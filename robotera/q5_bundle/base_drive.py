@@ -1,0 +1,505 @@
+"""Q5 direct base-drive velocity control card.
+
+This card publishes finite-duration TwistStamped commands via a separate
+subprocess running on rmw_cyclonedds_cpp / Domain 211.  The deployed Q5 base
+controller accepts the verified direct stream (empty frame id, zero timestamp,
+10 Hz); the similarly shaped FastDDS remote-control stream is not a direct SDK
+route.
+
+The parent process stays untouched so the base publisher cannot block sensor
+or media callbacks.
+"""
+
+from __future__ import annotations
+
+import math
+import multiprocessing as mp
+import os
+import queue
+import threading
+import time
+
+from control_contract import q5_active_status, q5_is_control_ready
+from q5_acp import notify as _acp_notify
+
+try:
+    import rclpy as _rclpy  # Verify availability before spawning the publisher process.
+    _HAS_RCLPY = True
+except Exception:
+    _HAS_RCLPY = False
+
+CARD = "base_drive"
+TYPE = "actuator"
+TOPIC = "/wr1_base_drive_controller/cmd_vel"
+NODE = "q5_base_drive"
+DESC = "Q5 底盘速度控制：前进、后退、左转、右转与高级速度组合；每次动作自动停车"
+
+
+def _failure(code: str, message: str, **details) -> dict:
+    return {
+        "ok": False,
+        "code": code,
+        "message": message,
+        "details": details,
+    }
+
+
+def _number(value, field: str):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite")
+    return value
+
+
+class _CommandScheduler:
+    """Apply ordered drive commands without losing a stop behind a move."""
+
+    def __init__(self, publish_rate: float, stop_repetitions: int):
+        self._period_s = 1.0 / publish_rate
+        self._stop_repetitions = stop_repetitions
+        self._active = None
+        self._stop_remaining = 0
+        self._next_publish_at = 0.0
+
+    def accept(self, command: dict, now: float):
+        kind = command.get("kind") if isinstance(command, dict) else None
+        if kind == "stop":
+            self._active = None
+            self._stop_remaining = self._stop_repetitions
+            self._next_publish_at = now
+        elif kind == "move":
+            duration_s = float(command.get("duration_s", 1.0))
+            self._active = {
+                "linear_x": float(command.get("linear_x", 0.0)),
+                "angular_z": float(command.get("angular_z", 0.0)),
+                "deadline": None if duration_s == -1.0 else now + duration_s,
+            }
+            self._stop_remaining = 0
+            self._next_publish_at = now
+
+    def next_output(self, now: float):
+        if now < self._next_publish_at:
+            return None
+        if self._active is not None:
+            if self._active["deadline"] is None or now < self._active["deadline"]:
+                self._next_publish_at = now + self._period_s
+                return self._active["linear_x"], self._active["angular_z"]
+            self._active = None
+            self._stop_remaining = self._stop_repetitions
+        if self._stop_remaining:
+            self._stop_remaining -= 1
+            self._next_publish_at = now + self._period_s
+            return 0.0, 0.0
+        return None
+
+
+# ── Subprocess launcher (CycloneDDS only — publishes TwistStamped) ───────────
+
+class _SubprocDriver:
+    """Spawn a CycloneDDS subprocess and send it commands via a Queue."""
+
+    def __init__(self, publish_rate: float, stop_repetitions: int, frame_id: str, enabled: bool = True):
+        self._ctx = mp.get_context("spawn")
+        self._cmd_q = self._ctx.Queue()
+        self._ready = self._ctx.Event()
+        self._publish_rate = publish_rate
+        self._stop_repetitions = stop_repetitions
+        self._frame_id = frame_id
+        self._enabled = enabled
+        self._proc = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        """Spawn the publisher and wait until its ROS endpoint exists."""
+        if not self._enabled or not _HAS_RCLPY:
+            return False
+        with self._lock:
+            if self._proc is not None and self._proc.is_alive():
+                return self._ready.is_set()
+            self._ready.clear()
+            self._proc = self._ctx.Process(
+                target=_subproc_main,
+                args=(self._cmd_q, self._ready, self._publish_rate, self._stop_repetitions, self._frame_id),
+                name="q5_base_drive_subproc", daemon=True,
+            )
+            self._proc.start()
+            print(f"[base_drive] subproc started → pid={self._proc.pid}", flush=True)
+        if self._ready.wait(timeout=5.0):
+            return True
+        with self._lock:
+            if self._proc is not None and self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=1.0)
+        return False
+
+    def move(self, linear_x: float, angular_z: float, duration_s: float):
+        if not self.start():
+            return False
+        self._cmd_q.put_nowait({
+            "kind": "move",
+            "linear_x": linear_x,
+            "angular_z": angular_z,
+            "duration_s": duration_s,
+        })
+        return True
+
+    def stop(self):
+        if not self.start():
+            return False
+        try:
+            self._cmd_q.put_nowait({"kind": "stop"})
+        except Exception:
+            return False
+        return True
+
+    def get_status(self) -> dict:
+        return {
+            "subproc_alive": self._proc.is_alive() if self._proc else False,
+            "subproc_pid": self._proc.pid if self._proc else None,
+            "publisher_ready": self._ready.is_set(),
+        }
+
+
+def _subproc_main(cmd_q: mp.Queue, ready: mp.Event, publish_rate: float, stop_repetitions: int,
+                  frame_id: str):
+    """Subprocess entry — CycloneDDS + Domain 211, publishes TwistStamped."""
+    os.environ["ROS_DOMAIN_ID"] = "211"
+    os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+    os.environ.pop("FASTDDS_BUILTIN_TRANSPORTS", None)
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
+    import signal
+
+    import rclpy
+    import rclpy.executors
+    from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+    from geometry_msgs.msg import TwistStamped
+
+    rclpy.init()
+    node = Node("q5_base_drive_subproc")
+    pub = node.create_publisher(
+        TwistStamped, "/wr1_base_drive_controller/cmd_vel",
+        QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        ),
+    )
+    ready.set()
+
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(node)
+
+    running = True
+
+    def _handle_sig(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, _handle_sig)
+    signal.signal(signal.SIGINT, _handle_sig)
+
+    last_log = time.time()
+
+    def _publish(linear_x: float, angular_z: float):
+        msg = TwistStamped()
+        # This Q5 controller rejects host-clock-stamped direct commands; its
+        # vendor CLI accepts the ROS zero timestamp and applies receipt time.
+        msg.header.frame_id = frame_id
+        msg.twist.linear.x = linear_x
+        msg.twist.angular.z = angular_z
+        pub.publish(msg)
+
+    scheduler = _CommandScheduler(publish_rate, stop_repetitions)
+
+    while running:
+        now = time.monotonic()
+        # Apply every queued command in arrival order before publishing. This
+        # makes move(-1) followed by stop resolve to zero velocity immediately.
+        try:
+            while True:
+                scheduler.accept(cmd_q.get_nowait(), now)
+        except queue.Empty:
+            pass
+        output = scheduler.next_output(now)
+        if output is not None:
+            _publish(*output)
+
+        # Health log every 10s
+        now = time.time()
+        if now - last_log >= 10.0:
+            last_log = now
+            node.get_logger().info("base_drive_subproc health OK")
+
+        executor.spin_once(timeout_sec=0.005)
+
+    for _ in range(stop_repetitions):
+        _publish(0.0, 0.0)
+        time.sleep(1.0 / publish_rate)
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+# ── Plugin ───────────────────────────────────────────────────────────────────
+
+class Plugin:
+    def __init__(self, plugin_config, namespace, executor, client):
+        self._client = client
+        self._max_linear = float(plugin_config.get("max_linear_x_mps", 0.50))
+        self._max_angular = float(plugin_config.get("max_angular_z_radps", math.radians(45.0)))
+        self._max_angular_deg = math.degrees(self._max_angular)
+        self._max_duration = float(plugin_config.get("max_duration_s", 5.0))
+        self._publish_rate = float(plugin_config.get("publish_rate_hz", 10.0))
+        self._stop_repetitions = int(plugin_config.get("stop_repetitions", 3))
+        self._frame_id = str(plugin_config.get("frame_id", ""))
+        self._driver = _SubprocDriver(
+            self._publish_rate, self._stop_repetitions, self._frame_id, enabled=executor is not None,
+        )
+        self._action_lock = threading.Lock()
+        self._active_action = None
+
+        if min(self._max_linear, self._max_angular, self._max_duration, self._publish_rate) <= 0:
+            raise ValueError("base_drive limits and publish_rate_hz must be positive")
+        if self._stop_repetitions < 1:
+            raise ValueError("base_drive stop_repetitions must be at least 1")
+
+    def get_tool(self):
+        return {
+            "name": CARD,
+            "type": TYPE,
+            "multiInstance": False,
+            "description": DESC,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "forward", "backward", "turn_left", "turn_right", "move", "cancel", "info"],
+                        "oneOf": [
+                            {"const": "start", "title": "检查控制条件"},
+                            {"const": "forward", "title": "前进"},
+                            {"const": "backward", "title": "后退"},
+                            {"const": "turn_left", "title": "原地左转"},
+                            {"const": "turn_right", "title": "原地右转"},
+                            {"const": "move", "title": "高级：组合速度"},
+                            {"const": "cancel", "title": "立即停止"},
+                            {"const": "info", "title": "查看状态"},
+                        ],
+                        "description": "方向动作到时自动停止；停止会立即重复发送零速度。",
+                    },
+                    "speed_mps": {
+                        "type": "number", "title": "移动速度 (m/s)", "minimum": 0.01,
+                        "maximum": self._max_linear, "multipleOf": 0.01,
+                        "default": min(0.20, self._max_linear),
+                        "description": f"范围[0.01,{self._max_linear:g}]m/s",
+                    },
+                    "turn_speed_degps": {
+                        "type": "number", "title": "转向速度 (deg/s)", "minimum": 1.0,
+                        "maximum": self._max_angular_deg, "multipleOf": 1.0,
+                        "default": min(15.0, self._max_angular_deg),
+                        "description": f"范围[1,{self._max_angular_deg:g}]deg/s",
+                    },
+                    "linear_x": {
+                        "type": "number",
+                        "title": "前后速度 (m/s)", "minimum": -self._max_linear,
+                        "maximum": self._max_linear, "multipleOf": 0.01, "default": min(0.20, self._max_linear),
+                        "description": f"范围[-{self._max_linear:g},{self._max_linear:g}]m/s",
+                    },
+                    "angular_z_degps": {
+                        "type": "number",
+                        "title": "转向速度 (deg/s)", "minimum": -self._max_angular_deg,
+                        "maximum": self._max_angular_deg, "multipleOf": 1.0, "default": 0.0,
+                        "description": f"范围[-{self._max_angular_deg:g},{self._max_angular_deg:g}]deg/s",
+                    },
+                    "duration_s": {
+                        "type": "number", "title": "持续时间 (秒)", "default": min(1.0, self._max_duration),
+                        "anyOf": [
+                            {"const": -1.0, "title": "持续运动（需取消）"},
+                            {"minimum": 0.1, "maximum": self._max_duration, "multipleOf": 0.1},
+                        ],
+                        "description": f"范围[0.1,{self._max_duration:g}]秒；-1 表示持续运动，需调用 cancel 停止。",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": False,
+                "x-action-params": {
+                    "start": {"params": [], "description": "检查控制锁、发布者冲突和当前限制。"},
+                    "forward": {"params": ["speed_mps", "duration_s"], "description": "以设定速度直线前进；duration_s=-1 时持续至 cancel。"},
+                    "backward": {"params": ["speed_mps", "duration_s"], "description": "以设定速度直线后退；duration_s=-1 时持续至 cancel。"},
+                    "turn_left": {"params": ["turn_speed_degps", "duration_s"], "description": "以设定角度速度原地左转；duration_s=-1 时持续至 cancel。"},
+                    "turn_right": {"params": ["turn_speed_degps", "duration_s"], "description": "以设定角度速度原地右转；duration_s=-1 时持续至 cancel。"},
+                    "move": {"params": ["linear_x", "angular_z_degps", "duration_s"], "description": "高级模式：duration_s=-1 时持续至 cancel。"},
+                    "cancel": {"params": [], "description": "立即发送零速度。"},
+                    "info": {"params": [], "description": "查看当前命令和安全条件。"},
+                },
+                "x-completion": {
+                    "actions": ["forward", "backward", "turn_left", "turn_right", "move"],
+                    "timeout": self._max_duration + (self._stop_repetitions / self._publish_rate) + 1.0,
+                },
+            },
+        }
+
+    def _control_status(self) -> dict:
+        return {
+            "ros_publisher_available": True,  # via subproc
+            "control_mode": "direct_velocity_interface",
+            "q5_fsm": q5_active_status(self._client),
+            "topic": TOPIC,
+            "frame_id": self._frame_id,
+            "limits": {
+                "max_linear_x_mps": self._max_linear,
+                "max_angular_z_degps": self._max_angular_deg,
+                "max_angular_z_radps": self._max_angular,
+                "max_duration_s": self._max_duration,
+            },
+            "subproc": self._driver.get_status(),
+        }
+
+    def _validate_move(self, args: dict):
+        status = self._control_status()
+        lifecycle_state = self._client.get_lifecycle_state()
+        if lifecycle_state != "active":
+            return _failure("LIFECYCLE_NOT_ACTIVE", "Q5 motion_manager must be active before base control",
+                            status={**status, "lifecycle_state": lifecycle_state})
+        q5_ready, q5_status = q5_is_control_ready(self._client)
+        if not q5_ready:
+            return _failure("Q5_FSM_NOT_READY", "Q5 /xbot_state must be fresh and READY or ACTIVE before base control",
+                            status={**status, "q5_fsm": q5_status})
+        if not self._client.snapshot().get("fresh", False):
+            return _failure("JOINT_STATE_UNAVAILABLE", "Refusing motion without fresh /joint_states")
+        try:
+            linear_x = _number(args.get("linear_x"), "linear_x")
+            angular_z_degps = _number(args.get("angular_z_degps"), "angular_z_degps")
+            duration_s = _number(args.get("duration_s"), "duration_s")
+        except ValueError as e:
+            return _failure("INVALID_ARGUMENT", str(e))
+        if linear_x == 0.0 and angular_z_degps == 0.0:
+            return _failure("INVALID_ARGUMENT", "Use action=stop for zero velocity")
+        if abs(linear_x) > self._max_linear or abs(angular_z_degps) > self._max_angular_deg:
+            return _failure("LIMIT_EXCEEDED", "Requested velocity exceeds configured deployment guardrails", limits=status["limits"])
+        if duration_s != -1.0 and not 0.0 < duration_s <= self._max_duration:
+            return _failure("INVALID_ARGUMENT", "duration_s is outside the configured safe interval", max_duration_s=self._max_duration)
+        return linear_x, math.radians(angular_z_degps), angular_z_degps, duration_s
+
+    def _directional_args(self, action: str, args: dict):
+        try:
+            duration_s = _number(args.get("duration_s"), "duration_s")
+            if action in ("forward", "backward"):
+                speed = _number(args.get("speed_mps"), "speed_mps")
+                if not 0.0 < speed <= self._max_linear:
+                    return _failure("LIMIT_EXCEEDED", "speed_mps is outside the configured base-drive limit",
+                                    max_linear_x_mps=self._max_linear)
+                return {"linear_x": speed if action == "forward" else -speed, "angular_z_degps": 0.0,
+                        "duration_s": duration_s}
+            speed = _number(args.get("turn_speed_degps"), "turn_speed_degps")
+            if not 0.0 < speed <= self._max_angular_deg:
+                return _failure("LIMIT_EXCEEDED", "turn_speed_degps is outside the configured base-drive limit",
+                                max_angular_z_degps=self._max_angular_deg)
+            return {"linear_x": 0.0, "angular_z_degps": speed if action == "turn_left" else -speed,
+                    "duration_s": duration_s}
+        except ValueError as e:
+            return _failure("INVALID_ARGUMENT", str(e))
+
+    def start(self):
+        if not self._driver.start():
+            return _failure("ROS_UNAVAILABLE",
+                            "Q5 base-drive CycloneDDS publisher did not become ready within 5 seconds",
+                            status=self._control_status())
+        return {"state": "ready", "safety": self._control_status()}
+
+    def stop(self):
+        self._driver.stop()
+        self._finish_active("cancelled", {"reason": "plugin_stopped"})
+        return {"state": "idle"}
+
+    def _finish_active(self, status: str, result: dict, action_id: str | None = None):
+        with self._action_lock:
+            active = self._active_action
+            if active is None or (action_id is not None and active["action_id"] != action_id):
+                return None
+            self._active_action = None
+            active["stop_event"].set()
+        _acp_notify(active["action_id"], status, {**active["command"], **result}, CARD)
+        return active
+
+    def _complete_after_duration(self, action_id: str, duration_s: float):
+        with self._action_lock:
+            active = self._active_action
+            if active is None or active["action_id"] != action_id:
+                return
+            stop_event = active["stop_event"]
+        stop_settle_s = self._stop_repetitions / self._publish_rate
+        if stop_event.wait(duration_s + stop_settle_s):
+            return
+        self._finish_active("completed", {"duration_s": duration_s, "stopped_automatically": True}, action_id)
+
+    def _cancel_for_replacement(self):
+        active = self._finish_active("cancelled", {"reason": "replaced_by_new_command"})
+        if active is not None:
+            self._driver.stop()
+
+    def _start_async_action(self, action: str, linear_x: float, angular_z: float,
+                            angular_z_degps: float, duration_s: float, supplied_action_id=None):
+        self._cancel_for_replacement()
+        if not self._driver.move(linear_x, angular_z, duration_s):
+            return _failure("ROS_UNAVAILABLE",
+            "Q5 base-drive CycloneDDS publisher is unavailable; no velocity command was sent",
+                            status=self._control_status())
+
+        action_id = str(supplied_action_id or f"base_drive_{action}_{int(time.time() * 1000)}")
+        command = {
+            "action": action,
+            "linear_x": linear_x,
+            "angular_z_degps": angular_z_degps,
+            "angular_z_radps": angular_z,
+            "duration_s": duration_s,
+        }
+        active = {"action_id": action_id, "command": command, "stop_event": threading.Event()}
+        with self._action_lock:
+            self._active_action = active
+        if duration_s != -1.0:
+            threading.Thread(target=self._complete_after_duration, args=(action_id, duration_s),
+                             daemon=True, name="q5_base_drive_completion").start()
+        return {
+            "ok": True, "state": "queued", "action_id": action_id, "command": command,
+            "stops_automatically": duration_s != -1.0,
+            "cancel_action": "cancel" if duration_s == -1.0 else None,
+        }
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "info":
+            with self._action_lock:
+                active = self._active_action
+            return {"ok": True, "state": "moving" if active else "idle",
+                    "active_command": active["command"] if active else None,
+                    "safety": self._control_status()}
+        if action in ("cancel", "stop"):
+            self._driver.stop()
+            active = self._finish_active("cancelled", {"reason": "cancelled_by_request"})
+            return {"ok": True, "state": "idle", "reason": "command",
+                    "action_id": active["action_id"] if active else None}
+
+        if action not in ("forward", "backward", "turn_left", "turn_right", "move"):
+            return None
+
+        move_args = self._directional_args(action, args) if action != "move" else args
+        if isinstance(move_args, dict) and move_args.get("ok") is False:
+            return move_args
+        command = self._validate_move(move_args)
+        if isinstance(command, dict):
+            return command
+
+        linear_x, angular_z, angular_z_degps, duration_s = command
+
+        return self._start_async_action(action, linear_x, angular_z, angular_z_degps, duration_s,
+                                        args.get("action_id"))
+
+
+def make_plugin(plugin_config, namespace, executor, client):
+    return Plugin(plugin_config, namespace, executor, client)

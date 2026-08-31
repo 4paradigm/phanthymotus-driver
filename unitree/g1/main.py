@@ -14,7 +14,18 @@ MCP 工具命名规则：直接使用 tool name（mic, tts, led, loco, loco_stat
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+
+
 from __future__ import annotations
+
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
 
 import json
 import os
@@ -80,9 +91,15 @@ class G1DeviceBundle:
             print("[bundle] NativeTtsPlugin loaded")
 
         if plugins_cfg.get("speaker", {}).get("enabled", False):
-            from device import SpeakerPlugin
-            self._plugins.append(SpeakerPlugin(plugins_cfg["speaker"], namespace, executor, audio_client))
-            print("[bundle] SpeakerPlugin loaded")
+            speaker_cfg = plugins_cfg["speaker"]
+            if speaker_cfg.get("isolated_process", False):
+                from device import SpeakerIsolatedProxy
+                self._plugins.append(SpeakerIsolatedProxy(speaker_cfg, namespace, executor, audio_client, network_iface=network_iface))
+                print("[bundle] SpeakerPlugin loaded (isolated process)")
+            else:
+                from device import SpeakerPlugin
+                self._plugins.append(SpeakerPlugin(speaker_cfg, namespace, executor, audio_client))
+                print("[bundle] SpeakerPlugin loaded")
 
         if plugins_cfg.get("led", {}).get("enabled", False):
             from device import LedPlugin
@@ -90,9 +107,23 @@ class G1DeviceBundle:
             print("[bundle] LedPlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False):
-            from device import LocoStatePlugin, LocoPlugin
-            self._plugins.append(LocoStatePlugin(plugins_cfg["loco"], namespace, executor))
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client, slam_client=slam_client, smart_motion=smart_motion))
+            from device import LocoStatePlugin, LocoPlugin, StatePlugin
+            loco_state = LocoStatePlugin(plugins_cfg["loco"], namespace, executor)
+            self._plugins.append(loco_state)
+            # StatePlugin owns the rt/lowstate subscription that posture is derived
+            # from. LocoPlugin needs it to tell lying from squatting once the robot
+            # is limp (FSM 0/1), so build it first when it is enabled and reuse the
+            # same instance rather than opening a second high-rate subscription.
+            posture_source = None
+            if plugins_cfg.get("state", {}).get("enabled", False):
+                state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor)
+                self._plugins.append(state_plugin)
+                posture_source = state_plugin.node
+                print("[bundle] StatePlugin loaded (posture source for LocoPlugin)")
+            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client,
+                                            slam_client=slam_client, smart_motion=smart_motion,
+                                            state_node=loco_state.node,
+                                            posture_node=posture_source))
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
@@ -107,8 +138,12 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
-            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
-            print("[bundle] StatePlugin loaded")
+            # Already built above when loco is enabled, to hand LocoPlugin its
+            # posture source — a second instance would duplicate the rt/lowstate
+            # subscription and clash on the ROS node name.
+            if not any(isinstance(p, StatePlugin) for p in self._plugins):
+                self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
+                print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
@@ -126,11 +161,16 @@ class G1DeviceBundle:
             print("[bundle] SpatialPlugin loaded")
 
         if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
-            from controlled_spatial import ControlledSpatialPlugin
             controlled_cfg = dict(plugins_cfg["controlled_spatial"])
             controlled_cfg["network_iface"] = network_iface
-            self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
-            print("[bundle] ControlledSpatialPlugin loaded")
+            if controlled_cfg.get("isolated_process", False):
+                from controlled_spatial import ControlledSpatialIsolatedProxy
+                self._plugins.append(ControlledSpatialIsolatedProxy(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
+                print("[bundle] ControlledSpatialPlugin loaded (isolated process)")
+            else:
+                from controlled_spatial import ControlledSpatialPlugin
+                self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
+                print("[bundle] ControlledSpatialPlugin loaded")
 
         if plugins_cfg.get("controlled_spatial_map", {}).get("enabled", False):
             try:
@@ -221,7 +261,11 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and '200' in msg:
                 return
-            print(f"[mcp] {self.address_string()} {msg}")
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
@@ -348,13 +392,12 @@ def main():
     ChannelFactoryInitialize(0, network_iface)
     print(f"[bundle] DDS initialized on interface: {network_iface}")
 
-    # Suppress C++ layer stdout (ClientStub recv/future logs) while keeping Python print working.
-    # C++ writes to fd 1 directly; we redirect fd 1 to /dev/null and give Python a dup of the original.
-    _orig_fd = os.dup(1)
-    _devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull, 1)
-    os.close(_devnull)
-    sys.stdout = os.fdopen(_orig_fd, 'w', buffering=1)
+    # NOTE: a fd-1 -> /dev/null shuffle used to live here to "suppress C++ layer
+    # stdout". The noise was actually Python `print()` in the vendored SDK, and
+    # the shuffle broke the "fd 1 is the docker log" invariant: two buffered
+    # writers on one pipe (non-atomic above PIPE_BUF -> torn log records) and
+    # every spawned subprocess silently lost stdout. SDK prints are now gated at
+    # source (UNITREE_RPC_DEBUG), so no redirection is needed.
 
     # AudioClient (shared by tts + led)
     audio_client = AudioClient()

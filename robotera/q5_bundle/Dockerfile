@@ -1,0 +1,102 @@
+ARG ROS_BASE_IMAGE=ros:humble-ros-base
+
+# Build local ROS interfaces separately so compiler toolchains and Python
+# development headers do not become part of the deployed robot image.
+FROM ${ROS_BASE_IMAGE} AS interface-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-dev \
+    python3-colcon-common-extensions \
+    cmake \
+    build-essential \
+    ros-humble-geometry-msgs \
+    ros-humble-diagnostic-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /q5_ws
+RUN mkdir -p src
+COPY vendor/xbot_common_interfaces /q5_ws/src/xbot_common_interfaces
+COPY vendor/audio_msgs /q5_ws/src/audio_msgs
+RUN . /opt/ros/humble/setup.sh && \
+    colcon build --packages-select xbot_common_interfaces audio_msgs
+
+FROM ${ROS_BASE_IMAGE}
+
+ENV ROS_DOMAIN_ID=211
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ENV PYTHONUNBUFFERED=1
+
+# Runtime-only dependencies. Interface build dependencies stay in the stage
+# above and are absent from the final image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-numpy \
+    python3-pil \
+    openssh-client \
+    sshpass \
+    python3-yaml \
+    ros-humble-rmw-cyclonedds-cpp \
+    ros-humble-rmw-fastrtps-cpp \
+    ros-humble-geometry-msgs \
+    ros-humble-lifecycle-msgs \
+    ros-humble-sensor-msgs \
+    ros-humble-std-srvs \
+    ros-humble-diagnostic-msgs \
+    ros-humble-action-msgs \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+COPY --from=interface-builder /q5_ws/install /q5_ws/install
+COPY common/ /work/common/
+COPY main.py /work/main.py
+COPY q5_bus_bridge.py /work/q5_bus_bridge.py
+COPY q5_bundle_entrypoint.sh /work/q5_bundle_entrypoint.sh
+COPY sensor_contract.py /work/sensor_contract.py
+COPY control_contract.py /work/control_contract.py
+COPY q5_sdk_client.py /work/q5_sdk_client.py
+COPY q5_acp.py /work/q5_acp.py
+COPY base_drive.py /work/base_drive.py
+COPY joints_state.py /work/joints_state.py
+COPY joints.py /work/joints.py
+COPY robot_ready.py /work/robot_ready.py
+COPY battery.py /work/battery.py
+COPY system_health.py /work/system_health.py
+COPY hand_state.py /work/hand_state.py
+COPY estop.py /work/estop.py
+COPY diagnostics.py /work/diagnostics.py
+COPY simple_action.py /work/simple_action.py
+COPY body_command.py /work/body_command.py
+COPY hand_command.py /work/hand_command.py
+COPY arm_control.py /work/arm_control.py
+COPY joint_limits.py /work/joint_limits.py
+COPY hand_control.py /work/hand_control.py
+COPY hand_gesture.py /work/hand_gesture.py
+COPY arm_gesture.py /work/arm_gesture.py
+COPY head_control.py /work/head_control.py
+COPY leg_control.py /work/leg_control.py
+COPY waist_control.py /work/waist_control.py
+COPY mic.py /work/mic.py
+COPY speaker.py /work/speaker.py
+COPY audio.py /work/audio.py
+COPY camera_rgb.py /work/camera_rgb.py
+COPY camera_depth.py /work/camera_depth.py
+COPY camera_pointcloud.py /work/camera_pointcloud.py
+COPY legacy_device.py /work/legacy_device.py
+COPY legacy_direct_control.py /work/legacy_direct_control.py
+COPY q5_media_bridge.py /work/q5_media_bridge.py
+COPY q5_camera_worker.py /work/q5_camera_worker.py
+COPY odom.py /work/odom.py
+COPY teleop_state.py /work/teleop_state.py
+COPY robot_status.py /work/robot_status.py
+COPY config.yaml /work/config.yaml
+COPY resource/q5_model.urdf /work/resource/q5_model.urdf
+COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
+COPY resource/startup_beep.pcm /work/resource/startup_beep.pcm
+COPY deploy/ /deploy/
+
+ENV PYTHONPATH=/work
+
+RUN chmod +x /work/q5_bundle_entrypoint.sh
+
+EXPOSE 15793
+
+CMD ["bash", "/work/q5_bundle_entrypoint.sh"]

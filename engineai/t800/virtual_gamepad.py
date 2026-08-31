@@ -118,10 +118,15 @@ class VirtualGamepadPlugin:
         except Exception as exc:
             self._lcm = None
             self._error = str(exc)
+            raise RuntimeError(f"LCM virtual gamepad initialization failed: {exc}") from exc
 
     def stop(self) -> None:
-        self._stream.stop()
-        self._publish_release()
+        self.halt()
+
+    def halt(self) -> None:
+        """Release all virtual inputs without tearing down the LCM client."""
+        if not self._stream.stop():
+            self._publish_release()
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "info", "status"):

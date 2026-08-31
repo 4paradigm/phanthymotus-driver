@@ -14,6 +14,7 @@ Clients (e.g. ext_mic plugin on another host) connect and receive raw PCM-16k.
 
 import argparse
 import numpy as np
+import os
 import re
 import select
 import socket
@@ -80,6 +81,9 @@ def _capture_loop(card_idx: int, clients: list, clients_lock: threading.Lock):
 
     print(f"[audio_sender] capturing card {card_idx}, {native_rate}Hz → {target_rate}Hz")
 
+    last_success = time.time()
+    MAX_FAIL_DURATION = 10  # exit if no successful read for 10s
+
     while True:
         try:
             length, data = pcm.read()
@@ -105,10 +109,19 @@ def _capture_loop(card_idx: int, clients: list, clients_lock: threading.Lock):
                     )
             except Exception:
                 time.sleep(3)
+            # Watchdog: exit if stuck too long
+            if time.time() - last_success > MAX_FAIL_DURATION:
+                print(f"[audio_sender] FATAL: no successful read for {MAX_FAIL_DURATION}s, exiting", flush=True)
+                os._exit(1)
             continue
 
         if length <= 0:
+            if time.time() - last_success > MAX_FAIL_DURATION:
+                print(f"[audio_sender] FATAL: no successful read for {MAX_FAIL_DURATION}s, exiting", flush=True)
+                os._exit(1)
             continue
+
+        last_success = time.time()
 
         # Convert S24_3LE stereo → S16_LE mono
         if is_s24_stereo:

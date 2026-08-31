@@ -1,7 +1,9 @@
 import struct
 import sys
 import time
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -46,6 +48,26 @@ class VirtualGamepadTests(unittest.TestCase):
         result = plugin.dispatch("command", {"buttons": [], "analogs": [2, -2, 0, 0, 0, 0], "duration": -1})
         self.assertEqual([1.0, -1.0, 0.0, 0.0, 0.0, 0.0], result["analogs"])
         plugin.dispatch("release", {})
+
+    def test_halt_releases_continuous_virtual_input(self):
+        plugin = VirtualGamepadPlugin({}, "robot", None)
+        plugin._lcm = FakeLcm()
+        plugin.dispatch("sticks", {"left_y": 0.5, "duration": -1})
+
+        plugin.halt()
+
+        self.assertFalse(plugin._stream.snapshot().active)
+        released = struct.unpack(">Qq12i6d", plugin._lcm.messages[-1][1])
+        self.assertEqual((0,) * 12, released[2:14])
+        self.assertEqual((0.0,) * 6, released[14:20])
+
+    def test_start_reports_lcm_initialization_failure_to_bundle(self):
+        plugin = VirtualGamepadPlugin({}, "robot", None)
+        fake_lcm = types.SimpleNamespace(LCM=mock.Mock(side_effect=OSError("no multicast route")))
+        with mock.patch.dict(sys.modules, {"lcm": fake_lcm}):
+            with self.assertRaisesRegex(RuntimeError, "no multicast route"):
+                plugin.start()
+        self.assertEqual("unavailable", plugin.dispatch("status", {})["state"])
 
 
 if __name__ == "__main__":

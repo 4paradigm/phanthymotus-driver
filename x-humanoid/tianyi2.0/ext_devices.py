@@ -462,7 +462,15 @@ class _NetworkMicNode(Node):
 
     def start(self) -> dict:
         if self.state == "running":
-            return self._status_dict()
+            # Check if capture thread is actually alive
+            if self._thread and self._thread.is_alive():
+                return self._status_dict()
+            # Thread died — reset and restart
+            self._running = False
+            self._thread = None
+            self.state = "idle"
+            log.warning(f"[ext_mic/net] thread was dead for {self._device_name}, restarting")
+
         self._running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -726,26 +734,27 @@ class _NetworkMicNode(Node):
                 time.sleep(2)
                 self._ensure_remote_ready(host, port)
 
-    def _ensure_remote_ready(self, host: str, port: int):
+    def _ensure_remote_ready(self, host: str, port: int, force_restart: bool = False):
         """Check remote audio_sender health; restart via SSH if unhealthy."""
         import socket as _socket
         import subprocess as _subprocess
 
         # Step 1: probe — connect and try to read data within 3s
-        healthy = False
-        try:
-            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-            sock.settimeout(3.0)
-            sock.connect((host, port))
-            sock.settimeout(3.0)
-            data = sock.recv(1024)
-            healthy = len(data) > 0
-            sock.close()
-        except Exception:
-            pass
+        if not force_restart:
+            healthy = False
+            try:
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                sock.settimeout(3.0)
+                sock.connect((host, port))
+                sock.settimeout(3.0)
+                data = sock.recv(1024)
+                healthy = len(data) > 0
+                sock.close()
+            except Exception:
+                pass
 
-        if healthy:
-            return
+            if healthy:
+                return
 
         # Step 2: unhealthy — SSH restart if config available
         if not self._ssh_user or not self._ssh_script:
@@ -753,24 +762,34 @@ class _NetworkMicNode(Node):
             return
 
         print(f"[ext_mic/tcp] remote unhealthy, restarting via SSH...", flush=True)
-        restart_cmd = (
-            f"pkill -f '{self._ssh_script}' 2>/dev/null; sleep 1; "
+        # Use SIGKILL to ensure immediate termination
+        kill_cmd = f"pkill -9 -f '{self._ssh_script}' 2>/dev/null"
+        ssh_base = [
+            "sshpass", "-p", self._ssh_pass,
+            "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+            f"{self._ssh_user}@{host}",
+        ]
+        try:
+            _subprocess.run(ssh_base + [kill_cmd], capture_output=True, timeout=10)
+        except Exception as e:
+            print(f"[ext_mic/tcp] SSH kill failed: {e}", flush=True)
+
+        # Wait for ALSA device to be fully released
+        time.sleep(3)
+
+        # Start fresh audio_sender
+        start_cmd = (
             f"nohup python3 {self._ssh_script} --port {port} --card {self._ssh_card} "
             f"> /tmp/audio_sender.log 2>&1 &"
         )
-        ssh_cmd = [
-            "sshpass", "-p", self._ssh_pass,
-            "ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
-            f"{self._ssh_user}@{host}", restart_cmd,
-        ]
         try:
-            _subprocess.run(ssh_cmd, capture_output=True, timeout=15)
+            _subprocess.run(ssh_base + [start_cmd], capture_output=True, timeout=10)
         except Exception as e:
-            print(f"[ext_mic/tcp] SSH restart failed: {e}", flush=True)
+            print(f"[ext_mic/tcp] SSH start failed: {e}", flush=True)
             return
 
-        # Step 3: wait for ready — poll TCP until data received (max ~8s)
-        for i in range(4):
+        # Step 3: wait for ready — poll TCP until data received (max ~10s)
+        for i in range(5):
             time.sleep(2)
             try:
                 sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
@@ -1072,6 +1091,9 @@ class ExtMicPlugin:
                 "ssh_pass": {
                     "type": "string",
                     "format": "password",
+                    "x-sensitive": False,   # 固定的出厂密码，不是用户秘密：打包成
+                                            # 解决方案时不需要清空（清了只会让载入
+                                            # 方重新敲一遍同一个默认值）
                     "description": "SSH password",
                     "default": "123",
                 },
