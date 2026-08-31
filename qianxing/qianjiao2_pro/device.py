@@ -78,7 +78,7 @@ class QianjiaoDevice:
         if self._video_proc is not None and self._video_proc.poll() is None:
             return
         try:
-            self._video_proc = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-rtsp_transport", "tcp", "-i", self.camera_rtsp, "-an", "-vf", "fps=10,scale=1280:-2", "-f", "mjpeg", "-q:v", "6", "pipe:1"], stdout=subprocess.PIPE)
+            self._video_proc = subprocess.Popen(["ffmpeg", "-loglevel", "fatal", "-rtsp_transport", "tcp", "-fflags", "+discardcorrupt", "-err_detect", "ignore_err", "-i", self.camera_rtsp, "-an", "-vf", "fps=10,scale=1280:-2", "-f", "mjpeg", "-q:v", "6", "pipe:1"], stdout=subprocess.PIPE)
             threading.Thread(target=self._video_loop, daemon=True, name="qianjiao-video-proxy").start()
         except Exception as exc:
             self._last_error = f"video proxy: {exc}"
