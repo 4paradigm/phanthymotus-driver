@@ -1,0 +1,11 @@
+id: adam-driver
+name: PNDbotics Adam Bundle
+category: driver
+hardware_provider: pndbotics
+hardware_model: "adam"
+image_name: pndbotics-adam
+port: 15702
+mcp_url: "http://localhost:15702/mcp"
+description: "PNDbotics Adam — 状态感知 + 手部状态 + 持续手部控制 + 步行运动 + 手臂控制 + 3D模型"
+build_context_extras:
+  - ../../common

@@ -1,4 +1,4 @@
-"""gRPC client wrapper for PNPbotics Adam locomotion control."""
+"""gRPC client wrapper for PNDbotics Adam locomotion control."""
 
 import grpc
 import sys
