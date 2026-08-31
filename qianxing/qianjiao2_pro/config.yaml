@@ -1,6 +1,8 @@
 name: "潜蛟 2.0 Pro ROV"
 driver_id: "qianxing-qianjiao2-pro"
 mcp_port: 15719
+# Address Agent Core uses to reach this driver. Override with the board IP if needed.
+mcp_advertise_host: "192.168.1.20"
 ros_namespace: ""
 rov:
   # The vehicle listens on UDP 14550. Set the vehicle address for udpout mode.
