@@ -486,12 +486,12 @@ class McpHttpContractTests(unittest.TestCase):
 
 
 class VendoredContractTests(unittest.TestCase):
-    def test_default_loco_profile_matches_approved_real_device_limits(self):
+    def test_default_loco_profile_matches_official_body_velocity_limits(self):
         config_text = (ROOT / "config.yaml").read_text()
         for declaration in (
-            "max_vx: 2.0",
+            "max_vx: 1.0",
             "max_vy: 1.0",
-            "max_vyaw: 2.0",
+            "max_vyaw: 1.0",
             "locomotion_prepare_duration_sec: 1.0",
         ):
             self.assertIn(declaration, config_text)
