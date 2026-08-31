@@ -274,6 +274,10 @@ _GAMEPAD_ACTIONS = {
     frozenset({"RB", "B"}): "dance",
     frozenset({"START", "CROSS_X_UP"}): "get_up",
     frozenset({"START", "CROSS_X_DOWN"}): "lie_down",
+    # Boxing punches (T800 keeps the same motion state during punches, so the
+    # action is derived from the gamepad combo only).
+    frozenset({"A", "CROSS_Y_RIGHT"}): "left_straight",
+    frozenset({"A", "CROSS_Y_LEFT"}): "right_straight",
 }
 
 
@@ -304,26 +308,112 @@ def _motion_direction(stick_x: float, stick_y: float, yaw_x: float = 0.0) -> str
     return "_".join(parts) if parts else "none"
 
 
+_SPEED_STALE_SECONDS = 0.5
+
+# T800 reports motion transitions as ``<source>_to_<target>`` (or
+# ``rl_mimic_<source>_to_<target>``). Resolve them to the stable *target* action
+# so the canvas sees a clean stand<->sit switch instead of a transient
+# intermediate state (e.g. ``rl_mimic_stance_to_sitdown`` -> sit,
+# ``rl_mimic_sitdown_to_stance`` -> stand).
+_TRANSITION_TARGETS = (
+    ("rl_mimic_stance_to_sitdown", "sit"),
+    ("stance_to_sitdown", "sit"),
+    ("rl_mimic_sitdown_to_stance", "stand"),
+    ("sitdown_to_stance", "stand"),
+    ("rl_mimic_supine_to_stance", "get_up"),
+    ("rl_mimic_prone_to_stance", "get_up"),
+    ("supine_to_stance", "get_up"),
+    ("prone_to_stance", "get_up"),
+    ("rl_mimic_stance_to_supine", "lie_down"),
+    ("stance_to_supine", "lie_down"),
+    ("rl_mimic_stance_to_kneeling", "kneel"),
+    ("rl_mimic_kneeling_to_stance", "stand"),
+)
+
+_MOTION_ALIASES = (
+    ("punch", ("punch", "boxing", "box", "fight", "fist", "打拳")),
+    ("dance", ("dance",)),
+    ("get_up", ("get_up", "getup", "supine_to_stance", "prone_to_stance")),
+    ("lie_down", ("lie_down", "liedown", "supine", "stance_to_supine")),
+    ("sit", ("sit_down", "sitdown", "pd_sitdown", "sit", "sitting", "seated", "seat", "squat")),
+    ("kneel", ("kneel", "kneeling", "knee", "跪")),
+    ("walk", ("walk", "loco", "rl_basic", "rl_terrain", "lower_body_balance", "walk_server")),
+    ("stand", ("stand", "pd_stand", "stance")),
+    ("idle", ("idle",)),
+    ("passive", ("passive", "damping")),
+)
+
+
+def _transition_target_action(name: str) -> str | None:
+    """Resolve a T800 ``*_to_*`` transition state to its stable target action."""
+    lowered = str(name or "").strip().lower()
+    if not lowered:
+        return None
+    for exact, action in _TRANSITION_TARGETS:
+        if lowered == exact:
+            return action
+    marker = "_to_"
+    if marker not in lowered:
+        return None
+    target = lowered.rsplit(marker, 1)[-1]
+    for normalized, tokens in _MOTION_ALIASES:
+        if any(token in target for token in tokens):
+            return normalized
+    return None
+
+
 def _normalize_motion_action(name: str) -> str:
     value = str(name or "").strip()
     lowered = value.lower()
     if not lowered or lowered == "unknown":
         return "unknown"
-    aliases = (
-        ("stand", ("stand", "pd_stand", "stance")),
-        ("sit", ("sit", "sitting", "seated", "seat", "squat")),
-        ("punch", ("punch", "boxing", "box", "fight", "fist", "打拳")),
-        ("dance", ("dance",)),
-        ("walk", ("walk", "loco")),
-        ("get_up", ("get_up", "getup")),
-        ("lie_down", ("lie_down", "liedown", "supine")),
-        ("idle", ("idle",)),
-        ("passive", ("passive", "damping")),
-    )
-    for normalized, tokens in aliases:
+    transition = _transition_target_action(lowered)
+    if transition:
+        return transition
+    # Match the more specific transition/screen states before broad terms such
+    # as "stance"; otherwise names like stance_to_sitdown are misclassified as
+    # stand on the canvas.
+    for normalized, tokens in _MOTION_ALIASES:
         if any(token in lowered for token in tokens):
             return normalized
     return value
+
+
+def _display_motion_action(name: str, *, moving: bool = False) -> str:
+    action = _normalize_motion_action(name)
+    # Any locomotion-capable state (rl_basic / walk_server / lower_body_balance /
+    # walk / loco / rl_terrain) describes a walking-ready pose: show "move" only
+    # while the robot is actually moving, otherwise "stand". ``moving`` must be
+    # freshness-aware so a stale speed sample never reports a stationary robot
+    # as walking.
+    if action == "walk":
+        return "move" if moving else "stand"
+    return action
+
+
+def _display_motion_action_from_state(
+    name: str,
+    available: list[str] | tuple[str, ...] | None = None,
+    *,
+    moving: bool = False,
+) -> str:
+    available = [str(item or "").strip().lower() for item in list(available or [])]
+    action = _normalize_motion_action(name)
+    # The T800 firmware may settle on the raw state ``passive`` after a posture
+    # transition.  The recovery transition advertised at the same time is the
+    # reliable posture signal: supine/prone recovery means lying, while
+    # sitdown recovery means sitting.
+    if action in ("passive", "idle"):
+        if any("supine_to_stance" in item or "prone_to_stance" in item for item in available):
+            return "lie"
+        if any("sitdown_to_stance" in item for item in available):
+            return "sit"
+        return "unknown"
+    if action == "walk":
+        return "move" if moving else "stand"
+    if action == "lie_down":
+        return "lie"
+    return action
 
 
 def _json_message(payload: dict) -> String:
@@ -1443,11 +1533,11 @@ class MotionCommandTracePlugin:
         self._publisher.publish(_json_message(self._snapshot()))
 
 class MotionEventsPlugin:
-    """Read-only event timeline for T800 motion-related MCP calls and feedback."""
+    """On-demand compact T800 motion status for the embodied model."""
 
     _MOTION_TOOLS = {
         "loco",
-        "motion_mode",
+        "safe_motion_mode",
         "dance",
         "joint_plan",
         "joint_plan_state",
@@ -1464,18 +1554,9 @@ class MotionEventsPlugin:
     def __init__(self, config: dict, namespace: str, ros2):
         self._config = config
         self._ns = namespace
-        capacity = int(config.get("diagnostics", {}).get("motion_events_capacity", 100))
-        self._capacity = max(1, min(capacity, 1000))
         self._robot_node = Node("t800_motion_events_sub", context=ros2.ctx_robot)
-        self._node = Node("t800_motion_events_pub", context=ros2.ctx_core)
         ros2.executor_robot.add_node(self._robot_node)
-        ros2.executor_core.add_node(self._node)
-        self._publisher = self._node.create_publisher(
-            String, f"/{namespace}/state/motion_events", _RELIABLE
-        )
         self._lock = threading.RLock()
-        self._events = deque(maxlen=self._capacity)
-        self._sequence = 0
         self._moving = False
         self._latest_speed = 0.0
         self._latest_speed_source = "none"
@@ -1485,6 +1566,8 @@ class MotionEventsPlugin:
         self._latest_control_source = "none"
         self._latest_direction = "none"
         self._current_motion_state = "unknown"
+        self._available_motion_states: list[str] = []
+        self._last_known_posture = "unknown"
         self._last_motion_state = "unknown"
         self._last_gamepad_signature = ""
         self._motion_start_threshold = 0.05
@@ -1495,6 +1578,20 @@ class MotionEventsPlugin:
         max_vx = abs(float(control.get("max_vx", 3.0)))
         max_vy = abs(float(control.get("max_vy", 1.0)))
         return max(1.0, math.hypot(max_vx, max_vy) * 1.5)
+
+    def _freshly_moving(self, now: float | None = None) -> bool:
+        """Whether the robot is currently moving based on a fresh speed sample.
+
+        ``_moving`` is only reset when a new sample arrives, so it can stay True
+        if the gamepad/odometry topic stops publishing. Requiring the latest
+        sample to be recent keeps a stationary robot from being reported as
+        moving (e.g. standing still in a walking-ready state).
+        """
+        now = time.monotonic() if now is None else now
+        updated = self._latest_speed_updated
+        if updated is None:
+            return False
+        return self._moving and (now - updated) <= _SPEED_STALE_SECONDS
 
     def _classify_gamepad_action(self, buttons: list[str], speed: float) -> str:
         button_set = frozenset(buttons)
@@ -1509,39 +1606,22 @@ class MotionEventsPlugin:
     def get_tool(self) -> dict:
         return {
             "name": "motion_events",
-            "type": "sensor",
+            "type": "actuator",
             "multiInstance": False,
             "readOnly": True,
-            "description": "T800 motion event stream — motion state changes and motion command lifecycle events",
-            "inputSchema": action_schema(
-                _with_lifecycle({
-                    "status": ([], "返回最新事件摘要"),
-                    "debug": (["limit", "since_event_id", "source_tool", "severity"], "返回筛选后的事件时间线"),
-                }),
-                {
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 200,
-                        "description": "最多返回事件条数",
-                    },
-                    "since_event_id": {
+            "description": "按需返回 T800 当前动作、运动/停止状态、速度和固件运动状态",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
                         "type": "string",
-                        "description": "只返回该事件之后的新事件",
-                    },
-                    "source_tool": {
-                        "type": "string",
-                        "description": "按来源 tool 过滤",
-                    },
-                    "severity": {
-                        "type": "string",
-                        "enum": ["debug", "info", "warning", "error"],
-                        "description": "按事件级别过滤",
+                        "enum": ["status"],
+                        "description": "查询当前运动状态",
                     },
                 },
-                "运动事件查询动作",
-            ),
-            "topic_out": [{"topic": f"/{self._ns}/state/motion_events", "format": "data/json"}],
+                "required": ["action"],
+                "additionalProperties": False,
+            },
         }
 
     def start(self) -> None:
@@ -1575,20 +1655,13 @@ class MotionEventsPlugin:
             self._robot_node.create_subscription(
                 Odometry, odometry_topic, self._on_odometry, _BEST_EFFORT
             )
-        self._node.create_timer(0.2, self._publish)
 
     def stop(self) -> None:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "info":
-            return _with_topic_out(self._summary_snapshot(), f"/{self._ns}/state/motion_events")
-        if action in ("motion_events", "status", "start"):
+        if action == "status":
             return self._summary_snapshot()
-        if action in ("debug", "list"):
-            return self._debug_snapshot(args)
-        if action == "stop":
-            return {"state": "idle"}
         return {"error": f"unknown motion events action: {action}"}
 
     def _on_velocity(self, msg) -> None:
@@ -1605,6 +1678,8 @@ class MotionEventsPlugin:
         motion_name = str(msg.target_motion_name)
         action = _normalize_motion_action(motion_name)
         with self._lock:
+            if action in ("passive", "idle"):
+                action = self._last_known_posture
             self._latest_action = action
             self._latest_control_source = "motion_request"
             self._latest_direction = "none"
@@ -1674,14 +1749,38 @@ class MotionEventsPlugin:
 
     def _on_motion_state(self, msg) -> None:
         current = str(getattr(msg, "current_motion_task", "") or "unknown")
-        action = _normalize_motion_action(current)
+        available = list(getattr(msg, "available_transition_motions", []) or [])
         with self._lock:
             previous = self._current_motion_state
             self._last_motion_state = previous
             self._current_motion_state = current
-            self._latest_action = action
-            self._latest_control_source = "motion_state"
-            self._latest_direction = "none"
+            self._available_motion_states = available
+            action = self._latest_action
+            # Refresh the displayed action only when the state actually changes.
+            # A periodic re-publish of the same state must not override a fresher
+            # gamepad action (e.g. a punch button mapped to left_straight while
+            # the robot stays in the boxing motion state).
+            if current != previous:
+                moving = self._freshly_moving()
+                raw_action = _normalize_motion_action(current)
+                if raw_action in ("passive", "idle"):
+                    inferred = _display_motion_action_from_state(current, available, moving=moving)
+                    if inferred in ("stand", "sit", "lie"):
+                        action = inferred
+                    else:
+                        requested_posture = "lie" if action == "lie_down" else action
+                        action = (
+                            requested_posture
+                            if requested_posture in ("stand", "sit", "lie")
+                            else self._last_known_posture
+                        )
+                else:
+                    action = _display_motion_action_from_state(current, available, moving=moving)
+                if action in ("stand", "sit", "lie"):
+                    self._last_known_posture = action
+                self._latest_action = action
+                self._latest_control_source = "motion_state"
+                self._latest_direction = "none"
         if current and current != "unknown" and current != previous:
             self.record_event(
                 source_tool="motion_state",
@@ -1689,7 +1788,7 @@ class MotionEventsPlugin:
                 severity="info",
                 phase="confirmed",
                 summary=f"motion state: {action} ({current})",
-                detail={"action": action, "previous": previous, "current": current},
+                detail={"action": action, "previous": previous, "current": current, "available": available},
             )
 
     def _on_odometry(self, msg) -> None:
@@ -1778,107 +1877,52 @@ class MotionEventsPlugin:
         summary: str,
         detail: dict | None = None,
     ) -> dict:
-        with self._lock:
-            self._sequence += 1
-            event_id = f"t800-motion-{self._sequence:06d}"
-            timestamp_ms = _now_ms()
-            event = {
-                "type": event_type,
-                "timestamp": round(timestamp_ms / 1000.0, 3),
-                "event_id": event_id,
-                "timestamp_ms": timestamp_ms,
-                "source_tool": source_tool,
-                "event_type": event_type,
-                "severity": severity,
-                "phase": phase,
-                "summary": summary,
-                "detail": detail or {},
-            }
-            self._events.append(event)
-            return dict(event)
+        # Kept as a compatibility hook for the bundle dispatcher.  Events are
+        # deliberately not buffered or streamed; status is computed on demand.
+        return {
+            "source_tool": source_tool,
+            "event_type": event_type,
+            "severity": severity,
+            "phase": phase,
+            "summary": summary,
+            "detail": detail or {},
+        }
 
     def _summary_snapshot(self) -> dict:
         now = time.monotonic()
         with self._lock:
-            latest_event = dict(self._events[-1]) if self._events else None
-            events = [dict(event) for event in self._events]
-            total_recorded = self._sequence
             moving = self._moving
             latest_speed = self._latest_speed
-            latest_speed_source = self._latest_speed_source
             latest_speed_updated = self._latest_speed_updated
             latest_action = self._latest_action
-            latest_buttons = list(self._latest_buttons)
-            latest_control_source = self._latest_control_source
-            latest_direction = self._latest_direction
             current_motion_state = self._current_motion_state
+            available_motion_states = list(self._available_motion_states)
+            last_known_posture = self._last_known_posture
         speed_age = None if latest_speed_updated is None else max(0.0, now - latest_speed_updated)
+        fresh_moving = (
+            moving
+            and speed_age is not None
+            and speed_age <= _SPEED_STALE_SECONDS
+        )
         display_action = latest_action
-        display_control_source = latest_control_source
         if display_action == "none" and current_motion_state not in ("", "unknown"):
-            display_action = _normalize_motion_action(current_motion_state)
-            display_control_source = "motion_state"
+            display_action = _display_motion_action_from_state(
+                current_motion_state, available_motion_states, moving=fresh_moving
+            )
+        if display_action in ("passive", "idle", "none"):
+            display_action = last_known_posture if last_known_posture in ("stand", "sit", "lie") else "unknown"
+        if display_action in ("walk", "move") and not fresh_moving:
+            display_action = "stand"
+        display_current_state = current_motion_state
+        if _normalize_motion_action(current_motion_state) in ("passive", "idle"):
+            display_current_state = display_action if display_action in ("stand", "sit", "lie") else "unknown"
         return {
-            "state": "running" if latest_event or latest_speed_updated is not None else "no_data",
-            "motion_state": "moving" if moving else "stopped",
-            "speed": f"{round(latest_speed, 2):.2f} m/s",
-            "speed_source": latest_speed_source,
-            "control_source": display_control_source,
+            "state": "running" if current_motion_state != "unknown" or latest_speed_updated is not None else "no_data",
             "action": display_action,
-            "direction": latest_direction,
-            "buttons": latest_buttons,
-            "current_motion_state": current_motion_state,
-            "event": None if latest_event is None else latest_event.get("type"),
-            "summary": None if latest_event is None else latest_event.get("summary"),
-            "event_id": None if latest_event is None else latest_event.get("event_id"),
-            "event_count": total_recorded,
+            "motion_state": "moving" if fresh_moving else "stopped",
+            "speed": f"{round(latest_speed, 2):.2f} m/s",
+            "current_motion_state": display_current_state,
         }
-
-    def _debug_snapshot(self, args: dict | None = None) -> dict:
-        args = args or {}
-        limit = int(args.get("limit", 50))
-        limit = max(1, min(limit, 200))
-        since_event_id = str(args.get("since_event_id", "") or "")
-        source_tool = str(args.get("source_tool", "") or "")
-        severity = str(args.get("severity", "") or "")
-        with self._lock:
-            events = [dict(event) for event in self._events]
-            total_buffered = len(self._events)
-            latest_event_id = events[-1]["event_id"] if events else None
-            total_recorded = self._sequence
-        if since_event_id:
-            events = self._after_event(events, since_event_id)
-        if source_tool:
-            events = [event for event in events if event["source_tool"] == source_tool]
-        if severity:
-            events = [event for event in events if event["severity"] == severity]
-        events = events[-limit:]
-        warning_count = sum(1 for event in events if event["severity"] == "warning")
-        error_count = sum(1 for event in events if event["severity"] == "error")
-        return {
-            "state": "running" if events else "no_data",
-            "ok": True,
-            "robot": "t800",
-            "tool": "motion_events",
-            "events": events,
-            "summary": {
-                "capacity": self._capacity,
-                "total_recorded": total_recorded,
-                "total_buffered": total_buffered,
-                "returned": len(events),
-                "latest_event_id": latest_event_id,
-                "warning_count": warning_count,
-                "error_count": error_count,
-            },
-            "timestamp_ms": _now_ms(),
-        }
-
-    @staticmethod
-    def _after_event(events: list[dict], since_event_id: str) -> list[dict]:
-        for index, event in enumerate(events):
-            if event["event_id"] == since_event_id:
-                return events[index + 1:]
-        return events
 
     @staticmethod
     def _classify(tool_name: str, action: str, result: dict) -> tuple[str, str, str]:
@@ -1921,9 +1965,6 @@ class MotionEventsPlugin:
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
         return str(value)
-
-    def _publish(self) -> None:
-        self._publisher.publish(_json_message(self._summary_snapshot()))
 
 class NativeInterfaceProbePlugin:
     _NAME_KEYWORDS = ("engineai", "motion", "hardware")
@@ -2552,40 +2593,132 @@ class LocomotionPlugin:
             self._publish_payload({"vx": 0.0, "vy": 0.0, "vyaw": 0.0})
 
 
-class MotionModePlugin:
-    _SHORTCUTS = {
-        "idle": "idle",
-        "passive": "passive",
-        "stand": "pd_stand",
-        "walk": "rl_basic",
-        "dance": "dance",
-        "get_up": "rl_mimic_supine_to_stance",
-        "lie_down": "rl_mimic_stance_to_supine",
+_MOTION_MODE_TRANSITION_TARGETS = (
+    ("rl_mimic_stance_to_sitdown", "sit"),
+    ("stance_to_sitdown", "sit"),
+    ("rl_mimic_sitdown_to_stance", "stand"),
+    ("sitdown_to_stance", "stand"),
+    ("rl_mimic_supine_to_stance", "get_up"),
+    ("rl_mimic_prone_to_stance", "get_up"),
+    ("supine_to_stance", "get_up"),
+    ("prone_to_stance", "get_up"),
+    ("rl_mimic_stance_to_supine", "lie_down"),
+    ("stance_to_supine", "lie_down"),
+)
+
+_MOTION_MODE_STATE_ALIASES = (
+    ("get_up", ("get_up", "getup", "supine_to_stance", "prone_to_stance")),
+    ("lie_down", ("lie_down", "liedown", "supine", "stance_to_supine")),
+    ("sit", ("sit_down", "sitdown", "pd_sitdown", "sit", "sitting", "seated", "seat", "squat")),
+    ("walk", ("walk", "loco", "rl_basic", "rl_terrain", "lower_body_balance", "walk_server")),
+    ("stand", ("stand", "pd_stand", "stance")),
+    ("idle", ("idle",)),
+    ("passive", ("passive", "damping")),
+)
+
+
+def _motion_mode_action(name: str) -> str:
+    """Normalize firmware-specific motion names for transition decisions."""
+    value = str(name or "").strip()
+    lowered = value.lower()
+    if not lowered or lowered == "unknown":
+        return "unknown"
+    for exact, action in _MOTION_MODE_TRANSITION_TARGETS:
+        if lowered == exact:
+            return action
+    for action, aliases in _MOTION_MODE_STATE_ALIASES:
+        if any(alias in lowered for alias in aliases):
+            return action
+    return value
+
+
+def _motion_mode_matches_any(name: str, candidates) -> bool:
+    lowered = str(name or "").strip().lower()
+    if not lowered:
+        return False
+    normalized = _motion_mode_action(lowered)
+    for candidate in candidates:
+        candidate_lowered = str(candidate or "").strip().lower()
+        if lowered == candidate_lowered or normalized == _motion_mode_action(candidate_lowered):
+            return True
+    return False
+
+
+def _first_available_motion(candidates, available: list[str]) -> str | None:
+    for candidate in candidates:
+        for item in available:
+            if _motion_mode_matches_any(item, (candidate,)):
+                return item
+    return None
+
+
+def _safe_motion_mode_action(
+    name: str,
+    available: list[str] | tuple[str, ...] | None = None,
+    fallback: str | None = None,
+) -> str:
+    """Return one of the three safe semantic postures from firmware feedback."""
+    action = _motion_mode_action(name)
+    if action in ("stand", "walk", "get_up"):
+        return "stand"
+    if action == "sit":
+        return "sit"
+    if action == "lie_down":
+        return "lie"
+    if action == "passive":
+        inferred = _display_motion_action_from_state(name, available)
+        if inferred in ("sit", "lie"):
+            return inferred
+        if fallback in ("sit", "lie"):
+            return str(fallback)
+    return "unknown"
+
+
+class SafeMotionModePlugin:
+    """Safe T800 posture transitions over the public ROS motion FSM."""
+
+    _ALIASES = {
+        "stand": (
+            "pd_stand", "stand", "stance",
+            "rl_mimic_sitdown_to_stance", "rl_mimic_supine_to_stance",
+            "rl_mimic_prone_to_stance",
+        ),
+        "sit": (
+            "rl_mimic_stance_to_sitdown", "pd_sitdown", "sit_down", "sitdown", "sit", "sitting",
+            "seated", "seat", "squat",
+        ),
+        "lie": (
+            "rl_mimic_stance_to_supine", "stance_to_supine", "lie_down", "liedown", "supine",
+        ),
     }
+    _ACTIONS = ("stand", "sit", "lie")
+
     def __init__(self, config: dict, namespace: str, ros2, state: StatePlugin):
         self._config = config
         self._state = state
-        self._node = Node("t800_motion_mode", context=ros2.ctx_robot)
+        self._node = Node("t800_safe_motion_mode", context=ros2.ctx_robot)
         ros2.executor_robot.add_node(self._node)
         self._publisher = None
+        self._last_confirmed_mode: str | None = None
 
     def get_tool(self) -> dict:
         return {
-            "name": "motion_mode",
+            "name": "safe_motion_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "T800 运动状态机切换，包含站立、行走、舞蹈、起身、躺下及桥接模式",
-            "inputSchema": action_schema(
-                {"switch": (["target", "force", "wait"], "请求切换到目标 Native SDK motion state"),
-                 **{name: (["force", "wait"], f"快捷切换到 {target}") for name, target in self._SHORTCUTS.items()},
-                 "status": ([], "查询当前和可转换状态")},
-                {
-                    "target": {"type": "string", "description": "目标 motion state；支持固件返回的自定义状态名"},
-                    "force": {"type": "boolean", "description": "目标不在 available transitions 时仍发送"},
-                    "wait": {"type": "boolean", "description": "等待状态反馈，默认 true"},
+            "description": "安全切换 T800 的 stand、sit、lie；非站立姿态互切会自动经过 stand",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": list(self._ACTIONS),
+                        "description": "目标安全姿态",
+                    },
                 },
-                "状态机动作",
-            ),
+                "required": ["action"],
+                "additionalProperties": False,
+            },
         }
 
     def start(self) -> None:
@@ -2600,40 +2733,196 @@ class MotionModePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        mode = str(action or "")
+        if mode not in self._ACTIONS:
+            return {"state": "rejected", "error": f"unknown safe motion action: {mode}"}
+        del args
+        timeout = float(self._config["control"]["mode_transition_timeout_sec"])
+        stabilize_sec = float(self._config.get("control", {}).get("mode_stand_stabilize_sec", 5.0))
+
         current, available = self._state.current_motion()
-        if action in ("start", "info", "status"):
-            return {"state": "ready", "current": current, "available": available}
-        if action == "stop":
-            return {"state": "idle"}
-        if action in self._SHORTCUTS:
-            args = dict(args)
-            args["target"] = self._SHORTCUTS[action]
-            action = "switch"
-        if action != "switch":
-            return {"error": f"unknown motion mode action: {action}"}
-        target = str(args.get("target", ""))
+        current_mode = _safe_motion_mode_action(current, available, self._last_confirmed_mode)
+        origin = current_mode
+        path = [origin] if origin in self._ACTIONS else []
+
+        if current_mode not in self._ACTIONS:
+            return self._failure(
+                "rejected", mode, origin, path, current, "current posture is not safely identifiable"
+            )
+        if mode == current_mode:
+            self._last_confirmed_mode = mode
+            return self._completed(mode, origin, [mode], current, changed=False)
+
+        if current_mode != "stand":
+            stand_target = self._pick_target("stand", available, current_mode)
+            if stand_target is None:
+                return self._reject(mode, origin, path, current, available, "stand")
+            step = self._request_and_wait(
+                stand_target,
+                desired_mode="stand",
+                timeout=timeout,
+            )
+            path.append("stand")
+            if step["state"] != "completed":
+                return self._failure(
+                    step["state"], mode, origin, path, step.get("current", current),
+                    f"could not reach stand before {mode}",
+                )
+            self._last_confirmed_mode = "stand"
+            if mode == "stand":
+                return self._completed(mode, origin, path, step.get("current", current), changed=True)
+            if stabilize_sec > 0:
+                time.sleep(stabilize_sec)
+            current, available = self._state.current_motion()
+
+        target = self._pick_target(mode, available, "stand")
+        if target is None:
+            return self._reject(mode, origin, path, current, available, mode)
+        final = self._request_and_wait(target, desired_mode=mode, timeout=timeout)
+        path.append(mode)
+        if final["state"] != "completed":
+            return self._failure(
+                final["state"], mode, origin, path, final.get("current", current),
+                f"could not reach {mode}",
+            )
+        self._last_confirmed_mode = mode
+        return self._completed(mode, origin, path, final.get("current", current), changed=True)
+
+    def request_target(self, target: str, args: dict, *, expected_actions=None) -> dict:
+        """Internal raw-state request used by the separate dance facade."""
+        args = dict(args or {})
+        force = bool(args.get("force", False))
+        wait = bool(args.get("wait", True))
+        timeout = float(args.get("timeout_sec", self._config["control"]["mode_transition_timeout_sec"]))
+        current, available = self._state.current_motion()
+        target = str(target or "")
         if not target:
-            return {"error": "target motion is required"}
-        if available and target not in available and not bool(args.get("force", False)):
-            return {"error": f"{target} is not available from {current}", "available": available}
+            return {"state": "rejected", "error": "target motion is required", "current": current}
+        if (not available or not _motion_mode_matches_any(target, available)) and not force:
+            return {
+                "state": "rejected",
+                "error": f"no available transition for {target} from {current}",
+                "current": current,
+            }
+        expected = frozenset(expected_actions or {_motion_mode_action(target)})
         msg = self._message_type()
         msg.target_motion_name = target
         self._publisher.publish(msg)
-        if not bool(args.get("wait", True)):
-            return {"state": "requested", "target": target, "previous": current}
-        deadline = time.monotonic() + float(self._config["control"]["mode_transition_timeout_sec"])
+        if not wait:
+            return {"state": "requested", "target": target, "current": current}
+        deadline = time.monotonic() + timeout
+        result = {"state": "timeout", "target": target, "current": current}
+        while time.monotonic() < deadline:
+            current, _ = self._state.current_motion()
+            if _motion_mode_action(current) in expected:
+                result = {"state": "completed", "target": target, "current": current}
+                break
+            time.sleep(0.05)
+        return {
+            "state": result["state"],
+            "target": target,
+            "current": result.get("current", current),
+        }
+
+    def _target_candidates(self, mode: str, current_mode: str) -> list[str]:
+        if mode == "stand":
+            if current_mode == "sit":
+                return [
+                    "rl_mimic_sitdown_to_stance", "sitdown_to_stance",
+                    "pd_stand", "stand", "stance",
+                ]
+            if current_mode == "lie":
+                return [
+                    "rl_mimic_supine_to_stance", "rl_mimic_prone_to_stance",
+                    "supine_to_stance", "prone_to_stance",
+                    "pd_stand", "stand", "stance",
+                ]
+        return list(self._ALIASES[mode])
+
+    def _pick_target(
+        self,
+        mode: str,
+        available: list[str],
+        current_mode: str,
+    ) -> str | None:
+        candidates = self._target_candidates(mode, current_mode)
+        if not available:
+            return None
+        return _first_available_motion(candidates, available)
+
+    def _request_and_wait(self, target: str, *, desired_mode: str, timeout: float) -> dict:
+        msg = self._message_type()
+        msg.target_motion_name = target
+        self._publisher.publish(msg)
+        deadline = time.monotonic() + timeout
+        current, available = "", []
         while time.monotonic() < deadline:
             current, available = self._state.current_motion()
-            if current == target:
-                return {"state": "completed", "current": current, "available": available}
+            motion = _safe_motion_mode_action(current, available, desired_mode)
+            if motion == desired_mode:
+                return {
+                    "state": "completed",
+                    "target": target,
+                    "current": current,
+                    "available": available,
+                    "motion": motion,
+                }
             time.sleep(0.05)
         return {"state": "timeout", "target": target, "current": current, "available": available}
+
+    @staticmethod
+    def _completed(mode: str, origin: str, path: list[str], firmware_state: str, *, changed: bool) -> dict:
+        return {
+            "state": "completed",
+            "action": mode,
+            "from": origin,
+            "to": mode,
+            "transition_path": path,
+            "transition": f"already {mode}" if not changed else " -> ".join(path),
+            "changed": changed,
+            "current": mode,
+            "firmware_state": firmware_state,
+        }
+
+    @staticmethod
+    def _failure(
+        state: str,
+        mode: str,
+        origin: str,
+        path: list[str],
+        firmware_state: str,
+        error: str,
+    ) -> dict:
+        return {
+            "state": state,
+            "action": mode,
+            "from": origin,
+            "to": mode,
+            "transition_path": path,
+            "transition": " -> ".join(path) if path else "not started",
+            "changed": False,
+            "current": _safe_motion_mode_action(firmware_state),
+            "firmware_state": firmware_state,
+            "error": error,
+        }
+
+    def _reject(
+        self,
+        mode: str,
+        origin: str,
+        path: list[str],
+        current: str,
+        available: list[str],
+        need: str,
+    ) -> dict:
+        error = "no_transition_data" if not available else f"no available transition for {need} from {current}"
+        return self._failure("rejected", mode, origin, path, current, error)
 
 
 class DancePlugin:
     """Discoverable dance facade over Native SDK motion states."""
 
-    def __init__(self, motion_mode: MotionModePlugin, state: StatePlugin):
+    def __init__(self, motion_mode: SafeMotionModePlugin, state: StatePlugin):
         self._motion_mode = motion_mode
         self._state = state
 
@@ -2683,13 +2972,21 @@ class DancePlugin:
             return {"state": "idle"}
         if action == "play":
             target = str(args.get("name", "dance"))
-        elif action == "stop_dance":
-            target = str(args.get("target", "rl_basic"))
-        else:
-            return {"error": f"unknown dance action: {action}"}
-        forwarded = dict(args)
-        forwarded["target"] = target
-        return self._motion_mode.dispatch("switch", forwarded)
+            current_action = _safe_motion_mode_action(current, available, self._motion_mode._last_confirmed_mode)
+            steps: list[dict] = []
+            if current_action != "stand":
+                stand = self._motion_mode.dispatch("stand", dict(args))
+                steps.append(stand)
+                if stand.get("state") != "completed":
+                    return {**stand, "dance_target": target, "steps": steps}
+            dance = self._motion_mode.request_target(target, dict(args), expected_actions={"dance"})
+            steps.append(dance)
+            return {**dance, "steps": steps}
+        if action == "stop_dance":
+            forwarded = dict(args)
+            forwarded.pop("target", None)
+            return self._motion_mode.dispatch("stand", forwarded)
+        return {"error": f"unknown dance action: {action}"}
 
 
 _JOINT_PLAN_COMPLETED_PROGRESS_MIN = 0.999

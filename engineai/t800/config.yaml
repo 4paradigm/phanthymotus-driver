@@ -17,6 +17,7 @@ control:
   max_vyaw: 2.0
   locomotion_prepare_duration_sec: 1.0
   mode_transition_timeout_sec: 5.0
+  mode_stand_stabilize_sec: 5.0
   motor_warning_temperature_c: 70.0
   tilt_warning_rad: 0.45
   fall_tilt_rad: 0.9
@@ -57,7 +58,6 @@ services:
 
 diagnostics:
   command_trace_capacity: 20
-  motion_events_capacity: 100
 
 plugins:
   state:
@@ -72,7 +72,7 @@ plugins:
     enabled: true
   locomotion:
     enabled: true
-  motion_mode:
+  safe_motion_mode:
     enabled: true
   dance:
     enabled: true
