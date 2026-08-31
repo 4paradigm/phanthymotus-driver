@@ -1,9 +1,12 @@
+import hashlib
 import importlib.util
 import json
+import math
 import os
 import ssl
 import struct
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -53,6 +56,50 @@ class FakePublisher:
         self.messages.append(message)
 
 
+class FakeAudioStdin:
+    def __init__(self):
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class FakeAudioProcess:
+    def __init__(self):
+        self.stdin = FakeAudioStdin()
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+class DeferredThread:
+    def __init__(self, target, args):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        pass
+
+    def join(self, timeout=None):
+        pass
+
+
 class FakeFuture:
     def done(self):
         return True
@@ -88,6 +135,11 @@ class FakeNode:
         subscription = types.SimpleNamespace(topic=topic, callback=callback)
         self.subscriptions.append(subscription)
         return subscription
+
+    def destroy_subscription(self, subscription):
+        if subscription in self.subscriptions:
+            self.subscriptions.remove(subscription)
+        return True
 
     def create_timer(self, period, callback):
         return types.SimpleNamespace(period=period, callback=callback)
@@ -199,7 +251,10 @@ def load_device():
 CONFIG = {
     "ros": {"robot_domain_id": 69, "core_domain_id": 42, "source_timeout_sec": 1.0},
     "control": {"velocity_rate_hz": 100.0, "low_level_rate_hz": 200.0, "override_rate_hz": 100.0,
-                "max_vx": 3.0, "max_vy": 1.0, "max_vyaw": 3.14, "mode_transition_timeout_sec": 0.1},
+                "max_vx": 1.0, "max_vy": 1.0, "max_vyaw": 1.0,
+                "locomotion_prepare_duration_sec": 0.0,
+                "mode_transition_timeout_sec": 0.1,
+                "stream_watchdog_period_sec": 0.5},
     "topics": {
         "joint_state": "/hardware/joint_state", "imu": "/hardware/imu_info",
         "gamepad": "/hardware/gamepad_keys", "motor_debug": "/hardware/motor_debug",
@@ -232,6 +287,10 @@ class DevicePluginContractTests(unittest.TestCase):
     def setUp(self):
         self.ros = FakeRos()
         self.state = self.device.StatePlugin(CONFIG, "robot", self.ros)
+        self._original_notify_acp = self.device._notify_acp_completion
+
+    def tearDown(self):
+        self.device._notify_acp_completion = self._original_notify_acp
 
     def test_complete_tool_surface_is_declared(self):
         from virtual_gamepad import VirtualGamepadPlugin
@@ -245,11 +304,13 @@ class DevicePluginContractTests(unittest.TestCase):
             self.device.DancePlugin(motion_mode, self.state),
             joint_plan,
             self.device.GesturePlugin(joint_plan),
+            self.device.HeadActuatorPlugin(CONFIG, joint_plan, self.state),
             self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.JointBridgePlugin(CONFIG, "robot", self.ros, self.state),
             self.device.LedPlugin(CONFIG, "robot", self.ros),
             self.device.TtsPlugin(CONFIG, "robot", self.ros),
             self.device.MicPlugin(CONFIG, "robot", self.ros),
+            self.device.SpeakerPlugin(CONFIG, "robot", self.ros),
             self.device.VisionPlugin(CONFIG, "robot", self.ros),
             self.device.MotorPowerPlugin(CONFIG, "robot", self.ros),
             self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros),
@@ -273,14 +334,14 @@ class DevicePluginContractTests(unittest.TestCase):
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
              "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
              "native_interface_probe",
-             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture",
+             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture", "head",
              "joint_override", "joint_bridge",
-             "led", "tts", "mic", "pointcloud", "camera", "depth",
+             "led", "tts", "mic", "speaker", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(41, len(names))
-        self.assertEqual(41, len(definitions), "tool names must be unique")
+        self.assertEqual(43, len(names))
+        self.assertEqual(43, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -294,6 +355,36 @@ class DevicePluginContractTests(unittest.TestCase):
                 self.assertIn(action_name, enum, tool["name"])
                 for parameter in detail.get("params", []):
                     self.assertIn(parameter, properties, f"{tool['name']}.{action_name}")
+
+    def test_latest_head_and_four_pr_cards_are_available_together(self):
+        self.assertTrue(hasattr(self.device, "GaitPlugin"))
+        self.assertTrue(hasattr(self.device, "MotionRecorderPlugin"))
+        motion_mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        gait = self.device.GaitPlugin(CONFIG, motion_mode, self.state)
+        with tempfile.TemporaryDirectory() as recordings_dir:
+            config = {
+                **CONFIG,
+                "plugins": {
+                    **CONFIG.get("plugins", {}),
+                    "motion_recorder": {"recordings_dir": recordings_dir},
+                },
+            }
+            recorder = self.device.MotionRecorderPlugin(config, "robot", self.ros)
+            joint_plan = self.device.JointPlanPlugin(
+                CONFIG, "robot", self.ros, self.state
+            )
+            names = {
+                self.device.SpeakerPlugin(CONFIG, "robot", self.ros).get_tool()["name"],
+                self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state).get_tool()["name"],
+                gait.get_tool()["name"],
+                recorder.get_tool()["name"],
+                self.device.HeadActuatorPlugin(
+                    CONFIG, joint_plan, self.state
+                ).get_tool()["name"],
+            }
+        self.assertEqual(
+            {"speaker", "loco", "gait", "motion_recorder", "head"}, names
+        )
 
     def test_sensor_lifecycle_schemas_and_info_topics_match_agent_core(self):
         plugins = [
@@ -390,7 +481,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("gamepad_analog", snapshot["source"])
         self.assertEqual("moving", snapshot["motion_state"])
         self.assertEqual("forward_left", snapshot["direction"])
-        self.assertEqual("0.98 m/s", snapshot["speed"])
+        self.assertEqual("0.50 m/s", snapshot["speed"])
 
     def test_motion_events_ignore_implausible_odin_odometry(self):
         plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
@@ -417,7 +508,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("move", moving["action"])
         self.assertEqual("forward", moving["direction"])
         self.assertEqual([], moving["buttons"])
-        self.assertEqual("1.50 m/s", moving["speed"])
+        self.assertEqual("0.50 m/s", moving["speed"])
         self.assertEqual("motion_start", moving["event"])
 
         plugin._on_gamepad(types.SimpleNamespace(
@@ -577,33 +668,447 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("stale", degraded["sources"]["odin2_camera_right"]["state"])
         self.assertIn("Odin2 右相机: stale", degraded["issues"])
 
-    def test_locomotion_force_path_publishes_and_stops(self):
+    def test_locomotion_allowed_state_publishes_and_stops(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
-        result = plugin.dispatch("move", {"vx": 9, "vy": -9, "vyaw": 9, "duration": 0.03, "force": True})
-        self.assertEqual(3.0, result["vx"])
-        self.assertEqual(-1.0, result["vy"])
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        result = plugin.dispatch("move", {"vx": 0.9, "vy": -0.9, "vyaw": 0.9, "duration": 0.03})
+        self.assertNotIn("action_id", result)
+        self.assertEqual(0.9, result["vx"])
+        self.assertEqual(-0.9, result["vy"])
         time.sleep(0.08)
         self.assertGreaterEqual(len(plugin._publisher.messages), 2)
         self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
 
+    def test_locomotion_rejects_direct_velocity_outside_safety_limits(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+
+        rejected = plugin.dispatch("move", {
+            "vx": 100.0,
+            "vy": 0.0,
+            "vyaw": 100.0,
+            "duration": 0.1,
+        })
+
+        self.assertEqual("SAFETY_LIMIT", rejected["code"])
+        self.assertIn("vx", rejected["error"])
+        self.assertIn("vyaw", rejected["error"])
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual([0.0, 0.0], plugin._publisher.messages[-1].linear_velocity)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_treats_optional_nulls_as_omitted_defaults(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+
+        result = plugin.dispatch("move", {
+            "vx": 0.1,
+            "vy": None,
+            "vyaw": None,
+            "duration": None,
+        })
+
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(0.1, result["vx"])
+        self.assertEqual(0.0, result["vy"])
+        self.assertEqual(0.0, result["vyaw"])
+        self.assertEqual(1.0, result["duration"])
+        plugin.dispatch("stop_move", {})
+        properties = plugin.get_tool()["inputSchema"]["properties"]
+        self.assertEqual(0.0, properties["vy"]["default"])
+        self.assertEqual(0.0, properties["vyaw"]["default"])
+        self.assertEqual(1.0, properties["duration"]["default"])
+
+    def test_locomotion_rejects_invalid_and_composite_safety_limits(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        cases = [
+            ("move", {"vx": True, "duration": 0.1}, "INVALID_ARGUMENT"),
+            ("move", {"vx": "0.1", "duration": 0.1}, "INVALID_ARGUMENT"),
+            ("move", {"vx": 10**400, "duration": 0.1}, "INVALID_ARGUMENT"),
+            ("move", {"vx": float("nan"), "duration": 0.1}, "INVALID_ARGUMENT"),
+            ("move", {"vx": 0.1, "duration": -0.5}, "INVALID_ARGUMENT"),
+            ("move", {"vx": 0.1, "duration": 10.1}, "SAFETY_LIMIT"),
+            ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": 10}, "SAFETY_LIMIT"),
+            ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": None}, "INVALID_ARGUMENT"),
+            ("move_displacement", {"x_m": 0.1, "y_m": 0, "speed_m_s": 0}, "INVALID_ARGUMENT"),
+            ("turn_angle", {"angle_rad": 0.1, "angular_speed_rad_s": 10}, "SAFETY_LIMIT"),
+            ("turn_angle", {"angle_rad": 0.1, "angular_speed_rad_s": 0}, "INVALID_ARGUMENT"),
+            ("arc", {"radius_m": 1, "angle_rad": 0.1, "linear_speed_m_s": 10}, "SAFETY_LIMIT"),
+            ("arc", {"radius_m": 0.1, "angle_rad": 0.1, "linear_speed_m_s": 0.2}, "SAFETY_LIMIT"),
+        ]
+        for action, arguments, expected_code in cases:
+            with self.subTest(action=action, arguments=arguments):
+                plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+                rejected = plugin.dispatch(action, arguments)
+                self.assertEqual(expected_code, rejected["code"])
+                self.assertIn("error", rejected)
+                self.assertFalse(plugin._stream.snapshot().active)
+                self.assertEqual([0.0, 0.0], plugin._publisher.messages[-1].linear_velocity)
+                self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+        duration_schema = plugin.get_tool()["inputSchema"]["properties"]["duration"]
+        self.assertEqual(
+            [
+                {"type": "number", "const": -1},
+                {"type": "number", "minimum": 0, "maximum": 10.0},
+            ],
+            duration_schema["anyOf"],
+        )
+
+    def test_locomotion_accepts_official_walk_states_without_force(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual(
+            ["move", "move_displacement", "turn_angle", "arc"],
+            schema["x-completion"]["actions"],
+        )
+        self.assertEqual(
+            {"on_interrupt_motion": {"action": "stop_move"}},
+            schema["x-hooks"],
+        )
+        self.assertNotIn("force", schema["properties"])
+        for motion in ("rl_basic", "walk", "lower_body_balance"):
+            with self.subTest(motion=motion):
+                self.state._on_motion(types.SimpleNamespace(
+                    current_motion_task=motion,
+                    available_transition_motions=["passive"],
+                ))
+                result = plugin.dispatch("move", {
+                    "vx": 0.2,
+                    "duration": 0.01,
+                })
+                self.assertEqual("completed", result["state"])
+                self.assertEqual(0.2, result["vx"])
+                plugin.dispatch("stop_move", {})
+
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="idle",
+            available_transition_motions=["passive"],
+        ))
+        rejected = plugin.dispatch("move", {"vx": 0.1, "duration": 0.01})
+        self.assertIn("rl_basic", rejected["error"])
+
+    def test_locomotion_continuous_move_does_not_block_manual_stop(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+
+        result = plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+
+        self.assertNotIn("action_id", result)
+        self.assertEqual("stopped", plugin.dispatch("stop_move", {})["state"])
+
+    def test_locomotion_timed_move_separates_preparation_and_reports_acp(self):
+        config = {
+            **CONFIG,
+            "control": {
+                **CONFIG["control"],
+                "locomotion_prepare_duration_sec": 0.04,
+            },
+        }
+        plugin = self.device.LocomotionPlugin(config, "robot", self.ros, self.state)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.05
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+
+        result = plugin.dispatch("move", {"vx": 0.1, "duration": 0.03})
+
+        self.assertTrue(result["action_id"].startswith("t800_loco_"))
+        self.assertEqual(0.04, result["preparation_duration"])
+        self.assertEqual(0.03, result["duration"])
+        self.assertEqual(0.07, result["command_duration"])
+        time.sleep(0.045)
+        self.assertTrue(plugin._stream.snapshot().active)
+        time.sleep(0.06)
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("completed", completions[0][1])
+
+    def test_locomotion_concurrent_starts_complete_every_action_id_once(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.01
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        first_publish_entered = threading.Event()
+        allow_first_publish = threading.Event()
+        real_publish = plugin._stream._publisher
+        publish_calls = 0
+
+        def gated_publish(payload):
+            nonlocal publish_calls
+            publish_calls += 1
+            if publish_calls == 1:
+                first_publish_entered.set()
+                allow_first_publish.wait(timeout=1.0)
+            real_publish(payload)
+
+        plugin._stream._publisher = gated_publish
+        results = [{}, {}]
+        first = threading.Thread(target=lambda: results[0].update(
+            plugin.dispatch("move", {"vx": 0.1, "duration": 0.05})
+        ))
+        second = threading.Thread(target=lambda: results[1].update(
+            plugin.dispatch("move", {"vx": 0.2, "duration": 0.05})
+        ))
+        first.start()
+        self.assertTrue(first_publish_entered.wait(timeout=1.0))
+        second.start()
+        allow_first_publish.set()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while len(completions) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        action_ids = {result["action_id"] for result in results}
+        self.assertEqual(2, len(action_ids))
+        self.assertEqual(action_ids, {call[0] for call in completions})
+        self.assertEqual(2, len(completions))
+        self.assertIn("cancelled", {call[1] for call in completions})
+        self.assertIn("completed", {call[1] for call in completions})
+
+    def test_locomotion_release_failure_completes_error_and_stays_gated(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.01
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        real_publish = plugin._publisher.publish
+        fail_release = True
+
+        def publish(message):
+            if (
+                fail_release
+                and list(message.linear_velocity) == [0.0, 0.0]
+                and float(message.yaw_velocity) == 0.0
+            ):
+                raise RuntimeError("zero velocity transport failed")
+            real_publish(message)
+
+        plugin._publisher.publish = publish
+        moving = plugin.dispatch("move", {"vx": 0.2, "duration": 0.5})
+        stopped = plugin.dispatch("stop_move", {})
+
+        self.assertEqual("error", stopped["state"])
+        self.assertTrue(stopped["release_failed"])
+        self.assertTrue(plugin.motion_active())
+        deadline = time.monotonic() + 1.0
+        while not completions and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(moving["action_id"], completions[0][0])
+        self.assertEqual("error", completions[0][1])
+
+        fail_release = False
+        retried = plugin.dispatch("stop_move", {})
+        self.assertEqual("stopped", retried["state"])
+        self.assertFalse(plugin.motion_active())
+
+    def test_locomotion_natural_release_failure_also_stays_gated(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.01
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        real_publish = plugin._publisher.publish
+
+        def publish(message):
+            if (
+                list(message.linear_velocity) == [0.0, 0.0]
+                and float(message.yaw_velocity) == 0.0
+            ):
+                raise RuntimeError("natural zero transport failed")
+            real_publish(message)
+
+        plugin._publisher.publish = publish
+        moving = plugin.dispatch("move", {"vx": 0.2, "duration": 0.03})
+        deadline = time.monotonic() + 1.0
+        while not completions and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(moving["action_id"], completions[0][0])
+        self.assertEqual("error", completions[0][1])
+        self.assertTrue(plugin.motion_active())
+        self.assertTrue(plugin.dispatch("status", {})["release_failed"])
+
+    def test_locomotion_manual_stop_zeroes_active_timed_action(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": 0.5})
+
+        stopped = plugin.dispatch("stop_move", {})
+
+        self.assertEqual("stopped", stopped["state"])
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_watchdog_zeroes_velocity(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": 0.5})
+        plugin._stream._last_publish_at = time.monotonic() - 2.0
+
+        plugin._stream_health_check()
+
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_background_publish_failure_is_visible_and_zeroes(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        real_publish = plugin._stream._publisher
+        publish_count = 0
+
+        def fail_after_first(payload):
+            nonlocal publish_count
+            publish_count += 1
+            if publish_count > 1:
+                raise RuntimeError("velocity publisher failed")
+            real_publish(payload)
+
+        plugin._stream._publisher = fail_after_first
+        plugin.dispatch("move", {"vx": 0.1, "duration": 0.5})
+
+        deadline = time.monotonic() + 0.5
+        while plugin._stream.snapshot().active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual("velocity publisher failed", plugin._stream.snapshot().error)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_rejected_command_stops_existing_stream(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+
+        rejected = plugin.dispatch("move_displacement", {"x_m": 0, "y_m": 0})
+
+        self.assertIn("non-zero", rejected["error"])
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_motion_state_transition_stops_active_stream(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="passive",
+            available_transition_motions=["pd_stand"],
+        ))
+
+        plugin._stream_health_check()
+
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_force_cannot_bypass_motion_state_gate(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="passive",
+            available_transition_motions=["pd_stand"],
+        ))
+
+        rejected = plugin.dispatch("move", {
+            "vx": 0.1, "duration": 0.1, "force": True,
+        })
+
+        self.assertIn("rl_basic", rejected["error"])
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+
+    def test_locomotion_rejects_timed_commands_beyond_safety_limit(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        rejected = plugin.dispatch("move", {
+            "vx": 0.1,
+            "duration": plugin._MAX_TIMED_DURATION_SEC + 0.1,
+        })
+        self.assertEqual("SAFETY_LIMIT", rejected["code"])
+        self.assertIn("10s safety limit", rejected["error"])
+
     def test_locomotion_open_loop_composites(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
         move = plugin.dispatch("move_displacement", {
-            "x_m": 1.0, "y_m": 0.0, "speed_m_s": 0.5, "force": True,
+            "x_m": 1.0, "y_m": 0.0, "speed_m_s": 0.5,
         })
         self.assertTrue(move["open_loop"])
         self.assertAlmostEqual(0.5, move["vx"])
         self.assertAlmostEqual(2.0, move["duration"])
         plugin.dispatch("stop_move", {})
         turn = plugin.dispatch("turn_angle", {
-            "angle_rad": -1.0, "angular_speed_rad_s": 0.5, "force": True,
+            "angle_rad": -1.0, "angular_speed_rad_s": 0.5,
         })
         self.assertAlmostEqual(-0.5, turn["vyaw"])
         plugin.dispatch("stop_move", {})
         arc = plugin.dispatch("arc", {
-            "radius_m": 1.0, "angle_rad": 1.0, "linear_speed_m_s": 0.5, "force": True,
+            "radius_m": 1.0, "angle_rad": 1.0, "linear_speed_m_s": 0.5,
         })
         self.assertAlmostEqual(arc["vx"], arc["vyaw"])
         plugin.dispatch("stop_move", {})
@@ -615,7 +1120,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("requested", result["state"])
         self.assertEqual("vendor_future_mode", plugin._publisher.messages[-1].target_motion_name)
         plugin.dispatch("get_up", {"force": True, "wait": False})
-        self.assertEqual("supine_to_stance", plugin._publisher.messages[-1].target_motion_name)
+        self.assertEqual("rl_mimic_supine_to_stance", plugin._publisher.messages[-1].target_motion_name)
 
     def test_dance_facade_lists_and_plays_official_dance(self):
         mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
@@ -661,6 +1166,20 @@ class DevicePluginContractTests(unittest.TestCase):
             plugin.dispatch("hold_current", {})
         self.assertEqual([], plugin._publisher.messages)
 
+    def test_joint_plan_validation_failure_does_not_leak_head_ownership(self):
+        plugin = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.start()
+        # head joints [23, 24] 但 target_positions 只给 1 个，验证失败
+        with self.assertRaises(ValueError):
+            plugin.dispatch("plan", {
+                "joint_indices": [23, 24],
+                "target_positions": [0.0],
+            })
+        # 验证失败后 head 不应被占有，head_pose 应能正常执行
+        result = plugin.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        self.assertEqual("requested", result["state"])
+        self.assertEqual([23, 24], plugin._publisher.messages[-1].joint_indices)
+
     def test_joint_plan_named_head_arm_and_hold_actions(self):
         plugin = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plugin.start()
@@ -670,8 +1189,17 @@ class DevicePluginContractTests(unittest.TestCase):
         })
         self.assertEqual("requested", named["state"])
         self.assertEqual([23, 24], plugin._publisher.messages[-1].joint_indices)
+        # head 请求持有锁，模拟完成后释放
+        req_id = plugin._publisher.messages[-1].request_id
+        plugin._on_state(JointMotionPlanState(req_id, JointMotionPlanState.EXECUTING, 0.5))
+        plugin._on_state(JointMotionPlanState(req_id, JointMotionPlanState.IDLE, 1.0))
+
         plugin.dispatch("head_pose", {"pitch_rad": 0.2, "yaw_rad": 0.3})
         self.assertEqual([23, 24], plugin._publisher.messages[-1].joint_indices)
+        req_id = plugin._publisher.messages[-1].request_id
+        plugin._on_state(JointMotionPlanState(req_id, JointMotionPlanState.EXECUTING, 0.5))
+        plugin._on_state(JointMotionPlanState(req_id, JointMotionPlanState.IDLE, 1.0))
+
         plugin.dispatch("arm_pose", {"side": "left", "target_positions": [0.0] * 5})
         self.assertEqual([13, 14, 15, 16, 17], plugin._publisher.messages[-1].joint_indices)
         plugin.dispatch("hold_current", {})
@@ -683,7 +1211,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_until_idle = lambda *_args, **_kwargs: {}
         plan.wait_for_request = lambda *_args, **_kwargs: {}
         gesture = self.device.GesturePlugin(plan)
-        gesture._acp_notify = lambda *_args: None
+        self.device._notify_acp_completion = lambda *_args, **_kwargs: None
         listed = {item["name"]: item["steps"] for item in gesture.dispatch("list", {})["gestures"]}
         self.assertEqual(8, listed["wave_hands"])
         self.assertEqual(2, listed["shake_hand"])
@@ -703,6 +1231,10 @@ class DevicePluginContractTests(unittest.TestCase):
         schema = gesture.get_tool()["inputSchema"]
         self.assertEqual(["play", "sequence"], schema["x-completion"]["actions"])
         self.assertGreaterEqual(schema["x-completion"]["timeout"], 60)
+        self.assertEqual(
+            {"on_interrupt_motion": {"action": "stop_gesture"}},
+            schema["x-hooks"],
+        )
         actions = set(schema["properties"]["action"]["enum"])
         self.assertTrue({"start", "info", "stop"}.issubset(actions))
         action_params = schema["x-action-params"]
@@ -732,7 +1264,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.start()
         gesture = self.device.GesturePlugin(plan)
         completions = []
-        gesture._acp_notify = lambda action_id, status, result: completions.append(
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
             (action_id, status, result)
         )
 
@@ -759,12 +1291,12 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("completed", completions[0][1])
         self.assertEqual(request_id, completions[0][2]["request_id"])
 
-    def test_gesture_reset_fails_when_exact_request_is_superseded(self):
+    def test_gesture_reset_after_completes_successfully(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
         plan.start()
         gesture = self.device.GesturePlugin(plan)
         completions = []
-        gesture._acp_notify = lambda action_id, status, result: completions.append(
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
             (action_id, status, result)
         )
         result = gesture.dispatch("sequence", {
@@ -792,15 +1324,57 @@ class DevicePluginContractTests(unittest.TestCase):
         reset_request = plan._publisher.messages[-1]
         self.assertEqual(JointMotionPlanRequest.REQUEST_RESET, reset_request.request_type)
         plan._on_state(JointMotionPlanState(
-            reset_request.request_id + 1, JointMotionPlanState.IDLE, 1.0
+            reset_request.request_id, JointMotionPlanState.EXECUTING, 0.5
+        ))
+        plan._on_state(JointMotionPlanState(
+            reset_request.request_id, JointMotionPlanState.IDLE, 1.0
         ))
         gesture._thread.join(timeout=1.0)
 
         status = gesture.dispatch("status", {})
-        self.assertEqual("error", status["state"])
-        self.assertIn("superseded", status["error"])
+        self.assertEqual("completed", status["state"])
+        self.assertIsNone(status["error"])
+        self.assertEqual(reset_request.request_id, status["request_id"])
         self.assertEqual(result["action_id"], completions[0][0])
-        self.assertEqual("error", completions[0][1])
+        self.assertEqual("completed", completions[0][1])
+        self.assertEqual(reset_request.request_id, completions[0][2]["request_id"])
+
+    def test_gesture_completion_releases_head_before_acp_callback(self):
+        """ACP 回调触发时 head 所有权必须已释放，否则连续动作会返回 head is busy。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        gesture = self.device.GesturePlugin(plan)
+        head_owner_during_callback = []
+
+        def notify(tool, action_id, status, result, timeout):
+            # 模拟 Agent Core 收到回调后立即尝试获取 head
+            head_owner_during_callback.append(plan.head_status().get("owner"))
+
+        self.device._notify_acp_completion = notify
+        gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
+            "reset_after": True,
+            "force": True,
+        })
+
+        deadline = time.monotonic() + 1.0
+        while not plan._publisher.messages and time.monotonic() < deadline:
+            time.sleep(0.005)
+        step_request_id = plan._publisher.messages[-1].request_id
+        plan._on_state(JointMotionPlanState(step_request_id, JointMotionPlanState.EXECUTING, 0.5))
+        plan._on_state(JointMotionPlanState(step_request_id, JointMotionPlanState.IDLE, 1.0))
+
+        deadline = time.monotonic() + 1.0
+        while len(plan._publisher.messages) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        reset_request = plan._publisher.messages[-1]
+        plan._on_state(JointMotionPlanState(reset_request.request_id, JointMotionPlanState.EXECUTING, 0.5))
+        plan._on_state(JointMotionPlanState(reset_request.request_id, JointMotionPlanState.IDLE, 1.0))
+        gesture._thread.join(timeout=1.0)
+
+        # 回调触发时 head 所有权应为 None（已释放），而非 "gesture"
+        self.assertEqual(1, len(head_owner_during_callback))
+        self.assertIsNone(head_owner_during_callback[0])
 
     def test_gesture_rejects_sequence_beyond_acp_runtime_budget(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -844,7 +1418,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_for_request = wait_for_request
         gesture = self.device.GesturePlugin(plan)
         completions = []
-        gesture._acp_notify = lambda action_id, status, result: completions.append(
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
             (action_id, status, result)
         )
         result = gesture.dispatch("sequence", {
@@ -859,8 +1433,15 @@ class DevicePluginContractTests(unittest.TestCase):
         })
         self.assertIn("already running", busy["error"])
         self.assertNotIn("action_id", busy)
+        stop_started = time.monotonic()
         stopped = gesture.dispatch("stop_gesture", {})
+        stop_elapsed = time.monotonic() - stop_started
         self.assertEqual("cancelled", stopped["state"])
+        self.assertLess(stop_elapsed, 0.02)
+        self.assertEqual(
+            JointMotionPlanRequest.REQUEST_CANCEL,
+            plan._publisher.messages[-1].request_type,
+        )
         release_wait.set()
         gesture._thread.join(timeout=1.0)
 
@@ -868,6 +1449,136 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(result["action_id"], completions[0][0])
         self.assertEqual("cancelled", completions[0][1])
         self.assertEqual({"state": "idle"}, gesture.dispatch("stop", {}))
+        message_count = len(plan._publisher.messages)
+        ignored_reset = gesture.dispatch("stop", {"reset_after": True})
+        self.assertTrue(ignored_reset["reset_after_ignored"])
+        self.assertEqual(message_count, len(plan._publisher.messages))
+
+    def test_gesture_cancel_transport_failure_stays_gated_until_retry(self):
+        class FlakyJointPlan:
+            def __init__(self):
+                self.fail_cancel = True
+                self.cancel_attempts = 0
+                self.entered_wait = threading.Event()
+                self.release_wait = threading.Event()
+                self.status = {"request_id": 41, "status": 2, "progress": 0.4}
+
+            def current_motion(self):
+                return "lower_body_balance", []
+
+            def wait_until_idle(self, *_args, **_kwargs):
+                return {}
+
+            def wait_for_request(self, *_args, **_kwargs):
+                self.entered_wait.set()
+                self.release_wait.wait(timeout=1.0)
+                return {}
+
+            def acquire_head(self, _owner):
+                return None
+
+            def release_head(self, _owner):
+                pass
+
+            def _dispatch_owned(self, _owner, action, args):
+                return self.dispatch(action, args)
+
+            def dispatch(self, action, _args):
+                if action in ("plan", "plan_named"):
+                    return {"state": "requested", "request_id": 41}
+                if action == "cancel":
+                    self.cancel_attempts += 1
+                    if self.fail_cancel:
+                        raise RuntimeError("gesture cancel publish failed")
+                    return {"state": "requested", "request_id": 41}
+                if action == "status":
+                    return dict(self.status)
+                return {"error": f"unexpected action: {action}"}
+
+        plan = FlakyJointPlan()
+        gesture = self.device.GesturePlugin(plan)
+        gesture._acp_notify = lambda *_args: None
+        interrupt_group = self.device.MotionInterruptGroup()
+        interrupt_group.register("gesture", gesture.halt, gesture.motion_active)
+        gesture.set_interrupt_group(interrupt_group)
+        gesture.dispatch("sequence", {
+            "steps": [{
+                "joint_indices": [23],
+                "target_positions": [0.1],
+                "duration": 0.05,
+            }],
+            "reset_after": False,
+            "force": True,
+        })
+        self.assertTrue(plan.entered_wait.wait(timeout=1.0))
+
+        stopped = gesture.dispatch("stop_gesture", {})
+        self.assertIn("gesture cancel publish failed", str(stopped))
+        plan.release_wait.set()
+        gesture._thread.join(timeout=1.0)
+        self.assertTrue(gesture.dispatch("status", {})["cancel_failed"])
+        self.assertEqual(["gesture"], interrupt_group.blocking_outputs())
+
+        plan.fail_cancel = False
+        retried = gesture.dispatch("stop_gesture", {})
+        self.assertEqual("", retried["error"])
+        self.assertNotIn("error", retried["cancel_result"])
+        self.assertEqual(2, plan.cancel_attempts)
+        self.assertTrue(gesture.dispatch("status", {})["cancel_pending"])
+        plan.status = {"request_id": 41, "status": 1, "progress": 1.0}
+        deadline = time.monotonic() + 1.0
+        while gesture.dispatch("status", {})["cancel_pending"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(gesture.dispatch("status", {})["cancel_failed"])
+        self.assertFalse(gesture.dispatch("status", {})["cancel_pending"])
+        self.assertEqual([], interrupt_group.blocking_outputs())
+
+    def test_gesture_stop_returns_promptly_but_retains_head_until_worker_exit(self):
+        """stop 立即返回，但 worker 退出前不能释放 head 锁。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_a, **_kw: {}
+
+        dispatch_entered = threading.Event()
+        release_dispatch = threading.Event()
+        real_dispatch = plan._dispatch_owned
+
+        def tracked_dispatch(owner, action, args):
+            if action == "plan":
+                # worker 已通过取消检查、正卡在 _dispatch_owned 前
+                dispatch_entered.set()
+                release_dispatch.wait(timeout=2.0)
+            return real_dispatch(owner, action, args)
+
+        plan._dispatch_owned = tracked_dispatch
+
+        gesture = self.device.GesturePlugin(plan)
+        result = gesture.dispatch("sequence", {
+            "steps": [{"joint_indices": [23], "target_positions": [0.1], "duration": 0.05}],
+            "reset_after": False,
+            "force": True,
+        })
+        self.assertTrue(dispatch_entered.wait(timeout=1.0))
+        self.assertEqual("gesture", plan.head_status()["owner"])
+
+        stop_done = threading.Event()
+
+        def do_stop():
+            gesture.dispatch("stop_gesture", {})
+            stop_done.set()
+
+        stop_thread = threading.Thread(target=do_stop)
+        stop_thread.start()
+        # ACP interrupt hook must return promptly, without releasing the lease.
+        self.assertTrue(stop_done.wait(timeout=0.2))
+        self.assertEqual("gesture", plan.head_status()["owner"])
+
+        release_dispatch.set()
+        stop_thread.join(timeout=1.0)
+        gesture._thread.join(timeout=1.0)
+
+        self.assertFalse(gesture._thread.is_alive())
+        self.assertIsNone(plan.head_status()["owner"])
 
     def test_gesture_async_error_reports_acp(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -878,7 +1589,7 @@ class DevicePluginContractTests(unittest.TestCase):
         )
         gesture = self.device.GesturePlugin(plan)
         completions = []
-        gesture._acp_notify = lambda action_id, status, result: completions.append(
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
             (action_id, status, result)
         )
         result = gesture.dispatch("sequence", {
@@ -921,8 +1632,10 @@ class DevicePluginContractTests(unittest.TestCase):
         ssl.create_default_context = create_default_context
         os.environ["AGENT_CORE_URL"] = f"http://127.0.0.1:{server.server_port}"
         try:
-            self.device.GesturePlugin._acp_notify(
-                "t800_gesture_test", "completed", {"gesture": "wave_hands"}
+            self.device._notify_acp_completion(
+                "gesture", "t800_gesture_test", "completed",
+                {"gesture": "wave_hands"},
+                self.device.GesturePlugin._ACP_CALLBACK_TIMEOUT_SEC,
             )
         finally:
             if previous is None:
@@ -941,8 +1654,128 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("completed", payload["status"])
         self.assertEqual("gesture", payload["tool"])
         self.assertEqual("wave_hands", payload["result"]["gesture"])
+        # HTTP loopback does not use TLS, but the shared transport still builds
+        # a secure default context rather than weakening verification globally.
         self.assertTrue(contexts[0].check_hostname)
         self.assertEqual(ssl.CERT_REQUIRED, contexts[0].verify_mode)
+
+    def test_motion_recorder_acp_notify_verifies_tls_with_configured_ca(self):
+        import urllib.request as urllib_request
+
+        previous_url = os.environ.get("AGENT_CORE_URL")
+        previous_ca = os.environ.get("AGENT_CORE_CA_CERT")
+        original_create_default_context = ssl.create_default_context
+        original_urlopen = urllib_request.urlopen
+        contexts = []
+        cafiles = []
+        requests = []
+
+        def create_default_context(*args, **kwargs):
+            cafiles.append(kwargs.get("cafile"))
+            context = original_create_default_context()
+            contexts.append(context)
+            return context
+
+        def urlopen(request, *, timeout, context):
+            requests.append((request.full_url, timeout, context))
+            return types.SimpleNamespace(close=lambda: None)
+
+        ssl.create_default_context = create_default_context
+        urllib_request.urlopen = urlopen
+        os.environ["AGENT_CORE_URL"] = "https://phanthy-motus:15678"
+        os.environ["AGENT_CORE_CA_CERT"] = "/opt/phanthy-motus/data/certs/cert.pem"
+        try:
+            self.device._t800_acp_notify(
+                "t800_motion_test", "completed", {"frames": 10}, "motion_recorder"
+            )
+        finally:
+            if previous_url is None:
+                os.environ.pop("AGENT_CORE_URL", None)
+            else:
+                os.environ["AGENT_CORE_URL"] = previous_url
+            if previous_ca is None:
+                os.environ.pop("AGENT_CORE_CA_CERT", None)
+            else:
+                os.environ["AGENT_CORE_CA_CERT"] = previous_ca
+            ssl.create_default_context = original_create_default_context
+            urllib_request.urlopen = original_urlopen
+
+        self.assertEqual(
+            ["/opt/phanthy-motus/data/certs/cert.pem"],
+            cafiles,
+        )
+        self.assertTrue(contexts[0].check_hostname)
+        self.assertEqual(ssl.CERT_REQUIRED, contexts[0].verify_mode)
+        self.assertEqual("https://phanthy-motus:15678/api/acp/complete", requests[0][0])
+
+    def test_acp_preflight_exposes_missing_ca_certificate(self):
+        previous_url = os.environ.get("AGENT_CORE_URL")
+        previous_ca = os.environ.pop("AGENT_CORE_CA_CERT", None)
+        os.environ["AGENT_CORE_URL"] = "https://phanthy-motus:15678"
+        try:
+            status = self.device._t800_acp_preflight()
+            self.assertEqual("error", status["state"])
+            self.assertFalse(status["configured"])
+            self.assertIn("AGENT_CORE_CA_CERT", status["last_error"])
+        finally:
+            if previous_url is None:
+                os.environ.pop("AGENT_CORE_URL", None)
+            else:
+                os.environ["AGENT_CORE_URL"] = previous_url
+            if previous_ca is not None:
+                os.environ["AGENT_CORE_CA_CERT"] = previous_ca
+
+    def test_agent_core_transport_requires_explicit_url(self):
+        previous_url = os.environ.pop("AGENT_CORE_URL", None)
+        try:
+            with self.assertRaisesRegex(ValueError, "AGENT_CORE_URL is required"):
+                self.device._t800_agent_core_transport("/api/mcp")
+        finally:
+            if previous_url is not None:
+                os.environ["AGENT_CORE_URL"] = previous_url
+
+    def test_acp_callback_failure_is_visible_and_success_recovers(self):
+        import urllib.request as urllib_request
+
+        previous_url = os.environ.get("AGENT_CORE_URL")
+        previous_ca = os.environ.pop("AGENT_CORE_CA_CERT", None)
+        original_urlopen = urllib_request.urlopen
+        os.environ["AGENT_CORE_URL"] = "http://127.0.0.1:15678"
+        attempts = 0
+
+        def urlopen(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("agent core unavailable")
+            return types.SimpleNamespace(close=lambda: None)
+
+        urllib_request.urlopen = urlopen
+        try:
+            self.device._t800_acp_preflight()
+            self.assertFalse(self.device._t800_acp_notify(
+                "failed_action", "completed", {}, "motion_recorder"
+            ))
+            failed = self.device._t800_acp_status()
+            self.assertEqual("error", failed["state"])
+            self.assertTrue(failed["configured"])
+            self.assertIn("agent core unavailable", failed["last_error"])
+
+            self.assertTrue(self.device._t800_acp_notify(
+                "recovered_action", "completed", {}, "motion_recorder"
+            ))
+            recovered = self.device._t800_acp_status()
+            self.assertEqual("ready", recovered["state"])
+            self.assertIsNone(recovered["last_error"])
+            self.assertIsNotNone(recovered["last_success_at"])
+        finally:
+            urllib_request.urlopen = original_urlopen
+            if previous_url is None:
+                os.environ.pop("AGENT_CORE_URL", None)
+            else:
+                os.environ["AGENT_CORE_URL"] = previous_url
+            if previous_ca is not None:
+                os.environ["AGENT_CORE_CA_CERT"] = previous_ca
 
     def test_gesture_uses_validated_real_device_trajectories(self):
         plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
@@ -951,7 +1784,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plan.wait_until_idle = lambda *_args, **kwargs: waits.append(("idle", kwargs)) or {}
         plan.wait_for_request = lambda request_id, *_args: waits.append(("request", request_id)) or {}
         gesture = self.device.GesturePlugin(plan)
-        gesture._acp_notify = lambda *_args: None
+        self.device._notify_acp_completion = lambda *_args, **_kwargs: None
 
         wave = gesture._prepare_steps(gesture._official_steps("wave_hands"))
         self.assertEqual("return_to_neutral", wave[-1]["name"])
@@ -999,6 +1832,109 @@ class DevicePluginContractTests(unittest.TestCase):
         state = plan.wait_for_request(7, 0.1, threading.Event())
         self.assertEqual(7, state["request_id"])
         self.assertEqual(JointMotionPlanState.IDLE, state["status"])
+
+    def test_joint_plan_accepts_exact_completed_idle_when_executing_frame_is_missing(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        requested = plan.dispatch("reset", {})
+
+        # Real T800 reset feedback can omit/drop the transient EXECUTING frame
+        # and finish just below 1.0 due to floating-point convergence.
+        plan._on_state(JointMotionPlanState(
+            requested["request_id"], JointMotionPlanState.IDLE, 0.999838584
+        ))
+
+        state = plan.wait_for_request(
+            requested["request_id"], 0.02, threading.Event()
+        )
+        self.assertEqual(requested["request_id"], state["request_id"])
+        self.assertEqual(JointMotionPlanState.IDLE, state["status"])
+        self.assertIsNone(plan.head_status()["owner"])
+
+    def test_joint_plan_does_not_accept_initial_zero_progress_idle(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan._on_state(JointMotionPlanState(
+            26, JointMotionPlanState.IDLE, 0.0
+        ))
+
+        with self.assertRaises(TimeoutError):
+            plan.wait_for_request(26, 0.01, threading.Event())
+
+    def test_joint_plan_retains_quiescence_evidence_after_partial_cancel_idle(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        requested = plan.dispatch("reset", {})
+        request_id = requested["request_id"]
+        plan._on_state(JointMotionPlanState(
+            request_id, JointMotionPlanState.EXECUTING, 0.5
+        ))
+        cancelled_idle = JointMotionPlanState(
+            request_id, JointMotionPlanState.IDLE, 0.5
+        )
+        plan._on_state(cancelled_idle)
+        status = plan.dispatch("status", {})
+
+        self.assertNotIn(request_id, plan._executing_requests)
+        self.assertTrue(plan.request_is_quiescent(request_id, status))
+
+    def test_motion_recorder_play_starts_after_completed_idle_without_executing_frame(self):
+        with tempfile.TemporaryDirectory() as recordings_dir:
+            config = {
+                **CONFIG,
+                "plugins": {
+                    "motion_recorder": {"recordings_dir": recordings_dir}
+                },
+            }
+            motion_state = types.SimpleNamespace(
+                current_motion=lambda: ("lower_body_balance", [])
+            )
+            plan = self.device.JointPlanPlugin(
+                config, "robot", self.ros, motion_state
+            )
+            plan.start()
+            recorder = self.device.MotionRecorderPlugin(
+                config, "robot", self.ros
+            )
+            recorder.start()
+            recorder.set_joint_plan(plan)
+            recorder.set_reset_controls(motion_state, object())
+            recorder._latest_joint_positions = [0.0] * 25
+            completions = []
+            recorder._acp_notify = lambda *args: completions.append(args)
+            recording = {
+                "metadata": {"label": "final_idle_feedback"},
+                "frames": [
+                    {"timestamp": 0, "positions": [0.0] * 25},
+                    {"timestamp": 50, "positions": [0.0] * 25},
+                ],
+            }
+            (Path(recordings_dir) / "final_idle_feedback.json").write_text(
+                json.dumps(recording), encoding="utf-8"
+            )
+
+            started = recorder.dispatch(
+                "play", {"name": "final_idle_feedback"}
+            )
+            deadline = time.monotonic() + 1.0
+            while not plan._publisher.messages and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(plan._publisher.messages)
+            request_id = plan._publisher.messages[-1].request_id
+            plan._on_state(JointMotionPlanState(
+                request_id, JointMotionPlanState.IDLE, 0.999838584
+            ))
+            recorder._prepare_thread.join(timeout=1.0)
+            recorder._playback_thread.join(timeout=2.0)
+
+            self.assertEqual("preparing", started["state"])
+            self.assertTrue(any(
+                message.weight == 1.0
+                for message in recorder._override_publisher.messages
+            ))
+            self.assertEqual(started["action_id"], completions[0][0])
+            self.assertEqual("completed", completions[0][1])
+            recorder.stop()
 
     def test_joint_override_force_path_and_release(self):
         plugin = self.device.JointOverridePlugin(CONFIG, "robot", self.ros, self.state)
@@ -1082,6 +2018,468 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("idle", stopped_health["state"])
         self.assertTrue(stopped_health["stale"])
 
+    def test_speaker_is_a_canvas_pcm_sink_per_official_audio_interface(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        tool = plugin.get_tool()
+        self.assertEqual([{"format": "audio/pcm-16k"}], tool["topic_in"])
+        self.assertEqual(
+            ["start", "stop", "info", "get_volume", "set_volume"],
+            tool["inputSchema"]["properties"]["action"]["enum"],
+        )
+        self.assertIn("set_volume", tool["inputSchema"]["x-action-params"])
+        missing = plugin.dispatch("start", {})
+        self.assertEqual("error", missing["state"])
+        self.assertEqual("Missing input_topic", missing["error"])
+
+        class FakeStdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, data):
+                self.writes.append(data)
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeStdin()
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        process = FakeProcess()
+        commands = []
+        plugin._check_pulse = lambda: None
+        plugin._run_command = lambda command: commands.append(command) or ""
+        plugin._spawn_player = lambda: process
+        plugin._clock = lambda: 0.0
+        plugin._startup_wait = lambda _event, _seconds: False
+        plugin._acp_notify = lambda *_args: None
+        started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
+        self.assertEqual("starting", started["state"])
+        plugin._startup_thread.join(timeout=1.0)
+        self.assertEqual("ready", plugin.dispatch("info", {})["state"])
+        self.assertEqual("/perception/tts", started["topic_in"][0]["topic"])
+        # 启动时按官方接口解除静音
+        self.assertIn(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"], commands)
+        process.stdin.writes.clear()
+
+        # 画布 PCM 块经 aplay stdin 流式播放；EOF magic 不入流
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k", data=[1, 2, 3, 4]))
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k",
+                                               data=list(plugin._EOF_MAGIC)))
+        deadline = time.monotonic() + 1
+        while not process.stdin.writes and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual([b"\x01\x02\x03\x04"], process.stdin.writes)
+        self.assertEqual("playing", plugin.dispatch("info", {})["state"])
+        time.sleep(0.35)
+        self.assertEqual("ready", plugin.dispatch("info", {})["state"])
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+        self.assertEqual([], plugin._node.subscriptions)
+
+    def test_speaker_discards_callbacks_from_previous_session(self):
+        # review 反馈:stop() 后残留的 ROS 回调若在新会话播放器就绪后执行,
+        # 会把旧 topic 的 PCM 入队泄漏到新连接——回调须绑定会话。
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        old_session = plugin._session
+        # 旧会话回调(模拟 stop 后仍被派发)必须被丢弃
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k",
+                                               data=[1, 2, 3, 4]), session=old_session)
+        self.assertEqual(0, plugin._queue.qsize())
+        # 未绑定会话且未运行的回调也丢弃
+        plugin._running = False
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k", data=[1, 2, 3, 4]))
+        self.assertEqual(0, plugin._queue.qsize())
+        # 当前会话回调正常入队
+        plugin._running = True
+        plugin._on_chunk(types.SimpleNamespace(format="audio/pcm-16k",
+                                               data=[1, 2, 3, 4]), session=plugin._session)
+        self.assertEqual(1, plugin._queue.qsize())
+
+    def test_speaker_sliding_window_drops_oldest_on_overflow(self):
+        # 持续实时流(remote_mic)发布速率高于播放速率时,队列满应丢最旧块
+        # 而非新块,保证播放跟随最新输入(否则永远滞后 6 秒+)。
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        plugin._running = True
+        # 队列 maxsize=50,塞 55 块,验证尾部(最新)数据保留、头部(最旧)被丢
+        for i in range(55):
+            plugin._on_chunk(types.SimpleNamespace(
+                format="audio/pcm-16k", data=list(bytes([i & 0xFF]) * 1024)))
+        qsize = plugin._queue.qsize()
+        self.assertEqual(50, qsize)
+        self.assertEqual(plugin._dropped, 5)
+        head = bytes(plugin._queue.queue[0])[0]
+        self.assertEqual(5, head)  # 0-4 被丢,队首是最新保留块中最旧的
+        tail = bytes(plugin._queue.queue[-1])[0]
+        self.assertEqual(54, tail)  # 最新的 54 在队尾
+
+    def test_speaker_volume_uses_official_pactl_interface(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        commands = []
+        plugin._run_command = lambda command: commands.append(command) or "Volume: front-left: 32768 /  50% / -18.06 dB"
+        result = plugin.dispatch("get_volume", {})
+        self.assertEqual(50, result["volume"])
+        self.assertEqual(["pactl", "get-sink-volume", "@DEFAULT_SINK@"], commands[-1])
+        result = plugin.dispatch("set_volume", {"volume": 80})
+        self.assertEqual(80, result["volume"])
+        self.assertEqual(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "80%"], commands[-1])
+        # 越界值收敛到 0-100；解析失败走 error 路径
+        self.assertEqual(100, plugin.dispatch("set_volume", {"volume": 999})["volume"])
+        plugin._run_command = lambda command: "unparseable"
+        self.assertIn("error", plugin.dispatch("get_volume", {}))
+
+    def test_speaker_aplay_command_flags_for_low_latency(self):
+        # 真机延迟根因:aplay 默认 500ms 读前缓冲 + ALSA dmix ~341ms 缓冲。
+        # aplay 需带 --buffer-time/--period-time;默认设备经 /etc/asound.conf
+        # 路由到 PulseAudio(pactl 音量才能作用于播放输出)。
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        calls = []
+
+        class FakeProc:
+            def __init__(self):
+                self.stdin = types.SimpleNamespace(
+                    write=lambda data: None, flush=lambda: None, close=lambda: None)
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return FakeProc()
+
+        original = self.device.subprocess.Popen
+        self.device.subprocess.Popen = fake_popen
+        try:
+            plugin._check_pulse = lambda: None
+            plugin._run_command = lambda command: ""
+            plugin._startup_wait = lambda _event, _seconds: False
+            plugin._acp_notify = lambda *_args: None
+            result = plugin.dispatch("start", {"input_topic": "/test/pcm"})
+            plugin._startup_thread.join(timeout=1.0)
+        finally:
+            self.device.subprocess.Popen = original
+        self.assertEqual("starting", result["state"])
+        self.assertEqual(
+            ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1",
+             "--buffer-time=100000", "--period-time=20000", "-"],
+            calls[-1],
+        )
+
+    def test_speaker_startup_asset_is_packaged_like_g1_without_external_fetch(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        startup_beep = ROOT / "resource" / "startup_beep.pcm"
+        g1_startup_beep = (
+            ROOT.parents[1]
+            / "unitree"
+            / "g1"
+            / "resource"
+            / "startup_beep.pcm"
+        )
+        self.assertTrue(startup_beep.is_file())
+        self.assertEqual(256000, startup_beep.stat().st_size)
+        self.assertLess(startup_beep.stat().st_size, 500 * 1024)
+        self.assertEqual(
+            g1_startup_beep.read_bytes(),
+            startup_beep.read_bytes(),
+        )
+        self.assertEqual(
+            "e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166",
+            hashlib.sha256(startup_beep.read_bytes()).hexdigest(),
+        )
+        self.assertIn("COPY resource/ /work/resource/", dockerfile)
+        self.assertIn(
+            "e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166  "
+            "/work/resource/startup_beep.pcm",
+            dockerfile,
+        )
+        self.assertIn("sha256sum -c -", dockerfile)
+        self.assertNotIn("STARTUP_BEEP_URL", dockerfile)
+        self.assertNotIn("raw.githubusercontent.com", dockerfile)
+
+    def test_speaker_aplay_exit_sets_error(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+
+        class DeadProcess:
+            def __init__(self):
+                self.stdin = None
+                self.returncode = 1
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                pass
+
+        plugin._check_pulse = lambda: None
+        plugin._run_command = lambda command: ""
+        plugin._spawn_player = lambda: DeadProcess()
+        started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
+        self.assertEqual("error", started["state"])
+        self.assertIn("aplay exited", started["message"])
+
+    def test_speaker_stop_is_idempotent_when_player_already_exited(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+
+        class ClosedStdin:
+            def close(self):
+                raise BrokenPipeError("aplay pipe is already closed")
+
+        class ReapedProcess:
+            def __init__(self):
+                self.stdin = ClosedStdin()
+                self.kill_calls = 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                self.kill_calls += 1
+                raise ProcessLookupError("aplay is already reaped")
+
+        process = ReapedProcess()
+        plugin._process = process
+        plugin._running = True
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+        self.assertEqual(0, process.kill_calls)
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+
+    def test_speaker_start_completes_full_g1_beep_before_live_subscription(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+
+        class FakeStdin:
+            def __init__(self):
+                self.writes = []
+
+            def write(self, data):
+                self.writes.append(data)
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeStdin()
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        process = FakeProcess()
+        subscription_offsets = []
+        completions = []
+        paced_seconds = []
+        plugin._check_pulse = lambda: None
+        plugin._run_command = lambda command: ""
+        plugin._spawn_player = lambda: process
+        plugin._clock = lambda: 0.0
+        plugin._startup_wait = (
+            lambda _event, seconds: paced_seconds.append(seconds) or False
+        )
+        plugin._acp_notify = lambda *args: completions.append(args)
+        real_create_subscription = plugin._node.create_subscription
+
+        def create_subscription(*args, **kwargs):
+            subscription_offsets.append(
+                sum(len(chunk) for chunk in process.stdin.writes)
+            )
+            return real_create_subscription(*args, **kwargs)
+
+        plugin._node.create_subscription = create_subscription
+        started = plugin.dispatch("start", {"input_topic": "/perception/tts"})
+        self.assertEqual("starting", started["state"])
+        self.assertTrue(started["action_id"].startswith("t800_speaker_start_"))
+        plugin._startup_thread.join(timeout=1.0)
+
+        expected_bytes = (ROOT / "resource" / "startup_beep.pcm").read_bytes()
+        self.assertEqual(256000, len(expected_bytes))
+        self.assertEqual(8.0, len(expected_bytes) / 32000.0)
+        self.assertAlmostEqual(8.0, sum(paced_seconds), places=6)
+        self.assertEqual(expected_bytes, b"".join(process.stdin.writes))
+        self.assertEqual([len(expected_bytes)], subscription_offsets)
+        self.assertEqual("ready", plugin.dispatch("info", {})["state"])
+        self.assertEqual(started["action_id"], completions[0][0])
+        self.assertEqual("completed", completions[0][1])
+        plugin.stop()
+
+    def test_speaker_pacing_deducts_pipe_write_backpressure(self):
+        plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+        now = [0.0]
+        waits = []
+        plugin._clock = lambda: now[0]
+        plugin._startup_wait = (
+            lambda _event, seconds: waits.append(seconds) or False
+        )
+
+        class Stdin:
+            def write(self, _data):
+                now[0] += 0.05
+
+            def flush(self):
+                pass
+
+        process = types.SimpleNamespace(
+            stdin=Stdin(), poll=lambda: None
+        )
+        plugin._play_full_startup_sound(
+            plugin._session, process, threading.Event()
+        )
+
+        block_count = math.ceil(256000 / 9600)
+        self.assertAlmostEqual(
+            8.0,
+            sum(waits) + block_count * 0.05,
+            places=6,
+        )
+
+    def test_speaker_old_player_cannot_consume_restarted_session_audio(self):
+        # review 反馈:旧播放线程可能已阻塞在 queue.get() 中；stop() 的 join
+        # 超时后若新会话复用同一队列，旧线程会取走并丢弃新会话首块音频。
+        real_queue = self.device.queue.Queue
+        real_thread = self.device.threading.Thread
+
+        class BlockingGetQueue(real_queue):
+            def __init__(self):
+                super().__init__(maxsize=50)
+                self.get_started = threading.Event()
+                self.release_get = threading.Event()
+
+            def get(self, block=True, timeout=None):
+                self.get_started.set()
+                self.release_get.wait(timeout=2)
+                return super().get(block=block, timeout=timeout)
+
+        blocking_queue = BlockingGetQueue()
+        live_queue_count = 0
+
+        def queue_factory(maxsize=0):
+            nonlocal live_queue_count
+            if maxsize == 50:
+                live_queue_count += 1
+                # 当前实现只在 __init__ 创建一次；per-session 实现会在首个
+                # start 再创建一次。两种情况下旧会话都使用这个受控队列。
+                if live_queue_count <= 2:
+                    return blocking_queue
+            return real_queue(maxsize=maxsize)
+
+        speaker_thread_count = 0
+        deferred_player = []
+
+        def thread_factory(*args, **kwargs):
+            nonlocal speaker_thread_count
+            if kwargs.get("name") == "t800-speaker":
+                speaker_thread_count += 1
+                if speaker_thread_count == 2:
+                    thread = DeferredThread(kwargs["target"], kwargs.get("args", ()))
+                    deferred_player.append(thread)
+                    return thread
+            return real_thread(*args, **kwargs)
+
+        self.device.queue.Queue = queue_factory
+        self.device.threading.Thread = thread_factory
+        plugin = None
+        old_player = None
+        new_player_runner = None
+        try:
+            plugin = self.device.SpeakerPlugin(CONFIG, "robot", self.ros)
+            processes = []
+            plugin._check_pulse = lambda: None
+            plugin._run_command = lambda command: ""
+            plugin._startup_wait = lambda _event, _seconds: False
+            plugin._acp_notify = lambda *_args: None
+
+            def spawn_player():
+                process = FakeAudioProcess()
+                processes.append(process)
+                return process
+
+            plugin._spawn_player = spawn_player
+            first = plugin.dispatch(
+                "start", {"input_topic": "/perception/tts/old"}
+            )
+            self.assertEqual("starting", first["state"])
+            plugin._startup_thread.join(timeout=1.0)
+            processes[-1].stdin.writes.clear()
+            old_player = plugin._thread
+            self.assertTrue(blocking_queue.get_started.wait(timeout=1))
+
+            self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+            second = plugin.dispatch(
+                "start", {"input_topic": "/perception/tts/new"}
+            )
+            self.assertEqual("starting", second["state"])
+            plugin._startup_thread.join(timeout=1.0)
+            processes[-1].stdin.writes.clear()
+            self.assertEqual(1, len(deferred_player))
+
+            live_pcm = b"\x11\x22\x33\x44"
+            plugin._subscription.callback(types.SimpleNamespace(
+                format="audio/pcm-16k", data=list(live_pcm)))
+            blocking_queue.release_get.set()
+            old_player.join(timeout=1)
+
+            deferred = deferred_player[0]
+            new_player_runner = real_thread(target=deferred.target, args=deferred.args)
+            new_player_runner.start()
+            deadline = time.monotonic() + 0.3
+            while not processes[-1].stdin.writes and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual([live_pcm], processes[-1].stdin.writes)
+        finally:
+            blocking_queue.release_get.set()
+            if plugin is not None:
+                plugin.stop()
+            if old_player is not None:
+                old_player.join(timeout=1)
+            if new_player_runner is not None:
+                new_player_runner.join(timeout=1)
+            self.device.queue.Queue = real_queue
+            self.device.threading.Thread = real_thread
+
     def test_native_node_control_and_composed_safety(self):
         native = self.device.NativeNodeControlPlugin(CONFIG, "robot", self.ros)
         native.start()
@@ -1108,6 +2506,50 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual([1.0] * 25, safety._joint_pub.messages[-1].damping)
         self.assertTrue(all(control.stopped for control in active_controls))
 
+    def test_safety_prefers_non_destructive_halt_over_lifecycle_stop(self):
+        class ActiveControl:
+            def __init__(self):
+                self.halted = False
+                self.stopped = False
+
+            def halt(self):
+                self.halted = True
+
+            def stop(self):
+                self.stopped = True
+
+        control = ActiveControl()
+        safety = self.device.SafetyControlPlugin(CONFIG, "robot", self.ros, self.state)
+        safety.set_controls([control])
+        safety.start()
+
+        safety.dispatch("emergency_passive", {})
+
+        self.assertTrue(control.halted)
+        self.assertFalse(control.stopped)
+
+    def test_vision_pointcloud_passthrough_binary_header(self):
+        import struct
+
+    def test_vision_pointcloud_passthrough_binary_header(self):
+        import struct
+
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        data = bytes(range(64))  # 4 点 × 16 字节 point_step
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        out = plugin._cloud_pub.messages[-1]
+        self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
+        self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
+        self.assertEqual(1, plugin._frames["pointcloud"])
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        data = bytes(range(64))  # 4 点 × 16 字节 point_step
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        out = plugin._cloud_pub.messages[-1]
+        self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
+        self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
+        self.assertEqual(1, plugin._frames["pointcloud"])
     def test_vision_pointcloud_passthrough_binary_header(self):
         import struct
 
@@ -1204,6 +2646,401 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("image/jpeg", tools["camera"]["topic_out"][0]["format"])
         self.assertEqual(2, len(tools["camera"]["topic_out"]))
         self.assertEqual("image/depth-z16", tools["depth"]["topic_out"][0]["format"])
+
+    def test_head_declares_lifecycle_and_completion_schema(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        schema = head.get_tool()["inputSchema"]
+        self.assertEqual(
+            ["nod", "shake", "look", "rotate_to", "reset"],
+            schema["x-completion"]["actions"],
+        )
+        self.assertEqual(
+            {"on_interrupt_motion": {"action": "stop"}},
+            schema["x-hooks"],
+        )
+        actions = set(schema["properties"]["action"]["enum"])
+        self.assertTrue({"start", "info", "stop", "status"}.issubset(actions))
+        self.assertTrue({"nod", "shake", "look", "rotate_to", "reset"}.issubset(actions))
+        params = schema["x-action-params"]
+        self.assertEqual(
+            ["pitch_deg", "yaw_deg", "rotation_time", "duration"],
+            params["rotate_to"]["params"],
+        )
+        self.assertEqual(["times", "speed"], params["nod"]["params"])
+
+    def test_head_acp_timeout_covers_max_rotate_to(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        timeout = head.get_tool()["inputSchema"]["x-completion"]["timeout"]
+        grace = float(head._config.get("feedback_grace_sec", 1.0))
+        budget = (
+            head._READY_TIMEOUT_SEC
+            + head._ROTATION_TIME_MAX_SEC + grace   # 就绪 + 目标规划
+            + head._HOLD_DURATION_MAX_SEC            # 保持
+            + head._ROTATION_TIME_MAX_SEC + grace   # 复位规划
+            + head._ACP_CALLBACK_TIMEOUT_SEC         # 完成回调
+        )
+        self.assertGreaterEqual(timeout, budget)
+
+    def test_head_lifecycle_returns_plain_dict(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        for action in ("start", "info"):
+            result = head.dispatch(action, {})
+            self.assertEqual("ready", result["state"])
+            self.assertEqual(
+                {"pitch": [-0.5, 0.5], "yaw": [-1.0, 1.0]},
+                result["limits_rad"],
+            )
+        status = head.dispatch("status", {})
+        self.assertEqual("idle", status["state"])
+        self.assertIn("limits_rad", status)
+        self.assertIn("joint_plan", status)
+
+    def test_head_rotate_to_rejects_out_of_range_angles(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        rejected = head.dispatch("rotate_to", {"pitch_deg": 90.0, "yaw_deg": 0.0})
+        self.assertIn("pitch_deg must be between", rejected["error"])
+        self.assertIsNone(head._thread)
+
+    def test_head_repeat_validation_rejects_non_integer_times(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        for bad in (1.9, True):
+            rejected = head.dispatch("nod", {"times": bad})
+            self.assertIn("times must be an integer", rejected["error"])
+            self.assertIsNone(head._thread)
+
+    def test_head_rejects_unsafe_config_at_init(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        with self.assertRaises(ValueError):
+            self.device.HeadActuatorPlugin({"nod_amplitude_rad": 2.0}, plan, self.state)
+        with self.assertRaises(ValueError):
+            self.device.HeadActuatorPlugin(
+                {"look_poses": {"forward": {"pitch_rad": 0.9, "yaw_rad": 0.0}}},
+                plan,
+                self.state,
+            )
+
+    def test_head_rejects_incomplete_look_poses_at_init(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        for pose in ({"pitch_rad": 0.0}, {"yaw_rad": 0.0}, {}):
+            with self.assertRaises(ValueError):
+                self.device.HeadActuatorPlugin(
+                    {"look_poses": {"forward": pose}}, plan, self.state
+                )
+
+    def test_head_rejects_invalid_timing_config_at_init(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        for grace in (-1.0, 0.0, float("nan"), float("inf"), 100.0):
+            with self.assertRaises(ValueError):
+                self.device.HeadActuatorPlugin(
+                    {"feedback_grace_sec": grace}, plan, self.state
+                )
+        for step in (-0.35, 0.0, float("nan"), float("inf"), 20.0):
+            with self.assertRaises(ValueError):
+                self.device.HeadActuatorPlugin(
+                    {"step_duration_sec": step}, plan, self.state
+                )
+
+    def test_head_nod_shake_clamp_step_duration_to_rotation_bounds(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(
+            {"step_duration_sec": 0.1}, plan, self.state
+        )
+        for steps in (
+            head._nod_steps({"times": 1, "speed": 2.0}),
+            head._shake_steps({"times": 1, "speed": 2.0}),
+        ):
+            for step in steps:
+                self.assertEqual(head._ROTATION_TIME_MIN_SEC, step["duration"])
+        head = self.device.HeadActuatorPlugin(
+            {"step_duration_sec": 10.0}, plan, self.state
+        )
+        for steps in (
+            head._nod_steps({"times": 1, "speed": 0.5}),
+            head._shake_steps({"times": 1, "speed": 0.5}),
+        ):
+            for step in steps:
+                self.assertEqual(head._ROTATION_TIME_MAX_SEC, step["duration"])
+
+    def test_head_completion_timeout_grows_with_worst_case_config(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        default = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        default_timeout = default.get_tool()["inputSchema"]["x-completion"]["timeout"]
+        pathological = self.device.HeadActuatorPlugin(
+            {"step_duration_sec": 10.0, "feedback_grace_sec": 5.0}, plan, self.state
+        )
+        grown_timeout = pathological.get_tool()["inputSchema"]["x-completion"]["timeout"]
+        self.assertEqual(int(default._ACP_TIMEOUT_SEC), default_timeout)
+        self.assertGreater(grown_timeout, default_timeout)
+
+    def test_head_ownership_blocks_joint_plan_head_pose(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        self.assertIsNone(plan.acquire_head("head"))
+        busy = plan.dispatch("head_pose", {"pitch_rad": 0.0, "yaw_rad": 0.0})
+        self.assertIn("head is busy", busy["error"])
+        self.assertEqual("head", busy["owner"])
+        plan.release_head("head")
+
+    def test_head_ownership_blocks_non_head_joint_plan_during_execution(self):
+        """head 执行期间，非 head 关节的 joint_plan.plan 也应被拒绝，避免 superseded。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        entered_wait = threading.Event()
+
+        def wait_for_request(_request_id, _timeout, cancel_event):
+            entered_wait.set()
+            while not cancel_event.is_set():
+                time.sleep(0.005)
+            raise RuntimeError("cancelled")
+
+        plan.wait_for_request = wait_for_request
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        self.device._notify_acp_completion = lambda *_args, **_kwargs: None
+        head.dispatch("nod", {"times": 1})
+        self.assertTrue(entered_wait.wait(timeout=1.0))
+        # head 执行中，针对手臂关节的 plan 应被拒绝
+        busy = plan.dispatch("plan", {
+            "joint_indices": [13, 14, 15, 16, 17],
+            "target_positions": [0.0] * 5,
+        })
+        self.assertIn("head is busy", busy["error"])
+        self.assertEqual("head", busy["owner"])
+        head.dispatch("stop", {})
+        head._thread.join(timeout=1.0)
+
+    def test_direct_joint_plan_head_pose_blocks_subsequent_non_head_plan(self):
+        """直接 joint_plan.head_pose 持有锁后，后续非 head plan 应被拒绝（owner=joint_plan 不重入）。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        # 直接调用 head_pose，owner="joint_plan" 获取锁
+        result = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        self.assertEqual("requested", result["state"])
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # 后续非 head plan 应被拒绝（同一个外部 owner 不允许重入）
+        busy = plan.dispatch("plan", {
+            "joint_indices": [13, 14, 15, 16, 17],
+            "target_positions": [0.0] * 5,
+        })
+        self.assertIn("head is busy", busy["error"])
+        self.assertEqual("joint_plan", busy["owner"])
+
+    def test_direct_head_request_not_released_by_initial_idle(self):
+        """直接 head 请求在初始 IDLE 确认时不应释放锁，必须等 EXECUTING→终态。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        result = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        req_id = result["request_id"]
+        # 初始 IDLE（planner 在 EXECUTING 前发布）不应释放锁
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.IDLE, 0.0))
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # EXECUTING 后再 IDLE 才释放
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.EXECUTING, 0.5))
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.IDLE, 1.0))
+        self.assertIsNone(plan.head_status()["owner"])
+
+    def test_direct_head_request_released_on_cancel_before_executing(self):
+        """直接 head 请求在 EXECUTING 前被 cancel 时，锁应立即释放，不永久持有。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        result = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        req_id = result["request_id"]
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # 未发布 EXECUTING，直接 cancel
+        cancelled = plan.dispatch("cancel", {"request_id": req_id})
+        self.assertEqual("requested", cancelled["state"])
+        # cancel 后锁应立即释放
+        self.assertIsNone(plan.head_status()["owner"])
+        # 后续请求应能正常获取锁
+        again = plan.dispatch("head_pose", {"pitch_rad": 0.2, "yaw_rad": 0.0})
+        self.assertEqual("requested", again["state"])
+
+    def test_direct_head_request_released_on_exiting_before_executing(self):
+        """直接 head 请求在 EXECUTING 前收到 EXITING（故障/拒绝）时应释放锁。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        result = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        req_id = result["request_id"]
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # planner 在 EXECUTING 前发布 EXITING（拒绝/故障）
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.EXITING, 0.0))
+        self.assertIsNone(plan.head_status()["owner"])
+        # 后续 head 动作不应被永久阻塞
+        again = plan.dispatch("head_pose", {"pitch_rad": 0.2, "yaw_rad": 0.0})
+        self.assertEqual("requested", again["state"])
+
+    def test_direct_reset_released_on_fault_before_executing(self):
+        """直接 reset 在 EXECUTING 前被 planner 拒绝/故障时应释放 head 锁。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        result = plan.dispatch("reset", {})
+        req_id = result["request_id"]
+        self.assertEqual("joint_plan", plan.head_status()["owner"])
+        # planner 在 EXECUTING 前发布 DISABLED（故障/禁用）
+        plan._on_state(JointMotionPlanState(req_id, JointMotionPlanState.STATUS_DISABLED, 0.0))
+        self.assertIsNone(plan.head_status()["owner"])
+        # 后续 head 动作不应被永久阻塞
+        again = plan.dispatch("head_pose", {"pitch_rad": 0.1, "yaw_rad": 0.0})
+        self.assertEqual("requested", again["state"])
+
+    def test_head_nod_shake_rejects_invalid_speed_types(self):
+        """speed 为 null/数组/对象时应返回 error，而非 TypeError 逃逸。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        for speed in (None, [], {}):
+            with self.subTest(speed=speed):
+                result = head.dispatch("nod", {"times": 1, "speed": speed})
+                self.assertIn("error", result)
+                result = head.dispatch("shake", {"times": 1, "speed": speed})
+                self.assertIn("error", result)
+
+    def test_head_look_works_without_configured_look_poses(self):
+        """配置中没有 look_poses 时，应使用内置默认值，look 动作正常可用。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        # 不传 look_poses 的配置
+        minimal_config = {"enabled": True, "step_duration_sec": 0.35}
+        head = self.device.HeadActuatorPlugin(minimal_config, plan, self.state)
+        self.device._notify_acp_completion = lambda *_args, **_kwargs: None
+        result = head.dispatch("look", {"direction": "forward"})
+        self.assertEqual("running", result["state"])
+        head._thread.join(timeout=1.0)
+        self.assertEqual("completed", head.dispatch("status", {})["state"])
+
+    def test_head_async_completion_reports_acp(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        plan.wait_for_request = lambda *_args, **_kwargs: {}
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        completions = []
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
+            (tool, action_id, status, result)
+        )
+        result = head.dispatch("nod", {"times": 1})
+        self.assertEqual("running", result["state"])
+        head._thread.join(timeout=1.0)
+        self.assertEqual("completed", head.dispatch("status", {})["state"])
+        self.assertEqual(1, len(completions))
+        self.assertEqual("head", completions[0][0])
+        self.assertEqual(result["action_id"], completions[0][1])
+        self.assertEqual("completed", completions[0][2])
+
+    def test_head_stop_cancels_and_reports_acp(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        entered_wait = threading.Event()
+
+        def wait_for_request(_request_id, _timeout, cancel_event):
+            entered_wait.set()
+            while not cancel_event.is_set():
+                time.sleep(0.005)
+            raise RuntimeError("cancelled")
+
+        plan.wait_for_request = wait_for_request
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        completions = []
+        self.device._notify_acp_completion = lambda tool, action_id, status, result, timeout: completions.append(
+            (tool, action_id, status, result)
+        )
+        result = head.dispatch("nod", {"times": 1})
+        self.assertTrue(entered_wait.wait(timeout=1.0))
+        stopped = head.dispatch("stop", {})
+        self.assertEqual("idle", stopped["state"])
+        head._thread.join(timeout=1.0)
+        self.assertEqual("cancelled", head.dispatch("status", {})["state"])
+        self.assertEqual(1, len(completions))
+        self.assertEqual("head", completions[0][0])
+        self.assertEqual(result["action_id"], completions[0][1])
+        self.assertEqual("cancelled", completions[0][2])
+
+    def test_head_interrupt_stays_gated_until_worker_and_planner_are_idle(self):
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_args, **_kwargs: {}
+        entered_wait = threading.Event()
+        release_wait = threading.Event()
+
+        def wait_for_request(_request_id, _timeout, _cancel_event):
+            entered_wait.set()
+            release_wait.wait(timeout=1.0)
+            return {}
+
+        plan.wait_for_request = wait_for_request
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        self.device._notify_acp_completion = lambda *_args, **_kwargs: None
+        group = self.device.MotionInterruptGroup()
+        sibling_stops = []
+        group.register("head", head.halt, head.motion_active)
+        group.register(
+            "motion_recorder",
+            lambda: sibling_stops.append(True) or {"state": "idle"},
+            lambda: False,
+        )
+        head.set_interrupt_group(group)
+
+        started = head.dispatch("nod", {"times": 1})
+        self.assertTrue(entered_wait.wait(timeout=1.0))
+        stop_started = time.monotonic()
+        stopped = head.dispatch("stop", {})
+        self.assertLess(time.monotonic() - stop_started, 0.05)
+        self.assertIn("motion_recorder", stopped["interrupted_outputs"])
+        self.assertEqual([True], sibling_stops)
+        self.assertEqual(["head"], group.blocking_outputs())
+
+        request_id = plan._publisher.messages[0].request_id
+        plan._on_state(JointMotionPlanState(
+            request_id, JointMotionPlanState.IDLE, 1.0
+        ))
+        release_wait.set()
+        head._thread.join(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while group.blocking_outputs() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual([], group.blocking_outputs())
+        self.assertFalse(head.dispatch("status", {})["cancel_pending"])
+
+    def test_head_timeout_cancels_active_request_before_releasing_lease(self):
+        """wait_for_request 超时时必须先 cancel 在飞请求，再释放 head 锁。"""
+        plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros, self.state)
+        plan.start()
+        plan.wait_until_idle = lambda *_a, **_kw: {}
+
+        def wait_for_request(_request_id, _timeout, cancel_event):
+            # planner 已报告 EXECUTING 但在超时时间内未完成（反馈超时）
+            raise TimeoutError("joint planner did not complete request")
+
+        plan.wait_for_request = wait_for_request
+        head = self.device.HeadActuatorPlugin(CONFIG, plan, self.state)
+        self.device._notify_acp_completion = lambda *_a, **_kw: None
+
+        result = head.dispatch("nod", {"times": 1})
+        self.assertIn("action_id", result)
+        head._thread.join(timeout=2.0)
+        self.assertFalse(head._thread.is_alive())
+
+        # 超时后应已发布 cancel 消息
+        cancel_msgs = [
+            m for m in plan._publisher.messages
+            if int(m.request_type) == JointMotionPlanRequest.REQUEST_CANCEL
+        ]
+        self.assertTrue(cancel_msgs, "timeout path must publish a cancel request")
+        # head 锁应已释放
+        self.assertIsNone(plan.head_status()["owner"])
+        # 下一个 head 动作应能正常获取锁
+        plan.wait_for_request = lambda *_a, **_kw: {}
+        again = head.dispatch("nod", {"times": 1})
+        self.assertIn("action_id", again)
+        head._thread.join(timeout=2.0)
 
 
 if __name__ == "__main__":
