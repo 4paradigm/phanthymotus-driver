@@ -1435,7 +1435,7 @@ class LocoPlugin:
             "description": "G1 safe locomotion mode switch. "
                            "squat2standup=蹲到站(平衡蹲姿706→主运控), standup2squat=站到蹲(主运控→平衡蹲姿706), "
                            "lie2standup=躺起(阻尼/零力矩→主运控), standup2lie=安全躺下(主运控→阻尼), "
-                           "damp=阻尼, zero_torque=零力矩, emergency_stop=紧急阻尼(任何状态都接受), "
+                           "emergency_stop=紧急阻尼(任何状态都接受), "
                            "get_current_mode=查询当前模式+姿态. "
                            "注意 蹲站切换(L2+A) 回主运控必须先经过阻尼(L2+B)，驱动已自动包含这一步；"
                            "模式不等于姿态：阻尼下躺和蹲是同一个 fsm_id，"
@@ -1446,7 +1446,7 @@ class LocoPlugin:
                     "mode": {
                         "type": "string",
                         "enum": ["lie2standup", "standup2lie", "standup2squat", "squat2standup",
-                                 "damp", "zero_torque", "emergency_stop", "get_current_mode"],
+                                 "emergency_stop", "get_current_mode"],
                         "description": "Target mode",
                     },
                 },
@@ -1460,8 +1460,6 @@ class LocoPlugin:
                     "standup2lie":     {"params": [], "description": "安全躺下 (主运控 → 平衡蹲姿 → 阻尼)"},
                     "standup2squat":   {"params": [], "description": "站到蹲 (主运控 → 平衡蹲姿 706)"},
                     "squat2standup":   {"params": [], "description": "蹲到站 (平衡蹲姿 706 → 主运控)"},
-                    "damp":            {"params": [], "description": "阻尼 (仅限已在地面时)"},
-                    "zero_torque":     {"params": [], "description": "零力矩 (仅限已在地面时)"},
                     "emergency_stop":  {"params": [], "description": "紧急阻尼 (任何状态)"},
                     "get_current_mode": {"params": [], "description": "查询当前模式 + 姿态"},
                 },
@@ -1582,7 +1580,7 @@ class LocoPlugin:
             ret = self._client.StopMove()
             return {"ret": ret}
         elif action in ("switch_mode", "lie2standup", "standup2lie", "standup2squat",
-                        "squat2standup", "damp", "zero_torque", "emergency_stop", "get_current_mode"):
+                        "squat2standup", "emergency_stop", "get_current_mode"):
             # x-action-params split: action is the mode directly
             # Legacy: action == "switch_mode" with mode in args
             mode = action if action != "switch_mode" else args.get("mode", "")
@@ -1686,19 +1684,16 @@ class LocoPlugin:
                 return _state({"error": f"Cannot lie down from {_SMS.fsm_name(current_fsm)}. "
                                         f"Use emergency_stop if needed."})
 
-            elif mode in ("damp", "zero_torque"):
-                if current_fsm not in self._LIMP_STATES:
-                    return _state({"error": f"Cannot enter {mode} from "
-                                            f"{_SMS.fsm_name(current_fsm)} — the robot will "
-                                            f"collapse. Use standup2lie first."})
-                fn = self._client.ZeroTorque if mode == "zero_torque" else self._client.Damp
-                ret = fn()
-                return {"ret": ret, "mode": mode}
-
             else:
+                # damp / zero_torque are deliberately not exposed. They are raw
+                # primitives with no posture handling, and reaching them is always
+                # part of a larger transition — standup2lie ends there, and
+                # squat2standup / lie2standup hop through 阻尼 on the way up. The
+                # sequences do it in order on their own. emergency_stop covers the
+                # one case a caller legitimately needs 阻尼 directly.
                 return {"error": f"Unknown mode: {mode}. Available: lie2standup, standup2lie, "
-                                 f"standup2squat, squat2standup, damp, zero_torque, "
-                                 f"emergency_stop, get_current_mode"}
+                                 f"standup2squat, squat2standup, emergency_stop, "
+                                 f"get_current_mode"}
         elif action == "switch_mode_expert":
             fid = int(args.get("fsm_id", 0))
             ret = self._client.SetFsmId(fid)
