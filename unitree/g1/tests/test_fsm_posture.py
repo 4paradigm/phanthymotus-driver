@@ -441,12 +441,45 @@ class TestStateReporting(unittest.TestCase):
         res = switch(plugin, "get_current_mode")
         self.assertIn("error", res)
 
-    def test_damp_refused_from_upright(self):
-        for fsm in (500, 706, 2):
+    def test_damp_and_zero_torque_are_not_exposed(self):
+        # Raw primitives with no posture handling. Every legitimate use is a step
+        # inside a larger sequence, which the driver runs in order by itself.
+        plugin, _ = make_plugin(500)
+        tool = plugin._switch_mode_tool()
+        enum = tool["inputSchema"]["properties"]["mode"]["enum"]
+        params = tool["inputSchema"]["x-action-params"]
+        for name in ("damp", "zero_torque"):
+            self.assertNotIn(name, enum)
+            self.assertNotIn(name, params)
+        self.assertIn("emergency_stop", enum)
+
+    def test_damp_is_not_routed_if_called_anyway(self):
+        # dispatch() returns None, which main.py turns into JSON-RPC -32601
+        # "Unknown tool". The point is that no Damp() reaches the robot.
+        for fsm in (500, 706, 1):
             plugin, client = make_plugin(fsm)
-            res = switch(plugin, "damp")
-            self.assertIn("error", res, f"damp from {fsm} should be refused")
+            self.assertEqual(plugin.dispatch("damp", {}), None, f"damp from {fsm}")
+            self.assertEqual(plugin.dispatch("zero_torque", {}), None)
             self.assertNotIn("Damp", client.calls)
+            self.assertNotIn("ZeroTorque", client.calls)
+
+    def test_legacy_mode_arg_is_rejected(self):
+        # switch_mode(mode="damp") used to work; it must now be refused rather
+        # than silently doing something.
+        plugin, client = make_plugin(500)
+        res = plugin.dispatch("switch_mode", {"mode": "damp"})
+        self.assertIn("error", res)
+        self.assertIn("Unknown mode", res["error"])
+        self.assertNotIn("Damp", client.calls)
+
+    def test_intermediate_damp_still_runs_inside_sequences(self):
+        # Removing the action must not remove the hop the transitions depend on.
+        plugin, _ = make_plugin(706)
+        self.assertIn("damp", [s[2] for s in switch(plugin, "squat2standup")["_steps"]])
+        plugin, _ = make_plugin(1, posture={"posture": "lying"})
+        self.assertIn("damp", [s[2] for s in switch(plugin, "lie2standup")["_steps"]])
+        plugin, _ = make_plugin(500)
+        self.assertIn("damp", [s[2] for s in switch(plugin, "standup2lie")["_steps"]])
 
 
 if __name__ == "__main__":
