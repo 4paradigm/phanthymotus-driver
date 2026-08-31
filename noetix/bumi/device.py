@@ -36,6 +36,16 @@ _LOW_LAT_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+# The ROS audio contract is a mono, little-endian PCM16 stream at 16 kHz.
+# ``pcm_16k_16bit_mono`` is kept as a compatibility alias because the Bumi
+# mic subprocess used that value before the common driver contract was
+# standardized on ``audio/pcm-16k``.
+_AUDIO_PCM_FORMATS = frozenset(("audio/pcm-16k", "pcm_16k_16bit_mono"))
+_AUDIO_SAMPLE_RATE = 16000
+_AUDIO_S16_LE_FORMAT = 2
+_AUDIO_PLAYBACK_CHANNELS = 2
+_AUDIO_CONFIG_INTERVAL_S = 0.5
+
 # ── Joint Mapping ─────────────────────────────────────────────────────────────
 # SDK motor_id order → URDF joint names (must match URDF exactly for skeleton renderer)
 
@@ -1030,6 +1040,196 @@ class SpeakerPlugin:
         executor.add_node(self._node)
         self._playing = False
         self._sub = None
+        self._input_topic = ""
+        self._received_frames = 0
+        self._last_audio_time = 0.0
+        self._last_error = None
+        self._last_config_change = 0.0
+        self._config_lock = threading.Lock()
+
+    @staticmethod
+    def _enum_name(value) -> str:
+        """Return a JSON-safe name for a pybind11 enum value."""
+        name = getattr(value, "name", None)
+        if name:
+            return str(name)
+        return str(value).rsplit(".", 1)[-1]
+
+    @staticmethod
+    def _make_playback_stream(msg):
+        """Convert an AudioChunk (mono PCM16) into a Bumi playback stream.
+
+        AudioChunk carries raw bytes.  The MediaController playback API
+        expects a typed AudioStream whose data is interleaved and stereo on
+        Bumi, so each mono sample is duplicated into L/R here.
+        """
+        audio_format = getattr(msg, "format", "")
+        if audio_format not in _AUDIO_PCM_FORMATS:
+            formats = ", ".join(sorted(_AUDIO_PCM_FORMATS))
+            raise ValueError(
+                f"unsupported AudioChunk format {audio_format!r}; expected one of {formats}"
+            )
+
+        pcm_bytes = bytes(msg.data)
+        if not pcm_bytes:
+            return None
+        if len(pcm_bytes) % 2:
+            raise ValueError(f"PCM16 payload has odd byte length: {len(pcm_bytes)}")
+
+        mono_samples = struct.unpack(f"<{len(pcm_bytes) // 2}h", pcm_bytes)
+        stereo_samples = [sample for sample in mono_samples for _ in range(2)]
+
+        from mediacontrol_py import AudioStream
+
+        stream = AudioStream()
+        stream.channels = _AUDIO_PLAYBACK_CHANNELS
+        stream.sample_rate = _AUDIO_SAMPLE_RATE
+        stream.format = _AUDIO_S16_LE_FORMAT
+        stream.duration_ms = max(
+            1,
+            round(len(mono_samples) * 1000 / _AUDIO_SAMPLE_RATE),
+        )
+        stream.timestamp_us = time.time_ns() // 1000
+        stream.audio_data = stereo_samples
+        return stream
+
+    def _destroy_subscription(self) -> None:
+        if self._sub is None:
+            return
+        try:
+            self._node.destroy_subscription(self._sub)
+        finally:
+            self._sub = None
+
+    def _wait_for_config_slot(self) -> None:
+        """Honor the SDK's 500 ms minimum interval between set calls."""
+        remaining = _AUDIO_CONFIG_INTERVAL_S - (
+            time.monotonic() - self._last_config_change
+        )
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _enable_config(self, getter_name: str, setter_name: str) -> bool:
+        """Enable one MediaController route, only writing when necessary."""
+        with self._config_lock:
+            getter = getattr(self._media_ctrl, getter_name)
+            setter = getattr(self._media_ctrl, setter_name)
+            if bool(getter()):
+                return False
+            self._wait_for_config_slot()
+            setter(True)
+            self._last_config_change = time.monotonic()
+            return True
+
+    def _enable_external_playback(self) -> None:
+        self._enable_config(
+            "get_external_custom_audio_data_to_playback_enable",
+            "set_external_custom_audio_data_to_playback_enable",
+        )
+
+    def _enable_voice_routes(self) -> None:
+        """Prepare the internal mic and agent reply routes for wakeup."""
+        self._enable_config(
+            "get_internal_capture_audio_data_to_agent_enable",
+            "set_internal_capture_audio_data_to_agent_enable",
+        )
+        self._enable_config(
+            "get_internal_agent_audio_data_to_playback_enable",
+            "set_internal_agent_audio_data_to_playback_enable",
+        )
+
+    def _read_system_status(self) -> dict:
+        status = self._media_ctrl.get_system_status()
+        return {
+            "work_status": self._enum_name(getattr(status, "value", None)),
+            "reason": self._enum_name(getattr(status, "reason", None)),
+        }
+
+    def _wait_for_system_status(self, expected: str, timeout_s: float = 3.0) -> dict:
+        deadline = time.monotonic() + timeout_s
+        latest = {"work_status": "unknown", "reason": "unknown"}
+        status_error = None
+        while time.monotonic() < deadline:
+            try:
+                latest = self._read_system_status()
+                status_error = None
+                if latest["work_status"] == expected:
+                    return latest
+            except Exception as exc:
+                status_error = str(exc)
+            time.sleep(0.1)
+        if status_error:
+            latest["status_error"] = status_error
+        return latest
+
+    def _get_system_error(self) -> dict | None:
+        try:
+            error = self._media_ctrl.get_system_error()
+            code = int(getattr(error, "code", 0))
+            message = str(getattr(error, "message", ""))
+            if code or message:
+                return {"code": code, "message": message}
+        except Exception as exc:
+            return {"message": str(exc)}
+        return None
+
+    def _do_wakeup(self) -> dict:
+        try:
+            # A successful wakeup requires both sides of the voice path:
+            # internal mic -> agent and agent -> internal speaker.  The
+            # MediaController wakeup() call alone only changes agent state.
+            self._enable_voice_routes()
+            self._media_ctrl.resume_audio_capture()
+            self._media_ctrl.resume_audio_playback()
+
+            try:
+                current = self._read_system_status()
+            except Exception:
+                # A transient status read must not prevent the control command
+                # from being sent; the following wait will report the result.
+                current = None
+            if current is None or current["work_status"] != "WAKEUPED":
+                self._media_ctrl.wakeup()
+
+            status = self._wait_for_system_status("WAKEUPED")
+            if status["work_status"] == "WAKEUPED":
+                return {
+                    "state": "awake",
+                    **status,
+                    "audio_routes": {
+                        "internal_capture_to_agent": True,
+                        "agent_audio_to_playback": True,
+                    },
+                }
+
+            result = {"state": "error", "requested_state": "awake", **status}
+            system_error = self._get_system_error()
+            if system_error:
+                result["system_error"] = system_error
+            return result
+        except Exception as exc:
+            return {"state": "error", "requested_state": "awake", "error": str(exc)}
+
+    def _do_sleep(self) -> dict:
+        try:
+            try:
+                current = self._read_system_status()
+            except Exception:
+                current = None
+            if current is None or current["work_status"] != "SLEEPED":
+                self._media_ctrl.sleep()
+
+            status = self._wait_for_system_status("SLEEPED")
+            if status["work_status"] == "SLEEPED":
+                return {"state": "sleeping", **status}
+
+            result = {"state": "error", "requested_state": "sleeping", **status}
+            system_error = self._get_system_error()
+            if system_error:
+                result["system_error"] = system_error
+            return result
+        except Exception as exc:
+            return {"state": "error", "requested_state": "sleeping", "error": str(exc)}
 
     def get_tool(self) -> dict:
         return {
@@ -1042,7 +1242,7 @@ class SpeakerPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["play", "stop", "get_volume", "set_volume", "wakeup", "sleep"],
+                        "enum": ["play", "stop", "info", "get_volume", "set_volume", "wakeup", "sleep"],
                     },
                     "input_topic": {
                         "type": "string",
@@ -1064,6 +1264,10 @@ class SpeakerPlugin:
                         "params": [],
                         "description": "Stop audio playback",
                     },
+                    "info": {
+                        "params": [],
+                        "description": "Get playback subscription, received-frame, and error status",
+                    },
                     "get_volume": {
                         "params": [],
                         "description": "Get current volume (0-200)",
@@ -1074,7 +1278,7 @@ class SpeakerPlugin:
                     },
                     "wakeup": {
                         "params": [],
-                        "description": "Wake up robot audio agent",
+                        "description": "Enable the internal voice routes and wake up the robot audio agent",
                     },
                     "sleep": {
                         "params": [],
@@ -1082,7 +1286,10 @@ class SpeakerPlugin:
                     },
                 },
             },
-            "topic_in": [{"format": "audio/pcm-16k"}],
+            "topic_in": [{
+                "format": "audio/pcm-16k",
+                "message_type": "audio_msgs/msg/AudioChunk",
+            }],
             "topic_out": [],
         }
 
@@ -1090,7 +1297,7 @@ class SpeakerPlugin:
         pass
 
     def stop(self) -> None:
-        self._playing = False
+        self._stop_playback()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         args.pop('_tool_name', None)
@@ -1098,64 +1305,118 @@ class SpeakerPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
-            self._playing = False
-            self._media_ctrl.pause_audio_playback()
-            return {"state": "idle"}
+            return self._stop_playback()
         if action == "play":
             return self._do_play(args)
+        if action == "info":
+            topic_in = [{
+                "format": "audio/pcm-16k",
+                "message_type": "audio_msgs/msg/AudioChunk",
+            }]
+            if self._input_topic:
+                topic_in[0]["topic"] = self._input_topic
+            return {
+                "state": "playing" if self._playing else "idle",
+                "topic_in": topic_in,
+                "received_frames": self._received_frames,
+                "last_audio_time": self._last_audio_time or None,
+                "last_error": self._last_error,
+            }
         if action == "get_volume":
             vol = self._media_ctrl.get_volume()
             return {"volume": vol}
         if action == "set_volume":
             vol = int(args.get("volume", 100))
-            self._media_ctrl.set_volume(vol)
-            return {"volume": vol, "state": "set"}
+            try:
+                with self._config_lock:
+                    self._wait_for_config_slot()
+                    self._media_ctrl.set_volume(vol)
+                    self._last_config_change = time.monotonic()
+                return {"volume": vol, "state": "set"}
+            except Exception as exc:
+                return {"state": "error", "error": str(exc)}
         if action == "wakeup":
-            self._media_ctrl.wakeup()
-            return {"state": "awake"}
+            return self._do_wakeup()
         if action == "sleep":
-            self._media_ctrl.sleep()
-            return {"state": "sleeping"}
+            return self._do_sleep()
         return None
 
+    def _stop_playback(self) -> dict:
+        self._playing = False
+        self._destroy_subscription()
+        self._input_topic = ""
+        try:
+            self._media_ctrl.pause_audio_playback()
+        except Exception as exc:
+            self._last_error = str(exc)
+            return {"state": "error", "error": str(exc)}
+        return {"state": "idle"}
+
     def _do_play(self, args: dict) -> dict:
-        input_topic = args.get("input_topic", "")
+        input_topic = str(args.get("input_topic") or "").strip()
         if not input_topic:
             return {"error": "input_topic is required"}
 
+        # Stop delivering frames from the previous topic before changing the
+        # MediaController route or installing the new subscription.
+        self._playing = False
+        self._destroy_subscription()
+        self._input_topic = ""
+
+        try:
+            # This gate is independent from the agent's wake/sleep state.
+            # Direct external playback therefore works in either state.
+            self._enable_external_playback()
+            self._media_ctrl.resume_audio_playback()
+        except Exception as exc:
+            self._last_error = str(exc)
+            return {"state": "error", "error": str(exc)}
+
         self._playing = True
-        self._media_ctrl.resume_audio_playback()
+        self._input_topic = input_topic
+        self._received_frames = 0
+        self._last_audio_time = 0.0
+        self._last_error = None
 
         # Subscribe to the audio topic
-        def _on_audio(msg):
+        def _on_audio(msg: AudioChunk):
             if not self._playing:
                 return
             try:
-                import base64
-                data = json.loads(msg.data)
-                pcm_bytes = base64.b64decode(data["data"])
-                # Convert mono to stereo (duplicate channel) for MediaController (2ch required)
-                mono_samples = struct.unpack(f'<{len(pcm_bytes)//2}h', pcm_bytes)
-                stereo_samples = []
-                for s in mono_samples:
-                    stereo_samples.extend([s, s])  # duplicate L=R
-
-                # Create AudioStream and publish
-                from mediacontrol_py import AudioStream
-                stream = AudioStream()
-                stream.channels = 2
-                stream.sample_rate = 16000
-                stream.format = 2
-                stream.audio_data = stereo_samples
+                stream = self._make_playback_stream(msg)
+                if stream is None:
+                    return
                 self._media_ctrl.publish_external_audio_playback_stream(stream)
+                self._received_frames += 1
+                self._last_audio_time = time.time()
+                if self._received_frames == 1 or self._received_frames % 100 == 0:
+                    self._node.get_logger().info(
+                        f"Speaker received {self._received_frames} AudioChunk frame(s) "
+                        f"from {input_topic}"
+                    )
             except Exception as e:
+                self._last_error = str(e)
                 self._node.get_logger().warn(f"Speaker playback error: {e}")
 
-        if self._sub is not None:
-            self._node.destroy_subscription(self._sub)
-        self._sub = self._node.create_subscription(String, input_topic, _on_audio, _LOW_LAT_QOS)
+        try:
+            self._sub = self._node.create_subscription(
+                AudioChunk, input_topic, _on_audio, _LOW_LAT_QOS
+            )
+        except Exception as exc:
+            self._playing = False
+            self._input_topic = ""
+            self._last_error = str(exc)
+            return {"state": "error", "error": str(exc)}
 
-        return {"state": "playing", "input_topic": input_topic}
+        return {
+            "state": "playing",
+            "input_topic": input_topic,
+            "topic_in": [{
+                "topic": input_topic,
+                "format": "audio/pcm-16k",
+                "message_type": "audio_msgs/msg/AudioChunk",
+            }],
+        }
 
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
