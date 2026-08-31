@@ -1527,6 +1527,8 @@ class OdometerPlugin:
         self._baseline: dict | None = None
         self._distance_total_m = 0.0
         self._trip_distance_m = 0.0
+        self._rotation_total_rad = 0.0
+        self._trip_rotation_rad = 0.0
         self._stationary: bool | None = None
         self._stationary_since: float | None = None
         self._received_count = 0
@@ -1589,6 +1591,7 @@ class OdometerPlugin:
         if action == "reset_trip":
             with self._lock:
                 self._trip_distance_m = 0.0
+                self._trip_rotation_rad = 0.0
                 if self._latest is None:
                     self._visual_origin = None
                     self._visual_pose = None
@@ -1693,11 +1696,18 @@ class OdometerPlugin:
                 else:
                     self._distance_total_m += delta
                     self._trip_distance_m += delta
+                    yaw_delta = math.atan2(
+                        math.sin(yaw - baseline["yaw"]),
+                        math.cos(yaw - baseline["yaw"]),
+                    )
+                    self._rotation_total_rad += yaw_delta
+                    self._trip_rotation_rad += yaw_delta
                     self._last_rejection = None
 
             self._baseline = {
                 "x": position[0],
                 "y": position[1],
+                "yaw": yaw,
                 "frame_id": frame_id,
                 "source_stamp": source_stamp,
                 "received_at": received_at,
@@ -1753,6 +1763,8 @@ class OdometerPlugin:
             updated = self._updated
             total = self._distance_total_m
             trip = self._trip_distance_m
+            rotation_total = self._rotation_total_rad
+            trip_rotation = self._trip_rotation_rad
             stationary_since = self._stationary_since
             counts = {
                 "received": self._received_count,
@@ -1773,6 +1785,8 @@ class OdometerPlugin:
                 "age_sec": None,
                 "distance_total_m": round(total, 6),
                 "trip_distance_m": round(trip, 6),
+                "rotation_total_rad": round(rotation_total, 6),
+                "trip_rotation_rad": round(trip_rotation, 6),
                 "trajectory_point_count": trajectory_count,
                 "sample_count": counts,
                 "last_rejection": last_rejection,
@@ -1791,6 +1805,8 @@ class OdometerPlugin:
             **latest,
             "distance_total_m": round(total, 6),
             "trip_distance_m": round(trip, 6),
+            "rotation_total_rad": round(rotation_total, 6),
+            "trip_rotation_rad": round(trip_rotation, 6),
             "trajectory_position_m": None if visual_pose is None else {
                 "x": round(visual_pose[0], 6),
                 "y": round(visual_pose[1], 6),
@@ -1803,6 +1819,28 @@ class OdometerPlugin:
             "sample_count": counts,
             "last_rejection": last_rejection,
             "timestamp_ms": _now_ms(),
+        }
+
+    def control_feedback(self) -> dict:
+        """Return unrounded, thread-safe motion progress for locomotion control."""
+        now = time.monotonic()
+        with self._lock:
+            latest = self._latest
+            updated = self._updated
+            distance_total = self._distance_total_m
+            rotation_total = self._rotation_total_rad
+            frame_resets = self._frame_reset_count
+            jump_rejections = self._jump_rejected_count
+        age_sec = None if updated is None else max(0.0, now - updated)
+        stale = age_sec is None or age_sec > self._timeout
+        return {
+            "state": "no_data" if latest is None else ("stale" if stale else "running"),
+            "age_sec": age_sec,
+            "distance_total_m": distance_total,
+            "rotation_total_rad": rotation_total,
+            "frame_id": None if latest is None else latest["frame_id"],
+            "frame_resets": frame_resets,
+            "jump_rejections": jump_rejections,
         }
 
     def _publish(self) -> None:
@@ -2610,6 +2648,32 @@ class LocomotionPlugin:
             raise ValueError(
                 "locomotion_prepare_duration_sec must be within [0, 3]"
             )
+        self._closed_loop_timeout_scale = float(
+            limits.get("locomotion_closed_loop_timeout_scale", 1.5)
+        )
+        self._closed_loop_timeout_margin_sec = float(
+            limits.get("locomotion_closed_loop_timeout_margin_sec", 1.0)
+        )
+        self._distance_tolerance_m = float(
+            limits.get("locomotion_distance_tolerance_m", 0.03)
+        )
+        self._angle_tolerance_rad = float(
+            limits.get("locomotion_angle_tolerance_rad", 0.03)
+        )
+        closed_loop_settings = (
+            self._closed_loop_timeout_scale,
+            self._closed_loop_timeout_margin_sec,
+            self._distance_tolerance_m,
+            self._angle_tolerance_rad,
+        )
+        if (
+            not all(math.isfinite(value) for value in closed_loop_settings)
+            or self._closed_loop_timeout_scale < 1.0
+            or self._closed_loop_timeout_margin_sec < 0.0
+            or self._distance_tolerance_m < 0.0
+            or self._angle_tolerance_rad < 0.0
+        ):
+            raise ValueError("invalid locomotion closed-loop configuration")
         self._action_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._active_action_id: str | None = None
@@ -2619,25 +2683,26 @@ class LocomotionPlugin:
         self._release_error: str | None = None
         self._acp_notify = _t800_acp_notify
         self._interrupt_group: MotionInterruptGroup | None = None
+        self._odometer: OdometerPlugin | None = None
 
     def get_tool(self) -> dict:
         schema = action_schema(
             {
                 "move": (
                     ["vx", "vy", "vyaw", "duration"],
-                    "按速度移动；duration=-1 持续到 stop_move",
+                    "有限动作按速度×时间生成里程目标；duration=-1 持续到 stop_move",
                 ),
                 "move_displacement": (
                     ["x_m", "y_m", "speed_m_s"],
-                    "按时间积分估算相对位移（开环，无里程计反馈）",
+                    "按 Odin2 里程反馈执行相对位移",
                 ),
                 "turn_angle": (
                     ["angle_rad", "angular_speed_rad_s"],
-                    "按时间积分估算原地转角（开环）",
+                    "按 Odin2 航向反馈执行原地转角",
                 ),
                 "arc": (
                     ["radius_m", "angle_rad", "linear_speed_m_s"],
-                    "按给定半径和角度走圆弧（开环）",
+                    "按 Odin2 里程和航向反馈执行圆弧",
                 ),
                 "stop_move": ([], "立即发布零速度并停止刷新"),
                 "status": ([], "查询速度控制刷新状态"),
@@ -2676,9 +2741,8 @@ class LocomotionPlugin:
                         },
                     ],
                     "description": (
-                        "实际行动时间（秒），不含内部"
-                        f"{self._prepare_duration_sec:g}秒预备补偿；"
-                        "-1=持续到 stop_move，0=停止"
+                        "有限动作的速度积分目标时间（秒）；启用里程计时以"
+                        "速度×时间作为闭环目标，-1=持续到 stop_move，0=停止"
                     ),
                 },
                 "x_m": {"type": "number", "description": "机身坐标系前向位移，米"},
@@ -2721,7 +2785,7 @@ class LocomotionPlugin:
             "name": "loco",
             "type": "actuator",
             "multiInstance": False,
-            "description": "T800 全向速度控制，支持定时和持续运动",
+            "description": "T800 全向速度控制，有限动作由 Odin2 里程反馈闭环终止",
             "inputSchema": schema,
         }
 
@@ -2795,6 +2859,9 @@ class LocomotionPlugin:
     def set_interrupt_group(self, group: MotionInterruptGroup) -> None:
         self._interrupt_group = group
 
+    def set_odometer(self, odometer: OdometerPlugin | None) -> None:
+        self._odometer = odometer
+
     def motion_active(self) -> bool:
         with self._lifecycle_lock:
             with self._action_lock:
@@ -2850,6 +2917,7 @@ class LocomotionPlugin:
                 limits=self._limits,
                 max_timed_duration_sec=self._MAX_TIMED_DURATION_SEC,
             )
+            feedback_goal = self._closed_loop_goal(command)
         except ControlValidationError as exc:
             return self._reject_and_halt(
                 str(exc), code=exc.code
@@ -2858,7 +2926,8 @@ class LocomotionPlugin:
         vy = command["vy"]
         vyaw = command["vyaw"]
         duration = command["duration"]
-        open_loop = command["open_loop"]
+        closed_loop = feedback_goal is not None
+        open_loop = not closed_loop and duration not in (-1, 0)
         with self._lifecycle_lock:
             if self.motion_active():
                 halt_result = self._halt_locked()
@@ -2867,11 +2936,18 @@ class LocomotionPlugin:
                         **halt_result,
                         "code": "RELEASE_FAILED",
                     }
-            command_duration = (
-                duration
-                if duration in (-1, 0)
-                else duration + self._prepare_duration_sec
-            )
+            if closed_loop:
+                command_duration = min(
+                    self._ACP_TIMEOUT_SEC - 1.0,
+                    duration * self._closed_loop_timeout_scale
+                    + self._closed_loop_timeout_margin_sec,
+                )
+            else:
+                command_duration = (
+                    duration
+                    if duration in (-1, 0)
+                    else duration + self._prepare_duration_sec
+                )
             self._command_generation += 1
             command_generation = self._command_generation
             action_id = None
@@ -2890,7 +2966,13 @@ class LocomotionPlugin:
         if action_id is not None:
             threading.Thread(
                 target=self._monitor_action,
-                args=(action_id, generation, duration),
+                args=(
+                    action_id,
+                    generation,
+                    command_generation,
+                    duration,
+                    feedback_goal,
+                ),
                 daemon=True,
                 name="t800-loco-acp",
             ).start()
@@ -2901,17 +2983,125 @@ class LocomotionPlugin:
             "vyaw": vyaw,
             "duration": duration,
             "preparation_duration": (
-                self._prepare_duration_sec if duration not in (-1, 0) else 0.0
+                self._prepare_duration_sec
+                if duration not in (-1, 0) and not closed_loop
+                else 0.0
             ),
             "command_duration": command_duration,
             "open_loop": open_loop,
+            "closed_loop": closed_loop,
             "stream": asdict(snapshot),
         }
+        if feedback_goal is not None:
+            result.update({
+                "target_distance_m": feedback_goal["target_distance_m"],
+                "target_rotation_rad": feedback_goal["target_rotation_rad"],
+                "odometry_frame": feedback_goal["frame_id"],
+            })
         if action_id is not None:
             result["action_id"] = action_id
         elif duration not in (-1, 0):
-            return self._wait_synchronous_action(result, command_generation)
+            return self._wait_synchronous_action(
+                result, command_generation, feedback_goal
+            )
         return result
+
+    def _closed_loop_goal(self, command: dict) -> dict | None:
+        duration = float(command["duration"])
+        if self._odometer is None or duration in (-1.0, 0.0):
+            return None
+        target_distance = math.hypot(command["vx"], command["vy"]) * duration
+        target_rotation = abs(command["vyaw"]) * duration
+        if target_distance == 0.0 and target_rotation == 0.0:
+            return None
+        feedback = self._odometer.control_feedback()
+        if feedback["state"] != "running":
+            age = feedback.get("age_sec")
+            age_text = "no samples" if age is None else f"age={age:.3f}s"
+            raise ControlValidationError(
+                "ODOMETRY_UNAVAILABLE",
+                f"fresh Odin2 odometry is required for finite movement ({age_text})",
+            )
+        return {
+            "distance_start_m": feedback["distance_total_m"],
+            "rotation_start_rad": feedback["rotation_total_rad"],
+            "target_distance_m": target_distance,
+            "target_rotation_rad": target_rotation,
+            "frame_id": feedback["frame_id"],
+            "frame_resets": feedback["frame_resets"],
+            "jump_rejections": feedback["jump_rejections"],
+        }
+
+    def _closed_loop_progress(self, goal: dict) -> dict:
+        feedback = self._odometer.control_feedback()
+        measured_distance = max(
+            0.0,
+            feedback["distance_total_m"] - goal["distance_start_m"],
+        )
+        measured_rotation = abs(
+            feedback["rotation_total_rad"] - goal["rotation_start_rad"]
+        )
+        result = {
+            "target_distance_m": goal["target_distance_m"],
+            "measured_distance_m": measured_distance,
+            "target_rotation_rad": goal["target_rotation_rad"],
+            "measured_rotation_rad": measured_rotation,
+            "odometry_age_sec": feedback.get("age_sec"),
+        }
+        if feedback["state"] != "running":
+            return {
+                **result,
+                "error": "Odin2 odometry became unavailable during movement",
+                "code": "ODOMETRY_LOST",
+                "reached": False,
+            }
+        if (
+            feedback["frame_id"] != goal["frame_id"]
+            or feedback["frame_resets"] != goal["frame_resets"]
+            or feedback["jump_rejections"] != goal["jump_rejections"]
+        ):
+            return {
+                **result,
+                "error": "Odin2 odometry reset or jump detected during movement",
+                "code": "ODOMETRY_RESET",
+                "reached": False,
+            }
+        distance_tolerance = min(
+            self._distance_tolerance_m,
+            goal["target_distance_m"] * 0.1,
+        )
+        angle_tolerance = min(
+            self._angle_tolerance_rad,
+            goal["target_rotation_rad"] * 0.1,
+        )
+        distance_reached = (
+            goal["target_distance_m"] == 0.0
+            or measured_distance + distance_tolerance >= goal["target_distance_m"]
+        )
+        rotation_reached = (
+            goal["target_rotation_rad"] == 0.0
+            or measured_rotation + angle_tolerance >= goal["target_rotation_rad"]
+        )
+        return {
+            **result,
+            "error": None,
+            "code": None,
+            "reached": distance_reached and rotation_reached,
+        }
+
+    def _stop_for_goal(self, command_generation: int) -> str | None:
+        with self._lifecycle_lock:
+            if self._command_generation != command_generation:
+                return "movement was superseded"
+            try:
+                self._halt_stream()
+            except Exception as exc:
+                self._release_failed = True
+                self._release_error = str(exc)
+                return f"zero velocity release failed: {exc}"
+            self._release_failed = False
+            self._release_error = None
+            return None
 
     def _reject_and_halt(self, error: str, *, code: str = "INVALID_ARGUMENT") -> dict:
         self.halt()
@@ -2927,7 +3117,9 @@ class LocomotionPlugin:
         self,
         action_id: str,
         generation: int,
+        command_generation: int,
         effective_duration: float,
+        feedback_goal: dict | None,
     ) -> None:
         while True:
             with self._action_lock:
@@ -2936,6 +3128,27 @@ class LocomotionPlugin:
                     or self._active_action_generation != generation
                 ):
                     return
+            progress = (
+                None
+                if feedback_goal is None
+                else self._closed_loop_progress(feedback_goal)
+            )
+            if progress is not None and (progress["error"] or progress["reached"]):
+                stop_error = self._stop_for_goal(command_generation)
+                if stop_error is not None:
+                    progress = {
+                        **progress,
+                        "error": stop_error,
+                        "code": "RELEASE_FAILED",
+                    }
+                status = "error" if progress["error"] else "completed"
+                self._finish_active_action(status, {
+                    "duration": effective_duration,
+                    "preparation_duration": 0.0,
+                    **{key: value for key, value in progress.items()
+                       if key != "reached"},
+                }, expected_action_id=action_id)
+                return
             snapshot = self._stream.snapshot()
             if not snapshot.active:
                 if (
@@ -2945,11 +3158,25 @@ class LocomotionPlugin:
                     with self._lifecycle_lock:
                         self._release_failed = True
                         self._release_error = snapshot.error
-                status = "error" if snapshot.error else "completed"
+                target_error = (
+                    "odometry target was not reached before the safety timeout"
+                    if feedback_goal is not None and not snapshot.error
+                    else None
+                )
+                status = "error" if snapshot.error or target_error else "completed"
+                progress_result = {} if progress is None else {
+                    key: value for key, value in progress.items()
+                    if key not in ("reached", "error", "code")
+                }
                 self._finish_active_action(status, {
                     "duration": effective_duration,
-                    "preparation_duration": self._prepare_duration_sec,
-                    "error": snapshot.error,
+                    "preparation_duration": (
+                        0.0 if feedback_goal is not None
+                        else self._prepare_duration_sec
+                    ),
+                    "error": snapshot.error or target_error,
+                    "code": "TARGET_NOT_REACHED" if target_error else None,
+                    **progress_result,
                 }, expected_action_id=action_id)
                 return
             time.sleep(0.01)
@@ -2987,7 +3214,10 @@ class LocomotionPlugin:
         ).start()
 
     def _wait_synchronous_action(
-        self, result: dict, command_generation: int
+        self,
+        result: dict,
+        command_generation: int,
+        feedback_goal: dict | None,
     ) -> dict:
         while True:
             with self._lifecycle_lock:
@@ -2997,6 +3227,36 @@ class LocomotionPlugin:
                         "state": "cancelled",
                         "stream": asdict(self._stream.snapshot()),
                     }
+            progress = (
+                None
+                if feedback_goal is None
+                else self._closed_loop_progress(feedback_goal)
+            )
+            if progress is not None and (progress["error"] or progress["reached"]):
+                stop_error = self._stop_for_goal(command_generation)
+                if stop_error is not None:
+                    return {
+                        "error": stop_error,
+                        "code": "RELEASE_FAILED",
+                        **{key: value for key, value in progress.items()
+                           if key not in ("error", "code", "reached")},
+                        "stream": asdict(self._stream.snapshot()),
+                    }
+                if progress["error"]:
+                    return {
+                        "error": progress["error"],
+                        "code": progress["code"],
+                        **{key: value for key, value in progress.items()
+                           if key not in ("error", "code", "reached")},
+                        "stream": asdict(self._stream.snapshot()),
+                    }
+                return {
+                    **result,
+                    **{key: value for key, value in progress.items()
+                       if key not in ("error", "code", "reached")},
+                    "state": "completed",
+                    "stream": asdict(self._stream.snapshot()),
+                }
             snapshot = self._stream.snapshot()
             if not snapshot.active:
                 if snapshot.error:
@@ -3007,6 +3267,14 @@ class LocomotionPlugin:
                     return {
                         "error": snapshot.error,
                         "code": "COMMAND_FAILED",
+                        "stream": asdict(snapshot),
+                    }
+                if feedback_goal is not None:
+                    return {
+                        "error": "odometry target was not reached before the safety timeout",
+                        "code": "TARGET_NOT_REACHED",
+                        **{key: value for key, value in progress.items()
+                           if key not in ("error", "code", "reached")},
                         "stream": asdict(snapshot),
                     }
                 return {

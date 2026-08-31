@@ -666,6 +666,27 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertGreater(metadata["trajectory_points"], 1)
         self.assertAlmostEqual(math.pi / 2.0, metadata["robot"]["yaw"])
 
+    def test_odometer_control_feedback_accumulates_unwrapped_rotation(self):
+        plugin = self.device.OdometerPlugin(CONFIG, "robot", self.ros)
+        first_yaw = math.radians(179.0)
+        second_yaw = math.radians(-179.0)
+        plugin._on_odometry(odometry_message(
+            quaternion=(0.0, 0.0, math.sin(first_yaw / 2.0), math.cos(first_yaw / 2.0)),
+            stamp=1.0,
+        ))
+        plugin._on_odometry(odometry_message(
+            x=0.1,
+            quaternion=(0.0, 0.0, math.sin(second_yaw / 2.0), math.cos(second_yaw / 2.0)),
+            stamp=1.1,
+        ))
+
+        feedback = plugin.control_feedback()
+
+        self.assertEqual("running", feedback["state"])
+        self.assertAlmostEqual(0.1, feedback["distance_total_m"])
+        self.assertAlmostEqual(math.radians(2.0), feedback["rotation_total_rad"])
+        self.assertEqual("odom", feedback["frame_id"])
+
     def test_motion_trace_prefers_fresh_command_over_stale_odometry(self):
         plugin = self.device.MotionCommandTracePlugin(CONFIG, "robot", self.ros)
         plugin._on_odometry(types.SimpleNamespace(
@@ -1087,6 +1108,96 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
         self.assertEqual(result["action_id"], completions[0][0])
         self.assertEqual("completed", completions[0][1])
+
+    def test_locomotion_uses_odometer_to_reach_speed_times_duration_distance(self):
+        config = {
+            **CONFIG,
+            "control": {
+                **CONFIG["control"],
+                "locomotion_prepare_duration_sec": 0.04,
+            },
+        }
+        odometer = self.device.OdometerPlugin(config, "robot", self.ros)
+        odometer._on_odometry(odometry_message(stamp=1.0))
+        plugin = self.device.LocomotionPlugin(config, "robot", self.ros, self.state)
+        plugin.set_odometer(odometer)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.01
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+
+        result = plugin.dispatch("move", {"vx": 1.0, "duration": 0.03})
+
+        self.assertTrue(result["closed_loop"])
+        self.assertFalse(result["open_loop"])
+        self.assertEqual(0.0, result["preparation_duration"])
+        self.assertAlmostEqual(0.03, result["target_distance_m"])
+        time.sleep(0.06)
+        self.assertTrue(
+            plugin._stream.snapshot().active,
+            "the command must continue past nominal duration until odometry reaches the target",
+        )
+
+        odometer._on_odometry(odometry_message(x=0.03, stamp=1.1))
+        deadline = time.monotonic() + 1.0
+        while plugin._stream.snapshot().active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        while not completions and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual(0.0, plugin._publisher.messages[-1].yaw_velocity)
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("completed", completions[0][1])
+        self.assertAlmostEqual(0.03, completions[0][2]["measured_distance_m"])
+
+    def test_locomotion_rejects_closed_loop_move_when_odometer_is_stale(self):
+        odometer = self.device.OdometerPlugin(CONFIG, "robot", self.ros)
+        odometer._on_odometry(odometry_message(stamp=1.0))
+        odometer._updated = time.monotonic() - 2.0
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.set_odometer(odometer)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+
+        result = plugin.dispatch("move", {"vx": 0.2, "duration": 1.0})
+
+        self.assertEqual("ODOMETRY_UNAVAILABLE", result["code"])
+        self.assertFalse(plugin._stream.snapshot().active)
+
+    def test_locomotion_fails_closed_when_odometer_rebases_after_a_jump(self):
+        odometer = self.device.OdometerPlugin(CONFIG, "robot", self.ros)
+        odometer._on_odometry(odometry_message(stamp=1.0))
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.set_odometer(odometer)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.01
+        completions = []
+        plugin._acp_notify = lambda *args: completions.append(args)
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        result = plugin.dispatch("move", {"vx": 0.2, "duration": 0.1})
+
+        odometer._on_odometry(odometry_message(x=20.0, stamp=1.1))
+        deadline = time.monotonic() + 0.3
+        while plugin._stream.snapshot().active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        while not completions and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertFalse(plugin._stream.snapshot().active)
+        self.assertEqual(result["action_id"], completions[0][0])
+        self.assertEqual("error", completions[0][1])
+        self.assertEqual("ODOMETRY_RESET", completions[0][2]["code"])
 
     def test_locomotion_concurrent_starts_complete_every_action_id_once(self):
         plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)

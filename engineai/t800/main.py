@@ -231,6 +231,7 @@ class T800DeviceBundle:
 
         locomotion = instances.get("locomotion")
         if locomotion is not None:
+            locomotion.set_odometer(instances.get("odometer"))
             locomotion.set_interrupt_group(motion_interrupt_group)
             motion_interrupt_group.register(
                 "locomotion", locomotion.halt, locomotion.motion_active

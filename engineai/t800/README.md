@@ -33,7 +33,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `capabilities` | sensor | Driver 能力发现、原生状态和已知限制 |
 | `ros_graph` | sensor | 实时发现固件节点、topic、service 和尚未映射的新接口 |
 | `model` | resource | 官方 `serial_t800.urdf` |
-| `loco` | actuator | 100 Hz 速度控制；定时/持续、相对位移、转角和圆弧开环动作 |
+| `loco` | actuator | 100 Hz 速度控制；有限动作由 Odin2 里程/航向反馈闭环终止，持续动作手动停止 |
 | `motion_mode` | actuator | 任意状态切换及 idle/passive/站立/行走/舞蹈/起身/躺下快捷动作 |
 | `gait` | actuator | 基于 Native SDK motion state 的步态选择；自动适配 `rl_basic`/`walk` 版本差异 |
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
@@ -62,18 +62,19 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 状态会立即归零停流。
 `force=true` 仅保留给 joint override 和 joint bridge 的专家级接口。
 
-`loco.move_displacement`、`turn_angle` 和 `arc` 由速度乘时间换算。T800
-基础运动协议没有供控制闭环使用的定位反馈，因此它们仍是开环动作并返回
-`open_loop: true`。若 Odin2 固件提供配置中的 odometry topic，
-`motion_command_trace` 会把它用于状态显示，但不会据此闭环控制动作。
-有限时长动作的用户有效 `duration` 最多 10 秒；Driver 会先额外发送 1 秒
-预备命令，再完整执行用户填写的时长，因此固件起步准备不再消耗有效行动
-时间。预备+行动总时长超过 3 秒的有限动作返回唯一 `action_id`，并在自然
-结束、异常或取消时发送 ACP completion；短动作保持同步语义，不建立无意义
-pending。
+启用默认 `odometer` 后，`loco` 的有限动作共享其经校验的 Odin2 反馈。
+`move` 以 `hypot(vx, vy) × duration` 和 `abs(vyaw) × duration` 作为目标里程与
+累计转角；`move_displacement`、`turn_angle` 和 `arc` 使用相同闭环终止逻辑。
+达到目标后立即发布零速度，不再用固定预备时间估算实际路程。反馈在起步前
+不可用会拒绝动作，运行中断流、坐标系重置或安全超时会 fail-closed 停车并以
+错误完成。闭环动作返回 `closed_loop: true`、目标值和最终实测值。
+若部署显式禁用 `odometer`，有限动作才退回旧的时间开环和 1 秒预备补偿。
+有限时长动作的用户 `duration` 最多 10 秒；预计或安全最长执行时间超过 3 秒
+时返回唯一 `action_id`，并在自然结束、异常或取消时发送 ACP completion；短
+动作保持同步语义。
 `stop_move` 是 `on_interrupt_motion` hook，可绕过 barrier 立即归零。
 `duration=-1` 仍持续发送到手动停止且不建立无限期 ACP pending。
-默认护栏为 `vx=±2.0m/s`、`vy=±1.0m/s`、`vyaw=±2.0rad/s`。所有速度、
+官方护栏为 `vx=±1.0m/s`、`vy=±1.0m/s`、`vyaw=±1.0rad/s`。所有速度、
 角速度、复合动作速度和 duration 都必须是有限值并落在配置安全
 范围内；越界输入返回 `INVALID_ARGUMENT` / `SAFETY_LIMIT` 并立即归零旧速度流，
 不会静默截断后继续执行。零速 release 发布失败时，原 action 以 `error` 完成，
