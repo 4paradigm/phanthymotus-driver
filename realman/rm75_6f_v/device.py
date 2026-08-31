@@ -321,9 +321,10 @@ class RM75Nodes:
             msg.block = bool(block)
         self.stop_pub.publish(msg)
         result = {"state": "stopped", "topic": self.topics["move_stop_cmd"], "result_topic": self.topics.get("move_stop_result")}
-        update = self.wait_for_update("move_stop_result", baseline, 1.0)
-        if update.get("state") != "timeout":
-            result["result"] = update
+        if "move_stop_result" in self.streams:
+            update = self.wait_for_update("move_stop_result", baseline, 1.0)
+            if update.get("state") != "timeout":
+                result["result"] = update
         return result
 
     def clear_joint_error(self, joint_num):
@@ -335,9 +336,10 @@ class RM75Nodes:
         baseline = self._sequence("joint_error_clear_result")
         self.clear_joint_error_pub.publish(msg)
         result = {"state": "published", "topic": self.topics["joint_error_clear_cmd"], "joint_num": joint_num}
-        update = self.wait_for_update("joint_error_clear_result", baseline, 1.0)
-        if update.get("state") != "timeout":
-            result["result"] = update
+        if "joint_error_clear_result" in self.streams:
+            update = self.wait_for_update("joint_error_clear_result", baseline, 1.0)
+            if update.get("state") != "timeout":
+                result["result"] = update
         return result
 
     def _sequence(self, key):
@@ -461,6 +463,10 @@ class RM75Nodes:
             age = now - latest["timestamp"]
             if age > max_age:
                 return self._reject("joint_state_stale", f"/joint_states is stale ({age:.2f}s)")
+        if self.safety.get("require_no_errors", True):
+            telemetry = self._error_telemetry_status(now, max_age)
+            if telemetry:
+                return telemetry
         limits = self.safety.get("joint_limits_rad") or []
         for idx, value in enumerate(joints):
             value = _finite_float(value, f"joints[{idx}]")
@@ -480,6 +486,26 @@ class RM75Nodes:
             errors = self._active_errors(values)
             if errors:
                 return self._reject("active_robot_error", "RM75 reports active errors; clear or diagnose before moving", errors=errors)
+        return None
+
+    def _error_telemetry_status(self, now, max_age):
+        stale = []
+        with self.lock:
+            values = dict(self.values)
+        for key in ("joint_error", "rm_error"):
+            item = values.get(key)
+            if not item:
+                stale.append({"key": key, "reason": "missing"})
+                continue
+            age = now - float(item.get("timestamp", 0))
+            if age > max_age:
+                stale.append({"key": key, "reason": "stale", "age_seconds": age})
+        if stale:
+            return self._reject(
+                "error_telemetry_unavailable",
+                "RM75 error telemetry is missing or stale; refusing to move",
+                stale_inputs=stale,
+            )
         return None
 
     def _latest(self, key):
