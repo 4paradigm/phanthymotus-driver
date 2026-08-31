@@ -257,12 +257,21 @@ class RM75Nodes:
         baseline = self._sequence("movej_result")
         msg = self._Movej()
         msg.joint = [float(value) for value in joints]
-        msg.v = int(speed)
-        msg.r = float(blend_radius)
-        if hasattr(msg, "block"):
+        fields = set(getattr(msg, "get_fields_and_field_types", lambda: {})())
+        if "speed" in fields:
+            msg.speed = int(speed)
+        elif "v" in fields:
+            msg.v = int(speed)
+        else:
+            raise AttributeError("Movej message has neither speed nor v field")
+        if "r" in fields:
+            msg.r = float(blend_radius)
+        if "block" in fields:
             msg.block = bool(block)
-        if hasattr(msg, "trajectory_connect"):
+        if "trajectory_connect" in fields:
             msg.trajectory_connect = int(trajectory_connect)
+        if "dof" in fields:
+            msg.dof = self.dof
         self.movej_pub.publish(msg)
         result = {
             "state": "published",
@@ -270,13 +279,16 @@ class RM75Nodes:
             "result_topic": self.topics.get("movej_result"),
             "joint": msg.joint,
             "speed": speed,
-            "v": msg.v,
-            "r": msg.r,
-            "blend_radius": msg.r,
+            "movej_fields": sorted(fields),
             "block": bool(block),
             "trajectory_connect": int(trajectory_connect),
             "dof": self.dof,
         }
+        if "v" in fields:
+            result["v"] = int(speed)
+        if "r" in fields:
+            result["r"] = float(blend_radius)
+            result["blend_radius"] = float(blend_radius)
         if wait_result:
             update = self.wait_for_update(
                 "movej_result",
@@ -288,7 +300,7 @@ class RM75Nodes:
             result["completion"] = self.wait_for_motion_complete(joints, baseline, timeout)
         return result
 
-    def start_movej_action(self, joints, *, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None, blend_radius=None, tool_name="arm_motion"):
+    def start_movej_action(self, joints, *, speed=20, block=False, trajectory_connect=0, wait_result=False, timeout=None, blend_radius=None, tool_name="joint_control"):
         joints, speed, trajectory_connect, timeout, blend_radius = self._normalize_movej_args(
             joints, speed, trajectory_connect, timeout, blend_radius
         )
@@ -335,81 +347,6 @@ class RM75Nodes:
             raise ValueError(f"/joint_states is missing required joint names: {missing}")
         positions = [positions_by_name[f"joint{idx}"] for idx in range(1, self.dof + 1)]
         return positions
-
-    def move_single_joint(self, joint_index, *, mode, value, speed=5, block=False, wait_result=False, timeout=None):
-        joint_index = _finite_int(joint_index, "joint_index")
-        if joint_index < 1 or joint_index > self.dof:
-            raise ValueError(f"joint_index must be in [1, {self.dof}]")
-        current = self.current_joint_positions()
-        before = current[joint_index - 1]
-        if mode == "absolute":
-            target = _finite_float(value, "target")
-        elif mode == "relative":
-            target = before + _finite_float(value, "delta")
-        else:
-            raise ValueError("mode must be 'absolute' or 'relative'")
-        current[joint_index - 1] = target
-        result = self.publish_movej(
-            current,
-            speed=speed,
-            block=block,
-            trajectory_connect=0,
-            wait_result=wait_result,
-            timeout=timeout,
-        )
-        result.update({
-            "controlled_joint": f"joint{joint_index}",
-            "mode": mode,
-            "previous_position_rad": before,
-            "target_position_rad": target,
-        })
-        return result
-
-    def start_single_joint_action(self, joint_index, *, mode, value, speed=5, block=False, wait_result=False, timeout=None):
-        joint_index = _finite_int(joint_index, "joint_index")
-        if joint_index < 1 or joint_index > self.dof:
-            raise ValueError(f"joint_index must be in [1, {self.dof}]")
-        speed = _bounded_int(speed, "speed", 1, 30)
-        if mode == "absolute":
-            value = _finite_float(value, "target")
-        elif mode == "relative":
-            value = _bounded_float(value, "delta", -0.2, 0.2)
-        else:
-            raise ValueError("mode must be 'absolute' or 'relative'")
-        timeout = self._motion_timeout(timeout)
-        blend_radius = _finite_float(self.safety.get("movej_blend_radius", 0), "movej_blend_radius")
-        current = self.current_joint_positions()
-        before = current[joint_index - 1]
-        target = value if mode == "absolute" else before + value
-        current[joint_index - 1] = target
-        preflight = self.preflight_movej(current)
-        if preflight:
-            return preflight
-        action_id = f"rm75_joint_{uuid4().hex[:12]}"
-        threading.Thread(
-            target=self._motion_worker,
-            args=(action_id, "joint_control", self._publish_movej_checked),
-            kwargs={
-                "joints": current,
-                "speed": speed,
-                "block": block,
-                "trajectory_connect": 0,
-                "wait_result": wait_result,
-                "timeout": timeout,
-                "blend_radius": blend_radius,
-            },
-            daemon=True,
-            name=action_id,
-        ).start()
-        return {
-            "state": "moving",
-            "action_id": action_id,
-            "timeout": timeout,
-            "controlled_joint": f"joint{joint_index}",
-            "mode": mode,
-            "previous_position_rad": before,
-            "target_position_rad": target,
-        }
 
     def _motion_worker(self, action_id, tool_name, func, **kwargs):
         try:
@@ -771,66 +708,9 @@ class RM75StatePlugin:
         return None
 
 
-class RM75MotionPlugin:
-    ACTIONS = {
-        "movej": (["joints", "speed", "block", "trajectory_connect", "wait_result", "timeout"], "关节空间 MoveJ；joints 为 7 个弧度值"),
-        "stopmotion": (["block"], "立即向 rm_driver 发布 move_stop_cmd"),
-        "clear_joint_error": (["joint_num"], "清除指定关节错误码"),
-    }
-
-    def __init__(self, nodes):
-        self.nodes = nodes
-
-    def get_tool(self):
-        return tool("arm_motion", "actuator", "RM75-6F-V 基础机械臂运动控制", _with_completion(action_schema(self.ACTIONS, {
-            "joints": {
-                "type": "array",
-                "items": {"type": "number"},
-                "minItems": 7,
-                "maxItems": 7,
-                "description": "目标关节角，单位 rad，顺序 joint1..joint7",
-            },
-            "speed": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "速度百分比"},
-            "blend_radius": {"type": "number", "minimum": 0, "default": 0, "description": "MoveJ 混合半径，对应官方消息字段 r，默认 0"},
-            "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
-            "trajectory_connect": {"type": "integer", "enum": [0, 1], "default": 0, "description": "0 立即规划，1 与下一轨迹连接"},
-            "wait_result": {"type": "boolean", "default": False, "description": "优先等待 movej_result；默认按 /joint_states/状态同步等待完成"},
-            "timeout": {"type": "number", "minimum": 0.1, "maximum": 30, "default": 10, "description": "等待结果超时时间，单位秒"},
-            "joint_num": {"type": "integer", "minimum": 1, "maximum": 7, "description": "待清错关节编号，1..7"},
-        }), ["movej"], 30))
-
-    def start(self):
-        pass
-
-    def stop(self):
-        self.nodes.publish_stop()
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "movej":
-            return self.nodes.start_movej_action(
-                _require(args, "joints"),
-                speed=args.get("speed", 20),
-                block=args.get("block", False),
-                trajectory_connect=args.get("trajectory_connect", 0),
-                wait_result=args.get("wait_result", False),
-                timeout=args.get("timeout"),
-                blend_radius=args.get("blend_radius"),
-            )
-        if action in ("stopmotion", "stop"):
-            return self.nodes.publish_stop(block=args.get("block", False))
-        if action == "clear_joint_error":
-            return self.nodes.clear_joint_error(_require(args, "joint_num"))
-        return None
-
-
 class RM75JointControlPlugin:
     ACTIONS = {
-        "set": (["joint", "target", "speed", "block", "wait_result", "timeout"], "选择 joint1..joint7，并移动到指定弧度位置"),
-        "nudge": (["joint", "delta", "speed", "block", "wait_result", "timeout"], "选择 joint1..joint7，并在当前角度基础上小幅增减，单位 rad"),
+        "set": (["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7", "speed", "block", "wait_result", "timeout"], "输入 joint1..joint7 的完整目标关节角，单位 rad"),
         "stopmotion": (["block"], "立即停止机械臂运动"),
     }
 
@@ -838,28 +718,25 @@ class RM75JointControlPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("joint_control", "actuator", "RM75-6F-V 单关节控制卡片：选择 joint1..joint7 后执行 set/nudge", _with_completion(action_schema(self.ACTIONS, {
-            "joint": {
-                "type": "string",
-                "enum": [f"joint{idx}" for idx in range(1, self.nodes.dof + 1)],
-                "description": "要控制的关节",
-            },
-            "target": {
+        properties = {
+            f"joint{idx}": {
                 "type": "number",
-                "description": "目标关节角，单位 rad；其他关节保持当前 /joint_states 位置",
-            },
-            "delta": {
-                "type": "number",
-                "minimum": -0.2,
-                "maximum": 0.2,
-                "default": 0.02,
-                "description": "相对移动量，单位 rad；建议首次测试使用 +/-0.02",
-            },
-            "speed": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5, "description": "单关节测试速度百分比，默认 5，最高限制 30"},
+                "description": f"joint{idx} 目标关节角，单位 rad",
+            }
+            for idx in range(1, self.nodes.dof + 1)
+        }
+        properties.update({
+            "speed": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5, "description": "七关节测试速度百分比，默认 5，最高限制 30"},
             "block": {"type": "boolean", "default": False, "description": "是否使用 rm_driver 阻塞模式"},
             "wait_result": {"type": "boolean", "default": False, "description": "优先等待 movej_result；默认按 /joint_states/状态同步等待完成"},
             "timeout": {"type": "number", "minimum": 0.1, "maximum": 30, "default": 10, "description": "等待结果超时时间，单位秒"},
-        }), ["set", "nudge"], 30))
+        })
+        return tool(
+            "joint_control",
+            "actuator",
+            "RM75-6F-V 七关节控制卡片：输入 joint1..joint7 后执行 set",
+            _with_completion(action_schema(self.ACTIONS, properties), ["set"], 30),
+        )
 
     def start(self):
         pass
@@ -875,42 +752,26 @@ class RM75JointControlPlugin:
         if action == "info":
             return {"state": "ready", "joints": [f"joint{idx}" for idx in range(1, self.nodes.dof + 1)]}
         if action == "set":
-            return self.nodes.start_single_joint_action(
-                self._joint_index(args),
-                mode="absolute",
-                value=_require(args, "target"),
-                speed=args.get("speed", 5),
+            return self.nodes.start_movej_action(
+                self._joint_targets(args),
+                speed=_bounded_int(args.get("speed", 5), "speed", 1, 30),
                 block=args.get("block", False),
+                trajectory_connect=0,
                 wait_result=args.get("wait_result", False),
                 timeout=args.get("timeout"),
-            )
-        if action == "nudge":
-            return self.nodes.start_single_joint_action(
-                self._joint_index(args),
-                mode="relative",
-                value=args.get("delta", 0.02),
-                speed=args.get("speed", 5),
-                block=args.get("block", False),
-                wait_result=args.get("wait_result", False),
-                timeout=args.get("timeout"),
+                tool_name="joint_control",
             )
         if action in ("stopmotion", "stop"):
             return self.nodes.publish_stop(block=args.get("block", False))
         return None
 
-    def _joint_index(self, args):
-        joint = str(args.get("joint", "")).strip().lower()
-        if joint.startswith("joint") and joint[5:].isdigit():
-            index = int(joint[5:])
-            if 1 <= index <= self.nodes.dof:
-                return index
-        raise ValueError(f"joint must be one of joint1..joint{self.nodes.dof}")
+    def _joint_targets(self, args):
+        return [_finite_float(_require(args, f"joint{idx}"), f"joint{idx}") for idx in range(1, self.nodes.dof + 1)]
 
 
 def build_plugins(config, namespace, ros2):
     nodes = RM75Nodes(config, namespace, ros2)
     return [
         RM75StatePlugin(nodes),
-        RM75MotionPlugin(nodes),
         RM75JointControlPlugin(nodes),
     ]

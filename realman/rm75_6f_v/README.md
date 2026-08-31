@@ -43,19 +43,18 @@ curl -s http://localhost:15718/mcp \
 
 ## First safe operations
 
-Use `state`, `joint_states`, `joint_error`, and `rm_error` first. The `arm_motion.movej` action publishes to `/rm_driver/movej_cmd` and should only be tested with a known-safe target pose, low speed, clear workspace, and an operator ready to stop the arm.
+Use `state`, `joint_states`, `joint_error`, and `rm_error` first. The `joint_control.set` action publishes to `/rm_driver/movej_cmd` and should only be tested with a known-safe target pose, low speed, clear workspace, and an operator ready to stop the arm.
 
 ## Driver surface
 
 - HTTP service: `/health` and `/mcp` on port `15718`.
 - MCP resources: `model` returns a simplified URDF for skeleton rendering.
 - MCP sensors: `state`, `joint_states`, `arm_state`, `arm_original_state`, `arm_current_status`, `joint_error`, `rm_error`, plus optional command result streams when matching `rm_ros_interfaces` message types are available. `state` is a request/response snapshot and intentionally has no `topic_out`; use the individual stream tools for topic-backed cards.
-- MCP actuator: `arm_motion` supports `movej`, `stopmotion`, and `clear_joint_error`.
-- MCP single-joint actuator: `joint_control` supports `set`, `nudge`, and `stopmotion`. Select `joint1` through `joint7` inside the card; it reads the latest `/joint_states`, replaces only the selected joint target, and publishes a full 7-DOF `movej` command.
+- MCP actuator: `joint_control` supports `set` and `stopmotion`. The `set` action exposes seven numeric inputs, `joint1` through `joint7`, and publishes them as one full 7-DOF `movej` command.
 
-`joint_control` maps positions by the explicit `joint1`..`joint7` names in `/joint_states` instead of trusting message order. Duplicate, missing, or non-finite joint values are rejected before any command is published.
+`joint_control` requires explicit `joint1`..`joint7` target values, so it never guesses omitted joints from `/joint_states`. Missing, out-of-limit, or non-finite joint values are rejected before any command is published.
 
-`movej` performs a conservative preflight before publishing: recent `/joint_states` required, configured joint limits checked, and active error topics rejected. MoveJ publishes the official RealMan `rm_ros_interfaces/msg/Movej` fields: `joint`, `v` for velocity percentage, and `r` for blend radius. MoveJ and single-joint actions use the Agent Core completion contract: the MCP call returns an `action_id` immediately, a worker publishes the ROS command, then reports `/api/acp/complete` when `movej_result` arrives, the target is reached within `safety.joint_target_tolerance_rad`, an error appears, or the bounded timeout expires. Set `safety.require_*` fields in `config.yaml` only when deliberately testing around those guards.
+`movej` performs a conservative preflight before publishing: recent `/joint_states` required, configured joint limits checked, and active error topics rejected. MoveJ populates the RealMan `rm_ros_interfaces/msg/Movej` fields available in the sourced workspace: `joint`, `speed`/`v` for velocity percentage, optional `block`, optional `trajectory_connect`, optional `dof`, and optional `r` for blend radius. Seven-joint control uses the Agent Core completion contract: the MCP call returns an `action_id` immediately, a worker publishes the ROS command, then reports `/api/acp/complete` when `movej_result` arrives, the target is reached within `safety.joint_target_tolerance_rad`, an error appears, or the bounded timeout expires. Set `safety.require_*` fields in `config.yaml` only when deliberately testing around those guards.
 
 The URDF in `resource/rm75_6f_v.urdf` is intentionally simplified for card-system skeleton rendering. Use the vendor description package when an accurate kinematic or visual model is required.
 
