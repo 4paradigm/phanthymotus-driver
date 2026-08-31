@@ -1,4 +1,5 @@
 name: "潜蛟 2.0 Pro ROV"
+driver_id: "qianxing-qianjiao2-pro"
 mcp_port: 15719
 ros_namespace: ""
 rov:

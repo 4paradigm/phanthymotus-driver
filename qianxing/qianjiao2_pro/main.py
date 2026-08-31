@@ -15,11 +15,13 @@ def start_registration(port: int) -> None:
     """Register with Agent Core and refresh the lease periodically."""
     import ssl
     import urllib.request
-    agent = os.environ.get("AGENT_CORE_URL", "http://127.0.0.1:15678").rstrip("/")
+    agent = os.environ.get("AGENT_CORE_URL", "https://127.0.0.1:15678").rstrip("/")
+    driver_id = CFG.get("driver_id", "qianxing-qianjiao2-pro")
     payload = json.dumps({
+        "id": driver_id,
         "name": CFG.get("name", "潜蛟 2.0 Pro ROV"),
         "url": f"http://localhost:{port}/mcp",
-        "category": "driver",
+        "transport": "http",
     }).encode()
     def loop():
         while True:
@@ -30,7 +32,7 @@ def start_registration(port: int) -> None:
                 context = ssl._create_unverified_context()
                 with urllib.request.urlopen(req, timeout=5, context=context) as response:
                     response.read()
-                print(f"[register] Agent Core <- {agent}/api/mcp", flush=True)
+                print(f"[register] Agent Core <- {agent}/api/mcp (id={driver_id})", flush=True)
                 time.sleep(30)
             except Exception as exc:
                 print(f"[register] failed: {exc}; retrying in 5s", flush=True)
