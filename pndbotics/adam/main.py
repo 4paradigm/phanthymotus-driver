@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-drivers/pnpbotics/adam/main.py — PNPbotics Adam MCP HTTP server.
+drivers/pndbotics/adam/main.py — PNDbotics Adam MCP HTTP server.
 
 Reads config.yaml, initializes DDS + gRPC + ROS2, loads plugins, and exposes
 them as MCP tools via HTTP JSON-RPC 2.0.
@@ -308,7 +308,7 @@ def main():
         spin_thread.start()
 
     # Register with Agent Core
-    driver_name = cfg.get("name", "PNPbotics Adam")
+    driver_name = cfg.get("name", "PNDbotics Adam")
     _start_registration(mcp_port, driver_name, "driver")
 
     # MCP HTTP server
