@@ -341,8 +341,8 @@ class DevicePluginContractTests(unittest.TestCase):
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(43, len(names))
-        self.assertEqual(43, len(definitions), "tool names must be unique")
+        self.assertEqual(44, len(names))
+        self.assertEqual(44, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -1387,7 +1387,7 @@ class DevicePluginContractTests(unittest.TestCase):
         first = arm.dispatch("raise", {"side": "right", "duration": 0.05, "force": True, "confirm": True})
         self.assertEqual("running", first["state"])
         time.sleep(0.05)
-        self.assertEqual("arm", plan.arm_status()["owner"])
+        self.assertTrue(plan.arm_status()["owner"].startswith("arm:"))
 
         # Second arm request arrives while the first is still running.
         second = arm.dispatch("raise", {"side": "left", "duration": 0.05, "force": True, "confirm": True})
@@ -1395,7 +1395,7 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertIn("already running", second["error"])
 
         # The first action's lock must still be held.
-        self.assertEqual("arm", plan.arm_status()["owner"])
+        self.assertTrue(plan.arm_status()["owner"].startswith("arm:"))
 
         # Clean up: unblock the worker and wait for completion.
         release_worker.set()
@@ -2009,6 +2009,10 @@ class DevicePluginContractTests(unittest.TestCase):
 
             def release_head(self, _owner):
                 pass
+
+            @staticmethod
+            def _new_owner_token(prefix: str) -> str:
+                return f"{prefix}:flakytest"
 
             def _dispatch_owned(self, _owner, action, args):
                 return self.dispatch(action, args)

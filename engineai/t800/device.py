@@ -3934,10 +3934,9 @@ class GesturePlugin:
     _LIMIT_MARGIN_RAD = 0.02
     _READY_TIMEOUT_SEC = 10.0
     _STEP_TIMEOUT_SEC = 15.0
-    # Interrupt hooks must return promptly.  The non-blocking join observes an
-    # already-finished worker only; a live worker retains its planner lease and
-    # keeps the bundle motion gate closed through motion_active().
-    _STOP_JOIN_TIMEOUT_SEC = 0.0
+    # stop 必须等 worker 退出后才返回，否则 worker 可能已通过取消检查、正准备
+    # 调用 _dispatch_owned，与新拿到锁的动作竞态；join 超时（卡死）则不释放锁。
+    _STOP_JOIN_TIMEOUT_SEC = 3.0
     _COOLDOWN_SEC = 3.0
     _ACP_TIMEOUT_SEC = 300.0
     _ACP_CALLBACK_TIMEOUT_SEC = 5.0
@@ -4614,8 +4613,7 @@ class ArmActuatorPlugin:
         if action == "status":
             return self._status_snapshot()
         if action == "stop":
-            self._stop()
-            return {"state": "idle"}
+            return self._stop()
         try:
             if action == "move_pos":
                 side = self._side(args.get("side", "both"), allow_both=True)
@@ -4768,6 +4766,10 @@ class ArmActuatorPlugin:
             }
 
             def run() -> None:
+                # 启动竞态保护：stop 可能先于 worker 首行执行发生；worker 一进来
+                # 就把 self._thread 固化为自己，保证 _stop 的 join 一定等得到。
+                with self._lock:
+                    self._thread = threading.current_thread()
                 request_id = None
                 try:
                     self._joint_plan.wait_until_idle(self._READY_TIMEOUT_SEC, self._cancel)
@@ -4829,13 +4831,13 @@ class ArmActuatorPlugin:
 
     def _stop(self) -> dict:
         with self._lock:
-            active = self._status.get("state") == "running" and self._thread is not None and self._thread.is_alive()
+            thread = self._thread
+            active = self._status.get("state") == "running" and thread is not None
             if active:
                 self._cancel.set()
                 self._status["state"] = "cancelled"
                 self._status["error"] = ""
                 request_id = self._status.get("request_id")
-                thread = self._thread
                 owner = self._owner
             else:
                 request_id = None
@@ -4850,7 +4852,9 @@ class ArmActuatorPlugin:
                 # worker 卡死（极端情况），不释放锁，让新动作拿不到所有权
                 # 避免旧 worker 与新动作并发发布
                 pass
-        return result if active else {"state": "idle"}
+        if not active:
+            return {"state": "idle"}
+        return {"state": result.get("state") if thread is not None and thread.is_alive() else "idle"}
 
     def _status_snapshot(self) -> dict:
         joints = self._state.joint_positions()
