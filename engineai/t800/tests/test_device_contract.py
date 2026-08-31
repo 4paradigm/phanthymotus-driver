@@ -367,7 +367,8 @@ class DevicePluginContractTests(unittest.TestCase):
             {"joints", "imu", "battery", "motor_health", "motor_state", "motor_command", "joint_command_feedback",
              "gamepad", "motion_state", "driver_health", "model",
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
-             "mainboard", "heartbeat_status", "motion_command_trace", "odometer", "motion_events",
+             "mainboard", "heartbeat_status", "motion_command_trace", "odometer",
+             "odometer_control", "motion_events",
              "native_interface_probe",
              "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture", "head",
              "joint_override", "joint_bridge",
@@ -375,8 +376,8 @@ class DevicePluginContractTests(unittest.TestCase):
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
             names,
         )
-        self.assertEqual(44, len(names))
-        self.assertEqual(44, len(definitions), "tool names must be unique")
+        self.assertEqual(45, len(names))
+        self.assertEqual(45, len(definitions), "tool names must be unique")
         for tool in definitions:
             schema = tool.get("inputSchema")
             self.assertEqual("object", schema.get("type"), tool["name"])
@@ -486,8 +487,16 @@ class DevicePluginContractTests(unittest.TestCase):
             tool["topic_out"],
         )
         actions = tool["inputSchema"]["properties"]["action"]["enum"]
-        self.assertTrue({"start", "info", "status", "reset_trip", "stop"}.issubset(actions))
+        self.assertTrue({"start", "info", "status", "stop"}.issubset(actions))
+        self.assertNotIn("reset_trip", actions)
         self.assertNotIn("required", tool["inputSchema"])
+
+        control = {item["name"]: item for item in plugin.get_tools()}["odometer_control"]
+        self.assertEqual("actuator", control["type"])
+        self.assertIn(
+            "reset_trip",
+            control["inputSchema"]["properties"]["action"]["enum"],
+        )
 
     def test_odometer_starts_with_configured_source_and_no_data_status(self):
         plugin = self.device.OdometerPlugin(CONFIG, "robot", self.ros)
@@ -521,7 +530,7 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin = self.device.OdometerPlugin(CONFIG, "robot", self.ros)
         plugin._on_odometry(odometry_message(stamp=1.0))
         plugin._on_odometry(odometry_message(x=0.4, stamp=2.0))
-        reset = plugin.dispatch("reset_trip", {})
+        reset = plugin.dispatch("reset_trip", {"_tool_name": "odometer_control"})
         self.assertTrue(reset["trip_reset"])
         self.assertEqual(0.4, reset["distance_total_m"])
         self.assertEqual(0.0, reset["trip_distance_m"])
@@ -866,6 +875,12 @@ class DevicePluginContractTests(unittest.TestCase):
         capabilities = self.state.dispatch("capabilities", {})
         self.assertEqual(25, capabilities["dof"])
         self.assertIn("odometer", capabilities["feedback"])
+        self.assertIn("odometry_closed_loop_move", capabilities["control"])
+        self.assertNotIn("open_loop_displacement", capabilities["control"])
+        self.assertNotIn(
+            "display/statistics only",
+            " ".join(capabilities["limitations"]),
+        )
         self.assertNotIn("no odometry topic", " ".join(capabilities["limitations"]))
         self.assertEqual([23, 24], [item["index"] for item in
                                    self.state.dispatch("joint_groups", {})["groups"]["head"]])
@@ -1170,6 +1185,70 @@ class DevicePluginContractTests(unittest.TestCase):
         result = plugin.dispatch("move", {"vx": 0.2, "duration": 1.0})
 
         self.assertEqual("ODOMETRY_UNAVAILABLE", result["code"])
+        self.assertFalse(plugin._stream.snapshot().active)
+
+    def test_locomotion_rejects_finite_move_when_bundle_has_no_odometer(self):
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.set_odometer(None)
+        plugin.start()
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+
+        result = plugin.dispatch("move", {"vx": 0.2, "duration": 0.01})
+
+        self.assertEqual("ODOMETRY_UNAVAILABLE", result["code"])
+        self.assertFalse(plugin._stream.snapshot().active)
+
+    def test_locomotion_captures_odometer_baseline_after_stopping_old_motion(self):
+        class Feedback:
+            def __init__(self):
+                self.distance = 0.0
+
+            def control_feedback(self):
+                return {
+                    "state": "running",
+                    "age_sec": 0.0,
+                    "distance_total_m": self.distance,
+                    "rotation_total_rad": 0.0,
+                    "frame_id": "odom",
+                    "frame_resets": 0,
+                    "jump_rejections": 0,
+                }
+
+        feedback = Feedback()
+        plugin = self.device.LocomotionPlugin(CONFIG, "robot", self.ros, self.state)
+        plugin.set_odometer(feedback)
+        plugin.start()
+        plugin._ACP_MIN_DURATION_SEC = 0.01
+        plugin._acp_notify = lambda *_args: None
+        self.state._on_motion(types.SimpleNamespace(
+            current_motion_task="rl_basic",
+            available_transition_motions=["passive"],
+        ))
+        plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+        real_publish = plugin._publisher.publish
+
+        def publish(message):
+            if (
+                list(message.linear_velocity) == [0.0, 0.0]
+                and float(message.yaw_velocity) == 0.0
+            ):
+                feedback.distance = 1.0
+            real_publish(message)
+
+        plugin._publisher.publish = publish
+
+        result = plugin.dispatch("move", {"vx": 0.2, "duration": 0.1})
+        time.sleep(0.05)
+
+        self.assertTrue(result["closed_loop"])
+        self.assertTrue(plugin._stream.snapshot().active)
+        feedback.distance = 1.02
+        deadline = time.monotonic() + 0.5
+        while plugin._stream.snapshot().active and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertFalse(plugin._stream.snapshot().active)
 
     def test_locomotion_fails_closed_when_odometer_rebases_after_a_jump(self):

@@ -677,7 +677,9 @@ class StatePlugin:
                 "dof": len(T800_JOINT_NAMES),
                 "native_motion_states": list(MOTION_STATES),
                 "control": [
-                    "body_velocity", "open_loop_displacement", "open_loop_turn", "open_loop_arc",
+                    "body_velocity", "odometry_closed_loop_move",
+                    "odometry_closed_loop_displacement",
+                    "odometry_closed_loop_turn", "odometry_closed_loop_arc",
                     "motion_fsm", "joint_plan", "joint_override", "joint_bridge", "native_node_control",
                     "gesture_sequences", "dance", "virtual_gamepad", "soft_emergency_stop",
                     "motor_power", "led", "tts", "ros_graph_discovery",
@@ -688,7 +690,7 @@ class StatePlugin:
                     "motion_events", "mainboard",
                 ],
                 "limitations": [
-                    "odometry is display/statistics only; displacement/turn/arc control remains open-loop",
+                    "finite loco actions require fresh Odin2 odometry feedback",
                     "no public dexterous-hand interface in the referenced T800 protocol",
                 ],
                 "timestamp_ms": _now_ms(),
@@ -1552,7 +1554,6 @@ class OdometerPlugin:
         schema = action_schema(
             _with_lifecycle({
                 "status": ([], "返回最新里程计、行程和数据健康状态"),
-                "reset_trip": ([], "清零单次行程和画面轨迹，不修改 Odin2 坐标系"),
             }),
             {},
             "里程计传感器动作",
@@ -1569,6 +1570,24 @@ class OdometerPlugin:
             "topic_out": self._topic_out(),
         }
 
+    def get_tools(self) -> list[dict]:
+        return [self.get_tool(), {
+            "name": "odometer_control",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "重置 T800 odometer 单次行程和轨迹显示",
+            "inputSchema": action_schema(
+                _with_lifecycle({
+                    "reset_trip": (
+                        [],
+                        "清零单次行程和画面轨迹，不修改累计总里程或 Odin2 坐标系",
+                    ),
+                }),
+                {},
+                "里程计控制动作",
+            ),
+        }]
+
     def start(self) -> None:
         from nav_msgs.msg import Odometry
 
@@ -1582,28 +1601,40 @@ class OdometerPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        tool_name = str(args.get("_tool_name", "odometer"))
+        if tool_name == "odometer_control":
+            if action == "start":
+                return {"state": "ready"}
+            if action == "stop":
+                return {"state": "idle"}
+            if action in ("info", "status"):
+                return {"state": "ready"}
+            if action == "reset_trip":
+                return self._reset_trip()
+            return {"error": f"unknown odometer control action: {action}"}
         if action == "info":
             return {**self._snapshot(), "topic_out": self._topic_out()}
         if action == "start":
             return {"state": "running"}
         if action in ("odometer", "status"):
             return self._snapshot()
-        if action == "reset_trip":
-            with self._lock:
-                self._trip_distance_m = 0.0
-                self._trip_rotation_rad = 0.0
-                if self._latest is None:
-                    self._visual_origin = None
-                    self._visual_pose = None
-                    self._trajectory.clear()
-                else:
-                    position = self._latest["position_m"]
-                    yaw = float(self._latest["orientation"]["yaw_rad"])
-                    self._reset_visual_locked(float(position["x"]), float(position["y"]), yaw)
-            return {**self._snapshot(), "trip_reset": True}
         if action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown odometer action: {action}"}
+
+    def _reset_trip(self) -> dict:
+        with self._lock:
+            self._trip_distance_m = 0.0
+            self._trip_rotation_rad = 0.0
+            if self._latest is None:
+                self._visual_origin = None
+                self._visual_pose = None
+                self._trajectory.clear()
+            else:
+                position = self._latest["position_m"]
+                yaw = float(self._latest["orientation"]["yaw_rad"])
+                self._reset_visual_locked(float(position["x"]), float(position["y"]), yaw)
+        return {**self._snapshot(), "trip_reset": True}
 
     def _record_invalid(self, reason: str) -> None:
         with self._lock:
@@ -2684,6 +2715,7 @@ class LocomotionPlugin:
         self._acp_notify = _t800_acp_notify
         self._interrupt_group: MotionInterruptGroup | None = None
         self._odometer: OdometerPlugin | None = None
+        self._odometer_wired = False
 
     def get_tool(self) -> dict:
         schema = action_schema(
@@ -2861,6 +2893,7 @@ class LocomotionPlugin:
 
     def set_odometer(self, odometer: OdometerPlugin | None) -> None:
         self._odometer = odometer
+        self._odometer_wired = True
 
     def motion_active(self) -> bool:
         with self._lifecycle_lock:
@@ -2917,7 +2950,6 @@ class LocomotionPlugin:
                 limits=self._limits,
                 max_timed_duration_sec=self._MAX_TIMED_DURATION_SEC,
             )
-            feedback_goal = self._closed_loop_goal(command)
         except ControlValidationError as exc:
             return self._reject_and_halt(
                 str(exc), code=exc.code
@@ -2926,8 +2958,6 @@ class LocomotionPlugin:
         vy = command["vy"]
         vyaw = command["vyaw"]
         duration = command["duration"]
-        closed_loop = feedback_goal is not None
-        open_loop = not closed_loop and duration not in (-1, 0)
         with self._lifecycle_lock:
             if self.motion_active():
                 halt_result = self._halt_locked()
@@ -2936,6 +2966,12 @@ class LocomotionPlugin:
                         **halt_result,
                         "code": "RELEASE_FAILED",
                     }
+            try:
+                feedback_goal = self._closed_loop_goal(command)
+            except ControlValidationError as exc:
+                return self._reject_and_halt(str(exc), code=exc.code)
+            closed_loop = feedback_goal is not None
+            open_loop = not closed_loop and duration not in (-1, 0)
             if closed_loop:
                 command_duration = min(
                     self._ACP_TIMEOUT_SEC - 1.0,
@@ -3008,7 +3044,16 @@ class LocomotionPlugin:
 
     def _closed_loop_goal(self, command: dict) -> dict | None:
         duration = float(command["duration"])
-        if self._odometer is None or duration in (-1.0, 0.0):
+        if duration in (-1.0, 0.0):
+            return None
+        if self._odometer is None:
+            if self._odometer_wired:
+                raise ControlValidationError(
+                    "ODOMETRY_UNAVAILABLE",
+                    "finite movement requires the odometer sensor plugin",
+                )
+            # Direct plugin construction is retained for isolated legacy tests;
+            # the production bundle always calls set_odometer(), including None.
             return None
         target_distance = math.hypot(command["vx"], command["vy"]) * duration
         target_rotation = abs(command["vyaw"]) * duration

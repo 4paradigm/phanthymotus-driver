@@ -25,6 +25,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `gamepad` | sensor | 遥控器连接、按键和摇杆状态 |
 | `motion_state` | sensor | 当前 Native SDK motion state 和允许转换 |
 | `odometer` | sensor | Odin2 位置、航向、速度、累计/单次里程，以及运动轨迹和朝向鸟瞰画面 |
+| `odometer_control` | actuator | 清零 odometer 单次行程和画面轨迹，不修改累计总里程或 Odin2 坐标系 |
 | `driver_health` | actuator | 每次执行返回一次机器人、麦克风与 Odin2 点云/双目/深度数据流的最新健康 JSON，不持续发布 |
 | `robot_snapshot` | sensor | 运动、关节、IMU、电源和电机健康聚合快照 |
 | `fault_summary` | sensor | 电机掉线/禁用/错误/过温及电源错误摘要 |
@@ -68,7 +69,8 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 达到目标后立即发布零速度，不再用固定预备时间估算实际路程。反馈在起步前
 不可用会拒绝动作，运行中断流、坐标系重置或安全超时会 fail-closed 停车并以
 错误完成。闭环动作返回 `closed_loop: true`、目标值和最终实测值。
-若部署显式禁用 `odometer`，有限动作才退回旧的时间开环和 1 秒预备补偿。
+若部署禁用或未能启动 `odometer`，有限动作会以 `ODOMETRY_UNAVAILABLE` 拒绝，
+不会退回可能产生距离偏差的时间开环。
 有限时长动作的用户 `duration` 最多 10 秒；预计或安全最长执行时间超过 3 秒
 时返回唯一 `action_id`，并在自然结束、异常或取消时发送 ACP completion；短
 动作保持同步语义。
@@ -85,7 +87,8 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 
 `odometer` 同时发布 `data/json` 状态面板和 `sensor/mapping` 鸟瞰画面。画面以
 当前单次行程起点为原点，显示运动轨迹、当前位置和朝向箭头；`reset_trip` 会
-清零单次里程并清空画面轨迹，但不会修改 Odin2 原始坐标或累计总里程。
+通过 `odometer_control` 清零单次里程并清空画面轨迹，但不会修改 Odin2 原始
+坐标或累计总里程。
 
 `gesture.play` 与旧的 `joint_plan.preset` 不同：前者执行官方示例里的完整多步
 动作（挥手包含准备、举手、5 次摆动和复位；握手包含伸手、收手和复位），
