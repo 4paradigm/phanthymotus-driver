@@ -1046,6 +1046,10 @@ class SpeakerPlugin:
         self._last_error = None
         self._last_config_change = 0.0
         self._config_lock = threading.Lock()
+        # HTTP MCP requests are handled concurrently.  Serialize operations
+        # which change the shared MediaController audio/agent state so a
+        # play/sleep/wakeup/reset sequence cannot interleave.
+        self._control_lock = threading.RLock()
 
     @staticmethod
     def _enum_name(value) -> str:
@@ -1111,15 +1115,23 @@ class SpeakerPlugin:
 
     def _enable_config(self, getter_name: str, setter_name: str) -> bool:
         """Enable one MediaController route, only writing when necessary."""
+        return self._set_config(getter_name, setter_name, True)
+
+    def _set_config(self, getter_name: str, setter_name: str, enabled: bool) -> bool:
+        """Set one MediaController route while honoring its 500 ms limit."""
         with self._config_lock:
             getter = getattr(self._media_ctrl, getter_name)
             setter = getattr(self._media_ctrl, setter_name)
-            if bool(getter()):
+            if bool(getter()) == enabled:
                 return False
             self._wait_for_config_slot()
-            setter(True)
+            setter(enabled)
             self._last_config_change = time.monotonic()
             return True
+
+    def _disable_config(self, getter_name: str, setter_name: str) -> bool:
+        """Disable one MediaController route, only writing when necessary."""
+        return self._set_config(getter_name, setter_name, False)
 
     def _enable_external_playback(self) -> None:
         self._enable_config(
@@ -1127,11 +1139,24 @@ class SpeakerPlugin:
             "set_external_custom_audio_data_to_playback_enable",
         )
 
+    def _disable_external_playback(self) -> None:
+        self._disable_config(
+            "get_external_custom_audio_data_to_playback_enable",
+            "set_external_custom_audio_data_to_playback_enable",
+        )
+
     def _enable_voice_routes(self) -> None:
-        """Prepare the internal mic and agent reply routes for wakeup."""
+        """Prepare the internal microphone and agent reply routes."""
         self._enable_config(
             "get_internal_capture_audio_data_to_agent_enable",
             "set_internal_capture_audio_data_to_agent_enable",
+        )
+        # The speaker card's wakeup mode is the normal onboard-microphone
+        # conversation mode.  Do not leave a stale external-agent route
+        # enabled from another client and feed two input sources at once.
+        self._disable_config(
+            "get_external_custom_audio_data_to_agent_enable",
+            "set_external_custom_audio_data_to_agent_enable",
         )
         self._enable_config(
             "get_internal_agent_audio_data_to_playback_enable",
@@ -1162,6 +1187,29 @@ class SpeakerPlugin:
             latest["status_error"] = status_error
         return latest
 
+    def _wait_for_reset(self, timeout_s: float = 5.0) -> dict:
+        """Wait for the reset acknowledgement from Bumi's audio agent."""
+        deadline = time.monotonic() + timeout_s
+        latest = {"work_status": "unknown", "reason": "unknown"}
+        status_error = None
+        while time.monotonic() < deadline:
+            try:
+                latest = self._read_system_status()
+                status_error = None
+                # The SDK documents CMD_RESET as the status reason emitted
+                # after TO_RESET/restart.  The work status after a reset is
+                # firmware-dependent (READY or SLEEPED), so match the reason.
+                if latest["reason"] == "CMD_RESET":
+                    return latest
+                if latest["work_status"] == "EXIT":
+                    return latest
+            except Exception as exc:
+                status_error = str(exc)
+            time.sleep(0.1)
+        if status_error:
+            latest["status_error"] = status_error
+        return latest
+
     def _get_system_error(self) -> dict | None:
         try:
             error = self._media_ctrl.get_system_error()
@@ -1173,76 +1221,182 @@ class SpeakerPlugin:
             return {"message": str(exc)}
         return None
 
-    def _do_wakeup(self) -> dict:
+    @staticmethod
+    def _is_error_status(status: dict) -> bool:
+        return status.get("reason") == "ERROR_SLEEPED" or status.get("work_status") == "EXIT"
+
+    def _status_error_result(self, requested_state: str, status: dict, recovery: str | None = None) -> dict:
+        result = {"state": "error", "requested_state": requested_state, **status}
+        system_error = self._get_system_error()
+        if system_error:
+            result["system_error"] = system_error
+        if recovery:
+            result["recovery"] = recovery
+        return result
+
+    def _stop_playback_locked(self) -> dict:
+        """Stop ROS playback and release its MediaController route."""
+        self._playing = False
+        self._destroy_subscription()
+        self._input_topic = ""
+        errors = []
         try:
-            # A successful wakeup requires both sides of the voice path:
-            # internal mic -> agent and agent -> internal speaker.  The
-            # MediaController wakeup() call alone only changes agent state.
-            self._enable_voice_routes()
-            self._media_ctrl.resume_audio_capture()
-            self._media_ctrl.resume_audio_playback()
-
-            try:
-                current = self._read_system_status()
-            except Exception:
-                # A transient status read must not prevent the control command
-                # from being sent; the following wait will report the result.
-                current = None
-            if current is None or current["work_status"] != "WAKEUPED":
-                self._media_ctrl.wakeup()
-
-            status = self._wait_for_system_status("WAKEUPED")
-            if status["work_status"] == "WAKEUPED":
-                return {
-                    "state": "awake",
-                    **status,
-                    "audio_routes": {
-                        "internal_capture_to_agent": True,
-                        "agent_audio_to_playback": True,
-                    },
-                }
-
-            result = {"state": "error", "requested_state": "awake", **status}
-            system_error = self._get_system_error()
-            if system_error:
-                result["system_error"] = system_error
-            return result
+            self._media_ctrl.pause_audio_playback()
         except Exception as exc:
-            return {"state": "error", "requested_state": "awake", "error": str(exc)}
+            errors.append(f"pause_audio_playback: {exc}")
+        try:
+            self._disable_external_playback()
+        except Exception as exc:
+            errors.append(f"disable_external_playback: {exc}")
+        if errors:
+            self._last_error = "; ".join(errors)
+            return {"state": "error", "error": self._last_error}
+        self._last_error = None
+        return {"state": "idle"}
+
+    def _do_wakeup(self) -> dict:
+        with self._control_lock:
+            try:
+                # Direct external playback and agent playback share the
+                # physical speaker.  Release the former before waking the
+                # voice agent, otherwise an active ROS stream can race the
+                # agent's state transition.
+                playback = self._stop_playback_locked()
+                if playback["state"] == "error":
+                    return {
+                        "state": "error",
+                        "requested_state": "awake",
+                        "error": playback["error"],
+                    }
+
+                try:
+                    current = self._read_system_status()
+                except Exception:
+                    # A transient status read must not prevent the control
+                    # command from being sent; the status wait below reports
+                    # whether the command actually took effect.
+                    current = None
+                if current is not None and self._is_error_status(current):
+                    return self._status_error_result(
+                        "awake", current, recovery="call speaker.reset, then speaker.wakeup",
+                    )
+
+                # A successful wakeup requires both sides of the voice path:
+                # internal mic -> agent and agent -> internal speaker.  The
+                # MediaController wakeup() call alone only changes agent state.
+                self._enable_voice_routes()
+                self._media_ctrl.resume_audio_capture()
+                self._media_ctrl.resume_audio_playback()
+
+                if current is None or current["work_status"] != "WAKEUPED":
+                    self._media_ctrl.wakeup()
+
+                status = self._wait_for_system_status("WAKEUPED", timeout_s=5.0)
+                if status["work_status"] == "WAKEUPED":
+                    return {
+                        "state": "awake",
+                        **status,
+                        "audio_routes": {
+                            "internal_capture_to_agent": True,
+                            "agent_audio_to_playback": True,
+                        },
+                    }
+
+                return self._status_error_result(
+                    "awake", status, recovery="call speaker.reset, then speaker.wakeup",
+                )
+            except Exception as exc:
+                return {"state": "error", "requested_state": "awake", "error": str(exc)}
 
     def _do_sleep(self) -> dict:
-        try:
+        with self._control_lock:
             try:
-                current = self._read_system_status()
-            except Exception:
-                current = None
-            if current is None or current["work_status"] != "SLEEPED":
-                self._media_ctrl.sleep()
+                # Do not leave a direct ROS playback stream running while the
+                # agent is transitioning to sleep.
+                playback = self._stop_playback_locked()
+                if playback["state"] == "error":
+                    return {
+                        "state": "error",
+                        "requested_state": "sleeping",
+                        "error": playback["error"],
+                    }
 
-            status = self._wait_for_system_status("SLEEPED")
-            if status["work_status"] == "SLEEPED":
+                try:
+                    current = self._read_system_status()
+                except Exception:
+                    current = None
+                if current is not None and self._is_error_status(current):
+                    return self._status_error_result(
+                        "sleeping", current, recovery="call speaker.reset to recover the audio agent",
+                    )
+                if current is None or current["work_status"] != "SLEEPED":
+                    self._media_ctrl.sleep()
+                    status = self._wait_for_system_status("SLEEPED", timeout_s=5.0)
+                else:
+                    status = current
+
+                # SLEEPED + ERROR_SLEEPED is not a successful user-requested
+                # sleep.  Preserve that distinction for the card consumer.
+                if status["work_status"] != "SLEEPED" or status["reason"] == "ERROR_SLEEPED":
+                    return self._status_error_result("sleeping", status)
+
+                # Pause the internal streams only after the agent confirms its
+                # sleep transition.  wakeup() resumes them again.
+                io_errors = []
+                try:
+                    self._media_ctrl.pause_audio_capture()
+                except Exception as exc:
+                    io_errors.append(f"pause_audio_capture: {exc}")
+                try:
+                    self._media_ctrl.pause_audio_playback()
+                except Exception as exc:
+                    io_errors.append(f"pause_audio_playback: {exc}")
+                if io_errors:
+                    result = self._status_error_result("sleeping", status)
+                    result["io_error"] = "; ".join(io_errors)
+                    return result
                 return {"state": "sleeping", **status}
+            except Exception as exc:
+                return {"state": "error", "requested_state": "sleeping", "error": str(exc)}
 
-            result = {"state": "error", "requested_state": "sleeping", **status}
-            system_error = self._get_system_error()
-            if system_error:
-                result["system_error"] = system_error
-            return result
-        except Exception as exc:
-            return {"state": "error", "requested_state": "sleeping", "error": str(exc)}
+    def _do_reset(self) -> dict:
+        with self._control_lock:
+            try:
+                # Reset is the documented recovery path for ERROR_SLEEPED.
+                # Release any direct playback stream before restarting the
+                # shared voice agent.
+                playback = self._stop_playback_locked()
+                if playback["state"] == "error":
+                    return {
+                        "state": "error",
+                        "requested_state": "reset",
+                        "error": playback["error"],
+                    }
+
+                self._media_ctrl.restart()
+                status = self._wait_for_reset()
+                if status["reason"] == "CMD_RESET":
+                    return {
+                        "state": "reset",
+                        **status,
+                        "next_action": "call speaker.wakeup to start voice interaction",
+                    }
+                return self._status_error_result("reset", status)
+            except Exception as exc:
+                return {"state": "error", "requested_state": "reset", "error": str(exc)}
 
     def get_tool(self) -> dict:
         return {
             "name": "speaker",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Bumi speaker — play audio from ROS2 topic on robot speaker, volume control, wake/sleep.",
+            "description": "Bumi speaker — play audio from ROS2 topic on robot speaker, volume control, wake/sleep/reset.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["play", "stop", "info", "get_volume", "set_volume", "wakeup", "sleep"],
+                        "enum": ["play", "stop", "info", "get_volume", "set_volume", "wakeup", "sleep", "reset"],
                     },
                     "input_topic": {
                         "type": "string",
@@ -1282,7 +1436,11 @@ class SpeakerPlugin:
                     },
                     "sleep": {
                         "params": [],
-                        "description": "Put robot audio agent to sleep",
+                        "description": "Stop direct playback, pause voice I/O, and put robot audio agent to sleep",
+                    },
+                    "reset": {
+                        "params": [],
+                        "description": "Restart the robot audio agent; use to recover ERROR_SLEEPED, then call wakeup",
                     },
                 },
             },
@@ -1339,84 +1497,80 @@ class SpeakerPlugin:
             return self._do_wakeup()
         if action == "sleep":
             return self._do_sleep()
+        if action == "reset":
+            return self._do_reset()
         return None
 
     def _stop_playback(self) -> dict:
-        self._playing = False
-        self._destroy_subscription()
-        self._input_topic = ""
-        try:
-            self._media_ctrl.pause_audio_playback()
-        except Exception as exc:
-            self._last_error = str(exc)
-            return {"state": "error", "error": str(exc)}
-        return {"state": "idle"}
+        with self._control_lock:
+            return self._stop_playback_locked()
 
     def _do_play(self, args: dict) -> dict:
         input_topic = str(args.get("input_topic") or "").strip()
         if not input_topic:
             return {"error": "input_topic is required"}
 
-        # Stop delivering frames from the previous topic before changing the
-        # MediaController route or installing the new subscription.
-        self._playing = False
-        self._destroy_subscription()
-        self._input_topic = ""
+        with self._control_lock:
+            # Stop delivering frames from the previous topic before changing
+            # the MediaController route or installing the new subscription.
+            previous = self._stop_playback_locked()
+            if previous["state"] == "error":
+                return previous
 
-        try:
-            # This gate is independent from the agent's wake/sleep state.
-            # Direct external playback therefore works in either state.
-            self._enable_external_playback()
-            self._media_ctrl.resume_audio_playback()
-        except Exception as exc:
-            self._last_error = str(exc)
-            return {"state": "error", "error": str(exc)}
-
-        self._playing = True
-        self._input_topic = input_topic
-        self._received_frames = 0
-        self._last_audio_time = 0.0
-        self._last_error = None
-
-        # Subscribe to the audio topic
-        def _on_audio(msg: AudioChunk):
-            if not self._playing:
-                return
             try:
-                stream = self._make_playback_stream(msg)
-                if stream is None:
+                # This gate is independent from the agent's wake/sleep state.
+                # Direct external playback therefore works in either state.
+                self._enable_external_playback()
+                self._media_ctrl.resume_audio_playback()
+            except Exception as exc:
+                self._last_error = str(exc)
+                return {"state": "error", "error": str(exc)}
+
+            self._playing = True
+            self._input_topic = input_topic
+            self._received_frames = 0
+            self._last_audio_time = 0.0
+            self._last_error = None
+
+            # Subscribe to the audio topic
+            def _on_audio(msg: AudioChunk):
+                if not self._playing:
                     return
-                self._media_ctrl.publish_external_audio_playback_stream(stream)
-                self._received_frames += 1
-                self._last_audio_time = time.time()
-                if self._received_frames == 1 or self._received_frames % 100 == 0:
-                    self._node.get_logger().info(
-                        f"Speaker received {self._received_frames} AudioChunk frame(s) "
-                        f"from {input_topic}"
-                    )
-            except Exception as e:
-                self._last_error = str(e)
-                self._node.get_logger().warn(f"Speaker playback error: {e}")
+                try:
+                    stream = self._make_playback_stream(msg)
+                    if stream is None:
+                        return
+                    self._media_ctrl.publish_external_audio_playback_stream(stream)
+                    self._received_frames += 1
+                    self._last_audio_time = time.time()
+                    if self._received_frames == 1 or self._received_frames % 100 == 0:
+                        self._node.get_logger().info(
+                            f"Speaker received {self._received_frames} AudioChunk frame(s) "
+                            f"from {input_topic}"
+                        )
+                except Exception as e:
+                    self._last_error = str(e)
+                    self._node.get_logger().warn(f"Speaker playback error: {e}")
 
-        try:
-            self._sub = self._node.create_subscription(
-                AudioChunk, input_topic, _on_audio, _LOW_LAT_QOS
-            )
-        except Exception as exc:
-            self._playing = False
-            self._input_topic = ""
-            self._last_error = str(exc)
-            return {"state": "error", "error": str(exc)}
+            try:
+                self._sub = self._node.create_subscription(
+                    AudioChunk, input_topic, _on_audio, _LOW_LAT_QOS
+                )
+            except Exception as exc:
+                self._playing = False
+                self._input_topic = ""
+                self._last_error = str(exc)
+                return {"state": "error", "error": str(exc)}
 
-        return {
-            "state": "playing",
-            "input_topic": input_topic,
-            "topic_in": [{
-                "topic": input_topic,
-                "format": "audio/pcm-16k",
-                "message_type": "audio_msgs/msg/AudioChunk",
-            }],
-        }
+            return {
+                "state": "playing",
+                "input_topic": input_topic,
+                "topic_in": [{
+                    "topic": input_topic,
+                    "format": "audio/pcm-16k",
+                    "message_type": "audio_msgs/msg/AudioChunk",
+                }],
+            }
 
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
