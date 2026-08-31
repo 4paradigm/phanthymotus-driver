@@ -17,3 +17,11 @@ particular robot. Before changing the status to `validated_on_device`, record:
 If the assumptions in the YAML do not match the deployed frame convention,
 leave the calibration unavailable or replace it with a measured transform.
 Never relabel a manually adjusted matrix as the Unitree factory nominal value.
+
+The navigation sensor bridge also publishes the factory-nominal static transform
+`base_link -> livox_frame`. It composes the zero-pose URDF waist joints from
+`pelvis` to `torso_link` with `mid360_joint`, matching the `base_link` convention
+used by the navigation card in PhanthyMotus PR 141. It uses reliable,
+transient-local `/tf_static` delivery through ROS 2 `StaticTransformBroadcaster`.
+Replace the configured translation and rotation after per-device calibration;
+do not describe the factory value as a measured extrinsic.

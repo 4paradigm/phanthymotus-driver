@@ -54,6 +54,31 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         sys.modules["sensor_msgs"] = sensor_msgs
         sys.modules["sensor_msgs.msg"] = sensor_msgs_msg
 
+        class TransformStamped:
+            def __init__(self):
+                self.header = types.SimpleNamespace(stamp=None, frame_id="")
+                self.child_frame_id = ""
+                self.transform = types.SimpleNamespace(
+                    translation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                    rotation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=0.0),
+                )
+
+        geometry_msgs = types.ModuleType("geometry_msgs")
+        geometry_msgs_msg = types.ModuleType("geometry_msgs.msg")
+        geometry_msgs_msg.TransformStamped = TransformStamped
+        geometry_msgs.msg = geometry_msgs_msg
+        sys.modules["geometry_msgs"] = geometry_msgs
+        sys.modules["geometry_msgs.msg"] = geometry_msgs_msg
+
+        tf2_ros = types.ModuleType("tf2_ros")
+        tf2_static = types.ModuleType("tf2_ros.static_transform_broadcaster")
+        tf2_static.StaticTransformBroadcaster = type(
+            "StaticTransformBroadcaster", (), {}
+        )
+        tf2_ros.static_transform_broadcaster = tf2_static
+        sys.modules["tf2_ros"] = tf2_ros
+        sys.modules["tf2_ros.static_transform_broadcaster"] = tf2_static
+
         std_msgs = sys.modules.setdefault("std_msgs", types.ModuleType("std_msgs"))
         std_msgs_msg = sys.modules.setdefault(
             "std_msgs.msg", types.ModuleType("std_msgs.msg")
@@ -87,6 +112,9 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             "raw_imu_topic: rt/utlidar/imu_livox_mid360",
             "cloud_topic: /ubuntu/navigation/lidar",
             "imu_topic: /ubuntu/navigation/imu",
+            "base_frame: base_link",
+            "base_to_sensor_translation_m: [-0.00368, 0.00003, 0.46018]",
+            "base_to_sensor_rotation_rpy_rad: [0.0, 0.04014257279586953, 0.0]",
         ):
             self.assertIn(expected, config)
 
@@ -164,6 +192,61 @@ class NavigationSensorCardContractTest(unittest.TestCase):
 
         self.assertEqual(monitor.lidar_frame, "configured_lidar_frame")
         self.assertEqual(monitor.imu_frame, "configured_imu_frame")
+
+    def test_worker_publishes_required_base_to_livox_static_transform(self):
+        module = self.load_bridge_module()
+        config = {
+            "base_frame": "base_link",
+            "base_to_sensor_translation_m": [-0.00368, 0.00003, 0.46018],
+            "base_to_sensor_rotation_rpy_rad": [0.0, 0.04014257279586953, 0.0],
+        }
+        base_frame, translation, rpy = module._required_static_transform(
+            config, "livox_frame"
+        )
+        node = module._NavigationSensorNode.__new__(module._NavigationSensorNode)
+        node._base_frame = base_frame
+        node._lidar_frame = "livox_frame"
+        node._base_to_sensor_translation = translation
+        node._base_to_sensor_rpy = rpy
+        stamp = object()
+        node.get_clock = lambda: types.SimpleNamespace(
+            now=lambda: types.SimpleNamespace(to_msg=lambda: stamp)
+        )
+        broadcaster = mock.Mock()
+
+        with mock.patch.object(
+            module, "StaticTransformBroadcaster", return_value=broadcaster
+        ):
+            node._publish_static_transform()
+
+        transform = broadcaster.sendTransform.call_args.args[0]
+        self.assertIs(transform.header.stamp, stamp)
+        self.assertEqual(transform.header.frame_id, "base_link")
+        self.assertEqual(transform.child_frame_id, "livox_frame")
+        self.assertEqual(
+            (
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+                transform.transform.translation.z,
+            ),
+            translation,
+        )
+        quaternion = (
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
+        )
+        self.assertAlmostEqual(sum(value * value for value in quaternion), 1.0)
+
+        for invalid in (
+            {},
+            {**config, "base_frame": "livox_frame"},
+            {**config, "base_to_sensor_translation_m": [0.0, 0.0]},
+            {**config, "base_to_sensor_rotation_rpy_rad": [0.0, float("nan"), 0.0]},
+        ):
+            with self.assertRaises(ValueError):
+                module._required_static_transform(invalid, "livox_frame")
 
     def test_driver_image_contains_the_sensor_card_runtime(self):
         dockerfile = (G1_DIR / "Dockerfile").read_text()
@@ -307,6 +390,28 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertIn("invalid imu timestamp count=100", messages[1])
         self.assertIn("invalid imu timestamp count=200", messages[2])
         self.assertIn("invalid cloud timestamp count=1", messages[3])
+
+    def test_duplicate_imu_timestamps_are_strictly_increasing(self):
+        module = self.load_bridge_module()
+        node = module._NavigationSensorNode.__new__(module._NavigationSensorNode)
+        node._clock_offset = mock.Mock()
+        node._clock_offset.correct_observation.return_value = 123456789
+        node._last_stamp_ns = {"cloud": 0, "imu": 0}
+        node._stamp_lock = threading.Lock()
+        node._counters = {
+            "imu_invalid_timestamps": 0,
+            "stamp_clamped": 0,
+        }
+        node.get_clock = lambda: types.SimpleNamespace(
+            now=lambda: types.SimpleNamespace(nanoseconds=987654321)
+        )
+        stamp = types.SimpleNamespace(sec=1, nanosec=2)
+
+        first = node._correct_stamp(stamp, "imu")
+        second = node._correct_stamp(stamp, "imu")
+
+        self.assertEqual(second, first + 1)
+        self.assertEqual(node._counters["stamp_clamped"], 1)
 
 
 if __name__ == "__main__":
