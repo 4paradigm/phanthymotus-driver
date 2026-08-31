@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MCP HTTP entry point for the Qianjiao 2.0 Pro ROV driver."""
 from __future__ import annotations
-import json, os, signal, threading
+import json, os, signal, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -10,6 +10,32 @@ from device import QianjiaoDevice
 
 CFG = yaml.safe_load(open(os.environ.get("CONFIG_PATH", str(Path(__file__).with_name("config.yaml")))))
 DEVICE = QianjiaoDevice(CFG.get("rov", {}))
+
+def start_registration(port: int) -> None:
+    """Register with Agent Core and refresh the lease periodically."""
+    import ssl
+    import urllib.request
+    agent = os.environ.get("AGENT_CORE_URL", "http://127.0.0.1:15678").rstrip("/")
+    payload = json.dumps({
+        "name": CFG.get("name", "潜蛟 2.0 Pro ROV"),
+        "url": f"http://localhost:{port}/mcp",
+        "category": "driver",
+    }).encode()
+    def loop():
+        while True:
+            try:
+                req = urllib.request.Request(
+                    f"{agent}/api/mcp", data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST")
+                context = ssl._create_unverified_context()
+                with urllib.request.urlopen(req, timeout=5, context=context) as response:
+                    response.read()
+                print(f"[register] Agent Core <- {agent}/api/mcp", flush=True)
+                time.sleep(30)
+            except Exception as exc:
+                print(f"[register] failed: {exc}; retrying in 5s", flush=True)
+                time.sleep(5)
+    threading.Thread(target=loop, daemon=True, name="agent-core-registration").start()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -34,6 +60,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     DEVICE.start()
     port = int(CFG.get("mcp_port", 15719)); server = ThreadingHTTPServer(("", port), Handler)
+    start_registration(port)
     def shutdown(*_): DEVICE.stop(); threading.Thread(target=server.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, shutdown); signal.signal(signal.SIGINT, shutdown)
     print(f"[bundle] Qianjiao MCP server -> http://localhost:{port}/mcp", flush=True); server.serve_forever()
