@@ -60,10 +60,13 @@ class BumiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
+        state_plugin = None
+        motion_state_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
-            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl))
+            state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)
+            self._plugins.append(state_plugin)
             print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
@@ -88,9 +91,16 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
-            self._plugins.append(MotionStatePlugin(
-                plugins_cfg["motion_state"], namespace, executor, high_ctrl))
+            motion_state_plugin = MotionStatePlugin(
+                plugins_cfg["motion_state"], namespace, executor, high_ctrl)
+            self._plugins.append(motion_state_plugin)
             print("[bundle] MotionStatePlugin loaded")
+
+        if plugins_cfg.get("state_record", {}).get("enabled", False):
+            from device import StateRecordPlugin
+            self._plugins.append(StateRecordPlugin(
+                plugins_cfg["state_record"], state_plugin, motion_state_plugin))
+            print("[bundle] StateRecordPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
