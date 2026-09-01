@@ -1,0 +1,21 @@
+brainco-revo2:
+  image: __IMAGE__
+  container_name: embodied-brainco-revo2
+  network_mode: host
+  ipc: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /run/udev:/run/udev:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped
