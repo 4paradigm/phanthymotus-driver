@@ -9,3 +9,20 @@ mcp_url: "http://localhost:15702/mcp"
 description: "PNDbotics Adam — 状态感知 + 手部状态 + 持续手部控制 + 步行运动 + 手臂控制 + 3D模型"
 build_context_extras:
   - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` — all six plugins
+# (state, loco, camera, arm, hand, model) are currently enabled, so every tool
+# they expose is listed. camera_pointcloud is included even though its nested
+# `camera.pointcloud.enabled` defaults to false — that only gates whether the
+# point-cloud stream auto-starts, not whether the card is discoverable.
+cards:
+  - { name: joints,             type: sensor }
+  - { name: imu,                type: sensor }
+  - { name: battery,            type: sensor }
+  - { name: loco,               type: actuator }
+  - { name: arm,                type: actuator }
+  - { name: hand,                type: actuator }
+  - { name: camera_head,         type: sensor }
+  - { name: camera_depth,        type: sensor }
+  - { name: camera_pointcloud,   type: sensor }
+  - { name: model,               type: resource }

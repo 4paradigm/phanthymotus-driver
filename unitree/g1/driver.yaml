@@ -9,3 +9,37 @@ mcp_url: "http://localhost:15701/mcp"
 description: "Unitree G1 — 麦克风 + 内置TTS + LED + 运动控制 + 手臂动作 + 状态感知 + 导航 LiDAR/IMU + 自描述 RGB/Depth"
 build_context_extras:
   - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` — `slam` is
+# disabled there (superseded by controlled_spatial/controlled_spatial_map) so
+# its tools (pos_tag, slam_mapping, slam_cloud, spatial) are excluded.
+# `smart_motion` and `safety_harness` are on by default even though absent
+# from config.yaml's plugins block (main.py defaults them to enabled=True).
+cards:
+  - { name: mic,                    type: sensor }
+  - { name: tts,                    type: actuator }
+  - { name: speaker,                type: actuator }
+  - { name: led,                    type: actuator }
+  - { name: loco_state,             type: sensor }
+  - { name: loco_motion_state,      type: sensor }
+  - { name: motion_events,          type: sensor }
+  - { name: loco,                   type: actuator }
+  - { name: switch_mode,            type: actuator }
+  - { name: switch_mode_expert,     type: actuator }
+  - { name: arm,                    type: actuator }
+  - { name: posture,                type: sensor }
+  - { name: imu,                    type: sensor }
+  - { name: battery,                type: sensor }
+  - { name: joints,                 type: sensor }
+  - { name: mainboard,              type: sensor }
+  - { name: model,                  type: resource }
+  - { name: camera_rgb,             type: sensor }
+  - { name: camera_depth,           type: sensor }
+  - { name: camera_distance,        type: sensor }
+  - { name: lidar_cloud,            type: sensor }
+  - { name: controlled_spatial,     type: actuator }
+  - { name: controlled_spatial_map, type: sensor }
+  - { name: motion_switcher,        type: actuator }
+  - { name: ext_mic,                type: sensor }
+  - { name: ext_camera,             type: sensor }
+  - { name: smart_motion,           type: actuator }

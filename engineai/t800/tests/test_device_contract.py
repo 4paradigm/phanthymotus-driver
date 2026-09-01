@@ -275,7 +275,7 @@ CONFIG = {
         "vision_depth": "/manifold/ODIN2/device0/depth",
     },
     "services": {"enable_motor": "/hardware/enable_motor"},
-    "diagnostics": {"command_trace_capacity": 20, "motion_events_capacity": 100},
+    "diagnostics": {"command_trace_capacity": 20},
 }
 
 
@@ -295,7 +295,7 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_complete_tool_surface_is_declared(self):
         from virtual_gamepad import VirtualGamepadPlugin
 
-        motion_mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        motion_mode = self.device.SafeMotionModePlugin(CONFIG, "robot", self.ros, self.state)
         joint_plan = self.device.JointPlanPlugin(CONFIG, "robot", self.ros)
         plugins = [
             self.state,
@@ -334,7 +334,7 @@ class DevicePluginContractTests(unittest.TestCase):
              "robot_snapshot", "fault_summary", "stability", "joint_groups", "capabilities", "ros_graph",
              "mainboard", "heartbeat_status", "motion_command_trace", "motion_events",
              "native_interface_probe",
-             "loco", "motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture", "head",
+             "loco", "safe_motion_mode", "dance", "joint_plan", "joint_plan_state", "gesture", "head",
              "joint_override", "joint_bridge",
              "led", "tts", "mic", "speaker", "pointcloud", "camera", "depth",
              "motor_power", "native_node_control", "virtual_gamepad", "safety", "native_sdk"},
@@ -359,7 +359,7 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_latest_head_and_four_pr_cards_are_available_together(self):
         self.assertTrue(hasattr(self.device, "GaitPlugin"))
         self.assertTrue(hasattr(self.device, "MotionRecorderPlugin"))
-        motion_mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        motion_mode = self.device.SafeMotionModePlugin(CONFIG, "robot", self.ros, self.state)
         gait = self.device.GaitPlugin(CONFIG, motion_mode, self.state)
         with tempfile.TemporaryDirectory() as recordings_dir:
             config = {
@@ -421,6 +421,17 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertEqual("waiting", direct["state"])
         self.assertEqual("0/9 路数据流正常", direct["health_summary"])
         self.assertEqual(direct["total_sources"], queried["total_sources"])
+
+    def test_motion_events_is_one_shot_status_actuator_without_topic_stream(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        tool = plugin.get_tool()
+        schema = tool["inputSchema"]
+        self.assertEqual("actuator", tool["type"])
+        self.assertNotIn("topic_out", tool)
+        self.assertEqual({"action"}, set(schema["properties"]))
+        self.assertEqual(["status"], schema["properties"]["action"]["enum"])
+        self.assertNotIn("x-action-params", schema)
+        self.assertIn("error", plugin.dispatch("debug", {}))
 
     def test_new_status_plugins_can_start_with_declared_ros_dependencies(self):
         plugins = [
@@ -503,13 +514,12 @@ class DevicePluginContractTests(unittest.TestCase):
         moving = plugin.dispatch("status", {})
         self.assertEqual("running", moving["state"])
         self.assertEqual("moving", moving["motion_state"])
-        self.assertEqual("gamepad", moving["speed_source"])
-        self.assertEqual("gamepad_analog", moving["control_source"])
         self.assertEqual("move", moving["action"])
-        self.assertEqual("forward", moving["direction"])
-        self.assertEqual([], moving["buttons"])
         self.assertEqual("0.50 m/s", moving["speed"])
-        self.assertEqual("motion_start", moving["event"])
+        self.assertEqual(
+            {"state", "action", "motion_state", "speed", "current_motion_state"},
+            set(moving),
+        )
 
         plugin._on_gamepad(types.SimpleNamespace(
             hardware_connected=False,
@@ -519,7 +529,6 @@ class DevicePluginContractTests(unittest.TestCase):
         stopped = plugin.dispatch("status", {})
         self.assertEqual("stopped", stopped["motion_state"])
         self.assertEqual("0.00 m/s", stopped["speed"])
-        self.assertEqual("motion_stop", stopped["event"])
 
     def test_motion_events_identify_gamepad_macro_and_motion_state(self):
         plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
@@ -533,22 +542,18 @@ class DevicePluginContractTests(unittest.TestCase):
         ))
         snapshot = plugin.dispatch("status", {})
         self.assertEqual("stand", snapshot["action"])
-        self.assertEqual("gamepad_analog", snapshot["control_source"])
-        self.assertEqual("none", snapshot["direction"])
-        self.assertEqual(["LB", "A"], snapshot["buttons"])
-        self.assertEqual("gamepad_action", snapshot["event"])
 
         plugin._on_motion_state(types.SimpleNamespace(current_motion_task="pd_stand"))
         snapshot = plugin.dispatch("status", {})
         self.assertEqual("pd_stand", snapshot["current_motion_state"])
         self.assertEqual("stand", snapshot["action"])
-        self.assertEqual("motion_state", snapshot["control_source"])
-        self.assertEqual("motion_state_changed", snapshot["event"])
 
     def test_motion_events_normalize_screen_motion_states(self):
         plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
         for raw, action in (
             ("sit_down", "sit"),
+            ("stance_to_sitdown", "sit"),
+            ("kneeling_pose", "kneel"),
             ("boxing_combo", "punch"),
             ("screen_punch", "punch"),
         ):
@@ -557,8 +562,6 @@ class DevicePluginContractTests(unittest.TestCase):
                 snapshot = plugin.dispatch("status", {})
                 self.assertEqual(raw, snapshot["current_motion_state"])
                 self.assertEqual(action, snapshot["action"])
-                self.assertEqual("motion_state", snapshot["control_source"])
-                self.assertEqual("motion_state_changed", snapshot["event"])
 
     def test_motion_events_keep_screen_state_visible_after_idle_gamepad(self):
         plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
@@ -570,7 +573,6 @@ class DevicePluginContractTests(unittest.TestCase):
         ))
         snapshot = plugin.dispatch("status", {})
         self.assertEqual("sit", snapshot["action"])
-        self.assertEqual("motion_state", snapshot["control_source"])
         self.assertEqual("sit_down", snapshot["current_motion_state"])
 
     def test_motion_events_accept_ros_array_like_gamepad_states(self):
@@ -593,7 +595,181 @@ class DevicePluginContractTests(unittest.TestCase):
         ))
         snapshot = plugin.dispatch("status", {})
         self.assertEqual("stand", snapshot["action"])
-        self.assertEqual(["LB", "A"], snapshot["buttons"])
+
+    def test_motion_events_show_rl_basic_as_stand_when_stationary(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_basic"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("rl_basic", snapshot["current_motion_state"])
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("stopped", snapshot["motion_state"])
+
+    def test_motion_events_locomotion_states_show_stand_when_stationary(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        for raw in ("walk", "walk_server", "lower_body_balance", "loco", "rl_terrain"):
+            with self.subTest(raw=raw):
+                plugin._on_motion_state(types.SimpleNamespace(current_motion_task=raw))
+                snapshot = plugin.dispatch("status", {})
+                self.assertEqual(raw, snapshot["current_motion_state"])
+                self.assertEqual("stand", snapshot["action"])
+                self.assertEqual("stopped", snapshot["motion_state"])
+
+    def test_motion_events_locomotion_state_shows_move_while_gamepad_moving(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[0] * 12,
+            analog_states=[0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+        ))
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_basic"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("move", snapshot["action"])
+        self.assertEqual("moving", snapshot["motion_state"])
+
+    def test_motion_events_stale_speed_treated_as_stationary(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[0] * 12,
+            analog_states=[0.0, 0.0, 0.0, 0.5, 0.0, 0.0],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("move", snapshot["action"])
+        self.assertEqual("moving", snapshot["motion_state"])
+        # If the gamepad/odometry topic stops publishing, the latest speed sample
+        # becomes stale and a stationary robot must not keep showing as moving.
+        with plugin._lock:
+            plugin._latest_speed_updated = time.monotonic() - 2.0
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("stopped", snapshot["motion_state"])
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="walk_server"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("stopped", snapshot["motion_state"])
+
+    def test_motion_events_transitions_map_to_target(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        for raw, action in (
+            ("rl_mimic_stance_to_sitdown", "sit"),
+            ("stance_to_sitdown", "sit"),
+            ("rl_mimic_sitdown_to_stance", "stand"),
+            ("sitdown_to_stance", "stand"),
+            ("supine_to_stance", "get_up"),
+            ("rl_mimic_prone_to_stance", "get_up"),
+            ("rl_mimic_stance_to_supine", "lie"),
+            ("rl_mimic_stance_to_kneeling", "kneel"),
+            ("rl_mimic_kneeling_to_stance", "stand"),
+        ):
+            with self.subTest(raw=raw):
+                plugin._on_motion_state(types.SimpleNamespace(current_motion_task=raw))
+                snapshot = plugin.dispatch("status", {})
+                self.assertEqual(raw, snapshot["current_motion_state"])
+                self.assertEqual(action, snapshot["action"])
+
+    def test_motion_events_unidentifiable_passive_is_reported_as_unknown(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_motion_request(types.SimpleNamespace(target_motion_name="passive"))
+        plugin._on_motion_state(types.SimpleNamespace(
+            current_motion_task="passive",
+            available_transition_motions=[],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("unknown", snapshot["current_motion_state"])
+        self.assertEqual("unknown", snapshot["action"])
+
+    def test_motion_events_lie_request_can_display_passive_feedback_as_lie(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_motion_request(types.SimpleNamespace(target_motion_name="rl_mimic_stance_to_supine"))
+        plugin._on_motion_state(types.SimpleNamespace(
+            current_motion_task="passive",
+            available_transition_motions=["rl_mimic_supine_to_stance"],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("lie", snapshot["current_motion_state"])
+        self.assertEqual("lie", snapshot["action"])
+
+    def test_motion_events_sit_transition_passive_feedback_displays_sit(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_motion_request(types.SimpleNamespace(target_motion_name="rl_mimic_stance_to_sitdown"))
+        plugin._on_motion_state(types.SimpleNamespace(
+            current_motion_task="passive",
+            available_transition_motions=["rl_mimic_sitdown_to_stance"],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("sit", snapshot["current_motion_state"])
+        self.assertEqual("sit", snapshot["action"])
+
+    def test_motion_events_idle_never_leaks_to_model_output(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        plugin._on_motion_state(types.SimpleNamespace(
+            current_motion_task="pd_stand",
+            available_transition_motions=[],
+        ))
+        plugin._on_motion_state(types.SimpleNamespace(
+            current_motion_task="idle",
+            available_transition_motions=[],
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("stand", snapshot["action"])
+        self.assertEqual("stand", snapshot["current_motion_state"])
+        self.assertNotIn("idle", json.dumps(snapshot))
+        self.assertNotIn("passive", json.dumps(snapshot))
+
+    def test_motion_events_punch_buttons_map_to_punch_names(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        # 左直拳 A + CROSS_Y_RIGHT
+        left = [0] * 12
+        left[2] = 1  # A
+        left[11] = 1  # CROSS_Y_RIGHT
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=left,
+            analog_states=[0.0] * 6,
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("left_straight", snapshot["action"])
+
+        # 右直拳 A + CROSS_Y_LEFT
+        right = [0] * 12
+        right[2] = 1  # A
+        right[10] = 1  # CROSS_Y_LEFT
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=right,
+            analog_states=[0.0] * 6,
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("right_straight", snapshot["action"])
+
+    def test_motion_events_punch_action_survives_same_motion_state_republish(self):
+        plugin = self.device.MotionEventsPlugin(CONFIG, "robot", self.ros)
+        # Enter the boxing motion state, then throw a left straight punch.
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_mimic_boxing"))
+        left = [0] * 12
+        left[2] = 1  # A
+        left[11] = 1  # CROSS_Y_RIGHT
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=left,
+            analog_states=[0.0] * 6,
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("left_straight", snapshot["action"])
+        # T800 keeps the same current_motion_task while punching; re-publishing the
+        # same boxing state must not override the fresher gamepad action.
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_mimic_boxing"))
+        plugin._on_motion_state(types.SimpleNamespace(current_motion_task="rl_mimic_boxing"))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("left_straight", snapshot["action"])
+        # Releasing the buttons falls back to the boxing motion state action.
+        plugin._on_gamepad(types.SimpleNamespace(
+            hardware_connected=True,
+            digital_states=[0] * 12,
+            analog_states=[0.0] * 6,
+        ))
+        snapshot = plugin.dispatch("status", {})
+        self.assertEqual("punch", snapshot["action"])
 
     def test_derived_diagnostics_and_capability_resources(self):
         self.state._set("imu", {
@@ -1113,20 +1289,135 @@ class DevicePluginContractTests(unittest.TestCase):
         self.assertAlmostEqual(arc["vx"], arc["vyaw"])
         plugin.dispatch("stop_move", {})
 
-    def test_motion_mode_force_path_publishes_custom_state(self):
-        plugin = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+    def test_safe_motion_mode_exposes_only_verified_actions(self):
+        plugin = self._safe_mode_plugin()
+        tool = plugin.get_tool()
+        schema = tool["inputSchema"]
+        self.assertEqual("safe_motion_mode", tool["name"])
+        self.assertEqual(["stand", "sit", "lie"], schema["properties"]["action"]["enum"])
+        self.assertEqual({"action"}, set(schema["properties"]))
+        self.assertNotIn("x-action-params", schema)
+        for removed in ("idle", "passive", "wait", "force", "timeout_sec", "stand_stabilize_sec"):
+            self.assertNotIn(removed, json.dumps(schema))
+
+    def _safe_mode_plugin(self):
+        config = {
+            **CONFIG,
+            "control": {
+                **CONFIG["control"],
+                "mode_transition_timeout_sec": 0.8,
+                "mode_stand_stabilize_sec": 0.0,
+            },
+        }
+        plugin = self.device.SafeMotionModePlugin(config, "robot", self.ros, self.state)
         plugin.start()
-        result = plugin.dispatch("switch", {"target": "vendor_future_mode", "force": True, "wait": False})
-        self.assertEqual("requested", result["state"])
-        self.assertEqual("vendor_future_mode", plugin._publisher.messages[-1].target_motion_name)
-        plugin.dispatch("get_up", {"force": True, "wait": False})
-        self.assertEqual("rl_mimic_supine_to_stance", plugin._publisher.messages[-1].target_motion_name)
+        return plugin
+
+    def test_safe_motion_mode_same_mode_is_noop(self):
+        plugin = self._safe_mode_plugin()
+        self.state._current_motion = "passive"
+        self.state._available_motions = ["rl_mimic_supine_to_stance"]
+        result = plugin.dispatch("lie", {})
+        self.assertEqual("completed", result["state"])
+        self.assertEqual("already lie", result["transition"])
+        self.assertEqual(["lie"], result["transition_path"])
+        self.assertFalse(result["changed"])
+        self.assertEqual([], plugin._publisher.messages)
+
+    def test_safe_motion_mode_sit_to_lie_chains_stand_first(self):
+        plugin = self._safe_mode_plugin()
+        self.state._current_motion = "pd_sitdown"
+        self.state._available_motions = ["rl_mimic_sitdown_to_stance"]
+
+        def robot_executes():
+            time.sleep(0.05)
+            plugin._state._current_motion = "pd_stand"
+            plugin._state._available_motions = ["rl_mimic_stance_to_supine"]
+            time.sleep(0.05)
+            plugin._state._current_motion = "passive"
+            plugin._state._available_motions = ["rl_mimic_supine_to_stance"]
+
+        thread = threading.Thread(target=robot_executes)
+        thread.start()
+        result = plugin.dispatch("lie", {})
+        thread.join()
+        self.assertEqual("completed", result["state"])
+        self.assertEqual("sit -> stand -> lie", result["transition"])
+        self.assertEqual(["sit", "stand", "lie"], result["transition_path"])
+        self.assertEqual("lie", result["current"])
+        targets = [msg.target_motion_name for msg in plugin._publisher.messages]
+        self.assertEqual(["rl_mimic_sitdown_to_stance", "rl_mimic_stance_to_supine"], targets)
+
+    def test_safe_motion_mode_lie_to_sit_chains_stand_first(self):
+        plugin = self._safe_mode_plugin()
+        self.state._current_motion = "passive"
+        self.state._available_motions = ["rl_mimic_supine_to_stance"]
+
+        def robot_executes():
+            time.sleep(0.05)
+            plugin._state._current_motion = "pd_stand"
+            plugin._state._available_motions = ["rl_mimic_stance_to_sitdown"]
+            time.sleep(0.05)
+            plugin._state._current_motion = "passive"
+            plugin._state._available_motions = ["rl_mimic_sitdown_to_stance"]
+
+        thread = threading.Thread(target=robot_executes)
+        thread.start()
+        result = plugin.dispatch("sit", {})
+        thread.join()
+        self.assertEqual("completed", result["state"])
+        self.assertEqual("lie -> stand -> sit", result["transition"])
+        self.assertEqual(["lie", "stand", "sit"], result["transition_path"])
+        self.assertEqual("sit", result["current"])
+        targets = [msg.target_motion_name for msg in plugin._publisher.messages]
+        self.assertEqual(["rl_mimic_supine_to_stance", "rl_mimic_stance_to_sitdown"], targets)
+
+    def test_safe_motion_mode_stand_to_lie_reports_direct_path(self):
+        plugin = self._safe_mode_plugin()
+        self.state._current_motion = "pd_stand"
+        self.state._available_motions = ["rl_mimic_stance_to_supine"]
+
+        def robot_executes():
+            time.sleep(0.05)
+            plugin._state._current_motion = "passive"
+            plugin._state._available_motions = ["rl_mimic_supine_to_stance"]
+
+        thread = threading.Thread(target=robot_executes)
+        thread.start()
+        result = plugin.dispatch("lie", {})
+        thread.join()
+        self.assertEqual("completed", result["state"])
+        self.assertEqual("stand -> lie", result["transition"])
+        self.assertEqual(["stand", "lie"], result["transition_path"])
+
+    def test_safe_motion_mode_rejects_missing_or_unavailable_transition(self):
+        plugin = self._safe_mode_plugin()
+        self.state._current_motion = "unknown"
+        self.state._available_motions = []
+        result = plugin.dispatch("stand", {})
+        self.assertEqual("rejected", result["state"])
+        self.assertIn("not safely identifiable", result["error"])
+
+        self.state._current_motion = "pd_stand"
+        self.state._available_motions = ["rl_mimic_stance_to_supine"]
+        result = plugin.dispatch("sit", {})
+        self.assertEqual("rejected", result["state"])
+        self.assertIn("no available transition", result["error"])
+
+    def test_safe_motion_mode_rejects_removed_modes(self):
+        plugin = self._safe_mode_plugin()
+        for action in ("idle", "passive"):
+            with self.subTest(action=action):
+                result = plugin.dispatch(action, {})
+                self.assertEqual("rejected", result["state"])
 
     def test_dance_facade_lists_and_plays_official_dance(self):
-        mode = self.device.MotionModePlugin(CONFIG, "robot", self.ros, self.state)
+        mode = self.device.SafeMotionModePlugin(CONFIG, "robot", self.ros, self.state)
         mode.start()
         dance = self.device.DancePlugin(mode, self.state)
         self.assertEqual("dance.mnn", dance.dispatch("list", {})["built_in"][0]["policy"])
+        self.state._current_motion = "pd_stand"
+        self.state._available_motions = ["dance"]
         result = dance.dispatch("play", {"name": "dance", "force": True, "wait": False})
         self.assertEqual("requested", result["state"])
         self.assertEqual("dance", mode._publisher.messages[-1].target_motion_name)
