@@ -9,3 +9,55 @@ mcp_url: "http://localhost:15708/mcp"
 description: "EngineAI T800 开发版 — speaker 音频播放、loco 安全运动、gait 步态切换、motion_recorder 录制回放、head 头部控制，以及 ROS2/Native SDK、全身状态、舞蹈/手势、虚拟手柄与 LED 控制"
 build_context_extras:
   - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` (all plugins are
+# currently enabled). One config key can gate several tool names when a
+# plugin class exposes multiple cards: `state` covers joints..mainboard plus
+# driver_health/model, and `vision` covers pointcloud/camera/depth.
+cards:
+  - { name: joints,                  type: sensor }
+  - { name: imu,                     type: sensor }
+  - { name: battery,                 type: sensor }
+  - { name: motor_health,            type: sensor }
+  - { name: motor_state,             type: sensor }
+  - { name: motor_command,           type: sensor }
+  - { name: joint_command_feedback,  type: sensor }
+  - { name: gamepad,                 type: sensor }
+  - { name: motion_state,            type: sensor }
+  - { name: robot_snapshot,          type: sensor }
+  - { name: fault_summary,           type: sensor }
+  - { name: stability,               type: sensor }
+  - { name: joint_groups,            type: sensor }
+  - { name: capabilities,            type: sensor }
+  - { name: ros_graph,               type: sensor }
+  - { name: mainboard,               type: sensor }
+  - { name: driver_health,           type: actuator }
+  - { name: model,                   type: resource }
+  - { name: motion_events,           type: actuator }
+  - { name: heartbeat_status,        type: sensor }
+  - { name: motion_command_trace,    type: sensor }
+  - { name: native_interface_probe,  type: sensor }
+  - { name: loco,                    type: actuator }
+  - { name: safe_motion_mode,        type: actuator }
+  - { name: dance,                   type: actuator }
+  - { name: joint_plan,              type: actuator }
+  - { name: gesture,                 type: actuator }
+  - { name: head,                    type: actuator }
+  - { name: joint_override,          type: actuator }
+  - { name: joint_bridge,            type: actuator }
+  - { name: led,                     type: actuator }
+  - { name: tts,                     type: actuator }
+  - { name: motor_power,             type: actuator }
+  - { name: native_node_control,     type: actuator }
+  - { name: virtual_gamepad,         type: actuator }
+  - { name: controlled_spatial,      type: actuator }
+  - { name: controlled_spatial_map,  type: sensor }
+  - { name: safety,                  type: actuator }
+  - { name: native_sdk,              type: actuator }
+  - { name: mic,                     type: sensor }
+  - { name: speaker,                 type: actuator }
+  - { name: pointcloud,              type: sensor }
+  - { name: camera,                  type: sensor }
+  - { name: depth,                   type: sensor }
+  - { name: gait,                    type: actuator }
+  - { name: motion_recorder,         type: actuator }
