@@ -40,6 +40,11 @@ class DeployFromGitContractTest(unittest.TestCase):
         self.assertIn('archive_tree="$(git -C "$temporary_source_root/archive" write-tree)"', source)
         self.assertIn("Source archive tree mismatch", source)
         self.assertIn('timeout 45 git clone', source)
+        self.assertIn(
+            '"$repo_url" "$temporary_source_root/git" &&\n'
+            '    git -C "$temporary_source_root/git" fetch',
+            source,
+        )
         self.assertIn('ps -q unitree-g1)', source)
         self.assertIn('docker inspect "$container_id"', source)
         self.assertIn('docker exec -w /work "$container_id"', source)

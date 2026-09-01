@@ -123,8 +123,8 @@ velocity proposal 合同与 `loco.move` 输入边界保持一致：前后和横�
 `/ubuntu/navigation/imu`（`Imu`）。两路数据保留 MID360 共享源时钟并统一
 归一化到 ROS system time；时钟未就绪、重置或样本无效时直接丢弃，不伪造
 源时间戳。
-点云转换只接受 `row_step == width * point_step` 的紧凑行布局；
-带行 padding 或行长不足的有组织点云会被丢弃，避免按错误偏移解码。
+点云转换只接受小端且满足 `row_step == width * point_step` 的紧凑行布局；
+大端、带行 padding 或行长不足的有组织点云会被丢弃，避免错误解码。
 
 `navigation_lidar` 与 `navigation_imu` 两张卡共享同一个 worker。停止任意一张
 卡都会停止两路数据并释放 MID360 worker；再次启动任意一张卡会创建新的共享

@@ -294,6 +294,7 @@ class _NavigationSensorNode(Node):
                     row_step=row_step,
                     fields=fields,
                     header_stamp_ns=corrected_ns,
+                    is_bigendian=is_bigendian,
                     rotation_matrix=self._sensor_rotation,
                 )
                 out = PointCloud2()

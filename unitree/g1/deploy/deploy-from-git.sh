@@ -132,9 +132,9 @@ if [[ -d "$remote_repo/.git" ]]; then
 else
   temporary_source_root="$(mktemp -d /tmp/g1-driver-source.XXXXXX)"
   if timeout 45 git clone --filter=blob:none --no-checkout \
-    "$repo_url" "$temporary_source_root/git"; then
+    "$repo_url" "$temporary_source_root/git" &&
     git -C "$temporary_source_root/git" fetch --prune --no-tags origin \
-      "refs/heads/$source_ref:refs/remotes/origin/$source_ref"
+      "refs/heads/$source_ref:refs/remotes/origin/$source_ref"; then
     remote_commit="$(git -C "$temporary_source_root/git" rev-parse "refs/remotes/origin/$source_ref")"
     [[ "$remote_commit" == "$expected_commit" ]] || {
       echo "Remote source mismatch: expected=$expected_commit actual=$remote_commit" >&2

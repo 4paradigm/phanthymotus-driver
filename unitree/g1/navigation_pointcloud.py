@@ -177,6 +177,7 @@ def unitree_mid360_to_navigation_cloud(
     row_step: int,
     fields: list[tuple[str, int, int, int]],
     header_stamp_ns: int,
+    is_bigendian: bool = False,
     rotation_matrix: np.ndarray | None = None,
 ) -> bytes:
     """Convert Unitree's packed MID360 points to the navigation PCL schema.
@@ -185,6 +186,8 @@ def unitree_mid360_to_navigation_cloud(
     preserves it as an absolute nanosecond ``timestamp`` in the same normalized
     clock domain as the ROS header and navigation IMU.
     """
+    if is_bigendian:
+        raise ValueError("big-endian MID360 PointCloud2 is not supported")
     height = int(height)
     width = int(width)
     point_step = int(point_step)

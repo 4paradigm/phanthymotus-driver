@@ -88,6 +88,19 @@ class Mid360ConversionTest(unittest.TestCase):
                 header_stamp_ns=1_000_000_000,
             )
 
+    def test_rejects_big_endian_input(self):
+        with self.assertRaisesRegex(ValueError, "big-endian MID360"):
+            unitree_mid360_to_navigation_cloud(
+                data=self.make_cloud(),
+                height=1,
+                width=2,
+                point_step=22,
+                row_step=44,
+                fields=UNITREE_FIELDS,
+                header_stamp_ns=1_000_000_000,
+                is_bigendian=True,
+            )
+
     def test_rejects_short_data(self):
         with self.assertRaisesRegex(ValueError, "size must equal"):
             unitree_mid360_to_navigation_cloud(

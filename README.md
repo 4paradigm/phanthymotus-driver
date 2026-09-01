@@ -153,9 +153,9 @@ publishes two algorithm-independent navigation sensor topics:
   RELIABLE + KEEP_LAST(2), with `x/y/z/intensity/tag/line/timestamp` fields;
 - `/ubuntu/navigation/imu` — `sensor_msgs/msg/Imu`, RELIABLE + KEEP_LAST(200);
 
-The MID360 converter accepts only tightly packed PointCloud2 rows
-(`row_step == width * point_step`). Organized clouds with row padding or an
-undersized row are dropped instead of being decoded with incorrect offsets.
+The MID360 converter accepts only little-endian, tightly packed PointCloud2 rows
+(`row_step == width * point_step`). Big-endian clouds, organized clouds with row
+padding, and undersized rows are dropped instead of being decoded incorrectly.
 
 The `navigation_imu` tool declares `format=sensor/imu`. Its native ROS message
 uses quaternion orientation, angular velocity in rad/s, linear acceleration in
