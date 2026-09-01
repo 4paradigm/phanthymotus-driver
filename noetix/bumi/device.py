@@ -1616,21 +1616,23 @@ class MotionStatePlugin:
         return None
 
 
-# ── StateRecordPlugin (actuator, persistent one-click snapshots) ──────────
+# ── StateRecordPlugin (actuator, persistent snapshot recording) ──────────
 
 class StateRecordPlugin:
-    """Save one selected state snapshot as a human-readable JSON file."""
+    """Save one-shot or interval state snapshots as readable JSON files."""
 
     PREFIX = "state_record"
-    _SOURCE_ACTIONS = {
-        "record_imu": ("imu",),
-        "record_battery": ("battery",),
-        "record_joints": ("joints",),
-        "record_motion_state": ("motion_state",),
-        "record_all": ("imu", "battery", "joints", "motion_state"),
+    _SCOPES = {
+        "imu": ("imu",),
+        "battery": ("battery",),
+        "joints": ("joints",),
+        "motion_state": ("motion_state",),
+        "all": ("imu", "battery", "joints", "motion_state"),
         # Reserved contract only. No camera topic or bytes are consumed in v1.
-        "record_camera": ("camera",),
+        "camera": ("camera",),
     }
+    _ACTIONS = ("record_once", "start_timed", "stop_recording")
+    _COUNTERS_FILE = ".label-counters.json"
 
     def __init__(self, plugin_config: dict, state_plugin: StatePlugin | None,
                  motion_state_plugin: MotionStatePlugin | None):
@@ -1642,43 +1644,92 @@ class StateRecordPlugin:
             plugin_config.get("max_age_s", 3.0), "state_record.max_age_s")
         if not 0.1 <= self._max_age_s <= 60.0:
             raise ValueError("state_record.max_age_s must be in [0.1, 60.0]")
+        self._default_label = str(plugin_config.get("default_label", "status")).strip() or "status"
+        self._default_interval_s = _finite_number(
+            plugin_config.get("default_interval_s", 1.0),
+            "state_record.default_interval_s",
+        )
+        self._min_interval_s = _finite_number(
+            plugin_config.get("min_interval_s", 0.1),
+            "state_record.min_interval_s",
+        )
+        self._max_interval_s = _finite_number(
+            plugin_config.get("max_interval_s", 3600.0),
+            "state_record.max_interval_s",
+        )
+        if not 0.05 <= self._min_interval_s <= self._max_interval_s <= 86400.0:
+            raise ValueError(
+                "state_record interval limits must satisfy "
+                "0.05 <= min_interval_s <= max_interval_s <= 86400")
+        if not self._min_interval_s <= self._default_interval_s <= self._max_interval_s:
+            raise ValueError("state_record.default_interval_s is outside the configured limits")
         self._write_lock = threading.Lock()
+        self._session_lock = threading.Lock()
+        self._recording_stop = threading.Event()
+        self._recording_thread: threading.Thread | None = None
+        self._recording_session: dict | None = None
 
     def get_tool(self) -> dict:
         action_descriptions = {
-            "record_imu": "保存最新 IMU 姿态、角速度和线性加速度。",
-            "record_battery": "保存最新电量、健康度、温度和告警。",
-            "record_joints": "保存最新 21 个关节状态、IMU 四元数和工作模式。",
-            "record_motion_state": "保存最新整机运动状态、关节统计和故障信息。",
-            "record_all": "把 IMU、电池、关节和整机运动状态保存到同一个 JSON 文件。",
-            "record_camera": "预留的相机记录接口；第一版未接入图像数据流，调用会明确返回未实现且不会创建文件。",
+            "record_once": "单次记录：选择范围和标签，点击执行后立即保存一个 JSON 文件。",
+            "start_timed": "定时记录：立即保存第一条，之后按 interval_s 周期持续保存，直到执行 stop_recording。",
+            "stop_recording": "停止当前定时记录任务；不影响已经保存的 JSON 文件。",
         }
         return {
             "name": "state_record",
             "type": "actuator",
             "multiInstance": False,
             "description": (
-                "Bumi 状态记录：选择一种状态或全部状态，点击执行后把当前最新快照保存成可直接查看的 JSON 文件。"
-                "相机选项仅预留接口，第一版不读取或保存照片。"
+                "Bumi 状态记录：支持单次记录、按可调频率定时记录和停止记录。"
+                "每次开始时可选择一种状态或 all，并设置文件名标签；相机范围仅预留接口。"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": list(self._SOURCE_ACTIONS),
-                        "description": "选择本次要保存的状态内容。",
+                        "enum": list(self._ACTIONS),
+                        "description": "选择单次记录、定时记录或停止记录。",
                     },
-                    "label": {
+                    "scope": {
+                        "type": "string",
+                        "enum": list(self._SCOPES),
+                        "default": "all",
+                        "description": "选择单独记录 imu、battery、joints、motion_state，或用 all 记录全部状态；camera 仅为预留接口。",
+                    },
+                    "label_mode": {
+                        "type": "string",
+                        "enum": ["default", "custom"],
+                        "default": "default",
+                        "description": "default=使用配置中的默认标签；custom=使用 custom_label 输入的文本。",
+                    },
+                    "custom_label": {
                         "type": "string",
                         "maxLength": 80,
-                        "description": "可选备注，会写入 JSON，并以安全形式追加到文件名。",
+                        "description": "自定义 JSON 文件名标签；仅 label_mode=custom 时使用，不能为空。",
+                    },
+                    "interval_s": {
+                        "type": "number",
+                        "default": self._default_interval_s,
+                        "minimum": self._min_interval_s,
+                        "maximum": self._max_interval_s,
+                        "description": "定时记录间隔，单位为秒。只用于 start_timed。",
                     },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    action: {"params": ["label"], "description": description}
-                    for action, description in action_descriptions.items()
+                    "record_once": {
+                        "params": ["scope", "label_mode", "custom_label"],
+                        "description": action_descriptions["record_once"],
+                    },
+                    "start_timed": {
+                        "params": ["scope", "label_mode", "custom_label", "interval_s"],
+                        "description": action_descriptions["start_timed"],
+                    },
+                    "stop_recording": {
+                        "params": [],
+                        "description": action_descriptions["stop_recording"],
+                    },
                 },
             },
             "topic_out": [],
@@ -1690,81 +1741,230 @@ class StateRecordPlugin:
         self._storage_dir.mkdir(parents=True, exist_ok=True)
 
     def stop(self) -> None:
-        pass
+        self._stop_timed()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "ready", "storage_dir": str(self._storage_dir)}
+            return {
+                "state": "ready",
+                "storage_dir": str(self._storage_dir),
+                "default_label": self._default_label,
+                "default_interval_s": self._default_interval_s,
+            }
         if action == "stop":
-            return {"state": "idle"}
-        if action not in self._SOURCE_ACTIONS:
+            result = self._stop_timed()
+            result["state"] = "idle"
+            return result
+        if action == "stop_recording":
+            return self._stop_timed()
+        if action not in self._ACTIONS:
             return {
                 "state": "error",
                 "saved": False,
                 "error": f"Unsupported state record action: {action}",
             }
-        if action == "record_camera":
-            return {
-                "state": "unavailable",
-                "saved": False,
-                "source": "camera",
-                "interface_reserved": True,
-                "error": "Camera recording is reserved but not connected to the image stream in version 1.",
-            }
-        return self._record(action, args.get("label", ""))
+        scope = args.get("scope", "all")
+        label_result = self._resolve_label(
+            args.get("label_mode", "default"), args.get("custom_label"))
+        if "error" in label_result:
+            return {"state": "error", "saved": False, **label_result}
+        label = label_result["label"]
+        label_mode = label_result["label_mode"]
+        if action == "record_once":
+            return self._record(scope, label, mode="single", label_mode=label_mode)
+        return self._start_timed(
+            scope, label, label_mode,
+            args.get("interval_s", self._default_interval_s),
+        )
 
-    def _record(self, action: str, label_value: Any) -> dict:
+    def _resolve_label(self, label_mode: Any, custom_label: Any) -> dict:
+        if label_mode not in {"default", "custom"}:
+            return {"error": "label_mode must be default or custom"}
+        if label_mode == "default":
+            return {"label": self._default_label, "label_mode": "default"}
+        if not isinstance(custom_label, str) or not custom_label.strip():
+            return {"error": "custom_label is required when label_mode is custom"}
+        if len(custom_label.strip()) > 80:
+            return {"error": "custom_label must be at most 80 characters"}
+        return {"label": custom_label.strip(), "label_mode": "custom"}
+
+    def _start_timed(self, scope: Any, label: Any, label_mode: str,
+                     interval_value: Any) -> dict:
+        try:
+            interval_s = _finite_number(interval_value, "interval_s")
+        except (TypeError, ValueError) as exc:
+            return {
+                "state": "error", "started": False, "error": str(exc),
+            }
+        if not self._min_interval_s <= interval_s <= self._max_interval_s:
+            return {
+                "state": "error", "started": False,
+                "error": (
+                    f"interval_s must be in "
+                    f"[{self._min_interval_s}, {self._max_interval_s}]"
+                ),
+            }
+        with self._session_lock:
+            if self._recording_thread and self._recording_thread.is_alive():
+                return {
+                    "state": "error", "started": False,
+                    "error": "A timed state recording is already running. Stop it before starting another.",
+                    **self._session_summary(self._recording_session),
+                }
+
+            # Keep the session lock through the first write and thread start so
+            # two simultaneous start_timed calls cannot create two workers.
+            first_result = self._create_timed_file(
+                scope, label, label_mode, interval_s)
+            if not first_result.get("saved", False):
+                return {
+                    "state": "error", "started": False,
+                    "error": "Timed recording did not start because the first record could not be saved.",
+                    "first_result": first_result,
+                }
+
+            session = {
+                "session_id": first_result["session_id"],
+                "scope": scope,
+                "label": first_result["label"],
+                "label_mode": first_result["label_mode"],
+                "filename_label": first_result["filename_label"],
+                "interval_s": interval_s,
+                "started_at": datetime.now().astimezone().isoformat(),
+                "records_saved": 1,
+                "last_file": first_result["file"],
+                "last_error": None,
+            }
+            self._recording_stop.clear()
+            thread = threading.Thread(
+                target=self._timed_loop,
+                args=(session,),
+                daemon=True,
+                name="bumi_state_record",
+            )
+            self._recording_session = session
+            self._recording_thread = thread
+            thread.start()
+        return {
+            "state": "running",
+            "started": True,
+            "first_record": first_result,
+            **self._session_summary(session),
+        }
+
+    def _timed_loop(self, session: dict) -> None:
+        while not self._recording_stop.wait(session["interval_s"]):
+            result = self._append_timed_record(session)
+            with self._session_lock:
+                if result.get("saved", False):
+                    session["records_saved"] += 1
+                    session["last_error"] = None
+                else:
+                    session["last_error"] = result.get("error") or result.get("errors")
+
+    def _stop_timed(self) -> dict:
+        with self._session_lock:
+            thread = self._recording_thread
+            session = self._recording_session
+            running = bool(thread and thread.is_alive())
+        if not running:
+            return {
+                "state": "completed",
+                "stopped": False,
+                "message": "No timed state recording is running.",
+                **self._session_summary(session),
+            }
+        self._recording_stop.set()
+        thread.join(timeout=5.0)
+        still_running = thread.is_alive()
+        finalize_error = None
+        if not still_running and session:
+            finalized = self._finalize_timed_file(session)
+            if not finalized.get("saved", False):
+                finalize_error = finalized.get("error")
+        with self._session_lock:
+            summary = self._session_summary(session)
+            if not still_running:
+                self._recording_thread = None
+        return {
+            "state": "error" if still_running or finalize_error else "completed",
+            "stopped": not still_running,
+            "error": (
+                "Timed recording thread did not stop within 5 seconds."
+                if still_running else finalize_error
+            ),
+            **summary,
+        }
+
+    @staticmethod
+    def _session_summary(session: dict | None) -> dict:
+        if not session:
+            return {}
+        return {
+            key: copy.deepcopy(session.get(key))
+            for key in (
+                "session_id", "scope", "label_mode", "label", "filename_label", "interval_s",
+                "started_at", "records_saved", "last_file", "last_error",
+            )
+        }
+
+    def _record(self, scope: Any, label_value: Any, mode: str,
+                label_mode: str) -> dict:
         if not isinstance(label_value, str):
             return {"state": "error", "saved": False, "error": "label must be a string"}
         label = label_value.strip()
         if len(label) > 80:
             return {"state": "error", "saved": False, "error": "label must be at most 80 characters"}
-
-        sources: dict[str, dict] = {}
-        errors: dict[str, str] = {}
-        for source in self._SOURCE_ACTIONS[action]:
-            try:
-                sources[source] = self._read_source(source)
-            except Exception as exc:
-                errors[source] = str(exc)
-
-        if not sources:
-            return {
-                "state": "error",
-                "saved": False,
-                "requested_sources": list(self._SOURCE_ACTIONS[action]),
-                "errors": errors,
-            }
-
-        now = datetime.now(timezone.utc)
-        record_id = f"{now.strftime('%Y%m%dT%H%M%S.%fZ')}-{uuid.uuid4().hex[:8]}"
-        safe_label = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "-", label).strip("-")[:40]
-        filename = record_id + (f"-{safe_label}" if safe_label else "") + ".json"
-        path = self._storage_dir / filename
-        record = {
-            "schema_version": 1,
-            "record_id": record_id,
-            "captured_at": now.isoformat(),
-            "label": label or None,
-            "requested_sources": list(self._SOURCE_ACTIONS[action]),
-            "sources": sources,
-            "errors": errors,
-            "camera": {
-                "interface_reserved": True,
-                "connected": False,
-                "description": "Version 1 does not consume the camera image stream.",
-            },
-        }
-        serialized = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
-        temp_path = path.with_suffix(".json.tmp")
+        label = label or self._default_label
+        filename_label = self._filename_label(label)
+        captured = self._capture_scope(scope)
+        if not captured.get("captured", False):
+            return captured
+        sources = captured["sources"]
+        errors = captured["errors"]
+        now = captured["captured_datetime"]
         try:
             with self._write_lock:
                 self._storage_dir.mkdir(parents=True, exist_ok=True)
+                sequence, counters = self._next_sequence(filename_label)
+                filename = f"{now.strftime('%Y%m%d')}_{filename_label}_{sequence:06d}.json"
+                path = self._storage_dir / filename
+                record = {
+                    "schema_version": 2,
+                    "record_id": f"{filename_label}:{sequence}",
+                    "record_mode": mode,
+                    "captured_at": now.isoformat(),
+                    "date": now.strftime("%Y-%m-%d"),
+                    "label": label,
+                    "label_mode": label_mode,
+                    "filename_label": filename_label,
+                    "sequence": sequence,
+                    "scope": scope,
+                    "requested_sources": list(self._SCOPES[scope]),
+                    "sources": sources,
+                    "errors": errors,
+                    "camera": {
+                        "interface_reserved": True,
+                        "connected": False,
+                        "description": "Version 1 does not consume the camera image stream.",
+                    },
+                }
+                serialized = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
+                temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
                 temp_path.write_text(serialized, encoding="utf-8")
                 os.replace(temp_path, path)
+                counters[filename_label] = sequence
+                counter_warning = None
+                try:
+                    self._write_counters(counters)
+                except Exception as counter_exc:
+                    # The next write also scans filenames, so numbering remains
+                    # safe even if this auxiliary file cannot be updated.
+                    counter_warning = f"Counter file update failed: {counter_exc}"
         except Exception as exc:
             try:
-                temp_path.unlink(missing_ok=True)
+                if "temp_path" in locals():
+                    temp_path.unlink(missing_ok=True)
             except Exception:
                 pass
             return {
@@ -1777,14 +1977,246 @@ class StateRecordPlugin:
         return {
             "state": "completed" if not errors else "partial",
             "saved": True,
-            "record_id": record_id,
-            "label": label or None,
+            "record_id": f"{filename_label}:{sequence}",
+            "mode": mode,
+            "scope": scope,
+            "label": label,
+            "label_mode": label_mode,
+            "filename_label": filename_label,
+            "sequence": sequence,
             "sources": list(sources),
             "fresh": fresh,
             "errors": errors,
+            "warning": counter_warning,
             "file": str(path),
             "storage_dir": str(self._storage_dir),
         }
+
+    def _create_timed_file(self, scope: Any, label: str, label_mode: str,
+                           interval_s: float) -> dict:
+        filename_label = self._filename_label(label)
+        captured = self._capture_scope(scope)
+        if not captured.get("captured", False):
+            return captured
+        now = captured["captured_datetime"]
+        session_id = uuid.uuid4().hex
+        try:
+            with self._write_lock:
+                self._storage_dir.mkdir(parents=True, exist_ok=True)
+                sequence, counters = self._next_sequence(filename_label)
+                filename = (
+                    f"{now.strftime('%Y%m%d')}_{filename_label}_timed_"
+                    f"{sequence:06d}.json"
+                )
+                path = self._storage_dir / filename
+                entry = self._timed_entry(1, captured)
+                document = {
+                    "schema_version": 3,
+                    "record_id": f"{filename_label}:timed:{sequence}",
+                    "record_mode": "timed",
+                    "status": "running",
+                    "session_id": session_id,
+                    "started_at": now.isoformat(),
+                    "stopped_at": None,
+                    "date": now.strftime("%Y-%m-%d"),
+                    "label": label,
+                    "label_mode": label_mode,
+                    "filename_label": filename_label,
+                    "sequence": sequence,
+                    "scope": scope,
+                    "interval_s": interval_s,
+                    "record_count": 1,
+                    "records": [entry],
+                    "camera": {
+                        "interface_reserved": True,
+                        "connected": False,
+                        "description": "Version 1 does not consume the camera image stream.",
+                    },
+                }
+                self._atomic_write_json(path, document)
+                counters[filename_label] = sequence
+                counter_warning = None
+                try:
+                    self._write_counters(counters)
+                except Exception as counter_exc:
+                    counter_warning = f"Counter file update failed: {counter_exc}"
+        except Exception as exc:
+            return {
+                "state": "error", "saved": False,
+                "error": f"Failed to create timed state record: {exc}",
+                "storage_dir": str(self._storage_dir),
+            }
+        return {
+            "state": "completed" if not captured["errors"] else "partial",
+            "saved": True,
+            "record_id": f"{filename_label}:timed:{sequence}",
+            "session_id": session_id,
+            "mode": "timed",
+            "scope": scope,
+            "label": label,
+            "label_mode": label_mode,
+            "filename_label": filename_label,
+            "sequence": sequence,
+            "fresh": captured["fresh"],
+            "errors": captured["errors"],
+            "warning": counter_warning,
+            "file": str(path),
+            "storage_dir": str(self._storage_dir),
+        }
+
+    def _append_timed_record(self, session: dict) -> dict:
+        captured = self._capture_scope(session["scope"])
+        if not captured.get("captured", False):
+            return captured
+        path = Path(session["last_file"])
+        try:
+            with self._write_lock:
+                document = json.loads(path.read_text(encoding="utf-8"))
+                if document.get("session_id") != session["session_id"]:
+                    raise RuntimeError("Timed record session id does not match its file")
+                index = len(document.get("records", [])) + 1
+                document.setdefault("records", []).append(
+                    self._timed_entry(index, captured))
+                document["record_count"] = index
+                document["updated_at"] = captured["captured_datetime"].isoformat()
+                self._atomic_write_json(path, document)
+        except Exception as exc:
+            return {
+                "state": "error", "saved": False,
+                "error": f"Failed to append timed state record: {exc}",
+                "file": str(path),
+            }
+        return {
+            "state": "completed" if not captured["errors"] else "partial",
+            "saved": True,
+            "file": str(path),
+            "record_index": index,
+            "fresh": captured["fresh"],
+            "errors": captured["errors"],
+        }
+
+    def _finalize_timed_file(self, session: dict) -> dict:
+        path = Path(session["last_file"])
+        try:
+            with self._write_lock:
+                document = json.loads(path.read_text(encoding="utf-8"))
+                if document.get("session_id") != session["session_id"]:
+                    raise RuntimeError("Timed record session id does not match its file")
+                document["status"] = "stopped"
+                document["stopped_at"] = datetime.now().astimezone().isoformat()
+                document["record_count"] = len(document.get("records", []))
+                self._atomic_write_json(path, document)
+        except Exception as exc:
+            return {
+                "state": "error", "saved": False,
+                "error": f"Timed recording stopped but its final status could not be saved: {exc}",
+                "file": str(path),
+            }
+        return {"state": "completed", "saved": True, "file": str(path)}
+
+    @staticmethod
+    def _timed_entry(index: int, captured: dict) -> dict:
+        return {
+            "index": index,
+            "captured_at": captured["captured_datetime"].isoformat(),
+            "fresh": captured["fresh"],
+            "requested_sources": captured["requested_sources"],
+            "sources": captured["sources"],
+            "errors": captured["errors"],
+        }
+
+    def _capture_scope(self, scope: Any) -> dict:
+        if not isinstance(scope, str) or scope not in self._SCOPES:
+            return {
+                "state": "error", "saved": False, "captured": False,
+                "error": f"scope must be one of: {', '.join(self._SCOPES)}",
+            }
+        if scope == "camera":
+            return {
+                "state": "unavailable", "saved": False, "captured": False,
+                "scope": "camera", "interface_reserved": True,
+                "error": "Camera recording is reserved but not connected to the image stream in version 1.",
+            }
+        sources: dict[str, dict] = {}
+        errors: dict[str, str] = {}
+        for source in self._SCOPES[scope]:
+            try:
+                sources[source] = self._read_source(source)
+            except Exception as exc:
+                errors[source] = str(exc)
+        if not sources:
+            return {
+                "state": "error", "saved": False, "captured": False,
+                "scope": scope,
+                "requested_sources": list(self._SCOPES[scope]),
+                "errors": errors,
+            }
+        return {
+            "state": "completed" if not errors else "partial",
+            "saved": False,
+            "captured": True,
+            "scope": scope,
+            "captured_datetime": datetime.now().astimezone(),
+            "requested_sources": list(self._SCOPES[scope]),
+            "sources": sources,
+            "errors": errors,
+            "fresh": all(item.get("fresh", False) for item in sources.values()),
+        }
+
+    @staticmethod
+    def _atomic_write_json(path: Path, document: dict) -> None:
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _filename_label(label: str) -> str:
+        value = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "-", label).strip("-_")[:40]
+        return value or "status"
+
+    def _next_sequence(self, filename_label: str) -> tuple[int, dict]:
+        counters_path = self._storage_dir / self._COUNTERS_FILE
+        counters: dict[str, int] = {}
+        if counters_path.exists():
+            try:
+                loaded = json.loads(counters_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    for key, value in loaded.items():
+                        if isinstance(key, str) and isinstance(value, int) and value >= 0:
+                            counters[key] = value
+            except (OSError, ValueError):
+                # Existing filenames are authoritative and are scanned below.
+                counters = {}
+
+        # Recover safely if a previous process wrote a record but exited before
+        # updating the counter file, or if the counter file was removed.
+        pattern = re.compile(
+            rf"^\d{{8}}_{re.escape(filename_label)}_(?:timed_)?(\d+)\.json$")
+        existing_max = 0
+        for candidate in self._storage_dir.glob(f"*_{filename_label}_*.json"):
+            match = pattern.match(candidate.name)
+            if match:
+                existing_max = max(existing_max, int(match.group(1)))
+        sequence = max(counters.get(filename_label, 0), existing_max) + 1
+        return sequence, counters
+
+    def _write_counters(self, counters: dict[str, int]) -> None:
+        path = self._storage_dir / self._COUNTERS_FILE
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(counters, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def _read_source(self, source: str) -> dict:
         if source in {"imu", "battery", "joints"}:

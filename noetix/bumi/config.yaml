@@ -24,3 +24,9 @@ plugins:
     storage_dir: /opt/phanthy-motus/data/bumi/state-records
     # Samples older than this are still recorded but marked fresh=false.
     max_age_s: 3.0
+    # Defaults shown by the state_record card.
+    default_label: status
+    default_interval_s: 1.0
+    # Allowed timed-recording interval range, in seconds.
+    min_interval_s: 0.1
+    max_interval_s: 3600.0
