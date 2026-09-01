@@ -588,10 +588,13 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         ]
         self.assertLess(
             callback_source.index("refresh_proposal_execution_deadline("),
-            callback_source.index("proposal_apply_diagnostics.record_accepted()"),
+            callback_source.index("proposal_apply_diagnostics.record_accepted(now)"),
         )
         self.assertIn('name="g1_loco_proposal_ros"', source)
-        self.assertEqual(source.count("executor.spin_once"), 2)
+        self.assertIn('name="g1_loco_lidar_ros"', source)
+        self.assertIn("lidar_node.create_subscription(", source)
+        self.assertIn("lidar_executor.spin_once", source)
+        self.assertEqual(source.count("executor.spin_once"), 3)
         self.assertIn("nonlocal forward_obstacle_log_count", source)
         self.assertNotIn("self._fwd_log_n", source)
 

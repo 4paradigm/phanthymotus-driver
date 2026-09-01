@@ -221,10 +221,10 @@ class ProposalGateTest(unittest.TestCase):
         rejected = self.gate.accept(
             proposal(nav_id="attacker-selected", sequence=1), now=10.0
         )
-        self.assertFalse(rejected.stop)
+        self.assertTrue(rejected.stop)
         self.assertFalse(rejected.execute)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
-        self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.armed)
         self.assertEqual(self.gate.expected_nav_id, "nav-001")
 
     def test_first_fresh_legal_nonzero_proposal_binds_and_executes(self):
@@ -298,7 +298,7 @@ class ProposalGateTest(unittest.TestCase):
                 self.assertFalse(gate.armed)
                 self.assertTrue(gate.awaiting_nav_id)
 
-    def test_mid_task_other_nav_id_is_rejected_without_interrupting_active_task(self):
+    def test_mid_task_other_nav_id_hard_disarms_active_task(self):
         gate = VelocityProposalGate(ProposalLimits())
         gate.bind(EXPECTED_TOPIC)
         self.assertTrue(gate.accept(proposal(sequence=1), now=10.0).execute)
@@ -308,10 +308,10 @@ class ProposalGateTest(unittest.TestCase):
             now=10.1,
         )
 
-        self.assertFalse(rejected.stop)
+        self.assertTrue(rejected.stop)
         self.assertFalse(rejected.execute)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
-        self.assertTrue(gate.armed)
+        self.assertFalse(gate.armed)
         self.assertEqual(gate.expected_nav_id, "nav-001")
         self.assertEqual(gate.last_sequence, 1)
 
@@ -396,10 +396,10 @@ class ProposalGateTest(unittest.TestCase):
     def test_nav_id_cannot_change_mid_task(self):
         self.assertTrue(self.gate.accept(proposal(), now=10.0).execute)
         rejected = self.gate.accept(proposal(nav_id="nav-002", sequence=2), now=10.1)
-        self.assertFalse(rejected.stop)
+        self.assertTrue(rejected.stop)
         self.assertFalse(rejected.execute)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
-        self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.armed)
 
     def test_control_plane_terminal_waits_for_confirmation_before_rebind(self):
         self.assertTrue(self.gate.accept(proposal(), now=10.0).execute)
@@ -508,6 +508,63 @@ class ProposalGateTest(unittest.TestCase):
         )
         self.assertTrue(escape.execute)
         self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
+
+    def test_confirmed_scan_stale_stop_waits_for_scan_before_resuming(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=50.0).execute)
+        stopped = self.gate.request_recoverable_stop("scan_stale", now=50.1)
+
+        self.assertTrue(stopped.stop)
+        self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
+
+        self.assertTrue(
+            self.gate.record_recoverable_stop_result("scan_stale", True)
+        )
+        held = self.gate.accept(
+            proposal(sequence=2),
+            now=50.2,
+            recoverable_resume_allowed=False,
+        )
+        self.assertFalse(held.stop)
+        self.assertFalse(held.execute)
+        self.assertEqual(held.reason, "scan_stale_stop_recoverable")
+        self.assertTrue(self.gate.armed)
+        self.assertTrue(self.gate.recoverable_stop_active)
+
+        resumed = self.gate.accept(
+            proposal(sequence=3),
+            now=50.3,
+            recoverable_resume_allowed=True,
+        )
+        self.assertTrue(resumed.execute)
+        self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
+
+    def test_unconfirmed_scan_stale_stop_hard_disarms(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
+        self.gate.request_recoverable_stop("scan_stale", now=10.1)
+
+        self.assertFalse(
+            self.gate.record_recoverable_stop_result("scan_stale", False)
+        )
+        self.assertFalse(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_active)
+        self.assertEqual(self.gate.last_reason, "scan_stale_stop_unconfirmed")
+
+    def test_invalid_schema_hard_disarms_during_scan_stale_hold(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
+        self.gate.hold_after_confirmed_stop("scan_stale")
+
+        rejected = self.gate.accept(
+            proposal(sequence=2, schema="unknown"),
+            now=10.1,
+            recoverable_resume_allowed=False,
+        )
+
+        self.assertTrue(rejected.stop)
+        self.assertEqual(rejected.reason, "schema_mismatch")
+        self.assertFalse(self.gate.armed)
         self.assertFalse(self.gate.recoverable_stop_active)
 
     def test_stale_samples_drain_during_confirmed_ttl_hold(self):

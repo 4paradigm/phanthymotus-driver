@@ -25,6 +25,11 @@ TERMINAL_STATUSES = {
 }
 ACTIVE_STATUSES = {"planning", "navigating", "replanning", "running", "active"}
 ALLOWED_STATUSES = TERMINAL_STATUSES | ACTIVE_STATUSES
+RECOVERABLE_PROPOSAL_STOP_REASONS = {
+    "obstacle": "obstacle_stop_recoverable",
+    "proposal_ttl_expired": "proposal_ttl_stop_recoverable",
+    "scan_stale": "scan_stale_stop_recoverable",
+}
 _STATUS_FIELD = "nav_status"
 _UNSUPPORTED_STATUS_ALIASES = {"status", "navigation_status", "navigation_state"}
 
@@ -302,15 +307,49 @@ class VelocityProposalGate:
         """
         if not self.armed:
             return
-        recoverable_reasons = {
-            "obstacle": "obstacle_stop_recoverable",
-            "proposal_ttl_expired": "proposal_ttl_stop_recoverable",
-        }
-        if reason not in recoverable_reasons:
+        if reason not in RECOVERABLE_PROPOSAL_STOP_REASONS:
             raise ValueError("unsupported_recoverable_stop_reason")
         self.deadline_monotonic = 0.0
-        self.last_reason = recoverable_reasons[reason]
+        self.last_reason = RECOVERABLE_PROPOSAL_STOP_REASONS[reason]
         self.recoverable_stop_active = True
+
+    def request_recoverable_stop(
+        self,
+        reason: str,
+        now: float,
+        proposal: Optional[ValidatedVelocityProposal] = None,
+    ) -> ProposalDecision:
+        """Block execution until a recoverable stop is physically confirmed."""
+        if reason == "proposal_ttl_expired":
+            return self.request_ttl_stop(now, proposal)
+        if reason not in RECOVERABLE_PROPOSAL_STOP_REASONS:
+            raise ValueError("unsupported_recoverable_stop_reason")
+        if proposal is not None:
+            self.last_sequence = proposal.sequence
+            self.last_receive_monotonic = now
+        self.deadline_monotonic = 0.0
+        self.last_reason = reason
+        self.recoverable_stop_active = False
+        return ProposalDecision(stop=True, reason=reason, proposal=proposal)
+
+    def record_recoverable_stop_result(
+        self,
+        reason: str,
+        stop_confirmed: bool,
+    ) -> bool:
+        """Retain a recoverable lease only after measured zero velocity."""
+        if reason not in RECOVERABLE_PROPOSAL_STOP_REASONS:
+            raise ValueError("unsupported_recoverable_stop_reason")
+        if stop_confirmed:
+            self.hold_after_confirmed_stop(reason)
+            return self.recoverable_stop_active
+        unconfirmed_reason = {
+            "obstacle": "obstacle_stop_unconfirmed",
+            "proposal_ttl_expired": "proposal_ttl_stop_unconfirmed",
+            "scan_stale": "scan_stale_stop_unconfirmed",
+        }[reason]
+        self.disarm(unconfirmed_reason)
+        return False
 
     def request_ttl_stop(
         self,
@@ -402,6 +441,7 @@ class VelocityProposalGate:
         payload: Mapping[str, Any],
         now: float,
         now_unix_ms: Optional[float] = None,
+        recoverable_resume_allowed: bool = True,
     ) -> ProposalDecision:
         if not self.connected_topic:
             return ProposalDecision(stop=True, reason="proposal_not_connected")
@@ -467,7 +507,9 @@ class VelocityProposalGate:
                     proposal=proposal,
                 )
         elif proposal.nav_id != self.expected_nav_id:
+            self.disarm("nav_id_mismatch")
             return ProposalDecision(
+                stop=True,
                 reason="nav_id_mismatch",
                 proposal=proposal,
             )
@@ -477,6 +519,17 @@ class VelocityProposalGate:
 
         self.last_sequence = proposal.sequence
         self.last_receive_monotonic = now
+        if (
+            self.recoverable_stop_active
+            and self.last_reason == "scan_stale_stop_recoverable"
+            and not recoverable_resume_allowed
+            and not proposal.is_zero
+        ):
+            self.deadline_monotonic = 0.0
+            return ProposalDecision(
+                reason=self.last_reason,
+                proposal=proposal,
+            )
         if proposal.is_zero:
             self.deadline_monotonic = 0.0
             if proposal.is_terminal:

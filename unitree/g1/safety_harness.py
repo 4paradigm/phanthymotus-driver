@@ -33,8 +33,11 @@ from typing import Optional
 from velocity_proposal import (
     DEFAULT_VELOCITY_PROPOSAL_TOPIC,
     ProposalLimits,
+    RECOVERABLE_PROPOSAL_STOP_REASONS,
     VelocityProposalGate,
+    VelocityProposalValidationError,
     resolve_optional_expected_nav_id,
+    validate_velocity_proposal,
 )
 
 
@@ -515,6 +518,10 @@ class ProposalApplyDiagnostics:
     coalesced: int = 0
     first_received_monotonic: Optional[float] = None
     last_received_monotonic: Optional[float] = None
+    last_legal_proposal_monotonic: Optional[float] = None
+    last_accepted_proposal_monotonic: Optional[float] = None
+    last_applied_proposal_monotonic: Optional[float] = None
+    last_nav2_heartbeat_monotonic: Optional[float] = None
     last_receive_gap_ms: Optional[int] = None
     max_receive_gap_ms: Optional[int] = None
     last_proposal_age_ms: Optional[int] = None
@@ -564,6 +571,10 @@ class ProposalApplyDiagnostics:
             self.coalesced = 0
             self.first_received_monotonic = None
             self.last_received_monotonic = None
+            self.last_legal_proposal_monotonic = None
+            self.last_accepted_proposal_monotonic = None
+            self.last_applied_proposal_monotonic = None
+            self.last_nav2_heartbeat_monotonic = None
             self.last_receive_gap_ms = None
             self.max_receive_gap_ms = None
             self.last_proposal_age_ms = None
@@ -650,9 +661,24 @@ class ProposalApplyDiagnostics:
                 self.watchdog_faults_by_reason.get(reason, 0) + 1
             )
 
-    def record_accepted(self) -> None:
+    def record_legal_proposal(self, now: Optional[float] = None) -> None:
+        with self._lock:
+            self.last_legal_proposal_monotonic = (
+                time.monotonic() if now is None else float(now)
+            )
+
+    def record_nav2_heartbeat(self, now: Optional[float] = None) -> None:
+        with self._lock:
+            self.last_nav2_heartbeat_monotonic = (
+                time.monotonic() if now is None else float(now)
+            )
+
+    def record_accepted(self, now: Optional[float] = None) -> None:
         with self._lock:
             self.accepted += 1
+            self.last_accepted_proposal_monotonic = (
+                time.monotonic() if now is None else float(now)
+            )
 
     def record_coalesced(self) -> None:
         with self._lock:
@@ -746,6 +772,7 @@ class ProposalApplyDiagnostics:
         self,
         nav_id: Optional[str] = None,
         sequence: Optional[int] = None,
+        now: Optional[float] = None,
     ) -> None:
         with self._lock:
             if nav_id is not None and sequence is not None:
@@ -754,6 +781,9 @@ class ProposalApplyDiagnostics:
                     return
                 self._applied_identities.add(identity)
             self.applied += 1
+            self.last_applied_proposal_monotonic = (
+                time.monotonic() if now is None else float(now)
+            )
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -766,6 +796,21 @@ class ProposalApplyDiagnostics:
                 "coalesced": self.coalesced,
                 "first_received_monotonic": self.first_received_monotonic,
                 "last_received_monotonic": self.last_received_monotonic,
+                "last_callback_received_monotonic": (
+                    self.last_received_monotonic
+                ),
+                "last_legal_proposal_monotonic": (
+                    self.last_legal_proposal_monotonic
+                ),
+                "last_accepted_proposal_monotonic": (
+                    self.last_accepted_proposal_monotonic
+                ),
+                "last_applied_proposal_monotonic": (
+                    self.last_applied_proposal_monotonic
+                ),
+                "last_nav2_heartbeat_monotonic": (
+                    self.last_nav2_heartbeat_monotonic
+                ),
                 "last_receive_gap_ms": self.last_receive_gap_ms,
                 "max_receive_gap_ms": self.max_receive_gap_ms,
                 "last_proposal_age_ms": self.last_proposal_age_ms,
@@ -1364,6 +1409,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     # ── Initialize ROS2 ──
     rclpy.init()
     executor = SingleThreadedExecutor()
+    lidar_executor = SingleThreadedExecutor()
 
     class _EventNode(Node):
         def __init__(self):
@@ -1404,6 +1450,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     proposal_node = _VelocityProposalNode()
     executor.add_node(proposal_node)
+    lidar_node = Node("g1_safety_lidar")
+    lidar_executor.add_node(lidar_node)
 
     # ── Config ──
     decel_threshold = config.get("decel_threshold", 2.0)
@@ -1512,7 +1560,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     last_fsm_ret = None
     last_fsm_error = None
     main_control_ready = False
-    last_nav_status_time = 0.0
+    last_nav2_heartbeat_time = 0.0
     odom_stop_monitor = OdomStopMonitor()
     safety_lock = threading.Lock()
     motion_command_lock = threading.RLock()
@@ -1565,6 +1613,15 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     def current_proposal_watchdog_fault():
         return proposal_execution_lease.current_fault()
+
+    def prepare_proposal_stop(reason, now=None):
+        if reason in RECOVERABLE_PROPOSAL_STOP_REASONS:
+            proposal_gate.request_recoverable_stop(
+                reason,
+                time.monotonic() if now is None else now,
+            )
+        else:
+            proposal_gate.disarm(reason)
 
     def apply_parent_velocity_proposal(command):
         nonlocal parent_loco_request_id
@@ -1680,12 +1737,18 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             reason_str,
             watchdog_fault,
         )
-        if watchdog_fault and reason_str != "proposal_ttl_expired":
+        if (
+            watchdog_fault
+            and reason_str not in RECOVERABLE_PROPOSAL_STOP_REASONS
+        ):
             proposal_gate.disarm(reason_str)
         recoverable_stop_requested = bool(
             proposal_gate.armed
-            and reason_str in {"obstacle", "proposal_ttl_expired"}
-            and (was_proposal_motion or reason_str == "proposal_ttl_expired")
+            and reason_str in RECOVERABLE_PROPOSAL_STOP_REASONS
+            and (
+                was_proposal_motion
+                or reason_str in {"proposal_ttl_expired", "scan_stale"}
+            )
         )
         proposal_stop_context = bool(
             was_proposal_motion
@@ -1818,15 +1881,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             if stop_error:
                 result["error"] = f"StopMove failed: {stop_error}"
         if recoverable_stop_requested:
-            if result.get("stop_confirmed"):
-                proposal_gate.hold_after_confirmed_stop(reason_str)
-            else:
-                unconfirmed_reason = (
-                    "obstacle_stop_unconfirmed"
-                    if reason_str == "obstacle"
-                    else "proposal_ttl_stop_unconfirmed"
-                )
-                proposal_gate.disarm(unconfirmed_reason)
+            proposal_gate.record_recoverable_stop_result(
+                reason_str,
+                result.get("stop_confirmed") is True,
+            )
         if was_moving:
             event_data = {"reason": reason_str}
             if reason_str == "obstacle":
@@ -2002,7 +2060,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             obstacle_scan_heading = heading
 
     try:
-        event_node.create_subscription(
+        lidar_node.create_subscription(
             UInt8MultiArray, f"/{namespace}/lidar/cloud", on_cloud, _QOS)
         print(f"[SmartMotion:pid={os.getpid()}] LiDAR subscribed (ROS2 /{namespace}/lidar/cloud)")
     except Exception as e:
@@ -2262,7 +2320,9 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             lowstate_age = now - last_lowstate_time if last_lowstate_time else float("inf")
             scan_age = now - last_cloud_time if last_cloud_time else float("inf")
             nav_status_age = (
-                now - last_nav_status_time if last_nav_status_time else float("inf")
+                now - last_nav2_heartbeat_time
+                if last_nav2_heartbeat_time
+                else float("inf")
             )
             fsm_age = now - last_fsm_check if last_fsm_check else float("inf")
             temperature = max_motor_temp
@@ -2309,6 +2369,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             "odometry_callback_count": odom["callback_count"],
             "scan_age_ms": None if not math.isfinite(scan_age) else round(scan_age * 1000),
             "nav2_status_age_ms": None if not math.isfinite(nav_status_age) else round(nav_status_age * 1000),
+            "nav2_heartbeat_age_ms": None if not math.isfinite(nav_status_age) else round(nav_status_age * 1000),
             "fsm_age_ms": None if not math.isfinite(fsm_age) else round(fsm_age * 1000),
         }
 
@@ -2826,7 +2887,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     @motion_synchronized
     def on_velocity_proposal(msg):
-        nonlocal last_nav_status_time
+        nonlocal last_nav2_heartbeat_time
         now = time.monotonic()
         received_unix_ms = time.time() * 1000
         proposal_apply_diagnostics.record_received(now)
@@ -2837,15 +2898,6 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         try:
             payload = json.loads(msg.data)
         except (json.JSONDecodeError, TypeError, AttributeError):
-            if pending_fault:
-                _, reason = pending_fault
-                proposal_apply_diagnostics.record_rejected(reason)
-                if reason == "proposal_ttl_expired":
-                    proposal_gate.watchdog(now)
-                else:
-                    proposal_gate.disarm(reason)
-                do_stop(reason)
-                return
             proposal_apply_diagnostics.record_rejected("invalid_json")
             if proposal_gate.armed:
                 proposal_gate.disarm("invalid_json")
@@ -2857,19 +2909,30 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         )
         if pending_fault:
             _, reason = pending_fault
+            try:
+                validate_velocity_proposal(payload, proposal_limits)
+            except VelocityProposalValidationError as exc:
+                proposal_apply_diagnostics.record_rejected(exc.code)
+                proposal_gate.disarm(exc.code)
+                do_stop(exc.code)
+                return
             proposal_apply_diagnostics.record_rejected(reason)
-            if reason == "proposal_ttl_expired":
-                proposal_gate.watchdog(now)
-            else:
-                proposal_gate.disarm(reason)
+            prepare_proposal_stop(reason, now)
             do_stop(reason)
             return
 
         was_armed = proposal_gate.armed
+        resume_allowed = not (
+            proposal_gate.recoverable_stop_active
+            and proposal_gate.last_reason == "scan_stale_stop_recoverable"
+            and proposal_runtime_status(force_fsm_check=False)["reason"]
+            == "scan_stale"
+        )
         decision = proposal_gate.accept(
             payload,
             now,
             now_unix_ms=received_unix_ms,
+            recoverable_resume_allowed=resume_allowed,
         )
         if not was_armed and proposal_gate.armed:
             proposal_apply_diagnostics.begin_session(
@@ -2882,6 +2945,18 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 payload,
                 received_unix_ms,
             )
+        if decision.proposal is not None:
+            proposal_apply_diagnostics.record_legal_proposal(now)
+            if (
+                decision.proposal.nav_id == proposal_gate.expected_nav_id
+                and decision.reason not in {
+                    "proposal_ttl_expired",
+                    "sequence_not_increasing",
+                }
+            ):
+                with safety_lock:
+                    last_nav2_heartbeat_time = now
+                proposal_apply_diagnostics.record_nav2_heartbeat(now)
         if decision.stop:
             if decision.reason != "proposal_zero":
                 proposal_apply_diagnostics.record_rejected(decision.reason)
@@ -2906,16 +2981,13 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             )
             return
 
-        with safety_lock:
-            last_nav_status_time = now
-
         # The independent FSM monitor keeps this sample fresh.  Avoid a
         # synchronous per-frame query that would block ROS proposal callbacks.
         runtime = proposal_runtime_status(force_fsm_check=False)
         if not runtime["ready"]:
             reason = runtime["reason"] or "driver_safety_not_ready"
             proposal_apply_diagnostics.record_rejected(reason)
-            proposal_gate.disarm(reason)
+            prepare_proposal_stop(reason, now)
             do_stop(reason)
             return
 
@@ -2934,13 +3006,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             fault = current_proposal_watchdog_fault()
             reason = fault[1] if fault else "proposal_execution_fault"
             proposal_apply_diagnostics.record_rejected(reason)
-            if reason == "proposal_ttl_expired":
-                proposal_gate.watchdog(time.monotonic())
-            else:
-                proposal_gate.disarm(reason)
+            prepare_proposal_stop(reason)
             do_stop(reason)
             return
-        proposal_apply_diagnostics.record_accepted()
+        proposal_apply_diagnostics.record_accepted(now)
         handle_move(
             proposal.x,
             proposal.y,
@@ -3125,7 +3194,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 if not runtime["ready"]:
                     reason = runtime["reason"] or "driver_safety_not_ready"
                     proposal_apply_diagnostics.record_rejected(reason)
-                    proposal_gate.disarm(reason)
+                    prepare_proposal_stop(reason, now)
                     do_stop(reason)
                     continue
                 generation = arm_proposal_execution(
@@ -3135,10 +3204,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                     fault = current_proposal_watchdog_fault()
                     reason = fault[1] if fault else "proposal_execution_fault"
                     proposal_apply_diagnostics.record_rejected(reason)
-                    if reason == "proposal_ttl_expired":
-                        proposal_gate.watchdog(time.monotonic())
-                    else:
-                        proposal_gate.disarm(reason)
+                    prepare_proposal_stop(reason)
                     do_stop(reason)
                     continue
 
@@ -3150,10 +3216,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                     proposal_apply_diagnostics.record_rejected(
                         watchdog_reason
                     )
-                    if watchdog_reason == "proposal_ttl_expired":
-                        proposal_gate.watchdog(time.monotonic())
-                    else:
-                        proposal_gate.disarm(watchdog_reason)
+                    prepare_proposal_stop(watchdog_reason)
                     do_stop(watchdog_reason)
                     continue
 
@@ -3179,6 +3242,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 proposal_apply_diagnostics.record_applied(
                     command["nav_id"],
                     command["sequence"],
+                    now=time.monotonic(),
                 )
 
     def proposal_watchdog_loop():
@@ -3213,11 +3277,19 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         with motion_command_lock:
             if current_proposal_watchdog_fault() != fault:
                 return
-            if reason == "proposal_ttl_expired":
-                proposal_gate.watchdog(time.monotonic())
-            else:
-                proposal_gate.disarm(reason)
+            prepare_proposal_stop(reason)
             do_stop(reason)
+
+    def lidar_ros_spin_loop():
+        """Keep LiDAR freshness callbacks independent of stop confirmation."""
+        try:
+            while not safety_threads_shutdown.is_set():
+                lidar_executor.spin_once(timeout_sec=0.02)
+        except Exception as exc:
+            print(
+                f"[SmartMotion] LiDAR ROS callback failed closed: {exc}",
+                flush=True,
+            )
 
     def proposal_ros_spin_loop():
         """Service proposal/event callbacks independently of the busy loop."""
@@ -3269,6 +3341,12 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         daemon=True,
         name="g1_loco_proposal_ros",
     )
+    lidar_ros_thread = threading.Thread(
+        target=lidar_ros_spin_loop,
+        daemon=True,
+        name="g1_loco_lidar_ros",
+    )
+    lidar_ros_thread.start()
     proposal_ros_thread.start()
     if not proposal_callback_ready.wait(timeout=1.0):
         with proposal_callback_error_lock:
@@ -3459,6 +3537,11 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         executor.wake()
     except Exception:
         pass
+    try:
+        lidar_executor.wake()
+    except Exception:
+        pass
+    lidar_ros_thread.join(timeout=0.5)
     proposal_ros_thread.join(timeout=0.5)
     proposal_watchdog_thread.join(timeout=0.5)
     fsm_monitor_thread.join(timeout=0.75)
@@ -3470,5 +3553,6 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         proposal_gate.unbind("process_exit")
         proposal_node.unbind()
     executor.shutdown()
+    lidar_executor.shutdown()
     rclpy.shutdown()
     print(f"[SmartMotion:pid={os.getpid()}] shutdown complete")

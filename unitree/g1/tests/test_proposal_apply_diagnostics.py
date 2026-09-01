@@ -23,7 +23,9 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
         diagnostics = ProposalApplyDiagnostics()
         diagnostics.begin_session("nav-1")
         diagnostics.record_received(10.0)
-        diagnostics.record_accepted()
+        diagnostics.record_legal_proposal(10.1)
+        diagnostics.record_nav2_heartbeat(10.2)
+        diagnostics.record_accepted(10.3)
         diagnostics.record_set_velocity(
             {
                 "request_id": 12,
@@ -45,7 +47,7 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
             },
             queued_monotonic=34.25,
         )
-        diagnostics.record_applied()
+        diagnostics.record_applied(now=10.4)
 
         self.assertEqual(
             diagnostics.snapshot(),
@@ -58,6 +60,11 @@ class ProposalApplyDiagnosticsTest(unittest.TestCase):
                 "coalesced": 0,
                 "first_received_monotonic": 10.0,
                 "last_received_monotonic": 10.0,
+                "last_callback_received_monotonic": 10.0,
+                "last_legal_proposal_monotonic": 10.1,
+                "last_accepted_proposal_monotonic": 10.3,
+                "last_applied_proposal_monotonic": 10.4,
+                "last_nav2_heartbeat_monotonic": 10.2,
                 "last_receive_gap_ms": None,
                 "max_receive_gap_ms": None,
                 "last_proposal_age_ms": None,
