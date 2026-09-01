@@ -1,0 +1,101 @@
+{
+  "product": "BrainCo Revo 2 仿生灵巧手",
+  "variants": {
+    "basic": {
+      "code": "XRL/XRR",
+      "interfaces": ["RS485", "CANFD"],
+      "supply_voltage_v": [12, 28],
+      "touch": false
+    },
+    "pro": {
+      "code": "XEL/XER",
+      "interfaces": ["RS485", "CANFD", "EtherCAT"],
+      "supply_voltage_v": [12, 64],
+      "touch": false
+    },
+    "touch": {
+      "code": "XTL/XTR",
+      "interfaces": ["RS485", "CANFD", "EtherCAT"],
+      "supply_voltage_v": [12, 64],
+      "touch": true,
+      "touch_hardware_types": [
+        "Revo2Touch",
+        "Revo2TouchPressure",
+        "Revo2TouchForce3D",
+        "Revo2TouchArrayPressure"
+      ]
+    }
+  },
+  "dof": {
+    "active_joints": 6,
+    "total_dof": 11,
+    "note": "拇指2主动(内收外展+屈伸)+1被动屈伸；其余四指各1主动屈伸+1被动屈伸"
+  },
+  "joint_ranges_deg": {
+    "thumb_flex": [0, 59],
+    "thumb_aux": [0, 90],
+    "index": [0, 81],
+    "middle": [0, 81],
+    "ring": [0, 81],
+    "pinky": [0, 81]
+  },
+  "dimensions": {
+    "weight_g_no_wrist": 383,
+    "height_mm_palm_to_middle_tip": 160,
+    "max_finger_spread_mm": 100
+  },
+  "performance": {
+    "five_finger_grip_force_n_min": 50,
+    "single_finger_pinch_force_n_min": 15,
+    "payload_kg_min": 20,
+    "noise_db_at_50cm_max": 50,
+    "flex_extend_time_s_max": 0.65,
+    "repeat_accuracy_deg": 0.1
+  },
+  "operating_temperature_c": [-10, 40],
+  "default_device_ids": {
+    "left": 126,
+    "right": 127,
+    "configurable_range": [1, 254]
+  },
+  "motor_ids": ["Thumb", "ThumbAux", "Index", "Middle", "Ring", "Pinky"],
+  "motor_states": ["Idle", "Running", "Stall", "Turbo"],
+  "control_modes": [
+    "PositionWithDuration",
+    "PositionWithSpeed",
+    "Speed",
+    "Current",
+    "Pwm"
+  ],
+  "position_range": {
+    "min": 0,
+    "max": 1000,
+    "meaning": "0 = fully open, 1000 = fully closed (unified across all protocols/devices)"
+  },
+  "preset_gestures": [
+    "DefaultGestureOpen",
+    "DefaultGestureFist",
+    "DefaultGesturePinchTwo",
+    "DefaultGesturePinchThree",
+    "DefaultGesturePinchSide",
+    "DefaultGesturePoint"
+  ],
+  "led_states": {
+    "green_blink": "开机中（未完成复位）",
+    "green_solid": "正常工作（完成复位）",
+    "yellow_blink": "供电过低",
+    "cyan_solid": "OTA 升级中",
+    "red_solid": "异常"
+  },
+  "button_actions": {
+    "short_press": "复位",
+    "long_press_5s": "恢复出厂设置",
+    "double_short_press": "装箱手势"
+  },
+  "sdk": {
+    "pypi_package": "bc-stark-sdk",
+    "docs_pinned_version": "2.0.2",
+    "python_module": "bc_stark_sdk.main_mod"
+  },
+  "source": "https://www.brainco-hz.com/docs/revolimb-hand/revo2/parameters.html"
+}
