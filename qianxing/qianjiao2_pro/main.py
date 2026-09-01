@@ -83,6 +83,8 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     DEVICE.start()
     DEVICE.start_ros_status()
+    if DEVICE._last_error:
+        print(f"[startup] {DEVICE._last_error}", flush=True)
     port = int(CFG.get("mcp_port", 15719))
     advertise_host = os.environ.get("MCP_ADVERTISE_HOST", CFG.get("mcp_advertise_host", "192.168.1.20"))
     DEVICE.video_url = f"http://{advertise_host}:{port}/video.mjpeg"
