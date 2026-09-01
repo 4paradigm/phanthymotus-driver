@@ -76,13 +76,13 @@ plugins:
     source_topic: "/camera/camera/color/image_raw"
     # This directory is inside the robot-driver container. It is temporary
     # storage and can be cleared if the container or robot is restarted.
-    output_dir: "/tmp/visitor_photos"
+    output_dir: "/work/visitor_photos"
     jpeg_quality: 90
   visitor_video:
     enabled: true
     source_topic: "/camera/camera/color/image_raw"
-    # Temporary local storage; use a mounted persistent volume for retention.
-    output_dir: "/tmp/visitor_videos"
+    # Container-local storage; use a mounted persistent volume for retention.
+    output_dir: "/work/visitor_videos"
     fps: 10
     max_duration_s: 30
   camera_depth:
