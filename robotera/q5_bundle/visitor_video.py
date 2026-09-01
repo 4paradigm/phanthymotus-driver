@@ -54,7 +54,10 @@ class Plugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["record", "info"]},
+                    # The canvas startup sequence calls action="start" for
+                    # every card.  This is only a readiness check; recording
+                    # still creates the temporary RGB subscription on demand.
+                    "action": {"type": "string", "enum": ["start", "record", "info", "stop"]},
                     "duration_s": {
                         "type": "integer", "minimum": 1, "maximum": 30,
                         "description": "Recording length in seconds; never more than 30 seconds.",
@@ -190,6 +193,9 @@ class Plugin:
             return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready" if self._node is not None else "error",
+                    "message": "" if self._node is not None else "Q5 ROS camera subscription is unavailable"}
         if action == "info":
             return self._info()
         if action == "record":
@@ -197,6 +203,9 @@ class Plugin:
                 return self._record(args)
             finally:
                 self._release_subscription()
+        if action == "stop":
+            self._release_subscription()
+            return {"state": "idle"}
         return None
 
 

@@ -56,7 +56,11 @@ class Plugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["capture", "info"]},
+                    # Canvas project startup sends action="start" to every
+                    # card before any user action.  Treat it as a harmless
+                    # readiness check: creating the ROS subscription here
+                    # would unnecessarily compete with camera_rgb.
+                    "action": {"type": "string", "enum": ["start", "capture", "info", "stop"]},
                     "visitor_label": {
                         "type": "string",
                         "description": "Optional label used only in the saved filename.",
@@ -152,6 +156,9 @@ class Plugin:
             return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready" if self._node is not None else "error",
+                    "message": "" if self._node is not None else "Q5 ROS camera subscription is unavailable"}
         if action == "info":
             return self._info()
         if action == "capture":
@@ -159,6 +166,9 @@ class Plugin:
                 return self._capture(args)
             finally:
                 self._release_subscription()
+        if action == "stop":
+            self._release_subscription()
+            return {"state": "idle"}
         return None
 
 
