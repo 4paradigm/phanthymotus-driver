@@ -71,6 +71,13 @@ plugins:
       port: 2222
       depth_profile: "848x480x30"
       color_profile: "848x480x30"
+  visitor_photo:
+    enabled: true
+    source_topic: "/camera/camera/color/image_raw"
+    # This directory is inside the robot-driver container. It is temporary
+    # storage and can be cleared if the container or robot is restarted.
+    output_dir: "/tmp/visitor_photos"
+    jpeg_quality: 90
   camera_depth:
     enabled: true
     source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
