@@ -45,6 +45,14 @@ _AUDIO_SAMPLE_RATE = 16000
 _AUDIO_S16_LE_FORMAT = 2
 _AUDIO_PLAYBACK_CHANNELS = 2
 _AUDIO_CONFIG_INTERVAL_S = 0.5
+# The Bumi audio agent publishes EXIT/CMD_RESET for roughly 10–11 seconds
+# after MediaController.restart() on the tested hardware.  Keep the wait
+# longer than that transition and poll the same MediaController instance;
+# creating another SDK instance is neither necessary nor safe for a live card.
+_AUDIO_AGENT_RESET_TIMEOUT_S = 20.0
+_AUDIO_AGENT_TRANSITION_TIMEOUT_S = 8.0
+_AUDIO_AGENT_POLL_INTERVAL_S = 0.1
+_AUDIO_HEALTHY_WORK_STATUSES = frozenset(("READY", "SLEEPED", "WAKEUPED"))
 
 # ── Joint Mapping ─────────────────────────────────────────────────────────────
 # SDK motor_id order → URDF joint names (must match URDF exactly for skeleton renderer)
@@ -1170,7 +1178,50 @@ class SpeakerPlugin:
             "reason": self._enum_name(getattr(status, "reason", None)),
         }
 
-    def _wait_for_system_status(self, expected: str, timeout_s: float = 3.0) -> dict:
+    @staticmethod
+    def _is_healthy_status(
+        status: dict,
+        allowed_work_statuses=_AUDIO_HEALTHY_WORK_STATUSES,
+    ) -> bool:
+        """Return whether the audio agent has left a reset/error transition."""
+        return (
+            status.get("work_status") in allowed_work_statuses
+            and status.get("reason") not in {"CMD_RESET", "ERROR_SLEEPED"}
+        )
+
+    def _wait_for_healthy_status(
+        self,
+        timeout_s: float = _AUDIO_AGENT_RESET_TIMEOUT_S,
+        allowed_work_statuses=_AUDIO_HEALTHY_WORK_STATUSES,
+    ) -> dict:
+        """Wait for a stable agent state while reusing this SDK instance.
+
+        ``restart()`` is asynchronous.  On Bumi the status remains
+        ``EXIT/CMD_RESET`` for about 10–11 seconds before a fresh
+        ``READY/SYSTEM_LAUNCH`` sample arrives.  A fixed short sleep or an
+        immediate error check races that transition.
+        """
+        deadline = time.monotonic() + timeout_s
+        latest = {"work_status": "unknown", "reason": "unknown"}
+        status_error = None
+        while time.monotonic() < deadline:
+            try:
+                latest = self._read_system_status()
+                status_error = None
+                if self._is_healthy_status(latest, allowed_work_statuses):
+                    return latest
+            except Exception as exc:
+                status_error = str(exc)
+            time.sleep(_AUDIO_AGENT_POLL_INTERVAL_S)
+        if status_error:
+            latest["status_error"] = status_error
+        return latest
+
+    def _wait_for_system_status(
+        self,
+        expected: str,
+        timeout_s: float = _AUDIO_AGENT_TRANSITION_TIMEOUT_S,
+    ) -> dict:
         deadline = time.monotonic() + timeout_s
         latest = {"work_status": "unknown", "reason": "unknown"}
         status_error = None
@@ -1182,13 +1233,23 @@ class SpeakerPlugin:
                     return latest
             except Exception as exc:
                 status_error = str(exc)
-            time.sleep(0.1)
+            time.sleep(_AUDIO_AGENT_POLL_INTERVAL_S)
         if status_error:
             latest["status_error"] = status_error
         return latest
 
-    def _wait_for_reset(self, timeout_s: float = 5.0, reinitialized: bool = False) -> dict:
-        """Wait for reset acknowledgement and post-reset agent readiness."""
+    def _wait_for_reset(
+        self,
+        timeout_s: float = _AUDIO_AGENT_RESET_TIMEOUT_S,
+    ) -> tuple[dict, bool]:
+        """Wait for CMD_RESET, then a fresh READY/SLEEPED state.
+
+        The SDK status before the command can still be returned immediately
+        after ``restart()``.  Therefore a healthy status alone is not enough:
+        first observe the reset acknowledgement, then wait for the subsequent
+        healthy sample.  The boolean distinguishes a real completed reset from
+        a timeout whose last sample happened to be healthy.
+        """
         deadline = time.monotonic() + timeout_s
         latest = {"work_status": "unknown", "reason": "unknown"}
         status_error = None
@@ -1197,39 +1258,19 @@ class SpeakerPlugin:
             try:
                 latest = self._read_system_status()
                 status_error = None
-                # Bumi briefly reports EXIT + CMD_RESET while restarting.  It
-                # must not be returned as a successful reset: wakeup cannot
-                # work until the agent has published a healthy post-reset
-                # READY/SLEEPED state.
                 if latest["reason"] == "CMD_RESET":
                     reset_acknowledged = True
-                    if latest["work_status"] == "EXIT":
-                        time.sleep(0.1)
-                        continue
                 if (
-                    (reset_acknowledged or reinitialized)
-                    and latest["work_status"] in {"READY", "SLEEPED"}
-                    and latest["reason"] != "ERROR_SLEEPED"
+                    reset_acknowledged
+                    and self._is_healthy_status(latest, {"READY", "SLEEPED"})
                 ):
-                    return latest
+                    return latest, True
             except Exception as exc:
                 status_error = str(exc)
-            time.sleep(0.1)
+            time.sleep(_AUDIO_AGENT_POLL_INTERVAL_S)
         if status_error:
             latest["status_error"] = status_error
-        return latest
-
-    def _reinitialize_media_controller(self) -> str | None:
-        """Rebuild the local SDK DDS session after the agent is restarted."""
-        try:
-            if not bool(self._media_ctrl.init()):
-                return "MediaController.init() returned false"
-        except Exception as exc:
-            return f"MediaController.init() failed: {exc}"
-        # init() establishes the DDS endpoints; allow the first post-reset
-        # status sample to arrive before reading the state below.
-        time.sleep(1.0)
-        return None
+        return latest, False
 
     def _get_system_error(self) -> dict | None:
         try:
@@ -1244,7 +1285,9 @@ class SpeakerPlugin:
 
     @staticmethod
     def _is_error_status(status: dict) -> bool:
-        return status.get("reason") == "ERROR_SLEEPED" or status.get("work_status") == "EXIT"
+        # EXIT/CMD_RESET is a normal asynchronous reset transition.  Callers
+        # wait for it to settle and only treat ERROR_SLEEPED as a hard error.
+        return status.get("reason") == "ERROR_SLEEPED"
 
     def _status_error_result(self, requested_state: str, status: dict, recovery: str | None = None) -> dict:
         result = {"state": "error", "requested_state": requested_state, **status}
@@ -1301,6 +1344,16 @@ class SpeakerPlugin:
                     return self._status_error_result(
                         "awake", current, recovery="call speaker.reset, then speaker.wakeup",
                     )
+                if current is not None and not self._is_healthy_status(current):
+                    # EXIT/CMD_RESET is the normal interval after reset.  It
+                    # is not a reason to create another MediaController or
+                    # to reject wakeup; wait for the same instance to settle.
+                    current = self._wait_for_healthy_status()
+                    if not self._is_healthy_status(current):
+                        return self._status_error_result(
+                            "awake", current,
+                            recovery="call speaker.reset, then speaker.wakeup",
+                        )
 
                 # A successful wakeup requires both sides of the voice path:
                 # internal mic -> agent and agent -> internal speaker.  The
@@ -1312,7 +1365,7 @@ class SpeakerPlugin:
                 if current is None or current["work_status"] != "WAKEUPED":
                     self._media_ctrl.wakeup()
 
-                status = self._wait_for_system_status("WAKEUPED", timeout_s=5.0)
+                status = self._wait_for_system_status("WAKEUPED")
                 if status["work_status"] == "WAKEUPED":
                     return {
                         "state": "awake",
@@ -1350,9 +1403,16 @@ class SpeakerPlugin:
                     return self._status_error_result(
                         "sleeping", current, recovery="call speaker.reset to recover the audio agent",
                     )
+                if current is not None and not self._is_healthy_status(current):
+                    # A reset may still be publishing EXIT/CMD_RESET.  Wait
+                    # for its READY/SLEEPED/WAKEUPED state before issuing a
+                    # sleep command on this same MediaController instance.
+                    current = self._wait_for_healthy_status()
+                    if not self._is_healthy_status(current):
+                        return self._status_error_result("sleeping", current)
                 if current is None or current["work_status"] != "SLEEPED":
                     self._media_ctrl.sleep()
-                    status = self._wait_for_system_status("SLEEPED", timeout_s=5.0)
+                    status = self._wait_for_system_status("SLEEPED")
                 else:
                     status = current
 
@@ -1394,22 +1454,13 @@ class SpeakerPlugin:
                         "error": playback["error"],
                     }
 
+                # restart() is asynchronous.  Keep using the MediaController
+                # created during driver startup: init() or instance() here
+                # races the SDK's existing audio agent and can leave the card
+                # stuck at EXIT/CMD_RESET.
                 self._media_ctrl.restart()
-                init_error = self._reinitialize_media_controller()
-                if init_error:
-                    status = self._read_system_status()
-                    result = self._status_error_result(
-                        "reset", status,
-                        recovery="restart the Bumi driver container, then call speaker.wakeup",
-                    )
-                    result["init_error"] = init_error
-                    return result
-
-                status = self._wait_for_reset(timeout_s=8.0, reinitialized=True)
-                if (
-                    status["work_status"] in {"READY", "SLEEPED"}
-                    and status["reason"] != "ERROR_SLEEPED"
-                ):
+                status, reset_completed = self._wait_for_reset()
+                if reset_completed:
                     return {
                         "state": "reset",
                         **status,
