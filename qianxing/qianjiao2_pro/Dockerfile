@@ -6,7 +6,7 @@ WORKDIR /work
 RUN grep -RIl 'mirrors.tencentyun.com/ubuntu-ports' /etc/apt 2>/dev/null | \
     xargs -r sed -i "s#http://mirrors.tencentyun.com/ubuntu-ports#${UBUNTU_MIRROR}#g" && \
     apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip ffmpeg ros-humble-rclpy ros-humble-std-msgs && \
+    python3-pip ffmpeg ros-humble-rclpy ros-humble-sensor-msgs ros-humble-std-msgs && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" 'pymavlink>=2.4.41,<3' 'PyYAML>=6'
 COPY main.py device.py config.yaml driver.yaml ./

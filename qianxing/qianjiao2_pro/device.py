@@ -63,6 +63,8 @@ class QianjiaoDevice:
         self.camera_rtsp = str(cfg.get("camera_rtsp", f"rtsp://admin:admin@{self.camera_ip}:8554/stream/0/0"))
         self.camera_light_path = str(cfg.get("camera_light_path", "/v1/light"))
         self.video_url = str(cfg.get("video_url", "/video.mjpeg"))
+        self.status_topic = str(cfg.get("status_topic", "/qianjiao2_pro/status"))
+        self.camera_topic = str(cfg.get("camera_topic", "/qianjiao2_pro/camera/color"))
         self._status_sock: socket.socket | None = None
         self._status_thread: threading.Thread | None = None
         self._rov_status: dict[str, Any] = {}
@@ -70,6 +72,7 @@ class QianjiaoDevice:
         self._rov_status_source: str | None = None
         self._ros_node = None
         self._ros_pub = None
+        self._ros_camera_pub = None
         self._video_proc = None
         self._video_thread: threading.Thread | None = None
         self._video_cond = threading.Condition()
@@ -109,6 +112,13 @@ class QianjiaoDevice:
                         with self._video_cond:
                             self._video_frame = frame
                             self._video_cond.notify_all()
+                        if self._ros_camera_pub is not None and self._ros_node is not None:
+                            from sensor_msgs.msg import CompressedImage
+                            message = CompressedImage()
+                            message.header.stamp = self._ros_node.get_clock().now().to_msg()
+                            message.format = "jpeg"
+                            message.data = frame
+                            self._ros_camera_pub.publish(message)
                 if self._video_proc.poll() is None:
                     self._video_proc.terminate()
                 self._video_proc.wait(timeout=2)
@@ -128,11 +138,17 @@ class QianjiaoDevice:
         try:
             import rclpy
             from rclpy.node import Node
+            from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+            from sensor_msgs.msg import CompressedImage
             from std_msgs.msg import String
             if not rclpy.ok():
                 rclpy.init(args=None)
             self._ros_node = Node("qianjiao2_pro_status")
-            self._ros_pub = self._ros_node.create_publisher(String, "/qianjiao2_pro/status", 10)
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=1,
+                             durability=DurabilityPolicy.VOLATILE)
+            self._ros_pub = self._ros_node.create_publisher(String, self.status_topic, qos)
+            self._ros_camera_pub = self._ros_node.create_publisher(CompressedImage, self.camera_topic, qos)
             threading.Thread(target=rclpy.spin, args=(self._ros_node,), daemon=True, name="qianjiao-status-ros").start()
         except Exception as exc:
             self._last_error = f"ROS status publisher: {exc}"
@@ -176,6 +192,8 @@ class QianjiaoDevice:
         if self._ros_node is not None:
             self._ros_node.destroy_node()
             self._ros_node = None
+            self._ros_pub = None
+            self._ros_camera_pub = None
 
     def _loop(self):
         while not self._stop.is_set():
@@ -312,8 +330,8 @@ class QianjiaoDevice:
 
     def get_tools(self):
         return [
-            {"name": "rov_status", "type": "sensor", "description": "潜蛟实时状态：姿态、深度、位置、温度、电池和陀螺仪（UDP 8500，10Hz）", "topic_out": [{"topic": "/qianjiao2_pro/status", "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"]}}}},
-            {"name": "rov_camera", "type": "sensor", "description": "潜蛟实时视频流（RTSP 转 MJPEG 代理）", "topic_out": [{"topic": self.video_url, "format": "video/mjpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
+            {"name": "rov_status", "type": "sensor", "description": "潜蛟实时状态：姿态、深度、位置、温度、电池和陀螺仪（UDP 8500，10Hz）", "topic_out": [{"topic": self.status_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"]}}}},
+            {"name": "rov_camera", "type": "sensor", "description": "潜蛟实时视频流（RTSP 转 JPEG 并发布 ROS2 DDS）", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
             {"name": "rov_camera_control", "type": "actuator", "description": "潜蛟相机控制：拍照、媒体列表、下载和补光灯", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["capture", "medias", "download", "light"]}, "name": {"type": "string"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["action"]}},
             {"name": "rov_control", "type": "actuator", "description": "潜蛟 2.0 Pro 解锁及 6DOF 运动控制", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["arm", "disarm", "move", "stop"]}, "heave": {"type": "number", "minimum": -1, "maximum": 1}, "pitch": {"type": "number", "minimum": -1, "maximum": 1}, "forward": {"type": "number", "minimum": -1, "maximum": 1}, "yaw": {"type": "number", "minimum": -1, "maximum": 1}, "lateral": {"type": "number", "minimum": -1, "maximum": 1}, "roll": {"type": "number", "minimum": -1, "maximum": 1}}, "required": ["action"]}},
         ]
@@ -323,9 +341,9 @@ class QianjiaoDevice:
         if tool == "rov_status":
             if action == "start": self.start()
             elif action == "stop": self.stop()
-            return self.status()
+            return {**self.status(), "topic_out": [{"topic": self.status_topic, "format": "data/json"}]}
         if tool == "rov_camera":
-            return {"state": "available", "stream_url": self.video_url, "source_rtsp": self.camera_rtsp}
+            return {"state": "available", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "stream_url": self.video_url, "source_rtsp": self.camera_rtsp}
         if tool == "rov_camera_control":
             if action == "capture":
                 return self.camera_request("POST", "/v1/capture")
