@@ -1,0 +1,28 @@
+name: "潜蛟 2.0 Pro ROV"
+driver_id: "qianxing-qianjiao2-pro"
+mcp_port: 15719
+# Address Agent Core uses to reach this driver.
+mcp_advertise_host: "10.100.128.225"
+ros_namespace: ""
+rov:
+  # The vehicle listens on UDP 14550.
+  target_ip: "192.168.1.88"
+  target_port: 14550
+  source_system: 255
+  source_component: 190
+  heartbeat_timeout: 3.0
+  heartbeat_rate: 1.0
+  status_port: 8500
+  camera_ip: "192.168.1.88"
+  camera_http_port: 80
+  camera_rtsp: "rtsp://admin:admin@192.168.1.88:8554/stream/0/0"
+  connection_topic: "/qianjiao2_pro/connection"
+  attitude_topic: "/qianjiao2_pro/attitude"
+  depth_topic: "/qianjiao2_pro/depth"
+  temperature_topic: "/qianjiao2_pro/temperature"
+  battery_topic: "/qianjiao2_pro/battery"
+  imu_topic: "/qianjiao2_pro/imu"
+  position_topic: "/qianjiao2_pro/position"
+  camera_topic: "/qianjiao2_pro/camera/color"
+  camera_light_path: "/v1/light"
+  mock: false
