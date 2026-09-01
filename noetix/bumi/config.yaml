@@ -18,3 +18,9 @@ plugins:
     poll_interval_s: 0.5
     # Activity classification only; this is not a motor safety or command limit.
     activity_velocity_threshold: 0.15
+  state_record:
+    enabled: true
+    # This directory is on the persistent host volume declared in deploy/service.yml.
+    storage_dir: /opt/phanthy-motus/data/bumi/state-records
+    # Samples older than this are still recorded but marked fresh=false.
+    max_age_s: 3.0
