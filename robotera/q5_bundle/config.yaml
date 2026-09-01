@@ -78,6 +78,13 @@ plugins:
     # storage and can be cleared if the container or robot is restarted.
     output_dir: "/tmp/visitor_photos"
     jpeg_quality: 90
+  visitor_video:
+    enabled: true
+    source_topic: "/camera/camera/color/image_raw"
+    # Temporary local storage; use a mounted persistent volume for retention.
+    output_dir: "/tmp/visitor_videos"
+    fps: 10
+    max_duration_s: 30
   camera_depth:
     enabled: true
     source_topic: "/camera/camera/aligned_depth_to_color/image_raw"
