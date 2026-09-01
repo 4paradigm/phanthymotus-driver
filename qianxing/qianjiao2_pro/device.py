@@ -64,6 +64,8 @@ class QianjiaoDevice:
         self.camera_light_path = str(cfg.get("camera_light_path", "/v1/light"))
         self.video_url = str(cfg.get("video_url", "/video.mjpeg"))
         self.status_topic = str(cfg.get("status_topic", "/qianjiao2_pro/status"))
+        self.battery_topic = str(cfg.get("battery_topic", "/qianjiao2_pro/battery"))
+        self.imu_topic = str(cfg.get("imu_topic", "/qianjiao2_pro/imu"))
         self.camera_topic = str(cfg.get("camera_topic", "/qianjiao2_pro/camera/color"))
         self._status_sock: socket.socket | None = None
         self._status_thread: threading.Thread | None = None
@@ -72,6 +74,8 @@ class QianjiaoDevice:
         self._rov_status_source: str | None = None
         self._ros_node = None
         self._ros_pub = None
+        self._ros_battery_pub = None
+        self._ros_imu_pub = None
         self._ros_camera_pub = None
         self._video_proc = None
         self._video_thread: threading.Thread | None = None
@@ -148,6 +152,8 @@ class QianjiaoDevice:
                              history=HistoryPolicy.KEEP_LAST, depth=1,
                              durability=DurabilityPolicy.VOLATILE)
             self._ros_pub = self._ros_node.create_publisher(String, self.status_topic, qos)
+            self._ros_battery_pub = self._ros_node.create_publisher(String, self.battery_topic, qos)
+            self._ros_imu_pub = self._ros_node.create_publisher(String, self.imu_topic, qos)
             self._ros_camera_pub = self._ros_node.create_publisher(CompressedImage, self.camera_topic, qos)
             threading.Thread(target=rclpy.spin, args=(self._ros_node,), daemon=True, name="qianjiao-status-ros").start()
         except Exception as exc:
@@ -193,6 +199,8 @@ class QianjiaoDevice:
             self._ros_node.destroy_node()
             self._ros_node = None
             self._ros_pub = None
+            self._ros_battery_pub = None
+            self._ros_imu_pub = None
             self._ros_camera_pub = None
 
     def _loop(self):
@@ -239,6 +247,12 @@ class QianjiaoDevice:
                             msg = String()
                             msg.data = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
                             self._ros_pub.publish(msg)
+                            if self._ros_battery_pub is not None:
+                                msg.data = json.dumps(self._battery_snapshot(parsed), ensure_ascii=False, separators=(",", ":"))
+                                self._ros_battery_pub.publish(msg)
+                            if self._ros_imu_pub is not None:
+                                msg.data = json.dumps(self._imu_snapshot(parsed), ensure_ascii=False, separators=(",", ":"))
+                                self._ros_imu_pub.publish(msg)
                 except socket.timeout:
                     continue
         except Exception as exc:
@@ -258,6 +272,35 @@ class QianjiaoDevice:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
         return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _battery_snapshot(status: dict[str, Any]) -> dict[str, Any]:
+        batteries = []
+        for battery in status.get("batteries", []):
+            if not isinstance(battery, dict):
+                continue
+            item = dict(battery)
+            if isinstance(item.get("volt"), (int, float)):
+                item["voltage_v"] = round(item["volt"] / 1000.0, 3)
+            if isinstance(item.get("current"), (int, float)):
+                item["current_a"] = round(item["current"] / 100.0, 2)
+            if "remain" in item:
+                item["remaining_percent"] = item["remain"]
+            batteries.append(item)
+        return {"batteries": batteries, "attUpdateAt": status.get("attUpdateAt")}
+
+    @staticmethod
+    def _imu_snapshot(status: dict[str, Any]) -> dict[str, Any]:
+        raw = status.get("imu") if isinstance(status.get("imu"), dict) else {}
+        angular_velocity = {
+            axis: round(raw[axis] / 10.0, 1)
+            for axis in ("gx", "gy", "gz") if isinstance(raw.get(axis), (int, float))
+        }
+        return {
+            "angular_velocity_deg_s": angular_velocity,
+            "raw_0_1_deg_s": raw,
+            "attUpdateAt": status.get("attUpdateAt"),
+        }
 
     def camera_request(self, method: str, path: str, body: Any = None) -> dict:
         url = self.camera_http_base + path
@@ -331,6 +374,8 @@ class QianjiaoDevice:
     def get_tools(self):
         return [
             {"name": "rov_status", "type": "sensor", "description": "潜蛟实时状态：姿态、深度、位置、温度、电池和陀螺仪（UDP 8500，10Hz）", "topic_out": [{"topic": self.status_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"]}}}},
+            {"name": "rov_battery", "type": "sensor", "description": "潜蛟电池：电压、电流和剩余电量（10Hz）", "topic_out": [{"topic": self.battery_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
+            {"name": "rov_imu", "type": "sensor", "description": "潜蛟 IMU 角速度（度/秒，10Hz）", "topic_out": [{"topic": self.imu_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
             {"name": "rov_camera", "type": "sensor", "description": "潜蛟实时视频流（RTSP 转 JPEG 并发布 ROS2 DDS）", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
             {"name": "rov_camera_control", "type": "actuator", "description": "潜蛟相机控制：拍照、媒体列表、下载和补光灯", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["capture", "medias", "download", "light"]}, "name": {"type": "string"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["action"]}},
             {"name": "rov_control", "type": "actuator", "description": "潜蛟 2.0 Pro 解锁及 6DOF 运动控制", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["arm", "disarm", "move", "stop"]}, "heave": {"type": "number", "minimum": -1, "maximum": 1}, "pitch": {"type": "number", "minimum": -1, "maximum": 1}, "forward": {"type": "number", "minimum": -1, "maximum": 1}, "yaw": {"type": "number", "minimum": -1, "maximum": 1}, "lateral": {"type": "number", "minimum": -1, "maximum": 1}, "roll": {"type": "number", "minimum": -1, "maximum": 1}}, "required": ["action"]}},
@@ -344,6 +389,10 @@ class QianjiaoDevice:
             return {**self.status(), "topic_out": [{"topic": self.status_topic, "format": "data/json"}]}
         if tool == "rov_camera":
             return {"state": "available", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "stream_url": self.video_url, "source_rtsp": self.camera_rtsp}
+        if tool == "rov_battery":
+            return {**self._battery_snapshot(self._rov_status), "topic_out": [{"topic": self.battery_topic, "format": "data/json"}]}
+        if tool == "rov_imu":
+            return {**self._imu_snapshot(self._rov_status), "topic_out": [{"topic": self.imu_topic, "format": "data/json"}]}
         if tool == "rov_camera_control":
             if action == "capture":
                 return self.camera_request("POST", "/v1/capture")
