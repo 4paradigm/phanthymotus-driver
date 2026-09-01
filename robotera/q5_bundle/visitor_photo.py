@@ -14,6 +14,7 @@ import time
 
 try:
     from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import Image
     _HAS_ROS2 = True
 except Exception:
@@ -22,6 +23,11 @@ except Exception:
 
 CARD = "visitor_photo"
 NODE = "q5_visitor_photo"
+_CAMERA_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+) if _HAS_ROS2 else None
 
 
 class Plugin:
@@ -29,9 +35,9 @@ class Plugin:
         self._source_topic = str(plugin_config.get(
             "source_topic", "/camera/camera/color/image_raw"))
         self._output_dir = Path(str(plugin_config.get(
-            "output_dir", "/tmp/visitor_photos"))).expanduser()
+            "output_dir", "/work/visitor_photos"))).expanduser()
         self._jpeg_quality = max(20, min(95, int(plugin_config.get("jpeg_quality", 90))))
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()
         self._latest = None
         self._latest_at = 0.0
         self._node = None
@@ -40,8 +46,6 @@ class Plugin:
         if _HAS_ROS2 and executor is not None:
             self._node = Node(NODE)
             executor.add_node(self._node)
-            self._subscription = self._node.create_subscription(
-                Image, self._source_topic, self._on_image, 1)
 
     def get_tool(self):
         return {
@@ -70,12 +74,25 @@ class Plugin:
         return {"state": "ready" if self._node is not None else "unavailable"}
 
     def stop(self):
-        return None
+        self._release_subscription()
+
+    def _release_subscription(self):
+        if self._node is not None and self._subscription is not None:
+            self._node.destroy_subscription(self._subscription)
+            self._subscription = None
+
+    def _ensure_subscription(self):
+        if self._node is not None and self._subscription is None:
+            # The camera worker owns continuous RGB streaming. Subscribe only
+            # while an actual photo is requested.
+            self._subscription = self._node.create_subscription(
+                Image, self._source_topic, self._on_image, _CAMERA_QOS)
 
     def _on_image(self, msg):
         with self._lock:
             self._latest = msg
             self._latest_at = time.time()
+            self._lock.notify_all()
 
     def _info(self):
         with self._lock:
@@ -95,7 +112,10 @@ class Plugin:
     def _capture(self, args):
         if self._node is None:
             return {"ok": False, "code": "ROS_UNAVAILABLE", "message": "Q5 ROS camera subscription is unavailable"}
+        self._ensure_subscription()
         with self._lock:
+            if self._latest is None:
+                self._lock.wait(timeout=2.0)
             msg = self._latest
             frame_age = time.time() - self._latest_at if self._latest_at else None
         if msg is None:
@@ -135,7 +155,10 @@ class Plugin:
         if action == "info":
             return self._info()
         if action == "capture":
-            return self._capture(args)
+            try:
+                return self._capture(args)
+            finally:
+                self._release_subscription()
         return None
 
 
