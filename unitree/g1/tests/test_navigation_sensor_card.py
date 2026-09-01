@@ -193,7 +193,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertEqual(monitor.lidar_frame, "configured_lidar_frame")
         self.assertEqual(monitor.imu_frame, "configured_imu_frame")
 
-    def test_worker_publishes_required_base_to_livox_static_transform(self):
+    def test_static_transform_does_not_reapply_sensor_rotation(self):
         module = self.load_bridge_module()
         config = {
             "base_frame": "base_link",
@@ -241,9 +241,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
             transform.transform.rotation.w,
         )
         self.assertAlmostEqual(sum(value * value for value in quaternion), 1.0)
-        expected = module.rotate_orientation_xyzw(
-            module._quaternion_from_rpy(*rpy), node._sensor_rotation
-        )
+        expected = module._quaternion_from_rpy(*rpy)
         for actual, wanted in zip(quaternion, expected):
             self.assertAlmostEqual(actual, wanted)
 

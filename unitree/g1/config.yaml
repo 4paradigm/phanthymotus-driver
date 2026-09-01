@@ -71,12 +71,12 @@ plugins:
     lidar_frame: livox_frame
     imu_frame: livox_frame
     base_frame: base_link
-    # Unitree G1 factory nominal pelvis -> mid360 composition at zero waist pose;
-    # navigation base_link follows the pelvis convention used by PR 141.
+    # Unitree G1 factory nominal pelvis -> corrected livox_frame extrinsic at
+    # zero waist pose; navigation base_link follows the PR 141 pelvis convention.
     base_to_sensor_translation_m: [-0.00368, 0.00003, 0.46018]
     base_to_sensor_rotation_rpy_rad: [0.0, 0.04014257279586953, 0.0]
-    # The G1 MID360 is mounted upside down. Apply the same fixed rotation to
-    # both the cloud and its built-in IMU so every consumer sees one frame.
+    # The G1 MID360 is mounted upside down. Apply this only to raw cloud/IMU
+    # samples; base_to_sensor_* already targets their corrected output frame.
     sensor_rotation_matrix: [1.0, 0.0, 0.0,
                              0.0, -1.0, 0.0,
                              0.0, 0.0, -1.0]

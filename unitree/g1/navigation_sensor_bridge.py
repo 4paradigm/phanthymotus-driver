@@ -191,9 +191,10 @@ class _NavigationSensorNode(Node):
         translation = transform.transform.translation
         translation.x, translation.y, translation.z = self._base_to_sensor_translation
         rotation = transform.transform.rotation
-        rotation.x, rotation.y, rotation.z, rotation.w = rotate_orientation_xyzw(
-            _quaternion_from_rpy(*self._base_to_sensor_rpy),
-            self._sensor_rotation,
+        # The configured extrinsic already targets the corrected, published
+        # navigation frame.  sensor_rotation only converts raw cloud/IMU data.
+        rotation.x, rotation.y, rotation.z, rotation.w = _quaternion_from_rpy(
+            *self._base_to_sensor_rpy
         )
         self._static_tf_broadcaster = StaticTransformBroadcaster(self)
         self._static_tf_broadcaster.sendTransform(transform)
