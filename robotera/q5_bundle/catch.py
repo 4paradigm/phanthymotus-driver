@@ -1,4 +1,4 @@
-"""Q5 visitor-video card: record the newest RGB frames as a bounded MP4."""
+"""Q5 visitor-media card: capture a photo or a bounded video to persistent storage."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ except Exception:
     _HAS_ROS2 = False
 
 
-CARD = "visitor_video"
-NODE = "q5_visitor_video"
+CARD = "catch"
+NODE = "q5_catch"
 _CAMERA_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -30,8 +30,11 @@ class Plugin:
     def __init__(self, plugin_config, namespace, executor, client):
         self._source_topic = str(plugin_config.get(
             "source_topic", "/camera/camera/color/image_raw"))
+        # /opt/phanthy-motus/data is a host-mounted volume in the Q5 service,
+        # unlike /work which is discarded when the driver container is rebuilt.
         self._output_dir = Path(str(plugin_config.get(
-            "output_dir", "/work/visitor_videos"))).expanduser()
+            "output_dir", "/opt/phanthy-motus/data/catch"))).expanduser()
+        self._jpeg_quality = max(20, min(95, int(plugin_config.get("jpeg_quality", 90))))
         self._fps = max(1, min(15, int(plugin_config.get("fps", 10))))
         self._max_duration_s = max(1, min(30, int(plugin_config.get("max_duration_s", 30))))
         self._lock = threading.Condition()
@@ -50,17 +53,17 @@ class Plugin:
             "name": CARD,
             "type": "actuator",
             "multiInstance": False,
-            "description": "Record the Q5 RGB camera for 1 to 30 seconds and save an MP4 locally.",
+            "description": "Capture a visitor photo or record a Q5 RGB video (1–30 seconds) to persistent storage.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    # The canvas startup sequence calls action="start" for
-                    # every card.  This is only a readiness check; recording
-                    # still creates the temporary RGB subscription on demand.
-                    "action": {"type": "string", "enum": ["start", "record", "info", "stop"]},
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "capture_photo", "record_video", "info", "stop"],
+                    },
                     "duration_s": {
                         "type": "integer", "minimum": 1, "maximum": 30,
-                        "description": "Recording length in seconds; never more than 30 seconds.",
+                        "description": "Video duration in seconds; only used by record_video.",
                     },
                     "visitor_label": {
                         "type": "string",
@@ -88,8 +91,8 @@ class Plugin:
 
     def _ensure_subscription(self):
         if self._node is not None and self._subscription is None:
-            # Do not create a second permanent RGB consumer beside the
-            # isolated camera worker; subscribe only for an explicit record.
+            # Only consume RGB while a capture is in progress: camera_rgb keeps
+            # ownership of continuous dashboard streaming at all other times.
             self._subscription = self._node.create_subscription(
                 Image, self._source_topic, self._on_image, _CAMERA_QOS)
 
@@ -107,6 +110,8 @@ class Plugin:
             "ok": self._node is not None,
             "source_topic": self._source_topic,
             "output_dir": str(self._output_dir),
+            "photos_dir": str(self._output_dir / "photos"),
+            "videos_dir": str(self._output_dir / "videos"),
             "fps": self._fps,
             "max_duration_s": self._max_duration_s,
             "latest_frame_age_s": age,
@@ -118,7 +123,7 @@ class Plugin:
         return value.strip("_")[:40] or "visitor"
 
     @staticmethod
-    def _rgb_bytes(msg):
+    def _rgb_image(msg):
         import numpy as np
         channels = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4}.get(msg.encoding)
         if channels is None or msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * channels:
@@ -132,35 +137,60 @@ class Plugin:
             image = image[:, :, :3]
         elif msg.encoding == "bgra8":
             image = image[:, :, [2, 1, 0]]
-        return np.ascontiguousarray(image).tobytes(), int(msg.width), int(msg.height)
+        return np.ascontiguousarray(image)
 
-    def _record(self, args):
-        if self._node is None:
-            return {"ok": False, "code": "ROS_UNAVAILABLE", "message": "Q5 ROS camera subscription is unavailable"}
+    def _wait_for_frame(self):
         self._ensure_subscription()
-        requested = int(args.get("duration_s", 5))
-        if not 1 <= requested <= self._max_duration_s:
-            return {"ok": False, "code": "INVALID_DURATION", "message": f"duration_s must be between 1 and {self._max_duration_s}"}
         with self._lock:
             if self._latest is None:
                 self._lock.wait(timeout=2.0)
-            if self._latest is None:
-                return {"ok": False, "code": "NO_FRAME", "message": "No RGB frame has arrived yet"}
             msg = self._latest
+            age = time.time() - self._latest_at if self._latest_at else None
             sequence = self._sequence
+        if msg is None:
+            raise RuntimeError("No RGB frame has arrived yet")
+        if age is not None and age > 3.0:
+            raise RuntimeError(f"Latest RGB frame is stale ({age:.2f}s old)")
+        return msg, age, sequence
+
+    def _capture_photo(self, args):
+        if self._node is None:
+            return {"ok": False, "code": "ROS_UNAVAILABLE", "message": "Q5 ROS camera subscription is unavailable"}
         try:
-            first_frame, width, height = self._rgb_bytes(msg)
-            self._output_dir.mkdir(parents=True, exist_ok=True)
+            msg, age, _ = self._wait_for_frame()
+            from PIL import Image as PilImage
+            directory = self._output_dir / "photos"
+            directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            label = self._safe_label(args.get("visitor_label", "visitor"))
-            path = self._output_dir / f"{stamp}_{label}.mp4"
-            command = [
+            path = directory / f"{stamp}_{self._safe_label(args.get('visitor_label', 'visitor'))}.jpg"
+            PilImage.fromarray(self._rgb_image(msg), "RGB").save(path, "JPEG", quality=self._jpeg_quality)
+            return {"ok": True, "media_type": "photo", "file_path": str(path),
+                    "captured_at": datetime.now().isoformat(timespec="seconds"),
+                    "frame_age_s": round(age or 0.0, 2)}
+        except Exception as exc:
+            return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
+
+    def _record_video(self, args):
+        if self._node is None:
+            return {"ok": False, "code": "ROS_UNAVAILABLE", "message": "Q5 ROS camera subscription is unavailable"}
+        process = None
+        try:
+            requested = int(args.get("duration_s", 5))
+            if not 1 <= requested <= self._max_duration_s:
+                return {"ok": False, "code": "INVALID_DURATION", "message": f"duration_s must be between 1 and {self._max_duration_s}"}
+            msg, _, sequence = self._wait_for_frame()
+            first_frame = self._rgb_image(msg)
+            height, width = first_frame.shape[:2]
+            directory = self._output_dir / "videos"
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = directory / f"{stamp}_{self._safe_label(args.get('visitor_label', 'visitor'))}.mp4"
+            process = subprocess.Popen([
                 "ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-                "-s", f"{width}x{height}", "-r", str(self._fps), "-i", "-",
-                "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
-            ]
-            process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-            process.stdin.write(first_frame)
+                "-s", f"{width}x{height}", "-r", str(self._fps), "-i", "-", "-an",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
+            ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            process.stdin.write(first_frame.tobytes())
             frames = 1
             deadline = time.monotonic() + requested
             while time.monotonic() < deadline:
@@ -170,26 +200,23 @@ class Plugin:
                     if self._sequence <= sequence:
                         continue
                     msg, sequence = self._latest, self._sequence
-                frame, frame_width, frame_height = self._rgb_bytes(msg)
-                if frame_width == width and frame_height == height:
-                    process.stdin.write(frame)
+                frame = self._rgb_image(msg)
+                if frame.shape[:2] == (height, width):
+                    process.stdin.write(frame.tobytes())
                     frames += 1
             process.stdin.close()
             stderr = process.stderr.read().decode("utf-8", "replace")
             if process.wait(timeout=10) != 0 or not path.exists():
                 raise RuntimeError(stderr.strip() or "ffmpeg failed to create MP4")
-            return {
-                "ok": True,
-                "file_path": str(path),
-                "recorded_duration_s": requested,
-                "frames": frames,
-                "captured_at": datetime.now().isoformat(timespec="seconds"),
-            }
+            return {"ok": True, "media_type": "video", "file_path": str(path),
+                    "recorded_duration_s": requested, "frames": frames,
+                    "captured_at": datetime.now().isoformat(timespec="seconds")}
         except Exception as exc:
-            try:
-                process.kill()
-            except Exception:
-                pass
+            if process is not None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
             return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
 
     def dispatch(self, action, args):
@@ -198,9 +225,14 @@ class Plugin:
                     "message": "" if self._node is not None else "Q5 ROS camera subscription is unavailable"}
         if action == "info":
             return self._info()
-        if action == "record":
+        if action == "capture_photo":
             try:
-                return self._record(args)
+                return self._capture_photo(args)
+            finally:
+                self._release_subscription()
+        if action == "record_video":
+            try:
+                return self._record_video(args)
             finally:
                 self._release_subscription()
         if action == "stop":

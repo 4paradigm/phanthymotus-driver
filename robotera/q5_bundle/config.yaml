@@ -71,18 +71,13 @@ plugins:
       port: 2222
       depth_profile: "848x480x30"
       color_profile: "848x480x30"
-  visitor_photo:
+  catch:
     enabled: true
     source_topic: "/camera/camera/color/image_raw"
-    # This directory is inside the robot-driver container. It is temporary
-    # storage and can be cleared if the container or robot is restarted.
-    output_dir: "/work/visitor_photos"
+    # This is mounted from the Q5 host (/opt/phanthy-motus/data), so files
+    # survive driver container replacement and restarts.
+    output_dir: "/opt/phanthy-motus/data/catch"
     jpeg_quality: 90
-  visitor_video:
-    enabled: true
-    source_topic: "/camera/camera/color/image_raw"
-    # Container-local storage; use a mounted persistent volume for retention.
-    output_dir: "/work/visitor_videos"
     fps: 10
     max_duration_s: 30
   camera_depth:
