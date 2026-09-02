@@ -81,7 +81,7 @@ COPY audio.py /work/audio.py
 COPY camera_rgb.py /work/camera_rgb.py
 COPY camera_depth.py /work/camera_depth.py
 COPY camera_pointcloud.py /work/camera_pointcloud.py
-COPY catch.py /work/catch.py
+COPY vision_capture.py /work/vision_capture.py
 COPY legacy_device.py /work/legacy_device.py
 COPY legacy_direct_control.py /work/legacy_direct_control.py
 COPY q5_media_bridge.py /work/q5_media_bridge.py
