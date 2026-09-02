@@ -1193,6 +1193,7 @@ class CameraSnapshotPlugin:
                     "duration": {"type": "number", "description": "视频时长（秒），默认使用 max_video_seconds，最大 300"},
                 },
                 "required": ["action"],
+                "x-completion": {"actions": ["record_video"], "timeout": 300},
                 "x-action-params": {
                     "capture": {"params": ["name"], "description": "拍照；name 可选，不填则使用默认时间戳文件名"},
                     "record_video": {"params": ["name", "duration"], "description": "录制指定时长的视频；name 和 duration 均可选，duration 默认使用 max_video_seconds"},
@@ -1303,6 +1304,20 @@ class CameraSnapshotPlugin:
         if action == "stop_recording":
             result = self._stop_recording()
             return result or {"state": "idle", "message": "no active recording"}
+        if action == "record_video" and not args.get("_background"):
+            from uuid import uuid4
+            action_id = f"camera_record_video_{uuid4().hex[:8]}"
+            background_args = dict(args)
+            background_args["_background"] = True
+            def _record_async():
+                try:
+                    result = self.dispatch("record_video", background_args)
+                    status = "completed" if result.get("state") == "recorded" else "error"
+                    _acp_notify(action_id, status, result, "camera_snapshot")
+                except Exception as exc:
+                    _acp_notify(action_id, "error", {"action": "record_video", "error": str(exc)}, "camera_snapshot")
+            threading.Thread(target=_record_async, daemon=True, name="camera-record-video").start()
+            return {"state": "recording", "action_id": action_id, "name": args.get("name"), "duration": args.get("duration", self._max_video_seconds)}
         if action == "record_video":
             try:
                 stem = self._file_stem(args) or f"head_{time.time_ns()}"

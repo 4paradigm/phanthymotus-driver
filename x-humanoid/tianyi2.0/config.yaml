@@ -30,7 +30,7 @@ plugins:
     # by channel_reply's outbound file whitelist.
     channel_output_dir: "/work/resource/images"
     jpeg_quality: 90
-    video_fps: 15
+    video_fps: 30
     max_video_seconds: 60
   imu:
     enabled: true
