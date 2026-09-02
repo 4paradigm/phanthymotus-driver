@@ -978,6 +978,35 @@ class LocoStatePlugin:
 
 # ── LocoPlugin (actuator) ────────────────────────────────────────────────────
 
+import os as _os
+
+_LOCO_AGENT_CORE_URL = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+
+
+def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loco"):
+    """POST ACP completion callback to Agent Core."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id, "status": status,
+        "result": result, "tool": tool, "ts": time.time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{_LOCO_AGENT_CORE_URL}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        print(f"[Loco] ACP notify failed: {e}", flush=True)
+
+
 class LocoPlugin:
     """R1 locomotion control via LocoClient RPC (sport service) + ArmClient (arm service).
 
@@ -1071,6 +1100,23 @@ class LocoPlugin:
                     },
                 },
                 "required": ["mode"],
+                # lie2standup / standup2lie run a multi-step FSM sequence that takes
+                # ~12s. They return immediately with an action_id and fire the ACP
+                # callback when the sequence ends, so the agent can keep reasoning
+                # (and keep talking) while the robot moves.
+                #
+                # No "actions" filter here: agent-core matches it against
+                # args["action"] (mcp_client.py:504), and this tool's parameter is
+                # named "mode" -- a filter would never match. Without one every
+                # dispatch is eligible, and the real gate becomes whether the
+                # response carries an action_id (mcp_client.py:511). The synchronous
+                # modes (damp, zero_torque, emergency_stop, get_current_mode) are
+                # single RPCs that return in milliseconds and deliberately return no
+                # action_id, so they stay synchronous.
+                #
+                # timeout mirrors _run_fsm_sequence's worst case: 4 steps x 15s
+                # step_timeout plus interval, with margin.
+                "x-completion": {"timeout": 90},
             },
         }
 
@@ -1151,7 +1197,7 @@ class LocoPlugin:
                 # Skip completed steps based on current FSM
                 fsm_to_start = {0: 1, 1: 2, 4: 3}
                 start_idx = fsm_to_start.get(current_fsm, 0)
-                return self._run_fsm_sequence(all_steps[start_idx:])
+                return self._async_fsm(mode, all_steps[start_idx:])
 
             elif mode == "standup2lie":
                 if current_fsm in self._GROUND_STATES:
@@ -1159,12 +1205,13 @@ class LocoPlugin:
                 if current_fsm == 4:
                     # From stance: enter loco first, then lie down
                     steps = [("Start", 811, "start"), ("StandUp2Lie", 1, "standup2lie")]
-                else:
-                    # From 811 (loco mode): stop movement first, then lie down safely
-                    self._client.StopMove()
-                    import time as _time; _time.sleep(1.0)
-                    steps = [("StandUp2Lie", 1, "standup2lie")]
-                return self._run_fsm_sequence(steps)
+                    return self._async_fsm(mode, steps)
+                # From 811 (loco mode): stop movement first, then lie down safely.
+                # StopMove + the settle sleep run inside the worker thread too --
+                # leaving them here would keep dispatch blocked for a second and
+                # defeat the point of going async.
+                steps = [("StandUp2Lie", 1, "standup2lie")]
+                return self._async_fsm(mode, steps, stop_first=True)
 
             elif mode in ("zero_torque", "damp"):
                 if current_fsm in self._STANDING_STATES or current_fsm == 4:
@@ -1216,6 +1263,41 @@ class LocoPlugin:
         if result is None:
             return {"error": "RPC timeout during sequence execution"}
         return result
+
+    def _async_fsm(self, mode: str, steps: list, stop_first: bool = False) -> dict:
+        """Launch an FSM sequence in the background, return an action_id immediately.
+
+        The sequence takes ~12s (4 steps, 1s apart). Running it synchronously froze
+        the whole agent turn for that long -- no reasoning, no speech, nothing.
+        Now dispatch returns at once and the ACP callback reports the outcome.
+        """
+        from uuid import uuid4
+        action_id = f"r1_fsm_{uuid4().hex[:8]}"
+        threading.Thread(
+            target=self._acp_fsm_sequence,
+            args=(action_id, mode, steps, stop_first),
+            daemon=True,
+        ).start()
+        return {"status": "executing", "mode": mode, "action_id": action_id}
+
+    def _acp_fsm_sequence(self, action_id: str, mode: str, steps: list,
+                          stop_first: bool = False):
+        """Worker: run the sequence, then fire the ACP callback.
+
+        The callback must go out on every path. Swallowing an exception here would
+        leave agent-core's barrier waiting out the full 90s timeout for a sequence
+        that already died.
+        """
+        try:
+            if stop_first:
+                self._client.StopMove()
+                time.sleep(1.0)
+            result = self._run_fsm_sequence(steps)
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+        status = "error" if result.get("error") else "completed"
+        _loco_acp_notify(action_id, status, {"mode": mode, **result},
+                         tool="switch_mode")
 
     # ── Arm helpers ───────────────────────────────────────────────────────────
 
