@@ -1142,8 +1142,7 @@ class CameraSnapshotPlugin:
 
         self._native_dir = Path(plugin_config.get(
             "output_dir", "/opt/phanthy-motus/data/images"))
-        self._channel_dir = plugin_config.get(
-            "channel_output_dir", "/work/resource/images")
+        self._channel_dir = self._derive_channel_dir(self._native_dir)
         self._jpeg_quality = max(1, min(100, int(plugin_config.get("jpeg_quality", 90))))
         self._video_fps = max(1.0, min(30.0, float(plugin_config.get("video_fps", 15))))
         self._max_video_seconds = max(1.0, min(300.0, float(plugin_config.get("max_video_seconds", 60))))
@@ -1151,6 +1150,18 @@ class CameraSnapshotPlugin:
         self._recording_stop = None
         self._recording_thread = None
         self._recording_path = None
+
+    @staticmethod
+    def _derive_channel_dir(native_dir: Path) -> str:
+        """Map persistent media mount to the channel-visible mount."""
+        import os
+        override = os.environ.get("PHANTHY_CHANNEL_OUTPUT_DIR")
+        if override:
+            return str(Path(override))
+        try:
+            return str(Path("/work/resource") / native_dir.relative_to(Path("/opt/phanthy-motus/data")))
+        except ValueError:
+            return str(native_dir)
 
     @staticmethod
     def _file_stem(args: dict) -> str | None:
@@ -1190,6 +1201,7 @@ class CameraSnapshotPlugin:
                         "description": "操作类型",
                     },
                     "name": {"type": "string", "description": "文件名（不含 .jpg 或 .mp4）"},
+                    "type": {"type": "string", "enum": ["image", "video"], "description": "删除类型；image 删除 .jpg，video 删除 .mp4"},
                     "duration": {"type": "number", "description": "视频时长（秒），默认使用 max_video_seconds，最大 300"},
                 },
                 "required": ["action"],
@@ -1200,7 +1212,7 @@ class CameraSnapshotPlugin:
                     "start_recording": {"params": ["name"], "description": "开始持续录制；name 可选，不填则使用默认时间戳文件名"},
                     "stop_recording": {"params": [], "description": "结束当前持续录制并保存视频"},
                     "list": {"params": [], "description": "查询已保存的照片和视频"},
-                    "delete": {"params": ["name"], "description": "删除指定名称的照片或视频"},
+                    "delete": {"params": ["name", "type"], "description": "删除指定名称的照片或视频；同名文件同时存在时必须指定 type"},
                     "info": {"params": [], "description": "查看相机和录制状态"},
                     "start": {"params": [], "description": "启动相机订阅"},
                     "stop": {"params": [], "description": "停止相机订阅"},
@@ -1247,7 +1259,11 @@ class CameraSnapshotPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
-            return {"state": "running"}
+            try:
+                self.start()
+            except Exception as e:
+                return {"error": str(e), "state": "error"}
+            return {"state": "ready"}
         if action == "stop":
             self.stop()
             return {"state": "idle"}
@@ -1275,9 +1291,16 @@ class CameraSnapshotPlugin:
                 return {"error": "name is required"}
             if not self._native_dir.exists():
                 return {"error": f"file not found: {stem}"}
-            matches = [p for p in self._native_dir.iterdir() if p.is_file() and p.stem == stem and p.suffix.lower() in (".jpg", ".mp4")]
+            media_type = args.get("type")
+            suffixes = {"image": ".jpg", "video": ".mp4"}
+            if media_type is not None and media_type not in suffixes:
+                return {"error": "type must be 'image' or 'video'"}
+            allowed_suffixes = (suffixes[media_type],) if media_type else (".jpg", ".mp4")
+            matches = [p for p in self._native_dir.iterdir() if p.is_file() and p.stem == stem and p.suffix.lower() in allowed_suffixes]
             if not matches:
                 return {"error": f"file not found: {stem}"}
+            if media_type is None and len(matches) > 1:
+                return {"error": f"multiple media files found for {stem}; specify type as image or video"}
             for path in matches:
                 path.unlink()
             return {"state": "deleted", "filename": [p.name for p in matches]}

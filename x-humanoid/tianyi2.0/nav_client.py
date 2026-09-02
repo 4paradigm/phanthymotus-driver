@@ -331,10 +331,6 @@ class SlamtecClient:
 
     # ── System ────────────────────────────────────────────────────────────────
 
-    def get_power_status(self) -> dict:
-        """获取底盘电源状态"""
-        return self._get("/api/core/system/v1/power/status")
-
     def get_robot_health(self) -> dict:
         """获取底盘健康状态"""
         return self._get("/api/core/system/v1/robot/health")

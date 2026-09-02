@@ -7,12 +7,15 @@ exposes the capabilities as MCP tools.
 ## Head camera snapshot card
 
 The `camera_snapshot` card subscribes to `/ob_camera_head/color/image_raw` and
-provides `action: capture`. Each capture saves a JPEG under
-`/opt/phanthy-motus/data/images` and returns `channel_reply_path`, for example
-`/work/resource/images/head_123456789.jpg`. Use that returned path with
-`channel_reply(files=[{"path": "..."}])` to send the image through Feishu or
-Telegram. The `/work/resource` path is the Agent Core container view of the
-same host directory and is required by the channel file whitelist.
+provides `capture`, `record_video`, `start_recording`, `stop_recording`,
+`list`, and `delete` actions. Each capture or recording is saved under
+`/opt/phanthy-motus/data/images` and returns a channel-visible path. The
+driver derives the corresponding `/work/resource/...` path from the persistent
+mount (or uses `PHANTHY_CHANNEL_OUTPUT_DIR` when a deployment uses another
+mount). Use that returned path with `channel_reply(files=[{"path": "..."}])`
+to send media through Feishu or Telegram. To delete media, pass
+`type: "image"` for `.jpg` or `type: "video"` for `.mp4`; omitting `type`
+returns an error when both files share the same name.
 
 ## Raw arm joint card
 
