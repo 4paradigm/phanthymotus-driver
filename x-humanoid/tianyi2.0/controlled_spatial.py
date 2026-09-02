@@ -380,6 +380,8 @@ class ControlledSpatialPlugin:
         }
 
     def start(self) -> None:
+        if self._poll_running:
+            return
         self._poll_running = True
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()

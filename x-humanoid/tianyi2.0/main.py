@@ -527,7 +527,7 @@ class TianyiDeviceBundle:
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
     _ALWAYS_START = {
         'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
-        'ExtMicPlugin', 'CameraSnapshotPlugin',
+        'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
     }
 
     def start_all(self) -> None:
