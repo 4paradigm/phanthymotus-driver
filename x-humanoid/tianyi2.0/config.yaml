@@ -7,6 +7,14 @@ name: "Tianyi 2.0 Pro"
 joints_bridge:
   enabled: true
 
+# Make power-on self-check automatic on the robot's x86 motion-control board.
+auto_self_check:
+  enabled: true
+  ssh_host: "192.168.41.1"
+  ssh_user: "ubuntu"
+  ssh_password: "123"
+  timeout: 15
+
 slamtec:
   base_url: "http://192.168.11.1:1448"
 
@@ -15,6 +23,15 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  camera_snapshot:
+    enabled: true
+    output_dir: "/opt/phanthy-motus/data/images"
+    # The channel-visible path is derived from the persistent mount. Set
+    # PHANTHY_CHANNEL_OUTPUT_DIR only when deployment uses another mount.
+    jpeg_quality: 90
+    video_fps: 20
+    default_video_seconds: 5
+    max_video_seconds: 60
   imu:
     enabled: true
   camera_depth:

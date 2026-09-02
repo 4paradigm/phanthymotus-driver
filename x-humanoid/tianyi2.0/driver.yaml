@@ -49,3 +49,4 @@ cards:
   - { name: chassis_raw,        type: actuator }
   - { name: ext_mic,            type: sensor }
   - { name: light,              type: actuator }
+  - { name: vision_capture,     type: actuator }

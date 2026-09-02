@@ -28,6 +28,7 @@ except ImportError as _e:  # running outside the container image
 
 
 import json
+import base64
 import os
 import queue as _queue
 import re
@@ -96,6 +97,72 @@ def _ensure_lyre_audio_mode():
         time.sleep(3)
     except Exception as e:
         print(f"[lyre] WARNING: could not switch to {target} mode: {e}")
+
+
+_AUTO_SELF_CHECK_SCRIPT = r'''import json
+import os
+import shutil
+import tempfile
+
+path = "/home/ubuntu/ros2ws/install/proc_manager/share/proc_manager/param/proc_manager_ty2.0_pro.json"
+desired_start_proc = ["body_control"]
+desired_action = [{"power_light": "SYSTEM_SERVICE_START"}, {"robot_status": "Initing"}]
+
+with open(path, encoding="utf-8") as stream:
+    data = json.load(stream)
+trigger = next((item for item in data.get("trigger", [])
+               if item.get("type") == "OnNodeState"
+               and item.get("topic") == "power_board_state"), None)
+if trigger is None:
+    raise RuntimeError("OnNodeState trigger for power_board_state was not found")
+if trigger.get("start_proc") == desired_start_proc and trigger.get("action") == desired_action:
+    print("already-configured")
+    raise SystemExit(0)
+
+backup = path + ".bak-auto-self-check"
+if not os.path.exists(backup):
+    shutil.copy2(path, backup)
+trigger["start_proc"] = desired_start_proc
+trigger["action"] = desired_action
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp-", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+print("updated")
+'''
+
+
+def _ensure_remote_auto_self_check(cfg: dict) -> None:
+    """Ensure the x86 proc_manager trigger starts body_control automatically."""
+    settings = cfg.get("auto_self_check", {})
+    if not settings.get("enabled", True):
+        print("[auto-self-check] disabled")
+        return
+    host = settings.get("ssh_host", "192.168.41.1")
+    user = settings.get("ssh_user", "ubuntu")
+    password = settings.get("ssh_password", "")
+    encoded = base64.b64encode(_AUTO_SELF_CHECK_SCRIPT.encode()).decode("ascii")
+    command = f"python3 -c \"import base64; exec(base64.b64decode('{encoded}'))\""
+    try:
+        result = subprocess.run(
+            ["sshpass", "-p", password, "ssh", "-o", "StrictHostKeyChecking=no",
+             "-o", "ConnectTimeout=3", f"{user}@{host}", command],
+            capture_output=True, text=True, timeout=int(settings.get("timeout", 15)))
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(detail or f"ssh exited with status {result.returncode}")
+        status = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "completed"
+        print(f"[auto-self-check] {host}: {status}")
+    except Exception as exc:
+        print(f"[auto-self-check] WARNING: {host}: {exc}")
 
 
 def _probe_remote_mics(cfg: dict) -> list[dict]:
@@ -313,6 +380,12 @@ class TianyiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
+            from device import CameraSnapshotPlugin
+            self._plugins.append(CameraSnapshotPlugin(
+                plugins_cfg["camera_snapshot"], namespace, ros2))
+            print("[bundle] CameraSnapshotPlugin loaded")
+
         for config_name, class_name in (("imu", "ImuPlugin"),
                                         ("camera_depth", "DepthCameraPlugin"),
                                         ("camera_pointcloud", "PointCloudPlugin")):
@@ -452,7 +525,10 @@ class TianyiDeviceBundle:
             print("[bundle] LightPlugin loaded")
 
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
-    _ALWAYS_START = {'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin', 'ExtMicPlugin'}
+    _ALWAYS_START = {
+        'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
+        'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
+    }
 
     def start_all(self) -> None:
         self._started_plugins: set = set()
@@ -709,6 +785,9 @@ def main():
     mcp_port  = int(cfg.get("mcp_port", 15707))
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
+
+    # Repair the x86 proc_manager trigger before ROS plugins start publishing.
+    _ensure_remote_auto_self_check(cfg)
 
     # Slamtec HTTP client
     slamtec_url = os.environ.get("SLAMTEC_URL", cfg.get("slamtec", {}).get("base_url", "http://192.168.11.1:1448"))
