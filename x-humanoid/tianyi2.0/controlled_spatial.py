@@ -670,6 +670,12 @@ class ControlledSpatialPlugin:
         return None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        # Agent Core 在 start 前会自动下发一次 action:config（卡片里存过配置时），
+        # 少了这个分支就会 return None，被 main.py 翻译成 "Unknown tool"。
+        if action == "config":
+            if "password" in args:
+                self._password = str(args["password"])
+            return {"status": "configured"}
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -685,7 +691,9 @@ class ControlledSpatialPlugin:
 
         # ── Mapping ────────────────────────────────────────────────────────
 
-        elif action == "start_mapping":
+        # 独立的 if（不是 elif）：上面的密码块只在校验失败时 return，
+        # 挂成 elif 会让所有通过校验的受保护操作直接跳过整条分支链。
+        if action == "start_mapping":
             map_name = args.get("map_name", "")
             if not map_name:
                 return {"error": "map_name is required"}
