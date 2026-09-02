@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-drivers/pnpbotics/adam/main.py — PNPbotics Adam MCP HTTP server.
+drivers/pndbotics/adam/main.py — PNDbotics Adam MCP HTTP server.
 
 Reads config.yaml, initializes DDS + gRPC + ROS2, loads plugins, and exposes
 them as MCP tools via HTTP JSON-RPC 2.0.
@@ -205,31 +205,56 @@ def main():
         else:
             ChannelFactoryInitialize(dds_domain_id)
         print(f"[adam] DDS initialized (domain={dds_domain_id}, iface={network_iface or 'auto'})")
-    except ImportError:
-        print("[adam] WARNING: pndbotics_sdk_py not found, DDS features disabled")
-    except Exception as e:
-        print(f"[adam] WARNING: DDS init failed: {e}")
+    except Exception as exc:
+        print(f"[adam] WARNING: DDS init unavailable, DDS features disabled: {exc}")
 
-    # Pre-create DDS subscribers before rclpy.init() to avoid CycloneDDS/FastDDS conflict
+    # Pre-create DDS channels before rclpy.init() to avoid CycloneDDS/FastDDS
+    # participant conflicts. One shared rt/handstate reader feeds the hand
+    # card's get_state action and its partial-command logic.
     dds_lowstate_sub = None
     dds_handstate_sub = None
     dds_hand_pub = None
-    dds_hand_sub = None
+    plugins_cfg = cfg.get("plugins", {})
+    need_lowstate = plugins_cfg.get("state", {}).get("enabled", True)
+    need_handstate = plugins_cfg.get("hand", {}).get("enabled", True)
+    need_hand_pub = plugins_cfg.get("hand", {}).get("enabled", True)
     try:
         from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher
         from pndbotics_sdk_py.idl.pnd_adam.msg.dds_ import LowState_, HandState_, HandCmd_
 
-        dds_lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
-        dds_lowstate_sub.Init()
-        dds_handstate_sub = ChannelSubscriber("rt/handstate", HandState_)
-        dds_handstate_sub.Init()
-        dds_hand_pub = ChannelPublisher("rt/handcmd", HandCmd_)
-        dds_hand_pub.Init()
-        dds_hand_sub = ChannelSubscriber("rt/handstate", HandState_)
-        dds_hand_sub.Init()
-        print("[adam] DDS subscribers/publishers created")
-    except Exception as e:
-        print(f"[adam] WARNING: DDS channels failed: {e}")
+        def _init_channel(label, factory):
+            channel = None
+            try:
+                channel = factory()
+                channel.Init()
+                print(f"[adam] DDS channel ready: {label}")
+                return channel
+            except Exception as exc:
+                if channel is not None:
+                    try:
+                        channel.Close()
+                    except Exception:
+                        pass
+                print(f"[adam] WARNING: DDS channel unavailable ({label}): {exc}")
+                return None
+
+        if need_lowstate:
+            dds_lowstate_sub = _init_channel(
+                "rt/lowstate reader",
+                lambda: ChannelSubscriber("rt/lowstate", LowState_),
+            )
+        if need_handstate:
+            dds_handstate_sub = _init_channel(
+                "rt/handstate reader",
+                lambda: ChannelSubscriber("rt/handstate", HandState_),
+            )
+        if need_hand_pub:
+            dds_hand_pub = _init_channel(
+                "rt/handcmd writer",
+                lambda: ChannelPublisher("rt/handcmd", HandCmd_),
+            )
+    except Exception as exc:
+        print(f"[adam] WARNING: DDS channel setup failed: {exc}")
 
     # gRPC client
     grpc_host = os.environ.get("GRPC_HOST", cfg.get("grpc_host", "localhost"))
@@ -239,12 +264,28 @@ def main():
     grpc_client.connect()
     print(f"[adam] gRPC client → {grpc_host}:{grpc_port}")
 
-    # ROS2 — init after DDS to avoid CycloneDDS participant conflict
-    import rclpy
-    import rclpy.executors
-    rclpy.init()
-    executor = rclpy.executors.MultiThreadedExecutor()
-    print("[adam] ROS2 initialized")
+    # ROS2 — init after DDS to avoid CycloneDDS participant conflict.
+    # The MCP server can still expose DDS-only cards when ROS2 is unavailable.
+    rclpy = None
+    executor = None
+    ros2_enabled = False
+    _rclpy = None
+    try:
+        import rclpy as _rclpy
+        import rclpy.executors
+        _rclpy.init()
+        rclpy = _rclpy
+        executor = rclpy.executors.MultiThreadedExecutor()
+        ros2_enabled = True
+        print("[adam] ROS2 initialized")
+    except Exception as exc:
+        print(f"[adam] WARNING: ROS2 unavailable; ROS2 cards disabled: {exc}")
+        if _rclpy is not None:
+            try:
+                _rclpy.shutdown()
+            except Exception:
+                pass
+        rclpy = None
 
     # Load plugins (pass pre-created DDS channels)
     from device import AdamDeviceBundle
@@ -252,20 +293,22 @@ def main():
                                dds_lowstate_sub=dds_lowstate_sub,
                                dds_handstate_sub=dds_handstate_sub,
                                dds_hand_pub=dds_hand_pub,
-                               dds_hand_sub=dds_hand_sub)
+                               ros2_enabled=ros2_enabled)
     _bundle.start_all()
     print(f"[adam] Bundle loaded ({len(_bundle.get_all_tools())} tools)")
 
     # ROS2 spin thread
-    def _spin():
-        while rclpy.ok():
-            executor.spin_once(timeout_sec=0.1)
+    spin_thread = None
+    if ros2_enabled:
+        def _spin():
+            while rclpy.ok():
+                executor.spin_once(timeout_sec=0.1)
 
-    spin_thread = threading.Thread(target=_spin, daemon=True, name="ros2_spin")
-    spin_thread.start()
+        spin_thread = threading.Thread(target=_spin, daemon=True, name="ros2_spin")
+        spin_thread.start()
 
     # Register with Agent Core
-    driver_name = cfg.get("name", "PNPbotics Adam")
+    driver_name = cfg.get("name", "PNDbotics Adam")
     _start_registration(mcp_port, driver_name, "driver")
 
     # MCP HTTP server
@@ -284,10 +327,26 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _bundle.stop_all()
+        _bundle.close_all()
+        for label, channel in (
+            ("rt/lowstate reader", dds_lowstate_sub),
+            ("rt/handcmd writer", dds_hand_pub),
+        ):
+            if channel is not None:
+                try:
+                    channel.Close()
+                except Exception as exc:
+                    print(f"[adam] WARNING: DDS channel close failed ({label}): {exc}", flush=True)
         grpc_client.close()
-        executor.shutdown()
-        rclpy.shutdown()
+        if executor is not None:
+            executor.shutdown()
+        if rclpy is not None:
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
+        if spin_thread is not None:
+            spin_thread.join(1.0)
 
 
 if __name__ == "__main__":

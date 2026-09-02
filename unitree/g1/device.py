@@ -19,6 +19,7 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
 """
 
 import json
+import math
 import queue
 import socket
 import struct
@@ -34,6 +35,7 @@ from audio_msgs.msg import AudioChunk
 
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from pointcloud_utils import gravity_align_inplace
+import sport_mode_state as _SMS
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 
@@ -307,8 +309,31 @@ APP_NAME = "g1_speaker"
 
 
 class _SpeakerNode(Node):
-    PREFILL = 3       # buffer 3 chunks (~300ms) before starting playback
+    # Prefill is counted in bytes, not chunks: the upstream chunk size is the
+    # TTS's choice (perception sends 3200B/100ms, README.md allows down to
+    # 1024B), so "3 chunks ≈ 300ms" silently became 96ms on a conforming
+    # producer — starting the drain already starved of the 300ms block it is
+    # about to try to assemble.
+    PREFILL_BYTES = 9600  # ~300ms @ 16k/16bit/mono before playback starts
     MERGE_BYTES = 9600  # merge into ~300ms blocks before calling PlayStream
+    EMPTY_POLL_S = 0.1  # _buf.get timeout — one unit of "idle"
+    # Idle tolerance. Only EXIT_AFTER_IDLE moved: it used to be 3 (300ms), so a
+    # stall of one text chunk's synthesis on the TTS side tore the drain thread
+    # down, and restarting it cost another PREFILL_BYTES on top of the stall.
+    # That is why a gap upstream was always audibly *longer* on the robot than
+    # the stall that caused it. FLUSH_AFTER_IDLE stays short on purpose: when
+    # the stream goes quiet mid-utterance the MCU holds at most MAX_LEAD_S, so
+    # pushing the partial block out early is what shortens the silence.
+    FLUSH_AFTER_IDLE = 2  # 200ms with no data → push out the partial block
+    EXIT_AFTER_IDLE = 15  # 1.5s with nothing at all → drain thread may exit
+    # How far ahead of the audio timeline PlayStream may run. The old code did
+    # `duration - elapsed - 0.08` per block with no cumulative deadline, so it
+    # ran 220ms of wall clock per 300ms of audio — a permanent, compounding
+    # +80ms/block overrun of the MCU's queue.
+    MAX_LEAD_S = 0.24
+
+    # Sentinel meaning "utterance finished, flush what you have now".
+    _END_OF_UTTERANCE = object()
 
     def __init__(self, audio_client: AudioClient):
         super().__init__("g1_speaker")
@@ -318,6 +343,7 @@ class _SpeakerNode(Node):
         self._idx    = 0
         self.state   = "idle"
         self._buf = queue.Queue()
+        self._pending_bytes = 0  # bytes buffered while no drain thread is running
         self._draining = threading.Event()
         self._drain_thread: threading.Thread | None = None
         self._last_chunk_time = 0.0
@@ -371,6 +397,7 @@ class _SpeakerNode(Node):
                 self._buf.get_nowait()
             except queue.Empty:
                 break
+        self._pending_bytes = 0
         try:
             self._client.PlayStop(APP_NAME)
         except Exception as e:
@@ -388,6 +415,7 @@ class _SpeakerNode(Node):
                     self._buf.get_nowait()
                 except queue.Empty:
                     break
+            self._pending_bytes = 0
             # 停止 SDK 播放
             try:
                 self._client.PlayStop(APP_NAME)
@@ -446,6 +474,14 @@ class _SpeakerNode(Node):
             if self._muted:
                 self._muted = False
                 self.get_logger().info("[speaker] unmuted — received EOF marker")
+                return
+            # EOF 是明确的「本句结束」信号。用它立刻冲出残块，就不必靠空等超时
+            # 来发现句尾 —— 否则放宽 FLUSH_AFTER_IDLE 会给每句尾都加上几百 ms。
+            self._last_chunk_time = now
+            if self._draining.is_set():
+                self._buf.put(self._END_OF_UTTERANCE)
+            elif not self._buf.empty() and self.state == "playing":
+                self._start_drain()
             return  # EOF 不入 buffer、不播放
 
         # Muted 状态：interrupt 后丢弃来自旧 utterance 的 chunks
@@ -454,11 +490,18 @@ class _SpeakerNode(Node):
             return  # 丢弃，等 EOF 到达
 
         self._buf.put(pcm)
+        # 只统计「等待 drain 启动」期间攒下的字节。drain 运行时这些 chunk 是被
+        # 消耗掉的，计入就会让计数器一路涨到整句大小 —— 等 drain 因
+        # EXIT_AFTER_IDLE 自行退出后，下一句的第一个 chunk 就满足了 prefill。
+        # 旧代码读 _buf.qsize() 时天然没有这个问题，因为那是个派生量。
+        if not self._draining.is_set():
+            self._pending_bytes += len(pcm)
         self._last_chunk_time = now
         # 更新状态：收到 chunk 时如果是 ready，变为 playing
         if self.state == "ready":
             self.state = "playing"
-        if not self._draining.is_set() and self.state == "playing" and self._buf.qsize() >= self.PREFILL:
+        if (not self._draining.is_set() and self.state == "playing"
+                and self._pending_bytes >= self.PREFILL_BYTES):
             self._start_drain()
         elif not self._draining.is_set() and self.state == "playing" and self._flush_timer is None:
             # start a flush timer — if no more chunks arrive, drain what we have
@@ -469,6 +512,7 @@ class _SpeakerNode(Node):
             self._flush_timer.cancel()
             self.destroy_timer(self._flush_timer)
             self._flush_timer = None
+        self._pending_bytes = 0
         self._draining.set()
         self._drain_thread = threading.Thread(target=self._drain, daemon=True)
         self._drain_thread.start()
@@ -487,7 +531,9 @@ class _SpeakerNode(Node):
     def _drain(self) -> None:
         play_idx = 0
         merged = b''
-        empty_count = 0
+        idle = 0
+        max_idle = 0
+        deadline = None
         while self._draining.is_set():
             # 检查 interrupt
             if self._interrupt_flag.is_set():
@@ -497,35 +543,51 @@ class _SpeakerNode(Node):
                 continue  # 还在 paused，循环检查 interrupt
 
             try:
-                pcm = self._buf.get(timeout=0.1)
-                merged += pcm
-                empty_count = 0
+                item = self._buf.get(timeout=self.EMPTY_POLL_S)
+                idle = 0
             except queue.Empty:
-                empty_count += 1
-                if merged and empty_count >= 2:
+                idle += 1
+                max_idle = max(max_idle, idle)
+                if merged and idle >= self.FLUSH_AFTER_IDLE:
                     play_idx += 1
-                    self._play_merged(merged, play_idx)
+                    deadline = self._play_merged(merged, play_idx, deadline)
                     merged = b''
-                elif not merged and empty_count >= 3:
+                elif not merged and idle >= self.EXIT_AFTER_IDLE:
                     break
                 continue
+            if item is self._END_OF_UTTERANCE:
+                # 句尾：立刻把残块播完，但不退出线程 —— 下一句马上就来，
+                # 重建线程要重新攒满 PREFILL_BYTES，那就是可听的空洞。
+                if merged:
+                    play_idx += 1
+                    deadline = self._play_merged(merged, play_idx, deadline)
+                    merged = b''
+                continue
+            merged += item
             if len(merged) >= self.MERGE_BYTES:
                 play_idx += 1
-                self._play_merged(merged, play_idx)
+                deadline = self._play_merged(merged, play_idx, deadline)
                 merged = b''
         if merged and not self._interrupt_flag.is_set():
             play_idx += 1
-            self._play_merged(merged, play_idx)
+            self._play_merged(merged, play_idx, deadline)
         self._draining.clear()
+        # 清掉 drain 运行期间可能漏进来的计数（_on_chunk 的检查与这里存在竞态），
+        # 保证下一句必须重新攒满 PREFILL_BYTES 才启动。
+        self._pending_bytes = 0
         # 播放完毕，回到 ready（如果没有被 interrupt/stop）
         if self.state == "playing":
             self.state = "ready"
-        self.get_logger().info("[speaker] drain finished")
+        self.get_logger().info(
+            f"[speaker] drain finished: blocks={play_idx} "
+            f"max_idle={max_idle * self.EMPTY_POLL_S:.1f}s"
+        )
 
-    def _play_merged(self, pcm: bytes, idx: int) -> None:
+    def _play_merged(self, pcm: bytes, idx: int, deadline: float | None) -> float | None:
+        """Send one block; return the wall-clock deadline for the next one."""
         # 播放前再次检查 interrupt
         if self._interrupt_flag.is_set():
-            return
+            return deadline
         duration = len(pcm) / 32000
         t0 = time.monotonic()
         try:
@@ -534,10 +596,22 @@ class _SpeakerNode(Node):
                 self.get_logger().error(f"[speaker] PlayStream error code={code}, data={data}")
         except Exception as e:
             self.get_logger().error(f"[speaker] PlayStream error: {e}")
-        elapsed = time.monotonic() - t0
-        remaining = duration - elapsed - 0.08
-        if remaining > 0 and not self._interrupt_flag.is_set():
-            time.sleep(remaining)
+        now = time.monotonic()
+        # Cumulative deadline rather than a per-block `- 0.08`: the old form had
+        # no way to give back the lead it took, so it drifted 80ms further ahead
+        # of the MCU on every block. Here the lead is bounded by MAX_LEAD_S no
+        # matter how long the utterance runs.
+        if deadline is None:
+            deadline = t0
+        deadline += duration
+        if deadline < now:
+            # PlayStream itself is the bottleneck — stop accruing a debt we
+            # cannot pay off and re-anchor on the current time.
+            deadline = now
+        wake = deadline - self.MAX_LEAD_S
+        if wake > now and not self._interrupt_flag.is_set():
+            time.sleep(wake - now)
+        return deadline
 
 
 class SpeakerPlugin:
@@ -581,16 +655,24 @@ class SpeakerPlugin:
         try:
             pcm = pcm_path.read_bytes()
             block_size = 9600  # ~300ms per block
+            deadline = None
             for offset in range(0, len(pcm), block_size):
                 block = pcm[offset:offset + block_size]
+                t0 = time.monotonic()
                 code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
                 if code != 0:
                     self._node.get_logger().warn(f"[speaker] startup sound stopped at offset {offset}: code={code}")
                     return
-                duration = len(block) / 32000
-                remaining = duration - 0.08
-                if remaining > 0:
-                    time.sleep(remaining)
+                # Same bounded cumulative deadline as _SpeakerNode._play_merged.
+                # This loop did not even subtract the PlayStream call's own cost,
+                # so it ran further ahead of the MCU than the streaming path.
+                now = time.monotonic()
+                deadline = (t0 if deadline is None else deadline) + len(block) / 32000
+                if deadline < now:
+                    deadline = now
+                wake = deadline - _SpeakerNode.MAX_LEAD_S
+                if wake > now:
+                    time.sleep(wake - now)
             self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
         except Exception as e:
             self._node.get_logger().warn(f"[speaker] startup sound error: {e}")
@@ -683,16 +765,22 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
         try:
             pcm = pcm_path.read_bytes()
             block_size = 9600
+            deadline = None
             for off in range(0, len(pcm), block_size):
                 block = pcm[off:off + block_size]
+                t0 = time.monotonic()
                 code, _ = audio_client.PlayStream(APP_NAME, "0", block)
                 if code != 0:
                     print(f"[Speaker:subprocess] startup sound stopped at offset {off}: code={code}", flush=True)
                     return
-                duration = len(block) / 32000
-                remaining = duration - 0.08
-                if remaining > 0:
-                    time.sleep(remaining)
+                # Bounded cumulative deadline, as in _SpeakerNode._play_merged.
+                now = time.monotonic()
+                deadline = (t0 if deadline is None else deadline) + len(block) / 32000
+                if deadline < now:
+                    deadline = now
+                wake = deadline - _SpeakerNode.MAX_LEAD_S
+                if wake > now:
+                    time.sleep(wake - now)
             print(f"[Speaker:subprocess] startup sound OK ({len(pcm)} bytes)", flush=True)
         except Exception as e:
             print(f"[Speaker:subprocess] startup sound error: {e}", flush=True)
@@ -1109,7 +1197,13 @@ class LedPlugin:
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
 
 class _LocoStateNode(Node):
-    """Subscribes to DDS odommodestate + sportmodestate and republishes as JSON to ROS2."""
+    """Subscribes to DDS odommodestate + sportmodestate and republishes as JSON to ROS2.
+
+    The two topics carry *different* IDL types on G1: rt/odommodestate uses the
+    unitree_go SportModeState_ layout (odometry/IMU), while rt/sportmodestate uses
+    the much smaller unitree_hg SportModeState_ (fsm_id/fsm_mode/task_id/task_time).
+    Subscribing to the latter with the go type silently never matches.
+    """
 
     _ODOM_INTERVAL = 0.1  # 10 Hz throttle
 
@@ -1118,6 +1212,7 @@ class _LocoStateNode(Node):
         self._odom_pub   = self.create_publisher(String, odom_topic,   _LOW_LAT_QOS)
         self._motion_pub = self.create_publisher(String, motion_topic, _LOW_LAT_QOS)
         self._last_state: dict = {}
+        self._last_fsm: dict = {}
         self._lock       = threading.Lock()
         self._last_odom_time: float = 0.0
 
@@ -1132,8 +1227,8 @@ class _LocoStateNode(Node):
 
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
-            from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
-            sport_sub = ChannelSubscriber("rt/sportmodestate", SportModeState_)
+            from sport_mode_state import SportModeState_ as HgSportModeState_
+            sport_sub = ChannelSubscriber("rt/sportmodestate", HgSportModeState_)
             sport_sub.Init(self._on_motion, 10)
             self.get_logger().info(f"LocoStateNode subscribed rt/sportmodestate → {motion_topic}")
         except Exception as e:
@@ -1171,7 +1266,19 @@ class _LocoStateNode(Node):
         self._odom_pub.publish(out)
 
     def _on_motion(self, msg) -> None:
-        state = self._format_state(msg)
+        state = {
+            "fsm_id":     int(msg.fsm_id),
+            "fsm_mode":   int(msg.fsm_mode),
+            "task_id":    int(msg.task_id),
+            "task_time":  float(msg.task_time),
+            "mode":       _SMS.fsm_name(int(msg.fsm_id)),
+            "balanced":   bool(_SMS.FSM_MODES.get(int(msg.fsm_id), {}).get("balanced", False)),
+            # fsm_mode 0=静态 (switching allowed), 1=动态 (most switches refused).
+            "switchable": int(msg.fsm_mode) == 0,
+            "ts":         time.time(),
+        }
+        with self._lock:
+            self._last_fsm = state
         out = String()
         out.data = json.dumps(state)
         self._motion_pub.publish(out)
@@ -1179,6 +1286,11 @@ class _LocoStateNode(Node):
     def get_last_state(self) -> dict:
         with self._lock:
             return dict(self._last_state)
+
+    def get_fsm(self) -> dict:
+        """Latest rt/sportmodestate snapshot, or {} if the topic has not been seen."""
+        with self._lock:
+            return dict(self._last_fsm)
 
 
 class LocoStatePlugin:
@@ -1208,10 +1320,18 @@ class LocoStatePlugin:
             "name": "loco_motion_state",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"G1 sport mode state (only active when standing/walking) — same fields as loco_state but from motion controller. Publishes to {self._motion_topic}",
+            "description": (
+                "G1 FSM state from rt/sportmodestate — fsm_id (运控模式), fsm_mode "
+                "(0=静态/可切换, 1=动态/拒绝切换), switchable, balanced, task_id/task_time. "
+                f"This is the authoritative mode feed. Publishes to {self._motion_topic}"
+            ),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._motion_topic, "format": "data/json"}],
         }
+
+    @property
+    def node(self):
+        return self._node
 
     def start(self) -> None:
         pass  # DDS subscription starts in __init__
@@ -1268,12 +1388,18 @@ def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loc
 class LocoPlugin:
     PREFIX = "loco"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client, slam_client=None, smart_motion=None):
+    def __init__(self, plugin_config: dict, namespace: str, executor, loco_client, slam_client=None,
+                 smart_motion=None, state_node=None, posture_node=None):
         self._client = loco_client
         self._slam_client = slam_client
         self._smart_motion = smart_motion
         self._namespace = namespace
         self._move_timer: threading.Timer | None = None
+        # _LocoStateNode — authoritative fsm_id/fsm_mode from rt/sportmodestate.
+        self._state_node = state_node
+        # _LowStateNode — joint-derived posture, needed to tell lying from squatting
+        # once the robot is limp (FSM 0/1), where the mode carries no pose info.
+        self._posture_node = posture_node
 
     def get_tools(self) -> list:
         tools = [self._loco_tool(), self._switch_mode_tool(), self._switch_mode_expert_tool()]
@@ -1334,11 +1460,58 @@ class LocoPlugin:
             },
         }
 
-    # ── FSM state groups for safety checks ──────────────────────────────────────
-    _GROUND_STATES = {0, 1}            # zero_torque, damp — ground/damped state
-    _LOW_STATES = {2, 702}             # squat, prep — stable low stance
-    _STANDING_STATES = {500, 501, 801} # normal_loco, 3dof_waist, run — active balance
-    _UNSAFE_STATES = {3, 706}          # sit, balance_stand — not directly switchable
+    # ── FSM state groups ────────────────────────────────────────────────────────
+    # Official ID table: 专家接口 § 模式ID说明 at
+    # https://support.unitree.com/home/zh/G1_developer/sport_services_interface
+    #
+    #   0 零力矩 / 1 阻尼 / 2 位控下蹲 / 3 位控落座 / 4 锁定站立  → NO balance control
+    #   702 躺起 / 706 平衡下蹲、蹲起 / 500 常规运控 / 501 常规运控-3Dof-waist
+    #   801 走跑运控 (renumbered to 802 on 29-DoF from ai_sport 8.6.x.x)
+    #
+    # Two separate ways down from 主运控, and they are NOT interchangeable:
+    #   * 706 平衡下蹲、蹲起 — balanced squat (遥控器 L2+A 蹲站切换). Getting back up
+    #     goes through 阻尼: 遥控说明 § 模式切换 note 1 says L2+A from 蹲姿 requires
+    #     L2+B first, and 蹲姿开机流程 is likewise ① 阻尼 → ⑥ 蹲站切换. So the damp
+    #     hop is part of the documented path, not a failure.
+    #   * 2/3/4 位控下蹲/落座/锁定站立 — position modes with no balance control.
+    #     锁定站立 (L2+UP) then R1+X is the *unbalanced* way to stand and is not
+    #     used here; 躺卧站立 (⑤) and 蹲站切换 (⑥) are the balanced ones.
+    _LOCO_STATES     = _SMS.LOCO_STATES       # 500/501/801/802 — upright, balanced
+    _LIMP_STATES     = _SMS.LIMP_STATES       # 0/1 — limp, posture is ambiguous
+    _POSITION_STATES = {2, 3, 4}              # 位控下蹲/落座/锁定站立 — no balance
+    _BALANCED_SQUAT  = _SMS.BALANCED_SQUAT    # 706
+    _LIE_TO_STAND    = _SMS.LIE_TO_STAND      # 702
+
+    # Physical transitions are slow; the old 15s budget expired mid-motion and the
+    # abort then reported failure while the robot was still moving.
+    _SQUAT_TIMEOUT = 25.0
+    _STAND_TIMEOUT = 45.0
+
+    def _read_fsm(self) -> tuple[int, int | None, str]:
+        """Return (fsm_id, fsm_mode, source).
+
+        Prefers the rt/sportmodestate feed, which also carries fsm_mode (0=静态,
+        switching allowed / 1=动态, most switches refused). Falls back to the
+        GetFsmId RPC when the topic has not been seen, in which case fsm_mode is
+        None and the caller cannot check switchability.
+        """
+        if self._state_node is not None:
+            fsm = self._state_node.get_fsm()
+            # Stale guard: the feed is ~high rate, anything older than a second
+            # means the subscription died and we should not trust it.
+            if fsm and (time.time() - fsm.get("ts", 0)) < 1.0:
+                return fsm["fsm_id"], fsm["fsm_mode"], "sportmodestate"
+        code, fsm_id = self._client.GetFsmId()
+        if code != 0:
+            return -1, None, "rpc_failed"
+        return fsm_id, None, "rpc"
+
+    def _posture(self) -> dict:
+        """Joint-derived posture, or {} when the lowstate node is not wired in."""
+        if self._posture_node is None:
+            return {}
+        return self._posture_node.get_posture()
+
 
     def _switch_mode_tool(self) -> dict:
         return {
@@ -1346,33 +1519,35 @@ class LocoPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": "G1 safe locomotion mode switch. "
-                           "lie2standup=安全起立(ground→主运控), "
-                           "standup2squat=站到蹲(standing→下蹲), squat2standup=蹲到站(下蹲→主运控), "
-                           "damp=阻尼(ground only), zero_torque=零力矩(ground only), "
-                           "emergency_stop=紧急阻尼(any state), get_current_mode=查询当前状态",
+                           "squat2standup=蹲到站(平衡蹲姿706→主运控), standup2squat=站到蹲(主运控→平衡蹲姿706), "
+                           "lie2standup=躺起(阻尼/零力矩→主运控), standup2lie=安全躺下(主运控→阻尼), "
+                           "emergency_stop=紧急阻尼(任何状态都接受), "
+                           "get_current_mode=查询当前模式+姿态. "
+                           "注意 蹲站切换(L2+A) 回主运控必须先经过阻尼(L2+B)，驱动已自动包含这一步；"
+                           "模式不等于姿态：阻尼下躺和蹲是同一个 fsm_id，"
+                           "所以蹲着用 squat2standup、躺着用 lie2standup，姿态请看 posture 工具。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["lie2standup", "standup2squat", "squat2standup",
-                                 "damp", "zero_torque", "emergency_stop", "get_current_mode"],
+                        "enum": ["lie2standup", "standup2lie", "standup2squat", "squat2standup",
+                                 "emergency_stop", "get_current_mode"],
                         "description": "Target mode",
                     },
                 },
                 "required": ["mode"],
                 "x-completion": {
-                    "actions": ["lie2standup", "standup2squat", "squat2standup"],
-                    "timeout": 90,
+                    "actions": ["lie2standup", "standup2lie", "standup2squat", "squat2standup"],
+                    "timeout": 150,
                 },
                 "x-action-params": {
-                    "lie2standup":     {"params": [], "description": "安全起立 (ground/squat → standing)"},
-                    "standup2squat":   {"params": [], "description": "站到蹲 (standing → squat)"},
-                    "squat2standup":   {"params": [], "description": "蹲到站 (squat → standing)"},
-                    "damp":            {"params": [], "description": "阻尼模式 (ground only)"},
-                    "zero_torque":     {"params": [], "description": "零力矩 (ground only)"},
-                    "emergency_stop":  {"params": [], "description": "紧急阻尼 (any state)"},
-                    "get_current_mode": {"params": [], "description": "查询当前状态"},
+                    "lie2standup":     {"params": [], "description": "躺起 (阻尼/零力矩 → 主运控)"},
+                    "standup2lie":     {"params": [], "description": "安全躺下 (主运控 → 平衡蹲姿 → 阻尼)"},
+                    "standup2squat":   {"params": [], "description": "站到蹲 (主运控 → 平衡蹲姿 706)"},
+                    "squat2standup":   {"params": [], "description": "蹲到站 (平衡蹲姿 706 → 主运控)"},
+                    "emergency_stop":  {"params": [], "description": "紧急阻尼 (任何状态)"},
+                    "get_current_mode": {"params": [], "description": "查询当前模式 + 姿态"},
                 },
             },
         }
@@ -1382,7 +1557,7 @@ class LocoPlugin:
             "name": "switch_mode_expert",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 locomotion mode switch — directly set FSM mode ID (EXPERT ONLY, bypasses safety checks, robot may fall!). IDs: 0=zero_torque, 1=damp, 2=squat, 3=sit, 4=lock_stand, 500=normal_loco, 501=3dof_waist, 702=lie_to_stand, 706=balance_squat, 801=run_loco",
+            "description": "G1 locomotion mode switch — directly set FSM mode ID (EXPERT ONLY, bypasses safety checks, robot may fall!). IDs: 0=零力矩, 1=阻尼, 2=位控下蹲, 3=位控落座, 4=锁定站立 (0-4 均无平衡控制), 702=躺起, 706=平衡下蹲/蹲起, 500=常规运控, 501=常规运控-3Dof-waist, 801/802=走跑运控",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1490,100 +1665,121 @@ class LocoPlugin:
                     pass
             ret = self._client.StopMove()
             return {"ret": ret}
-        elif action in ("switch_mode", "lie2standup", "standup2squat",
-                        "squat2standup", "damp", "zero_torque", "emergency_stop", "get_current_mode"):
+        elif action in ("switch_mode", "lie2standup", "standup2lie", "standup2squat",
+                        "squat2standup", "emergency_stop", "get_current_mode"):
             # x-action-params split: action is the mode directly
             # Legacy: action == "switch_mode" with mode in args
             mode = action if action != "switch_mode" else args.get("mode", "")
-            code, current_fsm = self._client.GetFsmId()
 
-            if code != 0:
-                return {"error": f"Cannot read current FSM state (code={code}). Aborting for safety."}
-
+            # 阻尼 is the guaranteed fallback mode — the vendor doc states it can
+            # always be entered, so emergency_stop must not be gated on anything.
             if mode == "emergency_stop":
                 ret = self._client.Damp()
                 return {"ret": ret, "mode": "emergency_stop",
                         "warning": "Emergency damp executed regardless of state"}
 
-            elif mode == "get_current_mode":
-                FSM_DESCRIPTIONS = {
-                    0: "squatting, zero torque (下蹲零力矩, no resistance)",
-                    1: "squatting, damping (下蹲阻尼, resists movement)",
-                    2: "squatting (下蹲, position hold, stable)",
-                    3: "sitting (落座, needs external support, unstable)",
-                    500: "standing, normal locomotion (主运控, balanced)",
-                    501: "standing, 3DOF waist locomotion (balanced)",
-                    702: "prep stance (预备模式, stable low stance)",
-                    706: "balance stand (过渡态, intermediate)",
-                    801: "standing, running gait (跑步运控, balanced)",
-                }
-                desc = FSM_DESCRIPTIONS.get(current_fsm, f"unknown state")
-                return {"fsm_id": current_fsm, "description": desc}
+            current_fsm, fsm_mode, src = self._read_fsm()
+            if current_fsm < 0:
+                return {"error": "Cannot read current FSM state. Aborting for safety."}
 
-            elif mode == "lie2standup":
-                if current_fsm in self._STANDING_STATES:
-                    return {"info": "Robot is already standing", "fsm_id": current_fsm}
-                if current_fsm in self._UNSAFE_STATES:
-                    return {"error": f"Robot is in unsafe state (FSM={current_fsm}). Use emergency_stop first."}
-                # From ground: damp → Lie2StandUp(FSM=702) → stable FSM=500
-                if current_fsm in self._GROUND_STATES:
-                    steps = []
-                    if current_fsm == 0:
-                        steps.append(("Damp", 1, "damp"))
-                    steps.append(("Lie2StandUp", 500, "lie2standup"))
-                    return self._async_fsm(mode, steps)
-                # From low states (squat/prep): start(500)
-                if current_fsm in {2, 702}:
-                    steps = [("Start", 500, "start")]
-                    return self._async_fsm(mode, steps)
-                if current_fsm == 1:
-                    return {"error": "Robot is in squat damping (FSM=1). Use squat2standup instead."}
-                return {"error": f"Cannot stand up from FSM={current_fsm}"}
+            posture = self._posture()
 
-            elif mode == "standup2squat":
-                if current_fsm in self._GROUND_STATES or current_fsm in self._LOW_STATES:
-                    return {"info": "Robot is already in low/ground state", "fsm_id": current_fsm}
-                if current_fsm in self._STANDING_STATES:
-                    self._client.StopMove()
-                    import time as _time; _time.sleep(1.0)
-                    steps = [("StandUp2Squat", 1, "standup2squat")]
-                    return self._async_fsm(mode, steps)
-                return {"error": f"Cannot squat from FSM={current_fsm}. Use emergency_stop if needed."}
+            def _state(extra: dict | None = None) -> dict:
+                out = {"fsm_id": current_fsm, "fsm": _SMS.fsm_name(current_fsm),
+                       "fsm_mode": fsm_mode, "source": src}
+                if posture:
+                    out["posture"] = posture.get("posture")
+                    out["posture_detail"] = posture
+                if extra:
+                    out.update(extra)
+                return out
+
+            if mode == "get_current_mode":
+                return _state({"description": _SMS.fsm_describe(current_fsm)})
+
+            # fsm_mode 1 = 动态: the controller itself refuses most switches while the
+            # robot is mid-motion. Honour it instead of firing and timing out.
+            if fsm_mode == 1:
+                return _state({"error": "Robot is in a dynamic state (fsm_mode=1) and refuses "
+                                        "mode switches. Wait for it to settle, or use "
+                                        "emergency_stop, which is always accepted."})
+
+            if mode == "standup2squat":
+                if current_fsm == self._BALANCED_SQUAT:
+                    return _state({"info": "Robot is already in a balanced squat"})
+                if current_fsm not in self._LOCO_STATES:
+                    return _state({"error": "Balanced squat (706) is only reachable from 主运控 "
+                                            f"({sorted(self._LOCO_STATES)}). Stand up first."})
+                self._client.StopMove()
+                import time as _time; _time.sleep(1.0)
+                # StandUp2Squat() sets FSM 706 — NOT 2. FSM 2 is 位控下蹲, which the
+                # Python SDK has no method for at all.
+                steps = [("StandUp2Squat", self._BALANCED_SQUAT, "standup2squat", self._SQUAT_TIMEOUT)]
+                return self._async_fsm(mode, steps)
 
             elif mode == "squat2standup":
-                if current_fsm in self._STANDING_STATES:
-                    return {"info": "Robot is already standing", "fsm_id": current_fsm}
-                if current_fsm in self._GROUND_STATES:
-                    steps = [("Damp", 1, "damp")]
-                    steps.extend([
-                        ("Squat2StandUp", 801, "squat2standup_transition"),
-                        ("Start", 500, "start"),
-                    ])
+                if current_fsm in self._LOCO_STATES:
+                    return _state({"info": "Robot is already standing"})
+                # 遥控说明 § 模式切换 note 1: after L2+A drops from 主运控 to 蹲姿,
+                # getting back to 主运控 requires L2+B (阻尼) FIRST and then L2+A
+                # again — 706 does not toggle straight back. The documented
+                # 蹲姿开机流程 is the same two steps: ① 阻尼 → ⑥ 蹲站切换.
+                # So always hop through damp, whether we sit at 706 or are already
+                # limp. Damp() from 阻尼 is a no-op and its poll passes immediately.
+                if current_fsm == self._BALANCED_SQUAT or current_fsm in self._LIMP_STATES:
+                    if posture and posture.get("posture") == "lying":
+                        return _state({"error": "Posture reads as lying, not squatting — "
+                                                "use lie2standup (躺卧站立) instead."})
+                    steps = [("Damp", 1, "damp", 10.0),
+                             ("Squat2StandUp", self._LOCO_STATES, "squat2standup",
+                              self._STAND_TIMEOUT)]
                     return self._async_fsm(mode, steps)
-                if current_fsm in self._LOW_STATES:
-                    steps = [
-                        ("Squat2StandUp", 801, "squat2standup_transition"),
-                        ("Start", 500, "start"),
-                    ]
+                return _state({"error": f"Cannot stand up from {_SMS.fsm_name(current_fsm)}"})
+
+            elif mode == "lie2standup":
+                if current_fsm in self._LOCO_STATES:
+                    return _state({"info": "Robot is already standing"})
+                if current_fsm not in self._LIMP_STATES:
+                    return _state({"error": f"躺起 (702) expects the robot limp on the ground "
+                                            f"(FSM 0/1), but it is in {_SMS.fsm_name(current_fsm)}."})
+                if posture and posture.get("posture") == "squat":
+                    return _state({"error": "Posture reads as a folded squat, not lying flat — "
+                                            "use squat2standup (蹲站切换) instead."})
+                # 躺倒开机流程: ① 阻尼 → ⑤ 躺卧站立. Damp first unconditionally; from
+                # 阻尼 it is a no-op whose poll passes at once.
+                steps = [("Damp", 1, "damp", 10.0)]
+                # Lie2StandUp() sets FSM 702 (躺起) — it does not jump straight to 500.
+                # Wait for 702 to latch, then for the controller to carry it to 主运控.
+                steps.append(("Lie2StandUp", self._LIE_TO_STAND, "lie2standup", self._SQUAT_TIMEOUT))
+                steps.append(("Start", self._LOCO_STATES, "start", self._STAND_TIMEOUT))
+                return self._async_fsm(mode, steps)
+
+            elif mode == "standup2lie":
+                if current_fsm in self._LIMP_STATES:
+                    return _state({"info": "Robot is already limp on the ground"})
+                if current_fsm in self._LOCO_STATES:
+                    self._client.StopMove()
+                    import time as _time; _time.sleep(1.0)
+                    steps = [("StandUp2Squat", self._BALANCED_SQUAT, "standup2squat", self._SQUAT_TIMEOUT),
+                             ("Damp", 1, "damp", 10.0)]
                     return self._async_fsm(mode, steps)
-
-                return {"error": f"Cannot stand from FSM={current_fsm}"}
-
-            elif mode in ("damp", "zero_torque"):
-                if current_fsm in self._STANDING_STATES or current_fsm in self._LOW_STATES:
-                    return {"error": f"Cannot enter {mode} from upright/low state (FSM={current_fsm}). "
-                                     f"Robot will collapse. Use squat2standup or lie2standup first."}
-                if current_fsm in self._UNSAFE_STATES:
-                    return {"error": f"Cannot enter {mode} from unsafe state (FSM={current_fsm}). "
-                                     f"Use emergency_stop first."}
-                fn = self._client.ZeroTorque if mode == "zero_torque" else self._client.Damp
-                ret = fn()
-                return {"ret": ret, "mode": mode}
+                if current_fsm in (self._BALANCED_SQUAT, self._LIE_TO_STAND) or \
+                        current_fsm in self._POSITION_STATES:
+                    steps = [("Damp", 1, "damp", 10.0)]
+                    return self._async_fsm(mode, steps)
+                return _state({"error": f"Cannot lie down from {_SMS.fsm_name(current_fsm)}. "
+                                        f"Use emergency_stop if needed."})
 
             else:
-                return {"error": f"Unknown mode: {mode}. Available: lie2standup, "
-                                 f"standup2squat, squat2standup, damp, zero_torque, "
-                                 f"emergency_stop, get_current_mode"}
+                # damp / zero_torque are deliberately not exposed. They are raw
+                # primitives with no posture handling, and reaching them is always
+                # part of a larger transition — standup2lie ends there, and
+                # squat2standup / lie2standup hop through 阻尼 on the way up. The
+                # sequences do it in order on their own. emergency_stop covers the
+                # one case a caller legitimately needs 阻尼 directly.
+                return {"error": f"Unknown mode: {mode}. Available: lie2standup, standup2lie, "
+                                 f"standup2squat, squat2standup, emergency_stop, "
+                                 f"get_current_mode"}
         elif action == "switch_mode_expert":
             fid = int(args.get("fsm_id", 0))
             ret = self._client.SetFsmId(fid)
@@ -1825,6 +2021,7 @@ class _LowStateNode(Node):
         self._mainboard_pub = self.create_publisher(String, mainboard_topic, _LOW_LAT_QOS)
         self._last_imu:     dict = {}
         self._last_battery: dict = {}
+        self._last_posture: dict = {}
         self._lock = threading.Lock()
         self._last_joints_time:    float = 0.0
         self._last_imu_time:       float = 0.0
@@ -1896,6 +2093,68 @@ class _LowStateNode(Node):
             joints_out.data = json.dumps({"joints": joints, "imu_quat": list(msg.imu_state.quaternion)})
             self._joints_pub.publish(joints_out)
 
+            posture = self._estimate_posture(msg)
+            with self._lock:
+                self._last_posture = posture
+
+    # ── Posture estimation ──────────────────────────────────────────────────
+    # The FSM ID reports the *control mode*, not the pose. In the unbalanced modes
+    # (0 zero_torque / 1 damp) the robot is limp, and lying flat vs. folded into a
+    # squat are the same FSM ID — so the pose has to be read off the joints.
+    #
+    # G1 29-DoF leg indices (unitree_hg motor order).
+    _J_HIP_PITCH = (0, 6)
+    _J_KNEE      = (3, 9)
+
+    # Calibrated against a real G1 (10.100.129.168) sitting in a collapsed squat:
+    # knee 2.90 rad, hip_pitch -2.53 rad, torso pitch 29°, |tau| 0.26 N·m.
+    # Standing/lying bounds are derived from the kinematics, not measured — hence
+    # the raw values are always returned so a caller can second-guess the label.
+    _KNEE_FOLDED_RAD   = 1.5   # above this the knee is deeply flexed
+    _KNEE_EXTENDED_RAD = 0.6   # below this the leg is essentially straight
+    _TORSO_TILT_DEG    = 50.0  # beyond this the torso is closer to horizontal
+    _LOADED_TAU_NM     = 5.0   # above this the joint is actively holding, not limp
+
+    def _estimate_posture(self, msg) -> dict:
+        try:
+            motors = msg.motor_state
+            knees = [float(motors[i].q) for i in self._J_KNEE]
+            hips  = [float(motors[i].q) for i in self._J_HIP_PITCH]
+            taus  = [abs(float(motors[i].tau_est)) for i in self._J_KNEE]
+            roll, pitch, _yaw = (math.degrees(v) for v in tuple(msg.imu_state.rpy)[:3])
+        except (AttributeError, IndexError, TypeError, ValueError) as e:
+            return {"posture": "unknown", "reason": f"cannot read joints/imu: {e}"}
+
+        knee = sum(knees) / len(knees)
+        hip  = sum(hips) / len(hips)
+        tau  = sum(taus) / len(taus)
+        tilt = max(abs(roll), abs(pitch))
+
+        if tilt > self._TORSO_TILT_DEG:
+            posture = "lying"
+        elif knee > self._KNEE_FOLDED_RAD:
+            posture = "squat"
+        elif knee < self._KNEE_EXTENDED_RAD:
+            posture = "standing"
+        else:
+            posture = "crouched"
+
+        return {
+            "posture":    posture,
+            "loaded":     tau > self._LOADED_TAU_NM,
+            "knee_rad":   round(knee, 3),
+            "hip_pitch_rad": round(hip, 3),
+            "knee_tau_nm": round(tau, 2),
+            "torso_roll_deg":  round(roll, 1),
+            "torso_pitch_deg": round(pitch, 1),
+            "ts": time.time(),
+        }
+
+    def get_posture(self) -> dict:
+        """Latest joint-derived posture estimate, or {} if rt/lowstate has not arrived."""
+        with self._lock:
+            return dict(self._last_posture)
+
     def _on_bms(self, msg) -> None:
         now = time.monotonic()
         if now - self._last_bms_time < self._BMS_INTERVAL:
@@ -1947,7 +2206,27 @@ class StatePlugin:
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._imu_tool(), self._battery_tool(), self._joints_tool(), self._mainboard_tool(), self._model_tool()]
+        return [self._imu_tool(), self._battery_tool(), self._joints_tool(), self._mainboard_tool(),
+                self._posture_tool(), self._model_tool()]
+
+    @property
+    def node(self):
+        return self._node
+
+    def _posture_tool(self) -> dict:
+        return {
+            "name": "posture",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": (
+                "G1 physical posture derived from joint angles + IMU — standing / squat / "
+                "crouched / lying, plus knee_rad, hip_pitch_rad, knee_tau_nm, torso tilt and "
+                "whether the joints are actively loaded. Use this when the FSM mode is "
+                "0 (zero_torque) or 1 (damp): those modes are limp and cannot distinguish "
+                "lying from squatting. On-demand query, does not publish."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        }
 
     def _imu_tool(self) -> dict:
         return {
@@ -2005,6 +2284,11 @@ class StatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "posture":
+            posture = self._node.get_posture()
+            if not posture:
+                return {"error": "No rt/lowstate data yet — posture unavailable"}
+            return posture
         if action == "start":
             return {"state": "running"}
         if action == "stop":
@@ -2020,6 +2304,8 @@ class StatePlugin:
             if tool_name in topic_map:
                 topic, fmt = topic_map[tool_name]
                 return {"state": "running", "topic_out": [{"topic": topic, "format": fmt}]}
+            if tool_name == 'posture':
+                return self._node.get_posture() or {"state": "running"}
             return {"state": "running"}
         if action == "model":
             from pathlib import Path
