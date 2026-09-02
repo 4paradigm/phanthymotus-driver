@@ -504,7 +504,6 @@ class ControlledSpatialPlugin:
 
     def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90, target_xy=None):
         """Wait for navigation to complete, then fire ACP callback."""
-        self._nav_action_id = action_id
         t0 = time.time()
 
         # Primary: delegate to SmartMotion subprocess which has reliable
@@ -773,10 +772,12 @@ class ControlledSpatialPlugin:
             tag_name = args.get("tag_name", "")
             if not tag_name:
                 return {"error": "tag_name is required"}
-            # Cancel any in-flight navigation ACP
-            if self._nav_action_id:
-                _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
-                self._nav_action_id = None
+            from uuid import uuid4
+            action_id = f"g1_nav_{uuid4().hex[:8]}"
+            with self._lock:
+                if self._nav_action_id:
+                    _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
+                self._nav_action_id = action_id
             active_map = self._active_map
             if not active_map:
                 return {"error": "No active map. Load a map first."}
@@ -795,9 +796,6 @@ class ControlledSpatialPlugin:
                 self._nav_error = None
                 result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
                                                      speed=speed, mode=mode)
-                # ACP: spawn completion thread
-                from uuid import uuid4
-                action_id = f"g1_nav_{uuid4().hex[:8]}"
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
@@ -817,8 +815,6 @@ class ControlledSpatialPlugin:
             self._nav_error = None
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
-                from uuid import uuid4
-                action_id = f"g1_nav_{uuid4().hex[:8]}"
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, tag_name, float(args.get("stall_timeout", 90)), (poi["x"], poi["y"])),
@@ -833,10 +829,12 @@ class ControlledSpatialPlugin:
             x = float(args.get("x", 0))
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
-            # Cancel any in-flight navigation ACP
-            if self._nav_action_id:
-                _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
-                self._nav_action_id = None
+            from uuid import uuid4
+            action_id = f"g1_nav_{uuid4().hex[:8]}"
+            with self._lock:
+                if self._nav_action_id:
+                    _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
+                self._nav_action_id = action_id
 
             if self._smart_motion:
                 speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
@@ -846,8 +844,6 @@ class ControlledSpatialPlugin:
                 self._nav_arrived.clear()
                 self._nav_error = None
                 result = self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode)
-                from uuid import uuid4
-                action_id = f"g1_nav_{uuid4().hex[:8]}"
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
@@ -864,8 +860,6 @@ class ControlledSpatialPlugin:
             self._nav_error = None
             code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
-                from uuid import uuid4
-                action_id = f"g1_nav_{uuid4().hex[:8]}"
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)), (x, y)),
