@@ -1170,9 +1170,9 @@ class CameraSnapshotPlugin:
         return f"{prefix}_{time.time_ns()}"
 
     @staticmethod
-    def _file_stem(args: dict) -> str | None:
+    def _file_stem(args: dict, key: str) -> str | None:
         import re
-        value = args.get("name")
+        value = args.get(key)
         if value is None or value == "":
             return None
         value = str(value).strip()
@@ -1206,19 +1206,20 @@ class CameraSnapshotPlugin:
                         "enum": ["capture_image", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "start", "stop"],
                         "description": "操作类型",
                     },
-                    "name": {"type": "string", "description": "文件名；capture_image/delete image 不含 .jpg，record_video/start_recording/delete video 不含 .mp4"},
+                    "image_name": {"type": "string", "description": "照片文件名（不含 .jpg）"},
+                    "video_name": {"type": "string", "description": "视频文件名（不含 .mp4）"},
                     "type": {"type": "string", "enum": ["image", "video"], "description": "删除类型；image 删除 .jpg，video 删除 .mp4"},
                     "duration": {"type": "number", "description": "视频时长（秒），默认 5，最大 60"},
                 },
                 "required": ["action"],
                 "x-completion": {"actions": ["record_video"], "timeout": 60},
                 "x-action-params": {
-                    "capture_image": {"params": ["name"], "description": "拍照；name 可选，不填则使用 IMG_时间戳.jpg；name 不含 .jpg"},
-                    "record_video": {"params": ["name", "duration"], "description": "录制指定时长的视频；name 可选，不填则使用 VID_时间戳.mp4；name 不含 .mp4，duration 默认 5 秒、最大 60 秒"},
-                    "start_recording": {"params": ["name"], "description": "开始持续录制；name 可选，不填则使用 VID_时间戳.mp4；name 不含 .mp4"},
+                    "capture_image": {"params": ["image_name"], "description": "拍照；不填 image_name 则使用 IMG_时间戳.jpg"},
+                    "record_video": {"params": ["video_name", "duration"], "description": "录制指定时长的视频；不填 video_name 则使用 VID_时间戳.mp4；duration 默认 5 秒、最大 60 秒"},
+                    "start_recording": {"params": ["video_name"], "description": "开始持续录制；不填 video_name 则使用 VID_时间戳.mp4"},
                     "stop_recording": {"params": [], "description": "结束当前持续录制并保存视频"},
                     "list": {"params": [], "description": "查询已保存的照片和视频"},
-                    "delete": {"params": ["name", "type"], "description": "删除指定媒体；type=image 时 name 不含 .jpg，type=video 时 name 不含 .mp4"},
+                    "delete": {"params": ["type", "image_name", "video_name"], "description": "删除指定媒体；根据 type 使用对应的 image_name 或 video_name"},
                     "info": {"params": [], "description": "查看相机和录制状态"},
                     "start": {"params": [], "description": "启动相机订阅"},
                     "stop": {"params": [], "description": "停止相机订阅"},
@@ -1289,19 +1290,27 @@ class CameraSnapshotPlugin:
             files = sorted((p for p in self._native_dir.iterdir() if p.is_file() and p.suffix.lower() in (".jpg", ".mp4")), key=lambda p: p.stat().st_mtime, reverse=True)
             return {"state": "listed", "files": [{"filename": p.name, "path": str(p), "size": p.stat().st_size, "mime": "image/jpeg" if p.suffix.lower() == ".jpg" else "video/mp4"} for p in files]}
         if action == "delete":
-            try:
-                stem = self._file_stem(args)
-            except ValueError as e:
-                return {"error": str(e)}
-            if not stem:
-                return {"error": "name is required"}
-            if not self._native_dir.exists():
-                return {"error": f"file not found: {stem}"}
             media_type = args.get("type")
             suffixes = {"image": ".jpg", "video": ".mp4"}
             if media_type is not None and media_type not in suffixes:
                 return {"error": "type must be 'image' or 'video'"}
-            allowed_suffixes = (suffixes[media_type],) if media_type else (".jpg", ".mp4")
+            if media_type:
+                name_key = "image_name" if media_type == "image" else "video_name"
+            elif args.get("image_name") and not args.get("video_name"):
+                name_key = "image_name"
+            elif args.get("video_name") and not args.get("image_name"):
+                name_key = "video_name"
+            else:
+                return {"error": "type and the matching image_name/video_name are required"}
+            try:
+                stem = self._file_stem(args, name_key)
+            except ValueError as e:
+                return {"error": str(e)}
+            if not stem:
+                return {"error": f"{name_key} is required"}
+            if not self._native_dir.exists():
+                return {"error": f"file not found: {stem}"}
+            allowed_suffixes = (suffixes[media_type],) if media_type else ((".jpg",) if name_key == "image_name" else (".mp4",))
             matches = [p for p in self._native_dir.iterdir() if p.is_file() and p.stem == stem and p.suffix.lower() in allowed_suffixes]
             if not matches:
                 return {"error": f"file not found: {stem}"}
@@ -1312,7 +1321,7 @@ class CameraSnapshotPlugin:
             return {"state": "deleted", "filename": [p.name for p in matches]}
         if action == "start_recording":
             try:
-                stem = self._file_stem(args) or self._default_stem("VID")
+                stem = self._file_stem(args, "video_name") or self._default_stem("VID")
             except ValueError as e:
                 return {"error": str(e)}
             with self._recording_lock:
@@ -1349,7 +1358,7 @@ class CameraSnapshotPlugin:
             return {"state": "recording", "action_id": action_id, "name": args.get("name"), "duration": args.get("duration", self._default_video_seconds)}
         if action == "record_video":
             try:
-                stem = self._file_stem(args) or self._default_stem("VID")
+                stem = self._file_stem(args, "video_name") or self._default_stem("VID")
                 duration = max(1.0, min(self._max_video_seconds, float(args.get("duration", self._default_video_seconds))))
             except (TypeError, ValueError) as e:
                 return {"error": str(e)}
@@ -1406,7 +1415,7 @@ class CameraSnapshotPlugin:
                 return {"error": "JPEG encoding failed"}
 
             try:
-                stem = self._file_stem(args) or self._default_stem("IMG")
+                stem = self._file_stem(args, "image_name") or self._default_stem("IMG")
             except ValueError as e:
                 return {"error": str(e)}
             filename = f"{stem}.jpg"
