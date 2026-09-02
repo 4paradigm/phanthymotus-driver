@@ -29,8 +29,16 @@ class Plugin:
                 "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "info", "stop"]},
                 "duration_s": {"type": "integer", "minimum": 1, "maximum": 30,
                                "description": "Video duration in seconds; only used by record_video."},
-                "visitor_label": {"type": "string", "description": "Optional label used only in the saved filename."},
-            }, "required": ["action"], "additionalProperties": False},
+                "file_label": {"type": "string", "title": "文件备注",
+                               "description": "可选，仅用于生成保存文件的名称。"},
+            }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {
+                    "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
+                    "capture_photo": {"params": ["file_label"], "description": "拍摄并保存一张当前 RGB 照片。"},
+                    "record_video": {"params": ["duration_s", "file_label"], "description": "录制并保存 1–30 秒 RGB 视频。"},
+                    "info": {"params": [], "description": "查看保存目录与相机状态。"},
+                    "stop": {"params": [], "description": "停止卡片。"},
+                }},
         }
 
     def get_tools(self):
@@ -84,7 +92,7 @@ class Plugin:
             directory = self._output_dir / "photos"
             directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = directory / f"{stamp}_{self._safe_label(args.get('visitor_label', 'visitor'))}.jpg"
+            path = directory / f"{stamp}_{self._safe_label(args.get('file_label', 'visitor'))}.jpg"
             path.write_bytes(frame["data"])
             return {"ok": True, "media_type": "photo", "file_path": str(path),
                     "captured_at": datetime.now().isoformat(timespec="seconds"),
@@ -102,7 +110,7 @@ class Plugin:
             directory = self._output_dir / "videos"
             directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = directory / f"{stamp}_{self._safe_label(args.get('visitor_label', 'visitor'))}.mp4"
+            path = directory / f"{stamp}_{self._safe_label(args.get('file_label', 'visitor'))}.mp4"
             process = subprocess.Popen([
                 "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", str(self._fps), "-i", "-",
                 "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
