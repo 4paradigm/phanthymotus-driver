@@ -98,7 +98,7 @@ class Plugin:
             requested = int(args.get("duration_s", 5))
             if not 1 <= requested <= self._max_duration_s:
                 return {"ok": False, "code": "INVALID_DURATION", "message": f"duration_s must be between 1 and {self._max_duration_s}"}
-            frame, sequence = self._frame()
+            frame, _ = self._frame()
             directory = self._output_dir / "videos"
             directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -107,14 +107,18 @@ class Plugin:
                 "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", str(self._fps), "-i", "-",
                 "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
             ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-            process.stdin.write(frame["data"])
-            frames, deadline = 1, time.monotonic() + requested
+            frames, deadline = 0, time.monotonic() + requested
             while time.monotonic() < deadline:
-                frame, sequence = self._frame(
-                    after_sequence=sequence,
-                    timeout_s=min(1.0, max(0.01, deadline - time.monotonic())))
+                # The worker continuously refreshes its newest JPEG cache.
+                # Sample that cache at the requested output FPS rather than
+                # failing the whole recording when one inter-process notify is
+                # missed between two otherwise healthy camera frames.
+                tick = time.monotonic()
+                frame, _ = self._frame(timeout_s=0)
                 process.stdin.write(frame["data"])
                 frames += 1
+                time.sleep(min(max(0.0, 1.0 / self._fps - (time.monotonic() - tick)),
+                               max(0.0, deadline - time.monotonic())))
             process.stdin.close()
             stderr = process.stderr.read().decode("utf-8", "replace")
             if process.wait(timeout=10) != 0 or not path.exists():
