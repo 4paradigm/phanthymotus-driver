@@ -118,9 +118,9 @@ if [[ -d "$remote_repo/.git" ]]; then
       git -C "$remote_repo" remote add "$source_remote" "$repo_url"
     fi
   fi
-  if timeout 45 git -C "$remote_repo" fetch --prune --no-tags "$source_remote" \
-    "refs/heads/$source_ref:refs/remotes/$source_remote/$source_ref"; then
-    remote_commit="$(git -C "$remote_repo" rev-parse "refs/remotes/$source_remote/$source_ref")"
+  if timeout 45 git -C "$remote_repo" fetch --prune --no-tags \
+    "$source_remote" "$source_ref"; then
+    remote_commit="$(git -C "$remote_repo" rev-parse 'FETCH_HEAD^{commit}')"
     [[ "$remote_commit" == "$expected_commit" ]] || {
       echo "Remote source mismatch: expected=$expected_commit actual=$remote_commit" >&2
       exit 1
@@ -134,8 +134,8 @@ else
   if timeout 45 git clone --filter=blob:none --no-checkout \
     "$repo_url" "$temporary_source_root/git" &&
     git -C "$temporary_source_root/git" fetch --prune --no-tags origin \
-      "refs/heads/$source_ref:refs/remotes/origin/$source_ref"; then
-    remote_commit="$(git -C "$temporary_source_root/git" rev-parse "refs/remotes/origin/$source_ref")"
+      "$source_ref"; then
+    remote_commit="$(git -C "$temporary_source_root/git" rev-parse 'FETCH_HEAD^{commit}')"
     [[ "$remote_commit" == "$expected_commit" ]] || {
       echo "Remote source mismatch: expected=$expected_commit actual=$remote_commit" >&2
       exit 1

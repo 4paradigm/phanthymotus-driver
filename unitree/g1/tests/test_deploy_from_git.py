@@ -34,6 +34,8 @@ class DeployFromGitContractTest(unittest.TestCase):
     def test_deploy_script_uses_the_template_and_compose_service_identity(self):
         source = DEPLOY_SCRIPT.read_text()
 
+        self.assertNotIn('"refs/heads/$source_ref:', source)
+        self.assertEqual(source.count("'FETCH_HEAD^{commit}'"), 2)
         self.assertIn('service_template="$source_dir/unitree/g1/deploy/service.yml"', source)
         self.assertIn("https://codeload.github.com/", source)
         self.assertIn("SOURCE_MODE=github_archive", source)
@@ -120,6 +122,49 @@ class DeployFromGitContractTest(unittest.TestCase):
             result.stdout,
         )
         self.assertIn("remote_repo=~/hanzebei/phanthymotus-driver", result.stdout)
+
+    def test_source_ref_fetch_accepts_branches_and_tags(self):
+        with tempfile.TemporaryDirectory(prefix="g1-driver-ref-test.") as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            remote = root / "origin.git"
+            target = root / "target"
+            subprocess.run(["git", "init", "-q", "-b", "main", source], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", source,
+                    "-c", "user.name=codex-test",
+                    "-c", "user.email=codex-test@example.invalid",
+                    "commit", "-q", "--allow-empty", "-m", "test",
+                ],
+                check=True,
+            )
+            subprocess.run(["git", "-C", source, "tag", "release-test"], check=True)
+            subprocess.run(["git", "clone", "-q", "--bare", source, remote], check=True)
+            subprocess.run(["git", "init", "-q", target], check=True)
+            expected = subprocess.check_output(
+                ["git", "-C", source, "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            for source_ref in (
+                "main",
+                "refs/heads/main",
+                "release-test",
+                "refs/tags/release-test",
+            ):
+                with self.subTest(source_ref=source_ref):
+                    subprocess.run(
+                        [
+                            "git", "-C", target, "fetch", "-q", "--no-tags",
+                            remote, source_ref,
+                        ],
+                        check=True,
+                    )
+                    actual = subprocess.check_output(
+                        ["git", "-C", target, "rev-parse", "FETCH_HEAD^{commit}"],
+                        text=True,
+                    ).strip()
+                    self.assertEqual(actual, expected)
 
     def test_archive_tree_reconstruction_detects_content_changes(self):
         with tempfile.TemporaryDirectory(prefix="g1-driver-archive-test.") as tmp:

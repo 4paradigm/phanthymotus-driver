@@ -48,21 +48,22 @@ cp .env.example .env  # 填写镜像仓库凭据
 
 驱动容器启动后会自动向 Agent Core（`http://<agent-core>:15678/api/mcp`）发送注册请求。注册成功后即可在 Web Dashboard 中看到设备及其工具。
 
-开发版 G1 使用仓库内的 Git 部署入口。请先把当前分支推送到远程，并确保
+开发版 G1 使用仓库内的 Git 部署入口。请先把来源 ref 推送到远程，并确保
 本地工作树干净：
 
 ```bash
 ./unitree/g1/deploy/deploy-from-git.sh g1-bj-wifi
 ```
 
-脚本不会把本地工作树复制到机器人。它会记录本地分支和提交，在目标机器的
-`~/hanzebei/phanthymotus-driver` 中拉取该分支，要求远程分支 tip 与固定提交
+脚本不会把本地工作树复制到机器人。它默认记录当前分支和精确提交，在目标机器的
+`~/hanzebei/phanthymotus-driver` 中拉取 `SOURCE_REF`，要求解析后提交与固定提交
 完全一致，再使用仓库自带的 G1 Dockerfile 构建镜像。当 GitHub Git 端点不可用时，
 GitHub 仓库会自动回退到官方 `codeload.github.com` 上的同一固定提交归档，
 解压后的文件必须能重建出该提交记录的 Git tree 才允许构建，且不使用
 第三方源码镜像。只有明确需要覆盖部署输入时才设置 `REPO_URL`、
 `SOURCE_ARCHIVE_URL`、`SOURCE_REF`、`EXPECTED_COMMIT`、`REMOTE_REPO` 或
-`IMAGE`。`DRY_RUN=1` 只校验并打印最终来源，不连接机器人。
+`IMAGE`。`SOURCE_REF` 支持分支、tag 或完整 Git ref；`DRY_RUN=1`
+只校验并打印最终来源，不连接机器人。
 
 G1 Dockerfile 默认同时使用阿里云 Ubuntu Ports 和 PyPI 国内镜像，并在安装
 构建依赖前替换基础镜像遗留且已不可解析的腾讯云 Ubuntu 源。直接执行

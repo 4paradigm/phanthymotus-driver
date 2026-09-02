@@ -58,15 +58,15 @@ When run without arguments, `build.sh` shows an interactive multi-select menu to
 Once the driver container starts, it registers itself with Agent Core at `http://<agent-core>:15678/api/mcp`. You can then see the device and its tools in the Web Dashboard.
 
 For a G1 development deployment, run the versioned Git deployment entry from
-a clean, pushed branch:
+a clean checkout whose source ref has been pushed:
 
 ```bash
 ./unitree/g1/deploy/deploy-from-git.sh g1-bj-wifi
 ```
 
 The script does not copy the local working tree to the robot. It records the
-local branch and commit, fetches that branch in
-`~/hanzebei/phanthymotus-driver` on the target, requires the fetched tip to
+current branch by default and the exact commit, fetches `SOURCE_REF` in
+`~/hanzebei/phanthymotus-driver` on the target, requires the fetched commit to
 match the exact commit, builds with the repository's G1 Dockerfile, and applies
 the complete `unitree/g1/deploy/service.yml` runtime contract on top of the
 target's Agent Core Compose file. If GitHub's Git endpoint is unavailable, a
@@ -76,8 +76,8 @@ Git tree recorded by that commit before it can be built. Third-party source
 mirrors are not used.
 Set `REPO_URL`, `SOURCE_ARCHIVE_URL`, `SOURCE_REF`, `EXPECTED_COMMIT`,
 `REMOTE_REPO`, or `IMAGE` only when overriding those explicit deployment
-inputs. `DRY_RUN=1` validates and prints the resolved provenance without
-connecting to the robot.
+inputs. `SOURCE_REF` accepts a branch, tag, or complete Git ref. `DRY_RUN=1`
+validates and prints the resolved provenance without connecting to the robot.
 
 The G1 Dockerfile uses the Aliyun mirrors for both Ubuntu Ports and PyPI by
 default. It replaces the obsolete Tencent Cloud Ubuntu source inherited from

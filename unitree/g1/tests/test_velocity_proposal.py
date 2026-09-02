@@ -391,6 +391,19 @@ class ProposalGateTest(unittest.TestCase):
             ).execute
         )
 
+    def test_manual_override_retires_active_proposal_authority(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
+
+        self.gate.disarm("manual_override")
+
+        self.assertFalse(self.gate.armed)
+        self.assertFalse(self.gate.awaiting_nav_id)
+        self.assertIn("nav-001", self.gate.retired_nav_ids)
+        rejected = self.gate.accept(proposal(sequence=2), now=10.1)
+        self.assertTrue(rejected.stop)
+        self.assertFalse(rejected.execute)
+        self.assertEqual(rejected.reason, "manual_override")
+
     def test_sequence_must_strictly_increase_for_active_nav(self):
         first = self.gate.accept(proposal(sequence=10), now=100.0)
         second = self.gate.accept(proposal(sequence=11), now=100.05)

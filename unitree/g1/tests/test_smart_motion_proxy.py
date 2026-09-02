@@ -677,6 +677,14 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         self.assertIn("lidar_node.create_subscription(", source)
         self.assertIn("lidar_executor.spin_once", source)
         self.assertEqual(source.count("executor.spin_once"), 3)
+        manual_move_source = source[
+            source.index('if method == "move":'):
+            source.index('elif method == "stop":')
+        ]
+        self.assertLess(
+            manual_move_source.index('proposal_gate.disarm("manual_override")'),
+            manual_move_source.index("handle_move("),
+        )
         self.assertIn("nonlocal forward_obstacle_log_count", source)
         self.assertNotIn("self._fwd_log_n", source)
 
