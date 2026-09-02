@@ -9,3 +9,16 @@ mcp_url: "http://localhost:15702/mcp"
 description: "DJI Matrice 300 RTK — 飞行控制 + 遥测 + 感知 + HMS + 飞机信息"
 build_context_extras:
   - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` — all six
+# plugins (telemetry, camera_stream, perception, hms, flight, time_sync) are
+# enabled. hms.py's hidden test-only tools (hms_inject, hms_eliminate) are
+# excluded since main.py filters `hidden: true` tools out of the visible
+# listing; time_sync's tool is named `aircraft_info` in device.py.
+cards:
+  - { name: telemetry,     type: sensor }
+  - { name: camera_stream, type: sensor }
+  - { name: perception,    type: sensor }
+  - { name: hms,           type: sensor }
+  - { name: flight,        type: actuator }
+  - { name: aircraft_info, type: actuator }

@@ -1,0 +1,65 @@
+# 触觉灵巧手自适应抓取示例 (https://www.brainco-hz.com/docs/revolimb-hand/revo2/tactile_grasp.html)
+
+Source: (see original URL)
+
+# Revo 2 触觉灵巧手自适应抓取示例 ​
+
+## 获取代码 ​
+
+- Revo 2 触觉自适应抓取 Example
+
+## 简介 ​
+
+基于 **电容式传感器-触觉反馈灵巧手** 的自适应抓握示例 通过实时采集手指触觉信号、执行触觉感知算法（接触检测、刚度识别），并动态调节抓握电流，实现对不同刚度物体的柔顺抓握与自适应控制。
+
+## 系统结构与功能 ​
+
+| 模块文件 | 功能简介 |
+| --- | --- |
+| main.py | 系统主入口，负责模块初始化与异步调度，执行示例抓握任务。 |
+| data_reader.py | 实时采集 Revo 2 电容式触觉传感器数据，维护固定长度缓冲区。 |
+| tactile_processor.py | 对采集的触觉数据进行算法处理，包括接触检、刚度识别。 |
+| grasp_controller.py | 控制灵巧手，根据触觉反馈动态调节手指电流，实现自适应抓握与释放。 |
+
+## 核心控制指令与参数说明 ​
+
+系统的核心控制命令为：
+
+python
+
+```
+await controller.grasp_with_speed(num_fingers=0)
+
+该指令基于位置与速度控制模式执行抓握或释放动作，通过指定手指数量与动作时间来实现不同类型的抓握。
+```
+
+num_fingers 参数含义
+
+| num_fingers 值 | 抓握类型 | 参与手指 | 说明 |
+| --- | --- | --- | --- |
+| 0 | 全部释放 | — | 所有手指张开，回到初始位置 |
+| 2 | 两指捏 | 拇指 + 食指 | 适合捏取小物体（如泡沫块） |
+| 3 | 三指捏 | 拇指 + 食指 + 中指 | 稳定捏持中等大小物体（如纸杯） |
+| 5 | 五指握 | 拇指 + 四指 | 完整握拳动作，用于抓握较大物体 （如水瓶） |
+
+## Usage ​
+
+shell
+
+```
+cd revo2_tactile_grasp
+# 安装依赖
+(py310) ➜  python git:(main) ✗ pip3 install -r requirements.txt
+# 运行示例
+(py310) ➜  python git:(main) ✗ python main.py
+```
+
+## 示例视频 ​
+
+## ​
+
+## ​
+
+## ​
+
+## ​

@@ -1,0 +1,19 @@
+id: brainco-revo2-driver
+name: BrainCo Revo 2 Dexterous Hand
+category: driver
+hardware_provider: brainco
+hardware_model: "revo2"
+image_name: brainco-revo2
+port: 15706
+mcp_url: "http://localhost:15706/mcp"
+description: "BrainCo Revo 2 灵巧手 — 6主动关节/11自由度控制、状态遥测、预设手势、LED，触觉版附带指尖触觉数据"
+build_context_extras:
+  - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled`. hand_touch is
+# excluded: config.yaml has it enabled, but device.py's build_plugins() only
+# loads it when variant=="touch", and this config's variant is "basic".
+cards:
+  - { name: hand,       type: actuator }
+  - { name: hand_state, type: sensor }
+  - { name: model,      type: resource }

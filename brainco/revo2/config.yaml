@@ -1,0 +1,45 @@
+mcp_port: 15706
+ros_namespace: ""   # 留空则自动使用 hostname
+
+# 灵巧手没有独立的机器人侧 DDS 网络（直连 RS485/CAN FD），
+# 两个 domain 保持一致即可；只使用 core 侧发布状态遥测。
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+
+name: "BrainCo Revo 2"
+
+# basic (XRL/XRR) | pro (XEL/XER) | touch (XTL/XTR)
+# 决定是否加载 hand_touch 卡片，以及 model 资源里展示哪个规格。
+variant: "basic"
+
+# modbus (RS-485) | canfd (SocketCAN CAN FD)。EtherCAT 需要主机安装 IgH
+# EtherCAT Master，v1 暂不支持。
+protocol: "canfd"
+
+connection:
+  port_name: "/dev/ttyUSB0"   # protocol=modbus 时使用
+  baudrate: "Baud460800"       # Baudrate 枚举名，见 reference/main_mod.pyi
+  can_iface: "can0"            # protocol=canfd 时使用 (SocketCAN)
+
+# 同一条总线上可以挂 1~2 只手，通过 slave_id 区分。默认出厂 ID：左手 126 / 右手 127。
+hands:
+  - side: "right"
+    slave_id: 127
+
+# variant=touch 时使用，选择实际传感器供应商/类型
+# capacitive | pressure | array_pressure | force3d
+touch_vendor: "array_pressure"
+
+plugins:
+  hand:
+    enabled: true
+    # SDK 统一范围 0~1000：0=全开，1000=全闭（所有协议/设备一致）。
+    open_positions: [0, 0, 0, 0, 0, 0]
+    close_positions: [1000, 1000, 1000, 1000, 1000, 1000]
+  hand_state:
+    enabled: true
+    poll_interval_s: 0.15
+  hand_touch:
+    enabled: true   # 仅在 variant=touch 时真正生效
+    poll_interval_s: 0.1

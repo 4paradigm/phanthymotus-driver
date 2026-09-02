@@ -21,7 +21,9 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `noetix/bumi` | Noetix Bumi-EDU Humanoid | 15704 | Mic, speaker, locomotion, RealSense camera, state monitoring |
 | `x-humanoid/tianyi2.0` | Tianyi 2.0 Pro Humanoid | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
-| `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
+| `pndbotics/adam` | PNDbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
+| `booster/k1` | Booster K1 Humanoid | 15705 | State (IMU/joints/battery/odom/fall-detection + URDF), camera, locomotion, upper-body joint control, actions/get-up (ACP), audio |
+| `brainco/revo2` | BrainCo Revo 2 Dexterous Hand | 15706 | Finger position/gesture/LED control, state telemetry, tactile telemetry (touch variant only) |
 
 ## Quick Start
 

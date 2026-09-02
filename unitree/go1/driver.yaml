@@ -9,3 +9,36 @@ mcp_url: "http://localhost:15715/mcp"
 description: "Unitree Go1 (EDU) 状态+控制驱动（原始 unitree_legged_sdk）。卡片实现聚合在 sensors.py、controllers.py、ext_devices.py 与 camera.py 四个文件中；camera.py 向 AgentCore 独立注册 camera_rgb、camera_depth、camera_pointcloud 三张五机位视觉卡，分别输出 RGB、彩色深度、XYZ 点云（点云保留 JPEG 俯视预览）。三种流在同一物理机位互斥。其余卡提供 Go1 状态、运动控制、外设和 URDF 资源；beep/speaker 与视觉 Nano 后端由容器首启自动部署。"
 build_context_extras:
   - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled`. camera_depth and
+# camera_pointcloud are disabled (Nano needs DEPTH_ENABLE=1 / PCL_ENABLE=1) and
+# excluded. `system_health` is intentionally excluded too: config.yaml has a
+# YAML indentation bug (line ~18) that nests `system_health:` as a dead key
+# inside `face_light`'s mapping instead of a sibling plugin key, so
+# `pc.get("system_health", {})` in main.py never finds it and the card never
+# loads — confirmed by parsing config.yaml with PyYAML. Fix that indentation
+# bug first if system_health should ship. activity_monitor is listed as
+# `actuator` because that's what its own get_tool() declares in sensors.py,
+# even though the card is read-only (samples velocity/mode, action=report).
+cards:
+  - { name: loco_state,         type: sensor }
+  - { name: battery,            type: sensor }
+  - { name: face_light,         type: actuator }
+  - { name: camera_rgb,         type: sensor }
+  - { name: imu,                type: sensor }
+  - { name: feet,               type: sensor }
+  - { name: fall_alarm,         type: sensor }
+  - { name: odometry,           type: sensor }
+  - { name: obstacle_range,     type: sensor }
+  - { name: udp_diagnostics,    type: sensor }
+  - { name: joints,             type: sensor }
+  - { name: remote_controller,  type: sensor }
+  - { name: model,              type: resource }
+  - { name: activity_monitor,   type: actuator }
+  - { name: beep,               type: actuator }
+  - { name: speaker,            type: actuator }
+  - { name: loco,               type: actuator }
+  - { name: body_pose,          type: actuator }
+  - { name: gesture,            type: actuator }
+  - { name: switch_gait,        type: actuator }
+  - { name: special_motion,     type: actuator }
