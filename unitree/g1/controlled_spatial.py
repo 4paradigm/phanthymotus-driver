@@ -549,6 +549,11 @@ class ControlledSpatialPlugin:
                     dx = current_pose["x"] - target_xy[0]
                     dy = current_pose["y"] - target_xy[1]
                     if math.sqrt(dx * dx + dy * dy) < 0.3:
+                        # Guard: if this nav was superseded, don't fire stale ACP
+                        if self._nav_action_id != action_id:
+                            print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                            return
+                        self._nav_action_id = None
                         elapsed = round(time.time() - t0, 1)
                         _acp_notify(action_id, "completed", {
                             "target": target, "pose": current_pose, "elapsed": elapsed,
@@ -556,6 +561,11 @@ class ControlledSpatialPlugin:
                         return
 
             if self._nav_arrived.wait(timeout=1.0):
+                # Guard: if this nav was superseded, don't fire stale ACP
+                if self._nav_action_id != action_id:
+                    print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                    return
+                self._nav_action_id = None
                 elapsed = round(time.time() - t0, 1)
                 if self._nav_error:
                     error = self._nav_error
@@ -849,7 +859,7 @@ class ControlledSpatialPlugin:
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)), (x, y)),
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw},
