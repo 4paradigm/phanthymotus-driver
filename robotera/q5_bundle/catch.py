@@ -19,6 +19,7 @@ except Exception:
 
 CARD = "catch"
 NODE = "q5_catch"
+_FIRST_FRAME_TIMEOUT_S = 5.0
 _CAMERA_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -151,7 +152,11 @@ class Plugin:
     def _wait_for_frame(self):
         baseline = self._ensure_subscription()
         with self._lock:
-            self._lock.wait_for(lambda: self._sequence > baseline, timeout=2.0)
+            # DDS discovery can take a few seconds after a temporary
+            # subscription is created.  Five seconds keeps the card reliable
+            # without retaining an idle camera subscription.
+            self._lock.wait_for(
+                lambda: self._sequence > baseline, timeout=_FIRST_FRAME_TIMEOUT_S)
             msg = self._latest
             age = time.time() - self._latest_at if self._latest_at else None
             sequence = self._sequence
