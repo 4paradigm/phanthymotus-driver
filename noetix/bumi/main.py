@@ -62,6 +62,7 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         state_plugin = None
         motion_state_plugin = None
+        camera_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
@@ -86,7 +87,8 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
-            self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
+            camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
+            self._plugins.append(camera_plugin)
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
@@ -99,7 +101,8 @@ class BumiDeviceBundle:
         if plugins_cfg.get("state_record", {}).get("enabled", False):
             from device import StateRecordPlugin
             self._plugins.append(StateRecordPlugin(
-                plugins_cfg["state_record"], state_plugin, motion_state_plugin))
+                plugins_cfg["state_record"], state_plugin, motion_state_plugin,
+                camera_plugin))
             print("[bundle] StateRecordPlugin loaded")
 
     def start_all(self) -> None:

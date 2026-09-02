@@ -15,6 +15,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
@@ -1292,6 +1293,66 @@ def _camera_subprocess(namespace: str):
         pipeline.stop()
 
 
+class _CameraFrameNode(Node):
+    """Caches color JPEG frames and can wait for the first frame after a click."""
+
+    def __init__(self, color_topic: str):
+        super().__init__("bumi_camera_frame_cache")
+        self._color_topic = color_topic
+        self._condition = threading.Condition()
+        self._sequence = 0
+        self._latest: dict | None = None
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._sub = self.create_subscription(
+            CompressedImage, color_topic, self._on_frame, qos)
+
+    def _on_frame(self, msg: CompressedImage) -> None:
+        received_at = datetime.now().astimezone()
+        frame = {
+            "topic": self._color_topic,
+            "format": msg.format or "jpeg",
+            "width": 640,
+            "height": 480,
+            "ros_timestamp": {
+                "sec": int(msg.header.stamp.sec),
+                "nanosec": int(msg.header.stamp.nanosec),
+            },
+            "received_at": received_at.isoformat(),
+            "received_monotonic": time.monotonic(),
+            "data": bytes(msg.data),
+        }
+        with self._condition:
+            self._sequence += 1
+            frame["frame_sequence"] = self._sequence
+            self._latest = frame
+            self._condition.notify_all()
+
+    def wait_for_next_frame(self, timeout_s: float) -> dict:
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            baseline = self._sequence
+            while self._sequence <= baseline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    latest_age = None
+                    if self._latest is not None:
+                        latest_age = round(
+                            max(0.0, time.monotonic() - self._latest["received_monotonic"]),
+                            3,
+                        )
+                    raise TimeoutError(
+                        f"No new color frame arrived within {timeout_s}s; "
+                        f"latest_frame_age_s={latest_age}"
+                    )
+                self._condition.wait(remaining)
+            return copy.deepcopy(self._latest)
+
+
 class CameraPlugin:
     PREFIX = "camera"
 
@@ -1300,6 +1361,8 @@ class CameraPlugin:
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._proc: subprocess.Popen | None = None
+        self._frame_node = _CameraFrameNode(self._color_topic)
+        executor.add_node(self._frame_node)
 
     def get_tools(self) -> list:
         return [
@@ -1337,6 +1400,9 @@ class CameraPlugin:
         if self._proc:
             self._proc.terminate()
             self._proc = None
+
+    def capture_next_color_frame(self, timeout_s: float) -> dict:
+        return self._frame_node.wait_for_next_frame(timeout_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -1627,23 +1693,31 @@ class StateRecordPlugin:
         "battery": ("battery",),
         "joints": ("joints",),
         "motion_state": ("motion_state",),
+        "all_withoutcamera": ("imu", "battery", "joints", "motion_state"),
         "all": ("imu", "battery", "joints", "motion_state"),
-        # Reserved contract only. No camera topic or bytes are consumed in v1.
-        "camera": ("camera",),
+        "camera": (),
     }
     _ACTIONS = ("record_once", "start_timed", "stop_recording")
     _COUNTERS_FILE = ".label-counters.json"
 
     def __init__(self, plugin_config: dict, state_plugin: StatePlugin | None,
-                 motion_state_plugin: MotionStatePlugin | None):
+                 motion_state_plugin: MotionStatePlugin | None,
+                 camera_plugin: CameraPlugin | None):
         self._state_plugin = state_plugin
         self._motion_state_plugin = motion_state_plugin
+        self._camera_plugin = camera_plugin
         self._storage_dir = Path(plugin_config.get(
             "storage_dir", "/opt/phanthy-motus/data/bumi/state-records"))
         self._max_age_s = _finite_number(
             plugin_config.get("max_age_s", 3.0), "state_record.max_age_s")
         if not 0.1 <= self._max_age_s <= 60.0:
             raise ValueError("state_record.max_age_s must be in [0.1, 60.0]")
+        self._camera_timeout_s = _finite_number(
+            plugin_config.get("camera_timeout_s", 1.0),
+            "state_record.camera_timeout_s",
+        )
+        if not 0.1 <= self._camera_timeout_s <= 10.0:
+            raise ValueError("state_record.camera_timeout_s must be in [0.1, 10.0]")
         self._default_label = str(plugin_config.get("default_label", "status")).strip() or "status"
         self._default_interval_s = _finite_number(
             plugin_config.get("default_interval_s", 1.0),
@@ -1681,7 +1755,8 @@ class StateRecordPlugin:
             "multiInstance": False,
             "description": (
                 "Bumi 状态记录：支持单次记录、按可调频率定时记录和停止记录。"
-                "每次开始时可选择一种状态或 all，并设置文件名标签；相机范围仅预留接口。"
+                "all_withoutcamera 记录全部状态但不含照片；all 记录全部状态和一张彩色照片。"
+                "camera 与 all 仅支持单次记录，不保存深度图。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -1694,8 +1769,8 @@ class StateRecordPlugin:
                     "scope": {
                         "type": "string",
                         "enum": list(self._SCOPES),
-                        "default": "all",
-                        "description": "选择单独记录 imu、battery、joints、motion_state，或用 all 记录全部状态；camera 仅为预留接口。",
+                        "default": "all_withoutcamera",
+                        "description": "imu/battery/joints/motion_state=单项；all_withoutcamera=全部状态但不含照片；all=全部状态加彩色照片；camera=仅彩色照片。camera 与 all 只能用于 record_once。",
                     },
                     "label_mode": {
                         "type": "string",
@@ -1763,7 +1838,7 @@ class StateRecordPlugin:
                 "saved": False,
                 "error": f"Unsupported state record action: {action}",
             }
-        scope = args.get("scope", "all")
+        scope = args.get("scope", "all_withoutcamera")
         label_result = self._resolve_label(
             args.get("label_mode", "default"), args.get("custom_label"))
         if "error" in label_result:
@@ -1790,6 +1865,14 @@ class StateRecordPlugin:
 
     def _start_timed(self, scope: Any, label: Any, label_mode: str,
                      interval_value: Any) -> dict:
+        if scope in {"camera", "all"}:
+            return {
+                "state": "error", "started": False,
+                "error": (
+                    f"scope={scope} includes a color photo and is supported only by record_once. "
+                    "Use all_withoutcamera for timed state recording."
+                ),
+            }
         try:
             interval_s = _finite_number(interval_value, "interval_s")
         except (TypeError, ValueError) as exc:
@@ -1910,6 +1993,11 @@ class StateRecordPlugin:
 
     def _record(self, scope: Any, label_value: Any, mode: str,
                 label_mode: str) -> dict:
+        if not isinstance(scope, str) or scope not in self._SCOPES:
+            return {
+                "state": "error", "saved": False,
+                "error": f"scope must be one of: {', '.join(self._SCOPES)}",
+            }
         if not isinstance(label_value, str):
             return {"state": "error", "saved": False, "error": "label must be a string"}
         label = label_value.strip()
@@ -1917,20 +2005,60 @@ class StateRecordPlugin:
             return {"state": "error", "saved": False, "error": "label must be at most 80 characters"}
         label = label or self._default_label
         filename_label = self._filename_label(label)
-        captured = self._capture_scope(scope)
-        if not captured.get("captured", False):
-            return captured
+        camera_requested = scope in {"camera", "all"}
+        if scope == "camera":
+            captured = {
+                "captured": True,
+                "captured_datetime": datetime.now().astimezone(),
+                "requested_sources": [],
+                "sources": {},
+                "errors": {},
+                "fresh": True,
+            }
+        else:
+            captured = self._capture_scope(scope)
+            if not captured.get("captured", False):
+                return captured
         sources = captured["sources"]
-        errors = captured["errors"]
-        now = captured["captured_datetime"]
+        errors = dict(captured["errors"])
+        camera_meta = {
+            "requested": camera_requested,
+            "captured": False,
+            "depth_included": False,
+        }
+        jpeg_bytes = None
+        if camera_requested:
+            camera_meta, jpeg_bytes = self._capture_camera()
+            if not camera_meta["captured"]:
+                errors["camera"] = camera_meta["error"]
+        now = datetime.now().astimezone()
+        marker = "_camera" if scope == "camera" else "_all" if scope == "all" else ""
+        image_created = False
         try:
             with self._write_lock:
                 self._storage_dir.mkdir(parents=True, exist_ok=True)
                 sequence, counters = self._next_sequence(filename_label)
-                filename = f"{now.strftime('%Y%m%d')}_{filename_label}_{sequence:06d}.json"
-                path = self._storage_dir / filename
+                stem = (
+                    f"{now.strftime('%Y%m%d')}_{filename_label}{marker}_"
+                    f"{sequence:06d}"
+                )
+                path = self._storage_dir / f"{stem}.json"
+                image_path = self._storage_dir / f"{stem}.jpg"
+                if jpeg_bytes is not None:
+                    try:
+                        self._atomic_write_bytes(image_path, jpeg_bytes)
+                        image_created = True
+                        camera_meta["file"] = image_path.name
+                    except Exception as image_exc:
+                        camera_meta = {
+                            **camera_meta,
+                            "captured": False,
+                            "file": None,
+                            "error": f"Color frame was received but JPEG save failed: {image_exc}",
+                        }
+                        errors["camera"] = camera_meta["error"]
                 record = {
-                    "schema_version": 2,
+                    "schema_version": 4,
                     "record_id": f"{filename_label}:{sequence}",
                     "record_mode": mode,
                     "captured_at": now.isoformat(),
@@ -1940,19 +2068,14 @@ class StateRecordPlugin:
                     "filename_label": filename_label,
                     "sequence": sequence,
                     "scope": scope,
-                    "requested_sources": list(self._SCOPES[scope]),
+                    "requested_sources": (
+                        list(self._SCOPES[scope]) + (["camera"] if camera_requested else [])
+                    ),
                     "sources": sources,
                     "errors": errors,
-                    "camera": {
-                        "interface_reserved": True,
-                        "connected": False,
-                        "description": "Version 1 does not consume the camera image stream.",
-                    },
+                    "camera": camera_meta,
                 }
-                serialized = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
-                temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-                temp_path.write_text(serialized, encoding="utf-8")
-                os.replace(temp_path, path)
+                self._atomic_write_json(path, record)
                 counters[filename_label] = sequence
                 counter_warning = None
                 try:
@@ -1963,8 +2086,8 @@ class StateRecordPlugin:
                     counter_warning = f"Counter file update failed: {counter_exc}"
         except Exception as exc:
             try:
-                if "temp_path" in locals():
-                    temp_path.unlink(missing_ok=True)
+                if image_created:
+                    image_path.unlink(missing_ok=True)
             except Exception:
                 pass
             return {
@@ -1973,7 +2096,10 @@ class StateRecordPlugin:
                 "storage_dir": str(self._storage_dir),
             }
 
-        fresh = all(item.get("fresh", False) for item in sources.values())
+        fresh = (
+            all(item.get("fresh", False) for item in sources.values())
+            and (not camera_requested or camera_meta["captured"])
+        )
         return {
             "state": "completed" if not errors else "partial",
             "saved": True,
@@ -1985,12 +2111,50 @@ class StateRecordPlugin:
             "filename_label": filename_label,
             "sequence": sequence,
             "sources": list(sources),
+            "camera": camera_meta,
+            "photo_saved": bool(camera_meta.get("captured") and camera_meta.get("file")),
+            "image_file": str(image_path) if image_created else None,
             "fresh": fresh,
             "errors": errors,
             "warning": counter_warning,
             "file": str(path),
             "storage_dir": str(self._storage_dir),
         }
+
+    def _capture_camera(self) -> tuple[dict, bytes | None]:
+        if self._camera_plugin is None:
+            return ({
+                "requested": True,
+                "captured": False,
+                "depth_included": False,
+                "timeout_s": self._camera_timeout_s,
+                "error": "CameraPlugin is disabled or unavailable",
+            }, None)
+        try:
+            frame = self._camera_plugin.capture_next_color_frame(
+                self._camera_timeout_s)
+        except Exception as exc:
+            return ({
+                "requested": True,
+                "captured": False,
+                "depth_included": False,
+                "timeout_s": self._camera_timeout_s,
+                "error": str(exc),
+            }, None)
+        jpeg_bytes = frame.pop("data")
+        received_monotonic = frame.pop("received_monotonic")
+        return ({
+            "requested": True,
+            "captured": True,
+            "depth_included": False,
+            "timeout_s": self._camera_timeout_s,
+            **frame,
+            "frame_age_ms": round(
+                max(0.0, time.monotonic() - received_monotonic) * 1000.0, 3),
+            "byte_size": len(jpeg_bytes),
+            "sha256": hashlib.sha256(jpeg_bytes).hexdigest(),
+            "file": None,
+        }, jpeg_bytes)
 
     def _create_timed_file(self, scope: Any, label: str, label_mode: str,
                            interval_s: float) -> dict:
@@ -2028,9 +2192,9 @@ class StateRecordPlugin:
                     "record_count": 1,
                     "records": [entry],
                     "camera": {
-                        "interface_reserved": True,
-                        "connected": False,
-                        "description": "Version 1 does not consume the camera image stream.",
+                        "requested": False,
+                        "captured": False,
+                        "depth_included": False,
                     },
                 }
                 self._atomic_write_json(path, document)
@@ -2176,6 +2340,15 @@ class StateRecordPlugin:
             temp_path.unlink(missing_ok=True)
 
     @staticmethod
+    def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_bytes(payload)
+            os.replace(temp_path, path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    @staticmethod
     def _filename_label(label: str) -> str:
         value = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "-", label).strip("-_")[:40]
         return value or "status"
@@ -2197,7 +2370,7 @@ class StateRecordPlugin:
         # Recover safely if a previous process wrote a record but exited before
         # updating the counter file, or if the counter file was removed.
         pattern = re.compile(
-            rf"^\d{{8}}_{re.escape(filename_label)}_(?:timed_)?(\d+)\.json$")
+            rf"^\d{{8}}_{re.escape(filename_label)}_(?:(?:timed|camera|all)_)?(\d+)\.json$")
         existing_max = 0
         for candidate in self._storage_dir.glob(f"*_{filename_label}_*.json"):
             match = pattern.match(candidate.name)
