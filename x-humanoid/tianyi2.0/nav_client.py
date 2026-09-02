@@ -299,6 +299,10 @@ class SlamtecClient:
         """Get the currently selected dock pose (404 when no dock is set)."""
         return self._get("/api/core/slam/v1/homepose")
 
+    def get_power_status(self) -> dict:
+        """Get docking and charging state from the chassis power API."""
+        return self._get("/api/core/system/v1/power/status")
+
     def set_home_pose(self, pose: dict) -> dict:
         """Set the currently selected dock pose (Pose3D)."""
         pose3d = {
