@@ -1164,6 +1164,11 @@ class CameraSnapshotPlugin:
             return str(native_dir)
 
     @staticmethod
+    def _default_stem(prefix: str) -> str:
+        """Generate a unique conventional media name when no name is given."""
+        return f"{prefix}_{time.time_ns()}"
+
+    @staticmethod
     def _file_stem(args: dict) -> str | None:
         import re
         value = args.get("name")
@@ -1207,9 +1212,9 @@ class CameraSnapshotPlugin:
                 "required": ["action"],
                 "x-completion": {"actions": ["record_video"], "timeout": 300},
                 "x-action-params": {
-                    "capture": {"params": ["name"], "description": "拍照；name 可选，不填则使用默认时间戳文件名"},
-                    "record_video": {"params": ["name", "duration"], "description": "录制指定时长的视频；name 和 duration 均可选，duration 默认使用 max_video_seconds"},
-                    "start_recording": {"params": ["name"], "description": "开始持续录制；name 可选，不填则使用默认时间戳文件名"},
+                    "capture": {"params": ["name"], "description": "拍照；name 可选，不填则使用 IMG_时间戳.jpg"},
+                    "record_video": {"params": ["name", "duration"], "description": "录制指定时长的视频；name 可选，不填则使用 VID_时间戳.mp4，duration 默认使用 max_video_seconds"},
+                    "start_recording": {"params": ["name"], "description": "开始持续录制；name 可选，不填则使用 VID_时间戳.mp4"},
                     "stop_recording": {"params": [], "description": "结束当前持续录制并保存视频"},
                     "list": {"params": [], "description": "查询已保存的照片和视频"},
                     "delete": {"params": ["name", "type"], "description": "删除指定名称的照片或视频；同名文件同时存在时必须指定 type"},
@@ -1306,7 +1311,7 @@ class CameraSnapshotPlugin:
             return {"state": "deleted", "filename": [p.name for p in matches]}
         if action == "start_recording":
             try:
-                stem = self._file_stem(args) or f"head_{time.time_ns()}"
+                stem = self._file_stem(args) or self._default_stem("VID")
             except ValueError as e:
                 return {"error": str(e)}
             with self._recording_lock:
@@ -1343,7 +1348,7 @@ class CameraSnapshotPlugin:
             return {"state": "recording", "action_id": action_id, "name": args.get("name"), "duration": args.get("duration", self._max_video_seconds)}
         if action == "record_video":
             try:
-                stem = self._file_stem(args) or f"head_{time.time_ns()}"
+                stem = self._file_stem(args) or self._default_stem("VID")
                 duration = max(1.0, min(self._max_video_seconds, float(args.get("duration", self._max_video_seconds))))
             except (TypeError, ValueError) as e:
                 return {"error": str(e)}
@@ -1400,7 +1405,7 @@ class CameraSnapshotPlugin:
                 return {"error": "JPEG encoding failed"}
 
             try:
-                stem = self._file_stem(args) or f"head_{time.time_ns()}"
+                stem = self._file_stem(args) or self._default_stem("IMG")
             except ValueError as e:
                 return {"error": str(e)}
             filename = f"{stem}.jpg"
