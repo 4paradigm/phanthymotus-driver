@@ -30,6 +30,8 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
         ros-humble-nav-msgs \
         ros-humble-sensor-msgs \
         pulseaudio-utils \
+        alsa-utils \
+        libasound2-plugins \
         build-essential \
         cmake && \
     rm -rf /var/lib/apt/lists/*
@@ -71,7 +73,14 @@ RUN echo "[t800] checking ROS interface build dependencies" && \
 
 COPY common/ /work/common/
 COPY main.py device.py control.py native_sdk.py virtual_gamepad.py config.yaml driver.yaml controlled_spatial_map.py /work/
+# 与 unitree/g1 一致：开机音作为小型规范资源随 driver 构建上下文打包，
+# 不依赖运行时或镜像构建时的外部网络。
 COPY resource/ /work/resource/
+RUN echo "e634d402feeead175e7a669a77fa8d6aa5770e162fbd3c867503d4897dc2f166  /work/resource/startup_beep.pcm" \
+    | sha256sum -c -
+# aplay 默认设备经 PulseAudio 路由（官方音量接口 pactl 才能作用于播放输出，
+# 且避免 ALSA dmix 默认 ~341ms 大缓冲带来的流式播放延迟）
+COPY resource/asound.conf /etc/asound.conf
 COPY deploy/ /deploy/
 RUN . /opt/ros/humble/setup.sh && \
     . /ros_ws/install/setup.sh && \
@@ -84,8 +93,9 @@ RUN . /opt/ros/humble/setup.sh && \
 ENV T800_PREFERRED_RMW=rmw_cyclonedds_cpp
 ENV ROS_LOCALHOST_ONLY=0
 ENV PYTHONUNBUFFERED=1
+ENV RCUTILS_COLORIZED_OUTPUT=0
 ENV PYTHONPATH=/work
 
 EXPOSE 15708
 
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /t800_ws/install/setup.bash && if [ -n \"${RMW_IMPLEMENTATION:-}\" ] && ! ros2 pkg prefix \"${RMW_IMPLEMENTATION}\" >/dev/null 2>&1; then echo \"[t800] ignoring unavailable RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}\"; unset RMW_IMPLEMENTATION; fi && if [ -n \"${T800_PREFERRED_RMW:-}\" ] && ros2 pkg prefix \"${T800_PREFERRED_RMW}\" >/dev/null 2>&1; then export RMW_IMPLEMENTATION=\"${T800_PREFERRED_RMW}\"; fi && if [ -z \"${CYCLONEDDS_URI:-}\" ]; then export CYCLONEDDS_URI=\"<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='${NETWORK_INTERFACE:-eth1}'/></Interfaces></General></Domain></CycloneDDS>\"; fi && exec python3 /work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /t800_ws/install/setup.bash && if [ -n \"${RMW_IMPLEMENTATION:-}\" ] && ! ros2 pkg prefix \"${RMW_IMPLEMENTATION}\" >/dev/null 2>&1; then echo \"[t800] ignoring unavailable RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}\"; unset RMW_IMPLEMENTATION; fi && if [ -n \"${T800_PREFERRED_RMW:-}\" ] && ros2 pkg prefix \"${T800_PREFERRED_RMW}\" >/dev/null 2>&1; then export RMW_IMPLEMENTATION=\"${T800_PREFERRED_RMW}\"; fi && if [ -z \"${CYCLONEDDS_URI:-}\" ]; then export CYCLONEDDS_URI=\"<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='${NETWORK_INTERFACE:-eth1}'/></Interfaces></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>\"; fi && exec python3 /work/main.py"]

@@ -9,3 +9,30 @@ mcp_url: "http://localhost:15702/mcp"
 description: "Unitree R1-EDU — 麦克风 + TTS + LED + 运动控制 + 双目摄像头 + 状态感知"
 build_context_extras:
   - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` — one config key
+# (loco, state) gates several MCP tools implemented by separate plugin classes.
+# smart_motion is not in config.yaml but defaults to enabled=True in main.py
+# (R1DeviceBundle.__init__), so it is included too.
+cards:
+  - { name: mic,          type: sensor }
+  - { name: tts,          type: actuator }
+  - { name: speaker,      type: actuator }
+  - { name: led,          type: actuator }
+  - { name: loco_state,   type: sensor }
+  - { name: loco,         type: actuator }
+  - { name: switch_mode,  type: actuator }
+  - { name: arm,          type: actuator }
+  - { name: imu,          type: sensor }
+  - { name: battery,      type: sensor }
+  - { name: joints,       type: sensor }
+  - { name: mainboard,    type: sensor }
+  - { name: model,        type: resource }
+  - { name: asr,          type: sensor }
+  - { name: camera_main,  type: sensor }
+  - { name: camera_left,  type: sensor }
+  - { name: camera_right, type: sensor }
+  - { name: camera_depth, type: sensor }
+  - { name: ext_mic,      type: sensor }
+  - { name: ext_camera,   type: sensor }
+  - { name: smart_motion, type: actuator }

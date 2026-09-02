@@ -134,16 +134,10 @@ class _ControlledSpatialDB:
         return [dict(r) for r in rows]
 
     def find_poi(self, query: str, map_name: str) -> dict | None:
-        # Try exact match first to avoid prefix collisions (e.g. "P1" matching "P10")
         row = self._conn.execute(
-            "SELECT name, description, x, y, yaw FROM poi WHERE map_name = ? AND name = ?",
-            (map_name, query)
+            "SELECT name, description, x, y, yaw FROM poi WHERE map_name = ? AND name LIKE ?",
+            (map_name, f"%{query}%")
         ).fetchone()
-        if not row:
-            row = self._conn.execute(
-                "SELECT name, description, x, y, yaw FROM poi WHERE map_name = ? AND name LIKE ?",
-                (map_name, f"%{query}%")
-            ).fetchone()
         return dict(row) if row else None
 
 
@@ -676,14 +670,12 @@ class ControlledSpatialPlugin:
         return None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        # Agent Core 在 start 前会自动下发一次 action:config（卡片里存过配置时），
+        # 少了这个分支就会 return None，被 main.py 翻译成 "Unknown tool"。
         if action == "config":
-            # Agent Core replays saved tool configuration before starting a
-            # card. Keep the runtime password in sync with that configuration.
-            password = args.get("password")
-            if password not in (None, ""):
-                self._password = str(password)
-            return {"state": "configured"}
-
+            if "password" in args:
+                self._password = str(args["password"])
+            return {"status": "configured"}
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -699,6 +691,8 @@ class ControlledSpatialPlugin:
 
         # ── Mapping ────────────────────────────────────────────────────────
 
+        # 独立的 if（不是 elif）：上面的密码块只在校验失败时 return，
+        # 挂成 elif 会让所有通过校验的受保护操作直接跳过整条分支链。
         if action == "start_mapping":
             map_name = args.get("map_name", "")
             if not map_name:
