@@ -28,7 +28,7 @@ class Plugin:
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "info", "stop"]},
                 "duration_s": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5,
-                               "description": "Video duration in seconds; only used by record_video. Default: 5 seconds."},
+                               "description": "默认值为5秒（可填写1–30秒）"},
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
