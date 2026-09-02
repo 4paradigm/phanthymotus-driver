@@ -1193,6 +1193,17 @@ class CameraSnapshotPlugin:
                     "duration": {"type": "number", "description": "视频时长（秒），默认使用 max_video_seconds，最大 300"},
                 },
                 "required": ["action"],
+                "x-action-params": {
+                    "capture": {"params": ["name"], "description": "拍照；name 可选，不填则使用默认时间戳文件名"},
+                    "record_video": {"params": ["name", "duration"], "description": "录制指定时长的视频；name 和 duration 均可选，duration 默认使用 max_video_seconds"},
+                    "start_recording": {"params": ["name"], "description": "开始持续录制；name 可选，不填则使用默认时间戳文件名"},
+                    "stop_recording": {"params": [], "description": "结束当前持续录制并保存视频"},
+                    "list": {"params": [], "description": "查询已保存的照片和视频"},
+                    "delete": {"params": ["name"], "description": "删除指定名称的照片或视频"},
+                    "info": {"params": [], "description": "查看相机和录制状态"},
+                    "start": {"params": [], "description": "启动相机订阅"},
+                    "stop": {"params": [], "description": "停止相机订阅"},
+                },
             },
         }
 
