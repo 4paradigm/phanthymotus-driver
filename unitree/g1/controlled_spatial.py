@@ -502,7 +502,7 @@ class ControlledSpatialPlugin:
 
     # ── ACP completion thread ────────────────────────────────────────────────
 
-    def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90):
+    def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90, target_xy=None):
         """Wait for navigation to complete, then fire ACP callback."""
         self._nav_action_id = action_id
         t0 = time.time()
@@ -537,11 +537,24 @@ class ControlledSpatialPlugin:
                 })
             return
 
-        # Fallback: no SmartMotion — poll local DDS callback + stall detection
+        # Fallback: no SmartMotion — pose-based arrival (dist < 0.3m) + stall detection
         last_pose = self._get_pose()
         last_move_time = time.time()
 
         while True:
+            # Pose-based arrival check before waiting for stale ctrl_info signal
+            if target_xy is not None:
+                current_pose = self._get_pose()
+                if current_pose:
+                    dx = current_pose["x"] - target_xy[0]
+                    dy = current_pose["y"] - target_xy[1]
+                    if math.sqrt(dx * dx + dy * dy) < 0.3:
+                        elapsed = round(time.time() - t0, 1)
+                        _acp_notify(action_id, "completed", {
+                            "target": target, "pose": current_pose, "elapsed": elapsed,
+                        })
+                        return
+
             if self._nav_arrived.wait(timeout=1.0):
                 elapsed = round(time.time() - t0, 1)
                 if self._nav_error:
@@ -769,7 +782,7 @@ class ControlledSpatialPlugin:
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    args=(action_id, tag_name, float(args.get("stall_timeout", 90)), (poi["x"], poi["y"])),
                     daemon=True,
                 ).start()
                 return result
@@ -789,7 +802,7 @@ class ControlledSpatialPlugin:
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    args=(action_id, tag_name, float(args.get("stall_timeout", 90)), (poi["x"], poi["y"])),
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target": tag_name,
@@ -819,7 +832,7 @@ class ControlledSpatialPlugin:
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)), (x, y)),
                     daemon=True,
                 ).start()
                 return result
@@ -927,6 +940,7 @@ def _controlled_spatial_process(plugin_config: dict, namespace: str, command_que
         child_config = dict(plugin_config)
         child_config["isolated_process"] = False
         plugin = ControlledSpatialPlugin(child_config, namespace, None, slam_client=None, smart_motion=None)
+        print("[ControlledSpatial:subprocess] no smart_motion — using pose-based fallback for arrival detection", flush=True)
         plugin.start()
         tool_def = plugin.get_tools()
         result_queue.put({"ready": True, "tools": tool_def})
