@@ -6,8 +6,8 @@ exposes the capabilities as MCP tools.
 
 ## Head camera snapshot card
 
-The `camera_snapshot` card subscribes to `/ob_camera_head/color/image_raw` and
-provides `capture`, `record_video`, `start_recording`, `stop_recording`,
+The `vision_capture` card subscribes to `/ob_camera_head/color/image_raw` and
+provides `capture_image`, `record_video`, `start_recording`, `stop_recording`,
 `list`, and `delete` actions. Each capture or recording is saved under
 `/opt/phanthy-motus/data/images` and returns a channel-visible path. The
 driver derives the corresponding `/work/resource/...` path from the persistent

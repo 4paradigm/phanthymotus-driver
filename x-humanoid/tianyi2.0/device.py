@@ -1145,7 +1145,8 @@ class CameraSnapshotPlugin:
         self._channel_dir = self._derive_channel_dir(self._native_dir)
         self._jpeg_quality = max(1, min(100, int(plugin_config.get("jpeg_quality", 90))))
         self._video_fps = max(1.0, min(30.0, float(plugin_config.get("video_fps", 15))))
-        self._max_video_seconds = max(1.0, min(300.0, float(plugin_config.get("max_video_seconds", 60))))
+        self._max_video_seconds = max(1.0, min(60.0, float(plugin_config.get("max_video_seconds", 60))))
+        self._default_video_seconds = max(1.0, min(self._max_video_seconds, float(plugin_config.get("default_video_seconds", 5))))
         self._recording_lock = threading.Lock()
         self._recording_stop = None
         self._recording_thread = None
@@ -1191,33 +1192,33 @@ class CameraSnapshotPlugin:
 
     def get_tool(self) -> dict:
         return {
-            "name": "camera_snapshot",
+            "name": "vision_capture",
             "type": "actuator",
             "description": (
                 "拍照、录制视频以及管理 /opt/phanthy-motus/data/images 中的媒体文件。"
-                "name 为不含后缀的文件名；拍摄成功后可使用返回的 channel_reply_path 通过消息渠道发送。"
+                "照片 name 不含 .jpg，视频 name 不含 .mp4；拍摄成功后可使用返回的 channel_reply_path 通过消息渠道发送。"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["capture", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "start", "stop"],
+                        "enum": ["capture_image", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "start", "stop"],
                         "description": "操作类型",
                     },
-                    "name": {"type": "string", "description": "文件名（不含 .jpg 或 .mp4）"},
+                    "name": {"type": "string", "description": "文件名；capture_image/delete image 不含 .jpg，record_video/start_recording/delete video 不含 .mp4"},
                     "type": {"type": "string", "enum": ["image", "video"], "description": "删除类型；image 删除 .jpg，video 删除 .mp4"},
-                    "duration": {"type": "number", "description": "视频时长（秒），默认使用 max_video_seconds，最大 300"},
+                    "duration": {"type": "number", "description": "视频时长（秒），默认 5，最大 60"},
                 },
                 "required": ["action"],
-                "x-completion": {"actions": ["record_video"], "timeout": 300},
+                "x-completion": {"actions": ["record_video"], "timeout": 60},
                 "x-action-params": {
-                    "capture": {"params": ["name"], "description": "拍照；name 可选，不填则使用 IMG_时间戳.jpg"},
-                    "record_video": {"params": ["name", "duration"], "description": "录制指定时长的视频；name 可选，不填则使用 VID_时间戳.mp4，duration 默认使用 max_video_seconds"},
-                    "start_recording": {"params": ["name"], "description": "开始持续录制；name 可选，不填则使用 VID_时间戳.mp4"},
+                    "capture_image": {"params": ["name"], "description": "拍照；name 可选，不填则使用 IMG_时间戳.jpg；name 不含 .jpg"},
+                    "record_video": {"params": ["name", "duration"], "description": "录制指定时长的视频；name 可选，不填则使用 VID_时间戳.mp4；name 不含 .mp4，duration 默认 5 秒、最大 60 秒"},
+                    "start_recording": {"params": ["name"], "description": "开始持续录制；name 可选，不填则使用 VID_时间戳.mp4；name 不含 .mp4"},
                     "stop_recording": {"params": [], "description": "结束当前持续录制并保存视频"},
                     "list": {"params": [], "description": "查询已保存的照片和视频"},
-                    "delete": {"params": ["name", "type"], "description": "删除指定名称的照片或视频；同名文件同时存在时必须指定 type"},
+                    "delete": {"params": ["name", "type"], "description": "删除指定媒体；type=image 时 name 不含 .jpg，type=video 时 name 不含 .mp4"},
                     "info": {"params": [], "description": "查看相机和录制状态"},
                     "start": {"params": [], "description": "启动相机订阅"},
                     "stop": {"params": [], "description": "停止相机订阅"},
@@ -1341,15 +1342,15 @@ class CameraSnapshotPlugin:
                 try:
                     result = self.dispatch("record_video", background_args)
                     status = "completed" if result.get("state") == "recorded" else "error"
-                    _acp_notify(action_id, status, result, "camera_snapshot")
+                    _acp_notify(action_id, status, result, "vision_capture")
                 except Exception as exc:
-                    _acp_notify(action_id, "error", {"action": "record_video", "error": str(exc)}, "camera_snapshot")
+                    _acp_notify(action_id, "error", {"action": "record_video", "error": str(exc)}, "vision_capture")
             threading.Thread(target=_record_async, daemon=True, name="camera-record-video").start()
-            return {"state": "recording", "action_id": action_id, "name": args.get("name"), "duration": args.get("duration", self._max_video_seconds)}
+            return {"state": "recording", "action_id": action_id, "name": args.get("name"), "duration": args.get("duration", self._default_video_seconds)}
         if action == "record_video":
             try:
                 stem = self._file_stem(args) or self._default_stem("VID")
-                duration = max(1.0, min(self._max_video_seconds, float(args.get("duration", self._max_video_seconds))))
+                duration = max(1.0, min(self._max_video_seconds, float(args.get("duration", self._default_video_seconds))))
             except (TypeError, ValueError) as e:
                 return {"error": str(e)}
             with self._frame_lock:
@@ -1381,7 +1382,7 @@ class CameraSnapshotPlugin:
                 if writer is not None:
                     writer.release()
                 return {"error": f"failed to save MP4: {e}"}
-        if action != "capture":
+        if action != "capture_image":
             return {"error": f"unknown action: {action}"}
         if not self._running:
             try:
