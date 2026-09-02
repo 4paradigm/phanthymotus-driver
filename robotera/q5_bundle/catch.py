@@ -93,8 +93,17 @@ class Plugin:
         if self._node is not None and self._subscription is None:
             # Only consume RGB while a capture is in progress: camera_rgb keeps
             # ownership of continuous dashboard streaming at all other times.
+            # Discard the frame from a previous capture.  A new request must
+            # wait for a frame that arrives after this subscription is made.
+            with self._lock:
+                self._latest = None
+                self._latest_at = 0.0
+                baseline = self._sequence
             self._subscription = self._node.create_subscription(
                 Image, self._source_topic, self._on_image, _CAMERA_QOS)
+            return baseline
+        with self._lock:
+            return self._sequence
 
     def _on_image(self, msg):
         with self._lock:
@@ -140,10 +149,9 @@ class Plugin:
         return np.ascontiguousarray(image)
 
     def _wait_for_frame(self):
-        self._ensure_subscription()
+        baseline = self._ensure_subscription()
         with self._lock:
-            if self._latest is None:
-                self._lock.wait(timeout=2.0)
+            self._lock.wait_for(lambda: self._sequence > baseline, timeout=2.0)
             msg = self._latest
             age = time.time() - self._latest_at if self._latest_at else None
             sequence = self._sequence
