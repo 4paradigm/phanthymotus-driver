@@ -115,6 +115,15 @@ class LightPlugin:
             self._clear_active_effect()
 
     def dispatch(self, action, args):
+        if action == "start":
+            try:
+                self.start()
+            except Exception as e:
+                return {"error": f"light initialization failed: {e}", "state": "error"}
+            return {"state": "ready"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
         if action not in self._commands:
             return {"error": f"unknown action: {action}"}
         if self._pub is None:

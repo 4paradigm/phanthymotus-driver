@@ -1208,7 +1208,7 @@ class CameraSnapshotPlugin:
                     },
                     "image_name": {"type": "string", "description": "照片文件名（不含 .jpg）"},
                     "video_name": {"type": "string", "description": "视频文件名（不含 .mp4）"},
-                    "type": {"type": "string", "enum": ["image", "video"], "description": "删除类型；image 删除 .jpg，video 删除 .mp4"},
+                    "name": {"type": "string", "description": "删除时填写完整文件名，必须包含 .jpg 或 .mp4"},
                     "duration": {"type": "number", "description": "视频时长（秒），默认 5，最大 60"},
                 },
                 "required": ["action"],
@@ -1219,7 +1219,7 @@ class CameraSnapshotPlugin:
                     "start_recording": {"params": ["video_name"], "description": "开始持续录制；不填 video_name 则使用 VID_时间戳.mp4"},
                     "stop_recording": {"params": [], "description": "结束当前持续录制并保存视频"},
                     "list": {"params": [], "description": "查询已保存的照片和视频"},
-                    "delete": {"params": ["type", "image_name", "video_name"], "description": "删除指定媒体；根据 type 使用对应的 image_name 或 video_name"},
+                    "delete": {"params": ["name"], "description": "删除指定媒体；name 必须填写完整文件名，例如 test.jpg 或 test.mp4"},
                     "info": {"params": [], "description": "查看相机和录制状态"},
                     "start": {"params": [], "description": "启动相机订阅"},
                     "stop": {"params": [], "description": "停止相机订阅"},
@@ -1290,35 +1290,16 @@ class CameraSnapshotPlugin:
             files = sorted((p for p in self._native_dir.iterdir() if p.is_file() and p.suffix.lower() in (".jpg", ".mp4")), key=lambda p: p.stat().st_mtime, reverse=True)
             return {"state": "listed", "files": [{"filename": p.name, "path": str(p), "size": p.stat().st_size, "mime": "image/jpeg" if p.suffix.lower() == ".jpg" else "video/mp4"} for p in files]}
         if action == "delete":
-            media_type = args.get("type")
-            suffixes = {"image": ".jpg", "video": ".mp4"}
-            if media_type is not None and media_type not in suffixes:
-                return {"error": "type must be 'image' or 'video'"}
-            if media_type:
-                name_key = "image_name" if media_type == "image" else "video_name"
-            elif args.get("image_name") and not args.get("video_name"):
-                name_key = "image_name"
-            elif args.get("video_name") and not args.get("image_name"):
-                name_key = "video_name"
-            else:
-                return {"error": "type and the matching image_name/video_name are required"}
-            try:
-                stem = self._file_stem(args, name_key)
-            except ValueError as e:
-                return {"error": str(e)}
-            if not stem:
-                return {"error": f"{name_key} is required"}
+            filename = args.get("name")
+            if not isinstance(filename, str) or not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|mp4)", filename, _re.IGNORECASE):
+                return {"error": "name is required and must be a complete .jpg or .mp4 filename"}
             if not self._native_dir.exists():
-                return {"error": f"file not found: {stem}"}
-            allowed_suffixes = (suffixes[media_type],) if media_type else ((".jpg",) if name_key == "image_name" else (".mp4",))
-            matches = [p for p in self._native_dir.iterdir() if p.is_file() and p.stem == stem and p.suffix.lower() in allowed_suffixes]
-            if not matches:
-                return {"error": f"file not found: {stem}"}
-            if media_type is None and len(matches) > 1:
-                return {"error": f"multiple media files found for {stem}; specify type as image or video"}
-            for path in matches:
-                path.unlink()
-            return {"state": "deleted", "filename": [p.name for p in matches]}
+                return {"error": f"file not found: {filename}"}
+            path = self._native_dir / filename
+            if not path.is_file() or path.suffix.lower() not in (".jpg", ".mp4"):
+                return {"error": f"file not found: {filename}"}
+            path.unlink()
+            return {"state": "deleted", "filename": [filename]}
         if action == "start_recording":
             try:
                 stem = self._file_stem(args, "video_name") or self._default_stem("VID")
@@ -1355,13 +1336,18 @@ class CameraSnapshotPlugin:
                 except Exception as exc:
                     _acp_notify(action_id, "error", {"action": "record_video", "error": str(exc)}, "vision_capture")
             threading.Thread(target=_record_async, daemon=True, name="camera-record-video").start()
-            return {"state": "recording", "action_id": action_id, "name": args.get("name"), "duration": args.get("duration", self._default_video_seconds)}
+            return {"state": "recording", "action_id": action_id, "video_name": args.get("video_name"), "duration": args.get("duration", self._default_video_seconds)}
         if action == "record_video":
             try:
                 stem = self._file_stem(args, "video_name") or self._default_stem("VID")
                 duration = max(1.0, min(self._max_video_seconds, float(args.get("duration", self._default_video_seconds))))
             except (TypeError, ValueError) as e:
                 return {"error": str(e)}
+            if not self._running:
+                try:
+                    self.start()
+                except Exception as e:
+                    return {"error": f"camera snapshot initialization failed: {e}"}
             with self._frame_lock:
                 first = self._latest_frame
             if first is None:
