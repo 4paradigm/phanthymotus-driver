@@ -99,6 +99,7 @@ class FakeLocoClient:
 
     def __init__(self, fsm_id=0, seq_delay=0.0, seq_result=None, seq_raises=None):
         self.fsm_id = fsm_id
+        self.fsm_code = 0
         self.seq_delay = seq_delay
         self.seq_result = seq_result if seq_result is not None else {"ok": True}
         self.seq_raises = seq_raises
@@ -106,7 +107,7 @@ class FakeLocoClient:
         self.sequence_thread = None
 
     def GetFsmId(self):
-        return 0, self.fsm_id
+        return self.fsm_code, self.fsm_id
 
     def StopMove(self):
         self.calls.append("StopMove")
@@ -249,13 +250,11 @@ def test_exception_in_the_worker_still_fires_the_callback(notified):
 
 @pytest.mark.parametrize('mode,fsm', [
     ('emergency_stop', 811),
-    ('damp', 0),
-    ('zero_torque', 0),
     ('get_current_mode', 811),
 ])
 def test_single_rpc_modes_carry_no_action_id(mode, fsm, notified):
     """agent-core arms a barrier iff the response has an action_id
-    (mcp_client.py:511). These must not get one, or every damp would block the
+    (mcp_client.py:511). These must not get one, or every query would block the
     turn waiting for a callback that never comes."""
     plugin, _ = make_plugin(fsm_id=fsm)
     result = plugin.dispatch('switch_mode', {'mode': mode})
@@ -276,13 +275,56 @@ def test_no_op_shortcuts_carry_no_action_id(mode, fsm, key, notified):
     assert not notified
 
 
-def test_upright_guard_still_refuses_damp(notified):
-    """Going limp while standing drops the robot -- the guard predates this change
-    and must survive it."""
-    plugin, _ = make_plugin(fsm_id=811)
-    result = plugin.dispatch('switch_mode', {'mode': 'damp'})
+# ── damp / zero_torque are gone from the model's surface ─────────────────────
+
+@pytest.mark.parametrize('mode', ['damp', 'zero_torque'])
+def test_raw_motor_modes_are_not_offered(mode):
+    """They were the only way for the model to go limp directly, and four ways to
+    'lie down' in one enum invited picking a motor mode for a posture change."""
+    plugin, _ = make_plugin()
+    assert mode not in plugin._switch_mode_tool()['inputSchema']['properties']['mode']['enum']
+
+
+@pytest.mark.parametrize('mode', ['damp', 'zero_torque'])
+@pytest.mark.parametrize('fsm', [0, 1, 4, 811])
+def test_raw_motor_modes_are_refused_from_every_state(mode, fsm, notified):
+    """A stale cached schema or a hand-made call must get a clear refusal, not a
+    silently dropped robot -- including from the ground states where they used to
+    be allowed."""
+    plugin, client = make_plugin(fsm_id=fsm)
+    result = plugin.dispatch('switch_mode', {'mode': mode})
+    assert 'error' in result
+    assert 'standup2lie' in result['error']
+    assert client.calls == [], 'no motor RPC may be issued'
+    assert not notified
+
+
+def test_the_posture_modes_survive():
+    enum = make_plugin()[0]._switch_mode_tool()['inputSchema']['properties']['mode']['enum']
+    assert enum == ['lie2standup', 'standup2lie', 'emergency_stop', 'get_current_mode']
+
+
+def test_emergency_stop_still_damps_from_standing(notified):
+    """The one remaining deliberate way to go limp. Must not be gated on state."""
+    plugin, client = make_plugin(fsm_id=811)
+    result = plugin.dispatch('switch_mode', {'mode': 'emergency_stop'})
+    assert result['mode'] == 'emergency_stop'
+    assert client.calls == ['Damp']
+
+
+# ── an unreadable FSM must not be acted on ───────────────────────────────────
+
+@pytest.mark.parametrize('mode', ['lie2standup', 'standup2lie'])
+def test_failed_fsm_read_refuses_instead_of_guessing(mode, notified):
+    """Every branch below keys off current_fsm. Acting on a failed read is how a
+    'safe' sequence turns into a collapse -- and RpcProxy returns (3104, None) for
+    a timed-out call, which used to fall straight through to the else branch."""
+    plugin, client = make_plugin(fsm_id=0)
+    client.fsm_code = 3104
+    result = plugin.dispatch('switch_mode', {'mode': mode})
     assert 'error' in result
     assert 'action_id' not in result
+    assert client.calls == []
     assert not notified
 
 

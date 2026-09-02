@@ -1002,9 +1002,14 @@ def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loc
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        _urllib.urlopen(req, timeout=5, context=ctx)
+        resp = _urllib.urlopen(req, timeout=5, context=ctx)
+        print(f"[Loco] ACP notify {action_id} -> {resp.status} "
+              f"({_LOCO_AGENT_CORE_URL})", flush=True)
     except Exception as e:
-        print(f"[Loco] ACP notify failed: {e}", flush=True)
+        # agent-core's barrier is now waiting on this callback. If it never lands the
+        # turn stalls until x-completion times out, so make the failure loud.
+        print(f"[Loco] ACP notify FAILED for {action_id} -> {_LOCO_AGENT_CORE_URL}: "
+              f"{type(e).__name__}: {e}", flush=True)
 
 
 class LocoPlugin:
@@ -1084,19 +1089,26 @@ class LocoPlugin:
             "name": "switch_mode",
             "type": "actuator",
             "multiInstance": False,
-            "description": "R1 locomotion mode switch (safe). "
-                           "damp=阻尼(ground only), zero_torque=零力矩(ground only), "
-                           "lie2standup=安全起立序列(ground→运控), standup2lie=安全躺下序列(standing→阻尼), "
-                           "emergency_stop=紧急阻尼(any state, accepts fall risk)",
+            "description": "R1 posture switch. "
+                           "lie2standup=安全起立序列(躺→站), standup2lie=安全躺下序列(站→躺), "
+                           "emergency_stop=紧急阻尼(任何状态，接受摔倒风险), "
+                           "get_current_mode=查询当前姿态。"
+                           "起立/躺下是异步的：立即返回 action_id，动作完成后回调通知。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["damp", "zero_torque",
-                                 "lie2standup", "standup2lie",
+                        # damp / zero_torque used to be exposed here. They are the only
+                        # way for the model to go limp directly, they only ever made
+                        # sense on the ground, and having four ways to "lie down" in one
+                        # enum invited the model to pick a raw motor mode when it wanted
+                        # a posture change. The model only needs lie/stand; the internal
+                        # ZeroTorque/Damp steps still run inside lie2standup, and
+                        # emergency_stop remains the one explicit way to go limp.
+                        "enum": ["lie2standup", "standup2lie",
                                  "emergency_stop", "get_current_mode"],
-                        "description": "Target mode, or get_current_mode to query current state.",
+                        "description": "Target posture, or get_current_mode to query current state.",
                     },
                 },
                 "required": ["mode"],
@@ -1109,13 +1121,12 @@ class LocoPlugin:
                 # args["action"] (mcp_client.py:504), and this tool's parameter is
                 # named "mode" -- a filter would never match. Without one every
                 # dispatch is eligible, and the real gate becomes whether the
-                # response carries an action_id (mcp_client.py:511). The synchronous
-                # modes (damp, zero_torque, emergency_stop, get_current_mode) are
-                # single RPCs that return in milliseconds and deliberately return no
-                # action_id, so they stay synchronous.
+                # response carries an action_id (mcp_client.py:511). emergency_stop
+                # and get_current_mode are single RPCs that return in milliseconds and
+                # deliberately return no action_id, so they stay synchronous.
                 #
                 # timeout mirrors _run_fsm_sequence's worst case: 4 steps x 15s
-                # step_timeout plus interval, with margin.
+                # step_timeout plus interval and settle, with margin.
                 "x-completion": {"timeout": 90},
             },
         }
@@ -1178,14 +1189,25 @@ class LocoPlugin:
         elif action == "switch_mode":
             mode = args.get("mode", "")
             code, current_fsm = self._client.GetFsmId()
+            print(f"[fsm] switch_mode(mode={mode!r}): GetFsmId -> fsm={current_fsm} "
+                  f"(code={code})", flush=True)
+            if code != 0:
+                # Every guard below keys off current_fsm. Acting on a failed read is
+                # how a "safe" call turns into a collapse, so refuse instead.
+                print(f"[fsm] switch_mode: REFUSED, cannot read FSM (code={code})", flush=True)
+                return {"error": f"Cannot read current FSM state (code={code}). "
+                                 f"Refusing to switch posture."}
 
             if mode == "emergency_stop":
+                print("[fsm] emergency_stop: Damp() regardless of state", flush=True)
                 ret = self._client.Damp()
+                print(f"[fsm] emergency_stop: Damp() -> ret={ret}", flush=True)
                 return {"ret": ret, "mode": "emergency_stop",
                         "warning": "Emergency damp executed regardless of state"}
 
             elif mode == "lie2standup":
                 if current_fsm == 811:
+                    print("[fsm] lie2standup: already standing, no-op", flush=True)
                     return {"info": "Robot is already in loco mode (standing)", "fsm_id": 811}
                 # Full sequence: zero_torque(0) → damp(1) → stance(4) → start(811)
                 all_steps = [
@@ -1197,30 +1219,39 @@ class LocoPlugin:
                 # Skip completed steps based on current FSM
                 fsm_to_start = {0: 1, 1: 2, 4: 3}
                 start_idx = fsm_to_start.get(current_fsm, 0)
-                return self._async_fsm(mode, all_steps[start_idx:])
+                steps = all_steps[start_idx:]
+                print(f"[fsm] lie2standup: from fsm={current_fsm}, skipping {start_idx} step(s), "
+                      f"running {[s[2] for s in steps]}", flush=True)
+                return self._async_fsm(mode, steps)
 
             elif mode == "standup2lie":
                 if current_fsm in self._GROUND_STATES:
+                    print(f"[fsm] standup2lie: already down (fsm={current_fsm}), no-op", flush=True)
                     return {"info": "Robot is already lying down", "fsm_id": current_fsm}
                 if current_fsm == 4:
                     # From stance: enter loco first, then lie down
                     steps = [("Start", 811, "start"), ("StandUp2Lie", 1, "standup2lie")]
+                    print(f"[fsm] standup2lie: from stance (fsm=4), running "
+                          f"{[s[2] for s in steps]}", flush=True)
                     return self._async_fsm(mode, steps)
                 # From 811 (loco mode): stop movement first, then lie down safely.
                 # StopMove + the settle sleep run inside the worker thread too --
                 # leaving them here would keep dispatch blocked for a second and
                 # defeat the point of going async.
                 steps = [("StandUp2Lie", 1, "standup2lie")]
+                print(f"[fsm] standup2lie: from fsm={current_fsm}, StopMove first, then "
+                      f"{[s[2] for s in steps]}", flush=True)
                 return self._async_fsm(mode, steps, stop_first=True)
 
             elif mode in ("zero_torque", "damp"):
-                if current_fsm in self._STANDING_STATES or current_fsm == 4:
-                    return {"error": f"Cannot enter {mode} from upright state "
-                                     f"(FSM={current_fsm}). Robot will collapse. "
-                                     f"Use standup2lie first."}
-                fn = self._client.ZeroTorque if mode == "zero_torque" else self._client.Damp
-                ret = fn()
-                return {"ret": ret, "mode": mode}
+                # Removed from the tool enum: these are raw motor modes, not postures,
+                # and they were the only way for the model to go limp directly. Kept as
+                # an explicit refusal so a stale cached schema or a hand-made call gets
+                # a clear answer instead of silently dropping the robot.
+                print(f"[fsm] switch_mode: REFUSED removed mode {mode!r}", flush=True)
+                return {"error": f"'{mode}' is no longer available. "
+                                 f"Use standup2lie to lie down, or emergency_stop "
+                                 f"if the robot must go limp immediately."}
 
             elif mode == "get_current_mode":
                 code, fsm_id = self._client.GetFsmId()
@@ -1235,7 +1266,7 @@ class LocoPlugin:
 
             else:
                 return {"error": f"Unknown mode: {mode}. "
-                                 f"Available: damp, zero_torque, lie2standup, standup2lie, emergency_stop, get_current_mode"}
+                                 f"Available: lie2standup, standup2lie, emergency_stop, get_current_mode"}
         # ── Arm actions (tool_name="arm", action = gesture name) ────────────────
         elif action == "release":
             # release_arm (id=99) puts hands down
@@ -1273,6 +1304,8 @@ class LocoPlugin:
         """
         from uuid import uuid4
         action_id = f"r1_fsm_{uuid4().hex[:8]}"
+        print(f"[fsm] {action_id}: dispatching async, mode={mode} "
+              f"steps={[s[2] for s in steps]} stop_first={stop_first}", flush=True)
         threading.Thread(
             target=self._acp_fsm_sequence,
             args=(action_id, mode, steps, stop_first),
@@ -1288,16 +1321,32 @@ class LocoPlugin:
         leave agent-core's barrier waiting out the full 90s timeout for a sequence
         that already died.
         """
+        t0 = time.monotonic()
+        print(f"[fsm] {action_id}: worker started (thread={threading.current_thread().name})",
+              flush=True)
         try:
             if stop_first:
-                self._client.StopMove()
+                ret = self._client.StopMove()
+                print(f"[fsm] {action_id}: StopMove() -> ret={ret}, settling 1.0s", flush=True)
                 time.sleep(1.0)
+            print(f"[fsm] {action_id}: entering RunFsmSequence at t={time.monotonic()-t0:.2f}s",
+                  flush=True)
             result = self._run_fsm_sequence(steps)
         except Exception as e:
+            print(f"[fsm] {action_id}: worker raised {type(e).__name__}: {e}", flush=True)
             result = {"error": f"{type(e).__name__}: {e}"}
         status = "error" if result.get("error") else "completed"
-        _loco_acp_notify(action_id, status, {"mode": mode, **result},
+        elapsed = time.monotonic() - t0
+        print(f"[fsm] {action_id}: {status} after {elapsed:.2f}s -> {result}", flush=True)
+        if status == "completed" and not result.get("fsm_measured", True):
+            # The final FSM could not be read, so "completed" is the target we aimed
+            # at, not the state the robot is in. Say so rather than implying evidence.
+            print(f"[fsm] {action_id}: WARNING final FSM unreadable; "
+                  f"reporting target {result.get('fsm_target')} unverified", flush=True)
+        _loco_acp_notify(action_id, status,
+                         {"mode": mode, "elapsed_s": round(elapsed, 2), **result},
                          tool="switch_mode")
+        print(f"[fsm] {action_id}: ACP callback sent (status={status})", flush=True)
 
     # ── Arm helpers ───────────────────────────────────────────────────────────
 
