@@ -69,6 +69,12 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
             if method == "__run_fsm_sequence":
                 steps_spec, interval, step_timeout, settle_delay = args
                 completed = []
+                # Every distinct FSM value seen while waiting, per step. The caller
+                # uses it to tell a controlled transition from a fall: a healthy
+                # standup2lie passes through 702 for ~6s, lie2standup through 701 for
+                # ~3s, so arriving at the target without them means the robot did not
+                # move through the posture.
+                fsm_seen: dict = {}
                 t_seq = time.monotonic()
                 code0, fsm0 = client.GetFsmId()
                 print(f"[RpcWorker] fsm_sequence start: steps={[s[2] for s in steps_spec]} "
@@ -87,15 +93,19 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                               flush=True)
                         result_queue.put({"seq": seq, "result": {
                             "error": f"Step '{step_name}' failed: code={ret}",
-                            "step": step_name, "completed": completed}})
+                            "step": step_name, "completed": completed,
+                            "fsm_seen": fsm_seen}})
                         break  # abort sequence on failure
                     # Poll FSM until target reached or timeout
                     elapsed = 0.0
                     ok = False
+                    seen = fsm_seen.setdefault(step_name, [])
                     while elapsed < step_timeout:
                         time.sleep(interval)
                         elapsed += interval
                         code, fsm_id = client.GetFsmId()
+                        if code == 0 and fsm_id not in seen:
+                            seen.append(fsm_id)
                         print(f"[RpcWorker] fsm_step '{step_name}': poll t={elapsed:.1f}s "
                               f"fsm={fsm_id} (code={code}) want={target_fsm}", flush=True)
                         if code == 0 and fsm_id == target_fsm:
@@ -107,12 +117,13 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                               f"fsm={current} want={target_fsm}", flush=True)
                         result_queue.put({"seq": seq, "result": {
                             "error": f"Timeout '{step_name}' (expected={target_fsm}, got={current})",
-                            "step": step_name, "fsm_id": current, "completed": completed}})
+                            "step": step_name, "fsm_id": current, "completed": completed,
+                            "fsm_seen": fsm_seen}})
                         break  # abort sequence on timeout
                     completed.append(step_name)
                     # Wait for physical motion to settle before next step
-                    print(f"[RpcWorker] fsm_step '{step_name}': reached target in {elapsed:.1f}s, "
-                          f"settling {settle_delay}s", flush=True)
+                    print(f"[RpcWorker] fsm_step '{step_name}': reached target in {elapsed:.1f}s "
+                          f"(saw {seen}), settling {settle_delay}s", flush=True)
                     time.sleep(settle_delay)
                 else:
                     # Only reached if loop completed without break (all steps succeeded)
@@ -127,6 +138,7 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                         "fsm_id": fsm_final if code_f == 0 else steps_spec[-1][1],
                         "fsm_target": steps_spec[-1][1],
                         "fsm_measured": code_f == 0,
+                        "fsm_seen": fsm_seen,
                         "elapsed_s": round(time.monotonic() - t_seq, 2)}})
                 continue  # next cmd
 

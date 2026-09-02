@@ -132,6 +132,14 @@ class FakeLocoClient:
         return self.seq_result
 
 
+def _healthy(mode):
+    """What the worker returns for a real, controlled transition."""
+    transit = {"standup2lie": 702, "lie2standup": 701}[mode]
+    target = {"standup2lie": 1, "lie2standup": 811}[mode]
+    return {"ret": 0, "steps": [mode], "fsm_id": target, "fsm_target": target,
+            "fsm_measured": True, "fsm_seen": {mode: [transit, target]}}
+
+
 @pytest.fixture
 def notified(monkeypatch):
     """Capture ACP callbacks instead of POSTing them."""
@@ -167,7 +175,8 @@ def wait_for(predicate, timeout=5.0):
 ])
 def test_sequence_modes_return_before_the_sequence_finishes(mode, start_fsm, notified):
     """dispatch returns while RunFsmSequence is still running -- that is the point."""
-    plugin, client = make_plugin(fsm_id=start_fsm, seq_delay=1.0)
+    plugin, client = make_plugin(fsm_id=start_fsm, seq_delay=1.0,
+                                 seq_result=_healthy(mode))
 
     import time
     t0 = time.monotonic()
@@ -187,7 +196,7 @@ def test_sequence_modes_return_before_the_sequence_finishes(mode, start_fsm, not
 
 
 def test_sequence_runs_off_the_dispatch_thread():
-    plugin, client = make_plugin(fsm_id=0)
+    plugin, client = make_plugin(fsm_id=0, seq_result=_healthy('lie2standup'))
     plugin.dispatch('switch_mode', {'mode': 'lie2standup'})
     assert wait_for(lambda: client.sequence_thread is not None)
     assert client.sequence_thread is not threading.current_thread()
@@ -196,7 +205,7 @@ def test_sequence_runs_off_the_dispatch_thread():
 def test_standup2lie_from_loco_stops_movement_in_the_worker(notified):
     """StopMove + the 1s settle used to run inline, so dispatch blocked a second
     even before the sequence started."""
-    plugin, client = make_plugin(fsm_id=811)
+    plugin, client = make_plugin(fsm_id=811, seq_result=_healthy('standup2lie'))
 
     import time
     t0 = time.monotonic()
@@ -210,7 +219,7 @@ def test_standup2lie_from_loco_stops_movement_in_the_worker(notified):
 
 def test_standup2lie_from_stance_does_not_stop_move(notified):
     """FSM 4 is not walking; StopMove there would be a spurious RPC."""
-    plugin, client = make_plugin(fsm_id=4)
+    plugin, client = make_plugin(fsm_id=4, seq_result=_healthy('standup2lie'))
     plugin.dispatch('switch_mode', {'mode': 'standup2lie'})
     assert wait_for(lambda: notified)
     assert 'StopMove' not in client.calls
@@ -340,3 +349,161 @@ def test_schema_declares_x_completion_without_an_action_filter():
     assert 'actions' not in completion
     assert completion['timeout'] >= 60, 'must outlast 4 steps x 15s step_timeout'
     assert 'action' not in schema['properties']
+
+
+# ── mid-transition and unknown states must be refused ────────────────────────
+#
+# 701/702 are "motion in progress". Every guard used to ignore them, and
+# lie2standup's `fsm_to_start.get(current_fsm, 0)` defaulted anything it did not
+# recognise to step 0 -- ZeroTorque() on a robot that may be halfway up.
+#
+# While switch_mode was synchronous the robot could not be caught in those states:
+# dispatch blocked for the whole sequence and the ACP barrier held back the next
+# actuator. Async dispatch leaves the window open for 6-13s.
+
+@pytest.mark.parametrize('mode', ['lie2standup', 'standup2lie'])
+@pytest.mark.parametrize('fsm', [701, 702])
+def test_transitional_states_are_refused(mode, fsm, notified):
+    plugin, client = make_plugin(fsm_id=fsm)
+    result = plugin.dispatch('switch_mode', {'mode': mode})
+    assert 'error' in result
+    assert str(fsm) in result['error']
+    assert 'action_id' not in result
+    assert client.calls == [], 'no motor RPC may be issued mid-transition'
+    assert not notified
+
+
+def test_lie2standup_no_longer_zero_torques_on_an_unknown_state(notified):
+    """The dangerous default. fsm=999 used to select step 0 = ZeroTorque()."""
+    plugin, client = make_plugin(fsm_id=999)
+    result = plugin.dispatch('switch_mode', {'mode': 'lie2standup'})
+    assert 'error' in result
+    assert 'Unrecognised' in result['error']
+    assert 'ZeroTorque' not in client.calls
+    assert client.calls == []
+    assert not notified
+
+
+def test_standup2lie_refuses_an_unknown_state(notified):
+    plugin, client = make_plugin(fsm_id=999)
+    result = plugin.dispatch('switch_mode', {'mode': 'standup2lie'})
+    assert 'error' in result
+    assert client.calls == []
+    assert not notified
+
+
+@pytest.mark.parametrize('fsm,expect_steps', [
+    (0, ['damp', 'stance', 'lie2standup']),   # from zero_torque, skip step 0
+    (1, ['stance', 'lie2standup']),
+    (4, ['lie2standup']),
+])
+def test_lie2standup_still_skips_completed_steps(fsm, expect_steps, notified):
+    """The recognised states must behave exactly as before."""
+    captured = {}
+    plugin, _ = make_plugin(fsm_id=fsm)
+
+    def fake_async(mode, steps, stop_first=False):
+        captured['steps'] = [s[2] for s in steps]
+        return {'status': 'executing', 'action_id': 'test'}
+
+    plugin._async_fsm = fake_async
+    plugin.dispatch('switch_mode', {'mode': 'lie2standup'})
+    assert captured['steps'] == expect_steps
+
+
+# ── only one sequence at a time ──────────────────────────────────────────────
+
+def test_a_second_posture_change_is_refused_while_one_runs(notified):
+    """Two sequences moving the robot at once is how a safe call becomes a fall."""
+    plugin, client = make_plugin(fsm_id=811, seq_delay=1.0,
+                                 seq_result=_healthy('standup2lie'))
+    first = plugin.dispatch('switch_mode', {'mode': 'standup2lie'})
+    assert first['status'] == 'executing'
+
+    # Same reading, so only the busy flag can stop the second one.
+    second = plugin.dispatch('switch_mode', {'mode': 'standup2lie'})
+    assert 'error' in second
+    assert 'already running' in second['error']
+    assert 'action_id' not in second
+
+    assert wait_for(lambda: notified)
+    assert client.calls.count('RunFsmSequence') == 1
+
+
+def test_the_lock_is_released_after_a_sequence_finishes(notified):
+    plugin, _ = make_plugin(fsm_id=811, seq_result=_healthy('standup2lie'))
+    plugin.dispatch('switch_mode', {'mode': 'standup2lie'})
+    assert wait_for(lambda: notified)
+    assert not plugin._fsm_busy.locked()
+    assert plugin._fsm_active is None
+
+
+def test_the_lock_is_released_after_a_crash(notified):
+    """A wedged lock would refuse every future posture change for the process life."""
+    plugin, _ = make_plugin(fsm_id=811, seq_raises=RuntimeError('sdk exploded'))
+    plugin.dispatch('switch_mode', {'mode': 'standup2lie'})
+    assert wait_for(lambda: notified)
+    assert notified[0]['status'] == 'error'
+    assert not plugin._fsm_busy.locked()
+
+
+# ── "arrived" is not the same as "moved there" ───────────────────────────────
+
+@pytest.mark.parametrize('mode,transit,target', [
+    ('standup2lie', 702, 1),
+    ('lie2standup', 701, 811),
+])
+def test_reaching_the_target_without_the_transitional_state_is_an_error(
+        mode, transit, target, notified):
+    """The 2026-09-02 signature: standup2lie hit damp at the first poll, having
+    never entered 702, and was reported as a clean "completed" -- so the model went
+    on to say it had lain down while the robot was on the floor.
+
+    A healthy transition sits in 702 for ~6s / 701 for ~3s, so 1s polling cannot
+    miss it.
+    """
+    start = 811 if mode == 'standup2lie' else 4
+    plugin, _ = make_plugin(fsm_id=start, seq_result={
+        "ret": 0, "steps": [mode], "fsm_id": target, "fsm_target": target,
+        "fsm_measured": True, "fsm_seen": {mode: [target]}})   # target only
+    plugin.dispatch('switch_mode', {'mode': mode})
+
+    assert wait_for(lambda: notified)
+    assert notified[0]['status'] == 'error', 'a fall must not report as completed'
+    r = notified[0]['result']
+    assert r['anomaly'] == 'missing_transitional_state'
+    assert r['expected_transitional'] == transit
+    assert str(transit) in r['error']
+
+
+@pytest.mark.parametrize('mode', ['standup2lie', 'lie2standup'])
+def test_a_controlled_transition_is_reported_as_completed(mode, notified):
+    start = 811 if mode == 'standup2lie' else 4
+    plugin, _ = make_plugin(fsm_id=start, seq_result=_healthy(mode))
+    plugin.dispatch('switch_mode', {'mode': mode})
+    assert wait_for(lambda: notified)
+    assert notified[0]['status'] == 'completed'
+    assert 'anomaly' not in notified[0]['result']
+
+
+def test_a_step_failure_is_not_relabelled_by_the_transit_check(notified):
+    """An error must keep its own message, not be overwritten by the anomaly text."""
+    plugin, _ = make_plugin(fsm_id=811, seq_result={
+        "error": "Step 'standup2lie' failed: code=7", "fsm_seen": {}})
+    plugin.dispatch('switch_mode', {'mode': 'standup2lie'})
+    assert wait_for(lambda: notified)
+    assert notified[0]['status'] == 'error'
+    assert 'code=7' in notified[0]['result']['error']
+    assert 'anomaly' not in notified[0]['result']
+
+
+def test_stop_move_return_code_reaches_the_acp_result(notified):
+    """StopMove clears residual motion before the lie-down. It returns non-zero on
+    healthy runs too, so it is reported rather than acted on -- but it must not be
+    silently dropped, since "lie down while still moving" is the leading theory for
+    a controlled descent degrading into a collapse."""
+    plugin, client = make_plugin(fsm_id=811, seq_result=_healthy('standup2lie'))
+    client.StopMove = lambda: 127
+    plugin.dispatch('switch_mode', {'mode': 'standup2lie'})
+    assert wait_for(lambda: notified)
+    assert notified[0]['result']['stop_move_ret'] == 127
