@@ -19,6 +19,12 @@ class CameraWorker:
         self._configs = configs
         self._process = None
         self._running = False
+        # Parent-process cache of the same JPEG frames forwarded to the media
+        # bridge. Other cards can consume this proven camera path instead of
+        # adding a separate raw ROS subscription.
+        self._latest_frames = {}
+        self._frame_sequences = {}
+        self._frame_ready = threading.Condition()
 
     def start(self):
         if self._running:
@@ -50,7 +56,31 @@ class CameraWorker:
             if isinstance(frame, dict) and frame.get("kind"):
                 newest[frame["kind"]] = frame
         for frame in newest.values():
+            kind = frame["kind"]
+            with self._frame_ready:
+                self._latest_frames[kind] = frame
+                self._frame_sequences[kind] = self._frame_sequences.get(kind, 0) + 1
+                self._frame_ready.notify_all()
             sender(frame)
+
+    def wait_for_frame(self, kind: str, after_sequence: int | None = None,
+                       timeout_s: float = 5.0):
+        """Return a current worker frame and its monotonically increasing sequence.
+
+        ``after_sequence`` requests a later frame, which is used by recording
+        to avoid repeatedly writing the same cached JPEG.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._frame_ready:
+            if after_sequence is None and kind in self._latest_frames:
+                return self._latest_frames[kind], self._frame_sequences.get(kind, 0)
+            baseline = self._frame_sequences.get(kind, 0) if after_sequence is None else after_sequence
+            while self._frame_sequences.get(kind, 0) <= baseline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, self._frame_sequences.get(kind, 0)
+                self._frame_ready.wait(timeout=remaining)
+            return self._latest_frames.get(kind), self._frame_sequences.get(kind, 0)
 
     def stop(self):
         if not self._running:
