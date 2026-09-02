@@ -8,7 +8,7 @@ import subprocess
 import time
 
 
-CARD = "catch"
+CARD = "vision_capture"
 _FIRST_FRAME_TIMEOUT_S = 5.0
 
 
@@ -17,25 +17,23 @@ class Plugin:
         del namespace, executor
         self._worker = getattr(client, "camera_worker", None)
         self._output_dir = Path(str(plugin_config.get(
-            "output_dir", "/opt/phanthy-motus/data/catch"))).expanduser()
+            "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
         self._fps = max(1, min(15, int(plugin_config.get("fps", 10))))
         self._max_duration_s = max(1, min(30, int(plugin_config.get("max_duration_s", 30))))
 
     def get_tool(self):
         return {
             "name": CARD, "type": "actuator", "multiInstance": False,
-            "description": "Capture a visitor photo or record a Q5 RGB video (1–30 seconds) to persistent storage.",
+            "description": "Capture a Q5 RGB photo or record a video (1–30 seconds) to persistent storage.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "info", "stop"]},
-                "duration_s": {"type": "integer", "minimum": 1, "maximum": 30,
-                               "description": "Video duration in seconds; only used by record_video."},
-                "file_label": {"type": "string", "title": "文件备注",
-                               "description": "可选，仅用于生成保存文件的名称。"},
+                "duration_s": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5,
+                               "description": "Video duration in seconds; only used by record_video. Default: 5 seconds."},
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
-                    "capture_photo": {"params": ["file_label"], "description": "拍摄并保存一张当前 RGB 照片。"},
-                    "record_video": {"params": ["duration_s", "file_label"], "description": "录制并保存 1–30 秒 RGB 视频。"},
+                    "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
+                    "record_video": {"params": ["duration_s"], "description": "录制并保存 1–30 秒 RGB 视频，默认 5 秒。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
                     "stop": {"params": [], "description": "停止卡片。"},
                 }},
@@ -68,28 +66,6 @@ class Plugin:
                 "max_duration_s": self._max_duration_s, "latest_frame_age_s": age,
                 "source": "q5_camera_worker"}
 
-    @staticmethod
-    def _safe_label(value):
-        value = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(value))
-        return value.strip("_")[:40]
-
-    def _media_path(self, directory, args, extension):
-        """Use an explicit file label verbatim; timestamp only anonymous media.
-
-        A numeric suffix preserves an earlier labelled file instead of silently
-        overwriting it when an operator reuses a label.
-        """
-        label = self._safe_label(args.get("file_label", ""))
-        if label:
-            path = directory / f"{label}.{extension}"
-            index = 1
-            while path.exists():
-                path = directory / f"{label}_{index}.{extension}"
-                index += 1
-            return path
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        return directory / f"{stamp}_visitor.{extension}"
-
     def _frame(self, after_sequence=None, timeout_s=_FIRST_FRAME_TIMEOUT_S):
         if not self._camera_ready():
             raise RuntimeError("Q5 camera worker is unavailable")
@@ -108,7 +84,8 @@ class Plugin:
             frame, _ = self._frame()
             directory = self._output_dir / "photos"
             directory.mkdir(parents=True, exist_ok=True)
-            path = self._media_path(directory, args, "jpg")
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = directory / f"IMG_{stamp}.jpg"
             path.write_bytes(frame["data"])
             return {"ok": True, "media_type": "photo", "file_path": str(path),
                     "captured_at": datetime.now().isoformat(timespec="seconds"),
@@ -125,7 +102,8 @@ class Plugin:
             frame, _ = self._frame()
             directory = self._output_dir / "videos"
             directory.mkdir(parents=True, exist_ok=True)
-            path = self._media_path(directory, args, "mp4")
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = directory / f"video_{stamp}.mp4"
             process = subprocess.Popen([
                 "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", str(self._fps), "-i", "-",
                 "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),

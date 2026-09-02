@@ -71,13 +71,12 @@ plugins:
       port: 2222
       depth_profile: "848x480x30"
       color_profile: "848x480x30"
-  catch:
+  vision_capture:
     enabled: true
     source_topic: "/camera/camera/color/image_raw"
     # This is mounted from the Q5 host (/opt/phanthy-motus/data), so files
     # survive driver container replacement and restarts.
-    output_dir: "/opt/phanthy-motus/data/catch"
-    jpeg_quality: 90
+    output_dir: "/opt/phanthy-motus/data/vision_capture"
     fps: 10
     max_duration_s: 30
   camera_depth:
