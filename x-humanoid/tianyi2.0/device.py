@@ -1361,15 +1361,20 @@ class CameraSnapshotPlugin:
                 writer = self._cv2.VideoWriter(str(path), self._cv2.VideoWriter_fourcc(*"mp4v"), self._video_fps, (first_image.shape[1], first_image.shape[0]))
                 if not writer.isOpened():
                     return {"error": "MP4 video writer initialization failed"}
-                deadline = time.monotonic() + duration
-                next_frame = time.monotonic()
-                while time.monotonic() < deadline:
+                total_frames = max(1, int(round(duration * self._video_fps)))
+                record_start = time.monotonic()
+                last_image = first_image
+                for frame_index in range(total_frames):
                     with self._frame_lock:
                         current = self._latest_frame
                     if current is not None:
-                        writer.write(self._decode_frame(current))
-                    next_frame += 1.0 / self._video_fps
-                    time.sleep(max(0.0, next_frame - time.monotonic()))
+                        last_image = self._decode_frame(current)
+                    # Always write one frame per target slot. Reusing the last
+                    # decoded frame keeps the MP4 duration stable if encoding
+                    # or camera delivery briefly falls behind the target FPS.
+                    writer.write(last_image)
+                    target_time = record_start + (frame_index + 1) / self._video_fps
+                    time.sleep(max(0.0, target_time - time.monotonic()))
                 writer.release()
                 writer = None
                 return {"state": "recorded", "filename": path.name, "path": str(path), "channel_reply_path": str(Path(self._channel_dir) / path.name), "mime": "video/mp4", "size": path.stat().st_size, "duration": duration}

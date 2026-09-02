@@ -29,7 +29,7 @@ plugins:
     # The channel-visible path is derived from the persistent mount. Set
     # PHANTHY_CHANNEL_OUTPUT_DIR only when deployment uses another mount.
     jpeg_quality: 90
-    video_fps: 30
+    video_fps: 20
     default_video_seconds: 5
     max_video_seconds: 60
   imu:
