@@ -110,7 +110,12 @@ latest-only execution queue, so older unread or pending velocities are replaced
 instead of backlogged. A proposal TTL lapse immediately triggers `StopMove`;
 only a successful post-call zero-odometry confirmation keeps the same navigation
 lease recoverable for the next fresh proposal. Hard safety, identity, sequence,
-RPC, and stop-confirmation faults still disarm the lease.
+motion-RPC, explicit invalid-FSM, and stop-confirmation faults still disarm the
+lease.
+Transient stale or failed FSM observations also stop immediately, but retain a
+confirmed-zero lease until a fresh allowed FSM and the other runtime safety
+inputs are ready again. Pending FSM and StopMove calls take priority over the
+next velocity RPC, and `loco info` reports FSM sample age and RPC-lock wait time.
 
 `loco.start` connects the sole proposal topic and remains physically stopped.
 While idle, the Driver validates the first fresh, legal, nonzero proposal and

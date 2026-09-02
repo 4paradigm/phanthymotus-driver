@@ -8,12 +8,91 @@ import time
 import unittest
 
 from safety_harness import (
+    PrioritizedRpcGate,
     SmartMotionProxy,
     _run_smart_motion_process,
     request_parent_apply_velocity_proposal,
     request_parent_get_fsm_id,
     request_parent_stop_velocity_proposal,
 )
+
+
+class PrioritizedRpcGateTest(unittest.TestCase):
+    def test_pending_fsm_query_runs_before_next_velocity_rpc(self):
+        gate = PrioritizedRpcGate()
+        first_velocity_entered = threading.Event()
+        release_first_velocity = threading.Event()
+        order = []
+
+        def first_velocity():
+            with gate.regular():
+                first_velocity_entered.set()
+                release_first_velocity.wait(timeout=0.5)
+
+        def fsm_query():
+            with gate.priority():
+                order.append("fsm")
+
+        def next_velocity():
+            with gate.regular():
+                order.append("velocity")
+
+        first = threading.Thread(target=first_velocity)
+        first.start()
+        self.assertTrue(first_velocity_entered.wait(timeout=0.5))
+
+        fsm = threading.Thread(target=fsm_query)
+        fsm.start()
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            with gate._condition:
+                if gate._priority_waiters:
+                    break
+            time.sleep(0.001)
+        else:
+            self.fail("FSM query did not reach the priority gate")
+
+        velocity = threading.Thread(target=next_velocity)
+        velocity.start()
+        release_first_velocity.set()
+        for thread in (first, fsm, velocity):
+            thread.join(timeout=0.5)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(order, ["fsm", "velocity"])
+
+    def test_five_hz_velocity_stream_keeps_fsm_poll_below_stale_limit(self):
+        gate = PrioritizedRpcGate()
+        fsm_samples = []
+
+        def velocity_stream():
+            for _ in range(6):
+                cycle_started = time.monotonic()
+                with gate.regular():
+                    time.sleep(0.17)
+                time.sleep(max(0.0, 0.2 - (time.monotonic() - cycle_started)))
+
+        def fsm_stream():
+            for _ in range(6):
+                cycle_started = time.monotonic()
+                with gate.priority():
+                    fsm_samples.append(time.monotonic())
+                time.sleep(max(0.0, 0.2 - (time.monotonic() - cycle_started)))
+
+        velocity = threading.Thread(target=velocity_stream)
+        fsm = threading.Thread(target=fsm_stream)
+        velocity.start()
+        fsm.start()
+        velocity.join(timeout=2.0)
+        fsm.join(timeout=2.0)
+
+        self.assertFalse(velocity.is_alive())
+        self.assertFalse(fsm.is_alive())
+        self.assertEqual(len(fsm_samples), 6)
+        self.assertLess(
+            max(b - a for a, b in zip(fsm_samples, fsm_samples[1:])),
+            0.5,
+        )
 
 
 class FakeProcess:
@@ -580,7 +659,10 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
             'proposal_gate.disarm("terminal_stop_unconfirmed")',
             source,
         )
-        self.assertIn("parent_loco_rpc_lock", source)
+        self.assertIn("parent_loco_rpc_gate", source)
+        self.assertIn("parent_loco_rpc_gate.regular()", source)
+        self.assertIn("parent_loco_rpc_gate.priority()", source)
+        self.assertIn('"fsm_lock_wait_ms": fsm_lock_wait_ms', source)
         self.assertIn("proposal_ros_spin_loop", source)
         callback_source = source[
             source.index("def on_velocity_proposal"):

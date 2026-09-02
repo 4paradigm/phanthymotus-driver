@@ -27,6 +27,7 @@ import struct
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -462,6 +463,47 @@ class ProposalExecutionLease:
             self._active = False
             self._fault = (generation, reason)
             return True
+
+
+class PrioritizedRpcGate:
+    """Serialize one shared RPC result queue while prioritizing safety work."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._busy = False
+        self._priority_waiters = 0
+
+    @contextmanager
+    def regular(self):
+        with self._condition:
+            while self._busy or self._priority_waiters:
+                self._condition.wait()
+            self._busy = True
+        try:
+            yield
+        finally:
+            self._release()
+
+    @contextmanager
+    def priority(self):
+        wait_started = time.monotonic()
+        with self._condition:
+            self._priority_waiters += 1
+            try:
+                while self._busy:
+                    self._condition.wait()
+                self._busy = True
+            finally:
+                self._priority_waiters -= 1
+        try:
+            yield max(0, round((time.monotonic() - wait_started) * 1000))
+        finally:
+            self._release()
+
+    def _release(self):
+        with self._condition:
+            self._busy = False
+            self._condition.notify_all()
 
 
 def velocity_commands_differ(current, target, abs_tol: float = 1e-9) -> bool:
@@ -1556,9 +1598,13 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     move_timer = None   # threading.Timer
     last_cloud_time = 0.0
     last_fsm_check = 0.0
+    last_fsm_success = 0.0
     last_fsm_id = None
     last_fsm_ret = None
     last_fsm_error = None
+    last_fsm_lock_wait_ms = None
+    max_fsm_lock_wait_ms = None
+    fsm_query_count = 0
     main_control_ready = False
     last_nav2_heartbeat_time = 0.0
     odom_stop_monitor = OdomStopMonitor()
@@ -1574,7 +1620,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     proposal_callback_error = None
     proposal_ros_thread = None
     parent_loco_request_id = 0
-    parent_loco_rpc_lock = threading.Lock()
+    parent_loco_rpc_gate = PrioritizedRpcGate()
     proposal_apply_diagnostics = ProposalApplyDiagnostics()
     proposal_apply_queue = queue.Queue(maxsize=1)
     last_stop_result = None
@@ -1626,8 +1672,9 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     def apply_parent_velocity_proposal(command):
         nonlocal parent_loco_request_id
         # The FSM monitor and proposal callback share one request/result pair.
-        # Serialize them so one waiter cannot consume the other's reply.
-        with parent_loco_rpc_lock:
+        # Serialize them so one waiter cannot consume the other's reply, while
+        # allowing a pending health query to run before the next velocity RPC.
+        with parent_loco_rpc_gate.regular():
             parent_loco_request_id += 1
             result = request_parent_apply_velocity_proposal(
                 request_queue=parent_velocity_queue,
@@ -1650,7 +1697,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     def stop_parent_velocity_proposal():
         """Serialize StopMove behind any in-flight parent proposal apply."""
         nonlocal parent_loco_request_id
-        with parent_loco_rpc_lock:
+        with parent_loco_rpc_gate.priority():
             parent_loco_request_id += 1
             return request_parent_stop_velocity_proposal(
                 request_queue=parent_velocity_queue,
@@ -1673,14 +1720,15 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     def query_parent_fsm_id():
         nonlocal parent_loco_request_id
-        with parent_loco_rpc_lock:
+        with parent_loco_rpc_gate.priority() as lock_wait_ms:
             parent_loco_request_id += 1
-            return request_parent_get_fsm_id(
+            result = request_parent_get_fsm_id(
                 request_queue=parent_velocity_queue,
                 result_queue=parent_velocity_result_queue,
                 request_id=parent_loco_request_id,
                 timeout=fsm_rpc_timeout,
             )
+        return result, lock_wait_ms
 
     # Obstacle state (written by LiDAR callback, read by main loop)
     obstacle_lock = threading.Lock()
@@ -1745,10 +1793,6 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         recoverable_stop_requested = bool(
             proposal_gate.armed
             and reason_str in RECOVERABLE_PROPOSAL_STOP_REASONS
-            and (
-                was_proposal_motion
-                or reason_str in {"proposal_ttl_expired", "scan_stale"}
-            )
         )
         proposal_stop_context = bool(
             was_proposal_motion
@@ -2285,13 +2329,15 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         print(f"[SmartMotion:pid={os.getpid()}] WARNING: rt/slam_info subscribe failed: {e}")
 
     def refresh_fsm_state():
-        nonlocal last_fsm_check, last_fsm_id, last_fsm_ret
-        nonlocal last_fsm_error, main_control_ready
+        nonlocal last_fsm_check, last_fsm_success, last_fsm_id, last_fsm_ret
+        nonlocal last_fsm_error, last_fsm_lock_wait_ms
+        nonlocal max_fsm_lock_wait_ms, fsm_query_count, main_control_ready
         fsm_id = None
         ret = None
         error = None
+        lock_wait_ms = None
         try:
-            result = query_parent_fsm_id()
+            result, lock_wait_ms = query_parent_fsm_id()
             ret = result.get("ret")
             fsm_id = result.get("fsm_id")
             error = result.get("error")
@@ -2303,11 +2349,21 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         except Exception as exc:
             error = str(exc)
             ready = False
+        completed = time.monotonic()
         with safety_lock:
-            last_fsm_check = time.monotonic()
-            last_fsm_id = fsm_id
+            last_fsm_check = completed
+            if error is None and ret == 0:
+                last_fsm_success = completed
+                last_fsm_id = fsm_id
             last_fsm_ret = ret
             last_fsm_error = error
+            last_fsm_lock_wait_ms = lock_wait_ms
+            if lock_wait_ms is not None:
+                max_fsm_lock_wait_ms = max(
+                    max_fsm_lock_wait_ms or 0,
+                    lock_wait_ms,
+                )
+            fsm_query_count += 1
             main_control_ready = ready
 
     def proposal_runtime_status(force_fsm_check=False):
@@ -2324,11 +2380,19 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 if last_nav2_heartbeat_time
                 else float("inf")
             )
-            fsm_age = now - last_fsm_check if last_fsm_check else float("inf")
+            fsm_query_age = (
+                now - last_fsm_check if last_fsm_check else float("inf")
+            )
+            fsm_age = (
+                now - last_fsm_success if last_fsm_success else float("inf")
+            )
             temperature = max_motor_temp
             fsm_id = last_fsm_id
             fsm_ret = last_fsm_ret
             fsm_error = last_fsm_error
+            fsm_lock_wait_ms = last_fsm_lock_wait_ms
+            fsm_lock_wait_max_ms = max_fsm_lock_wait_ms
+            fsm_queries = fsm_query_count
             control_ready = main_control_ready
             tilted = tilt_triggered
         odom_age = odom["age"]
@@ -2371,6 +2435,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             "nav2_status_age_ms": None if not math.isfinite(nav_status_age) else round(nav_status_age * 1000),
             "nav2_heartbeat_age_ms": None if not math.isfinite(nav_status_age) else round(nav_status_age * 1000),
             "fsm_age_ms": None if not math.isfinite(fsm_age) else round(fsm_age * 1000),
+            "fsm_query_age_ms": None if not math.isfinite(fsm_query_age) else round(fsm_query_age * 1000),
+            "fsm_lock_wait_ms": fsm_lock_wait_ms,
+            "fsm_lock_wait_max_ms": fsm_lock_wait_max_ms,
+            "fsm_query_count": fsm_queries,
         }
 
     # ── Command handlers ──
@@ -2922,11 +2990,14 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             return
 
         was_armed = proposal_gate.armed
+        hold_runtime = (
+            proposal_runtime_status(force_fsm_check=False)
+            if proposal_gate.recoverable_stop_active
+            else None
+        )
         resume_allowed = not (
-            proposal_gate.recoverable_stop_active
-            and proposal_gate.last_reason == "scan_stale_stop_recoverable"
-            and proposal_runtime_status(force_fsm_check=False)["reason"]
-            == "scan_stale"
+            hold_runtime
+            and hold_runtime["reason"] in RECOVERABLE_PROPOSAL_STOP_REASONS
         )
         decision = proposal_gate.accept(
             payload,

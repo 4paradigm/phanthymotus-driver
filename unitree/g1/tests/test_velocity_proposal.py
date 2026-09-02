@@ -517,7 +517,6 @@ class ProposalGateTest(unittest.TestCase):
         self.assertTrue(stopped.stop)
         self.assertTrue(self.gate.armed)
         self.assertFalse(self.gate.recoverable_stop_active)
-
         self.assertTrue(
             self.gate.record_recoverable_stop_result("scan_stale", True)
         )
@@ -540,6 +539,61 @@ class ProposalGateTest(unittest.TestCase):
         self.assertTrue(resumed.execute)
         self.assertTrue(self.gate.armed)
         self.assertFalse(self.gate.recoverable_stop_active)
+
+    def test_confirmed_fsm_observation_stop_waits_for_fresh_health(self):
+        for reason in (
+            "main_control_status_stale",
+            "main_control_rpc_failed",
+        ):
+            with self.subTest(reason=reason):
+                gate = VelocityProposalGate(ProposalLimits())
+                gate.bind(EXPECTED_TOPIC, "nav-001")
+                self.assertTrue(
+                    gate.accept(proposal(sequence=1), now=50.0).execute
+                )
+                self.assertTrue(
+                    gate.request_recoverable_stop(reason, now=50.1).stop
+                )
+                self.assertTrue(
+                    gate.record_recoverable_stop_result(reason, True)
+                )
+
+                held = gate.accept(
+                    proposal(sequence=2),
+                    now=50.2,
+                    recoverable_resume_allowed=False,
+                )
+                self.assertFalse(held.execute)
+                self.assertTrue(gate.armed)
+                self.assertTrue(gate.recoverable_stop_active)
+
+                resumed = gate.accept(
+                    proposal(sequence=3),
+                    now=50.3,
+                    recoverable_resume_allowed=True,
+                )
+                self.assertTrue(resumed.execute)
+                self.assertEqual(gate.expected_nav_id, "nav-001")
+                self.assertFalse(gate.recoverable_stop_active)
+
+    def test_unconfirmed_fsm_observation_stop_hard_disarms(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
+        self.gate.request_recoverable_stop(
+            "main_control_status_stale",
+            now=10.1,
+        )
+
+        self.assertFalse(
+            self.gate.record_recoverable_stop_result(
+                "main_control_status_stale",
+                False,
+            )
+        )
+        self.assertFalse(self.gate.armed)
+        self.assertEqual(
+            self.gate.last_reason,
+            "main_control_status_stale_stop_unconfirmed",
+        )
 
     def test_unconfirmed_scan_stale_stop_hard_disarms(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)

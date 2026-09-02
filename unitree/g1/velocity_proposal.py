@@ -29,6 +29,8 @@ RECOVERABLE_PROPOSAL_STOP_REASONS = {
     "obstacle": "obstacle_stop_recoverable",
     "proposal_ttl_expired": "proposal_ttl_stop_recoverable",
     "scan_stale": "scan_stale_stop_recoverable",
+    "main_control_status_stale": "main_control_status_stale_stop_recoverable",
+    "main_control_rpc_failed": "main_control_rpc_failed_stop_recoverable",
 }
 _STATUS_FIELD = "nav_status"
 _UNSUPPORTED_STATUS_ALIASES = {"status", "navigation_status", "navigation_state"}
@@ -300,10 +302,10 @@ class VelocityProposalGate:
     def hold_after_confirmed_stop(self, reason: str) -> None:
         """Keep a trusted nav lease after a confirmed recoverable stop.
 
-        Ordinary obstacle stops and a single proposal TTL lapse are local
-        braking events, not proof that the Agent Core lease is invalid.  The
-        caller must only enter this state after StopMove has been acknowledged
-        and fresh odometry has confirmed zero velocity.
+        A local obstacle, proposal TTL lapse, stale scan, or transient FSM
+        observation failure is not proof that the task identity is invalid.
+        The caller must only enter this state after StopMove has been
+        acknowledged and fresh odometry has confirmed zero velocity.
         """
         if not self.armed:
             return
@@ -347,6 +349,8 @@ class VelocityProposalGate:
             "obstacle": "obstacle_stop_unconfirmed",
             "proposal_ttl_expired": "proposal_ttl_stop_unconfirmed",
             "scan_stale": "scan_stale_stop_unconfirmed",
+            "main_control_status_stale": "main_control_status_stale_stop_unconfirmed",
+            "main_control_rpc_failed": "main_control_rpc_failed_stop_unconfirmed",
         }[reason]
         self.disarm(unconfirmed_reason)
         return False
@@ -521,7 +525,6 @@ class VelocityProposalGate:
         self.last_receive_monotonic = now
         if (
             self.recoverable_stop_active
-            and self.last_reason == "scan_stale_stop_recoverable"
             and not recoverable_resume_allowed
             and not proposal.is_zero
         ):
