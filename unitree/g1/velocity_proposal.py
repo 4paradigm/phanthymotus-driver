@@ -511,9 +511,7 @@ class VelocityProposalGate:
                     proposal=proposal,
                 )
         elif proposal.nav_id != self.expected_nav_id:
-            self.disarm("nav_id_mismatch")
             return ProposalDecision(
-                stop=True,
                 reason="nav_id_mismatch",
                 proposal=proposal,
             )

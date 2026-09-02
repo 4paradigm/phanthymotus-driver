@@ -101,7 +101,8 @@ lease 才能保留并接受下一条新鲜 proposal。安全、身份、序列�
 
 `loco.start` 只订阅唯一 proposal topic，并保持物理停止。Driver 空闲时会先
 完整校验首条新鲜、合法、非零 proposal，再原子绑定其 `nav_id` 并执行该帧。
-当前任务期间，其他 ID 既不能替换 lease，也不能中断当前任务。终态零速
+当前任务期间，其他 ID 既不能替换 lease，也不能中断当前任务：仅拒绝该包，
+当前 lease、sequence 和执行 deadline 保持不变。终态零速
 proposal 会先进入 `terminal_pending_stop`；只有零速停车确认成功后才退役
 当前 ID，并保留订阅以等待下一任务。首次停车确认失败时保持 fail-closed，
 后续重试确认成功会恢复 `awaiting_first_valid_proposal`。格式错误、过期、

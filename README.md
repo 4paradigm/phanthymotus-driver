@@ -120,7 +120,8 @@ next velocity RPC, and `loco info` reports FSM sample age and RPC-lock wait time
 `loco.start` connects the sole proposal topic and remains physically stopped.
 While idle, the Driver validates the first fresh, legal, nonzero proposal and
 atomically binds its `nav_id` before executing that same proposal. Another ID
-cannot replace or interrupt the active task. A terminal zero proposal first
+cannot replace or interrupt the active task: only that packet is rejected, while
+the current lease, sequence, and execution deadline remain unchanged. A terminal zero proposal first
 enters `terminal_pending_stop`; only a successful zero-odometry stop
 confirmation retires the active ID and keeps the subscription ready for the
 next task. A failed confirmation stays fail-closed, and a later successful

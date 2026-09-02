@@ -221,11 +221,14 @@ class ProposalGateTest(unittest.TestCase):
         rejected = self.gate.accept(
             proposal(nav_id="attacker-selected", sequence=1), now=10.0
         )
-        self.assertTrue(rejected.stop)
+        self.assertFalse(rejected.stop)
         self.assertFalse(rejected.execute)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
-        self.assertFalse(self.gate.armed)
+        self.assertTrue(self.gate.armed)
         self.assertEqual(self.gate.expected_nav_id, "nav-001")
+        self.assertTrue(
+            self.gate.accept(proposal(sequence=1), now=10.1).execute
+        )
 
     def test_first_fresh_legal_nonzero_proposal_binds_and_executes(self):
         gate = VelocityProposalGate(ProposalLimits())
@@ -298,22 +301,27 @@ class ProposalGateTest(unittest.TestCase):
                 self.assertFalse(gate.armed)
                 self.assertTrue(gate.awaiting_nav_id)
 
-    def test_mid_task_other_nav_id_hard_disarms_active_task(self):
+    def test_mid_task_other_nav_id_preserves_active_task(self):
         gate = VelocityProposalGate(ProposalLimits())
         gate.bind(EXPECTED_TOPIC)
         self.assertTrue(gate.accept(proposal(sequence=1), now=10.0).execute)
+        deadline = gate.deadline_monotonic
+        last_receive = gate.last_receive_monotonic
 
         rejected = gate.accept(
             proposal(nav_id="nav-002", sequence=2),
             now=10.1,
         )
 
-        self.assertTrue(rejected.stop)
+        self.assertFalse(rejected.stop)
         self.assertFalse(rejected.execute)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
-        self.assertFalse(gate.armed)
+        self.assertTrue(gate.armed)
         self.assertEqual(gate.expected_nav_id, "nav-001")
         self.assertEqual(gate.last_sequence, 1)
+        self.assertEqual(gate.deadline_monotonic, deadline)
+        self.assertEqual(gate.last_receive_monotonic, last_receive)
+        self.assertTrue(gate.accept(proposal(sequence=2), now=10.2).execute)
 
     def test_failed_terminal_stop_then_success_releases_for_next_nav_id(self):
         gate = VelocityProposalGate(ProposalLimits())
@@ -396,10 +404,14 @@ class ProposalGateTest(unittest.TestCase):
     def test_nav_id_cannot_change_mid_task(self):
         self.assertTrue(self.gate.accept(proposal(), now=10.0).execute)
         rejected = self.gate.accept(proposal(nav_id="nav-002", sequence=2), now=10.1)
-        self.assertTrue(rejected.stop)
+        self.assertFalse(rejected.stop)
         self.assertFalse(rejected.execute)
         self.assertEqual(rejected.reason, "nav_id_mismatch")
-        self.assertFalse(self.gate.armed)
+        self.assertTrue(self.gate.armed)
+        self.assertEqual(self.gate.expected_nav_id, "nav-001")
+        self.assertTrue(
+            self.gate.accept(proposal(sequence=2), now=10.2).execute
+        )
 
     def test_control_plane_terminal_waits_for_confirmation_before_rebind(self):
         self.assertTrue(self.gate.accept(proposal(), now=10.0).execute)
