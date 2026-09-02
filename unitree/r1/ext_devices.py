@@ -847,7 +847,12 @@ class ExtCameraPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id", "")
-        print(f"[ext_camera] dispatch: action={action!r} instance_id={instance_id!r} args_keys={list(args.keys())}", flush=True)
+        # `info` is polled by the dashboard every couple of seconds and changes
+        # nothing, so logging it buries the lines that matter (posture changes,
+        # errors) in the driver log. Only trace state-changing actions.
+        if action not in ("info", "status"):
+            print(f"[ext_camera] dispatch: action={action!r} instance_id={instance_id!r} "
+                  f"args_keys={list(args.keys())}", flush=True)
 
         if action == 'config':
             if instance_id:

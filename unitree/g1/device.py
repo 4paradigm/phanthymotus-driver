@@ -1837,8 +1837,16 @@ class LocoPlugin:
         return {"status": "executing", "mode": mode, "action_id": action_id}
 
     def _acp_fsm_sequence(self, action_id: str, mode: str, steps: list):
-        """Background thread: execute FSM sequence, then fire ACP callback."""
-        result = self._run_fsm_sequence(steps)
+        """Background thread: execute FSM sequence, then fire ACP callback.
+
+        The callback must go out on every path. An exception escaping here would
+        leave agent-core's barrier waiting out the full 150s x-completion timeout
+        for a sequence that already died.
+        """
+        try:
+            result = self._run_fsm_sequence(steps)
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
         status = "error" if result.get("error") else "completed"
         _loco_acp_notify(action_id, status, {"mode": mode, **result}, tool="switch_mode")
 

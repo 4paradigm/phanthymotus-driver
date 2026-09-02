@@ -181,6 +181,11 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and '200' in msg:
                 return
+            # The dashboard probes for an SSE endpoint this server does not serve,
+            # every couple of seconds. A 404 there is expected, not news, and it
+            # drowns out the posture/error lines in the driver log.
+            if '"GET /mcp/sse' in msg and '404' in msg:
+                return
             # Escape and cap: msg embeds the raw request line, which on host
             # networking is remote-controlled bytes going straight into the
             # Docker log framer (log injection / control-byte corruption).
