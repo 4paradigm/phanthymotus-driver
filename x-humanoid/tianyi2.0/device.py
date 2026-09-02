@@ -1145,23 +1145,52 @@ class CameraSnapshotPlugin:
         self._channel_dir = plugin_config.get(
             "channel_output_dir", "/work/resource/images")
         self._jpeg_quality = max(1, min(100, int(plugin_config.get("jpeg_quality", 90))))
+        self._video_fps = max(1.0, min(30.0, float(plugin_config.get("video_fps", 15))))
+        self._max_video_seconds = max(1.0, min(300.0, float(plugin_config.get("max_video_seconds", 60))))
+        self._recording_lock = threading.Lock()
+        self._recording_stop = None
+        self._recording_thread = None
+        self._recording_path = None
+
+    @staticmethod
+    def _file_stem(args: dict) -> str | None:
+        import re
+        value = args.get("name")
+        if value is None or value == "":
+            return None
+        value = str(value).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", value):
+            raise ValueError("name must be 1-100 chars: letters, numbers, '.', '_' or '-' only")
+        return value
+
+    def _decode_frame(self, msg):
+        image = self._np.frombuffer(msg.data, dtype=self._np.uint8)
+        expected = msg.height * msg.width * 3
+        if image.size != expected:
+            raise ValueError(f"unexpected RGB frame size: {image.size}, expected {expected}")
+        image = image.reshape(msg.height, msg.width, 3)
+        if msg.encoding.lower() == "rgb8":
+            image = self._cv2.cvtColor(image, self._cv2.COLOR_RGB2BGR)
+        return image
 
     def get_tool(self) -> dict:
         return {
             "name": "camera_snapshot",
             "type": "actuator",
             "description": (
-                "拍摄一张天轶2.0头部摄像机当前画面并保存为JPEG。"
-                "拍摄成功后可使用返回的 channel_reply_path 通过消息渠道发送。"
+                "拍照、录制视频以及管理 /opt/phanthy-motus/data/images 中的媒体文件。"
+                "name 为不含后缀的文件名；拍摄成功后可使用返回的 channel_reply_path 通过消息渠道发送。"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["capture", "info", "start", "stop"],
+                        "enum": ["capture", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "start", "stop"],
                         "description": "操作类型",
                     },
+                    "name": {"type": "string", "description": "文件名（不含 .jpg 或 .mp4）"},
+                    "duration": {"type": "number", "description": "视频时长（秒），默认使用 max_video_seconds，最大 300"},
                 },
                 "required": ["action"],
             },
@@ -1190,6 +1219,7 @@ class CameraSnapshotPlugin:
             raise RuntimeError(f"camera snapshot initialization failed: {e}") from e
 
     def stop(self):
+        self._stop_recording()
         self._running = False
         with self._frame_lock:
             self._latest_frame = None
@@ -1219,6 +1249,84 @@ class CameraSnapshotPlugin:
                 "output_dir": str(self._native_dir),
                 "channel_output_dir": self._channel_dir,
             }
+        if action == "list":
+            if not self._native_dir.exists():
+                return {"state": "listed", "files": []}
+            files = sorted((p for p in self._native_dir.iterdir() if p.is_file() and p.suffix.lower() in (".jpg", ".mp4")), key=lambda p: p.stat().st_mtime, reverse=True)
+            return {"state": "listed", "files": [{"filename": p.name, "path": str(p), "size": p.stat().st_size, "mime": "image/jpeg" if p.suffix.lower() == ".jpg" else "video/mp4"} for p in files]}
+        if action == "delete":
+            try:
+                stem = self._file_stem(args)
+            except ValueError as e:
+                return {"error": str(e)}
+            if not stem:
+                return {"error": "name is required"}
+            if not self._native_dir.exists():
+                return {"error": f"file not found: {stem}"}
+            matches = [p for p in self._native_dir.iterdir() if p.is_file() and p.stem == stem and p.suffix.lower() in (".jpg", ".mp4")]
+            if not matches:
+                return {"error": f"file not found: {stem}"}
+            for path in matches:
+                path.unlink()
+            return {"state": "deleted", "filename": [p.name for p in matches]}
+        if action == "start_recording":
+            try:
+                stem = self._file_stem(args) or f"head_{time.time_ns()}"
+            except ValueError as e:
+                return {"error": str(e)}
+            with self._recording_lock:
+                if self._recording_thread and self._recording_thread.is_alive():
+                    return {"error": f"recording already active: {Path(self._recording_path).name}"}
+                with self._frame_lock:
+                    first = self._latest_frame
+                if first is None:
+                    return {"error": "no camera frame received yet"}
+                path = self._native_dir / f"{stem}.mp4"
+                if path.exists():
+                    return {"error": f"file already exists: {path.name}"}
+                self._recording_stop = threading.Event()
+                self._recording_path = path
+                self._recording_thread = threading.Thread(target=self._record_loop, args=(path, self._recording_stop), daemon=True)
+                self._recording_thread.start()
+            return {"state": "recording", "filename": path.name, "path": str(path), "channel_reply_path": str(Path(self._channel_dir) / path.name), "mime": "video/mp4"}
+        if action == "stop_recording":
+            result = self._stop_recording()
+            return result or {"state": "idle", "message": "no active recording"}
+        if action == "record_video":
+            try:
+                stem = self._file_stem(args) or f"head_{time.time_ns()}"
+                duration = max(1.0, min(self._max_video_seconds, float(args.get("duration", self._max_video_seconds))))
+            except (TypeError, ValueError) as e:
+                return {"error": str(e)}
+            with self._frame_lock:
+                first = self._latest_frame
+            if first is None:
+                return {"error": "no camera frame received yet"}
+            writer = None
+            try:
+                first_image = self._decode_frame(first)
+                path = self._native_dir / f"{stem}.mp4"
+                if path.exists():
+                    return {"error": f"file already exists: {path.name}"}
+                writer = self._cv2.VideoWriter(str(path), self._cv2.VideoWriter_fourcc(*"mp4v"), self._video_fps, (first_image.shape[1], first_image.shape[0]))
+                if not writer.isOpened():
+                    return {"error": "MP4 video writer initialization failed"}
+                deadline = time.monotonic() + duration
+                next_frame = time.monotonic()
+                while time.monotonic() < deadline:
+                    with self._frame_lock:
+                        current = self._latest_frame
+                    if current is not None:
+                        writer.write(self._decode_frame(current))
+                    next_frame += 1.0 / self._video_fps
+                    time.sleep(max(0.0, next_frame - time.monotonic()))
+                writer.release()
+                writer = None
+                return {"state": "recorded", "filename": path.name, "path": str(path), "channel_reply_path": str(Path(self._channel_dir) / path.name), "mime": "video/mp4", "size": path.stat().st_size, "duration": duration}
+            except Exception as e:
+                if writer is not None:
+                    writer.release()
+                return {"error": f"failed to save MP4: {e}"}
         if action != "capture":
             return {"error": f"unknown action: {action}"}
         if not self._running:
@@ -1236,20 +1344,20 @@ class CameraSnapshotPlugin:
             }
 
         try:
-            image = self._np.frombuffer(msg.data, dtype=self._np.uint8)
-            expected = msg.height * msg.width * 3
-            if image.size != expected:
-                return {"error": f"unexpected RGB frame size: {image.size}, expected {expected}"}
-            image = image.reshape(msg.height, msg.width, 3)
-            if msg.encoding.lower() == "rgb8":
-                image = self._cv2.cvtColor(image, self._cv2.COLOR_RGB2BGR)
+            image = self._decode_frame(msg)
             ok, encoded = self._cv2.imencode(
                 ".jpg", image, [self._cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
             if not ok:
                 return {"error": "JPEG encoding failed"}
 
-            filename = f"head_{time.time_ns()}.jpg"
+            try:
+                stem = self._file_stem(args) or f"head_{time.time_ns()}"
+            except ValueError as e:
+                return {"error": str(e)}
+            filename = f"{stem}.jpg"
             native_path = self._native_dir / filename
+            if native_path.exists():
+                return {"error": f"file already exists: {filename}"}
             native_path.write_bytes(encoded.tobytes())
             channel_path = str(Path(self._channel_dir) / filename)
             return {
@@ -1262,6 +1370,40 @@ class CameraSnapshotPlugin:
             }
         except Exception as e:
             return {"error": f"failed to save JPEG: {e}"}
+
+    def _record_loop(self, path: Path, stop_event: threading.Event):
+        writer = None
+        try:
+            while not stop_event.is_set():
+                with self._frame_lock:
+                    msg = self._latest_frame
+                if msg is not None:
+                    image = self._decode_frame(msg)
+                    if writer is None:
+                        writer = self._cv2.VideoWriter(str(path), self._cv2.VideoWriter_fourcc(*"mp4v"), self._video_fps, (image.shape[1], image.shape[0]))
+                        if not writer.isOpened():
+                            raise RuntimeError("MP4 video writer initialization failed")
+                    writer.write(image)
+                stop_event.wait(1.0 / self._video_fps)
+        finally:
+            if writer is not None:
+                writer.release()
+
+    def _stop_recording(self):
+        with self._recording_lock:
+            thread = self._recording_thread
+            path = self._recording_path
+            stop_event = self._recording_stop
+            self._recording_thread = None
+            self._recording_path = None
+            self._recording_stop = None
+        if not thread or not stop_event:
+            return None
+        stop_event.set()
+        thread.join(timeout=5)
+        if path and path.exists() and path.stat().st_size > 0:
+            return {"state": "recorded", "filename": path.name, "path": str(path), "channel_reply_path": str(Path(self._channel_dir) / path.name), "mime": "video/mp4", "size": path.stat().st_size}
+        return {"error": "recording produced no video frames"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5326,6 +5468,19 @@ class HomePlugin:
                 if result_code == 0:
                     _acp_notify(action_id, "completed", {"action": action, "elapsed": round(elapsed, 1), **context}, "home")
                 else:
+                    if action == "go_home":
+                        try:
+                            power = self._slamtec.get_power_status()
+                            if (power.get("dockingStatus") == "on_dock"
+                                    or power.get("isCharging") is True):
+                                _acp_notify(action_id, "completed", {
+                                    "action": action, "elapsed": round(elapsed, 1),
+                                    "completion": "power_status", "power_status": power,
+                                    **context,
+                                }, "home")
+                                return
+                        except Exception:
+                            pass
                     _acp_notify(action_id, "error", {"action": action, "error": current.get("reason") or f"result_code={result_code}", "elapsed": round(elapsed, 1), **context}, "home")
                 return
             if state == 3:
@@ -5337,6 +5492,19 @@ class HomePlugin:
                 # A successful action is reported as Done/result=0. Never infer
                 # success merely because the chassis no longer exposes an action.
                 if elapsed > self._MISSING_ACTION_TIMEOUT:
+                    if action == "go_home":
+                        try:
+                            power = self._slamtec.get_power_status()
+                            if (power.get("dockingStatus") == "on_dock"
+                                    or power.get("isCharging") is True):
+                                _acp_notify(action_id, "completed", {
+                                    "action": action, "elapsed": round(elapsed, 1),
+                                    "completion": "power_status", "power_status": power,
+                                    **context,
+                                }, "home")
+                                return
+                        except Exception:
+                            pass
                     _acp_notify(action_id, "error", {"action": action, "error": "action_disappeared", "elapsed": round(elapsed, 1), **context}, "home")
                     return
             if action == "go_home":
