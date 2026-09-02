@@ -1048,6 +1048,13 @@ class LocoPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, loco_client):
         self._client = loco_client
         self._namespace = namespace
+        # Only one FSM sequence may be in flight. Async dispatch means the robot
+        # now spends 6-13s mid-transition while the agent is free to send more
+        # posture commands, and a second sequence starting on a half-standing robot
+        # is how a "safe" call becomes a fall.
+        self._fsm_busy = threading.Lock()
+        self._fsm_active: str | None = None
+        self._stop_move_ret: int | None = None
 
     def get_tools(self) -> list:
         return [self._loco_tool(), self._switch_mode_tool(), self._arm_tool()]
@@ -1083,6 +1090,29 @@ class LocoPlugin:
     _GROUND_STATES = {0, 1}       # zero_torque, damp — robot is on the ground
     _STANDING_STATES = {811}      # loco_mode — fully operational standing
     # FSM=4 (stance) is intermediate: allow both standup (continue) and lie-down (retreat)
+
+    # 701/702 are the *motion in progress* states: the robot is physically moving
+    # between postures and is neither down nor up. Measured on hardware: a healthy
+    # standup2lie sits in 702 for ~6s, a healthy lie2standup sits in 701 for ~3s.
+    #
+    # Every guard used to ignore them, and `fsm_to_start` below defaulted unknown
+    # readings to "start from step 0" -- i.e. ZeroTorque() on a robot that is
+    # halfway through standing up. While switch_mode was synchronous the window
+    # could not be observed (dispatch blocked, and the ACP barrier held back the
+    # next actuator); async dispatch opens it for the full 6-9s.
+    _TRANSITIONAL_STATES = {701, 702}
+
+    # Which transitional state a posture change must pass through. Reaching the
+    # target without ever seeing it means the robot got there by falling, not by
+    # lowering/raising itself -- both transitions last several seconds, so 1s
+    # polling cannot miss them.
+    _EXPECTED_TRANSIT = {"standup2lie": 702, "lie2standup": 701}
+
+    _FSM_NAMES = {
+        0: "zero_torque", 1: "damp", 4: "stance",
+        701: "lie2standup (in progress)", 702: "standup2lie (in progress)",
+        811: "loco_mode",
+    }
 
     def _switch_mode_tool(self) -> dict:
         return {
@@ -1205,7 +1235,25 @@ class LocoPlugin:
                 return {"ret": ret, "mode": "emergency_stop",
                         "warning": "Emergency damp executed regardless of state"}
 
-            elif mode == "lie2standup":
+            # Everything below moves the robot between postures. None of it is safe
+            # to start while a previous transition is still running, so both the
+            # measured FSM and our own in-flight flag have to be clear first.
+            if mode in ("lie2standup", "standup2lie"):
+                if current_fsm in self._TRANSITIONAL_STATES:
+                    print(f"[fsm] {mode}: REFUSED, robot is mid-transition "
+                          f"(fsm={current_fsm})", flush=True)
+                    return {"error": f"Robot is still changing posture "
+                                     f"(fsm={current_fsm}: "
+                                     f"{self._FSM_NAMES.get(current_fsm)}). "
+                                     f"Wait for the current action to report完成 "
+                                     f"before switching again."}
+                if self._fsm_busy.locked():
+                    print(f"[fsm] {mode}: REFUSED, a sequence is already running "
+                          f"({self._fsm_active})", flush=True)
+                    return {"error": f"A posture change ({self._fsm_active}) is already "
+                                     f"running. Wait for its completion callback."}
+
+            if mode == "lie2standup":
                 if current_fsm == 811:
                     print("[fsm] lie2standup: already standing, no-op", flush=True)
                     return {"info": "Robot is already in loco mode (standing)", "fsm_id": 811}
@@ -1216,9 +1264,22 @@ class LocoPlugin:
                     ("Stance",      4, "stance"),
                     ("Lie2StandUp", 811, "lie2standup"),
                 ]
-                # Skip completed steps based on current FSM
+                # Skip completed steps based on current FSM.
+                #
+                # This used to be `fsm_to_start.get(current_fsm, 0)` -- any FSM the
+                # table did not recognise fell through to "start at step 0", i.e.
+                # ZeroTorque() on a robot whose posture we did not understand. 701
+                # and 702 (transition in progress) are exactly such values, and they
+                # are caught above; anything else is a state we have no plan for, so
+                # refuse rather than guess and drop the robot.
                 fsm_to_start = {0: 1, 1: 2, 4: 3}
-                start_idx = fsm_to_start.get(current_fsm, 0)
+                if current_fsm not in fsm_to_start:
+                    print(f"[fsm] lie2standup: REFUSED, unrecognised fsm={current_fsm}",
+                          flush=True)
+                    return {"error": f"Unrecognised FSM state {current_fsm} "
+                                     f"({self._FSM_NAMES.get(current_fsm, 'unknown')}). "
+                                     f"Refusing to run the stand-up sequence from here."}
+                start_idx = fsm_to_start[current_fsm]
                 steps = all_steps[start_idx:]
                 print(f"[fsm] lie2standup: from fsm={current_fsm}, skipping {start_idx} step(s), "
                       f"running {[s[2] for s in steps]}", flush=True)
@@ -1234,6 +1295,12 @@ class LocoPlugin:
                     print(f"[fsm] standup2lie: from stance (fsm=4), running "
                           f"{[s[2] for s in steps]}", flush=True)
                     return self._async_fsm(mode, steps)
+                if current_fsm not in self._STANDING_STATES:
+                    print(f"[fsm] standup2lie: REFUSED, unrecognised fsm={current_fsm}",
+                          flush=True)
+                    return {"error": f"Unrecognised FSM state {current_fsm} "
+                                     f"({self._FSM_NAMES.get(current_fsm, 'unknown')}). "
+                                     f"Refusing to run the lie-down sequence from here."}
                 # From 811 (loco mode): stop movement first, then lie down safely.
                 # StopMove + the settle sleep run inside the worker thread too --
                 # leaving them here would keep dispatch blocked for a second and
@@ -1298,28 +1365,45 @@ class LocoPlugin:
     def _async_fsm(self, mode: str, steps: list, stop_first: bool = False) -> dict:
         """Launch an FSM sequence in the background, return an action_id immediately.
 
-        The sequence takes ~12s (4 steps, 1s apart). Running it synchronously froze
-        the whole agent turn for that long -- no reasoning, no speech, nothing.
-        Now dispatch returns at once and the ACP callback reports the outcome.
+        The sequence takes ~10-13s. Running it synchronously froze the whole agent
+        turn for that long -- no reasoning, no speech, nothing. Now dispatch returns
+        at once and the ACP callback reports the outcome.
+
+        Claiming _fsm_busy here rather than in the worker closes the window between
+        "dispatch decided to go" and "the thread got scheduled": two calls arriving
+        together would both pass the check in dispatch and both start moving the
+        robot.
         """
         from uuid import uuid4
+        if not self._fsm_busy.acquire(blocking=False):
+            print(f"[fsm] {mode}: REFUSED at launch, {self._fsm_active} still running",
+                  flush=True)
+            return {"error": f"A posture change ({self._fsm_active}) is already running. "
+                             f"Wait for its completion callback."}
         action_id = f"r1_fsm_{uuid4().hex[:8]}"
+        self._fsm_active = action_id
         print(f"[fsm] {action_id}: dispatching async, mode={mode} "
               f"steps={[s[2] for s in steps]} stop_first={stop_first}", flush=True)
-        threading.Thread(
-            target=self._acp_fsm_sequence,
-            args=(action_id, mode, steps, stop_first),
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=self._acp_fsm_sequence,
+                args=(action_id, mode, steps, stop_first),
+                daemon=True,
+            ).start()
+        except Exception:
+            self._fsm_active = None
+            self._fsm_busy.release()
+            raise
         return {"status": "executing", "mode": mode, "action_id": action_id}
 
     def _acp_fsm_sequence(self, action_id: str, mode: str, steps: list,
                           stop_first: bool = False):
         """Worker: run the sequence, then fire the ACP callback.
 
-        The callback must go out on every path. Swallowing an exception here would
-        leave agent-core's barrier waiting out the full 90s timeout for a sequence
-        that already died.
+        The callback must go out on every path, and _fsm_busy must be released on
+        every path. Swallowing an exception here would leave agent-core's barrier
+        waiting out the full 90s timeout for a sequence that already died, and would
+        wedge the plugin against every future posture change.
         """
         t0 = time.monotonic()
         print(f"[fsm] {action_id}: worker started (thread={threading.current_thread().name})",
@@ -1327,7 +1411,17 @@ class LocoPlugin:
         try:
             if stop_first:
                 ret = self._client.StopMove()
-                print(f"[fsm] {action_id}: StopMove() -> ret={ret}, settling 1.0s", flush=True)
+                if ret != 0:
+                    # StopMove is what clears residual motion before the lie-down.
+                    # It is not fatal on its own (it returns non-zero on healthy runs
+                    # too), but "lie down while still moving" is the leading theory
+                    # for a controlled descent degrading into a collapse, so carry it
+                    # into the result rather than dropping it.
+                    print(f"[fsm] {action_id}: WARNING StopMove() -> ret={ret} (non-zero)",
+                          flush=True)
+                else:
+                    print(f"[fsm] {action_id}: StopMove() -> ret={ret}", flush=True)
+                self._stop_move_ret = ret
                 time.sleep(1.0)
             print(f"[fsm] {action_id}: entering RunFsmSequence at t={time.monotonic()-t0:.2f}s",
                   flush=True)
@@ -1335,8 +1429,38 @@ class LocoPlugin:
         except Exception as e:
             print(f"[fsm] {action_id}: worker raised {type(e).__name__}: {e}", flush=True)
             result = {"error": f"{type(e).__name__}: {e}"}
+        finally:
+            self._fsm_active = None
+            self._fsm_busy.release()
+
         status = "error" if result.get("error") else "completed"
         elapsed = time.monotonic() - t0
+
+        # Did the robot actually move through the posture, or just arrive at the
+        # target? A healthy standup2lie sits in 702 for ~6s and lie2standup in 701
+        # for ~3s, so 1s polling cannot miss them. Reaching damp without ever seeing
+        # 702 means the robot got down by falling -- which is what happened on
+        # 2026-09-02 and was reported as a clean "completed".
+        expected = self._EXPECTED_TRANSIT.get(mode)
+        seen = result.get("fsm_seen") or {}
+        if status == "completed" and expected is not None:
+            observed = seen.get(mode, [])
+            if expected not in observed:
+                status = "error"
+                result = {**result,
+                          "error": f"{mode} reached its target without ever passing "
+                                   f"through {expected} "
+                                   f"({self._FSM_NAMES.get(expected)}). The robot did "
+                                   f"not perform a controlled transition.",
+                          "anomaly": "missing_transitional_state",
+                          "expected_transitional": expected,
+                          "fsm_observed": observed}
+                print(f"[fsm] {action_id}: ANOMALY {mode} never entered {expected}; "
+                      f"observed={observed} -- treating as error, not completion",
+                      flush=True)
+
+        if stop_first:
+            result = {**result, "stop_move_ret": self._stop_move_ret}
         print(f"[fsm] {action_id}: {status} after {elapsed:.2f}s -> {result}", flush=True)
         if status == "completed" and not result.get("fsm_measured", True):
             # The final FSM could not be read, so "completed" is the target we aimed
