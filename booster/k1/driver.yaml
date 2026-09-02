@@ -9,3 +9,18 @@ mcp_url: "http://localhost:15705/mcp"
 description: "Booster K1 — 22DOF 双足人形机器人，IMU/关节/电池/跌倒/里程计感知、相机、行走与上身关节控制、动作/起身/轨迹/音频异步任务"
 build_context_extras:
   - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` — speech and
+# detection are disabled by default (require boosteros[brain]) and excluded.
+cards:
+  - { name: imu,             type: sensor }
+  - { name: battery,         type: sensor }
+  - { name: joints,          type: sensor }
+  - { name: odom,            type: sensor }
+  - { name: fall_down_state, type: sensor }
+  - { name: model,           type: resource }
+  - { name: camera,          type: sensor }
+  - { name: loco,            type: actuator }
+  - { name: upper_body,      type: actuator }
+  - { name: action,          type: actuator }
+  - { name: audio,           type: actuator }
