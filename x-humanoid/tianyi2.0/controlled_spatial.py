@@ -134,10 +134,16 @@ class _ControlledSpatialDB:
         return [dict(r) for r in rows]
 
     def find_poi(self, query: str, map_name: str) -> dict | None:
+        # Prefer an exact tag name so P1 cannot resolve to P10.
         row = self._conn.execute(
-            "SELECT name, description, x, y, yaw FROM poi WHERE map_name = ? AND name LIKE ?",
-            (map_name, f"%{query}%")
+            "SELECT name, description, x, y, yaw FROM poi WHERE map_name = ? AND name = ?",
+            (map_name, query)
         ).fetchone()
+        if not row:
+            row = self._conn.execute(
+                "SELECT name, description, x, y, yaw FROM poi WHERE map_name = ? AND name LIKE ?",
+                (map_name, f"%{query}%")
+            ).fetchone()
         return dict(row) if row else None
 
 
@@ -374,6 +380,8 @@ class ControlledSpatialPlugin:
         }
 
     def start(self) -> None:
+        if self._poll_running:
+            return
         self._poll_running = True
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
