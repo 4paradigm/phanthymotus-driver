@@ -593,20 +593,29 @@ class ControlledSpatialPlugin:
                 last_move_time = time.time()
 
             if time.time() - last_move_time > stall_timeout:
-                if self._client:
-                    self._client.PauseNav()
-                _acp_notify(action_id, "error", {
-                    "target": target,
-                    "error": f"stall_timeout ({stall_timeout}s)",
-                    "elapsed": round(time.time() - t0, 1),
-                })
+                # Guard: if superseded, don't PauseNav (would pause active nav) or post stale error
+                if self._nav_action_id == action_id:
+                    self._nav_action_id = None
+                    if self._client:
+                        self._client.PauseNav()
+                    _acp_notify(action_id, "error", {
+                        "target": target,
+                        "error": f"stall_timeout ({stall_timeout}s)",
+                        "elapsed": round(time.time() - t0, 1),
+                    })
+                else:
+                    print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping stall_timeout notify')
                 return
 
             if time.time() - t0 > 180:
-                _acp_notify(action_id, "error", {
-                    "target": target, "error": "timeout_180s",
-                    "elapsed": 180,
-                })
+                if self._nav_action_id == action_id:
+                    self._nav_action_id = None
+                    _acp_notify(action_id, "error", {
+                        "target": target, "error": "timeout_180s",
+                        "elapsed": 180,
+                    })
+                else:
+                    print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping timeout_180s notify')
                 return
 
     # ── Dispatch ─────────────────────────────────────────────────────────────

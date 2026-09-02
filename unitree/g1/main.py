@@ -164,12 +164,10 @@ class G1DeviceBundle:
             controlled_cfg = dict(plugins_cfg["controlled_spatial"])
             controlled_cfg["network_iface"] = network_iface
             if controlled_cfg.get("isolated_process", False):
-                sm_enabled = plugins_cfg.get("smart_motion", {}).get("enabled", True)
-                if sm_enabled:
-                    print("[WARNING] controlled_spatial isolated_process=true with smart_motion enabled — "
-                          "navigation arrival detection uses pose-based fallback (dist<0.3m). "
-                          "If audio stutter reappears, set isolated_process=false and verify TTS latency.",
-                          flush=True)
+                print("[WARNING] controlled_spatial isolated_process=true — navigation arrival detection "
+                      "uses pose-based fallback (dist<0.3m). If audio stutter reappears, set "
+                      "isolated_process=false and verify TTS latency.",
+                      flush=True)
                 from controlled_spatial import ControlledSpatialIsolatedProxy
                 self._plugins.append(ControlledSpatialIsolatedProxy(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
                 print("[bundle] ControlledSpatialPlugin loaded (isolated process)")
