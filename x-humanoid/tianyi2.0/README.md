@@ -13,9 +13,9 @@ provides `capture_image`, `record_video`, `start_recording`, `stop_recording`,
 driver derives the corresponding `/work/resource/...` path from the persistent
 mount (or uses `PHANTHY_CHANNEL_OUTPUT_DIR` when a deployment uses another
 mount). Use that returned path with `channel_reply(files=[{"path": "..."}])`
-to send media through Feishu or Telegram. To delete media, pass
-`type: "image"` for `.jpg` or `type: "video"` for `.mp4`; omitting `type`
-returns an error when both files share the same name.
+to send media through Feishu or Telegram. Use `image_name` (without `.jpg`)
+for photos and `video_name` (without `.mp4`) for videos. To delete media, pass
+`type: "image"` with `image_name` or `type: "video"` with `video_name`.
 
 ## Raw arm joint card
 
