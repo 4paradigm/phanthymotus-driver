@@ -71,7 +71,24 @@ class Plugin:
     @staticmethod
     def _safe_label(value):
         value = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(value))
-        return value.strip("_")[:40] or "visitor"
+        return value.strip("_")[:40]
+
+    def _media_path(self, directory, args, extension):
+        """Use an explicit file label verbatim; timestamp only anonymous media.
+
+        A numeric suffix preserves an earlier labelled file instead of silently
+        overwriting it when an operator reuses a label.
+        """
+        label = self._safe_label(args.get("file_label", ""))
+        if label:
+            path = directory / f"{label}.{extension}"
+            index = 1
+            while path.exists():
+                path = directory / f"{label}_{index}.{extension}"
+                index += 1
+            return path
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return directory / f"{stamp}_visitor.{extension}"
 
     def _frame(self, after_sequence=None, timeout_s=_FIRST_FRAME_TIMEOUT_S):
         if not self._camera_ready():
@@ -91,8 +108,7 @@ class Plugin:
             frame, _ = self._frame()
             directory = self._output_dir / "photos"
             directory.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = directory / f"{stamp}_{self._safe_label(args.get('file_label', 'visitor'))}.jpg"
+            path = self._media_path(directory, args, "jpg")
             path.write_bytes(frame["data"])
             return {"ok": True, "media_type": "photo", "file_path": str(path),
                     "captured_at": datetime.now().isoformat(timespec="seconds"),
@@ -109,8 +125,7 @@ class Plugin:
             frame, _ = self._frame()
             directory = self._output_dir / "videos"
             directory.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = directory / f"{stamp}_{self._safe_label(args.get('file_label', 'visitor'))}.mp4"
+            path = self._media_path(directory, args, "mp4")
             process = subprocess.Popen([
                 "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", str(self._fps), "-i", "-",
                 "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
