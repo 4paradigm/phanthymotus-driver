@@ -15,7 +15,7 @@ mount (or uses `PHANTHY_CHANNEL_OUTPUT_DIR` when a deployment uses another
 mount). Use that returned path with `channel_reply(files=[{"path": "..."}])`
 to send media through Feishu or Telegram. Use `image_name` (without `.jpg`)
 for photos and `video_name` (without `.mp4`) for videos. To delete media, pass
-`type: "image"` with `image_name` or `type: "video"` with `video_name`.
+Use `delete` with the complete filename in `name`, including `.jpg` or `.mp4`.
 
 ## Raw arm joint card
 
