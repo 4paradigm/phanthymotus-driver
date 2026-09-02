@@ -509,6 +509,11 @@ class TianyiDeviceBundle:
                             return {"error": f"start failed: {e}"}
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
+                    # 工具存在但插件不认这个 action：别把 None 冒泡上去，
+                    # 否则 HTTP 层会报成 "Unknown tool"，把排查引向错误方向。
+                    if result is None:
+                        return {"state": "error",
+                                "error": f"Unknown action: {action} (tool={tool_name})"}
                     return result
         return None
 
