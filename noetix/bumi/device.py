@@ -1697,6 +1697,9 @@ class StateRecordPlugin:
         "all": ("imu", "battery", "joints", "motion_state"),
         "camera": (),
     }
+    _TIMED_SCOPES = (
+        "imu", "battery", "joints", "motion_state", "all_withoutcamera",
+    )
     _ACTIONS = ("record_once", "start_timed", "stop_recording")
     _COUNTERS_FILE = ".label-counters.json"
 
@@ -1772,6 +1775,13 @@ class StateRecordPlugin:
                         "default": "all_withoutcamera",
                         "description": "imu/battery/joints/motion_state=单项；all_withoutcamera=全部状态但不含照片；all=全部状态加彩色照片；camera=仅彩色照片。camera 与 all 只能用于 record_once。",
                     },
+                    "timed_scope": {
+                        "type": "string",
+                        "title": "scope",
+                        "enum": list(self._TIMED_SCOPES),
+                        "default": "all_withoutcamera",
+                        "description": "定时记录范围：可选择单项状态或 all_withoutcamera；定时模式不支持 all 和 camera。",
+                    },
                     "label_mode": {
                         "type": "string",
                         "enum": ["default", "custom"],
@@ -1798,7 +1808,7 @@ class StateRecordPlugin:
                         "description": action_descriptions["record_once"],
                     },
                     "start_timed": {
-                        "params": ["scope", "label_mode", "custom_label", "interval_s"],
+                        "params": ["timed_scope", "label_mode", "custom_label", "interval_s"],
                         "description": action_descriptions["start_timed"],
                     },
                     "stop_recording": {
@@ -1838,7 +1848,12 @@ class StateRecordPlugin:
                 "saved": False,
                 "error": f"Unsupported state record action: {action}",
             }
-        scope = args.get("scope", "all_withoutcamera")
+        if action == "start_timed":
+            # The card uses a dedicated enum so photo scopes are not offered in
+            # timed mode. Keep accepting `scope` for backwards-compatible API calls.
+            scope = args.get("timed_scope", args.get("scope", "all_withoutcamera"))
+        else:
+            scope = args.get("scope", "all_withoutcamera")
         label_result = self._resolve_label(
             args.get("label_mode", "default"), args.get("custom_label"))
         if "error" in label_result:
