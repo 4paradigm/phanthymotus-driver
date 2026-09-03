@@ -541,7 +541,25 @@ class VelocityProposalGate:
                 + proposal.ttl_ms
                 - float(now_unix_ms)
             ) / 1000.0
-            if remaining <= 0.0:
+            late_terminal = (
+                remaining <= 0.0 and not bootstrap and proposal.is_terminal
+            )
+            if late_terminal and proposal.nav_id != self.expected_nav_id:
+                return ProposalDecision(
+                    reason="nav_id_mismatch",
+                    proposal=proposal,
+                )
+            if late_terminal and proposal.sequence <= self.last_sequence:
+                self.disarm("sequence_not_increasing")
+                return ProposalDecision(
+                    stop=True,
+                    reason="sequence_not_increasing",
+                    proposal=proposal,
+                )
+            # A terminal zero cannot cause motion.  Preserve its task ordering
+            # and let the normal stop-confirmation path retire the lease even
+            # when transport delay consumed its TTL.
+            if remaining <= 0.0 and not late_terminal:
                 if bootstrap:
                     return ProposalDecision(
                         stop=True,

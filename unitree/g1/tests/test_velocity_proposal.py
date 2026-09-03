@@ -713,6 +713,65 @@ class ProposalGateTest(unittest.TestCase):
             self.gate.accept(proposal(sequence=3), now=50.5).execute
         )
 
+    def test_expired_terminal_zero_releases_confirmed_ttl_hold(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+        self.assertTrue(gate.accept(proposal(sequence=1), now=50.0).execute)
+        gate.watchdog(now=50.3)
+        gate.hold_after_confirmed_stop("proposal_ttl_expired")
+
+        terminal = gate.accept(
+            proposal(
+                sequence=2,
+                issued_at_unix_ms=1_000,
+                ttl_ms=200,
+                nav_status="arrived",
+                velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            ),
+            now=50.4,
+            now_unix_ms=1_201,
+        )
+
+        self.assertTrue(terminal.stop)
+        self.assertEqual(terminal.reason, "proposal_zero")
+        self.assertTrue(gate.terminal_pending_stop)
+        self.assertEqual(gate.last_sequence, 2)
+        self.assertTrue(gate.record_terminal_stop_result(True))
+        self.assertTrue(gate.awaiting_nav_id)
+        self.assertTrue(
+            gate.accept(
+                proposal(nav_id="nav-002", sequence=1),
+                now=50.5,
+            ).execute
+        )
+
+    def test_expired_terminal_from_other_nav_does_not_mutate_lease(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=50.0).execute)
+        self.gate.watchdog(now=50.3)
+        self.gate.hold_after_confirmed_stop("proposal_ttl_expired")
+        last_receive = self.gate.last_receive_monotonic
+
+        rejected = self.gate.accept(
+            proposal(
+                nav_id="nav-002",
+                sequence=99,
+                issued_at_unix_ms=1_000,
+                ttl_ms=200,
+                nav_status="arrived",
+                velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            ),
+            now=50.4,
+            now_unix_ms=1_201,
+        )
+
+        self.assertFalse(rejected.stop)
+        self.assertFalse(rejected.execute)
+        self.assertEqual(rejected.reason, "nav_id_mismatch")
+        self.assertEqual(self.gate.expected_nav_id, "nav-001")
+        self.assertEqual(self.gate.last_sequence, 1)
+        self.assertEqual(self.gate.last_receive_monotonic, last_receive)
+        self.assertTrue(self.gate.recoverable_stop_active)
+
     def test_hard_fault_still_disarms_from_recoverable_obstacle_stop(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
         self.gate.hold_for_obstacle()
