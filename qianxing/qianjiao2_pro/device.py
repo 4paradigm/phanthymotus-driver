@@ -484,24 +484,12 @@ class QianjiaoDevice:
                 "info": {"params": [], "description": "读取控制链路状态"},
             },
         }
-        camera_control_schema = {
-            "type": "object",
-            "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "capture", "list", "light"], "description": "相机动作"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "补光灯亮度（0-100，light 时必填）"}},
-            "required": ["action"],
-            "x-action-params": {
-                "capture": {"params": [], "description": "拍摄一张照片"},
-                "list": {"params": [], "description": "列出相机中已保存的照片和视频"},
-                "light": {"params": ["brightness"], "description": "设置补光灯亮度"},
-                "start": {"params": [], "description": "初始化相机控制卡"}, "stop": {"params": [], "description": "停止相机控制卡"}, "info": {"params": [], "description": "读取相机控制状态"},
-            },
-        }
         return [
             sensor("loco_state", "潜蛟运动状态：姿态角、深度和定位信息。", self.loco_state_topic),
             sensor("status", "潜蛟系统状态：连接、温度和健康信息。", self.status_topic),
             sensor("battery", "潜蛟电池状态：电压、电流和剩余电量。", self.battery_topic),
             sensor("imu", "潜蛟 IMU 角速度数据。", self.imu_topic),
             {"name": "camera", "type": "sensor", "description": "潜蛟实时相机图像（RTSP 转 JPEG）。", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"], "description": "读取相机流信息"}}, "required": ["action"]}},
-            {"name": "camera_control", "type": "actuator", "description": "潜蛟相机控制：拍照、查询媒体或设置补光灯。", "inputSchema": camera_control_schema},
             {"name": "control", "type": "actuator", "description": "潜蛟 2.0 Pro 运动控制：解锁、停止或发送 6 自由度控制量。", "inputSchema": control_schema},
         ]
 
@@ -519,19 +507,6 @@ class QianjiaoDevice:
             return {**self._imu_snapshot(self._rov_status), "topic_out": [{"topic": self.imu_topic, "format": "data/json"}]}
         if tool == "loco_state":
             return {**self._loco_snapshot(self._rov_status), "topic_out": [{"topic": self.loco_state_topic, "format": "data/json"}]}
-        if tool == "camera_control":
-            # The canvas sends lifecycle actions to every actuator card when
-            # it is mounted. They are not camera API operations.
-            if action in ("start", "stop", "info"):
-                return {"state": "ready" if action != "stop" else "idle", "camera": self.camera_ip}
-            if action == "capture":
-                return self.camera_request("POST", "/v1/capture")
-            if action in ("list", "medias"):
-                return self.camera_request("GET", "/v1/medias")
-            if action == "light":
-                brightness = int(args.get("brightness", 0))
-                return self.camera_request("POST", self.camera_light_path, {"brightness": brightness})
-            raise ValueError(f"unsupported camera action: {action}")
         if tool == "control" and action in ("start", "info"): return {"state": "ready", "mavlink_connected": self._connected()}
         if tool == "control" and action == "stop": return self.stop_motion()
         if tool == "control" and action == "unlock": return self.arm(True)
