@@ -261,6 +261,10 @@ class McStatePlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import GetMcAction
         request = GetMcAction.Request()
         request.request = self.nodes.request_header()
@@ -282,6 +286,10 @@ class JointStatePlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import GetAllJointState
         request = GetAllJointState.Request()
         request.request = self.nodes.request_header()
@@ -309,6 +317,8 @@ class HandStatePlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             from aimdk_msgs.srv import GetHandType
             request = GetHandType.Request()
@@ -335,6 +345,8 @@ class ImuPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
         return {"state": "running", **self.nodes.streams["imu"]}
 
 
@@ -356,6 +368,8 @@ class CameraPlugin:
 
     def dispatch(self, action, args):
         name = args.get("_tool_name")
+        if action == "stop":
+            return {"state": "idle"}
         return {"state": "running", **self.nodes.streams[name]}
 
 
@@ -373,6 +387,8 @@ class LidarPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
         return {"state": "running", **self.nodes.streams["lidar"]}
 
 
@@ -390,6 +406,8 @@ class SlamPosePlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
         return {"state": "running", **self.nodes.streams["slam_odom"]}
 
 
@@ -407,6 +425,10 @@ class SystemStatePlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import GetSystemState
         request = GetSystemState.Request()
         request.header = self.nodes.request_header()
@@ -428,6 +450,10 @@ class LinkcraftCatalogPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import GetRobotResources
         request = GetRobotResources.Request()
         request.header = self.nodes.request_header()
@@ -474,6 +500,10 @@ class McModePlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import SetMcAction
         request = SetMcAction.Request()
         request.header.stamp = self.nodes.robot.get_clock().now().to_msg()
@@ -527,6 +557,10 @@ class LocomotionPlugin:
         return jsonable(result.response)
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "register":
             result = self._set_input_source(1)  # ADD
             self._registered = True
@@ -570,6 +604,10 @@ class PresetMotionPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import SetMcPresetMotion
         request = SetMcPresetMotion.Request()
         request.header.stamp = self.nodes.robot.get_clock().now().to_msg()
@@ -618,6 +656,10 @@ class JointCommandPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         area = args["area"]
         pub = self.nodes.joint_command_pubs[area]
         msg = self.nodes._JointCommandArray()
@@ -669,6 +711,10 @@ class HandCommandPlugin:
     def dispatch(self, action, args):
         from aimdk_msgs.msg import HandCommand
 
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "get_state":
             return self.nodes.snapshot("hand_state")
 
@@ -718,6 +764,10 @@ class LinkcraftPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import ExecuteActionResource
         request = ExecuteActionResource.Request()
         request.header = self.nodes.request_header()
@@ -752,6 +802,10 @@ class PmuLedPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import SetPmuLed
         request = SetPmuLed.Request()
         request.request = self.nodes.request_header()
@@ -788,6 +842,10 @@ class TtsPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import PlayTts
         request = PlayTts.Request()
         request.header = self.nodes.request_header()
@@ -823,6 +881,10 @@ class EmojiPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import PlayEmoji
         request = PlayEmoji.Request()
         request.header = self.nodes.request_header()
@@ -851,6 +913,10 @@ class MicSourcePlugin:
 
     def dispatch(self, action, args):
         from aimdk_msgs.srv import GetMicSourceRequest, SetMicSourceRequest
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "get":
             request = GetMicSourceRequest.Request()
             request.header = self.nodes.request_header()
@@ -895,6 +961,10 @@ class SlamControlPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "set_relocalization_pose":
             pose = self.nodes._msg["Pose"]()
             pose.position.x = float(args["x"])
@@ -933,6 +1003,10 @@ class MapGetPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         from aimdk_msgs.srv import GetStoredMapByName
         request = GetStoredMapByName.Request()
         request.header.stamp = self.nodes.robot.get_clock().now().to_msg()
