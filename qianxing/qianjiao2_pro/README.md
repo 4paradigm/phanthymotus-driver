@@ -4,7 +4,7 @@
 
 - ROV 监听 UDP `14550`；`target_ip`/`target_port` 在 `config.yaml` 配置。
 - 每秒发送 `HEARTBEAT`，超过 3 秒没有收到 ROV 心跳则拒绝运动。
-- `rov_control.arm`/`disarm` 使用 `COMMAND_LONG`，命令 `400`，`param1=1/0`。
+- `control.unlock`/`lock` 使用 `COMMAND_LONG`，命令 `400`，`param1=0/1`。
 - `rov_control.move` 使用 `RC_CHANNELS_OVERRIDE`。输入轴为 `[-1, 1]`，映射到 PWM `1100..1900`，中位 `1500`：
   `heave=chan1`、`pitch=chan2`、`forward=chan3`、`yaw=chan4`、`lateral=chan5`、`roll=chan7`（chan6 保留）。
 - `rov_status` 提供连接、心跳年龄、解锁状态和最近错误。
@@ -13,7 +13,6 @@
 相机卡片：
 
 - `rov_camera` 返回 RTSP 地址 `rtsp://admin:admin@192.168.1.88:8554/stream/0/0`。
-- `rov_camera_control` 支持 `capture`、`medias`、`download` 和 `light`。拍照接口不返回文件名，调用方应在拍照前后比较 `/v1/medias` 列表。
-- 补光灯路径和请求体以当前固件 API 为准，可通过 `camera_light_path` 配置；厂商文档没有给出具体路径，因此默认值需现场确认。
+- 当前仅提供 `camera` 实时视频卡；当前固件已确认的 HTTP 能力不足以稳定支持拍照和补光灯控制。
 
 将 `mock: true` 用于无硬件开发测试。接入真实设备前，先通过 QGroundControl 验证 UDP 链路并确认解锁/失联保护行为。
