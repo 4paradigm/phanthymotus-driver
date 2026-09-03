@@ -21,7 +21,7 @@ class Plugin:
         self._worker = getattr(client, "camera_worker", None)
         self._output_dir = Path(str(plugin_config.get(
             "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
-        self._fps = max(1, min(15, int(plugin_config.get("fps", 10))))
+        self._fps = max(1, min(15, int(plugin_config.get("fps", 15))))
         self._max_duration_s = max(1, min(30, int(plugin_config.get("max_duration_s", 30))))
         self._recording_lock = threading.Lock()
         self._active_recording = None
@@ -109,8 +109,10 @@ class Plugin:
 
     def _record_video(self, requested, cancel_event):
         process = None
+        path = None
+        completed = False
         try:
-            frame, _ = self._frame()
+            _, sequence = self._frame()
             directory = self._output_dir / "videos"
             directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -121,12 +123,14 @@ class Plugin:
             ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
             frames, deadline = 0, time.monotonic() + requested
             while time.monotonic() < deadline and not cancel_event.is_set():
-                # The worker continuously refreshes its newest JPEG cache.
-                # Sample that cache at the requested output FPS rather than
-                # failing the whole recording when one inter-process notify is
-                # missed between two otherwise healthy camera frames.
+                # Require a later worker sequence for every encoded frame.  A
+                # cache read without this sequence would encode the same JPEG
+                # repeatedly when the camera has not published in this tick.
                 tick = time.monotonic()
-                frame, _ = self._frame(timeout_s=0)
+                frame, sequence = self._frame(
+                    after_sequence=sequence,
+                    timeout_s=max(0.25, 2.0 / self._fps),
+                )
                 process.stdin.write(frame["data"])
                 frames += 1
                 time.sleep(min(max(0.0, 1.0 / self._fps - (time.monotonic() - tick)),
@@ -136,18 +140,31 @@ class Plugin:
             if process.wait(timeout=10) != 0 or not path.exists():
                 raise RuntimeError(stderr.strip() or "ffmpeg failed to create MP4")
             if cancel_event.is_set():
-                path.unlink(missing_ok=True)
                 return {"ok": False, "code": "RECORD_CANCELLED", "message": "Video recording was cancelled"}
+            completed = True
             return {"ok": True, "media_type": "video", "file_path": str(path),
                     "recorded_duration_s": requested, "frames": frames,
                     "captured_at": datetime.now().isoformat(timespec="seconds")}
         except Exception as exc:
+            return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
+        finally:
             if process is not None:
                 try:
-                    process.kill()
+                    if process.stdin and not process.stdin.closed:
+                        process.stdin.close()
                 except Exception:
                     pass
-            return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=2)
+                except Exception:
+                    pass
+            if not completed and path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def _record_video_async(self, action_id, requested, cancel_event):
         result = self._record_video(requested, cancel_event)
