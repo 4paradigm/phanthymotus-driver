@@ -297,7 +297,19 @@ class QianjiaoDevice:
             if "remain" in item:
                 item["remaining_percent"] = item["remain"]
             batteries.append(item)
-        return {"batteries": batteries, "attUpdateAt": status.get("attUpdateAt")}
+        # The dashboard monitor renders top-level scalar fields.  Keep the
+        # common (single-pack) ROV battery flat so it is readable instead of
+        # displaying the nested ``batteries`` array as JSON text.
+        if len(batteries) == 1:
+            item = batteries[0]
+            return {
+                "battery_id": item.get("id"),
+                "voltage_v": item.get("voltage_v"),
+                "current_a": item.get("current_a"),
+                "remaining_percent": item.get("remaining_percent"),
+                "update_at": status.get("attUpdateAt"),
+            }
+        return {"battery_count": len(batteries), "batteries": batteries, "update_at": status.get("attUpdateAt")}
 
     @staticmethod
     def _imu_snapshot(status: dict[str, Any]) -> dict[str, Any]:
