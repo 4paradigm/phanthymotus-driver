@@ -44,6 +44,14 @@ PRESET_MOTIONS = {
     "point_head": 4001, "shake_head": 4002,
 }
 
+# 单臂动作：vendor 自带的 preset_motion_client.py 示例里这几个动作必须显式传 area=
+# left_hand/right_hand（1/2），area=none(0) 时机器人不知道该动哪只手臂，SetMcPresetMotion
+# 会返回 response.header.code=1（失败）。其余全身/头部交互动作用 area=none 即可。
+PRESET_MOTIONS_REQUIRE_ARM_AREA = {
+    "raise_hand", "wave_hand", "shake_hand", "flying_kiss_hand",
+    "clap_hand", "clipfist", "salute", "turn_wave_hand",
+}
+
 MC_CONTROL_AREAS = {"none": 0, "left_hand": 1, "right_hand": 2, "head": 4, "waist": 8}
 
 JOINT_AREAS = ("leg", "waist", "arm", "head")
@@ -585,7 +593,15 @@ class LocomotionPlugin:
 
 
 class PresetMotionPlugin:
-    ACTIONS = {name: (["area", "interrupt"], f"播放预设动作 {name}") for name in PRESET_MOTIONS}
+    ACTIONS = {
+        name: (
+            ["area", "interrupt"],
+            f"播放预设动作 {name}"
+            + ("（单臂动作，area 必须传 left_hand/right_hand，否则返回 code=1 失败）"
+               if name in PRESET_MOTIONS_REQUIRE_ARM_AREA else "")
+        )
+        for name in PRESET_MOTIONS
+    }
 
     def __init__(self, nodes):
         self.nodes = nodes
@@ -594,7 +610,7 @@ class PresetMotionPlugin:
         return tool("preset_motion", "actuator", "播放预设动作库（SetMcPresetMotion）", action_schema(
             self.ACTIONS,
             {
-                "area": {"type": "string", "enum": list(MC_CONTROL_AREAS), "default": "none", "description": "受控区域位掩码（多数全身动作留空）"},
+                "area": {"type": "string", "enum": list(MC_CONTROL_AREAS), "default": "none", "description": "受控区域位掩码；raise_hand/wave_hand/shake_hand 等单臂动作必须传 left_hand 或 right_hand，其余全身/头部交互动作留空即可"},
                 "interrupt": {"type": "boolean", "default": True, "description": "是否打断当前动作"},
             },
         ))
@@ -610,10 +626,13 @@ class PresetMotionPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        area = args.get("area", "none")
+        if action in PRESET_MOTIONS_REQUIRE_ARM_AREA and area not in ("left_hand", "right_hand"):
+            raise ValueError(f"preset_motion '{action}' 是单臂动作，area 必须是 left_hand 或 right_hand（当前: {area!r}）")
         from aimdk_msgs.srv import SetMcPresetMotion
         request = SetMcPresetMotion.Request()
         request.header.stamp = self.nodes.robot.get_clock().now().to_msg()
-        request.area.value = MC_CONTROL_AREAS[args.get("area", "none")]
+        request.area.value = MC_CONTROL_AREAS[area]
         request.motion.value = PRESET_MOTIONS[action]
         request.interrupt = bool(args.get("interrupt", True))
         request.ani_path = ""
