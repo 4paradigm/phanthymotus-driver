@@ -923,6 +923,11 @@ class LocoPlugin:
 
 def _mic_subprocess(namespace: str):
     """Mic capture subprocess — polls MediaController, publishes AudioChunk."""
+    # A fresh interpreter does not inherit the parent's atomic log writer.
+    # Idempotent when the launcher has already installed it before importing device.
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     import os as _os
     _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
     import sys as _sys
@@ -1016,7 +1021,10 @@ class MicPlugin:
         import sys
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
-             f"import sys; sys.path.insert(0, '/work'); from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
+             # Protect import-time output as well as the child entry point.
+             "import sys; sys.path.insert(0, '/work'); "
+             "from common import logsafe; logsafe.install(check_fd=False); "
+             f"from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         # Forward subprocess stdout in background
@@ -1495,6 +1503,11 @@ class SpeakerPlugin:
 
 def _camera_subprocess(namespace: str):
     """Camera subprocess — captures Realsense D435i color+depth, publishes to ROS2."""
+    # Match the Q5 camera worker's child-process logging protection.
+    # Idempotent when the launcher has already installed it before importing device.
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     import time as _time
     import numpy as _np
 
@@ -1682,7 +1695,10 @@ class CameraPlugin:
         import sys
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
-             f"import sys; sys.path.insert(0, '/work'); from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
+             # Protect import-time output as well as the child entry point.
+             "import sys; sys.path.insert(0, '/work'); "
+             "from common import logsafe; logsafe.install(check_fd=False); "
+             f"from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         def _fwd():
