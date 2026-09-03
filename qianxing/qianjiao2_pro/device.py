@@ -407,8 +407,9 @@ class QianjiaoDevice:
                     # MAVLink channels are 1-indexed; the vendor maps roll to
                     # channel 7 and leaves channel 6 unused.
                     channels = values_pwm[:5] + [UINT16_MAX, values_pwm[5], UINT16_MAX]
-                    args = [1, 1] + channels + [UINT16_MAX] * 10
-                    self.link.mav.rc_channels_override_send(*args)
+                    # MAVLink v1 RC_CHANNELS_OVERRIDE has exactly eight
+                    # channel fields after target_system/component.
+                    self.link.mav.rc_channels_override_send(1, 1, *channels)
 
         send(pwm)
         if duration != -1:
