@@ -57,6 +57,30 @@ When run without arguments, `build.sh` shows an interactive multi-select menu to
 
 Once the driver container starts, it registers itself with Agent Core at `http://<agent-core>:15678/api/mcp`. You can then see the device and its tools in the Web Dashboard.
 
+### DDS is confined to the local machine
+
+Every container on the ROS2 bus — Agent Core, perception, actucore and **every driver** — loads the
+same loopback-only FastDDS profile, so a robot's internal bus cannot be seen from the network:
+
+```yaml
+volumes:
+  - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+environment:
+  - ROS_DOMAIN_ID=42
+  - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+```
+
+Every driver's `deploy/service.yml` carries this except two dual-domain drivers that configure DDS in
+code (`engineai/t800`, `x-humanoid/tianyi2.0` — see the table in README_dev). Deploying through the
+dashboard needs no extra step. It matters when you write a new driver or hand-assemble a compose
+file, because a container that misses it **cannot reach Agent Core at all** — the device registers
+over HTTP and appears in the dashboard while none of its topics ever carry data.
+
+`ROS_DOMAIN_ID` is 42 on every robot; there are no per-robot numbers to allocate. Links to the robot
+body are unaffected — those go over CycloneDDS with an explicitly bound interface, which this
+profile does not touch. Full rationale, the failure modes and how to verify:
+[README_dev.md § DDS isolation](README_dev.md#dds-isolation--every-driver-must-load-the-profile).
+
 ### Run Locally (without Docker)
 
 ```bash
