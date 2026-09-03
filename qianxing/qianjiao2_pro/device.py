@@ -329,8 +329,10 @@ class QianjiaoDevice:
         return {key: status.get(key) for key in ("pitch", "roll", "yaw", "depth", "lat", "lon")}
 
     def _status_snapshot(self, status: dict[str, Any]) -> dict[str, Any]:
+        age = time.monotonic() - self._rov_status_received_at if self._rov_status_received_at else None
         return {"connected": self._connected(), "temperature": status.get("temperature"),
-                "status_age": round(time.monotonic() - self._rov_status_received_at, 3) if self._rov_status_received_at else None,
+                "status_age": round(age, 6) if age is not None else None,
+                "status_age_ms": round(age * 1000, 1) if age is not None else None,
                 "source": self._rov_status_source, "last_error": self._last_error}
 
     def camera_request(self, method: str, path: str, body: Any = None) -> dict:
@@ -361,7 +363,7 @@ class QianjiaoDevice:
             "rov": self._rov_status,
             "status_port": self.status_port,
             "status_source": self._rov_status_source,
-            "status_age": None if not self._rov_status_received_at else round(time.monotonic() - self._rov_status_received_at, 3),
+            "status_age": None if not self._rov_status_received_at else round(time.monotonic() - self._rov_status_received_at, 6),
             "camera": {"ip": self.camera_ip, "rtsp": self.camera_rtsp},
             "last_error": self._last_error,
         }
@@ -404,6 +406,22 @@ class QianjiaoDevice:
 
     def get_tools(self):
         sensor = lambda name, description, topic: {"name": name, "type": "sensor", "description": description, "topic_out": [{"topic": topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"], "description": "读取实时数据"}}, "required": ["action"]}}
+        axis = lambda name, description: {"type": "number", "minimum": -1, "maximum": 1, "description": description}
+        control_schema = {
+            "type": "object",
+            "oneOf": [
+                {"properties": {"action": {"const": "arm", "description": "解锁运动控制"}}, "required": ["action"]},
+                {"properties": {"action": {"const": "disarm", "description": "停止并锁定运动控制"}}, "required": ["action"]},
+                {"properties": {"action": {"const": "stop", "description": "停止运动并将各轴归中"}}, "required": ["action"]},
+                {"properties": {"action": {"const": "move", "description": "发送 6 自由度控制量"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1")}, "required": ["action"]},
+            ],
+            "x-action-params": {
+                "arm": {"params": [], "description": "解锁运动控制"},
+                "disarm": {"params": [], "description": "停止并锁定运动控制"},
+                "move": {"params": ["heave", "pitch", "forward", "yaw", "lateral", "roll"], "description": "发送 6 自由度控制量，未提供的轴默认为 0"},
+                "stop": {"params": [], "description": "停止运动并将各轴归中"},
+            },
+        }
         return [
             sensor("loco_state", "潜蛟运动状态：姿态角、深度和定位信息。", self.loco_state_topic),
             sensor("status", "潜蛟系统状态：连接、温度和健康信息。", self.status_topic),
@@ -411,7 +429,7 @@ class QianjiaoDevice:
             sensor("imu", "潜蛟 IMU 角速度数据。", self.imu_topic),
             {"name": "camera", "type": "sensor", "description": "潜蛟实时相机图像（RTSP 转 JPEG）。", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"], "description": "读取相机流信息"}}, "required": ["action"]}},
             {"name": "camera_control", "type": "actuator", "description": "潜蛟相机控制：拍照、查询媒体或设置补光灯。", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["capture", "medias", "download", "light"], "description": "要执行的相机操作"}, "name": {"type": "string", "description": "下载时的媒体文件名，仅允许文件名"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "补光灯亮度（0-100）"}}, "required": ["action"]}, "x-action-params": {"capture": {"params": [], "description": "拍摄一张照片"}, "medias": {"params": [], "description": "获取相机媒体列表"}, "download": {"params": ["name"], "description": "生成媒体文件下载地址"}, "light": {"params": ["brightness"], "description": "设置补光灯亮度"}}},
-            {"name": "control", "type": "actuator", "description": "潜蛟 2.0 Pro 运动控制：解锁、停止或发送 6 自由度控制量。", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["arm", "disarm", "move", "stop"], "description": "控制操作；move 时需提供运动轴参数"}, "heave": {"type": "number", "minimum": -1, "maximum": 1, "description": "升沉，-1 到 1"}, "pitch": {"type": "number", "minimum": -1, "maximum": 1, "description": "俯仰，-1 到 1"}, "forward": {"type": "number", "minimum": -1, "maximum": 1, "description": "前后，-1 到 1"}, "yaw": {"type": "number", "minimum": -1, "maximum": 1, "description": "偏航，-1 到 1"}, "lateral": {"type": "number", "minimum": -1, "maximum": 1, "description": "横移，-1 到 1"}, "roll": {"type": "number", "minimum": -1, "maximum": 1, "description": "横滚，-1 到 1"}}, "required": ["action"]}, "x-action-params": {"arm": {"params": [], "description": "解锁运动控制"}, "disarm": {"params": [], "description": "停止并锁定运动控制"}, "move": {"params": ["heave", "pitch", "forward", "yaw", "lateral", "roll"], "description": "发送 6 自由度控制量，未提供的轴默认为 0"}, "stop": {"params": [], "description": "停止运动并将各轴归中"}}},
+            {"name": "control", "type": "actuator", "description": "潜蛟 2.0 Pro 运动控制：解锁、停止或发送 6 自由度控制量。", "inputSchema": control_schema},
         ]
 
     def dispatch(self, tool: str, args: dict) -> dict:
