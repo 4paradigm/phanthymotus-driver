@@ -516,6 +516,19 @@ class ControlledSpatialPlugin:
                 return True
             return False
 
+    def _supersede_nav(self, action_id: str) -> None:
+        """Replace the current navigation action_id, cancelling the previous one.
+
+        The old action's ACP "cancelled" notification is posted outside the
+        lock so an Agent Core outage cannot block pose updates or other
+        navigation calls behind the network I/O.
+        """
+        with self._lock:
+            old_action_id = self._nav_action_id
+            self._nav_action_id = action_id
+        if old_action_id:
+            _acp_notify(old_action_id, "cancelled", {"reason": "superseded by new navigate"})
+
     def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90, target_xy=None):
         """Wait for navigation to complete, then fire ACP callback."""
         t0 = time.time()
@@ -803,10 +816,7 @@ class ControlledSpatialPlugin:
                     return result
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
-                with self._lock:
-                    if self._nav_action_id:
-                        _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
-                    self._nav_action_id = action_id
+                self._supersede_nav(action_id)
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
@@ -828,10 +838,7 @@ class ControlledSpatialPlugin:
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
-                with self._lock:
-                    if self._nav_action_id:
-                        _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
-                    self._nav_action_id = action_id
+                self._supersede_nav(action_id)
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, tag_name, float(args.get("stall_timeout", 90)), (poi["x"], poi["y"])),
@@ -859,10 +866,7 @@ class ControlledSpatialPlugin:
                     return result
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
-                with self._lock:
-                    if self._nav_action_id:
-                        _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
-                    self._nav_action_id = action_id
+                self._supersede_nav(action_id)
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
@@ -881,10 +885,7 @@ class ControlledSpatialPlugin:
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
-                with self._lock:
-                    if self._nav_action_id:
-                        _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
-                    self._nav_action_id = action_id
+                self._supersede_nav(action_id)
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)), (x, y)),
