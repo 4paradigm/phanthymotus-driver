@@ -16,5 +16,5 @@ ENV PYTHONPATH=/work:/opt/ros/humble/lib/python3.10/site-packages:/usr/lib/pytho
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_LOCALHOST_ONLY=0
-EXPOSE 15719
+EXPOSE 15729
 CMD ["/bin/bash", "-lc", "source /opt/ros/humble/setup.bash && exec /usr/bin/python3 main.py"]
