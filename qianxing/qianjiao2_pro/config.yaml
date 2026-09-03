@@ -10,6 +10,9 @@ rov:
   target_port: 14550
   source_system: 255
   source_component: 190
+  # Optional MAVLink target IDs; live HEARTBEAT values take precedence.
+  target_system: 1
+  target_component: 1
   heartbeat_timeout: 3.0
   heartbeat_rate: 1.0
   status_port: 8500
