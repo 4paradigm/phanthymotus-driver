@@ -18,6 +18,7 @@ cards:
   - { name: joints,            type: sensor }
   - { name: joints_state,      type: sensor }
   - { name: battery,           type: sensor }
+  - { name: imu,               type: sensor }
   - { name: hand_state,        type: sensor }
   - { name: mic,               type: sensor }
   - { name: speaker,           type: actuator }

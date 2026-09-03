@@ -59,6 +59,7 @@ COPY joints_state.py /work/joints_state.py
 COPY joints.py /work/joints.py
 COPY robot_ready.py /work/robot_ready.py
 COPY battery.py /work/battery.py
+COPY imu.py /work/imu.py
 COPY system_health.py /work/system_health.py
 COPY hand_state.py /work/hand_state.py
 COPY estop.py /work/estop.py

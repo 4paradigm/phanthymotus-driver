@@ -23,6 +23,8 @@ plugins:
     enabled: false  # merged into robot_status
   battery:
     enabled: true
+  imu:
+    enabled: true
   system_health:
     enabled: false  # merged into robot_status
   hand_state:
