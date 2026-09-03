@@ -539,7 +539,7 @@ class LocomotionPlugin:
         pass
 
     def stop(self):
-        self._set_input_source(4)  # DISABLE
+        self._set_input_source(2002)  # INPUTACTION_DISABLE
 
     def _source_name(self):
         return self.nodes.config.get("plugins", {}).get("locomotion", {}).get("input_source_name", "phanthymotus")
@@ -562,15 +562,15 @@ class LocomotionPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "register":
-            result = self._set_input_source(1)  # ADD
+            result = self._set_input_source(1001)  # INPUTACTION_ADD
             self._registered = True
             return result
         if action == "disable":
-            result = self._set_input_source(4)  # DISABLE
+            result = self._set_input_source(2002)  # INPUTACTION_DISABLE
             self._registered = False
             return result
         if not self._registered:
-            self._set_input_source(1)
+            self._set_input_source(1001)  # INPUTACTION_ADD
             self._registered = True
         msg = self.nodes._McLocomotionVelocity()
         msg.header.stamp = self.nodes.robot.get_clock().now().to_msg()
@@ -791,7 +791,12 @@ class PmuLedPlugin:
                 "r": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0},
                 "g": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0},
                 "b": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0},
-                "priority": {"type": "integer", "default": 0},
+                "priority": {
+                    "type": "integer", "default": 1,
+                    "description": "灯带控制优先级；PMU 固件把 0 当作无优先级声明并拒绝请求"
+                    "（返回 status_code 4132），必须传 >=1 才会生效。",
+                },
+                "reset_priority": {"type": "boolean", "default": False},
             },
         })
 
@@ -814,8 +819,8 @@ class PmuLedPlugin:
         request.r = int(args.get("r", 0))
         request.g = int(args.get("g", 0))
         request.b = int(args.get("b", 0))
-        request.priority = int(args.get("priority", 0))
-        request.reset_priority = False
+        request.priority = int(args.get("priority", 1))
+        request.reset_priority = bool(args.get("reset_priority", False))
         result = call_service(self.nodes.set_pmu_led, request)
         return {"status_code": result.status_code}
 
