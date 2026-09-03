@@ -114,6 +114,35 @@ play-teach mode and confirms the return to walking.
 vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
 unexposed.
 
+## `speaker`
+
+Plays the PCM audio of its connected input topic (`audio_msgs/AudioChunk`, mono
+16 kHz S16LE) on the robot speaker. Actions: `start` / `stop` / `info` /
+`get_volume` / `set_volume`.
+
+`start` **is** the playback action — the canvas starts a card by sending `start`
+with the resolved `input_topic`, so there is no separate `play`. A card whose
+`start` only answers `{"state": "ready"}` shows as running while the driver
+holds no subscription at all, which is silence that looks like success.
+
+The vendor voice agent (`MediaController.wakeup()` / `sleep()` / `restart()`) is
+deliberately **not** exposed. Waking it would hand the robot's microphone to the
+vendor's own model and let it talk over this stack through the same speaker.
+Two behaviours verified on hardware and worth not re-deriving:
+
+- **`work_status=SLEEPED` does not block playback.** A full TTS utterance played
+  while the agent sat at `SLEEPED/CMD_SLEEPED`. Only `ERROR_SLEEPED` means the
+  audio agent is really down; `start` then calls the documented `restart()`
+  recovery by itself and reports it.
+- **`get_volume()` is not trustworthy.** A freshly created MediaController reads
+  `0` for 12 s and longer while audio plays normally, and each client appears to
+  read back its own last `set_volume`. Treat a `0` as "unknown", never as the
+  reason for silence — `info` reports it for reference only.
+
+Likewise `frames_submitted` in `info` counts frames handed to the SDK, not
+frames heard: `publish_external_audio_playback_stream` is fire-and-forget, so a
+rising count proves the subscription works and nothing more.
+
 Useful observations while the driver is running:
 
 ```bash
