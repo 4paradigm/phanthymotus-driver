@@ -484,12 +484,25 @@ class QianjiaoDevice:
                     self._active_action = None
             _acp_notify(action_id, "error", {"message": str(exc)})
 
+    def _run_continuous_move(self, args: dict, action_id: str, cancel_event: threading.Event) -> None:
+        try:
+            self.move({**args, "_cancel_event": cancel_event})
+            with self._action_lock:
+                if self._active_action and self._active_action.get("action_id") == action_id:
+                    self._active_action = None
+            _acp_notify(action_id, "cancelled", {"reason": "stopped_by_user"})
+        except Exception as exc:
+            with self._action_lock:
+                if self._active_action and self._active_action.get("action_id") == action_id:
+                    self._active_action = None
+            _acp_notify(action_id, "error", {"message": str(exc)})
+
     def get_tools(self):
         sensor = lambda name, description, topic: {"name": name, "type": "sensor", "description": description, "topic_out": [{"topic": topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"], "description": "卡片生命周期或数据查询动作"}}, "required": ["action"]}}
         axis = lambda name, description: {"type": "number", "minimum": -1, "maximum": 1, "default": 0, "description": description}
         control_schema = {
             "type": "object",
-            "properties": {"action": {"type": "string", "enum": ["start", "info", "unlock", "lock", "move", "stop"], "description": "控制动作"}, "action_id": {"type": "string", "description": "ACP 异步动作标识，可选；不填写时由驱动生成"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1"), "duration": {"type": "number", "minimum": -1, "maximum": 60, "description": "move 持续时间（秒）；-1 表示持续控制，0 无效，0.1-60 到时自动停止"}},
+            "properties": {"action": {"type": "string", "enum": ["start", "info", "unlock", "lock", "move", "stop", "cancel"], "description": "控制动作"}, "action_id": {"type": "string", "description": "ACP 异步动作标识，可选；不填写时由驱动生成"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1"), "duration": {"type": "number", "minimum": -1, "maximum": 60, "description": "move 持续时间（秒）；-1 表示持续控制，0 无效，0.1-60 到时自动停止"}},
             "required": ["action"],
             "x-completion": {"actions": ["move"], "timeout": 61},
             "x-action-params": {
@@ -497,6 +510,7 @@ class QianjiaoDevice:
                 "lock": {"params": [], "description": "锁定推进器，禁止运动控制"},
                 "move": {"params": ["heave", "pitch", "forward", "yaw", "lateral", "roll", "duration"], "required": ["duration"], "description": "发送 6 自由度控制量；duration=-1 持续控制，0.1-60 秒后自动停止，未提供的轴默认为 0"},
                 "stop": {"params": [], "description": "停止运动并将各轴归中"},
+                "cancel": {"params": [], "description": "取消当前 ACP 运动任务并立即停止"},
                 "start": {"params": [], "description": "初始化控制卡"},
                 "info": {"params": [], "description": "读取控制链路状态"},
             },
@@ -534,6 +548,7 @@ class QianjiaoDevice:
             return {**self._loco_snapshot(self._rov_status), "topic_out": [{"topic": self.loco_state_topic, "format": "data/json"}]}
         if tool == "control" and action in ("start", "info"): return {"state": "ready", "mavlink_connected": self._connected()}
         if tool == "control" and action == "stop": return self.stop_motion()
+        if tool == "control" and action == "cancel": return self.stop_motion()
         if tool == "control" and action == "unlock": return self.arm(True)
         if tool == "control" and action == "lock":
             self.stop_motion()
@@ -542,10 +557,15 @@ class QianjiaoDevice:
             action_id = str(args.get("action_id") or f"qianjiao_move_{int(time.time() * 1000)}")
             duration = float(args["duration"])
             if duration == -1:
-                result = self.move(args)
+                cancel_event = threading.Event()
                 with self._action_lock:
-                    self._active_action = {"action_id": action_id, "cancel_event": threading.Event()}
-                return {"state": "running", "action_id": action_id, "stops_automatically": False, **result}
+                    previous = self._active_action
+                    self._active_action = {"action_id": action_id, "cancel_event": cancel_event}
+                if previous:
+                    previous["cancel_event"].set()
+                    _acp_notify(previous["action_id"], "cancelled", {"reason": "replaced_by_new_command"})
+                threading.Thread(target=self._run_continuous_move, args=(args, action_id, cancel_event), daemon=True, name="qianjiao-move-acp").start()
+                return {"state": "running", "action_id": action_id, "stops_automatically": False}
             with self._action_lock:
                 previous = self._active_action
                 cancel_event = threading.Event()
