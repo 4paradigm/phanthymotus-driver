@@ -77,6 +77,8 @@ class QianjiaoDevice:
         self._active_action: dict[str, Any] | None = None
         self._last_heartbeat = 0.0
         self._armed = False
+        self.target_system = int(cfg.get("target_system", 1))
+        self.target_component = int(cfg.get("target_component", 1))
         self._last_error: str | None = None
         self.status_port = int(cfg.get("status_port", 8500))
         self.camera_ip = str(cfg.get("camera_ip", "192.168.1.88"))
@@ -124,7 +126,7 @@ class QianjiaoDevice:
         # Ubuntu 22.04 ships FFmpeg 4.4, which does not support the newer
         # ``-fps_mode`` option.  ``-vsync 0`` provides the same passthrough
         # behavior while keeping compatibility with that version.
-        command = ["ffmpeg", "-loglevel", "fatal", "-rtsp_transport", "tcp", "-fflags", "+discardcorrupt+nobuffer", "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32", "-err_detect", "ignore_err", "-i", self.camera_rtsp, "-an", "-vf", "scale=1280:-2", "-vsync", "0", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
+        command = ["ffmpeg", "-loglevel", "error", "-rtsp_transport", "tcp", "-fflags", "+nobuffer", "-flags", "low_delay", "-analyzeduration", "1M", "-probesize", "1M", "-i", self.camera_rtsp, "-an", "-vf", "scale=1280:-2", "-vsync", "0", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
         backoff = 1.0
         while not self._stop.is_set():
             buf = bytearray()
@@ -288,6 +290,12 @@ class QianjiaoDevice:
                     while msg is not None:
                         if msg.get_type() == "HEARTBEAT":
                             self._last_heartbeat = time.monotonic()
+                            src_system = msg.get_srcSystem()
+                            src_component = msg.get_srcComponent()
+                            if src_system is not None:
+                                self.target_system = int(src_system)
+                            if src_component is not None:
+                                self.target_component = int(src_component)
                             self._armed = bool(int(getattr(msg, "base_mode", 0)) & MAV_MODE_FLAG_SAFETY_ARMED)
                         msg = self.link.recv_match(blocking=False)
             except Exception as exc:
@@ -403,7 +411,8 @@ class QianjiaoDevice:
                 "status_age": round(age, 6) if age is not None else None,
                 "status_age_ms": round(age * 1000, 1) if age is not None else None,
                 "source": self._rov_status_source, "last_error": self._last_error,
-                "video_ready": self._video_ready, "video_error": self._video_error}
+                "video_ready": self._video_ready, "video_error": self._video_error,
+                "mavlink_target": {"system": self.target_system, "component": self.target_component}}
 
     def camera_request(self, method: str, path: str, body: Any = None) -> dict:
         url = self.camera_http_base + path
@@ -451,7 +460,7 @@ class QianjiaoDevice:
                 self.link.last_command = {"command": MAV_CMD_COMPONENT_ARM_DISARM, "param1": 0 if armed else 1}
             else:
                 # Vendor documentation: param1=0 unlocks, param1=1 locks.
-                self.link.mav.command_long_send(1, 1, MAV_CMD_COMPONENT_ARM_DISARM, 0, 0 if armed else 1, 0, 0, 0, 0, 0, 0)
+                self.link.mav.command_long_send(self.target_system, self.target_component, MAV_CMD_COMPONENT_ARM_DISARM, 0, 0 if armed else 1, 0, 0, 0, 0, 0, 0)
             return {"state": "armed" if armed else "disarmed", "command": MAV_CMD_COMPONENT_ARM_DISARM}
 
     def move(self, values: dict) -> dict:
@@ -483,7 +492,7 @@ class QianjiaoDevice:
                     channels = values_pwm[:5] + [UINT16_MAX, values_pwm[5], UINT16_MAX]
                     # MAVLink v1 RC_CHANNELS_OVERRIDE has exactly eight
                     # channel fields after target_system/component.
-                    self.link.mav.rc_channels_override_send(1, 1, *channels)
+                    self.link.mav.rc_channels_override_send(self.target_system, self.target_component, *channels)
             return True
 
         send(pwm)
