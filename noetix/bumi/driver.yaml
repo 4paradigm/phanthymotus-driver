@@ -6,12 +6,12 @@ hardware_model: "bumi"
 image_name: noetix-bumi
 port: 15704
 mcp_url: "http://localhost:15704/mcp"
-description: "Noetix Bumi-EDU — 麦克风、扬声器、摄像头、整机运动遥测、状态记录、移动、起身收纳、预设动作和动作示教"
+description: "Noetix Bumi-EDU — 麦克风、扬声器、摄像头、整机运动遥测、照片与视频采集、移动、起身收纳、预设动作和动作示教"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
-# Kept in sync by hand with config.yaml's `plugins.*.enabled` (all six are
-# currently enabled: state, loco, mic, speaker, camera, motion_state).
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` (all seven are
+# currently enabled: state, loco, mic, speaker, camera, motion_state, vision_capture).
 cards:
   - { name: imu,               type: sensor }
   - { name: battery,           type: sensor }
@@ -26,3 +26,4 @@ cards:
   - { name: camera,            type: sensor }
   - { name: depth,             type: sensor }
   - { name: motion_state,      type: sensor }
+  - { name: vision_capture,    type: actuator }
