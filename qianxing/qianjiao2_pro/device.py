@@ -64,6 +64,7 @@ class QianjiaoDevice:
         self.camera_light_path = str(cfg.get("camera_light_path", "/v1/light"))
         self.video_url = str(cfg.get("video_url", "/video.mjpeg"))
         self.status_topic = str(cfg.get("status_topic", "/qianjiao2_pro/status"))
+        self.loco_state_topic = str(cfg.get("loco_state_topic", "/qianjiao2_pro/loco_state"))
         self.battery_topic = str(cfg.get("battery_topic", "/qianjiao2_pro/battery"))
         self.imu_topic = str(cfg.get("imu_topic", "/qianjiao2_pro/imu"))
         self.camera_topic = str(cfg.get("camera_topic", "/qianjiao2_pro/camera/color"))
@@ -74,6 +75,7 @@ class QianjiaoDevice:
         self._rov_status_source: str | None = None
         self._ros_node = None
         self._ros_pub = None
+        self._ros_loco_pub = None
         self._ros_battery_pub = None
         self._ros_imu_pub = None
         self._ros_camera_pub = None
@@ -152,6 +154,7 @@ class QianjiaoDevice:
                              history=HistoryPolicy.KEEP_LAST, depth=1,
                              durability=DurabilityPolicy.VOLATILE)
             self._ros_pub = self._ros_node.create_publisher(String, self.status_topic, qos)
+            self._ros_loco_pub = self._ros_node.create_publisher(String, self.loco_state_topic, qos)
             self._ros_battery_pub = self._ros_node.create_publisher(String, self.battery_topic, qos)
             self._ros_imu_pub = self._ros_node.create_publisher(String, self.imu_topic, qos)
             self._ros_camera_pub = self._ros_node.create_publisher(CompressedImage, self.camera_topic, qos)
@@ -199,6 +202,7 @@ class QianjiaoDevice:
             self._ros_node.destroy_node()
             self._ros_node = None
             self._ros_pub = None
+            self._ros_loco_pub = None
             self._ros_battery_pub = None
             self._ros_imu_pub = None
             self._ros_camera_pub = None
@@ -245,8 +249,11 @@ class QianjiaoDevice:
                         if self._ros_pub is not None:
                             from std_msgs.msg import String
                             msg = String()
-                            msg.data = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+                            msg.data = json.dumps(self._status_snapshot(parsed), ensure_ascii=False, separators=(",", ":"))
                             self._ros_pub.publish(msg)
+                            if self._ros_loco_pub is not None:
+                                msg.data = json.dumps(self._loco_snapshot(parsed), separators=(",", ":"))
+                                self._ros_loco_pub.publish(msg)
                             if self._ros_battery_pub is not None:
                                 msg.data = json.dumps(self._battery_snapshot(parsed), ensure_ascii=False, separators=(",", ":"))
                                 self._ros_battery_pub.publish(msg)
@@ -301,6 +308,15 @@ class QianjiaoDevice:
             "raw_0_1_deg_s": raw,
             "attUpdateAt": status.get("attUpdateAt"),
         }
+
+    @staticmethod
+    def _loco_snapshot(status: dict[str, Any]) -> dict[str, Any]:
+        return {key: status.get(key) for key in ("pitch", "roll", "yaw", "depth", "lat", "lon")}
+
+    def _status_snapshot(self, status: dict[str, Any]) -> dict[str, Any]:
+        return {"connected": self._connected(), "temperature": status.get("temperature"),
+                "status_age": round(time.monotonic() - self._rov_status_received_at, 3) if self._rov_status_received_at else None,
+                "source": self._rov_status_source, "last_error": self._last_error}
 
     def camera_request(self, method: str, path: str, body: Any = None) -> dict:
         url = self.camera_http_base + path
@@ -372,25 +388,32 @@ class QianjiaoDevice:
         return self._armed
 
     def get_tools(self):
+        sensor = lambda name, description, topic: {"name": name, "type": "sensor", "description": description, "topic_out": [{"topic": topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"], "description": "读取实时数据"}}, "required": ["action"]}}
         return [
-            {"name": "rov_status", "type": "sensor", "description": "潜蛟综合状态：连接、姿态、深度、位置、温度、电池和 IMU（10Hz）", "topic_out": [{"topic": self.status_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"]}}}},
-            {"name": "rov_health", "type": "sensor", "description": "潜蛟能源与惯性状态（电池、IMU）", "topic_out": [{"topic": self.battery_topic, "format": "data/json"}, {"topic": self.imu_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
-            {"name": "rov_camera", "type": "sensor", "description": "潜蛟实时视频流（RTSP 转 JPEG 并发布 ROS2 DDS）", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
-            {"name": "rov_camera_control", "type": "actuator", "description": "潜蛟相机控制：拍照、媒体列表、下载和补光灯", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["capture", "medias", "download", "light"]}, "name": {"type": "string"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["action"]}},
-            {"name": "rov_control", "type": "actuator", "description": "潜蛟 2.0 Pro 解锁及 6DOF 运动控制", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["arm", "disarm", "move", "stop"]}, "heave": {"type": "number", "minimum": -1, "maximum": 1}, "pitch": {"type": "number", "minimum": -1, "maximum": 1}, "forward": {"type": "number", "minimum": -1, "maximum": 1}, "yaw": {"type": "number", "minimum": -1, "maximum": 1}, "lateral": {"type": "number", "minimum": -1, "maximum": 1}, "roll": {"type": "number", "minimum": -1, "maximum": 1}}, "required": ["action"]}},
+            sensor("loco_state", "潜蛟运动状态：姿态角、深度和定位信息。", self.loco_state_topic),
+            sensor("status", "潜蛟系统状态：连接、温度和健康信息。", self.status_topic),
+            sensor("battery", "潜蛟电池状态：电压、电流和剩余电量。", self.battery_topic),
+            sensor("imu", "潜蛟 IMU 角速度数据。", self.imu_topic),
+            {"name": "camera", "type": "sensor", "description": "潜蛟实时相机图像（RTSP 转 JPEG）。", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"], "description": "读取相机流信息"}}, "required": ["action"]}},
+            {"name": "camera_control", "type": "actuator", "description": "潜蛟相机控制：拍照、查询媒体或设置补光灯。", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["capture", "medias", "download", "light"], "description": "要执行的相机操作"}, "name": {"type": "string", "description": "下载时的媒体文件名，仅允许文件名"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "补光灯亮度（0-100）"}}, "required": ["action"]}, "x-action-params": {"capture": {"params": [], "description": "拍摄一张照片"}, "medias": {"params": [], "description": "获取相机媒体列表"}, "download": {"params": ["name"], "description": "生成媒体文件下载地址"}, "light": {"params": ["brightness"], "description": "设置补光灯亮度"}}},
+            {"name": "control", "type": "actuator", "description": "潜蛟 2.0 Pro 运动控制：解锁、停止或发送 6 自由度控制量。", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["arm", "disarm", "move", "stop"], "description": "控制操作；move 时需提供运动轴参数"}, "heave": {"type": "number", "minimum": -1, "maximum": 1, "description": "升沉，-1 到 1"}, "pitch": {"type": "number", "minimum": -1, "maximum": 1, "description": "俯仰，-1 到 1"}, "forward": {"type": "number", "minimum": -1, "maximum": 1, "description": "前后，-1 到 1"}, "yaw": {"type": "number", "minimum": -1, "maximum": 1, "description": "偏航，-1 到 1"}, "lateral": {"type": "number", "minimum": -1, "maximum": 1, "description": "横移，-1 到 1"}, "roll": {"type": "number", "minimum": -1, "maximum": 1, "description": "横滚，-1 到 1"}}, "required": ["action"]}, "x-action-params": {"arm": {"params": [], "description": "解锁运动控制"}, "disarm": {"params": [], "description": "停止并锁定运动控制"}, "move": {"params": ["heave", "pitch", "forward", "yaw", "lateral", "roll"], "description": "发送 6 自由度控制量，未提供的轴默认为 0"}, "stop": {"params": [], "description": "停止运动并将各轴归中"}}},
         ]
 
     def dispatch(self, tool: str, args: dict) -> dict:
         action = args.get("action", "info")
-        if tool == "rov_status":
+        if tool in ("status", "rov_status"):
             if action == "start": self.start()
             elif action == "stop": self.stop()
-            return {**self.status(), "topic_out": [{"topic": self.status_topic, "format": "data/json"}]}
-        if tool == "rov_camera":
+            return {**self._status_snapshot(self._rov_status), "topic_out": [{"topic": self.status_topic, "format": "data/json"}]}
+        if tool in ("camera", "rov_camera"):
             return {"state": "available", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "stream_url": self.video_url, "source_rtsp": self.camera_rtsp}
-        if tool == "rov_health":
-            return {"state": "available", "topic_out": [{"topic": self.battery_topic, "format": "data/json"}, {"topic": self.imu_topic, "format": "data/json"}]}
-        if tool == "rov_camera_control":
+        if tool == "battery":
+            return {**self._battery_snapshot(self._rov_status), "topic_out": [{"topic": self.battery_topic, "format": "data/json"}]}
+        if tool == "imu":
+            return {**self._imu_snapshot(self._rov_status), "topic_out": [{"topic": self.imu_topic, "format": "data/json"}]}
+        if tool == "loco_state":
+            return {**self._loco_snapshot(self._rov_status), "topic_out": [{"topic": self.loco_state_topic, "format": "data/json"}]}
+        if tool == "camera_control":
             if action == "capture":
                 return self.camera_request("POST", "/v1/capture")
             if action == "medias":
@@ -404,8 +427,8 @@ class QianjiaoDevice:
                 brightness = int(args.get("brightness", 0))
                 return self.camera_request("POST", self.camera_light_path, {"brightness": brightness})
             raise ValueError(f"unsupported camera action: {action}")
-        if action == "arm": return self.arm(True)
-        if action == "disarm": return self.arm(False)
-        if action == "move": return self.move(args)
-        if action == "stop": return self.stop_motion()
+        if tool == "control" and action == "arm": return self.arm(True)
+        if tool == "control" and action == "disarm": return self.arm(False)
+        if tool == "control" and action == "move": return self.move(args)
+        if tool == "control" and action == "stop": return self.stop_motion()
         raise ValueError(f"unsupported action: {action}")
