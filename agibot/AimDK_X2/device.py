@@ -159,7 +159,12 @@ class AimdkNodes:
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
         mirror("hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json", qos=sensor_qos)
-        mirror("camera_rgb", CompressedImage, "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed", "image/jpeg", qos=sensor_qos)
+        # SDK's topics_and_services catalog documents rgbd_head_front/* as the front camera, but
+        # on real hardware that topic has zero publishers -- this unit's camera service actually
+        # publishes RGB under rgb_head_front_center/* instead (confirmed live via `ros2 topic
+        # info`, 30Hz). No depth topic is published anywhere on this hardware at all, so
+        # camera_depth stays wired to the documented (currently inactive) topic.
+        mirror("camera_rgb", CompressedImage, "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed", "image/jpeg", qos=sensor_qos)
         mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
         mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
         mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
