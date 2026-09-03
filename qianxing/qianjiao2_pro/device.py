@@ -382,7 +382,7 @@ class QianjiaoDevice:
         with self._lock:
             if self.mock:
                 self.link.armed = armed
-                self.link.last_command = {"command": MAV_CMD_COMPONENT_ARM_DISARM, "param1": int(armed)}
+                self.link.last_command = {"command": MAV_CMD_COMPONENT_ARM_DISARM, "param1": 0 if armed else 1}
             else:
                 # Vendor documentation: param1=0 unlocks, param1=1 locks.
                 self.link.mav.command_long_send(1, 1, MAV_CMD_COMPONENT_ARM_DISARM, 0, 0 if armed else 1, 0, 0, 0, 0, 0, 0)
@@ -391,7 +391,7 @@ class QianjiaoDevice:
     def move(self, values: dict) -> dict:
         self._require_connected()
         if not self.mock and not self._is_armed_from_heartbeat():
-            raise RuntimeError("ROV is not armed; call arm first")
+            raise RuntimeError("ROV is locked; call unlock first")
         pwm = [_pwm(values.get(axis, 0.0)) for axis in CHANNELS]
         if "duration" not in values:
             raise ValueError("duration is required for move (-1 means continuous control)")
@@ -432,11 +432,11 @@ class QianjiaoDevice:
         axis = lambda name, description: {"type": "number", "minimum": -1, "maximum": 1, "default": 0, "description": description}
         control_schema = {
             "type": "object",
-            "properties": {"action": {"type": "string", "enum": ["start", "info", "arm", "disarm", "move", "stop"], "description": "控制动作"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1"), "duration": {"type": "number", "minimum": -1, "maximum": 60, "description": "move 持续时间（秒）；-1 表示持续控制，0 无效，0.1-60 到时自动停止"}},
+            "properties": {"action": {"type": "string", "enum": ["start", "info", "unlock", "lock", "move", "stop"], "description": "控制动作"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1"), "duration": {"type": "number", "minimum": -1, "maximum": 60, "description": "move 持续时间（秒）；-1 表示持续控制，0 无效，0.1-60 到时自动停止"}},
             "required": ["action"],
             "x-action-params": {
-                "arm": {"params": [], "description": "解锁运动控制"},
-                "disarm": {"params": [], "description": "停止并锁定运动控制"},
+                "unlock": {"params": [], "description": "解锁推进器，允许运动控制"},
+                "lock": {"params": [], "description": "锁定推进器，禁止运动控制"},
                 "move": {"params": ["heave", "pitch", "forward", "yaw", "lateral", "roll", "duration"], "required": ["duration"], "description": "发送 6 自由度控制量；duration=-1 持续控制，0.1-60 秒后自动停止，未提供的轴默认为 0"},
                 "stop": {"params": [], "description": "停止运动并将各轴归中"},
                 "start": {"params": [], "description": "初始化控制卡"},
@@ -445,12 +445,11 @@ class QianjiaoDevice:
         }
         camera_control_schema = {
             "type": "object",
-            "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "capture", "list", "download", "light"], "description": "相机动作"}, "name": {"type": "string", "description": "媒体文件名（download 时必填）"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "补光灯亮度（0-100，light 时必填）"}},
+            "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "capture", "list", "light"], "description": "相机动作"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "补光灯亮度（0-100，light 时必填）"}},
             "required": ["action"],
             "x-action-params": {
                 "capture": {"params": [], "description": "拍摄一张照片"},
                 "list": {"params": [], "description": "列出相机中已保存的照片和视频"},
-                "download": {"params": ["name"], "description": "生成媒体文件下载地址"},
                 "light": {"params": ["brightness"], "description": "设置补光灯亮度"},
                 "start": {"params": [], "description": "初始化相机控制卡"}, "stop": {"params": [], "description": "停止相机控制卡"}, "info": {"params": [], "description": "读取相机控制状态"},
             },
@@ -488,18 +487,13 @@ class QianjiaoDevice:
                 return self.camera_request("POST", "/v1/capture")
             if action in ("list", "medias"):
                 return self.camera_request("GET", "/v1/medias")
-            if action == "download":
-                name = str(args.get("name", "")).strip()
-                if not name or "/" in name or ".." in name:
-                    raise ValueError("name must be a media filename")
-                return {"download_url": f"{self.camera_http_base}/v1/medias/{urllib.parse.quote(name)}/download"}
             if action == "light":
                 brightness = int(args.get("brightness", 0))
                 return self.camera_request("POST", self.camera_light_path, {"brightness": brightness})
             raise ValueError(f"unsupported camera action: {action}")
         if tool == "control" and action in ("start", "info"): return {"state": "ready", "mavlink_connected": self._connected()}
         if tool == "control" and action == "stop": return self.stop_motion()
-        if tool == "control" and action == "arm": return self.arm(True)
-        if tool == "control" and action == "disarm": return self.arm(False)
+        if tool == "control" and action == "unlock": return self.arm(True)
+        if tool == "control" and action == "lock": return self.arm(False)
         if tool == "control" and action == "move": return self.move(args)
         raise ValueError(f"unsupported action: {action}")
