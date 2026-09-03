@@ -9,3 +9,30 @@ mcp_url: "http://localhost:15703/mcp"
 description: "Unitree Go2 — 运动控制 + 避障 + 语音 + 视频 + 导航"
 build_context_extras:
   - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` — controlled_spatial
+# is disabled here (spatial plugin covers SLAM/nav instead), so its tool is excluded.
+cards:
+  - { name: mic,           type: sensor }
+  - { name: speaker,       type: actuator }
+  - { name: vui,           type: actuator }
+  - { name: loco_state,    type: sensor }
+  - { name: loco,          type: actuator }
+  - { name: switch_gait,   type: actuator }
+  - { name: gesture,       type: actuator }
+  - { name: acrobatics,    type: actuator }
+  - { name: obstacles_avoid, type: actuator }
+  - { name: camera_front,  type: sensor }
+  - { name: imu,           type: sensor }
+  - { name: battery,       type: sensor }
+  - { name: joints,        type: sensor }
+  - { name: motion_switcher, type: actuator }
+  - { name: lidar_cloud,   type: sensor }
+  - { name: pos_tag,       type: sensor }
+  - { name: slam_mapping,  type: sensor }
+  - { name: slam_cloud,    type: sensor }
+  - { name: grid_map,      type: sensor }
+  - { name: spatial,       type: actuator }
+  - { name: asr,           type: sensor }
+  - { name: ext_mic,       type: sensor }
+  - { name: ext_camera,    type: sensor }
