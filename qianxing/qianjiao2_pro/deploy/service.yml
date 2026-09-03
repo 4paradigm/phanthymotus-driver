@@ -6,8 +6,6 @@ qianxing-qianjiao2-pro:
     - /opt/phanthy-motus/.env
   environment:
     - MCP_ADVERTISE_HOST=${MCP_ADVERTISE_HOST:-127.0.0.1}
-    - QIANJIAO_CAMERA_USER=${QIANJIAO_CAMERA_USER:-admin}
-    - QIANJIAO_CAMERA_PASSWORD=${QIANJIAO_CAMERA_PASSWORD}
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - RCUTILS_COLORIZED_OUTPUT=0
