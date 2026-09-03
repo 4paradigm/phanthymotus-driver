@@ -445,11 +445,11 @@ class QianjiaoDevice:
         }
         camera_control_schema = {
             "type": "object",
-            "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "capture", "medias", "download", "light"], "description": "相机动作"}, "name": {"type": "string", "description": "媒体文件名（download 时必填）"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "补光灯亮度（0-100，light 时必填）"}},
+            "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "capture", "list", "download", "light"], "description": "相机动作"}, "name": {"type": "string", "description": "媒体文件名（download 时必填）"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "补光灯亮度（0-100，light 时必填）"}},
             "required": ["action"],
             "x-action-params": {
                 "capture": {"params": [], "description": "拍摄一张照片"},
-                "medias": {"params": [], "description": "获取相机媒体列表"},
+                "list": {"params": [], "description": "列出相机中已保存的照片和视频"},
                 "download": {"params": ["name"], "description": "生成媒体文件下载地址"},
                 "light": {"params": ["brightness"], "description": "设置补光灯亮度"},
                 "start": {"params": [], "description": "初始化相机控制卡"}, "stop": {"params": [], "description": "停止相机控制卡"}, "info": {"params": [], "description": "读取相机控制状态"},
@@ -486,7 +486,7 @@ class QianjiaoDevice:
                 return {"state": "ready" if action != "stop" else "idle", "camera": self.camera_ip}
             if action == "capture":
                 return self.camera_request("POST", "/v1/capture")
-            if action == "medias":
+            if action in ("list", "medias"):
                 return self.camera_request("GET", "/v1/medias")
             if action == "download":
                 name = str(args.get("name", "")).strip()
