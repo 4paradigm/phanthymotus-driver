@@ -393,15 +393,32 @@ class QianjiaoDevice:
         if not self.mock and not self._is_armed_from_heartbeat():
             raise RuntimeError("ROV is not armed; call arm first")
         pwm = [_pwm(values.get(axis, 0.0)) for axis in CHANNELS]
-        with self._lock:
-            if self.mock:
-                self.link.last_rc = pwm
-            else:
-                # MAVLink channels are 1-indexed; the vendor maps roll to
-                # channel 7 and leaves channel 6 unused.
-                channels = pwm[:5] + [UINT16_MAX, pwm[5], UINT16_MAX]
-                args = [1, 1] + channels + [UINT16_MAX] * 10
-                self.link.mav.rc_channels_override_send(*args)
+        duration = values.get("duration")
+        if duration is not None:
+            duration = float(duration)
+            if not 0.1 <= duration <= 60:
+                raise ValueError("duration must be between 0.1 and 60 seconds")
+
+        def send(values_pwm):
+            with self._lock:
+                if self.mock:
+                    self.link.last_rc = values_pwm
+                else:
+                    # MAVLink channels are 1-indexed; the vendor maps roll to
+                    # channel 7 and leaves channel 6 unused.
+                    channels = values_pwm[:5] + [UINT16_MAX, values_pwm[5], UINT16_MAX]
+                    args = [1, 1] + channels + [UINT16_MAX] * 10
+                    self.link.mav.rc_channels_override_send(*args)
+
+        send(pwm)
+        if duration is not None:
+            deadline = time.monotonic() + duration
+            while time.monotonic() < deadline and not self._stop.is_set():
+                self._stop.wait(min(0.1, deadline - time.monotonic()))
+                if time.monotonic() < deadline:
+                    send(pwm)
+            send([1500] * len(CHANNELS))
+            return {"state": "stopped", "duration": duration, "channels": dict(zip(CHANNELS, pwm))}
         return {"state": "moving", "channels": dict(zip(CHANNELS, pwm))}
 
     def stop_motion(self) -> dict:
@@ -415,12 +432,12 @@ class QianjiaoDevice:
         axis = lambda name, description: {"type": "number", "minimum": -1, "maximum": 1, "description": description}
         control_schema = {
             "type": "object",
-            "properties": {"action": {"type": "string", "enum": ["start", "info", "arm", "disarm", "move", "stop"], "description": "控制动作"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1")},
+            "properties": {"action": {"type": "string", "enum": ["start", "info", "arm", "disarm", "move", "stop"], "description": "控制动作"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1"), "duration": {"type": "number", "minimum": 0.1, "maximum": 60, "description": "move 持续时间（秒）；填写后到时自动停止，不填写则持续输出"}},
             "required": ["action"],
             "x-action-params": {
                 "arm": {"params": [], "description": "解锁运动控制"},
                 "disarm": {"params": [], "description": "停止并锁定运动控制"},
-                "move": {"params": ["heave", "pitch", "forward", "yaw", "lateral", "roll"], "description": "发送 6 自由度控制量，未提供的轴默认为 0"},
+                "move": {"params": ["heave", "pitch", "forward", "yaw", "lateral", "roll", "duration"], "description": "发送 6 自由度控制量；填写 duration 后按指定秒数运动并自动停止，未提供的轴默认为 0"},
                 "stop": {"params": [], "description": "停止运动并将各轴归中"},
                 "start": {"params": [], "description": "初始化控制卡"},
                 "info": {"params": [], "description": "读取控制链路状态"},
