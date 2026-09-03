@@ -282,6 +282,8 @@ class McStatePlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "running"}
         from aimdk_msgs.srv import GetMcAction
         request = GetMcAction.Request()
         request.request = self.nodes.request_header()
@@ -307,6 +309,8 @@ class JointStatePlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "running"}
         from aimdk_msgs.srv import GetAllJointState
         request = GetAllJointState.Request()
         request.request = self.nodes.request_header()
@@ -446,6 +450,8 @@ class SystemStatePlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "running"}
         from aimdk_msgs.srv import GetSystemState
         request = GetSystemState.Request()
         request.header = self.nodes.request_header()
@@ -471,6 +477,8 @@ class LinkcraftCatalogPlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "running"}
         from aimdk_msgs.srv import GetRobotResources
         request = GetRobotResources.Request()
         request.header = self.nodes.request_header()
@@ -521,6 +529,10 @@ class McModePlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action not in MC_ACTIONS:
+            raise ValueError(f"mc_mode: unknown action {action!r}")
         from aimdk_msgs.srv import SetMcAction
         request = SetMcAction.Request()
         request.header.stamp = self.nodes.robot.get_clock().now().to_msg()
@@ -563,7 +575,13 @@ class LocomotionPlugin:
         pass
 
     def stop(self):
-        self._set_input_source(2002)  # INPUTACTION_DISABLE
+        # Only unregister if we actually registered -- calling this unconditionally on every
+        # shutdown (even when this driver never registered as an input source) means every
+        # container restart pays a real service round-trip that can time out, adding 5s of
+        # noise to `stop_all()` for no effect.
+        if self._registered:
+            self._set_input_source(2002)  # INPUTACTION_DISABLE
+            self._registered = False
 
     def _source_name(self):
         return self.nodes.config.get("plugins", {}).get("locomotion", {}).get("input_source_name", "phanthymotus")
@@ -585,6 +603,8 @@ class LocomotionPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready", "registered": self._registered}
         if action == "register":
             result = self._set_input_source(1001)  # INPUTACTION_ADD
             self._registered = True
@@ -593,6 +613,12 @@ class LocomotionPlugin:
             result = self._set_input_source(2002)  # INPUTACTION_DISABLE
             self._registered = False
             return result
+        if action != "set_velocity":
+            # Any other/unrecognized action used to fall through to the block below, which
+            # silently auto-registers this driver as an input source and publishes a (default
+            # zero) velocity command -- so a stray health-check probe with an unknown action
+            # name could trigger a real actuator side effect. Refuse instead.
+            raise ValueError(f"locomotion: unknown action {action!r}")
         if not self._registered:
             self._set_input_source(1001)  # INPUTACTION_ADD
             self._registered = True
@@ -644,6 +670,10 @@ class PresetMotionPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action not in PRESET_MOTIONS:
+            raise ValueError(f"preset_motion: unknown action {action!r}")
         if action in PRESET_MOTIONS_REQUIRE_ARM_AREA:
             area = args.get("area")
             if area not in ("left_hand", "right_hand"):
@@ -702,6 +732,8 @@ class JointCommandPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         area = args["area"]
         pub = self.nodes.joint_command_pubs[area]
         msg = self.nodes._JointCommandArray()
@@ -757,6 +789,8 @@ class HandCommandPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         if action == "get_state":
             return self.nodes.snapshot("hand_state")
 
@@ -764,9 +798,11 @@ class HandCommandPlugin:
             value = self.OPEN_POSITION if action == "open" else self.CLOSE_POSITION
             left = [value] * len(self.FINGERS)
             right = [value] * len(self.FINGERS)
-        else:
+        elif action == "set_positions":
             left = args.get("left", [])
             right = args.get("right", [])
+        else:
+            raise ValueError(f"hand_command: unknown action {action!r}")
 
         msg = self.nodes._HandCommandArray()
         msg.header.stamp = self.nodes.robot.get_clock().now().to_msg()
@@ -810,6 +846,8 @@ class LinkcraftPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         from aimdk_msgs.srv import ExecuteActionResource
         request = ExecuteActionResource.Request()
         request.header = self.nodes.request_header()
@@ -854,6 +892,8 @@ class PmuLedPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         from aimdk_msgs.srv import SetPmuLed
         request = SetPmuLed.Request()
         request.request = self.nodes.request_header()
@@ -894,6 +934,8 @@ class TtsPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         from aimdk_msgs.srv import PlayTts
         request = PlayTts.Request()
         request.header = self.nodes.request_header()
@@ -933,6 +975,8 @@ class EmojiPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         from aimdk_msgs.srv import PlayEmoji
         request = PlayEmoji.Request()
         request.header = self.nodes.request_header()
@@ -965,11 +1009,15 @@ class MicSourcePlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         if action == "get":
             request = GetMicSourceRequest.Request()
             request.header = self.nodes.request_header()
             result = call_service(self.nodes.get_mic_source, request)
             return {"mic_source": result.mic_source}
+        if action != "set":
+            raise ValueError(f"mic_source: unknown action {action!r}")
         request = SetMicSourceRequest.Request()
         request.header = self.nodes.request_header()
         request.mic_source = MIC_SOURCES[args["source"]]
@@ -1013,6 +1061,8 @@ class SlamControlPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         if action == "set_relocalization_pose":
             pose = self.nodes._msg["Pose"]()
             pose.position.x = float(args["x"])
@@ -1021,6 +1071,12 @@ class SlamControlPlugin:
             pose.orientation.w = 1.0
             self.nodes.relocalization_pose_pub.publish(pose)
             return {"state": "published", "topic": "/relocalization_pose"}
+        if action not in ("start_mapping", "stop_mapping", "start_relocalization"):
+            # Previously any unrecognized action fell through to publishing whatever
+            # string_msg.data happened to default to (empty string) as a real command on
+            # /integrated_command -- a stray "info" health-check probe would have actually
+            # commanded the robot. Refuse instead of guessing.
+            raise ValueError(f"slam_control: unknown action {action!r}")
         string_msg = self.nodes._msg["String"]()
         if action == "start_mapping":
             string_msg.data = "start_mapping"
@@ -1055,6 +1111,8 @@ class MapGetPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
         from aimdk_msgs.srv import GetStoredMapByName
         request = GetStoredMapByName.Request()
         request.header.stamp = self.nodes.robot.get_clock().now().to_msg()
