@@ -89,7 +89,7 @@ class QianjiaoDevice:
         self._video_thread.start()
 
     def _video_loop(self):
-        command = ["ffmpeg", "-loglevel", "fatal", "-rtsp_transport", "tcp", "-fflags", "+discardcorrupt", "-err_detect", "ignore_err", "-i", self.camera_rtsp, "-an", "-vf", "fps=10,scale=1280:-2", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
+        command = ["ffmpeg", "-loglevel", "fatal", "-rtsp_transport", "tcp", "-fflags", "+discardcorrupt+nobuffer", "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32", "-err_detect", "ignore_err", "-i", self.camera_rtsp, "-an", "-vf", "scale=1280:-2", "-fps_mode", "vfr", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
         while not self._stop.is_set():
             buf = bytearray()
             try:
@@ -373,9 +373,8 @@ class QianjiaoDevice:
 
     def get_tools(self):
         return [
-            {"name": "rov_status", "type": "sensor", "description": "潜蛟实时状态：姿态、深度、位置、温度、电池和陀螺仪（UDP 8500，10Hz）", "topic_out": [{"topic": self.status_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"]}}}},
-            {"name": "rov_battery", "type": "sensor", "description": "潜蛟电池：电压、电流和剩余电量（10Hz）", "topic_out": [{"topic": self.battery_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
-            {"name": "rov_imu", "type": "sensor", "description": "潜蛟 IMU 角速度（度/秒，10Hz）", "topic_out": [{"topic": self.imu_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
+            {"name": "rov_status", "type": "sensor", "description": "潜蛟综合状态：连接、姿态、深度、位置、温度、电池和 IMU（10Hz）", "topic_out": [{"topic": self.status_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info", "start", "stop"]}}}},
+            {"name": "rov_health", "type": "sensor", "description": "潜蛟能源与惯性状态（电池、IMU）", "topic_out": [{"topic": self.battery_topic, "format": "data/json"}, {"topic": self.imu_topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
             {"name": "rov_camera", "type": "sensor", "description": "潜蛟实时视频流（RTSP 转 JPEG 并发布 ROS2 DDS）", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"]}}}},
             {"name": "rov_camera_control", "type": "actuator", "description": "潜蛟相机控制：拍照、媒体列表、下载和补光灯", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["capture", "medias", "download", "light"]}, "name": {"type": "string"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100}}, "required": ["action"]}},
             {"name": "rov_control", "type": "actuator", "description": "潜蛟 2.0 Pro 解锁及 6DOF 运动控制", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["arm", "disarm", "move", "stop"]}, "heave": {"type": "number", "minimum": -1, "maximum": 1}, "pitch": {"type": "number", "minimum": -1, "maximum": 1}, "forward": {"type": "number", "minimum": -1, "maximum": 1}, "yaw": {"type": "number", "minimum": -1, "maximum": 1}, "lateral": {"type": "number", "minimum": -1, "maximum": 1}, "roll": {"type": "number", "minimum": -1, "maximum": 1}}, "required": ["action"]}},
@@ -389,10 +388,8 @@ class QianjiaoDevice:
             return {**self.status(), "topic_out": [{"topic": self.status_topic, "format": "data/json"}]}
         if tool == "rov_camera":
             return {"state": "available", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "stream_url": self.video_url, "source_rtsp": self.camera_rtsp}
-        if tool == "rov_battery":
-            return {**self._battery_snapshot(self._rov_status), "topic_out": [{"topic": self.battery_topic, "format": "data/json"}]}
-        if tool == "rov_imu":
-            return {**self._imu_snapshot(self._rov_status), "topic_out": [{"topic": self.imu_topic, "format": "data/json"}]}
+        if tool == "rov_health":
+            return {"state": "available", "topic_out": [{"topic": self.battery_topic, "format": "data/json"}, {"topic": self.imu_topic, "format": "data/json"}]}
         if tool == "rov_camera_control":
             if action == "capture":
                 return self.camera_request("POST", "/v1/capture")
