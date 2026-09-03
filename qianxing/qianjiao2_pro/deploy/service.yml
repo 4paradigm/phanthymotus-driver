@@ -1,0 +1,18 @@
+qianxing-qianjiao2-pro:
+  image: __IMAGE__
+  container_name: embodied-qianxing-qianjiao2-pro
+  network_mode: host
+  env_file:
+    - /opt/phanthy-motus/.env
+  environment:
+    - MCP_ADVERTISE_HOST=10.100.128.225
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

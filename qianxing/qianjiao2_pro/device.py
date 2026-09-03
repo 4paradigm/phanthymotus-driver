@@ -10,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import ssl
+import os
 import time
 from typing import Any
 
@@ -80,7 +81,10 @@ class QianjiaoDevice:
         self.status_port = int(cfg.get("status_port", 8500))
         self.camera_ip = str(cfg.get("camera_ip", "192.168.1.88"))
         self.camera_http_base = f"http://{self.camera_ip}:{int(cfg.get('camera_http_port', 80))}"
-        self.camera_rtsp = str(cfg.get("camera_rtsp", f"rtsp://admin:admin@{self.camera_ip}:8554/stream/0/0"))
+        camera_user = os.environ.get("QIANJIAO_CAMERA_USER", str(cfg.get("camera_user", "admin")))
+        camera_password = os.environ.get("QIANJIAO_CAMERA_PASSWORD", str(cfg.get("camera_password", "")))
+        credentials = f"{urllib.parse.quote(camera_user)}:{urllib.parse.quote(camera_password)}@" if camera_password else ""
+        self.camera_rtsp = str(cfg.get("camera_rtsp", f"rtsp://{credentials}{self.camera_ip}:8554/stream/0/0"))
         self.camera_light_path = str(cfg.get("camera_light_path", "/v1/light"))
         self.video_url = str(cfg.get("video_url", "/video.mjpeg"))
         self.status_topic = str(cfg.get("status_topic", "/qianjiao2_pro/status"))
@@ -501,12 +505,20 @@ class QianjiaoDevice:
 
     def dispatch(self, tool: str, args: dict) -> dict:
         action = args.get("action", "info")
+        sensor_tools = {
+            "status": self.status_topic, "battery": self.battery_topic,
+            "imu": self.imu_topic, "loco_state": self.loco_state_topic,
+        }
+        if tool in sensor_tools and action in ("start", "stop"):
+            return {"state": "ready" if action == "start" else "idle",
+                    "topic_out": [{"topic": sensor_tools[tool], "format": "data/json"}]}
+        if tool in ("camera", "rov_camera") and action in ("start", "stop"):
+            return {"state": "ready" if action == "start" else "idle",
+                    "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}]}
         if tool in ("status", "rov_status"):
-            if action == "start": self.start()
-            elif action == "stop": self.stop()
             return {**self._status_snapshot(self._rov_status), "topic_out": [{"topic": self.status_topic, "format": "data/json"}]}
         if tool in ("camera", "rov_camera"):
-            return {"state": "available", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "stream_url": self.video_url, "source_rtsp": self.camera_rtsp}
+            return {"state": "available", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "stream_url": self.video_url, "source_rtsp": f"rtsp://{self.camera_ip}:8554/stream/0/0"}
         if tool == "battery":
             return {**self._battery_snapshot(self._rov_status), "topic_out": [{"topic": self.battery_topic, "format": "data/json"}]}
         if tool == "imu":

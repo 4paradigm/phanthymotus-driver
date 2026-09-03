@@ -10,15 +10,15 @@ def live():
 def test_mapping_and_safety():
     d = live()
     assert d.status()["connected"]
-    assert d.dispatch("rov_control", {"action":"arm"})["state"] == "armed"
-    result = d.dispatch("rov_control", {"action":"move", "forward":1, "yaw":-1})
-    assert result["channels"]["forward"] == 1900
-    assert result["channels"]["yaw"] == 1100
+    assert d.dispatch("control", {"action":"unlock"})["state"] == "armed"
+    result = d.dispatch("control", {"action":"move", "forward":1, "yaw":-1, "duration":0.1})
+    assert result["state"] == "queued"
+    assert result["action_id"]
     d.stop()
 
 def test_range_rejected():
-    d = live(); d.dispatch("rov_control", {"action":"arm"})
-    with pytest.raises(ValueError): d.dispatch("rov_control", {"action":"move", "pitch":1.1})
+    d = live(); d.dispatch("control", {"action":"unlock"})
+    with pytest.raises(ValueError): d.move({"pitch":1.1, "duration":0.1})
     d.stop()
 
 def test_status_packet_parser():
