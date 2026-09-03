@@ -75,7 +75,11 @@ class LightPlugin:
 
     def start(self):
         from bodyctrl_msgs.msg import LightCtrl
-        self._pub = self._pub_node.create_publisher(LightCtrl, "/xsys/light/ctrl", _RELIABLE_QOS)
+        with self._timer_lock:
+            if self._pub is not None:
+                return
+            self._pub = self._pub_node.create_publisher(LightCtrl, "/xsys/light/ctrl", _RELIABLE_QOS)
+        print("[LightPlugin] publisher created")
 
     def stop(self):
         with self._timer_lock:
@@ -111,8 +115,22 @@ class LightPlugin:
             self._clear_active_effect()
 
     def dispatch(self, action, args):
+        if action == "start":
+            try:
+                self.start()
+            except Exception as e:
+                return {"error": f"light initialization failed: {e}", "state": "error"}
+            return {"state": "ready"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
         if action not in self._commands:
             return {"error": f"unknown action: {action}"}
+        if self._pub is None:
+            try:
+                self.start()
+            except Exception as e:
+                return {"error": f"light initialization failed: {e}", "state": "error"}
         raw_duration = args.get("duration", 5)
         try:
             duration = float(raw_duration)
