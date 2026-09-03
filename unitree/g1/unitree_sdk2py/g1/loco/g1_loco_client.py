@@ -63,7 +63,7 @@ class LocoClient(Client):
         parameter = json.dumps(p)
         code, data = self._Call(ROBOT_API_ID_LOCO_SET_VELOCITY, parameter)
         return code
-    
+
     # 7106
     def SetTaskId(self, task_id: float):
         p = {}

@@ -349,6 +349,7 @@ class ControlledSpatialPlugin:
         self._nav_arrived = threading.Event()
         self._nav_error: str | None = None
         self._nav_action_id: str | None = None  # current navigate ACP action_id
+        self._nav_target: str | None = None
         self._last_db_map_status: str | None = None
         self._lock = threading.Lock()
 
@@ -399,7 +400,6 @@ class ControlledSpatialPlugin:
                     "y": {"type": "number", "description": "Target Y coordinate (meters)"},
                     "yaw": {"type": "number", "description": "Target yaw (radians)"},
                     "speed": {"type": "number", "description": "Navigation speed 0.2-0.8 m/s (default 0.5)"},
-                    "mode": {"type": "integer", "description": "Obstacle mode: 1=stop(default), 0=detour"},
                     "stall_timeout": {"type": "number", "description": "Seconds without movement before declaring timeout (default 90)"},
                 },
                 "required": ["action"],
@@ -416,8 +416,8 @@ class ControlledSpatialPlugin:
                     "list_maps": {"params": [], "description": "List all saved maps"},
                     "delete_map": {"params": ["map_name"], "description": "Delete a map and its associated data"},
                     "load_map": {"params": ["map_name"], "description": "Load a map (robot must be at map origin)"},
-                    "navigate_to_tag": {"params": ["tag_name", "speed", "mode"], "description": "Navigate to a tagged place. System automatically waits for arrival via ACP barrier."},
-                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed", "mode"], "description": "Navigate to coordinates. System automatically waits for arrival via ACP barrier."},
+                    "navigate_to_tag": {"params": ["tag_name", "speed"], "description": "Navigate to a tagged place. SLAM obstacle mode is disabled; the local safety harness pauses navigation on LiDAR obstacles."},
+                    "navigate_to_pose": {"params": ["x", "y", "yaw", "speed"], "description": "Navigate to coordinates. SLAM obstacle mode is disabled; the local safety harness pauses navigation on LiDAR obstacles."},
                     "pause_nav": {"params": [], "description": "Pause navigation"},
                     "resume_nav": {"params": [], "description": "Resume navigation"},
                     "stop_nav": {"params": [], "description": "Stop and cancel navigation"},
@@ -502,47 +502,103 @@ class ControlledSpatialPlugin:
 
     # ── ACP completion thread ────────────────────────────────────────────────
 
-    def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90):
+    def _acp_wait_nav(
+        self,
+        action_id: str,
+        target: str,
+        stall_timeout: float = 90,
+        target_pose: dict | None = None,
+    ):
         """Wait for navigation to complete, then fire ACP callback."""
-        self._nav_action_id = action_id
         t0 = time.time()
 
-        # Primary: delegate to SmartMotion subprocess which has reliable
-        # pose-based arrival detection (dist < 0.3m from target).
-        # The main process DDS callback for ctrl_info.is_arrived is unreliable
-        # (SLAM service never publishes ctrl_info in practice).
+        # Poll SmartMotion state instead of calling its blocking
+        # ``wait_nav_done`` command.  That command occupied the subprocess's
+        # only command loop until arrival, so a replacement target and stop_nav
+        # could not be processed and timed out at the MCP boundary.
         if self._smart_motion:
-            result = self._smart_motion.wait_nav_done(stall_timeout=stall_timeout)
-            elapsed = round(time.time() - t0, 1)
-            # Guard: if this nav was superseded, don't fire stale ACP
-            if self._nav_action_id != action_id:
-                print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
-                return
-            self._nav_action_id = None
-            status = result.get("status", "error")
-            if status == "arrived":
-                _acp_notify(action_id, "completed", {
-                    "target": target, "pose": result.get("pose"), "elapsed": elapsed,
-                })
-            else:
-                # Validate: if status is unexpected (e.g. "navigating" from queue race),
-                # treat as error with full result for debugging
-                error_msg = result.get("error", status)
-                if status not in ("error", "timeout", "stopped"):
-                    print(f'[ControlledSpatial] _acp_wait_nav unexpected status: {result}')
-                _acp_notify(action_id, "error", {
-                    "target": target,
-                    "error": error_msg,
-                    "elapsed": elapsed,
-                })
-            return
+            last_pose = None
+            last_move_time = time.monotonic()
+            poll_interval = 0.1
+            while True:
+                if self._nav_action_id != action_id:
+                    print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                    return
+
+                result = self._smart_motion.get_state()
+                if result.get("error"):
+                    # A transient proxy timeout must not cancel a live route.
+                    time.sleep(poll_interval)
+                    continue
+
+                pose = result.get("pose")
+                if pose and target_pose:
+                    dx = pose["x"] - target_pose["x"]
+                    dy = pose["y"] - target_pose["y"]
+                    distance = math.sqrt(dx * dx + dy * dy)
+                    if distance < 0.3:
+                        if self._nav_action_id != action_id:
+                            return
+                        self._nav_action_id = None
+                        self._nav_target = None
+                        elapsed = round(time.time() - t0, 1)
+                        completion = self._smart_motion.complete_nav()
+                        if completion.get("error"):
+                            print(f"[ControlledSpatial] failed to mark {target} complete: {completion}", flush=True)
+                        print(f"[ControlledSpatial] nav arrived target={target} "
+                              f"distance={distance:.3f}m elapsed={elapsed}s", flush=True)
+                        _acp_notify(action_id, "completed", {
+                            "target": target, "pose": pose,
+                            "distance": round(distance, 3),
+                            "elapsed": elapsed,
+                        })
+                        return
+                    if last_pose:
+                        moved = math.hypot(pose["x"] - last_pose["x"], pose["y"] - last_pose["y"])
+                        if moved > 0.05:
+                            last_move_time = time.monotonic()
+                    else:
+                        last_move_time = time.monotonic()
+                    last_pose = pose
+
+                if result.get("state") == "idle":
+                    if self._nav_action_id != action_id:
+                        return
+                    self._nav_action_id = None
+                    self._nav_target = None
+                    _acp_notify(action_id, "error", {
+                        "target": target, "error": "navigation stopped",
+                        "elapsed": round(time.time() - t0, 1),
+                    })
+                    return
+
+                if (result.get("state") == "navigating"
+                        and time.monotonic() - last_move_time > stall_timeout):
+                    self._smart_motion.stop_nav()
+                    if self._nav_action_id == action_id:
+                        self._nav_action_id = None
+                        self._nav_target = None
+                        _acp_notify(action_id, "error", {
+                            "target": target,
+                            "error": f"stall_timeout ({stall_timeout}s)",
+                            "elapsed": round(time.time() - t0, 1),
+                        })
+                    return
+
+                time.sleep(poll_interval)
 
         # Fallback: no SmartMotion — poll local DDS callback + stall detection
         last_pose = self._get_pose()
         last_move_time = time.time()
 
         while True:
+            if self._nav_action_id != action_id:
+                print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                return
             if self._nav_arrived.wait(timeout=1.0):
+                if self._nav_action_id != action_id:
+                    print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                    return
                 elapsed = round(time.time() - t0, 1)
                 if self._nav_error:
                     error = self._nav_error
@@ -555,9 +611,28 @@ class ControlledSpatialPlugin:
                     _acp_notify(action_id, "completed", {
                         "target": target, "pose": pose, "elapsed": elapsed,
                     })
+                if self._nav_action_id == action_id:
+                    self._nav_action_id = None
+                    self._nav_target = None
                 return
 
             current_pose = self._get_pose()
+            if current_pose and target_pose:
+                dx = current_pose["x"] - target_pose["x"]
+                dy = current_pose["y"] - target_pose["y"]
+                distance = math.sqrt(dx * dx + dy * dy)
+                if distance < 0.3:
+                    elapsed = round(time.time() - t0, 1)
+                    _acp_notify(action_id, "completed", {
+                        "target": target,
+                        "pose": current_pose,
+                        "distance": round(distance, 3),
+                        "elapsed": elapsed,
+                    })
+                    if self._nav_action_id == action_id:
+                        self._nav_action_id = None
+                        self._nav_target = None
+                    return
             if current_pose and last_pose:
                 dx = current_pose["x"] - last_pose["x"]
                 dy = current_pose["y"] - last_pose["y"]
@@ -577,6 +652,9 @@ class ControlledSpatialPlugin:
                     "error": f"stall_timeout ({stall_timeout}s)",
                     "elapsed": round(time.time() - t0, 1),
                 })
+                if self._nav_action_id == action_id:
+                    self._nav_action_id = None
+                    self._nav_target = None
                 return
 
             if time.time() - t0 > 180:
@@ -584,6 +662,9 @@ class ControlledSpatialPlugin:
                     "target": target, "error": "timeout_180s",
                     "elapsed": 180,
                 })
+                if self._nav_action_id == action_id:
+                    self._nav_action_id = None
+                    self._nav_target = None
                 return
 
     # ── Dispatch ─────────────────────────────────────────────────────────────
@@ -741,10 +822,16 @@ class ControlledSpatialPlugin:
             tag_name = args.get("tag_name", "")
             if not tag_name:
                 return {"error": "tag_name is required"}
+            # Decision models may repeat a tool call after seeing a
+            # "navigating" result. Keep the original route and ACP action.
+            if self._nav_action_id and self._nav_target == tag_name:
+                return {"status": "navigating", "target": tag_name,
+                        "action_id": self._nav_action_id, "duplicate": True}
             # Cancel any in-flight navigation ACP
             if self._nav_action_id:
                 _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
                 self._nav_action_id = None
+                self._nav_target = None
             active_map = self._active_map
             if not active_map:
                 return {"error": "No active map. Load a map first."}
@@ -756,9 +843,7 @@ class ControlledSpatialPlugin:
 
             if self._smart_motion:
                 speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-                mode = int(args.get("mode", 1))
-                if mode != 1:
-                    mode = 1  # 强制停障模式，不允许绕障
+                mode = 0  # Local safety harness owns LiDAR-based pause/resume.
                 self._nav_arrived.clear()
                 self._nav_error = None
                 result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
@@ -767,9 +852,12 @@ class ControlledSpatialPlugin:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 result["action_id"] = action_id
+                self._nav_action_id = action_id
+                self._nav_target = tag_name
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    kwargs={"target_pose": {"x": poi["x"], "y": poi["y"]}},
                     daemon=True,
                 ).start()
                 return result
@@ -778,18 +866,19 @@ class ControlledSpatialPlugin:
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
             speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-            mode = int(args.get("mode", 1))
-            if mode != 1:
-                mode = 1  # 强制停障模式，不允许绕障
+            mode = 0  # Local safety harness owns LiDAR-based pause/resume.
             self._nav_arrived.clear()
             self._nav_error = None
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
+                self._nav_action_id = action_id
+                self._nav_target = tag_name
                 threading.Thread(
                     target=self._acp_wait_nav,
                     args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    kwargs={"target_pose": {"x": poi["x"], "y": poi["y"]}},
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target": tag_name,
@@ -801,25 +890,31 @@ class ControlledSpatialPlugin:
             x = float(args.get("x", 0))
             y = float(args.get("y", 0))
             yaw = float(args.get("yaw", 0))
+            target = f"pose({x},{y})"
+            if self._nav_action_id and self._nav_target == target:
+                return {"status": "navigating", "target": target,
+                        "action_id": self._nav_action_id, "duplicate": True}
             # Cancel any in-flight navigation ACP
             if self._nav_action_id:
                 _acp_notify(self._nav_action_id, "cancelled", {"reason": "superseded by new navigate"})
                 self._nav_action_id = None
+                self._nav_target = None
 
             if self._smart_motion:
                 speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-                mode = int(args.get("mode", 1))
-                if mode != 1:
-                    mode = 1  # 强制停障模式，不允许绕障
+                mode = 0  # Local safety harness owns LiDAR-based pause/resume.
                 self._nav_arrived.clear()
                 self._nav_error = None
                 result = self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode)
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 result["action_id"] = action_id
+                self._nav_action_id = action_id
+                self._nav_target = target
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    args=(action_id, target, float(args.get("stall_timeout", 90))),
+                    kwargs={"target_pose": {"x": x, "y": y}},
                     daemon=True,
                 ).start()
                 return result
@@ -827,16 +922,19 @@ class ControlledSpatialPlugin:
             q_z = math.sin(yaw / 2)
             q_w = math.cos(yaw / 2)
             speed = max(0.2, min(0.8, float(args.get("speed", 0.5))))
-            mode = int(args.get("mode", 1))
+            mode = 0  # Local safety harness owns LiDAR-based pause/resume.
             self._nav_arrived.clear()
             self._nav_error = None
             code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
+                self._nav_action_id = action_id
+                self._nav_target = target
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    args=(action_id, target, float(args.get("stall_timeout", 90))),
+                    kwargs={"target_pose": {"x": x, "y": y}},
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw},
@@ -1032,4 +1130,3 @@ class ControlledSpatialIsolatedProxy:
                         return result.get("result")
             except _q.Empty:
                 return {"error": f"controlled_spatial action '{action}' timed out (120s)"}
-

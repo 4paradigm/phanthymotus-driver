@@ -27,7 +27,9 @@ plugins:
     db_path: /opt/phanthy-motus/data/spatial.db
   controlled_spatial:
     enabled: true
-    isolated_process: true
+    # Navigation must share the main-process SmartMotionProxy. That proxy owns
+    # LiDAR pause/resume safety and runs its control loop in a separate process.
+    isolated_process: false
     native_slam_pcd_dir: /home/unitree
     native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
   controlled_spatial_map:
@@ -42,9 +44,15 @@ plugins:
 
 safety_harness:
   enabled: true
-  decel_threshold: 2.0
-  stop_threshold: 0.8
-  lateral_threshold: 0.8
+  decel_threshold: 0.8
+  stop_threshold: 0.5
+  lateral_threshold: 0.5
+  # SLAM navigation ignores side doorway frames; only a close, centered object
+  # in this narrower cone pauses the route.
+  nav_stop_threshold: 0.5
+  nav_cone_half_angle: 15
+  nav_min_points: 5
+  nav_confirm_frames: 2
   cone_half_angle: 30
   z_min: 0.1
   z_max: 1.0
