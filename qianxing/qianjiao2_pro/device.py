@@ -103,10 +103,13 @@ class QianjiaoDevice:
         self._ros_battery_pub = None
         self._ros_imu_pub = None
         self._ros_camera_pub = None
+        self._ros_thread: threading.Thread | None = None
         self._video_proc = None
         self._video_thread: threading.Thread | None = None
         self._video_cond = threading.Condition()
         self._video_frame = None
+        self._video_ready = False
+        self._video_error: str | None = None
 
     def _redacted_rtsp(self) -> str:
         return f"rtsp://{self.camera_ip}:8554/stream/0/0"
@@ -122,10 +125,12 @@ class QianjiaoDevice:
         # ``-fps_mode`` option.  ``-vsync 0`` provides the same passthrough
         # behavior while keeping compatibility with that version.
         command = ["ffmpeg", "-loglevel", "fatal", "-rtsp_transport", "tcp", "-fflags", "+discardcorrupt+nobuffer", "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32", "-err_detect", "ignore_err", "-i", self.camera_rtsp, "-an", "-vf", "scale=1280:-2", "-vsync", "0", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
+        backoff = 1.0
         while not self._stop.is_set():
             buf = bytearray()
             try:
-                self._video_proc = subprocess.Popen(command, stdout=subprocess.PIPE)
+                self._video_proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                self._video_error = None
                 stream = self._video_proc.stdout
                 while not self._stop.is_set() and stream:
                     chunk = stream.read(4096)
@@ -147,7 +152,9 @@ class QianjiaoDevice:
                         del buf[:end + 2]
                         with self._video_cond:
                             self._video_frame = frame
+                            self._video_ready = True
                             self._video_cond.notify_all()
+                        backoff = 1.0
                         if self._ros_camera_pub is not None and self._ros_node is not None:
                             from sensor_msgs.msg import CompressedImage
                             message = CompressedImage()
@@ -160,9 +167,16 @@ class QianjiaoDevice:
                 self._video_proc.wait(timeout=2)
             except Exception as exc:
                 self._last_error = f"video proxy: {exc}"
+                self._video_error = str(exc)
             finally:
+                if self._video_proc is not None and self._video_proc.returncode not in (None, 0):
+                    self._video_error = f"ffmpeg exited with code {self._video_proc.returncode}"
                 self._video_proc = None
-            self._stop.wait(1.0)
+            if self._stop.is_set():
+                break
+            self._video_ready = False
+            self._stop.wait(backoff)
+            backoff = min(backoff * 2.0, 30.0)
 
     def get_video_frame(self, timeout=5.0):
         with self._video_cond:
@@ -188,7 +202,8 @@ class QianjiaoDevice:
             self._ros_battery_pub = self._ros_node.create_publisher(String, self.battery_topic, qos)
             self._ros_imu_pub = self._ros_node.create_publisher(String, self.imu_topic, qos)
             self._ros_camera_pub = self._ros_node.create_publisher(CompressedImage, self.camera_topic, qos)
-            threading.Thread(target=rclpy.spin, args=(self._ros_node,), daemon=True, name="qianjiao-status-ros").start()
+            self._ros_thread = threading.Thread(target=rclpy.spin, args=(self._ros_node,), daemon=True, name="qianjiao-status-ros")
+            self._ros_thread.start()
         except Exception as exc:
             self._last_error = f"ROS status publisher: {exc}"
 
@@ -225,6 +240,9 @@ class QianjiaoDevice:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
+        if self._status_thread:
+            self._status_thread.join(timeout=2)
+            self._status_thread = None
         if self.link is not None and hasattr(self.link, "close"):
             self.link.close()
         if self._status_sock:
@@ -236,6 +254,9 @@ class QianjiaoDevice:
                 self._video_proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self._video_proc.kill()
+        if self._video_thread:
+            self._video_thread.join(timeout=3)
+            self._video_thread = None
         if self._ros_node is not None:
             self._ros_node.destroy_node()
             self._ros_node = None
@@ -244,6 +265,9 @@ class QianjiaoDevice:
             self._ros_battery_pub = None
             self._ros_imu_pub = None
             self._ros_camera_pub = None
+        if self._ros_thread:
+            self._ros_thread.join(timeout=2)
+            self._ros_thread = None
 
     def _loop(self):
         while not self._stop.is_set():
@@ -370,7 +394,8 @@ class QianjiaoDevice:
         return {"connected": self._connected(), "status_connected": self._status_connected(), "temperature": status.get("temperature"),
                 "status_age": round(age, 6) if age is not None else None,
                 "status_age_ms": round(age * 1000, 1) if age is not None else None,
-                "source": self._rov_status_source, "last_error": self._last_error}
+                "source": self._rov_status_source, "last_error": self._last_error,
+                "video_ready": self._video_ready, "video_error": self._video_error}
 
     def camera_request(self, method: str, path: str, body: Any = None) -> dict:
         url = self.camera_http_base + path
@@ -548,7 +573,11 @@ class QianjiaoDevice:
         if tool in ("status", "rov_status"):
             return {**self._status_snapshot(self._rov_status), "topic_out": [{"topic": self.status_topic, "format": "data/json"}]}
         if tool in ("camera", "rov_camera"):
-            return {"state": "available", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "stream_url": self.video_url, "source_rtsp": f"rtsp://{self.camera_ip}:8554/stream/0/0"}
+            return {"state": "available" if self._video_ready else "unavailable",
+                    "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}],
+                    "stream_url": self.video_url,
+                    "source_rtsp": f"rtsp://{self.camera_ip}:8554/stream/0/0",
+                    "error": self._video_error}
         if tool == "battery":
             return {**self._battery_snapshot(self._rov_status), "topic_out": [{"topic": self.battery_topic, "format": "data/json"}]}
         if tool == "imu":

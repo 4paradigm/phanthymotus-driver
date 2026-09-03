@@ -9,8 +9,8 @@ import yaml
 try:
     from common import logsafe
     logsafe.install()
-except ImportError:
-    pass
+except ImportError as exc:
+    print(f"[startup] warning: atomic logging unavailable: {exc}", flush=True)
 from device import QianjiaoDevice
 
 CFG = yaml.safe_load(open(os.environ.get("CONFIG_PATH", str(Path(__file__).with_name("config.yaml")))))
@@ -22,7 +22,7 @@ def start_registration(port: int) -> None:
     import urllib.request
     agent = os.environ.get("AGENT_CORE_URL", "https://127.0.0.1:15678").rstrip("/")
     driver_id = CFG.get("driver_id", "qianxing-qianjiao2-pro")
-    advertise_host = os.environ.get("MCP_ADVERTISE_HOST", CFG.get("mcp_advertise_host", "192.168.1.20"))
+    advertise_host = os.environ.get("MCP_ADVERTISE_HOST") or CFG.get("mcp_advertise_host") or "127.0.0.1"
     payload = json.dumps({
         "id": driver_id,
         "name": CFG.get("name", "潜蛟 2.0 Pro ROV"),
@@ -109,7 +109,7 @@ def main():
     if DEVICE._last_error:
         print(f"[startup] {DEVICE._last_error}", flush=True)
     port = int(CFG.get("mcp_port", 15739))
-    advertise_host = os.environ.get("MCP_ADVERTISE_HOST", CFG.get("mcp_advertise_host", "192.168.1.20"))
+    advertise_host = os.environ.get("MCP_ADVERTISE_HOST") or CFG.get("mcp_advertise_host") or "127.0.0.1"
     DEVICE.video_url = f"http://{advertise_host}:{port}/video.mjpeg"
     server = ThreadingHTTPServer(("", port), Handler)
     start_registration(port)
