@@ -171,10 +171,12 @@ class QianjiaoDevice:
         if not self.mock:
             if mavutil is None:
                 raise RuntimeError("pymavlink is required for live mode")
-            # udpin binds locally.  ``udp:<remote>`` would incorrectly try to
-            # bind the board's socket to the remote ROV address (192.168.1.101).
+            # The ROV learns the controller destination from incoming MAVLink
+            # traffic when no mobile app is connected.  udpout initiates that
+            # exchange; udpin would wait forever for a packet before it knows
+            # where to send the heartbeat.
             self.link = mavutil.mavlink_connection(
-                f"udpin:0.0.0.0:{self.target_port}",
+                f"udpout:{self.target_ip}:{self.target_port}",
                 source_system=int(self.cfg.get("source_system", 255)),
                 source_component=int(self.cfg.get("source_component", 190)),
                 mavlink20=False,
@@ -216,10 +218,7 @@ class QianjiaoDevice:
                 if self.mock:
                     self.link.heartbeat()
                 else:
-                    # mavudp learns the peer address from the first packet.
-                    # Do not attempt sendto(None) before that packet arrives.
-                    if getattr(self.link, "address", None):
-                        self.link.mav.heartbeat_send(11, 3, 0, 0, 4)
+                    self.link.mav.heartbeat_send(11, 3, 0, 0, 4)
                     msg = self.link.recv_match(blocking=False)
                     while msg is not None:
                         if msg.get_type() == "HEARTBEAT":
@@ -335,7 +334,7 @@ class QianjiaoDevice:
 
     def _status_snapshot(self, status: dict[str, Any]) -> dict[str, Any]:
         age = time.monotonic() - self._rov_status_received_at if self._rov_status_received_at else None
-        return {"connected": self._status_connected(), "mavlink_connected": self._connected(), "temperature": status.get("temperature"),
+        return {"connected": self._connected(), "status_connected": self._status_connected(), "temperature": status.get("temperature"),
                 "status_age": round(age, 6) if age is not None else None,
                 "status_age_ms": round(age * 1000, 1) if age is not None else None,
                 "source": self._rov_status_source, "last_error": self._last_error}
@@ -360,8 +359,8 @@ class QianjiaoDevice:
     def status(self) -> dict:
         armed = bool(self.link.armed) if self.mock else self._armed
         return {
-            "connected": self._status_connected(),
-            "mavlink_connected": self._connected(),
+            "connected": self._connected(),
+            "status_connected": self._status_connected(),
             "armed": armed,
             "heartbeat_age": None if not self._connected() else round(time.monotonic() - (self.link.last_heartbeat if self.mock else self._last_heartbeat), 3),
             "transport": "mock" if self.mock else "mavlink-udp-v1",
@@ -385,7 +384,8 @@ class QianjiaoDevice:
                 self.link.armed = armed
                 self.link.last_command = {"command": MAV_CMD_COMPONENT_ARM_DISARM, "param1": int(armed)}
             else:
-                self.link.mav.command_long_send(1, 1, MAV_CMD_COMPONENT_ARM_DISARM, 0, int(armed), 0, 0, 0, 0, 0, 0)
+                # Vendor documentation: param1=0 unlocks, param1=1 locks.
+                self.link.mav.command_long_send(1, 1, MAV_CMD_COMPONENT_ARM_DISARM, 0, 0 if armed else 1, 0, 0, 0, 0, 0, 0)
             return {"state": "armed" if armed else "disarmed", "command": MAV_CMD_COMPONENT_ARM_DISARM}
 
     def move(self, values: dict) -> dict:
