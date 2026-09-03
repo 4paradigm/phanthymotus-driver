@@ -12,6 +12,7 @@ COPY requirements.txt ./
 RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r requirements.txt
 COPY main.py device.py config.yaml driver.yaml ./
 COPY common /work/common
+COPY deploy/service.yml /deploy/service.yml
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/work
 ENV PYTHONPATH=/work:/opt/ros/humble/lib/python3.10/site-packages:/usr/lib/python3/dist-packages:/usr/local/lib/python3.10/dist-packages
