@@ -516,8 +516,13 @@ class McModePlugin:
         request = SetMcAction.Request()
         request.header.stamp = self.nodes.robot.get_clock().now().to_msg()
         request.source = self.nodes.config.get("plugins", {}).get("mc_mode", {}).get("input_source_name", "phanthymotus")
+        # vendor's own set_mc_action.py example never sets command.action.value at all — the
+        # firmware looks the mode up by action_desc's exact string, matching McAction.msg's
+        # UPPERCASE constant name (e.g. "STAND_DEFAULT"), not the integer value or our
+        # lowercase snake_case key. Sending action_desc="stand_body_control" is what produced
+        # the literal firmware error "can not find action: stand_body_control".
         request.command.action.value = MC_ACTIONS[action]
-        request.command.action_desc = action
+        request.command.action_desc = action.upper()
         result = call_service(self.nodes.set_mc_action, request)
         return jsonable(result.response)
 
