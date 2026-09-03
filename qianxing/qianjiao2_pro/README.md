@@ -15,7 +15,7 @@
 
 - `camera` 提供 RTSP 转 JPEG 的实时视频卡；当前固件已确认的 HTTP 能力不足以稳定支持拍照和补光灯控制。
 
-部署时请在 `/opt/phanthy-motus/.env` 或 compose 环境中设置 `MCP_ADVERTISE_HOST`（板卡可被 Agent Core 访问的地址）以及相机账号 `QIANJIAO_CAMERA_USER`、`QIANJIAO_CAMERA_PASSWORD`。密码不写入镜像或 MCP 返回值。
+当前配置内置设备默认账号 `admin/admin`；如设备密码已修改，可通过 `QIANJIAO_CAMERA_USER`、`QIANJIAO_CAMERA_PASSWORD` 环境变量覆盖。部署时仍需设置 `MCP_ADVERTISE_HOST`（板卡可被 Agent Core 访问的地址）。密码不会通过 MCP 返回值暴露。
 
 将 `mock: true` 用于无硬件开发测试。接入真实设备前，先通过 QGroundControl 验证 UDP 链路并确认解锁/失联保护行为。
 
