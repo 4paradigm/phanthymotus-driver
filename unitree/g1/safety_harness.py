@@ -193,6 +193,12 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     Initializes its own DDS channel, RPC clients, ROS2 node, and LiDAR subscription.
     Runs independently from the main driver process — no GIL contention.
     """
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
+
     import numpy as np
     import rclpy
     from rclpy.node import Node

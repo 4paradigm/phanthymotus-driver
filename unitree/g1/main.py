@@ -239,6 +239,13 @@ class G1DeviceBundle:
                 tools.append(p.get_tool())
         return tools
 
+    def has_tool(self, tool_name: str) -> bool:
+        for p in self._plugins:
+            plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
+            if any(tool_def["name"] == tool_name for tool_def in plugin_tools):
+                return True
+        return False
+
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
@@ -331,9 +338,13 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    if not _bundle.has_tool(name):
+                        err(-32601, f"Unknown tool: {name}")
+                        return
+                    requested_action = args.get("action", name)
                     result = _bundle.dispatch(name, args)
                     if result is None:
-                        err(-32601, f"Unknown action: {name}")
+                        err(-32601, f"Unknown action for tool {name}: {requested_action}")
                     else:
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
