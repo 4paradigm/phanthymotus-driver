@@ -593,9 +593,13 @@ class LocomotionPlugin:
 
 
 class PresetMotionPlugin:
+    # area 只对单臂动作有意义（vendor 自带的 preset_motion_client.py 示例只为 area 提供
+    # 1=left/2=right 两个选项，从未演示 head/waist/none 配合任何 motion）；其余动作（全身交互
+    # 动作、point_head/shake_head 头部动作）不接受 area，硬编码发送 none(0)，不作为可调参数暴露，
+    # 避免出现给 raise_hand 传 area=head 这种语义上不成立的组合。
     ACTIONS = {
         name: (
-            ["area", "interrupt"],
+            (["area", "interrupt"] if name in PRESET_MOTIONS_REQUIRE_ARM_AREA else ["interrupt"]),
             f"播放预设动作 {name}"
             + ("（单臂动作，area 必须传 left_hand/right_hand，否则返回 code=1 失败）"
                if name in PRESET_MOTIONS_REQUIRE_ARM_AREA else "")
@@ -610,7 +614,7 @@ class PresetMotionPlugin:
         return tool("preset_motion", "actuator", "播放预设动作库（SetMcPresetMotion）", action_schema(
             self.ACTIONS,
             {
-                "area": {"type": "string", "enum": list(MC_CONTROL_AREAS), "default": "none", "description": "受控区域位掩码；raise_hand/wave_hand/shake_hand 等单臂动作必须传 left_hand 或 right_hand，其余全身/头部交互动作留空即可"},
+                "area": {"type": "string", "enum": ["left_hand", "right_hand"], "description": "受控手臂；仅 raise_hand/wave_hand/shake_hand 等单臂动作需要，必须传 left_hand 或 right_hand"},
                 "interrupt": {"type": "boolean", "default": True, "description": "是否打断当前动作"},
             },
         ))
@@ -626,9 +630,12 @@ class PresetMotionPlugin:
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
-        area = args.get("area", "none")
-        if action in PRESET_MOTIONS_REQUIRE_ARM_AREA and area not in ("left_hand", "right_hand"):
-            raise ValueError(f"preset_motion '{action}' 是单臂动作，area 必须是 left_hand 或 right_hand（当前: {area!r}）")
+        if action in PRESET_MOTIONS_REQUIRE_ARM_AREA:
+            area = args.get("area")
+            if area not in ("left_hand", "right_hand"):
+                raise ValueError(f"preset_motion '{action}' 是单臂动作，area 必须是 left_hand 或 right_hand（当前: {area!r}）")
+        else:
+            area = "none"  # 非单臂动作不接受 area，忽略任何传入值
         from aimdk_msgs.srv import SetMcPresetMotion
         request = SetMcPresetMotion.Request()
         request.header.stamp = self.nodes.robot.get_clock().now().to_msg()
