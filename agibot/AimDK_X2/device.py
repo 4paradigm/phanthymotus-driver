@@ -205,15 +205,19 @@ class AimdkNodes:
         from std_msgs.msg import String
 
         def callback(msg):
-            value = jsonable(msg)
             if as_json:
+                # only the data/json path is ever read back via snapshot(); computing this for
+                # binary streams (camera/lidar) would mean converting a JPEG/pointcloud byte
+                # array into a full Python list on every frame for nothing, which was throttling
+                # camera_rgb to ~8fps despite the source publishing at 30Hz.
+                value = jsonable(msg)
                 output = String()
                 output.data = json.dumps(value, ensure_ascii=False)
                 publisher.publish(output)
+                with self.lock:
+                    self.values[key] = value
             else:
                 publisher.publish(msg)
-            with self.lock:
-                self.values[key] = value
         return callback
 
     def _imu_callback(self, source, publisher):
