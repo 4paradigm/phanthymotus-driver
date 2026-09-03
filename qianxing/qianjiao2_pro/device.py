@@ -416,6 +416,8 @@ class QianjiaoDevice:
         control_schema = {
             "type": "object",
             "oneOf": [
+                {"properties": {"action": {"const": "start", "description": "初始化控制卡"}}, "required": ["action"]},
+                {"properties": {"action": {"const": "info", "description": "读取控制链路状态"}}, "required": ["action"]},
                 {"properties": {"action": {"const": "arm", "description": "解锁运动控制"}}, "required": ["action"]},
                 {"properties": {"action": {"const": "disarm", "description": "停止并锁定运动控制"}}, "required": ["action"]},
                 {"properties": {"action": {"const": "stop", "description": "停止运动并将各轴归中"}}, "required": ["action"]},
@@ -431,6 +433,9 @@ class QianjiaoDevice:
         camera_control_schema = {
             "type": "object",
             "oneOf": [
+                {"properties": {"action": {"const": "start", "description": "初始化相机控制卡"}}, "required": ["action"]},
+                {"properties": {"action": {"const": "info", "description": "读取相机控制状态"}}, "required": ["action"]},
+                {"properties": {"action": {"const": "stop", "description": "停止相机控制卡"}}, "required": ["action"]},
                 {"properties": {"action": {"const": "capture", "description": "拍摄一张照片"}}, "required": ["action"]},
                 {"properties": {"action": {"const": "medias", "description": "获取相机媒体列表"}}, "required": ["action"]},
                 {"properties": {"action": {"const": "download", "description": "生成媒体文件下载地址"}, "name": {"type": "string", "description": "媒体文件名"}}, "required": ["action", "name"]},
@@ -468,6 +473,10 @@ class QianjiaoDevice:
         if tool == "loco_state":
             return {**self._loco_snapshot(self._rov_status), "topic_out": [{"topic": self.loco_state_topic, "format": "data/json"}]}
         if tool == "camera_control":
+            # The canvas sends lifecycle actions to every actuator card when
+            # it is mounted. They are not camera API operations.
+            if action in ("start", "stop", "info"):
+                return {"state": "ready" if action != "stop" else "idle", "camera": self.camera_ip}
             if action == "capture":
                 return self.camera_request("POST", "/v1/capture")
             if action == "medias":
@@ -481,8 +490,9 @@ class QianjiaoDevice:
                 brightness = int(args.get("brightness", 0))
                 return self.camera_request("POST", self.camera_light_path, {"brightness": brightness})
             raise ValueError(f"unsupported camera action: {action}")
+        if tool == "control" and action in ("start", "info"): return {"state": "ready", "mavlink_connected": self._connected()}
+        if tool == "control" and action == "stop": return self.stop_motion()
         if tool == "control" and action == "arm": return self.arm(True)
         if tool == "control" and action == "disarm": return self.arm(False)
         if tool == "control" and action == "move": return self.move(args)
-        if tool == "control" and action == "stop": return self.stop_motion()
         raise ValueError(f"unsupported action: {action}")
