@@ -91,7 +91,10 @@ class QianjiaoDevice:
         self._video_thread.start()
 
     def _video_loop(self):
-        command = ["ffmpeg", "-loglevel", "fatal", "-rtsp_transport", "tcp", "-fflags", "+discardcorrupt+nobuffer", "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32", "-err_detect", "ignore_err", "-i", self.camera_rtsp, "-an", "-vf", "scale=1280:-2", "-fps_mode", "vfr", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
+        # Ubuntu 22.04 ships FFmpeg 4.4, which does not support the newer
+        # ``-fps_mode`` option.  ``-vsync 0`` provides the same passthrough
+        # behavior while keeping compatibility with that version.
+        command = ["ffmpeg", "-loglevel", "fatal", "-rtsp_transport", "tcp", "-fflags", "+discardcorrupt+nobuffer", "-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32", "-err_detect", "ignore_err", "-i", self.camera_rtsp, "-an", "-vf", "scale=1280:-2", "-vsync", "0", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
         while not self._stop.is_set():
             buf = bytearray()
             try:
