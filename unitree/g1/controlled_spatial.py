@@ -517,13 +517,34 @@ class ControlledSpatialPlugin:
                 return True
             return False
 
-    def _supersede_nav(self, action_id: str) -> int:
-        """Replace the current navigation action and invalidate its local waiter."""
+    def _reserve_nav(self, action_id: str):
+        """Reserve action_id as the current navigation before sending the physical command.
+
+        Returns (old_action_id, old_generation, new_generation) for rollback.
+        Does NOT emit cancellation — the caller emits it only after the replacement
+        command is confirmed, so the old waiter is invalidated before the physical
+        motion can change.  Without this ordering, the old ACP waiter can claim its
+        action as terminal in the interval between navigate_to() submission and
+        _supersede_nav(), reporting completed/error for a motion that has already
+        been replaced.
+        """
         with self._lock:
             old_action_id = self._nav_action_id
+            old_generation = self._nav_generation
             self._nav_action_id = action_id
             self._nav_generation += 1
-            generation = self._nav_generation
+            return old_action_id, old_generation, self._nav_generation
+
+    def _rollback_nav(self, action_id: str, old_action_id: str | None, old_generation: int):
+        """Restore previous nav state if the replacement command failed and no newer nav exists."""
+        with self._lock:
+            if self._nav_action_id == action_id:
+                self._nav_action_id = old_action_id
+                self._nav_generation = old_generation
+
+    def _supersede_nav(self, action_id: str) -> int:
+        """Replace the current navigation action and invalidate its local waiter."""
+        old_action_id, _, generation = self._reserve_nav(action_id)
         if old_action_id:
             _acp_notify(old_action_id, "cancelled", {"reason": "superseded by new navigate"})
         return generation
@@ -821,12 +842,23 @@ class ControlledSpatialPlugin:
                 self._nav_error = None
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
+                # Reserve the action ID BEFORE sending the physical command so the old
+                # waiter is invalidated before the motion can change.  If navigate_to
+                # fails, the old nav was already PauseNav'd in the subprocess, so we
+                # report it cancelled and clean up the failed reservation.
+                old_id, _, generation = self._reserve_nav(action_id)
                 result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
                                                      speed=speed, mode=mode,
                                                      navigation_id=action_id)
                 if result.get("status") != "navigating":
+                    if old_id:
+                        _acp_notify(old_id, "cancelled", {"reason": "replacement navigation failed"})
+                    with self._lock:
+                        if self._nav_action_id == action_id:
+                            self._nav_action_id = None
                     return result
-                generation = self._supersede_nav(action_id)
+                if old_id:
+                    _acp_notify(old_id, "cancelled", {"reason": "superseded by new navigate"})
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
@@ -845,21 +877,26 @@ class ControlledSpatialPlugin:
                 mode = 1  # 强制停障模式，不允许绕障
             self._nav_arrived.clear()
             self._nav_error = None
+            from uuid import uuid4
+            action_id = f"g1_nav_{uuid4().hex[:8]}"
+            old_id, old_gen, generation = self._reserve_nav(action_id)
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
-            if code == 0:
-                from uuid import uuid4
-                action_id = f"g1_nav_{uuid4().hex[:8]}"
-                generation = self._supersede_nav(action_id)
-                threading.Thread(
-                    target=self._acp_wait_nav,
-                    args=(action_id, tag_name, float(args.get("stall_timeout", 90)),
-                          (poi["x"], poi["y"]), generation),
-                    daemon=True,
-                ).start()
-                return {"status": "navigating", "target": tag_name,
-                        "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw},
-                        "action_id": action_id}
-            return _rpc_error("NavigateTo", code, resp)
+            if code != 0:
+                # Direct SLAM NavigateTo failed — old navigation likely still running.
+                # Roll back the reservation so the old waiter can continue.
+                self._rollback_nav(action_id, old_id, old_gen)
+                return _rpc_error("NavigateTo", code, resp)
+            if old_id:
+                _acp_notify(old_id, "cancelled", {"reason": "superseded by new navigate"})
+            threading.Thread(
+                target=self._acp_wait_nav,
+                args=(action_id, tag_name, float(args.get("stall_timeout", 90)),
+                      (poi["x"], poi["y"]), generation),
+                daemon=True,
+            ).start()
+            return {"status": "navigating", "target": tag_name,
+                    "pose": {"x": poi["x"], "y": poi["y"], "yaw": yaw},
+                    "action_id": action_id}
 
         elif action == "navigate_to_pose":
             x = float(args.get("x", 0))
@@ -875,11 +912,19 @@ class ControlledSpatialPlugin:
                 self._nav_error = None
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
+                # Reserve before sending physical command — see navigate_to_tag for rationale.
+                old_id, _, generation = self._reserve_nav(action_id)
                 result = self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode,
                                                         navigation_id=action_id)
                 if result.get("status") != "navigating":
+                    if old_id:
+                        _acp_notify(old_id, "cancelled", {"reason": "replacement navigation failed"})
+                    with self._lock:
+                        if self._nav_action_id == action_id:
+                            self._nav_action_id = None
                     return result
-                generation = self._supersede_nav(action_id)
+                if old_id:
+                    _acp_notify(old_id, "cancelled", {"reason": "superseded by new navigate"})
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
@@ -895,20 +940,23 @@ class ControlledSpatialPlugin:
             mode = int(args.get("mode", 1))
             self._nav_arrived.clear()
             self._nav_error = None
+            from uuid import uuid4
+            action_id = f"g1_nav_{uuid4().hex[:8]}"
+            old_id, old_gen, generation = self._reserve_nav(action_id)
             code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
-            if code == 0:
-                from uuid import uuid4
-                action_id = f"g1_nav_{uuid4().hex[:8]}"
-                generation = self._supersede_nav(action_id)
-                threading.Thread(
-                    target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)),
-                          (x, y), generation),
-                    daemon=True,
-                ).start()
-                return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw},
-                        "action_id": action_id}
-            return _rpc_error("NavigateTo", code, resp)
+            if code != 0:
+                self._rollback_nav(action_id, old_id, old_gen)
+                return _rpc_error("NavigateTo", code, resp)
+            if old_id:
+                _acp_notify(old_id, "cancelled", {"reason": "superseded by new navigate"})
+            threading.Thread(
+                target=self._acp_wait_nav,
+                args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)),
+                      (x, y), generation),
+                daemon=True,
+            ).start()
+            return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw},
+                    "action_id": action_id}
 
         elif action == "wait_navigation_done":
             stall_timeout = float(args.get("stall_timeout", 60))
@@ -973,11 +1021,13 @@ class ControlledSpatialPlugin:
 def _controlled_spatial_process(plugin_config: dict, namespace: str, command_queue, result_queue):
     """Subprocess entry: runs ControlledSpatialPlugin with its own DDS + GIL."""
     # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
-    try:
-        from common import logsafe
-        logsafe.install(check_fd=False)
-    except ImportError:
-        pass
+    # logsafe is a hard dependency — the driver requires atomic log writes to avoid
+    # torn records from multiple writers.  If common is absent from the image/build
+    # context, fail startup clearly rather than silently continuing as an
+    # unsynchronised writer.  The outer try/except below propagates the error via
+    # result_queue so ControlledSpatialIsolatedProxy reports a startup failure.
+    from common import logsafe
+    logsafe.install(check_fd=False)
 
     import os as _os
     _os.setsid()

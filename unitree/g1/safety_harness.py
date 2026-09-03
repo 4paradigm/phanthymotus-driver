@@ -742,14 +742,23 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 arrived = nav_arrived_flag
                 error = nav_arrived_error
                 pose = dict(nav_current_pose) if nav_current_pose else None
+                target_pose = dict(nav_cmd["target_pose"]) if nav_cmd else None
                 nav_arrived_flag = False
                 nav_arrived_error = None
 
             # ctrl_info-based arrival (secondary — SLAM service may not publish ctrl_info)
+            # Terminal transition must happen inside slam_info_lock and be conditional on
+            # the same generation/navigation_id, otherwise a newly queued navigate_to can
+            # install its nav_cmd in the gap and the old waiter will wipe it.
             if arrived:
-                state = MotionState.IDLE
-                nav_cmd = None
-                speed_zone = SpeedZone.NORMAL
+                with slam_info_lock:
+                    if not nav_cmd or nav_cmd.get("generation") != wait_generation or \
+                            (navigation_id is not None and
+                             nav_cmd.get("navigation_id") != navigation_id):
+                        return {"status": "superseded"}
+                    state = MotionState.IDLE
+                    nav_cmd = None
+                    speed_zone = SpeedZone.NORMAL
                 if error:
                     return {"status": "error", "error": error}
                 print(f"[SmartMotion] wait_nav_done: arrived via ctrl_info "
@@ -757,14 +766,21 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 return {"status": "arrived", "pose": pose}
 
             # Pose-based arrival detection (primary mechanism)
-            if pose and nav_cmd:
-                tx = nav_cmd["target_pose"]["x"]
-                ty = nav_cmd["target_pose"]["y"]
+            # target_pose is snapshotted inside the lock above — never read nav_cmd
+            # outside the synchronization.
+            if pose and target_pose:
+                tx = target_pose["x"]
+                ty = target_pose["y"]
                 dist = math.sqrt((pose["x"] - tx)**2 + (pose["y"] - ty)**2)
                 if dist < 0.3:
-                    state = MotionState.IDLE
-                    nav_cmd = None
-                    speed_zone = SpeedZone.NORMAL
+                    with slam_info_lock:
+                        if not nav_cmd or nav_cmd.get("generation") != wait_generation or \
+                                (navigation_id is not None and
+                                 nav_cmd.get("navigation_id") != navigation_id):
+                            return {"status": "superseded"}
+                        state = MotionState.IDLE
+                        nav_cmd = None
+                        speed_zone = SpeedZone.NORMAL
                     print(f"[SmartMotion] wait_nav_done: arrived via pose "
                           f"after {elapsed:.1f}s, dist={dist:.3f}m, pose={pose}", flush=True)
                     return {"status": "arrived", "pose": pose}
@@ -787,7 +803,18 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     last_pose = pose
 
             if state == MotionState.NAVIGATING and time.time() - stall_start > stall_timeout:
-                do_stop_nav()
+                with slam_info_lock:
+                    if not nav_cmd or nav_cmd.get("generation") != wait_generation or \
+                            (navigation_id is not None and
+                             nav_cmd.get("navigation_id") != navigation_id):
+                        return {"status": "superseded"}
+                    state = MotionState.IDLE
+                    nav_cmd = None
+                    speed_zone = SpeedZone.NORMAL
+                try:
+                    slam_client.PauseNav()
+                except Exception:
+                    pass
                 print(f"[SmartMotion] wait_nav_done: TIMEOUT after {stall_timeout}s "
                       f"no movement, pose={pose}", flush=True)
                 return {"status": "timeout",
