@@ -195,12 +195,17 @@ decompression restores the original Z16 payload. These uint16 samples use
 conversion explicit for consumers.
 Every frame repeats its active-profile intrinsics, stable `calibration_id`,
 RealSense Depth-to-RGB transform, source/Driver-receive timing, and the
-configured LiDAR-to-RGB calibration. Invalid, warming-up, reset, or
+configured LiDAR-to-RGB calibration. RGB and depth also carry the same
+`base_to_camera` entry: a `target_from_source`, row-major 4x4 `T_base_camera`
+which transforms points from `camera_color_optical_frame` into `base_link`.
+It is included in their shared `calibration_id`, so consumers do not need to
+know the robot model. Invalid, warming-up, reset, or
 out-of-order source timestamps are published as explicitly unavailable; the
 Driver does not replace them with publish time.
 
-The bundled LiDAR-to-camera transform is derived from the pinned official G1
-URDF and is intentionally marked `factory_nominal`. It is not a measured
+The bundled LiDAR-to-camera and base-to-camera transforms are derived from the
+pinned official G1 URDF and are intentionally marked `factory_nominal`. They are
+not measured
 per-robot calibration and must not be relabeled `validated_on_device` until a
 projection overlay and pixel-residual acceptance run has been recorded on that
 G1. Missing or invalid calibration is represented as `unavailable`, never as

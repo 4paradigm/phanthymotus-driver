@@ -19,11 +19,28 @@ transform:
                      0.7033947028105038, 0.0, -0.7107994738729924, -0.028555045290882264,
                      0.0, 0.0, 0.0, 1.0]
 
+# T_base_camera: camera optical points -> base_link at the zero waist pose.
+base_to_camera:
+  source_frame: camera_color_optical_frame
+  target_frame: base_link
+  convention: target_from_source
+  translation_m: [0.05366, 0.01753, 0.47387]
+  rotation_matrix_row_major: [0.0, -0.7384553406258838, 0.6743023875837234,
+                              -1.0, 0.0, 0.0,
+                              0.0, -0.6743023875837234, -0.7384553406258838]
+  matrix_row_major: [0.0, -0.7384553406258838, 0.6743023875837234, 0.05366,
+                     -1.0, 0.0, 0.0, 0.01753,
+                     0.0, -0.6743023875837234, -0.7384553406258838, 0.47387,
+                     0.0, 0.0, 0.0, 1.0]
+
 provenance:
   organization: Unitree Robotics
   repository: https://github.com/unitreerobotics/unitree_ros
   commit: 9926cc2f179ae3b86f4f74087bd32ef0c8b6fd90
   file: robots/g1_description/g1_23dof.urdf
+  base_to_torso_zero_pose:
+    xyz_m: [-0.0039635, 0.0, 0.054]
+    rpy_rad: [0.0, 0.0, 0.0]
   d435_joint:
     xyz_m: [0.0576235, 0.01753, 0.41987]
     rpy_rad: [0.0, 0.8307767239493009, 0.0]
@@ -32,6 +49,7 @@ provenance:
     rpy_rad: [0.0, 0.04014257279586953, 0.0]
 
 assumptions:
+  - The navigation base_link is the official pelvis frame with all waist joints at zero.
   - The Driver navigation livox_frame is the gravity-aligned MID360 frame represented by the official mid360_link.
   - The official d435_link follows ROS camera_link axes before conversion to camera_color_optical_frame.
   - Mechanical tolerances and per-device mounting error are not corrected until on-device projection validation.

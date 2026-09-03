@@ -349,11 +349,19 @@ def realsense_extrinsics_transform(
     }
 
 
-def load_lidar_camera_calibration(path_value: str | None) -> tuple[dict, str | None]:
-    source_frame = "livox_frame"
-    target_frame = "camera_color_optical_frame"
+def load_lidar_camera_calibration(
+    path_value: str | None,
+) -> tuple[dict, dict, str | None]:
+    lidar_source_frame = "livox_frame"
+    camera_frame = "camera_color_optical_frame"
+    base_frame = "base_link"
     if not path_value:
-        return _unavailable_extrinsic(source_frame, target_frame, "configuration_missing"), "configuration_missing"
+        reason = "configuration_missing"
+        return (
+            _unavailable_extrinsic(lidar_source_frame, camera_frame, reason),
+            _unavailable_extrinsic(camera_frame, base_frame, reason),
+            reason,
+        )
     path = Path(path_value)
     try:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -368,16 +376,38 @@ def load_lidar_camera_calibration(path_value: str | None) -> tuple[dict, str | N
         status = value.get("calibration_status")
         if status not in {"factory_nominal", "validated_on_device"}:
             raise ValueError("calibration_status must be factory_nominal or validated_on_device")
-        return {
+        common = {
             "status": status,
             "calibration_version": str(value.get("calibration_version", "")),
-            "transform": transform,
             "provenance": value.get("provenance", {}),
             "assumptions": value.get("assumptions", []),
-        }, None
+        }
+        lidar_to_camera = {**common, "transform": transform}
     except Exception as exc:
         reason = f"invalid_configuration:{exc}"
-        return _unavailable_extrinsic(source_frame, target_frame, reason), reason
+        return (
+            _unavailable_extrinsic(lidar_source_frame, camera_frame, reason),
+            _unavailable_extrinsic(camera_frame, base_frame, reason),
+            reason,
+        )
+
+    try:
+        base_transform = value.get("base_to_camera")
+        if not isinstance(base_transform, dict):
+            raise ValueError("base_to_camera transform must be an object")
+        _validate_transform(base_transform)
+        if base_transform.get("source_frame") != camera_frame:
+            raise ValueError(f"base_to_camera source_frame must be {camera_frame}")
+        if base_transform.get("target_frame") != base_frame:
+            raise ValueError(f"base_to_camera target_frame must be {base_frame}")
+        return lidar_to_camera, {**common, "transform": base_transform}, None
+    except Exception as exc:
+        reason = f"invalid_base_to_camera:{exc}"
+        return (
+            lidar_to_camera,
+            _unavailable_extrinsic(camera_frame, base_frame, reason),
+            reason,
+        )
 
 
 def _validate_transform(transform: dict) -> None:
@@ -438,6 +468,7 @@ def build_calibrations(
     depth_intrinsics: dict,
     depth_to_rgb: dict,
     lidar_to_rgb: dict,
+    base_to_camera: dict,
     depth_scale_m: float,
 ) -> tuple[dict, dict]:
     scale = float(depth_scale_m)
@@ -449,6 +480,7 @@ def build_calibrations(
         "depth": depth_intrinsics,
         "depth_to_rgb": depth_to_rgb,
         "lidar_to_rgb": lidar_to_rgb,
+        "base_to_camera": base_to_camera,
         "depth_scale_m": scale,
     }
     calibration_id = "sha256:" + hashlib.sha256(canonical_json_bytes(seed)).hexdigest()
@@ -457,6 +489,7 @@ def build_calibrations(
         "camera_serial": str(serial),
         **rgb_intrinsics,
         "lidar_to_camera": lidar_to_rgb,
+        "base_to_camera": base_to_camera,
         "intrinsics_source": "realsense_active_profile",
     }
     depth = {
@@ -468,6 +501,7 @@ def build_calibrations(
         "depth_to_rgb": depth_to_rgb,
         "rgb_intrinsics": rgb_intrinsics,
         "lidar_to_camera": lidar_to_rgb,
+        "base_to_camera": base_to_camera,
         "intrinsics_source": "realsense_active_profile",
     }
     return rgb, depth

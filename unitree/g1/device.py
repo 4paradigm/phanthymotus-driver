@@ -4061,7 +4061,7 @@ class RealSensePlugin:
             "type": "sensor",
             "multiInstance": False,
             "description": "Self-describing RealSense RGB frames with source/receive timing, "
-                           "intrinsics, and LiDAR-to-camera calibration metadata.",
+                           "intrinsics, and LiDAR/base-to-camera calibration metadata.",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{
                 "topic": self._rgb_frame_topic,
@@ -4079,7 +4079,7 @@ class RealSensePlugin:
             "type": "sensor",
             "multiInstance": False,
             "description": "Self-describing RealSense depth frames with source/receive timing, "
-                           "depth scale, intrinsics, and RGB/LiDAR extrinsics.",
+                           "depth scale, intrinsics, and RGB/LiDAR/base extrinsics.",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{
                 "topic": self._depth_frame_topic,
@@ -4311,6 +4311,9 @@ def run_realsense_process(
                 value["lidar_camera_status"] = self._rgb_calibration[
                     "lidar_to_camera"
                 ].get("status")
+                value["base_camera_status"] = self._rgb_calibration[
+                    "base_to_camera"
+                ].get("status")
             if error:
                 value["error"] = str(error)
             if status_q is None:
@@ -4374,7 +4377,11 @@ def run_realsense_process(
                 rotation_column_major=list(depth_to_color_rs.rotation),
                 translation_m=list(depth_to_color_rs.translation),
             )
-            lidar_to_rgb, calibration_error = load_lidar_camera_calibration(
+            (
+                lidar_to_rgb,
+                base_to_camera,
+                calibration_error,
+            ) = load_lidar_camera_calibration(
                 config_values.get(
                     "lidar_camera_calibration",
                     "/work/calibration/g1_factory_nominal_lidar_camera.yaml",
@@ -4386,11 +4393,12 @@ def run_realsense_process(
                 depth_intrinsics=self._intrinsics(depth_profile),
                 depth_to_rgb=depth_to_rgb,
                 lidar_to_rgb=lidar_to_rgb,
+                base_to_camera=base_to_camera,
                 depth_scale_m=depth_scale_m,
             )
             if calibration_error:
                 self.get_logger().warn(
-                    f"LiDAR-camera calibration unavailable: {calibration_error}"
+                    f"Camera extrinsic calibration incomplete: {calibration_error}"
                 )
 
         def start_capture(self):

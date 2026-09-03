@@ -151,10 +151,14 @@ zlib 解压即可恢复原始 Z16。Z16 的 `uint16` 值单位是
 `depth_scale_semantics=meters_per_realsense_depth_unit` 明确比例语义。
 每帧完整携带当前 RealSense profile 内参、
 稳定 `calibration_id`、Depth→RGB 外参、源时间/Driver 接收时间，以及配置的
-LiDAR→RGB 外参。源时间无效、尚在预热、发生时钟重置或倒序时仍发布该帧，
+LiDAR→RGB 外参。RGB 和 Depth 还会携带完全相同的
+`base_to_camera`：该字段使用 `target_from_source` 约定和 row-major 4×4
+齐次矩阵，语义固定为 `T_base_camera`，将
+`camera_color_optical_frame` 中的点变换到 `base_link`。它也参与生成两路
+共用的 `calibration_id`，因此消费端无需知道机器人型号。源时间无效、尚在预热、发生时钟重置或倒序时仍发布该帧，
 但明确标记为 `unavailable`，不会用发布时刻伪造采集时间。
 
-仓库内置的 LiDAR→Camera 变换来自固定版本的宇树官方 G1 URDF，状态只能是
+仓库内置的 LiDAR→Camera 和 Camera→Base 变换来自固定版本的宇树官方 G1 URDF，状态只能是
 `factory_nominal`：它不是北京 G1 的实测外参。在该机器人上完成点云投影叠加
 与像素残差验收并保存证据前，不得改成 `validated_on_device`。配置缺失或非法
 时输出 `unavailable`，不会用单位矩阵冒充有效标定。相机重连后会重新读取

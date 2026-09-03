@@ -191,7 +191,9 @@ class CameraCalibrationTest(unittest.TestCase):
         self.assertEqual(transform["matrix_row_major"][3:12:4], [0.1, 0.2, 0.3])
 
     def test_factory_nominal_extrinsic_is_rigid_and_versioned(self):
-        calibration, error = load_lidar_camera_calibration(str(FACTORY_CALIBRATION))
+        calibration, base_to_camera, error = load_lidar_camera_calibration(
+            str(FACTORY_CALIBRATION)
+        )
         self.assertIsNone(error)
         self.assertEqual(calibration["status"], "factory_nominal")
         transform = calibration["transform"]
@@ -204,15 +206,28 @@ class CameraCalibrationTest(unittest.TestCase):
             + rotation[2] * (rotation[3] * rotation[7] - rotation[4] * rotation[6])
         )
         self.assertTrue(math.isclose(determinant, 1.0, abs_tol=1e-9))
+        self.assertEqual(base_to_camera["status"], "factory_nominal")
+        base_transform = base_to_camera["transform"]
+        self.assertEqual(base_transform["source_frame"], "camera_color_optical_frame")
+        self.assertEqual(base_transform["target_frame"], "base_link")
+        self.assertEqual(base_transform["convention"], "target_from_source")
+        self.assertEqual(
+            base_transform["translation_m"], [0.05366, 0.01753, 0.47387]
+        )
+        self.assertEqual(len(base_transform["matrix_row_major"]), 16)
 
     def test_missing_extrinsic_is_not_replaced_by_identity(self):
-        calibration, error = load_lidar_camera_calibration(None)
+        calibration, base_to_camera, error = load_lidar_camera_calibration(None)
         self.assertEqual(error, "configuration_missing")
         self.assertEqual(calibration["status"], "unavailable")
         self.assertNotIn("matrix_row_major", calibration["transform"])
+        self.assertEqual(base_to_camera["status"], "unavailable")
+        self.assertNotIn("matrix_row_major", base_to_camera["transform"])
 
     def test_camera_reconnect_profile_change_rebuilds_calibration_id(self):
-        lidar, _ = load_lidar_camera_calibration(str(FACTORY_CALIBRATION))
+        lidar, base_to_camera, _ = load_lidar_camera_calibration(
+            str(FACTORY_CALIBRATION)
+        )
         identity = realsense_extrinsics_transform(
             source_frame="depth",
             target_frame="rgb",
@@ -225,6 +240,7 @@ class CameraCalibrationTest(unittest.TestCase):
             depth_intrinsics=make_intrinsics(),
             depth_to_rgb=identity,
             lidar_to_rgb=lidar,
+            base_to_camera=base_to_camera,
             depth_scale_m=0.001,
         )
         rgb_b, _ = build_calibrations(
@@ -233,9 +249,11 @@ class CameraCalibrationTest(unittest.TestCase):
             depth_intrinsics=make_intrinsics(),
             depth_to_rgb=identity,
             lidar_to_rgb=lidar,
+            base_to_camera=base_to_camera,
             depth_scale_m=0.001,
         )
         self.assertEqual(rgb_a["calibration_id"], depth_a["calibration_id"])
+        self.assertEqual(rgb_a["base_to_camera"], depth_a["base_to_camera"])
         self.assertNotEqual(rgb_a["calibration_id"], rgb_b["calibration_id"])
 
     def test_unavailable_timestamp_remains_null_in_metadata(self):
