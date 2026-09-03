@@ -237,6 +237,14 @@ class QianjiaoDevice:
         self.start_video_proxy()
 
     def stop(self):
+        # Cancel an in-flight ACP action before closing transport resources.
+        # This prevents a worker from sending a late propulsion command while
+        # shutdown is tearing down the MAVLink link.
+        with self._action_lock:
+            active = self._active_action
+            self._active_action = None
+            if active:
+                active["cancel_event"].set()
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
@@ -458,6 +466,14 @@ class QianjiaoDevice:
             raise ValueError("duration must be -1 (continuous) or between 0.1 and 60 seconds")
 
         def send(values_pwm):
+            cancel_event = values.get("_cancel_event")
+            action_id = values.get("_action_id")
+            if cancel_event is not None:
+                with self._action_lock:
+                    owned = (not cancel_event.is_set() and self._active_action is not None
+                             and self._active_action.get("action_id") == action_id)
+                if not owned:
+                    return False
             with self._lock:
                 if self.mock:
                     self.link.last_rc = values_pwm
@@ -468,6 +484,7 @@ class QianjiaoDevice:
                     # MAVLink v1 RC_CHANNELS_OVERRIDE has exactly eight
                     # channel fields after target_system/component.
                     self.link.mav.rc_channels_override_send(1, 1, *channels)
+            return True
 
         send(pwm)
         cancel_event = values.get("_cancel_event")
@@ -602,7 +619,8 @@ class QianjiaoDevice:
                 if previous:
                     previous["cancel_event"].set()
                     _acp_notify(previous["action_id"], "cancelled", {"reason": "replaced_by_new_command"})
-                threading.Thread(target=self._run_continuous_move, args=(args, action_id, cancel_event), daemon=True, name="qianjiao-move-acp").start()
+                move_args = {**args, "_cancel_event": cancel_event, "_action_id": action_id}
+                threading.Thread(target=self._run_continuous_move, args=(move_args, action_id, cancel_event), daemon=True, name="qianjiao-move-acp").start()
                 return {"state": "running", "action_id": action_id, "stops_automatically": False}
             with self._action_lock:
                 previous = self._active_action
@@ -611,7 +629,7 @@ class QianjiaoDevice:
             if previous:
                 previous["cancel_event"].set()
                 _acp_notify(previous["action_id"], "cancelled", {"reason": "replaced_by_new_command"})
-            args = {**args, "_cancel_event": cancel_event}
+            args = {**args, "_cancel_event": cancel_event, "_action_id": action_id}
             threading.Thread(target=self._run_timed_move, args=(args, action_id), daemon=True, name="qianjiao-move-acp").start()
             return {"state": "queued", "action_id": action_id, "stops_automatically": True, "duration": duration}
         raise ValueError(f"unsupported action: {action}")
