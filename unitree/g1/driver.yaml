@@ -36,7 +36,11 @@ cards:
   - { name: camera_rgb,             type: sensor }
   - { name: camera_depth,           type: sensor }
   - { name: camera_distance,        type: sensor }
+  - { name: camera_rgb_frame,       type: sensor }
+  - { name: camera_depth_frame,     type: sensor }
   - { name: lidar_cloud,            type: sensor }
+  - { name: navigation_lidar,       type: sensor }
+  - { name: navigation_imu,         type: sensor }
   - { name: controlled_spatial,     type: actuator }
   - { name: controlled_spatial_map, type: sensor }
   - { name: motion_switcher,        type: actuator }

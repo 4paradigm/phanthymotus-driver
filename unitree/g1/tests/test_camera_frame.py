@@ -328,6 +328,18 @@ class DriverCameraContractTest(unittest.TestCase):
         self.assertIn("COPY camera_frame.py /work/camera_frame.py", dockerfile)
         self.assertIn("COPY calibration/ /work/calibration/", dockerfile)
 
+    def test_marketplace_manifest_includes_new_sensor_cards(self):
+        manifest = yaml.safe_load((G1_DIR / "driver.yaml").read_text(encoding="utf-8"))
+        card_names = {card["name"] for card in manifest["cards"]}
+        self.assertTrue(
+            {
+                "camera_rgb_frame",
+                "camera_depth_frame",
+                "navigation_lidar",
+                "navigation_imu",
+            }.issubset(card_names)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
