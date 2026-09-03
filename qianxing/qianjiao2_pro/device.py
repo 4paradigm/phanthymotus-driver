@@ -187,6 +187,9 @@ class QianjiaoDevice:
 
     def start(self):
         if self._thread and self._thread.is_alive():
+            if self._ros_node is None:
+                self.start_ros_status()
+            self.start_video_proxy()
             return
         if not self.mock:
             if mavutil is None:
@@ -207,6 +210,9 @@ class QianjiaoDevice:
         self._thread.start()
         self._status_thread = threading.Thread(target=self._status_loop, daemon=True, name="qianjiao-status")
         self._status_thread.start()
+        if self._ros_node is None:
+            self.start_ros_status()
+        self.start_video_proxy()
 
     def stop(self):
         self._stop.set()
