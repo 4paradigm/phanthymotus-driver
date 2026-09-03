@@ -47,6 +47,20 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, status, payload):
         data = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+
+    @staticmethod
+    def _with_info_topics(tool: str, args: dict, result: dict) -> dict:
+        """The monitor treats info().topic_out as authoritative.
+
+        Keep older card implementations compatible by filling it from the
+        current tools/list declaration when a dispatch response omits it.
+        """
+        if args.get("action", "info") != "info" or "topic_out" in result:
+            return result
+        for definition in DEVICE.get_tools():
+            if definition.get("name") == tool and definition.get("topic_out"):
+                return {**result, "topic_out": definition["topic_out"]}
+        return result
     def do_POST(self):
         if urlparse(self.path).path != "/mcp": self._send(404, {}); return
         try: rpc = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
@@ -55,7 +69,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "initialize": result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"qianjiao2-pro","version":"1.0.0"}}
             elif method == "tools/list": result = {"tools": DEVICE.get_tools()}
-            elif method == "tools/call": result = {"content":[{"type":"text","text":json.dumps(DEVICE.dispatch(params.get("name", ""), params.get("arguments") or {}), ensure_ascii=False)}]}
+            elif method == "tools/call":
+                tool = params.get("name", "")
+                args = params.get("arguments") or {}
+                value = DEVICE.dispatch(tool, args)
+                value = self._with_info_topics(tool, args, value)
+                result = {"content":[{"type":"text","text":json.dumps(value, ensure_ascii=False)}]}
             else: self._send(200, {"jsonrpc":"2.0","id":rid,"error":{"code":-32601,"message":"Method not found"}}); return
             self._send(200, {"jsonrpc":"2.0","id":rid,"result":result})
         except Exception as exc:
