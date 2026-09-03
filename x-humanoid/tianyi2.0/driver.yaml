@@ -9,3 +9,44 @@ mcp_url: "http://localhost:15707/mcp"
 description: "天轶2.0 Pro — 35DOF 人形机器人 (轮式底盘 + 双臂 + 灵巧手 + 头部 + 导航)"
 build_context_extras:
   - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` (all plugins are
+# currently enabled) — joints_bridge is a standalone ROS process with no MCP
+# tool of its own, and ext_devices.py's ExtCameraPlugin is dead code (never
+# registered in main.py, no `ext_camera` key in config.yaml) so it is excluded.
+cards:
+  - { name: joints,             type: sensor }
+  - { name: battery,            type: sensor }
+  - { name: estop,              type: sensor }
+  - { name: force_sensor,       type: sensor }
+  - { name: model,              type: resource }
+  - { name: camera_head,        type: sensor }
+  - { name: imu,                type: sensor }
+  - { name: camera_depth,       type: sensor }
+  - { name: camera_pointcloud,  type: sensor }
+  - { name: asr,                type: sensor }
+  - { name: nav_state,          type: sensor }
+  - { name: power_board,        type: sensor }
+  - { name: motors,             type: sensor }
+  - { name: hand_state,         type: sensor }
+  - { name: remote_event,       type: sensor }
+  - { name: head,               type: actuator }
+  - { name: head_gesture,       type: actuator }
+  - { name: arm,                type: actuator }
+  - { name: arm_gesture,        type: actuator }
+  - { name: waist,              type: actuator }
+  - { name: hand,               type: actuator }
+  - { name: tts,                type: actuator }
+  - { name: voice_play,         type: actuator }
+  - { name: nav,                type: actuator }
+  - { name: home,               type: actuator }
+  - { name: chat,               type: actuator }
+  - { name: voice_chat,         type: actuator }
+  - { name: controlled_spatial, type: actuator }
+  - { name: spatial_map,        type: actuator }
+  - { name: health_check,       type: actuator }
+  - { name: laser_scan,         type: sensor }
+  - { name: chassis_raw,        type: actuator }
+  - { name: ext_mic,            type: sensor }
+  - { name: light,              type: actuator }
+  - { name: vision_capture,     type: actuator }

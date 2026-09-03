@@ -2,6 +2,55 @@
 
 The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
 
+## `vision_capture` card
+
+Persistent RGB photo/video capture, with the card/action names and file layout
+from Q5 PR #220. This replaces `state_record`; existing workflows must select
+the new card. State scopes, JSON snapshots, labels and interval logging are no
+longer supported. Historical files under `/opt/phanthy-motus/data/bumi/state-records`
+are left untouched.
+
+- `start`: check whether the camera process is ready (does not take a photo).
+- `capture_photo`: save one current RGB JPEG.
+- `record_video`: asynchronously save an RGB MP4/H.264 video; `duration_s` is
+  an integer from 1 to 30, default 5 seconds.
+- `info`: return storage directories, camera/frame freshness and active recording.
+- `stop`: cancel recording and remove the incomplete video. This is not
+  “finish early and save”. It does not stop the existing camera sensor card.
+
+Bumi reuses its existing 640x480 JPEG topic `/<namespace>/camera/color`.
+A recent cached frame is used for a photo; if none is available or it is older
+than 3 seconds, capture waits for a fresh frame (up to 5 seconds per wait).
+Recording requests a strictly later frame sequence for each encoded frame.
+No second RealSense pipeline, depth capture, audio or state JSON is added.
+
+Default persistent output:
+
+```text
+/opt/phanthy-motus/data/vision_capture/
+  photos/IMG_20260903_143025_123456.jpg
+  videos/video_20260903_143025_123456.mp4
+```
+
+Names use local date, time and microseconds, with no label or counter.
+`deploy/service.yml` already mounts `/opt/phanthy-motus/data` from the robot
+host at the same path. Download files from that host and open them in a normal
+image viewer/video player. The MCP card returns paths, not a browser preview
+or a download server.
+
+Photos return `ok`, `media_type`, `file_path`, `captured_at`, `frame_age_s`.
+Photo failure returns `CAPTURE_FAILED` without creating a JSON sidecar.
+Video requests return `state=queued` and an `action_id`; completion/failure/
+cancellation is sent to `AGENT_CORE_URL/api/acp/complete` (default Agent Core
+URL: `https://localhost:15678`), matching Q5's ACP contract. Only one video
+recording may run at a time. A callback delivery failure is logged; it does not
+delete a successfully saved video.
+
+Configuration is under `plugins.vision_capture`: `output_dir`, `fps`
+(default/max 15), and `max_duration_s` (default/max 30). Rebuild the driver
+image to install the new FFmpeg dependency. All runtime implementation remains
+in `device.py`; no extra runtime Python file is required.
+
 ## New cards
 
 ### `motion_state`
@@ -64,6 +113,35 @@ play-teach mode and confirms the return to walking.
 `finish_and_save_recording` maps to the supported `SAVETEACH` command. The
 vendor-deprecated `ENDTEACH` command and unavailable `RUN` command remain
 unexposed.
+
+## `speaker`
+
+Plays the PCM audio of its connected input topic (`audio_msgs/AudioChunk`, mono
+16 kHz S16LE) on the robot speaker. Actions: `start` / `stop` / `info` /
+`get_volume` / `set_volume`.
+
+`start` **is** the playback action — the canvas starts a card by sending `start`
+with the resolved `input_topic`, so there is no separate `play`. A card whose
+`start` only answers `{"state": "ready"}` shows as running while the driver
+holds no subscription at all, which is silence that looks like success.
+
+The vendor voice agent (`MediaController.wakeup()` / `sleep()` / `restart()`) is
+deliberately **not** exposed. Waking it would hand the robot's microphone to the
+vendor's own model and let it talk over this stack through the same speaker.
+Two behaviours verified on hardware and worth not re-deriving:
+
+- **`work_status=SLEEPED` does not block playback.** A full TTS utterance played
+  while the agent sat at `SLEEPED/CMD_SLEEPED`. Only `ERROR_SLEEPED` means the
+  audio agent is really down; `start` then calls the documented `restart()`
+  recovery by itself and reports it.
+- **`get_volume()` is not trustworthy.** A freshly created MediaController reads
+  `0` for 12 s and longer while audio plays normally, and each client appears to
+  read back its own last `set_volume`. Treat a `0` as "unknown", never as the
+  reason for silence — `info` reports it for reference only.
+
+Likewise `frames_submitted` in `info` counts frames handed to the SDK, not
+frames heard: `publish_external_audio_playback_stream` is fire-and-forget, so a
+rising count proves the subscription works and nothing more.
 
 Useful observations while the driver is running:
 

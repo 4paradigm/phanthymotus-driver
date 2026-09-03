@@ -23,6 +23,8 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
 | `qianxing/qianjiao2_pro` | Qianxing Qianjiao 2.0 Pro ROV | 15729 | MAVLink v1/UDP 6DOF motion control, arming, heartbeat and link status |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
+| `booster/k1` | Booster K1 Humanoid | 15705 | State (IMU/joints/battery/odom/fall-detection + URDF), camera, locomotion, upper-body joint control, actions/get-up (ACP), audio |
+| `brainco/revo2` | BrainCo Revo 2 Dexterous Hand | 15706 | Finger position/gesture/LED control, state telemetry, tactile telemetry (touch variant only) |
 
 ## Quick Start
 

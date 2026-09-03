@@ -1,6 +1,6 @@
-pnpbotics-adam:
+pndbotics-adam:
   image: __IMAGE__
-  container_name: embodied-pnpbotics-adam
+  container_name: embodied-pndbotics-adam
   runtime: nvidia
   network_mode: host
   ipc: host

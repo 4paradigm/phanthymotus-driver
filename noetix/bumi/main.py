@@ -60,10 +60,12 @@ class BumiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
+        camera_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
-            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl))
+            state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)
+            self._plugins.append(state_plugin)
             print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
@@ -83,14 +85,22 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
-            self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
+            camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
+            self._plugins.append(camera_plugin)
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
-            self._plugins.append(MotionStatePlugin(
-                plugins_cfg["motion_state"], namespace, executor, high_ctrl))
+            motion_state_plugin = MotionStatePlugin(
+                plugins_cfg["motion_state"], namespace, executor, high_ctrl)
+            self._plugins.append(motion_state_plugin)
             print("[bundle] MotionStatePlugin loaded")
+
+        if plugins_cfg.get("vision_capture", {}).get("enabled", False):
+            from device import VisionCapturePlugin
+            self._plugins.append(VisionCapturePlugin(
+                plugins_cfg["vision_capture"], camera_plugin))
+            print("[bundle] VisionCapturePlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -103,7 +113,8 @@ class BumiDeviceBundle:
         print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
-        for p in self._plugins:
+        # Stop media consumers before tearing down the camera producer.
+        for p in reversed(self._plugins):
             p.stop()
         print("[bundle] All plugins stopped")
 
