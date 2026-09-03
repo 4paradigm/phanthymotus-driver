@@ -9,7 +9,13 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
   - SpeakerPlugin: audio playback via MediaController
   - CameraPlugin: Realsense D435i color + depth
   - MotionStatePlugin: combined whole-body motion state
+  - MotionEventsPlugin: workmode, protection, motor-fault and link events
 """
+
+from __future__ import annotations
+
+from collections import deque
+from datetime import datetime, timezone
 
 import json
 import math
@@ -1703,6 +1709,14 @@ def _finite_number(value: Any, field: str) -> float:
     return result
 
 
+def _utc_timestamp() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def _quaternion_xyzw_to_rpy(quaternion: list[float]) -> list[float] | None:
     """Convert the SDK's documented [x, y, z, w] quaternion to roll/pitch/yaw."""
     norm = math.sqrt(sum(value * value for value in quaternion))
@@ -1889,4 +1903,413 @@ class MotionStatePlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        return None
+
+
+def _read_motion_event_snapshot(
+    high_ctrl,
+    activity_velocity_threshold: float,
+) -> tuple[int, dict[int, dict], dict]:
+    mode = int(high_ctrl.get_mode())
+    raw_joint_state = high_ctrl.get_joint_state()
+    if len(raw_joint_state) != len(_JOINT_NAMES_BY_ID):
+        raise RuntimeError(
+            f"HighController returned {len(raw_joint_state)} joints, "
+            f"expected {len(_JOINT_NAMES_BY_ID)}"
+        )
+
+    faults = {}
+    joint_velocities = []
+    for index, joint in enumerate(raw_joint_state):
+        velocity = float(getattr(joint, "vel", 0.0))
+        if not math.isfinite(velocity):
+            raise RuntimeError(
+                f"HighController returned a non-finite velocity for "
+                f"{_JOINT_NAMES_BY_ID[index]}"
+            )
+        joint_velocities.append(abs(velocity))
+
+        error = int(getattr(joint, "error", 0))
+        if error not in _MOTOR_ERROR_NAMES:
+            continue
+
+        motor_id = int(getattr(joint, "motor_id", index))
+        faults[motor_id] = {
+            "motor_id": motor_id,
+            "joint": _JOINT_NAMES_BY_ID[index],
+            "error": error,
+            "error_name": _MOTOR_ERROR_NAMES[error],
+            "temperature": int(getattr(joint, "temperature", 0)),
+        }
+
+    moving_indices = [
+        index
+        for index, velocity in enumerate(joint_velocities)
+        if velocity >= activity_velocity_threshold
+    ]
+    activity = {
+        "active": bool(moving_indices),
+        "velocity_threshold": activity_velocity_threshold,
+        "moving_joint_count": len(moving_indices),
+        "moving_joints": [_JOINT_NAMES_BY_ID[index] for index in moving_indices],
+        "max_abs_velocity": round(max(joint_velocities), 6),
+    }
+
+    return mode, faults, activity
+
+
+class _MotionEventTracker:
+    def __init__(self, history_size: int):
+        if history_size < 1:
+            raise ValueError("history_size must be at least 1")
+        self._history = deque(maxlen=history_size)
+        self._next_id = 1
+        self._dropped_events = 0
+        self._previous_mode: int | None = None
+        self._previous_faults: dict[int, dict] | None = None
+        self._previous_activity: dict | None = None
+        self._fresh: bool | None = None
+        self._lock = threading.RLock()
+
+    @property
+    def cursor(self) -> int:
+        with self._lock:
+            return self._next_id - 1
+
+    @property
+    def history(self) -> list[dict]:
+        with self._lock:
+            return list(self._history)
+
+    @property
+    def dropped_events(self) -> int:
+        with self._lock:
+            return self._dropped_events
+
+    @property
+    def fresh(self) -> bool | None:
+        with self._lock:
+            return self._fresh
+
+    @property
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "fresh": self._fresh,
+                "cursor": self._next_id - 1,
+                "events": list(self._history),
+                "dropped_events": self._dropped_events,
+            }
+
+    def _record(self, event_type: str, **details) -> dict:
+        with self._lock:
+            event = {
+                "id": self._next_id,
+                "timestamp": _utc_timestamp(),
+                "type": event_type,
+                "source": "Noetix HighController/CycloneDDS",
+                **details,
+            }
+            self._next_id += 1
+            if len(self._history) == self._history.maxlen:
+                self._dropped_events += 1
+            self._history.append(event)
+        return event
+
+    def mark_stale(self, reason: str) -> list[dict]:
+        with self._lock:
+            if self._fresh is False:
+                return []
+            self._fresh = False
+            return [self._record("state_data_stale", reason=reason)]
+
+    def mark_fresh(self) -> list[dict]:
+        with self._lock:
+            if self._fresh is None:
+                self._fresh = True
+                return []
+            if self._fresh is False:
+                self._fresh = True
+                return [self._record("state_data_recovered")]
+            return []
+
+    def observe_mode(self, mode: int) -> list[dict]:
+        with self._lock:
+            if self._previous_mode is None:
+                self._previous_mode = mode
+                return []
+
+            previous_mode = self._previous_mode
+            self._previous_mode = mode
+
+            if mode == previous_mode:
+                return []
+
+            transition = {
+                "from": {
+                    "code": previous_mode,
+                    "name": _WORKMODE_NAMES.get(previous_mode, "unknown"),
+                },
+                "to": {
+                    "code": mode,
+                    "name": _WORKMODE_NAMES.get(mode, "unknown"),
+                },
+            }
+            events = [
+                self._record("workmode_changed", workmode=transition)
+            ]
+
+            if mode == 26:
+                events.append(
+                    self._record("protection_entered", workmode=transition)
+                )
+            elif previous_mode == 26:
+                events.append(
+                    self._record("protection_cleared", workmode=transition)
+                )
+
+            return events
+
+    def observe_faults(self, faults: dict[int, dict]) -> list[dict]:
+        with self._lock:
+            current_faults = {
+                motor_id: dict(fault)
+                for motor_id, fault in faults.items()
+            }
+
+            if self._previous_faults is None:
+                self._previous_faults = current_faults
+                return []
+
+            previous_faults = self._previous_faults
+            self._previous_faults = current_faults
+            events = []
+
+            motor_ids = sorted(set(previous_faults) | set(current_faults))
+            for motor_id in motor_ids:
+                previous = previous_faults.get(motor_id)
+                current = current_faults.get(motor_id)
+
+                if previous is None and current is not None:
+                    events.append(
+                        self._record("motor_fault_appeared", fault=current)
+                    )
+                elif previous is not None and current is None:
+                    events.append(
+                        self._record("motor_fault_cleared", fault=previous)
+                    )
+                elif (
+                    previous is not None
+                    and current is not None
+                    and previous["error"] != current["error"]
+                ):
+                    events.append(
+                        self._record(
+                            "motor_fault_changed",
+                            previous_fault=previous,
+                            current_fault=current,
+                        )
+                    )
+
+            return events
+
+    def observe_activity(self, activity: dict) -> list[dict]:
+        with self._lock:
+            current_activity = dict(activity)
+            if self._previous_activity is None:
+                self._previous_activity = current_activity
+                return []
+
+            previous_activity = self._previous_activity
+            self._previous_activity = current_activity
+            if current_activity["active"] == previous_activity["active"]:
+                return []
+
+            event_type = (
+                "joint_activity_started"
+                if current_activity["active"]
+                else "joint_activity_stopped"
+            )
+            return [
+                self._record(
+                    event_type,
+                    previous_activity=previous_activity,
+                    current_activity=current_activity,
+                )
+            ]
+
+
+class _MotionEventsNode(Node):
+    def __init__(self, namespace: str, high_ctrl, interval_s: float,
+                 history_size: int, activity_velocity_threshold: float):
+        super().__init__("bumi_motion_events")
+        self._high_ctrl = high_ctrl
+        self._topic = f"/{namespace}/motion/events"
+        self._pub = self.create_publisher(String, self._topic, 10)
+        self._interval_s = interval_s
+        self._activity_velocity_threshold = activity_velocity_threshold
+        self._tracker = _MotionEventTracker(history_size)
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    @property
+    def topic(self) -> str:
+        return self._topic
+
+    @property
+    def status(self) -> dict:
+        snapshot = self._tracker.snapshot
+        return {
+            "running": self._running,
+            "fresh": snapshot["fresh"],
+            "cursor": snapshot["cursor"],
+            "history_count": len(snapshot["events"]),
+            "dropped_events": snapshot["dropped_events"],
+        }
+
+    @property
+    def report(self) -> dict:
+        snapshot = self._tracker.snapshot
+        return {
+            "state": "completed",
+            "running": self._running,
+            "fresh": snapshot["fresh"],
+            "cursor": snapshot["cursor"],
+            "history_count": len(snapshot["events"]),
+            "dropped_events": snapshot["dropped_events"],
+            "events": snapshot["events"],
+        }
+
+    def start_polling(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._loop,
+            daemon=True,
+            name="bumi_motion_events",
+        )
+        self._thread.start()
+
+    def stop_polling(self):
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=max(1.0, self._interval_s + 0.5))
+
+    def _publish_event(self, event: dict):
+        snapshot = self._tracker.snapshot
+        payload = {
+            "state": "completed",
+            "event": event,
+            "cursor": event["id"],
+            "history_count": len(snapshot["events"]),
+            "dropped_events": snapshot["dropped_events"],
+        }
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self._pub.publish(msg)
+
+    def _poll_once(self) -> list[dict]:
+        try:
+            mode, faults, activity = _read_motion_event_snapshot(
+                self._high_ctrl,
+                self._activity_velocity_threshold,
+            )
+            events = []
+            events.extend(self._tracker.mark_fresh())
+            events.extend(self._tracker.observe_mode(mode))
+            events.extend(self._tracker.observe_faults(faults))
+            events.extend(self._tracker.observe_activity(activity))
+        except Exception as exc:
+            events = self._tracker.mark_stale(str(exc))
+            if events:
+                self.get_logger().warn(f"Motion event state read failed: {exc}")
+
+        for event in events:
+            self._publish_event(event)
+        return events
+
+    def _loop(self):
+        while self._running:
+            started_at = time.monotonic()
+            try:
+                self._poll_once()
+            except Exception as exc:
+                self.get_logger().error(f"Motion event publish failed: {exc}")
+            elapsed = time.monotonic() - started_at
+            time.sleep(max(0.0, self._interval_s - elapsed))
+
+
+class MotionEventsPlugin:
+    PREFIX = "motion_events"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl):
+        interval = _finite_number(
+            plugin_config.get("poll_interval_s", 0.5),
+            "poll_interval_s",
+        )
+        if not 0.02 <= interval <= 2.0:
+            raise ValueError("poll_interval_s must be in [0.02, 2.0]")
+
+        history_size = plugin_config.get("history_size", 100)
+        if isinstance(history_size, bool) or not isinstance(history_size, int):
+            raise ValueError("history_size must be an integer")
+        if not 1 <= history_size <= 1000:
+            raise ValueError("history_size must be in [1, 1000]")
+
+        activity_threshold = _finite_number(
+            plugin_config.get("activity_velocity_threshold", 0.15),
+            "activity_velocity_threshold",
+        )
+        if not 0.001 <= activity_threshold <= 10.0:
+            raise ValueError(
+                "activity_velocity_threshold must be in [0.001, 10.0]"
+            )
+
+        self._node = _MotionEventsNode(
+            namespace,
+            high_ctrl,
+            interval,
+            history_size,
+            activity_threshold,
+        )
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "motion_events",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": (
+                "Bumi 只读运动事件监测：记录工作模式变化、进入或退出保护、"
+                "关节运动开始/停止、已确认电机故障的出现/变化/恢复，以及 "
+                "HighController 数据中断/恢复。"
+                "用于动作测试和事后分析；不控制机器人，不证明物理动作已完成。"
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [
+                {"topic": self._node.topic, "format": "data/json"}
+            ],
+        }
+
+    def start(self):
+        self._node.start_polling()
+
+    def stop(self):
+        self._node.stop_polling()
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        topic_out = [{"topic": self._node.topic, "format": "data/json"}]
+        if action == "start":
+            self._node.start_polling()
+            return {"state": "running", "topic_out": topic_out, **self._node.status}
+        if action == "stop":
+            self._node.stop_polling()
+            return {"state": "idle", "topic_out": topic_out, **self._node.status}
+        if action == "info":
+            status = self._node.status
+            state = "running" if status["running"] else "idle"
+            return {"state": state, "topic_out": topic_out, **status}
+        if action == "motion_events":
+            return self._node.report
         return None

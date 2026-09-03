@@ -51,14 +51,17 @@ select_mirror() {
     case "${MIRROR}" in
         tencent)
             PYPI_MIRROR="https://mirrors.tencentyun.com/pypi/simple/"
+            UBUNTU_MIRROR="http://mirrors.tencentyun.com/ubuntu-ports"
             BINFMT_IMAGE="mirror.ccs.tencentyun.com/tonistiigi/binfmt"
             ;;
         tuna)
             PYPI_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple/"
+            UBUNTU_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports"
             BINFMT_IMAGE="docker.io/tonistiigi/binfmt"
             ;;
         none|*)
             PYPI_MIRROR="https://pypi.org/simple/"
+            UBUNTU_MIRROR="https://ports.ubuntu.com/ubuntu-ports"
             BINFMT_IMAGE="docker.io/tonistiigi/binfmt"
             ;;
     esac
@@ -321,6 +324,7 @@ for idx in "${SELECTED_INDICES[@]}"; do
         --platform linux/arm64 \
         ${NO_CACHE} \
         --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
+        --build-arg "UBUNTU_MIRROR=${UBUNTU_MIRROR}" \
         --file "${dir}Dockerfile" \
         --tag "${FULL_IMAGE}" \
         $(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker") \
