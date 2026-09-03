@@ -15,7 +15,6 @@ rov:
   status_port: 8500
   camera_ip: "192.168.1.88"
   camera_http_port: 80
-  camera_rtsp: "rtsp://admin:admin@192.168.1.88:8554/stream/0/0"
   status_topic: "/qianjiao2_pro/status"
   loco_state_topic: "/qianjiao2_pro/loco_state"
   battery_topic: "/qianjiao2_pro/battery"
