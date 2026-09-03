@@ -18,3 +18,9 @@ plugins:
     poll_interval_s: 0.5
     # Activity classification only; this is not a motor safety or command limit.
     activity_velocity_threshold: 0.15
+  vision_capture:
+    enabled: true
+    # Existing host bind mount keeps photos/videos across container replacements.
+    output_dir: /opt/phanthy-motus/data/vision_capture
+    fps: 15
+    max_duration_s: 30
