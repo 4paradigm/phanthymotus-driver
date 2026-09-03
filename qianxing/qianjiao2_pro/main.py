@@ -106,13 +106,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     DEVICE.start()
-    DEVICE.start_ros_status()
     if DEVICE._last_error:
         print(f"[startup] {DEVICE._last_error}", flush=True)
-    port = int(CFG.get("mcp_port", 15729))
+    port = int(CFG.get("mcp_port", 15739))
     advertise_host = os.environ.get("MCP_ADVERTISE_HOST", CFG.get("mcp_advertise_host", "192.168.1.20"))
     DEVICE.video_url = f"http://{advertise_host}:{port}/video.mjpeg"
-    DEVICE.start_video_proxy()
     server = ThreadingHTTPServer(("", port), Handler)
     start_registration(port)
     def shutdown(*_): DEVICE.stop(); threading.Thread(target=server.shutdown, daemon=True).start()
