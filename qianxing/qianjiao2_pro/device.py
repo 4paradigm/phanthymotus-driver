@@ -234,6 +234,11 @@ class QianjiaoDevice:
         last = self.link.last_heartbeat if self.mock else self._last_heartbeat
         return last > 0 and time.monotonic() - last <= self.timeout
 
+    def _status_connected(self) -> bool:
+        """Whether the vendor UDP status broadcast is fresh."""
+        return bool(self._rov_status_received_at and
+                    time.monotonic() - self._rov_status_received_at <= self.timeout)
+
     def _status_loop(self):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -330,7 +335,7 @@ class QianjiaoDevice:
 
     def _status_snapshot(self, status: dict[str, Any]) -> dict[str, Any]:
         age = time.monotonic() - self._rov_status_received_at if self._rov_status_received_at else None
-        return {"connected": self._connected(), "temperature": status.get("temperature"),
+        return {"connected": self._status_connected(), "mavlink_connected": self._connected(), "temperature": status.get("temperature"),
                 "status_age": round(age, 6) if age is not None else None,
                 "status_age_ms": round(age * 1000, 1) if age is not None else None,
                 "source": self._rov_status_source, "last_error": self._last_error}
@@ -355,7 +360,8 @@ class QianjiaoDevice:
     def status(self) -> dict:
         armed = bool(self.link.armed) if self.mock else self._armed
         return {
-            "connected": self._connected(),
+            "connected": self._status_connected(),
+            "mavlink_connected": self._connected(),
             "armed": armed,
             "heartbeat_age": None if not self._connected() else round(time.monotonic() - (self.link.last_heartbeat if self.mock else self._last_heartbeat), 3),
             "transport": "mock" if self.mock else "mavlink-udp-v1",
