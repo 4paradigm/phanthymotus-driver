@@ -217,9 +217,11 @@ class AimdkNodes:
         return callback
 
     def request_header(self):
+        # CommonRequest.header is typed RequestHeader, which per the vendor schema has only
+        # a `stamp` field (no `frame_id` — that belongs to the separate MessageHeader type
+        # used by outbound command messages, not by CommonRequest).
         request = self._msg["CommonRequest"]()
         request.header.stamp = self.robot.get_clock().now().to_msg()
-        request.header.frame_id = ""
         return request
 
     def snapshot(self, key):
