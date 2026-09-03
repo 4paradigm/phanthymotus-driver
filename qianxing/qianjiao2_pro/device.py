@@ -415,37 +415,27 @@ class QianjiaoDevice:
         axis = lambda name, description: {"type": "number", "minimum": -1, "maximum": 1, "description": description}
         control_schema = {
             "type": "object",
-            "oneOf": [
-                {"properties": {"action": {"const": "start", "description": "初始化控制卡"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "info", "description": "读取控制链路状态"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "arm", "description": "解锁运动控制"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "disarm", "description": "停止并锁定运动控制"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "stop", "description": "停止运动并将各轴归中"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "move", "description": "发送 6 自由度控制量"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1")}, "required": ["action"]},
-            ],
+            "properties": {"action": {"type": "string", "enum": ["start", "info", "arm", "disarm", "move", "stop"], "description": "控制动作"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1")},
+            "required": ["action"],
             "x-action-params": {
                 "arm": {"params": [], "description": "解锁运动控制"},
                 "disarm": {"params": [], "description": "停止并锁定运动控制"},
                 "move": {"params": ["heave", "pitch", "forward", "yaw", "lateral", "roll"], "description": "发送 6 自由度控制量，未提供的轴默认为 0"},
                 "stop": {"params": [], "description": "停止运动并将各轴归中"},
+                "start": {"params": [], "description": "初始化控制卡"},
+                "info": {"params": [], "description": "读取控制链路状态"},
             },
         }
         camera_control_schema = {
             "type": "object",
-            "oneOf": [
-                {"properties": {"action": {"const": "start", "description": "初始化相机控制卡"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "info", "description": "读取相机控制状态"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "stop", "description": "停止相机控制卡"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "capture", "description": "拍摄一张照片"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "medias", "description": "获取相机媒体列表"}}, "required": ["action"]},
-                {"properties": {"action": {"const": "download", "description": "生成媒体文件下载地址"}, "name": {"type": "string", "description": "媒体文件名"}}, "required": ["action", "name"]},
-                {"properties": {"action": {"const": "light", "description": "设置补光灯亮度"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "补光灯亮度（0-100）"}}, "required": ["action", "brightness"]},
-            ],
+            "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "capture", "medias", "download", "light"], "description": "相机动作"}, "name": {"type": "string", "description": "媒体文件名（download 时必填）"}, "brightness": {"type": "integer", "minimum": 0, "maximum": 100, "description": "补光灯亮度（0-100，light 时必填）"}},
+            "required": ["action"],
             "x-action-params": {
                 "capture": {"params": [], "description": "拍摄一张照片"},
                 "medias": {"params": [], "description": "获取相机媒体列表"},
                 "download": {"params": ["name"], "description": "生成媒体文件下载地址"},
                 "light": {"params": ["brightness"], "description": "设置补光灯亮度"},
+                "start": {"params": [], "description": "初始化相机控制卡"}, "stop": {"params": [], "description": "停止相机控制卡"}, "info": {"params": [], "description": "读取相机控制状态"},
             },
         }
         return [
