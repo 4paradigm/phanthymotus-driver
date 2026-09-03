@@ -9,6 +9,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
         python3-dev \
+        ffmpeg \
         cmake \
         build-essential \
         curl \
