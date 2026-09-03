@@ -277,15 +277,20 @@ def main():
         camera_worker = CameraWorker(camera_configs)
         camera_worker.start()
         client.camera_worker = camera_worker
-        if bridge is not None:
-            def _forward_camera_media():
-                while camera_worker and camera_worker._running:
-                    camera_worker.drain(bridge.push_media)
-                    time.sleep(0.005)
-            import time
-            camera_forwarder = threading.Thread(target=_forward_camera_media,
-                                                daemon=True, name="q5_camera_forwarder")
-            camera_forwarder.start()
+        # ``drain`` updates CameraWorker's parent-process frame cache before it
+        # invokes the sender. Keep it running even if the optional media bridge
+        # failed so vision_capture can still take photos and record videos.
+        camera_sender = bridge.push_media if bridge is not None else (lambda frame: None)
+
+        def _forward_camera_media():
+            while camera_worker and camera_worker._running:
+                camera_worker.drain(camera_sender)
+                time.sleep(0.005)
+
+        import time
+        camera_forwarder = threading.Thread(target=_forward_camera_media,
+                                            daemon=True, name="q5_camera_forwarder")
+        camera_forwarder.start()
         print("[bundle] Q5 camera worker started", flush=True)
     except Exception as exc:
         print(f"[bundle] camera worker unavailable, using in-process cards: {exc}", flush=True)
