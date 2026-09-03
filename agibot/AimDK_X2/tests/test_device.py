@@ -335,5 +335,44 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
 
 
+class StartStopLifecycleTests(unittest.TestCase):
+    """README_dev.md's 'start/stop in dispatch (Required)' rule: the canvas UI calls every
+    tool with {"action": "start"} the moment its card is placed, and {"action": "stop"} when
+    removed. A plugin that doesn't short-circuit on these either crashes (KeyError on a
+    required field the probe never supplies) or — worse for actuator tools — actually
+    performs the real action (registers an MC input source, publishes a command, flips an
+    LED) just from a card being dragged onto the canvas. This regression-tests that every
+    plugin handles both without touching a service client or publisher."""
+
+    def _assert_inert(self, plugin, tool_name, nodes):
+        publishers_before = {
+            topic: len(pub.published) for topic, pub in nodes.robot.publishers.items()
+        }
+        for client in nodes.robot.clients.values():
+            client.last_request = None
+
+        for action in ("start", "stop"):
+            result = plugin.dispatch(action, {"_tool_name": tool_name})
+            self.assertIsInstance(result, dict, f"{tool_name}.dispatch({action!r}) must return a dict")
+            self.assertIn("state", result, f"{tool_name}.dispatch({action!r}) must report a state")
+
+        for topic, pub in nodes.robot.publishers.items():
+            self.assertEqual(
+                len(pub.published), publishers_before[topic],
+                f"{tool_name}'s start/stop must not publish to {topic}",
+            )
+        for name, client in nodes.robot.clients.items():
+            self.assertIsNone(client.last_request, f"{tool_name}'s start/stop must not call service {name}")
+
+    def test_every_tool_handles_start_stop_without_side_effects(self):
+        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
+        nodes = plugins[0].nodes
+        for plugin in plugins:
+            for definition in (plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]):
+                if definition["type"] == "resource":
+                    continue  # resource tools always dispatch with action == tool name, never start/stop
+                self._assert_inert(plugin, definition["name"], nodes)
+
+
 if __name__ == "__main__":
     unittest.main()
