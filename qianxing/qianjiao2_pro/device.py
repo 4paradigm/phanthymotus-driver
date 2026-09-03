@@ -9,6 +9,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import ssl
 import time
 from typing import Any
 
@@ -22,6 +23,23 @@ CHANNELS = ("heave", "pitch", "forward", "yaw", "lateral", "roll")
 COMMAND_LONG = 76
 MAV_CMD_COMPONENT_ARM_DISARM = 400
 MAV_MODE_FLAG_SAFETY_ARMED = 128
+CONTROL_CARD = "control"
+
+
+def _acp_notify(action_id: str | None, status: str, result: dict, tool: str = CONTROL_CARD) -> None:
+    """Notify Agent Core when an asynchronous control action completes."""
+    if not action_id:
+        return
+    url = __import__("os").environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    payload = json.dumps({"action_id": action_id, "status": status, "result": result,
+                          "tool": tool, "ts": time.time()}).encode()
+    request = urllib.request.Request(f"{url}/api/acp/complete", data=payload,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(request, timeout=5,
+                               context=ssl._create_unverified_context() if url.startswith("https://") else None).read()
+    except Exception as exc:
+        print(f"[Qianjiao ACP] callback failed for {action_id}: {exc}", flush=True)
 
 
 def _pwm(value: Any) -> int:
@@ -54,6 +72,8 @@ class QianjiaoDevice:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
+        self._action_lock = threading.RLock()
+        self._active_action: dict[str, Any] | None = None
         self._last_heartbeat = 0.0
         self._armed = False
         self._last_error: str | None = None
@@ -423,18 +443,38 @@ class QianjiaoDevice:
         return {"state": "moving", "channels": dict(zip(CHANNELS, pwm))}
 
     def stop_motion(self) -> dict:
-        return self.move({**{axis: 0 for axis in CHANNELS}, "duration": 0.1}) if self._connected() and (self.mock or self._is_armed_from_heartbeat()) else {"state": "stopped", "channels": {axis: 1500 for axis in CHANNELS}}
+        result = self.move({**{axis: 0 for axis in CHANNELS}, "duration": 0.1}) if self._connected() and (self.mock or self._is_armed_from_heartbeat()) else {"state": "stopped", "channels": {axis: 1500 for axis in CHANNELS}}
+        with self._action_lock:
+            active = self._active_action
+            self._active_action = None
+        if active:
+            _acp_notify(active["action_id"], "cancelled", {"reason": "stopped_by_user"})
+        return result
 
     def _is_armed_from_heartbeat(self) -> bool:
         return self._armed
+
+    def _run_timed_move(self, args: dict, action_id: str) -> None:
+        try:
+            result = self.move(args)
+            with self._action_lock:
+                if self._active_action and self._active_action.get("action_id") == action_id:
+                    self._active_action = None
+                    _acp_notify(action_id, "completed", result)
+        except Exception as exc:
+            with self._action_lock:
+                if self._active_action and self._active_action.get("action_id") == action_id:
+                    self._active_action = None
+            _acp_notify(action_id, "error", {"message": str(exc)})
 
     def get_tools(self):
         sensor = lambda name, description, topic: {"name": name, "type": "sensor", "description": description, "topic_out": [{"topic": topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"], "description": "读取实时数据"}}, "required": ["action"]}}
         axis = lambda name, description: {"type": "number", "minimum": -1, "maximum": 1, "default": 0, "description": description}
         control_schema = {
             "type": "object",
-            "properties": {"action": {"type": "string", "enum": ["start", "info", "unlock", "lock", "move", "stop"], "description": "控制动作"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1"), "duration": {"type": "number", "minimum": -1, "maximum": 60, "description": "move 持续时间（秒）；-1 表示持续控制，0 无效，0.1-60 到时自动停止"}},
+            "properties": {"action": {"type": "string", "enum": ["start", "info", "unlock", "lock", "move", "stop"], "description": "控制动作"}, "action_id": {"type": "string", "description": "ACP 异步动作标识，可选；不填写时由驱动生成"}, "heave": axis("heave", "升沉，范围 -1 到 1"), "pitch": axis("pitch", "俯仰，范围 -1 到 1"), "forward": axis("forward", "前后，范围 -1 到 1"), "yaw": axis("yaw", "偏航，范围 -1 到 1"), "lateral": axis("lateral", "横移，范围 -1 到 1"), "roll": axis("roll", "横滚，范围 -1 到 1"), "duration": {"type": "number", "minimum": -1, "maximum": 60, "description": "move 持续时间（秒）；-1 表示持续控制，0 无效，0.1-60 到时自动停止"}},
             "required": ["action"],
+            "x-completion": {"actions": ["move"], "timeout": 61},
             "x-action-params": {
                 "unlock": {"params": [], "description": "解锁推进器，允许运动控制"},
                 "lock": {"params": [], "description": "锁定推进器，禁止运动控制"},
@@ -496,5 +536,19 @@ class QianjiaoDevice:
         if tool == "control" and action == "stop": return self.stop_motion()
         if tool == "control" and action == "unlock": return self.arm(True)
         if tool == "control" and action == "lock": return self.arm(False)
-        if tool == "control" and action == "move": return self.move(args)
+        if tool == "control" and action == "move":
+            action_id = str(args.get("action_id") or f"qianjiao_move_{int(time.time() * 1000)}")
+            duration = float(args["duration"])
+            if duration == -1:
+                result = self.move(args)
+                with self._action_lock:
+                    self._active_action = {"action_id": action_id}
+                return {"state": "running", "action_id": action_id, "stops_automatically": False, **result}
+            with self._action_lock:
+                previous = self._active_action
+                self._active_action = {"action_id": action_id}
+            if previous:
+                _acp_notify(previous["action_id"], "cancelled", {"reason": "replaced_by_new_command"})
+            threading.Thread(target=self._run_timed_move, args=(args, action_id), daemon=True, name="qianjiao-move-acp").start()
+            return {"state": "queued", "action_id": action_id, "stops_automatically": True, "duration": duration}
         raise ValueError(f"unsupported action: {action}")
