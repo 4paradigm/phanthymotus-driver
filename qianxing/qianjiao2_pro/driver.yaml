@@ -4,8 +4,8 @@ category: driver
 hardware_provider: qianxing
 hardware_model: qianjiao2-pro
 image_name: qianjiao2-pro
-port: 15729
-mcp_url: "http://localhost:15729/mcp"
+port: 15739
+mcp_url: "http://localhost:15739/mcp"
 description: "潜行科技潜蛟 2.0 Pro 水下机器人：MAVLink UDP 6DOF 运动控制、解锁和状态监控"
 build_context_extras:
   - ../../common
@@ -16,4 +16,4 @@ cards:
   - { name: imu, type: sensor }
   - { name: camera, type: sensor }
   - { name: control, type: actuator }
-mcp_port: 15729
+mcp_port: 15739

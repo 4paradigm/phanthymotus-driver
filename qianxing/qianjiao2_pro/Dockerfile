@@ -20,5 +20,5 @@ ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_LOCALHOST_ONLY=0
 ENV RCUTILS_COLORIZED_OUTPUT=0
-EXPOSE 15729
+EXPOSE 15739
 CMD ["/bin/bash", "-lc", "source /opt/ros/humble/setup.bash && exec /usr/bin/python3 main.py"]

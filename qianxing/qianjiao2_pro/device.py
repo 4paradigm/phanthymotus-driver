@@ -108,6 +108,9 @@ class QianjiaoDevice:
         self._video_cond = threading.Condition()
         self._video_frame = None
 
+    def _redacted_rtsp(self) -> str:
+        return f"rtsp://{self.camera_ip}:8554/stream/0/0"
+
     def start_video_proxy(self):
         if self._video_thread and self._video_thread.is_alive():
             return
@@ -399,7 +402,7 @@ class QianjiaoDevice:
             "status_port": self.status_port,
             "status_source": self._rov_status_source,
             "status_age": None if not self._rov_status_received_at else round(time.monotonic() - self._rov_status_received_at, 6),
-            "camera": {"ip": self.camera_ip, "rtsp": self.camera_rtsp},
+            "camera": {"ip": self.camera_ip, "rtsp": self._redacted_rtsp()},
             "last_error": self._last_error,
         }
 
@@ -444,21 +447,25 @@ class QianjiaoDevice:
         send(pwm)
         if duration != -1:
             deadline = time.monotonic() + duration
-            while time.monotonic() < deadline and not self._stop.is_set():
+            cancel_event = values.get("_cancel_event")
+            while (time.monotonic() < deadline and not self._stop.is_set()
+                   and not (cancel_event and cancel_event.is_set())):
                 self._stop.wait(min(0.1, deadline - time.monotonic()))
-                if time.monotonic() < deadline:
+                if (time.monotonic() < deadline and not (cancel_event and cancel_event.is_set())):
                     send(pwm)
-            send([1500] * len(CHANNELS))
+            if not (cancel_event and cancel_event.is_set()):
+                send([1500] * len(CHANNELS))
             return {"state": "stopped", "duration": duration, "channels": dict(zip(CHANNELS, pwm))}
         return {"state": "moving", "channels": dict(zip(CHANNELS, pwm))}
 
     def stop_motion(self) -> dict:
-        result = self.move({**{axis: 0 for axis in CHANNELS}, "duration": 0.1}) if self._connected() and (self.mock or self._is_armed_from_heartbeat()) else {"state": "stopped", "channels": {axis: 1500 for axis in CHANNELS}}
         with self._action_lock:
             active = self._active_action
             self._active_action = None
         if active:
+            active["cancel_event"].set()
             _acp_notify(active["action_id"], "cancelled", {"reason": "stopped_by_user"})
+        result = self.move({**{axis: 0 for axis in CHANNELS}, "duration": 0.1}) if self._connected() and (self.mock or self._is_armed_from_heartbeat()) else {"state": "stopped", "channels": {axis: 1500 for axis in CHANNELS}}
         return result
 
     def _is_armed_from_heartbeat(self) -> bool:
@@ -478,7 +485,7 @@ class QianjiaoDevice:
             _acp_notify(action_id, "error", {"message": str(exc)})
 
     def get_tools(self):
-        sensor = lambda name, description, topic: {"name": name, "type": "sensor", "description": description, "topic_out": [{"topic": topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"], "description": "读取实时数据"}}, "required": ["action"]}}
+        sensor = lambda name, description, topic: {"name": name, "type": "sensor", "description": description, "topic_out": [{"topic": topic, "format": "data/json"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"], "description": "卡片生命周期或数据查询动作"}}, "required": ["action"]}}
         axis = lambda name, description: {"type": "number", "minimum": -1, "maximum": 1, "default": 0, "description": description}
         control_schema = {
             "type": "object",
@@ -499,7 +506,7 @@ class QianjiaoDevice:
             sensor("status", "潜蛟系统状态：连接、温度和健康信息。", self.status_topic),
             sensor("battery", "潜蛟电池状态：电压、电流和剩余电量。", self.battery_topic),
             sensor("imu", "潜蛟 IMU 角速度数据。", self.imu_topic),
-            {"name": "camera", "type": "sensor", "description": "潜蛟实时相机图像（RTSP 转 JPEG）。", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["info"], "description": "读取相机流信息"}}, "required": ["action"]}},
+            {"name": "camera", "type": "sensor", "description": "潜蛟实时相机图像（RTSP 转 JPEG）。", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"], "description": "相机流生命周期或信息查询"}}, "required": ["action"]}},
             {"name": "control", "type": "actuator", "description": "潜蛟 2.0 Pro 运动控制：解锁、停止或发送 6 自由度控制量。", "inputSchema": control_schema},
         ]
 
@@ -510,10 +517,10 @@ class QianjiaoDevice:
             "imu": self.imu_topic, "loco_state": self.loco_state_topic,
         }
         if tool in sensor_tools and action in ("start", "stop"):
-            return {"state": "ready" if action == "start" else "idle",
+            return {"state": "running" if action == "start" else "idle",
                     "topic_out": [{"topic": sensor_tools[tool], "format": "data/json"}]}
         if tool in ("camera", "rov_camera") and action in ("start", "stop"):
-            return {"state": "ready" if action == "start" else "idle",
+            return {"state": "running" if action == "start" else "idle",
                     "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}]}
         if tool in ("status", "rov_status"):
             return {**self._status_snapshot(self._rov_status), "topic_out": [{"topic": self.status_topic, "format": "data/json"}]}
@@ -528,20 +535,25 @@ class QianjiaoDevice:
         if tool == "control" and action in ("start", "info"): return {"state": "ready", "mavlink_connected": self._connected()}
         if tool == "control" and action == "stop": return self.stop_motion()
         if tool == "control" and action == "unlock": return self.arm(True)
-        if tool == "control" and action == "lock": return self.arm(False)
+        if tool == "control" and action == "lock":
+            self.stop_motion()
+            return self.arm(False)
         if tool == "control" and action == "move":
             action_id = str(args.get("action_id") or f"qianjiao_move_{int(time.time() * 1000)}")
             duration = float(args["duration"])
             if duration == -1:
                 result = self.move(args)
                 with self._action_lock:
-                    self._active_action = {"action_id": action_id}
+                    self._active_action = {"action_id": action_id, "cancel_event": threading.Event()}
                 return {"state": "running", "action_id": action_id, "stops_automatically": False, **result}
             with self._action_lock:
                 previous = self._active_action
-                self._active_action = {"action_id": action_id}
+                cancel_event = threading.Event()
+                self._active_action = {"action_id": action_id, "cancel_event": cancel_event}
             if previous:
+                previous["cancel_event"].set()
                 _acp_notify(previous["action_id"], "cancelled", {"reason": "replaced_by_new_command"})
+            args = {**args, "_cancel_event": cancel_event}
             threading.Thread(target=self._run_timed_move, args=(args, action_id), daemon=True, name="qianjiao-move-acp").start()
             return {"state": "queued", "action_id": action_id, "stops_automatically": True, "duration": duration}
         raise ValueError(f"unsupported action: {action}")
