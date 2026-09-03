@@ -246,6 +246,8 @@ class VelocityProposalGate:
         self.deadline_monotonic = 0.0
         self.last_reason = "not_connected"
         self.recoverable_stop_active = False
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
         self.terminal_pending_stop = False
 
     def bind(self, topic: str, expected_nav_id: Optional[str] = None) -> None:
@@ -270,6 +272,8 @@ class VelocityProposalGate:
             "" if nav_id is not None else "awaiting_first_valid_proposal"
         )
         self.recoverable_stop_active = False
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
         self.terminal_pending_stop = False
 
     def unbind(self, reason: str = "canvas_stop") -> None:
@@ -284,6 +288,8 @@ class VelocityProposalGate:
         self.deadline_monotonic = 0.0
         self.last_reason = reason
         self.recoverable_stop_active = False
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
         self.terminal_pending_stop = False
 
     def disarm(self, reason: str) -> None:
@@ -293,6 +299,8 @@ class VelocityProposalGate:
         self.deadline_monotonic = 0.0
         self.last_reason = reason
         self.recoverable_stop_active = False
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
         self.terminal_pending_stop = False
 
     def hold_for_obstacle(self) -> None:
@@ -307,13 +315,22 @@ class VelocityProposalGate:
         The caller must only enter this state after StopMove has been
         acknowledged and fresh odometry has confirmed zero velocity.
         """
-        if not self.armed:
+        if not self.armed and not self.recoverable_stop_pending:
             return
         if reason not in RECOVERABLE_PROPOSAL_STOP_REASONS:
             raise ValueError("unsupported_recoverable_stop_reason")
+        if (
+            self.recoverable_stop_pending
+            and self.recoverable_stop_reason != reason
+        ):
+            raise ValueError("recoverable_stop_reason_mismatch")
+        self.armed = True
+        self.awaiting_nav_id = False
         self.deadline_monotonic = 0.0
         self.last_reason = RECOVERABLE_PROPOSAL_STOP_REASONS[reason]
         self.recoverable_stop_active = True
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
 
     def request_recoverable_stop(
         self,
@@ -332,6 +349,8 @@ class VelocityProposalGate:
         self.deadline_monotonic = 0.0
         self.last_reason = reason
         self.recoverable_stop_active = False
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
         return ProposalDecision(stop=True, reason=reason, proposal=proposal)
 
     def record_recoverable_stop_result(
@@ -339,12 +358,34 @@ class VelocityProposalGate:
         reason: str,
         stop_confirmed: bool,
     ) -> bool:
-        """Retain a recoverable lease only after measured zero velocity."""
+        """Hold a recoverable lease, pending bounded retries if unconfirmed."""
         if reason not in RECOVERABLE_PROPOSAL_STOP_REASONS:
             raise ValueError("unsupported_recoverable_stop_reason")
         if stop_confirmed:
             self.hold_after_confirmed_stop(reason)
             return self.recoverable_stop_active
+        self.armed = False
+        self.awaiting_nav_id = False
+        self.deadline_monotonic = 0.0
+        self.recoverable_stop_active = False
+        self.recoverable_stop_pending = True
+        self.recoverable_stop_reason = reason
+        self.last_reason = {
+            "obstacle": "obstacle_stop_pending",
+            "proposal_ttl_expired": "proposal_ttl_stop_pending",
+            "scan_stale": "scan_stale_stop_pending",
+            "main_control_status_stale": "main_control_status_stale_stop_pending",
+            "main_control_rpc_failed": "main_control_rpc_failed_stop_pending",
+        }[reason]
+        return False
+
+    def fail_recoverable_stop(self, reason: str) -> bool:
+        """Hard-disarm a still-unconfirmed stop after its retry budget."""
+        if (
+            not self.recoverable_stop_pending
+            or self.recoverable_stop_reason != reason
+        ):
+            return False
         unconfirmed_reason = {
             "obstacle": "obstacle_stop_unconfirmed",
             "proposal_ttl_expired": "proposal_ttl_stop_unconfirmed",
@@ -353,7 +394,7 @@ class VelocityProposalGate:
             "main_control_rpc_failed": "main_control_rpc_failed_stop_unconfirmed",
         }[reason]
         self.disarm(unconfirmed_reason)
-        return False
+        return True
 
     def request_ttl_stop(
         self,
@@ -372,6 +413,8 @@ class VelocityProposalGate:
         self.deadline_monotonic = 0.0
         self.last_reason = "proposal_ttl_expired"
         self.recoverable_stop_active = False
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
         return ProposalDecision(
             stop=True,
             reason="proposal_ttl_expired",
@@ -390,8 +433,20 @@ class VelocityProposalGate:
         if self.connected_topic != topic:
             return False
         if expected_nav_id is None:
-            return self.awaiting_nav_id and not self.expected_nav_id
-        return self.armed and self.expected_nav_id == expected_nav_id
+            return (
+                self.nav_id_binding_mode == "first_valid_proposal"
+                and (
+                    self.awaiting_nav_id
+                    or self.armed
+                    or self.recoverable_stop_pending
+                    or self.terminal_pending_stop
+                )
+            )
+        return self.expected_nav_id == expected_nav_id and (
+            self.armed
+            or self.recoverable_stop_pending
+            or self.terminal_pending_stop
+        )
 
     def _adopt_first_valid_nav_id(self, nav_id: str) -> bool:
         if not self.awaiting_nav_id or nav_id in self.retired_nav_ids:
@@ -400,6 +455,8 @@ class VelocityProposalGate:
         self.armed = True
         self.awaiting_nav_id = False
         self.last_reason = ""
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
         return True
 
     def release_after_confirmed_stop(self, reason: str = "manual_stop") -> None:
@@ -410,6 +467,8 @@ class VelocityProposalGate:
         self.last_sequence = -1
         self.deadline_monotonic = 0.0
         self.recoverable_stop_active = False
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
         self.terminal_pending_stop = False
         if self.connected_topic and self.nav_id_binding_mode == "first_valid_proposal":
             self.awaiting_nav_id = True
@@ -424,6 +483,8 @@ class VelocityProposalGate:
         self.awaiting_nav_id = False
         self.deadline_monotonic = 0.0
         self.recoverable_stop_active = False
+        self.recoverable_stop_pending = False
+        self.recoverable_stop_reason = ""
         self.terminal_pending_stop = True
         self.last_reason = "terminal_pending_stop"
 
@@ -449,6 +510,10 @@ class VelocityProposalGate:
     ) -> ProposalDecision:
         if not self.connected_topic:
             return ProposalDecision(stop=True, reason="proposal_not_connected")
+        if self.recoverable_stop_pending:
+            return ProposalDecision(
+                reason=self.last_reason or "recoverable_stop_pending"
+            )
         if self.terminal_pending_stop:
             return ProposalDecision(reason=self.last_reason or "terminal_pending_stop")
         bootstrap = self.awaiting_nav_id
@@ -560,12 +625,18 @@ class VelocityProposalGate:
             "expected_nav_id": self.expected_nav_id or None,
             "active_nav_id": (
                 self.expected_nav_id
-                if self.armed or self.terminal_pending_stop
+                if (
+                    self.armed
+                    or self.recoverable_stop_pending
+                    or self.terminal_pending_stop
+                )
                 else None
             ),
             "awaiting_nav_id": self.awaiting_nav_id,
             "nav_id_binding_mode": self.nav_id_binding_mode or None,
             "terminal_pending_stop": self.terminal_pending_stop,
+            "recoverable_stop_pending": self.recoverable_stop_pending,
+            "recoverable_stop_reason": self.recoverable_stop_reason or None,
             "last_sequence": self.last_sequence if self.last_sequence >= 0 else None,
             "last_message_age_ms": age_ms,
             "last_reason": self.last_reason or None,

@@ -6,11 +6,13 @@ import unittest
 
 from safety_harness import (
     OdomStopMonitor,
+    RECOVERABLE_STOP_CONFIRM_RETRY_LIMIT,
     StopConfirmationStart,
     aggregate_stop_attempts,
     finish_stop_confirmation,
     issue_stop_and_confirm,
     resolve_stop_confirmation_timeout,
+    run_bounded_stop_confirmation_retries,
 )
 
 
@@ -262,6 +264,35 @@ class StopMoveConfirmationIntegrationTest(unittest.TestCase):
                 "confirmation_timed_out"
             ]
         )
+
+    def test_recoverable_stop_retry_budget_is_three_and_stops_on_success(self):
+        attempts = iter(
+            [
+                {"stop_confirmed": False},
+                {"stop_confirmed": True},
+                {"stop_confirmed": False},
+            ]
+        )
+        called = []
+
+        def attempt():
+            called.append(True)
+            return next(attempts)
+
+        result = run_bounded_stop_confirmation_retries(
+            attempt,
+            lambda: True,
+        )
+
+        self.assertEqual(RECOVERABLE_STOP_CONFIRM_RETRY_LIMIT, 3)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(len(called), 2)
+
+        exhausted = run_bounded_stop_confirmation_retries(
+            lambda: {"stop_confirmed": False},
+            lambda: True,
+        )
+        self.assertEqual(len(exhausted), 3)
 
 
 if __name__ == "__main__":

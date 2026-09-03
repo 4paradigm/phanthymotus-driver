@@ -647,8 +647,9 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         self.assertIn("stop_parent_velocity_proposal", source)
         self.assertEqual(
             source.count("= stop_parent_velocity_proposal()"),
-            2,
+            3,
         )
+        self.assertIn("def recoverable_stop_retry_loop", source)
         self.assertIn("last_proposal_stop_result = dict(result)", source)
         self.assertIn('"last_proposal_stop": (', source)
         self.assertIn("last_proposal_stop_result = None", source)

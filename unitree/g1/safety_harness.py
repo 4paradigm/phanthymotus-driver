@@ -45,6 +45,7 @@ from velocity_proposal import (
 UNITREE_STOP_MOVE_DURATION_SECONDS = 1.0
 DEFAULT_STOP_CONFIRM_TIMEOUT_SECONDS = 2.0
 MAX_STOP_CONFIRM_TIMEOUT_SECONDS = 3.0
+RECOVERABLE_STOP_CONFIRM_RETRY_LIMIT = 3
 TRANSLATION_OBSTACLE_EPSILON = 0.01
 
 
@@ -389,6 +390,25 @@ def aggregate_stop_attempts(attempts):
     result["stop_attempt_count"] = len(attempts)
     result["stop_attempts"] = [dict(attempt) for attempt in attempts]
     return result
+
+
+def run_bounded_stop_confirmation_retries(
+    attempt,
+    should_continue,
+    limit=RECOVERABLE_STOP_CONFIRM_RETRY_LIMIT,
+):
+    """Run at most ``limit`` stop confirmations, stopping on success/cancel."""
+    results = []
+    for _ in range(max(0, int(limit))):
+        if not should_continue():
+            break
+        result = attempt()
+        if result is None:
+            break
+        results.append(result)
+        if result.get("stop_confirmed") is True:
+            break
+    return results
 
 
 class ProposalExecutionLease:
@@ -1613,6 +1633,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     proposal_execution_lease = ProposalExecutionLease()
     proposal_connected = threading.Event()
     proposal_stop_transition = threading.Event()
+    recoverable_stop_retry_requested = threading.Event()
     safety_threads_shutdown = threading.Event()
     proposal_callback_ready = threading.Event()
     proposal_callback_failed = threading.Event()
@@ -1929,6 +1950,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 reason_str,
                 result.get("stop_confirmed") is True,
             )
+            if proposal_gate.recoverable_stop_pending:
+                # The dedicated retry worker owns the remaining three
+                # StopMove + odometry checks; do not also send bare retries.
+                stop_repeat_count = 0
         if was_moving:
             event_data = {"reason": reason_str}
             if reason_str == "obstacle":
@@ -1941,6 +1966,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             last_stop_result = dict(result)
             if proposal_stop_context:
                 last_proposal_stop_result = dict(result)
+        if recoverable_stop_requested and proposal_gate.recoverable_stop_pending:
+            recoverable_stop_retry_requested.set()
         if proposal_gate.terminal_pending_stop:
             proposal_gate.record_terminal_stop_result(
                 result.get("stop_confirmed") is True
@@ -1971,6 +1998,78 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
             0, stop_repeat_count - 1
         )
         return result
+
+    def retry_recoverable_stop_once(reason):
+        """Order one StopMove, then wait without holding the motion lock."""
+        with motion_command_lock:
+            if (
+                not proposal_gate.recoverable_stop_pending
+                or proposal_gate.recoverable_stop_reason != reason
+            ):
+                return None
+            start = odom_stop_monitor.begin_confirmation()
+            try:
+                watchdog_loco_client.StopMove()
+            except Exception:
+                pass
+            parent_stop = stop_parent_velocity_proposal()
+        return finish_stop_confirmation(
+            monitor=odom_stop_monitor,
+            start=start,
+            stop_move_ret=parent_stop.get("ret"),
+            stop_move_error=parent_stop.get("error"),
+            stop_move_completed_monotonic=parent_stop.get(
+                "completed_monotonic",
+                time.monotonic(),
+            ),
+            timeout=proposal_stop_confirm_timeout,
+            max_age=proposal_odom_timeout,
+            linear_epsilon=proposal_stop_linear_epsilon,
+            yaw_epsilon=proposal_stop_yaw_epsilon,
+        )
+
+    def recoverable_stop_retry_loop():
+        """Bound late physical-stop confirmation away from ROS callbacks."""
+        nonlocal last_stop_result, last_proposal_stop_result
+        while not safety_threads_shutdown.is_set():
+            if not recoverable_stop_retry_requested.wait(timeout=0.05):
+                continue
+            recoverable_stop_retry_requested.clear()
+            with motion_command_lock:
+                if not proposal_gate.recoverable_stop_pending:
+                    continue
+                reason = proposal_gate.recoverable_stop_reason
+                previous = dict(last_proposal_stop_result or {})
+                attempts = list(previous.get("stop_attempts") or [previous])
+                attempts = [attempt for attempt in attempts if attempt]
+
+            def should_continue():
+                return (
+                    not safety_threads_shutdown.is_set()
+                    and proposal_gate.recoverable_stop_pending
+                    and proposal_gate.recoverable_stop_reason == reason
+                )
+
+            retries = run_bounded_stop_confirmation_retries(
+                lambda: retry_recoverable_stop_once(reason),
+                should_continue,
+            )
+            if not retries:
+                continue
+            with motion_command_lock:
+                if (
+                    not proposal_gate.recoverable_stop_pending
+                    or proposal_gate.recoverable_stop_reason != reason
+                ):
+                    continue
+                result = aggregate_stop_attempts(attempts + retries)
+                result.update({"state": "idle", "reason": reason})
+                last_stop_result = dict(result)
+                last_proposal_stop_result = dict(result)
+                if result.get("stop_confirmed") is True:
+                    proposal_gate.record_recoverable_stop_result(reason, True)
+                else:
+                    proposal_gate.fail_recoverable_stop(reason)
 
     @motion_synchronized
     def do_stop_nav():
@@ -3407,6 +3506,11 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
         daemon=True,
         name="g1_loco_velocity_apply",
     )
+    recoverable_stop_retry_thread = threading.Thread(
+        target=recoverable_stop_retry_loop,
+        daemon=True,
+        name="g1_loco_recoverable_stop_retry",
+    )
     proposal_ros_thread = threading.Thread(
         target=proposal_ros_spin_loop,
         daemon=True,
@@ -3427,6 +3531,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     fsm_monitor_thread.start()
     proposal_watchdog_thread.start()
     proposal_apply_thread.start()
+    recoverable_stop_retry_thread.start()
     print(f"[SmartMotion:pid={os.getpid()}] entering main loop")
     running = True
     last_obstacle_check = 0.0
@@ -3603,6 +3708,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     # Cleanup
     safety_threads_shutdown.set()
+    recoverable_stop_retry_requested.set()
     proposal_connected.clear()
     try:
         executor.wake()
@@ -3617,6 +3723,9 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
     proposal_watchdog_thread.join(timeout=0.5)
     fsm_monitor_thread.join(timeout=0.75)
     proposal_apply_thread.join(timeout=proposal_rpc_timeout + 0.25)
+    recoverable_stop_retry_thread.join(
+        timeout=proposal_stop_confirm_timeout + 0.25
+    )
     if move_timer:
         move_timer.cancel()
     with motion_command_lock:

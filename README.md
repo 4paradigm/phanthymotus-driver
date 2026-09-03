@@ -109,9 +109,15 @@ through a reliable `KEEP_LAST(depth=1)` subscription and a capacity-one
 latest-only execution queue, so older unread or pending velocities are replaced
 instead of backlogged. A proposal TTL lapse immediately triggers `StopMove`;
 only a successful post-call zero-odometry confirmation keeps the same navigation
-lease recoverable for the next fresh proposal. Hard safety, identity, sequence,
-motion-RPC, explicit invalid-FSM, and stop-confirmation faults still disarm the
-lease.
+lease recoverable for the next fresh proposal. An initially unconfirmed
+recoverable stop enters `recoverable_stop_pending`: motion stays disabled and
+the task identity is retained while a dedicated worker performs at most three
+more ordered `StopMove` plus fresh-odometry confirmations. Each retry uses the
+configured confirmation timeout (2 seconds by default, hard-capped at 3
+seconds), so the default background budget is at most 6 seconds; success enters
+the normal recoverable hold, while exhausting the budget hard-disarms the lease.
+Hard safety, identity, sequence, motion-RPC, explicit invalid-FSM, and exhausted
+stop-confirmation faults still disarm the lease.
 Transient stale or failed FSM observations also stop immediately, but retain a
 confirmed-zero lease until a fresh allowed FSM and the other runtime safety
 inputs are ready again. Pending FSM and StopMove calls take priority over the

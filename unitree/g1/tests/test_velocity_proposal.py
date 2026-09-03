@@ -601,7 +601,7 @@ class ProposalGateTest(unittest.TestCase):
                 self.assertEqual(gate.expected_nav_id, "nav-001")
                 self.assertFalse(gate.recoverable_stop_active)
 
-    def test_unconfirmed_fsm_observation_stop_hard_disarms(self):
+    def test_unconfirmed_fsm_observation_stop_stays_pending(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
         self.gate.request_recoverable_stop(
             "main_control_status_stale",
@@ -615,12 +615,36 @@ class ProposalGateTest(unittest.TestCase):
             )
         )
         self.assertFalse(self.gate.armed)
+        self.assertTrue(self.gate.recoverable_stop_pending)
+        self.assertEqual(
+            self.gate.recoverable_stop_reason,
+            "main_control_status_stale",
+        )
         self.assertEqual(
             self.gate.last_reason,
-            "main_control_status_stale_stop_unconfirmed",
+            "main_control_status_stale_stop_pending",
         )
+        self.assertEqual(self.gate.snapshot(10.2)["active_nav_id"], "nav-001")
 
-    def test_unconfirmed_scan_stale_stop_hard_disarms(self):
+        blocked = self.gate.accept(
+            proposal(nav_id="nav-002", sequence=1),
+            now=10.2,
+        )
+        self.assertFalse(blocked.stop)
+        self.assertFalse(blocked.execute)
+        self.assertEqual(blocked.reason, "main_control_status_stale_stop_pending")
+
+        self.assertTrue(
+            self.gate.record_recoverable_stop_result(
+                "main_control_status_stale",
+                True,
+            )
+        )
+        self.assertTrue(self.gate.armed)
+        self.assertFalse(self.gate.recoverable_stop_pending)
+        self.assertTrue(self.gate.recoverable_stop_active)
+
+    def test_exhausted_scan_stale_stop_hard_disarms(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
         self.gate.request_recoverable_stop("scan_stale", now=10.1)
 
@@ -629,7 +653,27 @@ class ProposalGateTest(unittest.TestCase):
         )
         self.assertFalse(self.gate.armed)
         self.assertFalse(self.gate.recoverable_stop_active)
+        self.assertTrue(self.gate.recoverable_stop_pending)
+        self.assertEqual(self.gate.last_reason, "scan_stale_stop_pending")
+
+        self.assertTrue(self.gate.fail_recoverable_stop("scan_stale"))
+        self.assertFalse(self.gate.recoverable_stop_pending)
+        self.assertIsNone(self.gate.snapshot(10.2)["active_nav_id"])
         self.assertEqual(self.gate.last_reason, "scan_stale_stop_unconfirmed")
+
+    def test_repeated_implicit_bind_does_not_clear_pending_stop(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+        self.assertTrue(gate.accept(proposal(sequence=1), now=10.0).execute)
+        gate.request_recoverable_stop("obstacle", now=10.1)
+        gate.record_recoverable_stop_result("obstacle", False)
+
+        gate.bind(EXPECTED_TOPIC)
+
+        self.assertFalse(gate.armed)
+        self.assertTrue(gate.recoverable_stop_pending)
+        self.assertEqual(gate.expected_nav_id, "nav-001")
+        self.assertEqual(gate.last_reason, "obstacle_stop_pending")
 
     def test_invalid_schema_hard_disarms_during_scan_stale_hold(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)

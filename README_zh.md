@@ -93,8 +93,12 @@ G1 `loco` actuator 接收由导航 lease 约束的
 `KEEP_LAST(depth=1)`，执行端使用容量为 1 的 latest-only 队列：未读取
 或已等待的旧速度都会被新速度替换，不会积压。proposal TTL 失效会立即
 触发 `StopMove`；只有在返回后用新的 odometry 样本确认零速，同一导航
-lease 才能保留并接受下一条新鲜 proposal。安全、身份、序列、速度执行 RPC 和
-停车确认类硬故障仍会解除武装。明确查到非法 FSM 也属于硬故障；短暂的 FSM
+lease 才能保留并接受下一条新鲜 proposal。首次未确认的可恢复停车会进入
+`recoverable_stop_pending`：继续禁止运动并保留任务 ID，独立后台线程最多再执行
+3 次有序 `StopMove` 与新鲜里程计零速确认。每次使用配置的确认超时（默认
+2 秒，硬上限 3 秒），因此默认后台预算最多为 6 秒；任一次成功即进入
+正常可恢复 hold，耗尽预算才 hard disarm。
+安全、身份、序列、速度执行 RPC、明确非法 FSM 及耗尽停车确认预算仍属于硬故障。短暂的 FSM
 状态过期或查询失败同样会立即停车，但在确认零速后保留当前 lease。只有重新
 查到允许的 FSM，且其他运行时安全输入恢复新鲜，同一 `nav_id` 才能继续。
 待执行的 FSM 查询和 StopMove 优先于下一次速度 RPC；`loco info` 会返回 FSM 样本
