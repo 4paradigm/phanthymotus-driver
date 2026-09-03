@@ -1,5 +1,11 @@
 mcp_port: 15717
-ros_namespace: ""   # 留空则自动使用 hostname
+# Explicit, not blank: a blank value falls back to socket.gethostname(), which under Docker
+# is the container's random hex short ID -- ROS topic names cannot start with a digit, so
+# roughly 5/8 of container (re)starts crashed on the very first create_publisher() call
+# (e.g. namespace "3a80e6c6f048" -> invalid topic "/3a80e6c6f048/agibot_x2/imu"). This is
+# what caused the flaky deploy timeouts/crash-restart loops, independent of the "info" action
+# bug fixed alongside this.
+ros_namespace: "agibot_x2"
 
 # Which end-effector variant this robot is built with — selects the URDF served by the
 # `model` resource tool and the joint layout used by hand_state/hand_command.
