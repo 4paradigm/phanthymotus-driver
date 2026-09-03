@@ -333,7 +333,7 @@ def make_handler():
                     args   = params.get("arguments") or {}
                     result = _bundle.dispatch(name, args)
                     if result is None:
-                        err(-32601, f"Unknown tool: {name}")
+                        err(-32601, f"Unknown action: {name}")
                     else:
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
