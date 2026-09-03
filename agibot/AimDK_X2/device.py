@@ -526,7 +526,9 @@ class LocomotionPlugin:
         self._registered = False
 
     def get_tool(self):
-        return tool("locomotion", "actuator", "MC 行走速度控制：需先 register 输入源再 set_velocity", action_schema(
+        return tool("locomotion", "actuator", "MC 行走速度控制：需先 register 输入源再 set_velocity；"
+                    "另外机器人 FSM 必须已处于 locomotion_default/run_default 模式（用 mc_mode 切换），"
+                    "站立(stand_default)等模式下 register 会成功但 set_velocity 不会驱动实际行走", action_schema(
             self.ACTIONS,
             {
                 "forward": {"type": "number", "description": "前进速度 m/s，+前进/-后退"},
@@ -792,9 +794,10 @@ class PmuLedPlugin:
                 "g": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0},
                 "b": {"type": "integer", "minimum": 0, "maximum": 255, "default": 0},
                 "priority": {
-                    "type": "integer", "default": 1,
-                    "description": "灯带控制优先级；PMU 固件把 0 当作无优先级声明并拒绝请求"
-                    "（返回 status_code 4132），必须传 >=1 才会生效。",
+                    "type": "integer", "minimum": 0, "maximum": 100, "default": 100,
+                    "description": "灯带控制优先级 (0-100)；实测除 100（最高）外的任何值都被 PMU"
+                    "固件拒绝（返回 status_code 4132），推测系统默认状态灯以更高优先级占用了"
+                    "灯带，只有最高优先级请求才能覆盖。",
                 },
                 "reset_priority": {"type": "boolean", "default": False},
             },
@@ -819,7 +822,7 @@ class PmuLedPlugin:
         request.r = int(args.get("r", 0))
         request.g = int(args.get("g", 0))
         request.b = int(args.get("b", 0))
-        request.priority = int(args.get("priority", 1))
+        request.priority = int(args.get("priority", 100))
         request.reset_priority = bool(args.get("reset_priority", False))
         result = call_service(self.nodes.set_pmu_led, request)
         return {"status_code": result.status_code}
