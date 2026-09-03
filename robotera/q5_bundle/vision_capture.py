@@ -55,7 +55,10 @@ class Plugin:
         return {"state": "ready" if self._camera_ready() else "error"}
 
     def stop(self):
-        pass
+        # ``Q5Bundle.stop_all`` calls this during SIGTERM/redeploy.  Completing
+        # the ACP action here prevents Agent Core from retaining a pending
+        # recording while the daemon thread and its encoder are torn down.
+        return self._stop_recording()
 
     def _camera_ready(self):
         return self._worker is not None and bool(getattr(self._worker, "_running", False))
@@ -107,20 +110,71 @@ class Plugin:
         except Exception as exc:
             return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
 
-    def _record_video(self, requested, cancel_event):
+    @staticmethod
+    def _cancelled_result():
+        return {"ok": False, "code": "RECORD_CANCELLED",
+                "message": "Video recording was cancelled"}
+
+    def _set_recording_value(self, active, key, value):
+        if active is None:
+            return
+        with self._recording_lock:
+            if self._active_recording is active:
+                active[key] = value
+
+    def _finish_recording(self, active, status, result):
+        """Send one ACP terminal event and release the active-recording slot."""
+        with self._recording_lock:
+            if active.get("finished"):
+                return False
+            active["finished"] = True
+            if self._active_recording is active:
+                self._active_recording = None
+            action_id = active["action_id"]
+        _acp_notify(action_id, status, result, CARD)
+        return True
+
+    @staticmethod
+    def _terminate_encoder(process):
+        if process is None:
+            return
+        try:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2)
+        except Exception:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+            except Exception:
+                pass
+
+    def _record_video(self, requested, cancel_event, active=None):
         process = None
         path = None
         completed = False
         try:
             _, sequence = self._frame()
+            if cancel_event.is_set():
+                return self._cancelled_result()
             directory = self._output_dir / "videos"
             directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path = directory / f"video_{stamp}.mp4"
+            self._set_recording_value(active, "path", str(path))
             process = subprocess.Popen([
                 "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", str(self._fps), "-i", "-",
                 "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
             ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._set_recording_value(active, "process", process)
+            if cancel_event.is_set():
+                return self._cancelled_result()
             frames, deadline = 0, time.monotonic() + requested
             while time.monotonic() < deadline and not cancel_event.is_set():
                 # Require a later worker sequence for every encoded frame.  A
@@ -140,12 +194,14 @@ class Plugin:
             if process.wait(timeout=10) != 0 or not path.exists():
                 raise RuntimeError(stderr.strip() or "ffmpeg failed to create MP4")
             if cancel_event.is_set():
-                return {"ok": False, "code": "RECORD_CANCELLED", "message": "Video recording was cancelled"}
+                return self._cancelled_result()
             completed = True
             return {"ok": True, "media_type": "video", "file_path": str(path),
                     "recorded_duration_s": requested, "frames": frames,
                     "captured_at": datetime.now().isoformat(timespec="seconds")}
         except Exception as exc:
+            if cancel_event.is_set():
+                return self._cancelled_result()
             return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
         finally:
             if process is not None:
@@ -160,24 +216,22 @@ class Plugin:
                         process.wait(timeout=2)
                 except Exception:
                     pass
+            self._set_recording_value(active, "process", None)
             if not completed and path is not None:
                 try:
                     path.unlink(missing_ok=True)
                 except Exception:
                     pass
 
-    def _record_video_async(self, action_id, requested, cancel_event):
-        result = self._record_video(requested, cancel_event)
+    def _record_video_async(self, active, requested):
+        result = self._record_video(requested, active["cancel_event"], active)
         if result.get("ok"):
             status = "completed"
         elif result.get("code") == "RECORD_CANCELLED":
             status = "cancelled"
         else:
             status = "error"
-        _acp_notify(action_id, status, result, CARD)
-        with self._recording_lock:
-            if self._active_recording and self._active_recording["action_id"] == action_id:
-                self._active_recording = None
+        self._finish_recording(active, status, result)
 
     def _start_video_recording(self, args):
         try:
@@ -195,9 +249,11 @@ class Plugin:
             action_id = f"vision_capture_record_video_{int(time.time() * 1000)}"
             cancel_event = threading.Event()
             active = {"action_id": action_id, "state": "recording", "duration_s": requested,
-                      "started_at": datetime.now().isoformat(timespec="seconds"), "cancel_event": cancel_event}
+                      "started_at": datetime.now().isoformat(timespec="seconds"),
+                      "cancel_event": cancel_event, "process": None, "path": None,
+                      "finished": False}
             thread = threading.Thread(target=self._record_video_async,
-                                      args=(action_id, requested, cancel_event), daemon=True,
+                                      args=(active, requested), daemon=True,
                                       name="q5_vision_capture_record_video")
             active["thread"] = thread
             self._active_recording = active
@@ -211,7 +267,18 @@ class Plugin:
             if not active:
                 return {"state": "idle", "message": "No video recording is in progress"}
             active["cancel_event"].set()
-            return {"ok": True, "state": "cancelling", "action_id": active["action_id"]}
+            process = active.get("process")
+            partial_path = active.get("path")
+        self._terminate_encoder(process)
+        if partial_path:
+            try:
+                Path(partial_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        result = self._cancelled_result()
+        self._finish_recording(active, "cancelled", result)
+        return {"ok": True, "state": "idle", "action_id": active["action_id"],
+                "message": "Video recording cancelled"}
 
     def dispatch(self, action, args):
         if action == "start":

@@ -87,6 +87,39 @@ class VisionCaptureTests(unittest.TestCase):
         self.assertEqual(len(set(written)), len(written))
         self.assertTrue(all(sequence is not None for sequence in worker.after_sequences[1:]))
 
+    def test_stop_cancels_async_recording_and_notifies_acp_once(self):
+        worker = _Worker()
+        plugin = vision_capture.Plugin({}, "", None, _Client(worker))
+        started = threading.Event()
+        notifications = []
+        original_notify = vision_capture._acp_notify
+
+        def fake_record(requested, cancel_event, active=None):
+            del requested, active
+            started.set()
+            self.assertTrue(cancel_event.wait(1))
+            return plugin._cancelled_result()
+
+        plugin._record_video = fake_record
+        vision_capture._acp_notify = lambda *args: notifications.append(args)
+        try:
+            queued = plugin.dispatch("record_video", {"duration_s": 5})
+            self.assertTrue(started.wait(1))
+            stopped = plugin.stop()
+            self.assertEqual(stopped["state"], "idle")
+            self.assertEqual(stopped["action_id"], queued["action_id"])
+            for _ in range(100):
+                if notifications:
+                    break
+                time.sleep(0.01)
+        finally:
+            vision_capture._acp_notify = original_notify
+
+        self.assertEqual(len(notifications), 1)
+        self.assertEqual(notifications[0][0], queued["action_id"])
+        self.assertEqual(notifications[0][1], "cancelled")
+        self.assertEqual(plugin.dispatch("info", {})["active_recording"], None)
+
 
 if __name__ == "__main__":
     unittest.main()
