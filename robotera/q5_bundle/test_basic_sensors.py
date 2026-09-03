@@ -479,7 +479,8 @@ class Q5BasicSensorTests(unittest.TestCase):
         notifications = []
         original_notify = vision_capture._acp_notify
 
-        def fake_record(requested, cancel_event):
+        def fake_record(requested, cancel_event, active=None):
+            del active
             self.assertEqual(requested, 5)
             self.assertFalse(cancel_event.is_set())
             started.set()

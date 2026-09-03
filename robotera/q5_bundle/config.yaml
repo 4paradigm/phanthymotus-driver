@@ -73,7 +73,6 @@ plugins:
       color_profile: "848x480x30"
   vision_capture:
     enabled: true
-    source_topic: "/camera/camera/color/image_raw"
     # This is mounted from the Q5 host (/opt/phanthy-motus/data), so files
     # survive driver container replacement and restarts.
     output_dir: "/opt/phanthy-motus/data/vision_capture"
