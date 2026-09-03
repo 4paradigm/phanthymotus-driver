@@ -445,9 +445,16 @@ class QianjiaoDevice:
                     self.link.mav.rc_channels_override_send(1, 1, *channels)
 
         send(pwm)
+        cancel_event = values.get("_cancel_event")
+        if duration == -1:
+            while not self._stop.is_set() and not (cancel_event and cancel_event.is_set()):
+                self._stop.wait(0.1)
+                if not (cancel_event and cancel_event.is_set()) and not self._stop.is_set():
+                    send(pwm)
+            send([1500] * len(CHANNELS))
+            return {"state": "stopped", "duration": -1, "channels": dict(zip(CHANNELS, pwm))}
         if duration != -1:
             deadline = time.monotonic() + duration
-            cancel_event = values.get("_cancel_event")
             while (time.monotonic() < deadline and not self._stop.is_set()
                    and not (cancel_event and cancel_event.is_set())):
                 self._stop.wait(min(0.1, deadline - time.monotonic()))
@@ -488,9 +495,11 @@ class QianjiaoDevice:
         try:
             self.move({**args, "_cancel_event": cancel_event})
             with self._action_lock:
-                if self._active_action and self._active_action.get("action_id") == action_id:
+                owned = bool(self._active_action and self._active_action.get("action_id") == action_id)
+                if owned:
                     self._active_action = None
-            _acp_notify(action_id, "cancelled", {"reason": "stopped_by_user"})
+            if owned:
+                _acp_notify(action_id, "cancelled", {"reason": "stopped_by_user"})
         except Exception as exc:
             with self._action_lock:
                 if self._active_action and self._active_action.get("action_id") == action_id:
