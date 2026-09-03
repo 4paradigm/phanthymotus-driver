@@ -138,9 +138,9 @@ class SmartMotionProxy:
         return self._call("stop", reason=reason)
 
     def navigate_to(self, x: float, y: float, yaw: float, target_name: str = "",
-                    speed: float = 0.5, mode: int = 1) -> dict:
+                    speed: float = 0.5, mode: int = 1, navigation_id: str | None = None) -> dict:
         return self._call("navigate_to", x=x, y=y, yaw=yaw, target_name=target_name,
-                          speed=speed, mode=mode)
+                          speed=speed, mode=mode, navigation_id=navigation_id)
 
     def pause_nav(self, reason: str = "command") -> dict:
         return self._call("pause_nav", reason=reason)
@@ -151,9 +151,10 @@ class SmartMotionProxy:
     def stop_nav(self) -> dict:
         return self._call("stop_nav")
 
-    def wait_nav_done(self, stall_timeout: float = 60) -> dict:
+    def wait_nav_done(self, stall_timeout: float = 60,
+                      navigation_id: str | None = None) -> dict:
         return self._call("wait_nav_done", stall_timeout=stall_timeout,
-                          timeout=stall_timeout + 30)
+                          navigation_id=navigation_id, timeout=stall_timeout + 30)
 
     def get_state(self) -> dict:
         return self._call("get_state")
@@ -272,6 +273,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     nav_arrived_flag = False
     nav_arrived_error = None
     nav_current_pose = None
+    nav_generation = 0
 
     # ── Helpers ──
     def clamp(vx, vy, vyaw, zone):
@@ -660,16 +662,18 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         return {"ret": ret, "vx": clamped_vx, "vy": clamped_vy, "vyaw": clamped_vyaw,
                 "duration": duration, "state": state.value}
 
-    def handle_navigate_to(x, y, yaw, target_name, speed=0.5, mode=1, stall_timeout=60):
-        nonlocal state, nav_cmd, speed_zone, nav_arrived_flag, nav_arrived_error
+    def handle_navigate_to(x, y, yaw, target_name, speed=0.5, mode=1, stall_timeout=60,
+                           navigation_id=None):
+        nonlocal state, nav_cmd, speed_zone, nav_arrived_flag, nav_arrived_error, nav_generation
 
         if state == MotionState.MOVING:
             do_stop("command")
         elif state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
             do_stop_nav()
 
-        # Reset arrival state for this navigation session
+        # A new command invalidates all existing waits before resetting shared arrival state.
         with slam_info_lock:
+            nav_generation += 1
             nav_arrived_flag = False
             nav_arrived_error = None
 
@@ -689,7 +693,9 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             return {"error": f"NavigateTo failed, code={code}", "response": resp}
 
         label = target_name or f"({x:.1f}, {y:.1f})"
-        nav_cmd = {"target_name": label, "target_pose": {"x": x, "y": y, "yaw": yaw}, "start_time": time.time()}
+        nav_cmd = {"target_name": label, "target_pose": {"x": x, "y": y, "yaw": yaw},
+                   "start_time": time.time(), "navigation_id": navigation_id,
+                   "generation": nav_generation}
         state = MotionState.NAVIGATING
         speed_zone = SpeedZone.NORMAL
 
@@ -697,7 +703,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         # Return immediately — non-blocking. wait_navigation_done handles arrival detection.
         return {"status": "navigating", "target": label, "pose": {"x": x, "y": y, "yaw": yaw}}
 
-    def handle_wait_nav_done(stall_timeout=60):
+    def handle_wait_nav_done(stall_timeout=60, navigation_id=None):
         """Block until navigation completes or robot is stuck.
         Arrival detection: pose-based (distance to target < 0.3m).
         Also checks ctrl_info.is_arrived if SLAM service ever publishes it.
@@ -709,6 +715,10 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         wait_start = time.time()
 
         with slam_info_lock:
+            if not nav_cmd or (navigation_id is not None and
+                               nav_cmd.get("navigation_id") != navigation_id):
+                return {"status": "superseded"}
+            wait_generation = nav_cmd["generation"]
             last_pose = dict(nav_current_pose) if nav_current_pose else None
 
         if last_pose is None:
@@ -719,6 +729,10 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             elapsed = time.time() - wait_start
 
             with slam_info_lock:
+                if not nav_cmd or nav_cmd.get("generation") != wait_generation or \
+                        (navigation_id is not None and
+                         nav_cmd.get("navigation_id") != navigation_id):
+                    return {"status": "superseded"}
                 arrived = nav_arrived_flag
                 error = nav_arrived_error
                 pose = dict(nav_current_pose) if nav_current_pose else None
@@ -786,6 +800,12 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         # State changed externally (e.g., emergency stop)
         print(f"[SmartMotion] wait_nav_done: state changed to {state.value}", flush=True)
         return {"status": "stopped", "state": state.value}
+
+    def complete_wait_nav(cmd):
+        result = handle_wait_nav_done(cmd.get("stall_timeout", 60),
+                                      navigation_id=cmd.get("navigation_id"))
+        result["_req_id"] = cmd.get("_req_id")
+        result_queue.put(result)
 
     def handle_pause_nav(reason_str):
         nonlocal state
@@ -928,7 +948,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                                             cmd.get("target_name", ""),
                                             speed=cmd.get("speed", 0.5),
                                             mode=cmd.get("mode", 1),
-                                            stall_timeout=cmd.get("stall_timeout", 60))
+                                            stall_timeout=cmd.get("stall_timeout", 60),
+                                            navigation_id=cmd.get("navigation_id"))
             elif method == "pause_nav":
                 result = handle_pause_nav(cmd.get("reason", "command"))
             elif method == "resume_nav":
@@ -936,7 +957,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             elif method == "stop_nav":
                 result = do_stop_nav()
             elif method == "wait_nav_done":
-                result = handle_wait_nav_done(cmd.get("stall_timeout", 60))
+                threading.Thread(target=complete_wait_nav, args=(cmd,), daemon=True).start()
             elif method == "get_state":
                 result = handle_get_state()
             elif method == "start_mapping":

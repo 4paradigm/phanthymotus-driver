@@ -349,6 +349,7 @@ class ControlledSpatialPlugin:
         self._nav_arrived = threading.Event()
         self._nav_error: str | None = None
         self._nav_action_id: str | None = None  # current navigate ACP action_id
+        self._nav_generation = 0
         self._last_db_map_status: str | None = None
         self._lock = threading.Lock()
 
@@ -516,20 +517,19 @@ class ControlledSpatialPlugin:
                 return True
             return False
 
-    def _supersede_nav(self, action_id: str) -> None:
-        """Replace the current navigation action_id, cancelling the previous one.
-
-        The old action's ACP "cancelled" notification is posted outside the
-        lock so an Agent Core outage cannot block pose updates or other
-        navigation calls behind the network I/O.
-        """
+    def _supersede_nav(self, action_id: str) -> int:
+        """Replace the current navigation action and invalidate its local waiter."""
         with self._lock:
             old_action_id = self._nav_action_id
             self._nav_action_id = action_id
+            self._nav_generation += 1
+            generation = self._nav_generation
         if old_action_id:
             _acp_notify(old_action_id, "cancelled", {"reason": "superseded by new navigate"})
+        return generation
 
-    def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90, target_xy=None):
+    def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90,
+                      target_xy=None, generation: int | None = None):
         """Wait for navigation to complete, then fire ACP callback."""
         t0 = time.time()
 
@@ -538,7 +538,11 @@ class ControlledSpatialPlugin:
         # The main process DDS callback for ctrl_info.is_arrived is unreliable
         # (SLAM service never publishes ctrl_info in practice).
         if self._smart_motion:
-            result = self._smart_motion.wait_nav_done(stall_timeout=stall_timeout)
+            result = self._smart_motion.wait_nav_done(
+                stall_timeout=stall_timeout, navigation_id=action_id)
+            if result.get("status") == "superseded":
+                print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                return
             elapsed = round(time.time() - t0, 1)
             # Guard: if this nav was superseded, don't fire stale ACP
             if not self._try_claim_terminal(action_id):
@@ -567,6 +571,11 @@ class ControlledSpatialPlugin:
         last_move_time = time.time()
 
         while True:
+            with self._lock:
+                if generation is not None and self._nav_generation != generation:
+                    print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                    return
+
             # Pose-based arrival check before waiting for stale ctrl_info signal
             if target_xy is not None:
                 current_pose = self._get_pose()
@@ -810,17 +819,19 @@ class ControlledSpatialPlugin:
                     mode = 1  # 强制停障模式，不允许绕障
                 self._nav_arrived.clear()
                 self._nav_error = None
-                result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
-                                                     speed=speed, mode=mode)
-                if result.get("status") != "navigating":
-                    return result
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
-                self._supersede_nav(action_id)
+                result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
+                                                     speed=speed, mode=mode,
+                                                     navigation_id=action_id)
+                if result.get("status") != "navigating":
+                    return result
+                generation = self._supersede_nav(action_id)
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, tag_name, float(args.get("stall_timeout", 90)), (poi["x"], poi["y"])),
+                    args=(action_id, tag_name, float(args.get("stall_timeout", 90)),
+                          (poi["x"], poi["y"]), generation),
                     daemon=True,
                 ).start()
                 return result
@@ -838,10 +849,11 @@ class ControlledSpatialPlugin:
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
-                self._supersede_nav(action_id)
+                generation = self._supersede_nav(action_id)
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, tag_name, float(args.get("stall_timeout", 90)), (poi["x"], poi["y"])),
+                    args=(action_id, tag_name, float(args.get("stall_timeout", 90)),
+                          (poi["x"], poi["y"]), generation),
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target": tag_name,
@@ -861,16 +873,18 @@ class ControlledSpatialPlugin:
                     mode = 1  # 强制停障模式，不允许绕障
                 self._nav_arrived.clear()
                 self._nav_error = None
-                result = self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode)
-                if result.get("status") != "navigating":
-                    return result
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
-                self._supersede_nav(action_id)
+                result = self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode,
+                                                        navigation_id=action_id)
+                if result.get("status") != "navigating":
+                    return result
+                generation = self._supersede_nav(action_id)
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)), (x, y)),
+                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)),
+                          (x, y), generation),
                     daemon=True,
                 ).start()
                 return result
@@ -885,10 +899,11 @@ class ControlledSpatialPlugin:
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
-                self._supersede_nav(action_id)
+                generation = self._supersede_nav(action_id)
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)), (x, y)),
+                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)),
+                          (x, y), generation),
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw},
