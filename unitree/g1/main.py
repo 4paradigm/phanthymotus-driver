@@ -131,6 +131,11 @@ class G1DeviceBundle:
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
             print("[bundle] ArmActionPlugin loaded")
 
+        if plugins_cfg.get("arm_trajectory", {}).get("enabled", False):
+            from device import ArmTrajectoryPlugin
+            self._plugins.append(ArmTrajectoryPlugin(plugins_cfg["arm_trajectory"], namespace, executor))
+            print("[bundle] ArmTrajectoryPlugin loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from device import AsrPlugin
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, executor))

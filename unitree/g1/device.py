@@ -2011,6 +2011,340 @@ class ArmActionPlugin:
         return None
 
 
+# ── ArmTrajectoryPlugin (actuator) ────────────────────────────────────────────
+
+class ArmTrajectoryPlugin:
+    PREFIX = "arm_trajectory"
+
+    # 以下索引为推测值，必须真机确认
+    LEFT_ARM_MOTORS = {
+        "shoulder_pitch": 15,
+        "shoulder_roll": 16,
+        "shoulder_yaw": 17,
+        "elbow": 18,
+        "wrist_roll": 19,
+        "wrist_pitch": 20,
+        "wrist_yaw": 21,
+    }
+    # 以下索引为推测值，必须真机确认
+    # TODO: 真机确认：现有 config.yaml 中 head_control.motor_index=23 与此映射的 right_shoulder_roll 冲突，需同步核对。
+    RIGHT_ARM_MOTORS = {
+        "shoulder_pitch": 22,
+        "shoulder_roll": 23,
+        "shoulder_yaw": 24,
+        "elbow": 25,
+        "wrist_roll": 26,
+        "wrist_pitch": 27,
+        "wrist_yaw": 28,
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._lowcmd_topic = plugin_config.get("lowcmd_topic", "rt/lowcmd")
+        self._lowstate_topic = plugin_config.get("lowstate_topic", "rt/lowstate")
+        self._motor_mode = int(plugin_config.get("motor_mode", 10))  # TODO: 真机确认
+        self._default_kp = float(plugin_config.get("default_kp", 20.0))
+        self._default_kd = float(plugin_config.get("default_kd", 1.0))
+        self._control_freq_hz = float(plugin_config.get("control_freq_hz", 50))
+        self._publisher = None
+        self._trajectory_stop = threading.Event()
+        self._trajectory_thread = None
+        self._state_lock = threading.Lock()
+        self._current_angles_rad = {idx: None for idx in self._all_motor_indexes()}
+
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+            self._subscriber = ChannelSubscriber(self._lowstate_topic, LowState_)
+            self._subscriber.Init(self._on_lowstate, 10)
+        except Exception as e:
+            self._subscriber = None
+            print(f"[arm_trajectory] LowState subscription unavailable: {e}")
+
+    def get_tool(self) -> dict:
+        joint_schema = {
+            joint: {"type": "number", "description": f"{joint} target angle in degrees; omitted joints keep current command"}
+            for joint in self.LEFT_ARM_MOTORS
+        }
+        arm_schema = {
+            "type": "object",
+            "properties": joint_schema,
+            "description": "Arm joint target positions in degrees; omitted joints are not moved",
+        }
+        return {
+            "name": "arm_trajectory",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 custom arm joint position and trajectory control over LowCmd, complementary to the predefined gesture arm tool",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["set_positions", "move_to", "execute_trajectory", "get_positions", "release", "stop"],
+                        "description": "Action to perform",
+                    },
+                    "left_arm": arm_schema,
+                    "right_arm": arm_schema,
+                    "duration": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "default": 2.0,
+                        "description": "Interpolation duration in seconds for move_to and default waypoint duration",
+                    },
+                    "trajectory": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "left_arm": arm_schema,
+                                "right_arm": arm_schema,
+                                "duration": {"type": "number", "exclusiveMinimum": 0, "description": "Waypoint duration in seconds"},
+                            },
+                        },
+                        "description": "Array of waypoints; omitted joints inherit the previous waypoint/current LowState and may be commanded to hold position during execution",
+                    },
+                    "kp": {"type": "number", "default": self._default_kp, "description": "Position gain"},
+                    "kd": {"type": "number", "default": self._default_kd, "description": "Velocity damping gain"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "set_positions": {"params": ["left_arm", "right_arm", "kp", "kd"], "description": "Immediately publish one LowCmd frame for the specified joints only"},
+                    "move_to": {"params": ["left_arm", "right_arm", "duration", "kp", "kd"], "description": "Move from current LowState angles to target positions with linear interpolation"},
+                    "execute_trajectory": {"params": ["trajectory", "duration", "kp", "kd"], "description": "Execute an asynchronous multi-waypoint arm trajectory"},
+                    "get_positions": {"params": [], "description": "Read current arm joint positions from LowState"},
+                    "release": {"params": [], "description": "Release all 14 arm motors by publishing mode 0 once"},
+                    "stop": {"params": [], "description": "Stop the active background trajectory without publishing an extra command"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass  # DDS publisher is initialized lazily on the first command
+
+    def stop(self) -> None:
+        self._cancel_trajectory()
+
+    @classmethod
+    def _all_motor_indexes(cls) -> list[int]:
+        return list(cls.LEFT_ARM_MOTORS.values()) + list(cls.RIGHT_ARM_MOTORS.values())
+
+    @classmethod
+    def _motor_name(cls, idx: int) -> tuple[str, str]:
+        for joint, motor_idx in cls.LEFT_ARM_MOTORS.items():
+            if idx == motor_idx:
+                return "left_arm", joint
+        for joint, motor_idx in cls.RIGHT_ARM_MOTORS.items():
+            if idx == motor_idx:
+                return "right_arm", joint
+        return "unknown", str(idx)
+
+    def _on_lowstate(self, msg) -> None:
+        with self._state_lock:
+            for idx in self._all_motor_indexes():
+                if idx < len(msg.motor_state):
+                    self._current_angles_rad[idx] = float(msg.motor_state[idx].q)
+
+    def _get_publisher(self):
+        if self._publisher is None:
+            from unitree_sdk2py.core.channel import ChannelPublisher
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
+            self._publisher = ChannelPublisher(self._lowcmd_topic, LowCmd_)
+            self._publisher.Init()
+        return self._publisher
+
+    def _clamp_angle(self, angle_rad: float) -> float:
+        # TODO: 真机确认各手臂关节物理限位；当前使用宽泛保护范围。
+        return max(math.radians(-180.0), min(math.radians(180.0), angle_rad))
+
+    def _parse_arm_targets(self, args: dict) -> tuple[dict[int, float], dict[str, dict[str, float]]]:
+        targets: dict[int, float] = {}
+        reported = {"left_arm": {}, "right_arm": {}}
+        for arm_key, mapping in (("left_arm", self.LEFT_ARM_MOTORS), ("right_arm", self.RIGHT_ARM_MOTORS)):
+            arm_values = args.get(arm_key) or {}
+            for joint, angle_deg in arm_values.items():
+                if joint not in mapping:
+                    continue
+                angle_rad = self._clamp_angle(math.radians(float(angle_deg)))
+                targets[mapping[joint]] = angle_rad
+                reported[arm_key][joint] = math.degrees(angle_rad)
+        return targets, reported
+
+    def _current_snapshot(self) -> dict[int, float] | None:
+        with self._state_lock:
+            if any(angle is None for angle in self._current_angles_rad.values()):
+                return None
+            return {idx: float(angle) for idx, angle in self._current_angles_rad.items() if angle is not None}
+
+    def _send_positions(self, targets_rad: dict[int, float], kp: float | None = None, kd: float | None = None) -> dict:
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+
+        kp = self._default_kp if kp is None else float(kp)
+        kd = self._default_kd if kd is None else float(kd)
+        message = unitree_hg_msg_dds__LowCmd_()
+        set_joints = {"left_arm": {}, "right_arm": {}}
+        for idx, angle_rad in targets_rad.items():
+            if idx >= len(message.motor_cmd):
+                continue
+            angle_rad = self._clamp_angle(angle_rad)
+            motor = message.motor_cmd[idx]
+            # TODO: 真机确认手臂电机索引、position mode 10、角度方向与限位。
+            motor.mode = self._motor_mode
+            motor.q = angle_rad
+            motor.dq = 0.0
+            motor.tau = 0.0
+            motor.kp = kp
+            motor.kd = kd
+            arm_key, joint = self._motor_name(idx)
+            if arm_key in set_joints:
+                set_joints[arm_key][joint] = math.degrees(angle_rad)
+        # TODO: Confirm whether LowCmd CRC must be calculated before publishing.
+        published = self._get_publisher().Write(message)
+        return {"published": bool(published), "positions_deg": set_joints}
+
+    def _release_positions(self) -> dict:
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+
+        self._cancel_trajectory()
+        message = unitree_hg_msg_dds__LowCmd_()
+        for idx in self._all_motor_indexes():
+            if idx >= len(message.motor_cmd):
+                continue
+            motor = message.motor_cmd[idx]
+            # Release requires the arm to be physically supported before relaxing motors.
+            motor.mode = 0
+            motor.q = 0.0
+            motor.dq = 0.0
+            motor.tau = 0.0
+            motor.kp = 0.0
+            motor.kd = 0.0
+        published = self._get_publisher().Write(message)
+        return {"state": "released", "published": bool(published)}
+
+    def _cancel_trajectory(self) -> None:
+        self._trajectory_stop.set()
+        if self._trajectory_thread and self._trajectory_thread.is_alive() and self._trajectory_thread is not threading.current_thread():
+            timeout = max(0.2, 2.0 / max(self._control_freq_hz, 1.0))
+            self._trajectory_thread.join(timeout=timeout)
+
+    def _interpolate(self, start_rad: dict[int, float], target_rad: dict[int, float], duration: float, stop_event: threading.Event, kp: float, kd: float) -> bool:
+        duration = max(float(duration), 0.001)
+        period = 1.0 / max(self._control_freq_hz, 1.0)
+        steps = max(1, int(duration * self._control_freq_hz))
+        for step in range(1, steps + 1):
+            if stop_event.is_set():
+                return False
+            ratio = step / steps
+            frame = {
+                idx: start_rad[idx] + (target - start_rad[idx]) * ratio
+                for idx, target in target_rad.items()
+            }
+            self._send_positions(frame, kp=kp, kd=kd)
+            stop_event.wait(period)
+        return not stop_event.is_set()
+
+    def _start_move(self, targets_rad: dict[int, float], duration: float, kp: float, kd: float) -> dict:
+        if not targets_rad:
+            return {"error": "Provide left_arm and/or right_arm target joints"}
+        snapshot = self._current_snapshot()
+        if snapshot is None:
+            return {"error": "No complete LowState arm position received yet"}
+        self._cancel_trajectory()
+        stop_event = threading.Event()
+        self._trajectory_stop = stop_event
+        start = {idx: snapshot[idx] for idx in targets_rad}
+
+        def animate():
+            self._interpolate(start, targets_rad, duration, stop_event, kp, kd)
+
+        self._trajectory_thread = threading.Thread(target=animate, daemon=True, name="arm_trajectory_move")
+        self._trajectory_thread.start()
+        return {"state": "moving", "duration": duration, "target_deg": self._format_positions(targets_rad)}
+
+    def _start_trajectory(self, trajectory: list, default_duration: float, kp: float, kd: float) -> dict:
+        if not trajectory:
+            return {"error": "trajectory must contain at least one waypoint"}
+        snapshot = self._current_snapshot()
+        if snapshot is None:
+            return {"error": "No complete LowState arm position received yet"}
+
+        waypoints = []
+        previous = dict(snapshot)
+        for waypoint in trajectory:
+            if not isinstance(waypoint, dict):
+                return {"error": "Each trajectory waypoint must be an object"}
+            waypoint_duration = float(waypoint.get("duration", default_duration))
+            if waypoint_duration <= 0:
+                return {"error": "waypoint duration must be greater than 0"}
+            targets, _ = self._parse_arm_targets(waypoint)
+            merged = dict(previous)
+            merged.update(targets)
+            waypoints.append((merged, waypoint_duration))
+            previous = merged
+
+        self._cancel_trajectory()
+        stop_event = threading.Event()
+        self._trajectory_stop = stop_event
+
+        def animate():
+            current = dict(snapshot)
+            for target, duration in waypoints:
+                if stop_event.is_set():
+                    return
+                if not self._interpolate(current, target, duration, stop_event, kp, kd):
+                    return
+                current = dict(target)
+
+        self._trajectory_thread = threading.Thread(target=animate, daemon=True, name="arm_trajectory_execute")
+        self._trajectory_thread.start()
+        return {"state": "executing", "waypoints": len(waypoints)}
+
+    def _format_positions(self, positions_rad: dict[int, float]) -> dict:
+        result = {"left_arm": {}, "right_arm": {}}
+        for idx, angle_rad in positions_rad.items():
+            arm_key, joint = self._motor_name(idx)
+            if arm_key in result:
+                result[arm_key][joint] = math.degrees(angle_rad)
+        return result
+
+    def _get_positions(self) -> dict:
+        snapshot = self._current_snapshot()
+        if snapshot is None:
+            return {"error": "No complete LowState arm position received yet"}
+        return self._format_positions(snapshot)
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            self._cancel_trajectory()
+            return {"state": "idle"}
+        if action == "set_positions":
+            targets, _ = self._parse_arm_targets(args)
+            if not targets:
+                return {"error": "Provide left_arm and/or right_arm target joints"}
+            self._cancel_trajectory()
+            return self._send_positions(targets, kp=args.get("kp"), kd=args.get("kd"))
+        if action == "move_to":
+            targets, _ = self._parse_arm_targets(args)
+            duration = float(args.get("duration", 2.0))
+            if duration <= 0:
+                return {"error": "duration must be greater than 0"}
+            return self._start_move(targets, duration, float(args.get("kp", self._default_kp)), float(args.get("kd", self._default_kd)))
+        if action == "execute_trajectory":
+            trajectory = args.get("trajectory")
+            if not isinstance(trajectory, list) or not trajectory:
+                return {"error": "trajectory must be a non-empty array"}
+            duration = float(args.get("duration", 2.0))
+            if duration <= 0:
+                return {"error": "duration must be greater than 0"}
+            return self._start_trajectory(trajectory, duration, float(args.get("kp", self._default_kp)), float(args.get("kd", self._default_kd)))
+        if action == "get_positions":
+            return self._get_positions()
+        if action == "release":
+            return self._release_positions()
+        return None
+
+
 # ── StatePlugin (sensor) ─────────────────────────────────────────────────────
 
 class _LowStateNode(Node):
