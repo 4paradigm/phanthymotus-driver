@@ -214,6 +214,11 @@ def load_driver_yaml_cards():
     return {card["name"]: card["type"] for card in manifest["cards"]}
 
 
+def load_driver_config():
+    with open(DEVICE_DIR / "config.yaml", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
 def build_bundle_plugins(config=None):
     config = config if config is not None else {"end_effector": "hand", "plugins": {}}
     return device.build_plugins(config, "test_ns", FakeROS2())
@@ -235,14 +240,24 @@ def find_plugin(plugins, tool_name):
 
 
 class ToolInventoryTests(unittest.TestCase):
-    def test_tool_names_and_types_match_driver_yaml(self):
-        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
+    def test_default_config_tool_names_and_types_match_driver_yaml(self):
+        plugins = build_bundle_plugins(load_driver_config())
         definitions = tool_definitions(plugins)
         by_name = {d["name"]: d["type"] for d in definitions}
         expected = load_driver_yaml_cards()
-        self.assertEqual(set(by_name), set(expected), "tool inventory must match driver.yaml cards exactly")
+        self.assertEqual(set(by_name), set(expected), "default tool inventory must match driver.yaml cards exactly")
         for name, expected_type in expected.items():
             self.assertEqual(by_name[name], expected_type, f"tool '{name}' type mismatch")
+
+    def test_slam_enabled_adds_only_slam_control(self):
+        default_plugins = build_bundle_plugins(load_driver_config())
+        default_names = {d["name"] for d in tool_definitions(default_plugins)}
+
+        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
+        definitions = tool_definitions(plugins)
+        by_name = {d["name"]: d["type"] for d in definitions}
+        self.assertEqual(set(by_name) - default_names, {"slam_control"})
+        self.assertEqual(by_name["slam_control"], "actuator")
 
     def test_no_duplicate_tool_names(self):
         plugins = build_bundle_plugins()
