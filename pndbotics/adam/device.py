@@ -1372,6 +1372,97 @@ class HandPlugin:
 
 
 # ---------------------------------------------------------------------------
+# Hand-state sensor card
+# ---------------------------------------------------------------------------
+
+class _HandStatePublisherNode(Node):
+    """Publishes the shared DDS hand-state cache as JSON."""
+
+    def __init__(self, namespace: str, state_cache: HandStateCache,
+                 publish_rate_hz: float, state_timeout_sec: float):
+        super().__init__("adam_hand_state_publisher")
+        self._state_cache = state_cache
+        self._state_timeout_sec = state_timeout_sec
+        self._topic = f"/{namespace}/state/hand"
+        self._active = False
+        self._lock = threading.Lock()
+        self._publisher = self.create_publisher(String, self._topic, _best_effort_qos())
+        self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
+
+    def set_active(self, active: bool):
+        with self._lock:
+            self._active = bool(active)
+
+    def _publish(self):
+        with self._lock:
+            active = self._active
+        if not active:
+            return
+        payload = self._state_cache.snapshot(self._state_timeout_sec)
+        if payload is None:
+            return
+        message = String()
+        message.data = json.dumps(payload)
+        self._publisher.publish(message)
+
+
+class HandStatePlugin:
+    """Exposes actual 12-channel hand positions as a read-only sensor."""
+
+    PREFIX = "hand_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 state_cache: HandStateCache, **kwargs):
+        self._executor = executor
+        self._state_cache = state_cache
+        self._state_timeout_sec = float(plugin_config.get("state_timeout_sec", 1.0))
+        rate = float(plugin_config.get("publish_rate_hz", 50))
+        self._node = _HandStatePublisherNode(
+            namespace, state_cache, rate, self._state_timeout_sec)
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand_state",
+            "type": "sensor",
+            "description": "Adam hand state — actual positions for both 6-channel hands",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._state_cache.start()
+        self._node.set_active(True)
+
+    def stop(self):
+        self._node.set_active(False)
+
+    def close(self):
+        self.stop()
+        _destroy_ros_node(self._executor, self._node)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action in ("info", "hand_state"):
+            payload = self._state_cache.snapshot(self._state_timeout_sec)
+            if payload is not None:
+                return payload
+            status = self._state_cache.status(self._state_timeout_sec)
+            return {
+                "state": "unavailable" if not status["reader_available"] else "waiting",
+                "fresh": False,
+                "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+                **status,
+            }
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Local ZED Mini camera cards
 # ---------------------------------------------------------------------------
 
@@ -2346,9 +2437,10 @@ class AdamDeviceBundle:
             and (ros2_enabled is None or ros2_enabled)
         )
         hand_enabled = plugins_cfg.get("hand", {}).get("enabled", True)
+        hand_state_enabled = plugins_cfg.get("hand_state", {}).get("enabled", True)
         self._hand_state_cache = (
             HandStateCache(dds_handstate_sub)
-            if hand_enabled else None
+            if hand_enabled or hand_state_enabled else None
         )
 
         # StatePlugin
@@ -2382,11 +2474,16 @@ class AdamDeviceBundle:
             )
             self._plugins.append(p)
 
-        # HandPlugin
+        # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
+            self._plugins.append(p)
+        if hand_state_enabled and self._hand_state_cache is not None and self._ros2_enabled:
+            p = HandStatePlugin(
+                plugins_cfg.get("hand_state", {}), namespace, executor,
+                state_cache=self._hand_state_cache)
             self._plugins.append(p)
 
         # ModelPlugin
