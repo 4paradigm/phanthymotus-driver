@@ -1115,12 +1115,17 @@ class CameraPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
-            return {"state": "running"}
+            # Note: actual start() is called by lazy-start mechanism in main.py
+            # This just confirms the state
+            state = "running" if self._running else "starting"
+            return {"state": state}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
-        return {"state": "running"}
+            state = "running" if self._running else "idle"
+            return {"state": state, "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
+        return {"state": "running" if self._running else "idle"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
