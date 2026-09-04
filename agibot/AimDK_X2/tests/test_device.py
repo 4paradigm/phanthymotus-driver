@@ -249,15 +249,28 @@ class ToolInventoryTests(unittest.TestCase):
         for name, expected_type in expected.items():
             self.assertEqual(by_name[name], expected_type, f"tool '{name}' type mismatch")
 
-    def test_slam_enabled_adds_only_slam_control(self):
+    def test_explicitly_enabled_optional_features_register_expected_cards(self):
         default_plugins = build_bundle_plugins(load_driver_config())
         default_names = {d["name"] for d in tool_definitions(default_plugins)}
 
-        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
-        definitions = tool_definitions(plugins)
-        by_name = {d["name"]: d["type"] for d in definitions}
-        self.assertEqual(set(by_name) - default_names, {"slam_control"})
-        self.assertEqual(by_name["slam_control"], "actuator")
+        optional_cards = {
+            "hand_state": {"hand_state", "hand_command"},
+            "camera_depth": {"camera_depth"},
+            "lidar": {"lidar"},
+            "slam_pose": {"slam_pose"},
+            "slam": {"slam_control"},
+        }
+        for feature, expected_added in optional_cards.items():
+            config = load_driver_config()
+            config["plugins"][feature]["enabled"] = True
+            plugins = build_bundle_plugins(config)
+            names = {d["name"] for d in tool_definitions(plugins)}
+            self.assertEqual(names - default_names, expected_added, feature)
+
+    def test_default_config_does_not_register_unavailable_hardware_cards(self):
+        plugins = build_bundle_plugins(load_driver_config())
+        names = {d["name"] for d in tool_definitions(plugins)}
+        self.assertTrue(names.isdisjoint({"hand_state", "hand_command", "camera_depth", "lidar", "slam_pose", "slam_control"}))
 
     def test_no_duplicate_tool_names(self):
         plugins = build_bundle_plugins()
@@ -273,23 +286,23 @@ class ToolInventoryTests(unittest.TestCase):
         names_on = {d["name"] for d in tool_definitions(plugins_on)}
         self.assertIn("slam_control", names_on)
 
-    def test_actuator_tools_are_typed_actuator(self):
-        plugins = build_bundle_plugins()
+    def test_default_actuator_tools_are_typed_actuator(self):
+        plugins = build_bundle_plugins(load_driver_config())
         definitions = tool_definitions(plugins)
         expected_actuators = {
-            "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command",
-            "linkcraft", "pmu_led", "tts", "emoji", "mic_source",
+            "mc_mode", "locomotion", "preset_motion", "joint_command", "linkcraft",
+            "pmu_led", "tts", "emoji", "mic_source",
         }
         by_name = {d["name"]: d["type"] for d in definitions}
         for name in expected_actuators:
             self.assertEqual(by_name[name], "actuator", f"'{name}' must be an actuator tool")
 
-    def test_sensor_and_resource_tools_carry_expected_types(self):
-        plugins = build_bundle_plugins()
+    def test_default_sensor_resource_and_processor_tools_carry_expected_types(self):
+        plugins = build_bundle_plugins(load_driver_config())
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joint_state", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
+        for name in ("mc_state", "joint_state", "imu", "camera_rgb", "system_state", "linkcraft_catalog"):
             self.assertEqual(by_name[name], "sensor")
 
     def test_mc_mode_and_preset_motion_action_enums_nonempty(self):
