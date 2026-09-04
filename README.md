@@ -70,16 +70,23 @@ environment:
   - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
 ```
 
-Every driver's `deploy/service.yml` carries this except two dual-domain drivers that configure DDS in
-code (`engineai/t800`, `x-humanoid/tianyi2.0` — see the table in README_dev). Deploying through the
-dashboard needs no extra step. It matters when you write a new driver or hand-assemble a compose
-file, because a container that misses it **cannot reach Agent Core at all** — the device registers
+Every driver's `deploy/service.yml` carries this, with two exceptions that are not the same kind of
+exception. `x-humanoid/tianyi2.0` mounts the profile but selects it per DDS context in code, because a
+process-wide default would put its body link on loopback and cut it — it is isolated.
+`engineai/t800` runs on CycloneDDS, which a FastDDS profile cannot reach at all, so **its domain-42
+context is still on the LAN** — a known gap, not a covered case. Deploying through the dashboard
+needs no extra step. This matters when you write a new driver or hand-assemble a compose file,
+because a container that misses the profile **cannot reach Agent Core at all** — the device registers
 over HTTP and appears in the dashboard while none of its topics ever carry data.
 
 `ROS_DOMAIN_ID` is 42 on every robot; there are no per-robot numbers to allocate. Links to the robot
 body are unaffected — those go over CycloneDDS with an explicitly bound interface, which this
-profile does not touch. Full rationale, the failure modes and how to verify:
-[README_dev.md § DDS isolation](README_dev.md#dds-isolation--every-driver-must-load-the-profile).
+profile does not touch.
+
+`./scripts/check_service_yml.py` verifies all of the above across every driver; run it on any PR that
+adds or edits a `service.yml`. Full rationale, the failure modes and how to verify:
+[README_dev.md § DDS isolation](README_dev.md#dds-isolation--load-the-profile-unless-the-driver-manages-dds-itself)
+and [§ service.yml checklist](README_dev.md#serviceyml-checklist-for-a-new-driver).
 
 ### Run Locally (without Docker)
 
