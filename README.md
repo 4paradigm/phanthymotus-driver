@@ -70,9 +70,13 @@ environment:
   - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
 ```
 
-Every driver's `deploy/service.yml` carries this, with two exceptions that are not the same kind of
-exception. `x-humanoid/tianyi2.0` mounts the profile but selects it per DDS context in code, because a
-process-wide default would put its body link on loopback and cut it — it is isolated.
+Every driver's `deploy/service.yml` carries this, with two exceptions, neither of them fully
+isolated. `x-humanoid/tianyi2.0` cannot use this profile at all: it holds a body context and an
+Agent Core context in one process, and a loopback-only profile cuts the body link. It runs the
+**vendor** profile process-wide instead, whose whitelist happens to exclude the office LAN — so no
+cross-robot command leakage, but not loopback either. (Per-participant profile selection is *not*
+possible here; FastDDS caches profiles process-wide. An earlier version of this file claimed
+otherwise and the claim cost a regression — see README_dev.)
 `engineai/t800` runs on CycloneDDS, which a FastDDS profile cannot reach at all, so **its domain-42
 context is still on the LAN** — a known gap, not a covered case. Deploying through the dashboard
 needs no extra step. This matters when you write a new driver or hand-assemble a compose file,
