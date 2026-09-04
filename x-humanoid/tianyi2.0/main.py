@@ -660,7 +660,8 @@ def _start_joints_bridge(cfg: dict) -> None:
     global _joints_bridge_proc
     if not cfg.get("joints_bridge", {}).get("enabled", False):
         return
-    bridge_path = Path(__file__).parent / "joints_bridge.py"
+    # Use the new two-process bridge with proper DDS isolation
+    bridge_path = Path(__file__).parent / "joints_bridge_v2.py"
     bridge_env = os.environ.copy()
     bridge_env["CONFIG_PATH"] = os.environ.get(
         "CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
@@ -669,7 +670,7 @@ def _start_joints_bridge(cfg: dict) -> None:
             [sys.executable, str(bridge_path)],
             env=bridge_env,
         )
-        print(f"[bundle] joints bridge started (pid={_joints_bridge_proc.pid})", flush=True)
+        print(f"[bundle] joints bridge v2 started (pid={_joints_bridge_proc.pid})", flush=True)
     except Exception as e:
         print(f"[bundle] joints bridge FAILED: {e}", flush=True)
 
