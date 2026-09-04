@@ -11,11 +11,13 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 |---|---|---|
 | `/aima/hal/imu/chest/state`, `/aima/hal/imu/torso/state` | `imu` | merged into one `data/json` stream |
 | `/aima/hal/joint/hand/state` | `hand_state` | `HandStateArray`, includes touch sensors |
+| `/aima/hal/sensor/touch_head` | `head_touch` | `TouchState`, confirmed publisher on the X2 unit |
+| `/aima/hal/pmu/state` | `pmu_state` | `PmuState`, confirmed publisher on the X2 unit |
 | `/aima/hal/joint/hand/command` | `hand_command` | |
 | `/aima/hal/joint/*/command` | `joint_command` | wildcard resolved to `leg`/`waist`/`arm`/`head` |
-| `/aima/hal/pmu/state` | — | not currently exposed as a tool (no card in the approved plan) |
 | `/aima/hal/sensor/lidar_chest_front/lidar_pointcloud` | `lidar` | `sensor/pointcloud` |
 | `/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed` | `camera_rgb` | catalog documents `rgbd_head_front/rgb_image/compressed` instead, but on real hardware that topic has zero publishers — confirmed via `ros2 topic info` that `rgb_head_front_center` is what's actually live (30Hz); see below |
+| `/aima/hal/sensor/rgb_head_front_center/camera_info` | `camera_info` | `CameraInfo`, confirmed publisher on the X2 unit |
 | `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` | zero publishers on real hardware, and no depth topic exists anywhere in the live `ros2 topic list` on this unit — depth appears to not be active/available on this X2 at all, kept wired to the documented name pending vendor confirmation |
 | `/aima/mc/locomotion/velocity` | `locomotion` | |
 | `/integrated_command` | `slam_control` | plain `std_msgs/String`, not a service |

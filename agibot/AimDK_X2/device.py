@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from common.vendor_runtime import action_schema, jsonable, tool
@@ -76,6 +77,27 @@ EMOJI_IDS = {
 MIC_SOURCES = {"internal": 0, "external": 1}
 
 RESOURCE_DIR = Path(__file__).with_name("resource")
+SKELETON_TOPIC = "state/joints"
+
+
+def skeleton_layout(variant):
+    root = ET.parse(RESOURCE_DIR / f"x2_{variant}.urdf").getroot()
+    names = [
+        joint.get("name") for joint in root.findall("joint")
+        if joint.get("name") and joint.get("type") != "fixed"
+    ]
+    groups = {"leg": [], "waist": [], "arm": [], "head": []}
+    for name in names:
+        if name.startswith(("left_hip", "right_hip", "left_knee", "right_knee", "left_ankle", "right_ankle")):
+            groups["leg"].append(name)
+        elif name.startswith("waist_"):
+            groups["waist"].append(name)
+        elif name.startswith(("left_shoulder", "right_shoulder", "left_elbow", "right_elbow", "left_wrist", "right_wrist")):
+            groups["arm"].append(name)
+        elif name.startswith("head_"):
+            groups["head"].append(name)
+    indices = {name: index for index, name in enumerate(names)}
+    return {area: tuple(area_names) for area, area_names in groups.items()}, indices
 
 
 def call_service(client, request, timeout=5.0):
@@ -100,11 +122,11 @@ class AimdkNodes:
     def __init__(self, config, namespace, ros2):
         from rclpy.node import Node
         from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
-        from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
+        from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu, PointCloud2
         from std_msgs.msg import String
         from geometry_msgs.msg import Pose
         from nav_msgs.msg import Odometry
-        from aimdk_msgs.msg import CommonRequest
+        from aimdk_msgs.msg import CommonRequest, PmuState, TouchState
         from aimdk_msgs.srv import (
             ExecuteActionResource, GetAllJointState, GetCurrentInputSource, GetHandType,
             GetMcAction, GetMicSourceRequest, GetRobotResources, GetStoredMapByName,
@@ -113,6 +135,7 @@ class AimdkNodes:
         )
         from aimdk_msgs.msg import (
             HandCommand, HandCommandArray, HandStateArray, JointCommand, JointCommandArray,
+            JointStateArray,
             McLocomotionVelocity,
         )
 
@@ -125,6 +148,7 @@ class AimdkNodes:
 
         self.config = config
         self.end_effector = str(config.get("end_effector", "hand")).lower()
+        self.skeleton_joints, self.skeleton_joint_indices = skeleton_layout(self.end_effector)
         self.namespace = namespace
         self.robot = Node("agibot_x2_driver_robot", context=ros2.ctx_robot)
         self.core = Node("agibot_x2_driver_core", context=ros2.ctx_core)
@@ -133,6 +157,7 @@ class AimdkNodes:
 
         self.lock = threading.RLock()
         self.values = {}
+        self.joint_groups = {}
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         command_qos = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
@@ -159,15 +184,30 @@ class AimdkNodes:
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
         mirror("hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json", qos=sensor_qos)
+        mirror("head_touch", TouchState, "/aima/hal/sensor/touch_head", "data/json", qos=sensor_qos)
+        mirror("pmu_state", PmuState, "/aima/hal/pmu/state", "data/json", qos=sensor_qos)
         # SDK's topics_and_services catalog documents rgbd_head_front/* as the front camera, but
         # on real hardware that topic has zero publishers -- this unit's camera service actually
         # publishes RGB under rgb_head_front_center/* instead (confirmed live via `ros2 topic
         # info`, 30Hz). No depth topic is published anywhere on this hardware at all, so
         # camera_depth stays wired to the documented (currently inactive) topic.
         mirror("camera_rgb", CompressedImage, "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed", "image/jpeg", qos=sensor_qos)
+        mirror("camera_info", CameraInfo, "/aima/hal/sensor/rgb_head_front_center/camera_info", "data/json", qos=sensor_qos)
         mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
         mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
         mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
+
+        for area, topic in ((area, f"/aima/hal/joint/{area}/state") for area in JOINT_AREAS):
+            self.robot.create_subscription(
+                JointStateArray, topic, self._joint_state_callback(area), sensor_qos,
+            )
+        skeleton_topic = f"/{namespace}/{SKELETON_TOPIC}"
+        self.skeleton_pub = self.core.create_publisher(String, skeleton_topic, 5)
+        self.streams["joints"] = {
+            "robot_topic": "/aima/hal/joint/{leg,waist,arm,head}/state",
+            "topic": skeleton_topic,
+            "format": "sensor/skeleton",
+        }
 
         # /integrated_command and /relocalization_pose are outbound-only (SLAM control), not
         # mirrored streams -- they are plain publishers used by SlamControlPlugin.
@@ -233,6 +273,42 @@ class AimdkNodes:
             publisher.publish(output)
         return callback
 
+    def _joint_state_callback(self, area):
+        def callback(msg):
+            with self.lock:
+                self.joint_groups[area] = msg
+                snapshot = self._skeleton_snapshot_locked()
+            output = self._msg["String"]()
+            output.data = json.dumps(snapshot, ensure_ascii=False)
+            self.skeleton_pub.publish(output)
+        return callback
+
+    def _skeleton_snapshot_locked(self):
+        joints = []
+        for area, names in self.skeleton_joints.items():
+            msg = self.joint_groups.get(area)
+            if msg is None:
+                continue
+            for index, state in enumerate(getattr(msg, "joints", [])):
+                if index >= len(names):
+                    break
+                name = names[index]
+                item = {
+                    "idx": self.skeleton_joint_indices[name],
+                    "name": name,
+                    "q": float(state.position),
+                    "dq": float(state.velocity),
+                    "tau": float(state.effort),
+                }
+                if getattr(state, "error_code", 0):
+                    item["error_code"] = int(state.error_code)
+                joints.append(item)
+        return {"format": "sensor/skeleton", "joints": joints, "joint_count": len(joints), "position_unit": "rad"}
+
+    def skeleton_snapshot(self):
+        with self.lock:
+            return self._skeleton_snapshot_locked()
+
     def request_header(self):
         # CommonRequest.header is typed RequestHeader, which per the vendor schema has only
         # a `stamp` field (no `frame_id` — that belongs to the separate MessageHeader type
@@ -289,6 +365,29 @@ class McStatePlugin:
         request.request = self.nodes.request_header()
         result = call_service(self.nodes.get_mc_action, request)
         return jsonable(result.info)
+
+
+class JointsPlugin:
+    """Publish X2 joint feedback in the sensor/skeleton contract for 3D rendering."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return _stream_tool("joints", self.nodes.streams["joints"], "X2 全身关节实时骨架（由 JointStateArray 驱动）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        if action in ("info", "read", "get", "joints"):
+            return {"state": "running", "data": self.nodes.skeleton_snapshot(), **self.nodes.streams["joints"]}
+        return {"state": "running", **self.nodes.streams["joints"]}
 
 
 class JointStatePlugin:
@@ -378,6 +477,7 @@ class CameraPlugin:
     def get_tools(self):
         return [
             _stream_tool("camera_rgb", self.nodes.streams["camera_rgb"], "前置 RGBD 相机彩色画面（压缩 JPEG）"),
+            _stream_tool("camera_info", self.nodes.streams["camera_info"], "前置 RGB 相机标定内参（CameraInfo）"),
             _stream_tool("camera_depth", self.nodes.streams["camera_depth"], "前置 RGBD 相机深度画面"),
         ]
 
@@ -392,6 +492,29 @@ class CameraPlugin:
         if action == "stop":
             return {"state": "idle"}
         return {"state": "running", **self.nodes.streams[name]}
+
+
+class ReadOnlyStreamPlugin:
+    """Expose a JSON-mirrored vendor topic as a read-only sensor card."""
+
+    def __init__(self, nodes, name, description):
+        self.nodes = nodes
+        self.name = name
+        self.description = description
+
+    def get_tool(self):
+        return _stream_tool(self.name, self.nodes.streams[self.name], self.description)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        return {"state": "running", **self.nodes.streams[self.name]}
 
 
 class LidarPlugin:
@@ -1133,8 +1256,11 @@ def build_plugins(config, namespace, ros2):
         return plugin_config.get(name, {}).get("enabled", default)
 
     plugins = [
-        McStatePlugin(nodes), JointStatePlugin(nodes), HandStatePlugin(nodes),
-        ImuPlugin(nodes), CameraPlugin(nodes), LidarPlugin(nodes), SlamPosePlugin(nodes),
+        McStatePlugin(nodes), JointsPlugin(nodes), JointStatePlugin(nodes), HandStatePlugin(nodes),
+        ImuPlugin(nodes), CameraPlugin(nodes),
+        ReadOnlyStreamPlugin(nodes, "head_touch", "头部触摸事件与八通道原始触摸数据"),
+        ReadOnlyStreamPlugin(nodes, "pmu_state", "PMU 电压、电流、温度和电源状态"),
+        LidarPlugin(nodes), SlamPosePlugin(nodes),
         SystemStatePlugin(nodes), LinkcraftCatalogPlugin(nodes), ModelPlugin(nodes),
         McModePlugin(nodes), LocomotionPlugin(nodes), PresetMotionPlugin(nodes),
         JointCommandPlugin(nodes), HandCommandPlugin(nodes), LinkcraftPlugin(nodes),
