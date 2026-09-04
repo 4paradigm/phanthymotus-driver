@@ -769,12 +769,14 @@ Two things that bite when deploying by hand:
   which is expected — the whitelist decides which interface it joins on). Agent Core also exposes
   `GET /api/peer/dds_isolation`.
 
-**Two drivers do not set these lines in `environment`, because a process-wide default would reach
-the wrong context.** If you write a driver in either shape, the profile has to be applied in code:
+**Two drivers do not set these lines in `environment`, for two different reasons — and only one of
+them is a solved case.** If you write a driver in either shape, read the row that matches:
 
-| Driver | Why the compose variable does not work |
-|---|---|
-| `engineai/t800` | Its `CMD` forces `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, so **both** its domains run on CycloneDDS. `FASTRTPS_DEFAULT_PROFILES_FILE` has no effect at all; CycloneDDS is configured through `CYCLONEDDS_URI`, which this driver already pins to the robot interface (`eth1`). |
+| Driver | Why the compose variable does not work | Status |
+|---|---|---|
+| `engineai/t800` | Its `CMD` forces `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, so **both** its domains run on CycloneDDS. `FASTRTPS_DEFAULT_PROFILES_FILE` has no effect at all; CycloneDDS is configured through `CYCLONEDDS_URI`, which this driver pins to the robot interface (`eth1`) — for both contexts. | **Open gap — not isolated.** Its domain-42 traffic is still on the LAN. Closing it needs a separate CycloneDDS config confining the Agent Core context to loopback, selected per context the way tianyi does for FastDDS. Untried: no T800 hardware available. `check_service_yml.py` reports it as `GAP`. |
+| `x-humanoid/tianyi2.0` | It holds **two FastDDS contexts in one process** (`DualDomainROS2` in `main.py`, `BridgeROS2` in `joints_bridge.py`) and selects a profile per context by setting the variable around each `rclpy.init()`: the vendor profile for the body (domain 0), the loopback profile for Agent Core (domain 42). A process-wide default would put the body link on loopback and cut it — which is why the mount is there but the environment variable is not. | **Isolated**, verified on the robot (below). |
+
 | `x-humanoid/tianyi2.0` | It holds **two FastDDS contexts in one process** (`DualDomainROS2` in `main.py`, `BridgeROS2` in `joints_bridge.py`) and selects a profile per context by setting the variable around each `rclpy.init()`: the vendor profile for the body (domain 0), the loopback profile for Agent Core (domain 42). A process-wide default would put the body link on loopback and cut it — which is why the mount is there but the environment variable is not. |
 
 Tianyi's Agent Core context **is** isolated now (it used to pop the variable and run on every
@@ -785,6 +787,42 @@ interface). Measured on the robot with the body powered: its domain-42 sockets m
 Core's topic count and joint/IMU/battery states were unchanged. The code falls back to popping the
 variable if the profile file is missing, so a container predating the mount still reaches Agent Core
 rather than failing silently — it logs that it is not isolated.
+
+### service.yml checklist for a new driver
+
+Run `./scripts/check_service_yml.py` to verify all of this — it is what a reviewer should run on any
+PR that adds or edits a `deploy/service.yml`. It exits non-zero on a violation, so it also works as
+a CI step.
+
+- [ ] mounts `/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro`
+- [ ] sets `FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml`
+- [ ] does not set `FASTDDS_BUILTIN_TRANSPORTS` — it conflicts with the profile's
+      `useBuiltinTransports=false`, and an image that bakes it into `ENV` cannot be corrected from
+      compose anyway (the XML wins, so the variable only misleads whoever reads the file next)
+- [ ] `ROS_DOMAIN_ID=42` — the same on every robot; there is nothing to allocate. A driver holding
+      a second context may spell it `<PREFIX>_ROS_DOMAIN_ID` for the body and
+      `AGENT_CORE_ROS_DOMAIN_ID` for this one; only the Agent Core side must be 42
+- [ ] `network_mode: host` — isolation works by confining DDS to loopback, and containers share a
+      loopback only under host networking
+
+The first two are the ones that break a robot rather than merely leaving it unisolated: with
+`useBuiltinTransports=false` everywhere else, a container that misses them ends up on a different
+transport from the rest of the machine and **cannot reach Agent Core at all** — the device registers
+over HTTP and appears in the dashboard while none of its topics ever carry data, which sends you
+looking at the driver instead of at compose.
+
+The checker keeps two tables instead of one, so that neither exception quietly becomes a loophole:
+
+- `IN_CODE_PROFILE` — drivers that must **not** set the environment variable because they select a
+  profile per context in code (`x-humanoid/tianyi2.0`). The mount is still required. Setting the
+  variable here is a failure, not a pass.
+- `KNOWN_GAPS` — drivers a FastDDS profile cannot isolate at all, currently `engineai/t800`, whose
+  RMW is CycloneDDS. It is reported as `GAP` and does not fail the run. Adding a third such driver
+  means editing this table, which is the point: the gap stays visible rather than passing a check
+  named "isolation".
+
+`ipc` and `pid` are deliberately **not** checked — they vary legitimately across drivers (a drone
+does not need `pid: host`), and the profile disables shared memory anyway.
 
 ---
 
