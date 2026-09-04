@@ -6,7 +6,7 @@ hardware_model: "g1"
 image_name: g1
 port: 15701
 mcp_url: "http://localhost:15701/mcp"
-description: "Unitree G1 — 麦克风 + 内置TTS + LED + 运动控制 + 手臂动作 + 状态感知"
+description: "Unitree G1 — 麦克风 + 内置TTS + LED + 运动控制 + 手臂动作 + 状态感知 + 导航 LiDAR/IMU + 自描述 RGB/Depth"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -36,7 +36,11 @@ cards:
   - { name: camera_rgb,             type: sensor }
   - { name: camera_depth,           type: sensor }
   - { name: camera_distance,        type: sensor }
+  - { name: camera_rgb_frame,       type: sensor }
+  - { name: camera_depth_frame,     type: sensor }
   - { name: lidar_cloud,            type: sensor }
+  - { name: navigation_lidar,       type: sensor }
+  - { name: navigation_imu,         type: sensor }
   - { name: controlled_spatial,     type: actuator }
   - { name: controlled_spatial_map, type: sensor }
   - { name: motion_switcher,        type: actuator }
