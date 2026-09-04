@@ -769,19 +769,22 @@ Two things that bite when deploying by hand:
   which is expected — the whitelist decides which interface it joins on). Agent Core also exposes
   `GET /api/peer/dds_isolation`.
 
-**Two drivers deliberately do not carry these lines, because the variable would not reach the
-context that matters.** If you write a driver in either shape, the profile has to be applied in code,
-not in compose:
+**Two drivers do not set these lines in `environment`, because a process-wide default would reach
+the wrong context.** If you write a driver in either shape, the profile has to be applied in code:
 
 | Driver | Why the compose variable does not work |
 |---|---|
 | `engineai/t800` | Its `CMD` forces `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, so **both** its domains run on CycloneDDS. `FASTRTPS_DEFAULT_PROFILES_FILE` has no effect at all; CycloneDDS is configured through `CYCLONEDDS_URI`, which this driver already pins to the robot interface (`eth1`). |
-| `x-humanoid/tianyi2.0` | `joints_bridge.py` sets the *vendor* profile for the body context (domain 0), then **pops** `FASTRTPS_DEFAULT_PROFILES_FILE` before creating the Agent Core context (domain 42). Anything set in compose is removed before the context that would use it exists — so that context currently runs on the default transport, i.e. every interface. |
+| `x-humanoid/tianyi2.0` | It holds **two FastDDS contexts in one process** (`DualDomainROS2` in `main.py`, `BridgeROS2` in `joints_bridge.py`) and selects a profile per context by setting the variable around each `rclpy.init()`: the vendor profile for the body (domain 0), the loopback profile for Agent Core (domain 42). A process-wide default would put the body link on loopback and cut it — which is why the mount is there but the environment variable is not. |
 
-The Tianyi case is a **known isolation gap**, not a design decision: its Agent Core domain is still
-reachable from the network. Fixing it means setting the loopback profile (instead of popping the
-variable) just before `ctx_core` is created, which needs a check on the real robot because the same
-lines carry its body link.
+Tianyi's Agent Core context **is** isolated now (it used to pop the variable and run on every
+interface). Measured on the robot with the body powered: its domain-42 sockets moved from
+`0.0.0.0:17900/17912-17915` to `127.0.0.1`, the two profile lines appear in its log
+(`domain0: using DDS profile /work/dds_profile.xml`, `domain42: using DDS profile
+/opt/phanthy-motus/dds-local.xml`), the body's `/arm/*` topics stayed visible on domain 0, and Agent
+Core's topic count and joint/IMU/battery states were unchanged. The code falls back to popping the
+variable if the profile file is missing, so a container predating the mount still reaches Agent Core
+rather than failing silently — it logs that it is not isolated.
 
 ---
 
