@@ -384,6 +384,14 @@ class CameraMultiInstanceTests(unittest.TestCase):
         )["topic"]
         self.assertNotEqual(dashed, underscored)
 
+    def test_unicode_instance_id_starts_with_ascii_only_topic(self):
+        result = self.camera.dispatch(
+            "start", {"_tool_name": "camera_rgb", "instance_id": "camera-摄"},
+        )
+        self.assertEqual(result["state"], "running")
+        self.assertTrue(result["topic"].isascii())
+        self.assertNotIn("摄", result["topic"])
+
     def test_two_instances_can_stream_different_sources_concurrently(self):
         self.camera.dispatch("config", {
             "_tool_name": "camera_rgb", "instance_id": "front-card", "camera_source": "interaction",
@@ -495,6 +503,18 @@ class CameraMultiInstanceTests(unittest.TestCase):
         )
         self.assertEqual(info["state"], "idle")
         self.assertNotIn(info["topic"], self.nodes.core.publishers)
+
+    def test_depth_card_has_explicit_lifecycle_actions(self):
+        for action, expected_state in (
+            ("start", "running"),
+            ("info", "running"),
+            ("stop", "idle"),
+        ):
+            result = self.camera.dispatch(action, {"_tool_name": "camera_depth"})
+            self.assertEqual(result["state"], expected_state)
+
+        with self.assertRaises(ValueError):
+            self.camera.dispatch("unknown", {"_tool_name": "camera_depth"})
 
 
 class StartStopLifecycleTests(unittest.TestCase):

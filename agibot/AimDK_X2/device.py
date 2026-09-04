@@ -405,7 +405,12 @@ class CameraPlugin:
         return str(args.get("instance_id") or "default")
 
     def _safe_instance_id(self, instance_id):
-        safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in instance_id)
+        # ROS 2 topic names accept ASCII letters/digits/underscore here.  Python's
+        # str.isalnum() also accepts Unicode letters, so guard it with isascii().
+        safe = "".join(
+            ch if ch.isascii() and (ch.isalnum() or ch == "_") else "_"
+            for ch in instance_id
+        )
         if not safe:
             safe = "default"
         if safe[0].isdigit():
@@ -555,7 +560,9 @@ class CameraPlugin:
         if name == "camera_depth":
             if action == "stop":
                 return {"state": "idle"}
-            return {"state": "running", **self.nodes.streams["camera_depth"]}
+            if action in ("start", "info", "read", "get", "camera_depth"):
+                return {"state": "running", **self.nodes.streams["camera_depth"]}
+            raise ValueError(f"camera_depth: unknown action {action!r}")
 
         instance_id = self._instance_id(args)
         with self._lock:
