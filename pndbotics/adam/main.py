@@ -216,7 +216,10 @@ def main():
     dds_hand_pub = None
     plugins_cfg = cfg.get("plugins", {})
     need_lowstate = plugins_cfg.get("state", {}).get("enabled", True)
-    need_handstate = plugins_cfg.get("hand", {}).get("enabled", True)
+    need_handstate = (
+        plugins_cfg.get("hand", {}).get("enabled", True)
+        or plugins_cfg.get("hand_state", {}).get("enabled", True)
+    )
     need_hand_pub = plugins_cfg.get("hand", {}).get("enabled", True)
     try:
         from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher
