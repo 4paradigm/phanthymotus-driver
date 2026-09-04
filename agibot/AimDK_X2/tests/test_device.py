@@ -107,8 +107,21 @@ class FakeNode:
         return pub
 
     def create_subscription(self, msg_type, topic, callback, qos):
-        self.subscriptions.append((topic, callback))
-        return object()
+        subscription = types.SimpleNamespace(msg_type=msg_type, topic=topic, callback=callback, qos=qos)
+        self.subscriptions.append(subscription)
+        return subscription
+
+    def destroy_subscription(self, subscription):
+        if subscription in self.subscriptions:
+            self.subscriptions.remove(subscription)
+            return True
+        return False
+
+    def destroy_publisher(self, publisher):
+        if self.publishers.get(publisher.topic) is publisher:
+            del self.publishers[publisher.topic]
+            return True
+        return False
 
     def create_client(self, srv_type, name):
         client = FakeClient(srv_type, name)
@@ -206,6 +219,7 @@ _install_ros_stubs()
 import yaml  # noqa: E402
 
 import device  # noqa: E402
+from common.vendor_runtime import DriverBundle  # noqa: E402
 
 
 def load_driver_yaml_cards():
@@ -302,6 +316,16 @@ class ModelPluginTests(unittest.TestCase):
             model_plugin.dispatch("model", {"variant": "nonexistent"})
 
 
+class PackagingTests(unittest.TestCase):
+    def test_docker_image_includes_deployment_service_fragment(self):
+        dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
+        self.assertRegex(
+            dockerfile,
+            r"(?m)^COPY\s+deploy/\s+/deploy/\s*$",
+            "run-pr-image.sh requires /deploy/service.yml inside every driver image",
+        )
+
+
 class DispatchSmokeTests(unittest.TestCase):
     """Exercise a couple of simple service-backed dispatch() calls end-to-end against the
     fake ROS client, to catch request/response field mismatches (as opposed to only
@@ -335,6 +359,189 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
 
 
+class CameraMultiInstanceTests(unittest.TestCase):
+    def setUp(self):
+        self.plugins = build_bundle_plugins()
+        self.camera = find_plugin(self.plugins, "camera_rgb")
+        self.nodes = self.camera.nodes
+
+    def test_rgb_tool_is_multi_instance_with_instance_source_config(self):
+        tool = next(d for d in self.camera.get_tools() if d["name"] == "camera_rgb")
+        self.assertTrue(tool["multiInstance"])
+        input_schema = tool["inputSchema"]
+        self.assertIn("config", input_schema["properties"]["action"]["enum"])
+        self.assertEqual(
+            input_schema["x-action-params"]["config"]["params"],
+            ["camera_source"],
+        )
+        self.assertEqual(
+            set(input_schema["properties"]["camera_source"]["enum"]),
+            set(device.CAMERA_RGB_SOURCES),
+        )
+        source = tool["configSchema"]["properties"]["camera_source"]
+        self.assertEqual(source["scope"], "instance")
+        self.assertEqual(source["default"], device.DEFAULT_CAMERA_RGB_SOURCE)
+        self.assertEqual(
+            {choice["const"] for choice in source["oneOf"]},
+            set(device.CAMERA_RGB_SOURCES),
+        )
+
+    def test_info_returns_deterministic_instance_topic_before_start(self):
+        result = self.camera.dispatch("info", {"_tool_name": "camera_rgb", "instance_id": "card-a-1"})
+        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["camera_source"], "interaction")
+        self.assertEqual(
+            result["topic_out"],
+            [{"topic": "/test_ns/agibot_x2/camera_rgb/card_a_1_94b5805e", "format": "image/jpeg"}],
+        )
+
+    def test_missing_instance_id_is_rejected_for_every_rgb_action(self):
+        for action in ("info", "start", "stop", "config"):
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                self.camera.dispatch(action, {"_tool_name": "camera_rgb"})
+
+    def test_lossy_ros_name_sanitizing_does_not_merge_instance_topics(self):
+        dashed = self.camera.dispatch(
+            "info", {"_tool_name": "camera_rgb", "instance_id": "card-a"},
+        )["topic"]
+        underscored = self.camera.dispatch(
+            "info", {"_tool_name": "camera_rgb", "instance_id": "card_a"},
+        )["topic"]
+        self.assertNotEqual(dashed, underscored)
+
+    def test_unicode_instance_id_starts_with_ascii_only_topic(self):
+        result = self.camera.dispatch(
+            "start", {"_tool_name": "camera_rgb", "instance_id": "camera-摄"},
+        )
+        self.assertEqual(result["state"], "running")
+        self.assertTrue(result["topic"].isascii())
+        self.assertNotIn("摄", result["topic"])
+
+    def test_two_instances_can_stream_different_sources_concurrently(self):
+        self.camera.dispatch("config", {
+            "_tool_name": "camera_rgb", "instance_id": "front-card", "camera_source": "interaction",
+        })
+        self.camera.dispatch("config", {
+            "_tool_name": "camera_rgb", "instance_id": "rear-card", "camera_source": "rear",
+        })
+        front = self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "front-card"})
+        rear = self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "rear-card"})
+
+        self.assertEqual(front["state"], "running")
+        self.assertEqual(rear["state"], "running")
+        self.assertNotEqual(front["topic"], rear["topic"])
+        active_topics = {sub.topic for sub in self.nodes.robot.subscriptions}
+        self.assertIn(device.CAMERA_RGB_SOURCES["interaction"], active_topics)
+        self.assertIn(device.CAMERA_RGB_SOURCES["rear"], active_topics)
+
+        rgb_subs = [
+            sub for sub in self.nodes.robot.subscriptions
+            if sub.topic in device.CAMERA_RGB_SOURCES.values()
+        ]
+        self.assertEqual(len(rgb_subs), 2)
+
+    def test_bundle_start_consumes_nested_canvas_instance_config(self):
+        bundle = DriverBundle(self.plugins)
+        result = bundle.dispatch("camera_rgb", {
+            "action": "start",
+            "instance_id": "rear-from-canvas",
+            "config": {"camera_source": "rear"},
+        })
+
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(result["camera_source"], "rear")
+        self.assertEqual(result["robot_topic"], device.CAMERA_RGB_SOURCES["rear"])
+        self.assertIn(
+            device.CAMERA_RGB_SOURCES["rear"],
+            {subscription.topic for subscription in self.nodes.robot.subscriptions},
+        )
+
+    def test_frame_is_forwarded_unchanged_and_counted(self):
+        result = self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "card-frame"})
+        source_topic = device.CAMERA_RGB_SOURCES["interaction"]
+        subscription = next(sub for sub in self.nodes.robot.subscriptions if sub.topic == source_topic)
+        frame = FakeMsg()
+        subscription.callback(frame)
+
+        publisher = self.nodes.core.publishers[result["topic"]]
+        self.assertEqual(publisher.published, [frame])
+        info = self.camera.dispatch("info", {"_tool_name": "camera_rgb", "instance_id": "card-frame"})
+        self.assertEqual(info["frames_published"], 1)
+
+    def test_running_instance_hot_switches_without_affecting_other_instance(self):
+        self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "switch-me"})
+        self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "keep-me"})
+        keep_topic = self.camera.dispatch(
+            "info", {"_tool_name": "camera_rgb", "instance_id": "keep-me"},
+        )["topic"]
+
+        switched = self.camera.dispatch("config", {
+            "_tool_name": "camera_rgb", "instance_id": "switch-me", "camera_source": "stereo_left",
+        })
+        self.assertEqual(switched["state"], "running")
+        self.assertEqual(switched["robot_topic"], device.CAMERA_RGB_SOURCES["stereo_left"])
+        self.assertIn(keep_topic, self.nodes.core.publishers)
+        rgb_subs = [
+            sub.topic for sub in self.nodes.robot.subscriptions
+            if sub.topic in device.CAMERA_RGB_SOURCES.values()
+        ]
+        self.assertEqual(rgb_subs.count(device.CAMERA_RGB_SOURCES["interaction"]), 1)
+        self.assertEqual(rgb_subs.count(device.CAMERA_RGB_SOURCES["stereo_left"]), 1)
+
+    def test_stop_releases_only_target_instance_and_is_idempotent(self):
+        self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "a"})
+        self.camera.dispatch("config", {
+            "_tool_name": "camera_rgb", "instance_id": "b", "camera_source": "rear",
+        })
+        self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "b"})
+
+        stopped = self.camera.dispatch("stop", {"_tool_name": "camera_rgb", "instance_id": "a"})
+        stopped_again = self.camera.dispatch("stop", {"_tool_name": "camera_rgb", "instance_id": "a"})
+        running = self.camera.dispatch("info", {"_tool_name": "camera_rgb", "instance_id": "b"})
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(stopped_again["state"], "idle")
+        self.assertEqual(running["state"], "running")
+
+    def test_invalid_source_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.camera.dispatch("config", {
+                "_tool_name": "camera_rgb", "instance_id": "bad", "camera_source": "made_up",
+            })
+
+    def test_subscription_creation_failure_releases_provisional_instance(self):
+        original = self.nodes.robot.create_subscription
+
+        def fail_create_subscription(*args, **kwargs):
+            raise RuntimeError("subscription failed")
+
+        self.nodes.robot.create_subscription = fail_create_subscription
+        try:
+            with self.assertRaises(RuntimeError):
+                self.camera.dispatch(
+                    "start", {"_tool_name": "camera_rgb", "instance_id": "broken"},
+                )
+        finally:
+            self.nodes.robot.create_subscription = original
+
+        info = self.camera.dispatch(
+            "info", {"_tool_name": "camera_rgb", "instance_id": "broken"},
+        )
+        self.assertEqual(info["state"], "idle")
+        self.assertNotIn(info["topic"], self.nodes.core.publishers)
+
+    def test_depth_card_has_explicit_lifecycle_actions(self):
+        for action, expected_state in (
+            ("start", "running"),
+            ("info", "running"),
+            ("stop", "idle"),
+        ):
+            result = self.camera.dispatch(action, {"_tool_name": "camera_depth"})
+            self.assertEqual(result["state"], expected_state)
+
+        with self.assertRaises(ValueError):
+            self.camera.dispatch("unknown", {"_tool_name": "camera_depth"})
+
+
 class StartStopLifecycleTests(unittest.TestCase):
     """README_dev.md's 'start/stop in dispatch (Required)' rule: the canvas UI calls every
     tool with {"action": "start"} the moment its card is placed, and {"action": "stop"} when
@@ -344,15 +551,17 @@ class StartStopLifecycleTests(unittest.TestCase):
     LED) just from a card being dragged onto the canvas. This regression-tests that every
     plugin handles both without touching a service client or publisher."""
 
-    def _assert_inert(self, plugin, tool_name, nodes):
+    def _assert_inert(self, plugin, definition, nodes):
+        tool_name = definition["name"]
         publishers_before = {
             topic: len(pub.published) for topic, pub in nodes.robot.publishers.items()
         }
         for client in nodes.robot.clients.values():
             client.last_request = None
 
+        instance_args = {"instance_id": "lifecycle-test"} if definition.get("multiInstance") else {}
         for action in ("start", "stop"):
-            result = plugin.dispatch(action, {"_tool_name": tool_name})
+            result = plugin.dispatch(action, {"_tool_name": tool_name, **instance_args})
             self.assertIsInstance(result, dict, f"{tool_name}.dispatch({action!r}) must return a dict")
             self.assertIn("state", result, f"{tool_name}.dispatch({action!r}) must report a state")
 
@@ -371,7 +580,7 @@ class StartStopLifecycleTests(unittest.TestCase):
             for definition in (plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]):
                 if definition["type"] == "resource":
                     continue  # resource tools always dispatch with action == tool name, never start/stop
-                self._assert_inert(plugin, definition["name"], nodes)
+                self._assert_inert(plugin, definition, nodes)
 
 
 if __name__ == "__main__":
