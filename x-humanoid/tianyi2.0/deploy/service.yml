@@ -9,6 +9,13 @@ tianyi2:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /home/nvidia/data/param/dds_profile.xml:/work/dds_profile.xml:ro
+    # The loopback profile, used for the *agent-core* context only. Deliberately not
+    # set as FASTRTPS_DEFAULT_PROFILES_FILE in `environment`: this driver holds two
+    # DDS contexts in one process (body on domain 0 via the vendor profile above,
+    # agent-core on domain 42) and picks a profile per context by setting the variable
+    # around each rclpy.init(). A process-wide default would put the body link on
+    # loopback and cut it. See DualDomainROS2 in main.py.
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - PYTHONUNBUFFERED=1

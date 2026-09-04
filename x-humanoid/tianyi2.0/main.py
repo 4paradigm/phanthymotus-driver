@@ -327,8 +327,25 @@ class DualDomainROS2:
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
         self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
 
-        # Domain 42: publish to agent-core (no DDS profile — use all interfaces)
-        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+        # Domain 42: publish to agent-core. Loopback-only, because agent-core runs on
+        # this same host and nothing off-machine has any business on this domain —
+        # `/remote_control/message` carries *commands*, and DDS has no addressing, so
+        # every ROS_DOMAIN_ID=42 subscriber on the subnet used to receive them (one
+        # instruction typed on one robot was executed by a second one, same timestamp
+        # in both logs). Popping the variable here left this context on all
+        # interfaces, which is the one gap the fleet-wide profile could not close:
+        # this process sets the variable itself, so compose cannot do it for us.
+        #
+        # Falls back to popping only if the profile is missing, so a container that
+        # predates the mount still starts rather than failing to reach agent-core.
+        core_profile = "/opt/phanthy-motus/dds-local.xml"
+        if os.path.exists(core_profile):
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = core_profile
+            print(f"[ros2] domain42: using DDS profile {core_profile}")
+        else:
+            os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+            print(f"[ros2] domain42: {core_profile} missing — NOT isolated, "
+                  f"traffic will reach every interface")
         self.ctx_core = Context()
         rclpy.init(context=self.ctx_core, domain_id=42)
         self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)

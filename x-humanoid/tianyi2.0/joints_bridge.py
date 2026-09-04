@@ -25,7 +25,14 @@ class BridgeROS2:
         self.ctx_tianyi = Context()
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
         self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
-        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+        # Domain 42 reaches agent-core on this same host, so it is loopback-only.
+        # Popping the variable here left it on every interface — see the longer note
+        # in main.py's DualDomainROS2, which carries the same pair of contexts.
+        core_profile = "/opt/phanthy-motus/dds-local.xml"
+        if os.path.exists(core_profile):
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = core_profile
+        else:
+            os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
         self.ctx_core = Context()
         rclpy.init(context=self.ctx_core, domain_id=42)
         self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
