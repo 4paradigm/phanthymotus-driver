@@ -363,6 +363,12 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
 
+    def test_mirrored_subscriptions_are_retained_for_node_lifetime(self):
+        plugins = build_bundle_plugins(load_driver_config())
+        nodes = plugins[0].nodes
+        self.assertEqual(len(nodes._subscriptions), 8)
+        self.assertTrue(all(subscription is not None for subscription in nodes._subscriptions))
+
 
 class StartStopLifecycleTests(unittest.TestCase):
     """README_dev.md's 'start/stop in dispatch (Required)' rule: the canvas UI calls every
