@@ -316,6 +316,16 @@ class ModelPluginTests(unittest.TestCase):
             model_plugin.dispatch("model", {"variant": "nonexistent"})
 
 
+class PackagingTests(unittest.TestCase):
+    def test_docker_image_includes_deployment_service_fragment(self):
+        dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
+        self.assertRegex(
+            dockerfile,
+            r"(?m)^COPY\s+deploy/\s+/deploy/\s*$",
+            "run-pr-image.sh requires /deploy/service.yml inside every driver image",
+        )
+
+
 class DispatchSmokeTests(unittest.TestCase):
     """Exercise a couple of simple service-backed dispatch() calls end-to-end against the
     fake ROS client, to catch request/response field mismatches (as opposed to only
