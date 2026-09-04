@@ -15,8 +15,12 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/aima/hal/joint/*/command` | `joint_command` | wildcard resolved to `leg`/`waist`/`arm`/`head` |
 | `/aima/hal/pmu/state` | — | not currently exposed as a tool (no card in the approved plan) |
 | `/aima/hal/sensor/lidar_chest_front/lidar_pointcloud` | `lidar` | `sensor/pointcloud` |
-| `/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed` | `camera_rgb` | catalog documents `rgbd_head_front/rgb_image/compressed` instead, but on real hardware that topic has zero publishers — confirmed via `ros2 topic info` that `rgb_head_front_center` is what's actually live (30Hz); see below |
-| `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` | zero publishers on real hardware, and no depth topic exists anywhere in the live `ros2 topic list` on this unit — depth appears to not be active/available on this X2 at all, kept wired to the documented name pending vendor confirmation |
+| `/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed` | `camera_rgb` (`interaction`) | `CompressedImage`; publisher confirmed on X2 hardware on 2026-09-04 |
+| `/aima/hal/sensor/rgbd_head_front/rgb_image/compressed` | `camera_rgb` (`rgbd_front`) | `CompressedImage`; publisher confirmed on X2 hardware on 2026-09-04 |
+| `/aima/hal/sensor/stereo_head_front_left/rgb_image/compressed` | `camera_rgb` (`stereo_left`) | `CompressedImage`; publisher confirmed on X2 hardware on 2026-09-04 |
+| `/aima/hal/sensor/stereo_head_front_right/rgb_image/compressed` | `camera_rgb` (`stereo_right`) | `CompressedImage`; publisher confirmed on X2 hardware on 2026-09-04 |
+| `/aima/hal/sensor/rgb_head_rear/rgb_image/compressed` | `camera_rgb` (`rear`) | `CompressedImage`; publisher confirmed on X2 hardware on 2026-09-04 |
+| `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` | `Image`; publisher confirmed on X2 hardware on 2026-09-04 |
 | `/aima/mc/locomotion/velocity` | `locomotion` | |
 | `/integrated_command` | `slam_control` | plain `std_msgs/String`, not a service |
 | `/relocalization_pose` | `slam_control` | |
@@ -36,6 +40,30 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/aimdk_5Fmsgs/srv/SetMicSourceRequest`, `GetMicSourceRequest` | `mic_source` | |
 | `/aimdk_5Fmsgs/srv/GetStoredMapByName` | `map_get` | |
 
+## `camera_rgb` multi-instance routing
+
+`camera_rgb` is one sensor-card type with five selectable sources.  Its
+`camera_source` setting has `scope: instance`, so two copies of the card can select different
+cameras and run concurrently.  `interaction` is the default to preserve the previous card's
+source selection.
+
+Each card instance gets an independent core-domain output topic.  A canvas card whose ID is
+`card-example-1` reports:
+
+```text
+/{namespace}/agibot_x2/camera_rgb/card_example_1  (image/jpeg)
+```
+
+`info(instance_id)` returns this path before streaming starts.  `start(instance_id)` creates
+the selected robot-domain subscription and core-domain publisher; `stop(instance_id)` destroys
+only that instance's resources.  Changing `camera_source` while an instance is running replaces
+its subscription but keeps its output topic stable.
+
+`camera_depth` remains a separate, single-instance card because its ROS message and output format
+(`sensor_msgs/msg/Image`, `image/depth-z16`) differ from the compressed RGB streams.  The presence
+of left/right image publishers alone is not evidence that those streams are synchronized,
+rectified, or ready for stereo ranging.
+
 ## Available in the SDK but not yet wired
 
 Left out of this driver's initial tool set to stay within the approved plan's scope — add a
@@ -46,8 +74,6 @@ new plugin in `device.py` if a use case comes up:
 - `/aima/hal/audio/capture`, `/aima/hal/audio/playback`, `/aima/hal/audio/focus_response`,
   `/aima/hal/audio/play_state` — raw audio I/O topics; this driver relies on `tts`/`PlayTts`
   instead of raw audio playback.
-- `/aima/hal/sensor/rgb_head_rear/*`, `/aima/hal/sensor/stereo_head_front_{left,right}/*` —
-  additional cameras beyond the front RGBD pair this driver exposes.
 - `/aima/hal/sensor/touch_head` — head touch sensor, no dedicated tool yet.
 - `/aimdk_5Fmsgs/srv/AbandonAudioFocus`, `RequestAudioFocus`, `GetMute`, `SetMute`, `GetVolume`,
   `SetVolume` — audio focus/volume management.

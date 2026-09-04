@@ -75,6 +75,25 @@ EMOJI_IDS = {
 
 MIC_SOURCES = {"internal": 0, "external": 1}
 
+# X2 advertises publishers for all five compressed RGB streams concurrently.  PhanthyMotus
+# exposes them through one multi-instance card: each canvas instance chooses one source and
+# receives a distinct core-domain output topic.
+CAMERA_RGB_SOURCES = {
+    "interaction": "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed",
+    "rgbd_front": "/aima/hal/sensor/rgbd_head_front/rgb_image/compressed",
+    "stereo_left": "/aima/hal/sensor/stereo_head_front_left/rgb_image/compressed",
+    "stereo_right": "/aima/hal/sensor/stereo_head_front_right/rgb_image/compressed",
+    "rear": "/aima/hal/sensor/rgb_head_rear/rgb_image/compressed",
+}
+CAMERA_RGB_SOURCE_TITLES = {
+    "interaction": "交互 RGB（头部正面）",
+    "rgbd_front": "RGBD 彩色（头部前方）",
+    "stereo_left": "前方左目",
+    "stereo_right": "前方右目",
+    "rear": "后置 RGB",
+}
+DEFAULT_CAMERA_RGB_SOURCE = "interaction"
+
 RESOURCE_DIR = Path(__file__).with_name("resource")
 
 
@@ -137,6 +156,11 @@ class AimdkNodes:
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         command_qos = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
 
+        # CameraPlugin creates RGB publishers/subscriptions per canvas instance.  Keep the
+        # type and QoS on this shared node holder so the plugin does not need another ROS node.
+        self.compressed_image_type = CompressedImage
+        self.sensor_qos = sensor_qos
+
         self.streams = {}
 
         def mirror(key, msg_type, robot_topic, fmt, depth=10, qos=None):
@@ -159,12 +183,10 @@ class AimdkNodes:
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
         mirror("hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json", qos=sensor_qos)
-        # SDK's topics_and_services catalog documents rgbd_head_front/* as the front camera, but
-        # on real hardware that topic has zero publishers -- this unit's camera service actually
-        # publishes RGB under rgb_head_front_center/* instead (confirmed live via `ros2 topic
-        # info`, 30Hz). No depth topic is published anywhere on this hardware at all, so
-        # camera_depth stays wired to the documented (currently inactive) topic.
-        mirror("camera_rgb", CompressedImage, "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed", "image/jpeg", qos=sensor_qos)
+        # RGB subscriptions are intentionally not created here: camera_rgb is multi-instance,
+        # so CameraPlugin creates and destroys one subscription for each active canvas card.
+        # A 2026-09-04 live topic inspection confirmed publishers for all five RGB sources in
+        # CAMERA_RGB_SOURCES and for the RGBD depth stream below.
         mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
         mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
         mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
@@ -374,10 +396,119 @@ class ImuPlugin:
 class CameraPlugin:
     def __init__(self, nodes):
         self.nodes = nodes
+        self._lock = threading.RLock()
+        self._configs = {}
+        self._instances = {}
+
+    def _instance_id(self, args):
+        return str(args.get("instance_id") or "default")
+
+    def _safe_instance_id(self, instance_id):
+        safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in instance_id)
+        if not safe:
+            safe = "default"
+        if safe[0].isdigit():
+            safe = f"instance_{safe}"
+        return safe
+
+    def _output_topic(self, instance_id):
+        return f"/{self.nodes.namespace}/agibot_x2/camera_rgb/{self._safe_instance_id(instance_id)}"
+
+    def _source_for(self, instance_id):
+        return self._configs.get(instance_id, DEFAULT_CAMERA_RGB_SOURCE)
+
+    def _rgb_info_locked(self, instance_id):
+        source = self._source_for(instance_id)
+        instance = self._instances.get(instance_id)
+        output_topic = self._output_topic(instance_id)
+        return {
+            "state": "running" if instance is not None else "idle",
+            "instance_id": instance_id,
+            "camera_source": source,
+            "sources_available": list(CAMERA_RGB_SOURCES),
+            "robot_topic": CAMERA_RGB_SOURCES[source],
+            "topic": output_topic,
+            "format": "image/jpeg",
+            "frames_published": instance["frames"] if instance is not None else 0,
+            "topic_out": [{"topic": output_topic, "format": "image/jpeg"}],
+        }
+
+    def _stop_rgb_locked(self, instance_id):
+        instance = self._instances.pop(instance_id, None)
+        if instance is None:
+            return
+        # Remove the subscription before its publisher so no new callback can be queued for
+        # an output that has already been destroyed.
+        self.nodes.robot.destroy_subscription(instance["subscription"])
+        self.nodes.core.destroy_publisher(instance["publisher"])
+
+    def _start_rgb_locked(self, instance_id, source):
+        self._stop_rgb_locked(instance_id)
+        output_topic = self._output_topic(instance_id)
+        publisher = self.nodes.core.create_publisher(
+            self.nodes.compressed_image_type, output_topic, 5,
+        )
+        state = {"publisher": publisher, "subscription": None, "frames": 0, "source": source}
+
+        def forward(msg):
+            # HTTP dispatch and ROS callbacks run on different threads.  Holding the same lock
+            # as stop/config prevents publishing through a publisher while it is being retired.
+            with self._lock:
+                if self._instances.get(instance_id) is not state:
+                    return
+                publisher.publish(msg)
+                state["frames"] += 1
+
+        try:
+            state["subscription"] = self.nodes.robot.create_subscription(
+                self.nodes.compressed_image_type,
+                CAMERA_RGB_SOURCES[source],
+                forward,
+                self.nodes.sensor_qos,
+            )
+        except Exception:
+            self.nodes.core.destroy_publisher(publisher)
+            raise
+        self._instances[instance_id] = state
 
     def get_tools(self):
+        rgb_tool = {
+            "name": "camera_rgb",
+            "type": "sensor",
+            "multiInstance": True,
+            "description": "X2 多机位 RGB 实时画面；每个卡片实例独立选择一路摄像头",
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "camera_source": {
+                        "type": "string",
+                        "description": "该卡片实例订阅的 X2 RGB 摄像头",
+                        "scope": "instance",
+                        "default": DEFAULT_CAMERA_RGB_SOURCE,
+                        "oneOf": [
+                            {"const": source, "title": CAMERA_RGB_SOURCE_TITLES[source]}
+                            for source in CAMERA_RGB_SOURCES
+                        ],
+                    },
+                },
+            },
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["info", "start", "stop"],
+                        "description": "info=查询；start=开始转发；stop=停止并释放该实例",
+                    },
+                },
+                "required": ["action"],
+            },
+            # An empty path tells the canvas that this sensor has an image output while
+            # info(instance_id) supplies the real, instance-specific path.
+            "topic_out": [{"topic": "", "format": "image/jpeg"}],
+        }
         return [
-            _stream_tool("camera_rgb", self.nodes.streams["camera_rgb"], "前置 RGBD 相机彩色画面（压缩 JPEG）"),
+            rgb_tool,
             _stream_tool("camera_depth", self.nodes.streams["camera_depth"], "前置 RGBD 相机深度画面"),
         ]
 
@@ -385,13 +516,47 @@ class CameraPlugin:
         pass
 
     def stop(self):
-        pass
+        with self._lock:
+            for instance_id in list(self._instances):
+                self._stop_rgb_locked(instance_id)
 
     def dispatch(self, action, args):
         name = args.get("_tool_name")
-        if action == "stop":
-            return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams[name]}
+        if name == "camera_depth":
+            if action == "stop":
+                return {"state": "idle"}
+            return {"state": "running", **self.nodes.streams["camera_depth"]}
+
+        instance_id = self._instance_id(args)
+        with self._lock:
+            if action == "config":
+                source = args.get("camera_source", self._source_for(instance_id))
+                if source not in CAMERA_RGB_SOURCES:
+                    raise ValueError(
+                        f"camera_rgb: unknown camera_source {source!r}; "
+                        f"valid: {list(CAMERA_RGB_SOURCES)}"
+                    )
+                was_running = instance_id in self._instances
+                changed = source != self._source_for(instance_id)
+                self._configs[instance_id] = source
+                if was_running and changed:
+                    self._start_rgb_locked(instance_id, source)
+                return self._rgb_info_locked(instance_id)
+
+            if action == "start":
+                source = self._source_for(instance_id)
+                if instance_id not in self._instances:
+                    self._start_rgb_locked(instance_id, source)
+                return self._rgb_info_locked(instance_id)
+
+            if action == "stop":
+                self._stop_rgb_locked(instance_id)
+                return self._rgb_info_locked(instance_id)
+
+            if action in ("info", "read", "get", "camera_rgb"):
+                return self._rgb_info_locked(instance_id)
+
+        raise ValueError(f"camera_rgb: unknown action {action!r}")
 
 
 class LidarPlugin:

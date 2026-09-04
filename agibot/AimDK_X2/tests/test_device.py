@@ -107,8 +107,21 @@ class FakeNode:
         return pub
 
     def create_subscription(self, msg_type, topic, callback, qos):
-        self.subscriptions.append((topic, callback))
-        return object()
+        subscription = types.SimpleNamespace(msg_type=msg_type, topic=topic, callback=callback, qos=qos)
+        self.subscriptions.append(subscription)
+        return subscription
+
+    def destroy_subscription(self, subscription):
+        if subscription in self.subscriptions:
+            self.subscriptions.remove(subscription)
+            return True
+        return False
+
+    def destroy_publisher(self, publisher):
+        if self.publishers.get(publisher.topic) is publisher:
+            del self.publishers[publisher.topic]
+            return True
+        return False
 
     def create_client(self, srv_type, name):
         client = FakeClient(srv_type, name)
@@ -333,6 +346,108 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertTrue(locomotion._registered)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
+
+
+class CameraMultiInstanceTests(unittest.TestCase):
+    def setUp(self):
+        self.plugins = build_bundle_plugins()
+        self.camera = find_plugin(self.plugins, "camera_rgb")
+        self.nodes = self.camera.nodes
+
+    def test_rgb_tool_is_multi_instance_with_instance_source_config(self):
+        tool = next(d for d in self.camera.get_tools() if d["name"] == "camera_rgb")
+        self.assertTrue(tool["multiInstance"])
+        source = tool["configSchema"]["properties"]["camera_source"]
+        self.assertEqual(source["scope"], "instance")
+        self.assertEqual(source["default"], device.DEFAULT_CAMERA_RGB_SOURCE)
+        self.assertEqual(
+            {choice["const"] for choice in source["oneOf"]},
+            set(device.CAMERA_RGB_SOURCES),
+        )
+
+    def test_info_returns_deterministic_instance_topic_before_start(self):
+        result = self.camera.dispatch("info", {"_tool_name": "camera_rgb", "instance_id": "card-a-1"})
+        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["camera_source"], "interaction")
+        self.assertEqual(
+            result["topic_out"],
+            [{"topic": "/test_ns/agibot_x2/camera_rgb/card_a_1", "format": "image/jpeg"}],
+        )
+
+    def test_two_instances_can_stream_different_sources_concurrently(self):
+        self.camera.dispatch("config", {
+            "_tool_name": "camera_rgb", "instance_id": "front-card", "camera_source": "interaction",
+        })
+        self.camera.dispatch("config", {
+            "_tool_name": "camera_rgb", "instance_id": "rear-card", "camera_source": "rear",
+        })
+        front = self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "front-card"})
+        rear = self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "rear-card"})
+
+        self.assertEqual(front["state"], "running")
+        self.assertEqual(rear["state"], "running")
+        self.assertNotEqual(front["topic"], rear["topic"])
+        active_topics = {sub.topic for sub in self.nodes.robot.subscriptions}
+        self.assertIn(device.CAMERA_RGB_SOURCES["interaction"], active_topics)
+        self.assertIn(device.CAMERA_RGB_SOURCES["rear"], active_topics)
+
+        rgb_subs = [
+            sub for sub in self.nodes.robot.subscriptions
+            if sub.topic in device.CAMERA_RGB_SOURCES.values()
+        ]
+        self.assertEqual(len(rgb_subs), 2)
+
+    def test_frame_is_forwarded_unchanged_and_counted(self):
+        result = self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "card-frame"})
+        source_topic = device.CAMERA_RGB_SOURCES["interaction"]
+        subscription = next(sub for sub in self.nodes.robot.subscriptions if sub.topic == source_topic)
+        frame = FakeMsg()
+        subscription.callback(frame)
+
+        publisher = self.nodes.core.publishers[result["topic"]]
+        self.assertEqual(publisher.published, [frame])
+        info = self.camera.dispatch("info", {"_tool_name": "camera_rgb", "instance_id": "card-frame"})
+        self.assertEqual(info["frames_published"], 1)
+
+    def test_running_instance_hot_switches_without_affecting_other_instance(self):
+        self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "switch-me"})
+        self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "keep-me"})
+        keep_topic = self.camera.dispatch(
+            "info", {"_tool_name": "camera_rgb", "instance_id": "keep-me"},
+        )["topic"]
+
+        switched = self.camera.dispatch("config", {
+            "_tool_name": "camera_rgb", "instance_id": "switch-me", "camera_source": "stereo_left",
+        })
+        self.assertEqual(switched["state"], "running")
+        self.assertEqual(switched["robot_topic"], device.CAMERA_RGB_SOURCES["stereo_left"])
+        self.assertIn(keep_topic, self.nodes.core.publishers)
+        rgb_subs = [
+            sub.topic for sub in self.nodes.robot.subscriptions
+            if sub.topic in device.CAMERA_RGB_SOURCES.values()
+        ]
+        self.assertEqual(rgb_subs.count(device.CAMERA_RGB_SOURCES["interaction"]), 1)
+        self.assertEqual(rgb_subs.count(device.CAMERA_RGB_SOURCES["stereo_left"]), 1)
+
+    def test_stop_releases_only_target_instance_and_is_idempotent(self):
+        self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "a"})
+        self.camera.dispatch("config", {
+            "_tool_name": "camera_rgb", "instance_id": "b", "camera_source": "rear",
+        })
+        self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "b"})
+
+        stopped = self.camera.dispatch("stop", {"_tool_name": "camera_rgb", "instance_id": "a"})
+        stopped_again = self.camera.dispatch("stop", {"_tool_name": "camera_rgb", "instance_id": "a"})
+        running = self.camera.dispatch("info", {"_tool_name": "camera_rgb", "instance_id": "b"})
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(stopped_again["state"], "idle")
+        self.assertEqual(running["state"], "running")
+
+    def test_invalid_source_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.camera.dispatch("config", {
+                "_tool_name": "camera_rgb", "instance_id": "bad", "camera_source": "made_up",
+            })
 
 
 class StartStopLifecycleTests(unittest.TestCase):
