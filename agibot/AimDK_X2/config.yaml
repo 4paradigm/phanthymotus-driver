@@ -23,7 +23,7 @@ plugins:
   joint_state:
     enabled: true
   hand_state:
-    enabled: false
+    enabled: true
   imu:
     enabled: true
   leg_odometry:
@@ -31,9 +31,9 @@ plugins:
   camera_rgb:
     enabled: true
   camera_depth:
-    enabled: false
+    enabled: true
   lidar:
-    enabled: false
+    enabled: true
   system_state:
     enabled: true
   linkcraft:
@@ -59,6 +59,6 @@ plugins:
   mic_source:
     enabled: true
   slam_pose:
-    enabled: false
+    enabled: true
   slam:
-    enabled: false
+    enabled: true

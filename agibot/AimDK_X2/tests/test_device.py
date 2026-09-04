@@ -249,28 +249,23 @@ class ToolInventoryTests(unittest.TestCase):
         for name, expected_type in expected.items():
             self.assertEqual(by_name[name], expected_type, f"tool '{name}' type mismatch")
 
-    def test_explicitly_enabled_optional_features_register_expected_cards(self):
+    def test_disabling_hardware_features_unregisters_their_cards(self):
         default_plugins = build_bundle_plugins(load_driver_config())
         default_names = {d["name"] for d in tool_definitions(default_plugins)}
 
-        optional_cards = {
+        feature_cards = {
             "hand_state": {"hand_state", "hand_command"},
             "camera_depth": {"camera_depth"},
             "lidar": {"lidar"},
             "slam_pose": {"slam_pose"},
             "slam": {"slam_control"},
         }
-        for feature, expected_added in optional_cards.items():
+        for feature, expected_removed in feature_cards.items():
             config = load_driver_config()
-            config["plugins"][feature]["enabled"] = True
+            config["plugins"][feature]["enabled"] = False
             plugins = build_bundle_plugins(config)
             names = {d["name"] for d in tool_definitions(plugins)}
-            self.assertEqual(names - default_names, expected_added, feature)
-
-    def test_default_config_does_not_register_unavailable_hardware_cards(self):
-        plugins = build_bundle_plugins(load_driver_config())
-        names = {d["name"] for d in tool_definitions(plugins)}
-        self.assertTrue(names.isdisjoint({"hand_state", "hand_command", "camera_depth", "lidar", "slam_pose", "slam_control"}))
+            self.assertEqual(default_names - names, expected_removed, feature)
 
     def test_no_duplicate_tool_names(self):
         plugins = build_bundle_plugins()
@@ -290,8 +285,8 @@ class ToolInventoryTests(unittest.TestCase):
         plugins = build_bundle_plugins(load_driver_config())
         definitions = tool_definitions(plugins)
         expected_actuators = {
-            "mc_mode", "locomotion", "preset_motion", "joint_command", "linkcraft",
-            "pmu_led", "tts", "emoji", "mic_source",
+            "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command", "linkcraft",
+            "pmu_led", "tts", "emoji", "mic_source", "slam_control",
         }
         by_name = {d["name"]: d["type"] for d in definitions}
         for name in expected_actuators:
