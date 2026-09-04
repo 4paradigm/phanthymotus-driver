@@ -101,15 +101,15 @@ class SocketBridgeServer:
     SOCKET_DIR = "/tmp/tianyi_bridge"
 
     def __init__(self):
-        # Setup domain 42 WITHOUT dds-local.xml to match Agent Core
-        # Agent Core doesn't use dds-local.xml, so we shouldn't either
-        # Both will use default DDS configuration and can communicate
+        # Setup domain 42 with dds-local.xml
+        # This isolates DDS traffic to loopback, preventing cross-robot interference
+        os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = "/opt/phanthy-motus/dds-local.xml"
         self.ctx = Context()
         rclpy.init(context=self.ctx, domain_id=42)
         self.executor = rclpy.executors.MultiThreadedExecutor(context=self.ctx)
 
         print(
-            "[socket-bridge] domain 42 initialized (default DDS config, matching agent-core)",
+            "[socket-bridge] domain 42 initialized with /opt/phanthy-motus/dds-local.xml",
             flush=True,
         )
 
