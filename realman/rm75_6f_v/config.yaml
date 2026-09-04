@@ -5,7 +5,6 @@ arm_dof: 7
 arm_ip: ""
 tcp_port: 8080
 safety:
-  max_step_deg: 5.0
   max_speed_percent: 10
   default_speed_percent: 5
   target_tolerance_deg: 0.5

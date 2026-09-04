@@ -115,7 +115,6 @@ class RM75Plugin:
     def __init__(self, client, config):
         self.client = client
         safety = config.get("safety", {})
-        self.max_step_deg = min(float(safety.get("max_step_deg", 5.0)), 5.0)
         self.max_speed_percent = min(int(safety.get("max_speed_percent", 10)), 10)
         self.default_speed_percent = min(int(safety.get("default_speed_percent", 5)), self.max_speed_percent)
         self.target_tolerance_deg = float(safety.get("target_tolerance_deg", 0.5))
@@ -175,7 +174,6 @@ class RM75Plugin:
             **self.client.status(),
             "active_action_id": self._active_action_id,
             "limits_deg": JOINT_LIMITS_DEG,
-            "max_step_deg": self.max_step_deg,
             "max_speed_percent": self.max_speed_percent,
         }
 
@@ -222,10 +220,6 @@ class RM75Plugin:
                 raise RuntimeError(f"invalid controller limits for joint{index + 1}: [{low}, {high}]")
             if not low <= value <= high:
                 raise ValueError(f"joint{index + 1}_deg must be within [{low}, {high}]")
-            if abs(value - current[index]) > self.max_step_deg:
-                raise ValueError(
-                    f"joint{index + 1} step {abs(value - current[index]):.3f}deg exceeds {self.max_step_deg}deg limit"
-                )
             target[index] = value
         speed = int(args.get("speed_percent", self.default_speed_percent))
         if not 1 <= speed <= self.max_speed_percent:

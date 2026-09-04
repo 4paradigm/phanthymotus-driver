@@ -33,7 +33,7 @@ Motion has two independent interlocks. The container must set
 `joint1_deg` through `joint7_deg` targets. They are sent together as one API2
 `movej` trajectory, so the controller plans all joints concurrently. The
 Driver rejects non-finite values, targets outside the
-official RM75 limits, steps above 5 degrees, speed above 10 percent, disabled
+official RM75 limits, speed above 10 percent, disabled
 joints, and any reported arm or joint error. It sends non-blocking API2
 `rm_movej`, monitors the measured joints until they reach the target, and
 supports `stopmotion` while movement is active.
