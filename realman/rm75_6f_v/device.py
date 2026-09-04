@@ -185,7 +185,8 @@ class RM75Plugin:
         arm_errors = state.get("err", {})
         if len(joint_errors) != 7 or any(joint_errors):
             raise RuntimeError(f"joint error preflight failed: {joint_errors}")
-        if int(arm_errors.get("err_len", 0)) or arm_errors.get("err"):
+        arm_error_codes = [int(value) for value in arm_errors.get("err", []) if int(value) != 0]
+        if arm_error_codes:
             raise RuntimeError(f"arm error preflight failed: {arm_errors}")
         enabled = [int(value) for value in state.get("joint_en_flag", [])]
         if len(enabled) != 7 or not all(enabled):
@@ -284,6 +285,10 @@ class RM75Plugin:
             self._acp_callback(action_id, status, result)
 
     def _start_motion(self, args):
+        if not self.client.motion_enabled:
+            raise PermissionError("motion is locked; set RM_MOTION_ENABLED=1 only for supervised hardware testing")
+        if args.get("confirm_motion") is not True:
+            raise ValueError("confirm_motion must be true")
         if not self._motion_lock.acquire(blocking=False):
             raise RuntimeError(f"another motion is active: {self._active_action_id}")
         try:

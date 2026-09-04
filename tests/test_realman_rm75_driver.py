@@ -177,6 +177,16 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "joint error"):
             plugin._start_motion({**self._seven_targets(joint1_deg=1), "confirm_motion": True})
 
+    def test_zero_arm_error_code_is_not_treated_as_an_error(self):
+        plugin, robot = self._motion_plugin(all_state={
+            "joint_err_code": [0] * 7,
+            "joint_en_flag": [1] * 7,
+            "err": {"err_len": 1, "err": ["0"]},
+        })
+        result = plugin._start_motion({**self._seven_targets(), "confirm_motion": True})
+        self.assertEqual("executing", result["status"])
+        self.assertEqual(1, len(robot.moves))
+
     def test_stopmotion_uses_vendor_slow_stop(self):
         plugin, robot = self._motion_plugin()
         result = plugin._stop_motion()
