@@ -161,6 +161,8 @@ class AimdkNodes:
 
         if self.enabled("hand_state"):
             mirror("hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json", qos=sensor_qos)
+        if self.enabled("leg_odometry"):
+            mirror("leg_odometry", Odometry, "/aima/mc/leg_odometry", "data/json", qos=sensor_qos)
         if self.enabled("camera_rgb"):
             mirror("camera_rgb", CompressedImage, "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed", "image/jpeg", qos=sensor_qos)
         if self.enabled("camera_depth"):
@@ -417,6 +419,25 @@ class LidarPlugin:
         if action == "stop":
             return {"state": "idle"}
         return {"state": "running", **self.nodes.streams["lidar"]}
+
+
+class LegOdometryPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return _stream_tool("leg_odometry", self.nodes.streams["leg_odometry"], "腿部里程计位姿（/aima/mc/leg_odometry）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        return {"state": "running", **self.nodes.streams["leg_odometry"]}
 
 
 class SlamPosePlugin:
@@ -1140,6 +1161,8 @@ def build_plugins(config, namespace, ros2):
         JointCommandPlugin(nodes), LinkcraftPlugin(nodes), PmuLedPlugin(nodes),
         TtsPlugin(nodes), EmojiPlugin(nodes), MicSourcePlugin(nodes), MapGetPlugin(nodes),
     ]
+    if nodes.enabled("leg_odometry"):
+        plugins.append(LegOdometryPlugin(nodes))
     if nodes.enabled("hand_state"):
         plugins.append(HandStatePlugin(nodes))
     if nodes.enabled("camera_rgb") or nodes.enabled("camera_depth"):

@@ -302,8 +302,14 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joint_state", "imu", "camera_rgb", "system_state", "linkcraft_catalog"):
+        for name in ("mc_state", "joint_state", "imu", "leg_odometry", "camera_rgb", "system_state", "linkcraft_catalog"):
             self.assertEqual(by_name[name], "sensor")
+
+    def test_leg_odometry_is_gated_by_config(self):
+        config = load_driver_config()
+        config["plugins"]["leg_odometry"]["enabled"] = False
+        names = {d["name"] for d in tool_definitions(build_bundle_plugins(config))}
+        self.assertNotIn("leg_odometry", names)
 
     def test_mc_mode_and_preset_motion_action_enums_nonempty(self):
         plugins = build_bundle_plugins()
