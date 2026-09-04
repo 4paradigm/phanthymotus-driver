@@ -4523,77 +4523,192 @@ class TtsPlugin:
         # Health check: verify PlayEvent pipeline is working
         self._startup_error = self._lyre_health_check()
 
-    def _lyre_health_check(self) -> str | None:
-        """Call play_text and verify PlayEvent arrives. Returns error message or None."""
+    # lyre is a host systemd unit; the driver reaches it through PID 1's namespaces.
+    _LYRE_UNIT = "lyre"
+    _NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+    # Discovery of play_text measured 2.0–2.9 s on a settled robot, but start() runs
+    # while ~35 plugins are initialising. A generous window costs nothing when things
+    # work and avoids the misdiagnosis below; the first version allowed 5 s.
+    _DISCOVERY_WAIT_S = 20.0
+    # `systemctl restart lyre` stops a ros2 launch tree and starts it again. The first
+    # version capped the subprocess at 15 s and reported the restart as *failed* while
+    # it was in fact still working.
+    _RESTART_CMD_TIMEOUT_S = 90
+    _RESTART_DISCOVERY_WAIT_S = 60.0
+
+    def _lyre_unit_state(self) -> str:
+        """systemd's view of lyre, which does not depend on DDS at all.
+
+        This is what separates "lyre is down" from "lyre is fine but our participant
+        has not discovered it": the two need opposite responses, and DDS visibility
+        alone cannot tell them apart.
+        """
         import subprocess as _sp
+        try:
+            r = _sp.run(self._NSENTER + ["systemctl", "is-active", self._LYRE_UNIT],
+                        capture_output=True, timeout=10, text=True)
+            return ((r.stdout or "") + (r.stderr or "")).strip() or "unknown"
+        except Exception as e:
+            return f"unknown ({e})"
+
+    def _restart_lyre(self) -> str | None:
+        """Restart lyre. Returns an error string, or None on success."""
+        import subprocess as _sp
+        print(f"[TtsPlugin] restarting lyre (unit state was "
+              f"{self._lyre_unit_state()!r})", flush=True)
+        try:
+            r = _sp.run(self._NSENTER + ["systemctl", "restart", self._LYRE_UNIT],
+                        capture_output=True, timeout=self._RESTART_CMD_TIMEOUT_S, text=True)
+        except Exception as e:
+            return f"重启 lyre 失败：{e}"
+        if r.returncode != 0:
+            return f"重启 lyre 失败：{((r.stderr or r.stdout) or '').strip()[:200]}"
+        state = self._lyre_unit_state()
+        print(f"[TtsPlugin] lyre restarted, unit state now {state!r}", flush=True)
+        return None
+
+    def _wait_service(self, timeout_s: float) -> bool:
+        """Poll for the play_text server. No spinning needed — graph discovery happens
+        in the DDS threads, and the executor thread may not be running yet."""
+        import time as _time
+        deadline = _time.time() + timeout_s
+        while _time.time() < deadline:
+            if self._play_client.service_is_ready():
+                return True
+            _time.sleep(0.2)
+        return False
+
+    def _lyre_health_check(self) -> str | None:
+        """Verify the whole TTS chain: service discoverable → call accepted → PlayEvent
+        arrives. Returns an error message, or None when healthy.
+
+        Each failure mode gets its own message. The first version returned
+        "播放成功但无法收到完成事件" for all five of them, including the case where the
+        service was never discovered and nothing was ever played — which pointed the
+        investigation at the audio hardware for a while. It also restarted lyre on any
+        failure, so a discovery problem in this driver was "fixed" by killing a
+        perfectly healthy service, and the retry then ran before lyre could come back.
+        """
         import time as _time
 
         for attempt in range(2):
-            if attempt > 0:
-                # Restart lyre via nsenter on second attempt
-                print("[TtsPlugin] health check failed, restarting lyre...", flush=True)
-                try:
-                    _sp.run(["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
-                             "systemctl", "restart", "lyre"],
-                            capture_output=True, timeout=15)
-                    _time.sleep(5)
-                except Exception as e:
-                    print(f"[TtsPlugin] lyre restart failed: {e}", flush=True)
+            if not self._wait_service(self._DISCOVERY_WAIT_S):
+                state = self._lyre_unit_state()
+                if state != "active":
+                    # lyre really is down — restarting it is the right recovery, and
+                    # this is the only path where a restart is warranted up front.
+                    print(f"[TtsPlugin] play_text not found and lyre is {state!r} "
+                          f"— restarting", flush=True)
+                    err = self._restart_lyre()
+                    if err:
+                        return (f"Lyre 服务未运行（systemd: {state}），自动重启失败。{err} "
+                                f"请在机器人上执行 sudo systemctl restart lyre。")
+                    if not self._wait_service(self._RESTART_DISCOVERY_WAIT_S):
+                        return (f"Lyre 服务原为 {state}，已自动重启并恢复运行，但 "
+                                f"{self._RESTART_DISCOVERY_WAIT_S:.0f}s 内仍未发现 "
+                                f"/audio_play/play_text 服务。请检查 lyre 日志："
+                                f"journalctl -u lyre -n 100。")
+                    print("[TtsPlugin] play_text found after lyre restart", flush=True)
+                else:
+                    # lyre is up but we cannot see it. Restarting lyre would destroy a
+                    # working service without touching the actual fault, which is on
+                    # our side of the link (DDS domain / profile / interface).
+                    print(f"[TtsPlugin] play_text not discovered in "
+                          f"{self._DISCOVERY_WAIT_S:.0f}s, but lyre is active "
+                          f"— not restarting it", flush=True)
+                    return (f"Lyre 服务正在运行（systemd: active），但 "
+                            f"{self._DISCOVERY_WAIT_S:.0f}s 内发现不到 "
+                            f"/audio_play/play_text。问题在驱动到 lyre 的 DDS 链路，"
+                            f"不在 lyre 本身：请核对 domain 0 与 FastDDS profile "
+                            f"（本驱动应使用厂商 profile /work/dds_profile.xml，"
+                            f"需能绑到 192.168.41.x）。重启 lyre 不会有帮助。")
 
-            # Wait for service to be available (poll without spinning — executor thread handles it)
-            service_ready = False
-            deadline = _time.time() + 5
-            while _time.time() < deadline:
-                if self._play_client.service_is_ready():
-                    service_ready = True
-                    break
-                _time.sleep(0.2)
-            if not service_ready:
-                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text service not available", flush=True)
-                continue
-
-            # Send a silent test (single dot — minimal TTS)
+            # Service is there — send a minimal test and require a real response.
             from lyre_msgs.srv import PlayText
             req = PlayText.Request()
             req.text = "."
             req.force = True
             future = self._play_client.call_async(req)
-
-            # Wait for response (max 3s) — executor spin thread delivers it
-            deadline = _time.time() + 3
+            deadline = _time.time() + 5
             while not future.done() and _time.time() < deadline:
                 _time.sleep(0.1)
-
             if not future.done():
-                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text call timeout", flush=True)
-                continue
+                print(f"[TtsPlugin] health check attempt {attempt+1}: "
+                      f"play_text 调用无响应", flush=True)
+                if attempt == 0:
+                    err = self._restart_lyre()
+                    if err:
+                        return f"play_text 服务可见但调用无响应，且{err}"
+                    continue
+                return ("Lyre 的 play_text 服务可见，但调用 5s 无响应，重启后依旧。"
+                        "lyre 进程可能已卡死：请查看 journalctl -u lyre -n 100。")
 
             resp = future.result()
             if resp is None or resp.code != 0:
-                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text returned error", flush=True)
-                continue
+                msg = getattr(resp, "message", "") if resp is not None else "no response"
+                print(f"[TtsPlugin] health check attempt {attempt+1}: "
+                      f"play_text 返回错误 code={getattr(resp, 'code', '?')}", flush=True)
+                if attempt == 0:
+                    if self._restart_lyre() is None:
+                        continue
+                return (f"Lyre 拒绝了合成请求：code="
+                        f"{getattr(resp, 'code', '?')} message={msg!r}。"
+                        f"请检查 lyre 的 TTS 引擎与授权状态。")
 
             sid = resp.sid
-            # Wait for PlayEvent with this sid (3s timeout)
-            # The executor spin thread will call _on_play_event which populates _play_event_buffer
-            deadline = _time.time() + 3
+            if not sid:
+                # lyre generates a sid when the request omits one, so an empty sid
+                # means we cannot correlate PlayEvent and every playback would fall
+                # back to a fixed sleep.
+                return ("Lyre 接受了请求但未返回 sid，无法与 PlayEvent 关联，"
+                        "播放完成时间将不可知。请检查 lyre 版本是否匹配 lyre_msgs。")
+
+            deadline = _time.time() + 5
             while _time.time() < deadline:
                 if sid in self._play_event_buffer:
                     break
                 _time.sleep(0.1)
 
             if sid in self._play_event_buffer:
-                # Cleanup test sid from buffers
                 self._play_event_buffer.pop(sid, None)
                 self._pending_play.pop(sid, None)
                 self._pending_play_status.pop(sid, None)
                 self._pending_play_duration.pop(sid, None)
                 print(f"[TtsPlugin] health check passed (attempt {attempt+1})", flush=True)
-                return None  # success
-            else:
-                print(f"[TtsPlugin] health check attempt {attempt+1}: PlayEvent not received for sid={sid}", flush=True)
+                return None
 
-        return "Lyre TTS PlayEvent 链路异常：播放成功但无法收到完成事件。已尝试重启 lyre 仍未恢复，请检查 lyre 服务状态。"
+            # Call accepted, no event. This is the one case the original message
+            # described, and the one where restarting lyre is genuinely indicated.
+            print(f"[TtsPlugin] health check attempt {attempt+1}: "
+                  f"PlayEvent not received for sid={sid}", flush=True)
+            if attempt == 0:
+                err = self._restart_lyre()
+                if err:
+                    return f"播放成功但收不到 PlayEvent 完成事件，且{err}"
+                continue
+
+        return ("Lyre TTS 事件链路异常：合成请求被接受，但收不到 /audio_play/event "
+                "的完成事件，已自动重启 lyre 仍未恢复。播放时长将只能按字数估算。"
+                "请检查 lyre 服务：journalctl -u lyre -n 100。")
+
+    def _recheck_health(self) -> str | None:
+        """Cheap re-check for start/info: is the service there, and what does systemd
+        say? Plays nothing.
+
+        The startup result used to be latched forever, so once the check had failed
+        the dashboard kept reporting a fault long after the chain recovered.
+        """
+        if not self._play_client:
+            return "Lyre TTS 客户端未创建（lyre_msgs 导入失败）。"
+        if self._wait_service(3.0):
+            return None
+        state = self._lyre_unit_state()
+        if state != "active":
+            return (f"Lyre 服务未运行（systemd: {state}）。"
+                    f"请执行 sudo systemctl restart lyre，或重启本驱动容器以自动恢复。")
+        return (f"Lyre 服务正在运行，但当前发现不到 /audio_play/play_text。"
+                f"这是驱动到 lyre 的 DDS 链路问题（domain 0 / FastDDS profile），"
+                f"重启 lyre 无用。")
 
     # PlayEvent event codes
     _EVENT_NAMES = {0: "STARTED", 1: "COMPLETED", 2: "STOPPED", 3: "CANCELLED", 4: "FAILED"}
@@ -4644,8 +4759,20 @@ class TtsPlugin:
         elif action == "resume":
             return self._call_empty_service(self._resume_client, "resume")
         elif action in ("start", "info"):
-            if hasattr(self, '_startup_error') and self._startup_error:
-                return {"state": "error", "message": self._startup_error}
+            # Re-check rather than replay the startup verdict. The startup result used
+            # to be latched for the life of the process, so a chain that recovered
+            # (lyre finished restarting, discovery converged) still reported a fault
+            # on every start/info — and the operator had no way to clear it short of
+            # restarting the container.
+            if getattr(self, "_startup_error", None):
+                current = self._recheck_health()
+                if current is None:
+                    print("[TtsPlugin] startup error cleared — chain is healthy now",
+                          flush=True)
+                    self._startup_error = None
+                    return {"state": "ready"}
+                self._startup_error = current
+                return {"state": "error", "message": current}
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
 
@@ -4740,10 +4867,20 @@ class TtsPlugin:
                 break
 
             seg_sid = None
+            no_response = False
             if future.done():
                 result = future.result()
                 if result:
                     seg_sid = getattr(result, 'sid', None)
+                else:
+                    no_response = True
+            else:
+                # The call never came back. Nothing is playing: lyre either is not
+                # there or is wedged. Distinguished from "responded without a sid"
+                # because that one may well be audible, whereas this one is silence.
+                no_response = True
+                print(f"[TtsPlugin] no response from play_text in "
+                      f"{timeout_service:.0f}s seg {i+1}/{len(segments)}", flush=True)
             if seg_sid:
                 sid = seg_sid
 
@@ -4821,6 +4958,17 @@ class TtsPlugin:
                     continue
                 elif seg_status == "error" and is_last:
                     overall_status = "error"
+            elif no_response:
+                # Do not sleep-then-claim-success. This path used to fall into the
+                # fallback below and report ACP completed, so a silent robot looked
+                # like a successful utterance — verified on the robot, lyre had
+                # received nothing at all while the driver reported completion.
+                overall_status = "error"
+                print(f"[TtsPlugin] seg {i+1}/{len(segments)}: play_text 无响应，"
+                      f"未发声，报错而非假成功", flush=True)
+                self._startup_error = self._recheck_health() or (
+                    "play_text 调用无响应。")
+                break
             elif not seg_sid:
                 # 没拿到 sid，fallback 按字数估算（但也要检查 cancel）
                 fallback_s = len(seg_text) / 2.5 + 5.0
@@ -4845,9 +4993,14 @@ class TtsPlugin:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            acp_result = {"action": "speak", "sid": sid or "unknown",
+                          "segments": len(segments)}
+            # Carry the reason, not just the verdict — "error" with no detail sends the
+            # reader to the logs, and this is the field the dashboard already shows.
+            if overall_status == "error" and getattr(self, "_startup_error", None):
+                acp_result["error"] = self._startup_error
             p = _json.dumps({"action_id": action_id, "status": overall_status,
-                             "result": {"action": "speak", "sid": sid or "unknown",
-                                        "segments": len(segments)}}).encode()
+                             "result": acp_result}).encode()
             r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
                                       headers={"Content-Type": "application/json"}, method="POST")
             urllib.request.urlopen(r, timeout=5, context=ctx)
