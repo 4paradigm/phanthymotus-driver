@@ -11,6 +11,8 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+import json
+from types import SimpleNamespace
 from pathlib import Path
 
 DEVICE_DIR = Path(__file__).resolve().parent.parent
@@ -173,7 +175,7 @@ def _install_ros_stubs():
     rclpy.qos = sys.modules["rclpy.qos"]
 
     module("sensor_msgs")
-    module("sensor_msgs.msg", CompressedImage=FakeMsg, Image=FakeMsg, Imu=FakeMsg, PointCloud2=FakeMsg)
+    module("sensor_msgs.msg", CameraInfo=FakeMsg, CompressedImage=FakeMsg, Image=FakeMsg, Imu=FakeMsg, PointCloud2=FakeMsg)
     module("std_msgs")
     module("std_msgs.msg", String=FakeMsg)
     module("geometry_msgs")
@@ -185,9 +187,12 @@ def _install_ros_stubs():
     module(
         "aimdk_msgs.msg",
         CommonRequest=FakeMsg,
+        PmuState=FakeMsg,
+        TouchState=FakeMsg,
         HandCommand=FakeMsg,
         HandCommandArray=FakeMsg,
         HandStateArray=FakeMsg,
+        JointStateArray=FakeMsg,
         JointCommand=FakeMsg,
         JointCommandArray=FakeMsg,
         McLocomotionVelocity=FakeMsg,
@@ -274,8 +279,70 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joint_state", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
+        for name in ("mc_state", "joints", "joint_state", "hand_state", "imu", "camera_rgb", "camera_info", "camera_depth", "head_touch", "pmu_state", "lidar", "slam_pose"):
             self.assertEqual(by_name[name], "sensor")
+
+    def test_confirmed_sensor_topics_are_wired(self):
+        plugins = build_bundle_plugins()
+        nodes = plugins[0].nodes
+        expected = {
+            "head_touch": "/aima/hal/sensor/touch_head",
+            "pmu_state": "/aima/hal/pmu/state",
+            "camera_info": "/aima/hal/sensor/rgb_head_front_center/camera_info",
+        }
+        for name, topic in expected.items():
+            self.assertEqual(nodes.streams[name]["robot_topic"], topic)
+            self.assertEqual(nodes.streams[name]["format"], "data/json")
+
+    def test_joints_skeleton_topic_and_payload_contract(self):
+        plugins = build_bundle_plugins()
+        nodes = plugins[0].nodes
+        joints = find_plugin(plugins, "joints")
+        self.assertEqual(nodes.streams["joints"]["format"], "sensor/skeleton")
+        self.assertEqual(nodes.streams["joints"]["topic"], "/test_ns/state/joints")
+        self.assertEqual(joints.dispatch("info", {})["data"]["joint_count"], 0)
+
+    def test_joints_skeleton_uses_selected_urdf_variant(self):
+        for variant, expected_count in (("hand", 27), ("fist", 27), ("ultra", 31)):
+            plugins = build_bundle_plugins({"end_effector": variant, "plugins": {}})
+            nodes = plugins[0].nodes
+            self.assertEqual(sum(len(names) for names in nodes.skeleton_joints.values()), expected_count)
+
+    def test_joint_state_callbacks_publish_skeleton_values(self):
+        plugins = build_bundle_plugins()
+        nodes = plugins[0].nodes
+        joints_plugin = find_plugin(plugins, "joints")
+        callbacks = {topic: callback for topic, callback in nodes.robot.subscriptions}
+
+        leg_names = nodes.skeleton_joints["leg"]
+        leg_topic = "/aima/hal/joint/leg/state"
+        leg_message = SimpleNamespace(joints=[
+            SimpleNamespace(position=0.1, velocity=0.2, effort=0.3, error_code=0),
+            SimpleNamespace(position=-0.4, velocity=0.5, effort=0.6, error_code=7),
+        ])
+        callbacks[leg_topic](leg_message)
+
+        arm_names = nodes.skeleton_joints["arm"]
+        arm_topic = "/aima/hal/joint/arm/state"
+        callbacks[arm_topic](SimpleNamespace(joints=[
+            SimpleNamespace(position=1.0, velocity=1.1, effort=1.2, error_code=0),
+        ]))
+
+        payload = json.loads(nodes.skeleton_pub.published[-1].data)
+        self.assertEqual(payload["format"], "sensor/skeleton")
+        self.assertEqual(payload["joint_count"], 3)
+        self.assertEqual(payload["joints"][0], {
+            "idx": nodes.skeleton_joint_indices[leg_names[0]],
+            "name": leg_names[0], "q": 0.1, "dq": 0.2, "tau": 0.3,
+        })
+        self.assertEqual(payload["joints"][1]["name"], leg_names[1])
+        self.assertEqual(payload["joints"][1]["error_code"], 7)
+        self.assertEqual(payload["joints"][2], {
+            "idx": nodes.skeleton_joint_indices[arm_names[0]],
+            "name": arm_names[0], "q": 1.0, "dq": 1.1, "tau": 1.2,
+        })
+        self.assertIsInstance(nodes.skeleton_pub.published[-1], FakeMsg)
+        self.assertEqual(joints_plugin.dispatch("info", {})["data"], payload)
 
     def test_mc_mode_and_preset_motion_action_enums_nonempty(self):
         plugins = build_bundle_plugins()

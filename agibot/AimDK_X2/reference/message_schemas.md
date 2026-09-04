@@ -60,6 +60,17 @@ hal/srv/SetPmuLed.srv:         req: CommonRequest request; string trace_id;
                                 resp: ResponseHeader header; uint16 status_code
 ```
 
+## Sensors
+
+```
+hal/msg/TouchState.msg: uint8 event_type; uint32[8] data; uint32[8] threshold; bool[8] is_touched
+hal/msg/PmuState.msg: string pmu_software_version; string pmu_hardware_version;
+                     uint32 pmu_bool_status; float64 battery_voltage; float64 output_48v_voltage;
+                     float64 output_12v_voltage; float64 pmu_temperature; float64 fan_speed;
+                     uint8 fan_pecentage; ...
+sensor_msgs/msg/CameraInfo: standard ROS 2 camera calibration and projection parameters
+```
+
 ## Motion control (`mc`)
 
 ```

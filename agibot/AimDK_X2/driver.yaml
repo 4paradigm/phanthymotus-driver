@@ -13,11 +13,15 @@ build_context_extras:
 # Kept in sync by hand with config.yaml's plugin enabled flags and end_effector variant.
 cards:
   - { name: mc_state,           type: sensor }
+  - { name: joints,             type: sensor }
   - { name: joint_state,        type: sensor }
   - { name: hand_state,         type: sensor }
   - { name: imu,                type: sensor }
   - { name: camera_rgb,         type: sensor }
+  - { name: camera_info,        type: sensor }
   - { name: camera_depth,       type: sensor }
+  - { name: head_touch,         type: sensor }
+  - { name: pmu_state,          type: sensor }
   - { name: lidar,              type: sensor }
   - { name: slam_pose,          type: sensor }
   - { name: system_state,       type: sensor }
