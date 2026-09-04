@@ -214,6 +214,11 @@ def load_driver_yaml_cards():
     return {card["name"]: card["type"] for card in manifest["cards"]}
 
 
+def load_driver_config():
+    with open(DEVICE_DIR / "config.yaml", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
 def build_bundle_plugins(config=None):
     config = config if config is not None else {"end_effector": "hand", "plugins": {}}
     return device.build_plugins(config, "test_ns", FakeROS2())
@@ -235,14 +240,32 @@ def find_plugin(plugins, tool_name):
 
 
 class ToolInventoryTests(unittest.TestCase):
-    def test_tool_names_and_types_match_driver_yaml(self):
-        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
+    def test_default_config_tool_names_and_types_match_driver_yaml(self):
+        plugins = build_bundle_plugins(load_driver_config())
         definitions = tool_definitions(plugins)
         by_name = {d["name"]: d["type"] for d in definitions}
         expected = load_driver_yaml_cards()
-        self.assertEqual(set(by_name), set(expected), "tool inventory must match driver.yaml cards exactly")
+        self.assertEqual(set(by_name), set(expected), "default tool inventory must match driver.yaml cards exactly")
         for name, expected_type in expected.items():
             self.assertEqual(by_name[name], expected_type, f"tool '{name}' type mismatch")
+
+    def test_disabling_hardware_features_unregisters_their_cards(self):
+        default_plugins = build_bundle_plugins(load_driver_config())
+        default_names = {d["name"] for d in tool_definitions(default_plugins)}
+
+        feature_cards = {
+            "hand_state": {"hand_state", "hand_command"},
+            "camera_depth": {"camera_depth"},
+            "lidar": {"lidar"},
+            "slam_pose": {"slam_pose"},
+            "slam": {"slam_control"},
+        }
+        for feature, expected_removed in feature_cards.items():
+            config = load_driver_config()
+            config["plugins"][feature]["enabled"] = False
+            plugins = build_bundle_plugins(config)
+            names = {d["name"] for d in tool_definitions(plugins)}
+            self.assertEqual(default_names - names, expected_removed, feature)
 
     def test_no_duplicate_tool_names(self):
         plugins = build_bundle_plugins()
@@ -258,24 +281,30 @@ class ToolInventoryTests(unittest.TestCase):
         names_on = {d["name"] for d in tool_definitions(plugins_on)}
         self.assertIn("slam_control", names_on)
 
-    def test_actuator_tools_are_typed_actuator(self):
-        plugins = build_bundle_plugins()
+    def test_default_actuator_tools_are_typed_actuator(self):
+        plugins = build_bundle_plugins(load_driver_config())
         definitions = tool_definitions(plugins)
         expected_actuators = {
-            "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command",
-            "linkcraft", "pmu_led", "tts", "emoji", "mic_source",
+            "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command", "linkcraft",
+            "pmu_led", "tts", "emoji", "mic_source", "slam_control",
         }
         by_name = {d["name"]: d["type"] for d in definitions}
         for name in expected_actuators:
             self.assertEqual(by_name[name], "actuator", f"'{name}' must be an actuator tool")
 
-    def test_sensor_and_resource_tools_carry_expected_types(self):
-        plugins = build_bundle_plugins()
+    def test_default_sensor_resource_and_processor_tools_carry_expected_types(self):
+        plugins = build_bundle_plugins(load_driver_config())
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joint_state", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
+        for name in ("mc_state", "joint_state", "imu", "leg_odometry", "camera_rgb", "system_state", "linkcraft_catalog"):
             self.assertEqual(by_name[name], "sensor")
+
+    def test_leg_odometry_is_gated_by_config(self):
+        config = load_driver_config()
+        config["plugins"]["leg_odometry"]["enabled"] = False
+        names = {d["name"] for d in tool_definitions(build_bundle_plugins(config))}
+        self.assertNotIn("leg_odometry", names)
 
     def test_mc_mode_and_preset_motion_action_enums_nonempty(self):
         plugins = build_bundle_plugins()
@@ -333,6 +362,12 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertTrue(locomotion._registered)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
+
+    def test_mirrored_subscriptions_are_retained_for_node_lifetime(self):
+        plugins = build_bundle_plugins(load_driver_config())
+        nodes = plugins[0].nodes
+        self.assertEqual(len(nodes._subscriptions), 8)
+        self.assertTrue(all(subscription is not None for subscription in nodes._subscriptions))
 
 
 class StartStopLifecycleTests(unittest.TestCase):

@@ -133,10 +133,12 @@ class AimdkNodes:
 
         self.lock = threading.RLock()
         self.values = {}
+        self._subscriptions = []
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         command_qos = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
 
+        self.plugin_config = config.get("plugins", {})
         self.streams = {}
 
         def mirror(key, msg_type, robot_topic, fmt, depth=10, qos=None):
@@ -144,9 +146,9 @@ class AimdkNodes:
             as_json = fmt == "data/json"
             core_msg_type = String if as_json else msg_type
             pub = self.core.create_publisher(core_msg_type, core_topic, depth)
-            self.robot.create_subscription(
+            self._subscriptions.append(self.robot.create_subscription(
                 msg_type, robot_topic, self._callback(key, pub, as_json=as_json), qos or depth,
-            )
+            ))
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
         # Two physical IMUs (chest/torso) feed a single combined "imu" tool/topic — driver.yaml
@@ -154,20 +156,26 @@ class AimdkNodes:
         # than exposed as two separate tools.
         imu_topic = f"/{namespace}/agibot_x2/imu"
         imu_pub = self.core.create_publisher(String, imu_topic, 5)
-        self.robot.create_subscription(Imu, "/aima/hal/imu/chest/state", self._imu_callback("chest", imu_pub), sensor_qos)
-        self.robot.create_subscription(Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos)
+        self._subscriptions.append(self.robot.create_subscription(
+            Imu, "/aima/hal/imu/chest/state", self._imu_callback("chest", imu_pub), sensor_qos,
+        ))
+        self._subscriptions.append(self.robot.create_subscription(
+            Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos,
+        ))
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
-        mirror("hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json", qos=sensor_qos)
-        # SDK's topics_and_services catalog documents rgbd_head_front/* as the front camera, but
-        # on real hardware that topic has zero publishers -- this unit's camera service actually
-        # publishes RGB under rgb_head_front_center/* instead (confirmed live via `ros2 topic
-        # info`, 30Hz). No depth topic is published anywhere on this hardware at all, so
-        # camera_depth stays wired to the documented (currently inactive) topic.
-        mirror("camera_rgb", CompressedImage, "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed", "image/jpeg", qos=sensor_qos)
-        mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
-        mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
-        mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
+        if self.enabled("hand_state"):
+            mirror("hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json", qos=sensor_qos)
+        if self.enabled("leg_odometry"):
+            mirror("leg_odometry", Odometry, "/aima/mc/leg_odometry", "data/json", qos=sensor_qos)
+        if self.enabled("camera_rgb"):
+            mirror("camera_rgb", CompressedImage, "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed", "image/jpeg", qos=sensor_qos)
+        if self.enabled("camera_depth"):
+            mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
+        if self.enabled("lidar"):
+            mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
+        if self.enabled("slam_pose"):
+            mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
 
         # /integrated_command and /relocalization_pose are outbound-only (SLAM control), not
         # mirrored streams -- they are plain publishers used by SlamControlPlugin.
@@ -244,6 +252,9 @@ class AimdkNodes:
     def snapshot(self, key):
         with self.lock:
             return self.values.get(key, {})
+
+    def enabled(self, name, default=True):
+        return self.plugin_config.get(name, {}).get("enabled", default)
 
     def urdf_text(self, variant=None):
         variant = (variant or self.end_effector).lower()
@@ -376,10 +387,12 @@ class CameraPlugin:
         self.nodes = nodes
 
     def get_tools(self):
-        return [
-            _stream_tool("camera_rgb", self.nodes.streams["camera_rgb"], "前置 RGBD 相机彩色画面（压缩 JPEG）"),
-            _stream_tool("camera_depth", self.nodes.streams["camera_depth"], "前置 RGBD 相机深度画面"),
-        ]
+        tools = []
+        if self.nodes.enabled("camera_rgb"):
+            tools.append(_stream_tool("camera_rgb", self.nodes.streams["camera_rgb"], "前置相机彩色画面（压缩 JPEG）"))
+        if self.nodes.enabled("camera_depth"):
+            tools.append(_stream_tool("camera_depth", self.nodes.streams["camera_depth"], "前置相机深度画面"))
+        return tools
 
     def start(self):
         pass
@@ -411,6 +424,25 @@ class LidarPlugin:
         if action == "stop":
             return {"state": "idle"}
         return {"state": "running", **self.nodes.streams["lidar"]}
+
+
+class LegOdometryPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return _stream_tool("leg_odometry", self.nodes.streams["leg_odometry"], "腿部里程计位姿（/aima/mc/leg_odometry）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        return {"state": "running", **self.nodes.streams["leg_odometry"]}
 
 
 class SlamPosePlugin:
@@ -1127,20 +1159,25 @@ class MapGetPlugin:
 
 def build_plugins(config, namespace, ros2):
     nodes = AimdkNodes(config, namespace, ros2)
-    plugin_config = config.get("plugins", {})
-
-    def enabled(name, default=True):
-        return plugin_config.get(name, {}).get("enabled", default)
-
     plugins = [
-        McStatePlugin(nodes), JointStatePlugin(nodes), HandStatePlugin(nodes),
-        ImuPlugin(nodes), CameraPlugin(nodes), LidarPlugin(nodes), SlamPosePlugin(nodes),
+        McStatePlugin(nodes), JointStatePlugin(nodes), ImuPlugin(nodes),
         SystemStatePlugin(nodes), LinkcraftCatalogPlugin(nodes), ModelPlugin(nodes),
         McModePlugin(nodes), LocomotionPlugin(nodes), PresetMotionPlugin(nodes),
-        JointCommandPlugin(nodes), HandCommandPlugin(nodes), LinkcraftPlugin(nodes),
-        PmuLedPlugin(nodes), TtsPlugin(nodes), EmojiPlugin(nodes), MicSourcePlugin(nodes),
-        MapGetPlugin(nodes),
+        JointCommandPlugin(nodes), LinkcraftPlugin(nodes), PmuLedPlugin(nodes),
+        TtsPlugin(nodes), EmojiPlugin(nodes), MicSourcePlugin(nodes), MapGetPlugin(nodes),
     ]
-    if enabled("slam", default=False):
+    if nodes.enabled("leg_odometry"):
+        plugins.append(LegOdometryPlugin(nodes))
+    if nodes.enabled("hand_state"):
+        plugins.append(HandStatePlugin(nodes))
+    if nodes.enabled("camera_rgb") or nodes.enabled("camera_depth"):
+        plugins.append(CameraPlugin(nodes))
+    if nodes.enabled("lidar"):
+        plugins.append(LidarPlugin(nodes))
+    if nodes.enabled("slam_pose"):
+        plugins.append(SlamPosePlugin(nodes))
+    if nodes.enabled("hand_state"):
+        plugins.append(HandCommandPlugin(nodes))
+    if nodes.enabled("slam", default=False):
         plugins.append(SlamControlPlugin(nodes))
     return plugins
