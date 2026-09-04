@@ -14,9 +14,13 @@ build_context_extras:
 cards:
   - { name: mc_state,           type: sensor }
   - { name: joint_state,        type: sensor }
+  - { name: hand_state,         type: sensor }
   - { name: imu,                type: sensor }
   - { name: leg_odometry,       type: sensor }
   - { name: camera_rgb,         type: sensor }
+  - { name: camera_depth,       type: sensor }
+  - { name: lidar,              type: sensor }
+  - { name: slam_pose,          type: sensor }
   - { name: system_state,       type: sensor }
   - { name: linkcraft_catalog,  type: sensor }
   - { name: model,              type: resource }
@@ -24,9 +28,11 @@ cards:
   - { name: locomotion,         type: actuator }
   - { name: preset_motion,      type: actuator }
   - { name: joint_command,      type: actuator }
+  - { name: hand_command,       type: actuator }
   - { name: linkcraft,          type: actuator }
   - { name: pmu_led,            type: actuator }
   - { name: tts,                type: actuator }
   - { name: emoji,              type: actuator }
   - { name: mic_source,         type: actuator }
+  - { name: slam_control,       type: actuator }
   - { name: map_get,            type: processor }
