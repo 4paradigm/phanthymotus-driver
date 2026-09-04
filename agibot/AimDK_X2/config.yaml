@@ -26,6 +26,8 @@ plugins:
     enabled: false
   imu:
     enabled: true
+  leg_odometry:
+    enabled: true
   camera_rgb:
     enabled: true
   camera_depth:
