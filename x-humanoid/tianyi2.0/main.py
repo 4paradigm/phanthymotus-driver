@@ -653,26 +653,41 @@ class TianyiDeviceBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: TianyiDeviceBundle | None = None
-_joints_bridge_proc: subprocess.Popen | None = None
+_domain_bridge_proc: subprocess.Popen | None = None
 
 
-def _start_joints_bridge(cfg: dict) -> None:
-    global _joints_bridge_proc
-    if not cfg.get("joints_bridge", {}).get("enabled", False):
-        return
-    # Use the new two-process bridge with proper DDS isolation
-    bridge_path = Path(__file__).parent / "joints_bridge_v2.py"
+def _start_domain_bridge(cfg: dict) -> None:
+    """Start socket bridge to forward domain 42 topics to agent-core.
+
+    The bridge runs as a separate process with dds-local.xml, receiving messages
+    from plugins via Unix sockets and publishing them to agent-core on domain 42.
+
+    This allows plugins to continue publishing "normally" while the actual cross-domain
+    communication is handled transparently by the bridge.
+    """
+    global _domain_bridge_proc
+    if not cfg.get("domain_bridge", {}).get("enabled", False):
+        # Fallback: check old joints_bridge config for backward compatibility
+        if not cfg.get("joints_bridge", {}).get("enabled", False):
+            return
+        print("[bundle] WARNING: joints_bridge config is deprecated, use domain_bridge instead", flush=True)
+
+    bridge_path = Path(__file__).parent / "socket_bridge.py"
     bridge_env = os.environ.copy()
-    bridge_env["CONFIG_PATH"] = os.environ.get(
-        "CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
+
     try:
-        _joints_bridge_proc = subprocess.Popen(
+        _domain_bridge_proc = subprocess.Popen(
             [sys.executable, str(bridge_path)],
             env=bridge_env,
         )
-        print(f"[bundle] joints bridge v2 started (pid={_joints_bridge_proc.pid})", flush=True)
+        print(f"[bundle] socket bridge started (pid={_domain_bridge_proc.pid})", flush=True)
+        print("[bundle] domain 42 publishers will route through bridge to agent-core", flush=True)
+        
+        # Wait a moment for sockets to be created
+        time.sleep(2)
     except Exception as e:
-        print(f"[bundle] joints bridge FAILED: {e}", flush=True)
+        print(f"[bundle] socket bridge FAILED: {e}", flush=True)
+
 
 
 def make_handler():
@@ -861,11 +876,18 @@ def main():
     # Dual-domain ROS2
     ros2 = DualDomainROS2()
     ros2.start_spin()
-    print("[bundle] Dual-domain ROS2 initialized (domain 0 + domain 42)")
+    print("[bundle] ROS2 initialized: domain 0 (body controller) + domain 42 (local bridge)")
+    print("[bundle] Note: domain 42 uses same DDS profile as domain 0 (192.168.41.2 + 127.0.0.1)")
+    print("[bundle] External agent-core communication handled by domain_bridge process")
+
+    # Enable transparent bridge routing for domain 42 publishers
+    if cfg.get("domain_bridge", {}).get("enabled", False):
+        import bridge_integration
+        bridge_integration.enable(ros2.ctx_core)
 
     _bundle = TianyiDeviceBundle(cfg, namespace, ros2, slamtec_client, remote_mics=remote_mics)
     _bundle.start_all()
-    _start_joints_bridge(cfg)
+    _start_domain_bridge(cfg)
 
     _start_registration(mcp_port, cfg.get("name", "Tianyi 2.0 Pro"), "driver")
 
@@ -874,8 +896,8 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
-        if _joints_bridge_proc is not None:
-            _joints_bridge_proc.terminate()
+        if _domain_bridge_proc is not None:
+            _domain_bridge_proc.terminate()
         _bundle.stop_all()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
@@ -885,8 +907,8 @@ def main():
     try:
         server.serve_forever()
     finally:
-        if _joints_bridge_proc is not None and _joints_bridge_proc.poll() is None:
-            _joints_bridge_proc.terminate()
+        if _domain_bridge_proc is not None and _domain_bridge_proc.poll() is None:
+            _domain_bridge_proc.terminate()
         _bundle.stop_all()
         ros2.shutdown()
 
