@@ -650,6 +650,10 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
             3,
         )
         self.assertIn("def recoverable_stop_retry_loop", source)
+        self.assertIn(
+            "prepare_proposal_stop(reason, time.monotonic())",
+            source,
+        )
         self.assertIn("last_proposal_stop_result = dict(result)", source)
         self.assertIn('"last_proposal_stop": (', source)
         self.assertIn("last_proposal_stop_result = None", source)
@@ -700,6 +704,10 @@ class SmartMotionParentLocoSequenceTest(unittest.TestCase):
         )
         self.assertIn(
             "parent_get_fsm_id=loco_client.GetFsmId",
+            main_source,
+        )
+        self.assertIn(
+            "motion_rpc_timeout=proposal_cfg.get(",
             main_source,
         )
 

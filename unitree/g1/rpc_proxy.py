@@ -16,6 +16,7 @@ import time
 
 
 PROPOSAL_CONTINUOUS_DURATION_SECONDS = 864000.0
+_RPC_TIMEOUT = object()
 
 
 class ProposalRpcExecutor:
@@ -310,21 +311,67 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
 class RpcProxy:
     """Proxy that forwards LocoClient RPC calls to a subprocess, avoiding GIL contention."""
 
-    def __init__(self, network_iface: str = "eth0"):
-        ctx = multiprocessing.get_context("spawn")
-        self._cmd_q = ctx.Queue()
-        self._result_q = ctx.Queue()
-        self._proc = ctx.Process(
+    def __init__(
+        self,
+        network_iface: str = "eth0",
+        motion_rpc_timeout: float = 0.5,
+    ):
+        self._ctx = multiprocessing.get_context("spawn")
+        self._network_iface = network_iface
+        self._motion_rpc_timeout = min(
+            1.0,
+            max(0.1, float(motion_rpc_timeout)),
+        )
+        self._lock = threading.Lock()
+        self._request_id = 0
+        self._closed = False
+        self._start_worker()
+
+    def _start_worker(self) -> None:
+        self._cmd_q = self._ctx.Queue()
+        self._result_q = self._ctx.Queue()
+        self._proc = self._ctx.Process(
             target=_rpc_worker,
-            args=(self._cmd_q, self._result_q, network_iface),
+            args=(self._cmd_q, self._result_q, self._network_iface),
             daemon=True,
         )
         self._proc.start()
-        self._lock = threading.Lock()
-        self._request_id = 0
 
-    def _call(self, method: str, *args, timeout: float = 15.0, **kwargs):
+    def _replace_timed_out_worker(self) -> None:
+        """Retire an indeterminate motion worker before accepting another RPC."""
+        old_proc = self._proc
+        old_queues = (self._cmd_q, self._result_q)
+        old_pid = old_proc.pid
+        if old_proc.is_alive():
+            old_proc.terminate()
+        old_proc.join(timeout=0.5)
+        if old_proc.is_alive():
+            old_proc.kill()
+            old_proc.join(timeout=0.5)
+        for old_queue in old_queues:
+            try:
+                old_queue.close()
+                old_queue.cancel_join_thread()
+            except Exception:
+                pass
+        self._start_worker()
+        print(
+            f"[G1 RpcProxy] motion RPC timeout: replaced worker "
+            f"pid={old_pid} with pid={self._proc.pid}",
+            flush=True,
+        )
+
+    def _call(
+        self,
+        method: str,
+        *args,
+        timeout: float = 15.0,
+        replace_worker_on_timeout: bool = False,
+        **kwargs,
+    ):
         with self._lock:
+            if getattr(self, "_closed", False):
+                return None
             self._request_id += 1
             request_id = self._request_id
             self._cmd_q.put({
@@ -337,10 +384,16 @@ class RpcProxy:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
+                    if replace_worker_on_timeout:
+                        self._replace_timed_out_worker()
+                        return _RPC_TIMEOUT
                     return None
                 try:
                     response = self._result_q.get(timeout=remaining)
                 except Exception:
+                    if replace_worker_on_timeout:
+                        self._replace_timed_out_worker()
+                        return _RPC_TIMEOUT
                     return None
                 if response.get("request_id") != request_id:
                     continue
@@ -367,11 +420,16 @@ class RpcProxy:
         return result
 
     def stop(self):
-        try:
-            self._cmd_q.put(None)
-            self._proc.join(timeout=3)
-        except Exception:
-            pass
+        with self._lock:
+            self._closed = True
+            try:
+                self._cmd_q.put(None)
+                self._proc.join(timeout=3)
+                if self._proc.is_alive():
+                    self._proc.terminate()
+                    self._proc.join(timeout=1)
+            except Exception:
+                pass
 
     # ── LocoClient interface ──────────────────────────────────────────────────
 
@@ -437,7 +495,8 @@ class RpcProxy:
             nav_id,
             sequence,
             request_id,
-            timeout=1.0,
+            timeout=self._motion_rpc_timeout,
+            replace_worker_on_timeout=True,
         )
         if isinstance(result, dict):
             return result
@@ -453,7 +512,11 @@ class RpcProxy:
                 "sequence": sequence,
             },
             "ret": None,
-            "error": "parent_proposal_rpc_unavailable",
+            "error": (
+                "parent_velocity_proposal_timeout"
+                if result is _RPC_TIMEOUT
+                else "parent_proposal_rpc_unavailable"
+            ),
             "applied": False,
             "completed_monotonic": time.monotonic(),
             "completed_unix_ms": round(time.time() * 1000),

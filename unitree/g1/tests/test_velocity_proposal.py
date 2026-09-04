@@ -601,6 +601,64 @@ class ProposalGateTest(unittest.TestCase):
                 self.assertEqual(gate.expected_nav_id, "nav-001")
                 self.assertFalse(gate.recoverable_stop_active)
 
+    def test_confirmed_motion_rpc_timeout_resumes_same_navigation(self):
+        self.assertTrue(self.gate.accept(proposal(sequence=1), now=50.0).execute)
+        self.assertTrue(
+            self.gate.request_recoverable_stop(
+                "parent_velocity_proposal_timeout",
+                now=50.1,
+            ).stop
+        )
+        self.assertTrue(
+            self.gate.record_recoverable_stop_result(
+                "parent_velocity_proposal_timeout",
+                True,
+            )
+        )
+
+        resumed = self.gate.accept(proposal(sequence=2), now=50.2)
+
+        self.assertTrue(resumed.execute)
+        self.assertEqual(self.gate.expected_nav_id, "nav-001")
+        self.assertFalse(self.gate.recoverable_stop_active)
+
+    def test_motion_rpc_timeout_terminal_then_next_navigation_binds(self):
+        gate = VelocityProposalGate(ProposalLimits())
+        gate.bind(EXPECTED_TOPIC)
+        self.assertTrue(gate.accept(proposal(sequence=1), now=50.0).execute)
+        gate.request_recoverable_stop(
+            "parent_velocity_proposal_timeout",
+            now=50.1,
+        )
+        self.assertFalse(
+            gate.record_recoverable_stop_result(
+                "parent_velocity_proposal_timeout",
+                False,
+            )
+        )
+        self.assertTrue(gate.recoverable_stop_pending)
+
+        terminal = gate.accept(
+            proposal(
+                sequence=2,
+                nav_status="arrived",
+                velocity={"x": 0.0, "y": 0.0, "yaw": 0.0},
+            ),
+            now=50.2,
+        )
+        self.assertTrue(terminal.stop)
+        self.assertTrue(gate.terminal_pending_stop)
+        self.assertTrue(gate.record_terminal_stop_result(True))
+        self.assertTrue(gate.awaiting_nav_id)
+
+        next_navigation = gate.accept(
+            proposal(nav_id="nav-002", sequence=1),
+            now=50.3,
+        )
+
+        self.assertTrue(next_navigation.execute)
+        self.assertEqual(gate.expected_nav_id, "nav-002")
+
     def test_unconfirmed_fsm_observation_stop_stays_pending(self):
         self.assertTrue(self.gate.accept(proposal(sequence=1), now=10.0).execute)
         self.gate.request_recoverable_stop(

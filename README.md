@@ -94,8 +94,12 @@ more ordered `StopMove` plus fresh-odometry confirmations. Each retry uses the
 configured confirmation timeout (2 seconds by default, hard-capped at 3
 seconds), so the default background budget is at most 6 seconds; success enters
 the normal recoverable hold, while exhausting the budget hard-disarms the lease.
-Hard safety, identity, sequence, motion-RPC, explicit invalid-FSM, and exhausted
-stop-confirmation faults still disarm the lease.
+Hard safety, identity, sequence, explicit invalid-FSM, and exhausted
+stop-confirmation faults still disarm the lease. A timed-out motion RPC instead
+retires and replaces the indeterminate RPC worker, stops through the independent
+path, and retains the current task identity while physical zero is confirmed.
+After confirmation, a fresh increasing proposal from the same `nav_id` may
+resume; a confirmed terminal proposal releases that ID so the next task can bind.
 Transient stale or failed FSM observations also stop immediately, but retain a
 confirmed-zero lease until a fresh allowed FSM and the other runtime safety
 inputs are ready again. Pending FSM and StopMove calls take priority over the

@@ -31,6 +31,7 @@ RECOVERABLE_PROPOSAL_STOP_REASONS = {
     "scan_stale": "scan_stale_stop_recoverable",
     "main_control_status_stale": "main_control_status_stale_stop_recoverable",
     "main_control_rpc_failed": "main_control_rpc_failed_stop_recoverable",
+    "parent_velocity_proposal_timeout": "motion_rpc_timeout_stop_recoverable",
 }
 _STATUS_FIELD = "nav_status"
 _UNSUPPORTED_STATUS_ALIASES = {"status", "navigation_status", "navigation_state"}
@@ -376,6 +377,7 @@ class VelocityProposalGate:
             "scan_stale": "scan_stale_stop_pending",
             "main_control_status_stale": "main_control_status_stale_stop_pending",
             "main_control_rpc_failed": "main_control_rpc_failed_stop_pending",
+            "parent_velocity_proposal_timeout": "motion_rpc_timeout_stop_pending",
         }[reason]
         return False
 
@@ -392,6 +394,7 @@ class VelocityProposalGate:
             "scan_stale": "scan_stale_stop_unconfirmed",
             "main_control_status_stale": "main_control_status_stale_stop_unconfirmed",
             "main_control_rpc_failed": "main_control_rpc_failed_stop_unconfirmed",
+            "parent_velocity_proposal_timeout": "motion_rpc_timeout_stop_unconfirmed",
         }[reason]
         self.disarm(unconfirmed_reason)
         return True
@@ -511,6 +514,33 @@ class VelocityProposalGate:
         if not self.connected_topic:
             return ProposalDecision(stop=True, reason="proposal_not_connected")
         if self.recoverable_stop_pending:
+            try:
+                pending_proposal = validate_velocity_proposal(
+                    payload,
+                    self.limits,
+                )
+            except VelocityProposalValidationError:
+                pending_proposal = None
+            if (
+                pending_proposal is not None
+                and pending_proposal.nav_id == self.expected_nav_id
+                and pending_proposal.is_terminal
+            ):
+                if pending_proposal.sequence <= self.last_sequence:
+                    self.disarm("sequence_not_increasing")
+                    return ProposalDecision(
+                        stop=True,
+                        reason="sequence_not_increasing",
+                        proposal=pending_proposal,
+                    )
+                self.last_sequence = pending_proposal.sequence
+                self.last_receive_monotonic = now
+                self.begin_terminal_stop()
+                return ProposalDecision(
+                    stop=True,
+                    reason="proposal_zero",
+                    proposal=pending_proposal,
+                )
             return ProposalDecision(
                 reason=self.last_reason or "recoverable_stop_pending"
             )

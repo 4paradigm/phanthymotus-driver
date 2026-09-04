@@ -1707,7 +1707,10 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 deadline_monotonic=command["deadline_monotonic"],
                 nav_id=command["nav_id"],
                 sequence=command["sequence"],
-                timeout=proposal_rpc_timeout,
+                # RpcProxy owns the hardware deadline and may spend a short
+                # bounded interval terminating and replacing a timed-out
+                # worker before it reports the failure here.
+                timeout=proposal_rpc_timeout + 1.1,
             )
         proposal_apply_diagnostics.record_set_velocity(
             result,
@@ -3138,7 +3141,9 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                 decision.reason,
                 # Rejected bootstrap/replay samples arrive while already
                 # stopped and must not create a blocking StopMove backlog.
-                decision.proposal is not None and was_armed,
+                (
+                    decision.proposal is not None and was_armed
+                ) or proposal_gate.terminal_pending_stop,
                 is_proposal_motion,
                 newly_disarmed,
                 proposal_gate.recoverable_stop_active,
@@ -3403,10 +3408,7 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
                     else:
                         reason = "set_velocity_failed"
                     proposal_apply_diagnostics.record_rejected(reason)
-                    if reason == "proposal_ttl_expired":
-                        proposal_gate.request_ttl_stop(time.monotonic())
-                    else:
-                        proposal_gate.disarm(reason)
+                    prepare_proposal_stop(reason, time.monotonic())
                     do_stop(reason)
                     continue
                 proposal_apply_diagnostics.record_applied(

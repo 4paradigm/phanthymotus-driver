@@ -428,7 +428,14 @@ def main():
     print("[bundle] AudioClient ready")
 
     # LocoClient (locomotion control) — via subprocess proxy to avoid GIL contention
-    loco_client = RpcProxy(network_iface)
+    proposal_cfg = cfg.get("plugins", {}).get("loco", {})
+    loco_client = RpcProxy(
+        network_iface,
+        motion_rpc_timeout=proposal_cfg.get(
+            "velocity_proposal_rpc_timeout",
+            0.5,
+        ),
+    )
     print("[bundle] LocoClient ready (subprocess proxy)")
 
     # G1ArmActionClient (arm gestures)
@@ -458,7 +465,6 @@ def main():
     harness_cfg = cfg.get("safety_harness", {})
     if harness_cfg.get("enabled", True):
         from safety_harness import SmartMotionProxy
-        proposal_cfg = cfg.get("plugins", {}).get("loco", {})
         smart_motion = SmartMotionProxy(
             namespace,
             harness_cfg,

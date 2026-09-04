@@ -147,9 +147,29 @@ class RpcProxyCorrelationTest(unittest.TestCase):
         proxy = RpcProxy.__new__(RpcProxy)
         proxy._lock = threading.Lock()
         proxy._request_id = 0
+        proxy._motion_rpc_timeout = 0.01
         proxy._cmd_q = queue.Queue()
         proxy._result_q = queue.Queue()
         return proxy
+
+    def test_proposal_timeout_replaces_worker_and_reports_unknown_execution(self):
+        proxy = self.make_proxy()
+        replacements = []
+        proxy._replace_timed_out_worker = lambda: replacements.append(True)
+
+        result = proxy.ApplyVelocityProposal(
+            0.1,
+            0.0,
+            0.0,
+            deadline_monotonic=10.25,
+            nav_id="nav-1",
+            sequence=1,
+            request_id=7,
+        )
+
+        self.assertEqual(replacements, [True])
+        self.assertEqual(result["error"], "parent_velocity_proposal_timeout")
+        self.assertFalse(result["applied"])
 
     def test_late_timed_out_reply_cannot_satisfy_next_stop(self):
         proxy = self.make_proxy()
