@@ -30,10 +30,15 @@ class FakeMsg:
     # Names jsonable() probes via hasattr() to detect numpy-likes/dataclasses; must NOT
     # auto-vivify these or hasattr() reports a false positive and jsonable() calls it.
     _AUTOVIV_BLOCKLIST = {"tolist"}
+    _LIST_FIELDS = {"joints", "left_hands", "right_hands"}
 
     def __getattr__(self, name):
         if name.startswith("__") or name in FakeMsg._AUTOVIV_BLOCKLIST:
             raise AttributeError(name)
+        if name in FakeMsg._LIST_FIELDS:
+            value = []
+            object.__setattr__(self, name, value)
+            return value
         value = FakeMsg()
         object.__setattr__(self, name, value)
         return value
@@ -333,6 +338,33 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertTrue(locomotion._registered)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
+
+    def test_hand_command_uses_the_hand_types_reported_by_the_robot(self):
+        plugins = build_bundle_plugins()
+        hand_command = find_plugin(plugins, "hand_command")
+        hand_command.nodes.get_hand_type.response = FakeMsg()
+        hand_command.nodes.get_hand_type.response.left_hands_type.value = 1
+        hand_command.nodes.get_hand_type.response.right_hands_type.value = 3
+
+        result = hand_command.dispatch("open", {})
+
+        self.assertEqual(result["state"], "published")
+        sent = hand_command.nodes.hand_command_pub.published[-1]
+        self.assertEqual(sent.left_hand_type.value, 1)
+        self.assertEqual(sent.right_hand_type.value, 3)
+        self.assertEqual(len(sent.left_hands), 5)
+        self.assertEqual(len(sent.right_hands), 5)
+
+    def test_hand_command_rejects_an_unconfigured_hand_without_publishing(self):
+        plugins = build_bundle_plugins()
+        hand_command = find_plugin(plugins, "hand_command")
+        hand_command.nodes.get_hand_type.response = FakeMsg()
+        hand_command.nodes.get_hand_type.response.left_hands_type.value = 0
+        hand_command.nodes.get_hand_type.response.right_hands_type.value = 0
+
+        with self.assertRaisesRegex(ValueError, "not controllable"):
+            hand_command.dispatch("close", {})
+        self.assertEqual(hand_command.nodes.hand_command_pub.published, [])
 
 
 class StartStopLifecycleTests(unittest.TestCase):
