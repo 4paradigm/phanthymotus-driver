@@ -782,6 +782,26 @@ class HandCommandPlugin:
     def stop(self):
         pass
 
+    def _get_hand_types(self):
+        """Return the actual left/right hand types reported by the robot.
+
+        HandCommandArray carries a HandType for each side.  Leaving those fields at
+        their generated-message default (NONE) makes a command ambiguous to the
+        EtherCAT hand controller, even when the robot has dexterous hands fitted.
+        Query the source of truth immediately before publishing rather than assuming
+        the configured URDF variant matches the installed hardware.
+        """
+        from aimdk_msgs.srv import GetHandType
+
+        request = GetHandType.Request()
+        request.request = self.nodes.request_header()
+        result = call_service(self.nodes.get_hand_type, request)
+        return int(result.left_hands_type.value), int(result.right_hands_type.value)
+
+    @staticmethod
+    def _is_controllable_hand(hand_type):
+        return hand_type in (1, 2, 3)
+
     def dispatch(self, action, args):
         from aimdk_msgs.msg import HandCommand
 
@@ -804,8 +824,20 @@ class HandCommandPlugin:
         else:
             raise ValueError(f"hand_command: unknown action {action!r}")
 
+        left_type, right_type = self._get_hand_types()
+        if left and not self._is_controllable_hand(left_type):
+            raise ValueError(
+                f"hand_command: left hand is not controllable (type={HAND_TYPES.get(left_type, 'unknown')})"
+            )
+        if right and not self._is_controllable_hand(right_type):
+            raise ValueError(
+                f"hand_command: right hand is not controllable (type={HAND_TYPES.get(right_type, 'unknown')})"
+            )
+
         msg = self.nodes._HandCommandArray()
         msg.header.stamp = self.nodes.robot.get_clock().now().to_msg()
+        msg.left_hand_type.value = left_type
+        msg.right_hand_type.value = right_type
         for finger, position in zip(self.FINGERS, left):
             cmd = HandCommand()
             cmd.name = finger
