@@ -358,6 +358,7 @@ class CameraMultiInstanceTests(unittest.TestCase):
     def test_rgb_tool_is_multi_instance_with_instance_source_config(self):
         tool = next(d for d in self.camera.get_tools() if d["name"] == "camera_rgb")
         self.assertTrue(tool["multiInstance"])
+        self.assertIn("config", tool["inputSchema"]["properties"]["action"]["enum"])
         source = tool["configSchema"]["properties"]["camera_source"]
         self.assertEqual(source["scope"], "instance")
         self.assertEqual(source["default"], device.DEFAULT_CAMERA_RGB_SOURCE)
@@ -374,6 +375,11 @@ class CameraMultiInstanceTests(unittest.TestCase):
             result["topic_out"],
             [{"topic": "/test_ns/agibot_x2/camera_rgb/card_a_1_94b5805e", "format": "image/jpeg"}],
         )
+
+    def test_missing_instance_id_is_rejected_for_every_rgb_action(self):
+        for action in ("info", "start", "stop", "config"):
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                self.camera.dispatch(action, {"_tool_name": "camera_rgb"})
 
     def test_lossy_ros_name_sanitizing_does_not_merge_instance_topics(self):
         dashed = self.camera.dispatch(
@@ -526,15 +532,17 @@ class StartStopLifecycleTests(unittest.TestCase):
     LED) just from a card being dragged onto the canvas. This regression-tests that every
     plugin handles both without touching a service client or publisher."""
 
-    def _assert_inert(self, plugin, tool_name, nodes):
+    def _assert_inert(self, plugin, definition, nodes):
+        tool_name = definition["name"]
         publishers_before = {
             topic: len(pub.published) for topic, pub in nodes.robot.publishers.items()
         }
         for client in nodes.robot.clients.values():
             client.last_request = None
 
+        instance_args = {"instance_id": "lifecycle-test"} if definition.get("multiInstance") else {}
         for action in ("start", "stop"):
-            result = plugin.dispatch(action, {"_tool_name": tool_name})
+            result = plugin.dispatch(action, {"_tool_name": tool_name, **instance_args})
             self.assertIsInstance(result, dict, f"{tool_name}.dispatch({action!r}) must return a dict")
             self.assertIn("state", result, f"{tool_name}.dispatch({action!r}) must report a state")
 
@@ -553,7 +561,7 @@ class StartStopLifecycleTests(unittest.TestCase):
             for definition in (plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]):
                 if definition["type"] == "resource":
                     continue  # resource tools always dispatch with action == tool name, never start/stop
-                self._assert_inert(plugin, definition["name"], nodes)
+                self._assert_inert(plugin, definition, nodes)
 
 
 if __name__ == "__main__":

@@ -402,7 +402,10 @@ class CameraPlugin:
         self._instances = {}
 
     def _instance_id(self, args):
-        return str(args.get("instance_id") or "default")
+        instance_id = args.get("instance_id")
+        if instance_id is None or not str(instance_id).strip():
+            raise ValueError("instance_id is required for multiInstance tool camera_rgb")
+        return str(instance_id)
 
     def _safe_instance_id(self, instance_id):
         # ROS 2 topic names accept ASCII letters/digits/underscore here.  Python's
@@ -532,8 +535,8 @@ class CameraPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["info", "start", "stop"],
-                        "description": "info=查询；start=开始转发；stop=停止并释放该实例",
+                        "enum": ["info", "start", "stop", "config"],
+                        "description": "info=查询；start=开始转发；stop=停止并释放；config=切换该实例摄像头",
                     },
                 },
                 "required": ["action"],
