@@ -20,7 +20,7 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/aima/hal/sensor/stereo_head_front_left/rgb_image/compressed` | `camera_rgb` (`stereo_left`) | `CompressedImage`; publisher confirmed on X2 hardware on 2026-09-04 |
 | `/aima/hal/sensor/stereo_head_front_right/rgb_image/compressed` | `camera_rgb` (`stereo_right`) | `CompressedImage`; publisher confirmed on X2 hardware on 2026-09-04 |
 | `/aima/hal/sensor/rgb_head_rear/rgb_image/compressed` | `camera_rgb` (`rear`) | `CompressedImage`; publisher confirmed on X2 hardware on 2026-09-04 |
-| `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` | `Image`; publisher confirmed on X2 hardware on 2026-09-04 |
+| `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` | existing raw-depth relay; unchanged and outside this RGB-card change |
 | `/aima/mc/locomotion/velocity` | `locomotion` | |
 | `/integrated_command` | `slam_control` | plain `std_msgs/String`, not a service |
 | `/relocalization_pose` | `slam_control` | |
@@ -63,10 +63,9 @@ the selected robot-domain subscription and core-domain publisher; `stop(instance
 only that instance's resources.  Changing `camera_source` while an instance is running replaces
 its subscription but keeps its output topic stable.
 
-`camera_depth` remains a separate, single-instance card because its ROS message and output format
-(`sensor_msgs/msg/Image`, `image/depth-z16`) differ from the compressed RGB streams.  The presence
-of left/right image publishers alone is not evidence that those streams are synchronized,
-rectified, or ready for stereo ranging.
+`camera_depth` remains an existing, separate, single-instance card and is not changed by this RGB
+work.  The presence of left/right image publishers alone is not evidence that those streams are
+synchronized, rectified, or ready for stereo ranging.
 
 ## Available in the SDK but not yet wired
 

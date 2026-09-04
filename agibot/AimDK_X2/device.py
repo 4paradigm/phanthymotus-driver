@@ -422,6 +422,24 @@ class CameraPlugin:
     def _source_for(self, instance_id):
         return self._configs.get(instance_id, DEFAULT_CAMERA_RGB_SOURCE)
 
+    def _source_from_args(self, instance_id, args):
+        # Canvas instance settings are forwarded under ``config``.  Keep the
+        # top-level form as a compatibility fallback for direct callers/tests,
+        # with the canvas form taking explicit precedence.
+        config = args.get("config") or {}
+        return (
+            config.get("camera_source")
+            or args.get("camera_source")
+            or self._source_for(instance_id)
+        )
+
+    def _validate_source(self, source):
+        if source not in CAMERA_RGB_SOURCES:
+            raise ValueError(
+                f"camera_rgb: unknown camera_source {source!r}; "
+                f"valid: {list(CAMERA_RGB_SOURCES)}"
+            )
+
     def _rgb_info_locked(self, instance_id):
         source = self._source_for(instance_id)
         instance = self._instances.get(instance_id)
@@ -542,12 +560,8 @@ class CameraPlugin:
         instance_id = self._instance_id(args)
         with self._lock:
             if action == "config":
-                source = args.get("camera_source", self._source_for(instance_id))
-                if source not in CAMERA_RGB_SOURCES:
-                    raise ValueError(
-                        f"camera_rgb: unknown camera_source {source!r}; "
-                        f"valid: {list(CAMERA_RGB_SOURCES)}"
-                    )
+                source = self._source_from_args(instance_id, args)
+                self._validate_source(source)
                 was_running = instance_id in self._instances
                 changed = source != self._source_for(instance_id)
                 self._configs[instance_id] = source
@@ -556,8 +570,11 @@ class CameraPlugin:
                 return self._rgb_info_locked(instance_id)
 
             if action == "start":
-                source = self._source_for(instance_id)
-                if instance_id not in self._instances:
+                source = self._source_from_args(instance_id, args)
+                self._validate_source(source)
+                instance = self._instances.get(instance_id)
+                self._configs[instance_id] = source
+                if instance is None or instance["source"] != source:
                     self._start_rgb_locked(instance_id, source)
                 return self._rgb_info_locked(instance_id)
 

@@ -219,6 +219,7 @@ _install_ros_stubs()
 import yaml  # noqa: E402
 
 import device  # noqa: E402
+from common.vendor_runtime import DriverBundle  # noqa: E402
 
 
 def load_driver_yaml_cards():
@@ -405,6 +406,22 @@ class CameraMultiInstanceTests(unittest.TestCase):
             if sub.topic in device.CAMERA_RGB_SOURCES.values()
         ]
         self.assertEqual(len(rgb_subs), 2)
+
+    def test_bundle_start_consumes_nested_canvas_instance_config(self):
+        bundle = DriverBundle(self.plugins)
+        result = bundle.dispatch("camera_rgb", {
+            "action": "start",
+            "instance_id": "rear-from-canvas",
+            "config": {"camera_source": "rear"},
+        })
+
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(result["camera_source"], "rear")
+        self.assertEqual(result["robot_topic"], device.CAMERA_RGB_SOURCES["rear"])
+        self.assertIn(
+            device.CAMERA_RGB_SOURCES["rear"],
+            {subscription.topic for subscription in self.nodes.robot.subscriptions},
+        )
 
     def test_frame_is_forwarded_unchanged_and_counted(self):
         result = self.camera.dispatch("start", {"_tool_name": "camera_rgb", "instance_id": "card-frame"})
