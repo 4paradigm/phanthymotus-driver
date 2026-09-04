@@ -69,26 +69,99 @@ class SpeedLimits:
 # ── SmartMotionProxy (main process) ─────────────────────────────────────────
 
 class SmartMotionProxy:
-    """Main-process proxy that communicates with the SmartMotion subprocess."""
+    """Main-process proxy that communicates with the SmartMotion subprocess.
+
+    Auto-recovery: a watchdog thread probes the subprocess every 15s via a
+    lightweight GetFsmId round-trip (health_check command). If the process
+    dies or three consecutive probes fail, the worker is terminated and
+    respawned with a fresh DDS context. This is the only reliable recovery
+    from CycloneDDS "publisher context invalid" — ChannelFactory is a
+    Singleton that cannot be re-initialized in-process.
+    """
+
+    # Watchdog tuning (same as RpcProxy — keep in sync)
+    HEALTH_INTERVAL_S = 15.0
+    HEALTH_TIMEOUT_S = 5.0
+    UNHEALTHY_RESTART_S = 45.0
+    RESTART_COOLDOWN_S = 10.0
 
     def __init__(self, namespace: str, config: dict, network_iface: str):
+        self._namespace = namespace
+        self._config = config
+        self._network_iface = network_iface
+        self._restart_lock = threading.Lock()
+        self._restart_count = 0
+        self._last_healthy = time.time()
+        self._last_restart = 0.0
+        # Per-request result routing
+        self._pending: dict[str, queue.Queue] = {}
+        self._dispatch_lock = threading.Lock()
+        self._req_counter = 0
+        self._req_lock = threading.Lock()
+        self._start_worker()
+        self._dispatch_thread = threading.Thread(target=self._dispatch_results, daemon=True)
+        self._dispatch_thread.start()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog, daemon=True, name="smartmotion_watchdog")
+        self._watchdog_thread.start()
+        print(f"[SmartMotionProxy] worker started (pid={self._proc.pid}), watchdog active", flush=True)
+
+    def _start_worker(self):
+        """(Re)create queues + subprocess. Caller must hold _restart_lock or be in __init__."""
         ctx = mp.get_context("spawn")
         self._cmd_queue = ctx.Queue()
         self._result_queue = ctx.Queue()
         self._proc = ctx.Process(
             target=_run_smart_motion_process,
-            args=(namespace, config, network_iface, self._cmd_queue, self._result_queue),
+            args=(self._namespace, self._config, self._network_iface,
+                  self._cmd_queue, self._result_queue),
             name="smart_motion", daemon=True,
         )
         self._proc.start()
-        print(f"[SmartMotionProxy] subprocess started → pid={self._proc.pid}")
-        # Per-request result routing: avoid race when multiple threads call _call
-        self._pending: dict[str, queue.Queue] = {}  # req_id → per-request queue
-        self._dispatch_lock = threading.Lock()
-        self._dispatch_thread = threading.Thread(target=self._dispatch_results, daemon=True)
-        self._dispatch_thread.start()
-        self._req_counter = 0
-        self._req_lock = threading.Lock()
+
+    def _restart(self, reason: str):
+        """Terminate and respawn the worker with a fresh DDS context. Thread-safe."""
+        with self._restart_lock:
+            now = time.time()
+            if now - self._last_restart < self.RESTART_COOLDOWN_S:
+                print(f"[SmartMotionProxy] restart suppressed (cooldown, last={now-self._last_restart:.1f}s ago)", flush=True)
+                return
+            self._last_restart = now
+            self._restart_count += 1
+            print(f"[SmartMotionProxy] RESTART worker #{self._restart_count} (reason={reason})", flush=True)
+            # Abandon in-flight requests (they will timeout to callers)
+            with self._dispatch_lock:
+                self._pending.clear()
+            if self._proc.is_alive():
+                try:
+                    self._proc.terminate()
+                    self._proc.join(timeout=3)
+                except Exception:
+                    pass
+                if self._proc.is_alive():
+                    self._proc.kill()
+                    self._proc.join(timeout=2)
+            self._start_worker()
+            self._last_healthy = time.time()
+            print(f"[SmartMotionProxy] worker respawned (pid={self._proc.pid})", flush=True)
+
+    def _watchdog(self):
+        """Background: check process liveness + DDS health, restart on failure."""
+        while True:
+            time.sleep(self.HEALTH_INTERVAL_S)
+            if not self._proc.is_alive():
+                self._restart("process died")
+                continue
+            try:
+                result = self._call("health_check", timeout=self.HEALTH_TIMEOUT_S)
+                if result and isinstance(result, dict) and result.get("healthy"):
+                    self._last_healthy = time.time()
+                    continue
+                print(f"[SmartMotionProxy] watchdog probe unhealthy: {result}", flush=True)
+            except Exception as e:
+                print(f"[SmartMotionProxy] watchdog probe error: {e}", flush=True)
+            if time.time() - self._last_healthy > self.UNHEALTHY_RESTART_S:
+                self._restart(f"no healthy probe for {self.UNHEALTHY_RESTART_S:.0f}s")
 
     def _next_req_id(self) -> str:
         with self._req_lock:
@@ -958,6 +1031,25 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                     cmd.get("address", "")
                 )
                 result = {"code": code, "response": resp}
+            elif method == "health_check":
+                # Lightweight DDS health probe: GetFsmId round-trip proves both
+                # send and recv channels are alive. Both loco_client and slam_client
+                # share the same ChannelFactory/DomainParticipant, so if loco is
+                # healthy, slam's channel is alive too.
+                health = {"healthy": True, "checks": {}}
+                try:
+                    code, fsm_id = loco_client.GetFsmId()
+                    health["checks"]["loco"] = {"code": code, "fsm_id": fsm_id}
+                    if code != 0:
+                        health["healthy"] = False
+                        health["failed"] = "loco"
+                except Exception as e:
+                    health["checks"]["loco"] = {"error": f"{type(e).__name__}: {e}"}
+                    health["healthy"] = False
+                    health["failed"] = "loco"
+                health["pid"] = os.getpid()
+                health["state"] = state.value
+                result = health
             elif method == "shutdown":
                 if state == MotionState.MOVING:
                     loco_client.StopMove()

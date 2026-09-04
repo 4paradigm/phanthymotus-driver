@@ -94,6 +94,14 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
                                                  "fsm_id": final}})
                 continue  # next cmd
 
+            # Health check: lightweight GetFsmId round-trip proves both send and
+            # recv DDS channels are alive. A publisher-context-invalid failure makes
+            # the write return False before any request is sent, so this catches it
+            # immediately — well before a real move/FSM call times out.
+            if method == "health_check":
+                result_queue.put({"result": _health_check(loco)})
+                continue
+
             fn = getattr(loco, method)
             result = fn(*args, **kwargs)
             result_queue.put({"result": result})
@@ -101,20 +109,105 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
             result_queue.put({"error": str(e)})
 
 
+def _health_check(loco) -> dict:
+    """Lightweight DDS health probe via GetFsmId round-trip.
+
+    Returns {'healthy': bool, ...}. A successful round-trip proves both the
+    send channel (request went out) and recv channel (response came back)
+    are alive.
+    """
+    try:
+        code, fsm_id = loco.GetFsmId()
+        return {"healthy": code == 0, "fsm_code": code, "fsm_id": fsm_id}
+    except Exception as e:
+        return {"healthy": False, "error": f"{type(e).__name__}: {e}"}
+
+
 class RpcProxy:
-    """Proxy that forwards LocoClient RPC calls to a subprocess, avoiding GIL contention."""
+    """Proxy that forwards LocoClient RPC calls to a subprocess, avoiding GIL contention.
+
+    Auto-recovery: a watchdog thread probes the subprocess every 15s via a
+    lightweight GetFsmId round-trip. If the process dies or three consecutive
+    health probes fail, the worker is terminated and respawned with a fresh
+    DDS context — this is the only reliable way to recover from a CycloneDDS
+    "publisher context invalid" failure, because ChannelFactory is a Singleton
+    that cannot be re-initialized within the same process.
+    """
+
+    # Watchdog tuning
+    HEALTH_INTERVAL_S = 15.0   # seconds between health probes
+    HEALTH_TIMEOUT_S = 5.0      # per-probe timeout
+    UNHEALTHY_RESTART_S = 45.0  # restart after this long with no successful probe
+    RESTART_COOLDOWN_S = 10.0   # min seconds between restarts (avoid restart loop)
 
     def __init__(self, network_iface: str = "eth0"):
+        self._network_iface = network_iface
+        self._restart_lock = threading.Lock()
+        self._restart_count = 0
+        self._last_healthy = time.time()
+        self._last_restart = 0.0
+        self._start_worker()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog, daemon=True, name="rpc_proxy_watchdog")
+        self._watchdog_thread.start()
+        print(f"[RpcProxy] worker started (pid={self._proc.pid}), watchdog active", flush=True)
+
+    def _start_worker(self):
+        """(Re)create queues + subprocess. Caller must hold _restart_lock or be in __init__."""
         ctx = multiprocessing.get_context("spawn")
         self._cmd_q = ctx.Queue()
         self._result_q = ctx.Queue()
         self._proc = ctx.Process(
             target=_rpc_worker,
-            args=(self._cmd_q, self._result_q, network_iface),
+            args=(self._cmd_q, self._result_q, self._network_iface),
             daemon=True,
         )
         self._proc.start()
         self._lock = threading.Lock()
+
+    def _restart(self, reason: str):
+        """Terminate and respawn the worker with a fresh DDS context. Thread-safe."""
+        with self._restart_lock:
+            now = time.time()
+            if now - self._last_restart < self.RESTART_COOLDOWN_S:
+                print(f"[RpcProxy] restart suppressed (cooldown, last={now-self._last_restart:.1f}s ago)", flush=True)
+                return
+            self._last_restart = now
+            self._restart_count += 1
+            print(f"[RpcProxy] RESTART worker #{self._restart_count} (reason={reason})", flush=True)
+            if self._proc.is_alive():
+                try:
+                    self._proc.terminate()
+                    self._proc.join(timeout=3)
+                except Exception:
+                    pass
+                if self._proc.is_alive():
+                    self._proc.kill()
+                    self._proc.join(timeout=2)
+            self._start_worker()
+            self._last_healthy = time.time()
+            print(f"[RpcProxy] worker respawned (pid={self._proc.pid})", flush=True)
+
+    def _watchdog(self):
+        """Background: check process liveness + DDS health, restart on failure."""
+        while True:
+            time.sleep(self.HEALTH_INTERVAL_S)
+            # 1. Process liveness
+            if not self._proc.is_alive():
+                self._restart("process died")
+                continue
+            # 2. DDS health probe
+            try:
+                result = self._call("health_check", timeout=self.HEALTH_TIMEOUT_S)
+                if result and isinstance(result, dict) and result.get("healthy"):
+                    self._last_healthy = time.time()
+                    continue
+                print(f"[RpcProxy] watchdog probe unhealthy: {result}", flush=True)
+            except Exception as e:
+                print(f"[RpcProxy] watchdog probe error: {e}", flush=True)
+            # 3. Restart if unhealthy for too long
+            if time.time() - self._last_healthy > self.UNHEALTHY_RESTART_S:
+                self._restart(f"no healthy probe for {self.UNHEALTHY_RESTART_S:.0f}s")
 
     def _call(self, method: str, *args, timeout: float = 15.0, **kwargs):
         with self._lock:

@@ -87,6 +87,17 @@ def _slam_rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiproces
                 code, resp = client.PauseNav()
             elif method == "ResumeNav":
                 code, resp = client.ResumeNav()
+            elif method == "health_check":
+                # PauseNav is a no-op when not navigating (returns server error),
+                # but the DDS send/recv round-trip still proves the channel is alive.
+                # A timeout / send error (3102) means the DDS publisher context is
+                # invalid — the proxy's watchdog will then restart this worker.
+                try:
+                    code, resp = client.PauseNav()
+                    result_queue.put({"code": 0, "resp": {"healthy": True, "pause_code": code}})
+                except Exception as e:
+                    result_queue.put({"code": 0, "resp": {"healthy": False, "error": str(e)}})
+                continue
             else:
                 result_queue.put({"code": -1, "resp": f"unknown method: {method}"})
                 continue
@@ -96,19 +107,81 @@ def _slam_rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiproces
 
 
 class _SlamRpcProxy:
-    """Proxy that forwards SLAM RPC calls to a subprocess."""
+    """Proxy that forwards SLAM RPC calls to a subprocess.
+
+    Auto-recovery: watchdog probes DDS health every 15s; restarts worker on
+    process death or sustained health-check failure. Only used when
+    smart_motion is disabled — in production all SLAM calls go through
+    SmartMotionProxy, which has the same recovery mechanism.
+    """
+
+    HEALTH_INTERVAL_S = 15.0
+    HEALTH_TIMEOUT_S = 5.0
+    UNHEALTHY_RESTART_S = 45.0
+    RESTART_COOLDOWN_S = 10.0
 
     def __init__(self, network_iface: str = "eth0"):
-        ctx = multiprocessing.get_context("spawn")  # 'spawn' starts fresh process (no inherited DDS state)
+        self._network_iface = network_iface
+        self._restart_lock = threading.Lock()
+        self._restart_count = 0
+        self._last_healthy = time.time()
+        self._last_restart = 0.0
+        self._start_worker()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog, daemon=True, name="slam_rpc_watchdog")
+        self._watchdog_thread.start()
+        print(f"[_SlamRpcProxy] worker started (pid={self._proc.pid}), watchdog active", flush=True)
+
+    def _start_worker(self):
+        ctx = multiprocessing.get_context("spawn")
         self._cmd_q = ctx.Queue()
         self._result_q = ctx.Queue()
         self._proc = ctx.Process(
             target=_slam_rpc_worker,
-            args=(self._cmd_q, self._result_q, network_iface),
+            args=(self._cmd_q, self._result_q, self._network_iface),
             daemon=True,
         )
         self._proc.start()
         self._lock = threading.Lock()
+
+    def _restart(self, reason: str):
+        with self._restart_lock:
+            now = time.time()
+            if now - self._last_restart < self.RESTART_COOLDOWN_S:
+                print(f"[_SlamRpcProxy] restart suppressed (cooldown)", flush=True)
+                return
+            self._last_restart = now
+            self._restart_count += 1
+            print(f"[_SlamRpcProxy] RESTART worker #{self._restart_count} (reason={reason})", flush=True)
+            if self._proc.is_alive():
+                try:
+                    self._proc.terminate()
+                    self._proc.join(timeout=3)
+                except Exception:
+                    pass
+                if self._proc.is_alive():
+                    self._proc.kill()
+                    self._proc.join(timeout=2)
+            self._start_worker()
+            self._last_healthy = time.time()
+            print(f"[_SlamRpcProxy] worker respawned (pid={self._proc.pid})", flush=True)
+
+    def _watchdog(self):
+        while True:
+            time.sleep(self.HEALTH_INTERVAL_S)
+            if not self._proc.is_alive():
+                self._restart("process died")
+                continue
+            try:
+                code, resp = self._call("health_check", timeout=self.HEALTH_TIMEOUT_S)
+                if resp and isinstance(resp, dict) and resp.get("healthy"):
+                    self._last_healthy = time.time()
+                    continue
+                print(f"[_SlamRpcProxy] watchdog probe unhealthy: code={code}, resp={resp}", flush=True)
+            except Exception as e:
+                print(f"[_SlamRpcProxy] watchdog probe error: {e}", flush=True)
+            if time.time() - self._last_healthy > self.UNHEALTHY_RESTART_S:
+                self._restart(f"no healthy probe for {self.UNHEALTHY_RESTART_S:.0f}s")
 
     def _call(self, method: str, args: dict | None = None, timeout: float = 15.0) -> tuple:
         with self._lock:
