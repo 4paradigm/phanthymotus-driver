@@ -133,6 +133,7 @@ class AimdkNodes:
 
         self.lock = threading.RLock()
         self.values = {}
+        self._subscriptions = []
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         command_qos = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
@@ -145,9 +146,9 @@ class AimdkNodes:
             as_json = fmt == "data/json"
             core_msg_type = String if as_json else msg_type
             pub = self.core.create_publisher(core_msg_type, core_topic, depth)
-            self.robot.create_subscription(
+            self._subscriptions.append(self.robot.create_subscription(
                 msg_type, robot_topic, self._callback(key, pub, as_json=as_json), qos or depth,
-            )
+            ))
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
         # Two physical IMUs (chest/torso) feed a single combined "imu" tool/topic — driver.yaml
@@ -155,8 +156,12 @@ class AimdkNodes:
         # than exposed as two separate tools.
         imu_topic = f"/{namespace}/agibot_x2/imu"
         imu_pub = self.core.create_publisher(String, imu_topic, 5)
-        self.robot.create_subscription(Imu, "/aima/hal/imu/chest/state", self._imu_callback("chest", imu_pub), sensor_qos)
-        self.robot.create_subscription(Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos)
+        self._subscriptions.append(self.robot.create_subscription(
+            Imu, "/aima/hal/imu/chest/state", self._imu_callback("chest", imu_pub), sensor_qos,
+        ))
+        self._subscriptions.append(self.robot.create_subscription(
+            Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos,
+        ))
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
         if self.enabled("hand_state"):
