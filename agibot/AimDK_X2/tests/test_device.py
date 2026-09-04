@@ -371,8 +371,17 @@ class CameraMultiInstanceTests(unittest.TestCase):
         self.assertEqual(result["camera_source"], "interaction")
         self.assertEqual(
             result["topic_out"],
-            [{"topic": "/test_ns/agibot_x2/camera_rgb/card_a_1", "format": "image/jpeg"}],
+            [{"topic": "/test_ns/agibot_x2/camera_rgb/card_a_1_94b5805e", "format": "image/jpeg"}],
         )
+
+    def test_lossy_ros_name_sanitizing_does_not_merge_instance_topics(self):
+        dashed = self.camera.dispatch(
+            "info", {"_tool_name": "camera_rgb", "instance_id": "card-a"},
+        )["topic"]
+        underscored = self.camera.dispatch(
+            "info", {"_tool_name": "camera_rgb", "instance_id": "card_a"},
+        )["topic"]
+        self.assertNotEqual(dashed, underscored)
 
     def test_two_instances_can_stream_different_sources_concurrently(self):
         self.camera.dispatch("config", {
@@ -448,6 +457,27 @@ class CameraMultiInstanceTests(unittest.TestCase):
             self.camera.dispatch("config", {
                 "_tool_name": "camera_rgb", "instance_id": "bad", "camera_source": "made_up",
             })
+
+    def test_subscription_creation_failure_releases_provisional_instance(self):
+        original = self.nodes.robot.create_subscription
+
+        def fail_create_subscription(*args, **kwargs):
+            raise RuntimeError("subscription failed")
+
+        self.nodes.robot.create_subscription = fail_create_subscription
+        try:
+            with self.assertRaises(RuntimeError):
+                self.camera.dispatch(
+                    "start", {"_tool_name": "camera_rgb", "instance_id": "broken"},
+                )
+        finally:
+            self.nodes.robot.create_subscription = original
+
+        info = self.camera.dispatch(
+            "info", {"_tool_name": "camera_rgb", "instance_id": "broken"},
+        )
+        self.assertEqual(info["state"], "idle")
+        self.assertNotIn(info["topic"], self.nodes.core.publishers)
 
 
 class StartStopLifecycleTests(unittest.TestCase):

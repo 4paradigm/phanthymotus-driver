@@ -51,8 +51,12 @@ Each card instance gets an independent core-domain output topic.  A canvas card 
 `card-example-1` reports:
 
 ```text
-/{namespace}/agibot_x2/camera_rgb/card_example_1  (image/jpeg)
+/{namespace}/agibot_x2/camera_rgb/card_example_1_6b56f645  (image/jpeg)
 ```
+
+The final eight hexadecimal characters are a stable digest of the unsanitized card ID.  They
+prevent IDs such as `card-a` and `card_a` from collapsing onto the same ROS topic after invalid
+topic-name characters are replaced.
 
 `info(instance_id)` returns this path before streaming starts.  `start(instance_id)` creates
 the selected robot-domain subscription and core-domain publisher; `stop(instance_id)` destroys

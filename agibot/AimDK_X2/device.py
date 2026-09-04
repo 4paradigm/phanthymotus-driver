@@ -14,6 +14,7 @@ tooling names these services on the wire, not a typo introduced here.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -409,7 +410,11 @@ class CameraPlugin:
             safe = "default"
         if safe[0].isdigit():
             safe = f"instance_{safe}"
-        return safe
+        # Sanitizing is lossy (for example, "card-a" and "card_a" both become
+        # "card_a").  Preserve a readable prefix and append a stable identity suffix so
+        # two canvas instances cannot share a topic merely because of normalization.
+        digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()[:8]
+        return f"{safe}_{digest}"
 
     def _output_topic(self, instance_id):
         return f"/{self.nodes.namespace}/agibot_x2/camera_rgb/{self._safe_instance_id(instance_id)}"
@@ -439,8 +444,10 @@ class CameraPlugin:
             return
         # Remove the subscription before its publisher so no new callback can be queued for
         # an output that has already been destroyed.
-        self.nodes.robot.destroy_subscription(instance["subscription"])
-        self.nodes.core.destroy_publisher(instance["publisher"])
+        try:
+            self.nodes.robot.destroy_subscription(instance["subscription"])
+        finally:
+            self.nodes.core.destroy_publisher(instance["publisher"])
 
     def _start_rgb_locked(self, instance_id, source):
         self._stop_rgb_locked(instance_id)
@@ -449,6 +456,10 @@ class CameraPlugin:
             self.nodes.compressed_image_type, output_topic, 5,
         )
         state = {"publisher": publisher, "subscription": None, "frames": 0, "source": source}
+        # Register before create_subscription(): an executor may deliver the first frame as
+        # soon as the subscription is created, and the callback must already recognize its
+        # owning instance.  The exception path removes this provisional state again.
+        self._instances[instance_id] = state
 
         def forward(msg):
             # HTTP dispatch and ROS callbacks run on different threads.  Holding the same lock
@@ -467,9 +478,10 @@ class CameraPlugin:
                 self.nodes.sensor_qos,
             )
         except Exception:
+            if self._instances.get(instance_id) is state:
+                self._instances.pop(instance_id, None)
             self.nodes.core.destroy_publisher(publisher)
             raise
-        self._instances[instance_id] = state
 
     def get_tools(self):
         rgb_tool = {
