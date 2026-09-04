@@ -1429,7 +1429,7 @@ class LocoPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop_move", "set_stand_height", "get_fsm_id", "get_fsm_mode", "get_balance_mode", "get_swing_height", "get_stand_height", "get_phase", "wave_hand", "shake_hand"],
+                        "enum": ["move", "stop_move", "set_stand_height", "get_fsm_id", "get_fsm_mode", "get_balance_mode", "get_swing_height", "get_stand_height", "get_phase", "wave_hand", "shake_hand", "sit"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
@@ -1456,6 +1456,7 @@ class LocoPlugin:
                     "get_phase":        {"params": [],                                 "description": "Get current gait phase (deprecated)"},
                     "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture"},
                     "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture"},
+                    "sit":              {"params": [],                                 "description": "坐下（位控落座 FSM 3，无平衡控制）"},
                 },
             },
         }
@@ -1813,6 +1814,12 @@ class LocoPlugin:
         elif action == "shake_hand":
             ret = self._client.ShakeHand()
             return {"ret": ret}
+        elif action == "sit":
+            # 位控落座（FSM 3）无平衡控制，先停稳再落座，避免带速度摔倒
+            self._client.StopMove()
+            ret = self._client.Sit()
+            return {"ret": ret, "fsm_id": 3,
+                    "warning": "sit 为位控落座（FSM 3，无平衡控制）；回到运控请用 switch_mode 的 lie2standup/squat2standup"}
         return None
 
     # ── FSM sequence helper ───────────────────────────────────────────────────
