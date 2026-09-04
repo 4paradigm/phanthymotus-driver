@@ -9,6 +9,14 @@ tianyi2:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /home/nvidia/data/param/dds_profile.xml:/work/dds_profile.xml:ro
+    # No /opt/phanthy-motus/dds-local.xml mount, and no FASTRTPS_DEFAULT_PROFILES_FILE
+    # in `environment`. This driver holds two DDS contexts in one process (body on
+    # domain 0, agent-core on domain 42), FastDDS caches profiles process-wide, so one
+    # profile is all the process gets — and the fleet's loopback-only one confines the
+    # body context to 127.0.0.1, cutting the link to the vendor stack on 192.168.41.x.
+    # It therefore uses the vendor profile above for both, whose whitelist
+    # {192.168.41.2, 127.0.0.1} still excludes the office LAN, which is what the
+    # fleet-wide isolation is for. See DualDomainROS2._select_profile in main.py.
   environment:
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - PYTHONUNBUFFERED=1
