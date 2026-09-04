@@ -1,0 +1,57 @@
+mcp_port: 15717
+# Explicit, not blank: a blank value falls back to socket.gethostname(), which under Docker
+# is the container's random hex short ID -- ROS topic names cannot start with a digit, so
+# roughly 5/8 of container (re)starts crashed on the very first create_publisher() call
+# (e.g. namespace "3a80e6c6f048" -> invalid topic "/3a80e6c6f048/agibot_x2/imu"). This is
+# what caused the flaky deploy timeouts/crash-restart loops, independent of the "info" action
+# bug fixed alongside this.
+ros_namespace: "agibot_x2"
+
+# Which end-effector variant this robot is built with — selects the URDF served by the
+# `model` resource tool and the joint layout used by hand_state/hand_command.
+end_effector: "hand"   # fist | hand | ultra
+
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_interface: "eth0"
+
+plugins:
+  mc_state:
+    enabled: true
+  joint_state:
+    enabled: true
+  hand_state:
+    enabled: true
+  imu:
+    enabled: true
+  camera:
+    enabled: true
+  lidar:
+    enabled: true
+  system_state:
+    enabled: true
+  linkcraft:
+    enabled: true
+  mc_mode:
+    enabled: true
+  locomotion:
+    enabled: true
+    input_source_name: "phanthymotus"
+    input_source_priority: 50
+  preset_motion:
+    enabled: true
+  joint_command:
+    enabled: true
+  hand_command:
+    enabled: true
+  pmu_led:
+    enabled: true
+  tts:
+    enabled: true
+  emoji:
+    enabled: true
+  mic_source:
+    enabled: true
+  slam:
+    enabled: false
