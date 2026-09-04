@@ -1,0 +1,17 @@
+mcp_port: 15718
+ros_namespace: ""
+name: "睿尔曼 RM75-6F-V"
+arm_dof: 7
+arm_ip: ""
+tcp_port: 8080
+safety:
+  max_step_deg: 5.0
+  max_speed_percent: 10
+  default_speed_percent: 5
+  target_tolerance_deg: 0.5
+  motion_timeout_seconds: 30
+  poll_interval_seconds: 0.2
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+  robot_interface: "eth0"

@@ -1,0 +1,27 @@
+realman-rm75-6f-v:
+  container_name: embodied-realman-rm75-6f-v
+  image: __IMAGE__
+  privileged: true
+  volumes:
+    - /dev:/dev
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - ROS_LOCALHOST_ONLY=0
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+    # Safe default for image/MCP smoke tests. Enable only after the controller
+    # IP, receiving interface IP, E-stop, joint order and safety state are known.
+    - RM_DRIVER_ENABLED=0
+    # Independent motion interlock. Keep at 0 until read-only hardware checks,
+    # E-stop verification, and a supervised low-speed test are complete.
+    - RM_MOTION_ENABLED=0
+    # Required only when enabled after physical/network safety checks:
+    # - RM_ARM_IP=192.168.1.18
+    # - RM_TCP_PORT=8080
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

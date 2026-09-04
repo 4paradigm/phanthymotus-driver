@@ -1,0 +1,11 @@
+id: realman-rm75-6f-v-driver
+name: RealMan RM75-6F-V Driver
+category: driver
+hardware_provider: realman
+hardware_model: "rm75-6f-v"
+image_name: realman-rm75-6f-v
+port: 15718
+mcp_url: "http://localhost:15718/mcp"
+description: "Read-only ARM64 RealMan RM75-6F-V Driver using the official Python API2 SDK"
+build_context_extras:
+  - ../../common
