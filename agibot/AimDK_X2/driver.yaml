@@ -33,5 +33,4 @@ cards:
   - { name: tts,                type: actuator }
   - { name: emoji,              type: actuator }
   - { name: mic_source,         type: actuator }
-  - { name: slam_control,       type: actuator }
   - { name: map_get,            type: processor }
