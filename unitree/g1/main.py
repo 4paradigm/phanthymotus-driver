@@ -163,7 +163,19 @@ class G1DeviceBundle:
         if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
             controlled_cfg = dict(plugins_cfg["controlled_spatial"])
             controlled_cfg["network_iface"] = network_iface
+            # isolated_process defaults to false: the plugin runs in-process and shares
+            # the SmartMotion subprocess's reliable pose-based arrival detection
+            # (rt/slam_info DDS subscription, dist < 0.3m).  This trades process
+            # isolation for dependable nav completion and lower TTS latency (no extra
+            # spawned interpreter contending on the GIL / DDS).
+            # Set isolated_process=true only if you need strict process separation; in
+            # that mode arrival detection falls back to pose-based polling in the
+            # isolated child, which is less reliable and can reintroduce audio stutter.
             if controlled_cfg.get("isolated_process", False):
+                print("[WARNING] controlled_spatial isolated_process=true — navigation arrival detection "
+                      "uses pose-based fallback (dist<0.3m). If audio stutter reappears, set "
+                      "isolated_process=false and verify TTS latency.",
+                      flush=True)
                 from controlled_spatial import ControlledSpatialIsolatedProxy
                 self._plugins.append(ControlledSpatialIsolatedProxy(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
                 print("[bundle] ControlledSpatialPlugin loaded (isolated process)")
@@ -234,6 +246,13 @@ class G1DeviceBundle:
             else:
                 tools.append(p.get_tool())
         return tools
+
+    def has_tool(self, tool_name: str) -> bool:
+        for p in self._plugins:
+            plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
+            if any(tool_def["name"] == tool_name for tool_def in plugin_tools):
+                return True
+        return False
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
         for p in self._plugins:
@@ -327,9 +346,13 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    if not _bundle.has_tool(name):
+                        err(-32601, f"Unknown tool: {name}")
+                        return
+                    requested_action = args.get("action", name)
                     result = _bundle.dispatch(name, args)
                     if result is None:
-                        err(-32601, f"Unknown tool: {name}")
+                        err(-32601, f"Unknown action for tool {name}: {requested_action}")
                     else:
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
