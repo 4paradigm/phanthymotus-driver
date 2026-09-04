@@ -538,8 +538,19 @@ class CameraPlugin:
                         "enum": ["info", "start", "stop", "config"],
                         "description": "info=查询；start=开始转发；stop=停止并释放；config=切换该实例摄像头",
                     },
+                    "camera_source": {
+                        "type": "string",
+                        "description": "config 动作要切换到的 X2 RGB 摄像头",
+                        "enum": list(CAMERA_RGB_SOURCES),
+                    },
                 },
                 "required": ["action"],
+                "x-action-params": {
+                    "info": {"params": [], "description": "查询该相机实例状态"},
+                    "start": {"params": [], "description": "按实例配置开始转发画面"},
+                    "stop": {"params": [], "description": "停止并释放该相机实例"},
+                    "config": {"params": ["camera_source"], "description": "切换该实例的 RGB 摄像头来源"},
+                },
             },
             # An empty path tells the canvas that this sensor has an image output while
             # info(instance_id) supplies the real, instance-specific path.

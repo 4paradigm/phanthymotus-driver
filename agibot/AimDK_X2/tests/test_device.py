@@ -358,7 +358,16 @@ class CameraMultiInstanceTests(unittest.TestCase):
     def test_rgb_tool_is_multi_instance_with_instance_source_config(self):
         tool = next(d for d in self.camera.get_tools() if d["name"] == "camera_rgb")
         self.assertTrue(tool["multiInstance"])
-        self.assertIn("config", tool["inputSchema"]["properties"]["action"]["enum"])
+        input_schema = tool["inputSchema"]
+        self.assertIn("config", input_schema["properties"]["action"]["enum"])
+        self.assertEqual(
+            input_schema["x-action-params"]["config"]["params"],
+            ["camera_source"],
+        )
+        self.assertEqual(
+            set(input_schema["properties"]["camera_source"]["enum"]),
+            set(device.CAMERA_RGB_SOURCES),
+        )
         source = tool["configSchema"]["properties"]["camera_source"]
         self.assertEqual(source["scope"], "instance")
         self.assertEqual(source["default"], device.DEFAULT_CAMERA_RGB_SOURCE)
