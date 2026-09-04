@@ -9,8 +9,9 @@ so it also works as a CI step.
 
 What it enforces, and why each item is worth a check rather than a README line:
 
-  * the loopback profile is mounted, and (unless the driver picks profiles in code)
-    selected via FASTRTPS_DEFAULT_PROFILES_FILE. Miss these and the container ends up
+  * the loopback profile is mounted and selected via FASTRTPS_DEFAULT_PROFILES_FILE, unless the
+    driver ships its own profile (see OWN_PROFILE — per-participant selection is impossible, so a
+    dual-context driver must pick one profile for the whole process). Miss these and the container ends up
     on a different transport from everything else on the machine, so it cannot reach
     Agent Core at all. The failure does not look like "not isolated" — the device
     registers over HTTP and shows up in the dashboard while none of its topics ever
@@ -49,9 +50,16 @@ DOMAIN = '42'
 # process-wide default applies to every participant in the process, so a driver holding
 # a body context and an Agent Core context in one process has to select per context —
 # it sets the variable around each rclpy.init() instead. The mount is still required.
-IN_CODE_PROFILE = {
-    'x-humanoid/tianyi2.0': 'DualDomainROS2 in main.py sets the variable per rclpy.init() '
-                            '(body on domain 0 via the vendor profile, core on 42)',
+# Drivers that must NOT set FASTRTPS_DEFAULT_PROFILES_FILE to the fleet profile, with the
+# reason. Per-participant selection is impossible (FastDDS caches profiles process-wide), so a
+# driver holding a body context and an Agent Core context in one process has to pick ONE profile
+# for the process — and the fleet's loopback-only one cuts the body link. These drivers ship their
+# own, so they do not need the mount either: requiring it would only suggest it is in use.
+OWN_PROFILE = {
+    'x-humanoid/tianyi2.0': 'two FastDDS contexts in one process (DualDomainROS2 in main.py, '
+                            'BridgeROS2 in joints_bridge.py); runs the vendor profile '
+                            '/work/dds_profile.xml process-wide, whose whitelist excludes the '
+                            'office LAN. Setting the fleet profile here cuts the body link.',
 }
 
 # Drivers a FastDDS profile cannot isolate, with what they would need instead. Reported,
@@ -60,7 +68,9 @@ KNOWN_GAPS = {
     'engineai/t800': 'RMW is rmw_cyclonedds_cpp (Dockerfile T800_PREFERRED_RMW), so '
                      'FASTRTPS_DEFAULT_PROFILES_FILE is inert; its CYCLONEDDS_URI binds '
                      'NETWORK_INTERFACE for both contexts, leaving the domain-42 one on '
-                     'the LAN. Needs a CycloneDDS-level restriction for the core context.',
+                     'the LAN. Closing it needs a CycloneDDS-side restriction; note that a '
+                     'single process gets one config there too, so it is the same '
+                     'one-profile-per-process constraint as tianyi.',
 }
 
 
@@ -89,7 +99,7 @@ def check(path, driver):
 
     gap = KNOWN_GAPS.get(driver)
 
-    if MOUNT not in volumes:
+    if MOUNT not in volumes and driver not in OWN_PROFILE:
         # A read-write mount also works, but ro is the intent and a typo'd path is the
         # failure mode we are actually guarding against: Docker silently creates a
         # *directory* of that name, FastDDS falls back to every interface, nothing logs.
@@ -100,13 +110,13 @@ def check(path, driver):
             bad.append(f'missing volume {MOUNT!r} — without it the container is not isolated, '
                        'and a mistyped path fails silently')
 
-    reason = IN_CODE_PROFILE.get(driver)
+    reason = OWN_PROFILE.get(driver)
     have_var = env.get('FASTRTPS_DEFAULT_PROFILES_FILE')
     if reason:
         if have_var:
             bad.append(f'must NOT set FASTRTPS_DEFAULT_PROFILES_FILE: {reason}')
         else:
-            notes.append(f'profile selected in code — {reason}')
+            notes.append(f'ships its own process-wide profile — {reason}')
     elif not gap:
         if not have_var:
             bad.append('missing FASTRTPS_DEFAULT_PROFILES_FILE — the mount alone selects nothing')
