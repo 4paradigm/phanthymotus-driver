@@ -702,10 +702,13 @@ unitree-g1:                      # Service name (must be unique)
   privileged: true               # Required: access to /dev and hardware
   volumes:
     - /dev:/dev                  # Required: device access for cameras, sensors, etc.
+    # Required: the loopback-only DDS profile. See "DDS isolation" below —
+    # a driver that skips this cannot talk to Agent Core at all.
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
-    - ROS_DOMAIN_ID=42
+    - ROS_DOMAIN_ID=42           # Same on every robot; do not allocate per-robot
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
   logging:
     driver: local
@@ -722,6 +725,137 @@ unitree-g1:                      # Service name (must be unique)
 - `network_mode`, `ipc`, `pid` are injected by Agent Core during deployment — do not specify them in service.yml
 - The `__IMAGE__` placeholder is automatically replaced with the actual image reference
 - Service name should follow the pattern `{provider}-{model}` (e.g. `unitree-g1`, `phanthy-remote-control`)
+- Do **not** set `FASTDDS_BUILTIN_TRANSPORTS`. It conflicts with the profile's
+  `useBuiltinTransports=false`, and the value cannot be unset from compose once an image bakes it
+  into its `ENV` — the XML wins anyway, so the variable is only a source of confusion.
+
+---
+
+### DDS isolation — load the profile unless the driver manages DDS itself
+
+**Both lines above are mandatory for any driver that reaches Agent Core over FastDDS**, which is all
+of them except the two dual-domain cases listed at the end of this section. A driver container without them is not merely
+unisolated: with `useBuiltinTransports=false` everywhere else, it ends up on a different transport
+from the rest of the machine and **cannot reach Agent Core at all**. The symptom is a device that
+registers over HTTP and shows up in the dashboard, while none of its topics ever carry data.
+
+Why the profile exists: `/remote_control/message` — a *command* topic — was reaching every robot on
+the office LAN. An instruction typed on one robot was executed by a second one too, with the
+identical timestamp in both logs. DDS has no addressing and no authentication; every subscriber on
+the domain receives everything. The fix pins FastDDS to `127.0.0.1`
+(`interfaceWhiteList`), and because containers run with `network_mode: host` they share one
+loopback — the local bus works normally, nothing crosses the machine.
+
+`ROS_DOMAIN_ID` stays **42 everywhere**. Per-robot domain numbers were tried and rejected: the
+usable range is narrow, and cloned images have no way to coordinate a unique number.
+
+**Your robot-body link is unaffected.** Drivers that speak to the hardware over the vendor SDK use
+**CycloneDDS** with an explicitly bound interface (`ChannelFactoryInitialize(0, "eth0")`), and
+`FASTRTPS_DEFAULT_PROFILES_FILE` only affects FastDDS. The two stacks coexist in one process.
+Verified on a real R1: with and without the profile, a read-only `rt/lowstate` probe reported the
+identical packet count and IMU yaw. Raw UDP multicast (R1's microphone uses `239.168.123.161:5555`
+via `IP_ADD_MEMBERSHIP`) is likewise untouched — it is not DDS.
+
+Two things that bite when deploying by hand:
+
+- **A missing file fails silently, and worse.** If the host has no
+  `/opt/phanthy-motus/dds-local.xml`, Docker's bind mount creates a *directory* with that name;
+  FastDDS ignores it and falls back to every interface. Agent Core writes the file from its own
+  image when it is absent — but a container that already mounted the phantom directory must be
+  **recreated**, not restarted (`docker start` cannot change a mount type fixed at creation; it
+  fails with `not a directory: Are you trying to mount a directory onto a file`).
+- **Judge by socket bindings, not by config.** Check that the driver's UDP sockets bind loopback:
+  `sudo ss -lunp | grep 179` should show `127.0.0.1:179xx` (plus a `239.255.0.1` multicast join,
+  which is expected — the whitelist decides which interface it joins on). Agent Core also exposes
+  `GET /api/peer/dds_isolation`.
+
+**Two drivers do not set these lines in `environment`, for two different reasons — and neither is
+"isolated" in the sense the fleet profile means.** If you write a driver in either shape, read the
+row that matches:
+
+| Driver | Why the compose variable does not work | Status |
+|---|---|---|
+| `engineai/t800` | Its `CMD` forces `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, so **both** its domains run on CycloneDDS. `FASTRTPS_DEFAULT_PROFILES_FILE` has no effect at all; CycloneDDS is configured through `CYCLONEDDS_URI`, which this driver pins to the robot interface (`eth1`) — for both contexts. | **Open gap.** Its domain-42 traffic is still on the LAN. Untried: no T800 hardware available. `check_service_yml.py` reports it as `GAP`. |
+| `x-humanoid/tianyi2.0` | It holds **two FastDDS contexts in one process** (`DualDomainROS2` in `main.py`, `BridgeROS2` in `joints_bridge.py`), and the fleet profile would put the body link on loopback and cut it. It therefore selects the **vendor** profile (`/work/dds_profile.xml`) for the whole process, before any participant exists. | **Partly isolated, by whitelist rather than by loopback** — see below. |
+
+### One profile per process — per-participant selection does not work
+
+An earlier version of this section said tianyi "selects a profile per DDS context by setting the
+variable around each `rclpy.init()`", and cited it as proof that per-participant profiles are
+possible. **That was wrong, and shipping it silently cut part of the body link.** Two separate
+reasons, either one fatal:
+
+1. **FastDDS reads `FASTRTPS_DEFAULT_PROFILES_FILE` at participant creation, not at
+   `rclpy.init()`** — and rmw_fastrtps creates the participant lazily, with the first `Node` on the
+   context. Setting the variable around each `rclpy.init()` sets it around the wrong call: by the
+   time the first real Node appears, the variable holds whatever was written last.
+2. **The parsed profiles are cached process-wide**, so switching the variable between contexts
+   cannot give them different profiles at all — it only decides which single profile both use.
+   Measured on the robot: a process that set the vendor profile, created a domain-0 node, then set
+   the loopback profile and created a domain-42 node, ended with *both* domains bound to
+   `127.0.0.1` **and** `192.168.41.2` — the vendor whitelist, for both.
+
+What the wrong profile cost, for calibration on how quiet this failure is: with the loopback-only
+profile in force, the domain-0 participant bound `127.0.0.1` but not `192.168.41.2`, where the
+vendor stack lives. Visible domain-0 topics fell from 77 to 33, all 26 of the driver's own
+`tianyi2_*` nodes vanished from domain 0, and lyre's `/audio_play/play_text` became undiscoverable
+(2.76 s to discover under the vendor profile; nothing after 15 s under the loopback one). Nothing
+was logged. `/arm/status` and `/head/status` survived, so the robot looked healthy — while TTS
+reported success and produced no sound, with lyre's journal confirming it had received nothing.
+
+The earlier "verified" claim was a real measurement, but a one-sided one: it checked that domain 42
+had moved to `127.0.0.1` and did not check what had happened to domain 0. When you verify an
+isolation change, measure **both** sides of the link it runs through.
+
+So tianyi runs the vendor profile process-wide. Its whitelist is
+`{192.168.41.2, 127.0.0.1}`: the body link works, and — the point of the fleet-wide profile — the
+**office LAN is excluded**, so domain 42 cannot carry `/remote_control/message` to another robot.
+Be precise about what that is not: domain 42 is still reachable from the body board on
+`192.168.41.x`. That board runs no Agent Core and is internal to this robot, so nothing there can
+act on a command. Narrowing it to true loopback needs the agent-core-facing publishers moved into
+their own process, one profile each.
+
+Because of this, tianyi does **not** use the `dds-local.xml` mount, and `check_service_yml.py` does
+not require it for that driver. Verified after the fix: both domains bind `127.0.0.1` and
+`192.168.41.2`, **no `10.100.x`**; 26 `tianyi2_*` nodes visible on domain 0; TTS returns `ready`
+and plays with a real sid, `PlayProgress` and a `COMPLETED` `PlayEvent`.
+
+### service.yml checklist for a new driver
+
+Run `./scripts/check_service_yml.py` to verify all of this — it is what a reviewer should run on any
+PR that adds or edits a `deploy/service.yml`. It exits non-zero on a violation, so it also works as
+a CI step.
+
+- [ ] mounts `/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro`
+- [ ] sets `FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml`
+- [ ] does not set `FASTDDS_BUILTIN_TRANSPORTS` — it conflicts with the profile's
+      `useBuiltinTransports=false`, and an image that bakes it into `ENV` cannot be corrected from
+      compose anyway (the XML wins, so the variable only misleads whoever reads the file next)
+- [ ] `ROS_DOMAIN_ID=42` — the same on every robot; there is nothing to allocate. A driver holding
+      a second context may spell it `<PREFIX>_ROS_DOMAIN_ID` for the body and
+      `AGENT_CORE_ROS_DOMAIN_ID` for this one; only the Agent Core side must be 42
+- [ ] `network_mode: host` — isolation works by confining DDS to loopback, and containers share a
+      loopback only under host networking
+
+The first two are the ones that break a robot rather than merely leaving it unisolated: with
+`useBuiltinTransports=false` everywhere else, a container that misses them ends up on a different
+transport from the rest of the machine and **cannot reach Agent Core at all** — the device registers
+over HTTP and appears in the dashboard while none of its topics ever carry data, which sends you
+looking at the driver instead of at compose.
+
+The checker keeps two tables instead of one, so that neither exception quietly becomes a loophole:
+
+- `OWN_PROFILE` — drivers that must **not** set the fleet profile because they ship their own for
+  the whole process (`x-humanoid/tianyi2.0`; see § "One profile per process" above for why per-context
+  selection is not an option). The mount is not required either — requiring it would imply the file
+  is in use. Setting the fleet profile here is a failure, not a pass: it cuts the body link.
+- `KNOWN_GAPS` — drivers a FastDDS profile cannot isolate at all, currently `engineai/t800`, whose
+  RMW is CycloneDDS. It is reported as `GAP` and does not fail the run. Adding a third such driver
+  means editing this table, which is the point: the gap stays visible rather than passing a check
+  named "isolation".
+
+`ipc` and `pid` are deliberately **not** checked — they vary legitimately across drivers (a drone
+does not need `pid: host`), and the profile disables shared memory anyway.
 
 ---
 

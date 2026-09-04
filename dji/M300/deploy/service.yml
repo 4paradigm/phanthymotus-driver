@@ -7,6 +7,7 @@ dji-m300:
   ipc: host
   privileged: true
   volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /run/udev:/run/udev:ro
@@ -20,6 +21,7 @@ dji-m300:
     - AGENT_CORE_URL=https://127.0.0.1:15678
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

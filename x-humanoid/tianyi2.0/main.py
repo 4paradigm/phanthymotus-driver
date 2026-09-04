@@ -314,21 +314,77 @@ def _resolve_namespace(cfg: dict) -> str:
 # ── Dual Domain ROS2 Init ────────────────────────────────────────────────────
 
 class DualDomainROS2:
-    """Manages two ROS2 contexts: domain 0 (tianyi) and domain 42 (agent-core)."""
+    """Manages two ROS2 contexts: domain 0 (tianyi) and domain 42 (agent-core).
+
+    Both contexts share **one** FastDDS profile, because that is all FastDDS offers a
+    single process — see ``_select_profile``.
+    """
+
+    @staticmethod
+    def _select_profile() -> str:
+        """Load the one FastDDS profile this process gets, before any participant.
+
+        Two things were learned the hard way here, both silent when wrong.
+
+        **FastDDS reads FASTRTPS_DEFAULT_PROFILES_FILE at participant creation, not at
+        ``rclpy.init()``** — and rmw_fastrtps creates the participant lazily, with the
+        first Node on the context. Code that set the variable around each
+        ``rclpy.init()`` was therefore setting it around the wrong call: by the time
+        the first real Node appeared, the variable held whatever had been written last,
+        and both contexts got that.
+
+        **And the profiles are cached process-wide anyway**, so switching the variable
+        between contexts cannot give them different profiles. Measured on the robot: a
+        process that set the vendor profile, created a domain-0 node, then set the
+        loopback profile and created a domain-42 node, ended up with *both* domains
+        bound to 127.0.0.1 and 192.168.41.2 — the vendor whitelist, for both. An
+        earlier version of this file claimed to select a profile per context and was
+        cited elsewhere as proof that per-participant profiles work. It never worked.
+
+        What the wrong profile costs: with the loopback-only profile in force, the
+        domain-0 participant bound 127.0.0.1 but not 192.168.41.2, where the vendor
+        stack lives. Visible domain-0 topics fell from 77 to 33 and lyre's
+        ``/audio_play/play_text`` became undiscoverable (2.76 s to discover under the
+        vendor profile; still nothing after 15 s under the loopback one). Nothing was
+        logged, ``/arm/status`` and ``/head/status`` survived, so the robot looked
+        healthy while TTS reported success and made no sound.
+
+        So: the vendor profile, for the whole process. Its whitelist is
+        {192.168.41.2, 127.0.0.1}, which keeps the body link up and — the point of the
+        fleet-wide isolation — **excludes the office LAN**, so domain 42 cannot carry
+        `/remote_control/message` to another robot. It is not loopback-only: domain 42
+        is also reachable from the body board on 192.168.41.x. That board runs no
+        Agent Core and is internal to this robot, so nothing there can act on a
+        command. Narrowing it further needs the agent-core-facing publishers moved
+        into their own process, one profile each.
+        """
+        vendor = "/work/dds_profile.xml"
+        if os.path.exists(vendor):
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = vendor
+            print(f"[ros2] process-wide DDS profile: {vendor} "
+                  f"(whitelist 192.168.41.2 + 127.0.0.1 — body link up, office LAN "
+                  f"excluded on both domain 0 and domain 42)")
+            return vendor
+        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+        print(f"[ros2] WARNING {vendor} missing — no DDS profile. Both domains will "
+              f"use every interface, including the office LAN: domain 42 is NOT "
+              f"isolated and commands may reach other robots.")
+        return ""
 
     def __init__(self):
-        # Domain 0: connect to tianyi body controller
-        # Use lyre's DDS profile so we can discover topics on 192.168.41.x / 127.0.0.1
-        dds_profile = "/work/dds_profile.xml"
-        if os.path.exists(dds_profile):
-            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = dds_profile
-            print(f"[ros2] domain0: using DDS profile {dds_profile}")
+        # One profile, chosen before any participant exists.
+        self._dds_profile = self._select_profile()
+
+        # Domain 0: the tianyi body controller, on 192.168.41.x.
         self.ctx_tianyi = Context()
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
         self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
 
-        # Domain 42: publish to agent-core (no DDS profile — use all interfaces)
-        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+        # Domain 42: Agent Core, on this same host. `/remote_control/message` carries
+        # *commands* and DDS has no addressing, so every ROS_DOMAIN_ID=42 subscriber on
+        # the subnet used to receive them — an instruction typed on one robot was
+        # executed by a second one, same timestamp in both logs. The whitelist above is
+        # what closes that: no office-LAN interface, so nothing off this robot.
         self.ctx_core = Context()
         rclpy.init(context=self.ctx_core, domain_id=42)
         self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
