@@ -354,6 +354,13 @@ class _SpeakerNode(Node):
         self._pause_event = threading.Event()
         self._pause_event.set()  # 初始为非暂停状态
         self._muted = False  # interrupt 后静默，丢弃后续 chunks 直到新 utterance
+        # PlayStream health tracking — consecutive failures trigger error state so
+        # the caller can detect "speaker shows ready but no sound" instead of
+        # silently draining into a dead DDS channel.
+        self._playstream_total = 0
+        self._playstream_failures = 0
+        self._playstream_consecutive_failures = 0
+        self._playstream_error_threshold = 5  # consecutive failures → state="error"
         # Clear stale PlayStream session from previous container run (MCU keeps state across reboot)
         self._client.PlayStop(APP_NAME)
         self.get_logger().info("SpeakerNode ready")
@@ -368,6 +375,10 @@ class _SpeakerNode(Node):
             self.stop_play()
         self._topic = topic
         self._muted = False  # 新 start 时清除静默
+        # Reset PlayStream health counters for the new session — consecutive
+        # failures from a previous dead session must not latch this session
+        # into "error" before it has played a single block.
+        self._playstream_consecutive_failures = 0
         self.get_logger().info(f"[speaker] creating subscription: topic={topic}, msg_type=AudioChunk, qos=LOW_LAT")
         self._sub = self.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS,
@@ -590,12 +601,34 @@ class _SpeakerNode(Node):
             return deadline
         duration = len(pcm) / 32000
         t0 = time.monotonic()
+        play_ok = False
         try:
             code, data = self._client.PlayStream(APP_NAME, "0", pcm)
-            if code != 0:
+            if code == 0:
+                play_ok = True
+            else:
                 self.get_logger().error(f"[speaker] PlayStream error code={code}, data={data}")
         except Exception as e:
             self.get_logger().error(f"[speaker] PlayStream error: {e}")
+        # Health tracking: consecutive failures flip state to "error" so the
+        # caller's info poll can detect a dead DDS channel instead of seeing
+        # "ready" forever while no sound comes out.
+        self._playstream_total += 1
+        if play_ok:
+            self._playstream_consecutive_failures = 0
+            if self.state == "error":
+                self.state = "playing"
+                self.get_logger().warn("[speaker] recovered from error state (PlayStream OK)")
+        else:
+            self._playstream_failures += 1
+            self._playstream_consecutive_failures += 1
+            if (self._playstream_consecutive_failures >= self._playstream_error_threshold
+                    and self.state not in ("error", "paused")):
+                self.state = "error"
+                self.get_logger().error(
+                    f"[speaker] state → error: {self._playstream_consecutive_failures} consecutive "
+                    f"PlayStream failures (total={self._playstream_total}, "
+                    f"failures={self._playstream_failures})")
         now = time.monotonic()
         # Cumulative deadline rather than a per-block `- 0.08`: the old form had
         # no way to give back the lead it took, so it drifted 80ms further ahead
@@ -648,34 +681,48 @@ class SpeakerPlugin:
     def start(self) -> None:
         pass  # startup sound is played on first dispatch(start) when project starts
 
-    def _play_startup_sound(self) -> None:
-        """Play startup PCM by directly calling PlayStream in small blocks with pacing."""
+    def _play_startup_sound(self) -> bool:
+        """Play startup PCM by directly calling PlayStream in small blocks with pacing.
+
+        Returns True if at least one block played successfully (proves the DDS
+        audio channel is alive), False otherwise. The caller MUST check this
+        before returning "ready" — a silent startup beep means the audio
+        service is not reachable and subsequent TTS will also fail.
+        """
         import pathlib
         pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
         try:
             pcm = pcm_path.read_bytes()
-            block_size = 9600  # ~300ms per block
-            deadline = None
-            for offset in range(0, len(pcm), block_size):
-                block = pcm[offset:offset + block_size]
-                t0 = time.monotonic()
-                code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
-                if code != 0:
-                    self._node.get_logger().warn(f"[speaker] startup sound stopped at offset {offset}: code={code}")
-                    return
-                # Same bounded cumulative deadline as _SpeakerNode._play_merged.
-                # This loop did not even subtract the PlayStream call's own cost,
-                # so it ran further ahead of the MCU than the streaming path.
-                now = time.monotonic()
-                deadline = (t0 if deadline is None else deadline) + len(block) / 32000
-                if deadline < now:
-                    deadline = now
-                wake = deadline - _SpeakerNode.MAX_LEAD_S
-                if wake > now:
-                    time.sleep(wake - now)
-            self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
         except Exception as e:
-            self._node.get_logger().warn(f"[speaker] startup sound error: {e}")
+            self._node.get_logger().warn(f"[speaker] startup sound file missing: {e}")
+            return False  # no file = can't verify, but don't block startup
+        block_size = 9600  # ~300ms per block
+        any_ok = False
+        deadline = None
+        for offset in range(0, len(pcm), block_size):
+            block = pcm[offset:offset + block_size]
+            t0 = time.monotonic()
+            code, _ = self._node._client.PlayStream(APP_NAME, "0", block)
+            if code == 0:
+                any_ok = True
+            else:
+                self._node.get_logger().warn(
+                    f"[speaker] startup sound block failed at offset {offset}: code={code}")
+            # Same bounded cumulative deadline as _SpeakerNode._play_merged.
+            now = time.monotonic()
+            deadline = (t0 if deadline is None else deadline) + len(block) / 32000
+            if deadline < now:
+                deadline = now
+            wake = deadline - _SpeakerNode.MAX_LEAD_S
+            if wake > now:
+                time.sleep(wake - now)
+        if any_ok:
+            self._node.get_logger().info(f"[speaker] startup sound OK ({len(pcm)} bytes)")
+        else:
+            self._node.get_logger().error(
+                f"[speaker] startup sound COMPLETELY FAILED — audio DDS channel may be dead "
+                f"(all {len(pcm)//block_size} blocks returned error)")
+        return any_ok
 
     def stop(self) -> None:
         self._node.stop_play()
@@ -689,8 +736,31 @@ class SpeakerPlugin:
                 return {"error": "Missing input_topic"}
             # Always stop first to ensure clean restart
             self._node.stop_play()
-            # Play startup sound synchronously before starting subscription
-            self._play_startup_sound()
+            # Play startup sound with retries — the robot's audio service may
+            # not be ready immediately after boot, and a failed beep means the
+            # DDS audio channel is dead. Retry up to 3 times with 1s backoff
+            # before declaring failure. This is the fix for "speaker shows
+            # started but no sound": we no longer return "ready" when the
+            # startup beep silently failed.
+            startup_ok = False
+            for attempt in range(3):
+                startup_ok = self._play_startup_sound()
+                if startup_ok:
+                    break
+                self._node.get_logger().warn(
+                    f"[speaker] startup beep attempt {attempt+1}/3 failed, retrying in 1s...")
+                time.sleep(1.0)
+                # Re-clear stale session between retries
+                try:
+                    self._node._client.PlayStop(APP_NAME)
+                except Exception:
+                    pass
+            if not startup_ok:
+                self._node.state = "error"
+                return {"state": "error",
+                        "error": "Startup beep failed after 3 retries — audio DDS channel unreachable. "
+                                 "Check robot audio service and DDS connectivity.",
+                        "topic": topic}
             topic = self._node.start_play(topic)
             return {"state": "ready", "topic": topic}
         elif action == "stop":
@@ -701,6 +771,12 @@ class SpeakerPlugin:
                 "state": self._node.state,
                 "topic": self._node._topic,
                 "buffer_chunks": self._node._buf.qsize(),
+                "health": {
+                    "playstream_total": self._node._playstream_total,
+                    "playstream_failures": self._node._playstream_failures,
+                    "playstream_consecutive_failures": self._node._playstream_consecutive_failures,
+                    "healthy": self._node.state != "error",
+                },
             }
         return None
 
@@ -758,32 +834,38 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
         result_queue.put({"ready": False, "error": str(e)})
         return
 
-    def _play_beep():
-        """Play startup beep synchronously."""
+    def _play_beep() -> bool:
+        """Play startup beep synchronously. Returns True if any block played."""
         import pathlib
         pcm_path = pathlib.Path(__file__).parent / 'resource' / 'startup_beep.pcm'
         try:
             pcm = pcm_path.read_bytes()
-            block_size = 9600
-            deadline = None
-            for off in range(0, len(pcm), block_size):
-                block = pcm[off:off + block_size]
-                t0 = time.monotonic()
-                code, _ = audio_client.PlayStream(APP_NAME, "0", block)
-                if code != 0:
-                    print(f"[Speaker:subprocess] startup sound stopped at offset {off}: code={code}", flush=True)
-                    return
-                # Bounded cumulative deadline, as in _SpeakerNode._play_merged.
-                now = time.monotonic()
-                deadline = (t0 if deadline is None else deadline) + len(block) / 32000
-                if deadline < now:
-                    deadline = now
-                wake = deadline - _SpeakerNode.MAX_LEAD_S
-                if wake > now:
-                    time.sleep(wake - now)
+        except Exception:
+            return False
+        block_size = 9600
+        any_ok = False
+        deadline = None
+        for off in range(0, len(pcm), block_size):
+            block = pcm[off:off + block_size]
+            t0 = time.monotonic()
+            code, _ = audio_client.PlayStream(APP_NAME, "0", block)
+            if code == 0:
+                any_ok = True
+            else:
+                print(f"[Speaker:subprocess] beep block failed at offset {off}: code={code}", flush=True)
+            # Bounded cumulative deadline, as in _SpeakerNode._play_merged.
+            now = time.monotonic()
+            deadline = (t0 if deadline is None else deadline) + len(block) / 32000
+            if deadline < now:
+                deadline = now
+            wake = deadline - _SpeakerNode.MAX_LEAD_S
+            if wake > now:
+                time.sleep(wake - now)
+        if any_ok:
             print(f"[Speaker:subprocess] startup sound OK ({len(pcm)} bytes)", flush=True)
-        except Exception as e:
-            print(f"[Speaker:subprocess] startup sound error: {e}", flush=True)
+        else:
+            print(f"[Speaker:subprocess] startup sound COMPLETELY FAILED", flush=True)
+        return any_ok
 
     # Command loop
     while True:
@@ -803,8 +885,25 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
                     result_queue.put({"id": request_id, "result": {"error": "Missing input_topic"}})
                     continue
                 node.stop_play()
-                # Play startup sound before starting subscription (same as non-isolated path)
-                _play_beep()
+                # Play startup sound with retries (same logic as non-isolated path)
+                beep_ok = False
+                for attempt in range(3):
+                    beep_ok = _play_beep()
+                    if beep_ok:
+                        break
+                    print(f"[Speaker:subprocess] beep attempt {attempt+1}/3 failed, retrying", flush=True)
+                    time.sleep(1.0)
+                    try:
+                        audio_client.PlayStop(APP_NAME)
+                    except Exception:
+                        pass
+                if not beep_ok:
+                    node.state = "error"
+                    result_queue.put({"id": request_id, "result": {
+                        "state": "error",
+                        "error": "Startup beep failed after 3 retries — audio DDS channel unreachable",
+                        "topic": topic}})
+                    continue
                 topic = node.start_play(topic)
                 result_queue.put({"id": request_id, "result": {"state": "ready", "topic": topic}})
             elif action == "stop":
@@ -824,6 +923,12 @@ def _speaker_process(network_iface: str, namespace: str, plugin_config: dict,
                     "state": node.state,
                     "topic": node._topic,
                     "buffer_chunks": node._buf.qsize(),
+                    "health": {
+                        "playstream_total": node._playstream_total,
+                        "playstream_failures": node._playstream_failures,
+                        "playstream_consecutive_failures": node._playstream_consecutive_failures,
+                        "healthy": node.state != "error",
+                    },
                 }})
             else:
                 result_queue.put({"id": request_id, "result": None})
