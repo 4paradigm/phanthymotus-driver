@@ -713,7 +713,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         """Block until navigation completes or robot is stuck.
         Arrival detection: pose-based (distance to target < 0.3m).
         Also checks ctrl_info.is_arrived if SLAM service ever publishes it.
-        Runs safety checks and ROS2 spin during the wait."""
+        ROS2 spinning and safety checks are handled by the main loop."""
         nonlocal state, nav_arrived_flag, nav_arrived_error, nav_cmd, speed_zone, stop_repeat_count
         poll_interval = 0.5
         last_pose = None
@@ -821,13 +821,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                         "error": f"No movement for {stall_timeout}s, navigation cancelled",
                         "pose": pose}
 
-            # Run safety checks and ROS2 spin during wait
-            process_safety_checks()
-            if stop_repeat_count > 0 and state == MotionState.IDLE:
-                loco_client.StopMove()
-                stop_repeat_count -= 1
-            executor.spin_once(timeout_sec=0)
-
+            # ROS2 spinning and safety checks are owned by the main loop.
             time.sleep(poll_interval)
 
         # State changed externally (e.g., emergency stop)
@@ -835,8 +829,12 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         return {"status": "stopped", "state": state.value}
 
     def complete_wait_nav(cmd):
-        result = handle_wait_nav_done(cmd.get("stall_timeout", 60),
-                                      navigation_id=cmd.get("navigation_id"))
+        try:
+            result = handle_wait_nav_done(cmd.get("stall_timeout", 60),
+                                          navigation_id=cmd.get("navigation_id"))
+        except Exception as exc:
+            print(f"[SmartMotion] wait_nav_done failed: {exc!r}", flush=True)
+            result = {"status": "error", "error": f"wait_nav_done failed: {exc}"}
         result["_req_id"] = cmd.get("_req_id")
         result_queue.put(result)
 
