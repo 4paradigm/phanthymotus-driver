@@ -1055,6 +1055,60 @@ def _nav_poll_thread(self, action_id, target, stall_timeout=60):
 - Tools without `x-completion` → unchanged behavior (sync return)
 - Tools that don't return `action_id` → no pending registered, barrier passes through
 - Drivers that don't POST completion → barrier will timeout gracefully (uses `x-completion.timeout`)
+- Tools without `x-resource` → treated as exclusive against **everything** (old global
+  barrier behaviour). Declaring is an optimisation, never a requirement.
+
+---
+
+## Physical Resources (`x-resource`)
+
+The ACP barrier is scoped by **physical channel**, not by tool type. Declare which
+channel(s) an action occupies, next to `x-completion`:
+
+```python
+"inputSchema": {
+    "type": "object",
+    "properties": { ... },
+    "required": ["action"],
+    "x-completion": {"actions": ["speak"], "timeout": 60},
+    "x-resource": "mouth",                    # or ["base", "arm_l"] for multi-channel
+}
+```
+
+**Why this exists.** The barrier used to block *any* acting tool on *any* pending
+action. That conflates two unrelated things — "I need X's result before Y"
+(causality) and "X and Y both need the mouth" (exclusion) — and implements neither,
+landing on "everyone waits for everyone". Speaking blocked navigating. One
+background agent speaking blocked every other agent's every actuator call, on
+unrelated hardware. `robotera/q5_bundle/` already splits `base_drive`,
+`arm_gesture`, `leg_control` and `waist_control` into separate tools; the global
+barrier serialised all four for no reason.
+
+**Naming.** A resource is a thing there is physically one of. Use the same string
+across every tool that drives the same hardware, and different strings for channels
+that genuinely move independently:
+
+| Channel | Typical tools |
+|---------|---------------|
+| `mouth` | `tts`, `speaker` |
+| `base`  | `loco`, `navigate`, `base_drive` |
+| `arm_l` / `arm_r` | `arm_gesture`, arm IK, gripper |
+| `leg`   | `leg_control`, `switch_mode` |
+| `waist` | `waist_control` |
+| `head`  | gimbal / head pan-tilt |
+
+**Rules.**
+
+- **Undeclared means exclusive against everything.** Omitting `x-resource` is safe;
+  a *wrong* one is not, since it can let two conflicting actions run at once.
+- Malformed values (`{}`, `42`, `""`, `[]`) fall back to undeclared rather than to
+  "conflicts with nothing" — a typo must not silently unlock parallel actuation.
+- One tool may hold several channels: `"x-resource": ["base", "arm_l"]` for an action
+  that drives while pointing. It then conflicts with anything touching either.
+- Two *different* drivers using the same channel name is meaningful and correct —
+  two `tts` tools on one robot are still one speaker.
+- This is orthogonal to `type`. `type` decides whether a tool is barriered at all
+  (`sensor`/`resource` never are); `x-resource` decides *what it waits for*.
 
 ---
 

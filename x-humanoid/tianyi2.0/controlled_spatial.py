@@ -338,6 +338,9 @@ class ControlledSpatialPlugin:
                     "actions": ["navigate_to_tag", "navigate_to_pose"],
                     "timeout": 180
                 },
+                # Drives the chassis — same channel as the nav / home / chassis_raw
+                # tools in device.py.
+                "x-resource": "base",
                 "x-action-params": {
                     "start_mapping": {"params": ["map_name", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Start SLAM mapping with given map name."},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},

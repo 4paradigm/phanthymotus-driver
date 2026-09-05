@@ -2590,6 +2590,7 @@ class HeadGesturePlugin:
                     "actions": ["scan", "shake"],
                     "timeout": 30,
                 },
+                "x-resource": "head",
                 "x-action-params": {
                     "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
@@ -3584,6 +3585,10 @@ class ArmGesturePlugin:
                     "actions": ["salute", "welcome", "shake_hands"],
                     "timeout": 30,
                 },
+                # Both arms: the gestures are static per schema and some are
+                # two-handed, so claiming one side could let them overlap on shared
+                # joints. See README_dev.md § Physical Resources.
+                "x-resource": ["arm_l", "arm_r"],
                 "x-action-params": {
                     "salute": {"params": ["salute_side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
@@ -4494,6 +4499,10 @@ class TtsPlugin:
                 },
                 "required": ["action"],
                 "x-completion": {"actions": ["speak"], "timeout": 180},
+                # Same speaker as voice_play below — one physical channel, two tools,
+                # so they must serialise against each other while leaving the chassis
+                # and arms free.
+                "x-resource": "mouth",
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
                     "interrupt": {"params": [], "description": "立即停止播放并丢弃剩余内容，无需再调 pause"},
@@ -5104,6 +5113,8 @@ class VoicePlayActuatorPlugin:
                     "actions": ["play_text", "play_file", "play_url"],
                     "timeout": 60
                 },
+                # lyre audio output — the same speaker the tts tool uses.
+                "x-resource": "mouth",
                 "x-action-params": {
                     "play_file": {"params": ["path", "force"], "description": "播放本地音频文件"},
                     "play_url":  {"params": ["url", "force"],  "description": "播放远程URL音频"},
@@ -5313,6 +5324,8 @@ class NavPlugin:
                     "actions": ["move_to", "rotate", "rotate_to"],
                     "timeout": 180,
                 },
+                # Slamtec chassis. Same channel as home and chassis_raw.
+                "x-resource": "base",
                 "x-action-params": {
                     "move_to": {"params": ["x", "y", "speed"],
                                 "description": "自主导航到目标点(带避障)，系统自动等待到达"},
@@ -5547,6 +5560,7 @@ class HomePlugin:
                     "actions": ["go_home"],
                     "timeout": 180,
                 },
+                "x-resource": "base",
                 "x-action-params": {
                     "list_docks": {"params": [], "description": "列出当前地图已注册的全部充电桩，返回名称、dock_id 与位姿；可据此选择或删除充电桩"},
                     "register_dock": {"params": ["display_name"], "description": "将机器人当前定位位姿保存为一个新充电桩，并自动设为当前回桩目标。执行前应让机器人停在实际充电桩的对接位置并确认定位正常；成功后可直接执行 go_home"},
@@ -7217,6 +7231,7 @@ class ChassisRawPlugin:
                     "actions": ["move", "rotate"],
                     "timeout": 60
                 },
+                "x-resource": "base",
                 "x-action-params": {
                     "move":   {"params": ["direction", "duration"],
                                "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},
