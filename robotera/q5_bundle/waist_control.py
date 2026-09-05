@@ -190,6 +190,8 @@ class Plugin:
                     "actions": [*WAIST_ACTIONS.keys(), "reset"],
                     "timeout": 15,
                 },
+                # Waist yaw. Independent of legs, arms and the speaker.
+                "x-resource": "waist",
             }}
 
     def _safety(self):
