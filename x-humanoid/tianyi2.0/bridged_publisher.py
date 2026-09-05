@@ -64,7 +64,6 @@ class BridgedPublisher:
 
             self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._socket.connect(self.socket_path)
-            self._connected = True
 
             # Send topic metadata on first connect
             # Convert msg_type to ROS2 format: sensor_msgs/msg/JointState
@@ -90,8 +89,13 @@ class BridgedPublisher:
             self._socket.sendall(struct.pack("<I", len(metadata_bytes)))
             self._socket.sendall(metadata_bytes)
 
+            # Only mark connected after metadata is successfully sent
+            self._connected = True
+            print(f"[bridged_pub] {self.topic}: connected and metadata sent", flush=True)
+
             return True
         except Exception as e:
+            print(f"[bridged_pub] {self.topic}: connection failed: {e}", flush=True)
             if self._socket:
                 self._socket.close()
                 self._socket = None
