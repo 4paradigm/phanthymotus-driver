@@ -46,6 +46,7 @@ class BridgedPublisher:
         self._connected = False
         self._msg_count = 0
         self._send_lock = threading.Lock()  # Protect socket send operations
+        self._connect_lock = threading.Lock()  # Protect connection establishment
 
         # All publishers connect to the same main socket
         self.socket_path = os.path.join(self.SOCKET_DIR, self.MAIN_SOCKET)
@@ -54,53 +55,63 @@ class BridgedPublisher:
         self._try_connect()
 
     def _try_connect(self) -> bool:
-        """Attempt to connect to bridge process socket."""
+        """Attempt to connect to bridge process socket.
+
+        Thread-safe: only one thread can attempt connection at a time.
+        """
+        # Quick check without lock (optimization for already-connected case)
         if self._connected:
             return True
 
-        try:
-            if not os.path.exists(self.socket_path):
+        # Serialize connection attempts to prevent duplicate connections
+        with self._connect_lock:
+            # Double-check after acquiring lock (another thread may have connected)
+            if self._connected:
+                return True
+
+            try:
+                if not os.path.exists(self.socket_path):
+                    return False
+
+                self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._socket.connect(self.socket_path)
+
+                # Send topic metadata on first connect
+                # Convert msg_type to ROS2 format: sensor_msgs/msg/JointState
+                # from sensor_msgs.msg.JointState class
+                module_parts = self.msg_type.__module__.split('.')
+                if len(module_parts) >= 2:
+                    # e.g., "sensor_msgs.msg" -> "sensor_msgs/msg"
+                    package = module_parts[0]
+                    msg_module = module_parts[1] if len(module_parts) > 1 else "msg"
+                    msg_type_str = f"{package}/{msg_module}/{self.msg_type.__name__}"
+                else:
+                    # Fallback
+                    msg_type_str = f"{self.msg_type.__module__}/{self.msg_type.__name__}"
+
+                print(f"[bridged_pub] {self.topic}: msg_type={self.msg_type}, module={self.msg_type.__module__}, formatted={msg_type_str}", flush=True)
+
+                metadata = {
+                    "topic": self.topic,
+                    "msg_type": msg_type_str,
+                }
+                import json
+                metadata_bytes = json.dumps(metadata).encode("utf-8")
+                self._socket.sendall(struct.pack("<I", len(metadata_bytes)))
+                self._socket.sendall(metadata_bytes)
+
+                # Only mark connected after metadata is successfully sent
+                self._connected = True
+                print(f"[bridged_pub] {self.topic}: connected and metadata sent", flush=True)
+
+                return True
+            except Exception as e:
+                print(f"[bridged_pub] {self.topic}: connection failed: {e}", flush=True)
+                if self._socket:
+                    self._socket.close()
+                    self._socket = None
+                self._connected = False
                 return False
-
-            self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self._socket.connect(self.socket_path)
-
-            # Send topic metadata on first connect
-            # Convert msg_type to ROS2 format: sensor_msgs/msg/JointState
-            # from sensor_msgs.msg.JointState class
-            module_parts = self.msg_type.__module__.split('.')
-            if len(module_parts) >= 2:
-                # e.g., "sensor_msgs.msg" -> "sensor_msgs/msg"
-                package = module_parts[0]
-                msg_module = module_parts[1] if len(module_parts) > 1 else "msg"
-                msg_type_str = f"{package}/{msg_module}/{self.msg_type.__name__}"
-            else:
-                # Fallback
-                msg_type_str = f"{self.msg_type.__module__}/{self.msg_type.__name__}"
-
-            print(f"[bridged_pub] {self.topic}: msg_type={self.msg_type}, module={self.msg_type.__module__}, formatted={msg_type_str}", flush=True)
-
-            metadata = {
-                "topic": self.topic,
-                "msg_type": msg_type_str,
-            }
-            import json
-            metadata_bytes = json.dumps(metadata).encode("utf-8")
-            self._socket.sendall(struct.pack("<I", len(metadata_bytes)))
-            self._socket.sendall(metadata_bytes)
-
-            # Only mark connected after metadata is successfully sent
-            self._connected = True
-            print(f"[bridged_pub] {self.topic}: connected and metadata sent", flush=True)
-
-            return True
-        except Exception as e:
-            print(f"[bridged_pub] {self.topic}: connection failed: {e}", flush=True)
-            if self._socket:
-                self._socket.close()
-                self._socket = None
-            self._connected = False
-            return False
 
     def publish(self, msg: Any) -> None:
         """Publish message (same interface as rclpy.Publisher)."""
