@@ -61,6 +61,7 @@ class TopicHandler:
         self.msg_type_name = msg_type_name
         self.msg_class = get_message(msg_type_name)
         self.msg_count = 0
+        self.context_invalid = False
 
         # Create publisher on domain 42
         self.node = Node(
@@ -94,7 +95,15 @@ class TopicHandler:
                     flush=True,
                 )
         except Exception as e:
+            error_msg = str(e)
             print(f"[socket-bridge] ERROR publishing to {self.topic}: {e}", flush=True)
+
+            # If context is invalid, mark this handler as broken so it can be recreated
+            if "context is invalid" in error_msg or "publisher's context is invalid" in error_msg:
+                print(f"[socket-bridge] Context invalid for {self.topic}, handler needs recreation", flush=True)
+                self.context_invalid = True
+                raise  # Re-raise to let caller know this handler is broken
+
             print(f"[socket-bridge]   serialized length: {len(serialized_msg)} bytes", flush=True)
             print(f"[socket-bridge]   first 100 bytes: {serialized_msg[:100]}", flush=True)
             import traceback
@@ -151,8 +160,18 @@ class SocketBridgeServer:
 
             print(f"[socket-bridge] new client: {topic} ({msg_type})", flush=True)
 
-            # Create handler if not exists
-            if topic not in self.handlers:
+            # Create handler if not exists or if previous handler has invalid context
+            if topic not in self.handlers or getattr(self.handlers.get(topic), 'context_invalid', False):
+                if topic in self.handlers:
+                    print(f"[socket-bridge] recreating handler for {topic} (previous context was invalid)", flush=True)
+                    # Clean up old handler
+                    old_handler = self.handlers[topic]
+                    try:
+                        self.executor.remove_node(old_handler.node)
+                        old_handler.node.destroy_node()
+                    except Exception as e:
+                        print(f"[socket-bridge] cleanup error for {topic}: {e}", flush=True)
+
                 self.handlers[topic] = TopicHandler(topic, msg_type, self.ctx, self.executor)
 
             handler = self.handlers[topic]
