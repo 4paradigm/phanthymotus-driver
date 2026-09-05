@@ -1,0 +1,67 @@
+<?xml version="1.0"?>
+<robot name="rm75_6f_v">
+  <link name="base_link"/>
+  <link name="link1"/>
+  <link name="link2"/>
+  <link name="link3"/>
+  <link name="link4"/>
+  <link name="link5"/>
+  <link name="link6"/>
+  <link name="link7"/>
+  <link name="tool0"/>
+
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.16" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.10" upper="3.10" effort="80" velocity="2.0"/>
+  </joint>
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 0 0.18" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.35" upper="2.35" effort="80" velocity="2.0"/>
+  </joint>
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0.28 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.10" upper="3.10" effort="60" velocity="2.0"/>
+  </joint>
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/>
+    <child link="link4"/>
+    <origin xyz="0.26 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.35" upper="2.35" effort="60" velocity="2.0"/>
+  </joint>
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/>
+    <child link="link5"/>
+    <origin xyz="0 0 0.18" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.10" upper="3.10" effort="40" velocity="2.0"/>
+  </joint>
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/>
+    <child link="link6"/>
+    <origin xyz="0.16 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.35" upper="2.35" effort="40" velocity="2.0"/>
+  </joint>
+  <joint name="joint7" type="revolute">
+    <parent link="link6"/>
+    <child link="link7"/>
+    <origin xyz="0.10 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.28" upper="6.28" effort="30" velocity="2.0"/>
+  </joint>
+  <joint name="tool0_fixed" type="fixed">
+    <parent link="link7"/>
+    <child link="tool0"/>
+    <origin xyz="0.08 0 0" rpy="0 0 0"/>
+  </joint>
+</robot>

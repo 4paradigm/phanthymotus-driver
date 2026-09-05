@@ -1,0 +1,39 @@
+mcp_port: 15718
+ros_namespace: ""
+name: "睿尔曼 RM75-6F-V"
+arm_dof: 7
+arm_ip: "192.168.1.18"
+tcp_port: 8080
+safety:
+  require_fresh_joint_state: true
+  require_no_errors: true
+  max_state_age_seconds: 2.0
+  max_result_wait_seconds: 10.0
+  joint_target_tolerance_rad: 0.01
+  movej_blend_radius: 0
+  joint_limits_rad:
+    - [-3.10, 3.10]
+    - [-2.35, 2.35]
+    - [-3.10, 3.10]
+    - [-2.35, 2.35]
+    - [-3.10, 3.10]
+    - [-2.35, 2.35]
+    - [-6.28, 6.28]
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_interface: "eth0"
+topics:
+  joint_states: "/joint_states"
+  arm_state_cmd: "/rm_driver/get_current_arm_state_cmd"
+  arm_state: "/rm_driver/get_current_arm_state_result"
+  arm_original_state: "/rm_driver/get_current_arm_original_state_result"
+  arm_current_status: "/rm_driver/udp_arm_current_status"
+  joint_error: "/rm_driver/udp_joint_error_code"
+  rm_error: "/rm_driver/udp_rm_err"
+  movej_cmd: "/rm_driver/movej_cmd"
+  movej_result: "/rm_driver/movej_result"
+  move_stop_cmd: "/rm_driver/move_stop_cmd"
+  move_stop_result: "/rm_driver/move_stop_result"
+  joint_error_clear_cmd: "/rm_driver/set_joint_err_clear_cmd"
+  joint_error_clear_result: "/rm_driver/set_joint_err_clear_result"
