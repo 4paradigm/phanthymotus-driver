@@ -1056,7 +1056,8 @@ def _nav_poll_thread(self, action_id, target, stall_timeout=60):
 - Tools that don't return `action_id` → no pending registered, barrier passes through
 - Drivers that don't POST completion → barrier will timeout gracefully (uses `x-completion.timeout`)
 - Tools without `x-resource` → treated as exclusive against **everything** (old global
-  barrier behaviour). Declaring is an optimisation, never a requirement.
+  barrier behaviour). Safe, but see "Declare it on *every* acting tool" below: a
+  partially-declared driver is the case that behaves worst.
 
 ---
 
@@ -1109,6 +1110,68 @@ that genuinely move independently:
   two `tts` tools on one robot are still one speaker.
 - This is orthogonal to `type`. `type` decides whether a tool is barriered at all
   (`sensor`/`resource` never are); `x-resource` decides *what it waits for*.
+
+### Declare it on *every* acting tool, not only the async ones
+
+The barrier has two sides, and only one of them needs `x-completion`:
+
+| role | what `x-resource` does | needs `x-completion`? |
+|------|------------------------|------------------------|
+| **holder** | tells others what this action blocks while it runs | yes — only an async action has a pending |
+| **requester** | tells the barrier what this call must *wait for* | **no** — every `actuator`/`processor` tool asks |
+
+Miss the requester side and the tool asks with "undeclared", which means *conflicts
+with everything*, so it waits on any pending action anywhere on the robot. Measured
+on Tianyi, where `arm_gesture`/`tts` were declared but the direct-control `arm`/`head`
+were not:
+
+| observed | cause |
+|---|---|
+| head sat idle 5 s before moving | `head` (undeclared) waited on an `arm_gesture` pending |
+| arm sat idle 8 s before moving | `arm` (undeclared) waited on a `tts` pending |
+
+So **a partially-declared driver is worse than an undeclared one**: undeclared is
+uniformly serial and honest about it, partial looks like it should overlap and
+doesn't. It also compounds — with motions serialised behind unrelated channels,
+delegated subagents ran long enough to hit their delegation timeout, got cancelled
+mid-run, and the caller redid work that had already happened.
+
+Three-way summary of getting it wrong:
+
+- **undeclared** → safe, slow. No correctness risk.
+- **partially declared** → safe, slow, and *surprising*. This is the trap.
+- **wrongly declared** → the only case that is unsafe, because it permits
+  concurrency that the hardware does not.
+
+A tool that genuinely occupies no channel cannot say so — an empty `x-resource`
+normalises to "undeclared" on purpose, so a typo fails safe. Such a tool is almost
+always mis-typed: if it only reads state, give it `type: sensor` or `resource`, which
+exempts it from the barrier entirely. (Note that changing `type` also changes who may
+call it: a `viewer`-role peer may call sensor tools. Do not retype a tool casually.)
+
+### It is a vocabulary, not a fixed list — including for non-humanoids
+
+Agent Core contains **no channel names at all**; it only intersects the strings
+drivers declare. The names above are a humanoid convention, nothing more. A drone
+would declare `rotor`, `gimbal`, `camera`; an underwater vehicle `thruster`,
+`ballast`, `rudder`, `manipulator`. Nothing needs to change in the core for either.
+
+Two limits are worth knowing before relying on it:
+
+**It expresses mutual exclusion only.** Not ordering ("announce *before* moving"),
+not simultaneity ("both arms must start together"), not reader/writer sharing, not
+hierarchy (`arm_l` and a wrist-only tool are unrelated strings unless the wrist tool
+also declares `arm_l`), and not capacity (two motors each fine alone but not
+together). If your platform needs those, this is not the mechanism.
+
+**It assumes actions are discrete and bounded** — the same assumption `x-completion`
+makes. A multirotor's rotors are held *continuously* while airborne: hovering is a
+state, not an action that completes. Declaring `rotor` on a takeoff tool that never
+reports completion would hold that channel forever and block everything behind it.
+For continuous-state platforms, either keep the state-entering tool out of ACP
+(no `x-completion`, so no pending is held) or model the *transitions* as the actions.
+`dji/mavic3e` currently declares no `x-completion` at all, so it is in the first
+camp by default.
 
 ---
 
