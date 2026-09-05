@@ -26,6 +26,9 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -3856,6 +3859,221 @@ RS_COLOR_W, RS_COLOR_H, RS_COLOR_FPS = 1920, 1080, 15
 RS_DEPTH_W, RS_DEPTH_H, RS_DEPTH_FPS = 640, 480, 15
 RS_JPEG_QUALITY  = 80
 RS_DIST_INTERVAL = 0.1  # 10 Hz for distance JSON
+CAMERA_FRAME_STORAGE_DIR = "/opt/phanthy-motus/data/camera_frames"
+
+
+@dataclass(frozen=True)
+class CameraFrame:
+    seq: int
+    received_at: float
+    data: bytes
+    frame_id: str = ""
+    stamp_sec: int | None = None
+    stamp_nanosec: int | None = None
+    fmt: str = "jpeg"
+
+    def metadata(self) -> dict:
+        return {
+            "seq": self.seq,
+            "received_at_ms": round(self.received_at * 1000),
+            "size_bytes": len(self.data),
+            "frame_id": self.frame_id,
+            "stamp_sec": self.stamp_sec,
+            "stamp_nanosec": self.stamp_nanosec,
+            "format": self.fmt,
+        }
+
+
+class CameraFrameCache:
+    def __init__(self, max_frames: int = 90, storage_dir: str = CAMERA_FRAME_STORAGE_DIR):
+        self.max_frames = max(1, int(max_frames))
+        self.storage_dir = Path(storage_dir)
+        self._frames: deque[CameraFrame] = deque(maxlen=self.max_frames)
+        self._seq = 0
+        self._lock = threading.Lock()
+
+    def add_frame(self, data: bytes, *, received_at: float | None = None,
+                  frame_id: str = "", stamp_sec: int | None = None,
+                  stamp_nanosec: int | None = None, fmt: str = "jpeg") -> CameraFrame:
+        now = time.time() if received_at is None else float(received_at)
+        with self._lock:
+            self._seq += 1
+            frame = CameraFrame(
+                seq=self._seq,
+                received_at=now,
+                data=bytes(data),
+                frame_id=frame_id,
+                stamp_sec=stamp_sec,
+                stamp_nanosec=stamp_nanosec,
+                fmt=fmt or "jpeg",
+            )
+            self._frames.append(frame)
+            return frame
+
+    def info(self) -> dict:
+        with self._lock:
+            latest = self._frames[-1] if self._frames else None
+            count = len(self._frames)
+        return {
+            "state": "ready" if latest else "waiting",
+            "frames": count,
+            "max_frames": self.max_frames,
+            "latest": latest.metadata() if latest else None,
+        }
+
+    def clear(self) -> dict:
+        with self._lock:
+            removed = len(self._frames)
+            self._frames.clear()
+        return {"state": "ok", "cleared": removed}
+
+    def recent(self, count: int) -> list[CameraFrame]:
+        count = max(1, int(count))
+        with self._lock:
+            return list(self._frames)[-count:]
+
+    def sample(self, count: int, interval_sec: float) -> list[CameraFrame]:
+        count = max(1, int(count))
+        interval = max(0.0, float(interval_sec))
+        with self._lock:
+            frames = list(self._frames)
+        selected: list[CameraFrame] = []
+        next_latest_time = float("inf")
+        for frame in reversed(frames):
+            if not selected or next_latest_time - frame.received_at >= interval:
+                selected.append(frame)
+                next_latest_time = frame.received_at
+                if len(selected) >= count:
+                    break
+        selected.reverse()
+        return selected
+
+    def save_frames(self, frames: list[CameraFrame], prefix: str) -> list[dict]:
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for frame in frames:
+            path = self.storage_dir / f"{prefix}_{frame.seq:06d}.jpg"
+            path.write_bytes(frame.data)
+            item = frame.metadata()
+            item["saved_path"] = str(path)
+            saved.append(item)
+        return saved
+
+
+class CameraFrameBufferPlugin:
+    PREFIX = "camera_frame_buffer"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._source_topic = plugin_config.get("source_topic", f"/{namespace}/camera/rgb")
+        self._cache = CameraFrameCache(
+            max_frames=plugin_config.get("max_frames", 90),
+            storage_dir=plugin_config.get("storage_dir", CAMERA_FRAME_STORAGE_DIR),
+        )
+        self._node = self._make_node()
+        executor.add_node(self._node)
+
+    def _make_node(self):
+        from sensor_msgs.msg import CompressedImage
+
+        cache = self._cache
+        source_topic = self._source_topic
+
+        class CameraFrameBufferNode(Node):
+            def __init__(self):
+                super().__init__("g1_camera_frame_buffer")
+                self._sub = self.create_subscription(
+                    CompressedImage,
+                    source_topic,
+                    self._on_frame,
+                    _LOW_LAT_QOS,
+                )
+                self.get_logger().info(f"CameraFrameBuffer subscribed {source_topic}")
+
+            def _on_frame(self, msg):
+                stamp = getattr(msg.header, "stamp", None)
+                cache.add_frame(
+                    bytes(msg.data),
+                    frame_id=getattr(msg.header, "frame_id", ""),
+                    stamp_sec=getattr(stamp, "sec", None),
+                    stamp_nanosec=getattr(stamp, "nanosec", None),
+                    fmt=getattr(msg, "format", "jpeg") or "jpeg",
+                )
+
+        return CameraFrameBufferNode()
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "camera_frame_buffer",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": "Caches recent camera_rgb JPEG frames and saves recent or time-sampled bursts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["info", "latest", "recent", "sample", "clear"],
+                        "default": "info",
+                        "description": "Frame buffer query to perform",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": self._cache.max_frames,
+                        "description": "Number of frames to return or save",
+                    },
+                    "interval_sec": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Minimum spacing between sampled frames",
+                    },
+                    "save": {"type": "boolean", "description": "Save selected JPEG frames to disk"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action in ("info", "camera_frame_buffer"):
+            out = self._cache.info()
+            out["source_topic"] = self._source_topic
+            return out
+        if action == "clear":
+            return self._cache.clear()
+
+        count = max(1, int(args.get("count", 1)))
+        if action == "latest":
+            frames = self._cache.recent(1)
+            prefix = "latest"
+        elif action == "recent":
+            frames = self._cache.recent(count)
+            prefix = "recent"
+        elif action == "sample":
+            interval_sec = float(args.get("interval_sec", 0.2))
+            frames = self._cache.sample(count, interval_sec)
+            prefix = f"sample_{int(interval_sec * 1000)}ms"
+        else:
+            return {"error": f"Unknown action: {action}"}
+
+        saved = bool(args.get("save", False))
+        frame_items = self._cache.save_frames(frames, prefix) if saved else [frame.metadata() for frame in frames]
+        return {
+            "state": "ok" if frames else "waiting",
+            "source_topic": self._source_topic,
+            "requested": count,
+            "frames": len(frames),
+            "saved": saved,
+            "items": frame_items,
+        }
 
 
 class RealSensePlugin:
