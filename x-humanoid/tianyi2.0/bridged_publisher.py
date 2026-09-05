@@ -45,6 +45,7 @@ class BridgedPublisher:
         self._socket = None
         self._connected = False
         self._msg_count = 0
+        self._send_lock = threading.Lock()  # Protect socket send operations
 
         # All publishers connect to the same main socket
         self.socket_path = os.path.join(self.SOCKET_DIR, self.MAIN_SOCKET)
@@ -63,7 +64,6 @@ class BridgedPublisher:
 
             self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._socket.connect(self.socket_path)
-            self._connected = True
 
             # Send topic metadata on first connect
             # Convert msg_type to ROS2 format: sensor_msgs/msg/JointState
@@ -89,8 +89,13 @@ class BridgedPublisher:
             self._socket.sendall(struct.pack("<I", len(metadata_bytes)))
             self._socket.sendall(metadata_bytes)
 
+            # Only mark connected after metadata is successfully sent
+            self._connected = True
+            print(f"[bridged_pub] {self.topic}: connected and metadata sent", flush=True)
+
             return True
         except Exception as e:
+            print(f"[bridged_pub] {self.topic}: connection failed: {e}", flush=True)
             if self._socket:
                 self._socket.close()
                 self._socket = None
@@ -114,10 +119,16 @@ class BridgedPublisher:
             serialized = serialize_message(msg)
 
             # Send: [4-byte length][serialized message]
-            self._socket.sendall(struct.pack("<I", len(serialized)))
-            self._socket.sendall(serialized)
+            # Use lock to prevent interleaving when multiple threads publish to same topic
+            with self._send_lock:
+                self._socket.sendall(struct.pack("<I", len(serialized)))
+                self._socket.sendall(serialized)
 
             self._msg_count += 1
+
+            # Debug: log first few IMU publishes
+            if "imu" in self.topic.lower() and self._msg_count <= 5:
+                print(f"[bridged_pub] {self.topic}: published msg #{self._msg_count}, size={len(serialized)} bytes", flush=True)
 
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # Connection lost, mark as disconnected for retry

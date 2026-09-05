@@ -307,6 +307,12 @@ class Plugin:
                     "actions": ["salute", "welcome", "raise", "shake_hands", "high_five", "reset"],
                     "timeout": 60,
                 },
+                # Both arms, deliberately. `side` picks left/right/both per call, but
+                # x-resource is static per schema, so claiming only one would let a
+                # `side="both"` gesture run concurrently with a single-arm one on the
+                # same joints. Over-serialising left against right is the cheap
+                # mistake here; the other direction moves real hardware twice.
+                "x-resource": ["arm_l", "arm_r"],
             },
         }
 

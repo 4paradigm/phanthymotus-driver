@@ -675,6 +675,10 @@ def _start_domain_bridge(cfg: dict) -> None:
     bridge_path = Path(__file__).parent / "socket_bridge.py"
     bridge_env = os.environ.copy()
 
+    # Socket bridge must use the same DDS config as agent-core (loopback only)
+    # to ensure they can communicate on domain 42
+    bridge_env["FASTRTPS_DEFAULT_PROFILES_FILE"] = "/opt/phanthy-motus/dds-local.xml"
+
     try:
         _domain_bridge_proc = subprocess.Popen(
             [sys.executable, str(bridge_path)],
