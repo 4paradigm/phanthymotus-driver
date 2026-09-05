@@ -108,6 +108,40 @@ python main.py
 4. Tools become available to the LLM agent and appear in the Web Dashboard
 5. The LLM agent can invoke tools via MCP `tools/call`
 
+### Go2 Nav2 Driver Inputs
+
+The Go2 Driver reuses the same lease-bound
+`phanthy.navigation.velocity_proposal.v1` contract on
+`/ubuntu/navigation/nav2/velocity_proposal`. The subscription and execution
+queue are both latest-only. Valid velocities are forwarded to
+`SportClient.Move` in m/s and rad/s; terminal or expired proposals use
+`StopMove` and require a fresh zero `loco/state` sample before the lease is
+released or held for recovery. Direct `loco`, gait, gesture, or acrobatics
+actions revoke Nav2 authority and require a confirmed stop before issuing their
+RPC.
+
+The read-only `navigation_lidar` and `navigation_imu` cards convert Go2's
+native `rt/utlidar/cloud` and `rt/utlidar/imu` DDS streams into the
+same standard `/ubuntu/navigation/lidar` `PointCloud2` and
+`/ubuntu/navigation/imu` `Imu` contracts. Both outputs use the same non-empty
+REP-103 `sensor_frame`. The configured device-to-sensor rotation is applied to
+cloud xyz and to IMU orientation, angular velocity, linear acceleration, and
+all covariances. Go2 defaults to the identity rotation because the MID360 cloud
+and IMU axes are parallel and the installed sensor is REP-103 aligned. Per
+REP-145, a stationary upward sensor Z axis reports `+g`; this is not a frame
+inversion. Raw per-point `time` is in seconds and is converted to a strictly
+increasing FLOAT64 absolute nanosecond timestamp. Because one Go2 raw DDS
+message is only a partial near-field-heavy packet, the Driver combines two
+consecutive packets, rejects gaps over 120 ms, and removes returns below 0.5 m
+before publishing one navigation scan; `ring` and source `time` remain attached
+to every retained point. The isolated worker,
+source-clock normalization, fail-closed readiness checks, and shared card
+lifecycle match the G1 navigation sensor path. The same worker publishes the
+configured `base_link -> utlidar_lidar` mount through ROS 2's static transform
+broadcaster. Go2 defaults to Unitree's [factory `radar_joint` transform](https://github.com/unitreerobotics/unitree_ros/blob/master/robots/go2_description/urdf/go2_description.urdf)
+(`xyz=[0.28945, 0,-0.046825]`, `rpy=[0,2.8782,0]`); missing or invalid
+extrinsics fail worker startup instead of falling back to identity.
+
 ## Writing a New Driver
 
 Want to add support for new hardware? See the **[Driver Development Guide](README_dev.md)** for the full specification, including:
