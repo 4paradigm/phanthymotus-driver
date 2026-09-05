@@ -84,8 +84,8 @@ class TopicHandler:
             self.pub.publish(msg)
             self.msg_count += 1
 
-            # Debug first few messages for camera
-            if "camera" in self.topic and self.msg_count <= 5:
+            # Debug first few messages for camera and imu
+            if ("camera" in self.topic or "imu" in self.topic) and self.msg_count <= 5:
                 print(f"[socket-bridge] {self.topic}: msg #{self.msg_count}, serialized={len(serialized_msg)} bytes, type={type(msg)}", flush=True)
 
             if self.msg_count % 100 == 0:
@@ -95,6 +95,8 @@ class TopicHandler:
                 )
         except Exception as e:
             print(f"[socket-bridge] ERROR publishing to {self.topic}: {e}", flush=True)
+            print(f"[socket-bridge]   serialized length: {len(serialized_msg)} bytes", flush=True)
+            print(f"[socket-bridge]   first 100 bytes: {serialized_msg[:100]}", flush=True)
             import traceback
             traceback.print_exc()
 
