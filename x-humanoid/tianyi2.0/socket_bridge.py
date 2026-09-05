@@ -2,15 +2,15 @@
 """
 Socket Bridge Server - Receives messages via Unix socket and publishes to domain 42.
 
-This process runs independently with dds-local.xml, allowing it to communicate
-with agent-core while the main process uses dds_profile.xml for body controller.
+This process runs independently, allowing it to communicate with agent-core
+while the main process uses domain 0 for body controller.
 
 Architecture:
     Main process (domain 0, dds_profile.xml)
         → Plugins use BridgedPublisher
         → Send via Unix socket
         → This bridge process
-        → Publish to domain 42 (dds-local.xml)
+        → Publish to domain 42 (inherits DDS config from environment)
         → Agent Core receives
 
 Usage:
@@ -61,6 +61,7 @@ class TopicHandler:
         self.msg_type_name = msg_type_name
         self.msg_class = get_message(msg_type_name)
         self.msg_count = 0
+        self.context_invalid = False
 
         # Create publisher on domain 42
         self.node = Node(
@@ -68,11 +69,9 @@ class TopicHandler:
             context=ctx,
         )
 
-        # Choose QoS based on topic
-        if any(x in topic for x in ["/state/joints", "/state/imu", "/camera/"]):
-            qos = BEST_EFFORT_QOS
-        else:
-            qos = RELIABLE_QOS
+        # Use BEST_EFFORT for all topics to match Agent Core's expectations
+        # Agent Core's phanthy_bus_bridge subscribes with BEST_EFFORT
+        qos = BEST_EFFORT_QOS
 
         self.pub = self.node.create_publisher(self.msg_class, topic, qos)
         executor.add_node(self.node)
@@ -86,13 +85,29 @@ class TopicHandler:
             self.pub.publish(msg)
             self.msg_count += 1
 
+            # Debug first few messages for camera and imu
+            if ("camera" in self.topic or "imu" in self.topic) and self.msg_count <= 5:
+                print(f"[socket-bridge] {self.topic}: msg #{self.msg_count}, serialized={len(serialized_msg)} bytes, type={type(msg)}", flush=True)
+
             if self.msg_count % 100 == 0:
                 print(
                     f"[socket-bridge] {self.topic}: published {self.msg_count} messages",
                     flush=True,
                 )
         except Exception as e:
+            error_msg = str(e)
             print(f"[socket-bridge] ERROR publishing to {self.topic}: {e}", flush=True)
+
+            # If context is invalid, mark this handler as broken so it can be recreated
+            if "context is invalid" in error_msg or "publisher's context is invalid" in error_msg:
+                print(f"[socket-bridge] Context invalid for {self.topic}, handler needs recreation", flush=True)
+                self.context_invalid = True
+                raise  # Re-raise to let caller know this handler is broken
+
+            print(f"[socket-bridge]   serialized length: {len(serialized_msg)} bytes", flush=True)
+            print(f"[socket-bridge]   first 100 bytes: {serialized_msg[:100]}", flush=True)
+            import traceback
+            traceback.print_exc()
 
 
 class SocketBridgeServer:
@@ -101,15 +116,16 @@ class SocketBridgeServer:
     SOCKET_DIR = "/tmp/tianyi_bridge"
 
     def __init__(self):
-        # Setup domain 42 with dds-local.xml
-        # This isolates DDS traffic to loopback, preventing cross-robot interference
-        os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = "/opt/phanthy-motus/dds-local.xml"
+        # Setup domain 42 with default DDS config (same as agent-core)
+        # Agent-core and socket bridge must use the same DDS configuration
+        # to communicate. They inherit from main process environment.
         self.ctx = Context()
         rclpy.init(context=self.ctx, domain_id=42)
         self.executor = rclpy.executors.MultiThreadedExecutor(context=self.ctx)
 
+        dds_config = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", "default")
         print(
-            "[socket-bridge] domain 42 initialized with /opt/phanthy-motus/dds-local.xml",
+            f"[socket-bridge] domain 42 initialized (DDS config: {dds_config})",
             flush=True,
         )
 
@@ -126,9 +142,17 @@ class SocketBridgeServer:
             length_bytes = conn.recv(4)
             if len(length_bytes) < 4:
                 return
-            
+
             metadata_len = struct.unpack("<I", length_bytes)[0]
-            metadata_bytes = conn.recv(metadata_len)
+
+            # Read metadata in chunks (like message data)
+            metadata_bytes = b""
+            while len(metadata_bytes) < metadata_len:
+                chunk = conn.recv(min(metadata_len - len(metadata_bytes), 65536))
+                if not chunk:
+                    return
+                metadata_bytes += chunk
+
             metadata = json.loads(metadata_bytes.decode("utf-8"))
 
             topic = metadata["topic"]
@@ -136,8 +160,18 @@ class SocketBridgeServer:
 
             print(f"[socket-bridge] new client: {topic} ({msg_type})", flush=True)
 
-            # Create handler if not exists
-            if topic not in self.handlers:
+            # Create handler if not exists or if previous handler has invalid context
+            if topic not in self.handlers or getattr(self.handlers.get(topic), 'context_invalid', False):
+                if topic in self.handlers:
+                    print(f"[socket-bridge] recreating handler for {topic} (previous context was invalid)", flush=True)
+                    # Clean up old handler
+                    old_handler = self.handlers[topic]
+                    try:
+                        self.executor.remove_node(old_handler.node)
+                        old_handler.node.destroy_node()
+                    except Exception as e:
+                        print(f"[socket-bridge] cleanup error for {topic}: {e}", flush=True)
+
                 self.handlers[topic] = TopicHandler(topic, msg_type, self.ctx, self.executor)
 
             handler = self.handlers[topic]

@@ -1444,6 +1444,7 @@ class LocoPlugin:
                     "actions": ["move"],
                     "timeout": 60,
                 },
+                "x-resource": "base",
                 "x-action-params": {
                     "move":             {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with specified velocities. duration>0 for timed move, 0 or negative for continuous until stop."},
                     "stop_move":        {"params": [],                                 "description": "Stop all movement immediately"},
@@ -1541,6 +1542,12 @@ class LocoPlugin:
                     "actions": ["lie2standup", "standup2lie", "standup2squat", "squat2standup"],
                     "timeout": 150,
                 },
+                # Deliberately no x-resource. A posture transition moves the whole
+                # body, and nothing else should run during one — undeclared means
+                # exclusive against everything, which is exactly right here. This is
+                # the same reasoning that keeps switch_mode out of the interrupt
+                # sweep in agent-core: aborting a controlled descent partway is how
+                # it becomes a fall.
                 "x-action-params": {
                     "lie2standup":     {"params": [], "description": "躺起 (阻尼/零力矩 → 主运控)"},
                     "standup2lie":     {"params": [], "description": "安全躺下 (主运控 → 平衡蹲姿 → 阻尼)"},
