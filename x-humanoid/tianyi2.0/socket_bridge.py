@@ -2,15 +2,15 @@
 """
 Socket Bridge Server - Receives messages via Unix socket and publishes to domain 42.
 
-This process runs independently with dds-local.xml, allowing it to communicate
-with agent-core while the main process uses dds_profile.xml for body controller.
+This process runs independently, allowing it to communicate with agent-core
+while the main process uses domain 0 for body controller.
 
 Architecture:
     Main process (domain 0, dds_profile.xml)
         → Plugins use BridgedPublisher
         → Send via Unix socket
         → This bridge process
-        → Publish to domain 42 (dds-local.xml)
+        → Publish to domain 42 (inherits DDS config from environment)
         → Agent Core receives
 
 Usage:
@@ -101,15 +101,16 @@ class SocketBridgeServer:
     SOCKET_DIR = "/tmp/tianyi_bridge"
 
     def __init__(self):
-        # Setup domain 42 with dds-local.xml
-        # This isolates DDS traffic to loopback, preventing cross-robot interference
-        os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = "/opt/phanthy-motus/dds-local.xml"
+        # Setup domain 42 with default DDS config (same as agent-core)
+        # Agent-core and socket bridge must use the same DDS configuration
+        # to communicate. They inherit from main process environment.
         self.ctx = Context()
         rclpy.init(context=self.ctx, domain_id=42)
         self.executor = rclpy.executors.MultiThreadedExecutor(context=self.ctx)
 
+        dds_config = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", "default")
         print(
-            "[socket-bridge] domain 42 initialized with /opt/phanthy-motus/dds-local.xml",
+            f"[socket-bridge] domain 42 initialized (DDS config: {dds_config})",
             flush=True,
         )
 
