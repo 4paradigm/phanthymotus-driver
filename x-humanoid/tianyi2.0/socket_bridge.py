@@ -68,11 +68,9 @@ class TopicHandler:
             context=ctx,
         )
 
-        # Choose QoS based on topic
-        if any(x in topic for x in ["/state/joints", "/state/imu", "/camera/"]):
-            qos = BEST_EFFORT_QOS
-        else:
-            qos = RELIABLE_QOS
+        # Use BEST_EFFORT for all topics to match Agent Core's expectations
+        # Agent Core's phanthy_bus_bridge subscribes with BEST_EFFORT
+        qos = BEST_EFFORT_QOS
 
         self.pub = self.node.create_publisher(self.msg_class, topic, qos)
         executor.add_node(self.node)
@@ -86,6 +84,10 @@ class TopicHandler:
             self.pub.publish(msg)
             self.msg_count += 1
 
+            # Debug first few messages for camera
+            if "camera" in self.topic and self.msg_count <= 5:
+                print(f"[socket-bridge] {self.topic}: msg #{self.msg_count}, serialized={len(serialized_msg)} bytes, type={type(msg)}", flush=True)
+
             if self.msg_count % 100 == 0:
                 print(
                     f"[socket-bridge] {self.topic}: published {self.msg_count} messages",
@@ -93,6 +95,8 @@ class TopicHandler:
                 )
         except Exception as e:
             print(f"[socket-bridge] ERROR publishing to {self.topic}: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
 
 
 class SocketBridgeServer:
