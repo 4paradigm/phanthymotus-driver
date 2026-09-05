@@ -39,7 +39,7 @@ ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre
 
 COPY resource/ /work/resource/
 COPY common/ /work/common/
-COPY main.py device.py joints_bridge.py light.py nav_client.py ext_devices.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py /work/
+COPY main.py device.py joints_bridge.py light.py nav_client.py ext_devices.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py /work/
 COPY deploy/     /deploy/
 RUN mkdir -p /opt/phanthy-motus/data/maps
 
