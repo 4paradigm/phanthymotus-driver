@@ -2437,6 +2437,8 @@ class HeadPlugin:
                                "description": "预设方向"},
                 },
                 "required": ["action"],
+                # 头部 3DOF —— 与 head_gesture 同一通道
+                "x-resource": "head",
                 "x-action-params": {
                     "move_pos": {"params": ["yaw", "pitch", "roll"],
                                  "description": "移动头部到指定角度(度)"},
@@ -3055,6 +3057,8 @@ class ArmPlugin:
                            )},
                 },
                 "required": ["action"],
+                # 双臂关节 —— 与 arm_gesture 同一通道。side 按调用变化而 schema 是静态的，只声明一侧会让双臂动作与单臂动作并发抢同一批关节
+                "x-resource": ["arm_l", "arm_r"],
                 "x-action-params": {
                     "move_pos": {"params": ["left_positions", "right_positions", "speed"],
                                  "description": (
@@ -4078,6 +4082,8 @@ class WaistPlugin:
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                 },
                 "required": ["action"],
+                # 腰部偏航 + 腿部升降 —— 没有别的工具碰这两个自由度
+                "x-resource": "waist",
                 "x-action-params": {
                     "move_waist": {"params": ["yaw", "speed"],
                                  "description": "腰部偏航: 控制yaw角度(-120°~120°)"},
@@ -4284,6 +4290,8 @@ class HandPlugin:
                                        "description": "thumb rotation"},
                 },
                 "required": ["action"],
+                # 灵巧手指关节 —— 与手臂是独立自由度，可以同时动
+                "x-resource": ["hand_l", "hand_r"],
                 "x-action-params": {
                     **{g: {"params": ["side"],
                            "description": f"预设手势: {self._GESTURE_LABELS[g]}"}
