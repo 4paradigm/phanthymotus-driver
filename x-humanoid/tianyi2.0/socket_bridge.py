@@ -127,9 +127,17 @@ class SocketBridgeServer:
             length_bytes = conn.recv(4)
             if len(length_bytes) < 4:
                 return
-            
+
             metadata_len = struct.unpack("<I", length_bytes)[0]
-            metadata_bytes = conn.recv(metadata_len)
+
+            # Read metadata in chunks (like message data)
+            metadata_bytes = b""
+            while len(metadata_bytes) < metadata_len:
+                chunk = conn.recv(min(metadata_len - len(metadata_bytes), 65536))
+                if not chunk:
+                    return
+                metadata_bytes += chunk
+
             metadata = json.loads(metadata_bytes.decode("utf-8"))
 
             topic = metadata["topic"]
