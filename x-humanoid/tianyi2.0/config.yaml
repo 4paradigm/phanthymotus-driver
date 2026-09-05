@@ -2,10 +2,16 @@ mcp_port: 15707
 ros_namespace: ""   # 留空则自动使用 hostname
 name: "Tianyi 2.0 Pro"
 
+# Forward all topics from domain 0 (body controller) to domain 42 (agent-core)
+# via socket bridge. This enables proper DDS isolation.
+domain_bridge:
+  enabled: true
+
+# DEPRECATED: Use domain_bridge instead. Left for backward compatibility.
 # Run the skeleton publisher in its own ROS process. The main bundle keeps
 # the other cards but does not publish a competing joints topic.
 joints_bridge:
-  enabled: true
+  enabled: false
 
 # Make power-on self-check automatic on the robot's x86 motion-control board.
 auto_self_check:
