@@ -147,13 +147,12 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         values.update(overrides)
         return values
 
-    def test_set_rejects_any_missing_joint_field(self):
-        plugin, robot = self._motion_plugin()
-        args = self._seven_targets()
-        del args["joint7_deg"]
-        with self.assertRaisesRegex(ValueError, "missing: joint7_deg"):
-            plugin._start_motion({**args, "confirm_motion": True})
-        self.assertEqual([], robot.moves)
+    def test_missing_joint_fields_keep_current_positions(self):
+        current = [10, 20, 30, 40, 50, 60, 70]
+        plugin, robot = self._motion_plugin(current=current)
+        result = plugin._start_motion({"joint3_deg": 31, "confirm_motion": True})
+        self.assertEqual("executing", result["status"])
+        self.assertEqual(([10, 20, 31, 40, 50, 60, 70], 5, 0, 0, 0), robot.moves[0])
 
     def test_motion_requires_both_interlocks(self):
         plugin, robot = self._motion_plugin(motion_enabled=False)

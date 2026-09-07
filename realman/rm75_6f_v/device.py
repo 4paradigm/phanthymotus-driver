@@ -134,7 +134,7 @@ class RM75Plugin:
         joint_properties = {
             f"joint{i}_deg": {
                 "type": "number", "minimum": low, "maximum": high,
-                "description": f"Required absolute J{i} target in degrees",
+                "description": f"Optional absolute J{i} target in degrees; omitted keeps its current position",
             }
             for i, (low, high) in enumerate(JOINT_LIMITS_DEG, 1)
         }
@@ -142,13 +142,14 @@ class RM75Plugin:
             "speed_percent": {"type": "integer", "minimum": 1, "maximum": self.max_speed_percent,
                               "default": self.default_speed_percent},
             "timeout_seconds": {"type": "number", "minimum": 2, "maximum": 60,
-                                "default": self.default_timeout_seconds},
+                                "default": self.default_timeout_seconds,
+                                "description": "Maximum time to wait for arrival before requesting a slow stop"},
             "confirm_motion": {"type": "boolean", "description": "Must be true for every movement request"},
         })
         schema = action_schema(
             {
                 "set": ([*(f"joint{i}_deg" for i in range(1, 8)), "speed_percent", "timeout_seconds", "confirm_motion"],
-                        "Send one complete seven-joint target; all joints are planned together"),
+                        "Send absolute joint targets in degrees; omitted joints keep their current positions"),
                 "stopmotion": ([], "Request a controlled trajectory stop"),
                 "info": ([], "Read motion safety and active-action status"),
             },
@@ -197,13 +198,13 @@ class RM75Plugin:
         if args.get("confirm_motion") is not True:
             raise ValueError("confirm_motion must be true")
         joint_fields = [f"joint{i}_deg" for i in range(1, 8)]
-        missing = [field for field in joint_fields if field not in args]
-        if missing:
-            raise ValueError(f"set requires all seven joint targets; missing: {', '.join(missing)}")
-        requested = {index: args[field] for index, field in enumerate(joint_fields)}
         current = [float(value) for value in self.client.call("rm_get_joint_degree")]
         if len(current) != 7 or not all(math.isfinite(value) for value in current):
             raise RuntimeError(f"invalid current joint state: {current!r}")
+        requested = {
+            index: args.get(field, current[index])
+            for index, field in enumerate(joint_fields)
+        }
         controller_min = [float(value) for value in self.client.call("rm_get_joint_drive_min_pos")]
         controller_max = [float(value) for value in self.client.call("rm_get_joint_drive_max_pos")]
         if len(controller_min) != 7 or len(controller_max) != 7:
