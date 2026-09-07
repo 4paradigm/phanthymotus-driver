@@ -245,13 +245,26 @@ class MicPlugin:
 
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
 
+
+def _onboard_tts(audio_client: AudioClient, audio_lock: threading.Lock,
+                 tts_lock: threading.Lock, text: str, voice: int) -> int:
+    """Serialize onboard TTS until the firmware has time to start playback."""
+    with tts_lock:
+        with audio_lock:
+            ret = audio_client.TtsMaker(text, voice)
+            if ret == 0:
+                time.sleep(min(max(0.8, len(text) * 0.12), 8.0))
+            return ret
+
+
 class NativeTtsPlugin:
     PREFIX = "tts"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient,
-                 audio_lock: threading.Lock):
+                 audio_lock: threading.Lock, tts_lock: threading.Lock):
         self._client = audio_client
-        self._audio_lock = audio_lock  # shared lock serializing the shared AudioClient
+        self._audio_lock = audio_lock
+        self._tts_lock = tts_lock
 
     def get_tool(self) -> dict:
         return {
@@ -294,8 +307,7 @@ class NativeTtsPlugin:
         if action == "speak":
             text  = args.get("text", "")
             voice = int(args.get("voice", 0))
-            with self._audio_lock:
-                ret = self._client.TtsMaker(text, voice)
+            ret = _onboard_tts(self._client, self._audio_lock, self._tts_lock, text, voice)
             return {"ret": ret, "text": text}
         elif action == "get_volume":
             with self._audio_lock:
@@ -1212,10 +1224,13 @@ class GreetPlugin:
     _HIGH_WAVE_ACTION_ID = 26
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 arm_client, audio_client: AudioClient, audio_lock: threading.Lock):
+                 arm_client, audio_client: AudioClient, audio_lock: threading.Lock,
+                 tts_lock: threading.Lock):
         self._arm = arm_client
         self._audio = audio_client
-        self._audio_lock = audio_lock  # shared lock serializing the shared AudioClient (tts/led/greet)
+        self._audio_lock = audio_lock
+        self._tts_lock = tts_lock
+        self._greet_lock = threading.Lock()
         self._default_text = str(plugin_config.get("default_text", "你好，欢迎光临"))
         self._voice = int(plugin_config.get("voice", 0))
         rgb = plugin_config.get("led_rgb", [0, 255, 0])
@@ -1290,8 +1305,7 @@ class GreetPlugin:
             }
         if action == "speak":
             text = str(args.get("text", self._default_text))
-            with self._audio_lock:
-                ret = self._audio.TtsMaker(text, self._voice)
+            ret = _onboard_tts(self._audio, self._audio_lock, self._tts_lock, text, self._voice)
             return {"ret": ret, "text": text}
         if action == "led":
             r = int(args.get("r", self._led_rgb[0]))
@@ -1319,29 +1333,31 @@ class GreetPlugin:
         x-completion timeout for a sequence that already died.
         """
         try:
-            r, g, b = self._led_rgb
-            with self._audio_lock:
-                led_ret = self._audio.LedControl(r, g, b)
-            if led_ret != 0:
-                raise RuntimeError(f"LedControl failed: code={led_ret}")
+            with self._greet_lock:
+                r, g, b = self._led_rgb
+                with self._audio_lock:
+                    led_ret = self._audio.LedControl(r, g, b)
+                if led_ret != 0:
+                    raise RuntimeError(f"LedControl failed: code={led_ret}")
 
-            with self._audio_lock:
-                tts_ret = self._audio.TtsMaker(text, self._voice)
-            if tts_ret != 0:
-                raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
+                tts_ret = _onboard_tts(
+                    self._audio, self._audio_lock, self._tts_lock, text, self._voice
+                )
+                if tts_ret != 0:
+                    raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
 
-            wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
-            if wave_ret != 0:
-                raise RuntimeError(f"high wave failed: code={wave_ret}")
+                wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
+                if wave_ret != 0:
+                    raise RuntimeError(f"high wave failed: code={wave_ret}")
 
-            result = {
-                "ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
-                "wave_action_id": self._HIGH_WAVE_ACTION_ID,
-                "wave_gesture": "high wave",
-                "text": text,
-                "turn": turn,
-            }
-            status = "completed"
+                result = {
+                    "ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
+                    "wave_action_id": self._HIGH_WAVE_ACTION_ID,
+                    "wave_gesture": "high wave",
+                    "text": text,
+                    "turn": turn,
+                }
+                status = "completed"
         except Exception as e:
             result = {"error": f"{type(e).__name__}: {e}"}
             status = "error"
