@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import ssl
+import threading
 import time
 import unittest
 import xml.etree.ElementTree as ET
@@ -500,6 +501,73 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual(started["action_id"], action_id)
         self.assertEqual("cancelled", status)
         self.assertEqual("stopmotion", completion["reason"])
+
+    def test_interrupt_during_move_submission_waits_and_cancels_same_action(self):
+        plugin, robot = self._motion_plugin()
+        submitted = threading.Event()
+        release = threading.Event()
+        stop_attempted = threading.Event()
+        observed = {}
+        errors = []
+        original_move = robot.rm_movej
+
+        def move(*args):
+            observed["reserved"] = plugin._active_action_id
+            acquired = plugin._action_lock.acquire(blocking=False)
+            observed["submission_locked"] = not acquired
+            if acquired:
+                plugin._action_lock.release()
+            submitted.set()
+            if not release.wait(2):
+                raise RuntimeError("test submission release timed out")
+            return original_move(*args)
+
+        def start():
+            try:
+                observed["start"] = plugin._start_motion({"confirm_motion": True})
+            except Exception as exc:
+                errors.append(exc)
+
+        def stop():
+            stop_attempted.set()
+            try:
+                observed["stop"] = plugin._stop_motion()
+            except Exception as exc:
+                errors.append(exc)
+
+        robot.rm_movej = move
+        # Hold the monitor out of the race; this test isolates submission vs stop.
+        with mock.patch.object(plugin, "_monitor_motion"):
+            starter = threading.Thread(target=start)
+            stopper = threading.Thread(target=stop)
+            starter.start()
+            try:
+                self.assertTrue(submitted.wait(1))
+                stopper.start()
+                self.assertTrue(stop_attempted.wait(1))
+            finally:
+                release.set()
+                starter.join(2)
+                if stopper.ident is not None:
+                    stopper.join(2)
+        self.assertFalse(starter.is_alive())
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual([], errors)
+        self.assertTrue(observed["submission_locked"])
+        self.assertEqual(observed["start"]["action_id"], observed["reserved"])
+        self.assertEqual(observed["start"]["action_id"], observed["stop"]["action_id"])
+        self.assertIn(observed["reserved"], plugin._cancelled)
+        self.assertEqual(1, robot.stops)
+
+    def test_failed_submission_clears_reserved_id_and_releases_motion_lock(self):
+        plugin, robot = self._motion_plugin()
+        robot.rm_movej = lambda *args: 9
+        with self.assertRaisesRegex(RuntimeError, "SDK code 9"):
+            plugin._start_motion({"confirm_motion": True})
+        self.assertIsNone(plugin._active_action_id)
+        self.assertEqual(set(), plugin._cancelled)
+        self.assertTrue(plugin._motion_lock.acquire(blocking=False))
+        plugin._motion_lock.release()
 
     def test_stopmotion_marks_cancelled_before_sdk_stop_and_retains_it_on_failure(self):
         plugin, robot = self._motion_plugin(current=[0.0] * 7)
