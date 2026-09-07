@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 from typing import Any, Optional
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -139,6 +140,15 @@ def _enumerate_ext_mics() -> list[dict]:
     return devices
 
 
+def _realsense_usb_path(device_path: str) -> str:
+    """Read the selected V4L2 node's physical USB identity, not a camera index."""
+    device = Path('/sys/class/video4linux') / Path(device_path).name / 'device'
+    for parent in device.resolve().parents:
+        if (parent / 'idVendor').is_file():
+            return str(parent)
+    return ''
+
+
 def _enumerate_ext_cameras() -> list[dict]:
     """List V4L2 cameras, including only the color interfaces of RealSense."""
     devices = []
@@ -198,9 +208,11 @@ def _enumerate_ext_cameras() -> list[dict]:
                 continue
             if set(formats).intersection({'Z16', 'GREY', 'Y8I', 'Y12I', 'Y16'}):
                 continue
-            name += ' (Color)'
+            name += ' (RealSense)'
 
-        devices.append({"path": path, "name": name, "formats": formats, "resolutions": resolutions})
+        devices.append({"path": path, "name": name, "formats": formats, "resolutions": resolutions,
+                        "realsense": is_realsense,
+                        "usb_path": _realsense_usb_path(path) if is_realsense else ""})
     return devices
 
 
@@ -382,7 +394,7 @@ class _ExtCameraNode:
         self.state = "idle"
 
     def start(self) -> dict:
-        if self.state == "running":
+        if self.state == "running" and self._proc is not None and self._proc.is_alive():
             return self._status_dict()
         import multiprocessing as mp
         ctx = mp.get_context("spawn")
@@ -412,8 +424,12 @@ class _ExtCameraNode:
         return self._status_dict()
 
     def _status_dict(self) -> dict:
+        state = self.state
+        if state == "running" and (self._proc is None or not self._proc.is_alive()):
+            state = "error"
         return {
-            "state": self.state,
+            "state": state,
+            "channel": "rgb",
             "device_path": self._device_path,
             "device_name": self._device_name,
             "topic_in": [],
@@ -425,6 +441,8 @@ def _run_ext_camera_process(device_path: str, namespace: str, instance_id: str,
                             fps: int, width: int, height: int,
                             pixel_format: str, available_formats: list) -> None:
     """Ext camera subprocess entry — independent GIL for full throughput."""
+    from common import logsafe
+    logsafe.install(check_fd=False)
     import cv2
     import rclpy
     from rclpy.node import Node as _Node
@@ -663,145 +681,167 @@ class ExtMicPlugin:
         return None
 
 
+class _StereoCameraNode:
+    def __init__(self, session, instance_id, channel):
+        self.session, self.instance_id, self.channel = session, instance_id, channel
+
+    def start(self):
+        return self.session.start(self.instance_id, self.channel)
+
+    def stop(self):
+        self.session.stop(self.instance_id)
+        return self._status_dict()
+
+    def _status_dict(self):
+        return self.session.info(self.instance_id, self.channel)
+
+
 class ExtCameraPlugin:
     PREFIX = "ext_camera"
 
     def __init__(self, plugin_cfg: dict, namespace: str, executor):
         self._namespace = namespace
         self._executor = executor
-        self._nodes: dict[str, _ExtCameraNode] = {}
-        self._instance_configs: dict[str, dict] = {}
+        self._lock = threading.RLock()
+        self._nodes = {}
+        self._instance_configs = {}
+        self._sessions = {}
         self._available_devices = _enumerate_ext_cameras()
-        log.info(f"[ext_camera] found {len(self._available_devices)} external camera device(s)")
-        for d in self._available_devices:
-            log.info(f"  {d['path']} — {d['name']}")
+
     def get_tools(self) -> list:
-        # Build dynamic configSchema with enumerated devices
-        device_options = [{"const": d["path"], "title": f"{d['name']} ({d['path']})"} for d in self._available_devices]
-        # Collect all unique formats across devices for pixel_format selector
-        all_formats: list[str] = []
-        for d in self._available_devices:
-            for f in d.get("formats", []):
-                if f not in all_formats:
-                    all_formats.append(f)
-        format_options = [{"const": "auto", "title": "自动"}] + [{"const": f, "title": f} for f in all_formats]
-        # Collect all unique resolutions across devices
-        all_resolutions: list[str] = []
-        for d in self._available_devices:
-            for r in d.get("resolutions", []):
-                if r not in all_resolutions:
-                    all_resolutions.append(r)
-        resolution_options = [{"const": r, "title": r} for r in all_resolutions] or [{"const": "1920x1080", "title": "1920x1080"}]
+        devices = [{"const": d["path"], "title": f"{d['name']} ({d['path']})"}
+                   for d in self._available_devices]
+        resolutions = list(dict.fromkeys(r for d in self._available_devices
+                                         for r in d.get('resolutions', []))) or ['1280x720']
+        formats = ['auto'] + list(dict.fromkeys(f for d in self._available_devices
+                                               for f in d.get('formats', [])))
         tool = dict(TOOLS_EXT_CAMERA[0])
-        tool["configSchema"] = {
-            "type": "object",
-            "properties": {
-                "device_path": {
-                    "type": "string",
-                    "description": "摄像头设备",
-                    "scope": "instance",
-                    "oneOf": device_options if device_options else [{"const": "", "title": "无可用设备"}],
-                },
-                "device_name": {"type": "string", "description": "设备名称", "scope": "instance"},
-                "fps": {"type": "integer", "description": "帧率", "default": 15, "scope": "instance"},
-                "resolution": {
-                    "type": "string",
-                    "description": "分辨率",
-                    "default": "1920x1080",
-                    "scope": "instance",
-                    "oneOf": resolution_options,
-                },
-                "pixel_format": {
-                    "type": "string",
-                    "description": "像素格式",
-                    "default": "auto",
-                    "scope": "instance",
-                    "oneOf": format_options,
-                },
-            },
-        }
+        tool['description'] = ('External camera — channel selects RGB, RealSense depth, or left infrared. '
+                               'Infrared is light intensity, not temperature.')
+        tool['configSchema'] = {'type': 'object', 'properties': {
+            'device_path': {'type': 'string', 'description': '摄像头设备', 'scope': 'instance',
+                            'oneOf': devices or [{'const': '', 'title': '无可用设备'}]},
+            'channel': {'type': 'string', 'title': 'channel', 'scope': 'instance',
+                        'enum': ['rgb', 'depth', 'infrared'], 'default': 'rgb',
+                        'description': 'rgb 彩色；depth 深度；infrared 左近红外（非热成像）'},
+            'fps': {'type': 'integer', 'scope': 'instance', 'default': 15, 'minimum': 1,
+                    'maximum': 60, 'description': 'RGB 帧率；深度/红外按 USB 连接自动选择 6 或 15fps'},
+            'resolution': {'type': 'string', 'scope': 'instance', 'enum': resolutions,
+                           'default': '1280x720' if '1280x720' in resolutions else resolutions[0],
+                           'description': 'RGB 分辨率；深度/红外固定 640x480'},
+            'pixel_format': {'type': 'string', 'scope': 'instance', 'enum': formats,
+                             'default': 'auto', 'description': 'RGB 像素格式；深度 Z16 / 红外 Y8 自动选择'},
+        }}
         return [tool]
 
-    def start(self) -> None:
-        pass  # Don't auto-start
+    def start(self):
+        pass
 
-    def stop(self) -> None:
-        for key in list(self._nodes.keys()):
-            self._nodes[key].stop()
-            del self._nodes[key]
+    def stop(self):
+        with self._lock:
+            for node in self._nodes.values():
+                node.stop()
+            self._nodes.clear()
 
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        instance_id = args.get("instance_id", "")
-        print(f"[ext_camera] dispatch: action={action!r} instance_id={instance_id!r} args_keys={list(args.keys())}", flush=True)
+    def _topic(self, instance_id, channel):
+        topic = f"/{self._namespace}/ext_camera/{instance_id.replace('-', '_')}/{channel}" if instance_id else ''
+        return [{'topic': topic, 'format': 'image/depth-zlib' if channel == 'depth' else 'image/jpeg'}]
 
-        if action == 'config':
-            if instance_id:
-                self._instance_configs[instance_id] = {k: v for k, v in args.items()
-                                                        if k not in ('action', 'instance_id', '_tool_name')}
-                print(f"[ext_camera] config cached for instance {instance_id}: {self._instance_configs[instance_id]}", flush=True)
-            return {'ok': True}
+    def _info(self, instance_id):
+        cfg = self._instance_configs.get(instance_id, {})
+        channel = cfg.get('channel', 'rgb')
+        info = (self._nodes[instance_id]._status_dict() if instance_id in self._nodes else {'state': 'idle'})
+        return {**info, 'channel': channel, 'device_path': cfg.get('device_path', ''),
+                'topic_in': [], 'topic_out': self._topic(instance_id, channel),
+                'available_devices': self._available_devices,
+                'active_instances': list(self._nodes)}
 
-        if action == "info":
-            if instance_id and instance_id in self._nodes:
-                return self._nodes[instance_id]._status_dict()
-            # Infer topic from namespace + instance_id even before start
-            inferred_topic = f"/{self._namespace}/ext_camera/{instance_id.replace('-', '_')}/rgb" if instance_id else ""
-            return {
-                "state": "idle",
-                "available_devices": self._available_devices,
-                "active_instances": list(self._nodes.keys()),
-                "topic_in": [],
-                "topic_out": [{"topic": inferred_topic, "format": "image/jpeg", "desc": "external camera JPEG"}],
-            }
+    def _validate(self, cfg):
+        cfg = dict(cfg)
+        channel = cfg.setdefault('channel', 'rgb')
+        if channel not in ('rgb', 'depth', 'infrared'):
+            raise ValueError('channel must be rgb, depth or infrared')
+        self._available_devices = _enumerate_ext_cameras()
+        path = cfg.get('device_path') or (self._available_devices[0]['path'] if self._available_devices else '')
+        device = next((d for d in self._available_devices if d['path'] == path), None)
+        if device is None:
+            raise ValueError('Selected external camera is unavailable')
+        cfg['device_path'] = path
+        if channel != 'rgb':
+            if not device.get('realsense') or not device.get('usb_path'):
+                raise ValueError('depth/infrared requires a RealSense camera with a resolvable physical USB path')
+        else:
+            fps = cfg.setdefault('fps', 15)
+            if isinstance(fps, bool) or not isinstance(fps, int) or not 1 <= fps <= 60:
+                raise ValueError('RGB fps must be an integer between 1 and 60')
+            available_resolutions = device.get('resolutions', [])
+            default_resolution = ('1280x720' if '1280x720' in available_resolutions
+                                  else (available_resolutions[0] if available_resolutions else '1280x720'))
+            resolution = cfg.setdefault('resolution', default_resolution)
+            if not isinstance(resolution, str) or not re.fullmatch(r'[1-9][0-9]{1,4}x[1-9][0-9]{1,4}', resolution):
+                raise ValueError('RGB resolution must be WIDTHxHEIGHT')
+            if device.get('resolutions') and resolution not in device['resolutions']:
+                raise ValueError('RGB resolution is not advertised by the selected camera')
+            fmt = cfg.setdefault('pixel_format', 'auto')
+            if fmt != 'auto' and fmt not in device.get('formats', []):
+                raise ValueError('RGB pixel_format is not advertised by the selected camera')
+        return cfg, device
 
-        elif action == "start":
-            if not instance_id:
-                raise ValueError("instance_id is required for multiInstance tool")
-            # Merge cached config into args (config is sent before start)
-            if instance_id in self._instance_configs:
-                merged = {**self._instance_configs[instance_id], **{k: v for k, v in args.items() if k not in ('action', 'instance_id', '_tool_name')}}
-                args.update(merged)
-            device_path = args.get("device_path")
-            device_name = args.get("device_name", "")
-            if not device_path:
-                if self._available_devices:
-                    device_path = self._available_devices[0]["path"]
-                    device_name = self._available_devices[0]["name"]
+    def _make_node(self, instance_id, cfg, device):
+        channel = cfg['channel']
+        if channel == 'rgb':
+            for other, node in self._nodes.items():
+                other_cfg = self._instance_configs[other]
+                if other != instance_id and other_cfg['channel'] == 'rgb' and other_cfg['device_path'] == cfg['device_path']:
+                    raise ValueError('RGB device is already in use by another instance')
+            width, height = map(int, cfg['resolution'].split('x'))
+            return _ExtCameraNode(device['path'], device['name'], self._namespace, instance_id,
+                                  fps=cfg['fps'], width=width, height=height,
+                                  pixel_format=cfg['pixel_format'], available_formats=device['formats'])
+        from realsense import RealSenseSession
+        usb_path = device['usb_path']
+        if usb_path not in self._sessions:
+            self._sessions[usb_path] = RealSenseSession(self._namespace, usb_path)
+        return _StereoCameraNode(self._sessions[usb_path], instance_id, channel)
+
+    def dispatch(self, action, args):
+        instance_id = args.get('instance_id', '')
+        with self._lock:
+            if action == 'info':
+                return self._info(instance_id)
+            if action == 'stop':
+                if instance_id:
+                    node = self._nodes.pop(instance_id, None)
+                    if node is not None:
+                        node.stop()
                 else:
-                    raise ValueError("No external camera device available")
-            # Resolve available formats for the selected device
-            available_formats: list[str] = []
-            for d in self._available_devices:
-                if d["path"] == device_path:
-                    available_formats = d.get("formats", [])
-                    break
-            # Parse resolution
-            resolution = args.get("resolution", "1920x1080")
-            try:
-                w, h = resolution.lower().split('x')
-                width, height = int(w), int(h)
-            except Exception:
-                width, height = 1920, 1080
-            fps = int(args.get("fps", 15))
-            pixel_format = args.get("pixel_format", "auto")
-
-            if instance_id not in self._nodes:
-                node = _ExtCameraNode(device_path, device_name, self._namespace, instance_id,
-                                      fps=fps, width=width, height=height,
-                                      pixel_format=pixel_format, available_formats=available_formats)
-                self._nodes[instance_id] = node
-            return self._nodes[instance_id].start()
-
-        elif action == "stop":
-            if instance_id and instance_id in self._nodes:
-                result = self._nodes[instance_id].stop()
-                del self._nodes[instance_id]
-                return result
-            elif not instance_id:
-                for key in list(self._nodes.keys()):
-                    self._nodes[key].stop()
-                    del self._nodes[key]
-                return {"state": "idle"}
-            return {"state": "idle"}
-
-        return None
+                    self.stop()
+                return self._info(instance_id)
+            if action not in ('config', 'start'):
+                return None
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]{0,127}', instance_id):
+                raise ValueError('A valid instance_id is required')
+            if any(key != instance_id and key.replace('-', '_') == instance_id.replace('-', '_')
+                   for key in self._instance_configs):
+                raise ValueError('instance_id collides with an existing ROS topic')
+            supplied = {k: v for k, v in args.items() if k in
+                        ('channel', 'device_path', 'device_name', 'fps', 'resolution', 'pixel_format')}
+            previous = self._instance_configs.get(instance_id, {})
+            cfg, device = self._validate({**previous, **supplied})
+            changed = cfg != previous
+            node = self._nodes.get(instance_id)
+            if node is not None and changed:
+                # Validate the replacement before releasing the working channel.
+                replacement = self._make_node(instance_id, cfg, device)
+                node.stop()
+                self._nodes[instance_id] = replacement
+                self._instance_configs[instance_id] = cfg
+                replacement.start()
+            else:
+                self._instance_configs[instance_id] = cfg
+                if action == 'start':
+                    if node is None:
+                        node = self._make_node(instance_id, cfg, device)
+                        self._nodes[instance_id] = node
+                    node.start()
+            return self._info(instance_id)

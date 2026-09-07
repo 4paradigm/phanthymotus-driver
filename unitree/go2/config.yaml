@@ -38,7 +38,3 @@ plugins:
     enabled: true
   ext_camera:
     enabled: true
-  ext_depth:
-    enabled: true
-  ext_infrared:
-    enabled: true

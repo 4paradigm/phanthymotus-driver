@@ -1,8 +1,7 @@
-"""Go2 external RealSense depth and left-infrared sensor cards.
+"""Shared RealSense stereo capture for ext_camera depth/infrared instances.
 
-The stereo sensor has one owner. Card enable flags control publication without
-reopening the sensor when its sibling card starts/stops. The color sensor is
-never opened here, so ext_camera can continue using its V4L2 interface.
+RGB is owned independently by the existing V4L2 capture path. Each instance
+receives only its selected channel on a modality-specific topic.
 """
 from __future__ import annotations
 
@@ -16,8 +15,8 @@ import zlib
 import numpy as np
 
 WIDTH, HEIGHT = 640, 480
-STREAMS = ("ext_depth", "ext_infrared")
-FORMATS = {"ext_depth": "image/depth-zlib", "ext_infrared": "image/jpeg"}
+STREAMS = ("depth", "infrared")
+FORMATS = {"depth": "image/depth-zlib", "infrared": "image/jpeg"}
 STALE_SECONDS = 3.0
 STARTUP_SECONDS = 10.0
 
@@ -49,11 +48,14 @@ def _report(status_queue, status):
             pass
 
 
-def _capture(namespace, enabled, quit_event, status_queue):
+def _capture(namespace, usb_path, routes, commands, quit_event, status_queue):
     """Process boundary bounds SDK failures and isolates capture from robot RPC."""
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     sensor = node = None
     opened = streaming = False
-    status = {"frames": {s: 0 for s in STREAMS}, "last_frame": {}, "error": None}
+    status = {"frames": {}, "last_frame": {}, "channels": {}, "error": None}
     try:
         import cv2
         import pyrealsense2 as rs
@@ -62,9 +64,11 @@ def _capture(namespace, enabled, quit_event, status_queue):
         from sensor_msgs.msg import CompressedImage
 
         context = rs.context()
-        devices = list(context.query_devices())
+        devices = [d for d in context.query_devices()
+                   if d.supports(rs.camera_info.physical_port)
+                   and d.get_info(rs.camera_info.physical_port).startswith(usb_path + '/')]
         if len(devices) != 1:
-            raise RuntimeError(f"Expected one external RealSense camera, found {len(devices)}")
+            raise RuntimeError("Selected RealSense camera is unavailable")
         device = devices[0]
         usb_type = (device.get_info(rs.camera_info.usb_type_descriptor)
                     if device.supports(rs.camera_info.usb_type_descriptor) else 'unknown')
@@ -93,9 +97,7 @@ def _capture(namespace, enabled, quit_event, status_queue):
 
         rclpy.init()
         node = rclpy.create_node(f"{namespace}_realsense_stereo")
-        publishers = {s: node.create_publisher(
-            CompressedImage, f"/{namespace}/{s}/image", qos_profile_sensor_data)
-            for s in STREAMS}
+        publishers = {}
         frames = rs.frame_queue(4)
         sensor.open(profiles)
         opened = True
@@ -104,6 +106,19 @@ def _capture(namespace, enabled, quit_event, status_queue):
         last_received = {s: time.monotonic() for s in STREAMS}
         last_report = 0.0
         while not quit_event.is_set():
+            while True:
+                try:
+                    routes = commands.get_nowait()
+                except queue.Empty:
+                    break
+            for key in list(publishers):
+                if key not in routes or publishers[key][0] != routes[key]:
+                    node.destroy_publisher(publishers.pop(key)[1])
+            for key, channel in routes.items():
+                if key not in publishers:
+                    topic = f"/{namespace}/ext_camera/{key.replace('-', '_')}/{channel}"
+                    publishers[key] = (channel, node.create_publisher(
+                        CompressedImage, topic, qos_profile_sensor_data))
             ok, frame = frames.try_wait_for_frame(200)
             now = time.monotonic()
             if any(now - t > STALE_SECONDS for t in last_received.values()):
@@ -112,19 +127,19 @@ def _capture(namespace, enabled, quit_event, status_queue):
                 continue
             kind = frame.profile.stream_type()
             if kind == rs.stream.depth:
-                stream = "ext_depth"
+                stream = "depth"
             elif kind == rs.stream.infrared and frame.profile.stream_index() == 1:
-                stream = "ext_infrared"
+                stream = "infrared"
             else:
                 continue
             last_received[stream] = now
-            if not enabled[stream].is_set():
+            if stream not in routes.values():
                 continue
             raw = np.asanyarray(frame.get_data())
             msg = CompressedImage()
             msg.header.stamp = node.get_clock().now().to_msg()
             msg.header.frame_id = f"{namespace}_{stream}_optical"
-            if stream == "ext_depth":
+            if stream == "depth":
                 msg.format = "16UC1; compressedDepth zlib"
                 msg.data = encode_depth(raw, scale)
             else:
@@ -135,12 +150,12 @@ def _capture(namespace, enabled, quit_event, status_queue):
                     raise RuntimeError("Infrared JPEG encoding failed")
                 msg.format = "jpeg"
                 msg.data = jpeg.tobytes()
-            # Stop can race encoding; recheck immediately before publication.
-            if not enabled[stream].is_set():
-                continue
-            publishers[stream].publish(msg)
-            status["frames"][stream] += 1
-            status["last_frame"][stream] = now
+            for key, (channel, pub) in publishers.items():
+                if channel == stream:
+                    pub.publish(msg)
+                    status["frames"][key] = status["frames"].get(key, 0) + 1
+                    status["last_frame"][key] = now
+                    status["channels"][key] = channel
             if now - last_report >= 0.2:
                 _report(status_queue, status)
                 last_report = now
@@ -166,15 +181,15 @@ def _capture(namespace, enabled, quit_event, status_queue):
 
 
 class RealSenseSession:
-    """One stereo device shared by two single-instance cards."""
+    """One stereo device shared by ext_camera instances bound to its physical USB path."""
 
-    def __init__(self, namespace):
-        self.namespace = namespace
+    def __init__(self, namespace, usb_path):
+        self.namespace, self.usb_path = namespace, usb_path
         self._lock = threading.RLock()
         self._ctx = mp.get_context('spawn')
         self._proc = self._queue = self._quit = None
-        self._enabled = {}
-        self._wanted = set()
+        self._commands = None
+        self._wanted = {}
         self._requested_at = {}
         self._status = {}
 
@@ -198,58 +213,61 @@ class RealSenseSession:
                 self._proc.join(timeout=0.5)
             self._proc.close()
             self._proc = None
-        if self._queue is not None:
-            self._queue.close()
-            self._queue = None
+        for q in (self._queue, self._commands):
+            if q is not None:
+                q.cancel_join_thread()
+                q.close()
+        self._queue = self._commands = None
 
-    def start(self, stream):
+    def start(self, instance_id, channel):
         with self._lock:
             self._drain()
-            current = self.info(stream)
-            if current['state'] in ('running', 'starting'):
+            current = self.info(instance_id, channel)
+            if self._wanted.get(instance_id) == channel and current['state'] in ('running', 'starting'):
                 return current
-            self._wanted.add(stream)
-            self._requested_at[stream] = time.monotonic()
+            self._wanted[instance_id] = channel
+            self._requested_at[instance_id] = time.monotonic()
             if (self._proc is None or not self._proc.is_alive()
                     or self._status.get('error') or current['state'] == 'error'):
                 self._close()
                 self._status = {}
                 self._queue = self._ctx.Queue(maxsize=4)
                 self._quit = self._ctx.Event()
-                self._enabled = {s: self._ctx.Event() for s in STREAMS}
+                self._commands = self._ctx.Queue()
                 for s in self._wanted:
-                    self._enabled[s].set()
                     self._requested_at[s] = time.monotonic()
                 self._proc = self._ctx.Process(target=_capture, args=(
-                    self.namespace, self._enabled, self._quit, self._queue),
+                    self.namespace, self.usb_path, dict(self._wanted), self._commands,
+                    self._quit, self._queue),
                     name='go2_realsense_stereo', daemon=True)
                 self._proc.start()
             else:
-                self._enabled[stream].set()
+                self._commands.put(dict(self._wanted))
             # A start request schedules capture; running requires a published
             # frame. info exposes readiness/errors without blocking HTTP on USB.
-            return self.info(stream)
+            return self.info(instance_id, channel)
 
-    def stop(self, stream):
+    def stop(self, instance_id):
         with self._lock:
-            self._wanted.discard(stream)
-            if stream in self._enabled:
-                self._enabled[stream].clear()
+            channel = self._wanted.pop(instance_id, 'depth')
             if not self._wanted:
                 self._close()
                 self._status = {}
-            return self.info(stream)
+            elif self._commands is not None:
+                self._commands.put(dict(self._wanted))
+            return self.info(instance_id, channel)
 
-    def info(self, stream):
+    def info(self, instance_id, channel):
         with self._lock:
             self._drain()
             now = time.monotonic()
-            last = self._status.get('last_frame', {}).get(stream)
-            requested = self._requested_at.get(stream, now)
-            fresh = last is not None and last >= requested and now - last < STALE_SECONDS
+            last = self._status.get('last_frame', {}).get(instance_id)
+            requested = self._requested_at.get(instance_id, now)
+            fresh = (last is not None and last >= requested and now - last < STALE_SECONDS
+                     and self._status.get('channels', {}).get(instance_id) == channel)
             error = None
             state = 'idle'
-            if stream in self._wanted:
+            if instance_id in self._wanted:
                 error = self._status.get('error')
                 if not error and (self._proc is None or not self._proc.is_alive()):
                     error = 'RealSense capture process exited'
@@ -258,58 +276,18 @@ class RealSenseSession:
                     error = 'No fresh RealSense frames'
                 state = 'error' if error else ('running' if fresh else 'starting')
             return {
-                'state': state, 'fresh': fresh and state == 'running', 'error': error,
+                'channel': channel, 'state': state, 'fresh': fresh and state == 'running', 'error': error,
                 'device_name': self._status.get('device_name'),
                 'width': WIDTH, 'height': HEIGHT, 'fps': self._status.get('fps'),
                 'usb_type': self._status.get('usb_type'),
-                'encoding': '16UC1' if stream == 'ext_depth' else 'mono8',
-                'source_stream': 'depth' if stream == 'ext_depth' else 'infrared',
-                'stream_index': 0 if stream == 'ext_depth' else 1,
-                'unit': 'mm' if stream == 'ext_depth' else 'intensity',
-                'depth_scale_m': self._status.get('depth_scale_m') if stream == 'ext_depth' else None,
-                'frames_published': self._status.get('frames', {}).get(stream, 0),
+                'encoding': '16UC1' if channel == 'depth' else 'mono8',
+                'source_stream': channel,
+                'stream_index': 0 if channel == 'depth' else 1,
+                'unit': 'mm' if channel == 'depth' else 'intensity',
+                'depth_scale_m': self._status.get('depth_scale_m') if channel == 'depth' else None,
+                'frames_published': self._status.get('frames', {}).get(instance_id, 0),
                 'last_frame_age_s': None if last is None else max(0, now-last),
                 'topic_in': [],
-                'topic_out': [{'topic': f'/{self.namespace}/{stream}/image',
-                               'format': FORMATS[stream]}],
+                'topic_out': [{'topic': f"/{self.namespace}/ext_camera/{instance_id.replace('-', '_')}/{channel}",
+                               'format': FORMATS[channel]}],
             }
-
-
-class _StereoPlugin:
-    def __init__(self, plugin_config, namespace, executor, session):
-        self._session = session
-
-    def get_tool(self):
-        return {
-            'name': self.PREFIX, 'type': 'sensor', 'multiInstance': False,
-            'description': self.DESCRIPTION,
-            'inputSchema': {'type': 'object', 'properties': {}},
-            'topic_in': [],
-            'topic_out': [{'topic': f'/{self._session.namespace}/{self.PREFIX}/image',
-                           'format': FORMATS[self.PREFIX]}],
-        }
-
-    def start(self):
-        pass  # Start only when the canvas enables this sensor.
-
-    def stop(self):
-        self._session.stop(self.PREFIX)
-
-    def dispatch(self, action, args):
-        if action == 'start':
-            return self._session.start(self.PREFIX)
-        if action == 'stop':
-            return self._session.stop(self.PREFIX)
-        if action in ('info', self.PREFIX):
-            return self._session.info(self.PREFIX)
-        return None
-
-
-class ExtDepthPlugin(_StereoPlugin):
-    PREFIX = 'ext_depth'
-    DESCRIPTION = 'External RealSense depth — 640x480, zlib uint16 millimetres (0=invalid); USB2: 6fps, USB3: 15fps'
-
-
-class ExtInfraredPlugin(_StereoPlugin):
-    PREFIX = 'ext_infrared'
-    DESCRIPTION = 'RealSense 左近红外图像（反射强度，非热成像）— 640x480 灰度 JPEG；USB2: 6fps, USB3: 15fps'

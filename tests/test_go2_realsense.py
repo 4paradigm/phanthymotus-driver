@@ -40,13 +40,16 @@ class DepthEncodingTests(unittest.TestCase):
 
 
 class StatusQueue(queue.Queue):
+    def cancel_join_thread(self):
+        pass
+
     def close(self):
         pass
 
 
 class FakeProcess:
     def __init__(self, *, target, args, **kwargs):
-        self.quit = args[2]
+        self.quit = args[4]
         self.alive = False
         self.closed = False
 
@@ -74,80 +77,71 @@ class StereoLifecycleTests(unittest.TestCase):
         self.clock = mock.patch.object(rs.time, 'monotonic', return_value=100.0)
         self.now = self.clock.start()
         self.addCleanup(self.clock.stop)
-        self.session = rs.RealSenseSession('robot_a')
+        self.session = rs.RealSenseSession('robot_a', '/sys/devices/test-usb')
         self.session._ctx = types.SimpleNamespace(
             Event=threading.Event, Queue=StatusQueue, Process=FakeProcess)
-        self.depth = rs.ExtDepthPlugin({}, 'robot_a', None, self.session)
-        self.ir = rs.ExtInfraredPlugin({}, 'robot_a', None, self.session)
-        self.addCleanup(self.session.stop, 'ext_depth')
-        self.addCleanup(self.session.stop, 'ext_infrared')
+        self.addCleanup(self.session.stop, 'card-a')
+        self.addCleanup(self.session.stop, 'card-b')
 
-    def report(self, streams, error=None):
-        self.session._queue.put({'frames': {s: 1 for s in streams},
-                                 'last_frame': {s: self.now.return_value for s in streams},
-                                 'error': error, 'depth_scale_m': .001})
+    def report(self, routes, error=None):
+        self.session._queue.put({'frames': {key: 1 for key in routes},
+                                 'last_frame': {key: self.now.return_value for key in routes},
+                                 'channels': dict(routes), 'error': error, 'depth_scale_m': .001})
 
-    def test_schema_and_prestart_info_agree_without_opening_usb(self):
-        for plugin, fmt in ((self.depth, 'image/depth-zlib'), (self.ir, 'image/jpeg')):
-            plugin.start()
-            tool = plugin.get_tool()
-            self.assertEqual(tool['type'], 'sensor')
-            self.assertFalse(tool['multiInstance'])
-            info = plugin.dispatch('info', {})
-            self.assertEqual(info['state'], 'idle')
-            self.assertEqual(info['topic_out'], tool['topic_out'])
-            self.assertEqual(info['topic_out'][0]['format'], fmt)
-        self.assertIsNone(self.session._proc)
-
-    def test_running_requires_a_published_frame(self):
-        self.assertEqual(self.depth.dispatch('start', {})['state'], 'starting')
-        self.report(['ext_depth'])
-        self.assertTrue(self.depth.dispatch('info', {})['fresh'])
+    def test_start_and_stale_status_require_real_frames_for_the_channel(self):
+        self.assertEqual(self.session.start('card-a', 'depth')['state'], 'starting')
+        self.report({'card-a': 'depth'})
+        self.assertTrue(self.session.info('card-a', 'depth')['fresh'])
         self.now.return_value += 3.1
-        info = self.depth.dispatch('info', {})
+        info = self.session.info('card-a', 'depth')
         self.assertEqual(info['state'], 'error')
         self.assertFalse(info['fresh'])
 
-    def test_sibling_stop_does_not_close_sensor_and_last_stop_releases_it(self):
-        self.depth.dispatch('start', {})
+    def test_shared_owner_fanout_and_last_stop_release(self):
+        self.session.start('card-a', 'depth')
         process = self.session._proc
-        self.ir.dispatch('start', {})
-        self.report(rs.STREAMS)
+        self.session.start('card-b', 'infrared')
+        self.report({'card-a': 'depth', 'card-b': 'infrared'})
         self.assertIs(self.session._proc, process)
-        self.assertEqual(self.depth.dispatch('start', {})['state'], 'running')
-        self.assertEqual(self.depth.dispatch('stop', {})['state'], 'idle')
+        self.assertEqual(self.session.stop('card-a')['state'], 'idle')
         self.assertTrue(process.alive)
-        self.assertFalse(self.session._enabled['ext_depth'].is_set())
-        self.assertEqual(self.ir.dispatch('info', {})['state'], 'running')
-        self.ir.dispatch('stop', {})
+        self.assertEqual(self.session.info('card-b', 'infrared')['state'], 'running')
+        self.session.stop('card-b')
         self.assertTrue(process.closed)
         self.assertIsNone(self.session._proc)
 
-    def test_reenabled_stream_cannot_reuse_an_old_frame(self):
-        self.depth.dispatch('start', {})
-        self.ir.dispatch('start', {})
-        self.report(rs.STREAMS)
-        self.depth.dispatch('stop', {})
+    def test_channel_switch_rejects_inflight_frames_from_old_channel(self):
+        self.session.start('card-a', 'depth')
+        self.report({'card-a': 'depth'})
+        process = self.session._proc
         self.now.return_value += 1
-        self.assertEqual(self.depth.dispatch('start', {})['state'], 'starting')
-        self.report(rs.STREAMS)
-        self.assertEqual(self.depth.dispatch('info', {})['state'], 'running')
+        self.assertEqual(self.session.start('card-a', 'infrared')['state'], 'starting')
+        self.now.return_value += .1
+        self.report({'card-a': 'depth'})  # A previous frame was in flight during config.
+        self.assertFalse(self.session.info('card-a', 'infrared')['fresh'])
+        self.report({'card-a': 'infrared'})
+        info = self.session.info('card-a', 'infrared')
+        self.assertTrue(info['fresh'])
+        self.assertIs(self.session._proc, process)
+        self.assertEqual(info['topic_out'][0]['topic'], '/robot_a/ext_camera/card_a/infrared')
+        self.assertEqual(info['topic_out'][0]['format'], 'image/jpeg')
 
-    def test_failed_worker_is_reported_and_start_retries(self):
-        self.depth.dispatch('start', {})
-        self.report([], error='Device unavailable')
-        self.assertEqual(self.depth.dispatch('info', {})['error'], 'Device unavailable')
+    def test_retry_restores_all_instances_after_worker_failure(self):
+        self.session.start('card-a', 'depth')
+        self.session.start('card-b', 'infrared')
+        self.report({}, error='Device unavailable')
+        self.assertEqual(self.session.info('card-a', 'depth')['state'], 'error')
         old = self.session._proc
-        self.assertEqual(self.depth.dispatch('start', {})['state'], 'starting')
+        self.session.start('card-a', 'depth')
         self.assertTrue(old.closed)
-        self.assertIsNot(self.session._proc, old)
+        self.assertEqual(self.session._wanted, {'card-a':'depth', 'card-b':'infrared'})
         self.session._proc.alive = False
-        self.assertEqual(self.depth.dispatch('info', {})['state'], 'error')
+        self.assertEqual(self.session.info('card-b', 'infrared')['state'], 'error')
 
     def test_startup_timeout_is_not_running(self):
-        self.depth.dispatch('start', {})
+        self.session.start('card-a', 'depth')
         self.now.return_value += 10.1
-        self.assertEqual(self.depth.dispatch('info', {})['state'], 'error')
+        self.assertEqual(self.session.info('card-a', 'depth')['state'], 'error')
 
 
 if __name__ == '__main__':
