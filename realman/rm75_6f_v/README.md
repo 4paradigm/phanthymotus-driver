@@ -71,13 +71,10 @@ connection. An enabled connection fails with an explicit mount error when the
 library is absent. Set `RM_API2_LIB_DIR` to override the host directory. ACP
 HTTPS callbacks verify the Agent Core hostname and certificate using
 `AGENT_CORE_CA_CERT`; unencrypted callbacks are accepted only on loopback.
-After a successful ACP callback, the Driver also sends a display-only
-`canvas_action_complete` event through Agent Core's existing `/api/event`
-endpoint so direct Canvas card calls show a terminal `TRIGGER`. Set
-`RM75_AGENT_CORE_TOKEN` when Agent Core API authentication is enabled; the
-shared registration request and both RM75 completion requests then send the
-same Bearer token. Registration authentication adds no dependency or material
-image growth to the shared runtime.
+Following the standard ACP contract, `joint_control.set` immediately returns a
+unique `action_id`; its background monitor later reports exactly one
+`completed`, `error`, or `cancelled` terminal result to `/api/acp/complete`.
+Agent Core owns pending-action barrier release and completion-event delivery.
 
 The component installs `python3-yaml` because the shared runtime loads
 `config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared runtime
