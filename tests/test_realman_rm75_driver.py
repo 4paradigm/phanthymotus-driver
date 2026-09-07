@@ -3,6 +3,7 @@ import io
 import math
 import os
 from pathlib import Path
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -36,9 +37,11 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertEqual([], list((DRIVER / "vendor").rglob("libapi_c.so")))
         self.assertEqual([], list((DRIVER / "vendor").rglob("libapi_cpp.so")))
 
-    def test_service_has_safe_connection_default(self):
+    def test_service_has_motion_capable_rm75_default(self):
         service = (DRIVER / "deploy" / "service.yml").read_text()
-        self.assertIn("RM_DRIVER_ENABLED=0", service)
+        self.assertIn("RM_DRIVER_ENABLED=1", service)
+        self.assertIn("RM_MOTION_ENABLED=1", service)
+        self.assertIn("RM_ARM_IP=192.168.1.18", service)
         self.assertIn("network_mode: host", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
@@ -71,6 +74,14 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual(["set"], joint_control["inputSchema"]["x-completion"]["actions"])
         self.assertIs(True, joint_control["inputSchema"]["x-is-dangerous"])
         self.assertEqual(10, joint_control["inputSchema"]["properties"]["speed_percent"]["maximum"])
+        self.assertNotIn("timeout_seconds", joint_control["inputSchema"]["properties"])
+        self.assertEqual(305, joint_control["inputSchema"]["x-completion"]["timeout"])
+        descriptions = {
+            name: joint_control["inputSchema"]["properties"][name]["description"]
+            for name in (f"joint{i}_deg" for i in range(1, 8))
+        }
+        for index, (low, high) in enumerate(self.device.JOINT_LIMITS_DEG, 1):
+            self.assertEqual(f"[{low:g}°, {high:g}°]", descriptions[f"joint{index}_deg"])
 
     def test_enabled_driver_reports_missing_host_sdk_mount(self):
         with mock.patch.dict(os.environ, {"RM_DRIVER_ENABLED": "1", "RM_ARM_IP": "192.0.2.1"}, clear=True):
@@ -128,7 +139,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "code 5"):
             self.device._sdk_result("rm_get_robot_info", (5, {}))
 
-    def _motion_plugin(self, *, motion_enabled=True, current=None, all_state=None):
+    def _motion_plugin(self, *, motion_enabled=True, current=None, all_state=None, safety=None):
         current = current or [0.0] * 7
         all_state = all_state or {
             "joint_err_code": [0] * 7,
@@ -169,7 +180,9 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         client.motion_enabled = motion_enabled
         client._handle = Handle()
         client._robot = Robot()
-        plugin = self.device.RM75Plugin(client, {"safety": {"poll_interval_seconds": 0.001}})
+        safety_config = {"poll_interval_seconds": 0.001}
+        safety_config.update(safety or {})
+        plugin = self.device.RM75Plugin(client, {"safety": safety_config})
         plugin._acp_callback = mock.Mock()
         return plugin, client._robot
 
@@ -180,7 +193,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
             "joint4_deg": 40, "joint5_deg": 50, "joint6_deg": 60,
             "joint7_deg": 70, "speed_percent": 1, "confirm_motion": True,
         })
-        self.assertEqual("executing", result["status"])
+        self.assertEqual("running", result["state"])
         self.assertEqual(([10, 20, 31, 40, 50, 60, 70], 1, 0, 0, 0), robot.moves[0])
 
     @staticmethod
@@ -193,7 +206,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         current = [10, 20, 30, 40, 50, 60, 70]
         plugin, robot = self._motion_plugin(current=current)
         result = plugin._start_motion({"joint3_deg": 31, "confirm_motion": True})
-        self.assertEqual("executing", result["status"])
+        self.assertEqual("running", result["state"])
         self.assertEqual(([10, 20, 31, 40, 50, 60, 70], 5, 0, 0, 0), robot.moves[0])
 
     def test_motion_requires_both_interlocks(self):
@@ -217,7 +230,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
     def test_absolute_target_is_not_rejected_for_distance_from_current(self):
         plugin, robot = self._motion_plugin(current=[-10, 0, 0, 0, 0, 0, 0])
         result = plugin._start_motion({**self._seven_targets(joint1_deg=20), "confirm_motion": True})
-        self.assertEqual("executing", result["status"])
+        self.assertEqual("running", result["state"])
         self.assertEqual(20, robot.moves[0][0][0])
 
     def test_zero_arm_error_code_is_not_treated_as_an_error(self):
@@ -227,8 +240,47 @@ class RealManRM75SDKClientTests(unittest.TestCase):
             "err": {"err_len": 1, "err": ["0"]},
         })
         result = plugin._start_motion({**self._seven_targets(), "confirm_motion": True})
-        self.assertEqual("executing", result["status"])
+        self.assertEqual("running", result["state"])
         self.assertEqual(1, len(robot.moves))
+
+    def test_motion_reports_running_then_acp_completed(self):
+        plugin, robot = self._motion_plugin(current=[0.0] * 7)
+        result = plugin._start_motion({**self._seven_targets(), "confirm_motion": True})
+        self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("rm75_movej_"))
+        deadline = time.monotonic() + 1.0
+        while not plugin._acp_callback.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+        plugin._acp_callback.assert_called_once()
+        action_id, status, completion = plugin._acp_callback.call_args.args
+        self.assertEqual(result["action_id"], action_id)
+        self.assertEqual("completed", status)
+        self.assertEqual([0.0] * 7, completion["target_degree"])
+
+    def test_motion_stall_requests_slow_stop_and_reports_acp_error(self):
+        plugin, robot = self._motion_plugin(
+            current=[0.0] * 7,
+            safety={
+                "start_grace_seconds": 0,
+                "stall_timeout_seconds": 0.01,
+                "progress_threshold_deg": 0.05,
+            },
+        )
+        result = plugin._start_motion({
+            **self._seven_targets(joint1_deg=1),
+            "speed_percent": 1,
+            "confirm_motion": True,
+        })
+        self.assertEqual("running", result["state"])
+        deadline = time.monotonic() + 1.0
+        while not plugin._acp_callback.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+        plugin._acp_callback.assert_called_once()
+        action_id, status, completion = plugin._acp_callback.call_args.args
+        self.assertEqual(result["action_id"], action_id)
+        self.assertEqual("error", status)
+        self.assertEqual("motion_stalled", completion["reason"])
+        self.assertEqual(1, robot.stops)
 
     def test_stopmotion_uses_vendor_slow_stop(self):
         plugin, robot = self._motion_plugin()
