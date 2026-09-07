@@ -52,6 +52,13 @@ ARM64 `libapi_c.so` must be installed on the robot host at
 `/opt/realman/rm_api2/libs/linux_arm/libapi_c.so`; `service.yml` mounts that
 directory read-only at the path expected by API2. The expected SHA-256 is
 `5b9d236a5cf901cdf05418d9ef5815a77a8c717af0ff037e7aad9247beb76fb9`.
+Verify the operator-provided file before starting the enabled Driver:
+
+```bash
+echo "5b9d236a5cf901cdf05418d9ef5815a77a8c717af0ff037e7aad9247beb76fb9  /opt/realman/rm_api2/libs/linux_arm/libapi_c.so" \
+  | sha256sum -c -
+```
+
 The image can be built and smoke-tested with `RM_DRIVER_ENABLED=0` without the
 library, but an enabled hardware connection fails with an explicit mount error
 when it is absent. Set `RM_API2_LIB_DIR` to override the host directory.
