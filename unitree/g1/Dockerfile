@@ -2,6 +2,12 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+
+# The team base image bakes in Tencent's VPC-internal apt mirror
+# (mirrors.tencentyun.com), which on-premise robots cannot resolve.
+# Rewrite it to a public mirror so apt-get works outside Tencent VPC.
+RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|http://${APT_MIRROR}/ubuntu-ports|g" /etc/apt/sources.list
 
 WORKDIR /work
 
