@@ -47,10 +47,16 @@ The HTTP service listens on port `15718` and provides `/health` and `/mcp`.
 The normal Agent Core runtime still initializes its ROS/DDS transport, but robot
 communication itself goes directly through API2 TCP port `8080`.
 
-Only the Python SDK wrapper is stored in Git. The Linux ARM64 `libapi_c.so` is
-downloaded from COS during the image build and verified by SHA-256 before it is
-installed. The component installs `python3-yaml` because the shared runtime
-loads `config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared
-runtime creates the Agent Core ROS 2 participant. No compiler, pip, or ROS
-build tooling is installed. See `vendor/SOURCE.md` for provenance and
-redistribution notes.
+Only the Python SDK wrapper is stored in Git. The operator's licensed Linux
+ARM64 `libapi_c.so` must be installed on the robot host at
+`/opt/realman/rm_api2/libs/linux_arm/libapi_c.so`; `service.yml` mounts that
+directory read-only at the path expected by API2. The expected SHA-256 is
+`5b9d236a5cf901cdf05418d9ef5815a77a8c717af0ff037e7aad9247beb76fb9`.
+The image can be built and smoke-tested with `RM_DRIVER_ENABLED=0` without the
+library, but an enabled hardware connection fails with an explicit mount error
+when it is absent. Set `RM_API2_LIB_DIR` to override the host directory.
+
+The component installs `python3-yaml` because the shared runtime loads
+`config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared runtime
+creates the Agent Core ROS 2 participant. No compiler, pip, or ROS build tooling
+is installed. See `vendor/SOURCE.md` for provenance notes.
