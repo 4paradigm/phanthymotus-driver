@@ -252,31 +252,35 @@ class AimdkNodes:
     def query_joint_state(self):
         from aimdk_msgs.srv import GetAllJointState
 
-        request = GetAllJointState.Request()
-        request.request = self.request_header()
-        result = call_service(self.get_all_joint_state, request)
-        status = int(result.reponse.status.value)
-        if status != 1:  # CommonState.SUCCESS
+        try:
+            request = GetAllJointState.Request()
+            request.request = self.request_header()
+            result = call_service(self.get_all_joint_state, request)
+            status = int(result.reponse.status.value)
+            if status != 1:  # CommonState.SUCCESS
+                return {
+                    "state": "unavailable",
+                    "service": "GetAllJointState",
+                    "status": status,
+                    "message": result.reponse.message,
+                }
+            return {
+                "state": "ok",
+                "service": "GetAllJointState",
+                "leg": jsonable(result.leg_joints),
+                "waist": jsonable(result.waist_joints),
+                "arm": jsonable(result.arm_joints),
+                "head": jsonable(result.head_joints),
+            }
+        except Exception as exc:
             return {
                 "state": "unavailable",
                 "service": "GetAllJointState",
-                "status": status,
-                "message": result.reponse.message,
+                "message": str(exc),
             }
-        return {
-            "state": "ok",
-            "service": "GetAllJointState",
-            "leg": jsonable(result.leg_joints),
-            "waist": jsonable(result.waist_joints),
-            "arm": jsonable(result.arm_joints),
-            "head": jsonable(result.head_joints),
-        }
 
     def _publish_joint_state(self):
-        try:
-            value = self.query_joint_state()
-        except Exception as exc:
-            value = {"state": "unavailable", "service": "GetAllJointState", "message": str(exc)}
+        value = self.query_joint_state()
         output = self._msg["String"]()
         output.data = json.dumps(value, ensure_ascii=False)
         self.joint_state_pub.publish(output)

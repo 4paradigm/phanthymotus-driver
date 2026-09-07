@@ -76,13 +76,18 @@ class FakeClient:
         self.srv_name = name
         self.response = None
         self.last_request = None
+        self.available = True
+        self.future_exception = None
 
     def wait_for_service(self, timeout_sec=None):
-        return True
+        return self.available
 
     def call_async(self, request):
         self.last_request = request
-        return FakeFuture(result=self.response if self.response is not None else FakeMsg())
+        return FakeFuture(
+            result=self.response if self.response is not None else FakeMsg(),
+            exc=self.future_exception,
+        )
 
 
 class FakeClock:
@@ -397,6 +402,30 @@ class DispatchSmokeTests(unittest.TestCase):
             "service": "GetAllJointState",
             "status": 0,
             "message": "joint state unavailable",
+        })
+
+    def test_joint_state_reports_an_unavailable_service(self):
+        plugins = build_bundle_plugins()
+        joint_state = find_plugin(plugins, "joint_state")
+        joint_state.nodes.get_all_joint_state.available = False
+
+        result = joint_state.dispatch("get", {})
+
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["service"], "GetAllJointState")
+        self.assertIn("unavailable", result["message"])
+
+    def test_joint_state_reports_a_service_future_exception(self):
+        plugins = build_bundle_plugins()
+        joint_state = find_plugin(plugins, "joint_state")
+        joint_state.nodes.get_all_joint_state.future_exception = RuntimeError("transport failed")
+
+        result = joint_state.dispatch("get", {})
+
+        self.assertEqual(result, {
+            "state": "unavailable",
+            "service": "GetAllJointState",
+            "message": "transport failed",
         })
 
 class StartStopLifecycleTests(unittest.TestCase):
