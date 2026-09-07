@@ -797,6 +797,12 @@ class HandCommandPlugin:
         request = GetHandType.Request()
         request.request = self.nodes.request_header()
         result = call_service(self.nodes.get_hand_type, request)
+        status = int(result.reponse.status.value)
+        if status != 1:  # CommonState.SUCCESS
+            raise RuntimeError(
+                "hand_command: GetHandType failed "
+                f"(status={status}, message={result.reponse.message!r})"
+            )
         return int(result.left_hands_type.value), int(result.right_hands_type.value)
 
     @staticmethod

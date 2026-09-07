@@ -308,6 +308,15 @@ class ModelPluginTests(unittest.TestCase):
 
 
 class DispatchSmokeTests(unittest.TestCase):
+    @staticmethod
+    def _hand_type_response(left, right, *, status=1, message=""):
+        response = FakeMsg()
+        response.reponse.status.value = status
+        response.reponse.message = message
+        response.left_hands_type.value = left
+        response.right_hands_type.value = right
+        return response
+
     """Exercise a couple of simple service-backed dispatch() calls end-to-end against the
     fake ROS client, to catch request/response field mismatches (as opposed to only
     checking tool metadata)."""
@@ -342,9 +351,7 @@ class DispatchSmokeTests(unittest.TestCase):
     def test_hand_command_uses_the_hand_types_reported_by_the_robot(self):
         plugins = build_bundle_plugins()
         hand_command = find_plugin(plugins, "hand_command")
-        hand_command.nodes.get_hand_type.response = FakeMsg()
-        hand_command.nodes.get_hand_type.response.left_hands_type.value = 1
-        hand_command.nodes.get_hand_type.response.right_hands_type.value = 3
+        hand_command.nodes.get_hand_type.response = self._hand_type_response(1, 3)
 
         result = hand_command.dispatch("open", {"side": "both"})
 
@@ -362,9 +369,7 @@ class DispatchSmokeTests(unittest.TestCase):
     def test_hand_command_rejects_an_unconfigured_hand_without_publishing(self):
         plugins = build_bundle_plugins()
         hand_command = find_plugin(plugins, "hand_command")
-        hand_command.nodes.get_hand_type.response = FakeMsg()
-        hand_command.nodes.get_hand_type.response.left_hands_type.value = 0
-        hand_command.nodes.get_hand_type.response.right_hands_type.value = 0
+        hand_command.nodes.get_hand_type.response = self._hand_type_response(0, 0)
 
         with self.assertRaisesRegex(ValueError, "not controllable"):
             hand_command.dispatch("close", {"side": "both"})
@@ -375,9 +380,7 @@ class DispatchSmokeTests(unittest.TestCase):
             with self.subTest(hand_type=hand_type):
                 plugins = build_bundle_plugins()
                 hand_command = find_plugin(plugins, "hand_command")
-                hand_command.nodes.get_hand_type.response = FakeMsg()
-                hand_command.nodes.get_hand_type.response.left_hands_type.value = hand_type
-                hand_command.nodes.get_hand_type.response.right_hands_type.value = hand_type
+                hand_command.nodes.get_hand_type.response = self._hand_type_response(hand_type, hand_type)
 
                 with self.assertRaisesRegex(ValueError, "not controllable"):
                     hand_command.dispatch("close", {"side": "both"})
@@ -386,9 +389,7 @@ class DispatchSmokeTests(unittest.TestCase):
     def test_hand_command_can_target_a_controllable_right_hand(self):
         plugins = build_bundle_plugins()
         hand_command = find_plugin(plugins, "hand_command")
-        hand_command.nodes.get_hand_type.response = FakeMsg()
-        hand_command.nodes.get_hand_type.response.left_hands_type.value = 0
-        hand_command.nodes.get_hand_type.response.right_hands_type.value = 3
+        hand_command.nodes.get_hand_type.response = self._hand_type_response(0, 3)
 
         result = hand_command.dispatch("open", {"side": "right"})
 
@@ -402,9 +403,7 @@ class DispatchSmokeTests(unittest.TestCase):
     def test_hand_command_get_state_reports_current_hand_types(self):
         plugins = build_bundle_plugins()
         hand_command = find_plugin(plugins, "hand_command")
-        hand_command.nodes.get_hand_type.response = FakeMsg()
-        hand_command.nodes.get_hand_type.response.left_hands_type.value = 0
-        hand_command.nodes.get_hand_type.response.right_hands_type.value = 3
+        hand_command.nodes.get_hand_type.response = self._hand_type_response(0, 3)
 
         result = hand_command.dispatch("get_state", {})
 
@@ -412,6 +411,17 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(result["left_hand_type_value"], 0)
         self.assertEqual(result["right_hand_type"], "leisai_nimble_hands")
         self.assertEqual(result["right_hand_type_value"], 3)
+
+    def test_hand_command_reports_a_failed_hand_type_query_without_publishing(self):
+        plugins = build_bundle_plugins()
+        hand_command = find_plugin(plugins, "hand_command")
+        hand_command.nodes.get_hand_type.response = self._hand_type_response(
+            0, 0, status=2, message="hand controller unavailable"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "GetHandType failed .*hand controller unavailable"):
+            hand_command.dispatch("open", {"side": "right"})
+        self.assertEqual(hand_command.nodes.hand_command_pub.published, [])
 
 
 class StartStopLifecycleTests(unittest.TestCase):
