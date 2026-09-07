@@ -44,6 +44,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("RM_MOTION_ENABLED=1", service)
         self.assertIn("RM_ARM_IP=${RM75_ARM_IP:-192.168.1.18}", service)
         self.assertIn("AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}", service)
+        self.assertIn("AGENT_CORE_TOKEN=${RM75_AGENT_CORE_TOKEN:-}", service)
         self.assertIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
         self.assertIn("network_mode: host", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
@@ -187,7 +188,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "code -2"):
             client.call_dict("rm_get_controller_state")
 
-    def test_acp_https_requires_and_uses_configured_ca(self):
+    def test_acp_https_requires_ca_and_mirrors_terminal_event_to_canvas(self):
         client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
         plugin = self.device.RM75Plugin(client, {})
         with mock.patch.dict(os.environ, {"AGENT_CORE_URL": "https://phanthy-motus:15678"}, clear=True), \
@@ -199,12 +200,50 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {
                 "AGENT_CORE_URL": "https://phanthy-motus:15678",
                 "AGENT_CORE_CA_CERT": "/cert.pem",
+                "AGENT_CORE_TOKEN": "secret-token",
             }, clear=True), \
                 mock.patch.object(self.device.ssl, "create_default_context", return_value=context) as create_context, \
                 mock.patch.object(self.device.urllib.request, "urlopen") as urlopen:
-            plugin._acp_callback("action-2", "completed", {})
+            plugin._acp_callback("action-2", "completed", {"max_error_deg": 0.1})
             create_context.assert_called_once_with(cafile="/cert.pem")
-            self.assertIs(context, urlopen.call_args.kwargs["context"])
+            self.assertEqual(2, urlopen.call_count)
+            acp_call, canvas_call = urlopen.call_args_list
+            self.assertEqual(
+                "https://phanthy-motus:15678/api/acp/complete",
+                acp_call.args[0].full_url,
+            )
+            self.assertEqual(
+                "https://phanthy-motus:15678/api/event",
+                canvas_call.args[0].full_url,
+            )
+            self.assertIs(context, acp_call.kwargs["context"])
+            self.assertIs(context, canvas_call.kwargs["context"])
+            self.assertEqual(
+                "Bearer secret-token",
+                canvas_call.args[0].get_header("Authorization"),
+            )
+            canvas_payload = json.loads(canvas_call.args[0].data)
+            self.assertEqual("", canvas_payload["text"])
+            self.assertEqual("rm75_canvas", canvas_payload["source"])
+            self.assertEqual("completed", canvas_payload["payload"]["status"])
+            self.assertEqual("canvas_action_complete", canvas_payload["payload"]["type"])
+            self.assertEqual("action-2", canvas_payload["payload"]["action_id"])
+
+    def test_canvas_event_failure_does_not_repeat_or_replace_acp_completion(self):
+        client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+        plugin = self.device.RM75Plugin(client, {})
+        first_response = mock.Mock()
+        with mock.patch.dict(os.environ, {
+                "AGENT_CORE_URL": "http://127.0.0.1:15678",
+            }, clear=True), \
+                mock.patch.object(
+                    self.device.urllib.request,
+                    "urlopen",
+                    side_effect=[first_response, RuntimeError("canvas unavailable")],
+                ) as urlopen:
+            plugin._acp_callback("action-3", "completed", {})
+        self.assertEqual(2, urlopen.call_count)
+        first_response.close.assert_called_once_with()
 
     def _motion_plugin(self, *, motion_enabled=True, current=None, all_state=None, safety=None):
         current = current or [0.0] * 7
