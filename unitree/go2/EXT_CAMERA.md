@@ -39,15 +39,9 @@ paths prevent a depth payload from being delivered to an old RGB subscription.
 Existing downstream connections must be reviewed/reconnected for the newly
 selected modality and format; they are not automatically rewired by the driver.
 
-Multi-instance startup is out of scope for this version. All lifecycle calls,
-including calls carrying a legacy canvas ID, address the same capture slot;
-they cannot create additional simultaneous captures. Use `channel` to switch
-RGB/depth/infrared on the single card. Stop releases the active capture.
-
-Earlier experimental builds exposed `ext_depth`/`ext_infrared` or allowed
-multiple `ext_camera` cards. Keep one `ext_camera` and save its shared settings
-again when upgrading. The separate tools are no longer exported; the earlier
-multi-instance startup issue has not been fixed by this scope reduction.
+The card manages one capture slot. Use `channel` to select RGB, depth or
+infrared. Saving configuration switches the active modality; stopping the card
+releases its capture resources.
 
 ## What each modality is useful for
 
@@ -87,7 +81,6 @@ obstacle avoidance are downstream capabilities, not implemented by this sensor.
   `info` reports the actual selected profile, freshness and source stream/index.
   The fixed depth dimensions match the platform's headerless depth renderer.
 - USB 2 uses conservative VGA/6 stereo profiles; USB 3 uses VGA/15.
-  These profile choices do not imply simultaneous multi-card support.
   D435i RGB/depth/infrared switching has been verified on USB 3.2.
 - Linux USB serial and RealSense SDK serial are not necessarily equal. Device
   selection binds SDK `physical_port` to the selected V4L2 node's USB ancestor;
@@ -112,8 +105,8 @@ Tests cover real V4L2 capability formatting, unsupported formats, channel
 configuration/topic changes, USB device binding, RGB compatibility, single-card configuration and lifecycle, stale/wrong-channel frames, depth units and overflow.
 Hardware verification covers RGB→depth→infrared→RGB on the same instance,
 actual decoded image payloads. The single-instance facade additionally has
-regression coverage for config/start/stop/info without a card ID and for legacy
-canvas IDs resolving to the same capture rather than creating extra workers.
+regression coverage for shared configuration and config/start/stop/info calls
+without a card ID.
 
 Sources: [driver contract](../../README_dev.md),
 [SDK depth units](https://github.com/realsenseai/librealsense/wiki/Projection-in-RealSense-SDK-2.0),
