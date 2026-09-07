@@ -201,6 +201,14 @@ class AimdkNodes:
         self.get_mic_source = client(GetMicSourceRequest, "/aimdk_5Fmsgs/srv/GetMicSourceRequest")
         self.get_stored_map = client(GetStoredMapByName, "/aimdk_5Fmsgs/srv/GetStoredMapByName")
 
+        # GetAllJointState is a service, while the canvas' "view data stream" affordance
+        # requires a topic_out. Publish a low-rate JSON snapshot so the joint_state card has
+        # its own stream instead of being associated with an unrelated sensor stream.
+        joint_state_topic = f"/{namespace}/agibot_x2/joint_state"
+        self.joint_state_pub = self.core.create_publisher(String, joint_state_topic, 5)
+        self.streams["joint_state"] = {"topic": joint_state_topic, "format": "data/json"}
+        self.joint_state_timer = self.core.create_timer(1.0, self._publish_joint_state)
+
     def _callback(self, key, publisher, *, as_json=False):
         from std_msgs.msg import String
 
@@ -240,6 +248,40 @@ class AimdkNodes:
         request = self._msg["CommonRequest"]()
         request.header.stamp = self.robot.get_clock().now().to_msg()
         return request
+
+    def query_joint_state(self):
+        from aimdk_msgs.srv import GetAllJointState
+
+        request = GetAllJointState.Request()
+        request.request = self.request_header()
+        result = call_service(self.get_all_joint_state, request)
+        status = int(result.reponse.status.value)
+        if status != 1:  # CommonState.SUCCESS
+            return {
+                "state": "unavailable",
+                "service": "GetAllJointState",
+                "status": status,
+                "message": result.reponse.message,
+            }
+        return {
+            "state": "ok",
+            "service": "GetAllJointState",
+            "leg": jsonable(result.leg_joints),
+            "waist": jsonable(result.waist_joints),
+            "arm": jsonable(result.arm_joints),
+            "head": jsonable(result.head_joints),
+        }
+
+    def _publish_joint_state(self):
+        try:
+            value = self.query_joint_state()
+        except Exception as exc:
+            value = {"state": "unavailable", "service": "GetAllJointState", "message": str(exc)}
+        output = self._msg["String"]()
+        output.data = json.dumps(value, ensure_ascii=False)
+        self.joint_state_pub.publish(output)
+        with self.lock:
+            self.values["joint_state"] = value
 
     def snapshot(self, key):
         with self.lock:
@@ -296,7 +338,10 @@ class JointStatePlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("joint_state", "sensor", "查询全身关节状态：leg/waist/arm/head（GetAllJointState）")
+        return _stream_tool(
+            "joint_state", self.nodes.streams["joint_state"],
+            "全身关节状态流：leg/waist/arm/head（每秒查询 GetAllJointState）",
+        )
 
     def start(self):
         pass
@@ -310,27 +355,8 @@ class JointStatePlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running"}
-        from aimdk_msgs.srv import GetAllJointState
-        request = GetAllJointState.Request()
-        request.request = self.nodes.request_header()
-        result = call_service(self.nodes.get_all_joint_state, request)
-        status = int(result.reponse.status.value)
-        if status != 1:  # CommonState.SUCCESS
-            return {
-                "state": "unavailable",
-                "service": "GetAllJointState",
-                "status": status,
-                "message": result.reponse.message,
-            }
-        return {
-            "state": "ok",
-            "service": "GetAllJointState",
-            "leg": jsonable(result.leg_joints),
-            "waist": jsonable(result.waist_joints),
-            "arm": jsonable(result.arm_joints),
-            "head": jsonable(result.head_joints),
-        }
+            return {"state": "running", **self.nodes.streams["joint_state"]}
+        return self.nodes.query_joint_state()
 
 
 class HandStatePlugin:

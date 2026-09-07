@@ -100,6 +100,7 @@ class FakeNode:
         self.publishers = {}
         self.subscriptions = []
         self.clients = {}
+        self.timers = []
 
     def create_publisher(self, msg_type, topic, qos):
         pub = FakePublisher(msg_type, topic, qos)
@@ -114,6 +115,11 @@ class FakeNode:
         client = FakeClient(srv_type, name)
         self.clients[name] = client
         return client
+
+    def create_timer(self, period, callback):
+        timer = types.SimpleNamespace(period=period, callback=callback)
+        self.timers.append(timer)
+        return timer
 
     def get_clock(self):
         return FakeClock()
@@ -354,6 +360,27 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(result["state"], "ok")
         self.assertEqual(result["service"], "GetAllJointState")
         self.assertEqual(result["arm"], [{"name": "left_shoulder_pitch_joint", "position": 0.25}])
+
+    def test_joint_state_has_its_own_stream_and_publishes_service_values(self):
+        plugins = build_bundle_plugins()
+        joint_state = find_plugin(plugins, "joint_state")
+        response = FakeMsg()
+        response.reponse.status.value = 1
+        response.reponse.message = ""
+        response.leg_joints = []
+        response.waist_joints = []
+        response.arm_joints = []
+        response.head_joints = []
+        joint_state.nodes.get_all_joint_state.response = response
+
+        definition = joint_state.get_tool()
+        self.assertEqual(definition["topic_out"], [{
+            "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
+        }])
+        joint_state.nodes._publish_joint_state()
+        published = joint_state.nodes.joint_state_pub.published[-1]
+        self.assertIn('"state": "ok"', published.data)
+        self.assertEqual(joint_state.nodes.snapshot("joint_state")["arm"], [])
 
     def test_joint_state_reports_failed_queries_instead_of_default_values(self):
         plugins = build_bundle_plugins()
