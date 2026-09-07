@@ -39,6 +39,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
     def test_service_has_safe_connection_default(self):
         service = (DRIVER / "deploy" / "service.yml").read_text()
         self.assertIn("RM_DRIVER_ENABLED=0", service)
+        self.assertIn("network_mode: host", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
         self.assertIn(
@@ -46,7 +47,6 @@ class RealManRM75ImageContractTests(unittest.TestCase):
             service,
         )
         self.assertNotIn("/opt/realman/rm_ws", service)
-        self.assertNotIn("network_mode:", service)
         self.assertNotIn("ipc:", service)
 
 
@@ -69,6 +69,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         joint_control = next(item for item in tools if item["name"] == "joint_control")
         self.assertEqual("actuator", joint_control["type"])
         self.assertEqual(["set"], joint_control["inputSchema"]["x-completion"]["actions"])
+        self.assertIs(True, joint_control["inputSchema"]["x-is-dangerous"])
         self.assertEqual(10, joint_control["inputSchema"]["properties"]["speed_percent"]["maximum"])
 
     def test_enabled_driver_reports_missing_host_sdk_mount(self):

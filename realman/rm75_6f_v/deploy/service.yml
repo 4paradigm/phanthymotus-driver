@@ -1,6 +1,7 @@
 realman-rm75-6f-v:
   container_name: embodied-realman-rm75-6f-v
   image: __IMAGE__
+  network_mode: host
   privileged: true
   volumes:
     - /dev:/dev
