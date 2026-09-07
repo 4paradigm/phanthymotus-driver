@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import math
 import os
+import ssl
 import threading
 import time
+import urllib.parse
+import urllib.request
 from uuid import uuid4
 from pathlib import Path
 
@@ -91,6 +94,18 @@ class RM75SDKClient:
             if not self.connected or self._robot is None:
                 raise ConnectionError("RM75 SDK is not connected")
             return _sdk_result(method, getattr(self._robot, method)())
+
+    def call_dict(self, method):
+        with self._lock:
+            if not self.connected or self._robot is None:
+                raise ConnectionError("RM75 SDK is not connected")
+            result = getattr(self._robot, method)()
+            if not isinstance(result, dict) or "return_code" not in result:
+                raise RuntimeError(f"{method} returned an invalid SDK result: {result!r}")
+            code = int(result["return_code"])
+            if code != 0:
+                raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
+            return jsonable(result)
 
     def joint_states(self):
         degrees = self.call("rm_get_joint_degree")
@@ -250,12 +265,19 @@ class RM75Plugin:
 
     def _acp_callback(self, action_id, status, result):
         import json
-        import ssl
-        import urllib.request
-        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+        url = os.environ.get("AGENT_CORE_URL", "").strip().rstrip("/")
+        ca_cert = os.environ.get("AGENT_CORE_CA_CERT", "").strip()
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            print(f"[rm75] ACP callback failed for {action_id}: AGENT_CORE_URL must be absolute", flush=True)
+            return
+        if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+            print(f"[rm75] ACP callback failed for {action_id}: non-loopback HTTP is forbidden", flush=True)
+            return
+        if parsed.scheme == "https" and not ca_cert:
+            print(f"[rm75] ACP callback failed for {action_id}: AGENT_CORE_CA_CERT is required for HTTPS", flush=True)
+            return
+        context = ssl.create_default_context(cafile=ca_cert or None)
         payload = json.dumps({"action_id": action_id, "status": status, "result": result,
                               "tool": "joint_control", "ts": time.time()}).encode()
         try:
@@ -367,6 +389,8 @@ class RM75Plugin:
             path = Path(__file__).with_name("resource") / "rm75_6f_v.urdf"
             return {"urdf": path.read_text(encoding="utf-8")}
         if name in self.METHODS:
+            if name == "controller_state":
+                return self.client.call_dict(self.METHODS[name])
             return self.client.call(self.METHODS[name])
         if name == "joint_control":
             if action == "set":
