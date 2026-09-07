@@ -20,6 +20,8 @@ import time
 import zlib
 from pathlib import Path
 
+from estop import make_plugin as make_estop_plugin
+
 import numpy as np
 
 try:
@@ -2358,6 +2360,13 @@ class AdamDeviceBundle:
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
             )
+            self._plugins.append(p)
+
+        # Emergency-stop state sensor. This is intentionally read-only and
+        # only reports an emergency stop when the gRPC FSM names it explicitly.
+        if plugins_cfg.get("estop", {}).get("enabled", True):
+            p = make_estop_plugin(
+                plugins_cfg.get("estop", {}), namespace, executor, grpc_client)
             self._plugins.append(p)
 
         # LocoPlugin
