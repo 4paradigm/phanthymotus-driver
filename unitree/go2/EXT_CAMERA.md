@@ -1,6 +1,6 @@
 # External camera: RGB, depth and infrared
 
-`ext_camera` is one multi-instance sensor. Its instance configuration contains
+`ext_camera` is a single-instance sensor (`multiInstance: false`). Its shared configuration contains
 `channel: rgb | depth | infrared` (default `rgb`). There are no executable
 camera-control actions. `config`, `start`, `stop` and `info` are internal
 lifecycle operations, with plain-dict responses.
@@ -11,7 +11,7 @@ require a compatible RealSense with a resolvable physical USB path.
 
 ## Configure and switch
 
-1. Add `ext_camera`, select the camera device and choose `channel`.
+1. Keep one `ext_camera` card. Open its shared configuration, select the camera device and choose `channel`.
 2. For RGB, choose an advertised resolution, pixel format and frame rate.
    RGB settings are preserved when switching to another channel; depth/IR
    use their fixed profiles and ignore these RGB-only fields.
@@ -25,28 +25,29 @@ require a compatible RealSense with a resolvable physical USB path.
    by the driver. If the canvas still uses an old cached port, reopen the card's
    details to read its current output before opening the stream.
 
-An instance publishes only its selected modality:
+The card publishes only its selected modality. Configuration, start, stop and info
+calls do not require an instance ID:
 
 | channel | topic | format | payload |
 | --- | --- | --- | --- |
-| `rgb` | `/{namespace}/ext_camera/{instance_id}/rgb` | `image/jpeg` | Color JPEG |
-| `depth` | `/{namespace}/ext_camera/{instance_id}/depth` | `image/depth-zlib` | zlib of 640x480 little-endian uint16 millimetres |
-| `infrared` | `/{namespace}/ext_camera/{instance_id}/infrared` | `image/jpeg` | 640x480 left infrared Y8 encoded as grayscale JPEG |
+| `rgb` | `/{namespace}/ext_camera/default/rgb` | `image/jpeg` | Color JPEG |
+| `depth` | `/{namespace}/ext_camera/default/depth` | `image/depth-zlib` | zlib of 640x480 little-endian uint16 millimetres |
+| `infrared` | `/{namespace}/ext_camera/default/infrared` | `image/jpeg` | 640x480 left infrared Y8 encoded as grayscale JPEG |
 
-Hyphens in instance IDs become underscores in ROS topics. Channel-specific
+The stable `default` capture slot is independent of canvas card IDs. Channel-specific
 paths prevent a depth payload from being delivered to an old RGB subscription.
 Existing downstream connections must be reviewed/reconnected for the newly
 selected modality and format; they are not automatically rewired by the driver.
 
-Multiple instances can select different channels of the same RealSense. The
-stereo capture process is shared per physical camera and fans out to individual
-instance topics. Stopping one instance leaves the others running; stopping the
-last stereo instance releases the sensor. RGB uses its own V4L2 interface; two
-RGB instances cannot simultaneously own the same video device.
+Multi-instance startup is out of scope for this version. All lifecycle calls,
+including calls carrying a legacy canvas ID, address the same capture slot;
+they cannot create additional simultaneous captures. Use `channel` to switch
+RGB/depth/infrared on the single card. Stop releases the active capture.
 
-Earlier experimental builds of this PR exposed `ext_depth`/`ext_infrared`.
-Replace those with `ext_camera` instances configured with `depth`/`infrared`.
-Those separate tool names and marketplace entries are no longer exported.
+Earlier experimental builds exposed `ext_depth`/`ext_infrared` or allowed
+multiple `ext_camera` cards. Keep one `ext_camera` and save its shared settings
+again when upgrading. The separate tools are no longer exported; the earlier
+multi-instance startup issue has not been fixed by this scope reduction.
 
 ## What each modality is useful for
 
@@ -85,9 +86,9 @@ obstacle avoidance are downstream capabilities, not implemented by this sensor.
 - Stereo profiles are 640x480, 6fps on USB 2/unknown transport and 15fps on USB 3.
   `info` reports the actual selected profile, freshness and source stream/index.
   The fixed depth dimensions match the platform's headerless depth renderer.
-- On the tested USB 2 D435i, RGB 720p/15 + depth/IR VGA/6 coexist. Stereo VGA/15
-  or RGB 1080p/8 exceeded the tested concurrent bandwidth. USB 3.2 D435i switching
-  and concurrent RGB 720p/15 + stereo VGA/15 have also been verified.
+- USB 2 uses conservative VGA/6 stereo profiles; USB 3 uses VGA/15.
+  These profile choices do not imply simultaneous multi-card support.
+  D435i RGB/depth/infrared switching has been verified on USB 3.2.
 - Linux USB serial and RealSense SDK serial are not necessarily equal. Device
   selection binds SDK `physical_port` to the selected V4L2 node's USB ancestor;
   it does not choose an arbitrary first SDK camera or hard-code `/dev/video4`.
@@ -108,10 +109,11 @@ python3 -m unittest discover -s tests
 ```
 
 Tests cover real V4L2 capability formatting, unsupported formats, channel
-configuration/topic changes, USB device binding, RGB compatibility, shared
-instance lifecycle, stale/wrong-channel frames, depth units and overflow.
+configuration/topic changes, USB device binding, RGB compatibility, single-card configuration and lifecycle, stale/wrong-channel frames, depth units and overflow.
 Hardware verification covers RGB→depth→infrared→RGB on the same instance,
-concurrent instances and independent stop, plus actual decoded image payloads.
+actual decoded image payloads. The single-instance facade additionally has
+regression coverage for config/start/stop/info without a card ID and for legacy
+canvas IDs resolving to the same capture rather than creating extra workers.
 
 Sources: [driver contract](../../README_dev.md),
 [SDK depth units](https://github.com/realsenseai/librealsense/wiki/Projection-in-RealSense-SDK-2.0),
