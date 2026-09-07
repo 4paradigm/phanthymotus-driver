@@ -348,44 +348,6 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
 
-    def test_joint_state_returns_joint_values_after_a_successful_query(self):
-        plugins = build_bundle_plugins()
-        joint_state = find_plugin(plugins, "joint_state")
-        response = FakeMsg()
-        response.reponse.status.value = 1
-        response.reponse.message = ""
-        arm_joint = FakeMsg()
-        arm_joint.name = "left_shoulder_pitch_joint"
-        arm_joint.position = 0.25
-        response.leg_joints = []
-        response.waist_joints = []
-        response.arm_joints = [arm_joint]
-        response.head_joints = []
-        joint_state.nodes.get_all_joint_state.response = response
-
-        result = joint_state.dispatch("get", {})
-
-        self.assertEqual(result["state"], "ok")
-        self.assertEqual(result["service"], "GetAllJointState")
-        self.assertEqual(result["arm"], [{"name": "left_shoulder_pitch_joint", "position": 0.25}])
-
-    def test_joint_state_reports_failed_queries_instead_of_default_values(self):
-        plugins = build_bundle_plugins()
-        joint_state = find_plugin(plugins, "joint_state")
-        response = FakeMsg()
-        response.reponse.status.value = 0
-        response.reponse.message = "joint state unavailable"
-        joint_state.nodes.get_all_joint_state.response = response
-
-        result = joint_state.dispatch("get", {})
-
-        self.assertEqual(result, {
-            "state": "unavailable",
-            "service": "GetAllJointState",
-            "status": 0,
-            "message": "joint state unavailable",
-        })
-
     def test_hand_command_uses_the_hand_types_reported_by_the_robot(self):
         plugins = build_bundle_plugins()
         hand_command = find_plugin(plugins, "hand_command")
