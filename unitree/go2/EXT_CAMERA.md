@@ -2,6 +2,10 @@
 
 `camera_front` uses the Go2's built-in video service. `ext_camera` discovers
 USB V4L2 cameras attached to the host and publishes JPEG images for the canvas.
+The sensor exposes no executable action form. Device, resolution, frame rate
+and pixel format are configured through the instance settings; `config`,
+`start`, `stop` and `info` remain internal lifecycle operations. V4L2
+`set_*`/`get_*` control actions are no longer exposed or dispatched.
 
 Previously, discovery skipped every device whose V4L2 information contained
 `RealSense`. This also removed the external camera's color interface. With a
