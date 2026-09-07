@@ -12,6 +12,7 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
   MicPlugin          (sensor)    — UDP multicast → ROS2 topic
   NativeTtsPlugin    (actuator)  — G1 内置 TTS + 音量控制
   LedPlugin          (actuator)  — LED 灯带控制
+  GreetPlugin        (actuator)  — 迎宾：挥手 + 语音 + LED
   LocoStatePlugin    (sensor)    — DDS SportModeState → ROS2 topic
   LocoPlugin         (actuator)  — 运动控制
   ArmActionPlugin    (actuator)  — 手臂动作
@@ -1192,6 +1193,95 @@ class LedPlugin:
             if self._effect_stop.is_set(): return
             self._led_set(255, 0, 0)
             if self._effect_stop.wait(0.03): return
+
+
+class GreetPlugin:
+    """迎宾卡（actuator）：一个动作完成挥手 + 语音问候 + LED 灯。
+
+    组合三个已有能力（loco 的 WaveHand、audio 的 TtsMaker / LedControl），
+    对外暴露一个高层 "greet" 动作，LLM 一句话即可触发整套迎宾流程。
+    """
+    PREFIX = "greet"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 loco_client, audio_client: AudioClient):
+        self._loco = loco_client
+        self._audio = audio_client
+        self._audio_lock = threading.Lock()  # audio_client 与 tts/led 卡共享，串行化 RPC
+        self._default_text = str(plugin_config.get("default_text", "你好，欢迎光临"))
+        self._voice = int(plugin_config.get("voice", 0))
+        rgb = plugin_config.get("led_rgb", [0, 255, 0])
+        self._led_rgb = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "greet",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 迎宾：挥手 + 语音问候 + LED 灯（默认绿灯）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["greet", "wave", "speak", "led", "info"],
+                               "description": "要执行的动作"},
+                    "text": {"type": "string", "description": "要说的话（不填用默认问候语）"},
+                    "turn": {"type": "boolean", "description": "挥手时是否转身"},
+                    "r": {"type": "integer", "description": "LED 红 0-255"},
+                    "g": {"type": "integer", "description": "LED 绿 0-255"},
+                    "b": {"type": "integer", "description": "LED 蓝 0-255"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "greet": {"params": ["text", "turn"], "description": "完整迎宾：挥手 + 说话 + LED"},
+                    "wave":  {"params": ["turn"], "description": "只挥手"},
+                    "speak": {"params": ["text"], "description": "只语音问候"},
+                    "led":   {"params": ["r", "g", "b"], "description": "只设置 LED 颜色"},
+                    "info":  {"params": [], "description": "查看迎宾配置"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"default_text": self._default_text, "voice": self._voice,
+                    "led_rgb": list(self._led_rgb)}
+        if action == "wave":
+            turn = bool(args.get("turn", False))
+            ret = self._loco.WaveHand(turn)
+            return {"ret": ret, "turn": turn}
+        if action == "speak":
+            text = str(args.get("text", self._default_text))
+            ret = self._audio.TtsMaker(text, self._voice)
+            return {"ret": ret, "text": text}
+        if action == "led":
+            r = int(args.get("r", self._led_rgb[0]))
+            g = int(args.get("g", self._led_rgb[1]))
+            b = int(args.get("b", self._led_rgb[2]))
+            with self._audio_lock:
+                ret = self._audio.LedControl(r, g, b)
+            return {"ret": ret, "r": r, "g": g, "b": b}
+        if action == "greet":
+            text = str(args.get("text", self._default_text))
+            turn = bool(args.get("turn", False))
+            r, g, b = self._led_rgb
+            with self._audio_lock:
+                led_ret = self._audio.LedControl(r, g, b)
+            wave_ret = self._loco.WaveHand(turn)
+            with self._audio_lock:
+                tts_ret = self._audio.TtsMaker(text, self._voice)
+            return {"ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
+                    "text": text, "turn": turn}
+        return None
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────

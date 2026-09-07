@@ -106,6 +106,11 @@ class G1DeviceBundle:
             self._plugins.append(LedPlugin(plugins_cfg["led"], namespace, executor, audio_client))
             print("[bundle] LedPlugin loaded")
 
+        if plugins_cfg.get("greet", {}).get("enabled", False):
+            from device import GreetPlugin
+            self._plugins.append(GreetPlugin(plugins_cfg["greet"], namespace, executor, loco_client, audio_client))
+            print("[bundle] GreetPlugin loaded")
+
         if plugins_cfg.get("loco", {}).get("enabled", False):
             from device import LocoStatePlugin, LocoPlugin, StatePlugin
             loco_state = LocoStatePlugin(plugins_cfg["loco"], namespace, executor)

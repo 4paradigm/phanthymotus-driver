@@ -20,6 +20,7 @@ cards:
   - { name: tts,                    type: actuator }
   - { name: speaker,                type: actuator }
   - { name: led,                    type: actuator }
+  - { name: greet,                  type: actuator }
   - { name: loco_state,             type: sensor }
   - { name: loco_motion_state,      type: sensor }
   - { name: motion_events,          type: sensor }
