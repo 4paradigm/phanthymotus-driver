@@ -257,26 +257,50 @@ class AimdkNodes:
             request.request = self.request_header()
             result = call_service(self.get_all_joint_state, request)
             status = int(result.reponse.status.value)
-            if status != 1:  # CommonState.SUCCESS
-                return {
-                    "state": "unavailable",
-                    "service": "GetAllJointState",
-                    "status": status,
-                    "message": result.reponse.message,
-                }
-            return {
-                "state": "ok",
-                "service": "GetAllJointState",
+            status_name = {
+                0: "UNKNOWN", 1: "SUCCESS", 2: "FAILURE", 3: "ABORTED",
+                4: "TIMEOUT", 5: "INVALID", 6: "IN_MANUAL",
+                100: "NOT_READY", 200: "PENDING", 300: "CREATED", 400: "RUNNING",
+            }.get(status, "UNRECOGNIZED")
+            groups = {
                 "leg": jsonable(result.leg_joints),
                 "waist": jsonable(result.waist_joints),
                 "arm": jsonable(result.arm_joints),
                 "head": jsonable(result.head_joints),
+            }
+            counts = {name: len(joints) for name, joints in groups.items()}
+            has_joint_data = any(counts.values())
+            vendor_message = str(result.reponse.message or "")
+
+            if not has_joint_data:
+                state = "unavailable"
+                message = vendor_message or f"vendor returned {status_name} with no joint data"
+            elif status == 1:  # CommonState.SUCCESS
+                state = "ok"
+                message = vendor_message
+            else:
+                state = "degraded"
+                message = vendor_message or f"vendor returned {status_name}; using non-empty joint data"
+
+            return {
+                "state": state,
+                "service": "GetAllJointState",
+                "status": status,
+                "status_name": status_name,
+                "message": message,
+                "joint_counts": counts,
+                **groups,
             }
         except Exception as exc:
             return {
                 "state": "unavailable",
                 "service": "GetAllJointState",
                 "message": str(exc),
+                "joint_counts": {"leg": 0, "waist": 0, "arm": 0, "head": 0},
+                "leg": [],
+                "waist": [],
+                "arm": [],
+                "head": [],
             }
 
     def _publish_joint_state(self):

@@ -364,6 +364,8 @@ class DispatchSmokeTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "ok")
         self.assertEqual(result["service"], "GetAllJointState")
+        self.assertEqual(result["status_name"], "SUCCESS")
+        self.assertEqual(result["joint_counts"], {"leg": 0, "waist": 0, "arm": 1, "head": 0})
         self.assertEqual(result["arm"], [{"name": "left_shoulder_pitch_joint", "position": 0.25}])
         self.assertEqual(result["topic_out"], [{
             "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
@@ -375,9 +377,12 @@ class DispatchSmokeTests(unittest.TestCase):
         response = FakeMsg()
         response.reponse.status.value = 1
         response.reponse.message = ""
+        arm_joint = FakeMsg()
+        arm_joint.name = "left_shoulder_roll_joint"
+        arm_joint.position = 0.1
         response.leg_joints = []
         response.waist_joints = []
-        response.arm_joints = []
+        response.arm_joints = [arm_joint]
         response.head_joints = []
         joint_state.nodes.get_all_joint_state.response = response
 
@@ -393,27 +398,50 @@ class DispatchSmokeTests(unittest.TestCase):
         joint_state.nodes._publish_joint_state()
         published = joint_state.nodes.joint_state_pub.published[-1]
         self.assertIn('"state": "ok"', published.data)
-        self.assertEqual(joint_state.nodes.snapshot("joint_state")["arm"], [])
+        self.assertEqual(joint_state.nodes.snapshot("joint_state")["joint_counts"]["arm"], 1)
 
     def test_joint_state_reports_failed_queries_instead_of_default_values(self):
         plugins = build_bundle_plugins()
         joint_state = find_plugin(plugins, "joint_state")
         response = FakeMsg()
         response.reponse.status.value = 0
-        response.reponse.message = "joint state unavailable"
+        response.reponse.message = ""
+        response.leg_joints = []
+        response.waist_joints = []
+        response.arm_joints = []
+        response.head_joints = []
         joint_state.nodes.get_all_joint_state.response = response
 
         result = joint_state.dispatch("get", {})
 
-        self.assertEqual(result, {
-            "state": "unavailable",
-            "service": "GetAllJointState",
-            "status": 0,
-            "message": "joint state unavailable",
-            "topic_out": [{
-                "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
-            }],
-        })
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["status"], 0)
+        self.assertEqual(result["status_name"], "UNKNOWN")
+        self.assertEqual(result["joint_counts"], {"leg": 0, "waist": 0, "arm": 0, "head": 0})
+        self.assertEqual(result["message"], "vendor returned UNKNOWN with no joint data")
+
+    def test_joint_state_preserves_data_when_vendor_status_is_unknown(self):
+        plugins = build_bundle_plugins()
+        joint_state = find_plugin(plugins, "joint_state")
+        response = FakeMsg()
+        response.reponse.status.value = 0
+        response.reponse.message = ""
+        arm_joint = FakeMsg()
+        arm_joint.name = "right_elbow_pitch_joint"
+        arm_joint.position = -0.4
+        response.leg_joints = []
+        response.waist_joints = []
+        response.arm_joints = [arm_joint]
+        response.head_joints = []
+        joint_state.nodes.get_all_joint_state.response = response
+
+        result = joint_state.dispatch("get", {})
+
+        self.assertEqual(result["state"], "degraded")
+        self.assertEqual(result["status_name"], "UNKNOWN")
+        self.assertEqual(result["joint_counts"]["arm"], 1)
+        self.assertEqual(result["arm"], [{"name": "right_elbow_pitch_joint", "position": -0.4}])
+        self.assertIn("using non-empty joint data", result["message"])
 
     def test_joint_state_reports_an_unavailable_service(self):
         plugins = build_bundle_plugins()
@@ -433,14 +461,14 @@ class DispatchSmokeTests(unittest.TestCase):
 
         result = joint_state.dispatch("get", {})
 
-        self.assertEqual(result, {
-            "state": "unavailable",
-            "service": "GetAllJointState",
-            "message": "transport failed",
-            "topic_out": [{
-                "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
-            }],
-        })
+        self.assertEqual(result["state"], "unavailable")
+        self.assertEqual(result["service"], "GetAllJointState")
+        self.assertEqual(result["message"], "transport failed")
+        self.assertEqual(result["joint_counts"], {"leg": 0, "waist": 0, "arm": 0, "head": 0})
+        self.assertEqual(result["arm"], [])
+        self.assertEqual(result["topic_out"], [{
+            "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
+        }])
 
 class StartStopLifecycleTests(unittest.TestCase):
     """README_dev.md's 'start/stop in dispatch (Required)' rule: the canvas UI calls every
