@@ -26,6 +26,36 @@ so a grayscale scene is the expected image, not a missing visualization effect.
 Adding a false-color palette would not make it a temperature measurement.
 `info.source_stream` and `info.stream_index` identify the native source.
 
+## Practical value of each card
+
+| Card | Useful question | Typical use |
+| --- | --- | --- |
+| `ext_camera` | What is in view? | Remote inspection and RGB input for OCR or object recognition |
+| `ext_depth` | What is the depth at this image location? | Inspect nearby geometry, measure pixel depth, and examine missing depth regions |
+| `ext_infrared` | What intensity/texture is the stereo imager receiving? | Diagnose depth quality and assess scene visibility under near-infrared illumination |
+
+The most direct use of the infrared card is alongside the depth card. When a
+region has missing or unstable depth, inspect the infrared image for saturated
+highlights, poor texture, occlusion or a poorly visible projected pattern. This
+helps investigate the image input rather than assuming that transport or depth
+processing failed. It is a diagnostic observation, not an automatic diagnosis.
+
+Under weak visible light, available near-infrared illumination/projector light
+can provide texture for observation. This card does not add or control a light
+source. The D400 stereo imagers also use visible light, so a bright room can
+look much like an ordinary grayscale scene. A user does not need a false-color
+display to obtain a real infrared stream.
+
+The image can also serve as input for evaluating infrared feature/edge detection
+or target visibility. Those algorithms are not implemented by this sensor card.
+The current left-only JPEG output is for monitoring; stereo matching, precise
+calibration or lossless data collection would require additional raw streams
+and calibration metadata. No card here provides thermal measurement, automatic
+navigation or a complete obstacle-avoidance controller.
+
+See the vendor's [D400/D430 projector and low-light FAQ](https://www.realsenseai.com/developers/faqs/)
+and [optical filter discussion](https://dev.realsenseai.com/docs/optical-filters-for-intel-realsense-depth-cameras-d400/).
+
 ## Lifecycle
 
 The plugins are enabled in `config.yaml` and advertised in `driver.yaml`.
@@ -45,9 +75,9 @@ other running; stopping the last card releases the sensor and process, with
 bounded shutdown even if the SDK hangs. Multiple attached RealSense cameras
 are rejected explicitly to avoid selecting a camera arbitrarily.
 
-The RGB sensor is not opened, reset or reconfigured. `ext_camera` can own its
-color interface concurrently. Its RealSense enumeration fix is tracked
-separately in PR #248; these stereo cards do not depend on that fix.
+The RGB sensor is not opened, reset or reconfigured by these stereo cards.
+`ext_camera` owns its color interface independently; its RealSense enumeration
+and pure-sensor interface are included with this three-card integration.
 
 ## Build and verification
 
