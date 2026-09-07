@@ -2,8 +2,8 @@
 """
 drivers/unitree/go2/ext_devices.py — External mic and camera plugins (multiInstance).
 
-Enumerates system audio/video devices, excluding built-in mic
-and RealSense cameras. Each external device can be started as an independent
+Enumerates system audio/video devices, including RealSense color cameras and
+excluding the built-in mic. Each external device can be started as an independent
 tool instance on the canvas.
 """
 
@@ -140,7 +140,7 @@ def _enumerate_ext_mics() -> list[dict]:
 
 
 def _enumerate_ext_cameras() -> list[dict]:
-    """List external V4L2 video capture devices (excluding RealSense)."""
+    """List V4L2 cameras, including only the color interfaces of RealSense."""
     devices = []
     for path in sorted(glob.glob('/dev/video*')):
         try:
@@ -152,11 +152,11 @@ def _enumerate_ext_cameras() -> list[dict]:
         except Exception:
             continue
 
-        # Exclude RealSense (Intel vendor)
-        if 'RealSense' in info or 'Intel(R) RealSense' in info:
-            continue
-        # Only keep Video Capture devices (not metadata nodes)
-        if 'Video Capture' not in info:
+        is_realsense = 'realsense' in info.lower()
+        # Capabilities describes the whole device, including its sibling nodes.
+        # Device Caps describes this node; metadata siblings are not cameras.
+        caps = info.split('Device Caps', 1)[-1].split('Media Driver Info', 1)[0]
+        if 'Video Capture' not in caps:
             continue
 
         name = "Unknown"
@@ -178,7 +178,8 @@ def _enumerate_ext_cameras() -> list[dict]:
                 env={**os.environ, 'LC_ALL': 'C'},
             )
             fmt_probe_ok = True
-            formats = re.findall(r"'\s*([A-Z0-9]{4})\s*'", fmt_out)
+            formats = list(dict.fromkeys(f.rstrip() for f in re.findall(
+                r"\[\d+\]:\s*'([^']{4})'", fmt_out)))
             for line in fmt_out.splitlines():
                 m = re.search(r'Size: Discrete (\d+x\d+)', line)
                 if m and m.group(1) not in resolutions:
@@ -189,6 +190,15 @@ def _enumerate_ext_cameras() -> list[dict]:
         # Probe succeeded but no formats → secondary/metadata node, not usable for capture
         if fmt_probe_ok and not formats:
             continue
+
+        # The RealSense stereo module exposes depth/IR formats (including UYVY
+        # on IR nodes). Accept verified color formats, never an unprobed node.
+        if is_realsense:
+            if not set(formats).intersection({'YUYV', 'MJPG', 'RGB3', 'BGR3'}):
+                continue
+            if set(formats).intersection({'Z16', 'GREY', 'Y8I', 'Y12I', 'Y16'}):
+                continue
+            name += ' (Color)'
 
         devices.append({"path": path, "name": name, "formats": formats, "resolutions": resolutions})
     return devices
