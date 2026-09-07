@@ -467,9 +467,15 @@ class RM75Plugin:
             current, target, speed = self._prepare_target(args)
             max_duration = self._motion_deadline_seconds(current, target, speed)
             action_id = f"rm75_movej_{uuid4().hex[:10]}"
-            self.client.command("rm_movej", target, speed, 0, 0, 0)
+            # Reserve the ID and submit under the same lock used by stopmotion.
+            # An interrupt must see either no submitted move or its actual ID.
             with self._action_lock:
                 self._active_action_id = action_id
+                try:
+                    self.client.command("rm_movej", target, speed, 0, 0, 0)
+                except Exception:
+                    self._active_action_id = None
+                    raise
             threading.Thread(
                 target=self._monitor_motion,
                 args=(action_id, current, target, max_duration),
