@@ -141,16 +141,6 @@ class Go2DeviceBundle:
             self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
             print("[bundle] ExtCameraPlugin loaded")
 
-        if any(plugins_cfg.get(name, {}).get("enabled", False)
-               for name in ("ext_depth", "ext_infrared")):
-            from realsense import RealSenseSession, ExtDepthPlugin, ExtInfraredPlugin
-            stereo = RealSenseSession(namespace)
-            for name, cls in (("ext_depth", ExtDepthPlugin),
-                              ("ext_infrared", ExtInfraredPlugin)):
-                if plugins_cfg.get(name, {}).get("enabled", False):
-                    self._plugins.append(cls(plugins_cfg[name], namespace, executor, stereo))
-                    print(f"[bundle] {cls.__name__} loaded")
-
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

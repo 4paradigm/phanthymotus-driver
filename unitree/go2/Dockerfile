@@ -33,12 +33,10 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         v4l-utils && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml netifaces numpy opencv-python-headless pyalsaaudio sounddevice
-
 # Official SDK supplies calibrated depth units and shares the stereo streams.
 # This version provides Linux ARM64 wheels for the image's CPython 3.10.
-RUN pip3 install --no-cache-dir --only-binary=:all: -i ${PYPI_MIRROR} pyrealsense2==2.56.5.9235
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=pyrealsense2 \
+    pyyaml netifaces numpy opencv-python-headless pyalsaaudio sounddevice pyrealsense2==2.56.5.9235
 
 # Build CycloneDDS 0.10.5 from source
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz

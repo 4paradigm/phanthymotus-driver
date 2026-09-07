@@ -36,5 +36,3 @@ cards:
   - { name: asr,           type: sensor }
   - { name: ext_mic,       type: sensor }
   - { name: ext_camera,    type: sensor }
-  - { name: ext_depth,     type: sensor }
-  - { name: ext_infrared,  type: sensor }
