@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import math
 import os
 from pathlib import Path
@@ -41,7 +42,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         service = (DRIVER / "deploy" / "service.yml").read_text()
         self.assertIn("RM_DRIVER_ENABLED=1", service)
         self.assertIn("RM_MOTION_ENABLED=1", service)
-        self.assertIn("RM_ARM_IP=192.168.1.18", service)
+        self.assertIn("RM_ARM_IP=${RM75_ARM_IP:-192.168.1.18}", service)
         self.assertIn("AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}", service)
         self.assertIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
         self.assertIn("network_mode: host", service)
@@ -74,6 +75,10 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         joint_control = next(item for item in tools if item["name"] == "joint_control")
         self.assertEqual("actuator", joint_control["type"])
         self.assertEqual(["set"], joint_control["inputSchema"]["x-completion"]["actions"])
+        self.assertEqual(
+            {"on_interrupt_motion": {"action": "stopmotion"}},
+            joint_control["inputSchema"]["x-hooks"],
+        )
         self.assertIs(True, joint_control["inputSchema"]["x-is-dangerous"])
         self.assertEqual(10, joint_control["inputSchema"]["properties"]["speed_percent"]["maximum"])
         self.assertNotIn("timeout_seconds", joint_control["inputSchema"]["properties"])
@@ -347,11 +352,75 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual("motion_stalled", completion["reason"])
         self.assertEqual(1, robot.stops)
 
-    def test_stopmotion_uses_vendor_slow_stop(self):
-        plugin, robot = self._motion_plugin()
-        result = plugin._stop_motion()
-        self.assertEqual("stop_requested", result["state"])
+    def test_agent_core_interrupt_hook_stops_pending_motion_through_mcp(self):
+        runtime_spec = importlib.util.spec_from_file_location(
+            "realman_interrupt_vendor_runtime", ROOT / "common" / "vendor_runtime.py"
+        )
+        runtime = importlib.util.module_from_spec(runtime_spec)
+        runtime_spec.loader.exec_module(runtime)
+        plugin, robot = self._motion_plugin(
+            current=[0.0] * 7,
+            safety={"start_grace_seconds": 60},
+        )
+        bundle = runtime.DriverBundle([plugin])
+        handler_type = runtime.make_handler(lambda: bundle, "test", "test")
+
+        def call_mcp(request_id, method, params):
+            body = json.dumps({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }).encode()
+            handler = object.__new__(handler_type)
+            handler.path = "/mcp"
+            handler.headers = {"Content-Length": str(len(body))}
+            handler.rfile = io.BytesIO(body)
+            response = {}
+            handler.send_json = lambda status, payload: response.update(
+                status=status, payload=payload
+            )
+            handler.do_POST()
+            self.assertEqual(200, response["status"])
+            return response["payload"]
+
+        listed = call_mcp(1, "tools/list", {})
+        joint_control = next(
+            item for item in listed["result"]["tools"] if item["name"] == "joint_control"
+        )
+        interrupt = joint_control["inputSchema"]["x-hooks"]["on_interrupt_motion"]
+        self.assertEqual({"action": "stopmotion"}, interrupt)
+
+        started_rpc = call_mcp(2, "tools/call", {
+            "name": "joint_control",
+            "arguments": {
+                "action": "set",
+                "joint1_deg": 1,
+                "speed_percent": 1,
+                "confirm_motion": True,
+            },
+        })
+        started = json.loads(started_rpc["result"]["content"][0]["text"])
+        self.assertEqual("running", started["state"])
+        self.assertEqual(started["action_id"], plugin._active_action_id)
+
+        stopped_rpc = call_mcp(3, "tools/call", {
+            "name": "joint_control",
+            "arguments": {"action": interrupt["action"]},
+        })
+        stopped = json.loads(stopped_rpc["result"]["content"][0]["text"])
+        self.assertEqual("stop_requested", stopped["state"])
+        self.assertEqual(started["action_id"], stopped["action_id"])
         self.assertEqual(1, robot.stops)
+
+        deadline = time.monotonic() + 1.0
+        while not plugin._acp_callback.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+        plugin._acp_callback.assert_called_once()
+        action_id, status, completion = plugin._acp_callback.call_args.args
+        self.assertEqual(started["action_id"], action_id)
+        self.assertEqual("cancelled", status)
+        self.assertEqual("stopmotion", completion["reason"])
 
 
 if __name__ == "__main__":

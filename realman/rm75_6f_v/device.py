@@ -178,6 +178,7 @@ class RM75Plugin:
             joint_properties,
         )
         schema["x-completion"] = {"actions": ["set"], "timeout": 305}
+        schema["x-hooks"] = {"on_interrupt_motion": {"action": "stopmotion"}}
         schema["x-is-dangerous"] = True
         definitions.append(tool("joint_control", "actuator", "Bounded RM75 joint motion using official API2 movej", schema))
         return definitions

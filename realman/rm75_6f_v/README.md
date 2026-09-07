@@ -9,8 +9,9 @@ Card / Agent Core -> MCP Driver -> RealMan API2 SDK -> arm controller
 ```
 
 The deployment service connects to `192.168.1.18:8080` with motion enabled by
-default. Before starting it, verify the network, physical E-stop, work area and
-joint order. Every movement still requires explicit per-call confirmation:
+default; set `RM75_ARM_IP` on the host to select a different controller. Before
+starting it, verify the network, physical E-stop, work area and joint order.
+Every movement still requires explicit per-call confirmation:
 
 ```bash
 confirm_motion=true
@@ -34,7 +35,8 @@ Driver rejects non-finite values, targets outside the
 official RM75 limits, speed above 10 percent, disabled
 joints, and any reported arm or joint error. It sends non-blocking API2
 `rm_movej`, monitors the measured joints until they reach the target, and
-supports `stopmotion` while movement is active. The card does not expose a
+registers `stopmotion` as the Agent Core `on_interrupt_motion` hook so it
+bypasses an active ACP barrier. The card does not expose a
 fixed `timeout_seconds`: after a 2-second startup grace period, the driver asks
 for a controlled slow stop and reports `motion_stalled` through ACP if the
 maximum joint error has not improved by at least 0.05 degrees for 10 seconds.
