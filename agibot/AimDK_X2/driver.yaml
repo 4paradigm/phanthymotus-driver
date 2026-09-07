@@ -31,6 +31,7 @@ cards:
   - { name: linkcraft,          type: actuator }
   - { name: pmu_led,            type: actuator }
   - { name: tts,                type: actuator }
+  - { name: speaker,            type: actuator }
   - { name: emoji,              type: actuator }
   - { name: mic_source,         type: actuator }
   - { name: slam_control,       type: actuator }

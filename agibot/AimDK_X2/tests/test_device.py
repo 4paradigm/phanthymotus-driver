@@ -44,6 +44,17 @@ class FakeSrv:
     Response = FakeMsg
 
 
+class FakeLogger:
+    def __init__(self):
+        self.warnings = []
+
+    def warning(self, message):
+        self.warnings.append(message)
+
+    def info(self, message):
+        pass
+
+
 class FakePublisher:
     def __init__(self, msg_type, topic, qos):
         self.msg_type = msg_type
@@ -100,6 +111,7 @@ class FakeNode:
         self.publishers = {}
         self.subscriptions = []
         self.clients = {}
+        self.logger = FakeLogger()
 
     def create_publisher(self, msg_type, topic, qos):
         pub = FakePublisher(msg_type, topic, qos)
@@ -107,8 +119,15 @@ class FakeNode:
         return pub
 
     def create_subscription(self, msg_type, topic, callback, qos):
-        self.subscriptions.append((topic, callback))
-        return object()
+        subscription = (topic, callback)
+        self.subscriptions.append(subscription)
+        return subscription
+
+    def destroy_subscription(self, subscription):
+        self.subscriptions.remove(subscription)
+
+    def get_logger(self):
+        return self.logger
 
     def create_client(self, srv_type, name):
         client = FakeClient(srv_type, name)
@@ -184,6 +203,7 @@ def _install_ros_stubs():
     module("aimdk_msgs")
     module(
         "aimdk_msgs.msg",
+        AudioPlayback=FakeMsg,
         CommonRequest=FakeMsg,
         HandCommand=FakeMsg,
         HandCommandArray=FakeMsg,
@@ -199,6 +219,8 @@ def _install_ros_stubs():
         "SetMcPresetMotion", "SetMicSourceRequest", "SetPmuLed",
     ]
     module("aimdk_msgs.srv", **{name: FakeSrv for name in srv_names})
+    module("audio_msgs")
+    module("audio_msgs.msg", AudioChunk=FakeMsg)
 
 
 _install_ros_stubs()
@@ -263,7 +285,7 @@ class ToolInventoryTests(unittest.TestCase):
         definitions = tool_definitions(plugins)
         expected_actuators = {
             "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command",
-            "linkcraft", "pmu_led", "tts", "emoji", "mic_source",
+            "linkcraft", "pmu_led", "tts", "speaker", "emoji", "mic_source",
         }
         by_name = {d["name"]: d["type"] for d in definitions}
         for name in expected_actuators:

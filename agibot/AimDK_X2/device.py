@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from common.vendor_runtime import action_schema, jsonable, tool
@@ -104,7 +105,7 @@ class AimdkNodes:
         from std_msgs.msg import String
         from geometry_msgs.msg import Pose
         from nav_msgs.msg import Odometry
-        from aimdk_msgs.msg import CommonRequest
+        from aimdk_msgs.msg import AudioPlayback, CommonRequest
         from aimdk_msgs.srv import (
             ExecuteActionResource, GetAllJointState, GetCurrentInputSource, GetHandType,
             GetMcAction, GetMicSourceRequest, GetRobotResources, GetStoredMapByName,
@@ -122,6 +123,7 @@ class AimdkNodes:
         self._JointCommand = JointCommand
         self._JointCommandArray = JointCommandArray
         self._McLocomotionVelocity = McLocomotionVelocity
+        self._AudioPlayback = AudioPlayback
 
         self.config = config
         self.end_effector = str(config.get("end_effector", "hand")).lower()
@@ -180,6 +182,13 @@ class AimdkNodes:
         }
         self.hand_command_pub = self.robot.create_publisher(HandCommandArray, "/aima/hal/joint/hand/command", 10)
         self.locomotion_pub = self.robot.create_publisher(McLocomotionVelocity, "/aima/mc/locomotion/velocity", 10)
+        # The vendor's live /aima/hal/audio/playback subscriber is RELIABLE/VOLATILE.
+        # rclpy's integer-depth shorthand has those same defaults.  This publisher has no
+        # side effect by itself: SpeakerPlugin publishes only after an explicit start and an
+        # actual PCM frame arriving from the canvas-connected input topic.
+        self.audio_playback_pub = self.robot.create_publisher(
+            AudioPlayback, "/aima/hal/audio/playback", 10,
+        )
 
         def client(srv_type, name):
             return self.robot.create_client(srv_type, name)
@@ -1089,6 +1098,152 @@ class SlamControlPlugin:
         return {"state": "published", "topic": "/integrated_command", "command": string_msg.data}
 
 
+class SpeakerPlugin:
+    """Bridge a canvas ``audio/pcm-16k`` stream to AimDK's raw audio playback topic.
+
+    This intentionally does not reuse X2's text-based ``tts`` service.  The card receives
+    the common AudioChunk stream from Perception TTS on the Agent Core DDS domain, validates
+    it, then publishes the vendor-defined AudioPlayback message on the robot DDS domain.
+    """
+
+    AUDIO_FORMAT = "audio/pcm-16k"
+    SAMPLE_RATE_HZ = 16000
+    CHANNELS = 1
+    SAMPLE_FORMAT = "S16_LE"
+    CODING_FORMAT = "pcm"
+    AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
+
+    def __init__(self, nodes, namespace):
+        from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+
+        self.nodes = nodes
+        self._namespace = namespace
+        self._subscription = None
+        self._topic = None
+        self._token_id = ""
+        self._state = "idle"
+        self._forwarded_chunks = 0
+        self._dropped_chunks = 0
+        self._utterances_finished = 0
+        # Perception TTS uses BEST_EFFORT to keep latency low.  A RELIABLE reader would be
+        # QoS-incompatible and receive no frames, so match its reliability explicitly.
+        self._input_qos = QoSProfile(
+            depth=200, reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        )
+
+    def get_tool(self):
+        return {
+            "name": "speaker",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "X2 speaker — forwards canvas audio/pcm-16k to AimDK raw audio playback",
+            "inputSchema": action_schema(
+                {
+                    "start": (["input_topic"], "订阅画布连接的 audio/pcm-16k 输入并转发到机器人扬声器"),
+                    "stop": ([], "停止接收后续音频数据"),
+                    "info": ([], "查看订阅与转发状态"),
+                },
+                {
+                    "input_topic": {
+                        "type": "string",
+                        "description": "画布连接提供的 audio/pcm-16k ROS 2 Topic",
+                    },
+                },
+            ),
+            "topic_in": [{"format": self.AUDIO_FORMAT}],
+            # README_dev.md defines mouth as the physical resource for speaker/tts output.
+            "x-resource": "mouth",
+        }
+
+    def start(self):
+        pass
+
+    def _unsubscribe(self):
+        if self._subscription is not None:
+            self.nodes.core.destroy_subscription(self._subscription)
+            self._subscription = None
+        self._topic = None
+
+    def stop(self):
+        # Do not publish a synthetic empty AudioPlayback packet here.  The SDK documents that
+        # changing token_id clears its playback cache, but it does not document an empty packet
+        # as a valid cache-clear request.  Until that is verified on hardware, stop means no
+        # further input is forwarded rather than making up a raw-audio stop protocol.
+        self._unsubscribe()
+        self._state = "idle"
+
+    def _start(self, topic):
+        from audio_msgs.msg import AudioChunk
+
+        if not isinstance(topic, str) or not topic:
+            raise ValueError("speaker: start requires a non-empty input_topic")
+        self._unsubscribe()
+        self._token_id = uuid.uuid4().hex
+        self._subscription = self.nodes.core.create_subscription(
+            AudioChunk, topic, self._on_chunk, self._input_qos,
+        )
+        self._topic = topic
+        self._state = "ready"
+        return {"state": self._state, "topic_in": [{"topic": topic, "format": self.AUDIO_FORMAT}]}
+
+    def _on_chunk(self, msg):
+        if msg.format != self.AUDIO_FORMAT:
+            self._dropped_chunks += 1
+            self.nodes.core.get_logger().warning(
+                f"[speaker] dropped unsupported format: {msg.format!r}",
+            )
+            return
+        pcm = bytes(msg.data)
+        if pcm == self.AUDIO_EOF_MAGIC:
+            # The marker belongs to the PhanthyMotus audio-stream contract; it is not PCM to
+            # send to the vendor speaker.  There is no verified AimDK end-of-stream packet.
+            self._utterances_finished += 1
+            self._state = "ready"
+            return
+        if not pcm or len(pcm) % 2:
+            self._dropped_chunks += 1
+            self.nodes.core.get_logger().warning(
+                f"[speaker] dropped invalid PCM-16 frame ({len(pcm)} bytes)",
+            )
+            return
+
+        playback = self.nodes._AudioPlayback()
+        playback.stamps = self.nodes.robot.get_clock().now().to_msg()
+        playback.info.channels = self.CHANNELS
+        playback.info.sample_rate = self.SAMPLE_RATE_HZ
+        playback.info.size = len(pcm)
+        playback.info.sample_format = self.SAMPLE_FORMAT
+        playback.info.coding_format = self.CODING_FORMAT
+        playback.data.data = list(pcm)
+        # AudioPlayback requires a source identifier.  This comes from the configured X2
+        # ROS namespace, not from a Q5/vendor-specific package name.
+        playback.pkg_name = f"{self._namespace}_speaker"
+        playback.token_id = self._token_id
+        self.nodes.audio_playback_pub.publish(playback)
+        self._forwarded_chunks += 1
+        self._state = "playing"
+
+    def dispatch(self, action, args):
+        if action == "start":
+            if not args.get("input_topic"):
+                return {"state": "ready", "topic_in": [{"format": self.AUDIO_FORMAT}]}
+            return self._start(args.get("input_topic"))
+        if action == "stop":
+            self.stop()
+            return {"state": self._state}
+        if action == "info":
+            return {
+                "state": self._state,
+                "topic_in": ([{"topic": self._topic, "format": self.AUDIO_FORMAT}]
+                             if self._topic else [{"format": self.AUDIO_FORMAT}]),
+                "forwarded_chunks": self._forwarded_chunks,
+                "dropped_chunks": self._dropped_chunks,
+                "utterances_finished": self._utterances_finished,
+                "stop_behavior": "stops forwarding; raw-playback queue flush is not yet hardware-verified",
+            }
+        raise ValueError(f"speaker: unknown action {action!r}")
+
+
 class MapGetPlugin:
     def __init__(self, nodes):
         self.nodes = nodes
@@ -1139,6 +1294,7 @@ def build_plugins(config, namespace, ros2):
         McModePlugin(nodes), LocomotionPlugin(nodes), PresetMotionPlugin(nodes),
         JointCommandPlugin(nodes), HandCommandPlugin(nodes), LinkcraftPlugin(nodes),
         PmuLedPlugin(nodes), TtsPlugin(nodes), EmojiPlugin(nodes), MicSourcePlugin(nodes),
+        SpeakerPlugin(nodes, namespace),
         MapGetPlugin(nodes),
     ]
     if enabled("slam", default=False):
