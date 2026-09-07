@@ -357,6 +357,75 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
 
 
+class SpeakerPluginTests(unittest.TestCase):
+    def setUp(self):
+        self.plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"speaker": {"enabled": True}}})
+        self.speaker = find_plugin(self.plugins, "speaker")
+        self.nodes = self.speaker.nodes
+
+    def test_card_declares_pcm_input_and_mouth_resource(self):
+        definition = self.speaker.get_tool()
+        self.assertEqual(definition["topic_in"], [{"format": "audio/pcm-16k"}])
+        self.assertEqual(definition["x-resource"], "mouth")
+        self.assertEqual(definition["inputSchema"]["x-action-params"]["start"]["params"], ["input_topic"])
+
+    def test_valid_pcm_chunk_is_mapped_to_vendor_playback(self):
+        result = self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(self.nodes.core.subscriptions[-1][0], "/canvas/tts")
+        self.assertEqual(self.nodes.audio_playback_pub.published, [])
+
+        chunk = FakeMsg()
+        chunk.format = "audio/pcm-16k"
+        chunk.data = [1, 0, 255, 255]
+        self.speaker._on_chunk(chunk)
+
+        sent = self.nodes.audio_playback_pub.published[-1]
+        self.assertEqual(sent.stamps, "stamp")
+        self.assertEqual(sent.info.channels, 1)
+        self.assertEqual(sent.info.sample_rate, 16000)
+        self.assertEqual(sent.info.size, 4)
+        self.assertEqual(sent.info.sample_format, "S16_LE")
+        self.assertEqual(sent.info.coding_format, "pcm")
+        self.assertEqual(sent.data.data, [1, 0, 255, 255])
+        self.assertEqual(sent.pkg_name, "test_ns_speaker")
+        self.assertTrue(sent.token_id)
+
+    def test_eof_invalid_frame_and_stop_do_not_publish_extra_audio(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        eof = FakeMsg()
+        eof.format = "audio/pcm-16k"
+        eof.data = list(device.SpeakerPlugin.AUDIO_EOF_MAGIC)
+        self.speaker._on_chunk(eof)
+
+        invalid = FakeMsg()
+        invalid.format = "audio/pcm-16k"
+        invalid.data = [1]
+        self.speaker._on_chunk(invalid)
+        self.assertEqual(self.nodes.audio_playback_pub.published, [])
+        self.assertEqual(self.speaker.dispatch("info", {})["utterances_finished"], 1)
+        self.assertEqual(self.speaker.dispatch("info", {})["dropped_chunks"], 1)
+
+        self.speaker.dispatch("stop", {})
+        self.assertEqual(self.nodes.core.subscriptions, [])
+        self.assertEqual(self.speaker.dispatch("info", {})["state"], "idle")
+
+    def test_invalid_audio_warning_is_throttled(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        invalid = FakeMsg()
+        invalid.format = "not-pcm"
+        invalid.data = [1, 0]
+        for _ in range(101):
+            self.speaker._on_chunk(invalid)
+        self.assertEqual(self.speaker.dispatch("info", {})["dropped_chunks"], 101)
+        self.assertEqual(len(self.nodes.core.logger.warnings), 2)
+
+    def test_speaker_respects_enabled_switch(self):
+        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"speaker": {"enabled": False}}})
+        names = {definition["name"] for definition in tool_definitions(plugins)}
+        self.assertNotIn("speaker", names)
+
+
 class StartStopLifecycleTests(unittest.TestCase):
     """README_dev.md's 'start/stop in dispatch (Required)' rule: the canvas UI calls every
     tool with {"action": "start"} the moment its card is placed, and {"action": "stop"} when

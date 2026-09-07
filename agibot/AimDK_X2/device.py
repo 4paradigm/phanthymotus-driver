@@ -1186,12 +1186,18 @@ class SpeakerPlugin:
         self._state = "ready"
         return {"state": self._state, "topic_in": [{"topic": topic, "format": self.AUDIO_FORMAT}]}
 
+    def _drop_chunk(self, reason):
+        self._dropped_chunks += 1
+        # A malformed stream arrives at audio-frame cadence.  Keep counters for diagnosis,
+        # but write only the first rejection and every 100th to avoid exhausting Docker logs.
+        if self._dropped_chunks == 1 or self._dropped_chunks % 100 == 0:
+            self.nodes.core.get_logger().warning(
+                f"[speaker] dropped {self._dropped_chunks} invalid chunk(s); latest: {reason}",
+            )
+
     def _on_chunk(self, msg):
         if msg.format != self.AUDIO_FORMAT:
-            self._dropped_chunks += 1
-            self.nodes.core.get_logger().warning(
-                f"[speaker] dropped unsupported format: {msg.format!r}",
-            )
+            self._drop_chunk(f"unsupported format {msg.format!r}")
             return
         pcm = bytes(msg.data)
         if pcm == self.AUDIO_EOF_MAGIC:
@@ -1201,10 +1207,7 @@ class SpeakerPlugin:
             self._state = "ready"
             return
         if not pcm or len(pcm) % 2:
-            self._dropped_chunks += 1
-            self.nodes.core.get_logger().warning(
-                f"[speaker] dropped invalid PCM-16 frame ({len(pcm)} bytes)",
-            )
+            self._drop_chunk(f"invalid PCM-16 frame ({len(pcm)} bytes)")
             return
 
         playback = self.nodes._AudioPlayback()
@@ -1294,9 +1297,10 @@ def build_plugins(config, namespace, ros2):
         McModePlugin(nodes), LocomotionPlugin(nodes), PresetMotionPlugin(nodes),
         JointCommandPlugin(nodes), HandCommandPlugin(nodes), LinkcraftPlugin(nodes),
         PmuLedPlugin(nodes), TtsPlugin(nodes), EmojiPlugin(nodes), MicSourcePlugin(nodes),
-        SpeakerPlugin(nodes, namespace),
         MapGetPlugin(nodes),
     ]
+    if enabled("speaker"):
+        plugins.insert(-1, SpeakerPlugin(nodes, namespace))
     if enabled("slam", default=False):
         plugins.append(SlamControlPlugin(nodes))
     return plugins
