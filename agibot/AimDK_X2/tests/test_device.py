@@ -349,6 +349,10 @@ class DispatchSmokeTests(unittest.TestCase):
         result = hand_command.dispatch("open", {})
 
         self.assertEqual(result["state"], "published")
+        self.assertEqual(
+            hand_command.nodes.get_hand_type.last_request.request.header.stamp,
+            "stamp",
+        )
         sent = hand_command.nodes.hand_command_pub.published[-1]
         self.assertEqual(sent.left_hand_type.value, 1)
         self.assertEqual(sent.right_hand_type.value, 3)
@@ -365,6 +369,19 @@ class DispatchSmokeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not controllable"):
             hand_command.dispatch("close", {})
         self.assertEqual(hand_command.nodes.hand_command_pub.published, [])
+
+    def test_hand_command_rejects_error_and_unknown_hand_types_without_publishing(self):
+        for hand_type in (255, 99):
+            with self.subTest(hand_type=hand_type):
+                plugins = build_bundle_plugins()
+                hand_command = find_plugin(plugins, "hand_command")
+                hand_command.nodes.get_hand_type.response = FakeMsg()
+                hand_command.nodes.get_hand_type.response.left_hands_type.value = hand_type
+                hand_command.nodes.get_hand_type.response.right_hands_type.value = hand_type
+
+                with self.assertRaisesRegex(ValueError, "not controllable"):
+                    hand_command.dispatch("close", {})
+                self.assertEqual(hand_command.nodes.hand_command_pub.published, [])
 
 
 class StartStopLifecycleTests(unittest.TestCase):
