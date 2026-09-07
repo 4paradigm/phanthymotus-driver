@@ -8,8 +8,11 @@ safety:
   max_speed_percent: 10
   default_speed_percent: 5
   target_tolerance_deg: 0.5
-  motion_timeout_seconds: 30
   poll_interval_seconds: 0.2
+  start_grace_seconds: 2
+  stall_timeout_seconds: 10
+  progress_threshold_deg: 0.05
+  max_motion_seconds: 300
 ros:
   robot_domain_id: 42
   core_domain_id: 42

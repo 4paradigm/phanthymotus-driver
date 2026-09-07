@@ -18,6 +18,7 @@ SDK_LIBRARY_PATH = Path("/work/Robotic_Arm/libs/linux_arm/libapi_c.so")
 JOINT_LIMITS_DEG = [(-178.0, 178.0), (-130.0, 130.0), (-178.0, 178.0),
                     (-135.0, 135.0), (-178.0, 178.0), (-128.0, 128.0),
                     (-360.0, 360.0)]
+JOINT_MAX_SPEED_DEG_S = [180.0, 180.0, 225.0, 225.0, 225.0, 225.0, 225.0]
 
 
 def _sdk_result(name, result):
@@ -124,8 +125,11 @@ class RM75Plugin:
         self.max_speed_percent = min(int(safety.get("max_speed_percent", 10)), 10)
         self.default_speed_percent = min(int(safety.get("default_speed_percent", 5)), self.max_speed_percent)
         self.target_tolerance_deg = float(safety.get("target_tolerance_deg", 0.5))
-        self.default_timeout_seconds = float(safety.get("motion_timeout_seconds", 30.0))
         self.poll_interval_seconds = float(safety.get("poll_interval_seconds", 0.2))
+        self.start_grace_seconds = float(safety.get("start_grace_seconds", 2.0))
+        self.stall_timeout_seconds = float(safety.get("stall_timeout_seconds", 10.0))
+        self.progress_threshold_deg = float(safety.get("progress_threshold_deg", 0.05))
+        self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
         self._motion_lock = threading.Lock()
         self._active_action_id = None
         self._cancelled = set()
@@ -140,28 +144,25 @@ class RM75Plugin:
         joint_properties = {
             f"joint{i}_deg": {
                 "type": "number", "minimum": low, "maximum": high,
-                "description": f"Optional absolute J{i} target in degrees; omitted keeps its current position",
+                "description": f"[{low:g}°, {high:g}°]",
             }
             for i, (low, high) in enumerate(JOINT_LIMITS_DEG, 1)
         }
         joint_properties.update({
             "speed_percent": {"type": "integer", "minimum": 1, "maximum": self.max_speed_percent,
                               "default": self.default_speed_percent},
-            "timeout_seconds": {"type": "number", "minimum": 2, "maximum": 60,
-                                "default": self.default_timeout_seconds,
-                                "description": "Maximum time to wait for arrival before requesting a slow stop"},
             "confirm_motion": {"type": "boolean", "description": "Must be true for every movement request"},
         })
         schema = action_schema(
             {
-                "set": ([*(f"joint{i}_deg" for i in range(1, 8)), "speed_percent", "timeout_seconds", "confirm_motion"],
+                "set": ([*(f"joint{i}_deg" for i in range(1, 8)), "speed_percent", "confirm_motion"],
                         "Send absolute joint targets in degrees; omitted joints keep their current positions"),
                 "stopmotion": ([], "Request a controlled trajectory stop"),
                 "info": ([], "Read motion safety and active-action status"),
             },
             joint_properties,
         )
-        schema["x-completion"] = {"actions": ["set"], "timeout": 65}
+        schema["x-completion"] = {"actions": ["set"], "timeout": 305}
         schema["x-is-dangerous"] = True
         definitions.append(tool("joint_control", "actuator", "Bounded RM75 joint motion using official API2 movej", schema))
         return definitions
@@ -183,6 +184,12 @@ class RM75Plugin:
             "active_action_id": self._active_action_id,
             "limits_deg": JOINT_LIMITS_DEG,
             "max_speed_percent": self.max_speed_percent,
+            "watchdog": {
+                "start_grace_seconds": self.start_grace_seconds,
+                "stall_timeout_seconds": self.stall_timeout_seconds,
+                "progress_threshold_deg": self.progress_threshold_deg,
+                "max_motion_seconds": self.max_motion_seconds,
+            },
         }
 
     def _preflight(self):
@@ -232,10 +239,14 @@ class RM75Plugin:
         speed = int(args.get("speed_percent", self.default_speed_percent))
         if not 1 <= speed <= self.max_speed_percent:
             raise ValueError(f"speed_percent must be within [1, {self.max_speed_percent}]")
-        timeout = float(args.get("timeout_seconds", self.default_timeout_seconds))
-        if not math.isfinite(timeout) or not 2 <= timeout <= 60:
-            raise ValueError("timeout_seconds must be finite and within [2, 60]")
-        return current, target, speed, timeout
+        return current, target, speed
+
+    def _motion_deadline_seconds(self, start, target, speed_percent):
+        estimates = [
+            abs(expected - actual) / (maximum * speed_percent / 100.0)
+            for actual, expected, maximum in zip(start, target, JOINT_MAX_SPEED_DEG_S)
+        ]
+        return min(self.max_motion_seconds, max(30.0, max(estimates, default=0.0) * 3.0 + 10.0))
 
     def _acp_callback(self, action_id, status, result):
         import json
@@ -254,8 +265,11 @@ class RM75Plugin:
         except Exception as exc:
             print(f"[rm75] ACP callback failed for {action_id}: {exc}", flush=True)
 
-    def _monitor_motion(self, action_id, target, timeout):
-        deadline = time.monotonic() + timeout
+    def _monitor_motion(self, action_id, start, target, max_duration):
+        started = time.monotonic()
+        deadline = started + max_duration
+        last_progress = started + self.start_grace_seconds
+        best_error = max(abs(actual - expected) for actual, expected in zip(start, target))
         status, result = "error", {"reason": "unknown"}
         try:
             while time.monotonic() < deadline:
@@ -265,14 +279,32 @@ class RM75Plugin:
                 self._preflight()
                 current = [float(value) for value in self.client.call("rm_get_joint_degree")]
                 error = max(abs(actual - expected) for actual, expected in zip(current, target))
+                now = time.monotonic()
                 if error <= self.target_tolerance_deg:
                     status = "completed"
-                    result = {"target_degree": target, "actual_degree": current, "max_error_deg": error}
+                    result = {"target_degree": target, "actual_degree": current,
+                              "max_error_deg": error, "elapsed_seconds": now - started}
+                    break
+                if best_error - error >= self.progress_threshold_deg:
+                    best_error = error
+                    last_progress = now
+                elif now >= started + self.start_grace_seconds and now - last_progress >= self.stall_timeout_seconds:
+                    self.client.command("rm_set_arm_slow_stop")
+                    result = {
+                        "reason": "motion_stalled",
+                        "stall_seconds": self.stall_timeout_seconds,
+                        "target_degree": target,
+                        "actual_degree": current,
+                        "max_error_deg": error,
+                        "elapsed_seconds": now - started,
+                    }
                     break
                 time.sleep(self.poll_interval_seconds)
             else:
                 self.client.command("rm_set_arm_slow_stop")
-                result = {"reason": "timeout", "timeout_seconds": timeout}
+                result = {"reason": "motion_deadline_exceeded",
+                          "max_motion_seconds": max_duration,
+                          "elapsed_seconds": time.monotonic() - started}
         except Exception as exc:
             try:
                 self.client.command("rm_set_arm_slow_stop")
@@ -295,13 +327,19 @@ class RM75Plugin:
             raise RuntimeError(f"another motion is active: {self._active_action_id}")
         try:
             self._preflight()
-            current, target, speed, timeout = self._prepare_target(args)
+            current, target, speed = self._prepare_target(args)
+            max_duration = self._motion_deadline_seconds(current, target, speed)
             action_id = f"rm75_movej_{uuid4().hex[:10]}"
             self.client.command("rm_movej", target, speed, 0, 0, 0)
             self._active_action_id = action_id
-            threading.Thread(target=self._monitor_motion, args=(action_id, target, timeout), daemon=True).start()
-            return {"status": "executing", "action_id": action_id, "start_degree": current,
-                    "target_degree": target, "speed_percent": speed, "timeout_seconds": timeout}
+            threading.Thread(
+                target=self._monitor_motion,
+                args=(action_id, current, target, max_duration),
+                daemon=True,
+            ).start()
+            return {"state": "running", "action_id": action_id, "start_degree": current,
+                    "target_degree": target, "speed_percent": speed,
+                    "max_motion_seconds": max_duration}
         except Exception:
             self._motion_lock.release()
             raise
