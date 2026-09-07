@@ -20,10 +20,12 @@ confirm_motion=true
 Available tools are:
 
 - `connection`: SDK connection state.
-- `joint_states`: seven joint angles in radians, plus raw SDK degrees.
+- `joint_states`: seven joint angles in radians, plus raw SDK degrees; also
+  publishes a 10 Hz `sensor/skeleton` stream for the Canvas URDF renderer.
 - `robot_info`, `software_info`, `arm_all_state`, `controller_state`: read-only
   API2 queries.
-- `model`: simplified RM75-6F-V URDF for skeleton display.
+- `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
+  movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
 
 The deployment enables its motion capability, and every `set` call must still
@@ -72,7 +74,10 @@ HTTPS callbacks verify the Agent Core hostname and certificate using
 After a successful ACP callback, the Driver also sends a display-only
 `canvas_action_complete` event through Agent Core's existing `/api/event`
 endpoint so direct Canvas card calls show a terminal `TRIGGER`. Set
-`RM75_AGENT_CORE_TOKEN` when Agent Core API authentication is enabled.
+`RM75_AGENT_CORE_TOKEN` when Agent Core API authentication is enabled; the
+shared registration request and both RM75 completion requests then send the
+same Bearer token. Registration authentication adds no dependency or material
+image growth to the shared runtime.
 
 The component installs `python3-yaml` because the shared runtime loads
 `config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared runtime

@@ -277,6 +277,8 @@ def start_registration(port: int, config: dict, driver_id: str) -> None:
     import urllib.request
 
     url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    token = os.environ.get("AGENT_CORE_TOKEN", "").strip()
+    ca_cert = os.environ.get("AGENT_CORE_CA_CERT", "").strip()
     payload = json.dumps({
         "id": driver_id,
         "name": config.get("name", driver_id),
@@ -284,14 +286,23 @@ def start_registration(port: int, config: dict, driver_id: str) -> None:
         "transport": "http",
         "category": "driver",
     }).encode()
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
+    context = ssl.create_default_context(cafile=ca_cert) if ca_cert else ssl.create_default_context()
+    if not ca_cert:
+        # Preserve the existing registration behavior for deployments that do
+        # not yet provide a CA. RM75 provides one and therefore verifies the
+        # endpoint before sending its optional Bearer credential.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
     def loop():
         while True:
             try:
-                request = urllib.request.Request(f"{url}/api/mcp", data=payload, headers={"Content-Type": "application/json"}, method="POST")
+                request = urllib.request.Request(
+                    f"{url}/api/mcp", data=payload, headers=headers, method="POST"
+                )
                 with urllib.request.urlopen(request, timeout=3, context=context):
                     pass
                 time.sleep(30)

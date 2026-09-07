@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -68,7 +69,8 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         client.start()
         self.assertEqual("disabled", client.status()["state"])
         self.assertFalse(client.motion_enabled)
-        tools = self.device.RM75Plugin(client, {}).get_tools()
+        plugin = self.device.RM75Plugin(client, {}, namespace="test_robot")
+        tools = plugin.get_tools()
         self.assertEqual(
             {"connection", "joint_states", "model", "robot_info", "software_info", "arm_all_state", "controller_state", "joint_control"},
             {item["name"].split(".")[-1] for item in tools},
@@ -84,12 +86,60 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual(10, joint_control["inputSchema"]["properties"]["speed_percent"]["maximum"])
         self.assertNotIn("timeout_seconds", joint_control["inputSchema"]["properties"])
         self.assertEqual(305, joint_control["inputSchema"]["x-completion"]["timeout"])
+        joint_states = next(item for item in tools if item["name"] == "joint_states")
+        expected_topic_out = [
+            {"topic": "/test_robot/state/joints", "format": "sensor/skeleton"}
+        ]
+        self.assertEqual(expected_topic_out, joint_states["topic_out"])
+        self.assertEqual(
+            expected_topic_out,
+            plugin.dispatch("info", {"_tool_name": "joint_states"})["topic_out"],
+        )
         descriptions = {
             name: joint_control["inputSchema"]["properties"][name]["description"]
             for name in (f"joint{i}_deg" for i in range(1, 8))
         }
         for index, (low, high) in enumerate(self.device.JOINT_LIMITS_DEG, 1):
             self.assertEqual(f"[{low:g}°, {high:g}°]", descriptions[f"joint{index}_deg"])
+
+    def test_registration_uses_agent_core_bearer_token(self):
+        runtime_spec = importlib.util.spec_from_file_location(
+            "realman_registration_vendor_runtime", ROOT / "common" / "vendor_runtime.py"
+        )
+        runtime = importlib.util.module_from_spec(runtime_spec)
+        runtime_spec.loader.exec_module(runtime)
+        captured = {}
+
+        class DeferredThread:
+            def __init__(self, target, **kwargs):
+                captured["target"] = target
+                captured["thread_kwargs"] = kwargs
+
+            def start(self):
+                captured["started"] = True
+
+        with mock.patch.dict(os.environ, {
+                "AGENT_CORE_URL": "https://phanthy-motus:15678",
+                "AGENT_CORE_TOKEN": "registration-secret",
+                "AGENT_CORE_CA_CERT": "/agent-core-ca.pem",
+            }, clear=True), mock.patch.object(runtime.threading, "Thread", DeferredThread), \
+                mock.patch("ssl.create_default_context", return_value=object()) as create_context:
+            runtime.start_registration(15718, {"name": "RM75"}, "rm75-driver")
+
+        with mock.patch("urllib.request.urlopen") as urlopen, \
+                mock.patch("time.sleep", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                captured["target"]()
+
+        self.assertTrue(captured["started"])
+        create_context.assert_called_once_with(cafile="/agent-core-ca.pem")
+        request = urlopen.call_args.args[0]
+        self.assertEqual("https://phanthy-motus:15678/api/mcp", request.full_url)
+        self.assertEqual(
+            "Bearer registration-secret",
+            request.get_header("Authorization"),
+        )
+        self.assertEqual("rm75-driver", json.loads(request.data)["id"])
 
     def test_enabled_driver_reports_missing_host_sdk_mount(self):
         with mock.patch.dict(os.environ, {"RM_DRIVER_ENABLED": "1", "RM_ARM_IP": "192.0.2.1"}, clear=True):
@@ -142,6 +192,44 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertAlmostEqual(math.pi / 2, result["position"][1])
         self.assertAlmostEqual(-math.pi, result["position"][4])
         self.assertEqual("rad", result["position_unit"])
+
+    def test_skeleton_publisher_uses_urdf_joint_names_and_radians(self):
+        class Handle:
+            id = 1
+
+        class Robot:
+            def rm_get_joint_degree(self):
+                return 0, [0, 90, -90, 45, -45, 180, -180]
+
+        class StringMessage:
+            def __init__(self):
+                self.data = ""
+
+        client = self.device.RM75SDKClient({"arm_ip": "192.0.2.1", "tcp_port": 8080})
+        client._handle = Handle()
+        client._robot = Robot()
+        plugin = self.device.RM75Plugin(client, {}, namespace="test_robot")
+        plugin._skeleton_pub = mock.Mock()
+        plugin._skeleton_message_type = StringMessage
+
+        plugin._publish_skeleton()
+
+        message = plugin._skeleton_pub.publish.call_args.args[0]
+        payload = json.loads(message.data)
+        self.assertEqual("sensor/skeleton", payload["format"])
+        self.assertEqual("rad", payload["position_unit"])
+        self.assertEqual(7, payload["joint_count"])
+        self.assertEqual(self.device.JOINT_NAMES, [joint["name"] for joint in payload["joints"]])
+        self.assertEqual(list(range(7)), [joint["idx"] for joint in payload["joints"]])
+        self.assertAlmostEqual(math.pi / 2, payload["joints"][1]["q"])
+        self.assertAlmostEqual(-math.pi, payload["joints"][6]["q"])
+        urdf = ET.parse(DRIVER / "resource" / "rm75_6f_v.urdf").getroot()
+        movable_names = [
+            joint.attrib["name"]
+            for joint in urdf.findall("joint")
+            if joint.attrib.get("type") != "fixed"
+        ]
+        self.assertEqual(movable_names, [joint["name"] for joint in payload["joints"]])
 
     def test_sdk_error_is_not_returned_as_sensor_data(self):
         with self.assertRaisesRegex(RuntimeError, "code 5"):
@@ -460,6 +548,28 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual(started["action_id"], action_id)
         self.assertEqual("cancelled", status)
         self.assertEqual("stopmotion", completion["reason"])
+
+    def test_stopmotion_marks_cancelled_before_sdk_stop_and_retains_it_on_failure(self):
+        plugin, robot = self._motion_plugin(current=[0.0] * 7)
+        action_id = "rm75_movej_stop_race"
+        plugin._active_action_id = action_id
+        observed = {}
+
+        def failing_stop():
+            acquired = plugin._action_lock.acquire(blocking=False)
+            if acquired:
+                plugin._action_lock.release()
+            observed["action_lock_held"] = not acquired
+            observed["cancelled_before_sdk"] = action_id in plugin._cancelled
+            return 9
+
+        robot.rm_set_arm_slow_stop = failing_stop
+        with self.assertRaisesRegex(RuntimeError, "SDK code 9"):
+            plugin._stop_motion()
+
+        self.assertTrue(observed["action_lock_held"])
+        self.assertTrue(observed["cancelled_before_sdk"])
+        self.assertIn(action_id, plugin._cancelled)
 
 
 if __name__ == "__main__":
