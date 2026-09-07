@@ -346,7 +346,7 @@ class DispatchSmokeTests(unittest.TestCase):
         hand_command.nodes.get_hand_type.response.left_hands_type.value = 1
         hand_command.nodes.get_hand_type.response.right_hands_type.value = 3
 
-        result = hand_command.dispatch("open", {})
+        result = hand_command.dispatch("open", {"side": "both"})
 
         self.assertEqual(result["state"], "published")
         self.assertEqual(
@@ -367,7 +367,7 @@ class DispatchSmokeTests(unittest.TestCase):
         hand_command.nodes.get_hand_type.response.right_hands_type.value = 0
 
         with self.assertRaisesRegex(ValueError, "not controllable"):
-            hand_command.dispatch("close", {})
+            hand_command.dispatch("close", {"side": "both"})
         self.assertEqual(hand_command.nodes.hand_command_pub.published, [])
 
     def test_hand_command_rejects_error_and_unknown_hand_types_without_publishing(self):
@@ -380,8 +380,38 @@ class DispatchSmokeTests(unittest.TestCase):
                 hand_command.nodes.get_hand_type.response.right_hands_type.value = hand_type
 
                 with self.assertRaisesRegex(ValueError, "not controllable"):
-                    hand_command.dispatch("close", {})
+                    hand_command.dispatch("close", {"side": "both"})
                 self.assertEqual(hand_command.nodes.hand_command_pub.published, [])
+
+    def test_hand_command_can_target_a_controllable_right_hand(self):
+        plugins = build_bundle_plugins()
+        hand_command = find_plugin(plugins, "hand_command")
+        hand_command.nodes.get_hand_type.response = FakeMsg()
+        hand_command.nodes.get_hand_type.response.left_hands_type.value = 0
+        hand_command.nodes.get_hand_type.response.right_hands_type.value = 3
+
+        result = hand_command.dispatch("open", {"side": "right"})
+
+        self.assertEqual(result["state"], "published")
+        self.assertEqual(result["left_count"], 0)
+        self.assertEqual(result["right_count"], 5)
+        sent = hand_command.nodes.hand_command_pub.published[-1]
+        self.assertEqual(sent.left_hands, [])
+        self.assertEqual(len(sent.right_hands), 5)
+
+    def test_hand_command_get_state_reports_current_hand_types(self):
+        plugins = build_bundle_plugins()
+        hand_command = find_plugin(plugins, "hand_command")
+        hand_command.nodes.get_hand_type.response = FakeMsg()
+        hand_command.nodes.get_hand_type.response.left_hands_type.value = 0
+        hand_command.nodes.get_hand_type.response.right_hands_type.value = 3
+
+        result = hand_command.dispatch("get_state", {})
+
+        self.assertEqual(result["left_hand_type"], "none")
+        self.assertEqual(result["left_hand_type_value"], 0)
+        self.assertEqual(result["right_hand_type"], "leisai_nimble_hands")
+        self.assertEqual(result["right_hand_type_value"], 3)
 
 
 class StartStopLifecycleTests(unittest.TestCase):
