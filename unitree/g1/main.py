@@ -112,7 +112,7 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("greet", {}).get("enabled", False):
             from device import GreetPlugin
-            self._plugins.append(GreetPlugin(plugins_cfg["greet"], namespace, executor, loco_client, audio_client, audio_lock))
+            self._plugins.append(GreetPlugin(plugins_cfg["greet"], namespace, executor, arm_client, audio_client, audio_lock))
             print("[bundle] GreetPlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False):

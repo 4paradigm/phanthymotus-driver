@@ -1209,9 +1209,11 @@ class GreetPlugin:
     """
     PREFIX = "greet"
 
+    _HIGH_WAVE_ACTION_ID = 26
+
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 loco_client, audio_client: AudioClient, audio_lock: threading.Lock):
-        self._loco = loco_client
+                 arm_client, audio_client: AudioClient, audio_lock: threading.Lock):
+        self._arm = arm_client
         self._audio = audio_client
         self._audio_lock = audio_lock  # shared lock serializing the shared AudioClient (tts/led/greet)
         self._default_text = str(plugin_config.get("default_text", "你好，欢迎光临"))
@@ -1279,8 +1281,13 @@ class GreetPlugin:
             }
         if action == "wave":
             turn = args.get("turn", False)
-            ret = self._loco.WaveHand(turn)
-            return {"ret": ret, "turn": turn}
+            ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
+            return {
+                "ret": ret,
+                "action_id": self._HIGH_WAVE_ACTION_ID,
+                "gesture": "high wave",
+                "turn": turn,
+            }
         if action == "speak":
             text = str(args.get("text", self._default_text))
             with self._audio_lock:
@@ -1318,17 +1325,22 @@ class GreetPlugin:
             if led_ret != 0:
                 raise RuntimeError(f"LedControl failed: code={led_ret}")
 
-            wave_ret = self._loco.WaveHand(turn)
+            wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
             if wave_ret != 0:
-                raise RuntimeError(f"WaveHand failed: code={wave_ret}")
+                raise RuntimeError(f"high wave failed: code={wave_ret}")
 
             with self._audio_lock:
                 tts_ret = self._audio.TtsMaker(text, self._voice)
             if tts_ret != 0:
                 raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
 
-            result = {"ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
-                      "text": text, "turn": turn}
+            result = {
+                "ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
+                "wave_action_id": self._HIGH_WAVE_ACTION_ID,
+                "wave_gesture": "high wave",
+                "text": text,
+                "turn": turn,
+            }
             status = "completed"
         except Exception as e:
             result = {"error": f"{type(e).__name__}: {e}"}
