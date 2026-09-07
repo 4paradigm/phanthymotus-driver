@@ -1325,14 +1325,14 @@ class GreetPlugin:
             if led_ret != 0:
                 raise RuntimeError(f"LedControl failed: code={led_ret}")
 
-            wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
-            if wave_ret != 0:
-                raise RuntimeError(f"high wave failed: code={wave_ret}")
-
             with self._audio_lock:
                 tts_ret = self._audio.TtsMaker(text, self._voice)
             if tts_ret != 0:
                 raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
+
+            wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
+            if wave_ret != 0:
+                raise RuntimeError(f"high wave failed: code={wave_ret}")
 
             result = {
                 "ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},

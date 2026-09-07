@@ -26,11 +26,11 @@ class AudioClient(Client):
 
     ## API Call ##
     def TtsMaker(self, text: str, speaker_id: int):
-        self.tts_index += self.tts_index
         p = {}
         p["index"] = self.tts_index
         p["text"] = text
         p["speaker_id"] = speaker_id
+        self.tts_index += 1
         parameter = json.dumps(p)
         code, data = self._Call(ROBOT_API_ID_AUDIO_TTS, parameter)
         return code
