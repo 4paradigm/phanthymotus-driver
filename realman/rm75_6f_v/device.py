@@ -268,6 +268,7 @@ class RM75Plugin:
         import json
         url = os.environ.get("AGENT_CORE_URL", "").strip().rstrip("/")
         ca_cert = os.environ.get("AGENT_CORE_CA_CERT", "").strip()
+        token = os.environ.get("AGENT_CORE_TOKEN", "").strip()
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             print(f"[rm75] ACP callback failed for {action_id}: AGENT_CORE_URL must be absolute", flush=True)
@@ -278,15 +279,43 @@ class RM75Plugin:
         if parsed.scheme == "https" and not ca_cert:
             print(f"[rm75] ACP callback failed for {action_id}: AGENT_CORE_CA_CERT is required for HTTPS", flush=True)
             return
-        context = ssl.create_default_context(cafile=ca_cert or None)
-        payload = json.dumps({"action_id": action_id, "status": status, "result": result,
-                              "tool": "joint_control", "ts": time.time()}).encode()
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         try:
+            context = ssl.create_default_context(cafile=ca_cert or None)
+            payload = json.dumps({"action_id": action_id, "status": status, "result": result,
+                                  "tool": "joint_control", "ts": time.time()}).encode()
             request = urllib.request.Request(f"{url}/api/acp/complete", data=payload,
-                                             headers={"Content-Type": "application/json"}, method="POST")
+                                             headers=headers, method="POST")
             urllib.request.urlopen(request, timeout=5, context=context).close()
         except Exception as exc:
             print(f"[rm75] ACP callback failed for {action_id}: {exc}", flush=True)
+            return
+
+        # Canvas card calls use Agent Core's direct /api/mcp/{id}/call route,
+        # which does not bridge ACP event_bus messages to /ws/motus. Mirror a
+        # display-only, empty-text event through the existing /api/event route.
+        # Its distinct type avoids a second action_complete priority event and
+        # therefore does not trigger the LLM twice.
+        try:
+            canvas_payload = json.dumps({
+                "source": "rm75_canvas",
+                "text": "",
+                "payload": {
+                    "status": status,
+                    "type": "canvas_action_complete",
+                    "action_id": action_id,
+                    "tool": "joint_control",
+                    "result": result,
+                },
+            }).encode()
+            request = urllib.request.Request(f"{url}/api/event", data=canvas_payload,
+                                             headers=headers, method="POST")
+            urllib.request.urlopen(request, timeout=5, context=context).close()
+            print(f"[rm75] Canvas completion event delivered for {action_id}: {status}", flush=True)
+        except Exception as exc:
+            print(f"[rm75] Canvas completion event failed for {action_id}: {exc}", flush=True)
 
     def _monitor_motion(self, action_id, start, target, max_duration):
         started = time.monotonic()

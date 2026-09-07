@@ -19,6 +19,7 @@ realman-rm75-6f-v:
     - RCUTILS_COLORIZED_OUTPUT=0
     - AGENT_CORE_URL=${RM75_AGENT_CORE_URL:-https://phanthy-motus:15678}
     - AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}
+    - AGENT_CORE_TOKEN=${RM75_AGENT_CORE_TOKEN:-}
     # This deployment intentionally starts connected and motion-capable.
     # Physical E-stop, clear workspace and confirm_motion=true remain mandatory.
     - RM_DRIVER_ENABLED=1
