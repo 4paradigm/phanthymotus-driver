@@ -309,7 +309,7 @@ class RM75Plugin:
     def dispatch(self, action, args):
         name = args.get("_tool_name")
         if action == "start":
-            return self.client.status()
+            return {"state": "ready" if name in ("joint_control", "model") else "running"}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":

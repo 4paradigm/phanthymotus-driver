@@ -47,5 +47,10 @@ The HTTP service listens on port `15718` and provides `/health` and `/mcp`.
 The normal Agent Core runtime still initializes its ROS/DDS transport, but robot
 communication itself goes directly through API2 TCP port `8080`.
 
-Only the Python SDK wrapper and the Linux ARM64 `libapi_c.so` are copied into
-the image. See `vendor/SOURCE.md` for source and redistribution notes.
+Only the Python SDK wrapper is stored in Git. The Linux ARM64 `libapi_c.so` is
+downloaded from COS during the image build and verified by SHA-256 before it is
+installed. The component installs `python3-yaml` because the shared runtime
+loads `config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared
+runtime creates the Agent Core ROS 2 participant. No compiler, pip, or ROS
+build tooling is installed. See `vendor/SOURCE.md` for provenance and
+redistribution notes.
