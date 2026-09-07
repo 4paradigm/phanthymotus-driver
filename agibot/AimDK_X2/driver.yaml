@@ -6,7 +6,7 @@ hardware_model: "x2"
 image_name: agibot-x2
 port: 15717
 mcp_url: "http://localhost:15717/mcp"
-description: "AgiBot X2 humanoid — AimDK SDK (plain rclpy) MC mode/locomotion/preset motion, per-area joint control, dexterous hand, Linkcraft dynamic motion library, camera/lidar/IMU/SLAM, TTS/emoji/LED"
+description: "AgiBot X2 humanoid — AimDK SDK (plain rclpy) MC mode/locomotion/preset motion, per-area joint control, dexterous hand, Linkcraft dynamic motion library, camera/lidar/IMU/mic/SLAM, TTS/emoji/LED"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -16,6 +16,7 @@ cards:
   - { name: joint_state,        type: sensor }
   - { name: hand_state,         type: sensor }
   - { name: imu,                type: sensor }
+  - { name: mic,                type: sensor }
   - { name: camera_rgb,         type: sensor }
   - { name: camera_depth,       type: sensor }
   - { name: lidar,              type: sensor }

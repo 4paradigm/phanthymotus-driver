@@ -135,6 +135,7 @@ class FakeQoSReliabilityPolicy:
 
 class FakeQoSDurabilityPolicy:
     TRANSIENT_LOCAL = "TRANSIENT_LOCAL"
+    VOLATILE = "VOLATILE"
 
 
 class FakeExecutor:
@@ -174,6 +175,8 @@ def _install_ros_stubs():
 
     module("sensor_msgs")
     module("sensor_msgs.msg", CompressedImage=FakeMsg, Image=FakeMsg, Imu=FakeMsg, PointCloud2=FakeMsg)
+    module("audio_msgs")
+    module("audio_msgs.msg", AudioChunk=FakeMsg)
     module("std_msgs")
     module("std_msgs.msg", String=FakeMsg)
     module("geometry_msgs")
@@ -184,6 +187,7 @@ def _install_ros_stubs():
     module("aimdk_msgs")
     module(
         "aimdk_msgs.msg",
+        AudioCapture=FakeMsg,
         CommonRequest=FakeMsg,
         HandCommand=FakeMsg,
         HandCommandArray=FakeMsg,

@@ -75,7 +75,78 @@ EMOJI_IDS = {
 
 MIC_SOURCES = {"internal": 0, "external": 1}
 
+MIC_SOURCE_TOPIC = "/aima/hal/audio/capture"
+MIC_OUTPUT_FORMAT = "audio/pcm-16k"
+MIC_SAMPLE_RATE = 16000
+MIC_SAMPLE_BYTES = 2
+
 RESOURCE_DIR = Path(__file__).with_name("resource")
+
+
+class InterleavedS16leChannelExtractor:
+    """Extract one channel from interleaved PCM16 and emit fixed-size chunks.
+
+    Both input and output remainders are retained, so ROS message boundaries do
+    not need to coincide with either a six-channel sample frame or an output
+    AudioChunk boundary.
+    """
+
+    def __init__(self, channel_index=0, chunk_bytes=1024):
+        self.channel_index = int(channel_index)
+        self.chunk_bytes = int(chunk_bytes)
+        if self.channel_index < 0:
+            raise ValueError("mic channel_index must be non-negative")
+        if self.chunk_bytes <= 0 or self.chunk_bytes % MIC_SAMPLE_BYTES:
+            raise ValueError("mic chunk_bytes must be a positive multiple of 2")
+        self._channels = None
+        self._input_pending = bytearray()
+        self._mono_pending = bytearray()
+
+    def reset(self):
+        self._channels = None
+        self._input_pending.clear()
+        self._mono_pending.clear()
+
+    @property
+    def pending_bytes(self):
+        return len(self._input_pending) + len(self._mono_pending)
+
+    def feed(self, payload, channels):
+        channels = int(channels)
+        if channels <= 0:
+            raise ValueError("audio channel count must be positive")
+        if self.channel_index >= channels:
+            raise ValueError(
+                f"mic channel_index {self.channel_index} is outside {channels}-channel audio"
+            )
+
+        # A layout change invalidates both kinds of remainder: bytes retained
+        # under the old stride cannot safely be interpreted with the new one.
+        if self._channels is not None and channels != self._channels:
+            self.reset()
+        self._channels = channels
+        self._input_pending.extend(payload)
+
+        frame_bytes = channels * MIC_SAMPLE_BYTES
+        complete_bytes = len(self._input_pending) // frame_bytes * frame_bytes
+        if complete_bytes:
+            framed = bytes(self._input_pending[:complete_bytes])
+            del self._input_pending[:complete_bytes]
+
+            sample_count = complete_bytes // frame_bytes
+            channel_offset = self.channel_index * MIC_SAMPLE_BYTES
+            mono = bytearray(sample_count * MIC_SAMPLE_BYTES)
+            # Copy the low and high byte of every selected S16LE sample without
+            # pulling numpy into the deployed driver image.
+            mono[0::2] = framed[channel_offset:complete_bytes:frame_bytes]
+            mono[1::2] = framed[channel_offset + 1:complete_bytes:frame_bytes]
+            self._mono_pending.extend(mono)
+
+        chunks = []
+        while len(self._mono_pending) >= self.chunk_bytes:
+            chunks.append(bytes(self._mono_pending[:self.chunk_bytes]))
+            del self._mono_pending[:self.chunk_bytes]
+        return chunks
 
 
 def call_service(client, request, timeout=5.0):
@@ -100,11 +171,12 @@ class AimdkNodes:
     def __init__(self, config, namespace, ros2):
         from rclpy.node import Node
         from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+        from audio_msgs.msg import AudioChunk
         from sensor_msgs.msg import CompressedImage, Image, Imu, PointCloud2
         from std_msgs.msg import String
         from geometry_msgs.msg import Pose
         from nav_msgs.msg import Odometry
-        from aimdk_msgs.msg import CommonRequest
+        from aimdk_msgs.msg import AudioCapture, CommonRequest
         from aimdk_msgs.srv import (
             ExecuteActionResource, GetAllJointState, GetCurrentInputSource, GetHandType,
             GetMcAction, GetMicSourceRequest, GetRobotResources, GetStoredMapByName,
@@ -135,6 +207,16 @@ class AimdkNodes:
         self.values = {}
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+        audio_source_qos = QoSProfile(
+            depth=20,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        audio_output_qos = QoSProfile(
+            depth=200,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
         command_qos = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
 
         self.streams = {}
@@ -168,6 +250,44 @@ class AimdkNodes:
         mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
         mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
         mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
+
+        # AimDK publishes four microphone channels plus two playback-reference
+        # channels as interleaved S16LE. Agent Core's common audio contract is
+        # mono PCM16, so select one physical mic channel and re-chunk it instead
+        # of forwarding the vendor-specific AudioCapture message directly.
+        mic_config = config.get("plugins", {}).get("mic", {})
+        self._AudioChunk = AudioChunk
+        self._mic_channel_index = int(mic_config.get("channel_index", 0))
+        self._mic_chunk_bytes = int(mic_config.get("chunk_bytes", 1024))
+        self._mic_source_timeout = float(mic_config.get("source_timeout_sec", 1.0))
+        if self._mic_source_timeout <= 0:
+            raise ValueError("mic source_timeout_sec must be positive")
+        self._mic_extractor = InterleavedS16leChannelExtractor(
+            channel_index=self._mic_channel_index,
+            chunk_bytes=self._mic_chunk_bytes,
+        )
+        self._mic_stats = {
+            "source_messages": 0,
+            "source_bytes": 0,
+            "published_chunks": 0,
+            "published_bytes": 0,
+            "rejected_messages": 0,
+            "input_channels": None,
+            "mic_channels": None,
+            "ref_channels": None,
+            "last_frame_at": None,
+            "last_error": "",
+        }
+        mic_topic = f"/{namespace}/mic/audio"
+        self._mic_pub = self.core.create_publisher(AudioChunk, mic_topic, audio_output_qos)
+        self.robot.create_subscription(
+            AudioCapture, MIC_SOURCE_TOPIC, self._mic_callback(), audio_source_qos,
+        )
+        self.streams["mic"] = {
+            "robot_topic": MIC_SOURCE_TOPIC,
+            "topic": mic_topic,
+            "format": MIC_OUTPUT_FORMAT,
+        }
 
         # /integrated_command and /relocalization_pose are outbound-only (SLAM control), not
         # mirrored streams -- they are plain publishers used by SlamControlPlugin.
@@ -232,6 +352,87 @@ class AimdkNodes:
             output.data = json.dumps(snapshot, ensure_ascii=False)
             publisher.publish(output)
         return callback
+
+    def _mic_callback(self):
+        def callback(msg):
+            try:
+                channels = int(msg.info.channels)
+                mic_channels = int(msg.mic_channels)
+                ref_channels = int(msg.ref_channels)
+                sample_rate = int(msg.info.sample_rate)
+                sample_format = str(msg.info.sample_format).strip().replace("_", "").upper()
+                coding_format = str(msg.info.coding_format).strip().lower()
+
+                if sample_rate != MIC_SAMPLE_RATE:
+                    raise ValueError(f"expected 16000 Hz, received {sample_rate} Hz")
+                if sample_format != "S16LE":
+                    raise ValueError(f"expected S16LE, received {msg.info.sample_format!r}")
+                if coding_format != "pcm":
+                    raise ValueError(f"expected pcm, received {msg.info.coding_format!r}")
+                if mic_channels <= self._mic_channel_index:
+                    raise ValueError(
+                        f"channel_index {self._mic_channel_index} is outside "
+                        f"the {mic_channels} microphone channels"
+                    )
+                if mic_channels + ref_channels > channels:
+                    raise ValueError(
+                        f"invalid channel metadata: {mic_channels} mic + {ref_channels} ref "
+                        f"> {channels} total"
+                    )
+
+                payload = bytes(msg.data.data)
+                with self.lock:
+                    chunks = self._mic_extractor.feed(payload, channels)
+                for chunk in chunks:
+                    output = self._AudioChunk()
+                    output.header.stamp = self.core.get_clock().now().to_msg()
+                    output.format = MIC_OUTPUT_FORMAT
+                    output.data = chunk
+                    self._mic_pub.publish(output)
+
+                with self.lock:
+                    self._mic_stats["source_messages"] += 1
+                    self._mic_stats["source_bytes"] += len(payload)
+                    self._mic_stats["published_chunks"] += len(chunks)
+                    self._mic_stats["published_bytes"] += sum(map(len, chunks))
+                    self._mic_stats["input_channels"] = channels
+                    self._mic_stats["mic_channels"] = mic_channels
+                    self._mic_stats["ref_channels"] = ref_channels
+                    if payload:
+                        self._mic_stats["last_frame_at"] = time.monotonic()
+                    self._mic_stats["last_error"] = ""
+            except Exception as exc:
+                with self.lock:
+                    self._mic_stats["rejected_messages"] += 1
+                    self._mic_stats["last_error"] = str(exc)
+
+        return callback
+
+    def mic_snapshot(self):
+        with self.lock:
+            stats = dict(self._mic_stats)
+            pending_bytes = self._mic_extractor.pending_bytes
+        last_frame_at = stats.pop("last_frame_at")
+        age = None if last_frame_at is None else max(0.0, time.monotonic() - last_frame_at)
+        if stats["last_error"]:
+            state = "error"
+        elif age is None:
+            state = "waiting"
+        elif age > self._mic_source_timeout:
+            state = "stale"
+        else:
+            state = "running"
+        return {
+            "state": state,
+            **self.streams["mic"],
+            "channel_index": self._mic_channel_index,
+            "chunk_bytes": self._mic_chunk_bytes,
+            "sample_rate": MIC_SAMPLE_RATE,
+            "sample_format": "S16LE",
+            "age_sec": age,
+            "pending_bytes": pending_bytes,
+            **stats,
+        }
 
     def request_header(self):
         # CommonRequest.header is typed RequestHeader, which per the vendor schema has only
@@ -369,6 +570,29 @@ class ImuPlugin:
         if action == "stop":
             return {"state": "idle"}
         return {"state": "running", **self.nodes.streams["imu"]}
+
+
+class MicPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return _stream_tool(
+            "mic",
+            self.nodes.streams["mic"],
+            "内置麦克风阵列：提取单路 PCM 16kHz 16bit 音频",
+        )
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        return self.nodes.mic_snapshot()
 
 
 class CameraPlugin:
@@ -1134,7 +1358,7 @@ def build_plugins(config, namespace, ros2):
 
     plugins = [
         McStatePlugin(nodes), JointStatePlugin(nodes), HandStatePlugin(nodes),
-        ImuPlugin(nodes), CameraPlugin(nodes), LidarPlugin(nodes), SlamPosePlugin(nodes),
+        ImuPlugin(nodes), MicPlugin(nodes), CameraPlugin(nodes), LidarPlugin(nodes), SlamPosePlugin(nodes),
         SystemStatePlugin(nodes), LinkcraftCatalogPlugin(nodes), ModelPlugin(nodes),
         McModePlugin(nodes), LocomotionPlugin(nodes), PresetMotionPlugin(nodes),
         JointCommandPlugin(nodes), HandCommandPlugin(nodes), LinkcraftPlugin(nodes),

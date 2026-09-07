@@ -10,7 +10,10 @@ COPY aimdk_msgs-${AIMDK_MSGS_REV}.zip /tmp/aimdk_msgs.zip
 RUN echo "${AIMDK_MSGS_SHA256}  /tmp/aimdk_msgs.zip" | sha256sum -c - && \
     mkdir -p /aimdk_x2_ws/src/aimdk_msgs && \
     python3 -m zipfile -e /tmp/aimdk_msgs.zip /aimdk_x2_ws/src/aimdk_msgs && \
-    . /opt/ros/humble/setup.sh && cd /aimdk_x2_ws && colcon build --packages-select aimdk_msgs && \
+    . /opt/ros/humble/setup.sh && . /ros_ws/install/setup.sh && \
+    cd /aimdk_x2_ws && colcon build --packages-select aimdk_msgs && \
+    . /aimdk_x2_ws/install/setup.sh && \
+    python3 -c "from audio_msgs.msg import AudioChunk; from aimdk_msgs.msg import AudioCapture; print('AimDK X2 ROS imports ok')" && \
     rm -rf /tmp/aimdk_msgs.zip
 WORKDIR /work
 COPY common/ /work/common/
@@ -18,4 +21,4 @@ COPY main.py device.py config.yaml driver.yaml /work/agibot/AimDK_X2/
 COPY resource/ /work/agibot/AimDK_X2/resource/
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
 EXPOSE 15717
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /aimdk_x2_ws/install/setup.bash && python3 /work/agibot/AimDK_X2/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /aimdk_x2_ws/install/setup.bash && python3 /work/agibot/AimDK_X2/main.py"]

@@ -25,6 +25,13 @@ plugins:
     enabled: true
   imu:
     enabled: true
+  mic:
+    enabled: true
+    # /aima/hal/audio/capture 当前为 4 路 mic + 2 路回采；只选择物理 mic 0..3。
+    channel_index: 0
+    # 512 个 S16LE 单声道采样，即 16 kHz 下每包 32 ms。
+    chunk_bytes: 1024
+    source_timeout_sec: 1.0
   camera:
     enabled: true
   lidar:
