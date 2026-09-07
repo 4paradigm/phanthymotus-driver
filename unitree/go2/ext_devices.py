@@ -567,7 +567,7 @@ TOOLS_EXT_CAMERA = [
     {
         "name": "ext_camera",
         "type": "sensor",
-        "multiInstance": False,
+        "multiInstance": True,
         "description": "External camera (action cam / USB cam) — captures JPEG video",
         "inputSchema": {"type": "object", "properties": {}},
         "configSchema": {
@@ -716,23 +716,20 @@ class ExtCameraPlugin:
         formats = ['auto'] + list(dict.fromkeys(f for d in self._available_devices
                                                for f in d.get('formats', [])))
         tool = dict(TOOLS_EXT_CAMERA[0])
-        tool['multiInstance'] = False
-        channel = self._instance_configs.get('default', {}).get('channel', 'rgb')
-        tool['topic_out'] = self._topic('default', channel)
         tool['description'] = ('External camera — channel selects RGB, RealSense depth, or left infrared. '
                                'Infrared is light intensity, not temperature.')
         tool['configSchema'] = {'type': 'object', 'properties': {
-            'device_path': {'type': 'string', 'description': '摄像头设备', 'scope': 'shared',
+            'device_path': {'type': 'string', 'description': '摄像头设备', 'scope': 'instance',
                             'oneOf': devices or [{'const': '', 'title': '无可用设备'}]},
-            'channel': {'type': 'string', 'title': 'channel', 'scope': 'shared',
+            'channel': {'type': 'string', 'title': 'channel', 'scope': 'instance',
                         'enum': ['rgb', 'depth', 'infrared'], 'default': 'rgb',
                         'description': 'rgb 彩色；depth 深度；infrared 左近红外（非热成像）'},
-            'fps': {'type': 'integer', 'scope': 'shared', 'default': 15, 'minimum': 1,
+            'fps': {'type': 'integer', 'scope': 'instance', 'default': 15, 'minimum': 1,
                     'maximum': 60, 'description': 'RGB 帧率；深度/红外按 USB 连接自动选择 6 或 15fps'},
-            'resolution': {'type': 'string', 'scope': 'shared', 'enum': resolutions,
+            'resolution': {'type': 'string', 'scope': 'instance', 'enum': resolutions,
                            'default': '1280x720' if '1280x720' in resolutions else resolutions[0],
                            'description': 'RGB 分辨率；深度/红外固定 640x480'},
-            'pixel_format': {'type': 'string', 'scope': 'shared', 'enum': formats,
+            'pixel_format': {'type': 'string', 'scope': 'instance', 'enum': formats,
                              'default': 'auto', 'description': 'RGB 像素格式；深度 Z16 / 红外 Y8 自动选择'},
         }}
         return [tool]
@@ -808,9 +805,7 @@ class ExtCameraPlugin:
         return _StereoCameraNode(self._sessions[usb_path], instance_id, channel)
 
     def dispatch(self, action, args):
-        # Canvas may still send its card id for a single-instance tool.
-        # All lifecycle/config calls address the one shared capture.
-        instance_id = 'default'
+        instance_id = args.get('instance_id', '')
         with self._lock:
             if action == 'info':
                 return self._info(instance_id)
@@ -824,6 +819,11 @@ class ExtCameraPlugin:
                 return self._info(instance_id)
             if action not in ('config', 'start'):
                 return None
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]{0,127}', instance_id):
+                raise ValueError('A valid instance_id is required')
+            if any(key != instance_id and key.replace('-', '_') == instance_id.replace('-', '_')
+                   for key in self._instance_configs):
+                raise ValueError('instance_id collides with an existing ROS topic')
             supplied = {k: v for k, v in args.items() if k in
                         ('channel', 'device_path', 'device_name', 'fps', 'resolution', 'pixel_format')}
             previous = self._instance_configs.get(instance_id, {})
@@ -844,4 +844,10 @@ class ExtCameraPlugin:
                         node = self._make_node(instance_id, cfg, device)
                         self._nodes[instance_id] = node
                     node.start()
-            return self._info(instance_id)
+            result = self._info(instance_id)
+            if action == 'start' and result['state'] in ('starting', 'running'):
+                # Lifecycle activation is separate from the first captured frame.
+                # Preserve readiness/freshness; do not hide an actual start error.
+                result['readiness'] = result['state']
+                result['state'] = 'running'
+            return result

@@ -1,6 +1,6 @@
 # External camera: RGB, depth and infrared
 
-`ext_camera` is a single-instance sensor (`multiInstance: false`). Its shared configuration contains
+`ext_camera` is a multi-instance sensor (`multiInstance: true`). Each card has its own configuration containing
 `channel: rgb | depth | infrared` (default `rgb`). There are no executable
 camera-control actions. `config`, `start`, `stop` and `info` are internal
 lifecycle operations, with plain-dict responses.
@@ -11,7 +11,7 @@ require a compatible RealSense with a resolvable physical USB path.
 
 ## Configure and switch
 
-1. Keep one `ext_camera` card. Open its shared configuration, select the camera device and choose `channel`.
+1. Add one or more `ext_camera` cards. Configure each card's camera device and `channel` independently.
 2. For RGB, choose an advertised resolution, pixel format and frame rate.
    RGB settings are preserved when switching to another channel; depth/IR
    use their fixed profiles and ignore these RGB-only fields.
@@ -25,23 +25,32 @@ require a compatible RealSense with a resolvable physical USB path.
    by the driver. If the canvas still uses an old cached port, reopen the card's
    details to read its current output before opening the stream.
 
-The card publishes only its selected modality. Configuration, start, stop and info
-calls do not require an instance ID:
+Each card publishes its selected modality on its own topic. Configuration and
+start calls require its canvas `instance_id`; info and stop accept the same ID:
 
 | channel | topic | format | payload |
 | --- | --- | --- | --- |
-| `rgb` | `/{namespace}/ext_camera/default/rgb` | `image/jpeg` | Color JPEG |
-| `depth` | `/{namespace}/ext_camera/default/depth` | `image/depth-zlib` | zlib of 640x480 little-endian uint16 millimetres |
-| `infrared` | `/{namespace}/ext_camera/default/infrared` | `image/jpeg` | 640x480 left infrared Y8 encoded as grayscale JPEG |
+| `rgb` | `/{namespace}/ext_camera/{instance_id}/rgb` | `image/jpeg` | Color JPEG |
+| `depth` | `/{namespace}/ext_camera/{instance_id}/depth` | `image/depth-zlib` | zlib of 640x480 little-endian uint16 millimetres |
+| `infrared` | `/{namespace}/ext_camera/{instance_id}/infrared` | `image/jpeg` | 640x480 left infrared Y8 encoded as grayscale JPEG |
 
-The stable `default` capture slot is independent of canvas card IDs. Channel-specific
+Hyphens in instance IDs become underscores in ROS topic paths. Channel-specific
 paths prevent a depth payload from being delivered to an old RGB subscription.
 Existing downstream connections must be reviewed/reconnected for the newly
 selected modality and format; they are not automatically rewired by the driver.
 
-The card manages one capture slot. Use `channel` to select RGB, depth or
-infrared. Saving configuration switches the active modality; stopping the card
-releases its capture resources.
+For example, create three cards with channels RGB, depth and infrared, then
+start them together through Enable Intelligent Control. Their settings and
+output topics remain separate. Depth/IR instances share one stereo device
+owner; stopping one leaves the others active. The last stereo instance releases
+the device. A physical RGB video node has one owner, so choose distinct cameras
+for independent RGB sources rather than opening the same node twice.
+
+The startup modal and monitor require the companion Agent Core correction:
+startup events must include `instance_id`, progress rows must be keyed by it,
+and newly resolved producer formats must be used if the topic-registry snapshot
+predates their registration. Restoring the driver flag alone cannot fix the
+same-name startup-progress collision.
 
 ## What each modality is useful for
 
@@ -85,9 +94,11 @@ obstacle avoidance are downstream capabilities, not implemented by this sensor.
 - Linux USB serial and RealSense SDK serial are not necessarily equal. Device
   selection binds SDK `physical_port` to the selected V4L2 node's USB ancestor;
   it does not choose an arbitrary first SDK camera or hard-code `/dev/video4`.
-- Stereo start initially returns `starting`; only fresh published frames allow
-  `running`. Missing devices/profiles, child-process exit and stale data report
-  errors. Start retries after a fault. Shutdown is bounded if the SDK is stuck.
+- `start` returns lifecycle `state: running` after activation, with `readiness`
+  and `fresh` preserved separately. `info` can report `starting` until frames
+  arrive; only new frames count as fresh. Known capture errors are never hidden.
+  Missing devices/profiles, process exit and stale data are reported by `info`.
+  Start retries after a fault, and shutdown is bounded if the SDK is stuck.
 
 ## Build and verification
 
@@ -102,11 +113,15 @@ python3 -m unittest discover -s tests
 ```
 
 Tests cover real V4L2 capability formatting, unsupported formats, channel
-configuration/topic changes, USB device binding, RGB compatibility, single-card configuration and lifecycle, stale/wrong-channel frames, depth units and overflow.
+configuration/topic changes, USB device binding, RGB compatibility, per-instance configuration and lifecycle, stale/wrong-channel frames, depth units and overflow.
 Hardware verification covers RGB→depth→infrared→RGB on the same instance,
-actual decoded image payloads. The single-instance facade additionally has
-regression coverage for shared configuration and config/start/stop/info calls
-without a card ID.
+actual decoded image payloads in earlier device runs. The current startup fix
+has local coverage for three saved instance configurations starting separately,
+standard lifecycle responses without claiming frame readiness, and independent
+stop. Companion Core tests replay the actual startup function and verify three
+progress rows, unique bus registrations and three correctly typed monitor
+panels. The robot was powered off for this revision; full project startup and
+simultaneous live monitor streams still need a device run.
 
 Sources: [driver contract](../../README_dev.md),
 [SDK depth units](https://github.com/realsenseai/librealsense/wiki/Projection-in-RealSense-SDK-2.0),
