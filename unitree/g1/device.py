@@ -1232,18 +1232,20 @@ class GreetPlugin:
                                "description": "要执行的动作"},
                     "text": {"type": "string", "description": "要说的话（不填用默认问候语）"},
                     "turn": {"type": "boolean", "description": "挥手时是否转身"},
+                    "confirm": {"type": "boolean", "description": "确认执行机器人肢体动作"},
                     "r": {"type": "integer", "description": "LED 红 0-255"},
                     "g": {"type": "integer", "description": "LED 绿 0-255"},
                     "b": {"type": "integer", "description": "LED 蓝 0-255"},
                 },
                 "required": ["action"],
+                "x-is-dangerous": True,
                 "x-completion": {
                     "actions": ["greet"],
                     "timeout": 60,
                 },
                 "x-action-params": {
-                    "greet": {"params": ["text", "turn"], "description": "完整迎宾：挥手 + 说话 + LED（异步执行，完成后回调）"},
-                    "wave":  {"params": ["turn"], "description": "只挥手"},
+                    "greet": {"params": ["text", "turn", "confirm"], "description": "完整迎宾：挥手 + 说话 + LED（异步执行，完成后回调）"},
+                    "wave":  {"params": ["turn", "confirm"], "description": "只挥手"},
                     "speak": {"params": ["text"], "description": "只语音问候"},
                     "led":   {"params": ["r", "g", "b"], "description": "只设置 LED 颜色"},
                     "info":  {"params": [], "description": "查看迎宾配置"},
@@ -1265,6 +1267,11 @@ class GreetPlugin:
         if action == "info":
             return {"default_text": self._default_text, "voice": self._voice,
                     "led_rgb": list(self._led_rgb)}
+        if action in ("greet", "wave") and args.get("confirm") is not True:
+            return {
+                "error": f"{action} requires confirm=true",
+                "code": "PRECONDITION_FAILED",
+            }
         if action == "wave":
             turn = bool(args.get("turn", False))
             ret = self._loco.WaveHand(turn)
@@ -1303,9 +1310,18 @@ class GreetPlugin:
             r, g, b = self._led_rgb
             with self._audio_lock:
                 led_ret = self._audio.LedControl(r, g, b)
+            if led_ret != 0:
+                raise RuntimeError(f"LedControl failed: code={led_ret}")
+
             wave_ret = self._loco.WaveHand(turn)
+            if wave_ret != 0:
+                raise RuntimeError(f"WaveHand failed: code={wave_ret}")
+
             with self._audio_lock:
                 tts_ret = self._audio.TtsMaker(text, self._voice)
+            if tts_ret != 0:
+                raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
+
             result = {"ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
                       "text": text, "turn": turn}
             status = "completed"
