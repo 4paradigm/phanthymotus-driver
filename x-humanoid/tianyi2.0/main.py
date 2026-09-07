@@ -631,7 +631,11 @@ class TianyiDeviceBundle:
                         return p.dispatch(tool_name, args)
                     default_action = tool_def.get("default_action", "start")
                     action = args.pop("action", default_action)
-                    # 懒启动：首次 start 时真正初始化插件
+                    # 懒启动：首次 start 时真正初始化插件。
+                    # 注意这条路径每个插件只走一次（进了 _started_plugins 就再也
+                    # 不出来），所以一个能被 stop 的插件，它的 dispatch("start")
+                    # 必须自己有能力重新 arm——不能指望这里。否则 stop 之后就是
+                    # 永久失效，而 info 还报着一个健康的状态。
                     if action == "start" and p not in self._started_plugins:
                         try:
                             p.start()

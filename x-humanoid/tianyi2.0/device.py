@@ -955,6 +955,17 @@ class CameraPlugin:
         self._running = False
         self._frame_queue = None  # Will hold latest frame only
 
+        # Built here rather than in start(), so stop() and _on_image_grab are
+        # safe to call before the first start and across a restart.
+        self._latest_frame = None  # Only keep latest frame
+        self._frame_lock = threading.Lock()
+        self._pub = None
+        self._subscription = None
+        self._encode_thread = None
+        # Serializes start/stop. Every tools/call runs on its own thread of the
+        # ThreadingHTTPServer, and the canvas issues stop→start within seconds.
+        self._lifecycle_lock = threading.RLock()
+
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
@@ -971,35 +982,78 @@ class CameraPlugin:
         }
 
     def start(self):
-        self._running = True
+        """Arm the stream. Idempotent, and callable again after ``stop()``.
 
-        # Ensure Orbbec camera service is running
-        self._ensure_orbbec_service()
+        main.py's lazy start only ever calls this for the *first* ``action=start``
+        (the plugin then stays in its ``_started_plugins`` set forever), so a
+        restart has to come through here from ``dispatch``.
 
-        try:
-            from sensor_msgs.msg import Image, CompressedImage
-            import numpy as np
-            import cv2
+        Both ROS endpoints are created once and kept for the process lifetime;
+        only the encode thread is rebuilt, because ``stop()`` is what ends it.
+        Neither endpoint may be recycled per start:
+
+        * the publisher is a ``BridgedPublisher`` owning a Unix socket to the
+          socket_bridge process, and a second one for the same topic is exactly
+          the duplicate connection its connection lock exists to prevent;
+        * destroying and recreating the subscription on a node that a live
+          executor is spinning does not reliably re-deliver. Measured on Tianyi:
+          one slow cycle worked, then three quick stop→start cycles left the
+          subscription present in the graph, the executor healthy (other
+          domain-0 sensors kept publishing) and the callback never firing again.
+          A stopped camera therefore keeps deserializing raw frames it drops —
+          that waste is the price of a stream that always comes back.
+        """
+        with self._lifecycle_lock:
+            if self._running:
+                return
+
+            # Re-checked on every arm, not just the first: a restart should also
+            # recover a host service that died while the card was stopped.
+            self._ensure_orbbec_service()
+
+            try:
+                from sensor_msgs.msg import Image, CompressedImage
+                import numpy as np
+                import cv2
+            except ImportError as e:
+                print(f"[CameraPlugin] WARNING: import failed ({e})")
+                return
 
             self._np = np
             self._cv2 = cv2
-            self._latest_frame = None  # Only keep latest frame
-            self._frame_lock = threading.Lock()
+
+            # A worker from the previous stop may still be inside its 5 ms poll.
+            # Join it *before* re-arming the flag — otherwise it sees _running
+            # True again and keeps publishing beside its replacement, doubling
+            # the frame rate on the topic.
+            previous = self._encode_thread
+            if previous is not None and previous is not threading.current_thread():
+                previous.join(timeout=2.0)
+
+            with self._frame_lock:
+                self._latest_frame = None  # never publish a frame from before the stop
 
             # Publish JPEG as CompressedImage
-            self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
+            if self._pub is None:
+                self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
 
             # Subscribe - callback just grabs the frame, doesn't encode
-            self._sub_node.create_subscription(
-                Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
+            if self._subscription is None:
+                self._subscription = self._sub_node.create_subscription(
+                    Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
+
+            self._running = True
 
             # Separate encoding thread - avoids blocking executor
-            self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
-            self._encode_thread.start()
+            if previous is not None and previous.is_alive():
+                # Refused to exit within the grace period. It observes the flag
+                # we just re-armed and resumes, so don't stack a second one.
+                print("[CameraPlugin] WARNING: previous encode thread still running, reusing it")
+            else:
+                self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
+                self._encode_thread.start()
 
-            print("[CameraPlugin] subscription + encode thread created")
-        except ImportError as e:
-            print(f"[CameraPlugin] WARNING: import failed ({e})")
+            print("[CameraPlugin] subscription + encode thread created", flush=True)
 
     @staticmethod
     def _ensure_orbbec_service():
@@ -1077,7 +1131,17 @@ class CameraPlugin:
         return changed
 
     def stop(self):
-        self._running = False
+        """Disarm the stream, leaving it restartable by ``start()``.
+
+        Only the flag and the buffered frame are touched. Both ROS endpoints
+        survive on purpose — see ``start`` for why neither may be recycled. The
+        encode thread ends on the cleared flag, and ``_on_image_grab`` drops
+        every frame that arrives meanwhile.
+        """
+        with self._lifecycle_lock:
+            self._running = False
+            with self._frame_lock:
+                self._latest_frame = None
 
     def _on_image_grab(self, msg):
         """Callback: just grab the latest frame, don't encode here (non-blocking)."""
@@ -1115,10 +1179,15 @@ class CameraPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
-            # Note: actual start() is called by lazy-start mechanism in main.py
-            # This just confirms the state
-            state = "running" if self._running else "starting"
-            return {"state": state}
+            # Call start() here rather than leaning on main.py's lazy start:
+            # that only fires once per process, so trusting it left a camera
+            # that had been stopped dark for the rest of the container's life
+            # while still reporting a healthy-looking state.
+            self.start()
+            if not self._running:
+                return {"state": "error",
+                        "error": "camera start failed, see driver log"}
+            return {"state": "running"}
         if action == "stop":
             self.stop()
             return {"state": "idle"}
