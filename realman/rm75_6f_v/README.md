@@ -29,9 +29,10 @@ Available tools are:
 
 Motion has two independent interlocks. The container must set
 `RM_MOTION_ENABLED=1`, and every `set` call must include
-`confirm_motion=true`. Every request must provide all seven absolute
-`joint1_deg` through `joint7_deg` targets. They are sent together as one API2
-`movej` trajectory, so the controller plans all joints concurrently. The
+`confirm_motion=true`. `joint1_deg` through `joint7_deg` are absolute targets
+in degrees. An omitted joint defaults to its measured position at the start of
+the request, while the supplied targets are sent together as one API2 `movej`
+trajectory so the controller plans all joints concurrently. The
 Driver rejects non-finite values, targets outside the
 official RM75 limits, speed above 10 percent, disabled
 joints, and any reported arm or joint error. It sends non-blocking API2
