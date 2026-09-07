@@ -377,8 +377,32 @@ class SpeakerPluginTests(unittest.TestCase):
     def test_card_declares_pcm_input_and_mouth_resource(self):
         definition = self.speaker.get_tool()
         self.assertEqual(definition["topic_in"], [{"format": "audio/pcm-16k"}])
-        self.assertEqual(definition["x-resource"], "mouth")
+        self.assertEqual(definition["inputSchema"]["x-resource"], "mouth")
+        self.assertNotIn("x-resource", definition)
         self.assertEqual(definition["inputSchema"]["x-action-params"]["start"]["params"], ["input_topic"])
+
+    def test_tts_declares_the_same_mouth_resource(self):
+        tts = find_plugin(self.plugins, "tts")
+        self.assertEqual(tts.get_tool()["inputSchema"]["x-resource"], "mouth")
+
+    def test_framework_start_is_inert_then_canvas_start_and_stop_work(self):
+        self.speaker.start()
+        self.assertEqual(self.nodes.core.subscriptions, [])
+        self.assertEqual(self.nodes.audio_playback_pub.published, [])
+        self.assertIsNone(self.speaker._worker)
+        self.assertEqual(self.speaker.dispatch("info", {})["state"], "idle")
+
+        started = self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        worker = self.speaker._worker
+        self.assertEqual(started["state"], "ready")
+        self.assertEqual(self.nodes.core.subscriptions[-1][0], "/canvas/tts")
+        self.assertTrue(worker.is_alive())
+
+        stopped = self.speaker.dispatch("stop", {})
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(self.nodes.core.subscriptions, [])
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(self.speaker._worker)
 
     def test_valid_pcm_chunk_is_mapped_to_vendor_playback(self):
         result = self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})

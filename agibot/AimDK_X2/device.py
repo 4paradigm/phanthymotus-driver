@@ -925,6 +925,7 @@ class TtsPlugin:
     def get_tool(self):
         return tool("tts", "actuator", "文字转语音播报（PlayTts）", {
             "type": "object",
+            "x-resource": "mouth",
             "properties": {
                 "text": {"type": "string"},
                 "priority": {"type": "string", "enum": list(TTS_PRIORITY_LEVELS), "default": "interaction"},
@@ -1144,31 +1145,34 @@ class SpeakerPlugin:
         )
 
     def get_tool(self):
+        schema = action_schema(
+            {
+                "start": (["input_topic"], "订阅画布连接的 audio/pcm-16k 输入并转发到机器人扬声器"),
+                "stop": ([], "停止接收后续音频数据"),
+                "info": ([], "查看订阅与转发状态"),
+            },
+            {
+                "input_topic": {
+                    "type": "string",
+                    "description": "画布连接提供的 audio/pcm-16k ROS 2 Topic",
+                },
+            },
+        )
+        # Physical-resource exclusion is interpreted from inputSchema by Agent Core.
+        schema["x-resource"] = "mouth"
         return {
             "name": "speaker",
             "type": "actuator",
             "multiInstance": False,
             "description": "X2 speaker — forwards canvas audio/pcm-16k to AimDK raw audio playback",
-            "inputSchema": action_schema(
-                {
-                    "start": (["input_topic"], "订阅画布连接的 audio/pcm-16k 输入并转发到机器人扬声器"),
-                    "stop": ([], "停止接收后续音频数据"),
-                    "info": ([], "查看订阅与转发状态"),
-                },
-                {
-                    "input_topic": {
-                        "type": "string",
-                        "description": "画布连接提供的 audio/pcm-16k ROS 2 Topic",
-                    },
-                },
-            ),
+            "inputSchema": schema,
             "topic_in": [{"format": self.AUDIO_FORMAT}],
-            # README_dev.md defines mouth as the physical resource for speaker/tts output.
-            "x-resource": "mouth",
         }
 
     def start(self):
-        pass
+        # DriverBundle invokes this at startup. It deliberately has no input topic, so reset
+        # only local lifecycle state; no subscription, worker, or vendor audio is started.
+        self.stop()
 
     def _unsubscribe(self):
         if self._subscription is not None:
