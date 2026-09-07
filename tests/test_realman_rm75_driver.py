@@ -1,9 +1,10 @@
 import importlib.util
+import io
 import math
 import os
 from pathlib import Path
-import struct
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 
@@ -22,23 +23,25 @@ class RealManRM75ImageContractTests(unittest.TestCase):
     def test_image_contains_only_minimal_api2_runtime(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("COPY vendor/Robotic_Arm/ /work/Robotic_Arm/", dockerfile)
+        self.assertIn("ARG RM_API2_LIB_URL=", dockerfile)
+        self.assertIn("5b9d236a5cf901cdf05418d9ef5815a77a8c717af0ff037e7aad9247beb76fb9", dockerfile)
+        self.assertIn("sha256sum -c -", dockerfile)
         self.assertIn("COPY deploy/ /deploy/", dockerfile)
         self.assertNotIn("colcon", dockerfile)
         self.assertNotIn("rm_driver", dockerfile)
+        self.assertNotIn("python3-pip", dockerfile)
+        self.assertNotIn("pip3 install", dockerfile)
         self.assertFalse((DRIVER / "entrypoint.sh").exists())
 
-    def test_only_arm64_vendor_library_is_present(self):
-        library = DRIVER / "vendor" / "Robotic_Arm" / "libs" / "linux_arm" / "libapi_c.so"
-        self.assertEqual([library], list((DRIVER / "vendor").rglob("libapi_c.so")))
+    def test_vendor_shared_libraries_are_not_committed(self):
+        self.assertEqual([], list((DRIVER / "vendor").rglob("libapi_c.so")))
         self.assertEqual([], list((DRIVER / "vendor").rglob("libapi_cpp.so")))
-        header = library.read_bytes()[:20]
-        self.assertEqual(b"\x7fELF", header[:4])
-        endian = "<" if header[5] == 1 else ">"
-        self.assertEqual(183, struct.unpack(f"{endian}H", header[18:20])[0])
 
     def test_service_has_safe_connection_default(self):
         service = (DRIVER / "deploy" / "service.yml").read_text()
         self.assertIn("RM_DRIVER_ENABLED=0", service)
+        self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
+        self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
         self.assertNotIn("/opt/realman/rm_ws", service)
         self.assertNotIn("network_mode:", service)
         self.assertNotIn("ipc:", service)
@@ -64,6 +67,34 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual("actuator", joint_control["type"])
         self.assertEqual(["set"], joint_control["inputSchema"]["x-completion"]["actions"])
         self.assertEqual(10, joint_control["inputSchema"]["properties"]["speed_percent"]["maximum"])
+
+    def test_tool_start_returns_contract_lifecycle_state(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+        plugin = self.device.RM75Plugin(client, {})
+        self.assertEqual({"state": "running"}, plugin.dispatch("start", {"_tool_name": "joint_states"}))
+        self.assertEqual({"state": "ready"}, plugin.dispatch("start", {"_tool_name": "joint_control"}))
+        self.assertEqual({"state": "ready"}, plugin.dispatch("start", {"_tool_name": "model"}))
+
+    def test_http_log_message_is_escaped_and_capped(self):
+        runtime_spec = importlib.util.spec_from_file_location("realman_vendor_runtime", ROOT / "common" / "vendor_runtime.py")
+        runtime = importlib.util.module_from_spec(runtime_spec)
+        runtime_spec.loader.exec_module(runtime)
+        handler = runtime.make_handler(lambda: None, "test", "test")
+
+        class Request:
+            @staticmethod
+            def address_string():
+                return "192.0.2.1"
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            handler.log_message(Request(), "%s", "GET /bad\r\nINJECT " + "x" * 400)
+        logged = output.getvalue().rstrip("\n")
+        self.assertIn(r"GET /bad\r\nINJECT", logged)
+        self.assertNotIn("\r", logged)
+        self.assertNotIn("\nINJECT", logged)
+        self.assertLessEqual(len(logged.removeprefix("[mcp] 192.0.2.1 ")), 200)
 
     def test_joint_degrees_are_converted_to_radians(self):
         class Handle:

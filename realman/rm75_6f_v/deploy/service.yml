@@ -4,9 +4,11 @@ realman-rm75-6f-v:
   privileged: true
   volumes:
     - /dev:/dev
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - ROS_LOCALHOST_ONLY=0
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
