@@ -165,67 +165,89 @@ class CameraChannelTests(unittest.TestCase):
     def test_one_pure_sensor_with_channel_configuration(self):
         tools = self.plugin.get_tools()
         self.assertEqual([t['name'] for t in tools], ['ext_camera'])
+        self.assertTrue(tools[0]['multiInstance'])
         self.assertEqual(tools[0]['inputSchema'], {'type': 'object', 'properties': {}})
         channel = tools[0]['configSchema']['properties']['channel']
         self.assertEqual(channel['enum'], ['rgb', 'depth', 'infrared'])
         self.assertEqual(channel['default'], 'rgb')
-        self.assertEqual(channel['scope'], 'shared')
-        self.assertFalse(tools[0]['multiInstance'])
-        self.assertTrue(all(p['scope'] == 'shared' for p in tools[0]['configSchema']['properties'].values()))
+        self.assertEqual(channel['scope'], 'instance')
 
     def test_running_card_switches_all_modalities_and_topics(self):
         args = {'instance_id': 'card-a'}
         self.assertEqual(self.plugin.dispatch('start', args)['channel'], 'rgb')
-        original = self.plugin._nodes['default']
+        original = self.plugin._nodes['card-a']
         for channel in ('depth', 'infrared', 'rgb'):
             result = self.plugin.dispatch('config', {**args, 'channel': channel})
             self.assertEqual(result['state'], 'running')
             expected_format = 'image/depth-zlib' if channel == 'depth' else 'image/jpeg'
-            self.assertEqual(result['topic_out'], [{'topic': f'/robot_a/ext_camera/default/{channel}', 'format': expected_format}])
+            self.assertEqual(result['topic_out'], [{'topic': f'/robot_a/ext_camera/card_a/{channel}', 'format': expected_format}])
         self.assertEqual(original.state, 'idle')
 
     def test_idle_config_infers_selected_topic_without_starting(self):
-        result = self.plugin.dispatch('config', {'channel':'depth'})
+        result = self.plugin.dispatch('config', {'instance_id':'card-a', 'channel':'depth'})
         self.assertEqual(result['state'], 'idle')
         self.assertEqual(result['topic_out'][0]['format'], 'image/depth-zlib')
         self.assertEqual(self.plugin._nodes, {})
-        self.assertEqual(self.plugin.get_tools()[0]['topic_out'], result['topic_out'])
-        self.assertEqual(self.plugin.dispatch('start', {})['channel'], 'depth')
-        self.assertEqual(self.plugin.dispatch('stop', {})['state'], 'idle')
 
     def test_regular_camera_cannot_switch_to_depth_or_lose_working_rgb(self):
         args = {'instance_id':'card-a', 'device_path':'/dev/video8'}
         self.plugin.dispatch('start', args)
-        node = self.plugin._nodes['default']
+        node = self.plugin._nodes['card-a']
         with self.assertRaisesRegex(ValueError, 'RealSense'):
             self.plugin.dispatch('config', {**args, 'channel':'depth'})
         self.assertEqual(node.state, 'running')
         self.assertEqual(self.plugin.dispatch('info', args)['channel'], 'rgb')
 
-    def test_multiple_canvas_ids_do_not_create_multiple_captures(self):
+    def test_instances_share_stereo_owner_and_stopping_one_preserves_other(self):
         self.plugin.dispatch('start', {'instance_id':'card-a', 'channel':'depth'})
-        node = self.plugin._nodes['default']
-        self.plugin.dispatch('start', {'instance_id':'card-b'})
-        self.assertEqual(list(self.plugin._nodes), ['default'])
-        self.assertIs(self.plugin._nodes['default'], node)
-        self.assertEqual(self.plugin._sessions['test-a'].routes, {'default':'depth'})
-        self.plugin.dispatch('stop', {})
-        self.assertEqual(self.plugin._nodes, {})
+        self.plugin.dispatch('start', {'instance_id':'card-b', 'channel':'infrared'})
+        session = self.plugin._sessions['test-a']
+        self.assertEqual(session.routes, {'card-a':'depth', 'card-b':'infrared'})
+        self.plugin.dispatch('stop', {'instance_id':'card-a'})
+        self.assertEqual(session.routes, {'card-b':'infrared'})
+
+    def test_saved_channel_configs_are_isolated_when_project_starts_each_card(self):
+        channels = {'card-a': 'rgb', 'card-b': 'depth', 'card-c': 'infrared'}
+        for ident, channel in channels.items():
+            self.plugin.dispatch('config', {'instance_id': ident, 'channel': channel})
+        outputs = []
+        for ident, channel in channels.items():
+            result = self.plugin.dispatch('start', {'instance_id': ident})
+            self.assertEqual(result['state'], 'running')
+            self.assertEqual(result['channel'], channel)
+            outputs.append(result['topic_out'][0]['topic'])
+        self.assertEqual(len(set(outputs)), 3)
+        self.assertEqual(set(self.plugin._nodes), set(channels))
+
+    def test_start_reports_activation_but_info_keeps_pending_frame_readiness(self):
+        with mock.patch.object(FakeStereo, 'info', return_value={'state': 'starting', 'fresh': False}):
+            result = self.plugin.dispatch('start', {'instance_id': 'card-a', 'channel': 'depth'})
+            self.assertEqual(result['state'], 'running')
+            self.assertEqual(result['readiness'], 'starting')
+            self.assertFalse(result['fresh'])
+            self.assertEqual(self.plugin.dispatch('info', {'instance_id': 'card-a'})['state'], 'starting')
+
+    def test_start_does_not_mask_a_known_capture_error(self):
+        with mock.patch.object(FakeStereo, 'info', return_value={
+                'state': 'error', 'fresh': False, 'error': 'Device disconnected'}):
+            result = self.plugin.dispatch('start', {'instance_id': 'card-a', 'channel': 'depth'})
+            self.assertEqual(result['state'], 'error')
+            self.assertEqual(result['error'], 'Device disconnected')
 
     def test_selected_device_usb_path_is_used(self):
         self.devices.append({**self.devices[0], 'path':'/dev/video10', 'usb_path':'test-b'})
         self.plugin.dispatch('start', {'instance_id':'card-a', 'channel':'infrared', 'device_path':'/dev/video10'})
         self.assertEqual(list(self.plugin._sessions), ['test-b'])
 
-    def test_repeated_config_does_not_restart_and_info_needs_no_card_id(self):
+    def test_repeated_config_does_not_restart_and_ids_do_not_collide(self):
         args = {'instance_id':'card-a'}
         self.plugin.dispatch('start', args)
-        node = self.plugin._nodes['default']
+        node = self.plugin._nodes['card-a']
         self.plugin.dispatch('config', {**args, 'channel':'rgb'})
-        self.assertIs(node, self.plugin._nodes['default'])
+        self.assertIs(node, self.plugin._nodes['card-a'])
         self.assertEqual(node.starts, 1)
-        self.assertEqual(self.plugin.dispatch('info', {})['channel'], 'rgb')
-        self.assertEqual(self.plugin.dispatch('info', {})['topic_out'], self.plugin.dispatch('info', args)['topic_out'])
+        with self.assertRaisesRegex(ValueError, 'collides'):
+            self.plugin.dispatch('start', {'instance_id':'card_a'})
 
 
 if __name__ == '__main__':
