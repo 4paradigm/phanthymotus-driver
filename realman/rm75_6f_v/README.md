@@ -89,3 +89,8 @@ The component installs `python3-yaml` because the shared runtime loads
 `config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared runtime
 creates the Agent Core ROS 2 participant. No compiler, pip, or ROS build tooling
 is installed. See `vendor/SOURCE.md` for provenance notes.
+
+The TCP-only RM75 service does not require privileged mode or a host `/dev` mount.
+Skeleton publication skips disconnected/busy SDK clients, retries failed samples
+at most every two seconds, and logs once per outage until a successful sample.
+An already-running SDK TCP query still holds the SDK lock until it returns.

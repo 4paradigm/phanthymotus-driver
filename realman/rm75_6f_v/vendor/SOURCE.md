@@ -13,3 +13,6 @@
 The Python-only vendored subset is about 590 KB; the 1.5 MB shared library is
 neither stored in Git nor redistributed in the image. It must be provisioned
 on each robot host from the operator's licensed SDK copy.
+
+Local patch: the wrapper version and invalid-pose diagnostics use DEBUG logging
+instead of unconditional stdout prints. SDK calls and return codes are unchanged.

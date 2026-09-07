@@ -49,6 +49,8 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertNotIn("AGENT_CORE_TOKEN", service)
         self.assertNotIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
         self.assertIn("network_mode: host", service)
+        self.assertNotIn("privileged: true", service)
+        self.assertNotIn("/dev:/dev", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
         self.assertIn(
@@ -357,6 +359,66 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         result = plugin._start_motion({"joint3_deg": 31, "confirm_motion": True})
         self.assertEqual("running", result["state"])
         self.assertEqual(([10, 20, 31, 40, 50, 60, 70], 5, 0, 0, 0), robot.moves[0])
+
+    def test_lifecycle_stop_cancels_motion_and_reports_idle(self):
+        plugin, robot = self._motion_plugin(safety={"start_grace_seconds": 60})
+        started = plugin._start_motion({"joint1_deg": 1, "confirm_motion": True})
+        self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {"_tool_name": "joint_control"}))
+        deadline = time.monotonic() + 1
+        while not plugin._acp_callback.called and time.monotonic() < deadline:
+            time.sleep(0.001)
+        plugin._acp_callback.assert_called_once_with(started["action_id"], "cancelled", {"reason": "stopmotion"})
+        self.assertEqual(1, robot.stops)
+
+    def test_lifecycle_stop_failure_does_not_claim_idle(self):
+        plugin, robot = self._motion_plugin()
+        robot.rm_set_arm_slow_stop = lambda: 9
+        with self.assertRaisesRegex(RuntimeError, "SDK code 9"):
+            plugin.dispatch("stop", {"_tool_name": "joint_control"})
+        self.assertEqual({"state": "idle"}, plugin.dispatch("stop", {"_tool_name": "joint_states"}))
+
+    def test_skeleton_outage_backoff_and_recovery(self):
+        plugin, robot = self._motion_plugin()
+        plugin._skeleton_pub = mock.Mock()
+        plugin._skeleton_message_type = mock.Mock
+        query = mock.Mock(side_effect=[RuntimeError("first"), RuntimeError("different"), {"position": [0]*7}, RuntimeError("new outage")])
+        plugin.client.joint_states = query
+        with mock.patch.object(self.device.time, "monotonic", return_value=10) as clock, mock.patch("builtins.print") as log:
+            plugin._publish_skeleton()
+            for _ in range(20): plugin._publish_skeleton()
+            self.assertEqual(1, query.call_count)
+            clock.return_value = 12
+            plugin._publish_skeleton()
+            self.assertEqual(2, query.call_count)
+            self.assertEqual(1, log.call_count)
+            clock.return_value = 14
+            plugin._publish_skeleton()
+            plugin._skeleton_pub.publish.assert_called_once()
+            clock.return_value = 14.1
+            plugin._publish_skeleton()
+            self.assertEqual(2, log.call_count)
+
+    def test_skeleton_skips_disconnected_and_busy_client(self):
+        plugin, robot = self._motion_plugin()
+        plugin._skeleton_pub = mock.Mock()
+        plugin._skeleton_message_type = mock.Mock
+        plugin.client.joint_states = mock.Mock()
+        plugin.client._handle = None
+        plugin._publish_skeleton()
+        plugin.client.joint_states.assert_not_called()
+        plugin.client._handle = mock.Mock(id=1)
+        plugin._skeleton_retry_at = 0
+        acquired = threading.Event(); release = threading.Event()
+        def hold():
+            with plugin.client._lock:
+                acquired.set(); release.wait(2)
+        thread = threading.Thread(target=hold); thread.start()
+        try:
+            self.assertTrue(acquired.wait(1))
+            plugin._publish_skeleton()
+            plugin.client.joint_states.assert_not_called()
+        finally:
+            release.set(); thread.join(2)
 
     def test_motion_requires_both_interlocks(self):
         plugin, robot = self._motion_plugin(motion_enabled=False)

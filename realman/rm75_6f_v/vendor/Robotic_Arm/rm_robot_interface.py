@@ -18,6 +18,9 @@
 
 from .rm_ctypes_wrap import *
 import ctypes
+import logging
+
+_logger = logging.getLogger(__name__)
 from typing import Callable, Tuple, Optional
 
 
@@ -1797,7 +1800,7 @@ class MovePlan:
         elif len(pose) == 6:
             config.pose.euler = rm_euler_t(*pose[3:])
         else:
-            print("Error: pose length is error.")
+            _logger.debug("Error: pose length is error.")
         config.follow = follow
         config.trajectory_mode = trajectory_mode
         config.radio = radio
@@ -1851,7 +1854,7 @@ class MovePlan:
         elif len(pose) == 6:
             po1.euler = rm_euler_t(*pose[3:])
         else:
-            print("Error: pose length is error.")
+            _logger.debug("Error: pose length is error.")
 
         tag = rm_movep_follow(self.handle, po1)
 
@@ -4622,7 +4625,7 @@ class ForcePositionControl:
         elif len(pose) == 6:
             po1.euler = rm_euler_t(*pose[3:])
         else:
-            print("Error: pose length is error.")
+            _logger.debug("Error: pose length is error.")
         tag = rm_force_position_move_pose(
             self.handle, po1, sensor, mode, dir, force, follow)
         return tag
@@ -7110,7 +7113,8 @@ class RoboticArm(ArmState, MovePlan, JointConfigSettings, JointConfigReader, Arm
         if mode == None:
             return
         rm_init(mode)
-        print("current c api version: ", rm_api_version())
+        if _logger.isEnabledFor(logging.DEBUG):
+            _logger.debug("current c api version: %s", rm_api_version())
 
     def rm_create_robot_arm(self, ip: str, port: int, level: int = 3, log_func: CFUNCTYPE = None) -> rm_robot_handle:
         """
