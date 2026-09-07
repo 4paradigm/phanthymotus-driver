@@ -7,7 +7,6 @@ from pathlib import Path
 import time
 import unittest
 import xml.etree.ElementTree as ET
-from contextlib import redirect_stdout
 from unittest import mock
 
 
@@ -45,7 +44,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("RM_MOTION_ENABLED=1", service)
         self.assertIn("RM_ARM_IP=${RM75_ARM_IP:-192.168.1.18}", service)
         self.assertIn("AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}", service)
-        self.assertIn("AGENT_CORE_TOKEN=${RM75_AGENT_CORE_TOKEN:-}", service)
+        self.assertNotIn("AGENT_CORE_TOKEN", service)
         self.assertIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
         self.assertIn("network_mode: host", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
@@ -102,45 +101,6 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         for index, (low, high) in enumerate(self.device.JOINT_LIMITS_DEG, 1):
             self.assertEqual(f"[{low:g}°, {high:g}°]", descriptions[f"joint{index}_deg"])
 
-    def test_registration_uses_agent_core_bearer_token(self):
-        runtime_spec = importlib.util.spec_from_file_location(
-            "realman_registration_vendor_runtime", ROOT / "common" / "vendor_runtime.py"
-        )
-        runtime = importlib.util.module_from_spec(runtime_spec)
-        runtime_spec.loader.exec_module(runtime)
-        captured = {}
-
-        class DeferredThread:
-            def __init__(self, target, **kwargs):
-                captured["target"] = target
-                captured["thread_kwargs"] = kwargs
-
-            def start(self):
-                captured["started"] = True
-
-        with mock.patch.dict(os.environ, {
-                "AGENT_CORE_URL": "https://phanthy-motus:15678",
-                "AGENT_CORE_TOKEN": "registration-secret",
-                "AGENT_CORE_CA_CERT": "/agent-core-ca.pem",
-            }, clear=True), mock.patch.object(runtime.threading, "Thread", DeferredThread), \
-                mock.patch("ssl.create_default_context", return_value=object()) as create_context:
-            runtime.start_registration(15718, {"name": "RM75"}, "rm75-driver")
-
-        with mock.patch("urllib.request.urlopen") as urlopen, \
-                mock.patch("time.sleep", side_effect=SystemExit):
-            with self.assertRaises(SystemExit):
-                captured["target"]()
-
-        self.assertTrue(captured["started"])
-        create_context.assert_called_once_with(cafile="/agent-core-ca.pem")
-        request = urlopen.call_args.args[0]
-        self.assertEqual("https://phanthy-motus:15678/api/mcp", request.full_url)
-        self.assertEqual(
-            "Bearer registration-secret",
-            request.get_header("Authorization"),
-        )
-        self.assertEqual("rm75-driver", json.loads(request.data)["id"])
-
     def test_enabled_driver_reports_missing_host_sdk_mount(self):
         with mock.patch.dict(os.environ, {"RM_DRIVER_ENABLED": "1", "RM_ARM_IP": "192.0.2.1"}, clear=True):
             client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
@@ -155,26 +115,6 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual({"state": "running"}, plugin.dispatch("start", {"_tool_name": "joint_states"}))
         self.assertEqual({"state": "ready"}, plugin.dispatch("start", {"_tool_name": "joint_control"}))
         self.assertEqual({"state": "ready"}, plugin.dispatch("start", {"_tool_name": "model"}))
-
-    def test_http_log_message_is_escaped_and_capped(self):
-        runtime_spec = importlib.util.spec_from_file_location("realman_vendor_runtime", ROOT / "common" / "vendor_runtime.py")
-        runtime = importlib.util.module_from_spec(runtime_spec)
-        runtime_spec.loader.exec_module(runtime)
-        handler = runtime.make_handler(lambda: None, "test", "test")
-
-        class Request:
-            @staticmethod
-            def address_string():
-                return "192.0.2.1"
-
-        output = io.StringIO()
-        with redirect_stdout(output):
-            handler.log_message(Request(), "%s", "GET /bad\r\nINJECT " + "x" * 400)
-        logged = output.getvalue().rstrip("\n")
-        self.assertIn(r"GET /bad\r\nINJECT", logged)
-        self.assertNotIn("\r", logged)
-        self.assertNotIn("\nINJECT", logged)
-        self.assertLessEqual(len(logged.removeprefix("[mcp] 192.0.2.1 ")), 200)
 
     def test_joint_degrees_are_converted_to_radians(self):
         class Handle:
@@ -276,7 +216,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "code -2"):
             client.call_dict("rm_get_controller_state")
 
-    def test_acp_https_requires_ca_and_mirrors_terminal_event_to_canvas(self):
+    def test_acp_https_requires_ca_and_posts_standard_completion(self):
         client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
         plugin = self.device.RM75Plugin(client, {})
         with mock.patch.dict(os.environ, {"AGENT_CORE_URL": "https://phanthy-motus:15678"}, clear=True), \
@@ -288,50 +228,24 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {
                 "AGENT_CORE_URL": "https://phanthy-motus:15678",
                 "AGENT_CORE_CA_CERT": "/cert.pem",
-                "AGENT_CORE_TOKEN": "secret-token",
             }, clear=True), \
                 mock.patch.object(self.device.ssl, "create_default_context", return_value=context) as create_context, \
                 mock.patch.object(self.device.urllib.request, "urlopen") as urlopen:
             plugin._acp_callback("action-2", "completed", {"max_error_deg": 0.1})
             create_context.assert_called_once_with(cafile="/cert.pem")
-            self.assertEqual(2, urlopen.call_count)
-            acp_call, canvas_call = urlopen.call_args_list
+            urlopen.assert_called_once()
+            acp_call = urlopen.call_args
             self.assertEqual(
                 "https://phanthy-motus:15678/api/acp/complete",
                 acp_call.args[0].full_url,
             )
-            self.assertEqual(
-                "https://phanthy-motus:15678/api/event",
-                canvas_call.args[0].full_url,
-            )
             self.assertIs(context, acp_call.kwargs["context"])
-            self.assertIs(context, canvas_call.kwargs["context"])
-            self.assertEqual(
-                "Bearer secret-token",
-                canvas_call.args[0].get_header("Authorization"),
-            )
-            canvas_payload = json.loads(canvas_call.args[0].data)
-            self.assertEqual("", canvas_payload["text"])
-            self.assertEqual("rm75_canvas", canvas_payload["source"])
-            self.assertEqual("completed", canvas_payload["payload"]["status"])
-            self.assertEqual("canvas_action_complete", canvas_payload["payload"]["type"])
-            self.assertEqual("action-2", canvas_payload["payload"]["action_id"])
-
-    def test_canvas_event_failure_does_not_repeat_or_replace_acp_completion(self):
-        client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
-        plugin = self.device.RM75Plugin(client, {})
-        first_response = mock.Mock()
-        with mock.patch.dict(os.environ, {
-                "AGENT_CORE_URL": "http://127.0.0.1:15678",
-            }, clear=True), \
-                mock.patch.object(
-                    self.device.urllib.request,
-                    "urlopen",
-                    side_effect=[first_response, RuntimeError("canvas unavailable")],
-                ) as urlopen:
-            plugin._acp_callback("action-3", "completed", {})
-        self.assertEqual(2, urlopen.call_count)
-        first_response.close.assert_called_once_with()
+            request_payload = json.loads(acp_call.args[0].data)
+            self.assertEqual("action-2", request_payload["action_id"])
+            self.assertEqual("completed", request_payload["status"])
+            self.assertEqual("joint_control", request_payload["tool"])
+            self.assertEqual({"max_error_deg": 0.1}, request_payload["result"])
+            self.assertIsNone(acp_call.args[0].get_header("Authorization"))
 
     def _motion_plugin(self, *, motion_enabled=True, current=None, all_state=None, safety=None):
         current = current or [0.0] * 7
