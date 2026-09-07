@@ -79,6 +79,7 @@ MIC_SOURCE_TOPIC = "/aima/hal/audio/capture"
 MIC_OUTPUT_FORMAT = "audio/pcm-16k"
 MIC_SAMPLE_RATE = 16000
 MIC_SAMPLE_BYTES = 2
+MIC_CHANNEL_INDICES = (0, 1, 2, 3)
 
 RESOURCE_DIR = Path(__file__).with_name("resource")
 
@@ -106,6 +107,18 @@ class InterleavedS16leChannelExtractor:
         self._channels = None
         self._input_pending.clear()
         self._mono_pending.clear()
+
+    def select_channel(self, channel_index):
+        channel_index = int(channel_index)
+        if channel_index < 0:
+            raise ValueError("mic channel_index must be non-negative")
+        changed = channel_index != self.channel_index
+        if changed:
+            self.channel_index = channel_index
+            # Never combine samples from the old and new channels in one
+            # AudioChunk when the card is reconfigured while streaming.
+            self.reset()
+        return changed
 
     @property
     def pending_bytes(self):
@@ -260,6 +273,8 @@ class AimdkNodes:
         self._mic_channel_index = int(mic_config.get("channel_index", 0))
         self._mic_chunk_bytes = int(mic_config.get("chunk_bytes", 1024))
         self._mic_source_timeout = float(mic_config.get("source_timeout_sec", 1.0))
+        if self._mic_channel_index not in MIC_CHANNEL_INDICES:
+            raise ValueError(f"mic channel_index must be one of {list(MIC_CHANNEL_INDICES)}")
         if self._mic_source_timeout <= 0:
             raise ValueError("mic source_timeout_sec must be positive")
         self._mic_extractor = InterleavedS16leChannelExtractor(
@@ -275,6 +290,7 @@ class AimdkNodes:
             "input_channels": None,
             "mic_channels": None,
             "ref_channels": None,
+            "channel_switches": 0,
             "last_frame_at": None,
             "last_error": "",
         }
@@ -340,6 +356,26 @@ class AimdkNodes:
                 publisher.publish(msg)
         return callback
 
+    def set_mic_channel(self, channel_index):
+        if isinstance(channel_index, bool) or not isinstance(channel_index, int):
+            raise ValueError("channel_index must be an integer")
+        if channel_index not in MIC_CHANNEL_INDICES:
+            raise ValueError(f"channel_index must be one of {list(MIC_CHANNEL_INDICES)}")
+        with self.lock:
+            reported_channels = self._mic_stats["mic_channels"]
+            if reported_channels is not None and channel_index >= reported_channels:
+                raise ValueError(
+                    f"channel_index {channel_index} is outside the "
+                    f"{reported_channels} microphone channels reported by AimDK"
+                )
+            changed = self._mic_extractor.select_channel(channel_index)
+            self._mic_channel_index = channel_index
+            if changed:
+                self._mic_stats["channel_switches"] += 1
+                self._mic_stats["last_frame_at"] = None
+            self._mic_stats["last_error"] = ""
+        return changed
+
     def _imu_callback(self, source, publisher):
         from std_msgs.msg import String
 
@@ -369,11 +405,6 @@ class AimdkNodes:
                     raise ValueError(f"expected S16LE, received {msg.info.sample_format!r}")
                 if coding_format != "pcm":
                     raise ValueError(f"expected pcm, received {msg.info.coding_format!r}")
-                if mic_channels <= self._mic_channel_index:
-                    raise ValueError(
-                        f"channel_index {self._mic_channel_index} is outside "
-                        f"the {mic_channels} microphone channels"
-                    )
                 if mic_channels + ref_channels > channels:
                     raise ValueError(
                         f"invalid channel metadata: {mic_channels} mic + {ref_channels} ref "
@@ -382,15 +413,21 @@ class AimdkNodes:
 
                 payload = bytes(msg.data.data)
                 with self.lock:
+                    if mic_channels <= self._mic_channel_index:
+                        raise ValueError(
+                            f"channel_index {self._mic_channel_index} is outside "
+                            f"the {mic_channels} microphone channels"
+                        )
                     chunks = self._mic_extractor.feed(payload, channels)
-                for chunk in chunks:
-                    output = self._AudioChunk()
-                    output.header.stamp = self.core.get_clock().now().to_msg()
-                    output.format = MIC_OUTPUT_FORMAT
-                    output.data = chunk
-                    self._mic_pub.publish(output)
-
-                with self.lock:
+                    # Keep extraction and publication atomic with respect to a
+                    # channel switch: once config returns, no old-channel chunk
+                    # can still be waiting to publish.
+                    for chunk in chunks:
+                        output = self._AudioChunk()
+                        output.header.stamp = self.core.get_clock().now().to_msg()
+                        output.format = MIC_OUTPUT_FORMAT
+                        output.data = chunk
+                        self._mic_pub.publish(output)
                     self._mic_stats["source_messages"] += 1
                     self._mic_stats["source_bytes"] += len(payload)
                     self._mic_stats["published_chunks"] += len(chunks)
@@ -426,6 +463,7 @@ class AimdkNodes:
             "state": state,
             **self.streams["mic"],
             "channel_index": self._mic_channel_index,
+            "channels_available": list(MIC_CHANNEL_INDICES),
             "chunk_bytes": self._mic_chunk_bytes,
             "sample_rate": MIC_SAMPLE_RATE,
             "sample_format": "S16LE",
@@ -577,11 +615,27 @@ class MicPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return _stream_tool(
+        definition = _stream_tool(
             "mic",
             self.nodes.streams["mic"],
-            "内置麦克风阵列：提取单路 PCM 16kHz 16bit 音频",
+            "内置麦克风阵列：可热切换 Mic 0～3，输出单路 PCM 16kHz 16bit 音频",
         )
+        definition["configSchema"] = {
+            "type": "object",
+            "properties": {
+                "channel_index": {
+                    "type": "integer",
+                    "description": "选择用于语音识别的物理麦克风通道",
+                    "default": self.nodes._mic_channel_index,
+                    "scope": "shared",
+                    "oneOf": [
+                        {"const": index, "title": f"Mic {index}"}
+                        for index in MIC_CHANNEL_INDICES
+                    ],
+                },
+            },
+        }
+        return definition
 
     def start(self):
         pass
@@ -590,6 +644,26 @@ class MicPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "config":
+            config = args.get("config") if isinstance(args.get("config"), dict) else args
+            if "channel_index" not in config:
+                return {"ok": True, "status": "configured", **self.nodes.mic_snapshot()}
+            try:
+                changed = self.nodes.set_mic_channel(config["channel_index"])
+            except ValueError as exc:
+                return {
+                    "ok": False,
+                    "state": "error",
+                    "error": str(exc),
+                    "channel_index": self.nodes._mic_channel_index,
+                    "channels_available": list(MIC_CHANNEL_INDICES),
+                }
+            return {
+                "ok": True,
+                "status": "configured",
+                "changed": changed,
+                **self.nodes.mic_snapshot(),
+            }
         if action == "stop":
             return {"state": "idle"}
         return self.nodes.mic_snapshot()
