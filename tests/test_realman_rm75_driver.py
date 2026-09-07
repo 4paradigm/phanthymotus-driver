@@ -23,9 +23,8 @@ class RealManRM75ImageContractTests(unittest.TestCase):
     def test_image_contains_only_minimal_api2_runtime(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("COPY vendor/Robotic_Arm/ /work/Robotic_Arm/", dockerfile)
-        self.assertIn("ARG RM_API2_LIB_URL=", dockerfile)
-        self.assertIn("5b9d236a5cf901cdf05418d9ef5815a77a8c717af0ff037e7aad9247beb76fb9", dockerfile)
-        self.assertIn("sha256sum -c -", dockerfile)
+        self.assertNotIn("RM_API2_LIB_URL", dockerfile)
+        self.assertNotIn("ADD http", dockerfile)
         self.assertIn("COPY deploy/ /deploy/", dockerfile)
         self.assertNotIn("colcon", dockerfile)
         self.assertNotIn("rm_driver", dockerfile)
@@ -42,6 +41,10 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("RM_DRIVER_ENABLED=0", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
+        self.assertIn(
+            "${RM_API2_LIB_DIR:-/opt/realman/rm_api2/libs/linux_arm}:/work/Robotic_Arm/libs/linux_arm:ro",
+            service,
+        )
         self.assertNotIn("/opt/realman/rm_ws", service)
         self.assertNotIn("network_mode:", service)
         self.assertNotIn("ipc:", service)
@@ -67,6 +70,13 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual("actuator", joint_control["type"])
         self.assertEqual(["set"], joint_control["inputSchema"]["x-completion"]["actions"])
         self.assertEqual(10, joint_control["inputSchema"]["properties"]["speed_percent"]["maximum"])
+
+    def test_enabled_driver_reports_missing_host_sdk_mount(self):
+        with mock.patch.dict(os.environ, {"RM_DRIVER_ENABLED": "1", "RM_ARM_IP": "192.0.2.1"}, clear=True):
+            client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+        with mock.patch.object(self.device, "SDK_LIBRARY_PATH", Path("/definitely/missing/libapi_c.so")):
+            with self.assertRaisesRegex(FileNotFoundError, "mount RM_API2_LIB_DIR"):
+                client.start()
 
     def test_tool_start_returns_contract_lifecycle_state(self):
         with mock.patch.dict(os.environ, {}, clear=True):

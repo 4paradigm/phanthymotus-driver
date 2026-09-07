@@ -14,6 +14,7 @@ from common.vendor_runtime import action_schema, jsonable, tool
 
 
 JOINT_NAMES = [f"joint{i}" for i in range(1, 8)]
+SDK_LIBRARY_PATH = Path("/work/Robotic_Arm/libs/linux_arm/libapi_c.so")
 JOINT_LIMITS_DEG = [(-178.0, 178.0), (-130.0, 130.0), (-178.0, 178.0),
                     (-135.0, 135.0), (-178.0, 178.0), (-128.0, 128.0),
                     (-360.0, 360.0)]
@@ -52,6 +53,11 @@ class RM75SDKClient:
             return
         if not self.ip:
             raise ValueError("RM_ARM_IP is required when RM_DRIVER_ENABLED=1")
+        if not SDK_LIBRARY_PATH.is_file():
+            raise FileNotFoundError(
+                "RealMan API2 ARM64 library is missing; mount RM_API2_LIB_DIR "
+                "to /work/Robotic_Arm/libs/linux_arm"
+            )
         from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
 
         with self._lock:
