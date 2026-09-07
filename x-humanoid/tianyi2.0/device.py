@@ -986,16 +986,22 @@ class CameraPlugin:
 
         main.py's lazy start only ever calls this for the *first* ``action=start``
         (the plugin then stays in its ``_started_plugins`` set forever), so a
-        restart has to come through here from ``dispatch``. What gets rebuilt is
-        deliberately asymmetric:
+        restart has to come through here from ``dispatch``.
 
-        * the publisher is created once and kept — on domain 42 it is a
-          ``BridgedPublisher`` holding a Unix socket to the socket_bridge
-          process, and a second one for the same topic is exactly the duplicate
-          connection its connection lock exists to prevent;
-        * the raw-image subscription is rebuilt, because a stopped camera should
-          not keep pulling ~900 KB uncompressed frames off domain 0;
-        * the encode thread is rebuilt, because ``stop()`` is what ends it.
+        Both ROS endpoints are created once and kept for the process lifetime;
+        only the encode thread is rebuilt, because ``stop()`` is what ends it.
+        Neither endpoint may be recycled per start:
+
+        * the publisher is a ``BridgedPublisher`` owning a Unix socket to the
+          socket_bridge process, and a second one for the same topic is exactly
+          the duplicate connection its connection lock exists to prevent;
+        * destroying and recreating the subscription on a node that a live
+          executor is spinning does not reliably re-deliver. Measured on Tianyi:
+          one slow cycle worked, then three quick stop→start cycles left the
+          subscription present in the graph, the executor healthy (other
+          domain-0 sensors kept publishing) and the callback never firing again.
+          A stopped camera therefore keeps deserializing raw frames it drops —
+          that waste is the price of a stream that always comes back.
         """
         with self._lifecycle_lock:
             if self._running:
@@ -1047,7 +1053,7 @@ class CameraPlugin:
                 self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
                 self._encode_thread.start()
 
-            print("[CameraPlugin] subscription + encode thread created")
+            print("[CameraPlugin] subscription + encode thread created", flush=True)
 
     @staticmethod
     def _ensure_orbbec_service():
@@ -1127,15 +1133,13 @@ class CameraPlugin:
     def stop(self):
         """Disarm the stream, leaving it restartable by ``start()``.
 
-        The publisher deliberately survives (see ``start``); the subscription is
-        destroyed so a stopped camera stops consuming domain-0 bandwidth, and the
-        encode thread ends on the cleared flag.
+        Only the flag and the buffered frame are touched. Both ROS endpoints
+        survive on purpose — see ``start`` for why neither may be recycled. The
+        encode thread ends on the cleared flag, and ``_on_image_grab`` drops
+        every frame that arrives meanwhile.
         """
         with self._lifecycle_lock:
             self._running = False
-            if self._subscription is not None:
-                self._sub_node.destroy_subscription(self._subscription)
-                self._subscription = None
             with self._frame_lock:
                 self._latest_frame = None
 
