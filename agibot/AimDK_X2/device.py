@@ -303,8 +303,12 @@ class AimdkNodes:
         self.core.destroy_node()
 
 
+def _stream_topic_out(stream):
+    return [{"topic": stream["topic"], "format": stream["format"]}]
+
+
 def _stream_tool(key, stream, description):
-    return tool(key, "sensor", description, topic_out=[{"topic": stream["topic"], "format": stream["format"]}])
+    return tool(key, "sensor", description, topic_out=_stream_topic_out(stream))
 
 
 class McStatePlugin:
@@ -354,13 +358,14 @@ class JointStatePlugin:
         pass
 
     def dispatch(self, action, args):
+        topic_out = _stream_topic_out(self.nodes.streams["joint_state"])
         if action == "start":
-            return {"state": "running"}
+            return {"state": "running", "topic_out": topic_out}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", **self.nodes.streams["joint_state"]}
-        return self.nodes.query_joint_state()
+            return {"state": "running", "topic_out": topic_out}
+        return {**self.nodes.query_joint_state(), "topic_out": topic_out}
 
 
 class HandStatePlugin:

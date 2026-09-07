@@ -365,6 +365,9 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(result["state"], "ok")
         self.assertEqual(result["service"], "GetAllJointState")
         self.assertEqual(result["arm"], [{"name": "left_shoulder_pitch_joint", "position": 0.25}])
+        self.assertEqual(result["topic_out"], [{
+            "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
+        }])
 
     def test_joint_state_has_its_own_stream_and_publishes_service_values(self):
         plugins = build_bundle_plugins()
@@ -379,9 +382,14 @@ class DispatchSmokeTests(unittest.TestCase):
         joint_state.nodes.get_all_joint_state.response = response
 
         definition = joint_state.get_tool()
-        self.assertEqual(definition["topic_out"], [{
+        expected_topic_out = [{
             "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
-        }])
+        }]
+        self.assertEqual(definition["topic_out"], expected_topic_out)
+        for action in ("start", "info"):
+            result = joint_state.dispatch(action, {})
+            self.assertEqual(result["topic_out"], expected_topic_out)
+            self.assertNotIn("hand_state", str(result["topic_out"]))
         joint_state.nodes._publish_joint_state()
         published = joint_state.nodes.joint_state_pub.published[-1]
         self.assertIn('"state": "ok"', published.data)
@@ -402,6 +410,9 @@ class DispatchSmokeTests(unittest.TestCase):
             "service": "GetAllJointState",
             "status": 0,
             "message": "joint state unavailable",
+            "topic_out": [{
+                "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
+            }],
         })
 
     def test_joint_state_reports_an_unavailable_service(self):
@@ -426,6 +437,9 @@ class DispatchSmokeTests(unittest.TestCase):
             "state": "unavailable",
             "service": "GetAllJointState",
             "message": "transport failed",
+            "topic_out": [{
+                "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
+            }],
         })
 
 class StartStopLifecycleTests(unittest.TestCase):
