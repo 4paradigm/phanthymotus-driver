@@ -17,3 +17,4 @@ ros:
   robot_domain_id: 42
   core_domain_id: 42
   robot_interface: "eth0"
+  skeleton_publish_hz: 10

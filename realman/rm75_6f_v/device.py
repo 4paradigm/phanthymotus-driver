@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import ssl
@@ -134,8 +135,18 @@ class RM75Plugin:
         "controller_state": "rm_get_controller_state",
     }
 
-    def __init__(self, client, config):
+    def __init__(self, client, config, namespace="rm75", ros2=None):
         self.client = client
+        self._ros2 = ros2
+        self._skeleton_topic = f"/{namespace.strip('/') or 'rm75'}/state/joints"
+        ros_config = config.get("ros", {})
+        self._skeleton_publish_hz = float(ros_config.get("skeleton_publish_hz", 10.0))
+        if not math.isfinite(self._skeleton_publish_hz) or self._skeleton_publish_hz <= 0:
+            raise ValueError("ros.skeleton_publish_hz must be a positive finite number")
+        self._skeleton_node = None
+        self._skeleton_pub = None
+        self._skeleton_message_type = None
+        self._last_skeleton_error = None
         safety = config.get("safety", {})
         self.max_speed_percent = min(int(safety.get("max_speed_percent", 10)), 10)
         self.default_speed_percent = min(int(safety.get("default_speed_percent", 5)), self.max_speed_percent)
@@ -146,13 +157,22 @@ class RM75Plugin:
         self.progress_threshold_deg = float(safety.get("progress_threshold_deg", 0.05))
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
         self._motion_lock = threading.Lock()
+        self._action_lock = threading.Lock()
         self._active_action_id = None
         self._cancelled = set()
+
+    def _skeleton_topic_out(self):
+        return [{"topic": self._skeleton_topic, "format": "sensor/skeleton"}]
 
     def get_tools(self):
         definitions = [
             tool("connection", "sensor", "RM75 SDK connection status; never initiates motion"),
-            tool("joint_states", "sensor", "Read seven RM75 joint angles; output positions are radians"),
+            tool(
+                "joint_states",
+                "sensor",
+                f"Read and publish seven RM75 joint angles in radians at {self._skeleton_publish_hz:g} Hz",
+                topic_out=self._skeleton_topic_out(),
+            ),
             tool("model", "resource", "RM75-6F-V simplified URDF for skeleton rendering"),
         ]
         definitions.extend(tool(name, "sensor", f"Read-only RealMan API2 call: {method}") for name, method in self.METHODS.items())
@@ -185,19 +205,86 @@ class RM75Plugin:
 
     def start(self):
         self.client.start()
+        if self.client.connected and self._ros2 is not None:
+            self._start_skeleton_publisher()
 
     def stop(self):
-        if self._active_action_id and self.client.connected:
+        with self._action_lock:
+            action_id = self._active_action_id
+            if action_id:
+                self._cancelled.add(action_id)
+        if action_id and self.client.connected:
             try:
                 self.client.command("rm_set_arm_slow_stop")
             except Exception as exc:
                 print(f"[rm75] shutdown stop failed: {exc}", flush=True)
+        self._stop_skeleton_publisher()
         self.client.stop()
 
+    def _start_skeleton_publisher(self):
+        from rclpy.node import Node
+        from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+        from std_msgs.msg import String
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        node = Node("rm75_skeleton", context=self._ros2.ctx_core)
+        self._skeleton_message_type = String
+        self._skeleton_pub = node.create_publisher(String, self._skeleton_topic, qos)
+        node.create_timer(1.0 / self._skeleton_publish_hz, self._publish_skeleton)
+        self._ros2.executor_core.add_node(node)
+        self._skeleton_node = node
+
+    def _stop_skeleton_publisher(self):
+        node, self._skeleton_node = self._skeleton_node, None
+        self._skeleton_pub = None
+        self._skeleton_message_type = None
+        if node is None:
+            return
+        try:
+            self._ros2.executor_core.remove_node(node)
+        finally:
+            node.destroy_node()
+
+    def _skeleton_payload(self):
+        state = self.client.joint_states()
+        return {
+            "timestamp_ms": int(time.time() * 1000),
+            "format": "sensor/skeleton",
+            "position_unit": "rad",
+            "joint_count": len(JOINT_NAMES),
+            "joints": [
+                {"idx": index, "name": name, "q": float(position)}
+                for index, (name, position) in enumerate(zip(JOINT_NAMES, state["position"]))
+            ],
+        }
+
+    def _publish_skeleton(self):
+        publisher = self._skeleton_pub
+        message_type = self._skeleton_message_type
+        if publisher is None or message_type is None:
+            return
+        try:
+            message = message_type()
+            message.data = json.dumps(self._skeleton_payload(), ensure_ascii=False)
+            publisher.publish(message)
+            self._last_skeleton_error = None
+        except Exception as exc:
+            error = str(exc)
+            if error != self._last_skeleton_error:
+                print(f"[rm75] skeleton publish failed: {error}", flush=True)
+                self._last_skeleton_error = error
+
     def _motion_status(self):
+        with self._action_lock:
+            active_action_id = self._active_action_id
         return {
             **self.client.status(),
-            "active_action_id": self._active_action_id,
+            "active_action_id": active_action_id,
             "limits_deg": JOINT_LIMITS_DEG,
             "max_speed_percent": self.max_speed_percent,
             "watchdog": {
@@ -265,7 +352,6 @@ class RM75Plugin:
         return min(self.max_motion_seconds, max(30.0, max(estimates, default=0.0) * 3.0 + 10.0))
 
     def _acp_callback(self, action_id, status, result):
-        import json
         url = os.environ.get("AGENT_CORE_URL", "").strip().rstrip("/")
         ca_cert = os.environ.get("AGENT_CORE_CA_CERT", "").strip()
         token = os.environ.get("AGENT_CORE_TOKEN", "").strip()
@@ -325,7 +411,9 @@ class RM75Plugin:
         status, result = "error", {"reason": "unknown"}
         try:
             while time.monotonic() < deadline:
-                if action_id in self._cancelled:
+                with self._action_lock:
+                    cancelled = action_id in self._cancelled
+                if cancelled:
                     status, result = "cancelled", {"reason": "stopmotion"}
                     break
                 self._preflight()
@@ -364,9 +452,12 @@ class RM75Plugin:
                 pass
             result = {"reason": str(exc)}
         finally:
-            self._cancelled.discard(action_id)
-            if self._active_action_id == action_id:
-                self._active_action_id = None
+            with self._action_lock:
+                if action_id in self._cancelled:
+                    status, result = "cancelled", {"reason": "stopmotion"}
+                self._cancelled.discard(action_id)
+                if self._active_action_id == action_id:
+                    self._active_action_id = None
             self._motion_lock.release()
             self._acp_callback(action_id, status, result)
 
@@ -383,7 +474,8 @@ class RM75Plugin:
             max_duration = self._motion_deadline_seconds(current, target, speed)
             action_id = f"rm75_movej_{uuid4().hex[:10]}"
             self.client.command("rm_movej", target, speed, 0, 0, 0)
-            self._active_action_id = action_id
+            with self._action_lock:
+                self._active_action_id = action_id
             threading.Thread(
                 target=self._monitor_motion,
                 args=(action_id, current, target, max_duration),
@@ -397,10 +489,13 @@ class RM75Plugin:
             raise
 
     def _stop_motion(self):
-        action_id = self._active_action_id
-        self.client.command("rm_set_arm_slow_stop")
-        if action_id:
-            self._cancelled.add(action_id)
+        # Keep the action-state lock across the SDK stop request. The monitor
+        # cannot select a terminal state between cancellation and slow-stop.
+        with self._action_lock:
+            action_id = self._active_action_id
+            if action_id:
+                self._cancelled.add(action_id)
+            self.client.command("rm_set_arm_slow_stop")
         return {"state": "stop_requested", "action_id": action_id}
 
     def dispatch(self, action, args):
@@ -410,7 +505,8 @@ class RM75Plugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {**self._motion_status(), "topic_out": []}
+            topic_out = self._skeleton_topic_out() if name == "joint_states" else []
+            return {**self._motion_status(), "topic_out": topic_out}
         if name == "connection":
             return self.client.status()
         if name == "joint_states":
@@ -433,5 +529,4 @@ class RM75Plugin:
 
 
 def build_plugins(config, namespace, ros2):
-    del namespace, ros2
-    return [RM75Plugin(RM75SDKClient(config), config)]
+    return [RM75Plugin(RM75SDKClient(config), config, namespace=namespace, ros2=ros2)]
