@@ -248,8 +248,10 @@ class MicPlugin:
 class NativeTtsPlugin:
     PREFIX = "tts"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
+    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient,
+                 audio_lock: threading.Lock):
         self._client = audio_client
+        self._audio_lock = audio_lock  # shared lock serializing the shared AudioClient
 
     def get_tool(self) -> dict:
         return {
@@ -292,14 +294,17 @@ class NativeTtsPlugin:
         if action == "speak":
             text  = args.get("text", "")
             voice = int(args.get("voice", 0))
-            ret   = self._client.TtsMaker(text, voice)
+            with self._audio_lock:
+                ret = self._client.TtsMaker(text, voice)
             return {"ret": ret, "text": text}
         elif action == "get_volume":
-            ret = self._client.GetVolume()
+            with self._audio_lock:
+                ret = self._client.GetVolume()
             return {"ret": ret}
         elif action == "set_volume":
             vol = int(args.get("volume", 50))
-            ret = self._client.SetVolume(vol)
+            with self._audio_lock:
+                ret = self._client.SetVolume(vol)
             return {"ret": ret, "volume": vol}
         return None
 
@@ -1000,19 +1005,20 @@ class LedPlugin:
     # Auto-timeout per state (seconds). None = must be explicitly overridden.
     _TIMEOUT = {'idle': None, 'hearing': 1.2, 'thinking': 60, 'speaking': 120, 'error': 5}
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
+    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient,
+                 audio_lock: threading.Lock):
         self._client = audio_client
         self._state = 'idle'
         self._state_ts = 0.0
         self._state_lock = threading.Lock()
         self._effect_thread = None
         self._effect_stop = threading.Event()
-        self._hw_lock = threading.Lock()  # DDS RPC thread safety
+        self._audio_lock = audio_lock  # shared lock serializing the shared AudioClient
         self._timeout_timer = None
 
     def _led_set(self, r: int, g: int, b: int) -> int:
         """Thread-safe LED control with error logging."""
-        with self._hw_lock:
+        with self._audio_lock:
             code = self._client.LedControl(r, g, b)
             if code != 0:
                 print(f'[LED] LedControl({r},{g},{b}) failed: code={code}')
@@ -1204,10 +1210,10 @@ class GreetPlugin:
     PREFIX = "greet"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 loco_client, audio_client: AudioClient):
+                 loco_client, audio_client: AudioClient, audio_lock: threading.Lock):
         self._loco = loco_client
         self._audio = audio_client
-        self._audio_lock = threading.Lock()  # audio_client 与 tts/led 卡共享，串行化 RPC
+        self._audio_lock = audio_lock  # shared lock serializing the shared AudioClient (tts/led/greet)
         self._default_text = str(plugin_config.get("default_text", "你好，欢迎光临"))
         self._voice = int(plugin_config.get("voice", 0))
         rgb = plugin_config.get("led_rgb", [0, 255, 0])
@@ -1231,8 +1237,12 @@ class GreetPlugin:
                     "b": {"type": "integer", "description": "LED 蓝 0-255"},
                 },
                 "required": ["action"],
+                "x-completion": {
+                    "actions": ["greet"],
+                    "timeout": 60,
+                },
                 "x-action-params": {
-                    "greet": {"params": ["text", "turn"], "description": "完整迎宾：挥手 + 说话 + LED"},
+                    "greet": {"params": ["text", "turn"], "description": "完整迎宾：挥手 + 说话 + LED（异步执行，完成后回调）"},
                     "wave":  {"params": ["turn"], "description": "只挥手"},
                     "speak": {"params": ["text"], "description": "只语音问候"},
                     "led":   {"params": ["r", "g", "b"], "description": "只设置 LED 颜色"},
@@ -1261,7 +1271,8 @@ class GreetPlugin:
             return {"ret": ret, "turn": turn}
         if action == "speak":
             text = str(args.get("text", self._default_text))
-            ret = self._audio.TtsMaker(text, self._voice)
+            with self._audio_lock:
+                ret = self._audio.TtsMaker(text, self._voice)
             return {"ret": ret, "text": text}
         if action == "led":
             r = int(args.get("r", self._led_rgb[0]))
@@ -1271,17 +1282,37 @@ class GreetPlugin:
                 ret = self._audio.LedControl(r, g, b)
             return {"ret": ret, "r": r, "g": g, "b": b}
         if action == "greet":
+            from uuid import uuid4
+            action_id = f"g1_greet_{uuid4().hex[:8]}"
             text = str(args.get("text", self._default_text))
             turn = bool(args.get("turn", False))
+            threading.Thread(target=self._run_greet, args=(action_id, text, turn),
+                             daemon=True, name="greet_seq").start()
+            return {"status": "executing", "action_id": action_id, "text": text, "turn": turn}
+        return None
+
+    def _run_greet(self, action_id: str, text: str, turn: bool):
+        """Background thread: run the greet sequence, then fire ACP completion.
+
+        The vendor RPCs (LedControl/WaveHand/TtsMaker) are fire-and-forget, so
+        completion is signalled once the full sequence has been dispatched. Every
+        path must notify, otherwise agent-core's barrier waits out the full
+        x-completion timeout for a sequence that already died.
+        """
+        try:
             r, g, b = self._led_rgb
             with self._audio_lock:
                 led_ret = self._audio.LedControl(r, g, b)
             wave_ret = self._loco.WaveHand(turn)
             with self._audio_lock:
                 tts_ret = self._audio.TtsMaker(text, self._voice)
-            return {"ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
-                    "text": text, "turn": turn}
-        return None
+            result = {"ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
+                      "text": text, "turn": turn}
+            status = "completed"
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+            status = "error"
+        _loco_acp_notify(action_id, status, result, tool="greet")
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
@@ -1519,7 +1550,7 @@ class LocoPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["move", "stop_move", "set_stand_height", "get_fsm_id", "get_fsm_mode", "get_balance_mode", "get_swing_height", "get_stand_height", "get_phase", "wave_hand", "shake_hand", "sit"],
+                        "enum": ["move", "stop_move", "set_stand_height", "get_fsm_id", "get_fsm_mode", "get_balance_mode", "get_swing_height", "get_stand_height", "get_phase", "wave_hand", "shake_hand"],
                         "description": "Action to perform",
                     },
                     "vx":         {"type": "number", "description": "Forward velocity m/s [-1, 1]"},
@@ -1546,7 +1577,6 @@ class LocoPlugin:
                     "get_phase":        {"params": [],                                 "description": "Get current gait phase (deprecated)"},
                     "wave_hand":        {"params": ["turn"],                           "description": "Perform a waving hand gesture"},
                     "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture"},
-                    "sit":              {"params": [],                                 "description": "坐下（位控落座 FSM 3，无平衡控制）"},
                 },
             },
         }
@@ -1904,12 +1934,6 @@ class LocoPlugin:
         elif action == "shake_hand":
             ret = self._client.ShakeHand()
             return {"ret": ret}
-        elif action == "sit":
-            # 位控落座（FSM 3）无平衡控制，先停稳再落座，避免带速度摔倒
-            self._client.StopMove()
-            ret = self._client.Sit()
-            return {"ret": ret, "fsm_id": 3,
-                    "warning": "sit 为位控落座（FSM 3，无平衡控制）；回到运控请用 switch_mode 的 lie2standup/squat2standup"}
         return None
 
     # ── FSM sequence helper ───────────────────────────────────────────────────
