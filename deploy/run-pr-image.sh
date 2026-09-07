@@ -30,6 +30,8 @@ PR_IMAGE_DIR="${PR_IMAGE_DIR:-/tmp/pr-image}"
 COMPOSE_FILE="${PR_IMAGE_DIR}/docker-compose.yml"
 STATE_FILE="${PR_IMAGE_DIR}/state"
 SERVICE_YAML_PATH="/deploy/service.yml"
+PULL_TIMEOUT_SECONDS="${PULL_TIMEOUT_SECONDS:-300}"
+PULL_ATTEMPTS="${PULL_ATTEMPTS:-2}"
 
 die()  { echo "Error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -64,6 +66,32 @@ load_state() {
 }
 
 compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
+
+# A registry connection can leave the Docker client waiting indefinitely on a
+# blob. Bound each attempt and retry once; completed layers stay cached, so the
+# retry only requests the unfinished layers.
+pull_image() {
+    local image="$1" attempt=1
+    command -v timeout >/dev/null 2>&1 \
+        || die "the 'timeout' command is required to pull a PR image safely."
+    case "$PULL_TIMEOUT_SECONDS" in ''|*[!0-9]*) die "PULL_TIMEOUT_SECONDS must be a positive integer." ;; esac
+    case "$PULL_ATTEMPTS" in ''|*[!0-9]*) die "PULL_ATTEMPTS must be a positive integer." ;; esac
+    [ "$PULL_TIMEOUT_SECONDS" -gt 0 ] || die "PULL_TIMEOUT_SECONDS must be greater than zero."
+    [ "$PULL_ATTEMPTS" -gt 0 ] || die "PULL_ATTEMPTS must be greater than zero."
+
+    while [ "$attempt" -le "$PULL_ATTEMPTS" ]; do
+        info "Pulling $image (attempt $attempt/$PULL_ATTEMPTS; timeout ${PULL_TIMEOUT_SECONDS}s)"
+        if timeout --foreground "${PULL_TIMEOUT_SECONDS}s" docker pull "$image"; then
+            return 0
+        fi
+        if [ "$attempt" -lt "$PULL_ATTEMPTS" ]; then
+            info "Pull attempt failed; retrying cached layers in 3 seconds."
+            sleep 3
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
 
 # ── Extract the service fragment out of the image ─────────────────────────────
 #
@@ -130,8 +158,7 @@ cmd_up() {
     require_docker
     mkdir -p "$PR_IMAGE_DIR"
 
-    info "Pulling $image"
-    if ! docker pull "$image"; then
+    if ! pull_image "$image"; then
         # A pull failure is not fatal if the image is already here: the registry
         # may be briefly unreachable, or the image may have been built locally
         # and never pushed. Only give up when we have no copy at all.
