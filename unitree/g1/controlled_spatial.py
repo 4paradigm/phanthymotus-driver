@@ -352,6 +352,7 @@ class ControlledSpatialPlugin:
         self._nav_generation = 0
         self._last_db_map_status: str | None = None
         self._lock = threading.Lock()
+        self._nav_command_lock = threading.Lock()
 
         # Subscribe DDS for pose updates
         self._dds_subs = []
@@ -503,19 +504,29 @@ class ControlledSpatialPlugin:
 
     # ── ACP completion thread ────────────────────────────────────────────────
 
-    def _try_claim_terminal(self, action_id: str) -> bool:
+    def _nav_is_current(self, action_id: str, generation: int | None) -> bool:
+        # Wait until a provisional reservation commits or rolls back.
+        with self._nav_command_lock, self._lock:
+            return (self._nav_action_id == action_id and
+                    (generation is None or self._nav_generation == generation))
+
+    def _try_claim_terminal(self, action_id: str, pause: bool = False) -> bool:
         """Atomically claim the terminal transition for action_id.
 
         Returns True only if action_id is still the current navigation (and
         clears it), so exactly one waiter posts the terminal ACP callback.
-        Must not call _acp_notify inside the lock — network I/O stays out of
-        the critical section.
+        ACP callbacks stay outside both locks. Optional PauseNav holds only
+        the command lock so it cannot pause a newly submitted navigation.
         """
-        with self._lock:
-            if self._nav_action_id == action_id:
+        with self._nav_command_lock:
+            with self._lock:
+                if self._nav_action_id != action_id:
+                    return False
                 self._nav_action_id = None
-                return True
-            return False
+            # Prevent a replacement from starting before the old motion is paused.
+            if pause and self._client:
+                self._client.PauseNav()
+            return True
 
     def _reserve_nav(self, action_id: str):
         """Reserve action_id as the current navigation before sending the physical command.
@@ -559,11 +570,20 @@ class ControlledSpatialPlugin:
         # The main process DDS callback for ctrl_info.is_arrived is unreliable
         # (SLAM service never publishes ctrl_info in practice).
         if self._smart_motion:
-            result = self._smart_motion.wait_nav_done(
-                stall_timeout=stall_timeout, navigation_id=action_id)
-            if result.get("status") == "superseded":
-                print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
-                return
+            while True:
+                if not self._nav_is_current(action_id, generation):
+                    return
+                result = self._smart_motion.wait_nav_done(
+                    stall_timeout=stall_timeout, navigation_id=action_id)
+                if result.get("status") != "unknown":
+                    break
+                # Timeout does not confirm termination. Cancel only this ID, since
+                # a replacement may already be physically active.
+                result = self._smart_motion._call(
+                    "cancel_navigation", navigation_id=action_id)
+                if result.get("status") in ("stopped", "superseded"):
+                    break
+                time.sleep(0.5)
             elapsed = round(time.time() - t0, 1)
             # Guard: if this nav was superseded, don't fire stale ACP
             if not self._try_claim_terminal(action_id):
@@ -574,6 +594,8 @@ class ControlledSpatialPlugin:
                 _acp_notify(action_id, "completed", {
                     "target": target, "pose": result.get("pose"), "elapsed": elapsed,
                 })
+            elif status == "superseded":
+                _acp_notify(action_id, "cancelled", {"target": target, "reason": status})
             else:
                 # Validate: if status is unexpected (e.g. "navigating" from queue race),
                 # treat as error with full result for debugging
@@ -592,10 +614,9 @@ class ControlledSpatialPlugin:
         last_move_time = time.time()
 
         while True:
-            with self._lock:
-                if generation is not None and self._nav_generation != generation:
-                    print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
-                    return
+            if not self._nav_is_current(action_id, generation):
+                print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify')
+                return
 
             # Pose-based arrival check before waiting for stale ctrl_info signal
             if target_xy is not None:
@@ -647,11 +668,9 @@ class ControlledSpatialPlugin:
 
             if time.time() - last_move_time > stall_timeout:
                 # Guard: if superseded, don't PauseNav (would pause active nav) or post stale error
-                if not self._try_claim_terminal(action_id):
+                if not self._try_claim_terminal(action_id, pause=True):
                     print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping stall_timeout notify')
                     return
-                if self._client:
-                    self._client.PauseNav()
                 _acp_notify(action_id, "error", {
                     "target": target,
                     "error": f"stall_timeout ({stall_timeout}s)",
@@ -672,6 +691,15 @@ class ControlledSpatialPlugin:
     # ── Dispatch ─────────────────────────────────────────────────────────────
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action in ("navigate_to_tag", "navigate_to_pose",
+                      "pause_nav", "resume_nav", "stop_nav"):
+            # Serialize reservation through RPC and waiter setup, without holding
+            # the state lock needed by DDS callbacks and completion waiters.
+            with self._nav_command_lock:
+                return self._dispatch_serialized(action, args)
+        return self._dispatch_serialized(action, args)
+
+    def _dispatch_serialized(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -842,15 +870,18 @@ class ControlledSpatialPlugin:
                 self._nav_error = None
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
-                # Reserve the action ID BEFORE sending the physical command so the old
-                # waiter is invalidated before the motion can change.  If navigate_to
-                # fails, the old nav was already PauseNav'd in the subprocess, so we
-                # report it cancelled and clean up the failed reservation.
-                old_id, _, generation = self._reserve_nav(action_id)
+                # Invalidate the old waiter before physical motion can change.
+                # Only expired guarantees that the replacement was not executed.
+                old_id, old_gen, generation = self._reserve_nav(action_id)
                 result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
                                                      speed=speed, mode=mode,
                                                      navigation_id=action_id)
-                if result.get("status") != "navigating":
+                if result.get("status") == "expired":
+                    self._rollback_nav(action_id, old_id, old_gen)
+                    return result
+                # A timed-out submission may still be active. Keep its reservation
+                # and track the navigation ID until a terminal result is known.
+                if result.get("status") not in ("navigating", "unknown"):
                     if old_id:
                         _acp_notify(old_id, "cancelled", {"reason": "replacement navigation failed"})
                     with self._lock:
@@ -913,10 +944,15 @@ class ControlledSpatialPlugin:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 # Reserve before sending physical command — see navigate_to_tag for rationale.
-                old_id, _, generation = self._reserve_nav(action_id)
+                old_id, old_gen, generation = self._reserve_nav(action_id)
                 result = self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode,
                                                         navigation_id=action_id)
-                if result.get("status") != "navigating":
+                if result.get("status") == "expired":
+                    self._rollback_nav(action_id, old_id, old_gen)
+                    return result
+                # A timed-out submission may still be active. Keep its reservation
+                # and track the navigation ID until a terminal result is known.
+                if result.get("status") not in ("navigating", "unknown"):
                     if old_id:
                         _acp_notify(old_id, "cancelled", {"reason": "replacement navigation failed"})
                     with self._lock:
