@@ -9,6 +9,7 @@ verification" note in CLAUDE.md.
 from __future__ import annotations
 
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -61,9 +62,16 @@ class FakePublisher:
         self.topic = topic
         self.qos = qos
         self.published = []
+        self._published_condition = threading.Condition()
 
     def publish(self, msg):
-        self.published.append(msg)
+        with self._published_condition:
+            self.published.append(msg)
+            self._published_condition.notify_all()
+
+    def wait_for_count(self, count, timeout=1.0):
+        with self._published_condition:
+            return self._published_condition.wait_for(lambda: len(self.published) >= count, timeout)
 
 
 class FakeFuture:
@@ -363,6 +371,9 @@ class SpeakerPluginTests(unittest.TestCase):
         self.speaker = find_plugin(self.plugins, "speaker")
         self.nodes = self.speaker.nodes
 
+    def tearDown(self):
+        self.speaker.stop()
+
     def test_card_declares_pcm_input_and_mouth_resource(self):
         definition = self.speaker.get_tool()
         self.assertEqual(definition["topic_in"], [{"format": "audio/pcm-16k"}])
@@ -379,6 +390,7 @@ class SpeakerPluginTests(unittest.TestCase):
         chunk.format = "audio/pcm-16k"
         chunk.data = [1, 0, 255, 255]
         self.speaker._on_chunk(chunk)
+        self.assertTrue(self.nodes.audio_playback_pub.wait_for_count(1))
 
         sent = self.nodes.audio_playback_pub.published[-1]
         self.assertEqual(sent.stamps, "stamp")
@@ -390,6 +402,19 @@ class SpeakerPluginTests(unittest.TestCase):
         self.assertEqual(sent.data.data, [1, 0, 255, 255])
         self.assertEqual(sent.pkg_name, "test_ns_speaker")
         self.assertTrue(sent.token_id)
+
+    def test_valid_frames_are_published_in_input_order_by_worker(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        for payload in ([1, 0], [2, 0], [3, 0]):
+            chunk = FakeMsg()
+            chunk.format = "audio/pcm-16k"
+            chunk.data = payload
+            self.speaker._on_chunk(chunk)
+        self.assertTrue(self.nodes.audio_playback_pub.wait_for_count(3))
+        self.assertEqual(
+            [sent.data.data for sent in self.nodes.audio_playback_pub.published],
+            [[1, 0], [2, 0], [3, 0]],
+        )
 
     def test_eof_invalid_frame_and_stop_do_not_publish_extra_audio(self):
         self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
@@ -419,6 +444,48 @@ class SpeakerPluginTests(unittest.TestCase):
             self.speaker._on_chunk(invalid)
         self.assertEqual(self.speaker.dispatch("info", {})["dropped_chunks"], 101)
         self.assertEqual(len(self.nodes.core.logger.warnings), 2)
+
+    def test_unsafe_format_is_escaped_and_capped_in_warning(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        invalid = FakeMsg()
+        invalid.format = "bad\n\x1b[31m" + "x" * 1000
+        invalid.data = [1, 0]
+        self.speaker._on_chunk(invalid)
+        warning = self.nodes.core.logger.warnings[-1]
+        self.assertIn("code=unsupported_format", warning)
+        self.assertIn(r"bad\n\x1b[31m", warning)
+        self.assertNotIn("\n", warning)
+        self.assertNotIn("\x1b", warning)
+        self.assertLessEqual(len(warning), 200)
+
+    def test_queue_overflow_drops_newest_frame_and_reports_it(self):
+        # No worker is started here, so filling the bounded handoff queue deterministically
+        # exercises the explicit overflow policy without a scheduling race.
+        for value in range(self.speaker.QUEUE_SIZE + 1):
+            chunk = FakeMsg()
+            chunk.format = "audio/pcm-16k"
+            chunk.data = [value % 256, 0]
+            self.speaker._on_chunk(chunk)
+        info = self.speaker.dispatch("info", {})
+        self.assertEqual(info["queued_chunks"], self.speaker.QUEUE_SIZE)
+        self.assertEqual(info["overflow_dropped_chunks"], 1)
+        self.assertEqual(info["dropped_chunks"], 1)
+
+    def test_stop_joins_worker_and_repeated_start_creates_one_worker(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/first"})
+        first = self.speaker._worker
+        self.assertTrue(first.is_alive())
+        self.speaker.dispatch("stop", {})
+        self.assertFalse(first.is_alive())
+        self.assertIsNone(self.speaker._worker)
+
+        self.speaker.dispatch("start", {"input_topic": "/canvas/second"})
+        second = self.speaker._worker
+        self.assertIsNot(first, second)
+        self.assertTrue(second.is_alive())
+
+    def test_unknown_action_returns_none(self):
+        self.assertIsNone(self.speaker.dispatch("unknown_action", {}))
 
     def test_speaker_respects_enabled_switch(self):
         plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"speaker": {"enabled": False}}})

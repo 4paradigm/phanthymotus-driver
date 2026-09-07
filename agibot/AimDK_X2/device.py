@@ -15,6 +15,7 @@ tooling names these services on the wire, not a typo introduced here.
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 import uuid
@@ -1112,6 +1113,8 @@ class SpeakerPlugin:
     SAMPLE_FORMAT = "S16_LE"
     CODING_FORMAT = "pcm"
     AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
+    QUEUE_SIZE = 64
+    LOG_VALUE_LIMIT = 120
 
     def __init__(self, nodes, namespace):
         from rclpy.qos import QoSProfile, QoSReliabilityPolicy
@@ -1124,7 +1127,16 @@ class SpeakerPlugin:
         self._state = "idle"
         self._forwarded_chunks = 0
         self._dropped_chunks = 0
+        self._overflow_dropped_chunks = 0
         self._utterances_finished = 0
+        # Preserve PCM order, but cap pending audio so a blocked vendor subscriber cannot
+        # create unbounded memory use or ever-growing playback latency. On overflow, retain
+        # already queued audio and drop the newest frame; info exposes that count.
+        self._pcm_queue = queue.Queue(maxsize=self.QUEUE_SIZE)
+        self._worker = None
+        self._worker_stop = threading.Event()
+        self._lifecycle_lock = threading.RLock()
+        self._worker_sentinel = object()
         # Perception TTS uses BEST_EFFORT to keep latency low.  A RELIABLE reader would be
         # QoS-incompatible and receive no frames, so match its reliability explicitly.
         self._input_qos = QoSProfile(
@@ -1164,12 +1176,64 @@ class SpeakerPlugin:
             self._subscription = None
         self._topic = None
 
+    def _stop_worker(self):
+        with self._lifecycle_lock:
+            worker = self._worker
+            self._worker_stop.set()
+            # These frames have not reached AimDK yet, so dropping them is local queue cleanup,
+            # not an unverified vendor stop/flush request.
+            while True:
+                try:
+                    self._pcm_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if worker is not None:
+                self._pcm_queue.put_nowait(self._worker_sentinel)
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
+        with self._lifecycle_lock:
+            if self._worker is worker:
+                self._worker = None
+
+    def _start_worker(self):
+        self._worker_stop.clear()
+        self._worker = threading.Thread(
+            target=self._drain_pcm, daemon=True, name="aimdk_x2_speaker",
+        )
+        self._worker.start()
+
+    def _drain_pcm(self):
+        while True:
+            pcm = self._pcm_queue.get()
+            if pcm is self._worker_sentinel:
+                return
+            with self._lifecycle_lock:
+                if self._worker_stop.is_set():
+                    return
+                self._publish_pcm(pcm)
+
+    def _publish_pcm(self, pcm):
+        playback = self.nodes._AudioPlayback()
+        playback.stamps = self.nodes.robot.get_clock().now().to_msg()
+        playback.info.channels = self.CHANNELS
+        playback.info.sample_rate = self.SAMPLE_RATE_HZ
+        playback.info.size = len(pcm)
+        playback.info.sample_format = self.SAMPLE_FORMAT
+        playback.info.coding_format = self.CODING_FORMAT
+        playback.data.data = list(pcm)
+        playback.pkg_name = f"{self._namespace}_speaker"
+        playback.token_id = self._token_id
+        self.nodes.audio_playback_pub.publish(playback)
+        self._forwarded_chunks += 1
+        self._state = "playing"
+
     def stop(self):
         # Do not publish a synthetic empty AudioPlayback packet here.  The SDK documents that
         # changing token_id clears its playback cache, but it does not document an empty packet
         # as a valid cache-clear request.  Until that is verified on hardware, stop means no
         # further input is forwarded rather than making up a raw-audio stop protocol.
         self._unsubscribe()
+        self._stop_worker()
         self._state = "idle"
 
     def _start(self, topic):
@@ -1177,27 +1241,38 @@ class SpeakerPlugin:
 
         if not isinstance(topic, str) or not topic:
             raise ValueError("speaker: start requires a non-empty input_topic")
-        self._unsubscribe()
-        self._token_id = uuid.uuid4().hex
-        self._subscription = self.nodes.core.create_subscription(
-            AudioChunk, topic, self._on_chunk, self._input_qos,
-        )
-        self._topic = topic
-        self._state = "ready"
+        self.stop()
+        with self._lifecycle_lock:
+            self._token_id = uuid.uuid4().hex
+            self._subscription = self.nodes.core.create_subscription(
+                AudioChunk, topic, self._on_chunk, self._input_qos,
+            )
+            self._topic = topic
+            self._state = "ready"
+            self._start_worker()
         return {"state": self._state, "topic_in": [{"topic": topic, "format": self.AUDIO_FORMAT}]}
 
-    def _drop_chunk(self, reason):
+    @classmethod
+    def _safe_log_value(cls, value):
+        if not isinstance(value, str):
+            return "<non-string>"
+        escaped = value.encode("unicode_escape").decode("ascii")
+        if len(escaped) > cls.LOG_VALUE_LIMIT:
+            return escaped[:cls.LOG_VALUE_LIMIT - 3] + "..."
+        return escaped
+
+    def _drop_chunk(self, reason_code, detail=""):
         self._dropped_chunks += 1
         # A malformed stream arrives at audio-frame cadence.  Keep counters for diagnosis,
         # but write only the first rejection and every 100th to avoid exhausting Docker logs.
         if self._dropped_chunks == 1 or self._dropped_chunks % 100 == 0:
             self.nodes.core.get_logger().warning(
-                f"[speaker] dropped {self._dropped_chunks} invalid chunk(s); latest: {reason}",
+                f"[speaker] dropped count={self._dropped_chunks} code={reason_code} {detail}".rstrip(),
             )
 
     def _on_chunk(self, msg):
         if msg.format != self.AUDIO_FORMAT:
-            self._drop_chunk(f"unsupported format {msg.format!r}")
+            self._drop_chunk("unsupported_format", f"format={self._safe_log_value(msg.format)}")
             return
         pcm = bytes(msg.data)
         if pcm == self.AUDIO_EOF_MAGIC:
@@ -1207,24 +1282,16 @@ class SpeakerPlugin:
             self._state = "ready"
             return
         if not pcm or len(pcm) % 2:
-            self._drop_chunk(f"invalid PCM-16 frame ({len(pcm)} bytes)")
+            self._drop_chunk("invalid_pcm16_frame")
             return
-
-        playback = self.nodes._AudioPlayback()
-        playback.stamps = self.nodes.robot.get_clock().now().to_msg()
-        playback.info.channels = self.CHANNELS
-        playback.info.sample_rate = self.SAMPLE_RATE_HZ
-        playback.info.size = len(pcm)
-        playback.info.sample_format = self.SAMPLE_FORMAT
-        playback.info.coding_format = self.CODING_FORMAT
-        playback.data.data = list(pcm)
-        # AudioPlayback requires a source identifier.  This comes from the configured X2
-        # ROS namespace, not from a Q5/vendor-specific package name.
-        playback.pkg_name = f"{self._namespace}_speaker"
-        playback.token_id = self._token_id
-        self.nodes.audio_playback_pub.publish(playback)
-        self._forwarded_chunks += 1
-        self._state = "playing"
+        with self._lifecycle_lock:
+            if self._worker_stop.is_set():
+                return
+            try:
+                self._pcm_queue.put_nowait(pcm)
+            except queue.Full:
+                self._overflow_dropped_chunks += 1
+                self._drop_chunk("queue_full")
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1241,10 +1308,13 @@ class SpeakerPlugin:
                              if self._topic else [{"format": self.AUDIO_FORMAT}]),
                 "forwarded_chunks": self._forwarded_chunks,
                 "dropped_chunks": self._dropped_chunks,
+                "overflow_dropped_chunks": self._overflow_dropped_chunks,
+                "queue_capacity": self.QUEUE_SIZE,
+                "queued_chunks": self._pcm_queue.qsize(),
                 "utterances_finished": self._utterances_finished,
                 "stop_behavior": "stops forwarding; raw-playback queue flush is not yet hardware-verified",
             }
-        raise ValueError(f"speaker: unknown action {action!r}")
+        return None
 
 
 class MapGetPlugin:
