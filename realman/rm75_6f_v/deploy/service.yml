@@ -4,9 +4,7 @@ realman-rm75-6f-v:
   network_mode: host
   extra_hosts:
     - "${RM75_AGENT_CORE_HOSTNAME:-phanthy-motus}:${RM75_AGENT_CORE_ADDRESS:-127.0.0.1}"
-  privileged: true
   volumes:
-    - /dev:/dev
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - ${RM_API2_LIB_DIR:-/opt/realman/rm_api2/libs/linux_arm}:/work/Robotic_Arm/libs/linux_arm:ro
   environment:

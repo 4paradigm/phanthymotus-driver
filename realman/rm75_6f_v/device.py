@@ -144,6 +144,7 @@ class RM75Plugin:
         self._skeleton_pub = None
         self._skeleton_message_type = None
         self._last_skeleton_error = None
+        self._skeleton_retry_at = 0.0
         safety = config.get("safety", {})
         self.max_speed_percent = min(int(safety.get("max_speed_percent", 10)), 10)
         self.default_speed_percent = min(int(safety.get("default_speed_percent", 5)), self.max_speed_percent)
@@ -266,16 +267,30 @@ class RM75Plugin:
         message_type = self._skeleton_message_type
         if publisher is None or message_type is None:
             return
+        # A failed controller is sampled at most once every two seconds.
+        # Visualization must not queue behind motion/stop SDK operations.
+        if time.monotonic() < self._skeleton_retry_at:
+            return
+        if not self.client.connected:
+            self._skeleton_retry_at = time.monotonic() + 2.0
+            return
+        if not self.client._lock.acquire(blocking=False):
+            return
         try:
             message = message_type()
             message.data = json.dumps(self._skeleton_payload(), ensure_ascii=False)
             publisher.publish(message)
             self._last_skeleton_error = None
+            self._skeleton_retry_at = 0.0
         except Exception as exc:
-            error = str(exc)
-            if error != self._last_skeleton_error:
+            self._skeleton_retry_at = time.monotonic() + 2.0
+            # Report the outage transition once, even if each error text differs.
+            if self._last_skeleton_error is None:
+                error = str(exc).encode("unicode_escape").decode("ascii")[:200]
                 print(f"[rm75] skeleton publish failed: {error}", flush=True)
-                self._last_skeleton_error = error
+            self._last_skeleton_error = str(exc)
+        finally:
+            self.client._lock.release()
 
     def _motion_status(self):
         with self._action_lock:
@@ -502,6 +517,8 @@ class RM75Plugin:
         if action == "start":
             return {"state": "ready" if name in ("joint_control", "model") else "running"}
         if action == "stop":
+            if name == "joint_control":
+                self._stop_motion()
             return {"state": "idle"}
         if action == "info":
             topic_out = self._skeleton_topic_out() if name == "joint_states" else []
