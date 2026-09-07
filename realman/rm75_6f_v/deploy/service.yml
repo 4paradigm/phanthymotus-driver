@@ -23,7 +23,7 @@ realman-rm75-6f-v:
     # Physical E-stop, clear workspace and confirm_motion=true remain mandatory.
     - RM_DRIVER_ENABLED=1
     - RM_MOTION_ENABLED=1
-    - RM_ARM_IP=192.168.1.18
+    - RM_ARM_IP=${RM75_ARM_IP:-192.168.1.18}
     - RM_TCP_PORT=8080
   logging:
     driver: local
