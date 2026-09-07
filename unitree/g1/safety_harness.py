@@ -100,16 +100,18 @@ class SmartMotionProxy:
         while True:
             try:
                 item = self._result_queue.get(timeout=1.0)
-                req_id = item.pop("_req_id", None) if isinstance(item, dict) else None
-                if req_id and req_id in self._pending:
-                    self._pending[req_id].put(item)
-                else:
-                    # Fallback: shouldn't happen, but don't lose the result
-                    # Put it in any waiting queue (legacy behavior)
-                    with self._dispatch_lock:
-                        for q in self._pending.values():
-                            q.put(item)
-                            break
+                if not isinstance(item, dict):
+                    continue
+                req_id = item.pop("_req_id", None)
+                if not isinstance(req_id, str) or not req_id:
+                    continue
+                with self._dispatch_lock:
+                    result_q = self._pending.get(req_id)
+                    if result_q is not None:
+                        try:
+                            result_q.put_nowait(item)
+                        except queue.Full:
+                            pass
             except queue.Empty:
                 continue
             except Exception:
@@ -193,11 +195,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     Initializes its own DDS channel, RPC clients, ROS2 node, and LiDAR subscription.
     Runs independently from the main driver process — no GIL contention.
     """
-    try:
-        from common import logsafe
-        logsafe.install(check_fd=False)
-    except ImportError:
-        pass
+    from common import logsafe
+    logsafe.install(check_fd=False)
 
     import numpy as np
     import rclpy
