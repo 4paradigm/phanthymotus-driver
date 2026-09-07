@@ -1272,8 +1272,13 @@ class GreetPlugin:
                 "error": f"{action} requires confirm=true",
                 "code": "PRECONDITION_FAILED",
             }
+        if action in ("greet", "wave") and "turn" in args and not isinstance(args["turn"], bool):
+            return {
+                "error": f"{action} turn must be a boolean",
+                "code": "INVALID_ARGUMENT",
+            }
         if action == "wave":
-            turn = bool(args.get("turn", False))
+            turn = args.get("turn", False)
             ret = self._loco.WaveHand(turn)
             return {"ret": ret, "turn": turn}
         if action == "speak":
@@ -1292,7 +1297,7 @@ class GreetPlugin:
             from uuid import uuid4
             action_id = f"g1_greet_{uuid4().hex[:8]}"
             text = str(args.get("text", self._default_text))
-            turn = bool(args.get("turn", False))
+            turn = args.get("turn", False)
             threading.Thread(target=self._run_greet, args=(action_id, text, turn),
                              daemon=True, name="greet_seq").start()
             return {"status": "executing", "action_id": action_id, "text": text, "turn": turn}
