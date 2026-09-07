@@ -68,13 +68,22 @@ echo "5b9d236a5cf901cdf05418d9ef5815a77a8c717af0ff037e7aad9247beb76fb9  /opt/rea
 The image can still be smoke-tested manually with `RM_DRIVER_ENABLED=0` without
 the library, but the deployment service defaults to a live, motion-capable
 connection. An enabled connection fails with an explicit mount error when the
-library is absent. Set `RM_API2_LIB_DIR` to override the host directory. ACP
-HTTPS callbacks verify the Agent Core hostname and certificate using
-`AGENT_CORE_CA_CERT`; unencrypted callbacks are accepted only on loopback.
-Following the standard ACP contract, `joint_control.set` immediately returns a
+library is absent. Set `RM_API2_LIB_DIR` to override the host directory.
+Following the standard ACP contract in `README_dev.md`, `joint_control.set` immediately returns a
 unique `action_id`; its background monitor later reports exactly one
 `completed`, `error`, or `cancelled` terminal result to `/api/acp/complete`.
-Agent Core owns pending-action barrier release and completion-event delivery.
+The callback reads `AGENT_CORE_URL` inside the worker-thread function and uses
+the same HTTPS behavior as the documented G1/R1 implementation. Agent Core
+owns pending-action barrier release and completion-event delivery.
+
+The immediate card result contains only `state` and `action_id`. Completion
+callbacks keep the standard status and a short reason; full final joint evidence
+is available from `joint_control.info` in `last_completion`. Its `callback` is
+`accepted` only when Core acknowledges the same ID, or `failed` with an error.
+Acceptance confirms HTTP receipt, not pending-action matching or a visible UI
+trigger. No extra `/api/event` notifications are sent. This Driver cannot repair
+a stalled Core decision loop; a missing UI trigger alone is not proof of motion
+or callback failure.
 
 The component installs `python3-yaml` because the shared runtime loads
 `config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared runtime

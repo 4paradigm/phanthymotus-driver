@@ -7,7 +7,6 @@ realman-rm75-6f-v:
   privileged: true
   volumes:
     - /dev:/dev
-    - /opt/phanthy-motus/data:/opt/phanthy-motus/data:ro
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - ${RM_API2_LIB_DIR:-/opt/realman/rm_api2/libs/linux_arm}:/work/Robotic_Arm/libs/linux_arm:ro
   environment:
@@ -18,7 +17,6 @@ realman-rm75-6f-v:
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
     - AGENT_CORE_URL=${RM75_AGENT_CORE_URL:-https://phanthy-motus:15678}
-    - AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}
     # This deployment intentionally starts connected and motion-capable.
     # Physical E-stop, clear workspace and confirm_motion=true remain mandatory.
     - RM_DRIVER_ENABLED=1
