@@ -4,6 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
+import ssl
 import time
 import unittest
 import xml.etree.ElementTree as ET
@@ -43,9 +44,9 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("RM_DRIVER_ENABLED=1", service)
         self.assertIn("RM_MOTION_ENABLED=1", service)
         self.assertIn("RM_ARM_IP=${RM75_ARM_IP:-192.168.1.18}", service)
-        self.assertIn("AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}", service)
+        self.assertNotIn("AGENT_CORE_CA_CERT", service)
         self.assertNotIn("AGENT_CORE_TOKEN", service)
-        self.assertIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
+        self.assertNotIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
         self.assertIn("network_mode: host", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
@@ -216,23 +217,18 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "code -2"):
             client.call_dict("rm_get_controller_state")
 
-    def test_acp_https_requires_ca_and_posts_standard_completion(self):
+    def test_acp_posts_standard_completion_from_worker_context(self):
         client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
         plugin = self.device.RM75Plugin(client, {})
-        with mock.patch.dict(os.environ, {"AGENT_CORE_URL": "https://phanthy-motus:15678"}, clear=True), \
-                mock.patch.object(self.device.urllib.request, "urlopen") as urlopen:
-            plugin._acp_callback("action-1", "completed", {})
-            urlopen.assert_not_called()
-
-        context = object()
+        context = mock.Mock()
         with mock.patch.dict(os.environ, {
                 "AGENT_CORE_URL": "https://phanthy-motus:15678",
-                "AGENT_CORE_CA_CERT": "/cert.pem",
             }, clear=True), \
-                mock.patch.object(self.device.ssl, "create_default_context", return_value=context) as create_context, \
-                mock.patch.object(self.device.urllib.request, "urlopen") as urlopen:
+                mock.patch("ssl.create_default_context", return_value=context) as create_context, \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"action_id":"action-2"}'
             plugin._acp_callback("action-2", "completed", {"max_error_deg": 0.1})
-            create_context.assert_called_once_with(cafile="/cert.pem")
+            create_context.assert_called_once_with()
             urlopen.assert_called_once()
             acp_call = urlopen.call_args
             self.assertEqual(
@@ -240,12 +236,53 @@ class RealManRM75SDKClientTests(unittest.TestCase):
                 acp_call.args[0].full_url,
             )
             self.assertIs(context, acp_call.kwargs["context"])
+            self.assertIs(False, context.check_hostname)
+            self.assertEqual(ssl.CERT_NONE, context.verify_mode)
             request_payload = json.loads(acp_call.args[0].data)
             self.assertEqual("action-2", request_payload["action_id"])
             self.assertEqual("completed", request_payload["status"])
-            self.assertEqual("joint_control", request_payload["tool"])
-            self.assertEqual({"max_error_deg": 0.1}, request_payload["result"])
+            self.assertEqual(plugin.PREFIX, request_payload["tool"])
+            self.assertEqual({"reason": "target_reached"}, request_payload["result"])
+            completion = plugin._motion_status()["last_completion"]
+            self.assertEqual("accepted", completion["callback"])
+            self.assertEqual({"max_error_deg": 0.1}, completion["result"])
             self.assertIsNone(acp_call.args[0].get_header("Authorization"))
+
+    def test_acp_rejected_mismatched_and_malformed_ack_remain_visible(self):
+        for reply in (b'{"ok":false}', b'{"ok":true,"action_id":"other"}', b'not-json'):
+            with self.subTest(reply=reply):
+                plugin, _ = self._motion_plugin()
+                callback = self.device.RM75Plugin._acp_callback
+                with mock.patch("urllib.request.urlopen") as urlopen:
+                    urlopen.return_value.__enter__.return_value.read.return_value = reply
+                    callback(plugin, "test-ack", "completed", {"actual_degree": [0]*7})
+                info = plugin._motion_status()["last_completion"]
+                self.assertEqual("completed", info["status"])
+                self.assertEqual("failed", info["callback"])
+                self.assertIn("callback_error", info)
+                self.assertEqual([0]*7, info["result"]["actual_degree"])
+
+    def test_acp_transport_error_preserves_terminal_status(self):
+        plugin, _ = self._motion_plugin()
+        with mock.patch("urllib.request.urlopen", side_effect=TimeoutError("timeout")):
+            self.device.RM75Plugin._acp_callback(plugin, "test-timeout", "error", {"reason": "motion_stalled"})
+        last = plugin._motion_status()["last_completion"]
+        self.assertEqual("error", last["status"])
+        self.assertEqual("failed", last["callback"])
+        self.assertEqual("motion_stalled", last["result"]["reason"])
+
+    def test_acp_compact_errors_keep_reason_and_standard_endpoint(self):
+        for status in ("error", "cancelled"):
+            with self.subTest(status=status):
+                plugin, _ = self._motion_plugin()
+                with mock.patch.dict(os.environ, {"AGENT_CORE_URL": "https://localhost:15678/"}), mock.patch("urllib.request.urlopen") as urlopen:
+                    urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"action_id":"test-error"}'
+                    self.device.RM75Plugin._acp_callback(plugin, "test-error", status, {"reason": "stopmotion", "actual_degree": [0]*7})
+                self.assertEqual(1, urlopen.call_count)
+                request = urlopen.call_args.args[0]
+                self.assertEqual("https://localhost:15678/api/acp/complete", request.full_url)
+                self.assertEqual({"reason": "stopmotion"}, json.loads(request.data)["result"])
+                self.assertEqual("accepted", plugin._motion_status()["last_completion"]["callback"])
 
     def _motion_plugin(self, *, motion_enabled=True, current=None, all_state=None, safety=None):
         current = current or [0.0] * 7
@@ -359,6 +396,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         result = plugin._start_motion({**self._seven_targets(), "confirm_motion": True})
         self.assertEqual("running", result["state"])
         self.assertTrue(result["action_id"].startswith("rm75_movej_"))
+        self.assertEqual({"state", "action_id"}, set(result))
         deadline = time.monotonic() + 1.0
         while not plugin._acp_callback.called and time.monotonic() < deadline:
             time.sleep(0.01)

@@ -6,11 +6,8 @@ from __future__ import annotations
 import json
 import math
 import os
-import ssl
 import threading
 import time
-import urllib.parse
-import urllib.request
 from uuid import uuid4
 from pathlib import Path
 
@@ -126,7 +123,7 @@ class RM75SDKClient:
 
 
 class RM75Plugin:
-    PREFIX = "realman_state"
+    PREFIX = "joint_control"
 
     METHODS = {
         "robot_info": "rm_get_robot_info",
@@ -160,6 +157,7 @@ class RM75Plugin:
         self._action_lock = threading.Lock()
         self._active_action_id = None
         self._cancelled = set()
+        self._last_completion = None
 
     def _skeleton_topic_out(self):
         return [{"topic": self._skeleton_topic, "format": "sensor/skeleton"}]
@@ -282,9 +280,11 @@ class RM75Plugin:
     def _motion_status(self):
         with self._action_lock:
             active_action_id = self._active_action_id
+            last_completion = dict(self._last_completion) if self._last_completion else None
         return {
             **self.client.status(),
             "active_action_id": active_action_id,
+            "last_completion": last_completion,
             "limits_deg": JOINT_LIMITS_DEG,
             "max_speed_percent": self.max_speed_percent,
             "watchdog": {
@@ -351,29 +351,51 @@ class RM75Plugin:
         ]
         return min(self.max_motion_seconds, max(30.0, max(estimates, default=0.0) * 3.0 + 10.0))
 
-    def _acp_callback(self, action_id, status, result):
-        url = os.environ.get("AGENT_CORE_URL", "").strip().rstrip("/")
-        ca_cert = os.environ.get("AGENT_CORE_CA_CERT", "").strip()
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            print(f"[rm75] ACP callback failed for {action_id}: AGENT_CORE_URL must be absolute", flush=True)
-            return
-        if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
-            print(f"[rm75] ACP callback failed for {action_id}: non-loopback HTTP is forbidden", flush=True)
-            return
-        if parsed.scheme == "https" and not ca_cert:
-            print(f"[rm75] ACP callback failed for {action_id}: AGENT_CORE_CA_CERT is required for HTTPS", flush=True)
-            return
+    def _acp_callback(self, action_id: str, status: str, result: dict):
+        """POST action completion to Agent Core."""
+        import urllib.request as _urllib
+        import ssl as _ssl
+        import json
+        import os as _os
+
+        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        # Keep full motion evidence in info; the completion event stays small.
+        summary = {}
+        if status == "completed":
+            summary = {"reason": "target_reached"}
+        elif "reason" in result:
+            summary = {"reason": str(result["reason"])[:240]}
+        body = {"action_id": action_id, "status": status, "result": summary,
+                "tool": self.PREFIX, "ts": time.time()}
+        record = {"action_id": action_id, "status": status, "result": dict(result),
+                  "callback": "sending"}
+        with self._action_lock:
+            self._last_completion = record
         try:
-            context = ssl.create_default_context(cafile=ca_cert or None)
-            payload = json.dumps({"action_id": action_id, "status": status, "result": result,
-                                  "tool": "joint_control", "ts": time.time()}).encode()
-            request = urllib.request.Request(f"{url}/api/acp/complete", data=payload,
-                                             headers={"Content-Type": "application/json"}, method="POST")
-            urllib.request.urlopen(request, timeout=5, context=context).close()
-            print(f"[rm75] ACP completion delivered for {action_id}: {status}", flush=True)
+            req = _urllib.Request(
+                f"{agent_core_url.rstrip('/')}/api/acp/complete",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _urllib.urlopen(req, timeout=5, context=ctx) as response:
+                acknowledgement = json.loads(response.read())
+            if (not isinstance(acknowledgement, dict)
+                    or acknowledgement.get("ok") is not True
+                    or acknowledgement.get("action_id") != action_id):
+                raise RuntimeError("Agent Core did not acknowledge this action_id")
+            with self._action_lock:
+                record["callback"] = "accepted"
+            # Acceptance proves receipt, not that Core matched a pending action.
+            print(f"[rm75 ACP] {action_id} {status}: accepted", flush=True)
         except Exception as exc:
-            print(f"[rm75] ACP callback failed for {action_id}: {exc}", flush=True)
+            with self._action_lock:
+                record["callback"] = "failed"
+                record["callback_error"] = str(exc)
+            print(f"[rm75 ACP] {action_id} {status}: callback failed: {exc}", flush=True)
 
     def _monitor_motion(self, action_id, start, target, max_duration):
         started = time.monotonic()
@@ -453,9 +475,8 @@ class RM75Plugin:
                 args=(action_id, current, target, max_duration),
                 daemon=True,
             ).start()
-            return {"state": "running", "action_id": action_id, "start_degree": current,
-                    "target_degree": target, "speed_percent": speed,
-                    "max_motion_seconds": max_duration}
+            print(f"[rm75 ACP] {action_id}: started", flush=True)
+            return {"state": "running", "action_id": action_id}
         except Exception:
             self._motion_lock.release()
             raise
