@@ -64,7 +64,9 @@ echo "5b9d236a5cf901cdf05418d9ef5815a77a8c717af0ff037e7aad9247beb76fb9  /opt/rea
 The image can still be smoke-tested manually with `RM_DRIVER_ENABLED=0` without
 the library, but the deployment service defaults to a live, motion-capable
 connection. An enabled connection fails with an explicit mount error when the
-library is absent. Set `RM_API2_LIB_DIR` to override the host directory.
+library is absent. Set `RM_API2_LIB_DIR` to override the host directory. ACP
+HTTPS callbacks verify the Agent Core hostname and certificate using
+`AGENT_CORE_CA_CERT`; unencrypted callbacks are accepted only on loopback.
 
 The component installs `python3-yaml` because the shared runtime loads
 `config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared runtime

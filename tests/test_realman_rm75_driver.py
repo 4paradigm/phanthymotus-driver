@@ -42,6 +42,8 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("RM_DRIVER_ENABLED=1", service)
         self.assertIn("RM_MOTION_ENABLED=1", service)
         self.assertIn("RM_ARM_IP=192.168.1.18", service)
+        self.assertIn("AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}", service)
+        self.assertIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
         self.assertIn("network_mode: host", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
@@ -139,6 +141,66 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "code 5"):
             self.device._sdk_result("rm_get_robot_info", (5, {}))
 
+    def test_all_advertised_read_only_methods_accept_their_sdk_return_shapes(self):
+        class Handle:
+            id = 1
+
+        class Robot:
+            def rm_get_robot_info(self):
+                return 0, {"arm_dof": 7}
+
+            def rm_get_arm_software_info(self):
+                return 0, {"product_version": "test"}
+
+            def rm_get_arm_all_state(self):
+                return 0, {"joint_en_flag": [1] * 7}
+
+            def rm_get_controller_state(self):
+                return {"return_code": 0, "voltage": 48.0, "current": 1.0,
+                        "temperature": 30.0, "system_error": 0}
+
+        client = self.device.RM75SDKClient({"arm_ip": "192.0.2.1", "tcp_port": 8080})
+        client._handle = Handle()
+        client._robot = Robot()
+        plugin = self.device.RM75Plugin(client, {})
+        for name in plugin.METHODS:
+            result = plugin.dispatch("get", {"_tool_name": name})
+            self.assertIsInstance(result, dict, name)
+        self.assertEqual(0, plugin.dispatch("get", {"_tool_name": "controller_state"})["return_code"])
+
+    def test_controller_state_rejects_nonzero_return_code(self):
+        class Handle:
+            id = 1
+
+        class Robot:
+            def rm_get_controller_state(self):
+                return {"return_code": -2}
+
+        client = self.device.RM75SDKClient({"arm_ip": "192.0.2.1", "tcp_port": 8080})
+        client._handle = Handle()
+        client._robot = Robot()
+        with self.assertRaisesRegex(RuntimeError, "code -2"):
+            client.call_dict("rm_get_controller_state")
+
+    def test_acp_https_requires_and_uses_configured_ca(self):
+        client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+        plugin = self.device.RM75Plugin(client, {})
+        with mock.patch.dict(os.environ, {"AGENT_CORE_URL": "https://phanthy-motus:15678"}, clear=True), \
+                mock.patch.object(self.device.urllib.request, "urlopen") as urlopen:
+            plugin._acp_callback("action-1", "completed", {})
+            urlopen.assert_not_called()
+
+        context = object()
+        with mock.patch.dict(os.environ, {
+                "AGENT_CORE_URL": "https://phanthy-motus:15678",
+                "AGENT_CORE_CA_CERT": "/cert.pem",
+            }, clear=True), \
+                mock.patch.object(self.device.ssl, "create_default_context", return_value=context) as create_context, \
+                mock.patch.object(self.device.urllib.request, "urlopen") as urlopen:
+            plugin._acp_callback("action-2", "completed", {})
+            create_context.assert_called_once_with(cafile="/cert.pem")
+            self.assertIs(context, urlopen.call_args.kwargs["context"])
+
     def _motion_plugin(self, *, motion_enabled=True, current=None, all_state=None, safety=None):
         current = current or [0.0] * 7
         all_state = all_state or {
@@ -173,6 +235,9 @@ class RealManRM75SDKClientTests(unittest.TestCase):
 
             def rm_set_arm_slow_stop(self):
                 self.stops += 1
+                return 0
+
+            def rm_delete_robot_arm(self):
                 return 0
 
         self_module = self.device
