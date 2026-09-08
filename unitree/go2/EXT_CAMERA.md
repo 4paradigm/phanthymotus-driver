@@ -46,11 +46,12 @@ owner; stopping one leaves the others active. The last stereo instance releases
 the device. A physical RGB video node has one owner, so choose distinct cameras
 for independent RGB sources rather than opening the same node twice.
 
-The startup modal and monitor require the companion Agent Core correction:
-startup events must include `instance_id`, progress rows must be keyed by it,
-and newly resolved producer formats must be used if the topic-registry snapshot
-predates their registration. Restoring the driver flag alone cannot fix the
-same-name startup-progress collision.
+The existing Core can start the instances and display their streams. Its
+startup modal may nevertheless leave two same-name rows at "waiting": events
+are keyed by capability name instead of instance ID. A companion Core fix
+corrects that progress display and a newly registered-topic format race; it is
+not a prerequisite for concurrent camera acquisition. Check each instance's
+info and actual frames rather than interpreting the old modal as capture state.
 
 ## What each modality is useful for
 
@@ -120,8 +121,22 @@ has local coverage for three saved instance configurations starting separately,
 standard lifecycle responses without claiming frame readiness, and independent
 stop. Companion Core tests replay the actual startup function and verify three
 progress rows, unique bus registrations and three correctly typed monitor
-panels. The robot was powered off for this revision; full project startup and
-simultaneous live monitor streams still need a device run.
+panels. On 2026-09-08, the driver was tested on a D435i over USB 3 with Core
+release.260905.9005d5b unchanged. After the operator started the project, all
+three instances were running and the browser displayed all three images.
+Concurrent monitoring WebSocket sampling for 30 seconds received:
+
+| channel | dimensions | frames | measured fps | longest inter-frame gap |
+| --- | --- | --- | --- | --- |
+| RGB | 1280x720 | 450 | 14.99 | 0.090 s |
+| Depth | 640x480 | 451 | 15.00 | 0.078 s |
+| Infrared | 640x480 | 451 | 15.02 | 0.118 s |
+
+Every sampled payload was unique; depth decompressed to the expected buffer
+size with nonzero measurements. Only the driver image was changed for this
+acceptance run. USB disconnect/reconnect during setup changed video-node
+numbering and caused stale configured paths to fail; reselect the currently
+enumerated device after such a change.
 
 Sources: [driver contract](../../README_dev.md),
 [SDK depth units](https://github.com/realsenseai/librealsense/wiki/Projection-in-RealSense-SDK-2.0),
