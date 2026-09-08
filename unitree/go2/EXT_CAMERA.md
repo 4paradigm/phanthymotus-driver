@@ -94,8 +94,12 @@ obstacle avoidance are downstream capabilities, not implemented by this sensor.
 - USB 2 uses conservative VGA/6 stereo profiles; USB 3 uses VGA/15.
   D435i RGB/depth/infrared switching has been verified on USB 3.2.
 - Linux USB serial and RealSense SDK serial are not necessarily equal. Device
-  selection binds SDK `physical_port` to the selected V4L2 node's USB ancestor;
-  it does not choose an arbitrary first SDK camera or hard-code `/dev/video4`.
+  selection binds SDK `physical_port` to the selected V4L2 node's USB ancestor:
+  Linux V4L2 supplies an absolute depth-node sysfs path; Linux RSUSB supplies
+  `bus-port.chain-device_address`, matched against that ancestor's `busnum`,
+  `devpath` and `devnum`. Path boundaries and the full RSUSB identifier must
+  match, so similar ports and stale USB addresses do not select another device.
+  It does not choose an arbitrary first SDK camera or hard-code `/dev/video4`.
   A missing or unreadable sysfs identity skips only that RealSense node, so
   unplugging it does not abort discovery of unrelated webcams. Each stereo
   worker uses a stable USB-path hash in its ROS node name to distinguish devices.
@@ -119,7 +123,7 @@ are included in this driver PR.
 python3 -m unittest discover -s tests
 ```
 
-All 54 tests pass. They cover real V4L2 capability formatting, unsupported formats, channel
+All 58 tests pass. They cover real V4L2 capability formatting, unsupported formats, channel
 configuration/topic changes, USB device binding, RGB compatibility, per-instance configuration and lifecycle, stale/wrong-channel frames, depth units and overflow.
 Worker-loop regressions also cover delayed first frames, missing streams,
 post-start stalls and distinct node names for distinct physical USB paths.
@@ -127,6 +131,10 @@ Enumeration regressions cover sysfs resolution/ancestor failures while keeping
 an unrelated webcam available. Updated enumeration was checked read-only on the
 Go2; delayed USB startup and two-camera node naming were verified with SDK/ROS
 test doubles, not a new two-camera hardware acceptance run.
+SDK binding tests include a captured Go2/D435i V4L2 `physical_port` and the
+RSUSB format from the pinned SDK source. The matcher was checked read-only
+against the real SDK value and a compact ID derived from the same live sysfs
+ancestor. Running a full RSUSB capture pipeline was not part of this check.
 Hardware verification covers RGB→depth→infrared→RGB on the same instance,
 actual decoded image payloads in earlier device runs. The current startup fix
 has local coverage for three saved instance configurations starting separately,
@@ -152,6 +160,9 @@ numbering and caused stale configured paths to fail; reselect the currently
 enumerated device after such a change.
 
 Sources: [driver contract](../../README_dev.md),
+[V4L2 physical path](https://github.com/realsenseai/librealsense/blob/v2.56.5/src/linux/backend-v4l2.cpp#L804-L806),
+[RSUSB UVC path](https://github.com/realsenseai/librealsense/blob/v2.56.5/src/uvc/uvc-device.cpp#L44-L58),
+[libusb port identifier](https://github.com/realsenseai/librealsense/blob/v2.56.5/src/libusb/enumerator-libusb.cpp#L15-L32),
 [SDK depth units](https://github.com/realsenseai/librealsense/wiki/Projection-in-RealSense-SDK-2.0),
 [SDK stream/format definitions](https://github.com/realsenseai/librealsense/blob/master/include/librealsense2/h/rs_sensor.h),
 [D400/D430 FAQ](https://www.realsenseai.com/developers/faqs/), and

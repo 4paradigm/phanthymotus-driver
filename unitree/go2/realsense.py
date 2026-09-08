@@ -8,7 +8,9 @@ from __future__ import annotations
 import multiprocessing as mp
 import copy
 import hashlib
+from pathlib import Path
 import queue
+import re
 import threading
 import time
 import zlib
@@ -20,6 +22,30 @@ STREAMS = ("depth", "infrared")
 FORMATS = {"depth": "image/depth-zlib", "infrared": "image/jpeg"}
 STALE_SECONDS = 3.0
 STARTUP_SECONDS = 10.0
+
+
+def matches_usb_device(physical_port: str, usb_path: str) -> bool:
+    """Match the SDK device to the physical USB parent of the selected RGB node."""
+    if not physical_port or not usb_path:
+        return False
+    # Linux V4L2 reports the depth video node's absolute sysfs path. Require
+    # the directory boundary so port 2-1 cannot accidentally match port 2-10.
+    if physical_port.startswith('/'):
+        return physical_port.startswith(usb_path.rstrip('/') + '/')
+    # The Linux RSUSB backend instead reports bus-port.chain-device_address
+    # (librealsense v2.56.5 src/libusb/enumerator-libusb.cpp:get_device_path).
+    # Derive that identifier from the SAME selected USB ancestor. Include the
+    # device address to reject stale identifiers after a disconnect/reconnect.
+    if not re.fullmatch(r'\d+-\d+(?:\.\d+)*-\d+', physical_port):
+        return False
+    try:
+        root = Path(usb_path)
+        bus = int((root / 'busnum').read_text().strip())
+        ports = (root / 'devpath').read_text().strip()
+        address = int((root / 'devnum').read_text().strip())
+    except (OSError, ValueError):
+        return False
+    return physical_port == f'{bus}-{ports}-{address}'
 
 
 def encode_depth(raw: np.ndarray, scale: float) -> bytes:
@@ -67,7 +93,7 @@ def _capture(namespace, usb_path, routes, commands, quit_event, status_queue):
         context = rs.context()
         devices = [d for d in context.query_devices()
                    if d.supports(rs.camera_info.physical_port)
-                   and d.get_info(rs.camera_info.physical_port).startswith(usb_path + '/')]
+                   and matches_usb_device(d.get_info(rs.camera_info.physical_port), usb_path)]
         if len(devices) != 1:
             raise RuntimeError("Selected RealSense camera is unavailable")
         device = devices[0]
