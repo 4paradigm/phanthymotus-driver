@@ -17,6 +17,38 @@ rs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rs)
 
 
+class DeviceBindingTests(unittest.TestCase):
+    USB = '/sys/devices/platform/3610000.xhci/usb2/2-1'
+    # D435i + pinned SDK on Go2: physical_port is the depth V4L2 sysfs path,
+    # whereas the selected RGB interface is 2-1:1.3 under the same USB parent.
+    V4L2_PORT = USB + '/2-1:1.0/video4linux/video0'
+
+    def test_real_linux_physical_port_matches_the_selected_rgb_usb_parent(self):
+        self.assertTrue(rs.matches_usb_device(self.V4L2_PORT, self.USB))
+        self.assertFalse(rs.matches_usb_device(
+            self.USB + '0/2-10:1.0/video4linux/video0', self.USB))
+        self.assertFalse(rs.matches_usb_device(self.V4L2_PORT, self.USB + '0'))
+
+    def test_rsusb_identifier_matches_bus_port_chain_and_device_address(self):
+        # librealsense v2.56.5 get_device_path(): bus-port.chain-device_address.
+        fields = {'busnum': '2\n', 'devpath': '1.3\n', 'devnum': '7\n'}
+        with mock.patch.object(rs.Path, 'read_text', autospec=True,
+                               side_effect=lambda p: fields[p.name]):
+            self.assertTrue(rs.matches_usb_device('2-1.3-7', self.USB))
+            for unrelated in ('3-1.3-7', '2-1.30-7', '2-1.3-8', '2-1-7'):
+                with self.subTest(port=unrelated):
+                    self.assertFalse(rs.matches_usb_device(unrelated, self.USB))
+
+    def test_unknown_or_unavailable_usb_identity_does_not_pick_a_device(self):
+        for port in ('', 'unknown', '2-1', '/dev/video0'):
+            with self.subTest(port=port):
+                self.assertFalse(rs.matches_usb_device(port, self.USB))
+        with mock.patch.object(rs.Path, 'read_text', side_effect=FileNotFoundError('unplugged')):
+            self.assertFalse(rs.matches_usb_device('2-1-7', self.USB))
+        with mock.patch.object(rs.Path, 'read_text', return_value='invalid'):
+            self.assertFalse(rs.matches_usb_device('2-1-7', self.USB))
+
+
 class DepthEncodingTests(unittest.TestCase):
     def test_converts_device_units_to_millimetres_and_preserves_invalid(self):
         raw = np.zeros((480, 640), dtype=np.uint16)
@@ -148,7 +180,7 @@ class StereoLifecycleTests(unittest.TestCase):
 class StereoCaptureTests(unittest.TestCase):
     """Exercise the real worker loop with timed SDK frames and no ROS hardware."""
 
-    def capture(self, samples, usb_path='/sys/devices/usb1/1-1'):
+    def capture(self, samples, usb_path='/sys/devices/usb1/1-1', physical_port=None):
         clock = [100.0]
         quit_event = threading.Event()
         statuses = queue.Queue()
@@ -178,7 +210,7 @@ class StereoCaptureTests(unittest.TestCase):
         sensor.get_stream_profiles.return_value = profiles
         device = types.SimpleNamespace(
             supports=lambda key: True,
-            get_info=lambda key: {'physical_port': usb_path + '/video4linux/video0',
+            get_info=lambda key: {'physical_port': physical_port or usb_path + '/1-1:1.0/video4linux/video0',
                                   'usb_type_descriptor': '2.1', 'name': 'D435i'}[key],
             first_depth_sensor=lambda: sensor)
         sdk = types.SimpleNamespace(
@@ -204,6 +236,13 @@ class StereoCaptureTests(unittest.TestCase):
         sensor.close.assert_called_once()
         errors = [s['error'] for s in list(statuses.queue) if s.get('error')]
         return errors, ros.create_node.call_args.args[0]
+
+    def test_worker_can_bind_the_rsusb_backend_identifier(self):
+        fields = {'busnum': '1', 'devpath': '1', 'devnum': '4'}
+        with mock.patch.object(rs.Path, 'read_text', autospec=True,
+                               side_effect=lambda p: fields[p.name]):
+            errors, _ = self.capture([(.1, 'depth'), (.2, 'infrared')], physical_port='1-1-4')
+        self.assertEqual(errors, [])
 
     def test_slow_usb_first_frames_get_the_startup_window(self):
         errors, _ = self.capture([(4, None), (4.5, 'depth'), (5, 'infrared')])
