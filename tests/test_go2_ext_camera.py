@@ -1,5 +1,6 @@
 """Camera discovery regression tests using V4L2 output from the Go2 host."""
 import sys
+from contextlib import nullcontext
 import types
 import unittest
 import numpy as np  # Load before patching sys.modules so NumPy is not reimported.
@@ -33,7 +34,7 @@ ext = load_ext_devices()
 
 
 class CameraDiscoveryTest(unittest.TestCase):
-    def enumerate(self, devices):
+    def enumerate(self, devices, probe_usb=False):
         def output(args, **kwargs):
             name, caps, formats = devices[args[2]]
             if args[3] == '--info':
@@ -44,7 +45,9 @@ class CameraDiscoveryTest(unittest.TestCase):
                 raise ext.subprocess.CalledProcessError(1, args)
             return '\n'.join(f"[{i}]: '{fmt}'\n\tSize: Discrete 1280x720"
                              for i, fmt in enumerate(formats))
-        with mock.patch.object(ext.glob, 'glob', return_value=list(devices)), \
+        usb = (nullcontext() if probe_usb else mock.patch.object(
+            ext, '_realsense_usb_path', return_value='/sys/devices/test-usb'))
+        with usb, mock.patch.object(ext.glob, 'glob', return_value=list(devices)), \
              mock.patch.object(ext.subprocess, 'check_output', side_effect=output):
             return ext._enumerate_ext_cameras()
 
@@ -109,6 +112,28 @@ Media Driver Info:
         self.assertEqual(self.enumerate({
             '/dev/video4': ('Intel RealSense', 'Video Capture', ['ABCD']),
         }), [])
+
+    def test_sysfs_failure_does_not_hide_an_unrelated_webcam(self):
+        devices = {
+            '/dev/video4': ('Intel RealSense', 'Video Capture', ['YUYV']),
+            '/dev/video6': ('USB Webcam', 'Video Capture', ['MJPG']),
+        }
+        for error in (FileNotFoundError('unplugged'), OSError('sysfs unavailable')):
+            with self.subTest(error=error), \
+                 mock.patch.object(ext.Path, 'resolve', side_effect=error):
+                result = self.enumerate(devices, probe_usb=True)
+                self.assertEqual([d['path'] for d in result], ['/dev/video6'])
+
+    def test_disappearing_usb_ancestor_does_not_abort_enumeration(self):
+        with mock.patch.object(ext.Path, 'resolve', return_value=Path('/sys/devices/usb1/1-1/video4')), \
+             mock.patch.object(ext.Path, 'is_file', side_effect=OSError('unplugged')):
+            self.assertEqual(ext._realsense_usb_path('/dev/video4'), '')
+
+    def test_usb_identity_comes_from_the_physical_ancestor(self):
+        with mock.patch.object(ext.Path, 'resolve', return_value=Path('/sys/devices/usb1/1-1/video4')), \
+             mock.patch.object(ext.Path, 'is_file', autospec=True,
+                               side_effect=lambda p: p == Path('/sys/devices/usb1/1-1/idVendor')):
+            self.assertEqual(ext._realsense_usb_path('/dev/video4'), '/sys/devices/usb1/1-1')
 
 
 class FakeRGB:

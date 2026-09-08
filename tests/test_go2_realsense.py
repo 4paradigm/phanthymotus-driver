@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import queue
+import sys
 import threading
 import types
 import unittest
@@ -142,6 +143,93 @@ class StereoLifecycleTests(unittest.TestCase):
         self.session.start('card-a', 'depth')
         self.now.return_value += 10.1
         self.assertEqual(self.session.info('card-a', 'depth')['state'], 'error')
+
+
+class StereoCaptureTests(unittest.TestCase):
+    """Exercise the real worker loop with timed SDK frames and no ROS hardware."""
+
+    def capture(self, samples, usb_path='/sys/devices/usb1/1-1'):
+        clock = [100.0]
+        quit_event = threading.Event()
+        statuses = queue.Queue()
+        samples = iter(samples)
+
+        def profile(kind, fmt, index):
+            return types.SimpleNamespace(
+                stream_type=lambda: kind, format=lambda: fmt,
+                stream_index=lambda: index, fps=lambda: 6,
+                as_video_stream_profile=lambda: types.SimpleNamespace(
+                    width=lambda: 640, height=lambda: 480))
+
+        profiles = [profile('depth', 'z16', 0), profile('infrared', 'y8', 1)]
+
+        def wait_frame(timeout):
+            try:
+                elapsed, kind = next(samples)
+            except StopIteration:
+                quit_event.set()
+                return False, None
+            clock[0] = 100.0 + elapsed
+            p = next((p for p in profiles if p.stream_type() == kind), None)
+            return (True, types.SimpleNamespace(profile=p)) if p else (False, None)
+
+        sensor = mock.Mock()
+        sensor.get_depth_scale.return_value = .001
+        sensor.get_stream_profiles.return_value = profiles
+        device = types.SimpleNamespace(
+            supports=lambda key: True,
+            get_info=lambda key: {'physical_port': usb_path + '/video4linux/video0',
+                                  'usb_type_descriptor': '2.1', 'name': 'D435i'}[key],
+            first_depth_sensor=lambda: sensor)
+        sdk = types.SimpleNamespace(
+            context=lambda: types.SimpleNamespace(query_devices=lambda: [device]),
+            camera_info=types.SimpleNamespace(physical_port='physical_port',
+                usb_type_descriptor='usb_type_descriptor', name='name'),
+            stream=types.SimpleNamespace(depth='depth', infrared='infrared'),
+            format=types.SimpleNamespace(z16='z16', y8='y8'),
+            frame_queue=lambda size: types.SimpleNamespace(try_wait_for_frame=wait_frame))
+        ros = types.SimpleNamespace(init=mock.Mock(), create_node=mock.Mock(return_value=mock.Mock()),
+                                    shutdown=mock.Mock())
+        logsafe = types.SimpleNamespace(install=mock.Mock())
+        modules = {'common': types.SimpleNamespace(logsafe=logsafe), 'cv2': types.SimpleNamespace(),
+                   'pyrealsense2': sdk, 'rclpy': ros,
+                   'rclpy.qos': types.SimpleNamespace(qos_profile_sensor_data=None),
+                   'sensor_msgs.msg': types.SimpleNamespace(CompressedImage=object)}
+        with mock.patch.dict(sys.modules, modules), \
+             mock.patch.object(rs.time, 'monotonic', side_effect=lambda: clock[0]):
+            # Empty routes still require both SDK streams to remain healthy.
+            rs._capture('robot_a', usb_path, {}, queue.Queue(), quit_event, statuses)
+        logsafe.install.assert_called_once_with(check_fd=False)
+        sensor.stop.assert_called_once()
+        sensor.close.assert_called_once()
+        errors = [s['error'] for s in list(statuses.queue) if s.get('error')]
+        return errors, ros.create_node.call_args.args[0]
+
+    def test_slow_usb_first_frames_get_the_startup_window(self):
+        errors, _ = self.capture([(4, None), (4.5, 'depth'), (5, 'infrared')])
+        self.assertEqual(errors, [])
+
+    def test_startup_grace_applies_until_both_streams_have_arrived(self):
+        errors, _ = self.capture([(.1, 'depth'), (4, None), (4.5, 'depth'), (5, 'infrared')])
+        self.assertEqual(errors, [])
+
+    def test_missing_first_stream_eventually_times_out(self):
+        for samples in ([(10.1, None)], [(.1, 'depth'), (10.1, 'depth')]):
+            with self.subTest(samples=samples):
+                errors, _ = self.capture(samples)
+                self.assertEqual(errors, ['RealSense depth/infrared startup timed out'])
+
+    def test_stream_stall_after_startup_uses_shorter_deadline(self):
+        errors, _ = self.capture([(.1, 'depth'), (.2, 'infrared'), (3.3, 'depth')])
+        self.assertEqual(errors, ['RealSense depth/infrared frames stopped arriving'])
+
+    def test_two_physical_cameras_have_distinct_stable_ros_node_names(self):
+        _, first = self.capture([], '/sys/devices/usb1/1-1')
+        _, second = self.capture([], '/sys/devices/usb1/1-2')
+        _, again = self.capture([], '/sys/devices/usb1/1-1')
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, again)
+        self.assertRegex(first, r'^robot_a_realsense_stereo_[a-z0-9]+$')
 
 
 if __name__ == '__main__':

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import copy
+import hashlib
 import queue
 import threading
 import time
@@ -96,14 +97,16 @@ def _capture(namespace, usb_path, routes, commands, quit_event, status_queue):
             profiles.append(matches[0])
 
         rclpy.init()
-        node = rclpy.create_node(f"{namespace}_realsense_stereo")
+        usb_suffix = hashlib.sha256(usb_path.encode()).hexdigest()[:12]
+        node = rclpy.create_node(f"{namespace}_realsense_stereo_{usb_suffix}")
         publishers = {}
         frames = rs.frame_queue(4)
         sensor.open(profiles)
         opened = True
         sensor.start(frames)
         streaming = True
-        last_received = {s: time.monotonic() for s in STREAMS}
+        started_at = time.monotonic()
+        last_received = {s: None for s in STREAMS}
         last_report = 0.0
         while not quit_event.is_set():
             while True:
@@ -121,7 +124,10 @@ def _capture(namespace, usb_path, routes, commands, quit_event, status_queue):
                         CompressedImage, topic, qos_profile_sensor_data))
             ok, frame = frames.try_wait_for_frame(200)
             now = time.monotonic()
-            if any(now - t > STALE_SECONDS for t in last_received.values()):
+            if any(t is None for t in last_received.values()):
+                if now - started_at >= STARTUP_SECONDS:
+                    raise RuntimeError("RealSense depth/infrared startup timed out")
+            elif any(now - t >= STALE_SECONDS for t in last_received.values()):
                 raise RuntimeError("RealSense depth/infrared frames stopped arriving")
             if not ok:
                 continue

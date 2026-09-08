@@ -143,9 +143,14 @@ def _enumerate_ext_mics() -> list[dict]:
 def _realsense_usb_path(device_path: str) -> str:
     """Read the selected V4L2 node's physical USB identity, not a camera index."""
     device = Path('/sys/class/video4linux') / Path(device_path).name / 'device'
-    for parent in device.resolve().parents:
-        if (parent / 'idVendor').is_file():
-            return str(parent)
+    try:
+        for parent in device.resolve(strict=True).parents:
+            if (parent / 'idVendor').is_file():
+                return str(parent)
+    except OSError:
+        # USB removal can race both symlink resolution and ancestor inspection.
+        # A failed node must not abort discovery of other connected cameras.
+        return ''
     return ''
 
 
@@ -210,9 +215,12 @@ def _enumerate_ext_cameras() -> list[dict]:
                 continue
             name += ' (RealSense)'
 
+        usb_path = _realsense_usb_path(path) if is_realsense else ''
+        if is_realsense and not usb_path:
+            continue
         devices.append({"path": path, "name": name, "formats": formats, "resolutions": resolutions,
                         "realsense": is_realsense,
-                        "usb_path": _realsense_usb_path(path) if is_realsense else ""})
+                        "usb_path": usb_path})
     return devices
 
 
