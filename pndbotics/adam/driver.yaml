@@ -26,4 +26,5 @@ cards:
   - { name: camera_head,         type: sensor }
   - { name: camera_depth,        type: sensor }
   - { name: camera_pointcloud,   type: sensor }
+  - { name: vision_capture,      type: actuator }
   - { name: model,               type: resource }
