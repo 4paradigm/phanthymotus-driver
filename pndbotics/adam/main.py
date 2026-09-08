@@ -191,7 +191,7 @@ def main():
     network_iface = sys.argv[1] if len(sys.argv) > 1 else None
     cfg           = _load_config()
     namespace     = _resolve_namespace(cfg)
-    mcp_port      = int(cfg.get("mcp_port", 15720))
+    mcp_port      = int(cfg.get("mcp_port", 15722))
     variant       = cfg.get("variant", "sp")
 
     print(f"[adam] namespace={namespace} variant={variant} mcp_port={mcp_port}")
