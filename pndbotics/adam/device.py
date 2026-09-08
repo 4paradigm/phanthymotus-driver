@@ -8,6 +8,9 @@ Plugins:
   ModelPlugin  — URDF resource for 3D visualization
 """
 
+from __future__ import annotations
+
+import base64
 import json
 import io
 import math
@@ -18,6 +21,7 @@ import sys
 import threading
 import time
 import zlib
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -1499,6 +1503,13 @@ class ZedCameraPlugin:
         self._depth_pub = None
         self._pointcloud_pub = None
         self._lock = threading.Lock()
+        # A one-shot photo card shares this capture loop rather than opening a
+        # second ZED SDK handle.  The condition protects the JPEG cache and
+        # lets a caller wait specifically for a frame newer than its request.
+        self._photo_condition = threading.Condition(self._lock)
+        self._photo_waiters = 0
+        self._latest_rgb = None
+        self._rgb_sequence = 0
         self._state = {
             "state": "idle",
             "available": False,
@@ -1956,7 +1967,9 @@ class ZedCameraPlugin:
                 now = time.monotonic()
 
                 with self._lock:
-                    rgb_enabled = self._card_enabled["camera_head"]
+                    rgb_enabled = (
+                        self._card_enabled["camera_head"]
+                        or self._photo_waiters > 0)
                     depth_enabled = self._card_enabled["camera_depth"]
                     pointcloud_enabled = (
                         self._card_enabled["camera_pointcloud"]
@@ -2021,11 +2034,19 @@ class ZedCameraPlugin:
                 continue
             if not self._capture_active():
                 break
-            with self._lock:
-                if not self._card_enabled["camera_head"]:
-                    continue
             try:
                 jpeg = self._encode_jpeg(image, np, PillowImage)
+                with self._photo_condition:
+                    self._rgb_sequence += 1
+                    self._latest_rgb = {
+                        "data": jpeg,
+                        "timestamp_ms": int(time.time() * 1000),
+                        "sequence": self._rgb_sequence,
+                    }
+                    self._photo_condition.notify_all()
+                    publish_rgb = self._card_enabled["camera_head"]
+                if not publish_rgb:
+                    continue
                 msg = self._CompressedImage()
                 msg.format = "jpeg"
                 msg.data = jpeg
@@ -2230,6 +2251,34 @@ class ZedCameraPlugin:
         if should_stop:
             self.stop()
 
+    def capture_photo(self, timeout_s=5.0):
+        """Return a JPEG captured after this call starts.
+
+        The ZED remains lazy while only the photo card is installed: a raw RGB
+        frame is retrieved only while at least one caller is waiting here.
+        """
+        timeout_s = max(0.1, min(float(timeout_s), 15.0))
+        deadline = time.monotonic() + timeout_s
+        with self._photo_condition:
+            if not self._running:
+                if not self.start():
+                    raise RuntimeError("Adam ZED camera could not be started")
+            start_sequence = self._rgb_sequence
+            self._photo_waiters += 1
+            try:
+                while True:
+                    frame = self._latest_rgb
+                    if frame is not None and frame["sequence"] > start_sequence:
+                        return dict(frame)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        detail = self._state.get("error") or "no fresh RGB frame arrived"
+                        raise RuntimeError(detail)
+                    self._photo_condition.wait(remaining)
+            finally:
+                self._photo_waiters -= 1
+
+
     def dispatch(self, action, args):
         tool_name = args.get("_tool_name", action)
         if tool_name not in self._CARD_NAMES:
@@ -2273,6 +2322,89 @@ class ZedCameraPlugin:
 # ---------------------------------------------------------------------------
 # Resource card and bundle
 # ---------------------------------------------------------------------------
+
+class VisionCapturePlugin:
+    """Capture one Adam ZED RGB image and return it in the MCP response."""
+
+    CARD = "vision_capture"
+
+    def __init__(self, plugin_config, camera):
+        self._camera = camera
+        config = dict(plugin_config or {})
+        self._output_dir = Path(str(config.get(
+            "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
+        self._timeout_s = max(1, min(int(config.get("timeout_s", 5)), 15))
+
+    def get_tool(self):
+        return {
+            "name": self.CARD,
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "Capture one fresh RGB photo from Adam's head-mounted ZED Mini and return it as JPEG.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["capture_photo", "info"],
+                        "description": "capture_photo takes and returns a new JPEG image.",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": False,
+                "x-action-params": {
+                    "capture_photo": {"params": [], "description": "拍摄一张新的 RGB 照片并返回图片。"},
+                    "info": {"params": [], "description": "查看相机和照片保存目录状态。"},
+                },
+            },
+        }
+
+    def start(self):
+        return {"state": "ready"}
+
+    def stop(self):
+        return {"state": "idle"}
+
+    def _info(self):
+        with self._camera._lock:
+            state = dict(self._camera._state)
+        return {
+            "ok": bool(state.get("available")),
+            "source": "adam-zed-sdk-local",
+            "output_dir": str(self._output_dir / "photos"),
+            "camera_state": state.get("state"),
+            "error": state.get("error"),
+        }
+
+    def _capture_photo(self):
+        try:
+            frame = self._camera.capture_photo(self._timeout_s)
+            directory = self._output_dir / "photos"
+            directory.mkdir(parents=True, exist_ok=True)
+            captured_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            filename = f"IMG_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+            path = directory / filename
+            jpeg = frame["data"]
+            path.write_bytes(jpeg)
+            encoded = base64.b64encode(jpeg).decode("ascii")
+            return {
+                "ok": True,
+                "media_type": "image/jpeg",
+                "file_path": str(path),
+                "captured_at": captured_at,
+                "image_data_url": f"data:image/jpeg;base64,{encoded}",
+            }
+        except Exception as exc:
+            return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
+
+    def dispatch(self, action, args):
+        del args
+        if action == "capture_photo":
+            return self._capture_photo()
+        if action == "info":
+            return self._info()
+        return None
+
 
 class ModelPlugin:
     """Returns URDF for 3D skeleton visualization on dashboard."""
@@ -2369,10 +2501,18 @@ class AdamDeviceBundle:
             self._plugins.append(p)
 
         # CameraPlugin
+        camera_plugin = None
         if plugins_cfg.get("camera", {}).get("enabled", False) and self._ros2_enabled:
-            p = ZedCameraPlugin(
+            camera_plugin = ZedCameraPlugin(
                 plugins_cfg.get("camera", {}), namespace, executor)
-            self._plugins.append(p)
+            self._plugins.append(camera_plugin)
+
+        # Capture is intentionally a separate card, while sharing the single
+        # locally attached ZED SDK instance owned by ``camera_plugin``.
+        if (plugins_cfg.get("vision_capture", {}).get("enabled", False)
+                and camera_plugin is not None):
+            self._plugins.append(VisionCapturePlugin(
+                plugins_cfg.get("vision_capture", {}), camera_plugin))
 
         # ArmPlugin
         if plugins_cfg.get("arm", {}).get("enabled", True) and self._ros2_enabled:
