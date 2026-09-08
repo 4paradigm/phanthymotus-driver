@@ -780,6 +780,7 @@ class SpeakerPlugin:
                     },
                 },
                 "required": ["action"],
+                "x-resource": ["mouth"],
             },
             "topic_in": [{"format": "audio/pcm-16k"}],
         }
@@ -1038,6 +1039,7 @@ class SpeakerIsolatedProxy:
                     },
                 },
                 "required": ["action"],
+                "x-resource": ["mouth"],
             },
             "topic_in": [{"format": "audio/pcm-16k"}],
         }
