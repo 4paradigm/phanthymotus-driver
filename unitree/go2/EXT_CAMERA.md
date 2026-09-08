@@ -96,11 +96,16 @@ obstacle avoidance are downstream capabilities, not implemented by this sensor.
 - Linux USB serial and RealSense SDK serial are not necessarily equal. Device
   selection binds SDK `physical_port` to the selected V4L2 node's USB ancestor;
   it does not choose an arbitrary first SDK camera or hard-code `/dev/video4`.
+  A missing or unreadable sysfs identity skips only that RealSense node, so
+  unplugging it does not abort discovery of unrelated webcams. Each stereo
+  worker uses a stable USB-path hash in its ROS node name to distinguish devices.
 - `start` returns lifecycle `state: running` after activation, with `readiness`
   and `fresh` preserved separately. `info` can report `starting` until frames
   arrive; only new frames count as fresh. Known capture errors are never hidden.
   Missing devices/profiles, process exit and stale data are reported by `info`.
   Start retries after a fault, and shutdown is bounded if the SDK is stuck.
+  The worker allows 10 seconds after `sensor.start` for both first frames;
+  after both streams have arrived, its stream-stall deadline is 3 seconds.
 
 ## Build and verification
 
@@ -114,8 +119,14 @@ are included in this driver PR.
 python3 -m unittest discover -s tests
 ```
 
-All 46 tests pass. They cover real V4L2 capability formatting, unsupported formats, channel
+All 54 tests pass. They cover real V4L2 capability formatting, unsupported formats, channel
 configuration/topic changes, USB device binding, RGB compatibility, per-instance configuration and lifecycle, stale/wrong-channel frames, depth units and overflow.
+Worker-loop regressions also cover delayed first frames, missing streams,
+post-start stalls and distinct node names for distinct physical USB paths.
+Enumeration regressions cover sysfs resolution/ancestor failures while keeping
+an unrelated webcam available. Updated enumeration was checked read-only on the
+Go2; delayed USB startup and two-camera node naming were verified with SDK/ROS
+test doubles, not a new two-camera hardware acceptance run.
 Hardware verification covers RGB→depth→infrared→RGB on the same instance,
 actual decoded image payloads in earlier device runs. The current startup fix
 has local coverage for three saved instance configurations starting separately,
