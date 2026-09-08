@@ -19,6 +19,8 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
   StatePlugin        (sensor)    — DDS LowState → IMU/battery ROS2 topic
 """
 
+from __future__ import annotations
+
 import json
 import math
 import queue
@@ -1218,6 +1220,10 @@ class LedPlugin:
             if self._effect_stop.wait(0.03): return
 
 
+class _GreetCancelled(Exception):
+    pass
+
+
 class GreetPlugin:
     """迎宾卡（actuator）：一个动作完成挥手 + 语音问候 + LED 灯。
 
@@ -1237,6 +1243,9 @@ class GreetPlugin:
         self._audio_lock = audio_lock
         self._tts_lock = tts_lock
         self._greet_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._active_lock = threading.Lock()
+        self._active_greets: set[str] = set()
         self._default_text = str(plugin_config.get("default_text", "你好，欢迎光临"))
         self._voice = int(plugin_config.get("voice", 0))
         rgb = plugin_config.get("led_rgb", [0, 255, 0])
@@ -1276,15 +1285,50 @@ class GreetPlugin:
         }
 
     def start(self) -> None:
-        pass
+        self._stop_event.clear()
 
     def stop(self) -> None:
-        pass
+        self._stop_event.set()
+
+    def _cancelled(self) -> bool:
+        return self._stop_event.is_set()
+
+    def _cancelled_result(self) -> dict:
+        return {"reason": "greet plugin stopped"}
+
+    def _wait_or_cancelled(self, duration: float) -> bool:
+        return self._stop_event.wait(duration)
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled():
+            raise _GreetCancelled()
+
+    def _track_greet(self, action_id: str) -> None:
+        with self._active_lock:
+            self._active_greets.add(action_id)
+
+    def _untrack_greet(self, action_id: str) -> None:
+        with self._active_lock:
+            self._active_greets.discard(action_id)
+
+    def _validate_rgb(self, args: dict) -> tuple[dict | None, dict | None]:
+        rgb = {}
+        for name, default in (("r", self._led_rgb[0]), ("g", self._led_rgb[1]), ("b", self._led_rgb[2])):
+            value = args.get(name, default)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 255:
+                return None, {
+                    "error": f"{name} must be an integer in 0..255",
+                    "code": "INVALID_ARGUMENT",
+                }
+            rgb[name] = value
+        return rgb, None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
+            self.start()
             return {"state": "ready"}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action == "info":
             return {"default_text": self._default_text, "voice": self._voice,
@@ -1306,20 +1350,19 @@ class GreetPlugin:
             ret = _onboard_tts(self._audio, self._audio_lock, self._tts_lock, text, self._voice)
             return {"ret": ret, "text": text}
         if action == "led":
-            rgb = {}
-            for name, default in (("r", self._led_rgb[0]), ("g", self._led_rgb[1]), ("b", self._led_rgb[2])):
-                value = args.get(name, default)
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 255:
-                    return {
-                        "error": f"{name} must be an integer in 0..255",
-                        "code": "INVALID_ARGUMENT",
-                    }
-                rgb[name] = value
+            rgb, error = self._validate_rgb(args)
+            if error:
+                return error
             r, g, b = rgb["r"], rgb["g"], rgb["b"]
             with self._audio_lock:
                 ret = self._audio.LedControl(r, g, b)
             return {"ret": ret, "r": r, "g": g, "b": b}
         if action == "greet":
+            if self._cancelled():
+                return {
+                    "error": "greet plugin stopped",
+                    "code": "PRECONDITION_FAILED",
+                }
             from uuid import uuid4
             action_id = f"g1_greet_{uuid4().hex[:8]}"
             text = str(args.get("text", self._default_text))
@@ -1331,29 +1374,33 @@ class GreetPlugin:
     def _run_greet(self, action_id: str, text: str):
         """Background thread: run the greet sequence, then fire ACP completion.
 
-        The vendor RPCs (LedControl/WaveHand/TtsMaker) are fire-and-forget, so
-        completion is signalled once the full sequence has been dispatched. Every
-        path must notify, otherwise agent-core's barrier waits out the full
-        x-completion timeout for a sequence that already died.
+        Unitree's TTS and arm-action RPCs do not expose cancellation or completion
+        events. stop() prevents subsequent greet hardware commands and avoids false
+        completion, but any already-dispatched vendor action must finish naturally.
         """
+        self._track_greet(action_id)
         try:
             with self._greet_lock:
+                self._raise_if_cancelled()
                 r, g, b = self._led_rgb
                 with self._audio_lock:
                     led_ret = self._audio.LedControl(r, g, b)
                 if led_ret != 0:
                     raise RuntimeError(f"LedControl failed: code={led_ret}")
 
+                self._raise_if_cancelled()
                 tts_ret = _onboard_tts(
                     self._audio, self._audio_lock, self._tts_lock, text, self._voice
                 )
                 if tts_ret != 0:
                     raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
 
+                self._raise_if_cancelled()
                 wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
                 if wave_ret != 0:
                     raise RuntimeError(f"high wave failed: code={wave_ret}")
-                time.sleep(self._HIGH_WAVE_DURATION_S)
+                if self._wait_or_cancelled(self._HIGH_WAVE_DURATION_S):
+                    raise _GreetCancelled()
 
                 result = {
                     "ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
@@ -1362,9 +1409,14 @@ class GreetPlugin:
                     "text": text,
                 }
                 status = "completed"
+        except _GreetCancelled:
+            result = self._cancelled_result()
+            status = "cancelled"
         except Exception as e:
             result = {"error": f"{type(e).__name__}: {e}"}
             status = "error"
+        finally:
+            self._untrack_greet(action_id)
         _loco_acp_notify(action_id, status, result, tool="greet")
 
 
