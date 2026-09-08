@@ -246,14 +246,19 @@ class MicPlugin:
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
 
 
+def _onboard_tts_duration_s(text: str) -> float:
+    """Conservative onboard TTS duration estimate; the SDK has no done event."""
+    return min(max(1.2, len(text) * 0.35), 50.0)
+
+
 def _onboard_tts(audio_client: AudioClient, audio_lock: threading.Lock,
                  tts_lock: threading.Lock, text: str, voice: int) -> int:
-    """Serialize onboard TTS until the firmware has time to start playback."""
+    """Serialize onboard TTS until estimated playback completion."""
     with tts_lock:
         with audio_lock:
             ret = audio_client.TtsMaker(text, voice)
             if ret == 0:
-                time.sleep(min(max(0.8, len(text) * 0.12), 8.0))
+                time.sleep(_onboard_tts_duration_s(text))
             return ret
 
 
@@ -1222,6 +1227,7 @@ class GreetPlugin:
     PREFIX = "greet"
 
     _HIGH_WAVE_ACTION_ID = 26
+    _HIGH_WAVE_DURATION_S = 5.0
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  arm_client, audio_client: AudioClient, audio_lock: threading.Lock,
@@ -1248,11 +1254,10 @@ class GreetPlugin:
                     "action": {"type": "string", "enum": ["greet", "wave", "speak", "led", "info"],
                                "description": "要执行的动作"},
                     "text": {"type": "string", "description": "要说的话（不填用默认问候语）"},
-                    "turn": {"type": "boolean", "description": "挥手时是否转身"},
                     "confirm": {"type": "boolean", "description": "确认执行机器人肢体动作"},
-                    "r": {"type": "integer", "description": "LED 红 0-255"},
-                    "g": {"type": "integer", "description": "LED 绿 0-255"},
-                    "b": {"type": "integer", "description": "LED 蓝 0-255"},
+                    "r": {"type": "integer", "minimum": 0, "maximum": 255, "description": "LED 红 0-255"},
+                    "g": {"type": "integer", "minimum": 0, "maximum": 255, "description": "LED 绿 0-255"},
+                    "b": {"type": "integer", "minimum": 0, "maximum": 255, "description": "LED 蓝 0-255"},
                 },
                 "required": ["action"],
                 "x-is-dangerous": True,
@@ -1261,8 +1266,8 @@ class GreetPlugin:
                     "timeout": 60,
                 },
                 "x-action-params": {
-                    "greet": {"params": ["text", "turn", "confirm"], "description": "完整迎宾：挥手 + 说话 + LED（异步执行，完成后回调）"},
-                    "wave":  {"params": ["turn", "confirm"], "description": "只挥手"},
+                    "greet": {"params": ["text", "confirm"], "description": "完整迎宾：挥手 + 说话 + LED（异步执行，完成后回调）"},
+                    "wave":  {"params": ["confirm"], "description": "只挥手"},
                     "speak": {"params": ["text"], "description": "只语音问候"},
                     "led":   {"params": ["r", "g", "b"], "description": "只设置 LED 颜色"},
                     "info":  {"params": [], "description": "查看迎宾配置"},
@@ -1289,28 +1294,28 @@ class GreetPlugin:
                 "error": f"{action} requires confirm=true",
                 "code": "PRECONDITION_FAILED",
             }
-        if action in ("greet", "wave") and "turn" in args and not isinstance(args["turn"], bool):
-            return {
-                "error": f"{action} turn must be a boolean",
-                "code": "INVALID_ARGUMENT",
-            }
         if action == "wave":
-            turn = args.get("turn", False)
             ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
             return {
                 "ret": ret,
                 "action_id": self._HIGH_WAVE_ACTION_ID,
                 "gesture": "high wave",
-                "turn": turn,
             }
         if action == "speak":
             text = str(args.get("text", self._default_text))
             ret = _onboard_tts(self._audio, self._audio_lock, self._tts_lock, text, self._voice)
             return {"ret": ret, "text": text}
         if action == "led":
-            r = int(args.get("r", self._led_rgb[0]))
-            g = int(args.get("g", self._led_rgb[1]))
-            b = int(args.get("b", self._led_rgb[2]))
+            rgb = {}
+            for name, default in (("r", self._led_rgb[0]), ("g", self._led_rgb[1]), ("b", self._led_rgb[2])):
+                value = args.get(name, default)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 255:
+                    return {
+                        "error": f"{name} must be an integer in 0..255",
+                        "code": "INVALID_ARGUMENT",
+                    }
+                rgb[name] = value
+            r, g, b = rgb["r"], rgb["g"], rgb["b"]
             with self._audio_lock:
                 ret = self._audio.LedControl(r, g, b)
             return {"ret": ret, "r": r, "g": g, "b": b}
@@ -1318,13 +1323,12 @@ class GreetPlugin:
             from uuid import uuid4
             action_id = f"g1_greet_{uuid4().hex[:8]}"
             text = str(args.get("text", self._default_text))
-            turn = args.get("turn", False)
-            threading.Thread(target=self._run_greet, args=(action_id, text, turn),
+            threading.Thread(target=self._run_greet, args=(action_id, text),
                              daemon=True, name="greet_seq").start()
-            return {"status": "executing", "action_id": action_id, "text": text, "turn": turn}
+            return {"status": "executing", "action_id": action_id, "text": text}
         return None
 
-    def _run_greet(self, action_id: str, text: str, turn: bool):
+    def _run_greet(self, action_id: str, text: str):
         """Background thread: run the greet sequence, then fire ACP completion.
 
         The vendor RPCs (LedControl/WaveHand/TtsMaker) are fire-and-forget, so
@@ -1349,13 +1353,13 @@ class GreetPlugin:
                 wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
                 if wave_ret != 0:
                     raise RuntimeError(f"high wave failed: code={wave_ret}")
+                time.sleep(self._HIGH_WAVE_DURATION_S)
 
                 result = {
                     "ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
                     "wave_action_id": self._HIGH_WAVE_ACTION_ID,
                     "wave_gesture": "high wave",
                     "text": text,
-                    "turn": turn,
                 }
                 status = "completed"
         except Exception as e:
