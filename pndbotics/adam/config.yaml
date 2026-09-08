@@ -6,7 +6,7 @@ variant: "pro"
 
 # gRPC endpoint for locomotion control (PC1)
 grpc_host: "10.10.20.127"
-grpc_port: 6666
+grpc_port: 50051
 
 # DDS domain ID (must match robot's domain; Adam developer-mode DDS is domain 1)
 dds_domain_id: 1
