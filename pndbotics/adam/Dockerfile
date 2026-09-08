@@ -7,7 +7,7 @@ WORKDIR /work
 
 RUN sed -i 's|http://mirrors.tencentyun.com/ubuntu-ports|http://ports.ubuntu.com/ubuntu-ports|g' /etc/apt/sources.list && \
     apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip cmake build-essential curl git \
+    python3-pip cmake build-essential curl git ffmpeg \
     libturbojpeg libusb-1.0-0 libegl1 libgles2 libv4l-0 \
     libx11-6 libxext6 libbsd0 python3-pil && \
     rm -rf /var/lib/apt/lists/*

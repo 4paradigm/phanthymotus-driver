@@ -55,9 +55,12 @@ plugins:
   vision_capture:
     enabled: true
     # The host data mount makes captures survive container replacement.
-    output_dir: "/opt/phanthy-motus/data/vision_capture"
+    output_dir: "/opt/phanthy-motus/data/images"
     # Maximum wait for a fresh ZED frame after the card is triggered.
     timeout_s: 5
+    video_fps: 15
+    default_video_seconds: 5
+    max_video_seconds: 60
   arm:
     enabled: true
     publish_rate_hz: 100
