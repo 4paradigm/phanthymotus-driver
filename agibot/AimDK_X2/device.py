@@ -644,6 +644,8 @@ class MicPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "config":
             config = args.get("config") if isinstance(args.get("config"), dict) else args
             if "channel_index" not in config:

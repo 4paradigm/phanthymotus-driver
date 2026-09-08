@@ -19,7 +19,8 @@ WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py config.yaml driver.yaml /work/agibot/AimDK_X2/
 COPY resource/ /work/agibot/AimDK_X2/resource/
+# deploy/run-pr-image.sh reads this service fragment directly from the image.
 COPY deploy/ /deploy/
-ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work RCUTILS_COLORIZED_OUTPUT=0
 EXPOSE 15717
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /aimdk_x2_ws/install/setup.bash && python3 /work/agibot/AimDK_X2/main.py"]
