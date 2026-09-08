@@ -14,9 +14,9 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/aima/hal/joint/hand/command` | `hand_command` | |
 | `/aima/hal/joint/*/command` | `joint_command` | wildcard resolved to `leg`/`waist`/`arm`/`head` |
 | `/aima/hal/pmu/state` | — | not currently exposed as a tool (no card in the approved plan) |
-| `/aima/hal/sensor/lidar_chest_front/lidar_pointcloud` | `lidar` | `sensor/pointcloud` |
+| `/aima/hal/sensor/lidar_chest_front/lidar_pointcloud` | `lidar` | `sensor/pointcloud`; live unit has one `PointCloud2` publisher (`RELIABLE/TRANSIENT_LOCAL`), and the driver uses matching lidar QoS |
 | `/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed` | `camera_rgb` | catalog documents `rgbd_head_front/rgb_image/compressed` instead, but on real hardware that topic has zero publishers — confirmed via `ros2 topic info` that `rgb_head_front_center` is what's actually live (30Hz); see below |
-| `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` | zero publishers on real hardware, and no depth topic exists anywhere in the live `ros2 topic list` on this unit — depth appears to not be active/available on this X2 at all, kept wired to the documented name pending vendor confirmation |
+| `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` | live unit has one `sensor_msgs/msg/Image` publisher (`RELIABLE/VOLATILE`); driver subscribes with the matching image QoS |
 | `/aima/mc/locomotion/velocity` | `locomotion` | |
 | `/integrated_command` | `slam_control` | plain `std_msgs/String`, not a service |
 | `/relocalization_pose` | `slam_control` | |

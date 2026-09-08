@@ -275,6 +275,19 @@ fi
 # ── 构建 ──────────────────────────────────────────────────────────────────
 declare -a BUILT_INDICES
 
+if docker buildx version >/dev/null 2>&1; then
+    DOCKER_BUILD=(docker buildx build --platform linux/arm64)
+    DOCKER_BUILD_OUTPUT=$(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker")
+else
+    DOCKER_BUILD=(docker build)
+    DOCKER_BUILD_OUTPUT=""
+    if ${PUSH_ENABLED}; then
+        echo "错误：当前 Docker 不支持 buildx，无法直接构建并推送多架构镜像。"
+        exit 1
+    fi
+    echo "[info] Docker buildx unavailable — using native docker build."
+fi
+
 for idx in "${SELECTED_INDICES[@]}"; do
     dir="${DRIVER_DIRS[$idx]}"
     name="${DRIVER_NAMES[$idx]}"
@@ -317,13 +330,12 @@ for idx in "${SELECTED_INDICES[@]}"; do
     # Use the builder selected by the active Docker context. Docker Desktop
     # commonly names it desktop-linux; forcing `default` crosses contexts and
     # fails before the build starts.
-    docker buildx build \
-        --platform linux/arm64 \
+    "${DOCKER_BUILD[@]}" \
         ${NO_CACHE} \
         --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
         --file "${dir}Dockerfile" \
         --tag "${FULL_IMAGE}" \
-        $(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker") \
+        ${DOCKER_BUILD_OUTPUT} \
         "${BUILD_CTX}"
 
     [ -n "${CLEANUP_CTX}" ] && rm -rf "${CLEANUP_CTX}"
