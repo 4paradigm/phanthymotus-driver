@@ -48,9 +48,10 @@ for independent RGB sources rather than opening the same node twice.
 
 The existing Core can start the instances and display their streams. Its
 startup modal may nevertheless leave two same-name rows at "waiting": events
-are keyed by capability name instead of instance ID. A companion Core fix
-corrects that progress display and a newly registered-topic format race; it is
-not a prerequisite for concurrent camera acquisition. Check each instance's
+are keyed by capability name instead of instance ID. The companion
+[Core startup fix](https://github.com/4paradigm/phanthymotus/pull/175) adds
+instance identity to progress events and matches each row by that identity.
+It is not a prerequisite for concurrent camera acquisition. Check each instance's
 info and actual frames rather than interpreting the old modal as capture state.
 
 ## What each modality is useful for
@@ -113,15 +114,16 @@ are included in this driver PR.
 python3 -m unittest discover -s tests
 ```
 
-Tests cover real V4L2 capability formatting, unsupported formats, channel
+All 46 tests pass. They cover real V4L2 capability formatting, unsupported formats, channel
 configuration/topic changes, USB device binding, RGB compatibility, per-instance configuration and lifecycle, stale/wrong-channel frames, depth units and overflow.
 Hardware verification covers RGB→depth→infrared→RGB on the same instance,
 actual decoded image payloads in earlier device runs. The current startup fix
 has local coverage for three saved instance configurations starting separately,
 standard lifecycle responses without claiming frame readiness, and independent
 stop. Companion Core tests replay the actual startup function and verify three
-progress rows, unique bus registrations and three correctly typed monitor
-panels. On 2026-09-08, the driver was tested on a D435i over USB 3 with Core
+progress rows and unique bus registrations, including failure and asynchronous
+loading outcomes. A separate monitor registration-format race was investigated;
+it is not part of the Core startup PR. On 2026-09-08, the driver was tested on a D435i over USB 3 with Core
 release.260905.9005d5b unchanged. After the operator started the project, all
 three instances were running and the browser displayed all three images.
 Concurrent monitoring WebSocket sampling for 30 seconds received:
