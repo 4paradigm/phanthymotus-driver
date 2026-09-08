@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 from pathlib import Path
 import sys
 import tempfile
@@ -32,7 +31,16 @@ class VisionCaptureTests(unittest.TestCase):
         camera._state = {"state": "running", "available": True, "error": None}
         return camera
 
-    def test_capture_photo_waits_for_a_new_jpeg_and_returns_a_displayable_image(self):
+    def test_tool_matches_tianyi_action_contract(self):
+        card = VisionCapturePlugin({}, self._camera())
+        schema = card.get_tool()["inputSchema"]
+        self.assertEqual(schema["properties"]["action"]["enum"][:6], [
+            "capture_image", "record_video", "start_recording",
+            "stop_recording", "list", "delete",
+        ])
+        self.assertEqual(schema["x-completion"]["actions"], ["record_video"])
+
+    def test_capture_image_waits_for_a_new_jpeg_then_lists_and_deletes_it(self):
         camera = self._camera()
 
         def publish_new_frame():
@@ -48,14 +56,24 @@ class VisionCaptureTests(unittest.TestCase):
         writer.start()
         with tempfile.TemporaryDirectory() as directory:
             card = VisionCapturePlugin({"output_dir": directory, "timeout_s": 1}, camera)
-            result = card.dispatch("capture_photo", {})
-            self.assertTrue(result["ok"])
-            self.assertEqual(base64.b64decode(result["image_data_url"].split(",", 1)[1]), b"new-jpeg")
-            self.assertEqual(Path(result["file_path"]).read_bytes(), b"new-jpeg")
+            result = card.dispatch("capture_image", {"image_name": "adam-test"})
+            self.assertEqual(result["state"], "captured")
+            self.assertEqual(result["filename"], "adam-test.jpg")
+            self.assertEqual(Path(result["path"]).read_bytes(), b"new-jpeg")
+            listed = card.dispatch("list", {})
+            self.assertEqual(listed["files"][0]["filename"], "adam-test.jpg")
+            self.assertEqual(card.dispatch("delete", {"name": "adam-test.jpg"})["state"], "deleted")
+            self.assertFalse(Path(result["path"]).exists())
         writer.join()
         self.assertEqual(camera._photo_waiters, 0)
 
-    def test_capture_photo_reports_camera_timeout(self):
+    def test_capture_image_rejects_unsafe_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            card = VisionCapturePlugin({"output_dir": directory}, self._camera())
+            result = card.dispatch("capture_image", {"image_name": "../escape"})
+            self.assertIn("name must be", result["error"])
+
+    def test_capture_image_reports_camera_timeout(self):
         camera = self._camera()
         card = VisionCapturePlugin({"timeout_s": 1}, camera)
         # Call the camera directly so the test is bounded without waiting for
