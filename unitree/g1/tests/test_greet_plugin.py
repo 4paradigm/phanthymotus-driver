@@ -137,7 +137,7 @@ class GreetPluginTest(unittest.TestCase):
         self.assertEqual(tool["type"], "actuator")
         self.assertEqual(tool["inputSchema"]["properties"]["action"]["enum"], ["greet"])
         self.assertEqual(tool["inputSchema"]["x-completion"]["actions"], ["greet"])
-        self.assertNotIn("text", tool["inputSchema"]["properties"])
+        self.assertIn("text", tool["inputSchema"]["properties"])
         self.assertNotIn("r", tool["inputSchema"]["properties"])
 
     def test_invalid_led_rgb_config_falls_back_to_default(self):
@@ -188,6 +188,26 @@ class GreetPluginTest(unittest.TestCase):
         self.assertEqual(self.notifications[-1][2]["text"], "你好")
         self.assertEqual(self.notifications[-1][3], "greet")
 
+    def test_greet_uses_custom_text(self):
+        audio = FakeAudio()
+        p = self.plugin(audio=audio)
+        p._wait_or_cancelled = lambda duration: False
+        result = p.dispatch("greet", {"confirm": True, "text": "欢迎回家"})
+        while not self.notifications:
+            threading.Event().wait(0.01)
+        self.assertEqual(result["text"], "欢迎回家")
+        self.assertEqual(audio.calls, [("led", 0, 255, 0), ("tts", "欢迎回家", 0)])
+        self.assertEqual(self.notifications[-1][2]["text"], "欢迎回家")
+
+    def test_greet_rejects_oversized_text_before_reserving(self):
+        p = self.plugin()
+        too_long = "x" * (G1._MAX_TTS_TEXT_CHARS + 1)
+        result = p.dispatch("greet", {"confirm": True, "text": too_long})
+        self.assertEqual(result["code"], "INVALID_ARGUMENT")
+        self.assertNotIn("action_id", result)
+        # The mouth slot was never claimed, so a normal request still succeeds.
+        self.assertEqual(p.dispatch("greet", {"confirm": True})["status"], "executing")
+
     def test_failure_paths_report_acp_error(self):
         cases = [
             (FakeAudio(led_ret=7), FakeArm(), "LedControl failed: code=7"),
@@ -198,7 +218,7 @@ class GreetPluginTest(unittest.TestCase):
             self.notifications.clear()
             p = self.plugin(audio=audio, arm=arm)
             p._wait_or_cancelled = lambda duration: False
-            p._run_greet("action")
+            p._run_greet("action", "你好")
             self.assertEqual(self.notifications[-1][1], "error")
             self.assertIn(message, self.notifications[-1][2]["error"])
 
@@ -215,7 +235,7 @@ class GreetPluginTest(unittest.TestCase):
 
         G1._onboard_tts = stop_after_tts
         self.addCleanup(lambda: setattr(G1, "_onboard_tts", original_tts))
-        p._run_greet("action")
+        p._run_greet("action", "你好")
         self.assertEqual(audio.calls, [("led", 0, 255, 0), ("tts", "你好", 0)])
         self.assertEqual(arm.calls, [])
         self.assertEqual(self.notifications[-1][1], "cancelled")
@@ -223,7 +243,7 @@ class GreetPluginTest(unittest.TestCase):
     def test_stop_during_wave_wait_reports_cancelled_not_completed(self):
         p = self.plugin()
         p._wait_or_cancelled = lambda duration: True
-        p._run_greet("action")
+        p._run_greet("action", "你好")
         self.assertEqual(self.notifications[-1][1], "cancelled")
 
     def test_concurrent_greet_rejected_with_resource_busy(self):

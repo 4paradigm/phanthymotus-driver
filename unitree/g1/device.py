@@ -1454,15 +1454,19 @@ class GreetPlugin:
                 "error": "greet plugin stopped",
                 "code": "PRECONDITION_FAILED",
             }
+        text = str(args.get("text", self._GREET_TEXT))
+        error = _reject_oversized_text(text)
+        if error:
+            return error
         if not self._reserve():
             return self._resource_busy()
         from uuid import uuid4
         action_id = f"g1_greet_{uuid4().hex[:8]}"
-        threading.Thread(target=self._run_greet, args=(action_id,),
+        threading.Thread(target=self._run_greet, args=(action_id, text),
                          daemon=True, name="greet_seq").start()
-        return {"status": "executing", "action_id": action_id}
+        return {"status": "executing", "action_id": action_id, "text": text}
 
-    def _run_greet(self, action_id: str):
+    def _run_greet(self, action_id: str, text: str):
         """Background thread: run the greet sequence, then fire ACP completion.
 
         Unitree's TTS and arm-action RPCs do not expose cancellation or completion
@@ -1481,7 +1485,7 @@ class GreetPlugin:
 
                 self._raise_if_cancelled()
                 tts_ret = _onboard_tts(
-                    self._audio, self._audio_lock, self._tts_lock, self._GREET_TEXT, self._voice
+                    self._audio, self._audio_lock, self._tts_lock, text, self._voice
                 )
                 if tts_ret != 0:
                     raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
@@ -1497,7 +1501,7 @@ class GreetPlugin:
                     "ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
                     "wave_action_id": self._HIGH_WAVE_ACTION_ID,
                     "wave_gesture": "high wave",
-                    "text": self._GREET_TEXT,
+                    "text": text,
                 }
                 status = "completed"
         except _GreetCancelled:
