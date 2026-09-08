@@ -534,11 +534,6 @@ class TianyiDeviceBundle:
             self._plugins.append(HomePlugin(plugins_cfg["home"], namespace, ros2, slamtec_client))
             print("[bundle] HomePlugin loaded")
 
-        if plugins_cfg.get("chat", {}).get("enabled", False):
-            from device import ChatPlugin
-            self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
-            print("[bundle] ChatPlugin loaded")
-
         if plugins_cfg.get("voice_chat", {}).get("enabled", False):
             from device import VoiceChatActuatorPlugin
             self._plugins.append(VoiceChatActuatorPlugin(plugins_cfg["voice_chat"], namespace, ros2))

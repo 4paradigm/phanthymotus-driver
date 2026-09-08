@@ -40,7 +40,6 @@ cards:
   - { name: voice_play,         type: actuator }
   - { name: nav,                type: actuator }
   - { name: home,               type: actuator }
-  - { name: chat,               type: actuator }
   - { name: voice_chat,         type: actuator }
   - { name: controlled_spatial, type: actuator }
   - { name: spatial_map,        type: actuator }

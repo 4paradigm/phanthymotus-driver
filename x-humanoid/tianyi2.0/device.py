@@ -29,7 +29,6 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   VoicePlayActuatorPlugin (actuator)      — 音频播放控制(文件/URL/TTS)
   NavPlugin           (actuator)           — 底盘导航控制
   HomePlugin          (actuator)           — 充电桩管理与回桩
-  ChatPlugin          (actuator)           — 语音交互开关
   VoiceChatActuatorPlugin (actuator)      — 语音对话开关
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
@@ -52,7 +51,6 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   HandPlugin       (actuator)           — 灵巧手控制
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
-  ChatPlugin       (actuator)           — 语音交互开关
   ControlledSpatialPlugin (actuator)    — 人工控制建图与导航 (Slamtec REST API)
 """
 
@@ -5829,61 +5827,6 @@ class HomePlugin:
             if elapsed > self._ACTION_TIMEOUT:
                 _acp_notify(action_id, "error", {"action": action, "error": "timeout", "elapsed": self._ACTION_TIMEOUT, **context}, "home")
                 return
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ChatPlugin (actuator)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ChatPlugin:
-    """语音交互开关"""
-
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
-        self._ns = namespace
-        self._ros2 = ros2
-        self._pub_node = Node("tianyi2_chat_pub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "chat",
-            "type": "actuator",
-            "description": "天轶2.0 语音交互模式 — 开启/关闭内置语音对话功能",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["enable", "disable"],
-                               "description": "开启或关闭"},
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "enable": {"params": [], "description": "开启语音交互"},
-                    "disable": {"params": [], "description": "关闭语音交互"},
-                },
-            },
-        }
-
-    def start(self):
-        self._publisher = self._pub_node.create_publisher(Bool, "/audio_chat/enable", _RELIABLE_QOS)
-        print("[ChatPlugin] publisher created")
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("enable", "disable"):
-            if self._publisher:
-                msg = Bool()
-                msg.data = (action == "enable")
-                self._publisher.publish(msg)
-                return {"state": action + "d"}
-            return {"error": "publisher not initialized"}
-        elif action in ("start", "info"):
-            return {"state": "ready"}
-        elif action == "stop":
-            return {"state": "idle"}
-        return {"error": f"unknown action: {action}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
