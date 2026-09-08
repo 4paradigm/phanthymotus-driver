@@ -2362,8 +2362,9 @@ class AdamDeviceBundle:
             )
             self._plugins.append(p)
 
-        # Emergency-stop state sensor. This is intentionally read-only and
-        # only reports an emergency stop when the gRPC FSM names it explicitly.
+        # Physical emergency-stop sensor. This is intentionally read-only and
+        # observes PAC actuator/RCU power; the software FSM remains STOP both
+        # before and after Adam's physical emergency-stop button is pressed.
         if plugins_cfg.get("estop", {}).get("enabled", True):
             p = make_estop_plugin(
                 plugins_cfg.get("estop", {}), namespace, executor, grpc_client)
