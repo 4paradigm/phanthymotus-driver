@@ -19,6 +19,7 @@ build/
 resource/world/
 resource/log/
 resource/frame_rgb.jpg
+realman/rm75_6f_v/vendor/Robotic_Arm/libs/linux_arm/libapi_c.so
 
 # Media (runtime captures)
 *.jpg
