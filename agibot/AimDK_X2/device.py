@@ -269,41 +269,43 @@ class AimdkNodes:
         # mono PCM16, so select one physical mic channel and re-chunk it instead
         # of forwarding the vendor-specific AudioCapture message directly.
         mic_config = config.get("plugins", {}).get("mic", {})
-        self._AudioChunk = AudioChunk
-        self._mic_channel_index = int(mic_config.get("channel_index", 0))
-        self._mic_chunk_bytes = int(mic_config.get("chunk_bytes", 1024))
-        self._mic_source_timeout = float(mic_config.get("source_timeout_sec", 1.0))
-        if self._mic_channel_index not in MIC_CHANNEL_INDICES:
-            raise ValueError(f"mic channel_index must be one of {list(MIC_CHANNEL_INDICES)}")
-        if self._mic_source_timeout <= 0:
-            raise ValueError("mic source_timeout_sec must be positive")
-        self._mic_extractor = InterleavedS16leChannelExtractor(
-            channel_index=self._mic_channel_index,
-            chunk_bytes=self._mic_chunk_bytes,
-        )
-        self._mic_stats = {
-            "source_messages": 0,
-            "source_bytes": 0,
-            "published_chunks": 0,
-            "published_bytes": 0,
-            "rejected_messages": 0,
-            "input_channels": None,
-            "mic_channels": None,
-            "ref_channels": None,
-            "channel_switches": 0,
-            "last_frame_at": None,
-            "last_error": "",
-        }
-        mic_topic = f"/{namespace}/mic/audio"
-        self._mic_pub = self.core.create_publisher(AudioChunk, mic_topic, audio_output_qos)
-        self.robot.create_subscription(
-            AudioCapture, MIC_SOURCE_TOPIC, self._mic_callback(), audio_source_qos,
-        )
-        self.streams["mic"] = {
-            "robot_topic": MIC_SOURCE_TOPIC,
-            "topic": mic_topic,
-            "format": MIC_OUTPUT_FORMAT,
-        }
+        self.mic_enabled = bool(mic_config.get("enabled", True))
+        if self.mic_enabled:
+            self._AudioChunk = AudioChunk
+            self._mic_channel_index = int(mic_config.get("channel_index", 0))
+            self._mic_chunk_bytes = int(mic_config.get("chunk_bytes", 1024))
+            self._mic_source_timeout = float(mic_config.get("source_timeout_sec", 1.0))
+            if self._mic_channel_index not in MIC_CHANNEL_INDICES:
+                raise ValueError(f"mic channel_index must be one of {list(MIC_CHANNEL_INDICES)}")
+            if self._mic_source_timeout <= 0:
+                raise ValueError("mic source_timeout_sec must be positive")
+            self._mic_extractor = InterleavedS16leChannelExtractor(
+                channel_index=self._mic_channel_index,
+                chunk_bytes=self._mic_chunk_bytes,
+            )
+            self._mic_stats = {
+                "source_messages": 0,
+                "source_bytes": 0,
+                "published_chunks": 0,
+                "published_bytes": 0,
+                "rejected_messages": 0,
+                "input_channels": None,
+                "mic_channels": None,
+                "ref_channels": None,
+                "channel_switches": 0,
+                "last_frame_at": None,
+                "last_error": "",
+            }
+            mic_topic = f"/{namespace}/mic/audio"
+            self._mic_pub = self.core.create_publisher(AudioChunk, mic_topic, audio_output_qos)
+            self.robot.create_subscription(
+                AudioCapture, MIC_SOURCE_TOPIC, self._mic_callback(), audio_source_qos,
+            )
+            self.streams["mic"] = {
+                "robot_topic": MIC_SOURCE_TOPIC,
+                "topic": mic_topic,
+                "format": MIC_OUTPUT_FORMAT,
+            }
 
         # /integrated_command and /relocalization_pose are outbound-only (SLAM control), not
         # mirrored streams -- they are plain publishers used by SlamControlPlugin.
@@ -1434,7 +1436,9 @@ def build_plugins(config, namespace, ros2):
 
     plugins = [
         McStatePlugin(nodes), JointStatePlugin(nodes), HandStatePlugin(nodes),
-        ImuPlugin(nodes), MicPlugin(nodes), CameraPlugin(nodes), LidarPlugin(nodes), SlamPosePlugin(nodes),
+        ImuPlugin(nodes),
+        *([MicPlugin(nodes)] if nodes.mic_enabled else []),
+        CameraPlugin(nodes), LidarPlugin(nodes), SlamPosePlugin(nodes),
         SystemStatePlugin(nodes), LinkcraftCatalogPlugin(nodes), ModelPlugin(nodes),
         McModePlugin(nodes), LocomotionPlugin(nodes), PresetMotionPlugin(nodes),
         JointCommandPlugin(nodes), HandCommandPlugin(nodes), LinkcraftPlugin(nodes),
