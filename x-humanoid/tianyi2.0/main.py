@@ -314,21 +314,77 @@ def _resolve_namespace(cfg: dict) -> str:
 # ── Dual Domain ROS2 Init ────────────────────────────────────────────────────
 
 class DualDomainROS2:
-    """Manages two ROS2 contexts: domain 0 (tianyi) and domain 42 (agent-core)."""
+    """Manages two ROS2 contexts: domain 0 (tianyi) and domain 42 (agent-core).
+
+    Both contexts share **one** FastDDS profile, because that is all FastDDS offers a
+    single process — see ``_select_profile``.
+    """
+
+    @staticmethod
+    def _select_profile() -> str:
+        """Load the one FastDDS profile this process gets, before any participant.
+
+        Two things were learned the hard way here, both silent when wrong.
+
+        **FastDDS reads FASTRTPS_DEFAULT_PROFILES_FILE at participant creation, not at
+        ``rclpy.init()``** — and rmw_fastrtps creates the participant lazily, with the
+        first Node on the context. Code that set the variable around each
+        ``rclpy.init()`` was therefore setting it around the wrong call: by the time
+        the first real Node appeared, the variable held whatever had been written last,
+        and both contexts got that.
+
+        **And the profiles are cached process-wide anyway**, so switching the variable
+        between contexts cannot give them different profiles. Measured on the robot: a
+        process that set the vendor profile, created a domain-0 node, then set the
+        loopback profile and created a domain-42 node, ended up with *both* domains
+        bound to 127.0.0.1 and 192.168.41.2 — the vendor whitelist, for both. An
+        earlier version of this file claimed to select a profile per context and was
+        cited elsewhere as proof that per-participant profiles work. It never worked.
+
+        What the wrong profile costs: with the loopback-only profile in force, the
+        domain-0 participant bound 127.0.0.1 but not 192.168.41.2, where the vendor
+        stack lives. Visible domain-0 topics fell from 77 to 33 and lyre's
+        ``/audio_play/play_text`` became undiscoverable (2.76 s to discover under the
+        vendor profile; still nothing after 15 s under the loopback one). Nothing was
+        logged, ``/arm/status`` and ``/head/status`` survived, so the robot looked
+        healthy while TTS reported success and made no sound.
+
+        So: the vendor profile, for the whole process. Its whitelist is
+        {192.168.41.2, 127.0.0.1}, which keeps the body link up and — the point of the
+        fleet-wide isolation — **excludes the office LAN**, so domain 42 cannot carry
+        `/remote_control/message` to another robot. It is not loopback-only: domain 42
+        is also reachable from the body board on 192.168.41.x. That board runs no
+        Agent Core and is internal to this robot, so nothing there can act on a
+        command. Narrowing it further needs the agent-core-facing publishers moved
+        into their own process, one profile each.
+        """
+        vendor = "/work/dds_profile.xml"
+        if os.path.exists(vendor):
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = vendor
+            print(f"[ros2] process-wide DDS profile: {vendor} "
+                  f"(whitelist 192.168.41.2 + 127.0.0.1 — body link up, office LAN "
+                  f"excluded on both domain 0 and domain 42)")
+            return vendor
+        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+        print(f"[ros2] WARNING {vendor} missing — no DDS profile. Both domains will "
+              f"use every interface, including the office LAN: domain 42 is NOT "
+              f"isolated and commands may reach other robots.")
+        return ""
 
     def __init__(self):
-        # Domain 0: connect to tianyi body controller
-        # Use lyre's DDS profile so we can discover topics on 192.168.41.x / 127.0.0.1
-        dds_profile = "/work/dds_profile.xml"
-        if os.path.exists(dds_profile):
-            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = dds_profile
-            print(f"[ros2] domain0: using DDS profile {dds_profile}")
+        # One profile, chosen before any participant exists.
+        self._dds_profile = self._select_profile()
+
+        # Domain 0: the tianyi body controller, on 192.168.41.x.
         self.ctx_tianyi = Context()
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
         self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
 
-        # Domain 42: publish to agent-core (no DDS profile — use all interfaces)
-        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+        # Domain 42: Agent Core, on this same host. `/remote_control/message` carries
+        # *commands* and DDS has no addressing, so every ROS_DOMAIN_ID=42 subscriber on
+        # the subnet used to receive them — an instruction typed on one robot was
+        # executed by a second one, same timestamp in both logs. The whitelist above is
+        # what closes that: no office-LAN interface, so nothing off this robot.
         self.ctx_core = Context()
         rclpy.init(context=self.ctx_core, domain_id=42)
         self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
@@ -478,11 +534,6 @@ class TianyiDeviceBundle:
             self._plugins.append(HomePlugin(plugins_cfg["home"], namespace, ros2, slamtec_client))
             print("[bundle] HomePlugin loaded")
 
-        if plugins_cfg.get("chat", {}).get("enabled", False):
-            from device import ChatPlugin
-            self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
-            print("[bundle] ChatPlugin loaded")
-
         if plugins_cfg.get("voice_chat", {}).get("enabled", False):
             from device import VoiceChatActuatorPlugin
             self._plugins.append(VoiceChatActuatorPlugin(plugins_cfg["voice_chat"], namespace, ros2))
@@ -575,7 +626,11 @@ class TianyiDeviceBundle:
                         return p.dispatch(tool_name, args)
                     default_action = tool_def.get("default_action", "start")
                     action = args.pop("action", default_action)
-                    # 懒启动：首次 start 时真正初始化插件
+                    # 懒启动：首次 start 时真正初始化插件。
+                    # 注意这条路径每个插件只走一次（进了 _started_plugins 就再也
+                    # 不出来），所以一个能被 stop 的插件，它的 dispatch("start")
+                    # 必须自己有能力重新 arm——不能指望这里。否则 stop 之后就是
+                    # 永久失效，而 info 还报着一个健康的状态。
                     if action == "start" and p not in self._started_plugins:
                         try:
                             p.start()
@@ -597,25 +652,46 @@ class TianyiDeviceBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: TianyiDeviceBundle | None = None
-_joints_bridge_proc: subprocess.Popen | None = None
+_domain_bridge_proc: subprocess.Popen | None = None
 
 
-def _start_joints_bridge(cfg: dict) -> None:
-    global _joints_bridge_proc
-    if not cfg.get("joints_bridge", {}).get("enabled", False):
-        return
-    bridge_path = Path(__file__).parent / "joints_bridge.py"
+def _start_domain_bridge(cfg: dict) -> None:
+    """Start socket bridge to forward domain 42 topics to agent-core.
+
+    The bridge runs as a separate process with dds-local.xml, receiving messages
+    from plugins via Unix sockets and publishing them to agent-core on domain 42.
+
+    This allows plugins to continue publishing "normally" while the actual cross-domain
+    communication is handled transparently by the bridge.
+    """
+    global _domain_bridge_proc
+    if not cfg.get("domain_bridge", {}).get("enabled", False):
+        # Fallback: check old joints_bridge config for backward compatibility
+        if not cfg.get("joints_bridge", {}).get("enabled", False):
+            return
+        print("[bundle] WARNING: joints_bridge config is deprecated, use domain_bridge instead", flush=True)
+
+    bridge_path = Path(__file__).parent / "socket_bridge.py"
     bridge_env = os.environ.copy()
-    bridge_env["CONFIG_PATH"] = os.environ.get(
-        "CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
+
+    # Socket bridge must use the same DDS config as agent-core (loopback only)
+    # to ensure they can communicate on domain 42
+    bridge_env["FASTRTPS_DEFAULT_PROFILES_FILE"] = "/opt/phanthy-motus/dds-local.xml"
+    bridge_env["ROS_DOMAIN_ID"] = "42"
+
     try:
-        _joints_bridge_proc = subprocess.Popen(
+        _domain_bridge_proc = subprocess.Popen(
             [sys.executable, str(bridge_path)],
             env=bridge_env,
         )
-        print(f"[bundle] joints bridge started (pid={_joints_bridge_proc.pid})", flush=True)
+        print(f"[bundle] socket bridge started (pid={_domain_bridge_proc.pid})", flush=True)
+        print("[bundle] domain 42 publishers will route through bridge to agent-core", flush=True)
+        
+        # Wait a moment for sockets to be created
+        time.sleep(2)
     except Exception as e:
-        print(f"[bundle] joints bridge FAILED: {e}", flush=True)
+        print(f"[bundle] socket bridge FAILED: {e}", flush=True)
+
 
 
 def make_handler():
@@ -804,11 +880,18 @@ def main():
     # Dual-domain ROS2
     ros2 = DualDomainROS2()
     ros2.start_spin()
-    print("[bundle] Dual-domain ROS2 initialized (domain 0 + domain 42)")
+    print("[bundle] ROS2 initialized: domain 0 (body controller) + domain 42 (local bridge)")
+    print("[bundle] Note: domain 42 uses same DDS profile as domain 0 (192.168.41.2 + 127.0.0.1)")
+    print("[bundle] External agent-core communication handled by domain_bridge process")
+
+    # Enable transparent bridge routing for domain 42 publishers
+    if cfg.get("domain_bridge", {}).get("enabled", False):
+        import bridge_integration
+        bridge_integration.enable(ros2.ctx_core)
 
     _bundle = TianyiDeviceBundle(cfg, namespace, ros2, slamtec_client, remote_mics=remote_mics)
     _bundle.start_all()
-    _start_joints_bridge(cfg)
+    _start_domain_bridge(cfg)
 
     _start_registration(mcp_port, cfg.get("name", "Tianyi 2.0 Pro"), "driver")
 
@@ -817,8 +900,8 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
-        if _joints_bridge_proc is not None:
-            _joints_bridge_proc.terminate()
+        if _domain_bridge_proc is not None:
+            _domain_bridge_proc.terminate()
         _bundle.stop_all()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
@@ -828,8 +911,8 @@ def main():
     try:
         server.serve_forever()
     finally:
-        if _joints_bridge_proc is not None and _joints_bridge_proc.poll() is None:
-            _joints_bridge_proc.terminate()
+        if _domain_bridge_proc is not None and _domain_bridge_proc.poll() is None:
+            _domain_bridge_proc.terminate()
         _bundle.stop_all()
         ros2.shutdown()
 

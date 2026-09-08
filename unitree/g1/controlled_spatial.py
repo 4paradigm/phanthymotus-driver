@@ -407,6 +407,9 @@ class ControlledSpatialPlugin:
                     "actions": ["navigate_to_tag", "navigate_to_pose"],
                     "timeout": 180,
                 },
+                # Drives the chassis. Same channel as loco — the two must serialise
+                # against each other, but a 180s navigation should not block speech.
+                "x-resource": "base",
                 "x-action-params": {
                     "start_mapping": {"params": ["map_name"], "description": "Start SLAM mapping with given map name"},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},

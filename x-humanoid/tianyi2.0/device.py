@@ -29,7 +29,6 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   VoicePlayActuatorPlugin (actuator)      — 音频播放控制(文件/URL/TTS)
   NavPlugin           (actuator)           — 底盘导航控制
   HomePlugin          (actuator)           — 充电桩管理与回桩
-  ChatPlugin          (actuator)           — 语音交互开关
   VoiceChatActuatorPlugin (actuator)      — 语音对话开关
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
@@ -52,7 +51,6 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   HandPlugin       (actuator)           — 灵巧手控制
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
-  ChatPlugin       (actuator)           — 语音交互开关
   ControlledSpatialPlugin (actuator)    — 人工控制建图与导航 (Slamtec REST API)
 """
 
@@ -955,6 +953,17 @@ class CameraPlugin:
         self._running = False
         self._frame_queue = None  # Will hold latest frame only
 
+        # Built here rather than in start(), so stop() and _on_image_grab are
+        # safe to call before the first start and across a restart.
+        self._latest_frame = None  # Only keep latest frame
+        self._frame_lock = threading.Lock()
+        self._pub = None
+        self._subscription = None
+        self._encode_thread = None
+        # Serializes start/stop. Every tools/call runs on its own thread of the
+        # ThreadingHTTPServer, and the canvas issues stop→start within seconds.
+        self._lifecycle_lock = threading.RLock()
+
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
@@ -971,35 +980,78 @@ class CameraPlugin:
         }
 
     def start(self):
-        self._running = True
+        """Arm the stream. Idempotent, and callable again after ``stop()``.
 
-        # Ensure Orbbec camera service is running
-        self._ensure_orbbec_service()
+        main.py's lazy start only ever calls this for the *first* ``action=start``
+        (the plugin then stays in its ``_started_plugins`` set forever), so a
+        restart has to come through here from ``dispatch``.
 
-        try:
-            from sensor_msgs.msg import Image, CompressedImage
-            import numpy as np
-            import cv2
+        Both ROS endpoints are created once and kept for the process lifetime;
+        only the encode thread is rebuilt, because ``stop()`` is what ends it.
+        Neither endpoint may be recycled per start:
+
+        * the publisher is a ``BridgedPublisher`` owning a Unix socket to the
+          socket_bridge process, and a second one for the same topic is exactly
+          the duplicate connection its connection lock exists to prevent;
+        * destroying and recreating the subscription on a node that a live
+          executor is spinning does not reliably re-deliver. Measured on Tianyi:
+          one slow cycle worked, then three quick stop→start cycles left the
+          subscription present in the graph, the executor healthy (other
+          domain-0 sensors kept publishing) and the callback never firing again.
+          A stopped camera therefore keeps deserializing raw frames it drops —
+          that waste is the price of a stream that always comes back.
+        """
+        with self._lifecycle_lock:
+            if self._running:
+                return
+
+            # Re-checked on every arm, not just the first: a restart should also
+            # recover a host service that died while the card was stopped.
+            self._ensure_orbbec_service()
+
+            try:
+                from sensor_msgs.msg import Image, CompressedImage
+                import numpy as np
+                import cv2
+            except ImportError as e:
+                print(f"[CameraPlugin] WARNING: import failed ({e})")
+                return
 
             self._np = np
             self._cv2 = cv2
-            self._latest_frame = None  # Only keep latest frame
-            self._frame_lock = threading.Lock()
+
+            # A worker from the previous stop may still be inside its 5 ms poll.
+            # Join it *before* re-arming the flag — otherwise it sees _running
+            # True again and keeps publishing beside its replacement, doubling
+            # the frame rate on the topic.
+            previous = self._encode_thread
+            if previous is not None and previous is not threading.current_thread():
+                previous.join(timeout=2.0)
+
+            with self._frame_lock:
+                self._latest_frame = None  # never publish a frame from before the stop
 
             # Publish JPEG as CompressedImage
-            self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
+            if self._pub is None:
+                self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
 
             # Subscribe - callback just grabs the frame, doesn't encode
-            self._sub_node.create_subscription(
-                Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
+            if self._subscription is None:
+                self._subscription = self._sub_node.create_subscription(
+                    Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
+
+            self._running = True
 
             # Separate encoding thread - avoids blocking executor
-            self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
-            self._encode_thread.start()
+            if previous is not None and previous.is_alive():
+                # Refused to exit within the grace period. It observes the flag
+                # we just re-armed and resumes, so don't stack a second one.
+                print("[CameraPlugin] WARNING: previous encode thread still running, reusing it")
+            else:
+                self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
+                self._encode_thread.start()
 
-            print("[CameraPlugin] subscription + encode thread created")
-        except ImportError as e:
-            print(f"[CameraPlugin] WARNING: import failed ({e})")
+            print("[CameraPlugin] subscription + encode thread created", flush=True)
 
     @staticmethod
     def _ensure_orbbec_service():
@@ -1077,7 +1129,17 @@ class CameraPlugin:
         return changed
 
     def stop(self):
-        self._running = False
+        """Disarm the stream, leaving it restartable by ``start()``.
+
+        Only the flag and the buffered frame are touched. Both ROS endpoints
+        survive on purpose — see ``start`` for why neither may be recycled. The
+        encode thread ends on the cleared flag, and ``_on_image_grab`` drops
+        every frame that arrives meanwhile.
+        """
+        with self._lifecycle_lock:
+            self._running = False
+            with self._frame_lock:
+                self._latest_frame = None
 
     def _on_image_grab(self, msg):
         """Callback: just grab the latest frame, don't encode here (non-blocking)."""
@@ -1115,12 +1177,22 @@ class CameraPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
+            # Call start() here rather than leaning on main.py's lazy start:
+            # that only fires once per process, so trusting it left a camera
+            # that had been stopped dark for the rest of the container's life
+            # while still reporting a healthy-looking state.
+            self.start()
+            if not self._running:
+                return {"state": "error",
+                        "error": "camera start failed, see driver log"}
             return {"state": "running"}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
-        return {"state": "running"}
+            state = "running" if self._running else "idle"
+            return {"state": state, "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
+        return {"state": "running" if self._running else "idle"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2432,6 +2504,8 @@ class HeadPlugin:
                                "description": "预设方向"},
                 },
                 "required": ["action"],
+                # 头部 3DOF —— 与 head_gesture 同一通道
+                "x-resource": "head",
                 "x-action-params": {
                     "move_pos": {"params": ["yaw", "pitch", "roll"],
                                  "description": "移动头部到指定角度(度)"},
@@ -2585,6 +2659,7 @@ class HeadGesturePlugin:
                     "actions": ["scan", "shake"],
                     "timeout": 30,
                 },
+                "x-resource": "head",
                 "x-action-params": {
                     "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
@@ -3049,6 +3124,8 @@ class ArmPlugin:
                            )},
                 },
                 "required": ["action"],
+                # 双臂关节 —— 与 arm_gesture 同一通道。side 按调用变化而 schema 是静态的，只声明一侧会让双臂动作与单臂动作并发抢同一批关节
+                "x-resource": ["arm_l", "arm_r"],
                 "x-action-params": {
                     "move_pos": {"params": ["left_positions", "right_positions", "speed"],
                                  "description": (
@@ -3579,6 +3656,10 @@ class ArmGesturePlugin:
                     "actions": ["salute", "welcome", "shake_hands"],
                     "timeout": 30,
                 },
+                # Both arms: the gestures are static per schema and some are
+                # two-handed, so claiming one side could let them overlap on shared
+                # joints. See README_dev.md § Physical Resources.
+                "x-resource": ["arm_l", "arm_r"],
                 "x-action-params": {
                     "salute": {"params": ["salute_side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
@@ -4068,6 +4149,8 @@ class WaistPlugin:
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                 },
                 "required": ["action"],
+                # 腰部偏航 + 腿部升降 —— 没有别的工具碰这两个自由度
+                "x-resource": "waist",
                 "x-action-params": {
                     "move_waist": {"params": ["yaw", "speed"],
                                  "description": "腰部偏航: 控制yaw角度(-120°~120°)"},
@@ -4274,6 +4357,8 @@ class HandPlugin:
                                        "description": "thumb rotation"},
                 },
                 "required": ["action"],
+                # 灵巧手指关节 —— 与手臂是独立自由度，可以同时动
+                "x-resource": ["hand_l", "hand_r"],
                 "x-action-params": {
                     **{g: {"params": ["side"],
                            "description": f"预设手势: {self._GESTURE_LABELS[g]}"}
@@ -4489,6 +4574,10 @@ class TtsPlugin:
                 },
                 "required": ["action"],
                 "x-completion": {"actions": ["speak"], "timeout": 180},
+                # Same speaker as voice_play below — one physical channel, two tools,
+                # so they must serialise against each other while leaving the chassis
+                # and arms free.
+                "x-resource": "mouth",
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
                     "interrupt": {"params": [], "description": "立即停止播放并丢弃剩余内容，无需再调 pause"},
@@ -4523,77 +4612,192 @@ class TtsPlugin:
         # Health check: verify PlayEvent pipeline is working
         self._startup_error = self._lyre_health_check()
 
-    def _lyre_health_check(self) -> str | None:
-        """Call play_text and verify PlayEvent arrives. Returns error message or None."""
+    # lyre is a host systemd unit; the driver reaches it through PID 1's namespaces.
+    _LYRE_UNIT = "lyre"
+    _NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+    # Discovery of play_text measured 2.0–2.9 s on a settled robot, but start() runs
+    # while ~35 plugins are initialising. A generous window costs nothing when things
+    # work and avoids the misdiagnosis below; the first version allowed 5 s.
+    _DISCOVERY_WAIT_S = 20.0
+    # `systemctl restart lyre` stops a ros2 launch tree and starts it again. The first
+    # version capped the subprocess at 15 s and reported the restart as *failed* while
+    # it was in fact still working.
+    _RESTART_CMD_TIMEOUT_S = 90
+    _RESTART_DISCOVERY_WAIT_S = 60.0
+
+    def _lyre_unit_state(self) -> str:
+        """systemd's view of lyre, which does not depend on DDS at all.
+
+        This is what separates "lyre is down" from "lyre is fine but our participant
+        has not discovered it": the two need opposite responses, and DDS visibility
+        alone cannot tell them apart.
+        """
         import subprocess as _sp
+        try:
+            r = _sp.run(self._NSENTER + ["systemctl", "is-active", self._LYRE_UNIT],
+                        capture_output=True, timeout=10, text=True)
+            return ((r.stdout or "") + (r.stderr or "")).strip() or "unknown"
+        except Exception as e:
+            return f"unknown ({e})"
+
+    def _restart_lyre(self) -> str | None:
+        """Restart lyre. Returns an error string, or None on success."""
+        import subprocess as _sp
+        print(f"[TtsPlugin] restarting lyre (unit state was "
+              f"{self._lyre_unit_state()!r})", flush=True)
+        try:
+            r = _sp.run(self._NSENTER + ["systemctl", "restart", self._LYRE_UNIT],
+                        capture_output=True, timeout=self._RESTART_CMD_TIMEOUT_S, text=True)
+        except Exception as e:
+            return f"重启 lyre 失败：{e}"
+        if r.returncode != 0:
+            return f"重启 lyre 失败：{((r.stderr or r.stdout) or '').strip()[:200]}"
+        state = self._lyre_unit_state()
+        print(f"[TtsPlugin] lyre restarted, unit state now {state!r}", flush=True)
+        return None
+
+    def _wait_service(self, timeout_s: float) -> bool:
+        """Poll for the play_text server. No spinning needed — graph discovery happens
+        in the DDS threads, and the executor thread may not be running yet."""
+        import time as _time
+        deadline = _time.time() + timeout_s
+        while _time.time() < deadline:
+            if self._play_client.service_is_ready():
+                return True
+            _time.sleep(0.2)
+        return False
+
+    def _lyre_health_check(self) -> str | None:
+        """Verify the whole TTS chain: service discoverable → call accepted → PlayEvent
+        arrives. Returns an error message, or None when healthy.
+
+        Each failure mode gets its own message. The first version returned
+        "播放成功但无法收到完成事件" for all five of them, including the case where the
+        service was never discovered and nothing was ever played — which pointed the
+        investigation at the audio hardware for a while. It also restarted lyre on any
+        failure, so a discovery problem in this driver was "fixed" by killing a
+        perfectly healthy service, and the retry then ran before lyre could come back.
+        """
         import time as _time
 
         for attempt in range(2):
-            if attempt > 0:
-                # Restart lyre via nsenter on second attempt
-                print("[TtsPlugin] health check failed, restarting lyre...", flush=True)
-                try:
-                    _sp.run(["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
-                             "systemctl", "restart", "lyre"],
-                            capture_output=True, timeout=15)
-                    _time.sleep(5)
-                except Exception as e:
-                    print(f"[TtsPlugin] lyre restart failed: {e}", flush=True)
+            if not self._wait_service(self._DISCOVERY_WAIT_S):
+                state = self._lyre_unit_state()
+                if state != "active":
+                    # lyre really is down — restarting it is the right recovery, and
+                    # this is the only path where a restart is warranted up front.
+                    print(f"[TtsPlugin] play_text not found and lyre is {state!r} "
+                          f"— restarting", flush=True)
+                    err = self._restart_lyre()
+                    if err:
+                        return (f"Lyre 服务未运行（systemd: {state}），自动重启失败。{err} "
+                                f"请在机器人上执行 sudo systemctl restart lyre。")
+                    if not self._wait_service(self._RESTART_DISCOVERY_WAIT_S):
+                        return (f"Lyre 服务原为 {state}，已自动重启并恢复运行，但 "
+                                f"{self._RESTART_DISCOVERY_WAIT_S:.0f}s 内仍未发现 "
+                                f"/audio_play/play_text 服务。请检查 lyre 日志："
+                                f"journalctl -u lyre -n 100。")
+                    print("[TtsPlugin] play_text found after lyre restart", flush=True)
+                else:
+                    # lyre is up but we cannot see it. Restarting lyre would destroy a
+                    # working service without touching the actual fault, which is on
+                    # our side of the link (DDS domain / profile / interface).
+                    print(f"[TtsPlugin] play_text not discovered in "
+                          f"{self._DISCOVERY_WAIT_S:.0f}s, but lyre is active "
+                          f"— not restarting it", flush=True)
+                    return (f"Lyre 服务正在运行（systemd: active），但 "
+                            f"{self._DISCOVERY_WAIT_S:.0f}s 内发现不到 "
+                            f"/audio_play/play_text。问题在驱动到 lyre 的 DDS 链路，"
+                            f"不在 lyre 本身：请核对 domain 0 与 FastDDS profile "
+                            f"（本驱动应使用厂商 profile /work/dds_profile.xml，"
+                            f"需能绑到 192.168.41.x）。重启 lyre 不会有帮助。")
 
-            # Wait for service to be available (poll without spinning — executor thread handles it)
-            service_ready = False
-            deadline = _time.time() + 5
-            while _time.time() < deadline:
-                if self._play_client.service_is_ready():
-                    service_ready = True
-                    break
-                _time.sleep(0.2)
-            if not service_ready:
-                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text service not available", flush=True)
-                continue
-
-            # Send a silent test (single dot — minimal TTS)
+            # Service is there — send a minimal test and require a real response.
             from lyre_msgs.srv import PlayText
             req = PlayText.Request()
             req.text = "."
             req.force = True
             future = self._play_client.call_async(req)
-
-            # Wait for response (max 3s) — executor spin thread delivers it
-            deadline = _time.time() + 3
+            deadline = _time.time() + 5
             while not future.done() and _time.time() < deadline:
                 _time.sleep(0.1)
-
             if not future.done():
-                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text call timeout", flush=True)
-                continue
+                print(f"[TtsPlugin] health check attempt {attempt+1}: "
+                      f"play_text 调用无响应", flush=True)
+                if attempt == 0:
+                    err = self._restart_lyre()
+                    if err:
+                        return f"play_text 服务可见但调用无响应，且{err}"
+                    continue
+                return ("Lyre 的 play_text 服务可见，但调用 5s 无响应，重启后依旧。"
+                        "lyre 进程可能已卡死：请查看 journalctl -u lyre -n 100。")
 
             resp = future.result()
             if resp is None or resp.code != 0:
-                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text returned error", flush=True)
-                continue
+                msg = getattr(resp, "message", "") if resp is not None else "no response"
+                print(f"[TtsPlugin] health check attempt {attempt+1}: "
+                      f"play_text 返回错误 code={getattr(resp, 'code', '?')}", flush=True)
+                if attempt == 0:
+                    if self._restart_lyre() is None:
+                        continue
+                return (f"Lyre 拒绝了合成请求：code="
+                        f"{getattr(resp, 'code', '?')} message={msg!r}。"
+                        f"请检查 lyre 的 TTS 引擎与授权状态。")
 
             sid = resp.sid
-            # Wait for PlayEvent with this sid (3s timeout)
-            # The executor spin thread will call _on_play_event which populates _play_event_buffer
-            deadline = _time.time() + 3
+            if not sid:
+                # lyre generates a sid when the request omits one, so an empty sid
+                # means we cannot correlate PlayEvent and every playback would fall
+                # back to a fixed sleep.
+                return ("Lyre 接受了请求但未返回 sid，无法与 PlayEvent 关联，"
+                        "播放完成时间将不可知。请检查 lyre 版本是否匹配 lyre_msgs。")
+
+            deadline = _time.time() + 5
             while _time.time() < deadline:
                 if sid in self._play_event_buffer:
                     break
                 _time.sleep(0.1)
 
             if sid in self._play_event_buffer:
-                # Cleanup test sid from buffers
                 self._play_event_buffer.pop(sid, None)
                 self._pending_play.pop(sid, None)
                 self._pending_play_status.pop(sid, None)
                 self._pending_play_duration.pop(sid, None)
                 print(f"[TtsPlugin] health check passed (attempt {attempt+1})", flush=True)
-                return None  # success
-            else:
-                print(f"[TtsPlugin] health check attempt {attempt+1}: PlayEvent not received for sid={sid}", flush=True)
+                return None
 
-        return "Lyre TTS PlayEvent 链路异常：播放成功但无法收到完成事件。已尝试重启 lyre 仍未恢复，请检查 lyre 服务状态。"
+            # Call accepted, no event. This is the one case the original message
+            # described, and the one where restarting lyre is genuinely indicated.
+            print(f"[TtsPlugin] health check attempt {attempt+1}: "
+                  f"PlayEvent not received for sid={sid}", flush=True)
+            if attempt == 0:
+                err = self._restart_lyre()
+                if err:
+                    return f"播放成功但收不到 PlayEvent 完成事件，且{err}"
+                continue
+
+        return ("Lyre TTS 事件链路异常：合成请求被接受，但收不到 /audio_play/event "
+                "的完成事件，已自动重启 lyre 仍未恢复。播放时长将只能按字数估算。"
+                "请检查 lyre 服务：journalctl -u lyre -n 100。")
+
+    def _recheck_health(self) -> str | None:
+        """Cheap re-check for start/info: is the service there, and what does systemd
+        say? Plays nothing.
+
+        The startup result used to be latched forever, so once the check had failed
+        the dashboard kept reporting a fault long after the chain recovered.
+        """
+        if not self._play_client:
+            return "Lyre TTS 客户端未创建（lyre_msgs 导入失败）。"
+        if self._wait_service(3.0):
+            return None
+        state = self._lyre_unit_state()
+        if state != "active":
+            return (f"Lyre 服务未运行（systemd: {state}）。"
+                    f"请执行 sudo systemctl restart lyre，或重启本驱动容器以自动恢复。")
+        return (f"Lyre 服务正在运行，但当前发现不到 /audio_play/play_text。"
+                f"这是驱动到 lyre 的 DDS 链路问题（domain 0 / FastDDS profile），"
+                f"重启 lyre 无用。")
 
     # PlayEvent event codes
     _EVENT_NAMES = {0: "STARTED", 1: "COMPLETED", 2: "STOPPED", 3: "CANCELLED", 4: "FAILED"}
@@ -4644,8 +4848,20 @@ class TtsPlugin:
         elif action == "resume":
             return self._call_empty_service(self._resume_client, "resume")
         elif action in ("start", "info"):
-            if hasattr(self, '_startup_error') and self._startup_error:
-                return {"state": "error", "message": self._startup_error}
+            # Re-check rather than replay the startup verdict. The startup result used
+            # to be latched for the life of the process, so a chain that recovered
+            # (lyre finished restarting, discovery converged) still reported a fault
+            # on every start/info — and the operator had no way to clear it short of
+            # restarting the container.
+            if getattr(self, "_startup_error", None):
+                current = self._recheck_health()
+                if current is None:
+                    print("[TtsPlugin] startup error cleared — chain is healthy now",
+                          flush=True)
+                    self._startup_error = None
+                    return {"state": "ready"}
+                self._startup_error = current
+                return {"state": "error", "message": current}
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
 
@@ -4740,10 +4956,20 @@ class TtsPlugin:
                 break
 
             seg_sid = None
+            no_response = False
             if future.done():
                 result = future.result()
                 if result:
                     seg_sid = getattr(result, 'sid', None)
+                else:
+                    no_response = True
+            else:
+                # The call never came back. Nothing is playing: lyre either is not
+                # there or is wedged. Distinguished from "responded without a sid"
+                # because that one may well be audible, whereas this one is silence.
+                no_response = True
+                print(f"[TtsPlugin] no response from play_text in "
+                      f"{timeout_service:.0f}s seg {i+1}/{len(segments)}", flush=True)
             if seg_sid:
                 sid = seg_sid
 
@@ -4821,6 +5047,17 @@ class TtsPlugin:
                     continue
                 elif seg_status == "error" and is_last:
                     overall_status = "error"
+            elif no_response:
+                # Do not sleep-then-claim-success. This path used to fall into the
+                # fallback below and report ACP completed, so a silent robot looked
+                # like a successful utterance — verified on the robot, lyre had
+                # received nothing at all while the driver reported completion.
+                overall_status = "error"
+                print(f"[TtsPlugin] seg {i+1}/{len(segments)}: play_text 无响应，"
+                      f"未发声，报错而非假成功", flush=True)
+                self._startup_error = self._recheck_health() or (
+                    "play_text 调用无响应。")
+                break
             elif not seg_sid:
                 # 没拿到 sid，fallback 按字数估算（但也要检查 cancel）
                 fallback_s = len(seg_text) / 2.5 + 5.0
@@ -4845,9 +5082,14 @@ class TtsPlugin:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            acp_result = {"action": "speak", "sid": sid or "unknown",
+                          "segments": len(segments)}
+            # Carry the reason, not just the verdict — "error" with no detail sends the
+            # reader to the logs, and this is the field the dashboard already shows.
+            if overall_status == "error" and getattr(self, "_startup_error", None):
+                acp_result["error"] = self._startup_error
             p = _json.dumps({"action_id": action_id, "status": overall_status,
-                             "result": {"action": "speak", "sid": sid or "unknown",
-                                        "segments": len(segments)}}).encode()
+                             "result": acp_result}).encode()
             r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
                                       headers={"Content-Type": "application/json"}, method="POST")
             urllib.request.urlopen(r, timeout=5, context=ctx)
@@ -4946,6 +5188,8 @@ class VoicePlayActuatorPlugin:
                     "actions": ["play_text", "play_file", "play_url"],
                     "timeout": 60
                 },
+                # lyre audio output — the same speaker the tts tool uses.
+                "x-resource": "mouth",
                 "x-action-params": {
                     "play_file": {"params": ["path", "force"], "description": "播放本地音频文件"},
                     "play_url":  {"params": ["url", "force"],  "description": "播放远程URL音频"},
@@ -5155,6 +5399,8 @@ class NavPlugin:
                     "actions": ["move_to", "rotate", "rotate_to"],
                     "timeout": 180,
                 },
+                # Slamtec chassis. Same channel as home and chassis_raw.
+                "x-resource": "base",
                 "x-action-params": {
                     "move_to": {"params": ["x", "y", "speed"],
                                 "description": "自主导航到目标点(带避障)，系统自动等待到达"},
@@ -5389,6 +5635,7 @@ class HomePlugin:
                     "actions": ["go_home"],
                     "timeout": 180,
                 },
+                "x-resource": "base",
                 "x-action-params": {
                     "list_docks": {"params": [], "description": "列出当前地图已注册的全部充电桩，返回名称、dock_id 与位姿；可据此选择或删除充电桩"},
                     "register_dock": {"params": ["display_name"], "description": "将机器人当前定位位姿保存为一个新充电桩，并自动设为当前回桩目标。执行前应让机器人停在实际充电桩的对接位置并确认定位正常；成功后可直接执行 go_home"},
@@ -5580,61 +5827,6 @@ class HomePlugin:
             if elapsed > self._ACTION_TIMEOUT:
                 _acp_notify(action_id, "error", {"action": action, "error": "timeout", "elapsed": self._ACTION_TIMEOUT, **context}, "home")
                 return
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ChatPlugin (actuator)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ChatPlugin:
-    """语音交互开关"""
-
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
-        self._ns = namespace
-        self._ros2 = ros2
-        self._pub_node = Node("tianyi2_chat_pub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "chat",
-            "type": "actuator",
-            "description": "天轶2.0 语音交互模式 — 开启/关闭内置语音对话功能",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["enable", "disable"],
-                               "description": "开启或关闭"},
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "enable": {"params": [], "description": "开启语音交互"},
-                    "disable": {"params": [], "description": "关闭语音交互"},
-                },
-            },
-        }
-
-    def start(self):
-        self._publisher = self._pub_node.create_publisher(Bool, "/audio_chat/enable", _RELIABLE_QOS)
-        print("[ChatPlugin] publisher created")
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("enable", "disable"):
-            if self._publisher:
-                msg = Bool()
-                msg.data = (action == "enable")
-                self._publisher.publish(msg)
-                return {"state": action + "d"}
-            return {"error": "publisher not initialized"}
-        elif action in ("start", "info"):
-            return {"state": "ready"}
-        elif action == "stop":
-            return {"state": "idle"}
-        return {"error": f"unknown action: {action}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -7059,6 +7251,7 @@ class ChassisRawPlugin:
                     "actions": ["move", "rotate"],
                     "timeout": 60
                 },
+                "x-resource": "base",
                 "x-action-params": {
                     "move":   {"params": ["direction", "duration"],
                                "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},

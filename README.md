@@ -57,6 +57,41 @@ When run without arguments, `build.sh` shows an interactive multi-select menu to
 
 Once the driver container starts, it registers itself with Agent Core at `http://<agent-core>:15678/api/mcp`. You can then see the device and its tools in the Web Dashboard.
 
+### DDS is confined to the local machine
+
+Every container on the ROS2 bus — Agent Core, perception, actucore and **every driver** — loads the
+same loopback-only FastDDS profile, so a robot's internal bus cannot be seen from the network:
+
+```yaml
+volumes:
+  - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+environment:
+  - ROS_DOMAIN_ID=42
+  - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+```
+
+Every driver's `deploy/service.yml` carries this, with two exceptions, neither of them fully
+isolated. `x-humanoid/tianyi2.0` cannot use this profile at all: it holds a body context and an
+Agent Core context in one process, and a loopback-only profile cuts the body link. It runs the
+**vendor** profile process-wide instead, whose whitelist happens to exclude the office LAN — so no
+cross-robot command leakage, but not loopback either. (Per-participant profile selection is *not*
+possible here; FastDDS caches profiles process-wide. An earlier version of this file claimed
+otherwise and the claim cost a regression — see README_dev.)
+`engineai/t800` runs on CycloneDDS, which a FastDDS profile cannot reach at all, so **its domain-42
+context is still on the LAN** — a known gap, not a covered case. Deploying through the dashboard
+needs no extra step. This matters when you write a new driver or hand-assemble a compose file,
+because a container that misses the profile **cannot reach Agent Core at all** — the device registers
+over HTTP and appears in the dashboard while none of its topics ever carry data.
+
+`ROS_DOMAIN_ID` is 42 on every robot; there are no per-robot numbers to allocate. Links to the robot
+body are unaffected — those go over CycloneDDS with an explicitly bound interface, which this
+profile does not touch.
+
+`./scripts/check_service_yml.py` verifies all of the above across every driver; run it on any PR that
+adds or edits a `service.yml`. Full rationale, the failure modes and how to verify:
+[README_dev.md § DDS isolation](README_dev.md#dds-isolation--load-the-profile-unless-the-driver-manages-dds-itself)
+and [§ service.yml checklist](README_dev.md#serviceyml-checklist-for-a-new-driver).
+
 ### Run Locally (without Docker)
 
 ```bash

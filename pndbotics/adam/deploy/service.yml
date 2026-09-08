@@ -7,6 +7,7 @@ pndbotics-adam:
   pid: host
   privileged: true
   volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     # ZED SDK binaries and the Jetson/aarch64 pyzed extension are provided by
@@ -16,7 +17,7 @@ pndbotics-adam:
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
     - GRPC_HOST=localhost
     - GRPC_PORT=6666
