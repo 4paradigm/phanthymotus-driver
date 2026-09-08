@@ -9,7 +9,7 @@ ros_namespace: "agibot_x2"
 
 # Which end-effector variant this robot is built with — selects the URDF served by the
 # `model` resource tool and the joint layout used by hand_state/hand_command.
-end_effector: "hand"   # fist | hand | ultra
+end_effector: "ultra"  # fist | hand | ultra
 
 ros:
   robot_domain_id: 0
