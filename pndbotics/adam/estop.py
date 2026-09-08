@@ -37,18 +37,22 @@ def build(state: dict | None, received_at_ms: int | None, *, stale_after_ms: int
     state = state or {}
     actuator = state.get("actuator_status")
     rcu_power = state.get("rcu_power_enabled")
-    signals = [value for value in (actuator, rcu_power) if isinstance(value, bool)]
-    detection_supported = bool(signals)
-    available = detection_supported
-    detected = any(value is False for value in signals)
+    complete_sample = isinstance(actuator, bool) and isinstance(rcu_power, bool)
+    detection_supported = complete_sample
+    available = complete_sample
+    # Never infer "released" from only one physical input. A partial sample is
+    # reported as unknown below, while a complete disagreement remains active.
+    detected = complete_sample and (not actuator or not rcu_power)
     disagreement = (
         isinstance(actuator, bool)
         and isinstance(rcu_power, bool)
         and actuator != rcu_power
     )
 
+    fresh = complete_sample and fresh
+
     if not available:
-        message = state.get("error") or "未收到执行器供电状态"
+        message = state.get("error") or "实体急停信号不完整，状态未知"
     elif not fresh:
         message = "执行器供电状态已过期，急停状态未知"
     elif disagreement:
@@ -155,9 +159,18 @@ class Plugin:
             state = self._status_reader()
         except Exception as exc:
             state = {"error": str(exc)}
+        complete_sample = (
+            isinstance(state.get("actuator_status"), bool)
+            and isinstance(state.get("rcu_power_enabled"), bool)
+        )
         with self._lock:
             self._state = state
-            self._received_at_ms = int(time.time() * 1000)
+            # Freshness denotes a complete physical sample, not merely that a
+            # polling attempt finished. Drop the timestamp immediately when
+            # either PAC input is unavailable.
+            self._received_at_ms = (
+                int(time.time() * 1000) if complete_sample else None
+            )
 
     def _data(self, *, refresh: bool = False):
         if refresh:

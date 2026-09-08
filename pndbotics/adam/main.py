@@ -191,7 +191,7 @@ def main():
     network_iface = sys.argv[1] if len(sys.argv) > 1 else None
     cfg           = _load_config()
     namespace     = _resolve_namespace(cfg)
-    mcp_port      = int(cfg.get("mcp_port", 15702))
+    mcp_port      = int(cfg.get("mcp_port", 15720))
     variant       = cfg.get("variant", "sp")
 
     print(f"[adam] namespace={namespace} variant={variant} mcp_port={mcp_port}")
@@ -258,7 +258,7 @@ def main():
 
     # gRPC client
     grpc_host = os.environ.get("GRPC_HOST", cfg.get("grpc_host", "localhost"))
-    grpc_port = int(os.environ.get("GRPC_PORT", cfg.get("grpc_port", 6666)))
+    grpc_port = int(os.environ.get("GRPC_PORT", cfg.get("grpc_port", 50051)))
     from grpc_client import AdamGrpcClient
     grpc_client = AdamGrpcClient(grpc_host, grpc_port)
     grpc_client.connect()

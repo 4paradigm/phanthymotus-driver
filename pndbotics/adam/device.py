@@ -633,7 +633,7 @@ class StatePlugin:
 # ===========================================================================
 
 class LocoPlugin:
-    """High-level locomotion via gRPC on port 6666."""
+    """High-level locomotion via the Adam RL gRPC service."""
 
     PREFIX = "loco"
 
@@ -658,7 +658,11 @@ class LocoPlugin:
                             "list_actions", "clear_error", "carry_box",
                         ],
                     },
-                    "mode": {"type": "integer", "description": "Mode ID"},
+                    "mode": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Target state name returned by get_state.switchable_states",
+                    },
                     "vx": {"type": "number", "description": "Forward velocity (m/s)"},
                     "vy": {"type": "number", "description": "Lateral velocity (m/s)"},
                     "vyaw": {"type": "number", "description": "Yaw angular velocity (rad/s)"},
@@ -728,7 +732,7 @@ class LocoPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "set_mode":
-            return self._grpc.set_mode(args.get("mode", 0))
+            return self._grpc.set_mode(args.get("mode", ""))
         if action == "move":
             return self._grpc.set_speed(
                 args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0)

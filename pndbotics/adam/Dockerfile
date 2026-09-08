@@ -12,9 +12,12 @@ RUN sed -i 's|http://mirrors.tencentyun.com/ubuntu-ports|http://ports.ubuntu.com
     libx11-6 libxext6 libbsd0 python3-pil && \
     rm -rf /var/lib/apt/lists/*
 
-# Python dependencies
+# Python dependencies. Keep the deployed runtime identical to local installs;
+# generated protobuf/gRPC modules enforce the minimum versions listed here.
+COPY requirements.txt /tmp/adam-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml numpy grpcio protobuf
+    -r /tmp/adam-requirements.txt && \
+    rm -f /tmp/adam-requirements.txt
 
 # CycloneDDS 0.10.2 (required by pnd_sdk_python)
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
@@ -49,11 +52,12 @@ COPY deploy/        /deploy/
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+ENV RCUTILS_COLORIZED_OUTPUT=0
 ENV PYTHONPATH=/work:/opt/pyzed
 ENV PYTHONUNBUFFERED=1
 ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 ENV ZED_PYTHON_PATH=/opt/pyzed
 
-EXPOSE 15702
+EXPOSE 15720
 
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]

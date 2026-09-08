@@ -18,7 +18,10 @@ pndbotics-adam:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - RCUTILS_COLORIZED_OUTPUT=0
     - PYTHONUNBUFFERED=1
+    # Adam's RL server runs on the x86 controller. These remain environment
+    # overrides so another deployment topology can replace them.
     - GRPC_HOST=10.10.20.127
     - GRPC_PORT=50051
     - NVIDIA_VISIBLE_DEVICES=all
