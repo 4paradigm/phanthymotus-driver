@@ -450,11 +450,18 @@ class HandStatePlugin:
             from aimdk_msgs.srv import GetHandType
             request = GetHandType.Request()
             request.request = self.nodes.request_header()
-            result = call_service(self.nodes.get_hand_type, request)
-            return {
-                "left_hand_type": HAND_TYPES.get(result.left_hands_type.value, "unknown"),
-                "right_hand_type": HAND_TYPES.get(result.right_hands_type.value, "unknown"),
-            }
+            try:
+                result = call_service(self.nodes.get_hand_type, request)
+                return {
+                    "left_hand_type": HAND_TYPES.get(result.left_hands_type.value, "unknown"),
+                    "right_hand_type": HAND_TYPES.get(result.right_hands_type.value, "unknown"),
+                }
+            except TimeoutError as exc:
+                return {
+                    "state": "running",
+                    **self.nodes.streams["hand_state"],
+                    "warning": str(exc),
+                }
         return {"state": "running", **self.nodes.streams["hand_state"]}
 
 
