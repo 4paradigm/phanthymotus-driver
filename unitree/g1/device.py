@@ -1342,15 +1342,16 @@ def _parse_rgb(value, default=(0, 255, 0)) -> tuple:
 
 
 class GreetPlugin:
-    """迎宾卡（actuator）：一个动作完成挥手 + 语音问候 + LED 灯。
+    """迎宾卡（actuator）：一个动作完成挥手 + 说"你好" + LED 变绿。
 
-    组合三个已有能力（loco 的 WaveHand、audio 的 TtsMaker / LedControl），
+    组合三个已有能力（arm 的 ExecuteAction 26、audio 的 TtsMaker / LedControl），
     对外暴露一个高层 "greet" 动作，LLM 一句话即可触发整套迎宾流程。
     """
     PREFIX = "greet"
 
     _HIGH_WAVE_ACTION_ID = 26
     _HIGH_WAVE_DURATION_S = 5.0
+    _GREET_TEXT = "你好"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  arm_client, audio_client: AudioClient, audio_lock: threading.Lock,
@@ -1364,7 +1365,6 @@ class GreetPlugin:
         self._stop_event = threading.Event()
         self._active_lock = threading.Lock()
         self._active_greets: set[str] = set()
-        self._default_text = str(plugin_config.get("default_text", "你好，欢迎光临"))
         self._voice = int(plugin_config.get("voice", 0))
         self._led_rgb = _parse_rgb(plugin_config.get("led_rgb", [0, 255, 0]))
 
@@ -1373,31 +1373,24 @@ class GreetPlugin:
             "name": "greet",
             "type": "actuator",
             "multiInstance": False,
-            "description": "G1 迎宾：挥手 + 语音问候 + LED 灯（默认绿灯）",
+            "description": "G1 迎宾：挥手 + 说\"你好\" + LED 变绿",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["greet", "wave", "speak", "led", "info"],
+                    "action": {"type": "string", "enum": ["greet"],
                                "description": "要执行的动作"},
-                    "text": {"type": "string", "description": "要说的话（不填用默认问候语）"},
+                    "text": {"type": "string", "description": "要说的话（不填用默认\"你好\"）"},
                     "confirm": {"type": "boolean", "description": "确认执行机器人肢体动作"},
-                    "r": {"type": "integer", "minimum": 0, "maximum": 255, "description": "LED 红 0-255"},
-                    "g": {"type": "integer", "minimum": 0, "maximum": 255, "description": "LED 绿 0-255"},
-                    "b": {"type": "integer", "minimum": 0, "maximum": 255, "description": "LED 蓝 0-255"},
                 },
                 "required": ["action"],
                 "x-is-dangerous": True,
                 "x-resource": ["mouth", "arm_l", "arm_r"],
                 "x-completion": {
-                    "actions": ["greet", "wave", "speak"],
+                    "actions": ["greet"],
                     "timeout": 60,
                 },
                 "x-action-params": {
-                    "greet": {"params": ["text", "confirm"], "description": "完整迎宾：挥手 + 说话 + LED（异步执行，完成后回调）"},
-                    "wave":  {"params": ["confirm"], "description": "只挥手"},
-                    "speak": {"params": ["text"], "description": "只语音问候"},
-                    "led":   {"params": ["r", "g", "b"], "description": "只设置 LED 颜色"},
-                    "info":  {"params": [], "description": "查看迎宾配置"},
+                    "greet": {"params": ["text", "confirm"], "description": "挥手 + 说话 + LED 变绿（异步执行，完成后回调）"},
                 },
             },
         }
@@ -1428,9 +1421,9 @@ class GreetPlugin:
     def _release(self) -> None:
         self._mouth.release()
 
-    def _resource_busy(self, action: str) -> dict:
+    def _resource_busy(self) -> dict:
         return {
-            "error": f"greet {action} busy: mouth is in use by another speech action",
+            "error": "greet busy: mouth is in use by another speech action",
             "code": "RESOURCE_BUSY",
         }
 
@@ -1442,18 +1435,6 @@ class GreetPlugin:
         with self._active_lock:
             self._active_greets.discard(action_id)
 
-    def _validate_rgb(self, args: dict) -> tuple[dict | None, dict | None]:
-        rgb = {}
-        for name, default in (("r", self._led_rgb[0]), ("g", self._led_rgb[1]), ("b", self._led_rgb[2])):
-            value = args.get(name, default)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 255:
-                return None, {
-                    "error": f"{name} must be an integer in 0..255",
-                    "code": "INVALID_ARGUMENT",
-                }
-            rgb[name] = value
-        return rgb, None
-
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             self.start()
@@ -1461,127 +1442,27 @@ class GreetPlugin:
         if action == "stop":
             self.stop()
             return {"state": "idle"}
-        if action == "info":
-            return {"default_text": self._default_text, "voice": self._voice,
-                    "led_rgb": list(self._led_rgb)}
-        if action in ("greet", "wave") and args.get("confirm") is not True:
+        if action != "greet":
+            return None
+        if args.get("confirm") is not True:
             return {
-                "error": f"{action} requires confirm=true",
+                "error": "greet requires confirm=true",
                 "code": "PRECONDITION_FAILED",
             }
-        if action == "wave":
-            if self._cancelled():
-                return {
-                    "error": "greet plugin stopped",
-                    "code": "PRECONDITION_FAILED",
-                }
-            if not self._reserve():
-                return self._resource_busy("wave")
-            from uuid import uuid4
-            action_id = f"g1_wave_{uuid4().hex[:8]}"
-            threading.Thread(target=self._run_wave, args=(action_id,),
-                             daemon=True, name="greet_wave").start()
+        if self._cancelled():
             return {
-                "status": "executing",
-                "action_id": action_id,
-                "wave_action_id": self._HIGH_WAVE_ACTION_ID,
-                "gesture": "high wave",
+                "error": "greet plugin stopped",
+                "code": "PRECONDITION_FAILED",
             }
-        if action == "speak":
-            if self._cancelled():
-                return {
-                    "error": "greet plugin stopped",
-                    "code": "PRECONDITION_FAILED",
-                }
-            text = str(args.get("text", self._default_text))
-            error = _reject_oversized_text(text)
-            if error:
-                return error
-            if not self._reserve():
-                return self._resource_busy("speak")
-            from uuid import uuid4
-            action_id = f"g1_speak_{uuid4().hex[:8]}"
-            threading.Thread(target=self._run_speak, args=(action_id, text),
-                             daemon=True, name="greet_speak").start()
-            return {"status": "executing", "action_id": action_id, "text": text}
-        if action == "led":
-            rgb, error = self._validate_rgb(args)
-            if error:
-                return error
-            r, g, b = rgb["r"], rgb["g"], rgb["b"]
-            with self._audio_lock:
-                ret = self._audio.LedControl(r, g, b)
-            return {"ret": ret, "r": r, "g": g, "b": b}
-        if action == "greet":
-            if self._cancelled():
-                return {
-                    "error": "greet plugin stopped",
-                    "code": "PRECONDITION_FAILED",
-                }
-            if not self._reserve():
-                return self._resource_busy("greet")
-            from uuid import uuid4
-            action_id = f"g1_greet_{uuid4().hex[:8]}"
-            text = str(args.get("text", self._default_text))
-            error = _reject_oversized_text(text)
-            if error:
-                self._release()
-                return error
-            threading.Thread(target=self._run_greet, args=(action_id, text),
-                             daemon=True, name="greet_seq").start()
-            return {"status": "executing", "action_id": action_id, "text": text}
-        return None
+        if not self._reserve():
+            return self._resource_busy()
+        from uuid import uuid4
+        action_id = f"g1_greet_{uuid4().hex[:8]}"
+        threading.Thread(target=self._run_greet, args=(action_id,),
+                         daemon=True, name="greet_seq").start()
+        return {"status": "executing", "action_id": action_id}
 
-    def _run_speak(self, action_id: str, text: str):
-        self._track_action(action_id)
-        try:
-            with self._greet_lock:
-                self._raise_if_cancelled()
-                ret = _onboard_tts(self._audio, self._audio_lock, self._tts_lock, text, self._voice)
-                if ret != 0:
-                    raise RuntimeError(f"TtsMaker failed: code={ret}")
-                self._raise_if_cancelled()
-                result = {"ret": ret, "text": text}
-                status = "completed"
-        except _GreetCancelled:
-            result = self._cancelled_result()
-            status = "cancelled"
-        except Exception as e:
-            result = {"error": f"{type(e).__name__}: {e}"}
-            status = "error"
-        finally:
-            self._untrack_action(action_id)
-            self._release()
-        _loco_acp_notify(action_id, status, result, tool="greet")
-
-    def _run_wave(self, action_id: str):
-        self._track_action(action_id)
-        try:
-            with self._greet_lock:
-                self._raise_if_cancelled()
-                wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
-                if wave_ret != 0:
-                    raise RuntimeError(f"high wave failed: code={wave_ret}")
-                if self._wait_or_cancelled(self._HIGH_WAVE_DURATION_S):
-                    raise _GreetCancelled()
-                result = {
-                    "ret": wave_ret,
-                    "wave_action_id": self._HIGH_WAVE_ACTION_ID,
-                    "wave_gesture": "high wave",
-                }
-                status = "completed"
-        except _GreetCancelled:
-            result = self._cancelled_result()
-            status = "cancelled"
-        except Exception as e:
-            result = {"error": f"{type(e).__name__}: {e}"}
-            status = "error"
-        finally:
-            self._untrack_action(action_id)
-            self._release()
-        _loco_acp_notify(action_id, status, result, tool="greet")
-
-    def _run_greet(self, action_id: str, text: str):
+    def _run_greet(self, action_id: str):
         """Background thread: run the greet sequence, then fire ACP completion.
 
         Unitree's TTS and arm-action RPCs do not expose cancellation or completion
@@ -1600,7 +1481,7 @@ class GreetPlugin:
 
                 self._raise_if_cancelled()
                 tts_ret = _onboard_tts(
-                    self._audio, self._audio_lock, self._tts_lock, text, self._voice
+                    self._audio, self._audio_lock, self._tts_lock, self._GREET_TEXT, self._voice
                 )
                 if tts_ret != 0:
                     raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
@@ -1616,7 +1497,7 @@ class GreetPlugin:
                     "ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
                     "wave_action_id": self._HIGH_WAVE_ACTION_ID,
                     "wave_gesture": "high wave",
-                    "text": text,
+                    "text": self._GREET_TEXT,
                 }
                 status = "completed"
         except _GreetCancelled:

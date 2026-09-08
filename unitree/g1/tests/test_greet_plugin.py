@@ -128,8 +128,17 @@ class GreetPluginTest(unittest.TestCase):
         G1._onboard_tts_duration_s = lambda text: 0
         self.addCleanup(lambda: setattr(G1, "_onboard_tts_duration_s", self.real_duration))
 
-    def plugin(self, audio=None, arm=None):
-        return G1.GreetPlugin({}, "test", None, arm or FakeArm(), audio or FakeAudio(), threading.Lock(), threading.Lock())
+    def plugin(self, audio=None, arm=None, mouth=None):
+        return G1.GreetPlugin({}, "test", None, arm or FakeArm(), audio or FakeAudio(),
+                              threading.Lock(), threading.Lock(), mouth)
+
+    def test_tool_exposes_only_greet_action(self):
+        tool = self.plugin().get_tool()
+        self.assertEqual(tool["type"], "actuator")
+        self.assertEqual(tool["inputSchema"]["properties"]["action"]["enum"], ["greet"])
+        self.assertEqual(tool["inputSchema"]["x-completion"]["actions"], ["greet"])
+        self.assertNotIn("text", tool["inputSchema"]["properties"])
+        self.assertNotIn("r", tool["inputSchema"]["properties"])
 
     def test_invalid_led_rgb_config_falls_back_to_default(self):
         for bad in ([255], [0, 255], "green", [0, 255, 0, 1], [0, -1, 0], [0, 256, 0], [True, 0, 0]):
@@ -142,58 +151,93 @@ class GreetPluginTest(unittest.TestCase):
                            threading.Lock(), threading.Lock())
         self.assertEqual(p._led_rgb, (12, 34, 56))
 
-    def test_requires_confirmation_for_physical_actions(self):
+    def test_requires_confirmation(self):
         p = self.plugin()
-        self.assertEqual(p.dispatch("greet", {}), {"error": "greet requires confirm=true", "code": "PRECONDITION_FAILED"})
-        self.assertEqual(p.dispatch("wave", {}), {"error": "wave requires confirm=true", "code": "PRECONDITION_FAILED"})
+        result = p.dispatch("greet", {})
+        self.assertEqual(result["code"], "PRECONDITION_FAILED")
+        self.assertIn("confirm=true", result["error"])
 
-    def test_rejects_invalid_rgb_before_hardware_call(self):
-        audio = FakeAudio()
-        p = self.plugin(audio=audio)
-        for args in ({"r": -1}, {"g": 256}, {"b": True}, {"r": "255"}):
-            result = p.dispatch("led", args)
-            self.assertEqual(result["code"], "INVALID_ARGUMENT")
-        self.assertEqual(audio.calls, [])
-
-    def test_rejects_oversized_text_before_reserving_slot(self):
+    def test_greet_rejects_when_stopped(self):
         p = self.plugin()
-        too_long = "x" * (G1._MAX_TTS_TEXT_CHARS + 1)
-        for action, args in (("greet", {"confirm": True, "text": too_long}),
-                             ("speak", {"text": too_long})):
-            result = p.dispatch(action, args)
-            self.assertEqual(result["code"], "INVALID_ARGUMENT", f"action={action}")
-        # The slot was never claimed, so a normal request still succeeds.
-        self.assertEqual(p.dispatch("wave", {"confirm": True})["status"], "executing")
+        p.stop()
+        result = p.dispatch("greet", {"confirm": True})
+        self.assertEqual(result["code"], "PRECONDITION_FAILED")
 
-    def test_tts_plugin_rejects_oversized_text(self):
-        p = G1.NativeTtsPlugin({}, "test", None, FakeAudio(), threading.Lock(), threading.Lock())
-        result = p.dispatch("speak", {"text": "x" * (G1._MAX_TTS_TEXT_CHARS + 1)})
-        self.assertEqual(result["code"], "INVALID_ARGUMENT")
+    def test_unknown_action_returns_none(self):
+        p = self.plugin()
+        self.assertIsNone(p.dispatch("wave", {"confirm": True}))
+        self.assertIsNone(p.dispatch("speak", {"text": "hi"}))
+        self.assertIsNone(p.dispatch("led", {"r": 0, "g": 1, "b": 2}))
+        self.assertIsNone(p.dispatch("info", {}))
 
-    def test_tts_plugin_invalid_voice_does_not_leak_slot(self):
-        p = G1.NativeTtsPlugin({}, "test", None, FakeAudio(), threading.Lock(), threading.Lock())
-        bad = p.dispatch("speak", {"text": "hello", "voice": "not-a-number"})
-        self.assertEqual(bad["code"], "INVALID_ARGUMENT")
-        # The worker slot must not be claimed by the failed request.
-        ok = p.dispatch("speak", {"text": "hello"})
-        self.assertEqual(ok["status"], "executing")
-
-    def test_tts_plugin_rejects_concurrent_speak_with_resource_busy(self):
+    def test_greet_reports_acp_completion(self):
         audio = FakeAudio()
-        p = G1.NativeTtsPlugin({}, "test", None, audio, threading.Lock(), threading.Lock())
+        arm = FakeArm()
+        p = self.plugin(audio=audio, arm=arm)
+        p._wait_or_cancelled = lambda duration: False
+        result = p.dispatch("greet", {"confirm": True})
+        while not self.notifications:
+            threading.Event().wait(0.01)
+        self.assertEqual(result["status"], "executing")
+        self.assertTrue(result["action_id"].startswith("g1_greet_"))
+        # LED green first, then TTS "你好", then high wave.
+        self.assertEqual(audio.calls, [("led", 0, 255, 0), ("tts", "你好", 0)])
+        self.assertEqual(arm.calls, [("wave", p._HIGH_WAVE_ACTION_ID)])
+        self.assertEqual(self.notifications[-1][0], result["action_id"])
+        self.assertEqual(self.notifications[-1][1], "completed")
+        self.assertEqual(self.notifications[-1][2]["text"], "你好")
+        self.assertEqual(self.notifications[-1][3], "greet")
+
+    def test_failure_paths_report_acp_error(self):
+        cases = [
+            (FakeAudio(led_ret=7), FakeArm(), "LedControl failed: code=7"),
+            (FakeAudio(tts_ret=8), FakeArm(), "TtsMaker failed: code=8"),
+            (FakeAudio(), FakeArm(ret=9), "high wave failed: code=9"),
+        ]
+        for audio, arm, message in cases:
+            self.notifications.clear()
+            p = self.plugin(audio=audio, arm=arm)
+            p._wait_or_cancelled = lambda duration: False
+            p._run_greet("action")
+            self.assertEqual(self.notifications[-1][1], "error")
+            self.assertIn(message, self.notifications[-1][2]["error"])
+
+    def test_stop_cancels_before_later_hardware_commands(self):
+        audio = FakeAudio()
+        arm = FakeArm()
+        p = self.plugin(audio=audio, arm=arm)
+        original_tts = G1._onboard_tts
+
+        def stop_after_tts(*args):
+            ret = original_tts(*args)
+            p.stop()
+            return ret
+
+        G1._onboard_tts = stop_after_tts
+        self.addCleanup(lambda: setattr(G1, "_onboard_tts", original_tts))
+        p._run_greet("action")
+        self.assertEqual(audio.calls, [("led", 0, 255, 0), ("tts", "你好", 0)])
+        self.assertEqual(arm.calls, [])
+        self.assertEqual(self.notifications[-1][1], "cancelled")
+
+    def test_stop_during_wave_wait_reports_cancelled_not_completed(self):
+        p = self.plugin()
+        p._wait_or_cancelled = lambda duration: True
+        p._run_greet("action")
+        self.assertEqual(self.notifications[-1][1], "cancelled")
+
+    def test_concurrent_greet_rejected_with_resource_busy(self):
+        p = self.plugin()
         release = threading.Event()
 
-        def hold_then_tts(*args, **kwargs):
+        def hold_then_cancel(duration):
             release.wait(5.0)
-            return 0
+            return True
 
-        real_tts = G1._onboard_tts
-        G1._onboard_tts = hold_then_tts
-        self.addCleanup(lambda: setattr(G1, "_onboard_tts", real_tts))
-
-        first = p.dispatch("speak", {"text": "hello"})
+        p._wait_or_cancelled = hold_then_cancel
+        first = p.dispatch("greet", {"confirm": True})
         self.assertEqual(first["status"], "executing")
-        second = p.dispatch("speak", {"text": "world"})
+        second = p.dispatch("greet", {"confirm": True})
         self.assertEqual(second["code"], "RESOURCE_BUSY")
         self.assertNotIn("action_id", second)
         release.set()
@@ -214,15 +258,11 @@ class GreetPluginTest(unittest.TestCase):
         G1._onboard_tts = hold_then_tts
         self.addCleanup(lambda: setattr(G1, "_onboard_tts", real_tts))
 
-        # tts.speak claims the shared mouth first.
         first = tts.dispatch("speak", {"text": "hello"})
         self.assertEqual(first["status"], "executing")
-        # greet must be rejected rather than queueing behind the ~42s speech.
-        for action, args in (("greet", {"confirm": True, "text": "hi"}),
-                             ("speak", {"text": "hi"})):
-            result = greet.dispatch(action, args)
-            self.assertEqual(result["code"], "RESOURCE_BUSY", f"action={action}")
-            self.assertNotIn("action_id", result)
+        result = greet.dispatch("greet", {"confirm": True})
+        self.assertEqual(result["code"], "RESOURCE_BUSY")
+        self.assertNotIn("action_id", result)
         release.set()
 
     def test_tts_rejects_when_greet_holds_shared_mouth(self):
@@ -238,122 +278,65 @@ class GreetPluginTest(unittest.TestCase):
             return False
 
         greet._wait_or_cancelled = hold_then_wave
-        real_wave = G1._onboard_tts_duration_s
+        real_duration = G1._onboard_tts_duration_s
         G1._onboard_tts_duration_s = lambda text: 0
-        self.addCleanup(lambda: setattr(G1, "_onboard_tts_duration_s", real_wave))
+        self.addCleanup(lambda: setattr(G1, "_onboard_tts_duration_s", real_duration))
 
-        first = greet.dispatch("greet", {"confirm": True, "text": "hi"})
+        first = greet.dispatch("greet", {"confirm": True})
         self.assertEqual(first["status"], "executing")
-        # tts.speak must be rejected while greet owns the mouth.
         second = tts.dispatch("speak", {"text": "hello"})
         self.assertEqual(second["code"], "RESOURCE_BUSY")
         self.assertNotIn("action_id", second)
         release.set()
 
-    def test_greet_wave_and_speak_ids_are_unique(self):
+
+class NativeTtsPluginTest(unittest.TestCase):
+    def setUp(self):
+        self.notifications = []
+        self.real_notify = G1._loco_acp_notify
+        G1._loco_acp_notify = lambda action_id, status, result, tool="loco": self.notifications.append(
+            (action_id, status, result, tool)
+        )
+        self.addCleanup(lambda: setattr(G1, "_loco_acp_notify", self.real_notify))
+        self.real_duration = G1._onboard_tts_duration_s
+        G1._onboard_tts_duration_s = lambda text: 0
+        self.addCleanup(lambda: setattr(G1, "_onboard_tts_duration_s", self.real_duration))
+
+    def plugin(self, audio=None):
+        return G1.NativeTtsPlugin({}, "test", None, audio or FakeAudio(),
+                                  threading.Lock(), threading.Lock())
+
+    def test_rejects_oversized_text(self):
         p = self.plugin()
-        p._wait_or_cancelled = lambda duration: False
-        ids = {}
-        for name, action, args in (("greet", "greet", {"confirm": True}),
-                                   ("wave", "wave", {"confirm": True}),
-                                   ("speak", "speak", {"text": "hello"})):
-            result = p.dispatch(action, args)
-            ids[name] = result["action_id"]
-            while len(self.notifications) < len(ids):
-                threading.Event().wait(0.01)
-        self.assertNotEqual(ids["greet"], ids["wave"])
-        self.assertNotEqual(ids["greet"], ids["speak"])
-        self.assertNotEqual(ids["wave"], ids["speak"])
-        self.assertTrue(ids["greet"].startswith("g1_greet_"))
-        self.assertTrue(ids["wave"].startswith("g1_wave_"))
-        self.assertTrue(ids["speak"].startswith("g1_speak_"))
+        result = p.dispatch("speak", {"text": "x" * (G1._MAX_TTS_TEXT_CHARS + 1)})
+        self.assertEqual(result["code"], "INVALID_ARGUMENT")
 
-    def test_concurrent_dispatch_rejected_with_resource_busy(self):
+    def test_invalid_voice_does_not_leak_slot(self):
         p = self.plugin()
-        release = threading.Event()
+        bad = p.dispatch("speak", {"text": "hello", "voice": "not-a-number"})
+        self.assertEqual(bad["code"], "INVALID_ARGUMENT")
+        ok = p.dispatch("speak", {"text": "hello"})
+        self.assertEqual(ok["status"], "executing")
 
-        def hold_then_cancel(duration):
-            release.wait(5.0)
-            return True
-
-        p._wait_or_cancelled = hold_then_cancel
-        first = p.dispatch("greet", {"confirm": True})
-        self.assertEqual(first["status"], "executing")
-        # The slot is reserved synchronously in dispatch(), so a second physical
-        # request is rejected immediately rather than queueing behind the first
-        # (which would blow past its declared 60s x-completion timeout).
-        for action, args in (("greet", {"confirm": True}), ("wave", {"confirm": True}), ("speak", {"text": "hi"})):
-            result = p.dispatch(action, args)
-            self.assertEqual(result["code"], "RESOURCE_BUSY", f"action={action}")
-            self.assertNotIn("action_id", result)
-        # led stays available (independent of the greet worker slot)
-        self.assertEqual(p.dispatch("led", {"r": 0, "g": 1, "b": 2})["ret"], 0)
-        release.set()  # let the first worker finish (cancelled) and release the slot
-
-    def test_speak_reports_acp_completion_after_tts(self):
+    def test_rejects_concurrent_speak_with_resource_busy(self):
         audio = FakeAudio()
         p = self.plugin(audio=audio)
-        result = p.dispatch("speak", {"text": "hello"})
-        while not self.notifications:
-            threading.Event().wait(0.01)
-        self.assertEqual(result["status"], "executing")
-        self.assertEqual(audio.calls, [("tts", "hello", 0)])
-        self.assertEqual(self.notifications[-1][0], result["action_id"])
-        self.assertEqual(self.notifications[-1][1], "completed")
-        self.assertEqual(self.notifications[-1][2], {"ret": 0, "text": "hello"})
-        self.assertEqual(self.notifications[-1][3], "greet")
-    def test_wave_reports_acp_completion_after_duration(self):
-        arm = FakeArm()
-        p = self.plugin(arm=arm)
-        waits = []
-        p._wait_or_cancelled = lambda duration: waits.append(duration) or False
-        result = p.dispatch("wave", {"confirm": True})
-        while not self.notifications:
-            threading.Event().wait(0.01)
-        self.assertEqual(result["status"], "executing")
-        self.assertEqual(arm.calls, [("wave", p._HIGH_WAVE_ACTION_ID)])
-        self.assertEqual(waits, [p._HIGH_WAVE_DURATION_S])
-        self.assertEqual(self.notifications[-1][0], result["action_id"])
-        self.assertEqual(self.notifications[-1][1], "completed")
-        self.assertEqual(self.notifications[-1][3], "greet")
+        release = threading.Event()
 
-    def test_failure_paths_report_acp_error(self):
-        cases = [
-            (FakeAudio(led_ret=7), FakeArm(), "LedControl failed: code=7"),
-            (FakeAudio(tts_ret=8), FakeArm(), "TtsMaker failed: code=8"),
-            (FakeAudio(), FakeArm(ret=9), "high wave failed: code=9"),
-        ]
-        for audio, arm, message in cases:
-            self.notifications.clear()
-            p = self.plugin(audio=audio, arm=arm)
-            p._wait_or_cancelled = lambda duration: False
-            p._run_greet("action", "hello")
-            self.assertEqual(self.notifications[-1][1], "error")
-            self.assertIn(message, self.notifications[-1][2]["error"])
+        def hold_then_tts(*args, **kwargs):
+            release.wait(5.0)
+            return 0
 
-    def test_stop_cancels_before_later_hardware_commands(self):
-        audio = FakeAudio()
-        arm = FakeArm()
-        p = self.plugin(audio=audio, arm=arm)
-        original_tts = G1._onboard_tts
+        real_tts = G1._onboard_tts
+        G1._onboard_tts = hold_then_tts
+        self.addCleanup(lambda: setattr(G1, "_onboard_tts", real_tts))
 
-        def stop_after_tts(*args):
-            ret = original_tts(*args)
-            p.stop()
-            return ret
-
-        G1._onboard_tts = stop_after_tts
-        self.addCleanup(lambda: setattr(G1, "_onboard_tts", original_tts))
-        p._run_greet("action", "hello")
-        self.assertEqual(audio.calls, [("led", 0, 255, 0), ("tts", "hello", 0)])
-        self.assertEqual(arm.calls, [])
-        self.assertEqual(self.notifications[-1][1], "cancelled")
-
-    def test_stop_during_wave_wait_reports_cancelled_not_completed(self):
-        p = self.plugin()
-        p._wait_or_cancelled = lambda duration: True
-        p._run_greet("action", "hello")
-        self.assertEqual(self.notifications[-1][1], "cancelled")
+        first = p.dispatch("speak", {"text": "hello"})
+        self.assertEqual(first["status"], "executing")
+        second = p.dispatch("speak", {"text": "world"})
+        self.assertEqual(second["code"], "RESOURCE_BUSY")
+        self.assertNotIn("action_id", second)
+        release.set()
 
 
 if __name__ == "__main__":
