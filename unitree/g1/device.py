@@ -255,13 +255,18 @@ def _onboard_tts_duration_s(text: str) -> float:
 
 def _onboard_tts(audio_client: AudioClient, audio_lock: threading.Lock,
                  tts_lock: threading.Lock, text: str, voice: int) -> int:
-    """Serialize onboard TTS until estimated playback completion."""
+    """Serialize onboard TTS until estimated playback completion.
+
+    tts_lock is held for the full estimated playback so utterances do not
+    overlap; audio_lock is released immediately after TtsMaker returns so
+    unrelated AudioClient RPCs (LedControl/GetVolume/SetVolume) can proceed.
+    """
     with tts_lock:
         with audio_lock:
             ret = audio_client.TtsMaker(text, voice)
-            if ret == 0:
-                time.sleep(_onboard_tts_duration_s(text))
-            return ret
+        if ret == 0:
+            time.sleep(_onboard_tts_duration_s(text))
+        return ret
 
 
 class NativeTtsPlugin:
@@ -292,6 +297,7 @@ class NativeTtsPlugin:
                     "volume": {"type": "integer", "description": "Volume 0-100"},
                 },
                 "required": ["action"],
+                "x-resource": ["mouth"],
                 "x-action-params": {
                     "speak":      {"params": ["text", "voice"],  "description": "Synthesize text to speech on the robot"},
                     "get_volume": {"params": [],                 "description": "Get current speaker volume"},
@@ -1224,6 +1230,29 @@ class _GreetCancelled(Exception):
     pass
 
 
+def _parse_rgb(value, default=(0, 255, 0)) -> tuple:
+    """Validate a three-item integer RGB sequence (0..255); fall back to default.
+
+    A missing, short, or non-integer led_rgb override must not raise IndexError
+    during bundle construction (which would prevent the whole driver starting).
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        print(f"[greet] invalid led_rgb={value!r}; using default {default}", flush=True)
+        return tuple(default)
+    if any(isinstance(v, bool) for v in value):
+        print(f"[greet] invalid led_rgb={value!r}; using default {default}", flush=True)
+        return tuple(default)
+    try:
+        rgb = tuple(int(v) for v in value)
+    except (TypeError, ValueError):
+        print(f"[greet] invalid led_rgb={value!r}; using default {default}", flush=True)
+        return tuple(default)
+    if any(v < 0 or v > 255 for v in rgb):
+        print(f"[greet] led_rgb out of range {value!r}; using default {default}", flush=True)
+        return tuple(default)
+    return rgb
+
+
 class GreetPlugin:
     """迎宾卡（actuator）：一个动作完成挥手 + 语音问候 + LED 灯。
 
@@ -1248,8 +1277,7 @@ class GreetPlugin:
         self._active_greets: set[str] = set()
         self._default_text = str(plugin_config.get("default_text", "你好，欢迎光临"))
         self._voice = int(plugin_config.get("voice", 0))
-        rgb = plugin_config.get("led_rgb", [0, 255, 0])
-        self._led_rgb = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        self._led_rgb = _parse_rgb(plugin_config.get("led_rgb", [0, 255, 0]))
 
     def get_tool(self) -> dict:
         return {
@@ -1270,6 +1298,7 @@ class GreetPlugin:
                 },
                 "required": ["action"],
                 "x-is-dangerous": True,
+                "x-resource": ["mouth", "arm_l", "arm_r"],
                 "x-completion": {
                     "actions": ["greet", "wave", "speak"],
                     "timeout": 60,
@@ -2262,6 +2291,7 @@ class ArmActionPlugin:
                     "action_id":  {"type": "integer", "description": "Gesture ID (alternative to gesture name)"},
                 },
                 "required": ["action"],
+                "x-resource": ["arm_l", "arm_r"],
                 "x-action-params": {
                     "execute": {"params": ["gesture", "action_id"], "description": "Execute a predefined arm gesture by name or ID"},
                     "release": {"params": [],                       "description": "Release arm to relaxed state"},
