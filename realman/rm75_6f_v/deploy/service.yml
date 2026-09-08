@@ -1,0 +1,29 @@
+realman-rm75-6f-v:
+  container_name: embodied-realman-rm75-6f-v
+  image: __IMAGE__
+  network_mode: host
+  extra_hosts:
+    - "${RM75_AGENT_CORE_HOSTNAME:-phanthy-motus}:${RM75_AGENT_CORE_ADDRESS:-127.0.0.1}"
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - ${RM_API2_LIB_DIR:-/opt/realman/rm_api2/libs/linux_arm}:/work/Robotic_Arm/libs/linux_arm:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - ROS_LOCALHOST_ONLY=0
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - AGENT_CORE_URL=${RM75_AGENT_CORE_URL:-https://phanthy-motus:15678}
+    # This deployment intentionally starts connected and motion-capable.
+    # Physical E-stop, clear workspace and confirm_motion=true remain mandatory.
+    - RM_DRIVER_ENABLED=1
+    - RM_MOTION_ENABLED=1
+    - RM_ARM_IP=${RM75_ARM_IP:-192.168.1.18}
+    - RM_TCP_PORT=8080
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped
