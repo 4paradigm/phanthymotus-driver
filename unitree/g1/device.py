@@ -248,6 +248,33 @@ class MicPlugin:
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
 
 
+class MouthReservation:
+    """Cross-plugin admission control for the shared onboard-TTS mouth.
+
+    NativeTtsPlugin (tts.speak) and GreetPlugin (greet/speak) both drive the same
+    onboard TTS and hold tts_lock for the full estimated playback. A per-plugin
+    slot is insufficient: a greet could be accepted while a tts.speak is already
+    speaking, then block on tts_lock for up to ~42s before its own ~42s speech
+    plus 5s wave, exceeding the 60s ACP deadline. This shared token lets each
+    card reject with RESOURCE_BUSY instead of queueing behind the other.
+    """
+
+    def __init__(self):
+        self._busy = False
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._busy:
+                return False
+            self._busy = True
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._busy = False
+
+
 # Max onboard TTS text length. Each char costs ~0.35s of speech, and a full greet
 # adds a 5s wave gesture on top; capping at 120 chars keeps the worst case
 # (42s speech + 5s wave) comfortably under the 60s ACP x-completion deadline,
@@ -290,12 +317,12 @@ class NativeTtsPlugin:
     PREFIX = "tts"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient,
-                 audio_lock: threading.Lock, tts_lock: threading.Lock):
+                 audio_lock: threading.Lock, tts_lock: threading.Lock,
+                 mouth_reservation: MouthReservation | None = None):
         self._client = audio_client
         self._audio_lock = audio_lock
         self._tts_lock = tts_lock
-        self._worker_busy = False
-        self._busy_lock = threading.Lock()
+        self._mouth = mouth_reservation or MouthReservation()
 
     def get_tool(self) -> dict:
         return {
@@ -336,16 +363,11 @@ class NativeTtsPlugin:
         pass
 
     def _reserve(self) -> bool:
-        """Atomically claim the single TTS worker slot; False if already busy."""
-        with self._busy_lock:
-            if self._worker_busy:
-                return False
-            self._worker_busy = True
-            return True
+        """Claim the shared mouth token; False if any card is already speaking."""
+        return self._mouth.try_acquire()
 
     def _release(self) -> None:
-        with self._busy_lock:
-            self._worker_busy = False
+        self._mouth.release()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -1332,16 +1354,16 @@ class GreetPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  arm_client, audio_client: AudioClient, audio_lock: threading.Lock,
-                 tts_lock: threading.Lock):
+                 tts_lock: threading.Lock, mouth_reservation: MouthReservation | None = None):
         self._arm = arm_client
         self._audio = audio_client
         self._audio_lock = audio_lock
         self._tts_lock = tts_lock
+        self._mouth = mouth_reservation or MouthReservation()
         self._greet_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._active_lock = threading.Lock()
         self._active_greets: set[str] = set()
-        self._worker_busy = False
         self._default_text = str(plugin_config.get("default_text", "你好，欢迎光临"))
         self._voice = int(plugin_config.get("voice", 0))
         self._led_rgb = _parse_rgb(plugin_config.get("led_rgb", [0, 255, 0]))
@@ -1400,25 +1422,15 @@ class GreetPlugin:
             raise _GreetCancelled()
 
     def _reserve(self) -> bool:
-        """Atomically claim the single greet worker slot; False if already busy.
-
-        The slot is reserved synchronously in dispatch() (not by the worker), so
-        two concurrent requests can never both be accepted and queue behind one
-        another past their declared x-completion timeout.
-        """
-        with self._active_lock:
-            if self._worker_busy:
-                return False
-            self._worker_busy = True
-            return True
+        """Claim the shared mouth token; False if any card is already speaking."""
+        return self._mouth.try_acquire()
 
     def _release(self) -> None:
-        with self._active_lock:
-            self._worker_busy = False
+        self._mouth.release()
 
     def _resource_busy(self, action: str) -> dict:
         return {
-            "error": f"greet {action} busy: another greet action is in progress",
+            "error": f"greet {action} busy: mouth is in use by another speech action",
             "code": "RESOURCE_BUSY",
         }
 

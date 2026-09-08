@@ -198,6 +198,58 @@ class GreetPluginTest(unittest.TestCase):
         self.assertNotIn("action_id", second)
         release.set()
 
+    def test_greet_rejects_when_tts_card_holds_shared_mouth(self):
+        mouth = G1.MouthReservation()
+        audio = FakeAudio()
+        tts = G1.NativeTtsPlugin({}, "test", None, audio, threading.Lock(), threading.Lock(), mouth)
+        greet = G1.GreetPlugin({}, "test", None, FakeArm(), audio, threading.Lock(), threading.Lock(), mouth)
+
+        release = threading.Event()
+
+        def hold_then_tts(*args, **kwargs):
+            release.wait(5.0)
+            return 0
+
+        real_tts = G1._onboard_tts
+        G1._onboard_tts = hold_then_tts
+        self.addCleanup(lambda: setattr(G1, "_onboard_tts", real_tts))
+
+        # tts.speak claims the shared mouth first.
+        first = tts.dispatch("speak", {"text": "hello"})
+        self.assertEqual(first["status"], "executing")
+        # greet must be rejected rather than queueing behind the ~42s speech.
+        for action, args in (("greet", {"confirm": True, "text": "hi"}),
+                             ("speak", {"text": "hi"})):
+            result = greet.dispatch(action, args)
+            self.assertEqual(result["code"], "RESOURCE_BUSY", f"action={action}")
+            self.assertNotIn("action_id", result)
+        release.set()
+
+    def test_tts_rejects_when_greet_holds_shared_mouth(self):
+        mouth = G1.MouthReservation()
+        audio = FakeAudio()
+        tts = G1.NativeTtsPlugin({}, "test", None, audio, threading.Lock(), threading.Lock(), mouth)
+        greet = G1.GreetPlugin({}, "test", None, FakeArm(), audio, threading.Lock(), threading.Lock(), mouth)
+
+        release = threading.Event()
+
+        def hold_then_wave(duration):
+            release.wait(5.0)
+            return False
+
+        greet._wait_or_cancelled = hold_then_wave
+        real_wave = G1._onboard_tts_duration_s
+        G1._onboard_tts_duration_s = lambda text: 0
+        self.addCleanup(lambda: setattr(G1, "_onboard_tts_duration_s", real_wave))
+
+        first = greet.dispatch("greet", {"confirm": True, "text": "hi"})
+        self.assertEqual(first["status"], "executing")
+        # tts.speak must be rejected while greet owns the mouth.
+        second = tts.dispatch("speak", {"text": "hello"})
+        self.assertEqual(second["code"], "RESOURCE_BUSY")
+        self.assertNotIn("action_id", second)
+        release.set()
+
     def test_greet_wave_and_speak_ids_are_unique(self):
         p = self.plugin()
         p._wait_or_cancelled = lambda duration: False
