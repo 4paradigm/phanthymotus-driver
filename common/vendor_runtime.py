@@ -20,6 +20,7 @@ from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from textwrap import dedent
 
 
 def load_config(driver_file: str) -> dict:
@@ -36,21 +37,40 @@ def resolve_namespace(config: dict) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", raw)
 
 
-def configure_cyclonedds(config: dict) -> str:
+def configure_fastdds(config: dict) -> str:
     ros = config.get("ros", {})
     interface = os.environ.get("NETWORK_INTERFACE") or str(ros.get("robot_interface", "eth0"))
     if not re.fullmatch(r"[a-zA-Z0-9_.:-]+", interface):
         raise ValueError(f"invalid robot network interface: {interface}")
-    configured_uri = ros.get("cyclonedds_uri")
-    if configured_uri:
-        os.environ.setdefault("CYCLONEDDS_URI", str(configured_uri))
-        return interface
-    os.environ.setdefault(
-        "CYCLONEDDS_URI",
-        "<CycloneDDS><Domain><General><Interfaces>"
-        f"<NetworkInterface name='{interface}'/>"
-        "</Interfaces></General></Domain></CycloneDDS>",
-    )
+    profile_path = Path(os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE") or f"/tmp/{interface}_fastdds.xml")
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = dedent(f"""\
+        <?xml version="1.0" encoding="UTF-8"?>
+        <dds xmlns="http://www.eprosima.com">
+          <profiles>
+            <transport_descriptors>
+              <transport_descriptor>
+                <transport_id>{interface}_udp</transport_id>
+                <type>UDPv4</type>
+                <interfaceWhiteList>
+                  <address>{interface}</address>
+                </interfaceWhiteList>
+              </transport_descriptor>
+            </transport_descriptors>
+            <participant profile_name="x2_robot_profile" is_default_profile="true">
+              <rtps>
+                <userTransports>
+                  <transport_id>{interface}_udp</transport_id>
+                </userTransports>
+                <useBuiltinTransports>false</useBuiltinTransports>
+              </rtps>
+            </participant>
+          </profiles>
+        </dds>
+    """)
+    if not profile_path.exists() or profile_path.read_text(encoding="utf-8") != profile:
+        profile_path.write_text(profile, encoding="utf-8")
+    os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = str(profile_path)
     return interface
 
 
@@ -66,6 +86,7 @@ class DualDomainROS2:
         self.ctx_robot = Context()
         rclpy.init(context=self.ctx_robot, domain_id=robot_domain_id)
         self.executor_robot = rclpy.executors.MultiThreadedExecutor(context=self.ctx_robot)
+        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
         self.ctx_core = Context()
         rclpy.init(context=self.ctx_core, domain_id=core_domain_id)
         self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
@@ -317,7 +338,7 @@ def run_driver(
         pass
     config = load_config(driver_file)
     namespace = resolve_namespace(config)
-    interface = configure_cyclonedds(config)
+    interface = configure_fastdds(config)
     ros_cfg = config.get("ros", {})
     port = int(config["mcp_port"])
     robot_domain = int(ros_cfg.get("robot_domain_id", 0))
