@@ -285,16 +285,20 @@ class AimdkNodes:
 
     def _skeleton_snapshot_locked(self):
         joints = []
-        for area, names in self.skeleton_joints.items():
+        unknown_names = []
+        for area in self.skeleton_joints:
             msg = self.joint_groups.get(area)
             if msg is None:
                 continue
-            for index, state in enumerate(getattr(msg, "joints", [])):
-                if index >= len(names):
-                    break
-                name = names[index]
+            for state in getattr(msg, "joints", []):
+                name = getattr(state, "name", "")
+                idx = self.skeleton_joint_indices.get(name)
+                if idx is None:
+                    if name:
+                        unknown_names.append(name)
+                    continue
                 item = {
-                    "idx": self.skeleton_joint_indices[name],
+                    "idx": idx,
                     "name": name,
                     "q": float(state.position),
                     "dq": float(state.velocity),
@@ -303,7 +307,10 @@ class AimdkNodes:
                 if getattr(state, "error_code", 0):
                     item["error_code"] = int(state.error_code)
                 joints.append(item)
-        return {"format": "sensor/skeleton", "joints": joints, "joint_count": len(joints), "position_unit": "rad"}
+        payload = {"format": "sensor/skeleton", "joints": joints, "joint_count": len(joints), "position_unit": "rad"}
+        if unknown_names:
+            payload["diagnostics"] = {"unknown_joint_names": unknown_names}
+        return payload
 
     def skeleton_snapshot(self):
         with self.lock:

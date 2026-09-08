@@ -317,15 +317,15 @@ class ToolInventoryTests(unittest.TestCase):
         leg_names = nodes.skeleton_joints["leg"]
         leg_topic = "/aima/hal/joint/leg/state"
         leg_message = SimpleNamespace(joints=[
-            SimpleNamespace(position=0.1, velocity=0.2, effort=0.3, error_code=0),
-            SimpleNamespace(position=-0.4, velocity=0.5, effort=0.6, error_code=7),
+            SimpleNamespace(name=leg_names[0], position=0.1, velocity=0.2, effort=0.3, error_code=0),
+            SimpleNamespace(name=leg_names[1], position=-0.4, velocity=0.5, effort=0.6, error_code=7),
         ])
         callbacks[leg_topic](leg_message)
 
         arm_names = nodes.skeleton_joints["arm"]
         arm_topic = "/aima/hal/joint/arm/state"
         callbacks[arm_topic](SimpleNamespace(joints=[
-            SimpleNamespace(position=1.0, velocity=1.1, effort=1.2, error_code=0),
+            SimpleNamespace(name=arm_names[0], position=1.0, velocity=1.1, effort=1.2, error_code=0),
         ]))
 
         payload = json.loads(nodes.skeleton_pub.published[-1].data)
@@ -343,6 +343,26 @@ class ToolInventoryTests(unittest.TestCase):
         })
         self.assertIsInstance(nodes.skeleton_pub.published[-1], FakeMsg)
         self.assertEqual(joints_plugin.dispatch("info", {})["data"], payload)
+
+    def test_joint_state_callbacks_match_named_states_and_skip_unknowns(self):
+        plugins = build_bundle_plugins()
+        nodes = plugins[0].nodes
+        callbacks = {topic: callback for topic, callback in nodes.robot.subscriptions}
+        leg_names = nodes.skeleton_joints["leg"]
+        leg_topic = "/aima/hal/joint/leg/state"
+
+        callbacks[leg_topic](SimpleNamespace(joints=[
+            SimpleNamespace(name=leg_names[1], position=2.0, velocity=2.1, effort=2.2, error_code=0),
+            SimpleNamespace(name="vendor_extra_joint", position=9.0, velocity=9.1, effort=9.2, error_code=0),
+            SimpleNamespace(name=leg_names[0], position=1.0, velocity=1.1, effort=1.2, error_code=0),
+        ]))
+
+        payload = json.loads(nodes.skeleton_pub.published[-1].data)
+        self.assertEqual(payload["joint_count"], 2)
+        self.assertEqual([joint["name"] for joint in payload["joints"]], [leg_names[1], leg_names[0]])
+        self.assertEqual(payload["joints"][0]["idx"], nodes.skeleton_joint_indices[leg_names[1]])
+        self.assertEqual(payload["joints"][1]["idx"], nodes.skeleton_joint_indices[leg_names[0]])
+        self.assertEqual(payload["diagnostics"]["unknown_joint_names"], ["vendor_extra_joint"])
 
     def test_mc_mode_and_preset_motion_action_enums_nonempty(self):
         plugins = build_bundle_plugins()

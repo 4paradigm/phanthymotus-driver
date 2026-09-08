@@ -50,7 +50,6 @@ new plugin in `device.py` if a use case comes up:
   instead of raw audio playback.
 - `/aima/hal/sensor/rgb_head_rear/*`, `/aima/hal/sensor/stereo_head_front_{left,right}/*` —
   additional cameras beyond the front RGBD pair this driver exposes.
-- `/aima/hal/sensor/touch_head` — head touch sensor, no dedicated tool yet.
 - `/aimdk_5Fmsgs/srv/AbandonAudioFocus`, `RequestAudioFocus`, `GetMute`, `SetMute`, `GetVolume`,
   `SetVolume` — audio focus/volume management.
 - `/aimdk_5Fmsgs/srv/PlayAudioFile`, `PlayVideo`, `PlayVideoGroup` — media playback beyond TTS.
