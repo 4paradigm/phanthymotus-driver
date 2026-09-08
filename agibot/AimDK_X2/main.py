@@ -4,10 +4,6 @@
 import os
 from pathlib import Path
 
-os.environ.setdefault(
-    "FASTRTPS_DEFAULT_PROFILES_FILE",
-    str(Path(__file__).with_name("resource") / "fastdds_develop0.xml"),
-)
 os.environ.setdefault("NETWORK_INTERFACE", "develop0")
 
 from common.vendor_runtime import run_driver
