@@ -52,6 +52,6 @@ ENV PYTHONUNBUFFERED=1
 ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 ENV ZED_PYTHON_PATH=/opt/pyzed
 
-EXPOSE 15702
+EXPOSE 15722
 
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]

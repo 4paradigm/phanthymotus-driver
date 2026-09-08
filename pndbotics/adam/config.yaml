@@ -1,4 +1,4 @@
-mcp_port: 15702
+mcp_port: 15722
 ros_namespace: ""  # auto-detect from hostname
 
 # Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
