@@ -144,14 +144,47 @@ class GreetPluginTest(unittest.TestCase):
             self.assertEqual(result["code"], "INVALID_ARGUMENT")
         self.assertEqual(audio.calls, [])
 
-    def test_greet_ids_are_unique(self):
+    def test_greet_wave_and_speak_ids_are_unique(self):
         p = self.plugin()
         p._wait_or_cancelled = lambda duration: False
-        first = p.dispatch("greet", {"confirm": True})
-        second = p.dispatch("greet", {"confirm": True})
-        self.assertNotEqual(first["action_id"], second["action_id"])
-        while len(self.notifications) < 2:
+        greet = p.dispatch("greet", {"confirm": True})
+        wave = p.dispatch("wave", {"confirm": True})
+        speak = p.dispatch("speak", {"text": "hello"})
+        self.assertNotEqual(greet["action_id"], wave["action_id"])
+        self.assertNotEqual(greet["action_id"], speak["action_id"])
+        self.assertNotEqual(wave["action_id"], speak["action_id"])
+        self.assertTrue(greet["action_id"].startswith("g1_greet_"))
+        self.assertTrue(wave["action_id"].startswith("g1_wave_"))
+        self.assertTrue(speak["action_id"].startswith("g1_speak_"))
+        while len(self.notifications) < 3:
             threading.Event().wait(0.01)
+
+    def test_speak_reports_acp_completion_after_tts(self):
+        audio = FakeAudio()
+        p = self.plugin(audio=audio)
+        result = p.dispatch("speak", {"text": "hello"})
+        while not self.notifications:
+            threading.Event().wait(0.01)
+        self.assertEqual(result["status"], "executing")
+        self.assertEqual(audio.calls, [("tts", "hello", 0)])
+        self.assertEqual(self.notifications[-1][0], result["action_id"])
+        self.assertEqual(self.notifications[-1][1], "completed")
+        self.assertEqual(self.notifications[-1][2], {"ret": 0, "text": "hello"})
+        self.assertEqual(self.notifications[-1][3], "greet")
+    def test_wave_reports_acp_completion_after_duration(self):
+        arm = FakeArm()
+        p = self.plugin(arm=arm)
+        waits = []
+        p._wait_or_cancelled = lambda duration: waits.append(duration) or False
+        result = p.dispatch("wave", {"confirm": True})
+        while not self.notifications:
+            threading.Event().wait(0.01)
+        self.assertEqual(result["status"], "executing")
+        self.assertEqual(arm.calls, [("wave", p._HIGH_WAVE_ACTION_ID)])
+        self.assertEqual(waits, [p._HIGH_WAVE_DURATION_S])
+        self.assertEqual(self.notifications[-1][0], result["action_id"])
+        self.assertEqual(self.notifications[-1][1], "completed")
+        self.assertEqual(self.notifications[-1][3], "greet")
 
     def test_failure_paths_report_acp_error(self):
         cases = [

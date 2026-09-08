@@ -1271,7 +1271,7 @@ class GreetPlugin:
                 "required": ["action"],
                 "x-is-dangerous": True,
                 "x-completion": {
-                    "actions": ["greet"],
+                    "actions": ["greet", "wave", "speak"],
                     "timeout": 60,
                 },
                 "x-action-params": {
@@ -1303,11 +1303,11 @@ class GreetPlugin:
         if self._cancelled():
             raise _GreetCancelled()
 
-    def _track_greet(self, action_id: str) -> None:
+    def _track_action(self, action_id: str) -> None:
         with self._active_lock:
             self._active_greets.add(action_id)
 
-    def _untrack_greet(self, action_id: str) -> None:
+    def _untrack_action(self, action_id: str) -> None:
         with self._active_lock:
             self._active_greets.discard(action_id)
 
@@ -1339,16 +1339,33 @@ class GreetPlugin:
                 "code": "PRECONDITION_FAILED",
             }
         if action == "wave":
-            ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
+            if self._cancelled():
+                return {
+                    "error": "greet plugin stopped",
+                    "code": "PRECONDITION_FAILED",
+                }
+            from uuid import uuid4
+            action_id = f"g1_wave_{uuid4().hex[:8]}"
+            threading.Thread(target=self._run_wave, args=(action_id,),
+                             daemon=True, name="greet_wave").start()
             return {
-                "ret": ret,
-                "action_id": self._HIGH_WAVE_ACTION_ID,
+                "status": "executing",
+                "action_id": action_id,
+                "wave_action_id": self._HIGH_WAVE_ACTION_ID,
                 "gesture": "high wave",
             }
         if action == "speak":
+            if self._cancelled():
+                return {
+                    "error": "greet plugin stopped",
+                    "code": "PRECONDITION_FAILED",
+                }
+            from uuid import uuid4
+            action_id = f"g1_speak_{uuid4().hex[:8]}"
             text = str(args.get("text", self._default_text))
-            ret = _onboard_tts(self._audio, self._audio_lock, self._tts_lock, text, self._voice)
-            return {"ret": ret, "text": text}
+            threading.Thread(target=self._run_speak, args=(action_id, text),
+                             daemon=True, name="greet_speak").start()
+            return {"status": "executing", "action_id": action_id, "text": text}
         if action == "led":
             rgb, error = self._validate_rgb(args)
             if error:
@@ -1371,6 +1388,53 @@ class GreetPlugin:
             return {"status": "executing", "action_id": action_id, "text": text}
         return None
 
+    def _run_speak(self, action_id: str, text: str):
+        self._track_action(action_id)
+        try:
+            with self._greet_lock:
+                self._raise_if_cancelled()
+                ret = _onboard_tts(self._audio, self._audio_lock, self._tts_lock, text, self._voice)
+                if ret != 0:
+                    raise RuntimeError(f"TtsMaker failed: code={ret}")
+                self._raise_if_cancelled()
+                result = {"ret": ret, "text": text}
+                status = "completed"
+        except _GreetCancelled:
+            result = self._cancelled_result()
+            status = "cancelled"
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+            status = "error"
+        finally:
+            self._untrack_action(action_id)
+        _loco_acp_notify(action_id, status, result, tool="greet")
+
+    def _run_wave(self, action_id: str):
+        self._track_action(action_id)
+        try:
+            with self._greet_lock:
+                self._raise_if_cancelled()
+                wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
+                if wave_ret != 0:
+                    raise RuntimeError(f"high wave failed: code={wave_ret}")
+                if self._wait_or_cancelled(self._HIGH_WAVE_DURATION_S):
+                    raise _GreetCancelled()
+                result = {
+                    "ret": wave_ret,
+                    "wave_action_id": self._HIGH_WAVE_ACTION_ID,
+                    "wave_gesture": "high wave",
+                }
+                status = "completed"
+        except _GreetCancelled:
+            result = self._cancelled_result()
+            status = "cancelled"
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+            status = "error"
+        finally:
+            self._untrack_action(action_id)
+        _loco_acp_notify(action_id, status, result, tool="greet")
+
     def _run_greet(self, action_id: str, text: str):
         """Background thread: run the greet sequence, then fire ACP completion.
 
@@ -1378,7 +1442,7 @@ class GreetPlugin:
         events. stop() prevents subsequent greet hardware commands and avoids false
         completion, but any already-dispatched vendor action must finish naturally.
         """
-        self._track_greet(action_id)
+        self._track_action(action_id)
         try:
             with self._greet_lock:
                 self._raise_if_cancelled()
@@ -1416,7 +1480,7 @@ class GreetPlugin:
             result = {"error": f"{type(e).__name__}: {e}"}
             status = "error"
         finally:
-            self._untrack_greet(action_id)
+            self._untrack_action(action_id)
         _loco_acp_notify(action_id, status, result, tool="greet")
 
 
