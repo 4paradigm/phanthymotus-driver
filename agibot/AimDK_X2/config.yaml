@@ -21,6 +21,9 @@ plugins:
     enabled: true
   joint_state:
     enabled: true
+  joints:
+    enabled: true
+    poll_interval_sec: 0.1
   hand_state:
     enabled: true
   imu:
