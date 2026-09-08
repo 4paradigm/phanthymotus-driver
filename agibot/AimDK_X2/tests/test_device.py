@@ -107,7 +107,7 @@ class FakeNode:
         return pub
 
     def create_subscription(self, msg_type, topic, callback, qos):
-        self.subscriptions.append((topic, callback))
+        self.subscriptions.append((topic, callback, qos))
         return object()
 
     def create_client(self, srv_type, name):
@@ -131,9 +131,11 @@ class FakeQoSProfile:
 
 class FakeQoSReliabilityPolicy:
     BEST_EFFORT = "BEST_EFFORT"
+    RELIABLE = "RELIABLE"
 
 
 class FakeQoSDurabilityPolicy:
+    VOLATILE = "VOLATILE"
     TRANSIENT_LOCAL = "TRANSIENT_LOCAL"
 
 
@@ -175,7 +177,7 @@ def _install_ros_stubs():
     module("sensor_msgs")
     module("sensor_msgs.msg", CompressedImage=FakeMsg, Image=FakeMsg, Imu=FakeMsg, PointCloud2=FakeMsg)
     module("std_msgs")
-    module("std_msgs.msg", String=FakeMsg)
+    module("std_msgs.msg", String=FakeMsg, UInt8MultiArray=FakeMsg)
     module("geometry_msgs")
     module("geometry_msgs.msg", Pose=FakeMsg)
     module("nav_msgs")
@@ -254,10 +256,13 @@ class ToolInventoryTests(unittest.TestCase):
         default_names = {d["name"] for d in tool_definitions(default_plugins)}
 
         feature_cards = {
-            "hand_state": {"hand_state", "hand_command"},
+            "hand_state": {"hand_state"},
+            "leg_odometry": {"leg_odometry"},
+            "camera_rgb": {"camera_rgb"},
             "camera_depth": {"camera_depth"},
             "lidar": {"lidar"},
             "slam_pose": {"slam_pose"},
+            "hand_command": {"hand_command"},
             "slam": {"slam_control"},
         }
         for feature, expected_removed in feature_cards.items():
@@ -285,8 +290,8 @@ class ToolInventoryTests(unittest.TestCase):
         plugins = build_bundle_plugins(load_driver_config())
         definitions = tool_definitions(plugins)
         expected_actuators = {
-            "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command", "linkcraft",
-            "pmu_led", "tts", "emoji", "mic_source", "slam_control",
+            "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command",
+            "linkcraft", "pmu_led", "tts", "emoji", "mic_source", "slam_control",
         }
         by_name = {d["name"]: d["type"] for d in definitions}
         for name in expected_actuators:
@@ -297,7 +302,11 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joint_state", "imu", "leg_odometry", "camera_rgb", "system_state", "linkcraft_catalog"):
+        for name in (
+            "mc_state", "locomotion_input_source", "joint_state", "hand_state", "imu",
+            "leg_odometry", "camera_rgb", "camera_depth", "lidar", "slam_pose", "system_state",
+            "linkcraft_catalog",
+        ):
             self.assertEqual(by_name[name], "sensor")
 
     def test_leg_odometry_is_gated_by_config(self):
@@ -363,11 +372,45 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
 
+    def test_slam_relocalization_uses_map_id(self):
+        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
+        slam = find_plugin(plugins, "slam_control")
+        slam.dispatch("start_relocalization", {"map_id": "map-42"})
+        published = slam.nodes.integrated_command_pub.published[-1]
+        self.assertEqual(published.data, "start_relocalization:map-42")
+
     def test_mirrored_subscriptions_are_retained_for_node_lifetime(self):
         plugins = build_bundle_plugins(load_driver_config())
         nodes = plugins[0].nodes
         self.assertEqual(len(nodes._subscriptions), 8)
         self.assertTrue(all(subscription is not None for subscription in nodes._subscriptions))
+
+    def test_lidar_stream_uses_bridge_compatible_packet(self):
+        plugins = build_bundle_plugins(load_driver_config())
+        nodes = plugins[0].nodes
+        lidar_callback = next(
+            callback for topic, callback, _ in nodes.robot.subscriptions
+            if topic == "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud"
+        )
+        source = FakeMsg()
+        source.point_step = 16
+        source.data = bytes(range(32))
+        lidar_callback(source)
+
+        packet = nodes.core.publishers["/test_ns/agibot_x2/lidar"].published[-1]
+        self.assertEqual(packet.data[:8], [16, 0, 0, 0, 2, 0, 0, 0])
+        self.assertEqual(packet.data[8:], list(source.data))
+
+    def test_sensor_subscriptions_match_live_qos(self):
+        plugins = build_bundle_plugins(load_driver_config())
+        nodes = plugins[0].nodes
+        qos_by_topic = {topic: qos for topic, _, qos in nodes.robot.subscriptions}
+        self.assertEqual(qos_by_topic["/aima/hal/sensor/rgbd_head_front/depth_image"].reliability, "RELIABLE")
+        self.assertEqual(qos_by_topic["/aima/hal/sensor/rgbd_head_front/depth_image"].durability, "VOLATILE")
+        self.assertEqual(qos_by_topic["/aima/hal/sensor/lidar_chest_front/lidar_pointcloud"].reliability, "RELIABLE")
+        self.assertEqual(qos_by_topic["/aima/hal/sensor/lidar_chest_front/lidar_pointcloud"].durability, "TRANSIENT_LOCAL")
+        self.assertEqual(qos_by_topic["/aima/mc/leg_odometry"].reliability, "BEST_EFFORT")
+        self.assertEqual(qos_by_topic["/aima/mc/leg_odometry"].durability, "TRANSIENT_LOCAL")
 
 
 class StartStopLifecycleTests(unittest.TestCase):
