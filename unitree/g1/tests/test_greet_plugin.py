@@ -155,6 +155,41 @@ class GreetPluginTest(unittest.TestCase):
             self.assertEqual(result["code"], "INVALID_ARGUMENT")
         self.assertEqual(audio.calls, [])
 
+    def test_rejects_oversized_text_before_reserving_slot(self):
+        p = self.plugin()
+        too_long = "x" * (G1._MAX_TTS_TEXT_CHARS + 1)
+        for action, args in (("greet", {"confirm": True, "text": too_long}),
+                             ("speak", {"text": too_long})):
+            result = p.dispatch(action, args)
+            self.assertEqual(result["code"], "INVALID_ARGUMENT", f"action={action}")
+        # The slot was never claimed, so a normal request still succeeds.
+        self.assertEqual(p.dispatch("wave", {"confirm": True})["status"], "executing")
+
+    def test_tts_plugin_rejects_oversized_text(self):
+        p = G1.NativeTtsPlugin({}, "test", None, FakeAudio(), threading.Lock(), threading.Lock())
+        result = p.dispatch("speak", {"text": "x" * (G1._MAX_TTS_TEXT_CHARS + 1)})
+        self.assertEqual(result["code"], "INVALID_ARGUMENT")
+
+    def test_tts_plugin_rejects_concurrent_speak_with_resource_busy(self):
+        audio = FakeAudio()
+        p = G1.NativeTtsPlugin({}, "test", None, audio, threading.Lock(), threading.Lock())
+        release = threading.Event()
+
+        def hold_then_tts(*args, **kwargs):
+            release.wait(5.0)
+            return 0
+
+        real_tts = G1._onboard_tts
+        G1._onboard_tts = hold_then_tts
+        self.addCleanup(lambda: setattr(G1, "_onboard_tts", real_tts))
+
+        first = p.dispatch("speak", {"text": "hello"})
+        self.assertEqual(first["status"], "executing")
+        second = p.dispatch("speak", {"text": "world"})
+        self.assertEqual(second["code"], "RESOURCE_BUSY")
+        self.assertNotIn("action_id", second)
+        release.set()
+
     def test_greet_wave_and_speak_ids_are_unique(self):
         p = self.plugin()
         p._wait_or_cancelled = lambda duration: False

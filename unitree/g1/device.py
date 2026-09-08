@@ -248,9 +248,26 @@ class MicPlugin:
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
 
 
+# Max onboard TTS text length. Each char costs ~0.35s of speech, and a full greet
+# adds a 5s wave gesture on top; capping at 120 chars keeps the worst case
+# (42s speech + 5s wave) comfortably under the 60s ACP x-completion deadline,
+# with headroom for the audio RPC call itself.
+_MAX_TTS_TEXT_CHARS = 120
+
+
 def _onboard_tts_duration_s(text: str) -> float:
     """Conservative onboard TTS duration estimate; the SDK has no done event."""
     return min(max(1.2, len(text) * 0.35), 50.0)
+
+
+def _reject_oversized_text(text: str) -> dict | None:
+    """Return an INVALID_ARGUMENT error if text would blow the ACP deadline."""
+    if len(text) > _MAX_TTS_TEXT_CHARS:
+        return {
+            "error": f"text too long: {len(text)} chars (max {_MAX_TTS_TEXT_CHARS})",
+            "code": "INVALID_ARGUMENT",
+        }
+    return None
 
 
 def _onboard_tts(audio_client: AudioClient, audio_lock: threading.Lock,
@@ -277,6 +294,8 @@ class NativeTtsPlugin:
         self._client = audio_client
         self._audio_lock = audio_lock
         self._tts_lock = tts_lock
+        self._worker_busy = False
+        self._busy_lock = threading.Lock()
 
     def get_tool(self) -> dict:
         return {
@@ -316,13 +335,33 @@ class NativeTtsPlugin:
     def stop(self) -> None:
         pass
 
+    def _reserve(self) -> bool:
+        """Atomically claim the single TTS worker slot; False if already busy."""
+        with self._busy_lock:
+            if self._worker_busy:
+                return False
+            self._worker_busy = True
+            return True
+
+    def _release(self) -> None:
+        with self._busy_lock:
+            self._worker_busy = False
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         if action == "speak":
-            text  = args.get("text", "")
+            text  = str(args.get("text", ""))
+            error = _reject_oversized_text(text)
+            if error:
+                return error
+            if not self._reserve():
+                return {
+                    "error": "tts speak busy: another utterance is in progress",
+                    "code": "RESOURCE_BUSY",
+                }
             voice = int(args.get("voice", 0))
             from uuid import uuid4
             action_id = f"tts_speak_{uuid4().hex[:8]}"
@@ -350,6 +389,8 @@ class NativeTtsPlugin:
         except Exception as e:
             result = {"error": f"{type(e).__name__}: {e}"}
             status = "error"
+        finally:
+            self._release()
         _loco_acp_notify(action_id, status, result, tool="tts")
 
 
@@ -1434,11 +1475,14 @@ class GreetPlugin:
                     "error": "greet plugin stopped",
                     "code": "PRECONDITION_FAILED",
                 }
+            text = str(args.get("text", self._default_text))
+            error = _reject_oversized_text(text)
+            if error:
+                return error
             if not self._reserve():
                 return self._resource_busy("speak")
             from uuid import uuid4
             action_id = f"g1_speak_{uuid4().hex[:8]}"
-            text = str(args.get("text", self._default_text))
             threading.Thread(target=self._run_speak, args=(action_id, text),
                              daemon=True, name="greet_speak").start()
             return {"status": "executing", "action_id": action_id, "text": text}
@@ -1461,6 +1505,10 @@ class GreetPlugin:
             from uuid import uuid4
             action_id = f"g1_greet_{uuid4().hex[:8]}"
             text = str(args.get("text", self._default_text))
+            error = _reject_oversized_text(text)
+            if error:
+                self._release()
+                return error
             threading.Thread(target=self._run_greet, args=(action_id, text),
                              daemon=True, name="greet_seq").start()
             return {"status": "executing", "action_id": action_id, "text": text}
