@@ -17,9 +17,9 @@ driver_pid=$!
 (
   export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
   export RMW_IMPLEMENTATION="rmw_fastrtps_cpp"
+  export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-/work/agibot/AimDK_X2/resource/fastdds_bridge_local.xml}"
   export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
   export X2_DRIVER_URL="${X2_DRIVER_URL:-http://127.0.0.1:15717/mcp}"
-  unset FASTRTPS_DEFAULT_PROFILES_FILE
   unset NETWORK_INTERFACE
   exec python3 /work/agibot/AimDK_X2/x2_bus_bridge.py
 ) &

@@ -211,6 +211,7 @@ _install_ros_stubs()
 import yaml  # noqa: E402
 
 import device  # noqa: E402
+import x2_bus_bridge  # noqa: E402
 
 
 def load_driver_yaml_cards():
@@ -302,6 +303,11 @@ class ToolInventoryTests(unittest.TestCase):
         self.assertEqual(nodes.streams["joints"]["topic"], "/test_ns/state/joints")
         self.assertEqual(joints.dispatch("info", {})["data"]["joint_count"], 0)
 
+    def test_joints_start_is_explicitly_supported(self):
+        plugins = build_bundle_plugins()
+        joints = find_plugin(plugins, "joints")
+        self.assertEqual(joints.dispatch("start", {}), {"state": "running"})
+
     def test_joints_skeleton_uses_selected_urdf_variant(self):
         for variant, expected_count in (("hand", 27), ("fist", 27), ("ultra", 31)):
             plugins = build_bundle_plugins({"end_effector": variant, "plugins": {}})
@@ -387,6 +393,34 @@ class ModelPluginTests(unittest.TestCase):
         model_plugin = find_plugin(plugins, "model")
         with self.assertRaises(ValueError):
             model_plugin.dispatch("model", {"variant": "nonexistent"})
+
+
+class X2BridgeTests(unittest.TestCase):
+    def test_fastdds_bridge_profile_is_loopback_only(self):
+        self.assertTrue(x2_bus_bridge.DEFAULT_FASTDDS_PROFILE.name.endswith("fastdds_bridge_local.xml"))
+        text = x2_bus_bridge.DEFAULT_FASTDDS_PROFILE.read_text(encoding="utf-8")
+        self.assertIn("<address>127.0.0.1</address>", text)
+        self.assertIn("<useBuiltinTransports>false</useBuiltinTransports>", text)
+
+    def test_select_sensor_tools_ignores_non_sensor_and_duplicate_topics(self):
+        tools = [
+            {"name": "camera_info", "type": "sensor", "topic_out": [
+                {"topic": "/a", "format": "data/json"},
+                {"topic": "/a", "format": "data/json"},
+                {"topic": "/b", "format": "image/jpeg"},
+            ]},
+            {"name": "joint_command", "type": "actuator", "topic_out": [
+                {"topic": "/cmd", "format": "data/json"},
+            ]},
+        ]
+        self.assertEqual(x2_bus_bridge.select_sensor_tools(tools), {"camera_info": ["/a"]})
+
+    def test_extract_data_payload_requires_data_field(self):
+        good = {"result": {"content": [{"text": json.dumps({"data": {"ok": True}})}]}}
+        self.assertEqual(x2_bus_bridge.extract_data_payload(good), {"ok": True})
+        bad = {"result": {"content": [{"text": json.dumps({"value": 1})}]}}
+        with self.assertRaises(ValueError):
+            x2_bus_bridge.extract_data_payload(bad)
 
 
 class DispatchSmokeTests(unittest.TestCase):

@@ -17,16 +17,22 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as exc:  # running outside the driver image
+    import sys
+    sys.stderr.write(f"[x2-bridge] logsafe unavailable ({exc}); stdout unprotected\n")
 
 DEFAULT_DRIVER_URL = "http://127.0.0.1:15717/mcp"
 DEFAULT_POLL_HZ = 10.0
 DEFAULT_REFRESH_SECONDS = 30.0
 DEFAULT_TIMEOUT_SECONDS = 2.0
-DEFAULT_FASTDDS_PROFILE = Path(__file__).with_name("resource") / "fastdds_develop0.xml"
+DEFAULT_FASTDDS_PROFILE = Path(__file__).with_name("resource") / "fastdds_bridge_local.xml"
 
 
 def configure_fastdds_transport() -> str | None:
-    """Provide a default Fast DDS profile only when none was injected."""
+    """Provide a loopback-only Fast DDS profile only when none was injected."""
     if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fastrtps_cpp":
         return None
     configured = os.environ.get("FASTDDS_DEFAULT_PROFILES_FILE")

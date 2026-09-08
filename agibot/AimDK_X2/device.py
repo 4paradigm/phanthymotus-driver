@@ -390,6 +390,8 @@ class JointsPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         if action in ("info", "read", "get", "joints"):
