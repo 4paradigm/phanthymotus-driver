@@ -174,7 +174,7 @@ class GreetPluginTest(unittest.TestCase):
         audio = FakeAudio()
         arm = FakeArm()
         p = self.plugin(audio=audio, arm=arm)
-        p._wait_or_cancelled = lambda duration: False
+        p._wait_or_cancelled = lambda duration, stop_event: False
         result = p.dispatch("greet", {"confirm": True})
         while not self.notifications:
             threading.Event().wait(0.01)
@@ -191,7 +191,7 @@ class GreetPluginTest(unittest.TestCase):
     def test_greet_uses_custom_text(self):
         audio = FakeAudio()
         p = self.plugin(audio=audio)
-        p._wait_or_cancelled = lambda duration: False
+        p._wait_or_cancelled = lambda duration, stop_event: False
         result = p.dispatch("greet", {"confirm": True, "text": "欢迎回家"})
         while not self.notifications:
             threading.Event().wait(0.01)
@@ -217,7 +217,7 @@ class GreetPluginTest(unittest.TestCase):
         for audio, arm, message in cases:
             self.notifications.clear()
             p = self.plugin(audio=audio, arm=arm)
-            p._wait_or_cancelled = lambda duration: False
+            p._wait_or_cancelled = lambda duration, stop_event: False
             p._run_greet("action", "你好")
             self.assertEqual(self.notifications[-1][1], "error")
             self.assertIn(message, self.notifications[-1][2]["error"])
@@ -242,7 +242,7 @@ class GreetPluginTest(unittest.TestCase):
 
     def test_stop_during_wave_wait_reports_cancelled_not_completed(self):
         p = self.plugin()
-        p._wait_or_cancelled = lambda duration: True
+        p._wait_or_cancelled = lambda duration, stop_event: True
         p._run_greet("action", "你好")
         self.assertEqual(self.notifications[-1][1], "cancelled")
 
@@ -250,7 +250,7 @@ class GreetPluginTest(unittest.TestCase):
         p = self.plugin()
         release = threading.Event()
 
-        def hold_then_cancel(duration):
+        def hold_then_cancel(duration, stop_event):
             release.wait(5.0)
             return True
 
@@ -293,7 +293,7 @@ class GreetPluginTest(unittest.TestCase):
 
         release = threading.Event()
 
-        def hold_then_wave(duration):
+        def hold_then_wave(duration, stop_event):
             release.wait(5.0)
             return False
 
@@ -308,6 +308,119 @@ class GreetPluginTest(unittest.TestCase):
         self.assertEqual(second["code"], "RESOURCE_BUSY")
         self.assertNotIn("action_id", second)
         release.set()
+
+
+class ArmSafetyTest(unittest.TestCase):
+    def setUp(self):
+        self.notifications = []
+        self.real_notify = G1._loco_acp_notify
+        G1._loco_acp_notify = lambda action_id, status, result, tool="loco": self.notifications.append(
+            (action_id, status, result, tool)
+        )
+        self.addCleanup(lambda: setattr(G1, "_loco_acp_notify", self.real_notify))
+        self.real_duration = G1._onboard_tts_duration_s
+        G1._onboard_tts_duration_s = lambda text: 0
+        self.addCleanup(lambda: setattr(G1, "_onboard_tts_duration_s", self.real_duration))
+
+    def wait_for(self, predicate):
+        for _ in range(500):
+            if predicate():
+                return
+            threading.Event().wait(0.01)
+        self.fail("timed out waiting for worker")
+
+    def test_restart_does_not_revive_cancelled_greet_after_tts(self):
+        arm = FakeArm()
+        audio = FakeAudio()
+        entered_tts = threading.Event()
+        release_tts = threading.Event()
+        real_tts = G1._onboard_tts
+
+        def blocking_tts(*args, **kwargs):
+            entered_tts.set()
+            release_tts.wait(5.0)
+            return 0
+
+        G1._onboard_tts = blocking_tts
+        self.addCleanup(lambda: setattr(G1, "_onboard_tts", real_tts))
+        plugin = G1.GreetPlugin({}, "test", None, arm, audio,
+                                threading.Lock(), threading.Lock())
+        result = plugin.dispatch("greet", {"confirm": True})
+        self.assertEqual(result["status"], "executing")
+        self.assertTrue(entered_tts.wait(1.0))
+
+        plugin.stop()
+        plugin.start()
+        release_tts.set()
+        self.wait_for(lambda: bool(self.notifications))
+
+        self.assertEqual(arm.calls, [])
+        self.assertEqual(self.notifications[-1][1], "cancelled")
+
+    def test_greet_and_arm_actions_share_arm_reservation(self):
+        arms = G1.ArmReservation()
+        audio = FakeAudio()
+        greet = G1.GreetPlugin({}, "test", None, FakeArm(), audio,
+                               threading.Lock(), threading.Lock(),
+                               arm_reservation=arms)
+        arm_plugin = G1.ArmActionPlugin({}, "test", None, FakeArm(), arms)
+        release = threading.Event()
+
+        def hold_wave(duration, stop_event):
+            release.wait(5.0)
+            return False
+
+        greet._wait_or_cancelled = hold_wave
+        first = greet.dispatch("greet", {"confirm": True})
+        self.assertEqual(first["status"], "executing")
+        blocked = arm_plugin.dispatch("execute", {"gesture": "high five"})
+        self.assertEqual(blocked["code"], "RESOURCE_BUSY")
+        release.set()
+
+    def test_greet_rejects_while_arm_worker_holds_reservation(self):
+        arms = G1.ArmReservation()
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingArm(FakeArm):
+            def ExecuteAction(self, action_id):
+                self.calls.append(("wave", action_id))
+                entered.set()
+                release.wait(5.0)
+                return self.ret
+
+        arm_plugin = G1.ArmActionPlugin({}, "test", None, BlockingArm(), arms)
+        greet = G1.GreetPlugin({}, "test", None, FakeArm(), FakeAudio(),
+                               threading.Lock(), threading.Lock(),
+                               arm_reservation=arms)
+        first = arm_plugin.dispatch("execute", {"gesture": "high five"})
+        self.assertEqual(first["status"], "executing")
+        self.assertTrue(entered.wait(1.0))
+        blocked = greet.dispatch("greet", {"confirm": True})
+        self.assertEqual(blocked["code"], "RESOURCE_BUSY")
+        release.set()
+
+    def test_arm_action_reports_estimated_completion(self):
+        arm = FakeArm()
+        plugin = G1.ArmActionPlugin({}, "test", None, arm)
+        plugin._ACTION_DURATION_S = 0
+        result = plugin.dispatch("execute", {"gesture": "high five"})
+        self.assertEqual(result["status"], "executing")
+        self.assertEqual(result["vendor_action_id"], 18)
+        self.wait_for(lambda: bool(self.notifications))
+        action_id, status, completion, tool = self.notifications[-1]
+        self.assertEqual(action_id, result["action_id"])
+        self.assertEqual(status, "completed")
+        self.assertEqual(completion["completion"], "estimated")
+        self.assertEqual(tool, "arm")
+
+    def test_arm_reservation_can_only_be_released_by_owner(self):
+        arms = G1.ArmReservation()
+        self.assertTrue(arms.try_acquire("first"))
+        arms.release("other")
+        self.assertFalse(arms.try_acquire("second"))
+        arms.release("first")
+        self.assertTrue(arms.try_acquire("second"))
 
 
 class NativeTtsPluginTest(unittest.TestCase):

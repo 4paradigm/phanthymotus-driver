@@ -87,8 +87,9 @@ class G1DeviceBundle:
         # tts.speak and greet/speak drive the same onboard TTS; share one mouth
         # reservation so a greet cannot queue behind a concurrent tts.speak and
         # blow its 60s ACP deadline (see MouthReservation in device.py).
-        from device import MouthReservation
+        from device import ArmReservation, MouthReservation
         mouth_reservation = MouthReservation()
+        arm_reservation = ArmReservation()
 
         if plugins_cfg.get("mic", {}).get("enabled", False):
             from device import MicPlugin
@@ -118,7 +119,7 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("greet", {}).get("enabled", False):
             from device import GreetPlugin
-            self._plugins.append(GreetPlugin(plugins_cfg["greet"], namespace, executor, arm_client, audio_client, audio_lock, tts_lock, mouth_reservation))
+            self._plugins.append(GreetPlugin(plugins_cfg["greet"], namespace, executor, arm_client, audio_client, audio_lock, tts_lock, mouth_reservation, arm_reservation))
             print("[bundle] GreetPlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False):
@@ -143,7 +144,7 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
-            self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
+            self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client, arm_reservation))
             print("[bundle] ArmActionPlugin loaded")
 
         if plugins_cfg.get("asr", {}).get("enabled", False):

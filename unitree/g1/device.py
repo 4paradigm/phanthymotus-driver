@@ -248,6 +248,26 @@ class MicPlugin:
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
 
 
+class ArmReservation:
+    """Owner-aware admission control for the shared G1 arm action client."""
+
+    def __init__(self):
+        self._owner = None
+        self._lock = threading.Lock()
+
+    def try_acquire(self, owner: str) -> bool:
+        with self._lock:
+            if self._owner is not None:
+                return False
+            self._owner = owner
+            return True
+
+    def release(self, owner: str) -> None:
+        with self._lock:
+            if self._owner == owner:
+                self._owner = None
+
+
 class MouthReservation:
     """Cross-plugin admission control for the shared onboard-TTS mouth.
 
@@ -1355,13 +1375,17 @@ class GreetPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  arm_client, audio_client: AudioClient, audio_lock: threading.Lock,
-                 tts_lock: threading.Lock, mouth_reservation: MouthReservation | None = None):
+                 tts_lock: threading.Lock, mouth_reservation: MouthReservation | None = None,
+                 arm_reservation: ArmReservation | None = None):
         self._arm = arm_client
         self._audio = audio_client
         self._audio_lock = audio_lock
         self._tts_lock = tts_lock
         self._mouth = mouth_reservation or MouthReservation()
+        self._arms = arm_reservation or ArmReservation()
         self._greet_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._generation = 0
         self._stop_event = threading.Event()
         self._active_lock = threading.Lock()
         self._active_greets: set[str] = set()
@@ -1396,22 +1420,31 @@ class GreetPlugin:
         }
 
     def start(self) -> None:
-        self._stop_event.clear()
+        with self._lifecycle_lock:
+            self._generation += 1
+            self._stop_event = threading.Event()
 
     def stop(self) -> None:
-        self._stop_event.set()
+        with self._lifecycle_lock:
+            self._generation += 1
+            self._stop_event.set()
 
-    def _cancelled(self) -> bool:
-        return self._stop_event.is_set()
+    def _action_token(self) -> tuple[int, threading.Event]:
+        with self._lifecycle_lock:
+            return self._generation, self._stop_event
+
+    def _cancelled(self, generation: int, stop_event: threading.Event) -> bool:
+        with self._lifecycle_lock:
+            return generation != self._generation or stop_event.is_set()
 
     def _cancelled_result(self) -> dict:
         return {"reason": "greet plugin stopped"}
 
-    def _wait_or_cancelled(self, duration: float) -> bool:
-        return self._stop_event.wait(duration)
+    def _wait_or_cancelled(self, duration: float, stop_event: threading.Event) -> bool:
+        return stop_event.wait(duration)
 
-    def _raise_if_cancelled(self) -> None:
-        if self._cancelled():
+    def _raise_if_cancelled(self, generation: int, stop_event: threading.Event) -> None:
+        if self._cancelled(generation, stop_event):
             raise _GreetCancelled()
 
     def _reserve(self) -> bool:
@@ -1449,7 +1482,8 @@ class GreetPlugin:
                 "error": "greet requires confirm=true",
                 "code": "PRECONDITION_FAILED",
             }
-        if self._cancelled():
+        generation, stop_event = self._action_token()
+        if self._cancelled(generation, stop_event):
             return {
                 "error": "greet plugin stopped",
                 "code": "PRECONDITION_FAILED",
@@ -1458,43 +1492,61 @@ class GreetPlugin:
         error = _reject_oversized_text(text)
         if error:
             return error
-        if not self._reserve():
-            return self._resource_busy()
         from uuid import uuid4
         action_id = f"g1_greet_{uuid4().hex[:8]}"
-        threading.Thread(target=self._run_greet, args=(action_id, text),
-                         daemon=True, name="greet_seq").start()
+        if not self._reserve():
+            return self._resource_busy()
+        if not self._arms.try_acquire(action_id):
+            self._release()
+            return {
+                "error": "greet busy: arms are in use by another action",
+                "code": "RESOURCE_BUSY",
+            }
+        threading.Thread(
+            target=self._run_greet,
+            args=(action_id, text, generation, stop_event),
+            daemon=True,
+            name="greet_seq",
+        ).start()
         return {"status": "executing", "action_id": action_id, "text": text}
 
-    def _run_greet(self, action_id: str, text: str):
+    def _run_greet(self, action_id: str, text: str,
+                   generation: int | None = None,
+                   stop_event: threading.Event | None = None):
         """Background thread: run the greet sequence, then fire ACP completion.
 
         Unitree's TTS and arm-action RPCs do not expose cancellation or completion
         events. stop() prevents subsequent greet hardware commands and avoids false
         completion, but any already-dispatched vendor action must finish naturally.
         """
+        if generation is None or stop_event is None:
+            generation, stop_event = self._action_token()
         self._track_action(action_id)
         try:
             with self._greet_lock:
-                self._raise_if_cancelled()
+                self._raise_if_cancelled(generation, stop_event)
                 r, g, b = self._led_rgb
                 with self._audio_lock:
                     led_ret = self._audio.LedControl(r, g, b)
                 if led_ret != 0:
                     raise RuntimeError(f"LedControl failed: code={led_ret}")
 
-                self._raise_if_cancelled()
+                self._raise_if_cancelled(generation, stop_event)
                 tts_ret = _onboard_tts(
                     self._audio, self._audio_lock, self._tts_lock, text, self._voice
                 )
                 if tts_ret != 0:
                     raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
 
-                self._raise_if_cancelled()
+                self._raise_if_cancelled(generation, stop_event)
                 wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
                 if wave_ret != 0:
                     raise RuntimeError(f"high wave failed: code={wave_ret}")
-                if self._wait_or_cancelled(self._HIGH_WAVE_DURATION_S):
+                wait_started = time.monotonic()
+                if self._wait_or_cancelled(self._HIGH_WAVE_DURATION_S, stop_event):
+                    remaining = self._HIGH_WAVE_DURATION_S - (time.monotonic() - wait_started)
+                    if remaining > 0:
+                        time.sleep(remaining)
                     raise _GreetCancelled()
 
                 result = {
@@ -1512,6 +1564,7 @@ class GreetPlugin:
             status = "error"
         finally:
             self._untrack_action(action_id)
+            self._arms.release(action_id)
             self._release()
         _loco_acp_notify(action_id, status, result, tool="greet")
 
@@ -2272,9 +2325,16 @@ _ARM_ID_MAP = {v: k for k, v in _ARM_ACTION_MAP.items()}
 
 class ArmActionPlugin:
     PREFIX = "arm"
+    _ACTION_DURATION_S = 5.0
+    _RELEASE_DURATION_S = 1.0
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, arm_client):
+    def __init__(self, plugin_config: dict, namespace: str, executor, arm_client,
+                 arm_reservation: ArmReservation | None = None):
         self._client = arm_client
+        self._arms = arm_reservation or ArmReservation()
+        self._lifecycle_lock = threading.Lock()
+        self._generation = 0
+        self._stop_event = threading.Event()
 
     def get_tool(self) -> dict:
         return {
@@ -2295,6 +2355,10 @@ class ArmActionPlugin:
                 },
                 "required": ["action"],
                 "x-resource": ["arm_l", "arm_r"],
+                "x-completion": {
+                    "actions": ["execute", "release"],
+                    "timeout": 15,
+                },
                 "x-action-params": {
                     "execute": {"params": ["gesture", "action_id"], "description": "Execute a predefined arm gesture by name or ID"},
                     "release": {"params": [],                       "description": "Release arm to relaxed state"},
@@ -2304,33 +2368,104 @@ class ArmActionPlugin:
         }
 
     def start(self) -> None:
-        pass
+        with self._lifecycle_lock:
+            self._generation += 1
+            self._stop_event = threading.Event()
 
     def stop(self) -> None:
-        pass
+        with self._lifecycle_lock:
+            self._generation += 1
+            self._stop_event.set()
+
+    def _action_token(self) -> tuple[int, threading.Event]:
+        with self._lifecycle_lock:
+            return self._generation, self._stop_event
+
+    def _cancelled(self, generation: int, stop_event: threading.Event) -> bool:
+        with self._lifecycle_lock:
+            return generation != self._generation or stop_event.is_set()
+
+    def _run_action(self, request_id: str, action_id: int, gesture: str,
+                    duration: float, generation: int,
+                    stop_event: threading.Event) -> None:
+        try:
+            if self._cancelled(generation, stop_event):
+                status = "cancelled"
+                result = {"reason": "arm plugin stopped"}
+            else:
+                ret = self._client.ExecuteAction(action_id)
+                if ret != 0:
+                    raise RuntimeError(f"arm action failed: code={ret}")
+                wait_started = time.monotonic()
+                cancelled = stop_event.wait(duration)
+                if cancelled:
+                    remaining = duration - (time.monotonic() - wait_started)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                if cancelled or self._cancelled(generation, stop_event):
+                    status = "cancelled"
+                    result = {"reason": "arm plugin stopped"}
+                else:
+                    status = "completed"
+                    result = {
+                        "ret": ret,
+                        "action_id": action_id,
+                        "gesture": gesture,
+                        "completion": "estimated",
+                    }
+        except Exception as e:
+            status = "error"
+            result = {"error": f"{type(e).__name__}: {e}"}
+        finally:
+            self._arms.release(request_id)
+        _loco_acp_notify(request_id, status, result, tool="arm")
+
+    def _dispatch_action(self, action_id: int, duration: float) -> dict:
+        from uuid import uuid4
+        generation, stop_event = self._action_token()
+        if self._cancelled(generation, stop_event):
+            return {"error": "arm plugin stopped", "code": "PRECONDITION_FAILED"}
+        request_id = f"g1_arm_{uuid4().hex[:8]}"
+        if not self._arms.try_acquire(request_id):
+            return {"error": "arm busy: arms are in use by another action", "code": "RESOURCE_BUSY"}
+        gesture = _ARM_ID_MAP.get(action_id, "unknown")
+        threading.Thread(
+            target=self._run_action,
+            args=(request_id, action_id, gesture, duration, generation, stop_event),
+            daemon=True,
+            name="arm_action",
+        ).start()
+        return {
+            "status": "executing",
+            "action_id": request_id,
+            "vendor_action_id": action_id,
+            "gesture": gesture,
+        }
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
+            self.start()
             return {"state": "ready"}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action == "list":
             return {"actions": [{"id": v, "name": k} for k, v in _ARM_ACTION_MAP.items()]}
-        elif action == "execute":
-            action_id = None
+        if action == "execute":
             if "action_id" in args:
-                action_id = int(args["action_id"])
+                try:
+                    action_id = int(args["action_id"])
+                except (TypeError, ValueError):
+                    return {"error": "action_id must be an integer", "code": "INVALID_ARGUMENT"}
             elif "gesture" in args:
-                action_id = _ARM_ACTION_MAP.get(args["gesture"].lower().strip())
+                action_id = _ARM_ACTION_MAP.get(str(args["gesture"]).lower().strip())
                 if action_id is None:
                     return {"error": f"Unknown gesture: {args['gesture']}. Available: {list(_ARM_ACTION_MAP)}"}
             else:
                 return {"error": "Provide 'gesture' name or 'action_id'"}
-            ret = self._client.ExecuteAction(action_id)
-            return {"ret": ret, "action_id": action_id, "gesture": _ARM_ID_MAP.get(action_id, "unknown")}
-        elif action == "release":
-            ret = self._client.ExecuteAction(99)
-            return {"ret": ret, "action_id": 99, "gesture": "release arm"}
+            return self._dispatch_action(action_id, self._ACTION_DURATION_S)
+        if action == "release":
+            return self._dispatch_action(99, self._RELEASE_DURATION_S)
         return None
 
 
