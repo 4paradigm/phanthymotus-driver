@@ -298,6 +298,10 @@ class NativeTtsPlugin:
                 },
                 "required": ["action"],
                 "x-resource": ["mouth"],
+                "x-completion": {
+                    "actions": ["speak"],
+                    "timeout": 60,
+                },
                 "x-action-params": {
                     "speak":      {"params": ["text", "voice"],  "description": "Synthesize text to speech on the robot"},
                     "get_volume": {"params": [],                 "description": "Get current speaker volume"},
@@ -320,8 +324,11 @@ class NativeTtsPlugin:
         if action == "speak":
             text  = args.get("text", "")
             voice = int(args.get("voice", 0))
-            ret = _onboard_tts(self._client, self._audio_lock, self._tts_lock, text, voice)
-            return {"ret": ret, "text": text}
+            from uuid import uuid4
+            action_id = f"tts_speak_{uuid4().hex[:8]}"
+            threading.Thread(target=self._run_speak, args=(action_id, text, voice),
+                             daemon=True, name="tts_speak").start()
+            return {"status": "executing", "action_id": action_id, "text": text}
         elif action == "get_volume":
             with self._audio_lock:
                 ret = self._client.GetVolume()
@@ -332,6 +339,18 @@ class NativeTtsPlugin:
                 ret = self._client.SetVolume(vol)
             return {"ret": ret, "volume": vol}
         return None
+
+    def _run_speak(self, action_id: str, text: str, voice: int):
+        try:
+            ret = _onboard_tts(self._client, self._audio_lock, self._tts_lock, text, voice)
+            if ret != 0:
+                raise RuntimeError(f"TtsMaker failed: code={ret}")
+            result = {"ret": ret, "text": text}
+            status = "completed"
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+            status = "error"
+        _loco_acp_notify(action_id, status, result, tool="tts")
 
 
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
@@ -1275,6 +1294,7 @@ class GreetPlugin:
         self._stop_event = threading.Event()
         self._active_lock = threading.Lock()
         self._active_greets: set[str] = set()
+        self._worker_busy = False
         self._default_text = str(plugin_config.get("default_text", "你好，欢迎光临"))
         self._voice = int(plugin_config.get("voice", 0))
         self._led_rgb = _parse_rgb(plugin_config.get("led_rgb", [0, 255, 0]))
@@ -1332,6 +1352,29 @@ class GreetPlugin:
         if self._cancelled():
             raise _GreetCancelled()
 
+    def _reserve(self) -> bool:
+        """Atomically claim the single greet worker slot; False if already busy.
+
+        The slot is reserved synchronously in dispatch() (not by the worker), so
+        two concurrent requests can never both be accepted and queue behind one
+        another past their declared x-completion timeout.
+        """
+        with self._active_lock:
+            if self._worker_busy:
+                return False
+            self._worker_busy = True
+            return True
+
+    def _release(self) -> None:
+        with self._active_lock:
+            self._worker_busy = False
+
+    def _resource_busy(self, action: str) -> dict:
+        return {
+            "error": f"greet {action} busy: another greet action is in progress",
+            "code": "RESOURCE_BUSY",
+        }
+
     def _track_action(self, action_id: str) -> None:
         with self._active_lock:
             self._active_greets.add(action_id)
@@ -1373,6 +1416,8 @@ class GreetPlugin:
                     "error": "greet plugin stopped",
                     "code": "PRECONDITION_FAILED",
                 }
+            if not self._reserve():
+                return self._resource_busy("wave")
             from uuid import uuid4
             action_id = f"g1_wave_{uuid4().hex[:8]}"
             threading.Thread(target=self._run_wave, args=(action_id,),
@@ -1389,6 +1434,8 @@ class GreetPlugin:
                     "error": "greet plugin stopped",
                     "code": "PRECONDITION_FAILED",
                 }
+            if not self._reserve():
+                return self._resource_busy("speak")
             from uuid import uuid4
             action_id = f"g1_speak_{uuid4().hex[:8]}"
             text = str(args.get("text", self._default_text))
@@ -1409,6 +1456,8 @@ class GreetPlugin:
                     "error": "greet plugin stopped",
                     "code": "PRECONDITION_FAILED",
                 }
+            if not self._reserve():
+                return self._resource_busy("greet")
             from uuid import uuid4
             action_id = f"g1_greet_{uuid4().hex[:8]}"
             text = str(args.get("text", self._default_text))
@@ -1436,6 +1485,7 @@ class GreetPlugin:
             status = "error"
         finally:
             self._untrack_action(action_id)
+            self._release()
         _loco_acp_notify(action_id, status, result, tool="greet")
 
     def _run_wave(self, action_id: str):
@@ -1462,6 +1512,7 @@ class GreetPlugin:
             status = "error"
         finally:
             self._untrack_action(action_id)
+            self._release()
         _loco_acp_notify(action_id, status, result, tool="greet")
 
     def _run_greet(self, action_id: str, text: str):
@@ -1510,6 +1561,7 @@ class GreetPlugin:
             status = "error"
         finally:
             self._untrack_action(action_id)
+            self._release()
         _loco_acp_notify(action_id, status, result, tool="greet")
 
 

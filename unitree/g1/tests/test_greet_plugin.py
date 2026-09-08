@@ -131,6 +131,17 @@ class GreetPluginTest(unittest.TestCase):
     def plugin(self, audio=None, arm=None):
         return G1.GreetPlugin({}, "test", None, arm or FakeArm(), audio or FakeAudio(), threading.Lock(), threading.Lock())
 
+    def test_invalid_led_rgb_config_falls_back_to_default(self):
+        for bad in ([255], [0, 255], "green", [0, 255, 0, 1], [0, -1, 0], [0, 256, 0], [True, 0, 0]):
+            p = G1.GreetPlugin({"led_rgb": bad}, "test", None, FakeArm(), FakeAudio(),
+                               threading.Lock(), threading.Lock())
+            self.assertEqual(p._led_rgb, (0, 255, 0), f"bad led_rgb={bad!r}")
+
+    def test_valid_led_rgb_config_is_parsed(self):
+        p = G1.GreetPlugin({"led_rgb": [12, 34, 56]}, "test", None, FakeArm(), FakeAudio(),
+                           threading.Lock(), threading.Lock())
+        self.assertEqual(p._led_rgb, (12, 34, 56))
+
     def test_requires_confirmation_for_physical_actions(self):
         p = self.plugin()
         self.assertEqual(p.dispatch("greet", {}), {"error": "greet requires confirm=true", "code": "PRECONDITION_FAILED"})
@@ -147,17 +158,42 @@ class GreetPluginTest(unittest.TestCase):
     def test_greet_wave_and_speak_ids_are_unique(self):
         p = self.plugin()
         p._wait_or_cancelled = lambda duration: False
-        greet = p.dispatch("greet", {"confirm": True})
-        wave = p.dispatch("wave", {"confirm": True})
-        speak = p.dispatch("speak", {"text": "hello"})
-        self.assertNotEqual(greet["action_id"], wave["action_id"])
-        self.assertNotEqual(greet["action_id"], speak["action_id"])
-        self.assertNotEqual(wave["action_id"], speak["action_id"])
-        self.assertTrue(greet["action_id"].startswith("g1_greet_"))
-        self.assertTrue(wave["action_id"].startswith("g1_wave_"))
-        self.assertTrue(speak["action_id"].startswith("g1_speak_"))
-        while len(self.notifications) < 3:
-            threading.Event().wait(0.01)
+        ids = {}
+        for name, action, args in (("greet", "greet", {"confirm": True}),
+                                   ("wave", "wave", {"confirm": True}),
+                                   ("speak", "speak", {"text": "hello"})):
+            result = p.dispatch(action, args)
+            ids[name] = result["action_id"]
+            while len(self.notifications) < len(ids):
+                threading.Event().wait(0.01)
+        self.assertNotEqual(ids["greet"], ids["wave"])
+        self.assertNotEqual(ids["greet"], ids["speak"])
+        self.assertNotEqual(ids["wave"], ids["speak"])
+        self.assertTrue(ids["greet"].startswith("g1_greet_"))
+        self.assertTrue(ids["wave"].startswith("g1_wave_"))
+        self.assertTrue(ids["speak"].startswith("g1_speak_"))
+
+    def test_concurrent_dispatch_rejected_with_resource_busy(self):
+        p = self.plugin()
+        release = threading.Event()
+
+        def hold_then_cancel(duration):
+            release.wait(5.0)
+            return True
+
+        p._wait_or_cancelled = hold_then_cancel
+        first = p.dispatch("greet", {"confirm": True})
+        self.assertEqual(first["status"], "executing")
+        # The slot is reserved synchronously in dispatch(), so a second physical
+        # request is rejected immediately rather than queueing behind the first
+        # (which would blow past its declared 60s x-completion timeout).
+        for action, args in (("greet", {"confirm": True}), ("wave", {"confirm": True}), ("speak", {"text": "hi"})):
+            result = p.dispatch(action, args)
+            self.assertEqual(result["code"], "RESOURCE_BUSY", f"action={action}")
+            self.assertNotIn("action_id", result)
+        # led stays available (independent of the greet worker slot)
+        self.assertEqual(p.dispatch("led", {"r": 0, "g": 1, "b": 2})["ret"], 0)
+        release.set()  # let the first worker finish (cancelled) and release the slot
 
     def test_speak_reports_acp_completion_after_tts(self):
         audio = FakeAudio()
