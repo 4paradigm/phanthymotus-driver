@@ -5,45 +5,61 @@ import estop
 
 
 class EstopPayloadTests(unittest.TestCase):
-    def test_explicit_estop_is_detected(self):
+    def test_power_enabled_is_not_estop(self):
         now = int(time.time() * 1000)
-        data = estop.build({"fsm_state": "E_STOP"}, now)
-        self.assertTrue(data["emergency_stop"])
-        self.assertTrue(data["fsm_estop_detected"])
+        data = estop.build(
+            {"actuator_status": True, "rcu_power_enabled": True, "fsm_state": "STOP"},
+            now,
+        )
+        self.assertFalse(data["emergency_stop"])
         self.assertTrue(data["detection_supported"])
 
-    def test_stop_mode_is_not_physical_estop(self):
+    def test_power_disabled_is_estop(self):
         now = int(time.time() * 1000)
-        data = estop.build({"fsm_state": "Stop"}, now)
-        self.assertFalse(data["emergency_stop"])
-        self.assertFalse(data["fsm_estop_detected"])
+        data = estop.build(
+            {"actuator_status": False, "rcu_power_enabled": False, "fsm_state": "STOP"},
+            now,
+        )
+        self.assertTrue(data["emergency_stop"])
+        self.assertEqual(data["fsm_state"], "STOP")
 
-    def test_stale_estop_remains_reported_but_not_current(self):
+    def test_either_physical_signal_fails_safe(self):
+        now = int(time.time() * 1000)
+        data = estop.build(
+            {"actuator_status": True, "rcu_power_enabled": False}, now
+        )
+        self.assertTrue(data["emergency_stop"])
+        self.assertIn("不一致", data["message"])
+
+    def test_stale_state_is_unknown(self):
         old = int(time.time() * 1000) - 6000
-        data = estop.build({"fsm_state": "emergency-stop"}, old)
+        data = estop.build({"actuator_status": False}, old)
         self.assertIsNone(data["emergency_stop"])
-        self.assertFalse(data["fsm_estop_detected"])
-        self.assertTrue(data["fsm_estop_reported"])
+        self.assertIn("过期", data["message"])
 
-    def test_legacy_numeric_mode_is_unknown_not_safe(self):
+    def test_missing_physical_signals_is_unavailable(self):
         now = int(time.time() * 1000)
-        data = estop.build({"mode": 4}, now)
-        self.assertIsNone(data["emergency_stop"])
-        self.assertFalse(data["detection_supported"])
-        self.assertIn("无法可靠判断", data["message"])
-
-    def test_rpc_error_is_unavailable(self):
-        now = int(time.time() * 1000)
-        data = estop.build({"error": "offline"}, now)
+        data = estop.build({"fsm_state": "STOP", "error": "offline"}, now)
         self.assertFalse(data["available"])
+        self.assertFalse(data["detection_supported"])
         self.assertIsNone(data["emergency_stop"])
 
-    def test_plugin_info_refreshes_grpc_state(self):
+    def test_plugin_info_refreshes_pac_state(self):
         class FakeGrpc:
             def get_robot_state(self):
-                return {"fsm_state": "ESTOP"}
+                return {"fsm_state": "STOP"}
 
-        plugin = estop.Plugin({}, "adam", None, FakeGrpc())
+        plugin = estop.Plugin(
+            {},
+            "adam",
+            None,
+            FakeGrpc(),
+            status_reader=lambda: {
+                "actuator_status": False,
+                "rcu_power_enabled": False,
+                "fsm_state": "STOP",
+            },
+        )
         result = plugin.dispatch("info", {})
         self.assertTrue(result["data"]["emergency_stop"])
         self.assertEqual(
