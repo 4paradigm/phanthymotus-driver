@@ -79,6 +79,10 @@ MIC_SOURCE_TOPIC = "/aima/hal/audio/capture"
 MIC_OUTPUT_FORMAT = "audio/pcm-16k"
 MIC_SAMPLE_RATE = 16000
 MIC_SAMPLE_BYTES = 2
+MIC_CHUNK_BYTES = 1024
+MIC_INPUT_CHANNELS = 6
+MIC_INPUT_MIC_CHANNELS = 4
+MIC_INPUT_REF_CHANNELS = 2
 MIC_CHANNEL_INDICES = (0, 1, 2, 3)
 
 RESOURCE_DIR = Path(__file__).with_name("resource")
@@ -92,13 +96,11 @@ class InterleavedS16leChannelExtractor:
     AudioChunk boundary.
     """
 
-    def __init__(self, channel_index=0, chunk_bytes=1024):
+    def __init__(self, channel_index=0):
         self.channel_index = int(channel_index)
-        self.chunk_bytes = int(chunk_bytes)
+        self.chunk_bytes = MIC_CHUNK_BYTES
         if self.channel_index < 0:
             raise ValueError("mic channel_index must be non-negative")
-        if self.chunk_bytes <= 0 or self.chunk_bytes % MIC_SAMPLE_BYTES:
-            raise ValueError("mic chunk_bytes must be a positive multiple of 2")
         self._channels = None
         self._input_pending = bytearray()
         self._mono_pending = bytearray()
@@ -273,7 +275,7 @@ class AimdkNodes:
         if self.mic_enabled:
             self._AudioChunk = AudioChunk
             self._mic_channel_index = int(mic_config.get("channel_index", 0))
-            self._mic_chunk_bytes = int(mic_config.get("chunk_bytes", 1024))
+            self._mic_chunk_bytes = MIC_CHUNK_BYTES
             self._mic_source_timeout = float(mic_config.get("source_timeout_sec", 1.0))
             if self._mic_channel_index not in MIC_CHANNEL_INDICES:
                 raise ValueError(f"mic channel_index must be one of {list(MIC_CHANNEL_INDICES)}")
@@ -281,7 +283,6 @@ class AimdkNodes:
                 raise ValueError("mic source_timeout_sec must be positive")
             self._mic_extractor = InterleavedS16leChannelExtractor(
                 channel_index=self._mic_channel_index,
-                chunk_bytes=self._mic_chunk_bytes,
             )
             self._mic_stats = {
                 "source_messages": 0,
@@ -407,10 +408,17 @@ class AimdkNodes:
                     raise ValueError(f"expected S16LE, received {msg.info.sample_format!r}")
                 if coding_format != "pcm":
                     raise ValueError(f"expected pcm, received {msg.info.coding_format!r}")
-                if mic_channels + ref_channels > channels:
+                layout = (channels, mic_channels, ref_channels)
+                expected_layout = (
+                    MIC_INPUT_CHANNELS,
+                    MIC_INPUT_MIC_CHANNELS,
+                    MIC_INPUT_REF_CHANNELS,
+                )
+                if layout != expected_layout:
                     raise ValueError(
-                        f"invalid channel metadata: {mic_channels} mic + {ref_channels} ref "
-                        f"> {channels} total"
+                        f"expected channel layout {MIC_INPUT_CHANNELS} total / "
+                        f"{MIC_INPUT_MIC_CHANNELS} mic / {MIC_INPUT_REF_CHANNELS} ref, "
+                        f"received {channels} total / {mic_channels} mic / {ref_channels} ref"
                     )
 
                 payload = bytes(msg.data.data)
