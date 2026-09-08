@@ -170,6 +170,14 @@ class GreetPluginTest(unittest.TestCase):
         result = p.dispatch("speak", {"text": "x" * (G1._MAX_TTS_TEXT_CHARS + 1)})
         self.assertEqual(result["code"], "INVALID_ARGUMENT")
 
+    def test_tts_plugin_invalid_voice_does_not_leak_slot(self):
+        p = G1.NativeTtsPlugin({}, "test", None, FakeAudio(), threading.Lock(), threading.Lock())
+        bad = p.dispatch("speak", {"text": "hello", "voice": "not-a-number"})
+        self.assertEqual(bad["code"], "INVALID_ARGUMENT")
+        # The worker slot must not be claimed by the failed request.
+        ok = p.dispatch("speak", {"text": "hello"})
+        self.assertEqual(ok["status"], "executing")
+
     def test_tts_plugin_rejects_concurrent_speak_with_resource_busy(self):
         audio = FakeAudio()
         p = G1.NativeTtsPlugin({}, "test", None, audio, threading.Lock(), threading.Lock())

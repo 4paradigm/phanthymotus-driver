@@ -357,12 +357,18 @@ class NativeTtsPlugin:
             error = _reject_oversized_text(text)
             if error:
                 return error
+            try:
+                voice = int(args.get("voice", 0))
+            except (TypeError, ValueError):
+                return {
+                    "error": "voice must be an integer",
+                    "code": "INVALID_ARGUMENT",
+                }
             if not self._reserve():
                 return {
                     "error": "tts speak busy: another utterance is in progress",
                     "code": "RESOURCE_BUSY",
                 }
-            voice = int(args.get("voice", 0))
             from uuid import uuid4
             action_id = f"tts_speak_{uuid4().hex[:8]}"
             threading.Thread(target=self._run_speak, args=(action_id, text, voice),
