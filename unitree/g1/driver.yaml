@@ -10,6 +10,13 @@ description: "Unitree G1 — 麦克风 + 内置TTS + LED + 迎宾(greet) + 运�
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
+#
+# Adding a newly enabled card (here: `greet`) to this manifest is a metadata-only
+# change: it registers the card in the marketplace listing but does not grow the
+# driver image, because the card is implemented entirely by the already-built
+# device.py and pulls in no extra Python dependencies or Docker layers. `greet`
+# is listed in both `description` (for marketplace search/display) and `cards`
+# (so its type=actuator is advertised alongside the other exposed cards).
 # Kept in sync by hand with config.yaml's `plugins.*.enabled` — `slam` is
 # disabled there (superseded by controlled_spatial/controlled_spatial_map) so
 # its tools (pos_tag, slam_mapping, slam_cloud, spatial) are excluded.
