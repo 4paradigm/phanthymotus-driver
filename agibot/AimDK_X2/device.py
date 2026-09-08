@@ -447,22 +447,12 @@ class HandStatePlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            from aimdk_msgs.srv import GetHandType
-            request = GetHandType.Request()
-            request.request = self.nodes.request_header()
-            try:
-                result = call_service(self.nodes.get_hand_type, request)
-                return {
-                    "left_hand_type": HAND_TYPES.get(result.left_hands_type.value, "unknown"),
-                    "right_hand_type": HAND_TYPES.get(result.right_hands_type.value, "unknown"),
-                }
-            except TimeoutError as exc:
-                return {
-                    "state": "running",
-                    **self.nodes.streams["hand_state"],
-                    "warning": str(exc),
-                }
-        return {"state": "running", **self.nodes.streams["hand_state"]}
+            return {
+                "state": "running",
+                "data": self.nodes.snapshot("hand_state"),
+                **self.nodes.streams["hand_state"],
+            }
+        return {"state": "running", "data": self.nodes.snapshot("hand_state"), **self.nodes.streams["hand_state"]}
 
 
 class ImuPlugin:
@@ -481,7 +471,7 @@ class ImuPlugin:
     def dispatch(self, action, args):
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams["imu"]}
+        return {"state": "running", "data": self.nodes.snapshot("imu"), **self.nodes.streams["imu"]}
 
 
 class CameraPlugin:
@@ -505,7 +495,7 @@ class CameraPlugin:
         name = args.get("_tool_name")
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams[name]}
+        return {"state": "running", "data": self.nodes.snapshot(name), **self.nodes.streams[name]}
 
 
 class ReadOnlyStreamPlugin:
@@ -528,7 +518,7 @@ class ReadOnlyStreamPlugin:
     def dispatch(self, action, args):
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams[self.name]}
+        return {"state": "running", "data": self.nodes.snapshot(self.name), **self.nodes.streams[self.name]}
 
 
 class LidarPlugin:
@@ -547,7 +537,7 @@ class LidarPlugin:
     def dispatch(self, action, args):
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams["lidar"]}
+        return {"state": "running", "data": self.nodes.snapshot("lidar"), **self.nodes.streams["lidar"]}
 
 
 class SlamPosePlugin:
@@ -566,7 +556,7 @@ class SlamPosePlugin:
     def dispatch(self, action, args):
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams["slam_odom"]}
+        return {"state": "running", "data": self.nodes.snapshot("slam_odom"), **self.nodes.streams["slam_odom"]}
 
 
 class SystemStatePlugin:
@@ -588,12 +578,12 @@ class SystemStatePlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running"}
+            return {"state": "running", "data": self.nodes.snapshot("system_state")}
         from aimdk_msgs.srv import GetSystemState
         request = GetSystemState.Request()
         request.header = self.nodes.request_header()
         result = call_service(self.nodes.get_system_state, request)
-        return {"cur_state": result.cur_state, "status": jsonable(result.curr_status)}
+        return {"data": {"cur_state": result.cur_state, "status": jsonable(result.curr_status)}}
 
 
 class LinkcraftCatalogPlugin:
@@ -615,12 +605,12 @@ class LinkcraftCatalogPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running"}
+            return {"state": "running", "data": self.nodes.snapshot("linkcraft_catalog")}
         from aimdk_msgs.srv import GetRobotResources
         request = GetRobotResources.Request()
         request.header = self.nodes.request_header()
         result = call_service(self.nodes.get_robot_resources, request)
-        return {"resources": jsonable(result.robot_resources)}
+        return {"data": {"resources": jsonable(result.robot_resources)}}
 
 
 class ModelPlugin:
