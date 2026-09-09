@@ -94,9 +94,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
         self.end_headers()
+        sequence = 0
         try:
             while not DEVICE._stop.is_set():
-                frame = DEVICE.get_video_frame(timeout=2.0)
+                sequence, frame = DEVICE.get_next_video_frame(sequence, timeout=2.0)
                 if not frame:
                     continue
                 self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
