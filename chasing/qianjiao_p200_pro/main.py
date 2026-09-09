@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP HTTP entry point for the Qianjiao 2.0 Pro ROV driver."""
+"""MCP HTTP entry point for the Qianjiao P200 Pro ROV driver."""
 from __future__ import annotations
 import json, os, signal, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,11 +21,11 @@ def start_registration(port: int) -> None:
     import ssl
     import urllib.request
     agent = os.environ.get("AGENT_CORE_URL", "https://127.0.0.1:15678").rstrip("/")
-    driver_id = CFG.get("driver_id", "chasing-qianjiao2-pro")
+    driver_id = CFG.get("driver_id", "chasing-qianjiao-p200-pro")
     advertise_host = os.environ.get("MCP_ADVERTISE_HOST") or CFG.get("mcp_advertise_host") or "127.0.0.1"
     payload = json.dumps({
         "id": driver_id,
-        "name": CFG.get("name", "Qianjiao 2.0 pro ROV"),
+        "name": CFG.get("name", "Qianjiao P200 Pro ROV"),
         "url": f"http://{advertise_host}:{port}/mcp",
         "transport": "http",
         "category": "driver",
@@ -72,7 +72,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception: self._send(400, {"jsonrpc":"2.0","id":None,"error":{"code":-32700,"message":"Parse error"}}); return
         rid, method, params = rpc.get("id"), rpc.get("method", ""), rpc.get("params") or {}
         try:
-            if method == "initialize": result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"qianjiao2-pro","version":"1.0.0"}}
+            if method == "initialize": result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"qianjiao-p200-pro","version":"1.0.0"}}
             elif method == "tools/list": result = {"tools": DEVICE.get_tools()}
             elif method == "tools/call":
                 tool = params.get("name", "")
