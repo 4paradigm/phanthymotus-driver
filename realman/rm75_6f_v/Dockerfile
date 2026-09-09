@@ -7,7 +7,22 @@ RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${APT_MIRROR}|g" /etc/a
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         python3-pip python3-yaml ros-humble-rmw-fastrtps-cpp \
-        libusb-1.0-0 v4l-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Some x86 CI builders run this ARM64 image through QEMU versions whose
+# ldconfig crashes while dpkg processes the final libc-bin trigger.  The camera
+# packages have already been configured at that point.  Tolerate that emulator
+# failure only when every required package is actually installed; download or
+# package failures must still fail the layer.  Native ARM64 builds take the
+# normal successful apt path.
+RUN apt-get update \
+    && (apt-get install -y --no-install-recommends libusb-1.0-0 v4l-utils \
+        || { \
+            for package in libusb-1.0-0 libv4l-0 libv4l2rds0 libv4lconvert0 v4l-utils; do \
+                test "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null)" = installed \
+                    || exit 1; \
+            done; \
+        }) \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep the same ARM64/Python 3.10 SDK version as the repository's verified
