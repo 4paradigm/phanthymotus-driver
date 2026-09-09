@@ -24,7 +24,7 @@ def load_device():
 
 
 class RealManRM75ImageContractTests(unittest.TestCase):
-    def test_image_contains_only_minimal_api2_runtime(self):
+    def test_image_contains_api2_and_realsense_runtime(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("COPY vendor/Robotic_Arm/ /work/Robotic_Arm/", dockerfile)
         self.assertNotIn("RM_API2_LIB_URL", dockerfile)
@@ -32,8 +32,12 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("COPY deploy/ /deploy/", dockerfile)
         self.assertNotIn("colcon", dockerfile)
         self.assertNotIn("rm_driver", dockerfile)
-        self.assertNotIn("python3-pip", dockerfile)
-        self.assertNotIn("pip3 install", dockerfile)
+        self.assertIn("python3-pip", dockerfile)
+        self.assertIn("ARG APT_MIRROR=", dockerfile)
+        self.assertIn("${APT_MIRROR}", dockerfile)
+        self.assertIn("pyrealsense2==2.56.5.9235", dockerfile)
+        self.assertIn("opencv-python-headless", dockerfile)
+        self.assertIn("COPY main.py device.py camera.py realsense.py", dockerfile)
         self.assertFalse((DRIVER / "entrypoint.sh").exists())
 
     def test_vendor_shared_libraries_are_not_committed(self):
@@ -49,8 +53,8 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertNotIn("AGENT_CORE_TOKEN", service)
         self.assertNotIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
         self.assertIn("network_mode: host", service)
-        self.assertNotIn("privileged: true", service)
-        self.assertNotIn("/dev:/dev", service)
+        self.assertIn("privileged: true", service)
+        self.assertIn("/dev:/dev", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
         self.assertIn(
@@ -59,6 +63,30 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         )
         self.assertNotIn("/opt/realman/rm_ws", service)
         self.assertNotIn("ipc:", service)
+
+    def test_ext_camera_is_enabled_and_advertised(self):
+        config = (DRIVER / "config.yaml").read_text()
+        manifest = (DRIVER / "driver.yaml").read_text()
+        self.assertIn("ext_camera:\n  enabled: true", config)
+        self.assertIn("name: ext_camera", manifest)
+
+    def test_build_plugins_registers_camera_only_when_enabled(self):
+        device = load_device()
+        calls = []
+
+        class FakeCamera:
+            def __init__(self, config, namespace, executor):
+                calls.append((config, namespace, executor))
+
+        ros2 = type("ROS2", (), {"executor_core": object()})()
+        camera_module = type("CameraModule", (), {"ExtCameraPlugin": FakeCamera})()
+        with mock.patch.dict("sys.modules", {"camera": camera_module}):
+            enabled = device.build_plugins(
+                {"ext_camera": {"enabled": True}}, "rm75", ros2
+            )
+        self.assertEqual(2, len(enabled))
+        self.assertEqual(({"enabled": True}, "rm75", ros2.executor_core), calls[0])
+        self.assertEqual(1, len(device.build_plugins({}, "rm75", ros2)))
 
 
 class RealManRM75SDKClientTests(unittest.TestCase):
