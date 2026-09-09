@@ -197,10 +197,6 @@ class AimdkNodes:
         mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
         mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
 
-        for area, topic in ((area, f"/aima/hal/joint/{area}/state") for area in JOINT_AREAS):
-            self.robot.create_subscription(
-                JointStateArray, topic, self._joint_state_callback(area), sensor_qos,
-            )
         skeleton_topic = f"/{namespace}/{SKELETON_TOPIC}"
         self.skeleton_pub = self.core.create_publisher(String, skeleton_topic, 5)
         self.streams["joints"] = {
@@ -208,6 +204,12 @@ class AimdkNodes:
             "topic": skeleton_topic,
             "format": "sensor/skeleton",
         }
+        # The shared runtime starts both executors before constructing this
+        # object. Create the output before high-rate joint callbacks can fire.
+        for area, topic in ((area, f"/aima/hal/joint/{area}/state") for area in JOINT_AREAS):
+            self.robot.create_subscription(
+                JointStateArray, topic, self._joint_state_callback(area), sensor_qos,
+            )
 
         # /integrated_command and /relocalization_pose are outbound-only (SLAM control), not
         # mirrored streams -- they are plain publishers used by SlamControlPlugin.

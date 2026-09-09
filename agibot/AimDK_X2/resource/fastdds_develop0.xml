@@ -7,6 +7,7 @@
         <type>UDPv4</type>
         <interfaceWhiteList>
           <address>10.0.1.41</address>
+          <address>127.0.0.1</address>
         </interfaceWhiteList>
       </transport_descriptor>
     </transport_descriptors>
