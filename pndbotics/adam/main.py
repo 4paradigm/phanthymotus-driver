@@ -34,8 +34,11 @@ import signal
 import socket
 import sys
 import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 
@@ -84,6 +87,28 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
+            if urlparse(self.path).path == "/mcp/sse":
+                # The resource-center opens the legacy MCP SSE endpoint before
+                # it starts a sensor card.  Keep it alive and point requests at
+                # the same JSON-RPC handler used by POST /mcp.
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                try:
+                    session_id = uuid.uuid4().hex
+                    self.wfile.write(
+                        f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n".encode())
+                    self.wfile.flush()
+                    while True:
+                        time.sleep(15)
+                        self.wfile.write(b"event: ping\ndata: {}\n\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
             self.send_response(404)
             self.end_headers()
 
@@ -95,6 +120,9 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
+            if urlparse(self.path).path not in ("/mcp", "/mcp/messages"):
+                self._send(404, json.dumps({"error": "Not found"}))
+                return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             try:
