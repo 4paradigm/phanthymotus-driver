@@ -107,7 +107,7 @@ class FakeNode:
         return pub
 
     def create_subscription(self, msg_type, topic, callback, qos):
-        self.subscriptions.append((topic, callback))
+        self.subscriptions.append((topic, callback, qos))
         return object()
 
     def create_client(self, srv_type, name):
@@ -131,9 +131,11 @@ class FakeQoSProfile:
 
 class FakeQoSReliabilityPolicy:
     BEST_EFFORT = "BEST_EFFORT"
+    RELIABLE = "RELIABLE"
 
 
 class FakeQoSDurabilityPolicy:
+    VOLATILE = "VOLATILE"
     TRANSIENT_LOCAL = "TRANSIENT_LOCAL"
 
 
@@ -175,7 +177,7 @@ def _install_ros_stubs():
     module("sensor_msgs")
     module("sensor_msgs.msg", CompressedImage=FakeMsg, Image=FakeMsg, Imu=FakeMsg, PointCloud2=FakeMsg)
     module("std_msgs")
-    module("std_msgs.msg", String=FakeMsg)
+    module("std_msgs.msg", String=FakeMsg, UInt8MultiArray=FakeMsg)
     module("geometry_msgs")
     module("geometry_msgs.msg", Pose=FakeMsg)
     module("nav_msgs")
@@ -214,6 +216,11 @@ def load_driver_yaml_cards():
     return {card["name"]: card["type"] for card in manifest["cards"]}
 
 
+def load_driver_config():
+    with open(DEVICE_DIR / "config.yaml", encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
 def build_bundle_plugins(config=None):
     config = config if config is not None else {"end_effector": "hand", "plugins": {}}
     return device.build_plugins(config, "test_ns", FakeROS2())
@@ -235,14 +242,35 @@ def find_plugin(plugins, tool_name):
 
 
 class ToolInventoryTests(unittest.TestCase):
-    def test_tool_names_and_types_match_driver_yaml(self):
-        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
+    def test_default_config_tool_names_and_types_match_driver_yaml(self):
+        plugins = build_bundle_plugins(load_driver_config())
         definitions = tool_definitions(plugins)
         by_name = {d["name"]: d["type"] for d in definitions}
         expected = load_driver_yaml_cards()
-        self.assertEqual(set(by_name), set(expected), "tool inventory must match driver.yaml cards exactly")
+        self.assertEqual(set(by_name), set(expected), "default tool inventory must match driver.yaml cards exactly")
         for name, expected_type in expected.items():
             self.assertEqual(by_name[name], expected_type, f"tool '{name}' type mismatch")
+
+    def test_disabling_hardware_features_unregisters_their_cards(self):
+        default_plugins = build_bundle_plugins(load_driver_config())
+        default_names = {d["name"] for d in tool_definitions(default_plugins)}
+
+        feature_cards = {
+            "hand_state": {"hand_state"},
+            "leg_odometry": {"leg_odometry"},
+            "camera_rgb": {"camera_rgb"},
+            "camera_depth": {"camera_depth"},
+            "lidar": {"lidar"},
+            "slam_pose": {"slam_pose"},
+            "hand_command": {"hand_command"},
+            "slam": {"slam_control"},
+        }
+        for feature, expected_removed in feature_cards.items():
+            config = load_driver_config()
+            config["plugins"][feature]["enabled"] = False
+            plugins = build_bundle_plugins(config)
+            names = {d["name"] for d in tool_definitions(plugins)}
+            self.assertEqual(default_names - names, expected_removed, feature)
 
     def test_no_duplicate_tool_names(self):
         plugins = build_bundle_plugins()
@@ -258,24 +286,34 @@ class ToolInventoryTests(unittest.TestCase):
         names_on = {d["name"] for d in tool_definitions(plugins_on)}
         self.assertIn("slam_control", names_on)
 
-    def test_actuator_tools_are_typed_actuator(self):
-        plugins = build_bundle_plugins()
+    def test_default_actuator_tools_are_typed_actuator(self):
+        plugins = build_bundle_plugins(load_driver_config())
         definitions = tool_definitions(plugins)
         expected_actuators = {
             "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command",
-            "linkcraft", "pmu_led", "tts", "emoji", "mic_source",
+            "linkcraft", "pmu_led", "tts", "emoji", "mic_source", "slam_control",
         }
         by_name = {d["name"]: d["type"] for d in definitions}
         for name in expected_actuators:
             self.assertEqual(by_name[name], "actuator", f"'{name}' must be an actuator tool")
 
-    def test_sensor_and_resource_tools_carry_expected_types(self):
-        plugins = build_bundle_plugins()
+    def test_default_sensor_resource_and_processor_tools_carry_expected_types(self):
+        plugins = build_bundle_plugins(load_driver_config())
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joint_state", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
+        for name in (
+            "mc_state", "locomotion_input_source", "joint_state", "hand_state", "imu",
+            "leg_odometry", "camera_rgb", "camera_depth", "lidar", "slam_pose", "system_state",
+            "linkcraft_catalog",
+        ):
             self.assertEqual(by_name[name], "sensor")
+
+    def test_leg_odometry_is_gated_by_config(self):
+        config = load_driver_config()
+        config["plugins"]["leg_odometry"]["enabled"] = False
+        names = {d["name"] for d in tool_definitions(build_bundle_plugins(config))}
+        self.assertNotIn("leg_odometry", names)
 
     def test_mc_mode_and_preset_motion_action_enums_nonempty(self):
         plugins = build_bundle_plugins()
@@ -333,6 +371,46 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertTrue(locomotion._registered)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
+
+    def test_slam_relocalization_uses_map_id(self):
+        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
+        slam = find_plugin(plugins, "slam_control")
+        slam.dispatch("start_relocalization", {"map_id": "map-42"})
+        published = slam.nodes.integrated_command_pub.published[-1]
+        self.assertEqual(published.data, "start_relocalization:map-42")
+
+    def test_mirrored_subscriptions_are_retained_for_node_lifetime(self):
+        plugins = build_bundle_plugins(load_driver_config())
+        nodes = plugins[0].nodes
+        self.assertEqual(len(nodes._subscriptions), 8)
+        self.assertTrue(all(subscription is not None for subscription in nodes._subscriptions))
+
+    def test_lidar_stream_uses_bridge_compatible_packet(self):
+        plugins = build_bundle_plugins(load_driver_config())
+        nodes = plugins[0].nodes
+        lidar_callback = next(
+            callback for topic, callback, _ in nodes.robot.subscriptions
+            if topic == "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud"
+        )
+        source = FakeMsg()
+        source.point_step = 16
+        source.data = bytes(range(32))
+        lidar_callback(source)
+
+        packet = nodes.core.publishers["/test_ns/agibot_x2/lidar"].published[-1]
+        self.assertEqual(packet.data[:8], [16, 0, 0, 0, 2, 0, 0, 0])
+        self.assertEqual(packet.data[8:], list(source.data))
+
+    def test_sensor_subscriptions_match_live_qos(self):
+        plugins = build_bundle_plugins(load_driver_config())
+        nodes = plugins[0].nodes
+        qos_by_topic = {topic: qos for topic, _, qos in nodes.robot.subscriptions}
+        self.assertEqual(qos_by_topic["/aima/hal/sensor/rgbd_head_front/depth_image"].reliability, "RELIABLE")
+        self.assertEqual(qos_by_topic["/aima/hal/sensor/rgbd_head_front/depth_image"].durability, "VOLATILE")
+        self.assertEqual(qos_by_topic["/aima/hal/sensor/lidar_chest_front/lidar_pointcloud"].reliability, "RELIABLE")
+        self.assertEqual(qos_by_topic["/aima/hal/sensor/lidar_chest_front/lidar_pointcloud"].durability, "TRANSIENT_LOCAL")
+        self.assertEqual(qos_by_topic["/aima/mc/leg_odometry"].reliability, "BEST_EFFORT")
+        self.assertEqual(qos_by_topic["/aima/mc/leg_odometry"].durability, "TRANSIENT_LOCAL")
 
 
 class StartStopLifecycleTests(unittest.TestCase):

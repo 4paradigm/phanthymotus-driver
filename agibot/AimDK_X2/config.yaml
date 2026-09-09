@@ -9,7 +9,8 @@ ros_namespace: "agibot_x2"
 
 # Which end-effector variant this robot is built with — selects the URDF served by the
 # `model` resource tool and the joint layout used by hand_state/hand_command.
-end_effector: "hand"   # fist | hand | ultra
+# This X2 reports HandType=none on both sides, so it uses the fist model.
+end_effector: "fist"   # fist | hand | ultra
 
 ros:
   robot_domain_id: 0
@@ -25,7 +26,11 @@ plugins:
     enabled: true
   imu:
     enabled: true
-  camera:
+  leg_odometry:
+    enabled: true
+  camera_rgb:
+    enabled: true
+  camera_depth:
     enabled: true
   lidar:
     enabled: true
@@ -53,5 +58,7 @@ plugins:
     enabled: true
   mic_source:
     enabled: true
+  slam_pose:
+    enabled: true
   slam:
-    enabled: false
+    enabled: true
