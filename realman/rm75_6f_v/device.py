@@ -545,4 +545,10 @@ class RM75Plugin:
 
 
 def build_plugins(config, namespace, ros2):
-    return [RM75Plugin(RM75SDKClient(config), config, namespace=namespace, ros2=ros2)]
+    plugins = [RM75Plugin(RM75SDKClient(config), config, namespace=namespace, ros2=ros2)]
+    camera_config = config.get("ext_camera", {})
+    if camera_config.get("enabled", False):
+        from camera import ExtCameraPlugin
+
+        plugins.append(ExtCameraPlugin(camera_config, namespace, ros2.executor_core))
+    return plugins

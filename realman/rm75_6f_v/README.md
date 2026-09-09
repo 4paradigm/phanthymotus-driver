@@ -27,6 +27,56 @@ Available tools are:
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
+- `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
+  instance can publish RGB, depth, or left infrared without going through the
+  RealMan controller.
+
+## Upper-computer RealSense camera
+
+The camera is connected to the Linux upper computer that runs this Driver,
+not to the RM75 controller. Camera capture and arm control therefore have
+independent data paths:
+
+```text
+ext_camera -> V4L2 / pyrealsense2 -> upper-computer USB camera
+joint_control -> RealMan API2 -> RM75 controller TCP port 8080
+```
+
+`ext_camera` is a multi-instance sensor. Configure each card with an
+`instance_id`, an enumerated `device_path`, and one `channel`:
+
+| channel | topic | format |
+| --- | --- | --- |
+| `rgb` | `/{namespace}/ext_camera/{instance_id}/rgb` | `image/jpeg` |
+| `depth` | `/{namespace}/ext_camera/{instance_id}/depth` | `image/depth-zlib` |
+| `infrared` | `/{namespace}/ext_camera/{instance_id}/infrared` | `image/jpeg` |
+
+Hyphens in `instance_id` become underscores in the ROS topic. RGB uses the
+selected V4L2 color node; depth and infrared use `pyrealsense2` and bind the
+SDK device to the same physical USB ancestor. The Driver does not hard-code a
+`/dev/videoN` number because Linux may renumber nodes after a USB reconnect.
+
+Depth is 640x480 little-endian uint16 millimetres compressed with zlib. Zero
+is invalid/unrepresentable depth. Infrared is the left Y8 stream rendered as a
+grayscale JPEG; it is reflected near-infrared intensity, not temperature.
+Depth and infrared instances on one camera share a stereo session, while one
+V4L2 color node has only one RGB owner.
+
+The image pins `pyrealsense2==2.56.5.9235`, matching the repository's verified
+Linux ARM64 / Python 3.10 runtime. Deployment deliberately grants the container
+privileged access and mounts `/dev` so it can reach the upper-computer camera.
+Do not run `realsense-viewer` or another capture process against the same D435
+while the card is active.
+
+The observed target hardware is an Intel RealSense D435 (USB ID `8086:0b07`)
+on a 5 Gbit/s USB 3 link. Its six V4L2 nodes comprise depth, infrared and RGB
+capture nodes plus their metadata companions; discovery exposes the RGB node
+and excludes depth/infrared/metadata nodes from ordinary OpenCV RGB capture.
+
+For a supervised hardware check, create separate RGB, depth and infrared card
+instances, start them, then confirm that `info.frames` increases and the three
+topics render independently. USB disconnect must become an explicit error;
+after reconnect, reselect the currently enumerated device path before restart.
 
 The deployment enables its motion capability, and every `set` call must still
 include `confirm_motion=true`. `joint1_deg` through `joint7_deg` are absolute
@@ -87,10 +137,13 @@ or callback failure.
 
 The component installs `python3-yaml` because the shared runtime loads
 `config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared runtime
-creates the Agent Core ROS 2 participant. No compiler, pip, or ROS build tooling
-is installed. See `vendor/SOURCE.md` for provenance notes.
+creates the Agent Core ROS 2 participant. The camera layer additionally installs
+the pinned `pyrealsense2` wheel, NumPy and headless OpenCV through pip; no compiler
+or ROS build tooling is installed. See `vendor/SOURCE.md` for provenance notes.
 
-The TCP-only RM75 service does not require privileged mode or a host `/dev` mount.
+The RM75 API2 TCP path itself does not require privileged mode or host devices.
+The bundled upper-computer camera does: deployment grants privileged mode and
+mounts `/dev` so V4L2 and RealSense USB interfaces are visible in the container.
 Skeleton publication skips disconnected/busy SDK clients, retries failed samples
 at most every two seconds, and logs once per outage until a successful sample.
 An already-running SDK TCP query still holds the SDK lock until it returns.
