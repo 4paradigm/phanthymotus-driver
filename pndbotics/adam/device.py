@@ -1517,8 +1517,11 @@ class ZedCameraPlugin:
         # are expensive image streams, matching the point-cloud card's
         # on-demand behaviour.
         self._card_enabled = {
-            "camera_head": False,
-            "camera_depth": False,
+            # The dashboard treats these as live sensor cards. Start the RGB
+            # and depth flows with the driver so opening a card never depends
+            # on a separate, legacy MCP start request succeeding first.
+            "camera_head": True,
+            "camera_depth": True,
             "camera_pointcloud": self._pointcloud_enabled,
         }
         self._rgb_hz = max(1.0, min(float(self._config.get("rgb_hz", 15)), 30.0))
