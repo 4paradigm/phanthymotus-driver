@@ -435,9 +435,16 @@ ROS2_UPPER_BODY_JOINTS = [
 ]
 
 
-def _best_effort_qos():
+def _reliable_qos():
+    """QoS for dashboard-facing topics.
+
+    The dashboard's generic topic client requests RELIABLE delivery.  A
+    BEST_EFFORT writer is incompatible with that request, which makes a live
+    sensor appear to have no flow at all.  Keep the queue shallow so a slow
+    viewer cannot accumulate stale camera/state data.
+    """
     return QoSProfile(
-        reliability=ReliabilityPolicy.BEST_EFFORT,
+        reliability=ReliabilityPolicy.RELIABLE,
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
     )
@@ -485,11 +492,7 @@ class _StatePublisherNode(Node):
         self._variant = variant
         self._joints = VARIANT_JOINTS[variant]
 
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+        qos = _reliable_qos()
 
         self._topic_skeleton = f"/{namespace}/state/joints"
         self._topic_imu = f"/{namespace}/state/imu"
@@ -1511,11 +1514,11 @@ class ZedCameraPlugin:
         self._pointcloud_config = pointcloud_config
         self._pointcloud_enabled = bool(
             pointcloud_config.get(
-                "enabled", self._config.get("pointcloud_enabled", False)))
+                "enabled", self._config.get("pointcloud_enabled", True)))
         # The three cards share one ZED capture thread, but each card has its
-        # own publication lifecycle.  RGB and depth are opt-in because they
-        # are expensive image streams, matching the point-cloud card's
-        # on-demand behaviour.
+        # own publication lifecycle.  Keep every advertised card live by
+        # default: dashboard card creation is not guaranteed to invoke a
+        # separate legacy start action.
         self._card_enabled = {
             # The dashboard treats these as live sensor cards. Start the RGB
             # and depth flows with the driver so opening a card never depends
@@ -1661,7 +1664,7 @@ class ZedCameraPlugin:
                 from sensor_msgs.msg import CompressedImage
                 from std_msgs.msg import UInt8MultiArray
 
-                qos = _best_effort_qos()
+                qos = _reliable_qos()
                 self._CompressedImage = CompressedImage
                 self._UInt8MultiArray = UInt8MultiArray
                 self._rgb_pub = self._pub_node.create_publisher(
