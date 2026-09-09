@@ -329,6 +329,8 @@ class VisionCapturePlugin:
                 raise RuntimeError("Video recording was cancelled")
             completed = True
             return {"ok": True, "media_type": "video", "file_path": str(path), "source": source,
+                    "file_name": path.name,
+                    "message": f"视频录制完成。文件名：{path.name}；完整保存地址：{path}",
                     "recorded_duration_s": media["duration_s"], "frames": frames,
                     "encoded_frames": media["frames"],
                     "capture_started_at": capture_started_at,
