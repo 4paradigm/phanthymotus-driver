@@ -8,8 +8,9 @@ variant: "pro"
 grpc_host: "10.10.20.127"
 grpc_port: 50051
 
-# DDS domain ID (must match robot's domain; Adam developer-mode DDS is domain 1)
-dds_domain_id: 1
+# DDS domain ID (must match the robot controller).  The deployed Adam
+# controller publishes rt/lowstate on domain 0.
+dds_domain_id: 0
 # Adam's rt/lowstate DDS traffic is on the robot-facing Ethernet LAN, not the
 # Jetson's Wi-Fi management network.
 dds_interface: "eno1"
@@ -40,8 +41,10 @@ plugins:
     depth_hz: 8
     jpeg_quality: 70
     pointcloud:
-      # Discover the card without continuously consuming GPU/bandwidth.
-      enabled: false
+      # Keep the advertised point-cloud card live. Its 2Hz/10k-point cap
+      # bounds GPU and network usage while allowing a newly opened card to
+      # receive data immediately.
+      enabled: true
       hz: 2
       max_points: 10000
       max_distance_m: 8.0
