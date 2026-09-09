@@ -7,15 +7,95 @@ device rather than to an unstable /dev/video number.
 """
 
 import glob
+import errno
+import fcntl
 import logging
 import os
 from pathlib import Path
 import re
-import subprocess
+import struct
 import threading
 from typing import Any, Optional
 
 log = logging.getLogger(__name__)
+
+# Linux V4L2 ABI constants. They are stable across the target ARM64 and common
+# development architectures because the encoded ioctl sizes come from the
+# fixed-width structures below.
+_VIDIOC_QUERYCAP = 0x80685600
+_VIDIOC_ENUM_FMT = 0xC0405602
+_VIDIOC_ENUM_FRAMESIZES = 0xC02C564A
+_V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
+_V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+_V4L2_CAP_DEVICE_CAPS = 0x80000000
+
+
+def _ioctl(fd: int, request: int, buffer: bytearray) -> None:
+    fcntl.ioctl(fd, request, buffer, True)
+
+
+def _decode_c_string(value: bytes) -> str:
+    return value.split(b'\0', 1)[0].decode('utf-8', errors='replace').strip()
+
+
+def _fourcc(value: int) -> str:
+    return value.to_bytes(4, 'little').decode('ascii', errors='replace')
+
+
+def _query_v4l2_device(path: str) -> dict:
+    """Query one capture node directly through the Linux V4L2 ABI."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        capability = bytearray(104)
+        _ioctl(fd, _VIDIOC_QUERYCAP, capability)
+        capabilities = struct.unpack_from('=I', capability, 84)[0]
+        device_caps = struct.unpack_from('=I', capability, 88)[0]
+        effective_caps = device_caps if capabilities & _V4L2_CAP_DEVICE_CAPS else capabilities
+        if not effective_caps & _V4L2_CAP_VIDEO_CAPTURE:
+            return {}
+
+        formats: list[str] = []
+        resolutions: list[str] = []
+        format_index = 0
+        while True:
+            description = bytearray(64)
+            struct.pack_into('=II', description, 0, format_index, _V4L2_BUF_TYPE_VIDEO_CAPTURE)
+            try:
+                _ioctl(fd, _VIDIOC_ENUM_FMT, description)
+            except OSError as exc:
+                if exc.errno == errno.EINVAL:
+                    break
+                raise
+            pixel_format = struct.unpack_from('=I', description, 44)[0]
+            formats.append(_fourcc(pixel_format))
+
+            size_index = 0
+            while True:
+                frame_size = bytearray(44)
+                struct.pack_into('=II', frame_size, 0, size_index, pixel_format)
+                try:
+                    _ioctl(fd, _VIDIOC_ENUM_FRAMESIZES, frame_size)
+                except OSError as exc:
+                    if exc.errno == errno.EINVAL:
+                        break
+                    raise
+                # Only discrete sizes are useful in the Canvas selector. A
+                # continuous/stepwise device remains usable with its formats.
+                if struct.unpack_from('=I', frame_size, 8)[0] == 1:
+                    width, height = struct.unpack_from('=II', frame_size, 12)
+                    resolution = f'{width}x{height}'
+                    if resolution not in resolutions:
+                        resolutions.append(resolution)
+                size_index += 1
+            format_index += 1
+
+        return {
+            'name': _decode_c_string(capability[16:48]) or 'Unknown',
+            'formats': list(dict.fromkeys(formats)),
+            'resolutions': resolutions,
+        }
+    finally:
+        os.close(fd)
 
 def _realsense_usb_path(device_path: str) -> str:
     """Read the selected V4L2 node's physical USB identity, not a camera index."""
@@ -36,52 +116,18 @@ def _enumerate_ext_cameras() -> list[dict]:
     devices = []
     for path in sorted(glob.glob('/dev/video*')):
         try:
-            info = subprocess.check_output(
-                ['v4l2-ctl', '-d', path, '--info'],
-                text=True, timeout=2, stderr=subprocess.DEVNULL,
-                env={**os.environ, 'LC_ALL': 'C'},
-            )
-        except Exception:
+            details = _query_v4l2_device(path)
+        except (OSError, ValueError, struct.error):
+            continue
+        if not details:
+            continue
+        name = details['name']
+        formats = details['formats']
+        resolutions = details['resolutions']
+        if not formats:
             continue
 
-        is_realsense = 'realsense' in info.lower()
-        # Capabilities describes the whole device, including its sibling nodes.
-        # Device Caps describes this node; metadata siblings are not cameras.
-        caps = info.split('Device Caps', 1)[-1].split('Media Driver Info', 1)[0]
-        if 'Video Capture' not in caps:
-            continue
-
-        name = "Unknown"
-        for line in info.splitlines():
-            if 'Card type' in line:
-                name = line.split(':', 1)[-1].strip()
-                break
-
-        # Probe supported pixel formats and resolutions via v4l2-ctl --list-formats-ext.
-        # If the probe succeeds but returns no formats, the node is not a real capture device
-        # (e.g. secondary metadata interface) — skip it.
-        formats: list[str] = []
-        resolutions: list[str] = []
-        fmt_probe_ok = False
-        try:
-            fmt_out = subprocess.check_output(
-                ['v4l2-ctl', '-d', path, '--list-formats-ext'],
-                text=True, timeout=2, stderr=subprocess.DEVNULL,
-                env={**os.environ, 'LC_ALL': 'C'},
-            )
-            fmt_probe_ok = True
-            formats = list(dict.fromkeys(f.rstrip() for f in re.findall(
-                r"\[\d+\]:\s*'([^']{4})'", fmt_out)))
-            for line in fmt_out.splitlines():
-                m = re.search(r'Size: Discrete (\d+x\d+)', line)
-                if m and m.group(1) not in resolutions:
-                    resolutions.append(m.group(1))
-        except Exception:
-            pass
-
-        # Probe succeeded but no formats → secondary/metadata node, not usable for capture
-        if fmt_probe_ok and not formats:
-            continue
+        is_realsense = 'realsense' in name.lower()
 
         # The RealSense stereo module exposes depth/IR formats (including UYVY
         # on IR nodes). Accept verified color formats, never an unprobed node.

@@ -35,20 +35,16 @@ ext = load_camera()
 
 class CameraDiscoveryTest(unittest.TestCase):
     def enumerate(self, devices, probe_usb=False):
-        def output(args, **kwargs):
-            name, caps, formats = devices[args[2]]
-            if args[3] == '--info':
-                return (f'Card type : {name}\nCapabilities : 0x84a00001\n'
-                        f'\tVideo Capture\n\tMetadata Capture\n'
-                        f'Device Caps : 0x04200001\n\t{caps}\n\tStreaming\n')
-            if formats is None:
-                raise ext.subprocess.CalledProcessError(1, args)
-            return '\n'.join(f"[{i}]: '{fmt}'\n\tSize: Discrete 1280x720"
-                             for i, fmt in enumerate(formats))
+        def query(path):
+            name, caps, formats = devices[path]
+            if caps != 'Video Capture' or formats is None:
+                return {}
+            return {'name': name, 'formats': list(formats),
+                    'resolutions': ['1280x720'] if formats else []}
         usb = (nullcontext() if probe_usb else mock.patch.object(
             ext, '_realsense_usb_path', return_value='/sys/devices/test-usb'))
         with usb, mock.patch.object(ext.glob, 'glob', return_value=list(devices)), \
-             mock.patch.object(ext.subprocess, 'check_output', side_effect=output):
+             mock.patch.object(ext, '_query_v4l2_device', side_effect=query):
             return ext._enumerate_ext_cameras()
 
     def test_realsense_exposes_only_color_among_six_nodes(self):
@@ -80,33 +76,44 @@ class CameraDiscoveryTest(unittest.TestCase):
         self.assertEqual(result[0]['formats'], ['MJPG', 'YUYV'])
 
     def test_real_v4l2_device_caps_layout(self):
-        # Captured D435 layout (serial omitted); Device Caps is followed by media info.
-        info = """Driver Info:
-\tDriver name      : uvcvideo
-\tCard type        : Intel(R) RealSense(TM) Depth Ca
-\tBus info         : usb-3610000.xhci-1
-\tDriver version   : 5.10.104
-\tCapabilities     : 0x84a00001
-\t\tVideo Capture
-\t\tMetadata Capture
-\t\tStreaming
-\t\tExtended Pix Format
-\t\tDevice Capabilities
-\tDevice Caps      : 0x04200001
-\t\tVideo Capture
-\t\tStreaming
-\t\tExtended Pix Format
-Media Driver Info:
-\tDriver name      : uvcvideo
-\tModel            : Intel(R) RealSense(TM) Depth Ca
-"""
-        formats = "ioctl: VIDIOC_ENUM_FMT\n\tType: Video Capture\n\n\t[0]: 'YUYV' (YUYV 4:2:2)\n\t\tSize: Discrete 1280x720\n"
-        with mock.patch.object(ext.glob, 'glob', return_value=['/dev/video4']), \
-             mock.patch.object(ext.subprocess, 'check_output', side_effect=[info, formats]), \
-             mock.patch.object(ext, '_realsense_usb_path', return_value='/sys/devices/test-usb'):
-            result = ext._enumerate_ext_cameras()
-        self.assertEqual(result[0]['formats'], ['YUYV'])
-        self.assertEqual(result[0]['usb_path'], '/sys/devices/test-usb')
+        def ioctl(_fd, request, buffer):
+            if request == ext._VIDIOC_QUERYCAP:
+                buffer[16:16 + len(b'Intel RealSense D435')] = b'Intel RealSense D435'
+                ext.struct.pack_into('=I', buffer, 84, ext._V4L2_CAP_DEVICE_CAPS)
+                ext.struct.pack_into('=I', buffer, 88, ext._V4L2_CAP_VIDEO_CAPTURE)
+            elif request == ext._VIDIOC_ENUM_FMT:
+                if ext.struct.unpack_from('=I', buffer, 0)[0] > 0:
+                    raise OSError(ext.errno.EINVAL, 'done')
+                ext.struct.pack_into('=I', buffer, 44, int.from_bytes(b'YUYV', 'little'))
+            elif request == ext._VIDIOC_ENUM_FRAMESIZES:
+                if ext.struct.unpack_from('=I', buffer, 0)[0] > 0:
+                    raise OSError(ext.errno.EINVAL, 'done')
+                ext.struct.pack_into('=III', buffer, 8, 1, 1280, 720)
+            else:
+                self.fail(f'unexpected ioctl {request:#x}')
+
+        with mock.patch.object(ext.os, 'open', return_value=7) as opened, \
+             mock.patch.object(ext.os, 'close') as closed, \
+             mock.patch.object(ext, '_ioctl', side_effect=ioctl):
+            result = ext._query_v4l2_device('/dev/video4')
+        self.assertEqual(result, {'name': 'Intel RealSense D435',
+                                  'formats': ['YUYV'], 'resolutions': ['1280x720']})
+        opened.assert_called_once_with('/dev/video4', ext.os.O_RDONLY | ext.os.O_NONBLOCK)
+        closed.assert_called_once_with(7)
+
+    def test_metadata_capability_is_rejected_before_format_probe(self):
+        calls = []
+
+        def ioctl(_fd, request, buffer):
+            calls.append(request)
+            ext.struct.pack_into('=I', buffer, 84, ext._V4L2_CAP_DEVICE_CAPS)
+            ext.struct.pack_into('=I', buffer, 88, 0x00800000)
+
+        with mock.patch.object(ext.os, 'open', return_value=8), \
+             mock.patch.object(ext.os, 'close'), \
+             mock.patch.object(ext, '_ioctl', side_effect=ioctl):
+            self.assertEqual(ext._query_v4l2_device('/dev/video1'), {})
+        self.assertEqual(calls, [ext._VIDIOC_QUERYCAP])
 
     def test_realsense_unknown_format_is_not_exposed_as_rgb(self):
         self.assertEqual(self.enumerate({

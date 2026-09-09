@@ -7,29 +7,23 @@ RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${APT_MIRROR}|g" /etc/a
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         python3-pip python3-yaml ros-humble-rmw-fastrtps-cpp \
+    && cd /tmp \
+    && apt-get download libusb-1.0-0 \
+    && mkdir -p /opt/realman/libusb /tmp/libusb-root \
+    && dpkg-deb --extract ./libusb-1.0-0_*_arm64.deb /tmp/libusb-root \
+    && cp -a /tmp/libusb-root/usr/lib/aarch64-linux-gnu/libusb-1.0.so.0* /opt/realman/libusb/ \
+    && test -e /opt/realman/libusb/libusb-1.0.so.0 \
+    && test -z "$(dpkg --audit)" \
+    && rm -rf /tmp/libusb-root /tmp/libusb-1.0-0_*_arm64.deb \
     && rm -rf /var/lib/apt/lists/*
 
-# Some x86 CI builders run this ARM64 image through QEMU versions whose
-# ldconfig crashes while dpkg processes the final libc-bin trigger.  The camera
-# packages have already been configured at that point.  Tolerate that emulator
-# failure only when every required package is actually installed; download or
-# package failures must still fail the layer.  Native ARM64 builds take the
-# normal successful apt path.
-RUN apt-get update \
-    && (apt-get install -y --no-install-recommends libusb-1.0-0 v4l-utils \
-        || { \
-            for package in libusb-1.0-0 libv4l-0 libv4l2rds0 libv4lconvert0 v4l-utils; do \
-                test "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null)" = installed \
-                    || exit 1; \
-            done; \
-        }) \
-    && rm -rf /var/lib/apt/lists/*
-
-# Keep the same ARM64/Python 3.10 SDK version as the repository's verified
-# RealSense implementation. Canvas renders the published frames, so OpenCV
-# does not need a local GUI backend.
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=pyrealsense2 \
-    numpy opencv-python-headless pyrealsense2==2.56.5.9235
+# pyrealsense2 dynamically loads libusb. Only that shared object is extracted
+# from Ubuntu's signed runtime package above; no target-architecture maintainer
+# script or libc trigger is bypassed. Camera discovery uses the kernel V4L2
+# ioctl ABI directly, so v4l-utils and a compiler toolchain are unnecessary.
+# Canvas renders the published frames, so OpenCV does not need a GUI backend.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=:all: \
+    numpy==1.23.5 opencv-python-headless==4.11.0.86 pyrealsense2==2.56.5.9235
 
 WORKDIR /work
 COPY common/ /work/common/
@@ -43,6 +37,7 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
     PYTHONUNBUFFERED=1 \
     RCUTILS_COLORIZED_OUTPUT=0 \
     PYTHONPATH=/work \
+    LD_LIBRARY_PATH=/opt/realman/libusb \
     RM_DRIVER_ENABLED=0
 
 EXPOSE 15718
