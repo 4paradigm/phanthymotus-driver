@@ -420,8 +420,40 @@ def _best_effort_qos():
 # StatePlugin — subscribes DDS rt/lowstate, publishes to ROS2
 # ===========================================================================
 
+def _reliable_qos():
+    """Use the dashboard-compatible QoS while keeping a shallow queue."""
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+
+
+def _battery_payload(battery, timestamp_ms: int | None = None) -> dict:
+    """Normalize the BMS sample embedded in Adam's low-state DDS stream."""
+    def number(name: str) -> float | None:
+        try:
+            value = float(getattr(battery, name))
+            return value if math.isfinite(value) else None
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    status = getattr(battery, "status", None)
+    return {
+        "timestamp_ms": int(timestamp_ms or time.time() * 1000),
+        "voltage": number("voltage"),
+        "current": number("current"),
+        "power": number("power"),
+        "wh_accumulated": number("wh_accumulated"),
+        "status": str(status) if status not in (None, "") else "unknown",
+        "source_topic": "rt/lowstate",
+    }
+
+
 class _StatePublisherNode(Node):
-    """ROS2 node that publishes skeleton, IMU, and battery data."""
+    """ROS2 node that publishes skeleton, motor, robot, IMU, and battery data."""
+
+    _BATTERY_INTERVAL_S = 1.0
 
     def __init__(self, namespace: str, variant: str, publish_rate_hz: float):
         super().__init__("adam_state_publisher")
@@ -429,11 +461,7 @@ class _StatePublisherNode(Node):
         self._variant = variant
         self._joints = VARIANT_JOINTS[variant]
 
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+        qos = _reliable_qos()
 
         self._topic_skeleton = f"/{namespace}/state/joints"
         self._topic_imu = f"/{namespace}/state/imu"
@@ -448,15 +476,19 @@ class _StatePublisherNode(Node):
         self._pub_motor_state = self.create_publisher(String, self._topic_motor_state, qos)
 
         self._latest_state = None
+        self._latest_state_at_ms = None
         self._active = False
         self._lock = threading.Lock()
 
         interval = 1.0 / publish_rate_hz
         self._timer = self.create_timer(interval, self._publish)
+        self._battery_timer = self.create_timer(
+            self._BATTERY_INTERVAL_S, self._publish_battery)
 
     def update_state(self, state):
         with self._lock:
             self._latest_state = state
+            self._latest_state_at_ms = int(time.time() * 1000)
 
     def set_active(self, active: bool):
         with self._lock:
@@ -523,17 +555,18 @@ class _StatePublisherNode(Node):
         msg_imu.data = json.dumps(imu_data)
         self._pub_imu.publish(msg_imu)
 
-        # Battery
-        bat = state.battery_data
-        bat_data = {
-            "voltage": float(bat.voltage),
-            "current": float(bat.current),
-            "power": float(bat.power),
-            "wh_accumulated": float(bat.wh_accumulated),
-            "status": str(bat.status) if hasattr(bat, "status") else "unknown",
-        }
+    def _publish_battery(self):
+        with self._lock:
+            state = self._latest_state
+            received_at_ms = self._latest_state_at_ms
+            active = self._active
+
+        if not active or state is None:
+            return
+
         msg_bat = String()
-        msg_bat.data = json.dumps(bat_data)
+        msg_bat.data = json.dumps(
+            _battery_payload(getattr(state, "battery_data", None), received_at_ms))
         self._pub_battery.publish(msg_bat)
 
 

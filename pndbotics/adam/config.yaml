@@ -1,4 +1,4 @@
-mcp_port: 15702
+mcp_port: 15722
 ros_namespace: ""  # auto-detect from hostname
 
 # Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
@@ -6,12 +6,11 @@ variant: "pro"
 
 # gRPC endpoint for locomotion control (PC1)
 grpc_host: "10.10.20.127"
-grpc_port: 6666
+grpc_port: 50051
 
-# DDS domain ID (must match robot's domain; Adam developer-mode DDS is domain 1)
-dds_domain_id: 1
-# Adam's hardware DDS is carried on the wired interface.
-dds_network_interface: "eno1"
+# The deployed Adam controller publishes hardware DDS on domain 0 over eno1.
+dds_domain_id: 0
+dds_interface: "eno1"
 
 plugins:
   state:
@@ -39,8 +38,8 @@ plugins:
     depth_hz: 8
     jpeg_quality: 70
     pointcloud:
-      # Discover the card without continuously consuming GPU/bandwidth.
-      enabled: false
+      # Keep the advertised point-cloud card live for newly opened cards.
+      enabled: true
       hz: 2
       max_points: 10000
       max_distance_m: 8.0

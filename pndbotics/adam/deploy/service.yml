@@ -20,8 +20,8 @@ pndbotics-adam:
     - DDS_NETWORK_INTERFACE=eno1
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
-    - GRPC_HOST=localhost
-    - GRPC_PORT=6666
+    - GRPC_HOST=10.10.20.127
+    - GRPC_PORT=50051
     - NVIDIA_VISIBLE_DEVICES=all
     - NVIDIA_DRIVER_CAPABILITIES=all
     - ZED_PYTHON_PATH=/opt/pyzed

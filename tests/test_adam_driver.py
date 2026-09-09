@@ -93,5 +93,27 @@ class AdamStatePluginTests(unittest.TestCase):
         )
 
 
+class AdamBatteryPayloadTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = load_device()
+
+    def test_payload_retains_bms_values_and_lowstate_source(self):
+        battery = types.SimpleNamespace(
+            voltage=48.2,
+            current=3.4,
+            power=163.9,
+            wh_accumulated=120.0,
+            status="normal",
+        )
+
+        result = self.device._battery_payload(battery, 123)
+
+        self.assertEqual(123, result["timestamp_ms"])
+        self.assertEqual("rt/lowstate", result["source_topic"])
+        self.assertEqual(48.2, result["voltage"])
+        self.assertEqual("normal", result["status"])
+
+
 if __name__ == "__main__":
     unittest.main()
