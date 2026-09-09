@@ -18,6 +18,7 @@ ENV PYTHONPATH=/work
 ENV PYTHONPATH=/work:/opt/ros/humble/lib/python3.10/site-packages:/usr/lib/python3/dist-packages:/usr/local/lib/python3.10/dist-packages
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
 ENV ROS_LOCALHOST_ONLY=0
 ENV RCUTILS_COLORIZED_OUTPUT=0
 EXPOSE 15739

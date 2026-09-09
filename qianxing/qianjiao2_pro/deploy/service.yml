@@ -2,12 +2,19 @@ qianxing-qianjiao2-pro:
   image: __IMAGE__
   container_name: embodied-qianxing-qianjiao2-pro
   network_mode: host
+  ipc: host
+  pid: host
   env_file:
     - /opt/phanthy-motus/.env
+  volumes:
+    # All Agent Core-facing ROS2 participants use the host-local FastDDS profile.
+    # The ROV itself is reached over MAVLink/RTSP and does not use DDS.
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
     - MCP_ADVERTISE_HOST=${MCP_ADVERTISE_HOST:-127.0.0.1}
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - RCUTILS_COLORIZED_OUTPUT=0
     - PYTHONUNBUFFERED=1
   logging:
