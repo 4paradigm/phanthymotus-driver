@@ -1,6 +1,6 @@
-chasing-qianjiao2-pro:
+chasing-qianjiao-p200-pro:
   image: __IMAGE__
-  container_name: embodied-chasing-qianjiao2-pro
+  container_name: embodied-chasing-qianjiao-p200-pro
   network_mode: host
   ipc: host
   pid: host
