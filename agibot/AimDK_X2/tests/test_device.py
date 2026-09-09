@@ -144,6 +144,24 @@ class FakeExecutor:
         pass
 
 
+class FakeSocket:
+    def __init__(self):
+        self.sent = []
+        self.closed = False
+
+    def settimeout(self, value):
+        pass
+
+    def connect(self, path):
+        self.path = path
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def close(self):
+        self.closed = True
+
+
 class FakeROS2:
     def __init__(self):
         self.ctx_robot = object()
@@ -173,6 +191,7 @@ def _install_ros_stubs():
     )
     rclpy.node = sys.modules["rclpy.node"]
     rclpy.qos = sys.modules["rclpy.qos"]
+    module("rclpy.serialization", serialize_message=lambda msg: b"serialized")
 
     module("sensor_msgs")
     module("sensor_msgs.msg", CameraInfo=FakeMsg, CompressedImage=FakeMsg, Image=FakeMsg, Imu=FakeMsg, PointCloud2=FakeMsg)
