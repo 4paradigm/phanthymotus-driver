@@ -615,12 +615,12 @@ class QianjiaoDevice:
             },
         }
         return [
-            sensor("loco_state", "潜蛟运动状态：姿态角、深度和定位信息。", self.loco_state_topic),
-            sensor("status", "潜蛟系统状态：连接、温度和健康信息。", self.status_topic),
-            sensor("battery", "潜蛟电池状态：电压、电流和剩余电量。", self.battery_topic),
-            sensor("imu", "潜蛟 IMU 角速度数据。", self.imu_topic),
-            {"name": "camera", "type": "sensor", "description": "潜蛟实时相机图像（RTSP 转 JPEG）。", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"], "description": "相机流生命周期或信息查询"}}, "required": ["action"]}},
-            {"name": "control", "type": "actuator", "description": "潜蛟 P200 Pro 运动控制：解锁、停止或发送 6 自由度控制量。", "inputSchema": control_schema},
+            sensor("loco_state", "潜鲛运动状态：姿态角、深度和定位信息。", self.loco_state_topic),
+            sensor("status", "潜鲛系统状态：连接、温度和健康信息。", self.status_topic),
+            sensor("battery", "潜鲛电池状态：电压、电流和剩余电量。", self.battery_topic),
+            sensor("imu", "潜鲛 IMU 角速度数据。", self.imu_topic),
+            {"name": "camera", "type": "sensor", "description": "潜鲛实时相机图像（RTSP 转 JPEG）。", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"], "description": "相机流生命周期或信息查询"}}, "required": ["action"]}},
+            {"name": "control", "type": "actuator", "description": "潜鲛 P200 Pro 运动控制：解锁、停止或发送 6 自由度控制量。", "inputSchema": control_schema},
         ]
 
     def dispatch(self, tool: str, args: dict) -> dict:
