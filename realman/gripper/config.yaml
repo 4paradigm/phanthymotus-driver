@@ -1,0 +1,19 @@
+mcp_port: 15717
+ros_namespace: ""
+
+ros:
+  robot_domain_id: 42
+  core_domain_id: 42
+
+name: "RealMan Gripper"
+
+wire_format: "flat"
+
+topics:
+  command: "/realman_gripper/command"
+  state: "/realman_gripper/state"
+  ack: "/realman_gripper/ack"
+
+plugins:
+  gripper:
+    enabled: true

@@ -63,10 +63,14 @@ class JsonCommandBridge:
 
     def publish(self, command, params=None):
         from std_msgs.msg import String
-        envelope = {
-            "id": str(uuid.uuid4()), "command": str(command),
-            "params": jsonable(params or {}), "timestamp": time.time(),
-        }
+        params = jsonable(params or {})
+        if self.config.get("wire_format") == "flat":
+            envelope = {"command": str(command), **params}
+        else:
+            envelope = {
+                "id": str(uuid.uuid4()), "command": str(command),
+                "params": params, "timestamp": time.time(),
+            }
         msg = String(); msg.data = json.dumps(envelope, ensure_ascii=False)
         self.command_pub.publish(msg)
         with self.lock:
