@@ -163,7 +163,12 @@ class G1DeviceBundle:
         if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
             controlled_cfg = dict(plugins_cfg["controlled_spatial"])
             controlled_cfg["network_iface"] = network_iface
-            if controlled_cfg.get("isolated_process", False):
+            # SmartMotion owns the single SLAM client used by navigation. An
+            # isolated controlled_spatial child cannot receive that proxy and
+            # would create a second SLAM session, which can stall or reject the
+            # first NavigateTo request.
+            use_isolated_spatial = controlled_cfg.get("isolated_process", False) and smart_motion is None
+            if use_isolated_spatial:
                 from controlled_spatial import ControlledSpatialIsolatedProxy
                 self._plugins.append(ControlledSpatialIsolatedProxy(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
                 print("[bundle] ControlledSpatialPlugin loaded (isolated process)")
@@ -242,9 +247,10 @@ class G1DeviceBundle:
                 if tool_def["name"] == tool_name:
                     if tool_def["type"] == "resource":
                         return p.dispatch(tool_name, args)
-                    action = args.pop("action", tool_name)
-                    args['_tool_name'] = tool_name  # let multi-tool plugins know which tool was called
-                    result = p.dispatch(action, args)
+                    call_args = dict(args)
+                    action = call_args.pop("action", tool_name)
+                    call_args['_tool_name'] = tool_name  # let multi-tool plugins know which tool was called
+                    result = p.dispatch(action, call_args)
                     return result
         return None
 
