@@ -10,6 +10,8 @@ grpc_port: 6666
 
 # DDS domain ID (must match robot's domain; Adam developer-mode DDS is domain 1)
 dds_domain_id: 1
+# Adam's hardware DDS is carried on the wired interface.
+dds_network_interface: "eno1"
 
 plugins:
   state:

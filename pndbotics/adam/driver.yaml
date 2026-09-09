@@ -17,6 +17,8 @@ build_context_extras:
 # point-cloud stream auto-starts, not whether the card is discoverable.
 cards:
   - { name: joints,             type: sensor }
+  - { name: motor_state,        type: sensor }
+  - { name: robot_state,        type: sensor }
   - { name: imu,                type: sensor }
   - { name: battery,            type: sensor }
   - { name: estop,              type: sensor }
