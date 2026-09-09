@@ -10,6 +10,9 @@ grpc_port: 50051
 
 # DDS domain ID (must match robot's domain; Adam developer-mode DDS is domain 1)
 dds_domain_id: 1
+# Adam's rt/lowstate DDS traffic is on the robot-facing Ethernet LAN, not the
+# Jetson's Wi-Fi management network.
+dds_interface: "eno1"
 
 plugins:
   state:
