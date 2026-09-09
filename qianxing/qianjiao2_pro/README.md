@@ -9,6 +9,7 @@
   `heave=chan1`、`pitch=chan2`、`forward=chan3`、`yaw=chan4`、`lateral=chan5`、`roll=chan7`（chan6 保留）。
 - `status` 提供连接、心跳年龄、温度、视频代理状态和最近错误。
 - `status` 同时监听 UDP `8500` 的状态广播；`loco_state`、`battery`、`imu` 分别提供姿态/深度/定位、电池和 IMU 数据。
+- ROS2 状态主题发布到 Agent Core 的 DDS domain `42`，并使用宿主机挂载的 loopback-only `dds-local.xml`；ROV 本体链路仍通过 MAVLink/UDP，不依赖 DDS。
 - MAVLink 目标 system/component ID 默认是 `1/1`，收到 ROV 的 `HEARTBEAT` 后会自动切换为心跳来源 ID；也可通过 `target_system`、`target_component` 显式指定初始值。
 
 相机卡片：
