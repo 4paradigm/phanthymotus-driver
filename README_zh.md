@@ -64,6 +64,32 @@ python main.py
 4. 工具对 LLM Agent 可用，并显示在 Web Dashboard 中
 5. LLM Agent 通过 MCP `tools/call` 调用工具
 
+### Go2 Nav2 Driver 输入
+
+Go2 Driver 复用同一套 lease 约束的
+`phanthy.navigation.velocity_proposal.v1` 合同，固定订阅
+`/ubuntu/navigation/nav2/velocity_proposal`。ROS 订阅和执行队列均为
+latest-only；合法速度以 m/s 和 rad/s 原样交给 `SportClient.Move`。
+终态或 TTL 超时调用 `StopMove`，并用调用后新的零速 `loco/state` 样本确认
+停车后才释放任务或保留可恢复 lease。直接调用 loco、步态、动作或特技时，
+会先撤销 Nav2 控制权，并在确认停车后才执行对应 RPC。
+
+只读 `navigation_lidar` 和 `navigation_imu` 卡片把 Go2 原生
+`rt/utlidar/cloud` 与 `rt/utlidar/imu` DDS 流转换为同样的
+`/ubuntu/navigation/lidar` `PointCloud2` 和 `/ubuntu/navigation/imu` `Imu`
+合同。两路输出使用同一个非空 REP-103 `sensor_frame`；Driver 将配置的
+设备到传感器旋转同时应用于点云 xyz，以及 IMU 的姿态、角速度、线加速度和
+全部协方差。MID360 点云与 IMU 三轴平行，Go2 安装轴已对齐 REP-103，因此
+默认使用单位旋转。按 REP-145，静止且 Z 轴向上的 IMU 应输出 `+g`，这不是坐标翻转。
+原始逐点 `time` 的单位为秒，Driver 将其转为帧内严格递增的 FLOAT64
+绝对纳秒时间戳。Go2 的单条 raw DDS 消息只是近场点占比很高的部分包，因此 Driver
+默认连续聚合两个包，拒绝间隔超过 120 ms 的跨缺口拼接，并过滤 0.5 m 内本体回波后
+再发布一帧导航点云；所有保留点仍携带原始 `ring` 和 `time`。隔离 worker、源时钟归一化、fail-closed 就绪检查和两张卡共享生命周期
+与 G1 导航传感器路径一致。同一 worker 还通过 ROS 2 静态变换广播器发布配置的
+`base_link -> utlidar_lidar` 安装外参。Go2 默认采用[宇树出厂 `radar_joint` 变换](https://github.com/unitreerobotics/unitree_ros/blob/master/robots/go2_description/urdf/go2_description.urdf)
+（`xyz=[0.28945, 0, -0.046825]`，`rpy=[0, 2.8782, 0]`）；外参缺失或非法时
+worker 启动失败，不使用单位变换兜底。
+
 ## 开发新驱动
 
 想要为新硬件添加驱动？请参阅 **[驱动开发指南](README_dev.md)** 获取完整规范，包括：

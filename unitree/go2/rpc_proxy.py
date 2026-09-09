@@ -16,6 +16,12 @@ import time
 def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue,
                 network_iface: str):
     """Subprocess: holds dedicated RPC clients, processes commands sequentially."""
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
+
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
     from unitree_sdk2py.go2.sport.sport_client import SportClient
     from unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client import ObstaclesAvoidClient

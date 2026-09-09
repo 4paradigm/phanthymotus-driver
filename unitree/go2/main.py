@@ -112,6 +112,18 @@ class Go2DeviceBundle:
             self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))
             print("[bundle] LidarPlugin loaded")
 
+        if plugins_cfg.get("navigation_sensors", {}).get("enabled", False):
+            from navigation_sensor_bridge import NavigationSensorPlugin
+            self._plugins.append(
+                NavigationSensorPlugin(
+                    plugins_cfg["navigation_sensors"],
+                    namespace,
+                    executor,
+                    network_iface=network_iface,
+                )
+            )
+            print("[bundle] NavigationSensorPlugin loaded")
+
         if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
             from controlled_spatial import ControlledSpatialPlugin
             controlled_cfg = dict(plugins_cfg["controlled_spatial"])
@@ -152,7 +164,9 @@ class Go2DeviceBundle:
         print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
-        for p in self._plugins:
+        for p in sorted(
+            self._plugins, key=lambda plugin: getattr(plugin, "STOP_PRIORITY", 100)
+        ):
             p.stop()
         print("[bundle] All plugins stopped")
 
