@@ -2510,6 +2510,10 @@ class VisionCapturePlugin:
             result["duration"] = duration
         return result
 
+    def _target_frame_count(self, elapsed_s, current_count):
+        """Keep encoded duration aligned with wall time if camera frames lag."""
+        return max(current_count + 1, int(round(elapsed_s * self._video_fps)))
+
     def _record_loop(self, path, stop_event, duration=None):
         command = [
             "ffmpeg", "-loglevel", "error", "-y", "-f", "mjpeg",
@@ -2519,6 +2523,7 @@ class VisionCapturePlugin:
         ]
         process = None
         started = time.monotonic()
+        frames_written = 0
         error = None
         try:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -2526,7 +2531,17 @@ class VisionCapturePlugin:
                 if duration is not None and time.monotonic() - started >= duration:
                     break
                 frame = self._camera.capture_photo(self._timeout_s)
-                process.stdin.write(frame["data"])
+                elapsed = time.monotonic() - started
+                if duration is not None:
+                    elapsed = min(elapsed, duration)
+                # ZED frame delivery can be a little slower than the declared
+                # MP4 frame rate. Duplicate the newest frame when needed so a
+                # requested two-second recording remains two seconds instead
+                # of being shortened by the encoder's fixed frame timestamps.
+                target_count = self._target_frame_count(elapsed, frames_written)
+                while frames_written < target_count:
+                    process.stdin.write(frame["data"])
+                    frames_written += 1
                 process.stdin.flush()
             process.stdin.close()
             process.stdin = None
