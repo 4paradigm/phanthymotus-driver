@@ -28,7 +28,6 @@ class BridgedPublisher:
         self._connect_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._count = 0
-        self.published = []
 
     def _connect(self) -> bool:
         if self._connected:
@@ -46,7 +45,10 @@ class BridgedPublisher:
                     "msg_type": _type_name(self.msg_type),
                 }).encode()
                 sock.sendall(struct.pack("<I", len(metadata)) + metadata)
-                sock.settimeout(None)
+                # A stalled domain-42 consumer must not block the robot-domain
+                # executor indefinitely. Sensor frames are lossy by design, so
+                # drop a congested frame and reconnect on the next callback.
+                sock.settimeout(0.1)
                 self._socket = sock
                 self._connected = True
                 print(f"[x2-bridge-pub] connected {self.topic} ({_type_name(self.msg_type)})", flush=True)
@@ -60,7 +62,6 @@ class BridgedPublisher:
                 return False
 
     def publish(self, msg: Any) -> None:
-        self.published.append(msg)
         from rclpy.serialization import serialize_message
 
         payload = serialize_message(msg)

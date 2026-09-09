@@ -85,6 +85,8 @@ MIC_SOURCES = {"internal": 0, "external": 1}
 
 RESOURCE_DIR = Path(__file__).with_name("resource")
 SKELETON_TOPIC = "state/joints"
+SKELETON_MAX_HZ = 30.0
+CAMERA_RGB_MAX_HZ = 10.0
 
 
 def skeleton_layout(variant):
@@ -164,6 +166,8 @@ class AimdkNodes:
 
         self.lock = threading.RLock()
         self.values = {}
+        self._last_stream_publish = {}
+        self._last_skeleton_publish = 0.0
         self.joint_groups = {}
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
@@ -171,13 +175,14 @@ class AimdkNodes:
 
         self.streams = {}
 
-        def mirror(key, msg_type, robot_topic, fmt, depth=10, qos=None):
+        def mirror(key, msg_type, robot_topic, fmt, depth=10, qos=None, max_hz=None):
             core_topic = f"/{namespace}/agibot_x2/{key}"
             as_json = fmt == "data/json"
             core_msg_type = String if as_json else msg_type
             pub = core_publisher(self.core, core_msg_type, core_topic, depth)
             self.robot.create_subscription(
-                msg_type, robot_topic, self._callback(key, pub, as_json=as_json), qos or depth,
+                msg_type, robot_topic,
+                self._callback(key, pub, as_json=as_json, max_hz=max_hz), qos or depth,
             )
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
@@ -198,7 +203,11 @@ class AimdkNodes:
         # publishes RGB under rgb_head_front_center/* instead (confirmed live via `ros2 topic
         # info`, 30Hz). No depth topic is published anywhere on this hardware at all, so
         # camera_depth stays wired to the documented (currently inactive) topic.
-        mirror("camera_rgb", CompressedImage, "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed", "image/jpeg", qos=sensor_qos)
+        mirror(
+            "camera_rgb", CompressedImage,
+            "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed",
+            "image/jpeg", qos=sensor_qos, max_hz=CAMERA_RGB_MAX_HZ,
+        )
         mirror("camera_info", CameraInfo, "/aima/hal/sensor/rgb_head_front_center/camera_info", "data/json", qos=sensor_qos)
         mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
         mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
@@ -250,10 +259,17 @@ class AimdkNodes:
         self.get_mic_source = client(GetMicSourceRequest, "/aimdk_5Fmsgs/srv/GetMicSourceRequest")
         self.get_stored_map = client(GetStoredMapByName, "/aimdk_5Fmsgs/srv/GetStoredMapByName")
 
-    def _callback(self, key, publisher, *, as_json=False):
+    def _callback(self, key, publisher, *, as_json=False, max_hz=None):
         from std_msgs.msg import String
 
         def callback(msg):
+            if max_hz is not None:
+                now = time.monotonic()
+                with self.lock:
+                    previous = self._last_stream_publish.get(key, 0.0)
+                    if now - previous < 1.0 / max_hz:
+                        return
+                    self._last_stream_publish[key] = now
             if as_json:
                 # only the data/json path is ever read back via snapshot(); computing this for
                 # binary streams (camera/lidar) would mean converting a JPEG/pointcloud byte
@@ -285,8 +301,16 @@ class AimdkNodes:
     def _joint_state_callback(self, area):
         def callback(msg):
             with self.lock:
+                first_update_for_area = self.joint_groups.get(area) is None
                 self.joint_groups[area] = msg
                 snapshot = self._skeleton_snapshot_locked()
+                now = time.monotonic()
+                if (
+                    not first_update_for_area
+                    and now - self._last_skeleton_publish < 1.0 / SKELETON_MAX_HZ
+                ):
+                    return
+                self._last_skeleton_publish = now
             output = self._msg["String"]()
             output.data = json.dumps(snapshot, ensure_ascii=False)
             self.skeleton_pub.publish(output)

@@ -12,6 +12,7 @@ import sys
 import types
 import unittest
 import json
+from unittest import mock
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -231,6 +232,7 @@ import yaml  # noqa: E402
 
 import device  # noqa: E402
 import x2_bus_bridge  # noqa: E402
+import x2_bridged_publisher  # noqa: E402
 
 
 def load_driver_yaml_cards():
@@ -337,6 +339,7 @@ class ToolInventoryTests(unittest.TestCase):
         plugins = build_bundle_plugins()
         nodes = plugins[0].nodes
         joints_plugin = find_plugin(plugins, "joints")
+        nodes.skeleton_pub = FakePublisher(FakeMsg, "/test_ns/state/joints", 5)
         callbacks = {topic: callback for topic, callback in nodes.robot.subscriptions}
 
         leg_names = nodes.skeleton_joints["leg"]
@@ -372,6 +375,7 @@ class ToolInventoryTests(unittest.TestCase):
     def test_joint_state_callbacks_match_named_states_and_skip_unknowns(self):
         plugins = build_bundle_plugins()
         nodes = plugins[0].nodes
+        nodes.skeleton_pub = FakePublisher(FakeMsg, "/test_ns/state/joints", 5)
         callbacks = {topic: callback for topic, callback in nodes.robot.subscriptions}
         leg_names = nodes.skeleton_joints["leg"]
         leg_topic = "/aima/hal/joint/leg/state"
@@ -415,6 +419,15 @@ class ModelPluginTests(unittest.TestCase):
 
 
 class X2BridgeTests(unittest.TestCase):
+    def test_bridged_publisher_does_not_retain_sensor_frames(self):
+        publisher = x2_bridged_publisher.BridgedPublisher(FakeMsg, "/camera")
+        fake_socket = FakeSocket()
+        with mock.patch.object(x2_bridged_publisher.socket, "socket", return_value=fake_socket):
+            for _ in range(32):
+                publisher.publish(FakeMsg())
+        self.assertEqual(publisher._count, 32)
+        self.assertFalse(hasattr(publisher, "published"))
+
     def test_fastdds_bridge_profile_is_loopback_only(self):
         self.assertTrue(x2_bus_bridge.DEFAULT_FASTDDS_PROFILE.name.endswith("fastdds_bridge_local.xml"))
         text = x2_bus_bridge.DEFAULT_FASTDDS_PROFILE.read_text(encoding="utf-8")
