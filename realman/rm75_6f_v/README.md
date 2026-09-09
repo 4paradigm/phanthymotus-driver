@@ -63,10 +63,21 @@ Depth and infrared instances on one camera share a stereo session, while one
 V4L2 color node has only one RGB owner.
 
 The image pins `pyrealsense2==2.56.5.9235`, matching the repository's verified
-Linux ARM64 / Python 3.10 runtime. Deployment deliberately grants the container
-privileged access and mounts `/dev` so it can reach the upper-computer camera.
+Linux ARM64 / Python 3.10 runtime. Camera discovery calls the Linux V4L2 ioctl
+ABI directly, so the image does not install the `v4l-utils` command-line package.
 Do not run `realsense-viewer` or another capture process against the same D435
 while the card is active.
+
+The deployment is not privileged and does not mount the host's complete `/dev`.
+It maps the observed D435 UVC nodes `/dev/video0` through `/dev/video5` and the
+USB device filesystem used by `pyrealsense2`. Each video-node source can be
+overridden with `RM75_CAMERA_VIDEO0` through `RM75_CAMERA_VIDEO5` when another
+camera or an earlier-created video device changes the numbering. Only the
+selected video character devices and USB character-device major 189 are allowed;
+the arm's API2 TCP connection needs neither grant. The USB-bus mount necessarily
+exposes connected USB descriptors to the container because librealsense must
+enumerate and reconnect the selected physical camera. It does not grant access
+to unrelated host block, input, serial, GPU, or media devices.
 
 The observed target hardware is an Intel RealSense D435 (USB ID `8086:0b07`)
 on a 5 Gbit/s USB 3 link. Its six V4L2 nodes comprise depth, infrared and RGB
@@ -135,15 +146,24 @@ trigger. No extra `/api/event` notifications are sent. This Driver cannot repair
 a stalled Core decision loop; a missing UI trigger alone is not proof of motion
 or callback failure.
 
-The component installs `python3-yaml` because the shared runtime loads
-`config.yaml`, and `ros-humble-rmw-fastrtps-cpp` because the shared runtime
-creates the Agent Core ROS 2 participant. The camera layer additionally installs
-the pinned `pyrealsense2` wheel, NumPy and headless OpenCV through pip; no compiler
-or ROS build tooling is installed. See `vendor/SOURCE.md` for provenance notes.
+The component installs `python3-pip` to install the pinned camera wheels,
+`python3-yaml` because the shared runtime loads `config.yaml`, and
+`ros-humble-rmw-fastrtps-cpp` because the shared runtime creates the Agent Core
+ROS 2 participant. The camera layer installs the ARM64 `pyrealsense2` wheel,
+NumPy 1.23.5 and headless OpenCV 4.11.0.86 through pip. The wheel supplies its
+own RealSense implementation but dynamically loads `libusb-1.0.so.0`. The build
+downloads Ubuntu's signed `libusb-1.0-0` runtime package and extracts only that
+shared object into `/opt/realman/libusb`; it does not execute or suppress package
+maintainer scripts and does not claim the package is installed in dpkg. Direct
+V4L2 ioctl discovery avoids `v4l-utils`; no compiler, desktop OpenCV backend or
+ROS build tooling is installed. Every download/extraction step must succeed and
+the apt layer must finish with an empty `dpkg --audit`; package-install failures
+and partially configured package states are never accepted.
+See `vendor/SOURCE.md` for provenance notes.
 
 The RM75 API2 TCP path itself does not require privileged mode or host devices.
-The bundled upper-computer camera does: deployment grants privileged mode and
-mounts `/dev` so V4L2 and RealSense USB interfaces are visible in the container.
+The bundled upper-computer camera receives only its configured V4L2 nodes and
+the USB bus required by RealSense enumeration, as described above.
 Skeleton publication skips disconnected/busy SDK clients, retries failed samples
 at most every two seconds, and logs once per outage until a successful sample.
 An already-running SDK TCP query still holds the SDK lock until it returns.
