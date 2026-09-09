@@ -292,7 +292,9 @@ class HandStateCache:
         self._latest_position = None
         self._received_at_ms = 0
         self._received_monotonic = None
+        self._sample_count = 0
         self._last_read_error = None
+        self._last_sample_position = None
 
     def start(self) -> bool:
         with self._lifecycle_lock:
@@ -376,6 +378,8 @@ class HandStateCache:
                         self._latest_position = position
                         self._received_at_ms = int(time.time() * 1000)
                         self._received_monotonic = time.monotonic()
+                        self._sample_count += 1
+                        self._last_sample_position = _normalize_hand_state_positions(position)
                         self._last_read_error = None
                 elif stop_event.wait(0.01):
                     break
@@ -423,6 +427,7 @@ class HandStateCache:
             received_at_ms = self._received_at_ms
             received_monotonic = self._received_monotonic
             last_read_error = self._last_read_error
+            sample_count = self._sample_count
         fresh = self._fresh(received_monotonic, timeout_sec)
         result = {
             "reader_available": reader_available,
@@ -431,6 +436,7 @@ class HandStateCache:
                 max(0, int(time.time() * 1000) - received_at_ms)
                 if received_monotonic is not None else None
             ),
+            "sample_count": sample_count,
         }
         if last_read_error:
             result["last_read_error"] = last_read_error
@@ -445,7 +451,12 @@ class _HandStatePublisherNode(Node):
         self._topic = f"/{namespace}/state/hand_state"
         self._cache = cache
         self._timeout_sec = timeout_sec
-        self._active = False
+        # Sensor topics are live outputs; card actions must not be required to
+        # start the publisher after the driver has registered the tool.
+        self._active = True
+        self._publish_count = 0
+        self._last_publish_at_ms = 0
+        self._last_publish_error = None
         self._lock = threading.Lock()
         self._pub = self.create_publisher(String, self._topic, _best_effort_qos())
         self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
@@ -464,7 +475,27 @@ class _HandStatePublisherNode(Node):
             return
         msg = String()
         msg.data = json.dumps(_hand_state_sensor_payload(snapshot))
-        self._pub.publish(msg)
+        try:
+            self._pub.publish(msg)
+        except Exception as exc:
+            with self._lock:
+                self._last_publish_error = str(exc)
+            return
+        with self._lock:
+            self._publish_count += 1
+            self._last_publish_at_ms = int(time.time() * 1000)
+            self._last_publish_error = None
+
+    def metrics(self) -> dict:
+        with self._lock:
+            result = {
+                "publish_count": self._publish_count,
+                "last_publish_at_ms": self._last_publish_at_ms or None,
+                "active": self._active,
+            }
+            if self._last_publish_error:
+                result["last_publish_error"] = self._last_publish_error
+            return result
 
 
 class HandStatePlugin:
@@ -544,6 +575,7 @@ class HandStatePlugin:
             "state": "running" if self._running else "idle",
             "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
             **self._cache.status(self._timeout_sec),
+            **self._node.metrics(),
         }
 
 

@@ -135,6 +135,14 @@ class HandStateTests(unittest.TestCase):
         cache._received_monotonic = time.monotonic() - 2
         self.assertFalse(cache.snapshot(0.1)["fresh"])
 
+    def test_publisher_is_live_without_start_action(self):
+        executor = FakeExecutor()
+        snapshot = self.device._hand_state_payload([250] * 12, int(time.time() * 1000), fresh=True)
+        plugin = self.device.HandStatePlugin({}, "adam", executor, state_cache=FakeCache(snapshot))
+        plugin._node._publish()
+        self.assertEqual(len(plugin._node._pub.messages), 1)
+        self.assertEqual(plugin._node.metrics()["publish_count"], 1)
+
     def test_sensor_is_read_only_and_never_uses_command_writer(self):
         executor = FakeExecutor()
         snapshot = self.device._hand_state_payload([500] * 12, int(time.time() * 1000), fresh=True)
