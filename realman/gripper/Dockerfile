@@ -12,6 +12,7 @@ COPY common/     /work/common/
 COPY main.py     /work/main.py
 COPY device.py   /work/device.py
 COPY config.yaml /work/config.yaml
+COPY deploy/     /deploy/
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_LOCALHOST_ONLY=0

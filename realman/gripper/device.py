@@ -7,7 +7,7 @@ from common.ros2_json_bridge import JsonCommandBridge
 from common.vendor_runtime import action_schema, tool
 
 POSITION_MIN = 0
-POSITION_MAX = 12000
+POSITION_MAX = 1000
 
 
 def _position(value) -> int:
@@ -34,7 +34,7 @@ class GripperPlugin:
         return tool(
             "gripper",
             "actuator",
-            "RealMan 二指夹爪位置控制。位置范围 0~12000，对应夹爪行程 0~120 mm。",
+            "RealMan 二指夹爪位置控制。位置范围 0~1000，对应夹爪行程 0~120 mm。",
             action_schema(
                 {"set_position": (["position"], "设置二指夹爪目标位置")},
                 {
@@ -42,7 +42,7 @@ class GripperPlugin:
                         "type": "integer",
                         "minimum": POSITION_MIN,
                         "maximum": POSITION_MAX,
-                        "description": "夹爪驱动器目标位置，0~12000，对应 0~120 mm",
+                        "description": "夹爪驱动器目标位置，0~1000，对应 0~120 mm",
                     }
                 },
             ),

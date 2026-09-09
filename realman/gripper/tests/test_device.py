@@ -44,27 +44,27 @@ class GripperPluginTests(unittest.TestCase):
         self.assertEqual(schema["name"], "gripper")
         self.assertEqual(schema["type"], "actuator")
         self.assertEqual(position["minimum"], 0)
-        self.assertEqual(position["maximum"], 12000)
+        self.assertEqual(position["maximum"], 1000)
         self.assertEqual(
             schema["inputSchema"]["x-action-params"]["set_position"]["params"],
             ["position"],
         )
 
     def test_set_position_publishes_realman_payload(self):
-        result = self.plugin.dispatch("set_position", {"position": 10000})
+        result = self.plugin.dispatch("set_position", {"position": 800})
 
         self.assertEqual(
             self.nodes.bridge.calls,
-            [("hand_follow_pos", {"hand_pos": [10000]})],
+            [("hand_follow_pos", {"hand_pos": [800]})],
         )
-        self.assertEqual(result, {"command": "hand_follow_pos", "hand_pos": [10000]})
+        self.assertEqual(result, {"command": "hand_follow_pos", "hand_pos": [800]})
 
     def test_position_is_clamped_to_driver_range(self):
         self.plugin.dispatch("set_position", {"position": -1})
-        self.plugin.dispatch("set_position", {"position": 12001})
+        self.plugin.dispatch("set_position", {"position": 1001})
 
         self.assertEqual(self.nodes.bridge.calls[0][1]["hand_pos"], [0])
-        self.assertEqual(self.nodes.bridge.calls[1][1]["hand_pos"], [12000])
+        self.assertEqual(self.nodes.bridge.calls[1][1]["hand_pos"], [1000])
 
     def test_invalid_position_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "position must be a number"):

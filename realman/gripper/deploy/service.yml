@@ -1,0 +1,23 @@
+realman-gripper:
+  image: __IMAGE__
+  container_name: embodied-realman-gripper
+  network_mode: host
+  ipc: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    # 宿主上的 FastDDS 发现配置（本机 DDS 互联依赖它，见 /opt/phanthy-motus/docker-compose.yml）
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped
