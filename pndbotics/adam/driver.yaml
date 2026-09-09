@@ -19,6 +19,8 @@ cards:
   - { name: joints,             type: sensor }
   - { name: imu,                type: sensor }
   - { name: battery,            type: sensor }
+  - { name: health,             type: sensor }
+  - { name: hands,              type: sensor }
   - { name: loco,               type: actuator }
   - { name: arm,                type: actuator }
   - { name: hand,                type: actuator }

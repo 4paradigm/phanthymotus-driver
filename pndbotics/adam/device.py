@@ -215,6 +215,55 @@ def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
     }
 
 
+def _hand_status_payload(cache, timeout_sec: float) -> dict:
+    """Return a stable status payload when hand feedback is unavailable."""
+    status = cache.status(timeout_sec)
+    if not status["reader_available"]:
+        state = "unavailable"
+        state_text = "手部状态读取器不可用"
+    elif status["last_sample_age_ms"] is None:
+        state = "waiting"
+        state_text = "等待手部状态"
+    elif status["fresh"]:
+        state = "fresh"
+        state_text = "手部状态正常"
+    else:
+        state = "stale"
+        state_text = "手部状态延迟"
+    return {
+        "state": state,
+        "state_text": state_text,
+        "fresh": bool(status["fresh"]),
+        "reader_available": bool(status["reader_available"]),
+        "last_sample_age_ms": status["last_sample_age_ms"],
+        "position_max": HAND_POSITION_MAX,
+        **({"last_read_error": status["last_read_error"]}
+           if "last_read_error" in status else {}),
+    }
+
+
+def _state_health_payload(state, received_monotonic: float | None) -> dict:
+    """Expose transport health without guessing an operational robot mode."""
+    age_ms = None
+    if received_monotonic is not None:
+        age_ms = max(0, int((time.monotonic() - received_monotonic) * 1000))
+    mode_pr = int(getattr(state, "mode_pr", 0))
+    mode_pr_label = {
+        0: "PR 串联关节控制",
+        1: "AB 并联关节控制",
+    }.get(mode_pr, "未知控制拓扑")
+    motor_state = getattr(state, "motor_state", [])
+    return {
+        "status": "online" if age_ms is not None and age_ms <= 500 else "stale",
+        "status_text": "状态流正常" if age_ms is not None and age_ms <= 500 else "状态流延迟",
+        "state_age_ms": age_ms,
+        "body_joint_count": len(motor_state),
+        "control_topology": mode_pr_label,
+        "raw_mode_pr": mode_pr,
+        "tick": int(getattr(state, "tick", 0)),
+    }
+
+
 def _destroy_ros_node(executor, node):
     if node is None:
         return
@@ -420,11 +469,13 @@ def _best_effort_qos():
 class _StatePublisherNode(Node):
     """ROS2 node that publishes skeleton, IMU, and battery data."""
 
-    def __init__(self, namespace: str, variant: str, publish_rate_hz: float):
+    def __init__(self, namespace: str, variant: str, publish_rate_hz: float,
+                 hand_state_cache=None):
         super().__init__("adam_state_publisher")
         self._namespace = namespace
         self._variant = variant
         self._joints = VARIANT_JOINTS[variant]
+        self._hand_state_cache = hand_state_cache
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -435,12 +486,17 @@ class _StatePublisherNode(Node):
         self._topic_skeleton = f"/{namespace}/state/joints"
         self._topic_imu = f"/{namespace}/state/imu"
         self._topic_battery = f"/{namespace}/state/battery"
+        self._topic_health = f"/{namespace}/state/health"
+        self._topic_hand = f"/{namespace}/state/hands"
 
         self._pub_skeleton = self.create_publisher(String, self._topic_skeleton, qos)
         self._pub_imu = self.create_publisher(String, self._topic_imu, qos)
         self._pub_battery = self.create_publisher(String, self._topic_battery, qos)
+        self._pub_health = self.create_publisher(String, self._topic_health, qos)
+        self._pub_hand = self.create_publisher(String, self._topic_hand, qos)
 
         self._latest_state = None
+        self._latest_state_monotonic = None
         self._active = False
         self._lock = threading.Lock()
 
@@ -450,6 +506,7 @@ class _StatePublisherNode(Node):
     def update_state(self, state):
         with self._lock:
             self._latest_state = state
+            self._latest_state_monotonic = time.monotonic()
 
     def set_active(self, active: bool):
         with self._lock:
@@ -458,6 +515,7 @@ class _StatePublisherNode(Node):
     def _publish(self):
         with self._lock:
             state = self._latest_state
+            state_monotonic = self._latest_state_monotonic
             active = self._active
 
         if not active or state is None:
@@ -502,6 +560,22 @@ class _StatePublisherNode(Node):
         msg_bat.data = json.dumps(bat_data)
         self._pub_battery.publish(msg_bat)
 
+        msg_health = String()
+        msg_health.data = json.dumps(
+            _state_health_payload(state, state_monotonic))
+        self._pub_health.publish(msg_health)
+
+        if self._hand_state_cache is not None:
+            hand_state = self._hand_state_cache.snapshot(timeout_sec=1.0)
+            hand_payload = (
+                hand_state
+                if hand_state is not None
+                else _hand_status_payload(self._hand_state_cache, 1.0)
+            )
+            msg_hand = String()
+            msg_hand.data = json.dumps(hand_payload)
+            self._pub_hand.publish(msg_hand)
+
 
 class StatePlugin:
     """Subscribes DDS rt/lowstate and publishes body state to ROS2."""
@@ -519,7 +593,8 @@ class StatePlugin:
         self._poll_stop_event = None
 
         rate = plugin_config.get("publish_rate_hz", 50)
-        self._node = _StatePublisherNode(namespace, variant, rate)
+        self._node = _StatePublisherNode(
+            namespace, variant, rate, hand_state_cache=kwargs.get("hand_state_cache"))
         executor.add_node(self._node)
 
         # DDS subscribers (pre-created in main.py before rclpy.init to avoid conflict)
@@ -564,6 +639,24 @@ class StatePlugin:
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [
                     {"topic": self._node._topic_battery, "format": "data/json"}
+                ],
+            },
+            {
+                "name": "health",
+                "type": "sensor",
+                "description": "Adam state-stream health and confirmed control topology",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_health, "format": "data/json"}
+                ],
+            },
+            {
+                "name": "hands",
+                "type": "sensor",
+                "description": "Adam left and right hand feedback from DDS rt/handstate",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_hand, "format": "data/json"}
                 ],
             },
         ]
@@ -617,6 +710,12 @@ class StatePlugin:
             if tool_name == "battery":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
+            if tool_name == "health":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_health, "format": "data/json"}]}
+            if tool_name == "hands":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_hand, "format": "data/json"}]}
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._node._topic_skeleton, "format": "sensor/skeleton"}]}
         return None
@@ -2357,6 +2456,7 @@ class AdamDeviceBundle:
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
+                hand_state_cache=self._hand_state_cache,
             )
             self._plugins.append(p)
 
