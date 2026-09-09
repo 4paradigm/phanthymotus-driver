@@ -176,16 +176,21 @@ def _normalize_hand_state_positions(position) -> list[int]:
     except (TypeError, ValueError):
         raw_positions = []
 
-    try:
-        positions = _coerce_hand_positions(
-            raw_positions,
-            limit=HAND_POSITION_MAX,
-            expected=len(raw_positions),
-        )
-    except ValueError:
-        positions = []
-    if len(positions) < HAND_POSITION_COUNT:
-        positions.extend([HAND_POSITION_MIN] * (HAND_POSITION_COUNT - len(positions)))
+    positions = []
+    for raw in raw_positions:
+        if isinstance(raw, bool):
+            positions.append(HAND_POSITION_MIN)
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            positions.append(HAND_POSITION_MIN)
+            continue
+        if not math.isfinite(value):
+            positions.append(HAND_POSITION_MIN)
+            continue
+        positions.append(int(max(HAND_POSITION_MIN, min(HAND_POSITION_MAX, round(value)))))
+    positions.extend([HAND_POSITION_MIN] * (HAND_POSITION_COUNT - len(positions)))
     return positions[:HAND_POSITION_COUNT]
 
 
@@ -212,6 +217,51 @@ def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
         "position": positions,
         "left": side(positions[:6]),
         "right": side(positions[6:12]),
+    }
+
+
+def _hand_position_label(position: int) -> str:
+    ratio = position / HAND_POSITION_MAX
+    if ratio >= 0.95:
+        return "fully_open"
+    if ratio >= 0.75:
+        return "almost_open"
+    if ratio >= 0.25:
+        return "half_closed"
+    if ratio >= 0.05:
+        return "almost_closed"
+    return "fully_closed"
+
+
+def _hand_state_sensor_payload(snapshot: dict) -> dict:
+    """Present Adam's 12-channel feedback in the hand sensor card format."""
+    def hand_block(values):
+        fingers = []
+        for index, (name, position) in enumerate(zip(HAND_CHANNEL_NAMES, values), start=1):
+            fingers.append({
+                "id": index,
+                "name": name,
+                "label": HAND_CHANNEL_LABELS[name],
+                "position": position,
+                "position_label": _hand_position_label(position),
+            })
+        return {
+            "fingers": fingers,
+            "finger_count": 5,
+            "motor_channel_count": 6,
+        }
+
+    return {
+        "hands": {
+            "left": hand_block(snapshot["left"]["position"]),
+            "right": hand_block(snapshot["right"]["position"]),
+        },
+        "timestamp_ms": snapshot["timestamp_ms"],
+        "received_at_ms": snapshot["received_at_ms"],
+        "age_ms": snapshot["age_ms"],
+        "fresh": snapshot["fresh"],
+        "position_max": snapshot["position_max"],
+        "source_topic": "rt/handstate",
     }
 
 
@@ -385,6 +435,117 @@ class HandStateCache:
         if last_read_error:
             result["last_read_error"] = last_read_error
         return result
+
+
+class _HandStatePublisherNode(Node):
+    """Publishes snapshots supplied by the shared Adam hand-state cache."""
+
+    def __init__(self, namespace: str, publish_rate_hz: float, cache, timeout_sec: float):
+        super().__init__("adam_hand_state_publisher")
+        self._topic = f"/{namespace}/state/hand_state"
+        self._cache = cache
+        self._timeout_sec = timeout_sec
+        self._active = False
+        self._lock = threading.Lock()
+        self._pub = self.create_publisher(String, self._topic, _best_effort_qos())
+        self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
+
+    def set_active(self, active: bool):
+        with self._lock:
+            self._active = bool(active)
+
+    def _publish(self):
+        with self._lock:
+            active = self._active
+        if not active:
+            return
+        snapshot = self._cache.snapshot(self._timeout_sec)
+        if snapshot is None:
+            return
+        msg = String()
+        msg.data = json.dumps(_hand_state_sensor_payload(snapshot))
+        self._pub.publish(msg)
+
+
+class HandStatePlugin:
+    """Read-only sensor card backed by Adam's shared ``rt/handstate`` cache."""
+
+    PREFIX = "hand_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, state_cache=None, **kwargs):
+        self._cache = state_cache or HandStateCache()
+        self._owns_cache = state_cache is None
+        self._executor = executor
+        self._running = False
+        try:
+            rate = float(plugin_config.get("publish_rate_hz", 30))
+        except (TypeError, ValueError):
+            rate = 30.0
+        try:
+            self._timeout_sec = float(plugin_config.get("state_timeout_sec", 1.0))
+        except (TypeError, ValueError):
+            self._timeout_sec = 1.0
+        rate = rate if rate > 0 else 30.0
+        self._timeout_sec = self._timeout_sec if self._timeout_sec > 0 else 1.0
+        self._node = _HandStatePublisherNode(namespace, rate, self._cache, self._timeout_sec)
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand_state",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": "Adam hand feedback from DDS rt/handstate (left and right six-channel hands)",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+        }
+
+    def _read(self) -> dict:
+        snapshot = self._cache.snapshot(self._timeout_sec)
+        if snapshot is not None:
+            return _hand_state_sensor_payload(snapshot)
+        status = self._cache.status(self._timeout_sec)
+        return {
+            "state": "unavailable" if not status["reader_available"] else "waiting",
+            "fresh": False,
+            "reader_available": status["reader_available"],
+            "source_topic": "rt/handstate",
+            "message": "DDS hand state reader is unavailable" if not status["reader_available"] else "No hand state received yet",
+        }
+
+    def start(self):
+        self._running = True
+        self._cache.start()
+        self._node.set_active(True)
+
+    def stop(self):
+        self._running = False
+        self._node.set_active(False)
+        if self._owns_cache:
+            self._cache.stop()
+
+    def close(self):
+        self.stop()
+        _destroy_ros_node(self._executor, self._node)
+        if self._owns_cache:
+            self._cache.close()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("read", "get_hand_state"):
+            return self._read()
+        if action == "start":
+            self.start()
+        elif action == "stop":
+            self.stop()
+        elif action != "info":
+            return {"state": "error", "error": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
+        return {
+            "state": "running" if self._running else "idle",
+            "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+            **self._cache.status(self._timeout_sec),
+        }
+
 
 # ROS2 JointState joint names for upper body control (used by ArmPlugin)
 ROS2_UPPER_BODY_JOINTS = [
@@ -2346,9 +2507,10 @@ class AdamDeviceBundle:
             and (ros2_enabled is None or ros2_enabled)
         )
         hand_enabled = plugins_cfg.get("hand", {}).get("enabled", True)
+        hand_state_enabled = plugins_cfg.get("hand_state", {}).get("enabled", False)
         self._hand_state_cache = (
             HandStateCache(dds_handstate_sub)
-            if hand_enabled else None
+            if hand_enabled or hand_state_enabled else None
         )
 
         # StatePlugin
@@ -2387,6 +2549,14 @@ class AdamDeviceBundle:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
+            self._plugins.append(p)
+
+        # HandStatePlugin
+        if hand_state_enabled and self._ros2_enabled:
+            p = HandStatePlugin(
+                plugins_cfg.get("hand_state", {}), namespace, executor,
+                state_cache=self._hand_state_cache,
+            )
             self._plugins.append(p)
 
         # ModelPlugin
