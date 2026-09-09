@@ -9,7 +9,8 @@ ros_namespace: "agibot_x2"
 
 # Which end-effector variant this robot is built with — selects the URDF served by the
 # `model` resource tool and the joint layout used by hand_state/hand_command.
-end_effector: "hand"   # fist | hand | ultra
+# This unit reports HandType.NONE on both sides, so serve the matching no-finger model.
+end_effector: "fist"   # fist | hand | ultra
 
 ros:
   robot_domain_id: 0
@@ -23,12 +24,21 @@ plugins:
   joint_state:
     enabled: true
   hand_state:
-    enabled: true
+    # This X2 reports HandType.NONE for both sides; enable after dexterous hands are provisioned.
+    enabled: false
   imu:
     enabled: true
   camera:
     enabled: true
+  camera_depth:
+    # No depth publisher exists on the verified X2 firmware.
+    enabled: false
   lidar:
+    # The optional SLAM lidar has no publisher until the vendor enables that module.
+    enabled: false
+  head_touch:
+    enabled: true
+  pmu_state:
     enabled: true
   system_state:
     enabled: true
@@ -45,7 +55,7 @@ plugins:
   joint_command:
     enabled: true
   hand_command:
-    enabled: true
+    enabled: false
   pmu_led:
     enabled: true
   tts:

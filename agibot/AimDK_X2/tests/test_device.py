@@ -263,7 +263,7 @@ def find_plugin(plugins, tool_name):
 
 class ToolInventoryTests(unittest.TestCase):
     def test_tool_names_and_types_match_driver_yaml(self):
-        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
+        plugins = build_bundle_plugins()
         definitions = tool_definitions(plugins)
         by_name = {d["name"]: d["type"] for d in definitions}
         expected = load_driver_yaml_cards()
@@ -289,7 +289,7 @@ class ToolInventoryTests(unittest.TestCase):
         plugins = build_bundle_plugins()
         definitions = tool_definitions(plugins)
         expected_actuators = {
-            "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command",
+            "mc_mode", "locomotion", "preset_motion", "joint_command",
             "linkcraft", "pmu_led", "tts", "emoji", "mic_source",
         }
         by_name = {d["name"]: d["type"] for d in definitions}
@@ -301,8 +301,20 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joints", "joint_state", "hand_state", "imu", "camera_rgb", "camera_info", "camera_depth", "head_touch", "pmu_state", "lidar", "slam_pose"):
+        for name in ("mc_state", "joints", "joint_state", "imu", "camera_rgb", "camera_info", "head_touch", "pmu_state", "system_state", "linkcraft_catalog"):
             self.assertEqual(by_name[name], "sensor")
+
+    def test_unavailable_hardware_cards_are_not_registered_by_default(self):
+        names = {definition["name"] for definition in tool_definitions(build_bundle_plugins())}
+        self.assertTrue({"hand_state", "hand_command", "camera_depth", "lidar", "slam_pose", "slam_control"}.isdisjoint(names))
+
+    def test_optional_hardware_cards_register_only_when_enabled(self):
+        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {
+            "hand_state": {"enabled": True}, "hand_command": {"enabled": True},
+            "camera_depth": {"enabled": True}, "lidar": {"enabled": True}, "slam": {"enabled": True},
+        }})
+        names = {definition["name"] for definition in tool_definitions(plugins)}
+        self.assertTrue({"hand_state", "hand_command", "camera_depth", "lidar", "slam_pose", "slam_control"}.issubset(names))
 
     def test_confirmed_sensor_topics_are_wired(self):
         plugins = build_bundle_plugins()
@@ -328,6 +340,10 @@ class ToolInventoryTests(unittest.TestCase):
         plugins = build_bundle_plugins()
         joints = find_plugin(plugins, "joints")
         self.assertEqual(joints.dispatch("start", {}), {"state": "running"})
+
+    def test_joints_unknown_action_is_not_reported_as_running(self):
+        joints = find_plugin(build_bundle_plugins(), "joints")
+        self.assertIsNone(joints.dispatch("misspelled_action", {}))
 
     def test_joints_skeleton_uses_selected_urdf_variant(self):
         for variant, expected_count in (("hand", 27), ("fist", 27), ("ultra", 31)):
@@ -527,6 +543,28 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertTrue(locomotion._registered)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
+
+    def test_slam_relocalization_uses_vendor_map_id_command(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {"slam": {"enabled": True}}})
+        slam = find_plugin(plugins, "slam_control")
+        result = slam.dispatch("start_relocalization", {"map_id": 42})
+        self.assertEqual(result["command"], "start_relocalization:42")
+        self.assertEqual(slam.nodes.integrated_command_pub.published[-1].data, "start_relocalization:42")
+
+    def test_hand_state_payload_marks_no_hand_hardware_unavailable(self):
+        empty_sensors = SimpleNamespace(
+            palm_touch_data=[0] * 36, back_of_hand_touch_data=[0] * 36,
+            thumb_touch_data=[0] * 36, index_finger_touch_data=[0] * 36,
+            middle_finger_touch_data=[0] * 36, ring_finger_touch_data=[0] * 36,
+            little_finger_touch_data=[0] * 36,
+        )
+        payload = device.AimdkNodes._hand_state_payload(SimpleNamespace(
+            left_hand_type=SimpleNamespace(value=0), right_hand_type=SimpleNamespace(value=0),
+            left_hands=[], right_hands=[], left_touch_sensors=empty_sensors, right_touch_sensors=empty_sensors,
+        ))
+        self.assertFalse(payload["available"])
+        self.assertEqual(payload["left"]["joint_count"], 0)
+        self.assertEqual(payload["right"]["active_touch_channels"], 0)
 
 
 class StartStopLifecycleTests(unittest.TestCase):

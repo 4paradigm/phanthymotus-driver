@@ -175,14 +175,17 @@ class AimdkNodes:
 
         self.streams = {}
 
-        def mirror(key, msg_type, robot_topic, fmt, depth=10, qos=None, max_hz=None):
+        def stream_enabled(name, default=True):
+            return bool(config.get("plugins", {}).get(name, {}).get("enabled", default))
+
+        def mirror(key, msg_type, robot_topic, fmt, depth=10, qos=None, max_hz=None, transform=None):
             core_topic = f"/{namespace}/agibot_x2/{key}"
             as_json = fmt == "data/json"
             core_msg_type = String if as_json else msg_type
             pub = core_publisher(self.core, core_msg_type, core_topic, depth)
             self.robot.create_subscription(
                 msg_type, robot_topic,
-                self._callback(key, pub, as_json=as_json, max_hz=max_hz), qos or depth,
+                self._callback(key, pub, as_json=as_json, max_hz=max_hz, transform=transform), qos or depth,
             )
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
@@ -195,7 +198,11 @@ class AimdkNodes:
         self.robot.create_subscription(Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos)
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
-        mirror("hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json", qos=sensor_qos)
+        if stream_enabled("hand_state", default=False):
+            mirror(
+                "hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json",
+                qos=sensor_qos, transform=self._hand_state_payload,
+            )
         mirror("head_touch", TouchState, "/aima/hal/sensor/touch_head", "data/json", qos=sensor_qos)
         mirror("pmu_state", PmuState, "/aima/hal/pmu/state", "data/json", qos=sensor_qos)
         # SDK's topics_and_services catalog documents rgbd_head_front/* as the front camera, but
@@ -209,9 +216,12 @@ class AimdkNodes:
             "image/jpeg", qos=sensor_qos, max_hz=CAMERA_RGB_MAX_HZ,
         )
         mirror("camera_info", CameraInfo, "/aima/hal/sensor/rgb_head_front_center/camera_info", "data/json", qos=sensor_qos)
-        mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
-        mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
-        mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
+        if stream_enabled("camera_depth", default=False):
+            mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
+        if stream_enabled("lidar", default=False):
+            mirror("lidar", PointCloud2, "/aima/hal/sensor/lidar_chest_front/lidar_pointcloud", "sensor/pointcloud", qos=sensor_qos)
+        if stream_enabled("slam", default=False):
+            mirror("slam_odom", Odometry, "/slam/lidar_odom", "data/json", qos=sensor_qos)
 
         skeleton_topic = f"/{namespace}/{SKELETON_TOPIC}"
         self.skeleton_pub = core_publisher(self.core, String, skeleton_topic, 5)
@@ -259,7 +269,7 @@ class AimdkNodes:
         self.get_mic_source = client(GetMicSourceRequest, "/aimdk_5Fmsgs/srv/GetMicSourceRequest")
         self.get_stored_map = client(GetStoredMapByName, "/aimdk_5Fmsgs/srv/GetStoredMapByName")
 
-    def _callback(self, key, publisher, *, as_json=False, max_hz=None):
+    def _callback(self, key, publisher, *, as_json=False, max_hz=None, transform=None):
         from std_msgs.msg import String
 
         def callback(msg):
@@ -275,7 +285,7 @@ class AimdkNodes:
                 # binary streams (camera/lidar) would mean converting a JPEG/pointcloud byte
                 # array into a full Python list on every frame for nothing, which was throttling
                 # camera_rgb to ~8fps despite the source publishing at 30Hz.
-                value = jsonable(msg)
+                value = transform(msg) if transform else jsonable(msg)
                 output = String()
                 output.data = json.dumps(value, ensure_ascii=False)
                 publisher.publish(output)
@@ -284,6 +294,46 @@ class AimdkNodes:
             else:
                 publisher.publish(msg)
         return callback
+
+    @staticmethod
+    def _hand_state_payload(msg):
+        def hand_payload(hand_type, states, sensors):
+            type_value = int(getattr(hand_type, "value", 0))
+            joints = [
+                {
+                    "name": str(getattr(state, "name", "")),
+                    "position": float(getattr(state, "position", 0.0)),
+                    "velocity": float(getattr(state, "velocity", 0.0)),
+                    "effort": float(getattr(state, "effort", 0.0)),
+                    "state": int(getattr(state, "state", 0)),
+                    "fault_code": int(getattr(state, "faultcode", 0)),
+                }
+                for state in states
+            ]
+            active_touch_channels = 0
+            for field in (
+                "palm_touch_data", "back_of_hand_touch_data", "thumb_touch_data",
+                "index_finger_touch_data", "middle_finger_touch_data",
+                "ring_finger_touch_data", "little_finger_touch_data",
+            ):
+                active_touch_channels += sum(bool(value) for value in getattr(sensors, field, []))
+            return {
+                "type": HAND_TYPES.get(type_value, "unknown"),
+                "available": type_value not in (0, 255) or bool(joints),
+                "joint_count": len(joints),
+                "active_touch_channels": active_touch_channels,
+                "joints": joints,
+            }
+
+        left = hand_payload(
+            getattr(msg, "left_hand_type", None), getattr(msg, "left_hands", []),
+            getattr(msg, "left_touch_sensors", None),
+        )
+        right = hand_payload(
+            getattr(msg, "right_hand_type", None), getattr(msg, "right_hands", []),
+            getattr(msg, "right_touch_sensors", None),
+        )
+        return {"available": left["available"] or right["available"], "left": left, "right": right}
 
     def _imu_callback(self, source, publisher):
         from std_msgs.msg import String
@@ -429,7 +479,7 @@ class JointsPlugin:
             return {"state": "idle"}
         if action in ("info", "read", "get", "joints"):
             return {"state": "running", "data": self.nodes.skeleton_snapshot(), **self.nodes.streams["joints"]}
-        return {"state": "running", **self.nodes.streams["joints"]}
+        return None
 
 
 class JointStatePlugin:
@@ -522,11 +572,13 @@ class CameraPlugin:
         self.nodes = nodes
 
     def get_tools(self):
-        return [
+        tools = [
             _stream_tool("camera_rgb", self.nodes.streams["camera_rgb"], "前置 RGBD 相机彩色画面（压缩 JPEG）"),
             _stream_tool("camera_info", self.nodes.streams["camera_info"], "前置 RGB 相机标定内参（CameraInfo）"),
-            _stream_tool("camera_depth", self.nodes.streams["camera_depth"], "前置 RGBD 相机深度画面"),
         ]
+        if "camera_depth" in self.nodes.streams:
+            tools.append(_stream_tool("camera_depth", self.nodes.streams["camera_depth"], "前置 RGBD 相机深度画面"))
+        return tools
 
     def start(self):
         pass
@@ -1221,7 +1273,7 @@ class SlamControlPlugin:
     ACTIONS = {
         "start_mapping": ([], "开始建图"),
         "stop_mapping": (["map_name"], "结束建图并保存"),
-        "start_relocalization": (["timestamp_ms"], "开始重定位"),
+        "start_relocalization": (["map_id"], "开始重定位"),
         "set_relocalization_pose": (["x", "y"], "发布重定位初始位姿"),
     }
 
@@ -1233,7 +1285,7 @@ class SlamControlPlugin:
             self.ACTIONS,
             {
                 "map_name": {"type": "string"},
-                "timestamp_ms": {"type": "integer", "description": "留空则使用当前时间"},
+                "map_id": {"type": "integer", "description": "目标地图 ID（由 APP 或地图查询获得）"},
                 "x": {"type": "number"}, "y": {"type": "number"},
             },
         ))
@@ -1271,8 +1323,7 @@ class SlamControlPlugin:
         elif action == "stop_mapping":
             string_msg.data = f"stop_mapping:{args['map_name']}"
         elif action == "start_relocalization":
-            timestamp_ms = args.get("timestamp_ms") or int(time.time() * 1000)
-            string_msg.data = f"start_relocalization:{timestamp_ms}"
+            string_msg.data = f"start_relocalization:{int(args['map_id'])}"
         self.nodes.integrated_command_pub.publish(string_msg)
         return {"state": "published", "topic": "/integrated_command", "command": string_msg.data}
 
@@ -1320,18 +1371,39 @@ def build_plugins(config, namespace, ros2):
     def enabled(name, default=True):
         return plugin_config.get(name, {}).get("enabled", default)
 
-    plugins = [
-        McStatePlugin(nodes), JointsPlugin(nodes), JointStatePlugin(nodes), HandStatePlugin(nodes),
-        ImuPlugin(nodes), CameraPlugin(nodes),
-        ReadOnlyStreamPlugin(nodes, "head_touch", "头部触摸事件与八通道原始触摸数据"),
-        ReadOnlyStreamPlugin(nodes, "pmu_state", "PMU 电压、电流、温度和电源状态"),
-        LidarPlugin(nodes), SlamPosePlugin(nodes),
-        SystemStatePlugin(nodes), LinkcraftCatalogPlugin(nodes), ModelPlugin(nodes),
-        McModePlugin(nodes), LocomotionPlugin(nodes), PresetMotionPlugin(nodes),
-        JointCommandPlugin(nodes), HandCommandPlugin(nodes), LinkcraftPlugin(nodes),
-        PmuLedPlugin(nodes), TtsPlugin(nodes), EmojiPlugin(nodes), MicSourcePlugin(nodes),
-        MapGetPlugin(nodes),
-    ]
+    plugins = []
+
+    def add(name, plugin, default=True):
+        if enabled(name, default):
+            plugins.append(plugin)
+
+    add("mc_state", McStatePlugin(nodes))
+    add("joints", JointsPlugin(nodes))
+    add("joint_state", JointStatePlugin(nodes))
+    if "hand_state" in nodes.streams:
+        add("hand_state", HandStatePlugin(nodes), default=False)
+    add("imu", ImuPlugin(nodes))
+    add("camera", CameraPlugin(nodes))
+    add("head_touch", ReadOnlyStreamPlugin(nodes, "head_touch", "头部触摸状态（未触摸时 is_touched=false）"))
+    add("pmu_state", ReadOnlyStreamPlugin(nodes, "pmu_state", "PMU 电压、电流、温度和电源状态"))
+    if "lidar" in nodes.streams:
+        add("lidar", LidarPlugin(nodes), default=False)
+    if "slam_odom" in nodes.streams:
+        add("slam", SlamPosePlugin(nodes), default=False)
+    add("system_state", SystemStatePlugin(nodes))
+    add("linkcraft_catalog", LinkcraftCatalogPlugin(nodes))
+    add("model", ModelPlugin(nodes))
+    add("mc_mode", McModePlugin(nodes))
+    add("locomotion", LocomotionPlugin(nodes))
+    add("preset_motion", PresetMotionPlugin(nodes))
+    add("joint_command", JointCommandPlugin(nodes))
+    add("hand_command", HandCommandPlugin(nodes), default=False)
+    add("linkcraft", LinkcraftPlugin(nodes))
+    add("pmu_led", PmuLedPlugin(nodes))
+    add("tts", TtsPlugin(nodes))
+    add("emoji", EmojiPlugin(nodes))
+    add("mic_source", MicSourcePlugin(nodes))
+    add("map_get", MapGetPlugin(nodes))
     if enabled("slam", default=False):
         plugins.append(SlamControlPlugin(nodes))
     return plugins
