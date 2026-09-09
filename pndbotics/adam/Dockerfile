@@ -40,6 +40,7 @@ COPY resource/      /work/resource/
 COPY common/ /work/common/
 COPY main.py        /work/main.py
 COPY device.py      /work/device.py
+COPY estop.py       /work/estop.py
 COPY grpc_client.py /work/grpc_client.py
 COPY config.yaml    /work/config.yaml
 COPY deploy/        /deploy/
