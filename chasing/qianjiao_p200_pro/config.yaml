@@ -1,4 +1,4 @@
-name: "Qianjiao P200 Pro ROV"
+name: "Chasing Qianjiao P200 Pro ROV"
 driver_id: "chasing-qianjiao-p200-pro"
 mcp_port: 15739
 # Address Agent Core uses to reach this driver. Override with the board IP if needed.
