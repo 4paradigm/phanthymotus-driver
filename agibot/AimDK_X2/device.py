@@ -446,6 +446,8 @@ class HandStatePlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
@@ -454,7 +456,9 @@ class HandStatePlugin:
                 "data": self.nodes.snapshot("hand_state"),
                 **self.nodes.streams["hand_state"],
             }
-        return {"state": "running", "data": self.nodes.snapshot("hand_state"), **self.nodes.streams["hand_state"]}
+        if action in ("read", "get", "hand_state"):
+            return {"state": "running", "data": self.nodes.snapshot("hand_state"), **self.nodes.streams["hand_state"]}
+        return None
 
 
 class ImuPlugin:
@@ -471,9 +475,13 @@ class ImuPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", "data": self.nodes.snapshot("imu"), **self.nodes.streams["imu"]}
+        if action in ("info", "read", "get", "imu"):
+            return {"state": "running", "data": self.nodes.snapshot("imu"), **self.nodes.streams["imu"]}
+        return None
 
 
 class CameraPlugin:
@@ -495,9 +503,15 @@ class CameraPlugin:
 
     def dispatch(self, action, args):
         name = args.get("_tool_name")
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", "data": self.nodes.snapshot(name), **self.nodes.streams[name]}
+        if action in ("info", "read", "get", "camera_rgb", "camera_info", "camera_depth"):
+            if name not in self.nodes.streams:
+                return None
+            return {"state": "running", "data": self.nodes.snapshot(name), **self.nodes.streams[name]}
+        return None
 
 
 class ReadOnlyStreamPlugin:
@@ -518,9 +532,13 @@ class ReadOnlyStreamPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", "data": self.nodes.snapshot(self.name), **self.nodes.streams[self.name]}
+        if action in ("info", "read", "get", self.name):
+            return {"state": "running", "data": self.nodes.snapshot(self.name), **self.nodes.streams[self.name]}
+        return None
 
 
 class LidarPlugin:
@@ -537,9 +555,13 @@ class LidarPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", "data": self.nodes.snapshot("lidar"), **self.nodes.streams["lidar"]}
+        if action in ("info", "read", "get", "lidar"):
+            return {"state": "running", "data": self.nodes.snapshot("lidar"), **self.nodes.streams["lidar"]}
+        return None
 
 
 class SlamPosePlugin:
@@ -556,9 +578,13 @@ class SlamPosePlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", "data": self.nodes.snapshot("slam_odom"), **self.nodes.streams["slam_odom"]}
+        if action in ("info", "read", "get", "slam_pose"):
+            return {"state": "running", "data": self.nodes.snapshot("slam_odom"), **self.nodes.streams["slam_odom"]}
+        return None
 
 
 class SystemStatePlugin:

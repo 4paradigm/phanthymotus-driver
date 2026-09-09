@@ -28,6 +28,7 @@ DEFAULT_DRIVER_URL = "http://127.0.0.1:15717/mcp"
 DEFAULT_POLL_HZ = 10.0
 DEFAULT_REFRESH_SECONDS = 30.0
 DEFAULT_TIMEOUT_SECONDS = 2.0
+DEFAULT_FAILURE_LOG_INTERVAL = 30.0
 DEFAULT_FASTDDS_PROFILE = Path(__file__).with_name("resource") / "fastdds_bridge_local.xml"
 
 
@@ -123,10 +124,19 @@ class McpClient:
 
 
 class SensorBusBridge:
-    def __init__(self, mcp: Any, publish: Callable[[str, str], None]):
+    def __init__(
+        self,
+        mcp: Any,
+        publish: Callable[[str, str], None],
+        log_warning: Callable[[str], None] | None = None,
+        log_info: Callable[[str], None] | None = None,
+    ):
         self._mcp = mcp
         self._publish = publish
+        self._log_warning = log_warning or (lambda message: None)
+        self._log_info = log_info or (lambda message: None)
         self._sensors: dict[str, list[str]] = {}
+        self._failures: dict[str, tuple[float, str, int]] = {}
 
     @property
     def sensors(self) -> dict[str, list[str]]:
@@ -145,7 +155,28 @@ class SensorBusBridge:
                     self._publish(topic, encoded)
                     published += 1
             except Exception as exc:
-                print(f"[x2-bridge] sensor {name} failed: {exc}", flush=True)
+                now = time.monotonic()
+                message = str(exc).replace("\n", " ")[:240]
+                previous = self._failures.get(name)
+                count = (previous[2] if previous else 0) + 1
+                should_log = (
+                    previous is None
+                    or previous[1] != message
+                    or now - previous[0] >= DEFAULT_FAILURE_LOG_INTERVAL
+                )
+                if should_log:
+                    self._log_warning(
+                        f"sensor {name} failed ({count} consecutive polls): {message}"
+                    )
+                    self._failures[name] = (now, message, count)
+                else:
+                    self._failures[name] = (previous[0], previous[1], count)
+            else:
+                previous = self._failures.pop(name, None)
+                if previous is not None:
+                    self._log_info(
+                        f"sensor {name} recovered after {previous[2]} failed polls"
+                    )
         return published
 
 
@@ -185,7 +216,12 @@ def main() -> None:
         message.data = data
         publisher.publish(message)
 
-    bridge = SensorBusBridge(McpClient(driver_url, timeout_seconds), publish)
+    bridge = SensorBusBridge(
+        McpClient(driver_url, timeout_seconds),
+        publish,
+        log_warning=node.get_logger().warning,
+        log_info=node.get_logger().info,
+    )
     last_refresh = 0.0
 
     def tick() -> None:

@@ -422,6 +422,47 @@ class X2BridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             x2_bus_bridge.extract_data_payload(bad)
 
+    def test_poll_failure_logging_is_bounded_and_reports_recovery(self):
+        class FailingMcp:
+            def sensor_info(self, name):
+                raise RuntimeError("temporary failure")
+
+        warnings = []
+        infos = []
+        bridge = x2_bus_bridge.SensorBusBridge(
+            FailingMcp(),
+            lambda topic, data: None,
+            log_warning=warnings.append,
+            log_info=infos.append,
+        )
+        bridge._sensors = {"imu": ["/imu"]}
+        for _ in range(20):
+            bridge.poll_once()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("1 consecutive poll", warnings[0])
+
+        class RecoveredMcp:
+            def sensor_info(self, name):
+                return {"ok": True}
+
+        bridge._mcp = RecoveredMcp()
+        self.assertEqual(bridge.poll_once(), 1)
+        self.assertEqual(len(infos), 1)
+        self.assertIn("recovered after 20 failed polls", infos[0])
+
+    def test_poll_failure_message_is_bounded(self):
+        class FailingMcp:
+            def sensor_info(self, name):
+                raise RuntimeError("x" * 1000)
+
+        warnings = []
+        bridge = x2_bus_bridge.SensorBusBridge(
+            FailingMcp(), lambda topic, data: None, log_warning=warnings.append
+        )
+        bridge._sensors = {"imu": ["/imu"]}
+        bridge.poll_once()
+        self.assertLessEqual(len(warnings[0]), 320)
+
 
 class DispatchSmokeTests(unittest.TestCase):
     """Exercise a couple of simple service-backed dispatch() calls end-to-end against the
