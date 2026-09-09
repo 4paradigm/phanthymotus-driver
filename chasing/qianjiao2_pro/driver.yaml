@@ -1,12 +1,12 @@
-id: qianxing-qianjiao2-pro
-name: 潜蛟 2.0 Pro ROV
+id: chasing-qianjiao2-pro
+name: Qianjiao 2.0 pro ROV
 category: driver
-hardware_provider: qianxing
+hardware_provider: chasing
 hardware_model: qianjiao2-pro
 image_name: qianjiao2-pro
 port: 15739
 mcp_url: "http://localhost:15739/mcp"
-description: "潜行科技潜蛟 2.0 Pro 水下机器人：MAVLink UDP 6DOF 运动控制、解锁和状态监控"
+description: "Qianjiao 2.0 pro ROV: MAVLink UDP 6DOF motion control, lock/unlock, and status monitoring"
 build_context_extras:
   - ../../common
 cards:

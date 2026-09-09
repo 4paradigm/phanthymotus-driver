@@ -21,11 +21,11 @@ def start_registration(port: int) -> None:
     import ssl
     import urllib.request
     agent = os.environ.get("AGENT_CORE_URL", "https://127.0.0.1:15678").rstrip("/")
-    driver_id = CFG.get("driver_id", "qianxing-qianjiao2-pro")
+    driver_id = CFG.get("driver_id", "chasing-qianjiao2-pro")
     advertise_host = os.environ.get("MCP_ADVERTISE_HOST") or CFG.get("mcp_advertise_host") or "127.0.0.1"
     payload = json.dumps({
         "id": driver_id,
-        "name": CFG.get("name", "潜蛟 2.0 Pro ROV"),
+        "name": CFG.get("name", "Qianjiao 2.0 pro ROV"),
         "url": f"http://{advertise_host}:{port}/mcp",
         "transport": "http",
         "category": "driver",
