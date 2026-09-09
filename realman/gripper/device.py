@@ -55,6 +55,13 @@ class GripperPlugin:
         self.nodes.close()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "info":
+            # 画布放置/连线时调用；actuator 卡片无需 topic_out（见 agibot AimDK_X2 同款实现）
+            return {"state": "running", **self.nodes.bridge.snapshot()}
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action != "set_position":
             return None
         position = _position(args.get("position"))

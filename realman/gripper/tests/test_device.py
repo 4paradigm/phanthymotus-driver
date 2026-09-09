@@ -23,6 +23,9 @@ class FakeBridge:
         self.calls.append((command, params))
         return {"command": command, **params}
 
+    def snapshot(self):
+        return {"supplier": {"state": "waiting_for_supplier_state"}, "last_command": None}
+
 
 class FakeNodes:
     def __init__(self):
@@ -69,6 +72,19 @@ class GripperPluginTests(unittest.TestCase):
     def test_invalid_position_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "position must be a number"):
             self.plugin.dispatch("set_position", {"position": "bad"})
+
+    def test_info_action_reports_running_with_supplier_snapshot(self):
+        result = self.plugin.dispatch("info", {})
+
+        self.assertEqual(result["state"], "running")
+        self.assertIn("supplier", result)
+
+    def test_canvas_lifecycle_start_stop_actions(self):
+        self.assertEqual(self.plugin.dispatch("start", {}), {"state": "running"})
+        self.assertEqual(self.plugin.dispatch("stop", {}), {"state": "idle"})
+
+    def test_unknown_action_returns_none(self):
+        self.assertIsNone(self.plugin.dispatch("something_else", {}))
 
 
 if __name__ == "__main__":
