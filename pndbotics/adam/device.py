@@ -1454,7 +1454,10 @@ class HandStatePlugin:
         if action in ("info", "hand_state"):
             payload = self._state_cache.snapshot(self._state_timeout_sec)
             if payload is not None:
-                return payload
+                return {
+                    **payload,
+                    "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+                }
             status = self._state_cache.status(self._state_timeout_sec)
             return {
                 "state": "unavailable" if not status["reader_available"] else "waiting",
