@@ -35,6 +35,9 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("python3-pip", dockerfile)
         self.assertIn("ARG APT_MIRROR=", dockerfile)
         self.assertIn("${APT_MIRROR}", dockerfile)
+        self.assertIn("dpkg-query -W", dockerfile)
+        for package in ("libusb-1.0-0", "libv4l-0", "libv4l2rds0", "libv4lconvert0", "v4l-utils"):
+            self.assertIn(package, dockerfile)
         self.assertIn("pyrealsense2==2.56.5.9235", dockerfile)
         self.assertIn("opencv-python-headless", dockerfile)
         self.assertIn("COPY main.py device.py camera.py realsense.py", dockerfile)
