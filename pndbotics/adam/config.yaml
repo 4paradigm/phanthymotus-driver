@@ -15,6 +15,12 @@ plugins:
   state:
     enabled: true
     publish_rate_hz: 50
+  estop:
+    enabled: true
+    poll_rate_hz: 2
+    state_timeout_sec: 5
+    pac_url: "http://10.10.20.127:8626"
+    http_timeout_sec: 2
   loco:
     enabled: true
   camera:

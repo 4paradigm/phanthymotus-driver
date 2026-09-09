@@ -2,6 +2,7 @@
 
 Plugins:
   StatePlugin  — DDS rt/lowstate → ROS2 skeleton/IMU/battery
+  EStopPlugin  — read-only PAC physical emergency-stop state
   LocoPlugin   — gRPC locomotion control
   ArmPlugin    — ROS2 JointState upper body control
   HandPlugin   — DDS rt/handcmd finger control and hand-state query
@@ -21,6 +22,8 @@ import zlib
 from pathlib import Path
 
 import numpy as np
+
+from estop import EStopPlugin
 
 try:
     import rclpy
@@ -2449,6 +2452,14 @@ class AdamDeviceBundle:
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
+            )
+            self._plugins.append(p)
+
+        # EStopPlugin: read-only PAC power-state monitor.
+        if plugins_cfg.get("estop", {}).get("enabled", True):
+            p = EStopPlugin(
+                plugins_cfg.get("estop", {}), namespace, executor,
+                grpc_client=grpc_client,
             )
             self._plugins.append(p)
 
