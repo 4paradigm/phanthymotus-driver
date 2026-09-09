@@ -48,6 +48,11 @@ response, not completion. The terminal result is posted to Core's
 Only one recording may be active. Camera previews keep running when recording
 is cancelled. Missing, stale or stalled input produces an error.
 
+A successful video result includes `file_name`, the full `file_path`, and a
+human-readable `message` naming the saved file. These fields are added only
+after encoding and file validation succeed; cancellation does not advertise an
+incomplete file as a saved result.
+
 The queued response includes `queued_at`. A successful ACP completion is sent
 only after FFmpeg exits successfully and ffprobe verifies the completed MP4's
 duration and frame count. The result separates media duration from elapsed time:
@@ -94,6 +99,11 @@ No Core modification is required for the driver's completion protocol or timing
 fields: it uses the existing ACP endpoint and `info` result. Core's optional
 activity-log forwarding is a separate observability fix, not a prerequisite for
 recording or correct terminal signaling.
+For automatic user-facing file receipts, Core must retain the file-result fields
+when compacting ACP events. Legacy Core versions discard all `result` data and
+cannot deliver the saved path. A separate minimal Core fix preserves file receipts
+and sends their filename/path through the existing activity `trigger` renderer;
+it does not modify frontend files or change the capture protocol.
 
 ## Validation
 
@@ -116,3 +126,6 @@ Cancellation also reported ordered timestamps and elapsed time. The Core dropdow
 title patch was rolled back, and the temporary external test instance was stopped.
 All 27 capture checks passed in the ARM64 image; 63 local Go2 checks passed before
 deployment. Verification scripts remain local and are not part of this change.
+The file receipt was subsequently verified with a real 5-second recording: the
+existing browser log displayed the complete filename and path immediately from
+the ACP callback, and frontend JavaScript matched the original Core image.
