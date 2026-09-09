@@ -438,10 +438,14 @@ class _StatePublisherNode(Node):
         self._topic_skeleton = f"/{namespace}/state/joints"
         self._topic_imu = f"/{namespace}/state/imu"
         self._topic_battery = f"/{namespace}/state/battery"
+        self._topic_robot_state = f"/{namespace}/state/robot"
+        self._topic_motor_state = f"/{namespace}/state/motors"
 
         self._pub_skeleton = self.create_publisher(String, self._topic_skeleton, qos)
         self._pub_imu = self.create_publisher(String, self._topic_imu, qos)
         self._pub_battery = self.create_publisher(String, self._topic_battery, qos)
+        self._pub_robot_state = self.create_publisher(String, self._topic_robot_state, qos)
+        self._pub_motor_state = self.create_publisher(String, self._topic_motor_state, qos)
 
         self._latest_state = None
         self._active = False
@@ -466,6 +470,15 @@ class _StatePublisherNode(Node):
         if not active or state is None:
             return
 
+        robot_data = {
+            "mode_pr": int(state.mode_pr),
+            "tick": int(state.tick),
+            "wireless_remote": list(state.wireless_remote),
+        }
+        msg_robot = String()
+        msg_robot.data = json.dumps(robot_data)
+        self._pub_robot_state.publish(msg_robot)
+
         # Skeleton (joints)
         joints = []
         for idx, name in enumerate(self._joints):
@@ -478,6 +491,24 @@ class _StatePublisherNode(Node):
         msg = String()
         msg.data = json.dumps({"joints": joints})
         self._pub_skeleton.publish(msg)
+
+        motor_states = []
+        for idx, motor in enumerate(state.motor_state):
+            if idx >= len(self._joints):
+                break
+            motor_states.append({
+                "idx": idx,
+                "name": self._joints[idx],
+                "mode": int(motor.mode),
+                "q": float(motor.q),
+                "dq": float(motor.dq),
+                "ddq": float(motor.ddq),
+                "tau_est": float(motor.tau_est),
+                "state": int(motor.state),
+            })
+        msg_motor = String()
+        msg_motor.data = json.dumps({"motors": motor_states})
+        self._pub_motor_state.publish(msg_motor)
 
         # IMU
         imu = state.imu_state
@@ -552,6 +583,24 @@ class StatePlugin:
                 ],
             },
             {
+                "name": "motor_state",
+                "type": "sensor",
+                "description": "Adam motor feedback — position, velocity, acceleration, torque estimate and state",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_motor_state, "format": "data/json"}
+                ],
+            },
+            {
+                "name": "robot_state",
+                "type": "sensor",
+                "description": "Adam low-level state — mode, tick and wireless remote channels",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_robot_state, "format": "data/json"}
+                ],
+            },
+            {
                 "name": "imu",
                 "type": "sensor",
                 "description": "Adam IMU — quaternion, gyroscope, accelerometer",
@@ -617,6 +666,12 @@ class StatePlugin:
             if tool_name == "imu":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_imu, "format": "data/json"}]}
+            if tool_name == "motor_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_motor_state, "format": "data/json"}]}
+            if tool_name == "robot_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_robot_state, "format": "data/json"}]}
             if tool_name == "battery":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}

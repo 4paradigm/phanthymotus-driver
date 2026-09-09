@@ -17,6 +17,7 @@ pndbotics-adam:
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - DDS_NETWORK_INTERFACE=eno1
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
     - GRPC_HOST=localhost

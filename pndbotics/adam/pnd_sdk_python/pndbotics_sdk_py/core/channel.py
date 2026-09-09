@@ -63,12 +63,12 @@ class Channel:
                     sample = self.__reader.take_one(timeout=duration(seconds=timeout))
             except DDSException as e:
                 print("[Reader] catch DDSException msg:", e.msg)
-            except TimeoutError:
+            except (TimeoutError, StopIteration):
                 # Polling readers commonly time out while feedback is absent;
                 # initialization status is logged by the caller instead.
                 pass
-            except:
-                print("[Reader] take sample error")
+            except Exception as e:
+                print(f"[Reader] take sample error: {type(e).__name__}: {e}")
 
             return sample
 

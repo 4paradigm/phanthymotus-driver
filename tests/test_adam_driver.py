@@ -54,5 +54,44 @@ class AdamHandStatePluginTests(unittest.TestCase):
         self.assertEqual([{"topic": "/adam/state/hand", "format": "data/json"}], result["topic_out"])
 
 
+class AdamStatePluginTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = load_device()
+
+    def _plugin(self):
+        node = types.SimpleNamespace(
+            _topic_skeleton="/adam/state/joints",
+            _topic_motor_state="/adam/state/motors",
+            _topic_robot_state="/adam/state/robot",
+            _topic_imu="/adam/state/imu",
+            _topic_battery="/adam/state/battery",
+            set_active=mock.Mock(),
+        )
+        with mock.patch.object(self.device, "_StatePublisherNode", return_value=node):
+            return self.device.StatePlugin({}, "adam", mock.Mock(), "pro")
+
+    def test_motor_and_robot_state_tool_contracts(self):
+        plugin = self._plugin()
+        tools = {tool["name"]: tool for tool in plugin.get_tools()}
+
+        self.assertEqual(
+            [{"topic": "/adam/state/motors", "format": "data/json"}],
+            tools["motor_state"]["topic_out"],
+        )
+        self.assertEqual(
+            [{"topic": "/adam/state/robot", "format": "data/json"}],
+            tools["robot_state"]["topic_out"],
+        )
+        self.assertEqual(
+            [{"topic": "/adam/state/motors", "format": "data/json"}],
+            plugin.dispatch("info", {"_tool_name": "motor_state"})["topic_out"],
+        )
+        self.assertEqual(
+            [{"topic": "/adam/state/robot", "format": "data/json"}],
+            plugin.dispatch("info", {"_tool_name": "robot_state"})["topic_out"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
