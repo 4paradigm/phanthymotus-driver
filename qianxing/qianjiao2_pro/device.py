@@ -110,8 +110,10 @@ class QianjiaoDevice:
         self._video_thread: threading.Thread | None = None
         self._video_cond = threading.Condition()
         self._video_frame = None
+        self._video_sequence = 0
         self._video_ready = False
         self._video_error: str | None = None
+        self._last_rc_command: dict[str, Any] | None = None
 
     def _redacted_rtsp(self) -> str:
         return f"rtsp://{self.camera_ip}:8554/stream/0/0"
@@ -126,7 +128,7 @@ class QianjiaoDevice:
         # Ubuntu 22.04 ships FFmpeg 4.4, which does not support the newer
         # ``-fps_mode`` option.  ``-vsync 0`` provides the same passthrough
         # behavior while keeping compatibility with that version.
-        command = ["ffmpeg", "-loglevel", "error", "-rtsp_transport", "tcp", "-fflags", "+nobuffer", "-flags", "low_delay", "-analyzeduration", "1M", "-probesize", "1M", "-i", self.camera_rtsp, "-an", "-vf", "scale=1280:-2", "-vsync", "0", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
+        command = ["ffmpeg", "-loglevel", "error", "-rtsp_transport", "tcp", "-fflags", "+nobuffer+discardcorrupt", "-flags", "low_delay", "-analyzeduration", "1M", "-probesize", "1M", "-i", self.camera_rtsp, "-an", "-threads", "2", "-vf", "fps=10,scale=1280:-2", "-vsync", "0", "-f", "mjpeg", "-q:v", "6", "pipe:1"]
         backoff = 1.0
         while not self._stop.is_set():
             buf = bytearray()
@@ -154,6 +156,7 @@ class QianjiaoDevice:
                         del buf[:end + 2]
                         with self._video_cond:
                             self._video_frame = frame
+                            self._video_sequence += 1
                             self._video_ready = True
                             self._video_cond.notify_all()
                         backoff = 1.0
@@ -180,10 +183,16 @@ class QianjiaoDevice:
             self._stop.wait(backoff)
             backoff = min(backoff * 2.0, 30.0)
 
-    def get_video_frame(self, timeout=5.0):
+    def get_next_video_frame(self, after_sequence: int, timeout=5.0):
+        """Wait for a newer frame so slow HTTP clients never queue duplicates."""
         with self._video_cond:
-            if self._video_frame is None: self._video_cond.wait(timeout)
-            return self._video_frame
+            deadline = time.monotonic() + timeout
+            while self._video_sequence <= after_sequence and not self._stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return after_sequence, None
+                self._video_cond.wait(remaining)
+            return self._video_sequence, self._video_frame
 
     def start_ros_status(self):
         """Publish vendor UDP status for Agent Core topic renderers."""
@@ -474,14 +483,14 @@ class QianjiaoDevice:
         if duration != -1 and not 0.1 <= duration <= 60:
             raise ValueError("duration must be -1 (continuous) or between 0.1 and 60 seconds")
 
-        def send(values_pwm):
+        def send(values_pwm, force=False):
             cancel_event = values.get("_cancel_event")
             action_id = values.get("_action_id")
             if cancel_event is not None:
                 with self._action_lock:
                     owned = (not cancel_event.is_set() and self._active_action is not None
                              and self._active_action.get("action_id") == action_id)
-                if not owned:
+                if not owned and not force:
                     return False
             with self._lock:
                 if self.mock:
@@ -493,6 +502,11 @@ class QianjiaoDevice:
                     # MAVLink v1 RC_CHANNELS_OVERRIDE has exactly eight
                     # channel fields after target_system/component.
                     self.link.mav.rc_channels_override_send(self.target_system, self.target_component, *channels)
+                self._last_rc_command = {
+                    "channels": dict(zip(CHANNELS, values_pwm)),
+                    "sent_at": time.time(),
+                    "is_neutral": all(value == 1500 for value in values_pwm),
+                }
             return True
 
         send(pwm)
@@ -502,7 +516,7 @@ class QianjiaoDevice:
                 self._stop.wait(0.1)
                 if not (cancel_event and cancel_event.is_set()) and not self._stop.is_set():
                     send(pwm)
-            send([1500] * len(CHANNELS))
+            send([1500] * len(CHANNELS), force=True)
             return {"state": "stopped", "duration": -1, "channels": dict(zip(CHANNELS, pwm))}
         if duration != -1:
             deadline = time.monotonic() + duration
@@ -512,7 +526,7 @@ class QianjiaoDevice:
                 if (time.monotonic() < deadline and not (cancel_event and cancel_event.is_set())):
                     send(pwm)
             if not (cancel_event and cancel_event.is_set()):
-                send([1500] * len(CHANNELS))
+                send([1500] * len(CHANNELS), force=True)
             return {"state": "stopped", "duration": duration, "channels": dict(zip(CHANNELS, pwm))}
         return {"state": "moving", "channels": dict(zip(CHANNELS, pwm))}
 
@@ -610,7 +624,10 @@ class QianjiaoDevice:
             return {**self._imu_snapshot(self._rov_status), "topic_out": [{"topic": self.imu_topic, "format": "data/json"}]}
         if tool == "loco_state":
             return {**self._loco_snapshot(self._rov_status), "topic_out": [{"topic": self.loco_state_topic, "format": "data/json"}]}
-        if tool == "control" and action in ("start", "info"): return {"state": "ready", "mavlink_connected": self._connected()}
+        if tool == "control" and action in ("start", "info"):
+            return {"state": "ready", "mavlink_connected": self._connected(),
+                    "active_action": self._active_action["action_id"] if self._active_action else None,
+                    "last_rc_command": self._last_rc_command}
         if tool == "control" and action == "stop": return self.stop_motion()
         if tool == "control" and action == "cancel": return self.stop_motion()
         if tool == "control" and action == "unlock": return self.arm(True)
