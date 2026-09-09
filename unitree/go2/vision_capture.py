@@ -29,6 +29,10 @@ _MAX_FRAME_AGE_S = 3.0
 log = logging.getLogger(__name__)
 
 
+def _timestamp():
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
 class VisionCapturePlugin:
     PREFIX = "vision_capture"
 
@@ -53,8 +57,6 @@ class VisionCapturePlugin:
 
     def get_tool(self):
         camera_property = {"type": "string", "enum": ["front", "external"],
-                           "oneOf": [{"const": "front", "title": "front"},
-                                     {"const": "external", "title": "external (only rgb)"}],
                            "description": "摄像头：front 内置前置，external 外接（only rgb）；省略时使用卡片配置。"}
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
@@ -79,7 +81,7 @@ class VisionCapturePlugin:
                     "stop": {"params": [], "description": "取消当前录像并删除未完成文件。"},
                 },
                 "x-completion": {"actions": ["record_video"],
-                                 "timeout": self._max_duration_s + 20},
+                                 "timeout": self._max_duration_s + 25},
             },
             "configSchema": {"type": "object", "properties": {
                 "camera": {**camera_property, "default": "front"},
@@ -193,7 +195,7 @@ class VisionCapturePlugin:
                 "videos_dir": str(self._output_dir / "videos"),
                 "fps": self._fps, "max_duration_s": self._max_duration_s,
                 "latest_frame_age_s": round(age, 3) if age is not None else None,
-                "encoder_available": shutil.which("ffmpeg") is not None,
+                "encoder_available": all(shutil.which(name) is not None for name in ("ffmpeg", "ffprobe")),
                 "active_recording": public, "last_recording": last}
 
     def start(self):
@@ -287,6 +289,7 @@ class VisionCapturePlugin:
                 with self._recording_lock:
                     active["process"] = process
                 started = time.monotonic()
+                capture_started_at = _timestamp()
                 deadline = started + active["duration_s"]
                 frames = 0
                 while True:
@@ -307,6 +310,8 @@ class VisionCapturePlugin:
                                 and time.monotonic() - frame[1] < _MAX_FRAME_AGE_S):
                             break
                         raise
+                capture_finished = time.monotonic()
+                capture_finished_at = _timestamp()
                 if frames < min(2, self._fps * active["duration_s"]):
                     raise RuntimeError("Not enough fresh frames to record video")
                 process.stdin.close()
@@ -319,13 +324,18 @@ class VisionCapturePlugin:
                 if process.returncode != 0 or not path.exists() or path.stat().st_size == 0:
                     errors.seek(0)
                     raise RuntimeError(errors.read(4096).decode("utf-8", "replace") or "ffmpeg failed to create MP4")
+            media = self._probe_video(path, active["duration_s"], self._fps)
             if cancel.is_set():
                 raise RuntimeError("Video recording was cancelled")
             completed = True
             return {"ok": True, "media_type": "video", "file_path": str(path), "source": source,
-                    "recorded_duration_s": active["duration_s"], "frames": frames,
-                    "encoded_frames": self._fps * active["duration_s"],
-                    "captured_at": datetime.now().isoformat(timespec="seconds")}
+                    "recorded_duration_s": media["duration_s"], "frames": frames,
+                    "encoded_frames": media["frames"],
+                    "capture_started_at": capture_started_at,
+                    "capture_finished_at": capture_finished_at,
+                    "capture_elapsed_s": round(capture_finished - started, 3),
+                    "finalize_elapsed_s": round(time.monotonic() - capture_finished, 3),
+                    "captured_at": _timestamp()}
         except Exception as exc:
             return {"ok": False, "code": "RECORD_CANCELLED" if cancel.is_set() else "RECORD_FAILED",
                     "message": str(exc)}
@@ -340,6 +350,22 @@ class VisionCapturePlugin:
                 active["process"] = None
             if not completed and path is not None:
                 self._remove_partial(path)
+
+    @staticmethod
+    def _probe_video(path, requested, fps):
+        """Only acknowledge completion after the muxed file has the right duration."""
+        metadata = json.loads(subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "format=duration:stream=duration,nb_frames", "-of", "json", str(path),
+        ], stderr=subprocess.PIPE, timeout=5))
+        stream = metadata["streams"][0]
+        duration = float(metadata["format"]["duration"])
+        stream_duration = float(stream["duration"])
+        frames = int(stream["nb_frames"])
+        if (not abs(duration - requested) <= 0.001
+                or not abs(stream_duration - requested) <= 0.001 or frames != requested * fps):
+            raise RuntimeError(f"Invalid completed video: duration={duration}s, stream={stream_duration}s, frames={frames}")
+        return {"duration_s": duration, "frames": frames}
 
     def _notify_complete(self, action_id, status, result):
         payload = json.dumps({"action_id": action_id, "status": status,
@@ -374,6 +400,9 @@ class VisionCapturePlugin:
                     result["cleanup_error"] = cleanup_error
             status = "completed" if result.get("ok") else (
                 "cancelled" if result.get("code") == "RECORD_CANCELLED" else "error")
+            result.update({"requested_duration_s": active["duration_s"],
+                           "queued_at": active["queued_at"], "completed_at": _timestamp(),
+                           "elapsed_s": round(time.monotonic() - active["queued_mono"], 3)})
             self._last_recording = {"action_id": active["action_id"], "status": status, "result": result}
             active["state"] = status
             active["finished"] = True
@@ -389,8 +418,8 @@ class VisionCapturePlugin:
         if type(requested) is not int or not 1 <= requested <= self._max_duration_s:
             return {"ok": False, "code": "INVALID_DURATION",
                     "message": f"duration_s must be an integer between 1 and {self._max_duration_s}"}
-        if shutil.which("ffmpeg") is None:
-            return {"ok": False, "code": "RECORD_FAILED", "message": "ffmpeg is not installed"}
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            return {"ok": False, "code": "RECORD_FAILED", "message": "ffmpeg and ffprobe are required"}
         with self._recording_lock:
             if self._active_recording is not None:
                 return {"ok": False, "code": "RECORD_IN_PROGRESS", "message": "A video recording is already in progress"}
@@ -399,8 +428,9 @@ class VisionCapturePlugin:
             except ValueError as exc:
                 return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
             action_id = f"vision_capture_record_video_{uuid4().hex}"
+            queued_at = _timestamp()
             active = {"action_id": action_id, "state": "recording", "duration_s": requested,
-                      "started_at": datetime.now().isoformat(timespec="seconds"),
+                      "started_at": queued_at, "queued_at": queued_at, "queued_mono": time.monotonic(),
                       "cancel": threading.Event(), "process": None, "source": source}
             thread = threading.Thread(target=self._record_video_async, args=(active,),
                                       daemon=True, name="go2_vision_capture_record_video")
@@ -412,7 +442,9 @@ class VisionCapturePlugin:
                 self._active_recording = None
                 raise
         return {"ok": True, "state": "queued", "action_id": action_id,
-                "media_type": "video", "requested_duration_s": requested, "source": source}
+                "media_type": "video", "requested_duration_s": requested, "source": source,
+                "queued_at": queued_at,
+                "message": "Recording queued; ACP completion follows only after the MP4 is finalized and verified."}
 
     def stop(self):
         with self._recording_lock:

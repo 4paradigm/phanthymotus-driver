@@ -7,8 +7,8 @@ existing Go2 camera publishers, so it does not open a camera device twice.
 ## Select a camera
 
 Select `front` for the built-in front camera, or `external` for an external
-camera. The external option declares the display title **external (only rgb)**.
-The card exposes no `external_instance_id` input.
+camera. RGB-only support is explained in the field description; no Core
+dropdown-rendering change is needed. The card exposes no `external_instance_id` input.
 
 Start the source camera first. For an external camera, configure and start an
 [`ext_camera`](EXT_CAMERA.md) instance with `channel: rgb`. The capture card
@@ -48,6 +48,24 @@ response, not completion. The terminal result is posted to Core's
 Only one recording may be active. Camera previews keep running when recording
 is cancelled. Missing, stale or stalled input produces an error.
 
+The queued response includes `queued_at`. A successful ACP completion is sent
+only after FFmpeg exits successfully and ffprobe verifies the completed MP4's
+duration and frame count. The result separates media duration from elapsed time:
+
+| Field | Meaning |
+| --- | --- |
+| `requested_duration_s` | Requested video length. |
+| `recorded_duration_s` | Completed MP4 duration measured by ffprobe. |
+| `capture_elapsed_s` | Actual time spent collecting source frames, measured with a monotonic clock. |
+| `finalize_elapsed_s` | Time spent finalizing and validating the file after collection ends. |
+| `elapsed_s` | Total time from queue admission to terminal result, excluding callback network delivery. |
+| `queued_at`, `capture_started_at`, `capture_finished_at`, `completed_at` | Millisecond ISO timestamps with explicit timezone offsets. |
+
+For a 5-second recording, the MP4 must measure 5 seconds; the total elapsed time
+can be longer due to waiting for the first frame and finalizing the file.
+Failed/cancelled results still include request, queue, completion and total-time
+fields. The single ACP terminal callback follows validation or failure cleanup.
+
 Video timestamps preserve capture timing. Output uses the configured frame
 rate and extends the final frame to the requested endpoint. At 15 fps, a
 5-second video contains 75 encoded frames. `frames` counts fresh source frames;
@@ -72,11 +90,10 @@ mkdir -p ~/Downloads/go2-photos
 scp 'unitree@GO2_IP:/opt/phanthy-motus/data/vision_capture/photos/*.jpg' ~/Downloads/go2-photos/
 ```
 
-Core must support `oneOf.title` on actuator fields to display the external
-option's title instead of its raw `external` value. Showing ACP terminal events
-in the activity log also requires Core to forward callbacks to its activity
-stream. These are separate Core changes; the driver supplies the schema and
-completion callbacks and works with the existing `info` query independently.
+No Core modification is required for the driver's completion protocol or timing
+fields: it uses the existing ACP endpoint and `info` result. Core's optional
+activity-log forwarding is a separate observability fix, not a prerequisite for
+recording or correct terminal signaling.
 
 ## Validation
 
@@ -90,3 +107,12 @@ updated Core activity stream and browser.
 Local and ARM64-image checks covered selection, stale input, duration validation,
 exact output timing at slow source rates, encoder failures and cancellation.
 Local verification scripts are intentionally not included in this driver change.
+On 2026-09-09, the timing metadata and ffprobe completion gate passed real Go2
+verification on both sources. Each MP4 measured 5.000000 seconds and decoded to
+75 frames. Measured collection time was 5.001 seconds for each source; queue
+admission to file readiness took 5.335 seconds (front) and 5.328 seconds (external).
+ACP reached Core 0.095 and 0.141 seconds after file readiness, respectively.
+Cancellation also reported ordered timestamps and elapsed time. The Core dropdown
+title patch was rolled back, and the temporary external test instance was stopped.
+All 27 capture checks passed in the ARM64 image; 63 local Go2 checks passed before
+deployment. Verification scripts remain local and are not part of this change.
