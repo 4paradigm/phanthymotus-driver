@@ -81,6 +81,15 @@ class VisionCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no fresh RGB frame"):
             camera.capture_photo(0.01)
 
+    def test_video_frame_count_tracks_wall_clock_when_camera_lags(self):
+        card = VisionCapturePlugin({"video_fps": 15}, self._camera())
+        count = 0
+        # Simulate an 11.5 FPS camera feeding a 15 FPS encoder for two seconds.
+        for frame_index in range(23):
+            elapsed = min(2.0, (frame_index + 1) / 11.5)
+            count = card._target_frame_count(elapsed, count)
+        self.assertEqual(count, 30)
+
 
 if __name__ == "__main__":
     unittest.main()
