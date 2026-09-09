@@ -19,7 +19,7 @@ driver_pid=$!
 (
   export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
   export RMW_IMPLEMENTATION="rmw_fastrtps_cpp"
-  export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-/opt/phanthy-motus/dds-local.xml}"
+  export FASTRTPS_DEFAULT_PROFILES_FILE="${CORE_FASTRTPS_DEFAULT_PROFILES_FILE:-/opt/phanthy-motus/dds-local.xml}"
   export ROS_LOCALHOST_ONLY=0
   exec python3 /work/agibot/AimDK_X2/x2_socket_bridge.py
 ) &
