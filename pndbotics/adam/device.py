@@ -7,6 +7,7 @@ Plugins:
   HandPlugin   — DDS rt/handcmd finger control and hand-state query
   ModelPlugin  — URDF resource for 3D visualization
 """
+from __future__ import annotations
 
 import json
 import io
@@ -619,6 +620,159 @@ class StatePlugin:
                         "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._node._topic_skeleton, "format": "sensor/skeleton"}]}
+        return None
+
+
+# ===========================================================================
+# HandStatePlugin — ROS2 hand-state sensor card (read-only)
+# ===========================================================================
+
+class _HandStatePublisherNode(Node):
+    """ROS2 node that publishes hand-state JSON from HandStateCache."""
+
+    def __init__(self, namespace: str, publish_rate_hz: float):
+        super().__init__("adam_hand_state_publisher")
+        self._namespace = namespace
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self._topic_hand_state = f"/{namespace}/state/hand_state"
+        self._pub_hand_state = self.create_publisher(String, self._topic_hand_state, qos)
+        self._latest_payload = None
+        self._active = False
+        self._lock = threading.Lock()
+        interval = 1.0 / publish_rate_hz
+        self._timer = self.create_timer(interval, self._publish)
+
+    def update_payload(self, payload):
+        with self._lock:
+            self._latest_payload = payload
+
+    def set_active(self, active: bool):
+        with self._lock:
+            self._active = bool(active)
+
+    def _publish(self):
+        with self._lock:
+            payload = self._latest_payload
+            active = self._active
+        if not active or payload is None:
+            return
+        msg = String()
+        msg.data = json.dumps(payload)
+        self._pub_hand_state.publish(msg)
+
+
+class HandStatePlugin:
+    """Read-only hand-state sensor card powered by HandStateCache.
+
+    Publishes JSON snapshots of the 12-channel hand feedback to a ROS2 topic.
+    Does NOT write to ``rt/handcmd`` — it is purely observational.
+    """
+
+    PREFIX = "hand_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 state_cache=None, **kwargs):
+        self._namespace = namespace
+        self._running = False
+        self._executor = executor
+        self._state_cache = state_cache or HandStateCache()
+        try:
+            self._publish_rate_hz = float(plugin_config.get("publish_rate_hz", 30))
+        except (TypeError, ValueError):
+            self._publish_rate_hz = 30.0
+        if self._publish_rate_hz <= 0:
+            self._publish_rate_hz = 30.0
+        try:
+            self._state_timeout_sec = float(plugin_config.get("state_timeout_sec", 1.0))
+        except (TypeError, ValueError):
+            self._state_timeout_sec = 1.0
+        if self._state_timeout_sec <= 0:
+            self._state_timeout_sec = 1.0
+        self._node = _HandStatePublisherNode(namespace, self._publish_rate_hz)
+        executor.add_node(self._node)
+        self._poll_lifecycle_lock = threading.Lock()
+        self._poll_thread = None
+        self._poll_stop_event = None
+
+    def _poll_loop(self, stop_event: threading.Event):
+        """Poll HandStateCache and push snapshots to the ROS2 publisher."""
+        while not stop_event.is_set():
+            snapshot = self._state_cache.snapshot(self._state_timeout_sec)
+            if snapshot is not None:
+                self._node.update_payload(snapshot)
+            elif stop_event.wait(0.05):
+                break
+
+    def get_tools(self) -> list:
+        return [
+            {
+                "name": "hand_state",
+                "type": "sensor",
+                "multiInstance": False,
+                "description": (
+                    "Adam hand state — real-time 12-channel hand feedback "
+                    "(left/right, 6 motors each). Publishes to "
+                    f"{self._node._topic_hand_state}"
+                ),
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_hand_state, "format": "data/json"}
+                ],
+            },
+        ]
+
+    def start(self):
+        self._running = True
+        self._node.set_active(True)
+        self._state_cache.start()
+        with self._poll_lifecycle_lock:
+            if self._poll_thread is None or not self._poll_thread.is_alive():
+                stop_event = threading.Event()
+                self._poll_stop_event = stop_event
+                self._poll_thread = threading.Thread(
+                    target=self._poll_loop,
+                    args=(stop_event,),
+                    daemon=True,
+                    name="adam_hand_state_poll",
+                )
+                self._poll_thread.start()
+
+    def stop(self):
+        self._running = False
+        self._node.set_active(False)
+        with self._poll_lifecycle_lock:
+            thread = self._poll_thread
+            stop_event = self._poll_stop_event
+            if stop_event is not None:
+                stop_event.set()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(1.5)
+            if thread is None or not thread.is_alive():
+                self._poll_thread = None
+                self._poll_stop_event = None
+
+    def close(self):
+        self.stop()
+        _destroy_ros_node(self._executor, self._node)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "info":
+            return {
+                "state": "running" if self._running else "idle",
+                "topic_out": [
+                    {"topic": self._node._topic_hand_state, "format": "data/json"}
+                ],
+            }
         return None
 
 
@@ -2346,9 +2500,10 @@ class AdamDeviceBundle:
             and (ros2_enabled is None or ros2_enabled)
         )
         hand_enabled = plugins_cfg.get("hand", {}).get("enabled", True)
+        hand_state_enabled = plugins_cfg.get("hand_state", {}).get("enabled", True)
         self._hand_state_cache = (
             HandStateCache(dds_handstate_sub)
-            if hand_enabled else None
+            if (hand_enabled or hand_state_enabled) else None
         )
 
         # StatePlugin
@@ -2387,6 +2542,12 @@ class AdamDeviceBundle:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
+            self._plugins.append(p)
+
+        # HandStatePlugin — read-only sensor card
+        if hand_state_enabled and self._ros2_enabled:
+            p = HandStatePlugin(plugins_cfg.get("hand_state", {}), namespace, executor,
+                                state_cache=self._hand_state_cache)
             self._plugins.append(p)
 
         # ModelPlugin
