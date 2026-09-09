@@ -25,7 +25,7 @@ def start_registration(port: int) -> None:
     advertise_host = os.environ.get("MCP_ADVERTISE_HOST") or CFG.get("mcp_advertise_host") or "127.0.0.1"
     payload = json.dumps({
         "id": driver_id,
-        "name": CFG.get("name", "Qianjiao P200 Pro ROV"),
+        "name": CFG.get("name", "Chasing Qianjiao P200 Pro ROV"),
         "url": f"http://{advertise_host}:{port}/mcp",
         "transport": "http",
         "category": "driver",

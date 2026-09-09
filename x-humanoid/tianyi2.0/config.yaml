@@ -1,6 +1,6 @@
 mcp_port: 15707
 ros_namespace: ""   # 留空则自动使用 hostname
-name: "Tianyi 2.0 Pro"
+name: "X-humanoid Tianyi 2.0 Pro Bundle"
 
 # Forward all topics from domain 0 (body controller) to domain 42 (agent-core)
 # via socket bridge. This enables proper DDS isolation.
