@@ -1,0 +1,13 @@
+id: realman-gripper-driver
+name: RealMan Gripper
+category: driver
+hardware_provider: realman
+hardware_model: "robot-gripper"
+image_name: realman-gripper
+port: 15717
+mcp_url: "http://localhost:15717/mcp"
+description: "睿尔曼机械臂二指夹爪位置控制，使用 hand_follow_pos JSON 协议"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: gripper, type: actuator }
