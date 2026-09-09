@@ -472,6 +472,31 @@ class QianjiaoDevice:
                 self.link.mav.command_long_send(self.target_system, self.target_component, MAV_CMD_COMPONENT_ARM_DISARM, 0, 0 if armed else 1, 0, 0, 0, 0, 0, 0)
             return {"state": "armed" if armed else "disarmed", "command": MAV_CMD_COMPONENT_ARM_DISARM}
 
+    def _send_neutral(self, seconds: float = 1.0) -> None:
+        """Reassert neutral RC values briefly so firmware clears its override."""
+        neutral = [1500] * len(CHANNELS)
+        deadline = time.monotonic() + seconds
+        # Serialize the short neutral burst with new move dispatches.  Without
+        # this, a replaced action could interleave its neutral PWM with the
+        # replacement's target PWM.
+        with self._action_lock:
+            while True:
+                with self._lock:
+                    if self.mock:
+                        self.link.last_rc = neutral
+                    else:
+                        channels = neutral[:5] + [UINT16_MAX, neutral[5], UINT16_MAX]
+                        self.link.mav.rc_channels_override_send(
+                            self.target_system, self.target_component, *channels)
+                    self._last_rc_command = {
+                        "channels": dict(zip(CHANNELS, neutral)),
+                        "sent_at": time.time(),
+                        "is_neutral": True,
+                    }
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._stop.wait(min(0.1, remaining)):
+                    return
+
     def move(self, values: dict) -> dict:
         self._require_connected()
         if not self.mock and not self._is_armed_from_heartbeat():
@@ -516,7 +541,7 @@ class QianjiaoDevice:
                 self._stop.wait(0.1)
                 if not (cancel_event and cancel_event.is_set()) and not self._stop.is_set():
                     send(pwm)
-            send([1500] * len(CHANNELS), force=True)
+            self._send_neutral()
             return {"state": "stopped", "duration": -1, "channels": dict(zip(CHANNELS, pwm))}
         if duration != -1:
             deadline = time.monotonic() + duration
@@ -526,7 +551,7 @@ class QianjiaoDevice:
                 if (time.monotonic() < deadline and not (cancel_event and cancel_event.is_set())):
                     send(pwm)
             if not (cancel_event and cancel_event.is_set()):
-                send([1500] * len(CHANNELS), force=True)
+                self._send_neutral()
             return {"state": "stopped", "duration": duration, "channels": dict(zip(CHANNELS, pwm))}
         return {"state": "moving", "channels": dict(zip(CHANNELS, pwm))}
 
