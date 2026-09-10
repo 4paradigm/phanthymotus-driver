@@ -11,6 +11,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
+| [`generic/teleopit`](generic/teleopit/README.md) | Teleopit G1 29DoF simulation | 15719 | BVH/PICO whole-body input, MuJoCo preview and joint diagnostics; no hardware output |
 | `unitree/go1` | Unitree Go1 (EDU) Quadruped | 15715 | State, locomotion, camera (RGB/depth/pointcloud), ext peripherals, URDF |
 | `unitree/go2` | Unitree Go2 Quadruped | 15703 | Locomotion, obstacle avoidance, voice, video, navigation |
 | `unitree/r1` | Unitree R1 (EDU) Humanoid | 15702 | Mic, TTS, LED, locomotion, stereo camera, state monitoring |
