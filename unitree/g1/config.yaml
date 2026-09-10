@@ -11,6 +11,8 @@ plugins:
     isolated_process: true
   led:
     enabled: true
+  greet:
+    enabled: true
   loco:
     enabled: true
   arm:

@@ -194,6 +194,16 @@ def make_node(module, clock, cost=0.02):
     return node
 
 
+class SpeakerSchemaTest(unittest.TestCase):
+    def test_all_speaker_modes_declare_mouth_resource(self):
+        executor = types.SimpleNamespace(add_node=lambda node: None)
+        direct = G1.SpeakerPlugin({}, "test", executor, FakeAudioClient(FakeClock()))
+        isolated = G1.SpeakerIsolatedProxy.__new__(G1.SpeakerIsolatedProxy)
+
+        self.assertEqual(direct.get_tool()["inputSchema"]["x-resource"], ["mouth"])
+        self.assertEqual(isolated.get_tool()["inputSchema"]["x-resource"], ["mouth"])
+
+
 class SpeakerTestBase(unittest.TestCase):
     MODULE = G1
 

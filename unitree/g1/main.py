@@ -79,6 +79,17 @@ class G1DeviceBundle:
         self._plugins: list = []
         self._smart_motion = smart_motion
         plugins_cfg = cfg.get("plugins", {})
+        # One AudioClient is shared by tts + led + greet; a single lock serializes
+        # all their RPCs (TtsMaker/GetVolume/SetVolume/LedControl) so concurrent
+        # MCP requests and the LED effect thread cannot race the client state.
+        audio_lock = threading.Lock()
+        tts_lock = threading.Lock()
+        # tts.speak and greet/speak drive the same onboard TTS; share one mouth
+        # reservation so a greet cannot queue behind a concurrent tts.speak and
+        # blow its 60s ACP deadline (see MouthReservation in device.py).
+        from device import ArmReservation, MouthReservation
+        mouth_reservation = MouthReservation()
+        arm_reservation = ArmReservation()
 
         if plugins_cfg.get("mic", {}).get("enabled", False):
             from device import MicPlugin
@@ -87,7 +98,7 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from device import NativeTtsPlugin
-            self._plugins.append(NativeTtsPlugin(plugins_cfg["tts"], namespace, executor, audio_client))
+            self._plugins.append(NativeTtsPlugin(plugins_cfg["tts"], namespace, executor, audio_client, audio_lock, tts_lock, mouth_reservation))
             print("[bundle] NativeTtsPlugin loaded")
 
         if plugins_cfg.get("speaker", {}).get("enabled", False):
@@ -103,8 +114,13 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("led", {}).get("enabled", False):
             from device import LedPlugin
-            self._plugins.append(LedPlugin(plugins_cfg["led"], namespace, executor, audio_client))
+            self._plugins.append(LedPlugin(plugins_cfg["led"], namespace, executor, audio_client, audio_lock))
             print("[bundle] LedPlugin loaded")
+
+        if plugins_cfg.get("greet", {}).get("enabled", False):
+            from device import GreetPlugin
+            self._plugins.append(GreetPlugin(plugins_cfg["greet"], namespace, executor, arm_client, audio_client, audio_lock, tts_lock, mouth_reservation, arm_reservation))
+            print("[bundle] GreetPlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False):
             from device import LocoStatePlugin, LocoPlugin, StatePlugin
@@ -128,7 +144,7 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
-            self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
+            self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client, arm_reservation))
             print("[bundle] ArmActionPlugin loaded")
 
         if plugins_cfg.get("asr", {}).get("enabled", False):

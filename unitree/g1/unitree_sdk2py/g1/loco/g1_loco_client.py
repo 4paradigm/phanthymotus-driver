@@ -115,7 +115,7 @@ class LocoClient(Client):
         self.SetBalanceMode(1 if flag else 0)
 
     def WaveHand(self, turn_flag: bool = False):
-        self.SetTaskId(1 if turn_flag else 0)
+        return self.SetTaskId(1 if turn_flag else 0)
 
     def ShakeHand(self, stage: int = -1):
         if stage == 0:

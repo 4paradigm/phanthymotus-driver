@@ -12,11 +12,14 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
   MicPlugin          (sensor)    — UDP multicast → ROS2 topic
   NativeTtsPlugin    (actuator)  — G1 内置 TTS + 音量控制
   LedPlugin          (actuator)  — LED 灯带控制
+  GreetPlugin        (actuator)  — 迎宾：挥手 + 语音 + LED
   LocoStatePlugin    (sensor)    — DDS SportModeState → ROS2 topic
   LocoPlugin         (actuator)  — 运动控制
   ArmActionPlugin    (actuator)  — 手臂动作
   StatePlugin        (sensor)    — DDS LowState → IMU/battery ROS2 topic
 """
+
+from __future__ import annotations
 
 import json
 import math
@@ -244,11 +247,102 @@ class MicPlugin:
 
 # ── NativeTtsPlugin (actuator) ───────────────────────────────────────────────
 
+
+class ArmReservation:
+    """Owner-aware admission control for the shared G1 arm action client."""
+
+    def __init__(self):
+        self._owner = None
+        self._lock = threading.Lock()
+
+    def try_acquire(self, owner: str) -> bool:
+        with self._lock:
+            if self._owner is not None:
+                return False
+            self._owner = owner
+            return True
+
+    def release(self, owner: str) -> None:
+        with self._lock:
+            if self._owner == owner:
+                self._owner = None
+
+
+class MouthReservation:
+    """Cross-plugin admission control for the shared onboard-TTS mouth.
+
+    NativeTtsPlugin (tts.speak) and GreetPlugin (greet/speak) both drive the same
+    onboard TTS and hold tts_lock for the full estimated playback. A per-plugin
+    slot is insufficient: a greet could be accepted while a tts.speak is already
+    speaking, then block on tts_lock for up to ~42s before its own ~42s speech
+    plus 5s wave, exceeding the 60s ACP deadline. This shared token lets each
+    card reject with RESOURCE_BUSY instead of queueing behind the other.
+    """
+
+    def __init__(self):
+        self._busy = False
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._busy:
+                return False
+            self._busy = True
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._busy = False
+
+
+# Max onboard TTS text length. Each char costs ~0.35s of speech, and a full greet
+# adds a 5s wave gesture on top; capping at 120 chars keeps the worst case
+# (42s speech + 5s wave) comfortably under the 60s ACP x-completion deadline,
+# with headroom for the audio RPC call itself.
+_MAX_TTS_TEXT_CHARS = 120
+
+
+def _onboard_tts_duration_s(text: str) -> float:
+    """Conservative onboard TTS duration estimate; the SDK has no done event."""
+    return min(max(1.2, len(text) * 0.35), 50.0)
+
+
+def _reject_oversized_text(text: str) -> dict | None:
+    """Return an INVALID_ARGUMENT error if text would blow the ACP deadline."""
+    if len(text) > _MAX_TTS_TEXT_CHARS:
+        return {
+            "error": f"text too long: {len(text)} chars (max {_MAX_TTS_TEXT_CHARS})",
+            "code": "INVALID_ARGUMENT",
+        }
+    return None
+
+
+def _onboard_tts(audio_client: AudioClient, audio_lock: threading.Lock,
+                 tts_lock: threading.Lock, text: str, voice: int) -> int:
+    """Serialize onboard TTS until estimated playback completion.
+
+    tts_lock is held for the full estimated playback so utterances do not
+    overlap; audio_lock is released immediately after TtsMaker returns so
+    unrelated AudioClient RPCs (LedControl/GetVolume/SetVolume) can proceed.
+    """
+    with tts_lock:
+        with audio_lock:
+            ret = audio_client.TtsMaker(text, voice)
+        if ret == 0:
+            time.sleep(_onboard_tts_duration_s(text))
+        return ret
+
+
 class NativeTtsPlugin:
     PREFIX = "tts"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
+    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient,
+                 audio_lock: threading.Lock, tts_lock: threading.Lock,
+                 mouth_reservation: MouthReservation | None = None):
         self._client = audio_client
+        self._audio_lock = audio_lock
+        self._tts_lock = tts_lock
+        self._mouth = mouth_reservation or MouthReservation()
 
     def get_tool(self) -> dict:
         return {
@@ -269,6 +363,11 @@ class NativeTtsPlugin:
                     "volume": {"type": "integer", "description": "Volume 0-100"},
                 },
                 "required": ["action"],
+                "x-resource": ["mouth"],
+                "x-completion": {
+                    "actions": ["speak"],
+                    "timeout": 60,
+                },
                 "x-action-params": {
                     "speak":      {"params": ["text", "voice"],  "description": "Synthesize text to speech on the robot"},
                     "get_volume": {"params": [],                 "description": "Get current speaker volume"},
@@ -286,24 +385,64 @@ class NativeTtsPlugin:
     def stop(self) -> None:
         pass
 
+    def _reserve(self) -> bool:
+        """Claim the shared mouth token; False if any card is already speaking."""
+        return self._mouth.try_acquire()
+
+    def _release(self) -> None:
+        self._mouth.release()
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         if action == "speak":
-            text  = args.get("text", "")
-            voice = int(args.get("voice", 0))
-            ret   = self._client.TtsMaker(text, voice)
-            return {"ret": ret, "text": text}
+            text  = str(args.get("text", ""))
+            error = _reject_oversized_text(text)
+            if error:
+                return error
+            try:
+                voice = int(args.get("voice", 0))
+            except (TypeError, ValueError):
+                return {
+                    "error": "voice must be an integer",
+                    "code": "INVALID_ARGUMENT",
+                }
+            if not self._reserve():
+                return {
+                    "error": "tts speak busy: another utterance is in progress",
+                    "code": "RESOURCE_BUSY",
+                }
+            from uuid import uuid4
+            action_id = f"tts_speak_{uuid4().hex[:8]}"
+            threading.Thread(target=self._run_speak, args=(action_id, text, voice),
+                             daemon=True, name="tts_speak").start()
+            return {"status": "executing", "action_id": action_id, "text": text}
         elif action == "get_volume":
-            ret = self._client.GetVolume()
+            with self._audio_lock:
+                ret = self._client.GetVolume()
             return {"ret": ret}
         elif action == "set_volume":
             vol = int(args.get("volume", 50))
-            ret = self._client.SetVolume(vol)
+            with self._audio_lock:
+                ret = self._client.SetVolume(vol)
             return {"ret": ret, "volume": vol}
         return None
+
+    def _run_speak(self, action_id: str, text: str, voice: int):
+        try:
+            ret = _onboard_tts(self._client, self._audio_lock, self._tts_lock, text, voice)
+            if ret != 0:
+                raise RuntimeError(f"TtsMaker failed: code={ret}")
+            result = {"ret": ret, "text": text}
+            status = "completed"
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+            status = "error"
+        finally:
+            self._release()
+        _loco_acp_notify(action_id, status, result, tool="tts")
 
 
 # ── SpeakerPlugin (actuator) ─────────────────────────────────────────────────
@@ -644,6 +783,7 @@ class SpeakerPlugin:
                     },
                 },
                 "required": ["action"],
+                "x-resource": ["mouth"],
             },
             "topic_in": [{"format": "audio/pcm-16k"}],
         }
@@ -902,6 +1042,7 @@ class SpeakerIsolatedProxy:
                     },
                 },
                 "required": ["action"],
+                "x-resource": ["mouth"],
             },
             "topic_in": [{"format": "audio/pcm-16k"}],
         }
@@ -1002,19 +1143,20 @@ class LedPlugin:
     # Auto-timeout per state (seconds). None = must be explicitly overridden.
     _TIMEOUT = {'idle': None, 'hearing': 1.2, 'thinking': 60, 'speaking': 120, 'error': 5}
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient):
+    def __init__(self, plugin_config: dict, namespace: str, executor, audio_client: AudioClient,
+                 audio_lock: threading.Lock):
         self._client = audio_client
         self._state = 'idle'
         self._state_ts = 0.0
         self._state_lock = threading.Lock()
         self._effect_thread = None
         self._effect_stop = threading.Event()
-        self._hw_lock = threading.Lock()  # DDS RPC thread safety
+        self._audio_lock = audio_lock  # shared lock serializing the shared AudioClient
         self._timeout_timer = None
 
     def _led_set(self, r: int, g: int, b: int) -> int:
         """Thread-safe LED control with error logging."""
-        with self._hw_lock:
+        with self._audio_lock:
             code = self._client.LedControl(r, g, b)
             if code != 0:
                 print(f'[LED] LedControl({r},{g},{b}) failed: code={code}')
@@ -1195,6 +1337,241 @@ class LedPlugin:
             if self._effect_stop.is_set(): return
             self._led_set(255, 0, 0)
             if self._effect_stop.wait(0.03): return
+
+
+class _GreetCancelled(Exception):
+    pass
+
+
+def _parse_rgb(value, default=(0, 255, 0)) -> tuple:
+    """Validate a three-item integer RGB sequence (0..255); fall back to default.
+
+    A missing, short, or non-integer led_rgb override must not raise IndexError
+    during bundle construction (which would prevent the whole driver starting).
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        print(f"[greet] invalid led_rgb={value!r}; using default {default}", flush=True)
+        return tuple(default)
+    if any(isinstance(v, bool) for v in value):
+        print(f"[greet] invalid led_rgb={value!r}; using default {default}", flush=True)
+        return tuple(default)
+    try:
+        rgb = tuple(int(v) for v in value)
+    except (TypeError, ValueError):
+        print(f"[greet] invalid led_rgb={value!r}; using default {default}", flush=True)
+        return tuple(default)
+    if any(v < 0 or v > 255 for v in rgb):
+        print(f"[greet] led_rgb out of range {value!r}; using default {default}", flush=True)
+        return tuple(default)
+    return rgb
+
+
+class GreetPlugin:
+    """迎宾卡（actuator）：一个动作完成挥手 + 说"你好" + LED 变绿。
+
+    组合三个已有能力（arm 的 ExecuteAction 26、audio 的 TtsMaker / LedControl），
+    对外暴露一个高层 "greet" 动作，LLM 一句话即可触发整套迎宾流程。
+    """
+    PREFIX = "greet"
+
+    _HIGH_WAVE_ACTION_ID = 26
+    _HIGH_WAVE_DURATION_S = 5.0
+    _GREET_TEXT = "你好"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 arm_client, audio_client: AudioClient, audio_lock: threading.Lock,
+                 tts_lock: threading.Lock, mouth_reservation: MouthReservation | None = None,
+                 arm_reservation: ArmReservation | None = None):
+        self._arm = arm_client
+        self._audio = audio_client
+        self._audio_lock = audio_lock
+        self._tts_lock = tts_lock
+        self._mouth = mouth_reservation or MouthReservation()
+        self._arms = arm_reservation or ArmReservation()
+        self._greet_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._generation = 0
+        self._stop_event = threading.Event()
+        self._active_lock = threading.Lock()
+        self._active_greets: set[str] = set()
+        self._voice = int(plugin_config.get("voice", 0))
+        self._led_rgb = _parse_rgb(plugin_config.get("led_rgb", [0, 255, 0]))
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "greet",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "G1 迎宾：挥手 + 说\"你好\" + LED 变绿",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["greet"],
+                               "description": "要执行的动作"},
+                    "text": {"type": "string", "description": "要说的话（不填用默认\"你好\"）"},
+                    "confirm": {"type": "boolean", "description": "确认执行机器人肢体动作"},
+                },
+                "required": ["action"],
+                "x-is-dangerous": True,
+                "x-resource": ["mouth", "arm_l", "arm_r"],
+                "x-completion": {
+                    "actions": ["greet"],
+                    "timeout": 60,
+                },
+                "x-action-params": {
+                    "greet": {"params": ["text", "confirm"], "description": "挥手 + 说话 + LED 变绿（异步执行，完成后回调）"},
+                },
+            },
+        }
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            self._generation += 1
+            self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._generation += 1
+            self._stop_event.set()
+
+    def _action_token(self) -> tuple[int, threading.Event]:
+        with self._lifecycle_lock:
+            return self._generation, self._stop_event
+
+    def _cancelled(self, generation: int, stop_event: threading.Event) -> bool:
+        with self._lifecycle_lock:
+            return generation != self._generation or stop_event.is_set()
+
+    def _cancelled_result(self) -> dict:
+        return {"reason": "greet plugin stopped"}
+
+    def _wait_or_cancelled(self, duration: float, stop_event: threading.Event) -> bool:
+        return stop_event.wait(duration)
+
+    def _raise_if_cancelled(self, generation: int, stop_event: threading.Event) -> None:
+        if self._cancelled(generation, stop_event):
+            raise _GreetCancelled()
+
+    def _reserve(self) -> bool:
+        """Claim the shared mouth token; False if any card is already speaking."""
+        return self._mouth.try_acquire()
+
+    def _release(self) -> None:
+        self._mouth.release()
+
+    def _resource_busy(self) -> dict:
+        return {
+            "error": "greet busy: mouth is in use by another speech action",
+            "code": "RESOURCE_BUSY",
+        }
+
+    def _track_action(self, action_id: str) -> None:
+        with self._active_lock:
+            self._active_greets.add(action_id)
+
+    def _untrack_action(self, action_id: str) -> None:
+        with self._active_lock:
+            self._active_greets.discard(action_id)
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            self.start()
+            return {"state": "ready"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action != "greet":
+            return None
+        if args.get("confirm") is not True:
+            return {
+                "error": "greet requires confirm=true",
+                "code": "PRECONDITION_FAILED",
+            }
+        generation, stop_event = self._action_token()
+        if self._cancelled(generation, stop_event):
+            return {
+                "error": "greet plugin stopped",
+                "code": "PRECONDITION_FAILED",
+            }
+        text = str(args.get("text", self._GREET_TEXT))
+        error = _reject_oversized_text(text)
+        if error:
+            return error
+        from uuid import uuid4
+        action_id = f"g1_greet_{uuid4().hex[:8]}"
+        if not self._reserve():
+            return self._resource_busy()
+        if not self._arms.try_acquire(action_id):
+            self._release()
+            return {
+                "error": "greet busy: arms are in use by another action",
+                "code": "RESOURCE_BUSY",
+            }
+        threading.Thread(
+            target=self._run_greet,
+            args=(action_id, text, generation, stop_event),
+            daemon=True,
+            name="greet_seq",
+        ).start()
+        return {"status": "executing", "action_id": action_id, "text": text}
+
+    def _run_greet(self, action_id: str, text: str,
+                   generation: int | None = None,
+                   stop_event: threading.Event | None = None):
+        """Background thread: run the greet sequence, then fire ACP completion.
+
+        Unitree's TTS and arm-action RPCs do not expose cancellation or completion
+        events. stop() prevents subsequent greet hardware commands and avoids false
+        completion, but any already-dispatched vendor action must finish naturally.
+        """
+        if generation is None or stop_event is None:
+            generation, stop_event = self._action_token()
+        self._track_action(action_id)
+        try:
+            with self._greet_lock:
+                self._raise_if_cancelled(generation, stop_event)
+                r, g, b = self._led_rgb
+                with self._audio_lock:
+                    led_ret = self._audio.LedControl(r, g, b)
+                if led_ret != 0:
+                    raise RuntimeError(f"LedControl failed: code={led_ret}")
+
+                self._raise_if_cancelled(generation, stop_event)
+                tts_ret = _onboard_tts(
+                    self._audio, self._audio_lock, self._tts_lock, text, self._voice
+                )
+                if tts_ret != 0:
+                    raise RuntimeError(f"TtsMaker failed: code={tts_ret}")
+
+                self._raise_if_cancelled(generation, stop_event)
+                wave_ret = self._arm.ExecuteAction(self._HIGH_WAVE_ACTION_ID)
+                if wave_ret != 0:
+                    raise RuntimeError(f"high wave failed: code={wave_ret}")
+                wait_started = time.monotonic()
+                if self._wait_or_cancelled(self._HIGH_WAVE_DURATION_S, stop_event):
+                    remaining = self._HIGH_WAVE_DURATION_S - (time.monotonic() - wait_started)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                    raise _GreetCancelled()
+
+                result = {
+                    "ret": {"led": led_ret, "wave": wave_ret, "tts": tts_ret},
+                    "wave_action_id": self._HIGH_WAVE_ACTION_ID,
+                    "wave_gesture": "high wave",
+                    "text": text,
+                }
+                status = "completed"
+        except _GreetCancelled:
+            result = self._cancelled_result()
+            status = "cancelled"
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+            status = "error"
+        finally:
+            self._untrack_action(action_id)
+            self._arms.release(action_id)
+            self._release()
+        _loco_acp_notify(action_id, status, result, tool="greet")
 
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
@@ -1960,9 +2337,16 @@ _ARM_ID_MAP = {v: k for k, v in _ARM_ACTION_MAP.items()}
 
 class ArmActionPlugin:
     PREFIX = "arm"
+    _ACTION_DURATION_S = 5.0
+    _RELEASE_DURATION_S = 1.0
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, arm_client):
+    def __init__(self, plugin_config: dict, namespace: str, executor, arm_client,
+                 arm_reservation: ArmReservation | None = None):
         self._client = arm_client
+        self._arms = arm_reservation or ArmReservation()
+        self._lifecycle_lock = threading.Lock()
+        self._generation = 0
+        self._stop_event = threading.Event()
 
     def get_tool(self) -> dict:
         return {
@@ -1982,6 +2366,11 @@ class ArmActionPlugin:
                     "action_id":  {"type": "integer", "description": "Gesture ID (alternative to gesture name)"},
                 },
                 "required": ["action"],
+                "x-resource": ["arm_l", "arm_r"],
+                "x-completion": {
+                    "actions": ["execute", "release"],
+                    "timeout": 15,
+                },
                 "x-action-params": {
                     "execute": {"params": ["gesture", "action_id"], "description": "Execute a predefined arm gesture by name or ID"},
                     "release": {"params": [],                       "description": "Release arm to relaxed state"},
@@ -1991,33 +2380,104 @@ class ArmActionPlugin:
         }
 
     def start(self) -> None:
-        pass
+        with self._lifecycle_lock:
+            self._generation += 1
+            self._stop_event = threading.Event()
 
     def stop(self) -> None:
-        pass
+        with self._lifecycle_lock:
+            self._generation += 1
+            self._stop_event.set()
+
+    def _action_token(self) -> tuple[int, threading.Event]:
+        with self._lifecycle_lock:
+            return self._generation, self._stop_event
+
+    def _cancelled(self, generation: int, stop_event: threading.Event) -> bool:
+        with self._lifecycle_lock:
+            return generation != self._generation or stop_event.is_set()
+
+    def _run_action(self, request_id: str, action_id: int, gesture: str,
+                    duration: float, generation: int,
+                    stop_event: threading.Event) -> None:
+        try:
+            if self._cancelled(generation, stop_event):
+                status = "cancelled"
+                result = {"reason": "arm plugin stopped"}
+            else:
+                ret = self._client.ExecuteAction(action_id)
+                if ret != 0:
+                    raise RuntimeError(f"arm action failed: code={ret}")
+                wait_started = time.monotonic()
+                cancelled = stop_event.wait(duration)
+                if cancelled:
+                    remaining = duration - (time.monotonic() - wait_started)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                if cancelled or self._cancelled(generation, stop_event):
+                    status = "cancelled"
+                    result = {"reason": "arm plugin stopped"}
+                else:
+                    status = "completed"
+                    result = {
+                        "ret": ret,
+                        "action_id": action_id,
+                        "gesture": gesture,
+                        "completion": "estimated",
+                    }
+        except Exception as e:
+            status = "error"
+            result = {"error": f"{type(e).__name__}: {e}"}
+        finally:
+            self._arms.release(request_id)
+        _loco_acp_notify(request_id, status, result, tool="arm")
+
+    def _dispatch_action(self, action_id: int, duration: float) -> dict:
+        from uuid import uuid4
+        generation, stop_event = self._action_token()
+        if self._cancelled(generation, stop_event):
+            return {"error": "arm plugin stopped", "code": "PRECONDITION_FAILED"}
+        request_id = f"g1_arm_{uuid4().hex[:8]}"
+        if not self._arms.try_acquire(request_id):
+            return {"error": "arm busy: arms are in use by another action", "code": "RESOURCE_BUSY"}
+        gesture = _ARM_ID_MAP.get(action_id, "unknown")
+        threading.Thread(
+            target=self._run_action,
+            args=(request_id, action_id, gesture, duration, generation, stop_event),
+            daemon=True,
+            name="arm_action",
+        ).start()
+        return {
+            "status": "executing",
+            "action_id": request_id,
+            "vendor_action_id": action_id,
+            "gesture": gesture,
+        }
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
+            self.start()
             return {"state": "ready"}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action == "list":
             return {"actions": [{"id": v, "name": k} for k, v in _ARM_ACTION_MAP.items()]}
-        elif action == "execute":
-            action_id = None
+        if action == "execute":
             if "action_id" in args:
-                action_id = int(args["action_id"])
+                try:
+                    action_id = int(args["action_id"])
+                except (TypeError, ValueError):
+                    return {"error": "action_id must be an integer", "code": "INVALID_ARGUMENT"}
             elif "gesture" in args:
-                action_id = _ARM_ACTION_MAP.get(args["gesture"].lower().strip())
+                action_id = _ARM_ACTION_MAP.get(str(args["gesture"]).lower().strip())
                 if action_id is None:
                     return {"error": f"Unknown gesture: {args['gesture']}. Available: {list(_ARM_ACTION_MAP)}"}
             else:
                 return {"error": "Provide 'gesture' name or 'action_id'"}
-            ret = self._client.ExecuteAction(action_id)
-            return {"ret": ret, "action_id": action_id, "gesture": _ARM_ID_MAP.get(action_id, "unknown")}
-        elif action == "release":
-            ret = self._client.ExecuteAction(99)
-            return {"ret": ret, "action_id": 99, "gesture": "release arm"}
+            return self._dispatch_action(action_id, self._ACTION_DURATION_S)
+        if action == "release":
+            return self._dispatch_action(99, self._RELEASE_DURATION_S)
         return None
 
 
