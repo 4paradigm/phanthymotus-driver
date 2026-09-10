@@ -544,21 +544,26 @@ class RM75Plugin:
         return None
 
 
+GRIPPER_POSITION_MIN = 1   # SDK 契约：手爪开口位置 1~1000
+GRIPPER_POSITION_MAX = 1000
+GRIPPER_ACK_TIMEOUT = 5    # 非阻塞模式下等待控制器「设置成功」应答的秒数上限
+
+
 def _gripper_position(value) -> int:
     try:
         numeric = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("position must be a number") from exc
-    if not math.isfinite(numeric) or not 0 <= numeric <= 1000:
-        raise ValueError("position must be within 0~1000")
+    if not math.isfinite(numeric) or not GRIPPER_POSITION_MIN <= numeric <= GRIPPER_POSITION_MAX:
+        raise ValueError(f"position must be within {GRIPPER_POSITION_MIN}~{GRIPPER_POSITION_MAX}")
     return int(round(numeric))
 
 
 class GripperPlugin:
-    """RealMan 二指夹爪位置控制：复用 RM75SDKClient 的 SDK 连接直发 hand_follow_pos。
+    """RealMan 二指夹爪位置控制：复用 RM75SDKClient 的 SDK 连接调用 SDK 夹爪 API。
 
     与 ext_camera 同模式，作为 RM75-6F-V 驱动的内置卡片；不另起容器、
-    不另开 TCP 8080 连接（控制箱单客户端）。
+    不另开 TCP 8080 连接（控制箱单客户端）。运动守卫与 joint_control 一致。
     """
 
     def __init__(self, client, config, namespace="rm75", ros2=None):
@@ -567,23 +572,25 @@ class GripperPlugin:
     def get_tools(self):
         schema = action_schema(
             {
-                "set_position": (["position"], "设置二指夹爪目标位置"),
+                "set_position": (["position", "confirm_motion"], "设置二指夹爪目标位置"),
                 "info": ([], "读取夹爪与 SDK 连接状态"),
             },
             {
                 "position": {
                     "type": "integer",
-                    "minimum": 0,
-                    "maximum": 1000,
-                    "description": "夹爪驱动器目标位置，0~1000，对应 0~120 mm",
+                    "minimum": GRIPPER_POSITION_MIN,
+                    "maximum": GRIPPER_POSITION_MAX,
+                    "description": f"夹爪驱动器目标位置，{GRIPPER_POSITION_MIN}~{GRIPPER_POSITION_MAX}，对应 0~120 mm 行程",
                 },
+                "confirm_motion": {"type": "boolean", "description": "Must be true for every movement request"},
             },
         )
+        schema["x-is-dangerous"] = True
         return [
             tool(
                 "gripper",
                 "actuator",
-                "RealMan 二指夹爪位置控制。位置范围 0~1000，对应夹爪行程 0~120 mm。",
+                f"RealMan 二指夹爪位置控制。位置范围 {GRIPPER_POSITION_MIN}~{GRIPPER_POSITION_MAX}，对应夹爪行程 0~120 mm。",
                 schema,
             )
         ]
@@ -603,9 +610,12 @@ class GripperPlugin:
             return {"state": "idle"}
         if action != "set_position":
             return None
+        if not self.client.motion_enabled:
+            raise PermissionError("motion is locked; set RM_MOTION_ENABLED=1 only for supervised hardware testing")
+        if args.get("confirm_motion") is not True:
+            raise ValueError("confirm_motion must be true")
         position = _gripper_position(args.get("position"))
-        padded = [position] + [0] * 5  # 灵巧手数组固定 6 指，二指夹爪只占第 1 指
-        code = self.client.command("rm_set_hand_follow_pos", padded, False)
+        code = self.client.command("rm_set_gripper_position", position, False, GRIPPER_ACK_TIMEOUT)
         return {"success": True, "message": f"夹爪目标位置已下发: {position}"}
 
 

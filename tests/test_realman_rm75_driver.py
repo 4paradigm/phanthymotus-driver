@@ -71,6 +71,7 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
                 self.connected = True
+                self.motion_enabled = True
 
             def command(self, method, *args):
                 self.calls.append((method, args))
@@ -79,32 +80,50 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.client = FakeClient()
         self.plugin = self.device.GripperPlugin(self.client, {}, namespace="rm75")
 
-    def test_tool_schema_exposes_0_to_1000(self):
+    def test_tool_schema_exposes_1_to_1000_and_safety_contract(self):
         tools = self.plugin.get_tools()
         self.assertEqual(1, len(tools))
         self.assertEqual("gripper", tools[0]["name"])
         self.assertEqual("actuator", tools[0]["type"])
         position = tools[0]["inputSchema"]["properties"]["position"]
-        self.assertEqual(0, position["minimum"])
+        self.assertEqual(1, position["minimum"])
         self.assertEqual(1000, position["maximum"])
+        self.assertIs(True, tools[0]["inputSchema"]["x-is-dangerous"])
+        self.assertIn("confirm_motion", tools[0]["inputSchema"]["properties"])
+        self.assertIn("confirm_motion", tools[0]["inputSchema"]["x-action-params"]["set_position"]["params"])
 
-    def test_set_position_forwards_padded_hand_pos(self):
-        result = self.plugin.dispatch("set_position", {"position": 500})
+    def test_set_position_calls_two_finger_gripper_api(self):
+        result = self.plugin.dispatch(
+            "set_position", {"position": 500, "confirm_motion": True}
+        )
 
         self.assertEqual(
             {"success": True, "message": "夹爪目标位置已下发: 500"},
             result,
         )
         self.assertEqual(
-            [("rm_set_hand_follow_pos", ([500, 0, 0, 0, 0, 0], False))],
+            [("rm_set_gripper_position", (500, False, self.device.GRIPPER_ACK_TIMEOUT))],
             self.client.calls,
         )
 
     def test_out_of_range_position_is_rejected(self):
-        for value in (-1, 1001, float("nan"), float("inf")):
+        for value in (-1, 0, 1001, float("nan"), float("inf")):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
-                    self.plugin.dispatch("set_position", {"position": value})
+                    self.plugin.dispatch("set_position", {"position": value, "confirm_motion": True})
+        self.assertEqual([], self.client.calls)
+
+    def test_motion_requires_enabled_client(self):
+        self.client.motion_enabled = False
+        with self.assertRaisesRegex(PermissionError, "motion is locked"):
+            self.plugin.dispatch("set_position", {"position": 500, "confirm_motion": True})
+        self.assertEqual([], self.client.calls)
+
+    def test_motion_requires_confirmation(self):
+        for args in ({"position": 500}, {"position": 500, "confirm_motion": False}):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, "confirm_motion must be true"):
+                    self.plugin.dispatch("set_position", args)
         self.assertEqual([], self.client.calls)
 
     def test_canvas_lifecycle_actions(self):
