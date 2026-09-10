@@ -628,14 +628,25 @@ class DispatchSmokeTests(unittest.TestCase):
             if definition["type"] == "actuator":
                 self.assertIn("x-resource", definition["inputSchema"], definition["name"])
 
-    def test_locomotion_registers_before_first_velocity_publish(self):
+    def test_locomotion_uses_existing_rc_source_without_registration(self):
         plugins = build_bundle_plugins()
         locomotion = find_plugin(plugins, "locomotion")
-        locomotion.nodes.set_mc_input_source.response = FakeMsg()
         locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": -1})
-        self.assertTrue(locomotion._registered)
+        self.assertFalse(locomotion._registered)
+        self.assertIsNone(locomotion.nodes.set_mc_input_source.last_request)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
+        self.assertEqual(locomotion.nodes.locomotion_pub.published[0].source, "rc")
+
+    def test_locomotion_managed_source_rejection_prevents_publish(self):
+        plugins = build_bundle_plugins({"plugins": {"locomotion": {"manage_input_source": True}}})
+        locomotion = find_plugin(plugins, "locomotion")
+        response = FakeMsg()
+        response.header.code = 1
+        locomotion.nodes.set_mc_input_source.response = SimpleNamespace(response=response)
+        with self.assertRaisesRegex(RuntimeError, "registration rejected"):
+            locomotion.dispatch("set_velocity", {"duration": 1})
+        self.assertEqual(locomotion.nodes.locomotion_pub.published, [])
 
     def test_locomotion_duration_is_bounded_and_schedules_a_stop(self):
         plugins = build_bundle_plugins()
@@ -672,7 +683,7 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(result["state"], "cancelled")
         zero = locomotion.nodes.locomotion_pub.published[-1]
         self.assertEqual((zero.forward_velocity, zero.lateral_velocity, zero.angular_velocity), (0.0, 0.0, 0.0))
-        self.assertTrue(locomotion._registered)
+        self.assertFalse(locomotion._registered)
         self.assertEqual(notify.call_args.args[0], action_id)
         self.assertEqual(notify.call_args.args[1], "cancelled")
 

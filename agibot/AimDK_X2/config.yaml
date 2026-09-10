@@ -58,7 +58,11 @@ plugins:
     service_timeout_sec: 20
   locomotion:
     enabled: true
-    input_source_name: "phanthymotus"
+    # The X2 firmware accepts its built-in source names only. Historical successful
+    # velocity messages are source=rc, so do not add an arbitrary external source.
+    input_source_name: "rc"
+    # Leave the built-in source intact. Enable only with vendor approval for a managed source.
+    manage_input_source: false
     input_source_priority: 50
   preset_motion:
     enabled: true

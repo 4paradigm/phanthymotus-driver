@@ -29,7 +29,7 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/aimdk_5Fmsgs/srv/GetMcAction`, `/aima/mc/common/state` | `mc_state`, `mc_mode` ACP confirmation | `GetMcAction` remains call-on-demand; the verified X2 also broadcasts `McCommonState`, whose `action_info.action_desc/status` confirms a requested mode has become active. |
 | `/aimdk_5Fmsgs/srv/SetMcAction` | `mc_mode` | SDK enum is not a firmware capability list. This X2 rejected `STAND_UP_DEFAULT` and `ZERO_TORQUE_DEFAULT` with `can not find action`; `PASSIVE_DEFAULT`/`STAND_DEFAULT` only acknowledged the request, while `DAMPING_DEFAULT` is the sole observed end-to-end working mode. The driver exposes only `DAMPING_DEFAULT` by default and confirms activation from `/aima/mc/common/state`. |
 | `/aimdk_5Fmsgs/srv/SetMcPresetMotion` | `preset_motion` | |
-| `/aimdk_5Fmsgs/srv/SetMcInputSource`, `GetCurrentInputSource` | `locomotion` (action `register`/`disable`) | |
+| `/aimdk_5Fmsgs/srv/SetMcInputSource`, `GetCurrentInputSource` | `locomotion` (optional managed-source `register`/`disable`) | Firmware accepts built-in source names (`rc`, `vr`, `app_proxy`, `interaction`, `pnc`). Historical successful velocity bags use `source=rc`; default driver operation reuses it and does not add/disable a source. |
 | `/aimdk_5Fmsgs/srv/GetSystemState` | `system_state` | |
 | `/aimdk_5Fmsgs/srv/GetRobotResources` | `linkcraft_catalog` | |
 | `/aimdk_5Fmsgs/srv/ExecuteActionResource` | `linkcraft` | |
