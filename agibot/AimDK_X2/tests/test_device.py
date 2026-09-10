@@ -285,8 +285,24 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joint_state", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
+        for name in ("mc_state", "joint_state", "joints", "hand_state", "imu", "camera_rgb", "camera_depth", "lidar", "slam_pose"):
             self.assertEqual(by_name[name], "sensor")
+
+    def test_joint_stream_tools_have_distinct_topics_and_formats(self):
+        plugins = build_bundle_plugins()
+        by_name = {definition["name"]: definition for definition in tool_definitions(plugins)}
+        joint_state_topic = [{
+            "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
+        }]
+        joints_topic = [{
+            "topic": "/test_ns/agibot_x2/joints", "format": "sensor/skeleton",
+        }]
+
+        self.assertEqual(by_name["joint_state"]["topic_out"], joint_state_topic)
+        self.assertEqual(by_name["joints"]["topic_out"], joints_topic)
+        self.assertNotEqual(by_name["joint_state"]["topic_out"], by_name["joints"]["topic_out"])
+        self.assertEqual(find_plugin(plugins, "joint_state").dispatch("info", {})["topic_out"], joint_state_topic)
+        self.assertEqual(find_plugin(plugins, "joints").dispatch("info", {})["topic_out"], joints_topic)
 
     def test_mc_mode_and_preset_motion_action_enums_nonempty(self):
         plugins = build_bundle_plugins()
@@ -311,6 +327,42 @@ class ModelPluginTests(unittest.TestCase):
         model_plugin = find_plugin(plugins, "model")
         with self.assertRaises(ValueError):
             model_plugin.dispatch("model", {"variant": "nonexistent"})
+
+
+class JointsPluginTests(unittest.TestCase):
+    def test_normalize_maps_vendor_joint_fields_to_skeleton_contract(self):
+        def joint(name, position, velocity, effort, error_code):
+            state = FakeMsg()
+            state.name = name
+            state.position = position
+            state.velocity = velocity
+            state.effort = effort
+            state.error_code = error_code
+            return state
+
+        response = FakeMsg()
+        response.leg_joints = [joint("left_hip_pitch_joint", 0.1, 0.2, 0.3, 0)]
+        response.waist_joints = []
+        response.arm_joints = [joint("left_shoulder_pitch_joint", -0.4, 0.5, 0.6, 7)]
+        response.head_joints = []
+
+        self.assertEqual(device.JointsPlugin.normalize(response), [
+            {
+                "idx": 0, "name": "left_hip_pitch_joint", "q": 0.1,
+                "dq": 0.2, "tau": 0.3, "error_code": 0,
+            },
+            {
+                "idx": 1, "name": "left_shoulder_pitch_joint", "q": -0.4,
+                "dq": 0.5, "tau": 0.6, "error_code": 7,
+            },
+        ])
+
+    def test_invalid_poll_interval_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "poll_interval_sec"):
+            build_bundle_plugins({
+                "end_effector": "ultra",
+                "plugins": {"joints": {"poll_interval_sec": 0}},
+            })
 
 
 class DispatchSmokeTests(unittest.TestCase):

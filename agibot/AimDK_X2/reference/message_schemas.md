@@ -60,6 +60,37 @@ hal/srv/SetPmuLed.srv:         req: CommonRequest request; string trace_id;
                                 resp: ResponseHeader header; uint16 status_code
 ```
 
+## Joint state and skeleton streams
+
+The two cards deliberately expose different dashboard contracts:
+
+- `joint_state` publishes the raw, grouped `GetAllJointState` result as `data/json` on
+  `/<ros_namespace>/agibot_x2/joint_state`.
+- `joints` polls the same read-only service and publishes `sensor/skeleton` on
+  `/<ros_namespace>/agibot_x2/joints` for URDF visualization.
+
+The skeleton payload is:
+
+```json
+{
+  "joints": [
+    {
+      "idx": 0,
+      "name": "<JointState.name>",
+      "q": 0.0,
+      "dq": 0.0,
+      "tau": 0.0,
+      "error_code": 0
+    }
+  ]
+}
+```
+
+The list order is `leg`, `waist`, `arm`, then `head`, preserving AimDK's order within each
+group. `q`, `dq`, and `tau` map directly to `JointState.position`, `.velocity`, and `.effort`.
+Both tools return their own explicit `topic_out` from the `info` action so the dashboard cannot
+associate `joint_state` with the skeleton stream.
+
 ## Motion control (`mc`)
 
 ```

@@ -158,6 +158,14 @@ class AimdkNodes:
         self.robot.create_subscription(Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos)
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
+        joints_topic = f"/{namespace}/agibot_x2/joints"
+        self.joints_pub = self.core.create_publisher(String, joints_topic, 5)
+        self.streams["joints"] = {
+            "robot_topic": "/aimdk_5Fmsgs/srv/GetAllJointState",
+            "topic": joints_topic,
+            "format": "sensor/skeleton",
+        }
+
         mirror("hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json", qos=sensor_qos)
         # SDK's topics_and_services catalog documents rgbd_head_front/* as the front camera, but
         # on real hardware that topic has zero publishers -- this unit's camera service actually
@@ -311,6 +319,15 @@ class AimdkNodes:
         with self.lock:
             self.values["joint_state"] = value
 
+    def publish_joints(self, joints):
+        payload = {"joints": joints}
+        output = self._msg["String"]()
+        output.data = json.dumps(payload, ensure_ascii=False)
+        self.joints_pub.publish(output)
+        with self.lock:
+            self.values["joints"] = payload
+        return payload
+
     def snapshot(self, key):
         with self.lock:
             return self.values.get(key, {})
@@ -390,6 +407,71 @@ class JointStatePlugin:
         if action == "info":
             return {"state": "running", "topic_out": topic_out}
         return {**self.nodes.query_joint_state(), "topic_out": topic_out}
+
+
+class JointsPlugin:
+    """Normalize GetAllJointState into the dashboard's skeleton stream contract."""
+
+    def __init__(self, nodes, poll_interval_sec):
+        self.nodes = nodes
+        self.poll_interval_sec = poll_interval_sec
+        self._stop = threading.Event()
+        self._thread = None
+
+    def get_tool(self):
+        return _stream_tool(
+            "joints", self.nodes.streams["joints"],
+            "全身关节骨骼状态流（GetAllJointState）",
+        )
+
+    @staticmethod
+    def normalize(result):
+        joints = []
+        for group in ("leg_joints", "waist_joints", "arm_joints", "head_joints"):
+            for state in getattr(result, group, ()):
+                joints.append({
+                    "idx": len(joints),
+                    "name": state.name,
+                    "q": state.position,
+                    "dq": state.velocity,
+                    "tau": state.effort,
+                    "error_code": state.error_code,
+                })
+        return joints
+
+    def _poll(self):
+        from aimdk_msgs.srv import GetAllJointState
+
+        while not self._stop.is_set():
+            try:
+                request = GetAllJointState.Request()
+                request.request = self.nodes.request_header()
+                result = call_service(self.nodes.get_all_joint_state, request, timeout=1.0)
+                self.nodes.publish_joints(self.normalize(result))
+            except Exception as exc:
+                print(f"[joints] GetAllJointState failed: {exc}", flush=True)
+            self._stop.wait(self.poll_interval_sec)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._poll, name="agibot-x2-joints", daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=self.poll_interval_sec + 1.0)
+            self._thread = None
+
+    def dispatch(self, action, args):
+        topic_out = _stream_topic_out(self.nodes.streams["joints"])
+        if action == "stop":
+            return {"state": "idle"}
+        return {"state": "running", "topic_out": topic_out}
 
 
 class HandStatePlugin:
@@ -1201,6 +1283,11 @@ def build_plugins(config, namespace, ros2):
     def enabled(name, default=True):
         return plugin_config.get(name, {}).get("enabled", default)
 
+    joints_config = plugin_config.get("joints", {})
+    joints_interval_sec = float(joints_config.get("poll_interval_sec", 0.1))
+    if joints_interval_sec <= 0:
+        raise ValueError("plugins.joints.poll_interval_sec must be greater than zero")
+
     plugins = [
         McStatePlugin(nodes), JointStatePlugin(nodes), HandStatePlugin(nodes),
         ImuPlugin(nodes), CameraPlugin(nodes), LidarPlugin(nodes), SlamPosePlugin(nodes),
@@ -1210,6 +1297,8 @@ def build_plugins(config, namespace, ros2):
         PmuLedPlugin(nodes), TtsPlugin(nodes), EmojiPlugin(nodes), MicSourcePlugin(nodes),
         MapGetPlugin(nodes),
     ]
+    if enabled("joints", default=True):
+        plugins.append(JointsPlugin(nodes, joints_interval_sec))
     if enabled("slam", default=False):
         plugins.append(SlamControlPlugin(nodes))
     return plugins
