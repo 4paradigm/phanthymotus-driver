@@ -80,8 +80,7 @@ class VisionCapturePlugin:
                     "info": {"params": [], "description": "查看图像来源、保存目录和录像结果。"},
                     "stop": {"params": [], "description": "取消当前录像并删除未完成文件。"},
                 },
-                "x-completion": {"actions": ["record_video"],
-                                 "timeout": self._max_duration_s + 15},
+                "x-completion": {"actions": ["record_video"]},
             },
             "configSchema": {"type": "object", "properties": {
                 "camera": {**camera_property, "default": "front"},
@@ -267,7 +266,7 @@ class VisionCapturePlugin:
             with self._condition:
                 sequence = self._streams[source["topic"]]["sequence"]
             frame = self._frame(source, sequence, cancel=cancel)
-            path = self._new_path("videos", "video", ".mp4")
+            path = active["path"]
             with tempfile.TemporaryFile() as errors:
                 process = subprocess.Popen([
                     "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
@@ -395,12 +394,10 @@ class VisionCapturePlugin:
             self._last_recording = {"action_id": active["action_id"], "status": status, "result": result}
             active["state"] = status
             active["finished"] = True
-        # The worker owns the only terminal notification, including shutdown.
-        try:
-            self._notify_complete(active["action_id"], status, result)
-        finally:
-            with self._recording_lock:
-                self._active_recording = None
+            # The terminal outcome lives in info.last_recording; no ACP posts a
+            # file_path-based completion. The queued response already returned
+            # the destination path synchronously, like capture_photo.
+            self._active_recording = None
 
     def _start_video_recording(self, args):
         requested = args.get("duration_s", 5)
@@ -418,9 +415,10 @@ class VisionCapturePlugin:
                 return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
             action_id = f"vision_capture_record_video_{uuid4().hex}"
             queued_at = _timestamp()
+            path = self._new_path("videos", "video", ".mp4")
             active = {"action_id": action_id, "state": "recording", "duration_s": requested,
                       "started_at": queued_at, "queued_at": queued_at, "queued_mono": time.monotonic(),
-                      "cancel": threading.Event(), "process": None, "source": source}
+                      "cancel": threading.Event(), "process": None, "source": source, "path": path}
             thread = threading.Thread(target=self._record_video_async, args=(active,),
                                       daemon=True, name="go2_vision_capture_record_video")
             active["thread"] = thread
@@ -430,10 +428,10 @@ class VisionCapturePlugin:
             except Exception:
                 self._active_recording = None
                 raise
-        return {"ok": True, "state": "queued", "action_id": action_id,
+        return {"ok": True, "state": "recording", "action_id": action_id,
                 "media_type": "video", "requested_duration_s": requested, "source": source,
-                "queued_at": queued_at,
-                "message": "Recording queued; ACP completion follows only after the MP4 is finalized and verified."}
+                "queued_at": queued_at, "file_path": str(path),
+                "message": "Recording started; the file_path above is the completed MP4 destination."}
 
     def stop(self):
         with self._recording_lock:
@@ -475,7 +473,8 @@ class VisionCapturePlugin:
         if action == "capture_photo":
             return self._capture_photo(args)
         if action == "record_video":
-            return self._start_video_recording(args)
+            result = self._start_video_recording(args)
+            return result if result.get("state") != "recording" else {**result, "ok": True}
         if action == "stop":
             return self.stop()
         if action == "list_cameras":

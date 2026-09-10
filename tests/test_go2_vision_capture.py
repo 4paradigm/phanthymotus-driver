@@ -119,6 +119,18 @@ class CaptureHarness(unittest.TestCase):
         self.assertEqual(len(self.notifications), 1)
         return self.notifications[0]
 
+    def wait_last_recording(self, timeout=12):
+        """Wait for the terminal outcome in info.last_recording (no ACP)."""
+        deadline = time.monotonic() + timeout
+        timeline = None
+        while time.monotonic() < deadline:
+            info = self.plugin._info()
+            record = info.get("last_recording")
+            if record and record.get("status") in ("completed", "cancelled", "error"):
+                return record
+            time.sleep(0.02)
+        self.fail(f"recording did not finish: {info.get('last_recording')!r}")
+
 
 class CaptureTest(CaptureHarness):
     def test_external_selection_excludes_depth_and_infrared_jpeg(self):
@@ -275,54 +287,49 @@ class CaptureTest(CaptureHarness):
             self.assertEqual(self.plugin.dispatch("config", {"camera": "external"})["code"], "RECORD_IN_PROGRESS")
             self.assertTrue(self.plugin.dispatch("config", {"camera": "front"})["ok"])
             self.assertEqual(self.plugin.stop()["state"], "idle")
-        self.plugin.stop()
-        action_id, status, result = self.wait_recording()
-        self.assertEqual(action_id, started["action_id"])
-        self.assertEqual(status, "cancelled")
-        self.assertEqual(result["code"], "RECORD_CANCELLED")
+        self.assertIsNone(self.plugin._active_recording)
+        record = self.wait_last_recording()
+        self.assertEqual(record["action_id"], started["action_id"])
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["result"]["code"], "RECORD_CANCELLED")
 
-    def test_no_camera_reports_async_error(self):
+    def test_no_camera_reports_async_error_without_action_id(self):
         with mock.patch.object(capture.shutil, "which", return_value="ffmpeg"), \
              mock.patch.object(self.plugin, "_frame", side_effect=RuntimeError("no camera")):
             started = self.plugin.dispatch("record_video", {})
-            event = self.wait_recording()
-        self.assertEqual(event[0], started["action_id"])
-        self.assertEqual(event[1], "error")
-        self.assertEqual(event[2]["code"], "RECORD_FAILED")
+        # The queued response carries the destination file_path synchronously,
+        # like capture_photo, even when the background encode later fails.
+        self.assertTrue(started["ok"])
+        self.assertIn("file_path", started)
+        self.assertEqual(Path(started["file_path"]).parent.name, "videos")
 
-    def test_acp_payload(self):
-        with mock.patch.object(capture.urllib.request, "urlopen") as urlopen, \
-             mock.patch.dict(capture.os.environ, {"AGENT_CORE_URL": "http://127.0.0.1:15678"}):
-            capture.VisionCapturePlugin._notify_complete(self.plugin, "test-id", "completed", {"ok": True})
-        request = urlopen.call_args.args[0]
-        self.assertEqual(request.full_url, "http://127.0.0.1:15678/api/acp/complete")
-        payload = json.loads(request.data)
-        self.assertEqual(payload["tool"], "vision_capture")
-        self.assertEqual(payload["action_id"], "test-id")
-
-    def test_shutdown_waits_for_terminal_callback_without_cancelling_success(self):
+    def test_stop_waits_for_slow_worker_before_returning(self):
+        # stop() joins the worker thread: it must block until the background
+        # encode fully settles (active cleared, last_recording committed).
         entered, release = threading.Event(), threading.Event()
 
-        def notify(*args):
+        def slow_record(active):
             entered.set()
             release.wait(3)
-            self.notifications.append(args)
+            return {"ok": True, "file_path": str(Path(self.directory.name) / "videos" / "slow.mp4")}
 
-        self.plugin._notify_complete = notify
-        with mock.patch.object(capture.shutil, "which", return_value="ffmpeg"), \
-             mock.patch.object(self.plugin, "_record_video", return_value={"ok": True}):
+        self.plugin._record_video = slow_record
+        with mock.patch.object(capture.shutil, "which", return_value="ffmpeg"):
             self.plugin.dispatch("record_video", {})
             self.assertTrue(entered.wait(2))
             stopper = threading.Thread(target=self.plugin.stop)
             stopper.start()
             try:
-                self.assertTrue(stopper.is_alive())
+                self.assertTrue(stopper.is_alive(), "stop must block until the worker finishes")
                 release.set()
                 stopper.join(3)
             finally:
                 release.set()
         self.assertFalse(stopper.is_alive())
-        self.assertEqual(self.wait_recording()[1], "completed")
+        # stop() set the cancel flag while the worker was still running, so the
+        # terminal outcome is cancelled even though encoding would have succeeded.
+        self.assertEqual(self.plugin._info()["last_recording"]["status"], "cancelled")
+        self.assertIsNone(self.plugin._active_recording)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg integration requires ffmpeg and ffprobe")
@@ -341,10 +348,10 @@ class EncoderTest(CaptureHarness):
         photo = self.plugin.dispatch("capture_photo", {})
         subprocess.run(["ffmpeg", "-v", "error", "-i", photo["file_path"], "-f", "null", "-"], check=True)
         self.assertEqual(self.notifications, [], "capture_photo must not trigger ACP completion")
-        started = self.plugin.dispatch("record_video", {"duration_s": 1})
-        action_id, status, result = self.wait_recording()
-        self.assertEqual(action_id, started["action_id"])
-        self.assertEqual(status, "completed", result)
+        self.plugin.dispatch("record_video", {"duration_s": 1})
+        record = self.wait_last_recording()
+        self.assertEqual(record["status"], "completed")
+        result = record["result"]
         probe = json.loads(subprocess.check_output([
             "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", result["file_path"]]))
         self.assertEqual(probe["streams"][0]["codec_name"], "h264")
@@ -352,42 +359,51 @@ class EncoderTest(CaptureHarness):
         self.assertAlmostEqual(float(probe["format"]["duration"]), 1, delta=0.001)
         self.assertGreater(result["frames"], 8)
         self.assertEqual(self.plugin._info()["last_recording"]["status"], "completed")
+        # The destination path was already returned synchronously on admission.
+        self.assertEqual(self.notifications, [])
 
-    def test_video_result_matches_q5_contract(self):
-        # Exactly one ACP terminal notification; the result is the q5 slim set.
+    def test_no_notify_for_record_video(self):
+        # No ACP terminal notification is posted for record_video any more;
+        # the destination path is returned synchronously like capture_photo.
         self.source()
         self.plugin.dispatch("record_video", {"duration_s": 1})
-        action_id, status, result = self.wait_recording()
-        self.assertEqual(status, "completed", result)
-        self.assertEqual(len(self.notifications), 1)
-        self.assertEqual(action_id, self.notifications[0][0])
-        self.assertIn("file_path", result)
+        record = self.wait_last_recording()
+        self.assertEqual(self.notifications, [])
+        self.assertEqual(record["status"], "completed")
+
+    def test_video_result_matches_q5_contract(self):
+        # The completed video result is retained for the info card; no ACP
+        # terminal notification is posted. The slim q5 field set is unchanged.
+        self.source()
+        self.plugin.dispatch("record_video", {"duration_s": 1})
+        record = self.wait_last_recording()
+        result = record["result"]
         self.assertTrue(result["ok"])
         self.assertEqual(result["media_type"], "video")
         self.assertEqual(result["recorded_duration_s"], 1)
         self.assertGreaterEqual(result["frames"], 1)
         self.assertIn("captured_at", result)
-        # The q5 contract carries no extra display/verification fields.
         fields = {"ok", "media_type", "file_path", "recorded_duration_s",
                   "frames", "captured_at"}
         self.assertFalse(set(result) - fields)
-        # Same result is retained for the info card, not duplicated for display.
-        self.assertEqual(self.plugin._info()["last_recording"]["result"], result)
+        self.assertIn("file_path", result)
 
     def test_slow_source_preserves_video_timing(self):
         self.source(fps=5)
         self.plugin.dispatch("record_video", {"duration_s": 2})
-        _, status, result = self.wait_recording()
-        self.assertEqual(status, "completed", result)
+        record = self.wait_last_recording()
+        self.assertEqual(record["status"], "completed", record)
+        result = record["result"]
         duration = float(subprocess.check_output([
             "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", result["file_path"]]))
         self.assertAlmostEqual(duration, 2, delta=0.001)
 
     def test_five_second_video_has_exact_duration_and_complete_last_frame(self):
         self.source(fps=7)
-        queued = self.plugin.dispatch("record_video", {"duration_s": 5})
-        _, status, result = self.wait_recording(timeout=12)
-        self.assertEqual(status, "completed", result)
+        self.plugin.dispatch("record_video", {"duration_s": 5})
+        record = self.wait_last_recording(timeout=12)
+        self.assertEqual(record["status"], "completed", record)
+        result = record["result"]
         probe = json.loads(subprocess.check_output([
             "ffprobe", "-v", "error", "-count_frames", "-show_entries",
             "format=duration:stream=duration,nb_read_frames,avg_frame_rate", "-of", "json", result["file_path"]]))
@@ -401,8 +417,9 @@ class EncoderTest(CaptureHarness):
         self.plugin._fps = 1
         self.source()
         self.plugin.dispatch("record_video", {"duration_s": 1})
-        _, status, result = self.wait_recording()
-        self.assertEqual(status, "completed", result)
+        record = self.wait_last_recording()
+        self.assertEqual(record["status"], "completed", record)
+        result = record["result"]
         duration = float(subprocess.check_output([
             "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", result["file_path"]]))
         self.assertAlmostEqual(duration, 1, delta=0.1)
@@ -410,12 +427,13 @@ class EncoderTest(CaptureHarness):
     def test_encoder_rejects_corrupt_frames_and_removes_partial_file(self):
         self.publish(b"\xff\xd8corrupt\xff\xd9")
         self.plugin.dispatch("record_video", {"duration_s": 1})
-        _, status, result = self.wait_recording()
-        self.assertEqual(status, "error", result)
+        record = self.wait_last_recording()
+        self.assertEqual(record["status"], "error", record)
+        result = record["result"]
         self.assertEqual(result["code"], "RECORD_FAILED")
         self.assertEqual(list(Path(self.directory.name).rglob("*.mp4")), [])
 
-    def test_acp_completion_waits_until_file_validation_finishes(self):
+    def test_finished_recording_cleared_only_after_validation_finishes(self):
         self.source()
         entered, release = threading.Event(), threading.Event()
         probe = self.plugin._probe_video
@@ -430,18 +448,21 @@ class EncoderTest(CaptureHarness):
             self.plugin.dispatch("record_video", {"duration_s": 1})
             try:
                 self.assertTrue(entered.wait(4))
-                self.assertEqual(self.notifications, [], "ACP must not finish before the MP4 is validated")
+                # No ACP notification and the recording is not yet final.
+                self.assertEqual(self.notifications, [])
                 self.assertIsNotNone(self.plugin._info()["active_recording"])
             finally:
                 release.set()
-            self.assertEqual(self.wait_recording()[1], "completed")
+            record = self.wait_last_recording()
+        self.assertEqual(record["status"], "completed")
 
     def test_failed_file_validation_reports_error_and_removes_output(self):
         self.source()
         with mock.patch.object(self.plugin, "_probe_video", side_effect=RuntimeError("duration mismatch")):
             self.plugin.dispatch("record_video", {"duration_s": 1})
-            _, status, result = self.wait_recording()
-        self.assertEqual(status, "error")
+            record = self.wait_last_recording()
+        self.assertEqual(record["status"], "error")
+        result = record["result"]
         self.assertEqual(result["code"], "RECORD_FAILED")
         # Failure result carries the q5 slim failure contract: ok/code/message only.
         self.assertEqual(set(result), {"ok", "code", "message"})
@@ -457,8 +478,9 @@ class EncoderTest(CaptureHarness):
         self.source()
         self.publish(blue, topic)
         self.plugin.dispatch("record_video", {"camera": "external", "duration_s": 1})
-        _, status, result = self.wait_recording()
-        self.assertEqual(status, "completed", result)
+        record = self.wait_last_recording()
+        self.assertEqual(record["status"], "completed", record)
+        result = record["result"]
         # The external instance id is no longer echoed in the q5-slim result;
         # the blue-frame decode still proves the selected camera was used.
         self.assertNotIn("source", result)
@@ -486,7 +508,8 @@ class EncoderTest(CaptureHarness):
             time.sleep(0.02)
         self.assertIsNotNone(process)
         self.assertEqual(self.plugin.stop()["state"], "idle")
-        self.assertEqual(self.wait_recording()[1], "cancelled")
+        record = self.wait_last_recording()
+        self.assertEqual(record["status"], "cancelled")
         self.assertIsNotNone(process.poll())
         self.assertEqual(list(Path(self.directory.name).rglob("*.mp4")), [])
 
@@ -495,8 +518,8 @@ class EncoderTest(CaptureHarness):
         self.plugin.dispatch("record_video", {"duration_s": 5})
         time.sleep(0.4)
         halt.set()
-        _, status, result = self.wait_recording()
-        self.assertEqual(status, "error", result)
+        record = self.wait_last_recording()
+        self.assertEqual(record["status"], "error", record)
         self.assertEqual(list(Path(self.directory.name).rglob("*.mp4")), [])
 
 
