@@ -60,7 +60,7 @@ class GripperPluginTests(unittest.TestCase):
             self.nodes.bridge.calls,
             [("hand_follow_pos", {"hand_pos": [800]})],
         )
-        self.assertEqual(result, {"command": "hand_follow_pos", "hand_pos": [800]})
+        self.assertEqual(result, {"success": True, "message": "夹爪目标位置已下发: 800"})
 
     def test_position_is_clamped_to_driver_range(self):
         self.plugin.dispatch("set_position", {"position": -1})

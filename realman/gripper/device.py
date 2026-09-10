@@ -65,10 +65,12 @@ class GripperPlugin:
         if action != "set_position":
             return None
         position = _position(args.get("position"))
-        return self.nodes.bridge.publish(
+        self.nodes.bridge.publish(
             "hand_follow_pos",
             {"hand_pos": [position]},
         )
+        # 与 agibot 等驱动保持一致的画布返回格式：success + message
+        return {"success": True, "message": f"夹爪目标位置已下发: {position}"}
 
 
 def build_plugins(config, namespace, ros2):
