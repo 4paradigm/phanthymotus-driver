@@ -1227,6 +1227,14 @@ Each hook entry maps a `hook_id` to an action + params that will be called direc
 | `on_interrupt_speak` | User barge-in (speech) | Stop TTS |
 | `on_interrupt_motion` | Emergency stop | Stop locomotion |
 | `on_interrupt_all` | Full interrupt | Stop all outputs |
+| `on_notify` | LLM produced a notify-worthy content string | Speak it (`{"action": "speak"}`), or flash/blink if no speaker |
+
+`on_notify` fires with `extra_params={"text": "..."}` — the text is merged into whatever static
+`action`/`params` your binding declares. A speech-capable tool typically just needs `{"action":
+"speak"}` (the merged `text` key lines up with its own `speak` action). A device with no speaker
+(e.g. a drone) can bind its LED tool instead, e.g. `{"action": "set_effect", "params": {"pattern":
+"notify_blink"}}` — the unused `text` key in the merged args is harmless (hook calls skip schema
+validation) and the LED just blinks per its own fixed pattern.
 
 ### Key Differences from Normal Tools
 

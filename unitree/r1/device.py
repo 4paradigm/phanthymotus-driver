@@ -267,6 +267,9 @@ class NativeTtsPlugin:
                     "get_volume": {"params": [],                 "description": "Get current speaker volume"},
                     "set_volume": {"params": ["volume"],         "description": "Set speaker volume (0-100)"},
                 },
+                "x-hooks": {
+                    "on_notify": {"action": "speak"},
+                },
             },
         }
 
