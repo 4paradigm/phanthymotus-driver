@@ -13,7 +13,6 @@ realman-gripper:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

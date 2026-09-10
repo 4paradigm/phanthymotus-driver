@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+
 from common.ros2_json_bridge import JsonCommandBridge
 from common.vendor_runtime import action_schema, tool
 
@@ -15,7 +17,9 @@ def _position(value) -> int:
         numeric = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError("position must be a number") from exc
-    return int(max(POSITION_MIN, min(POSITION_MAX, round(numeric))))
+    if not math.isfinite(numeric) or not POSITION_MIN <= numeric <= POSITION_MAX:
+        raise ValueError(f"position must be within {POSITION_MIN}~{POSITION_MAX}")
+    return int(round(numeric))
 
 
 class GripperNodes:
@@ -59,7 +63,8 @@ class GripperPlugin:
             # 画布放置/连线时调用；actuator 卡片无需 topic_out（见 agibot AimDK_X2 同款实现）
             return {"state": "running", **self.nodes.bridge.snapshot()}
         if action == "start":
-            return {"state": "running"}
+            # actuator 生命周期契约：画布要求返回 ready 而非 running
+            return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         if action != "set_position":

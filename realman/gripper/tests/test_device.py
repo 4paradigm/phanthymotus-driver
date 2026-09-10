@@ -62,12 +62,12 @@ class GripperPluginTests(unittest.TestCase):
         )
         self.assertEqual(result, {"success": True, "message": "夹爪目标位置已下发: 800"})
 
-    def test_position_is_clamped_to_driver_range(self):
-        self.plugin.dispatch("set_position", {"position": -1})
-        self.plugin.dispatch("set_position", {"position": 1001})
-
-        self.assertEqual(self.nodes.bridge.calls[0][1]["hand_pos"], [0])
-        self.assertEqual(self.nodes.bridge.calls[1][1]["hand_pos"], [1000])
+    def test_out_of_range_position_is_rejected(self):
+        for value in (-1, 1001, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.plugin.dispatch("set_position", {"position": value})
+        self.assertEqual(self.nodes.bridge.calls, [])
 
     def test_invalid_position_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "position must be a number"):
@@ -80,7 +80,7 @@ class GripperPluginTests(unittest.TestCase):
         self.assertIn("supplier", result)
 
     def test_canvas_lifecycle_start_stop_actions(self):
-        self.assertEqual(self.plugin.dispatch("start", {}), {"state": "running"})
+        self.assertEqual(self.plugin.dispatch("start", {}), {"state": "ready"})
         self.assertEqual(self.plugin.dispatch("stop", {}), {"state": "idle"})
 
     def test_unknown_action_returns_none(self):
