@@ -2,6 +2,7 @@
 
 Plugins:
   StatePlugin  — DDS rt/lowstate → ROS2 skeleton/IMU/battery
+  EStopPlugin  — read-only PAC physical emergency-stop state
   LocoPlugin   — gRPC locomotion control
   ArmPlugin    — ROS2 JointState upper body control
   HandPlugin   — DDS rt/handcmd finger control and hand-state query
@@ -21,6 +22,8 @@ import zlib
 from pathlib import Path
 
 import numpy as np
+
+from estop import EStopPlugin
 
 try:
     import rclpy
@@ -417,8 +420,40 @@ def _best_effort_qos():
 # StatePlugin — subscribes DDS rt/lowstate, publishes to ROS2
 # ===========================================================================
 
+def _reliable_qos():
+    """Use the dashboard-compatible QoS while keeping a shallow queue."""
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+
+
+def _battery_payload(battery, timestamp_ms: int | None = None) -> dict:
+    """Normalize the BMS sample embedded in Adam's low-state DDS stream."""
+    def number(name: str) -> float | None:
+        try:
+            value = float(getattr(battery, name))
+            return value if math.isfinite(value) else None
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    status = getattr(battery, "status", None)
+    return {
+        "timestamp_ms": int(timestamp_ms or time.time() * 1000),
+        "voltage": number("voltage"),
+        "current": number("current"),
+        "power": number("power"),
+        "wh_accumulated": number("wh_accumulated"),
+        "status": str(status) if status not in (None, "") else "unknown",
+        "source_topic": "rt/lowstate",
+    }
+
+
 class _StatePublisherNode(Node):
-    """ROS2 node that publishes skeleton, IMU, and battery data."""
+    """ROS2 node that publishes skeleton, motor, robot, IMU, and battery data."""
+
+    _BATTERY_INTERVAL_S = 1.0
 
     def __init__(self, namespace: str, variant: str, publish_rate_hz: float):
         super().__init__("adam_state_publisher")
@@ -426,30 +461,34 @@ class _StatePublisherNode(Node):
         self._variant = variant
         self._joints = VARIANT_JOINTS[variant]
 
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+        qos = _reliable_qos()
 
         self._topic_skeleton = f"/{namespace}/state/joints"
         self._topic_imu = f"/{namespace}/state/imu"
         self._topic_battery = f"/{namespace}/state/battery"
+        self._topic_robot_state = f"/{namespace}/state/robot"
+        self._topic_motor_state = f"/{namespace}/state/motors"
 
         self._pub_skeleton = self.create_publisher(String, self._topic_skeleton, qos)
         self._pub_imu = self.create_publisher(String, self._topic_imu, qos)
         self._pub_battery = self.create_publisher(String, self._topic_battery, qos)
+        self._pub_robot_state = self.create_publisher(String, self._topic_robot_state, qos)
+        self._pub_motor_state = self.create_publisher(String, self._topic_motor_state, qos)
 
         self._latest_state = None
+        self._latest_state_at_ms = None
         self._active = False
         self._lock = threading.Lock()
 
         interval = 1.0 / publish_rate_hz
         self._timer = self.create_timer(interval, self._publish)
+        self._battery_timer = self.create_timer(
+            self._BATTERY_INTERVAL_S, self._publish_battery)
 
     def update_state(self, state):
         with self._lock:
             self._latest_state = state
+            self._latest_state_at_ms = int(time.time() * 1000)
 
     def set_active(self, active: bool):
         with self._lock:
@@ -462,6 +501,15 @@ class _StatePublisherNode(Node):
 
         if not active or state is None:
             return
+
+        robot_data = {
+            "mode_pr": int(state.mode_pr),
+            "tick": int(state.tick),
+            "wireless_remote": list(state.wireless_remote),
+        }
+        msg_robot = String()
+        msg_robot.data = json.dumps(robot_data)
+        self._pub_robot_state.publish(msg_robot)
 
         # Skeleton (joints)
         joints = []
@@ -476,6 +524,24 @@ class _StatePublisherNode(Node):
         msg.data = json.dumps({"joints": joints})
         self._pub_skeleton.publish(msg)
 
+        motor_states = []
+        for idx, motor in enumerate(state.motor_state):
+            if idx >= len(self._joints):
+                break
+            motor_states.append({
+                "idx": idx,
+                "name": self._joints[idx],
+                "mode": int(motor.mode),
+                "q": float(motor.q),
+                "dq": float(motor.dq),
+                "ddq": float(motor.ddq),
+                "tau_est": float(motor.tau_est),
+                "state": int(motor.state),
+            })
+        msg_motor = String()
+        msg_motor.data = json.dumps({"motors": motor_states})
+        self._pub_motor_state.publish(msg_motor)
+
         # IMU
         imu = state.imu_state
         imu_data = {
@@ -489,17 +555,18 @@ class _StatePublisherNode(Node):
         msg_imu.data = json.dumps(imu_data)
         self._pub_imu.publish(msg_imu)
 
-        # Battery
-        bat = state.battery_data
-        bat_data = {
-            "voltage": float(bat.voltage),
-            "current": float(bat.current),
-            "power": float(bat.power),
-            "wh_accumulated": float(bat.wh_accumulated),
-            "status": str(bat.status) if hasattr(bat, "status") else "unknown",
-        }
+    def _publish_battery(self):
+        with self._lock:
+            state = self._latest_state
+            received_at_ms = self._latest_state_at_ms
+            active = self._active
+
+        if not active or state is None:
+            return
+
         msg_bat = String()
-        msg_bat.data = json.dumps(bat_data)
+        msg_bat.data = json.dumps(
+            _battery_payload(getattr(state, "battery_data", None), received_at_ms))
         self._pub_battery.publish(msg_bat)
 
 
@@ -546,6 +613,24 @@ class StatePlugin:
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [
                     {"topic": self._node._topic_skeleton, "format": "sensor/skeleton"}
+                ],
+            },
+            {
+                "name": "motor_state",
+                "type": "sensor",
+                "description": "Adam motor feedback — position, velocity, acceleration, torque estimate and state",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_motor_state, "format": "data/json"}
+                ],
+            },
+            {
+                "name": "robot_state",
+                "type": "sensor",
+                "description": "Adam low-level state — mode, tick and wireless remote channels",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_robot_state, "format": "data/json"}
                 ],
             },
             {
@@ -614,6 +699,12 @@ class StatePlugin:
             if tool_name == "imu":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_imu, "format": "data/json"}]}
+            if tool_name == "motor_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_motor_state, "format": "data/json"}]}
+            if tool_name == "robot_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_robot_state, "format": "data/json"}]}
             if tool_name == "battery":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
@@ -1368,6 +1459,100 @@ class HandPlugin:
             return self._activate(positions, "set_fingers")
         if action == "info":
             return self._status()
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Hand-state sensor card
+# ---------------------------------------------------------------------------
+
+class _HandStatePublisherNode(Node):
+    """Publishes the shared DDS hand-state cache as JSON."""
+
+    def __init__(self, namespace: str, state_cache: HandStateCache,
+                 publish_rate_hz: float, state_timeout_sec: float):
+        super().__init__("adam_hand_state_publisher")
+        self._state_cache = state_cache
+        self._state_timeout_sec = state_timeout_sec
+        self._topic = f"/{namespace}/state/hand"
+        self._active = False
+        self._lock = threading.Lock()
+        self._publisher = self.create_publisher(String, self._topic, _best_effort_qos())
+        self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
+
+    def set_active(self, active: bool):
+        with self._lock:
+            self._active = bool(active)
+
+    def _publish(self):
+        with self._lock:
+            active = self._active
+        if not active:
+            return
+        payload = self._state_cache.snapshot(self._state_timeout_sec)
+        if payload is None:
+            return
+        message = String()
+        message.data = json.dumps(payload)
+        self._publisher.publish(message)
+
+
+class HandStatePlugin:
+    """Exposes actual 12-channel hand positions as a read-only sensor."""
+
+    PREFIX = "hand_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 state_cache: HandStateCache, **kwargs):
+        self._executor = executor
+        self._state_cache = state_cache
+        self._state_timeout_sec = float(plugin_config.get("state_timeout_sec", 1.0))
+        rate = float(plugin_config.get("publish_rate_hz", 50))
+        self._node = _HandStatePublisherNode(
+            namespace, state_cache, rate, self._state_timeout_sec)
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand_state",
+            "type": "sensor",
+            "description": "Adam hand state — actual positions for both 6-channel hands",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._state_cache.start()
+        self._node.set_active(True)
+
+    def stop(self):
+        self._node.set_active(False)
+
+    def close(self):
+        self.stop()
+        _destroy_ros_node(self._executor, self._node)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action in ("info", "hand_state"):
+            payload = self._state_cache.snapshot(self._state_timeout_sec)
+            if payload is not None:
+                return {
+                    **payload,
+                    "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+                }
+            status = self._state_cache.status(self._state_timeout_sec)
+            return {
+                "state": "unavailable" if not status["reader_available"] else "waiting",
+                "fresh": False,
+                "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+                **status,
+            }
         return None
 
 
@@ -2346,9 +2531,10 @@ class AdamDeviceBundle:
             and (ros2_enabled is None or ros2_enabled)
         )
         hand_enabled = plugins_cfg.get("hand", {}).get("enabled", True)
+        hand_state_enabled = plugins_cfg.get("hand_state", {}).get("enabled", True)
         self._hand_state_cache = (
             HandStateCache(dds_handstate_sub)
-            if hand_enabled else None
+            if hand_enabled or hand_state_enabled else None
         )
 
         # StatePlugin
@@ -2357,6 +2543,14 @@ class AdamDeviceBundle:
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
+            )
+            self._plugins.append(p)
+
+        # EStopPlugin: read-only PAC power-state monitor.
+        if plugins_cfg.get("estop", {}).get("enabled", True):
+            p = EStopPlugin(
+                plugins_cfg.get("estop", {}), namespace, executor,
+                grpc_client=grpc_client,
             )
             self._plugins.append(p)
 
@@ -2382,11 +2576,16 @@ class AdamDeviceBundle:
             )
             self._plugins.append(p)
 
-        # HandPlugin
+        # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
+            self._plugins.append(p)
+        if hand_state_enabled and self._hand_state_cache is not None and self._ros2_enabled:
+            p = HandStatePlugin(
+                plugins_cfg.get("hand_state", {}), namespace, executor,
+                state_cache=self._hand_state_cache)
             self._plugins.append(p)
 
         # ModelPlugin
