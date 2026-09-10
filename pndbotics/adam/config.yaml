@@ -8,8 +8,8 @@ variant: "pro"
 grpc_host: "10.10.20.127"
 grpc_port: 6666
 
-# DDS domain ID (must match robot's domain; Adam developer-mode DDS is domain 1)
-dds_domain_id: 1
+# DDS domain ID (must match the deployed Adam controller).
+dds_domain_id: 0
 # Adam's rt/lowstate DDS traffic is on the robot-facing Ethernet LAN, not the
 # Jetson's Wi-Fi management network.
 dds_interface: "eno1"
