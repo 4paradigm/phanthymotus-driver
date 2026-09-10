@@ -26,11 +26,11 @@ is rejected; repeating the same configuration is accepted.
 | Action | Result |
 | --- | --- |
 | `capture_photo` | Wait for a new JPEG frame, save it, return `file_path` synchronously (no ACP). |
-| `record_video` | Queue a 1–30-second recording, default 5 seconds, and return `action_id`. |
+| `record_video` | Start a 1–30-second recording, default 5 seconds; return the destination `file_path` synchronously. |
 | `list_cameras` | List the built-in source and running external RGB instances. |
 | `info` | Report source freshness, output directories, active recording and latest terminal result. |
 | `start` | Subscribe to the configured source; report readiness based on actual frames. |
-| `stop` | Cancel recording, remove incomplete output and report cancellation through ACP. |
+| `stop` | Cancel recording, remove incomplete output and record the cancellation outcome. |
 
 Example MCP arguments for tool `vision_capture`:
 
@@ -45,14 +45,16 @@ Example MCP arguments for tool `vision_capture`:
 Omit `duration_s` to use the default of 5 seconds. `maximum` is 30 seconds.
 Omit `camera` to use the saved card configuration.
 
-`queued` is an admission response, not completion. The terminal result is posted
-once to Core's `/api/acp/complete` and also remains in `info.last_recording`
-until restart. Only one recording may be active. Camera previews keep running
-when recording is cancelled. Missing, stale or stalled input produces an error.
+`record_video` returns `state: recording` with the destination `file_path`
+immediately, like `capture_photo`. The completed outcome (including the
+measured MP4 duration) is available in `info.last_recording` until restart;
+no ACP terminal notification is posted. Only one recording may be active.
+Camera previews keep running when recording is cancelled. Missing, stale or
+stalled input produces an error.
 
 The result contract matches the Q5 vision_capture card. A successful
-`record_video` completion carries only the Q5 slim field set, and the honored
-requested duration is returned after encoding:
+record carries only the Q5 slim field set, and the honored requested duration
+is returned after encoding:
 
 | Field | Meaning |
 | --- | --- |
@@ -62,11 +64,11 @@ requested duration is returned after encoding:
 | `frames` | Fresh source frames encoded. |
 | `captured_at` | Filesystem stamp ISO timestamp with timezone offset when encoding finished. |
 
-Failure and cancellation result carry only `ok`, `code` and `message` — no extra
-timing/display fields. `capture_photo` returns `file_path` synchronously and
-never posts ACP, as on Q5. No extra display/verification fields are added so the
-saved file is rendered by Core through the existing ACP `file_path` rendering
-with zero Core changes.
+Failure and cancellation records carry only `ok`, `code` and `message` — no
+extra timing/display fields. `capture_photo` returns `file_path` synchronously
+and never posts ACP, as on Q5. `record_video` returns the destination path
+synchronously too and does not post ACP, so the saved file is visible to the
+caller immediately without depending on Core's ACP `file_path` rendering.
 
 Video output preserves capture timing and extends the last frame to the exact
 requested endpoint, so a 5-second recording at 15 fps contains 75 encoded frames.
@@ -91,8 +93,10 @@ mkdir -p ~/Downloads/go2-photos
 scp 'unitree@GO2_IP:/opt/phanthy-motus/data/vision_capture/photos/*.jpg' ~/Downloads/go2-photos/
 ```
 
-No Core modification is required for the driver's completion protocol: single
-ACP terminal callback, `file_path` in the result, and no display-only fields.
+No Core modification is required for the driver's completion protocol: the
+destination `file_path` is returned synchronously on admission, the terminal
+outcome carries the slim field set in `info.last_recording`, and no ACP or
+display-only fields are used.
 
 ## Validation
 
@@ -104,7 +108,12 @@ front/RGB/depth/infrared data and nonzero ROS publishers.
 On 2026-09-09 the contract was aligned to the Q5 card: `duration_s` default is
 5 (maximum 30), `record_video` posts a single ACP `completed` whose result
 carries only `file_path`/`recorded_duration_s`/`frames`/`captured_at`, and the
-previous extra timing/display fields were removed. All 28 local capture checks
-(including real FFmpeg/ffprobe media) pass; ARM64-image verification on the Go2
-runs after the release image deploys.
+previous extra timing/display fields were removed.
+
+On 2026-09-10 the record flow was made synchronous like `capture_photo`: the
+admission response returns the destination `file_path` immediately, no ACP
+terminal notification is posted, and the completed/error/cancelled outcome is
+retained in `info.last_recording`. All 28 local capture checks (including real
+FFmpeg/ffprobe media) pass; ARM64-image verification on the Go2 runs after the
+release image deploys.
 '''
