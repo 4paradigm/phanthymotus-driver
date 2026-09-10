@@ -84,6 +84,11 @@ mc/action/McActionCommand.msg: McAction action; string action_desc
 mc/action/McActionInfo.msg:    McAction current_action; string action_desc; McActionStatus status
 mc/action/srv/SetMcAction.srv: req: RequestHeader header; string source; McActionCommand command
                                 resp: CommonResponse response
+                                Note: the enum is a build-time superset, not a promise that the
+                                deployed firmware implements every action. On the verified X2,
+                                SetMcAction accepted PASSIVE_DEFAULT, DAMPING_DEFAULT and
+                                STAND_DEFAULT, and rejected STAND_UP_DEFAULT and
+                                ZERO_TORQUE_DEFAULT as unknown actions.
 mc/action/srv/GetMcAction.srv: req: CommonRequest request
                                 resp: ResponseHeader header; McActionInfo info
 mc/motion/msg/McControlArea.msg: int32 value; NONE=0 LEFT_HAND=1 RIGHT_HAND=2 HEAD=4 WAIST=8

@@ -207,6 +207,7 @@ def _install_ros_stubs():
     module(
         "aimdk_msgs.msg",
         CommonRequest=FakeMsg,
+        McCommonState=FakeMsg,
         PmuState=FakeMsg,
         TouchState=FakeMsg,
         HandCommand=FakeMsg,
@@ -578,6 +579,41 @@ class DispatchSmokeTests(unittest.TestCase):
         sent = nodes.set_mc_action.last_request
         self.assertEqual(sent.command.action.value, device.MC_ACTIONS[action])
         self.assertEqual(sent.command.action_desc, action.upper())
+
+    def test_mc_mode_exposes_only_live_firmware_actions_and_returns_acp_id(self):
+        plugins = build_bundle_plugins()
+        nodes = plugins[0].nodes
+        nodes.set_mc_action.response = SimpleNamespace(response=SimpleNamespace(header=SimpleNamespace(code=0)))
+        nodes._mc_mode_state = {
+            "action_desc": "STAND_DEFAULT", "action_status": 100, "fsm_state": 2,
+        }
+        mc_mode = find_plugin(plugins, "mc_mode")
+        definition = next(item for item in tool_definitions(plugins) if item["name"] == "mc_mode")
+        actions = definition["inputSchema"]["properties"]["action"]["enum"]
+        self.assertEqual(actions, ["passive_default", "damping_default", "stand_default"])
+        self.assertNotIn("stand_up_default", actions)
+        self.assertNotIn("zero_torque_default", actions)
+        with mock.patch.object(device, "_acp_notify"):
+            result = mc_mode.dispatch("stand_default", {})
+        self.assertEqual(result["state"], "accepted")
+        self.assertTrue(result["action_id"].startswith("x2_mc_mode_"))
+
+    def test_mc_mode_confirmation_requires_live_non_transition_state(self):
+        plugins = build_bundle_plugins()
+        mc_mode = find_plugin(plugins, "mc_mode")
+        mc_mode.nodes._mc_mode_state = {
+            "action_desc": "STAND_DEFAULT", "action_status": 200, "fsm_state": 1,
+        }
+        with mock.patch.object(device, "_acp_notify") as notify:
+            with mock.patch.object(device.time, "monotonic", side_effect=[0, 0, 31]):
+                mc_mode._wait_for_mode_confirmation("id", "STAND_DEFAULT", "stand_default", 30)
+        self.assertEqual(notify.call_args.args[1], "error")
+
+    def test_all_actuators_declare_physical_resources(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {"slam": {"enabled": True}}})
+        for definition in tool_definitions(plugins):
+            if definition["type"] == "actuator":
+                self.assertIn("x-resource", definition["inputSchema"], definition["name"])
 
     def test_locomotion_registers_before_first_velocity_publish(self):
         plugins = build_bundle_plugins()

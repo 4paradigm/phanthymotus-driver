@@ -19,6 +19,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from uuid import uuid4
 
 from common.vendor_runtime import action_schema, jsonable, tool
 
@@ -32,12 +33,13 @@ def core_publisher(node, msg_type, topic, qos):
 
 HAND_TYPES = {0: "none", 1: "nimble_hands", 2: "claw", 3: "leisai_nimble_hands", 255: "error"}
 
+# The SDK enum is a compile-time superset.  The verified X2 firmware explicitly
+# rejects STAND_UP_DEFAULT and ZERO_TORQUE_DEFAULT, while accepting only these
+# entries.  Never expose an enum value merely because it exists in aimdk_msgs.
 MC_ACTIONS = {
-    "passive_default": 1, "soft_emergency_stop": 2, "damping_default": 3, "zero_torque_default": 4,
-    "joint_default": 100, "joint_freeze": 101, "stand_default": 200, "stand_body_control": 201,
-    "locomotion_default": 300, "run_default": 301, "locomotion_step": 302, "vr_remote_controller": 400,
-    "sit_down_default": 2000, "crouch_down_default": 2002, "lie_down_default": 2004,
-    "stand_up_default": 2005, "ascend_stairs": 2006, "descend_stairs": 2008,
+    "passive_default": 1,
+    "damping_default": 3,
+    "stand_default": 200,
 }
 
 PRESET_MOTIONS = {
@@ -127,6 +129,43 @@ def call_service(client, request, timeout=5.0):
     return future.result()
 
 
+def _with_actuation_contract(schema, resource, completion=None):
+    """Annotate an actuator schema for Agent Core's ACP resource barrier."""
+    schema = dict(schema)
+    schema["x-resource"] = resource
+    if completion is not None:
+        schema["x-completion"] = completion
+    return schema
+
+
+def _acp_notify(action_id, status, result, tool):
+    """Report a bounded, local ACP completion event without blocking ROS callbacks."""
+    import os
+    import ssl
+    import urllib.request
+
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }, ensure_ascii=False).encode("utf-8")
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        request = urllib.request.Request(
+            f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678').rstrip('/')}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=5, context=context).close()
+    except Exception as exc:
+        print(f"[acp] {tool} completion callback failed: {str(exc)[:200]}", flush=True)
+
+
 class AimdkNodes:
     def __init__(self, config, namespace, ros2):
         from rclpy.node import Node
@@ -135,7 +174,7 @@ class AimdkNodes:
         from std_msgs.msg import String, UInt8MultiArray
         from geometry_msgs.msg import Pose
         from nav_msgs.msg import Odometry
-        from aimdk_msgs.msg import CommonRequest, PmuState, TouchState
+        from aimdk_msgs.msg import CommonRequest, McCommonState, PmuState, TouchState
         from aimdk_msgs.srv import (
             ExecuteActionResource, GetAllJointState, GetCurrentInputSource, GetHandType,
             GetMcAction, GetMicSourceRequest, GetRobotResources, GetStoredMapByName,
@@ -172,11 +211,16 @@ class AimdkNodes:
         self._last_stream_publish = {}
         self._last_skeleton_publish = 0.0
         self.joint_groups = {}
+        self._mc_mode_state = {"action_desc": "", "action_status": None, "fsm_state": None}
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         command_qos = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
 
         self.streams = {}
+
+        # This is the vendor's live state-machine report.  It lets ACP distinguish
+        # a SetMcAction request being accepted from the requested mode being active.
+        self.robot.create_subscription(McCommonState, "/aima/mc/common/state", self._mc_common_state_callback, sensor_qos)
 
         def stream_enabled(name, default=True):
             return bool(config.get("plugins", {}).get(name, {}).get("enabled", default))
@@ -381,6 +425,29 @@ class AimdkNodes:
             return
         with self.lock:
             self._camera_calibration = calibration
+
+    def _mc_common_state_callback(self, msg):
+        action_info = getattr(msg, "action_info", None)
+        status = getattr(action_info, "status", None)
+        fsm_state = getattr(msg, "fsm_state", None)
+        try:
+            action_status = int(getattr(status, "value", None))
+        except (TypeError, ValueError):
+            action_status = None
+        try:
+            fsm_value = int(getattr(fsm_state, "current_state", None))
+        except (TypeError, ValueError):
+            fsm_value = None
+        with self.lock:
+            self._mc_mode_state = {
+                "action_desc": str(getattr(action_info, "action_desc", "")),
+                "action_status": action_status,
+                "fsm_state": fsm_value,
+            }
+
+    def mc_mode_state(self):
+        with self.lock:
+            return dict(self._mc_mode_state)
 
     def _camera_rgb_callback(self, msg):
         from array import array
@@ -812,13 +879,29 @@ class ModelPlugin:
 
 
 class McModePlugin:
-    ACTIONS = {name: ([], f"切换到 {name} 模式") for name in MC_ACTIONS}
+    ACTIONS = {
+        "passive_default": ([], "进入被动模式：不保持姿态；仅在人工扶持或吊挂条件下使用"),
+        "damping_default": ([], "进入阻尼模式：关节有阻尼但不保持姿态，机器人会缓慢倒地"),
+        "stand_default": ([], "进入厂商 STAND_DEFAULT 站立模式"),
+    }
 
     def __init__(self, nodes):
         self.nodes = nodes
+        configured = nodes.config.get("plugins", {}).get("mc_mode", {}).get("allowed_actions", list(MC_ACTIONS))
+        self.actions = {name: MC_ACTIONS[name] for name in configured if name in MC_ACTIONS}
 
     def get_tool(self):
-        return tool("mc_mode", "actuator", "切换 MC 运控状态机模式（SetMcAction）", action_schema(self.ACTIONS, {}))
+        actions = {name: self.ACTIONS[name] for name in self.actions}
+        schema = action_schema(actions, {})
+        return tool(
+            "mc_mode", "actuator",
+            "X2 已由实机固件确认的运控模式。平躺/平趴站起是遥控器专用恢复流程，不通过此服务提供。",
+            _with_actuation_contract(
+                schema,
+                ["leg", "waist", "arm_l", "arm_r", "head"],
+                {"actions": list(actions), "timeout": 30},
+            ),
+        )
 
     def start(self):
         pass
@@ -833,8 +916,8 @@ class McModePlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
-        if action not in MC_ACTIONS:
-            raise ValueError(f"mc_mode: unknown action {action!r}")
+        if action not in self.actions:
+            raise ValueError(f"mc_mode: action {action!r} is unavailable on this X2 firmware")
         from aimdk_msgs.srv import SetMcAction
         request = SetMcAction.Request()
         request.header.stamp = self.nodes.robot.get_clock().now().to_msg()
@@ -844,11 +927,52 @@ class McModePlugin:
         # UPPERCASE constant name (e.g. "STAND_DEFAULT"), not the integer value or our
         # lowercase snake_case key. Sending action_desc="stand_body_control" is what produced
         # the literal firmware error "can not find action: stand_body_control".
-        request.command.action.value = MC_ACTIONS[action]
+        request.command.action.value = self.actions[action]
         request.command.action_desc = action.upper()
         timeout = float(self.nodes.config.get("plugins", {}).get("mc_mode", {}).get("service_timeout_sec", 20))
         result = call_service(self.nodes.set_mc_action, request, timeout=timeout)
-        return jsonable(result.response)
+        response = result.response
+        try:
+            accepted = int(response.header.code) == 0
+        except (AttributeError, TypeError, ValueError):
+            accepted = True  # SDK test doubles and old firmware responses omit a numeric code.
+        response_data = jsonable(response)
+        if not accepted:
+            return {"state": "rejected", "action": action, "response": response_data}
+
+        action_id = f"x2_mc_mode_{uuid4().hex[:12]}"
+        threading.Thread(
+            target=self._wait_for_mode_confirmation,
+            args=(action_id, action.upper(), action, 30.0),
+            daemon=True,
+        ).start()
+        return {
+            "state": "accepted",
+            "action": action,
+            "action_id": action_id,
+            "response": response_data,
+        }
+
+    def _wait_for_mode_confirmation(self, action_id, action_desc, action, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.nodes.mc_mode_state()
+            if state["action_desc"] == action_desc and state["action_status"] == 100:
+                _acp_notify(action_id, "completed", {
+                    "action": action,
+                    "action_desc": action_desc,
+                    "action_status": state["action_status"],
+                    "fsm_state": state["fsm_state"],
+                    "completion": "mode_active",
+                }, "mc_mode")
+                return
+            time.sleep(0.1)
+        _acp_notify(action_id, "error", {
+            "action": action,
+            "action_desc": action_desc,
+            "last_state": self.nodes.mc_mode_state(),
+            "error": "mode_confirmation_timeout",
+        }, "mc_mode")
 
 
 class LocomotionPlugin:
@@ -863,16 +987,14 @@ class LocomotionPlugin:
         self._registered = False
 
     def get_tool(self):
-        return tool("locomotion", "actuator", "MC 行走速度控制：需先 register 输入源再 set_velocity；"
-                    "另外机器人 FSM 必须已处于 locomotion_default/run_default 模式（用 mc_mode 切换），"
-                    "站立(stand_default)等模式下 register 会成功但 set_velocity 不会驱动实际行走", action_schema(
-            self.ACTIONS,
-            {
-                "forward": {"type": "number", "description": "前进速度 m/s，+前进/-后退"},
-                "lateral": {"type": "number", "description": "侧移速度 m/s，+左移/-右移"},
-                "angular": {"type": "number", "description": "转向角速度 rad/s，+左转/-右转"},
-            },
-        ))
+        schema = action_schema(self.ACTIONS, {
+            "forward": {"type": "number", "description": "前进速度 m/s，+前进/-后退"},
+            "lateral": {"type": "number", "description": "侧移速度 m/s，+左移/-右移"},
+            "angular": {"type": "number", "description": "转向角速度 rad/s，+左转/-右转"},
+        })
+        return tool("locomotion", "actuator", "MC 行走速度控制：先注册输入源；仅当机器人已由遥控器或 APP "
+                    "进入走跑模式时，速度消息才会生效。当前固件未通过 SetMcAction 暴露走跑模式。",
+                    _with_actuation_contract(schema, ["base", "leg"]))
 
     def start(self):
         pass
@@ -954,13 +1076,15 @@ class PresetMotionPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("preset_motion", "actuator", "播放预设动作库（SetMcPresetMotion）", action_schema(
+        schema = action_schema(
             self.ACTIONS,
             {
                 "area": {"type": "string", "enum": ["left_hand", "right_hand"], "description": "受控手臂；仅 raise_hand/wave_hand/shake_hand 等单臂动作需要，必须传 left_hand 或 right_hand"},
                 "interrupt": {"type": "boolean", "default": True, "description": "是否打断当前动作"},
             },
-        ))
+        )
+        return tool("preset_motion", "actuator", "播放预设动作库（SetMcPresetMotion）。官方手册规定上肢预设动作只可在稳定站立模式使用。",
+                    _with_actuation_contract(schema, ["leg", "waist", "arm_l", "arm_r", "head"]))
 
     def start(self):
         pass
@@ -992,7 +1116,7 @@ class PresetMotionPlugin:
         request.ani_path = ""
         request.play_timestamp = 0
         result = call_service(self.nodes.set_mc_preset_motion, request)
-        return jsonable(result.response)
+        return {"state": "accepted", "task": jsonable(result.response)}
 
 
 class JointCommandPlugin:
@@ -1000,7 +1124,7 @@ class JointCommandPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("joint_command", "actuator", "按 leg/waist/arm/head 分组下发关节位置/速度/力矩/刚度/阻尼指令", {
+        schema = {
             "type": "object",
             "properties": {
                 "area": {"type": "string", "enum": list(JOINT_AREAS), "description": "关节分组"},
@@ -1022,7 +1146,9 @@ class JointCommandPlugin:
                 },
             },
             "required": ["area", "joints"],
-        })
+        }
+        return tool("joint_command", "actuator", "按 leg/waist/arm/head 分组下发底层关节指令；没有限位、轨迹或碰撞保护。",
+                    _with_actuation_contract(schema, ["leg", "waist", "arm_l", "arm_r", "head"]))
 
     def start(self):
         pass
@@ -1071,13 +1197,15 @@ class HandCommandPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("hand_command", "actuator", "手部指令：张开/握拳/自定义手指位置（HandCommandArray）", action_schema(
+        schema = action_schema(
             self.ACTIONS,
             {
                 "left": {"type": "array", "items": {"type": "number"}, "description": "左手各手指位置 [thumb, index, middle, ring, little]"},
                 "right": {"type": "array", "items": {"type": "number"}, "description": "右手各手指位置 [thumb, index, middle, ring, little]"},
             },
-        ))
+        )
+        return tool("hand_command", "actuator", "手部指令：张开/握拳/自定义手指位置（HandCommandArray）",
+                    _with_actuation_contract(schema, ["arm_l", "arm_r"]))
 
     def start(self):
         pass
@@ -1128,7 +1256,7 @@ class LinkcraftPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("linkcraft", "actuator", "执行灵创动作资源（ExecuteActionResource）", {
+        schema = {
             "type": "object",
             "properties": {
                 "resource_key": {"type": "string", "description": "资源 key，来自 linkcraft_catalog 工具"},
@@ -1136,7 +1264,9 @@ class LinkcraftPlugin:
                 "resource_type": {"type": "string", "enum": ["BODY_MONTION", "ARM_MONTION"], "description": "vendor 原始拼写（保留 MONTION 拼写以匹配 meta JSON 字段）"},
             },
             "required": ["resource_key", "resource_version", "resource_type"],
-        })
+        }
+        return tool("linkcraft", "actuator", "执行灵创动作资源（ExecuteActionResource）；仅执行 linkcraft_catalog 返回的资源。",
+                    _with_actuation_contract(schema, ["leg", "waist", "arm_l", "arm_r", "head"]))
 
     def start(self):
         pass
@@ -1159,7 +1289,7 @@ class LinkcraftPlugin:
         request.slaves = []
         request.meta = json.dumps({"resource_type": args["resource_type"]}, ensure_ascii=False)
         result = call_service(self.nodes.execute_action_resource, request)
-        return jsonable(result.header)
+        return {"state": "accepted", "response": jsonable(result.header)}
 
 
 class PmuLedPlugin:
@@ -1167,7 +1297,7 @@ class PmuLedPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("pmu_led", "actuator", "设置 PMU 灯带模式与颜色（SetPmuLed）", {
+        schema = {
             "type": "object",
             "properties": {
                 "mode": {"type": "string", "enum": list(LED_MODES), "default": "constant"},
@@ -1182,7 +1312,9 @@ class PmuLedPlugin:
                 },
                 "reset_priority": {"type": "boolean", "default": False},
             },
-        })
+        }
+        return tool("pmu_led", "actuator", "设置 PMU 灯带模式与颜色（SetPmuLed）",
+                    _with_actuation_contract(schema, "indicator"))
 
     def start(self):
         pass
@@ -1208,7 +1340,7 @@ class PmuLedPlugin:
         request.priority = int(args.get("priority", 100))
         request.reset_priority = bool(args.get("reset_priority", False))
         result = call_service(self.nodes.set_pmu_led, request)
-        return {"status_code": result.status_code}
+        return {"state": "accepted" if int(result.status_code) == 0 else "rejected", "status_code": result.status_code}
 
 
 class TtsPlugin:
@@ -1216,7 +1348,7 @@ class TtsPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("tts", "actuator", "文字转语音播报（PlayTts）", {
+        schema = {
             "type": "object",
             "properties": {
                 "text": {"type": "string"},
@@ -1224,7 +1356,9 @@ class TtsPlugin:
                 "interrupt": {"type": "boolean", "default": False, "description": "是否打断同等优先级播报"},
             },
             "required": ["text"],
-        })
+        }
+        return tool("tts", "actuator", "文字转语音播报（PlayTts）；服务响应表示请求已接受，当前固件没有可关联的播放完成事件。",
+                    _with_actuation_contract(schema, "mouth"))
 
     def start(self):
         pass
@@ -1249,7 +1383,7 @@ class TtsPlugin:
         request.tts_req.trace_id = ""
         request.tts_req.is_interrupted = bool(args.get("interrupt", False))
         result = call_service(self.nodes.play_tts, request)
-        return jsonable(result.tts_resp)
+        return {"state": "accepted", "response": jsonable(result.tts_resp)}
 
 
 class EmojiPlugin:
@@ -1257,7 +1391,7 @@ class EmojiPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("emoji", "actuator", "播放屏幕表情（PlayEmoji）", {
+        schema = {
             "type": "object",
             "properties": {
                 "emotion": {"type": "string", "enum": list(EMOJI_IDS)},
@@ -1265,7 +1399,9 @@ class EmojiPlugin:
                 "priority": {"type": "integer", "default": 0},
             },
             "required": ["emotion"],
-        })
+        }
+        return tool("emoji", "actuator", "播放屏幕表情（PlayEmoji）",
+                    _with_actuation_contract(schema, "face"))
 
     def start(self):
         pass
@@ -1287,7 +1423,11 @@ class EmojiPlugin:
         request.mode = 2 if args.get("loop", False) else 1
         request.priority = int(args.get("priority", 0))
         result = call_service(self.nodes.play_emoji, request)
-        return {"success": result.success, "message": result.message}
+        return {
+            "state": "accepted" if result.success else "rejected",
+            "success": result.success,
+            "message": result.message,
+        }
 
 
 class MicSourcePlugin:
@@ -1295,10 +1435,12 @@ class MicSourcePlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("mic_source", "actuator", "切换内置/外置麦克风来源（SetMicSourceRequest）", action_schema(
+        schema = action_schema(
             {"set": (["source"], "设置麦克风来源"), "get": ([], "查询当前麦克风来源")},
             {"source": {"type": "string", "enum": list(MIC_SOURCES)}},
-        ))
+        )
+        return tool("mic_source", "actuator", "切换内置/外置麦克风来源（SetMicSourceRequest）",
+                    _with_actuation_contract(schema, "microphone"))
 
     def start(self):
         pass
@@ -1325,7 +1467,7 @@ class MicSourcePlugin:
         request.header = self.nodes.request_header()
         request.mic_source = MIC_SOURCES[args["source"]]
         result = call_service(self.nodes.set_mic_source, request)
-        return jsonable(result.header)
+        return {"state": "accepted", "response": jsonable(result.header)}
 
 
 class SlamControlPlugin:
@@ -1344,14 +1486,16 @@ class SlamControlPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("slam_control", "actuator", "建图与重定位控制（/integrated_command 字符串指令）", action_schema(
+        schema = action_schema(
             self.ACTIONS,
             {
                 "map_name": {"type": "string"},
                 "map_id": {"type": "integer", "description": "目标地图 ID（由 APP 或地图查询获得）"},
                 "x": {"type": "number"}, "y": {"type": "number"},
             },
-        ))
+        )
+        return tool("slam_control", "actuator", "建图与重定位控制（/integrated_command 字符串指令）",
+                    _with_actuation_contract(schema, ["base", "leg"]))
 
     def start(self):
         pass

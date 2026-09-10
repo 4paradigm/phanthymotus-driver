@@ -26,8 +26,8 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/slam/lidar_odom` | `slam_pose` (optional) | disabled by default because this unit has no publisher. |
 | `/aimdk_5Fmsgs/srv/GetAllJointState` | `joint_state` | |
 | `/aimdk_5Fmsgs/srv/GetHandType` | `hand_state` (action `info`) | |
-| `/aimdk_5Fmsgs/srv/GetMcAction` | `mc_state` | no broadcast topic exists, so this is call-on-demand |
-| `/aimdk_5Fmsgs/srv/SetMcAction` | `mc_mode` | |
+| `/aimdk_5Fmsgs/srv/GetMcAction`, `/aima/mc/common/state` | `mc_state`, `mc_mode` ACP confirmation | `GetMcAction` remains call-on-demand; the verified X2 also broadcasts `McCommonState`, whose `action_info.action_desc/status` confirms a requested mode has become active. |
+| `/aimdk_5Fmsgs/srv/SetMcAction` | `mc_mode` | SDK enum is not a firmware capability list. This X2 accepted `PASSIVE_DEFAULT`, `DAMPING_DEFAULT`, and `STAND_DEFAULT`; it rejected `STAND_UP_DEFAULT` and `ZERO_TORQUE_DEFAULT` with `can not find action`. The driver exposes only the confirmed set and confirms activation from `/aima/mc/common/state`. |
 | `/aimdk_5Fmsgs/srv/SetMcPresetMotion` | `preset_motion` | |
 | `/aimdk_5Fmsgs/srv/SetMcInputSource`, `GetCurrentInputSource` | `locomotion` (action `register`/`disable`) | |
 | `/aimdk_5Fmsgs/srv/GetSystemState` | `system_state` | |

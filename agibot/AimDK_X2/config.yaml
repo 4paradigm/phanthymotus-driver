@@ -49,6 +49,9 @@ plugins:
     enabled: true
   mc_mode:
     enabled: true
+    # Verified on this firmware: PASSIVE_DEFAULT, DAMPING_DEFAULT, STAND_DEFAULT.
+    # Do not add SDK enum names until this robot's SetMcAction accepts them.
+    allowed_actions: [passive_default, damping_default, stand_default]
     # State transitions such as stand_up_default can take longer than ordinary
     # query/service calls. This is the response wait only; it does not retry.
     service_timeout_sec: 20
