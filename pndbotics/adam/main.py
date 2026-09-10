@@ -218,11 +218,15 @@ def main():
 
     cfg           = _load_config()
     # Adam exposes its low-state DDS bus on the robot-facing Ethernet NIC.
-    # Prefer an explicit CLI override, then configuration, instead of letting
+    # Prefer an explicit CLI override, then deployment environment and config,
+    # instead of letting
     # CycloneDDS pick a Wi-Fi/default-route interface on dual-homed Jetsons.
     network_iface = (
         sys.argv[1] if len(sys.argv) > 1
-        else os.environ.get("DDS_INTERFACE", cfg.get("dds_interface"))
+        else os.environ.get("DDS_NETWORK_INTERFACE")
+        or os.environ.get("DDS_INTERFACE")
+        or cfg.get("dds_interface")
+        or cfg.get("dds_network_interface")
     )
     namespace     = _resolve_namespace(cfg)
     mcp_port      = int(cfg.get("mcp_port", 15722))
@@ -250,7 +254,10 @@ def main():
     dds_hand_pub = None
     plugins_cfg = cfg.get("plugins", {})
     need_lowstate = plugins_cfg.get("state", {}).get("enabled", True)
-    need_handstate = plugins_cfg.get("hand", {}).get("enabled", True)
+    need_handstate = (
+        plugins_cfg.get("hand", {}).get("enabled", True)
+        or plugins_cfg.get("hand_state", {}).get("enabled", True)
+    )
     need_hand_pub = plugins_cfg.get("hand", {}).get("enabled", True)
     try:
         from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher
