@@ -10,6 +10,7 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | Catalog entry | Driver tool | Notes |
 |---|---|---|
 | `/aima/hal/imu/chest/state`, `/aima/hal/imu/torso/state` | `imu` | merged into one `data/json` stream |
+| `/aima/mc/leg_odometry` | `leg_odometry` | `nav_msgs/msg/Odometry`, mirrored as `data/json`; locomotion/leg odometry, not SLAM localization |
 | `/aima/hal/joint/hand/state` | `hand_state` (optional) | `HandStateArray`, includes touch sensors. Disabled by default: the verified X2 reports `HandType.NONE` and empty joint arrays on both sides. |
 | `/aima/hal/sensor/touch_head` | `head_touch` | `TouchState`, confirmed publisher on the X2 unit |
 | `/aima/hal/pmu/state` | `pmu_state` | `PmuState`, confirmed publisher on the X2 unit |
@@ -17,7 +18,7 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/aima/hal/joint/*/command` | `joint_command` | wildcard resolved to `leg`/`waist`/`arm`/`head` |
 | `/aima/hal/sensor/lidar_chest_front/lidar_pointcloud` | `lidar` (optional) | `sensor/pointcloud`; disabled by default because the verified unit has no publisher. |
 | `/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed` | `camera_rgb` | catalog documents `rgbd_head_front/rgb_image/compressed` instead, but on real hardware that topic has zero publishers — confirmed via `ros2 topic info` that `rgb_head_front_center` is what's actually live (30Hz); see below |
-| `/aima/hal/sensor/rgb_head_front_center/camera_info` | `camera_info` | `CameraInfo`, confirmed publisher on the X2 unit |
+| `/aima/hal/sensor/rgb_head_front_center/camera_info` | internal calibration input for `camera_rgb_frame` | `CameraInfo`, confirmed publisher on the X2 unit; intentionally not exposed as a separate card |
 | `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` (optional) | zero publishers on real hardware, and no depth topic exists anywhere in the live `ros2 topic list` on this unit. Disabled by default pending vendor confirmation. |
 | `/aima/mc/locomotion/velocity` | `locomotion` | |
 | `/integrated_command` | `slam_control` (optional) | plain `std_msgs/String`, not a service; disabled by default because SLAM is an optional vendor module and this unit has no subscriber. |

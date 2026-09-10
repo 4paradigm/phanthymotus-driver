@@ -14,7 +14,7 @@ RUN echo "${AIMDK_MSGS_SHA256}  /tmp/aimdk_msgs.zip" | sha256sum -c - && \
     rm -rf /tmp/aimdk_msgs.zip
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py config.yaml driver.yaml /work/agibot/AimDK_X2/
+COPY main.py device.py x2_camera_frame.py config.yaml driver.yaml /work/agibot/AimDK_X2/
 COPY x2_bus_bridge.py x2_bridged_publisher.py x2_socket_bridge.py x2_bundle_entrypoint.sh /work/agibot/AimDK_X2/
 COPY resource/ /work/agibot/AimDK_X2/resource/
 COPY deploy/ /deploy/

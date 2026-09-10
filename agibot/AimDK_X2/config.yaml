@@ -28,6 +28,9 @@ plugins:
     enabled: false
   imu:
     enabled: true
+  leg_odometry:
+    # X2's locomotion odometry; this is not SLAM/localization pose.
+    enabled: true
   camera:
     enabled: true
   camera_depth:

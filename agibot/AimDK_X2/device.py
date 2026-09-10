@@ -132,7 +132,7 @@ class AimdkNodes:
         from rclpy.node import Node
         from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
         from sensor_msgs.msg import CameraInfo, CompressedImage, Image, Imu, PointCloud2
-        from std_msgs.msg import String
+        from std_msgs.msg import String, UInt8MultiArray
         from geometry_msgs.msg import Pose
         from nav_msgs.msg import Odometry
         from aimdk_msgs.msg import CommonRequest, PmuState, TouchState
@@ -148,7 +148,10 @@ class AimdkNodes:
             McLocomotionVelocity,
         )
 
-        self._msg = {"CommonRequest": CommonRequest, "String": String, "Pose": Pose}
+        self._msg = {
+            "CommonRequest": CommonRequest, "String": String, "Pose": Pose,
+            "UInt8MultiArray": UInt8MultiArray,
+        }
         self._HandCommand = HandCommand
         self._HandCommandArray = HandCommandArray
         self._JointCommand = JointCommand
@@ -198,6 +201,14 @@ class AimdkNodes:
         self.robot.create_subscription(Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos)
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
+        # Locomotion odometry is available on X2 even when SLAM is disabled. Keep this
+        # separate from slam_odom: it reports leg/body-integrated motion, not map pose.
+        if stream_enabled("leg_odometry", default=True):
+            mirror(
+                "leg_odometry", Odometry, "/aima/mc/leg_odometry", "data/json",
+                qos=sensor_qos,
+            )
+
         if stream_enabled("hand_state", default=False):
             mirror(
                 "hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json",
@@ -210,12 +221,24 @@ class AimdkNodes:
         # publishes RGB under rgb_head_front_center/* instead (confirmed live via `ros2 topic
         # info`, 30Hz). No depth topic is published anywhere on this hardware at all, so
         # camera_depth stays wired to the documented (currently inactive) topic.
-        mirror(
-            "camera_rgb", CompressedImage,
-            "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed",
-            "image/jpeg", qos=sensor_qos, max_hz=CAMERA_RGB_MAX_HZ,
-        )
-        mirror("camera_info", CameraInfo, "/aima/hal/sensor/rgb_head_front_center/camera_info", "data/json", qos=sensor_qos)
+        self._camera_calibration = None
+        self._camera_sequence = 0
+        camera_topic = "/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed"
+        camera_info_topic = "/aima/hal/sensor/rgb_head_front_center/camera_info"
+        camera_rgb_topic = f"/{namespace}/agibot_x2/camera_rgb"
+        camera_frame_topic = f"/{namespace}/agibot_x2/camera_rgb_frame"
+        self.camera_rgb_pub = core_publisher(self.core, CompressedImage, camera_rgb_topic, 5)
+        self.camera_frame_pub = core_publisher(self.core, UInt8MultiArray, camera_frame_topic, 5)
+        self.robot.create_subscription(CameraInfo, camera_info_topic, self._camera_info_callback, sensor_qos)
+        self.robot.create_subscription(CompressedImage, camera_topic, self._camera_rgb_callback, sensor_qos)
+        self.streams["camera_rgb"] = {"robot_topic": camera_topic, "topic": camera_rgb_topic, "format": "image/jpeg"}
+        self.streams["camera_rgb_frame"] = {
+            "robot_topic": camera_topic,
+            "topic": camera_frame_topic,
+            "format": "application/vnd.phanthy.sensor-envelope.v1",
+            "ros_type": "std_msgs/msg/UInt8MultiArray",
+            "schema": "phanthy.sensor.camera_rgb_frame.v1",
+        }
         if stream_enabled("camera_depth", default=False):
             mirror("camera_depth", Image, "/aima/hal/sensor/rgbd_head_front/depth_image", "image/depth-z16", qos=sensor_qos)
         if stream_enabled("lidar", default=False):
@@ -348,6 +371,41 @@ class AimdkNodes:
             publisher.publish(output)
         return callback
 
+    def _camera_info_callback(self, msg):
+        from x2_camera_frame import calibration_from_camera_info
+
+        frame_id = str(getattr(getattr(msg, "header", None), "frame_id", "")) or "rgb_head_center_link"
+        try:
+            calibration = calibration_from_camera_info(msg, frame_id)
+        except (TypeError, ValueError):
+            return
+        with self.lock:
+            self._camera_calibration = calibration
+
+    def _camera_rgb_callback(self, msg):
+        from array import array
+        from x2_camera_frame import build_rgb_metadata, encode_envelope
+
+        now = time.monotonic()
+        with self.lock:
+            if now - self._last_stream_publish.get("camera_rgb", 0.0) < 1.0 / CAMERA_RGB_MAX_HZ:
+                return
+            self._last_stream_publish["camera_rgb"] = now
+            calibration = self._camera_calibration
+            self._camera_sequence += 1
+            sequence = self._camera_sequence
+        self.camera_rgb_pub.publish(msg)
+        if calibration is None:
+            return
+        try:
+            metadata = build_rgb_metadata(msg, calibration, sequence)
+            envelope = encode_envelope(metadata, getattr(msg, "data", b""))
+            framed = self._msg["UInt8MultiArray"]()
+            framed.data = array("B", envelope)
+            self.camera_frame_pub.publish(framed)
+        except (TypeError, ValueError, OverflowError):
+            return
+
     def _joint_state_callback(self, area):
         def callback(msg):
             with self.lock:
@@ -424,7 +482,11 @@ class AimdkNodes:
 
 
 def _stream_tool(key, stream, description):
-    return tool(key, "sensor", description, topic_out=[{"topic": stream["topic"], "format": stream["format"]}])
+    entry = {"topic": stream["topic"], "format": stream["format"]}
+    for field in ("ros_type", "schema"):
+        if field in stream:
+            entry[field] = stream[field]
+    return tool(key, "sensor", description, topic_out=[entry])
 
 
 class McStatePlugin:
@@ -574,7 +636,7 @@ class CameraPlugin:
     def get_tools(self):
         tools = [
             _stream_tool("camera_rgb", self.nodes.streams["camera_rgb"], "前置 RGBD 相机彩色画面（压缩 JPEG）"),
-            _stream_tool("camera_info", self.nodes.streams["camera_info"], "前置 RGB 相机标定内参（CameraInfo）"),
+            _stream_tool("camera_rgb_frame", self.nodes.streams["camera_rgb_frame"], "带时间、内参和名义机身外参的自描述前置 RGB 帧"),
         ]
         if "camera_depth" in self.nodes.streams:
             tools.append(_stream_tool("camera_depth", self.nodes.streams["camera_depth"], "前置 RGBD 相机深度画面"))
@@ -592,7 +654,7 @@ class CameraPlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
-        if action in ("info", "read", "get", "camera_rgb", "camera_info", "camera_depth"):
+        if action in ("info", "read", "get", "camera_rgb", "camera_rgb_frame", "camera_depth"):
             if name not in self.nodes.streams:
                 return None
             return {"state": "running", "data": self.nodes.snapshot(name), **self.nodes.streams[name]}
@@ -1383,6 +1445,8 @@ def build_plugins(config, namespace, ros2):
     if "hand_state" in nodes.streams:
         add("hand_state", HandStatePlugin(nodes), default=False)
     add("imu", ImuPlugin(nodes))
+    if "leg_odometry" in nodes.streams:
+        add("leg_odometry", ReadOnlyStreamPlugin(nodes, "leg_odometry", "X2 腿部/机体里程计（非 SLAM 定位）"))
     add("camera", CameraPlugin(nodes))
     add("head_touch", ReadOnlyStreamPlugin(nodes, "head_touch", "头部触摸状态（未触摸时 is_touched=false）"))
     add("pmu_state", ReadOnlyStreamPlugin(nodes, "pmu_state", "PMU 电压、电流、温度和电源状态"))

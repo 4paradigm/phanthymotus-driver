@@ -197,7 +197,7 @@ def _install_ros_stubs():
     module("sensor_msgs")
     module("sensor_msgs.msg", CameraInfo=FakeMsg, CompressedImage=FakeMsg, Image=FakeMsg, Imu=FakeMsg, PointCloud2=FakeMsg)
     module("std_msgs")
-    module("std_msgs.msg", String=FakeMsg)
+    module("std_msgs.msg", String=FakeMsg, UInt8MultiArray=FakeMsg)
     module("geometry_msgs")
     module("geometry_msgs.msg", Pose=FakeMsg)
     module("nav_msgs")
@@ -233,6 +233,7 @@ import yaml  # noqa: E402
 import device  # noqa: E402
 import x2_bus_bridge  # noqa: E402
 import x2_bridged_publisher  # noqa: E402
+import x2_camera_frame  # noqa: E402
 
 
 def load_driver_yaml_cards():
@@ -301,7 +302,7 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joints", "joint_state", "imu", "camera_rgb", "camera_info", "head_touch", "pmu_state", "system_state", "linkcraft_catalog"):
+        for name in ("mc_state", "joints", "joint_state", "imu", "leg_odometry", "camera_rgb", "camera_rgb_frame", "head_touch", "pmu_state", "system_state", "linkcraft_catalog"):
             self.assertEqual(by_name[name], "sensor")
 
     def test_unavailable_hardware_cards_are_not_registered_by_default(self):
@@ -320,13 +321,53 @@ class ToolInventoryTests(unittest.TestCase):
         plugins = build_bundle_plugins()
         nodes = plugins[0].nodes
         expected = {
+            "leg_odometry": "/aima/mc/leg_odometry",
             "head_touch": "/aima/hal/sensor/touch_head",
             "pmu_state": "/aima/hal/pmu/state",
-            "camera_info": "/aima/hal/sensor/rgb_head_front_center/camera_info",
         }
         for name, topic in expected.items():
             self.assertEqual(nodes.streams[name]["robot_topic"], topic)
             self.assertEqual(nodes.streams[name]["format"], "data/json")
+
+    def test_camera_rgb_frame_replaces_public_camera_info_card(self):
+        definitions = {item["name"]: item for item in tool_definitions(build_bundle_plugins())}
+        self.assertNotIn("camera_info", definitions)
+        frame = definitions["camera_rgb_frame"]
+        self.assertEqual(frame["topic_out"][0]["format"], x2_camera_frame.ENVELOPE_FORMAT)
+        self.assertEqual(frame["topic_out"][0]["schema"], x2_camera_frame.RGB_SCHEMA)
+
+    def test_camera_rgb_frame_envelope_uses_ros_calibration_and_nominal_urdf_extrinsic(self):
+        plugins = build_bundle_plugins()
+        nodes = plugins[0].nodes
+        nodes.camera_rgb_pub = FakePublisher(FakeMsg, "/test_ns/agibot_x2/camera_rgb", 5)
+        nodes.camera_frame_pub = FakePublisher(FakeMsg, "/test_ns/agibot_x2/camera_rgb_frame", 5)
+        callbacks = {topic: callback for topic, callback in nodes.robot.subscriptions}
+        info = SimpleNamespace(
+            header=SimpleNamespace(frame_id="rgb_head_center_link"), width=640, height=480,
+            distortion_model="plumb_bob", d=[0.1, 0.2], k=[1.0] * 9, r=[1.0] * 9, p=[1.0] * 12,
+        )
+        callbacks["/aima/hal/sensor/rgb_head_front_center/camera_info"](info)
+        image = SimpleNamespace(
+            header=SimpleNamespace(frame_id="rgb_head_center_link", stamp=SimpleNamespace(sec=1, nanosec=2)),
+            data=b"jpeg-data",
+        )
+        callbacks["/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed"](image)
+        metadata, payload = x2_camera_frame.decode_envelope(bytes(nodes.camera_frame_pub.published[-1].data))
+        self.assertEqual(payload, b"jpeg-data")
+        self.assertEqual(metadata["schema"], x2_camera_frame.RGB_SCHEMA)
+        extrinsic = metadata["calibration"]["base_to_camera"]
+        self.assertEqual(extrinsic["target_frame"], "pelvis")
+        self.assertEqual(extrinsic["status"], "nominal_zero_joint_pose")
+        self.assertEqual(len(extrinsic["matrix_4x4_row_major"]), 16)
+
+    def test_leg_odometry_is_distinct_from_slam_and_supports_lifecycle(self):
+        plugins = build_bundle_plugins()
+        nodes = plugins[0].nodes
+        odometry = find_plugin(plugins, "leg_odometry")
+        self.assertEqual(nodes.streams["leg_odometry"]["topic"], "/test_ns/agibot_x2/leg_odometry")
+        self.assertEqual(odometry.dispatch("start", {}), {"state": "running"})
+        self.assertEqual(odometry.dispatch("stop", {}), {"state": "idle"})
+        self.assertNotIn("slam_odom", nodes.streams)
 
     def test_joints_skeleton_topic_and_payload_contract(self):
         plugins = build_bundle_plugins()
