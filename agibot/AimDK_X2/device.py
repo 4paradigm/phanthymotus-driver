@@ -15,6 +15,7 @@ tooling names these services on the wire, not a typo introduced here.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -1021,7 +1022,7 @@ class LocomotionPlugin:
             "forward": {"type": "number", "default": 0.2,
                         "description": "前进速度 m/s，+前进/-后退；默认 0.2"},
             "lateral": {"type": "number", "description": "侧移速度 m/s，+左移/-右移"},
-            "angular": {"type": "number", "description": "转向角速度 rad/s，+左转/-右转"},
+            "angular": {"type": "number", "description": "转向角速度 °/s，+左转/-右转；驱动内部换算为 rad/s"},
             "duration": {"type": "number", "minimum": -1, "maximum": 60, "default": -1,
                          "description": "持续时间（秒）。-1 为持续移动，0.1-60 到时自动发布零速度。"},
         })
@@ -1214,7 +1215,8 @@ class LocomotionPlugin:
             self._register_input_source()
         forward = args.get("forward", 0.2)
         lateral = args.get("lateral", 0.0)
-        angular = args.get("angular", 0.0)
+        angular_deg = float(args.get("angular", 0.0))
+        angular = math.radians(angular_deg)
         self._publish_velocity(forward, lateral, angular)
         action_id = f"x2_locomotion_{uuid4().hex[:12]}"
         with self._lock:
@@ -1225,6 +1227,7 @@ class LocomotionPlugin:
         return {
             "state": "accepted", "action_id": action_id, "duration": duration,
             "topic": "/aima/mc/locomotion/velocity",
+            "angular_input_unit": "deg/s",
         }
 
 

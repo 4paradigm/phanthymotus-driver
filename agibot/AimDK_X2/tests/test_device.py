@@ -12,6 +12,7 @@ import sys
 import types
 import unittest
 import json
+import math
 from unittest import mock
 from types import SimpleNamespace
 from pathlib import Path
@@ -644,6 +645,12 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].source, "motus_x2")
+
+        locomotion.dispatch("move", {"forward": 0.0, "angular": 180.0, "duration": -1})
+        self.assertAlmostEqual(
+            locomotion.nodes.locomotion_pub.published[-1].angular_velocity,
+            math.pi,
+        )
 
     def test_locomotion_managed_source_rejection_prevents_publish(self):
         plugins = build_bundle_plugins()
