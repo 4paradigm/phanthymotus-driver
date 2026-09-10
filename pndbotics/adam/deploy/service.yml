@@ -19,7 +19,9 @@ pndbotics-adam:
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
-    - GRPC_HOST=localhost
+    # Adam RobotControl runs on the separate x86 controller, not this Jetson.
+    # Keep this aligned with config.yaml; an environment override wins there.
+    - GRPC_HOST=10.10.20.127
     - GRPC_PORT=6666
     - NVIDIA_VISIBLE_DEVICES=all
     - NVIDIA_DRIVER_CAPABILITIES=all
