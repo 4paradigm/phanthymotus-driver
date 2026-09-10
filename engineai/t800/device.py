@@ -4879,7 +4879,8 @@ class TtsPlugin:
             "inputSchema": {"type": "object", "properties": {
                 "text": {"type": "string"}, "language": {"type": "string"},
                 "speaker": {"type": "string"}, "rate": {"type": "integer", "minimum": 50, "maximum": 300}},
-                "required": ["text"]},
+                "required": ["text"],
+                "x-hooks": {"on_notify": {}}},
         }
 
     def start(self) -> None:

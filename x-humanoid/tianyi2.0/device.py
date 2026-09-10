@@ -4586,6 +4586,7 @@ class TtsPlugin:
                 },
                 "x-hooks": {
                     "on_interrupt_speak": {"action": "interrupt"},
+                    "on_notify": {"action": "speak"},
                 },
             },
         }
