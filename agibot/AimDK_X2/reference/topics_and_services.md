@@ -21,7 +21,7 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/integrated_command` | `slam_control` | plain `std_msgs/String`, not a service |
 | `/relocalization_pose` | `slam_control` | |
 | `/slam/lidar_odom` | `slam_pose` | |
-| `/aimdk_5Fmsgs/srv/GetAllJointState` | `joint_state` | |
+| `/aima/hal/joint/{leg,waist,arm,head}/state` | `joint_state`, `joints` | `JointStateArray`; shared source for raw JSON and skeleton streams |
 | `/aimdk_5Fmsgs/srv/GetHandType` | `hand_state` (action `info`) | |
 | `/aimdk_5Fmsgs/srv/GetMcAction` | `mc_state` | no broadcast topic exists, so this is call-on-demand |
 | `/aimdk_5Fmsgs/srv/SetMcAction` | `mc_mode` | |

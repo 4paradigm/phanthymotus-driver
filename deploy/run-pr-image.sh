@@ -23,7 +23,8 @@
 # For a lasting deployment, use the web console instead. This script is the
 # quick "does it work" path.
 #
-# Requires: docker with the compose plugin. Nothing else — no python, no yq.
+# Requires: docker with the compose plugin and GNU timeout (coreutils; `timeout` on Linux).
+# No python or yq is required.
 set -euo pipefail
 
 PR_IMAGE_DIR="${PR_IMAGE_DIR:-/tmp/pr-image}"

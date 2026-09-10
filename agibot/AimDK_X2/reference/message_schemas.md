@@ -62,12 +62,19 @@ hal/srv/SetPmuLed.srv:         req: CommonRequest request; string trace_id;
 
 ## Joint state and skeleton streams
 
-The two cards deliberately expose different dashboard contracts:
+The two cards share the same four read-only `JointStateArray` subscriptions and deliberately
+expose different dashboard contracts. This avoids depending on `GetAllJointState`, which is not
+discoverable on the verified X2 while the corresponding state topics are publishing:
 
-- `joint_state` publishes the raw, grouped `GetAllJointState` result as `data/json` on
+- `/aima/hal/joint/leg/state`
+- `/aima/hal/joint/waist/state`
+- `/aima/hal/joint/arm/state`
+- `/aima/hal/joint/head/state`
+
+- `joint_state` publishes the raw, grouped `JointStateArray.joints` values as `data/json` on
   `/<ros_namespace>/agibot_x2/joint_state`.
-- `joints` polls the same read-only service and publishes `sensor/skeleton` on
-  `/<ros_namespace>/agibot_x2/joints` for URDF visualization.
+- `joints` publishes `sensor/skeleton` on `/<ros_namespace>/state/joints` for URDF
+  visualization.
 
 The skeleton payload is:
 
@@ -87,7 +94,9 @@ The skeleton payload is:
 ```
 
 The list order is `leg`, `waist`, `arm`, then `head`, preserving AimDK's order within each
-group. `q`, `dq`, and `tau` map directly to `JointState.position`, `.velocity`, and `.effort`.
+group. `idx` is the matching movable-joint index from the selected X2 URDF; unknown names are
+reported in diagnostics instead of being assigned a fabricated index. `q`, `dq`, and `tau` map
+directly to `JointState.position`, `.velocity`, and `.effort`.
 Both tools return their own explicit `topic_out` from the `info` action so the dashboard cannot
 associate `joint_state` with the skeleton stream.
 
@@ -108,7 +117,7 @@ mc/action/srv/GetMcAction.srv: req: CommonRequest request
                                 resp: ResponseHeader header; McActionInfo info
 mc/motion/msg/McControlArea.msg: int32 value; NONE=0 LEFT_HAND=1 RIGHT_HAND=2 HEAD=4 WAIST=8
                                 (bitmask for body-part locking during preset motions — distinct
-                                from the leg/waist/arm/head split GetAllJointState returns)
+                                from the leg/waist/arm/head state-topic split)
 mc/motion/msg/McLocomotionVelocity.msg: MessageHeader header; string source;
                                 float64 forward_velocity; float64 lateral_velocity; float64 angular_velocity
 mc/motion/msg/McPresetMotion.msg: int32 value; large named gesture enum, see PRESET_MOTIONS in device.py

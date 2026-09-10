@@ -8,6 +8,7 @@ verification" note in CLAUDE.md.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 import unittest
@@ -201,10 +202,11 @@ def _install_ros_stubs():
         HandStateArray=FakeMsg,
         JointCommand=FakeMsg,
         JointCommandArray=FakeMsg,
+        JointStateArray=FakeMsg,
         McLocomotionVelocity=FakeMsg,
     )
     srv_names = [
-        "ExecuteActionResource", "GetAllJointState", "GetCurrentInputSource", "GetHandType",
+        "ExecuteActionResource", "GetCurrentInputSource", "GetHandType",
         "GetMcAction", "GetMicSourceRequest", "GetRobotResources", "GetStoredMapByName",
         "GetSystemState", "PlayEmoji", "PlayTts", "SetMcAction", "SetMcInputSource",
         "SetMcPresetMotion", "SetMicSourceRequest", "SetPmuLed",
@@ -295,7 +297,7 @@ class ToolInventoryTests(unittest.TestCase):
             "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
         }]
         joints_topic = [{
-            "topic": "/test_ns/agibot_x2/joints", "format": "sensor/skeleton",
+            "topic": "/test_ns/state/joints", "format": "sensor/skeleton",
         }]
 
         self.assertEqual(by_name["joint_state"]["topic_out"], joint_state_topic)
@@ -330,39 +332,68 @@ class ModelPluginTests(unittest.TestCase):
 
 
 class JointsPluginTests(unittest.TestCase):
-    def test_normalize_maps_vendor_joint_fields_to_skeleton_contract(self):
-        def joint(name, position, velocity, effort, error_code):
-            state = FakeMsg()
-            state.name = name
-            state.position = position
-            state.velocity = velocity
-            state.effort = effort
-            state.error_code = error_code
-            return state
+    @staticmethod
+    def _joint(name, position, velocity=0.0, effort=0.0, error_code=0):
+        return types.SimpleNamespace(
+            name=name, position=position, velocity=velocity,
+            effort=effort, error_code=error_code,
+        )
 
-        response = FakeMsg()
-        response.leg_joints = [joint("left_hip_pitch_joint", 0.1, 0.2, 0.3, 0)]
-        response.waist_joints = []
-        response.arm_joints = [joint("left_shoulder_pitch_joint", -0.4, 0.5, 0.6, 7)]
-        response.head_joints = []
+    def test_direct_joint_topic_publishes_raw_and_skeleton_streams(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})
+        nodes = plugins[0].nodes
+        callbacks = dict(nodes.robot.subscriptions)
+        leg_name = nodes.skeleton_joints["leg"][0]
 
-        self.assertEqual(device.JointsPlugin.normalize(response), [
-            {
-                "idx": 0, "name": "left_hip_pitch_joint", "q": 0.1,
-                "dq": 0.2, "tau": 0.3, "error_code": 0,
-            },
-            {
-                "idx": 1, "name": "left_shoulder_pitch_joint", "q": -0.4,
-                "dq": 0.5, "tau": 0.6, "error_code": 7,
-            },
-        ])
+        callbacks["/aima/hal/joint/leg/state"](types.SimpleNamespace(joints=[
+            self._joint(leg_name, 0.25, velocity=0.5, effort=0.75),
+        ]))
 
-    def test_invalid_poll_interval_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "poll_interval_sec"):
-            build_bundle_plugins({
-                "end_effector": "ultra",
-                "plugins": {"joints": {"poll_interval_sec": 0}},
-            })
+        raw = json.loads(nodes.joint_state_pub.published[-1].data)
+        skeleton = json.loads(nodes.joints_pub.published[-1].data)
+        self.assertEqual(raw["state"], "running")
+        self.assertEqual(raw["received_areas"], ["leg"])
+        self.assertEqual(raw["joint_counts"], {"leg": 1, "waist": 0, "arm": 0, "head": 0})
+        self.assertEqual(raw["leg"][0]["name"], leg_name)
+        self.assertEqual(skeleton["joints"], [{
+            "idx": nodes.skeleton_joint_indices[leg_name],
+            "name": leg_name, "q": 0.25, "dq": 0.5, "tau": 0.75,
+        }])
+
+    def test_unknown_joint_name_is_diagnostic_not_fabricated_skeleton_data(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})
+        nodes = plugins[0].nodes
+        callbacks = dict(nodes.robot.subscriptions)
+
+        callbacks["/aima/hal/joint/arm/state"](types.SimpleNamespace(joints=[
+            self._joint("vendor_joint_not_in_urdf", 1.0),
+        ]))
+
+        skeleton = json.loads(nodes.joints_pub.published[-1].data)
+        self.assertEqual(skeleton["joints"], [])
+        self.assertEqual(
+            skeleton["diagnostics"]["unknown_joint_names"],
+            ["vendor_joint_not_in_urdf"],
+        )
+
+    def test_streams_wait_without_inventing_zero_joint_values(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})
+        joint_state = find_plugin(plugins, "joint_state").dispatch("info", {})
+        joints = find_plugin(plugins, "joints").dispatch("info", {})
+
+        self.assertEqual(joint_state["state"], "waiting")
+        self.assertFalse(joint_state["available"])
+        self.assertEqual(joint_state["joint_counts"], {"leg": 0, "waist": 0, "arm": 0, "head": 0})
+        self.assertEqual(joints["state"], "waiting")
+        self.assertFalse(joints["available"])
+        self.assertEqual(joints["joints"], [])
+
+    def test_stop_reports_always_on_instead_of_false_idle_state(self):
+        plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})
+        for name in ("joint_state", "joints"):
+            result = find_plugin(plugins, name).dispatch("stop", {})
+            self.assertEqual(result["state"], "running")
+            self.assertTrue(result["always_on"])
 
 
 class DispatchSmokeTests(unittest.TestCase):
@@ -396,131 +427,6 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertTrue(locomotion._registered)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
-
-    def test_joint_state_returns_joint_values_after_a_successful_query(self):
-        plugins = build_bundle_plugins()
-        joint_state = find_plugin(plugins, "joint_state")
-        response = FakeMsg()
-        response.reponse.status.value = 1
-        response.reponse.message = ""
-        arm_joint = FakeMsg()
-        arm_joint.name = "left_shoulder_pitch_joint"
-        arm_joint.position = 0.25
-        response.leg_joints = []
-        response.waist_joints = []
-        response.arm_joints = [arm_joint]
-        response.head_joints = []
-        joint_state.nodes.get_all_joint_state.response = response
-
-        result = joint_state.dispatch("get", {})
-
-        self.assertEqual(result["state"], "ok")
-        self.assertEqual(result["service"], "GetAllJointState")
-        self.assertEqual(result["status_name"], "SUCCESS")
-        self.assertEqual(result["joint_counts"], {"leg": 0, "waist": 0, "arm": 1, "head": 0})
-        self.assertEqual(result["arm"], [{"name": "left_shoulder_pitch_joint", "position": 0.25}])
-        self.assertEqual(result["topic_out"], [{
-            "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
-        }])
-
-    def test_joint_state_has_its_own_stream_and_publishes_service_values(self):
-        plugins = build_bundle_plugins()
-        joint_state = find_plugin(plugins, "joint_state")
-        response = FakeMsg()
-        response.reponse.status.value = 1
-        response.reponse.message = ""
-        arm_joint = FakeMsg()
-        arm_joint.name = "left_shoulder_roll_joint"
-        arm_joint.position = 0.1
-        response.leg_joints = []
-        response.waist_joints = []
-        response.arm_joints = [arm_joint]
-        response.head_joints = []
-        joint_state.nodes.get_all_joint_state.response = response
-
-        definition = joint_state.get_tool()
-        expected_topic_out = [{
-            "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
-        }]
-        self.assertEqual(definition["topic_out"], expected_topic_out)
-        for action in ("start", "info"):
-            result = joint_state.dispatch(action, {})
-            self.assertEqual(result["topic_out"], expected_topic_out)
-            self.assertNotIn("hand_state", str(result["topic_out"]))
-        joint_state.nodes._publish_joint_state()
-        published = joint_state.nodes.joint_state_pub.published[-1]
-        self.assertIn('"state": "ok"', published.data)
-        self.assertEqual(joint_state.nodes.snapshot("joint_state")["joint_counts"]["arm"], 1)
-
-    def test_joint_state_reports_failed_queries_instead_of_default_values(self):
-        plugins = build_bundle_plugins()
-        joint_state = find_plugin(plugins, "joint_state")
-        response = FakeMsg()
-        response.reponse.status.value = 0
-        response.reponse.message = ""
-        response.leg_joints = []
-        response.waist_joints = []
-        response.arm_joints = []
-        response.head_joints = []
-        joint_state.nodes.get_all_joint_state.response = response
-
-        result = joint_state.dispatch("get", {})
-
-        self.assertEqual(result["state"], "unavailable")
-        self.assertEqual(result["status"], 0)
-        self.assertEqual(result["status_name"], "UNKNOWN")
-        self.assertEqual(result["joint_counts"], {"leg": 0, "waist": 0, "arm": 0, "head": 0})
-        self.assertEqual(result["message"], "vendor returned UNKNOWN with no joint data")
-
-    def test_joint_state_preserves_data_when_vendor_status_is_unknown(self):
-        plugins = build_bundle_plugins()
-        joint_state = find_plugin(plugins, "joint_state")
-        response = FakeMsg()
-        response.reponse.status.value = 0
-        response.reponse.message = ""
-        arm_joint = FakeMsg()
-        arm_joint.name = "right_elbow_pitch_joint"
-        arm_joint.position = -0.4
-        response.leg_joints = []
-        response.waist_joints = []
-        response.arm_joints = [arm_joint]
-        response.head_joints = []
-        joint_state.nodes.get_all_joint_state.response = response
-
-        result = joint_state.dispatch("get", {})
-
-        self.assertEqual(result["state"], "degraded")
-        self.assertEqual(result["status_name"], "UNKNOWN")
-        self.assertEqual(result["joint_counts"]["arm"], 1)
-        self.assertEqual(result["arm"], [{"name": "right_elbow_pitch_joint", "position": -0.4}])
-        self.assertIn("using non-empty joint data", result["message"])
-
-    def test_joint_state_reports_an_unavailable_service(self):
-        plugins = build_bundle_plugins()
-        joint_state = find_plugin(plugins, "joint_state")
-        joint_state.nodes.get_all_joint_state.available = False
-
-        result = joint_state.dispatch("get", {})
-
-        self.assertEqual(result["state"], "unavailable")
-        self.assertEqual(result["service"], "GetAllJointState")
-        self.assertIn("unavailable", result["message"])
-
-    def test_joint_state_reports_a_service_future_exception(self):
-        plugins = build_bundle_plugins()
-        joint_state = find_plugin(plugins, "joint_state")
-        joint_state.nodes.get_all_joint_state.future_exception = RuntimeError("transport failed")
-
-        result = joint_state.dispatch("get", {})
-
-        self.assertEqual(result["state"], "unavailable")
-        self.assertEqual(result["service"], "GetAllJointState")
-        self.assertEqual(result["message"], "transport failed")
-        self.assertEqual(result["joint_counts"], {"leg": 0, "waist": 0, "arm": 0, "head": 0})
-        self.assertEqual(result["arm"], [])
-        self.assertEqual(result["topic_out"], [{
-            "topic": "/test_ns/agibot_x2/joint_state", "format": "data/json",
-        }])
 
 class StartStopLifecycleTests(unittest.TestCase):
     """README_dev.md's 'start/stop in dispatch (Required)' rule: the canvas UI calls every

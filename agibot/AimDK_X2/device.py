@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from common.vendor_runtime import action_schema, jsonable, tool
@@ -76,6 +77,35 @@ EMOJI_IDS = {
 MIC_SOURCES = {"internal": 0, "external": 1}
 
 RESOURCE_DIR = Path(__file__).with_name("resource")
+SKELETON_TOPIC = "state/joints"
+JOINT_STREAM_MAX_HZ = 30.0
+
+
+def skeleton_layout(variant):
+    """Return the movable X2 URDF joint groups and each joint's renderer index."""
+    root = ET.parse(RESOURCE_DIR / f"x2_{variant}.urdf").getroot()
+    names = [
+        joint.get("name") for joint in root.findall("joint")
+        if joint.get("name") and joint.get("type") != "fixed"
+    ]
+    groups = {area: [] for area in JOINT_AREAS}
+    for name in names:
+        if name.startswith((
+            "left_hip", "right_hip", "left_knee", "right_knee",
+            "left_ankle", "right_ankle",
+        )):
+            groups["leg"].append(name)
+        elif name.startswith("waist_"):
+            groups["waist"].append(name)
+        elif name.startswith((
+            "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+            "left_wrist", "right_wrist",
+        )):
+            groups["arm"].append(name)
+        elif name.startswith("head_"):
+            groups["head"].append(name)
+    indices = {name: index for index, name in enumerate(names)}
+    return {area: tuple(area_names) for area, area_names in groups.items()}, indices
 
 
 def call_service(client, request, timeout=5.0):
@@ -106,14 +136,14 @@ class AimdkNodes:
         from nav_msgs.msg import Odometry
         from aimdk_msgs.msg import CommonRequest
         from aimdk_msgs.srv import (
-            ExecuteActionResource, GetAllJointState, GetCurrentInputSource, GetHandType,
+            ExecuteActionResource, GetCurrentInputSource, GetHandType,
             GetMcAction, GetMicSourceRequest, GetRobotResources, GetStoredMapByName,
             GetSystemState, PlayEmoji, PlayTts, SetMcAction, SetMcInputSource,
             SetMcPresetMotion, SetMicSourceRequest, SetPmuLed,
         )
         from aimdk_msgs.msg import (
             HandCommand, HandCommandArray, HandStateArray, JointCommand, JointCommandArray,
-            McLocomotionVelocity,
+            JointStateArray, McLocomotionVelocity,
         )
 
         self._msg = {"CommonRequest": CommonRequest, "String": String, "Pose": Pose}
@@ -125,6 +155,7 @@ class AimdkNodes:
 
         self.config = config
         self.end_effector = str(config.get("end_effector", "hand")).lower()
+        self.skeleton_joints, self.skeleton_joint_indices = skeleton_layout(self.end_effector)
         self.namespace = namespace
         self.robot = Node("agibot_x2_driver_robot", context=ros2.ctx_robot)
         self.core = Node("agibot_x2_driver_core", context=ros2.ctx_core)
@@ -133,6 +164,8 @@ class AimdkNodes:
 
         self.lock = threading.RLock()
         self.values = {}
+        self.joint_groups = {}
+        self._last_joint_stream_publish = 0.0
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         command_qos = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
@@ -158,13 +191,26 @@ class AimdkNodes:
         self.robot.create_subscription(Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos)
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
-        joints_topic = f"/{namespace}/agibot_x2/joints"
+        joint_state_topic = f"/{namespace}/agibot_x2/joint_state"
+        self.joint_state_pub = self.core.create_publisher(String, joint_state_topic, 5)
+        self.streams["joint_state"] = {
+            "robot_topic": "/aima/hal/joint/{leg,waist,arm,head}/state",
+            "topic": joint_state_topic,
+            "format": "data/json",
+        }
+
+        joints_topic = f"/{namespace}/{SKELETON_TOPIC}"
         self.joints_pub = self.core.create_publisher(String, joints_topic, 5)
         self.streams["joints"] = {
-            "robot_topic": "/aimdk_5Fmsgs/srv/GetAllJointState",
+            "robot_topic": "/aima/hal/joint/{leg,waist,arm,head}/state",
             "topic": joints_topic,
             "format": "sensor/skeleton",
         }
+        for area in JOINT_AREAS:
+            self.robot.create_subscription(
+                JointStateArray, f"/aima/hal/joint/{area}/state",
+                self._joint_state_callback(area), sensor_qos,
+            )
 
         mirror("hand_state", HandStateArray, "/aima/hal/joint/hand/state", "data/json", qos=sensor_qos)
         # SDK's topics_and_services catalog documents rgbd_head_front/* as the front camera, but
@@ -192,7 +238,6 @@ class AimdkNodes:
         def client(srv_type, name):
             return self.robot.create_client(srv_type, name)
 
-        self.get_all_joint_state = client(GetAllJointState, "/aimdk_5Fmsgs/srv/GetAllJointState")
         self.get_hand_type = client(GetHandType, "/aimdk_5Fmsgs/srv/GetHandType")
         self.get_mc_action = client(GetMcAction, "/aimdk_5Fmsgs/srv/GetMcAction")
         self.set_mc_action = client(SetMcAction, "/aimdk_5Fmsgs/srv/SetMcAction")
@@ -208,14 +253,6 @@ class AimdkNodes:
         self.set_mic_source = client(SetMicSourceRequest, "/aimdk_5Fmsgs/srv/SetMicSourceRequest")
         self.get_mic_source = client(GetMicSourceRequest, "/aimdk_5Fmsgs/srv/GetMicSourceRequest")
         self.get_stored_map = client(GetStoredMapByName, "/aimdk_5Fmsgs/srv/GetStoredMapByName")
-
-        # GetAllJointState is a service, while the canvas' "view data stream" affordance
-        # requires a topic_out. Publish a low-rate JSON snapshot so the joint_state card has
-        # its own stream instead of being associated with an unrelated sensor stream.
-        joint_state_topic = f"/{namespace}/agibot_x2/joint_state"
-        self.joint_state_pub = self.core.create_publisher(String, joint_state_topic, 5)
-        self.streams["joint_state"] = {"topic": joint_state_topic, "format": "data/json"}
-        self.joint_state_timer = self.core.create_timer(1.0, self._publish_joint_state)
 
     def _callback(self, key, publisher, *, as_json=False):
         from std_msgs.msg import String
@@ -257,76 +294,93 @@ class AimdkNodes:
         request.header.stamp = self.robot.get_clock().now().to_msg()
         return request
 
-    def query_joint_state(self):
-        from aimdk_msgs.srv import GetAllJointState
+    def _joint_state_callback(self, area):
+        def callback(msg):
+            with self.lock:
+                first_update_for_area = area not in self.joint_groups
+                self.joint_groups[area] = msg
+                joint_state = self._joint_state_snapshot_locked()
+                skeleton = self._skeleton_snapshot_locked()
+                now = time.monotonic()
+                if (
+                    not first_update_for_area
+                    and now - self._last_joint_stream_publish < 1.0 / JOINT_STREAM_MAX_HZ
+                ):
+                    return
+                self._last_joint_stream_publish = now
+                self.values["joint_state"] = joint_state
+                self.values["joints"] = skeleton
 
-        try:
-            request = GetAllJointState.Request()
-            request.request = self.request_header()
-            result = call_service(self.get_all_joint_state, request)
-            status = int(result.reponse.status.value)
-            status_name = {
-                0: "UNKNOWN", 1: "SUCCESS", 2: "FAILURE", 3: "ABORTED",
-                4: "TIMEOUT", 5: "INVALID", 6: "IN_MANUAL",
-                100: "NOT_READY", 200: "PENDING", 300: "CREATED", 400: "RUNNING",
-            }.get(status, "UNRECOGNIZED")
-            groups = {
-                "leg": jsonable(result.leg_joints),
-                "waist": jsonable(result.waist_joints),
-                "arm": jsonable(result.arm_joints),
-                "head": jsonable(result.head_joints),
-            }
-            counts = {name: len(joints) for name, joints in groups.items()}
-            has_joint_data = any(counts.values())
-            vendor_message = str(result.reponse.message or "")
+            joint_state_output = self._msg["String"]()
+            joint_state_output.data = json.dumps(joint_state, ensure_ascii=False)
+            self.joint_state_pub.publish(joint_state_output)
+            skeleton_output = self._msg["String"]()
+            skeleton_output.data = json.dumps(skeleton, ensure_ascii=False)
+            self.joints_pub.publish(skeleton_output)
+        return callback
 
-            if not has_joint_data:
-                state = "unavailable"
-                message = vendor_message or f"vendor returned {status_name} with no joint data"
-            elif status == 1:  # CommonState.SUCCESS
-                state = "ok"
-                message = vendor_message
-            else:
-                state = "degraded"
-                message = vendor_message or f"vendor returned {status_name}; using non-empty joint data"
+    def _joint_state_snapshot_locked(self):
+        groups = {
+            area: jsonable(getattr(self.joint_groups[area], "joints", []))
+            if area in self.joint_groups else []
+            for area in JOINT_AREAS
+        }
+        received_areas = [area for area in JOINT_AREAS if area in self.joint_groups]
+        return {
+            "state": "running" if received_areas else "waiting",
+            "available": bool(received_areas),
+            "source_topics": {
+                area: f"/aima/hal/joint/{area}/state" for area in JOINT_AREAS
+            },
+            "received_areas": received_areas,
+            "missing_areas": [area for area in JOINT_AREAS if area not in self.joint_groups],
+            "joint_counts": {area: len(groups[area]) for area in JOINT_AREAS},
+            **groups,
+        }
 
-            return {
-                "state": state,
-                "service": "GetAllJointState",
-                "status": status,
-                "status_name": status_name,
-                "message": message,
-                "joint_counts": counts,
-                **groups,
-            }
-        except Exception as exc:
-            return {
-                "state": "unavailable",
-                "service": "GetAllJointState",
-                "message": str(exc),
-                "joint_counts": {"leg": 0, "waist": 0, "arm": 0, "head": 0},
-                "leg": [],
-                "waist": [],
-                "arm": [],
-                "head": [],
-            }
-
-    def _publish_joint_state(self):
-        value = self.query_joint_state()
-        output = self._msg["String"]()
-        output.data = json.dumps(value, ensure_ascii=False)
-        self.joint_state_pub.publish(output)
-        with self.lock:
-            self.values["joint_state"] = value
-
-    def publish_joints(self, joints):
-        payload = {"joints": joints}
-        output = self._msg["String"]()
-        output.data = json.dumps(payload, ensure_ascii=False)
-        self.joints_pub.publish(output)
-        with self.lock:
-            self.values["joints"] = payload
+    def _skeleton_snapshot_locked(self):
+        joints = []
+        unknown_names = []
+        for area in JOINT_AREAS:
+            msg = self.joint_groups.get(area)
+            if msg is None:
+                continue
+            for state in getattr(msg, "joints", []):
+                name = str(getattr(state, "name", ""))
+                idx = self.skeleton_joint_indices.get(name)
+                if idx is None:
+                    if name:
+                        unknown_names.append(name)
+                    continue
+                item = {
+                    "idx": idx,
+                    "name": name,
+                    "q": float(state.position),
+                    "dq": float(state.velocity),
+                    "tau": float(state.effort),
+                }
+                if getattr(state, "error_code", 0):
+                    item["error_code"] = int(state.error_code)
+                joints.append(item)
+        payload = {
+            "format": "sensor/skeleton",
+            "state": "running" if self.joint_groups else "waiting",
+            "available": bool(self.joint_groups),
+            "joints": joints,
+            "joint_count": len(joints),
+            "position_unit": "rad",
+        }
+        if unknown_names:
+            payload["diagnostics"] = {"unknown_joint_names": unknown_names}
         return payload
+
+    def joint_state_snapshot(self):
+        with self.lock:
+            return self._joint_state_snapshot_locked()
+
+    def skeleton_snapshot(self):
+        with self.lock:
+            return self._skeleton_snapshot_locked()
 
     def snapshot(self, key):
         with self.lock:
@@ -389,7 +443,7 @@ class JointStatePlugin:
     def get_tool(self):
         return _stream_tool(
             "joint_state", self.nodes.streams["joint_state"],
-            "全身关节状态流：leg/waist/arm/head（每秒查询 GetAllJointState）",
+            "全身关节状态流：直接订阅 leg/waist/arm/head JointStateArray",
         )
 
     def start(self):
@@ -400,78 +454,34 @@ class JointStatePlugin:
 
     def dispatch(self, action, args):
         topic_out = _stream_topic_out(self.nodes.streams["joint_state"])
-        if action == "start":
-            return {"state": "running", "topic_out": topic_out}
         if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "running", "topic_out": topic_out}
-        return {**self.nodes.query_joint_state(), "topic_out": topic_out}
+            return {"state": "running", "always_on": True, "topic_out": topic_out}
+        return {**self.nodes.joint_state_snapshot(), "topic_out": topic_out}
 
 
 class JointsPlugin:
-    """Normalize GetAllJointState into the dashboard's skeleton stream contract."""
+    """Expose the always-on JointStateArray subscriptions as a skeleton stream."""
 
-    def __init__(self, nodes, poll_interval_sec):
+    def __init__(self, nodes):
         self.nodes = nodes
-        self.poll_interval_sec = poll_interval_sec
-        self._stop = threading.Event()
-        self._thread = None
 
     def get_tool(self):
         return _stream_tool(
             "joints", self.nodes.streams["joints"],
-            "全身关节骨骼状态流（GetAllJointState）",
+            "全身关节骨骼状态流：直接订阅 JointStateArray（常驻只读）",
         )
-
-    @staticmethod
-    def normalize(result):
-        joints = []
-        for group in ("leg_joints", "waist_joints", "arm_joints", "head_joints"):
-            for state in getattr(result, group, ()):
-                joints.append({
-                    "idx": len(joints),
-                    "name": state.name,
-                    "q": state.position,
-                    "dq": state.velocity,
-                    "tau": state.effort,
-                    "error_code": state.error_code,
-                })
-        return joints
-
-    def _poll(self):
-        from aimdk_msgs.srv import GetAllJointState
-
-        while not self._stop.is_set():
-            try:
-                request = GetAllJointState.Request()
-                request.request = self.nodes.request_header()
-                result = call_service(self.nodes.get_all_joint_state, request, timeout=1.0)
-                self.nodes.publish_joints(self.normalize(result))
-            except Exception as exc:
-                print(f"[joints] GetAllJointState failed: {exc}", flush=True)
-            self._stop.wait(self.poll_interval_sec)
 
     def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._poll, name="agibot-x2-joints", daemon=True,
-        )
-        self._thread.start()
+        pass
 
     def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=self.poll_interval_sec + 1.0)
-            self._thread = None
+        pass
 
     def dispatch(self, action, args):
         topic_out = _stream_topic_out(self.nodes.streams["joints"])
         if action == "stop":
-            return {"state": "idle"}
-        return {"state": "running", "topic_out": topic_out}
+            return {"state": "running", "always_on": True, "topic_out": topic_out}
+        return {**self.nodes.skeleton_snapshot(), "topic_out": topic_out}
 
 
 class HandStatePlugin:
@@ -1283,11 +1293,6 @@ def build_plugins(config, namespace, ros2):
     def enabled(name, default=True):
         return plugin_config.get(name, {}).get("enabled", default)
 
-    joints_config = plugin_config.get("joints", {})
-    joints_interval_sec = float(joints_config.get("poll_interval_sec", 0.1))
-    if joints_interval_sec <= 0:
-        raise ValueError("plugins.joints.poll_interval_sec must be greater than zero")
-
     plugins = [
         McStatePlugin(nodes), JointStatePlugin(nodes), HandStatePlugin(nodes),
         ImuPlugin(nodes), CameraPlugin(nodes), LidarPlugin(nodes), SlamPosePlugin(nodes),
@@ -1298,7 +1303,7 @@ def build_plugins(config, namespace, ros2):
         MapGetPlugin(nodes),
     ]
     if enabled("joints", default=True):
-        plugins.append(JointsPlugin(nodes, joints_interval_sec))
+        plugins.append(JointsPlugin(nodes))
     if enabled("slam", default=False):
         plugins.append(SlamControlPlugin(nodes))
     return plugins
