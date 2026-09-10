@@ -90,6 +90,7 @@ RESOURCE_DIR = Path(__file__).with_name("resource")
 SKELETON_TOPIC = "state/joints"
 SKELETON_MAX_HZ = 30.0
 CAMERA_RGB_MAX_HZ = 10.0
+LOCOMOTION_HEARTBEAT_HZ = 10.0
 
 
 def skeleton_layout(variant):
@@ -1012,6 +1013,7 @@ class LocomotionPlugin:
         self._registered = False
         self._lock = threading.RLock()
         self._stop_timer = None
+        self._velocity_timer = None
         self._motion_generation = 0
         self._active_action_id = None
 
@@ -1058,9 +1060,12 @@ class LocomotionPlugin:
         with self._lock:
             self._motion_generation += 1
             timer, self._stop_timer = self._stop_timer, None
+            velocity_timer, self._velocity_timer = self._velocity_timer, None
             action_id, self._active_action_id = self._active_action_id, None
         if timer is not None:
             timer.cancel()
+        if velocity_timer is not None:
+            velocity_timer.cancel()
         if send_stop and action_id is not None:
             self._publish_velocity()
         if action_id is not None:
@@ -1085,6 +1090,9 @@ class LocomotionPlugin:
                 if self._active_action_id != action_id:
                     return
                 self._active_action_id = None
+                velocity_timer, self._velocity_timer = self._velocity_timer, None
+            if velocity_timer is not None:
+                velocity_timer.cancel()
             self._publish_velocity()
             _acp_notify(action_id, "completed", {
                 "duration": duration,
@@ -1098,6 +1106,30 @@ class LocomotionPlugin:
             if generation != self._motion_generation:
                 return
             self._stop_timer = timer
+        timer.start()
+
+    def _start_velocity_stream(self, action_id, forward, lateral, angular):
+        """Refresh the vendor input before its 1000 ms watchdog expires."""
+        period = 1.0 / LOCOMOTION_HEARTBEAT_HZ
+        with self._lock:
+            generation = self._motion_generation
+
+        def tick():
+            with self._lock:
+                if generation != self._motion_generation or self._active_action_id != action_id:
+                    return
+                self._publish_velocity(forward, lateral, angular)
+                timer = threading.Timer(period, tick)
+                timer.daemon = True
+                self._velocity_timer = timer
+            timer.start()
+
+        timer = threading.Timer(period, tick)
+        timer.daemon = True
+        with self._lock:
+            if generation != self._motion_generation or self._active_action_id != action_id:
+                return
+            self._velocity_timer = timer
         timer.start()
 
     def _source_name(self):
@@ -1171,14 +1203,16 @@ class LocomotionPlugin:
         if duration != -1 and not 0.1 <= duration <= 60.0:
             raise ValueError("locomotion: duration must be -1 or between 0.1 and 60 seconds")
         self._cancel_motion("superseded")
-        self._publish_velocity(
-            args.get("forward", 0.2), args.get("lateral", 0.0), args.get("angular", 0.0),
-        )
+        forward = args.get("forward", 0.2)
+        lateral = args.get("lateral", 0.0)
+        angular = args.get("angular", 0.0)
+        self._publish_velocity(forward, lateral, angular)
         action_id = f"x2_locomotion_{uuid4().hex[:12]}"
         with self._lock:
             self._active_action_id = action_id
         if duration != -1:
             self._schedule_stop(duration, action_id)
+        self._start_velocity_stream(action_id, forward, lateral, angular)
         return {
             "state": "accepted", "action_id": action_id, "duration": duration,
             "topic": "/aima/mc/locomotion/velocity",

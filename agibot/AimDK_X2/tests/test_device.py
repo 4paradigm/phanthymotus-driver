@@ -658,9 +658,12 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(result["duration"], 1.5)
         self.assertTrue(result["action_id"].startswith("x2_locomotion_"))
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
-        self.assertEqual(timer_cls.call_args.args[0], 1.5)
+        stop_call = next(call for call in timer_cls.call_args_list if call.args[0] == 1.5)
+        heartbeat_call = next(call for call in timer_cls.call_args_list if call.args[0] == 0.1)
+        heartbeat_call.args[1]()
+        self.assertEqual(locomotion.nodes.locomotion_pub.published[-1].forward_velocity, 0.5)
         with mock.patch.object(device, "_acp_notify") as notify:
-            timer_cls.call_args.args[1]()
+            stop_call.args[1]()
         zero = locomotion.nodes.locomotion_pub.published[-1]
         self.assertEqual((zero.forward_velocity, zero.lateral_velocity, zero.angular_velocity), (0.0, 0.0, 0.0))
         self.assertEqual(notify.call_args.args[1], "completed")
@@ -673,10 +676,12 @@ class DispatchSmokeTests(unittest.TestCase):
         plugins = build_bundle_plugins()
         locomotion = find_plugin(plugins, "locomotion")
         locomotion.nodes.set_mc_input_source.response = FakeMsg()
-        result = locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": -1})
+        with mock.patch.object(device.threading, "Timer") as timer_cls:
+            result = locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": -1})
         self.assertEqual(result["state"], "accepted")
         self.assertEqual(result["duration"], -1)
         self.assertIsNone(locomotion._stop_timer)
+        self.assertTrue(any(call.args[0] == 0.1 for call in timer_cls.call_args_list))
         action_id = result["action_id"]
         with mock.patch.object(device, "_acp_notify") as notify:
             result = locomotion.dispatch("cancel", {})
