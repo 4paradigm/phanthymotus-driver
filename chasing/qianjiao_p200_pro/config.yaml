@@ -1,5 +1,5 @@
-name: "潜蛟 2.0 Pro ROV"
-driver_id: "qianxing-qianjiao2-pro"
+name: "Chasing Qianjiao P200 Pro ROV"
+driver_id: "chasing-qianjiao-p200-pro"
 mcp_port: 15739
 # Address Agent Core uses to reach this driver. Override with the board IP if needed.
 mcp_advertise_host: ""
@@ -21,10 +21,10 @@ rov:
   # Current factory credentials; environment variables override these values.
   camera_user: "admin"
   camera_password: "admin"
-  status_topic: "/qianjiao2_pro/status"
-  loco_state_topic: "/qianjiao2_pro/loco_state"
-  battery_topic: "/qianjiao2_pro/battery"
-  imu_topic: "/qianjiao2_pro/imu"
-  camera_topic: "/qianjiao2_pro/camera/color"
+  status_topic: "/qianjiao_p200_pro/status"
+  loco_state_topic: "/qianjiao_p200_pro/loco_state"
+  battery_topic: "/qianjiao_p200_pro/battery"
+  imu_topic: "/qianjiao_p200_pro/imu"
+  camera_topic: "/qianjiao_p200_pro/camera/color"
   camera_light_path: "/v1/light"
   mock: false

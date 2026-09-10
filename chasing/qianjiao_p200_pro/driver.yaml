@@ -1,12 +1,12 @@
-id: qianxing-qianjiao2-pro
-name: 潜蛟 2.0 Pro ROV
+id: chasing-qianjiao-p200-pro
+name: Chasing Qianjiao P200 Pro ROV
 category: driver
-hardware_provider: qianxing
-hardware_model: qianjiao2-pro
-image_name: qianjiao2-pro
+hardware_provider: chasing
+hardware_model: qianjiao-p200-pro
+image_name: qianjiao-p200-pro
 port: 15739
 mcp_url: "http://localhost:15739/mcp"
-description: "潜行科技潜蛟 2.0 Pro 水下机器人：MAVLink UDP 6DOF 运动控制、解锁和状态监控"
+description: "潜行科技潜鲛 P200 Pro 水下机器人：MAVLink UDP 6DOF 运动控制、解锁和状态监控"
 build_context_extras:
   - ../../common
 cards:

@@ -1,4 +1,4 @@
-# 潜蛟 2.0 Pro Driver
+# Qianjiao P200 Pro ROV Driver
 
 本驱动按供应商《如何集成 Mini 系列、P 系列 ROV 运动控制功能？》实现 MAVLink v1 UDP 控制：
 
