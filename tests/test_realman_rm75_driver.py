@@ -61,6 +61,65 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertNotIn("ipc:", service)
 
 
+class RealManRM75GripperPluginTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = load_device()
+
+    def setUp(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+                self.connected = True
+
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+        self.client = FakeClient()
+        self.plugin = self.device.GripperPlugin(self.client, {}, namespace="rm75")
+
+    def test_tool_schema_exposes_0_to_1000(self):
+        tools = self.plugin.get_tools()
+        self.assertEqual(1, len(tools))
+        self.assertEqual("gripper", tools[0]["name"])
+        self.assertEqual("actuator", tools[0]["type"])
+        position = tools[0]["inputSchema"]["properties"]["position"]
+        self.assertEqual(0, position["minimum"])
+        self.assertEqual(1000, position["maximum"])
+
+    def test_set_position_forwards_padded_hand_pos(self):
+        result = self.plugin.dispatch("set_position", {"position": 500})
+
+        self.assertEqual(
+            {"success": True, "message": "夹爪目标位置已下发: 500"},
+            result,
+        )
+        self.assertEqual(
+            [("rm_set_hand_follow_pos", ([500, 0, 0, 0, 0, 0], False))],
+            self.client.calls,
+        )
+
+    def test_out_of_range_position_is_rejected(self):
+        for value in (-1, 1001, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    self.plugin.dispatch("set_position", {"position": value})
+        self.assertEqual([], self.client.calls)
+
+    def test_canvas_lifecycle_actions(self):
+        self.assertEqual({"state": "ready"}, self.plugin.dispatch("start", {}))
+        self.assertEqual({"state": "idle"}, self.plugin.dispatch("stop", {}))
+        self.assertEqual({"state": "connected"}, self.plugin.dispatch("info", {}))
+
+    def test_unknown_action_returns_none(self):
+        self.assertIsNone(self.plugin.dispatch("something_else", {}))
+
+    def test_gripper_card_is_advertised(self):
+        manifest = (DRIVER / "driver.yaml").read_text()
+        self.assertIn("name: gripper", manifest)
+
+
 class RealManRM75SDKClientTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
