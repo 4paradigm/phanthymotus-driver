@@ -668,7 +668,7 @@ class StatePlugin:
 # ===========================================================================
 
 class LocoPlugin:
-    """Dashboard-facing locomotion with a server-side command watchdog."""
+    """Adam locomotion state-machine card backed by the RL gRPC service."""
 
     PREFIX = "loco"
 
@@ -676,145 +676,42 @@ class LocoPlugin:
                  grpc_client, **kwargs):
         self._grpc = grpc_client
         self._namespace = namespace
-        self._max_vx = self._positive_limit(plugin_config.get("max_vx_mps", 0.25), "max_vx_mps")
-        self._max_vy = self._positive_limit(plugin_config.get("max_vy_mps", 0.15), "max_vy_mps")
-        self._max_vyaw = self._positive_limit(plugin_config.get("max_vyaw_radps", 0.5), "max_vyaw_radps")
-        self._command_timeout_s = self._positive_limit(
-            plugin_config.get("command_timeout_s", 0.5), "command_timeout_s")
-        self._motion_lock = threading.Lock()
-        self._motion_timer = None
-        self._motion_sequence = 0
-
-    @staticmethod
-    def _positive_limit(value, name: str) -> float:
-        if isinstance(value, bool):
-            raise ValueError(f"{name} must be a positive number")
-        try:
-            value = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name} must be a positive number") from exc
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{name} must be a positive number")
-        return value
-
-    @staticmethod
-    def _speed(value, name: str, limit: float) -> float:
-        if isinstance(value, bool):
-            raise ValueError(f"{name} must be a finite number")
-        try:
-            value = float(value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name} must be a finite number") from exc
-        if not math.isfinite(value):
-            raise ValueError(f"{name} must be a finite number")
-        return max(-limit, min(limit, value))
-
-    def _cancel_watchdog_locked(self):
-        if self._motion_timer is not None:
-            self._motion_timer.cancel()
-            self._motion_timer = None
-
-    def _arm_watchdog(self):
-        with self._motion_lock:
-            self._cancel_watchdog_locked()
-            self._motion_sequence += 1
-            sequence = self._motion_sequence
-            timer = threading.Timer(
-                self._command_timeout_s, self._stop_after_timeout, args=(sequence,))
-            timer.daemon = True
-            self._motion_timer = timer
-            timer.start()
-
-    def _stop_after_timeout(self, sequence: int):
-        with self._motion_lock:
-            if sequence != self._motion_sequence:
-                return
-            self._motion_timer = None
-        # A dashboard client must renew move commands. If it disconnects,
-        # the robot receives a zero-speed command without relying on the UI.
-        self._grpc.set_speed(0.0, 0.0, 0.0)
-
-    def _stop_motion(self):
-        with self._motion_lock:
-            self._cancel_watchdog_locked()
-            self._motion_sequence += 1
-        return self._grpc.set_speed(0.0, 0.0, 0.0)
 
     def get_tool(self) -> dict:
         return {
             "name": "loco",
             "type": "actuator",
             "description": (
-                "Adam motion control — forward/lateral/yaw velocity with an "
-                f"automatic {self._command_timeout_s:g}s zero-speed watchdog"),
+                "Adam RL locomotion state machine — query available states and "
+                "switch only to a state returned by get_state"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": [
-                            "set_mode", "move", "stop", "stand_motion",
-                            "stand_action", "stand_dynamic", "get_state",
-                            "list_actions", "clear_error", "carry_box",
-                        ],
+                        "enum": ["set_mode", "get_state", "list_actions", "info"],
                     },
-                    "mode": {"type": "integer", "description": "Mode ID"},
-                    "vx": {"type": "number", "minimum": -self._max_vx, "maximum": self._max_vx,
-                           "description": "Forward velocity (m/s)"},
-                    "vy": {"type": "number", "minimum": -self._max_vy, "maximum": self._max_vy,
-                           "description": "Lateral velocity (m/s)"},
-                    "vyaw": {"type": "number", "minimum": -self._max_vyaw, "maximum": self._max_vyaw,
-                               "description": "Yaw angular velocity (rad/s)"},
-                    "motion_id": {"type": "integer", "description": "Predefined motion ID"},
-                    "action_id": {"type": "integer", "description": "Predefined action/gesture ID"},
-                    "pitch": {"type": "number", "description": "Body pitch (rad)"},
-                    "roll": {"type": "number", "description": "Body roll (rad)"},
-                    "yaw": {"type": "number", "description": "Body yaw (rad)"},
-                    "height": {"type": "number", "description": "Body height (m)"},
-                    "enable": {"type": "boolean", "description": "Enable/disable flag"},
+                    "mode": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Target state name returned by get_state.switchable_states",
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "set_mode": {
                         "params": ["mode"],
-                        "description": "Switch robot mode (e.g., stand, walk)",
-                    },
-                    "move": {
-                        "params": ["vx", "vy", "vyaw"],
-                        "description": "Send one bounded velocity command; renew before the watchdog expires",
-                    },
-                    "stop": {
-                        "params": [],
-                        "description": "Stop all movement",
-                    },
-                    "stand_motion": {
-                        "params": ["motion_id"],
-                        "description": "Execute predefined standing pose",
-                    },
-                    "stand_action": {
-                        "params": ["action_id"],
-                        "description": "Execute predefined gesture/action",
-                    },
-                    "stand_dynamic": {
-                        "params": ["pitch", "roll", "yaw", "height"],
-                        "description": "Adjust body orientation and height while standing",
+                        "description": "Switch to an RL state advertised by get_state",
                     },
                     "get_state": {
                         "params": [],
-                        "description": "Query current robot state (mode, gait, battery)",
+                        "description": "Query RL FSM state and supported transitions",
                     },
                     "list_actions": {
                         "params": [],
-                        "description": "List available motions and actions",
+                        "description": "List switchable RL states and available actions",
                     },
-                    "clear_error": {
-                        "params": [],
-                        "description": "Clear error state",
-                    },
-                    "carry_box": {
-                        "params": ["enable"],
-                        "description": "Enable/disable carry box mode",
-                    },
+                    "info": {"params": [], "description": "Describe the RL control contract"},
                 },
             },
         }
@@ -823,59 +720,23 @@ class LocoPlugin:
         return None
 
     def stop(self):
-        self._stop_motion()
+        return None
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             return {"state": "ready"}
-        if action == "stop":
-            result = self._stop_motion()
-            return {"state": "idle", "command": "zero_speed", "result": result}
         if action == "set_mode":
-            return self._grpc.set_mode(args.get("mode", 0))
-        if action == "move":
-            try:
-                vx = self._speed(args.get("vx", 0.0), "vx", self._max_vx)
-                vy = self._speed(args.get("vy", 0.0), "vy", self._max_vy)
-                vyaw = self._speed(args.get("vyaw", 0.0), "vyaw", self._max_vyaw)
-            except ValueError as exc:
-                return {"error": str(exc)}
-            result = self._grpc.set_speed(vx, vy, vyaw)
-            if "error" not in result:
-                self._arm_watchdog()
-            return {
-                **result,
-                "command": {"vx": vx, "vy": vy, "vyaw": vyaw},
-                "watchdog_timeout_s": self._command_timeout_s,
-            }
-        if action == "stand_motion":
-            return self._grpc.set_stand_motion(args.get("motion_id", 0))
-        if action == "stand_action":
-            return self._grpc.set_stand_action(args.get("action_id", 0))
-        if action == "stand_dynamic":
-            return self._grpc.set_stand_dynamic(
-                pitch=args.get("pitch", 0.0),
-                roll=args.get("roll", 0.0),
-                yaw=args.get("yaw", 0.0),
-                height=args.get("height", 0.0),
-            )
+            return self._grpc.set_mode(args.get("mode", ""))
         if action == "get_state":
             return self._grpc.get_robot_state()
         if action == "list_actions":
             return self._grpc.get_stand_list()
-        if action == "clear_error":
-            return self._grpc.set_error_clear()
-        if action == "carry_box":
-            return self._grpc.set_carry_box(args.get("enable", False))
         if action == "info":
             return {
                 "state": "ready",
-                "limits": {
-                    "vx_mps": self._max_vx,
-                    "vy_mps": self._max_vy,
-                    "vyaw_radps": self._max_vyaw,
-                    "command_timeout_s": self._command_timeout_s,
-                },
+                "protocol": "pnd.robot RobotControl (RL)",
+                "velocity_control": "unavailable: RL SetVelocity is reserved",
+                "set_mode": "requires a name returned by get_state.switchable_states",
             }
         return None
 

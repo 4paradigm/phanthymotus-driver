@@ -4,9 +4,9 @@ ros_namespace: ""  # auto-detect from hostname
 # Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
 variant: "pro"
 
-# gRPC endpoint for locomotion control (PC1)
+# Reinforcement-learning RobotControl endpoint on the x86 controller (PC1).
 grpc_host: "10.10.20.127"
-grpc_port: 6666
+grpc_port: 50051
 
 # DDS domain ID (must match the deployed Adam controller).
 dds_domain_id: 0
@@ -20,12 +20,8 @@ plugins:
     publish_rate_hz: 50
   loco:
     enabled: true
-    # Dashboard velocity-card limits. Commands expire unless the card renews
-    # them before command_timeout_s, so a disconnected UI stops the robot.
-    max_vx_mps: 0.25
-    max_vy_mps: 0.15
-    max_vyaw_radps: 0.5
-    command_timeout_s: 0.5
+    # The RL service currently reserves SetVelocity. This card exposes state
+    # discovery and named state transitions only; it does not send velocities.
   camera:
     enabled: true
     # The ZED Mini is connected to this Jetson. Keep the local SDK path; the
