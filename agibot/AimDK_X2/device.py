@@ -84,13 +84,14 @@ EMOJI_IDS = {
 }
 
 MIC_SOURCES = {"internal": 0, "external": 1}
-MC_INPUT_SOURCES = {"rc", "vr", "app_proxy", "interaction", "pnc"}
-
 RESOURCE_DIR = Path(__file__).with_name("resource")
 SKELETON_TOPIC = "state/joints"
 SKELETON_MAX_HZ = 30.0
 CAMERA_RGB_MAX_HZ = 10.0
-LOCOMOTION_HEARTBEAT_HZ = 10.0
+# The vendor's DirectVelocityControl example publishes at 50 Hz.  The source
+# watchdog is 1000 ms, but matching the reference cadence also keeps control
+# latency bounded under DDS packet loss.
+LOCOMOTION_HEARTBEAT_HZ = 50.0
 
 
 def skeleton_layout(variant):
@@ -1002,10 +1003,8 @@ class McModePlugin:
 
 class LocomotionPlugin:
     ACTIONS = {
-        "register": ([], "显式注册受管 MC 输入源；默认复用厂商已有 rc 源，不修改输入源配置"),
-        "set_velocity": (["forward", "lateral", "angular", "duration"], "发布行走速度指令；duration=-1 持续移动，否则到时自动刹停"),
+        "move": (["forward", "lateral", "angular", "duration"], "移动；duration=-1 持续移动，否则到时自动刹停"),
         "cancel": ([], "立即停止当前行走速度并取消定时动作"),
-        "disable": ([], "禁用本驱动的输入源"),
     }
 
     def __init__(self, nodes):
@@ -1027,25 +1026,19 @@ class LocomotionPlugin:
                          "description": "持续时间（秒）。-1 为持续移动，0.1-60 到时自动发布零速度。"},
         })
         schema["allOf"] = [{
-            "if": {"properties": {"action": {"const": "set_velocity"}}, "required": ["action"]},
+            "if": {"properties": {"action": {"const": "move"}}, "required": ["action"]},
             "then": {"required": ["duration"]},
         }]
-        return tool("locomotion", "actuator", "MC 行走速度控制：默认复用 X2 已配置的 rc 输入源；仅当机器人已由遥控器或 APP "
-                    "进入走跑模式时，速度消息才会生效。当前固件未通过 SetMcAction 暴露走跑模式。",
+        return tool("locomotion", "actuator", "MC 行走速度控制：动作开始时自动注册独立输入源，在稳定站立下直接进入走跑。动作期间该源优先于遥控器；"
+                    "取消、定时完成和驱动停止都会删除它并把控制权还给遥控器。",
                     _with_actuation_contract(schema, ["base", "leg"]))
 
     def start(self):
         pass
 
     def stop(self):
-        # Only unregister if we actually registered -- calling this unconditionally on every
-        # shutdown (even when this driver never registered as an input source) means every
-        # container restart pays a real service round-trip that can time out, adding 5s of
-        # noise to `stop_all()` for no effect.
         self._cancel_motion("driver_stopped", send_stop=True)
-        if self._registered:
-            self._set_input_source(2002)  # INPUTACTION_DISABLE
-            self._registered = False
+        self._release_input_source()
 
     def _publish_velocity(self, forward=0.0, lateral=0.0, angular=0.0):
         msg = self.nodes._McLocomotionVelocity()
@@ -1094,6 +1087,7 @@ class LocomotionPlugin:
             if velocity_timer is not None:
                 velocity_timer.cancel()
             self._publish_velocity()
+            self._release_input_source()
             _acp_notify(action_id, "completed", {
                 "duration": duration,
                 "topic": "/aima/mc/locomotion/velocity",
@@ -1133,13 +1127,10 @@ class LocomotionPlugin:
         timer.start()
 
     def _source_name(self):
-        name = self.nodes.config.get("plugins", {}).get("locomotion", {}).get("input_source_name", "rc")
-        if name not in MC_INPUT_SOURCES:
-            raise ValueError(f"locomotion: input_source_name must be one of {sorted(MC_INPUT_SOURCES)}")
+        name = str(self.nodes.config.get("plugins", {}).get("locomotion", {}).get("input_source_name", "motus_x2"))
+        if not name or name in {"rc", "vr", "app_proxy", "interaction", "pnc"}:
+            raise ValueError("locomotion: input_source_name must be a non-empty custom source name")
         return name
-
-    def _manages_input_source(self):
-        return bool(self.nodes.config.get("plugins", {}).get("locomotion", {}).get("manage_input_source", False))
 
     def _set_input_source(self, mc_input_action):
         from aimdk_msgs.srv import SetMcInputSource
@@ -1148,7 +1139,7 @@ class LocomotionPlugin:
         request.request = self.nodes.request_header()
         request.action.value = mc_input_action
         request.input_source.name = self._source_name()
-        request.input_source.priority = int(plugin_cfg.get("input_source_priority", 50))
+        request.input_source.priority = int(plugin_cfg.get("input_source_priority", 81))
         request.input_source.timeout = 1000
         result = call_service(self.nodes.set_mc_input_source, request)
         return jsonable(result.response)
@@ -1162,13 +1153,39 @@ class LocomotionPlugin:
             return True
 
     def _register_input_source(self):
-        if not self._manages_input_source():
-            return {"state": "using_existing_source", "source": self._source_name()}
         result = self._set_input_source(1001)  # INPUTACTION_ADD
+        restored_entry = False
         if not self._input_source_accepted(result):
-            raise RuntimeError(f"locomotion: input source registration rejected: {result}")
+            # The MC input-source registry outlives this container.  Reconfigure
+            # our own stale entry after a driver restart, but never touch vendor
+            # sources because _source_name() rejects their names.
+            add_result = result
+            result = self._set_input_source(1002)  # INPUTACTION_MODIFY
+            if not self._input_source_accepted(result):
+                raise RuntimeError(
+                    "locomotion: input source registration rejected: "
+                    f"add={add_result}, modify={result}"
+                )
+            restored_entry = True
         self._registered = True
+        if restored_entry:
+            # MODIFY changes configuration but does not promise to reactivate a
+            # source left behind by a previous driver instance.
+            result = self._set_input_source(2001)  # INPUTACTION_ENABLE
+            if not self._input_source_accepted(result):
+                raise RuntimeError(f"locomotion: input source enable rejected: {result}")
         return result
+
+    def _release_input_source(self):
+        if not self._registered:
+            return
+        try:
+            self._set_input_source(1003)  # INPUTACTION_DELETE
+        finally:
+            # A failed delete must not stop the next action from re-registering
+            # the source; ADD will reject stale entries and then repair them via
+            # MODIFY in _register_input_source().
+            self._registered = False
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1177,32 +1194,24 @@ class LocomotionPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready", "registered": self._registered}
-        if action == "register":
-            return self._register_input_source()
         if action == "cancel":
             self._cancel_motion("cancel_requested", send_stop=True)
+            self._release_input_source()
             return {"state": "cancelled", "topic": "/aima/mc/locomotion/velocity"}
-        if action == "disable":
-            self._cancel_motion("input_source_disabled", send_stop=True)
-            if not self._manages_input_source():
-                return {"state": "source_unchanged", "source": self._source_name()}
-            result = self._set_input_source(2002)  # INPUTACTION_DISABLE
-            self._registered = False
-            return result
-        if action != "set_velocity":
+        if action != "move":
             # Any other/unrecognized action used to fall through to the block below, which
             # silently auto-registers this driver as an input source and publishes a (default
             # zero) velocity command -- so a stray health-check probe with an unknown action
             # name could trigger a real actuator side effect. Refuse instead.
             raise ValueError(f"locomotion: unknown action {action!r}")
-        if self._manages_input_source() and not self._registered:
-            self._register_input_source()
         if "duration" not in args:
             raise ValueError("locomotion: duration is required (-1 or between 0.1 and 60 seconds)")
         duration = float(args["duration"])
         if duration != -1 and not 0.1 <= duration <= 60.0:
             raise ValueError("locomotion: duration must be -1 or between 0.1 and 60 seconds")
         self._cancel_motion("superseded")
+        if not self._registered:
+            self._register_input_source()
         forward = args.get("forward", 0.2)
         lateral = args.get("lateral", 0.0)
         angular = args.get("angular", 0.0)

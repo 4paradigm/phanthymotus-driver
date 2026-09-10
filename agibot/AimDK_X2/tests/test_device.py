@@ -628,38 +628,46 @@ class DispatchSmokeTests(unittest.TestCase):
             if definition["type"] == "actuator":
                 self.assertIn("x-resource", definition["inputSchema"], definition["name"])
 
-    def test_locomotion_uses_existing_rc_source_without_registration(self):
+    def test_locomotion_registers_a_dedicated_source_before_publishing(self):
         plugins = build_bundle_plugins()
         locomotion = find_plugin(plugins, "locomotion")
-        locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": -1})
-        self.assertFalse(locomotion._registered)
-        self.assertIsNone(locomotion.nodes.set_mc_input_source.last_request)
+        definition = next(item for item in tool_definitions(plugins) if item["name"] == "locomotion")
+        actions = definition["inputSchema"]["properties"]["action"]["enum"]
+        self.assertEqual(actions, ["move", "cancel"])
+        locomotion.dispatch("move", {"forward": 0.5, "duration": -1})
+        self.assertTrue(locomotion._registered)
+        request = locomotion.nodes.set_mc_input_source.last_request
+        self.assertEqual(request.action.value, 1001)
+        self.assertEqual(request.input_source.name, "motus_x2")
+        self.assertEqual(request.input_source.priority, 81)
+        self.assertEqual(request.input_source.timeout, 1000)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
-        self.assertEqual(locomotion.nodes.locomotion_pub.published[0].source, "rc")
+        self.assertEqual(locomotion.nodes.locomotion_pub.published[0].source, "motus_x2")
 
     def test_locomotion_managed_source_rejection_prevents_publish(self):
-        plugins = build_bundle_plugins({"plugins": {"locomotion": {"manage_input_source": True}}})
+        plugins = build_bundle_plugins()
         locomotion = find_plugin(plugins, "locomotion")
         response = FakeMsg()
         response.header.code = 1
         locomotion.nodes.set_mc_input_source.response = SimpleNamespace(response=response)
         with self.assertRaisesRegex(RuntimeError, "registration rejected"):
-            locomotion.dispatch("set_velocity", {"duration": 1})
+            locomotion.dispatch("move", {"duration": 1})
         self.assertEqual(locomotion.nodes.locomotion_pub.published, [])
+        self.assertEqual(locomotion.nodes.set_mc_input_source.last_request.action.value, 1002)
 
     def test_locomotion_duration_is_bounded_and_schedules_a_stop(self):
         plugins = build_bundle_plugins()
         locomotion = find_plugin(plugins, "locomotion")
         locomotion.nodes.set_mc_input_source.response = FakeMsg()
         with mock.patch.object(device.threading, "Timer") as timer_cls:
-            result = locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": 1.5})
+            result = locomotion.dispatch("move", {"forward": 0.5, "duration": 1.5})
         self.assertEqual(result["state"], "accepted")
         self.assertEqual(result["duration"], 1.5)
         self.assertTrue(result["action_id"].startswith("x2_locomotion_"))
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
         stop_call = next(call for call in timer_cls.call_args_list if call.args[0] == 1.5)
-        heartbeat_call = next(call for call in timer_cls.call_args_list if call.args[0] == 0.1)
+        heartbeat_call = next(call for call in timer_cls.call_args_list if call.args[0] == 0.02)
         heartbeat_call.args[1]()
         self.assertEqual(locomotion.nodes.locomotion_pub.published[-1].forward_velocity, 0.5)
         with mock.patch.object(device, "_acp_notify") as notify:
@@ -667,21 +675,23 @@ class DispatchSmokeTests(unittest.TestCase):
         zero = locomotion.nodes.locomotion_pub.published[-1]
         self.assertEqual((zero.forward_velocity, zero.lateral_velocity, zero.angular_velocity), (0.0, 0.0, 0.0))
         self.assertEqual(notify.call_args.args[1], "completed")
+        self.assertFalse(locomotion._registered)
+        self.assertEqual(locomotion.nodes.set_mc_input_source.last_request.action.value, 1003)
         definition = next(item for item in tool_definitions(plugins) if item["name"] == "locomotion")
         self.assertIn("duration", definition["inputSchema"]["properties"])
         with self.assertRaisesRegex(ValueError, "-1 or between 0.1 and 60"):
-            locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": 0})
+            locomotion.dispatch("move", {"forward": 0.5, "duration": 0})
 
     def test_locomotion_negative_one_is_continuous_and_cancel_stops(self):
         plugins = build_bundle_plugins()
         locomotion = find_plugin(plugins, "locomotion")
         locomotion.nodes.set_mc_input_source.response = FakeMsg()
         with mock.patch.object(device.threading, "Timer") as timer_cls:
-            result = locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": -1})
+            result = locomotion.dispatch("move", {"forward": 0.5, "duration": -1})
         self.assertEqual(result["state"], "accepted")
         self.assertEqual(result["duration"], -1)
         self.assertIsNone(locomotion._stop_timer)
-        self.assertTrue(any(call.args[0] == 0.1 for call in timer_cls.call_args_list))
+        self.assertTrue(any(call.args[0] == 0.02 for call in timer_cls.call_args_list))
         action_id = result["action_id"]
         with mock.patch.object(device, "_acp_notify") as notify:
             result = locomotion.dispatch("cancel", {})
@@ -689,6 +699,7 @@ class DispatchSmokeTests(unittest.TestCase):
         zero = locomotion.nodes.locomotion_pub.published[-1]
         self.assertEqual((zero.forward_velocity, zero.lateral_velocity, zero.angular_velocity), (0.0, 0.0, 0.0))
         self.assertFalse(locomotion._registered)
+        self.assertEqual(locomotion.nodes.set_mc_input_source.last_request.action.value, 1003)
         self.assertEqual(notify.call_args.args[0], action_id)
         self.assertEqual(notify.call_args.args[1], "cancelled")
 
@@ -697,8 +708,8 @@ class DispatchSmokeTests(unittest.TestCase):
         locomotion = find_plugin(plugins, "locomotion")
         locomotion.nodes.set_mc_input_source.response = FakeMsg()
         with self.assertRaisesRegex(ValueError, "duration is required"):
-            locomotion.dispatch("set_velocity", {})
-        result = locomotion.dispatch("set_velocity", {"duration": -1})
+            locomotion.dispatch("move", {})
+        result = locomotion.dispatch("move", {"duration": -1})
         self.assertEqual(result["state"], "accepted")
         self.assertEqual(locomotion.nodes.locomotion_pub.published[-1].forward_velocity, 0.2)
         definition = next(item for item in tool_definitions(plugins) if item["name"] == "locomotion")

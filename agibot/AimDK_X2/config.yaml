@@ -58,12 +58,12 @@ plugins:
     service_timeout_sec: 20
   locomotion:
     enabled: true
-    # The X2 firmware accepts its built-in source names only. Historical successful
-    # velocity messages are source=rc, so do not add an arbitrary external source.
-    input_source_name: "rc"
-    # Leave the built-in source intact. Enable only with vendor approval for a managed source.
-    manage_input_source: false
-    input_source_priority: 50
+    # AimDK requires a custom input source for external locomotion commands. Do not
+    # reuse rc/app_proxy/etc.: those native modules publish their own zero commands.
+    input_source_name: "motus_x2"
+    # rc is priority 80.  81 owns the base only while a Motus action is active;
+    # cancel, timeout, and driver stop delete this source immediately.
+    input_source_priority: 81
   preset_motion:
     enabled: true
   joint_command:
