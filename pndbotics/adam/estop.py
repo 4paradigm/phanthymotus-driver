@@ -77,7 +77,9 @@ def build(state: dict | None, received_at_ms: int | None, *, stale_after_ms: int
     }
 
 
-class Plugin:
+class EStopPlugin:
+    """Publishes the physical emergency-stop state without issuing commands."""
+
     def __init__(
         self,
         plugin_config: dict,
@@ -237,5 +239,6 @@ class Plugin:
         return None
 
 
-def make_plugin(plugin_config: dict, namespace: str, executor, grpc_client):
-    return Plugin(plugin_config, namespace, executor, grpc_client)
+# Preserve the original public name for existing integrations and tests while
+# the driver bundle uses the explicit EStopPlugin name.
+Plugin = EStopPlugin

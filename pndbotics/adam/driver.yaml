@@ -10,19 +10,22 @@ description: "PNDbotics Adam — 状态感知 + 实体急停 + ZED拍照 + 手�
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
-# Kept in sync by hand with config.yaml's `plugins.*.enabled` — all eight plugins
-# (state, estop, loco, camera, vision_capture, arm, hand, model) are enabled, so every tool
+# Kept in sync by hand with config.yaml's `plugins.*.enabled` — all nine plugins
+# (state, estop, loco, camera, vision_capture, arm, hand, hand_state, model) are enabled, so every tool
 # they expose is listed. camera_pointcloud is included even though its nested
 # `camera.pointcloud.enabled` defaults to false — that only gates whether the
 # point-cloud stream auto-starts, not whether the card is discoverable.
 cards:
   - { name: joints,             type: sensor }
+  - { name: motor_state,        type: sensor }
+  - { name: robot_state,        type: sensor }
   - { name: imu,                type: sensor }
   - { name: battery,            type: sensor }
   - { name: estop,              type: sensor }
   - { name: loco,               type: actuator }
   - { name: arm,                type: actuator }
   - { name: hand,                type: actuator }
+  - { name: hand_state,          type: sensor }
   - { name: camera_head,         type: sensor }
   - { name: camera_depth,        type: sensor }
   - { name: camera_pointcloud,   type: sensor }

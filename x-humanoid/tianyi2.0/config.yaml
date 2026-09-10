@@ -82,8 +82,6 @@ plugins:
     enabled: true
   home:
     enabled: true
-  chat:
-    enabled: true
   voice_chat:
     enabled: true
   controlled_spatial:
