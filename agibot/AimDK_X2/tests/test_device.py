@@ -572,9 +572,12 @@ class DispatchSmokeTests(unittest.TestCase):
         nodes.set_mc_action.response = FakeMsg()
         mc_mode = find_plugin(plugins, "mc_mode")
         action = next(iter(device.MC_ACTIONS))
-        mc_mode.dispatch(action, {})
+        with mock.patch.object(device, "call_service", wraps=device.call_service) as call:
+            mc_mode.dispatch(action, {})
+        self.assertEqual(call.call_args.kwargs["timeout"], 20.0)
         sent = nodes.set_mc_action.last_request
         self.assertEqual(sent.command.action.value, device.MC_ACTIONS[action])
+        self.assertEqual(sent.command.action_desc, action.upper())
 
     def test_locomotion_registers_before_first_velocity_publish(self):
         plugins = build_bundle_plugins()

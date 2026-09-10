@@ -846,7 +846,8 @@ class McModePlugin:
         # the literal firmware error "can not find action: stand_body_control".
         request.command.action.value = MC_ACTIONS[action]
         request.command.action_desc = action.upper()
-        result = call_service(self.nodes.set_mc_action, request)
+        timeout = float(self.nodes.config.get("plugins", {}).get("mc_mode", {}).get("service_timeout_sec", 20))
+        result = call_service(self.nodes.set_mc_action, request, timeout=timeout)
         return jsonable(result.response)
 
 

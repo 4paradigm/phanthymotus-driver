@@ -49,6 +49,9 @@ plugins:
     enabled: true
   mc_mode:
     enabled: true
+    # State transitions such as stand_up_default can take longer than ordinary
+    # query/service calls. This is the response wait only; it does not retry.
+    service_timeout_sec: 20
   locomotion:
     enabled: true
     input_source_name: "phanthymotus"
