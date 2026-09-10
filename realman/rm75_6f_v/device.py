@@ -546,7 +546,7 @@ class RM75Plugin:
 
 GRIPPER_POSITION_MIN = 1   # SDK 契约：手爪开口位置 1~1000
 GRIPPER_POSITION_MAX = 1000
-GRIPPER_ACK_TIMEOUT = 5    # 非阻塞模式下等待控制器「设置成功」应答的秒数上限
+GRIPPER_COMPLETION_TIMEOUT = 30  # SDK 阻塞模式下等待夹爪到位的秒数上限（ACP 完成窗口取 +10）
 
 
 def _gripper_position(value) -> int:
@@ -563,11 +563,19 @@ class GripperPlugin:
     """RealMan 二指夹爪位置控制：复用 RM75SDKClient 的 SDK 连接调用 SDK 夹爪 API。
 
     与 ext_camera 同模式，作为 RM75-6F-V 驱动的内置卡片；不另起容器、
-    不另开 TCP 8080 连接（控制箱单客户端）。运动守卫与 joint_control 一致。
+    不另开 TCP 8080 连接（控制箱单客户端）。运动守卫与 joint_control 一致，
+    到位结果通过 ACP 回调异步上报（x-completion 契约）。
     """
+
+    PREFIX = "gripper"
 
     def __init__(self, client, config, namespace="rm75", ros2=None):
         self.client = client
+        self._gripper_lock = threading.Lock()
+        self._action_lock = threading.Lock()
+        self._active_action_id = None
+        self._cancelled = set()
+        self._last_completion = None
 
     def get_tools(self):
         schema = action_schema(
@@ -585,6 +593,7 @@ class GripperPlugin:
                 "confirm_motion": {"type": "boolean", "description": "Must be true for every movement request"},
             },
         )
+        schema["x-completion"] = {"actions": ["set_position"], "timeout": GRIPPER_COMPLETION_TIMEOUT + 10}
         schema["x-is-dangerous"] = True
         return [
             tool(
@@ -599,11 +608,19 @@ class GripperPlugin:
         pass
 
     def stop(self):
-        pass
+        with self._action_lock:
+            action_id = self._active_action_id
+            if action_id:
+                self._cancelled.add(action_id)
 
     def dispatch(self, action, args):
         if action == "info":
-            return {"state": "connected" if self.client.connected else "disconnected"}
+            with self._action_lock:
+                active = self._active_action_id
+            return {
+                "state": "connected" if self.client.connected else "disconnected",
+                "active_action_id": active,
+            }
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -615,8 +632,79 @@ class GripperPlugin:
         if args.get("confirm_motion") is not True:
             raise ValueError("confirm_motion must be true")
         position = _gripper_position(args.get("position"))
-        code = self.client.command("rm_set_gripper_position", position, False, GRIPPER_ACK_TIMEOUT)
-        return {"success": True, "message": f"夹爪目标位置已下发: {position}"}
+        if not self._gripper_lock.acquire(blocking=False):
+            raise RuntimeError(f"another gripper motion is active: {self._active_action_id}")
+        action_id = f"rm75_gripper_{uuid4().hex[:10]}"
+        with self._action_lock:
+            self._active_action_id = action_id
+        threading.Thread(
+            target=self._gripper_worker,
+            args=(action_id, position),
+            daemon=True,
+        ).start()
+        print(f"[rm75 ACP] {action_id}: started", flush=True)
+        return {"state": "running", "action_id": action_id}
+
+    def _gripper_worker(self, action_id, position):
+        try:
+            # 阻塞模式：SDK 等待夹爪到位（上限 GRIPPER_COMPLETION_TIMEOUT 秒）后返回状态码
+            self.client.command("rm_set_gripper_position", position, True, GRIPPER_COMPLETION_TIMEOUT)
+            if action_id in self._cancelled:
+                status, result = "cancelled", {"reason": "cancelled", "position": position}
+            else:
+                status, result = "completed", {"reason": "target_reached", "position": position}
+        except Exception as exc:
+            status, result = "failed", {"reason": str(exc), "position": position}
+        finally:
+            with self._action_lock:
+                if self._active_action_id == action_id:
+                    self._active_action_id = None
+                self._cancelled.discard(action_id)
+            self._gripper_lock.release()
+            self._acp_callback(action_id, status, result)
+
+    def _acp_callback(self, action_id, status, result):
+        """POST action completion to Agent Core（与 RM75Plugin 同协议）。
+
+        TLS 校验关闭是有意为之：本驱动的部署契约不带 CA 证书
+        （见 deploy/service.yml 与镜像契约测试对 AGENT_CORE_CA_CERT 的断言），
+        与 RM75Plugin._acp_callback 及 common/vendor_runtime.start_registration
+        的既有实现保持一致。
+        """
+        import json
+        import os as _os
+        import ssl as _ssl
+        import urllib.request as _urllib
+
+        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        summary = {}
+        if status == "completed":
+            summary = {"reason": "target_reached"}
+        elif "reason" in result:
+            summary = {"reason": str(result["reason"])[:240]}
+        body = {"action_id": action_id, "status": status, "result": summary,
+                "tool": self.PREFIX, "ts": time.time()}
+        with self._action_lock:
+            self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
+        try:
+            req = _urllib.Request(
+                f"{agent_core_url.rstrip('/')}/api/acp/complete",
+                data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _urllib.urlopen(req, timeout=5, context=ctx) as response:
+                acknowledgement = json.loads(response.read())
+            if (not isinstance(acknowledgement, dict)
+                    or acknowledgement.get("ok") is not True
+                    or acknowledgement.get("action_id") != action_id):
+                raise RuntimeError("Agent Core did not acknowledge this action_id")
+            print(f"[rm75 ACP] {action_id} {status}: accepted", flush=True)
+        except Exception as exc:
+            print(f"[rm75 ACP] {action_id} {status}: callback failed: {exc}", flush=True)
 
 
 def build_plugins(config, namespace, ros2):
