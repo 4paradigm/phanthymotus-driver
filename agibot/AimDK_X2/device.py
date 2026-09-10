@@ -34,12 +34,12 @@ def core_publisher(node, msg_type, topic, qos):
 HAND_TYPES = {0: "none", 1: "nimble_hands", 2: "claw", 3: "leisai_nimble_hands", 255: "error"}
 
 # The SDK enum is a compile-time superset.  The verified X2 firmware explicitly
-# rejects STAND_UP_DEFAULT and ZERO_TORQUE_DEFAULT, while accepting only these
-# entries.  Never expose an enum value merely because it exists in aimdk_msgs.
+# rejects STAND_UP_DEFAULT and ZERO_TORQUE_DEFAULT. PASSIVE_DEFAULT and
+# STAND_DEFAULT returned success but have not produced the documented physical
+# behavior on this unit, so only the observed working mode is exposed by default.
+# Never expose an enum value merely because it exists in aimdk_msgs.
 MC_ACTIONS = {
-    "passive_default": 1,
     "damping_default": 3,
-    "stand_default": 200,
 }
 
 PRESET_MOTIONS = {
@@ -880,9 +880,7 @@ class ModelPlugin:
 
 class McModePlugin:
     ACTIONS = {
-        "passive_default": ([], "进入被动模式：不保持姿态；仅在人工扶持或吊挂条件下使用"),
         "damping_default": ([], "进入阻尼模式：关节有阻尼但不保持姿态，机器人会缓慢倒地"),
-        "stand_default": ([], "进入厂商 STAND_DEFAULT 站立模式"),
     }
 
     def __init__(self, nodes):

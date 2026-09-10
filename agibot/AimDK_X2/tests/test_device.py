@@ -585,16 +585,18 @@ class DispatchSmokeTests(unittest.TestCase):
         nodes = plugins[0].nodes
         nodes.set_mc_action.response = SimpleNamespace(response=SimpleNamespace(header=SimpleNamespace(code=0)))
         nodes._mc_mode_state = {
-            "action_desc": "STAND_DEFAULT", "action_status": 100, "fsm_state": 2,
+            "action_desc": "DAMPING_DEFAULT", "action_status": 100, "fsm_state": 4,
         }
         mc_mode = find_plugin(plugins, "mc_mode")
         definition = next(item for item in tool_definitions(plugins) if item["name"] == "mc_mode")
         actions = definition["inputSchema"]["properties"]["action"]["enum"]
-        self.assertEqual(actions, ["passive_default", "damping_default", "stand_default"])
+        self.assertEqual(actions, ["damping_default"])
+        self.assertNotIn("passive_default", actions)
+        self.assertNotIn("stand_default", actions)
         self.assertNotIn("stand_up_default", actions)
         self.assertNotIn("zero_torque_default", actions)
         with mock.patch.object(device, "_acp_notify"):
-            result = mc_mode.dispatch("stand_default", {})
+            result = mc_mode.dispatch("damping_default", {})
         self.assertEqual(result["state"], "accepted")
         self.assertTrue(result["action_id"].startswith("x2_mc_mode_"))
 

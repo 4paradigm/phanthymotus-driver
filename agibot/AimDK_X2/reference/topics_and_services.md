@@ -27,7 +27,7 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/aimdk_5Fmsgs/srv/GetAllJointState` | `joint_state` | |
 | `/aimdk_5Fmsgs/srv/GetHandType` | `hand_state` (action `info`) | |
 | `/aimdk_5Fmsgs/srv/GetMcAction`, `/aima/mc/common/state` | `mc_state`, `mc_mode` ACP confirmation | `GetMcAction` remains call-on-demand; the verified X2 also broadcasts `McCommonState`, whose `action_info.action_desc/status` confirms a requested mode has become active. |
-| `/aimdk_5Fmsgs/srv/SetMcAction` | `mc_mode` | SDK enum is not a firmware capability list. This X2 accepted `PASSIVE_DEFAULT`, `DAMPING_DEFAULT`, and `STAND_DEFAULT`; it rejected `STAND_UP_DEFAULT` and `ZERO_TORQUE_DEFAULT` with `can not find action`. The driver exposes only the confirmed set and confirms activation from `/aima/mc/common/state`. |
+| `/aimdk_5Fmsgs/srv/SetMcAction` | `mc_mode` | SDK enum is not a firmware capability list. This X2 rejected `STAND_UP_DEFAULT` and `ZERO_TORQUE_DEFAULT` with `can not find action`; `PASSIVE_DEFAULT`/`STAND_DEFAULT` only acknowledged the request, while `DAMPING_DEFAULT` is the sole observed end-to-end working mode. The driver exposes only `DAMPING_DEFAULT` by default and confirms activation from `/aima/mc/common/state`. |
 | `/aimdk_5Fmsgs/srv/SetMcPresetMotion` | `preset_motion` | |
 | `/aimdk_5Fmsgs/srv/SetMcInputSource`, `GetCurrentInputSource` | `locomotion` (action `register`/`disable`) | |
 | `/aimdk_5Fmsgs/srv/GetSystemState` | `system_state` | |
