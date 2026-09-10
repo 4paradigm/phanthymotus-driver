@@ -436,16 +436,10 @@ ROS2_UPPER_BODY_JOINTS = [
 ]
 
 
-def _reliable_qos():
-    """QoS for dashboard-facing topics.
-
-    The dashboard's generic topic client requests RELIABLE delivery.  A
-    BEST_EFFORT writer is incompatible with that request, which makes a live
-    sensor appear to have no flow at all.  Keep the queue shallow so a slow
-    viewer cannot accumulate stale camera/state data.
-    """
+def _best_effort_qos():
+    """Shallow best-effort queue for high-rate optional telemetry."""
     return QoSProfile(
-        reliability=ReliabilityPolicy.RELIABLE,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
     )
@@ -483,7 +477,7 @@ def _battery_payload(battery, timestamp_ms: int | None = None) -> dict:
 # ===========================================================================
 
 def _reliable_qos():
-    """Use the dashboard-compatible QoS while keeping a shallow queue."""
+    """QoS for Dashboard-facing state and camera streams."""
     return QoSProfile(
         reliability=ReliabilityPolicy.RELIABLE,
         history=HistoryPolicy.KEEP_LAST,
@@ -491,31 +485,8 @@ def _reliable_qos():
     )
 
 
-def _battery_payload(battery, timestamp_ms: int | None = None) -> dict:
-    """Normalize the BMS sample embedded in Adam's low-state DDS stream."""
-    def number(name: str) -> float | None:
-        try:
-            value = float(getattr(battery, name))
-            return value if math.isfinite(value) else None
-        except (AttributeError, TypeError, ValueError):
-            return None
-
-    status = getattr(battery, "status", None)
-    return {
-        "timestamp_ms": int(timestamp_ms or time.time() * 1000),
-        "voltage": number("voltage"),
-        "current": number("current"),
-        "power": number("power"),
-        "wh_accumulated": number("wh_accumulated"),
-        "status": str(status) if status not in (None, "") else "unknown",
-        "source_topic": "rt/lowstate",
-    }
-
-
 class _StatePublisherNode(Node):
     """ROS2 node that publishes skeleton, motor, robot, IMU, and battery data."""
-
-    _BATTERY_INTERVAL_S = 1.0
 
     _BATTERY_INTERVAL_S = 1.0
 
