@@ -621,10 +621,62 @@ class DispatchSmokeTests(unittest.TestCase):
         plugins = build_bundle_plugins()
         locomotion = find_plugin(plugins, "locomotion")
         locomotion.nodes.set_mc_input_source.response = FakeMsg()
-        locomotion.dispatch("set_velocity", {"forward": 0.5})
+        locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": -1})
         self.assertTrue(locomotion._registered)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
+
+    def test_locomotion_duration_is_bounded_and_schedules_a_stop(self):
+        plugins = build_bundle_plugins()
+        locomotion = find_plugin(plugins, "locomotion")
+        locomotion.nodes.set_mc_input_source.response = FakeMsg()
+        with mock.patch.object(device.threading, "Timer") as timer_cls:
+            result = locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": 1.5})
+        self.assertEqual(result["state"], "accepted")
+        self.assertEqual(result["duration"], 1.5)
+        self.assertTrue(result["action_id"].startswith("x2_locomotion_"))
+        self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
+        self.assertEqual(timer_cls.call_args.args[0], 1.5)
+        with mock.patch.object(device, "_acp_notify") as notify:
+            timer_cls.call_args.args[1]()
+        zero = locomotion.nodes.locomotion_pub.published[-1]
+        self.assertEqual((zero.forward_velocity, zero.lateral_velocity, zero.angular_velocity), (0.0, 0.0, 0.0))
+        self.assertEqual(notify.call_args.args[1], "completed")
+        definition = next(item for item in tool_definitions(plugins) if item["name"] == "locomotion")
+        self.assertIn("duration", definition["inputSchema"]["properties"])
+        with self.assertRaisesRegex(ValueError, "-1 or between 0.1 and 60"):
+            locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": 0})
+
+    def test_locomotion_negative_one_is_continuous_and_cancel_stops(self):
+        plugins = build_bundle_plugins()
+        locomotion = find_plugin(plugins, "locomotion")
+        locomotion.nodes.set_mc_input_source.response = FakeMsg()
+        result = locomotion.dispatch("set_velocity", {"forward": 0.5, "duration": -1})
+        self.assertEqual(result["state"], "accepted")
+        self.assertEqual(result["duration"], -1)
+        self.assertIsNone(locomotion._stop_timer)
+        action_id = result["action_id"]
+        with mock.patch.object(device, "_acp_notify") as notify:
+            result = locomotion.dispatch("cancel", {})
+        self.assertEqual(result["state"], "cancelled")
+        zero = locomotion.nodes.locomotion_pub.published[-1]
+        self.assertEqual((zero.forward_velocity, zero.lateral_velocity, zero.angular_velocity), (0.0, 0.0, 0.0))
+        self.assertTrue(locomotion._registered)
+        self.assertEqual(notify.call_args.args[0], action_id)
+        self.assertEqual(notify.call_args.args[1], "cancelled")
+
+    def test_locomotion_requires_duration_and_defaults_forward_speed(self):
+        plugins = build_bundle_plugins()
+        locomotion = find_plugin(plugins, "locomotion")
+        locomotion.nodes.set_mc_input_source.response = FakeMsg()
+        with self.assertRaisesRegex(ValueError, "duration is required"):
+            locomotion.dispatch("set_velocity", {})
+        result = locomotion.dispatch("set_velocity", {"duration": -1})
+        self.assertEqual(result["state"], "accepted")
+        self.assertEqual(locomotion.nodes.locomotion_pub.published[-1].forward_velocity, 0.2)
+        definition = next(item for item in tool_definitions(plugins) if item["name"] == "locomotion")
+        self.assertEqual(definition["inputSchema"]["properties"]["forward"]["default"], 0.2)
+        self.assertIn("allOf", definition["inputSchema"])
 
     def test_slam_relocalization_uses_vendor_map_id_command(self):
         plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {"slam": {"enabled": True}}})

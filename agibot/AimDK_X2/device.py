@@ -976,20 +976,32 @@ class McModePlugin:
 class LocomotionPlugin:
     ACTIONS = {
         "register": ([], "以本驱动名义注册一个 MC 输入源（SetMcInputSource ADD）"),
-        "set_velocity": (["forward", "lateral", "angular"], "发布行走速度指令"),
+        "set_velocity": (["forward", "lateral", "angular", "duration"], "发布行走速度指令；duration=-1 持续移动，否则到时自动刹停"),
+        "cancel": ([], "立即停止当前行走速度并取消定时动作"),
         "disable": ([], "禁用本驱动的输入源"),
     }
 
     def __init__(self, nodes):
         self.nodes = nodes
         self._registered = False
+        self._lock = threading.RLock()
+        self._stop_timer = None
+        self._motion_generation = 0
+        self._active_action_id = None
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
-            "forward": {"type": "number", "description": "前进速度 m/s，+前进/-后退"},
+            "forward": {"type": "number", "default": 0.2,
+                        "description": "前进速度 m/s，+前进/-后退；默认 0.2"},
             "lateral": {"type": "number", "description": "侧移速度 m/s，+左移/-右移"},
             "angular": {"type": "number", "description": "转向角速度 rad/s，+左转/-右转"},
+            "duration": {"type": "number", "minimum": -1, "maximum": 60, "default": -1,
+                         "description": "持续时间（秒）。-1 为持续移动，0.1-60 到时自动发布零速度。"},
         })
+        schema["allOf"] = [{
+            "if": {"properties": {"action": {"const": "set_velocity"}}, "required": ["action"]},
+            "then": {"required": ["duration"]},
+        }]
         return tool("locomotion", "actuator", "MC 行走速度控制：先注册输入源；仅当机器人已由遥控器或 APP "
                     "进入走跑模式时，速度消息才会生效。当前固件未通过 SetMcAction 暴露走跑模式。",
                     _with_actuation_contract(schema, ["base", "leg"]))
@@ -1002,9 +1014,65 @@ class LocomotionPlugin:
         # shutdown (even when this driver never registered as an input source) means every
         # container restart pays a real service round-trip that can time out, adding 5s of
         # noise to `stop_all()` for no effect.
+        self._cancel_motion("driver_stopped", send_stop=True)
         if self._registered:
             self._set_input_source(2002)  # INPUTACTION_DISABLE
             self._registered = False
+
+    def _publish_velocity(self, forward=0.0, lateral=0.0, angular=0.0):
+        msg = self.nodes._McLocomotionVelocity()
+        msg.header.stamp = self.nodes.robot.get_clock().now().to_msg()
+        msg.source = self._source_name()
+        msg.forward_velocity = float(forward)
+        msg.lateral_velocity = float(lateral)
+        msg.angular_velocity = float(angular)
+        self.nodes.locomotion_pub.publish(msg)
+
+    def _cancel_motion(self, reason, send_stop=False):
+        with self._lock:
+            self._motion_generation += 1
+            timer, self._stop_timer = self._stop_timer, None
+            action_id, self._active_action_id = self._active_action_id, None
+        if timer is not None:
+            timer.cancel()
+        if send_stop and self._registered:
+            self._publish_velocity()
+        if action_id is not None:
+            _acp_notify(action_id, "cancelled", {
+                "reason": reason,
+                "topic": "/aima/mc/locomotion/velocity",
+            }, "locomotion")
+
+    def _schedule_stop(self, duration, action_id):
+        with self._lock:
+            self._motion_generation += 1
+            generation = self._motion_generation
+            prior_timer, self._stop_timer = self._stop_timer, None
+        if prior_timer is not None:
+            prior_timer.cancel()
+
+        def finish():
+            with self._lock:
+                if generation != self._motion_generation:
+                    return
+                self._stop_timer = None
+                if self._active_action_id != action_id:
+                    return
+                self._active_action_id = None
+            self._publish_velocity()
+            _acp_notify(action_id, "completed", {
+                "duration": duration,
+                "topic": "/aima/mc/locomotion/velocity",
+                "final_velocity": {"forward": 0.0, "lateral": 0.0, "angular": 0.0},
+            }, "locomotion")
+
+        timer = threading.Timer(duration, finish)
+        timer.daemon = True
+        with self._lock:
+            if generation != self._motion_generation:
+                return
+            self._stop_timer = timer
+        timer.start()
 
     def _source_name(self):
         return self.nodes.config.get("plugins", {}).get("locomotion", {}).get("input_source_name", "phanthymotus")
@@ -1032,7 +1100,11 @@ class LocomotionPlugin:
             result = self._set_input_source(1001)  # INPUTACTION_ADD
             self._registered = True
             return result
+        if action == "cancel":
+            self._cancel_motion("cancel_requested", send_stop=True)
+            return {"state": "cancelled", "topic": "/aima/mc/locomotion/velocity"}
         if action == "disable":
+            self._cancel_motion("input_source_disabled", send_stop=True)
             result = self._set_input_source(2002)  # INPUTACTION_DISABLE
             self._registered = False
             return result
@@ -1045,14 +1117,24 @@ class LocomotionPlugin:
         if not self._registered:
             self._set_input_source(1001)  # INPUTACTION_ADD
             self._registered = True
-        msg = self.nodes._McLocomotionVelocity()
-        msg.header.stamp = self.nodes.robot.get_clock().now().to_msg()
-        msg.source = self._source_name()
-        msg.forward_velocity = float(args.get("forward", 0.0))
-        msg.lateral_velocity = float(args.get("lateral", 0.0))
-        msg.angular_velocity = float(args.get("angular", 0.0))
-        self.nodes.locomotion_pub.publish(msg)
-        return {"state": "published", "topic": "/aima/mc/locomotion/velocity"}
+        if "duration" not in args:
+            raise ValueError("locomotion: duration is required (-1 or between 0.1 and 60 seconds)")
+        duration = float(args["duration"])
+        if duration != -1 and not 0.1 <= duration <= 60.0:
+            raise ValueError("locomotion: duration must be -1 or between 0.1 and 60 seconds")
+        self._cancel_motion("superseded")
+        self._publish_velocity(
+            args.get("forward", 0.2), args.get("lateral", 0.0), args.get("angular", 0.0),
+        )
+        action_id = f"x2_locomotion_{uuid4().hex[:12]}"
+        with self._lock:
+            self._active_action_id = action_id
+        if duration != -1:
+            self._schedule_stop(duration, action_id)
+        return {
+            "state": "accepted", "action_id": action_id, "duration": duration,
+            "topic": "/aima/mc/locomotion/velocity",
+        }
 
 
 class PresetMotionPlugin:
