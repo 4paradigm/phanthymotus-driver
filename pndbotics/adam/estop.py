@@ -37,18 +37,22 @@ def build(state: dict | None, received_at_ms: int | None, *, stale_after_ms: int
     state = state or {}
     actuator = state.get("actuator_status")
     rcu_power = state.get("rcu_power_enabled")
-    signals = [value for value in (actuator, rcu_power) if isinstance(value, bool)]
-    detection_supported = bool(signals)
-    available = detection_supported
-    detected = any(value is False for value in signals)
+    complete_sample = isinstance(actuator, bool) and isinstance(rcu_power, bool)
+    detection_supported = complete_sample
+    available = complete_sample
+    # Never infer "released" from only one physical input. A partial sample is
+    # reported as unknown below, while a complete disagreement remains active.
+    detected = complete_sample and (not actuator or not rcu_power)
     disagreement = (
         isinstance(actuator, bool)
         and isinstance(rcu_power, bool)
         and actuator != rcu_power
     )
 
+    fresh = complete_sample and fresh
+
     if not available:
-        message = state.get("error") or "未收到执行器供电状态"
+        message = state.get("error") or "实体急停信号不完整，状态未知"
     elif not fresh:
         message = "执行器供电状态已过期，急停状态未知"
     elif disagreement:
@@ -76,13 +80,23 @@ def build(state: dict | None, received_at_ms: int | None, *, stale_after_ms: int
 class EStopPlugin:
     """Publishes the physical emergency-stop state without issuing commands."""
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, grpc_client, **kwargs):
+    def __init__(
+        self,
+        plugin_config: dict,
+        namespace: str,
+        executor,
+        grpc_client,
+        *,
+        status_reader=None,
+        **kwargs,
+    ):
         self._grpc = grpc_client
         self._executor = executor
         self._topic = TOPIC.format(namespace=namespace)
         self._stale_after_ms = int(float(plugin_config.get("state_timeout_sec", 5.0)) * 1000)
         self._pac_url = str(plugin_config.get("pac_url", "http://10.10.20.127:8626")).rstrip("/")
         self._http_timeout = max(0.1, float(plugin_config.get("http_timeout_sec", 2.0)))
+        self._status_reader = status_reader or self._read_pac_status
         self._state = None
         self._received_at_ms = None
         self._active = False
@@ -144,12 +158,21 @@ class EStopPlugin:
 
     def _refresh(self):
         try:
-            state = self._read_pac_status()
+            state = self._status_reader()
         except Exception as exc:
             state = {"error": str(exc)}
+        complete_sample = (
+            isinstance(state.get("actuator_status"), bool)
+            and isinstance(state.get("rcu_power_enabled"), bool)
+        )
         with self._lock:
             self._state = state
-            self._received_at_ms = int(time.time() * 1000)
+            # Freshness denotes a complete physical sample, not merely that a
+            # polling attempt finished. Drop the timestamp immediately when
+            # either PAC input is unavailable.
+            self._received_at_ms = (
+                int(time.time() * 1000) if complete_sample else None
+            )
 
     def _data(self, *, refresh: bool = False):
         if refresh:
@@ -214,3 +237,8 @@ class EStopPlugin:
                 "topic_out": [{"topic": self._topic, "format": FORMAT}],
             }
         return None
+
+
+# Preserve the original public name for existing integrations and tests while
+# the driver bundle uses the explicit EStopPlugin name.
+Plugin = EStopPlugin

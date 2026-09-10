@@ -34,8 +34,11 @@ import signal
 import socket
 import sys
 import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 
@@ -84,6 +87,28 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
+            if urlparse(self.path).path == "/mcp/sse":
+                # The resource-center opens the legacy MCP SSE endpoint before
+                # it starts a sensor card.  Keep it alive and point requests at
+                # the same JSON-RPC handler used by POST /mcp.
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                try:
+                    session_id = uuid.uuid4().hex
+                    self.wfile.write(
+                        f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n".encode())
+                    self.wfile.flush()
+                    while True:
+                        time.sleep(15)
+                        self.wfile.write(b"event: ping\ndata: {}\n\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
             self.send_response(404)
             self.end_headers()
 
@@ -95,6 +120,9 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
+            if urlparse(self.path).path not in ("/mcp", "/mcp/messages"):
+                self._send(404, json.dumps({"error": "Not found"}))
+                return
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             try:
@@ -189,14 +217,19 @@ def main():
     global _bundle
 
     cfg           = _load_config()
+    # Adam exposes its low-state DDS bus on the robot-facing Ethernet NIC.
+    # Prefer an explicit CLI override, then deployment environment and config,
+    # instead of letting
+    # CycloneDDS pick a Wi-Fi/default-route interface on dual-homed Jetsons.
     network_iface = (
-        os.environ.get("DDS_NETWORK_INTERFACE")
+        sys.argv[1] if len(sys.argv) > 1
+        else os.environ.get("DDS_NETWORK_INTERFACE")
+        or os.environ.get("DDS_INTERFACE")
         or cfg.get("dds_interface")
         or cfg.get("dds_network_interface")
-        or (sys.argv[1] if len(sys.argv) > 1 else None)
     )
     namespace     = _resolve_namespace(cfg)
-    mcp_port      = int(cfg.get("mcp_port", 15702))
+    mcp_port      = int(cfg.get("mcp_port", 15722))
     variant       = cfg.get("variant", "sp")
 
     print(f"[adam] namespace={namespace} variant={variant} mcp_port={mcp_port}")
@@ -266,7 +299,7 @@ def main():
 
     # gRPC client
     grpc_host = os.environ.get("GRPC_HOST", cfg.get("grpc_host", "localhost"))
-    grpc_port = int(os.environ.get("GRPC_PORT", cfg.get("grpc_port", 6666)))
+    grpc_port = int(os.environ.get("GRPC_PORT", cfg.get("grpc_port", 50051)))
     from grpc_client import AdamGrpcClient
     grpc_client = AdamGrpcClient(grpc_host, grpc_port)
     grpc_client.connect()
