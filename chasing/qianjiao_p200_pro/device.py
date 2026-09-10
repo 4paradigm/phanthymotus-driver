@@ -1,4 +1,4 @@
-"""MAVLink transport and MCP-facing tools for Qianjiao 2.0 Pro."""
+"""MAVLink transport and MCP-facing tools for Qianjiao P200 Pro."""
 from __future__ import annotations
 
 import json
@@ -89,11 +89,11 @@ class QianjiaoDevice:
         self.camera_rtsp = str(cfg.get("camera_rtsp", f"rtsp://{credentials}{self.camera_ip}:8554/stream/0/0"))
         self.camera_light_path = str(cfg.get("camera_light_path", "/v1/light"))
         self.video_url = str(cfg.get("video_url", "/video.mjpeg"))
-        self.status_topic = str(cfg.get("status_topic", "/qianjiao2_pro/status"))
-        self.loco_state_topic = str(cfg.get("loco_state_topic", "/qianjiao2_pro/loco_state"))
-        self.battery_topic = str(cfg.get("battery_topic", "/qianjiao2_pro/battery"))
-        self.imu_topic = str(cfg.get("imu_topic", "/qianjiao2_pro/imu"))
-        self.camera_topic = str(cfg.get("camera_topic", "/qianjiao2_pro/camera/color"))
+        self.status_topic = str(cfg.get("status_topic", "/qianjiao_p200_pro/status"))
+        self.loco_state_topic = str(cfg.get("loco_state_topic", "/qianjiao_p200_pro/loco_state"))
+        self.battery_topic = str(cfg.get("battery_topic", "/qianjiao_p200_pro/battery"))
+        self.imu_topic = str(cfg.get("imu_topic", "/qianjiao_p200_pro/imu"))
+        self.camera_topic = str(cfg.get("camera_topic", "/qianjiao_p200_pro/camera/color"))
         self._status_sock: socket.socket | None = None
         self._status_thread: threading.Thread | None = None
         self._rov_status: dict[str, Any] = {}
@@ -204,7 +204,7 @@ class QianjiaoDevice:
             from std_msgs.msg import String
             if not rclpy.ok():
                 rclpy.init(args=None)
-            self._ros_node = Node("qianjiao2_pro_status")
+            self._ros_node = Node("qianjiao_p200_pro_status")
             qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                              history=HistoryPolicy.KEEP_LAST, depth=1,
                              durability=DurabilityPolicy.VOLATILE)
@@ -615,12 +615,12 @@ class QianjiaoDevice:
             },
         }
         return [
-            sensor("loco_state", "潜蛟运动状态：姿态角、深度和定位信息。", self.loco_state_topic),
-            sensor("status", "潜蛟系统状态：连接、温度和健康信息。", self.status_topic),
-            sensor("battery", "潜蛟电池状态：电压、电流和剩余电量。", self.battery_topic),
-            sensor("imu", "潜蛟 IMU 角速度数据。", self.imu_topic),
-            {"name": "camera", "type": "sensor", "description": "潜蛟实时相机图像（RTSP 转 JPEG）。", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"], "description": "相机流生命周期或信息查询"}}, "required": ["action"]}},
-            {"name": "control", "type": "actuator", "description": "潜蛟 2.0 Pro 运动控制：解锁、停止或发送 6 自由度控制量。", "inputSchema": control_schema},
+            sensor("loco_state", "潜鲛运动状态：姿态角、深度和定位信息。", self.loco_state_topic),
+            sensor("status", "潜鲛系统状态：连接、温度和健康信息。", self.status_topic),
+            sensor("battery", "潜鲛电池状态：电压、电流和剩余电量。", self.battery_topic),
+            sensor("imu", "潜鲛 IMU 角速度数据。", self.imu_topic),
+            {"name": "camera", "type": "sensor", "description": "潜鲛实时相机图像（RTSP 转 JPEG）。", "topic_out": [{"topic": self.camera_topic, "format": "image/jpeg"}], "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"], "description": "相机流生命周期或信息查询"}}, "required": ["action"]}},
+            {"name": "control", "type": "actuator", "description": "潜鲛 P200 Pro 运动控制：解锁、停止或发送 6 自由度控制量。", "inputSchema": control_schema},
         ]
 
     def dispatch(self, tool: str, args: dict) -> dict:

@@ -893,7 +893,7 @@ def main():
     _bundle.start_all()
     _start_domain_bridge(cfg)
 
-    _start_registration(mcp_port, cfg.get("name", "Tianyi 2.0 Pro"), "driver")
+    _start_registration(mcp_port, cfg.get("name", "X-humanoid Tianyi 2.0 Pro Bundle"), "driver")
 
     server = ThreadingHTTPServer(("", mcp_port), make_handler())
     print(f"[bundle] MCP server → http://localhost:{mcp_port}")
