@@ -188,8 +188,13 @@ def _start_registration(mcp_port: int, name: str, category: str):
 def main():
     global _bundle
 
-    network_iface = sys.argv[1] if len(sys.argv) > 1 else None
     cfg           = _load_config()
+    network_iface = (
+        os.environ.get("DDS_NETWORK_INTERFACE")
+        or cfg.get("dds_interface")
+        or cfg.get("dds_network_interface")
+        or (sys.argv[1] if len(sys.argv) > 1 else None)
+    )
     namespace     = _resolve_namespace(cfg)
     mcp_port      = int(cfg.get("mcp_port", 15702))
     variant       = cfg.get("variant", "sp")
@@ -216,7 +221,10 @@ def main():
     dds_hand_pub = None
     plugins_cfg = cfg.get("plugins", {})
     need_lowstate = plugins_cfg.get("state", {}).get("enabled", True)
-    need_handstate = plugins_cfg.get("hand", {}).get("enabled", True)
+    need_handstate = (
+        plugins_cfg.get("hand", {}).get("enabled", True)
+        or plugins_cfg.get("hand_state", {}).get("enabled", True)
+    )
     need_hand_pub = plugins_cfg.get("hand", {}).get("enabled", True)
     try:
         from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher
