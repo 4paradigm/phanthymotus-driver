@@ -22,6 +22,7 @@ cards:
   - { name: loco,               type: actuator }
   - { name: arm,                type: actuator }
   - { name: hand,                type: actuator }
+  - { name: hand_state,          type: sensor }
   - { name: camera_head,         type: sensor }
   - { name: camera_depth,        type: sensor }
   - { name: camera_pointcloud,   type: sensor }
