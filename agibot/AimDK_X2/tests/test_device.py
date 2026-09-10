@@ -611,6 +611,17 @@ class DispatchSmokeTests(unittest.TestCase):
                 mc_mode._wait_for_mode_confirmation("id", "STAND_DEFAULT", "stand_default", 30)
         self.assertEqual(notify.call_args.args[1], "error")
 
+    def test_mc_mode_falls_back_when_image_lacks_mc_common_state(self):
+        plugins = build_bundle_plugins()
+        mc_mode = find_plugin(plugins, "mc_mode")
+        mc_mode.nodes.mc_state_available = False
+        with mock.patch.object(device.threading, "Thread") as thread_cls:
+            result = mc_mode.dispatch("damping_default", {})
+        self.assertEqual(result["state"], "accepted")
+        self.assertEqual(result["confirmation"], "service_accepted_state_unavailable")
+        self.assertIs(thread_cls.call_args.kwargs["target"], device._acp_notify)
+        self.assertEqual(thread_cls.call_args.kwargs["args"][1], "completed")
+
     def test_all_actuators_declare_physical_resources(self):
         plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {"slam": {"enabled": True}}})
         for definition in tool_definitions(plugins):

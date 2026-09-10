@@ -174,7 +174,11 @@ class AimdkNodes:
         from std_msgs.msg import String, UInt8MultiArray
         from geometry_msgs.msg import Pose
         from nav_msgs.msg import Odometry
-        from aimdk_msgs.msg import CommonRequest, McCommonState, PmuState, TouchState
+        from aimdk_msgs.msg import CommonRequest, PmuState, TouchState
+        try:
+            from aimdk_msgs.msg import McCommonState
+        except ImportError:
+            McCommonState = None
         from aimdk_msgs.srv import (
             ExecuteActionResource, GetAllJointState, GetCurrentInputSource, GetHandType,
             GetMcAction, GetMicSourceRequest, GetRobotResources, GetStoredMapByName,
@@ -212,6 +216,7 @@ class AimdkNodes:
         self._last_skeleton_publish = 0.0
         self.joint_groups = {}
         self._mc_mode_state = {"action_desc": "", "action_status": None, "fsm_state": None}
+        self.mc_state_available = McCommonState is not None
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         command_qos = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
@@ -220,7 +225,10 @@ class AimdkNodes:
 
         # This is the vendor's live state-machine report.  It lets ACP distinguish
         # a SetMcAction request being accepted from the requested mode being active.
-        self.robot.create_subscription(McCommonState, "/aima/mc/common/state", self._mc_common_state_callback, sensor_qos)
+        if self.mc_state_available:
+            self.robot.create_subscription(McCommonState, "/aima/mc/common/state", self._mc_common_state_callback, sensor_qos)
+        else:
+            print("[x2] McCommonState is unavailable in this AimDK image; MC mode completion is service-acknowledged", flush=True)
 
         def stream_enabled(name, default=True):
             return bool(config.get("plugins", {}).get(name, {}).get("enabled", default))
@@ -939,6 +947,23 @@ class McModePlugin:
             return {"state": "rejected", "action": action, "response": response_data}
 
         action_id = f"x2_mc_mode_{uuid4().hex[:12]}"
+        if not self.nodes.mc_state_available:
+            threading.Thread(
+                target=_acp_notify,
+                args=(action_id, "completed", {
+                    "action": action,
+                    "completion": "service_accepted_state_unavailable",
+                    "response": response_data,
+                }, "mc_mode"),
+                daemon=True,
+            ).start()
+            return {
+                "state": "accepted",
+                "action": action,
+                "action_id": action_id,
+                "response": response_data,
+                "confirmation": "service_accepted_state_unavailable",
+            }
         threading.Thread(
             target=self._wait_for_mode_confirmation,
             args=(action_id, action.upper(), action, 30.0),
