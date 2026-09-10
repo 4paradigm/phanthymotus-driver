@@ -544,5 +544,74 @@ class RM75Plugin:
         return None
 
 
+def _gripper_position(value) -> int:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("position must be a number") from exc
+    if not math.isfinite(numeric) or not 0 <= numeric <= 1000:
+        raise ValueError("position must be within 0~1000")
+    return int(round(numeric))
+
+
+class GripperPlugin:
+    """RealMan 二指夹爪位置控制：复用 RM75SDKClient 的 SDK 连接直发 hand_follow_pos。
+
+    与 ext_camera 同模式，作为 RM75-6F-V 驱动的内置卡片；不另起容器、
+    不另开 TCP 8080 连接（控制箱单客户端）。
+    """
+
+    def __init__(self, client, config, namespace="rm75", ros2=None):
+        self.client = client
+
+    def get_tools(self):
+        schema = action_schema(
+            {
+                "set_position": (["position"], "设置二指夹爪目标位置"),
+                "info": ([], "读取夹爪与 SDK 连接状态"),
+            },
+            {
+                "position": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000,
+                    "description": "夹爪驱动器目标位置，0~1000，对应 0~120 mm",
+                },
+            },
+        )
+        return [
+            tool(
+                "gripper",
+                "actuator",
+                "RealMan 二指夹爪位置控制。位置范围 0~1000，对应夹爪行程 0~120 mm。",
+                schema,
+            )
+        ]
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "info":
+            return {"state": "connected" if self.client.connected else "disconnected"}
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action != "set_position":
+            return None
+        position = _gripper_position(args.get("position"))
+        padded = [position] + [0] * 5  # 灵巧手数组固定 6 指，二指夹爪只占第 1 指
+        code = self.client.command("rm_set_hand_follow_pos", padded, False)
+        return {"success": True, "message": f"夹爪目标位置已下发: {position}"}
+
+
 def build_plugins(config, namespace, ros2):
-    return [RM75Plugin(RM75SDKClient(config), config, namespace=namespace, ros2=ros2)]
+    client = RM75SDKClient(config)
+    return [
+        RM75Plugin(client, config, namespace=namespace, ros2=ros2),
+        GripperPlugin(client, config, namespace=namespace, ros2=ros2),
+    ]
