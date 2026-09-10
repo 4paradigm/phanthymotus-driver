@@ -20,6 +20,12 @@ plugins:
     publish_rate_hz: 50
   loco:
     enabled: true
+    # Dashboard velocity-card limits. Commands expire unless the card renews
+    # them before command_timeout_s, so a disconnected UI stops the robot.
+    max_vx_mps: 0.25
+    max_vy_mps: 0.15
+    max_vyaw_radps: 0.5
+    command_timeout_s: 0.5
   camera:
     enabled: true
     # The ZED Mini is connected to this Jetson. Keep the local SDK path; the

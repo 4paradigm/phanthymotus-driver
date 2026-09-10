@@ -668,7 +668,7 @@ class StatePlugin:
 # ===========================================================================
 
 class LocoPlugin:
-    """High-level locomotion via gRPC on port 6666."""
+    """Dashboard-facing locomotion with a server-side command watchdog."""
 
     PREFIX = "loco"
 
@@ -676,12 +676,77 @@ class LocoPlugin:
                  grpc_client, **kwargs):
         self._grpc = grpc_client
         self._namespace = namespace
+        self._max_vx = self._positive_limit(plugin_config.get("max_vx_mps", 0.25), "max_vx_mps")
+        self._max_vy = self._positive_limit(plugin_config.get("max_vy_mps", 0.15), "max_vy_mps")
+        self._max_vyaw = self._positive_limit(plugin_config.get("max_vyaw_radps", 0.5), "max_vyaw_radps")
+        self._command_timeout_s = self._positive_limit(
+            plugin_config.get("command_timeout_s", 0.5), "command_timeout_s")
+        self._motion_lock = threading.Lock()
+        self._motion_timer = None
+        self._motion_sequence = 0
+
+    @staticmethod
+    def _positive_limit(value, name: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive number")
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a positive number") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be a positive number")
+        return value
+
+    @staticmethod
+    def _speed(value, name: str, limit: float) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a finite number")
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a finite number") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number")
+        return max(-limit, min(limit, value))
+
+    def _cancel_watchdog_locked(self):
+        if self._motion_timer is not None:
+            self._motion_timer.cancel()
+            self._motion_timer = None
+
+    def _arm_watchdog(self):
+        with self._motion_lock:
+            self._cancel_watchdog_locked()
+            self._motion_sequence += 1
+            sequence = self._motion_sequence
+            timer = threading.Timer(
+                self._command_timeout_s, self._stop_after_timeout, args=(sequence,))
+            timer.daemon = True
+            self._motion_timer = timer
+            timer.start()
+
+    def _stop_after_timeout(self, sequence: int):
+        with self._motion_lock:
+            if sequence != self._motion_sequence:
+                return
+            self._motion_timer = None
+        # A dashboard client must renew move commands. If it disconnects,
+        # the robot receives a zero-speed command without relying on the UI.
+        self._grpc.set_speed(0.0, 0.0, 0.0)
+
+    def _stop_motion(self):
+        with self._motion_lock:
+            self._cancel_watchdog_locked()
+            self._motion_sequence += 1
+        return self._grpc.set_speed(0.0, 0.0, 0.0)
 
     def get_tool(self) -> dict:
         return {
             "name": "loco",
             "type": "actuator",
-            "description": "Adam locomotion — walk, turn, stop, gestures, mode switching",
+            "description": (
+                "Adam motion control — forward/lateral/yaw velocity with an "
+                f"automatic {self._command_timeout_s:g}s zero-speed watchdog"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -694,9 +759,12 @@ class LocoPlugin:
                         ],
                     },
                     "mode": {"type": "integer", "description": "Mode ID"},
-                    "vx": {"type": "number", "description": "Forward velocity (m/s)"},
-                    "vy": {"type": "number", "description": "Lateral velocity (m/s)"},
-                    "vyaw": {"type": "number", "description": "Yaw angular velocity (rad/s)"},
+                    "vx": {"type": "number", "minimum": -self._max_vx, "maximum": self._max_vx,
+                           "description": "Forward velocity (m/s)"},
+                    "vy": {"type": "number", "minimum": -self._max_vy, "maximum": self._max_vy,
+                           "description": "Lateral velocity (m/s)"},
+                    "vyaw": {"type": "number", "minimum": -self._max_vyaw, "maximum": self._max_vyaw,
+                               "description": "Yaw angular velocity (rad/s)"},
                     "motion_id": {"type": "integer", "description": "Predefined motion ID"},
                     "action_id": {"type": "integer", "description": "Predefined action/gesture ID"},
                     "pitch": {"type": "number", "description": "Body pitch (rad)"},
@@ -713,7 +781,7 @@ class LocoPlugin:
                     },
                     "move": {
                         "params": ["vx", "vy", "vyaw"],
-                        "description": "Walk with specified velocities",
+                        "description": "Send one bounded velocity command; renew before the watchdog expires",
                     },
                     "stop": {
                         "params": [],
@@ -752,24 +820,34 @@ class LocoPlugin:
         }
 
     def start(self):
-        pass
+        return None
 
     def stop(self):
-        pass
+        self._stop_motion()
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
-            return {"state": "idle"}
+            result = self._stop_motion()
+            return {"state": "idle", "command": "zero_speed", "result": result}
         if action == "set_mode":
             return self._grpc.set_mode(args.get("mode", 0))
         if action == "move":
-            return self._grpc.set_speed(
-                args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0)
-            )
-        if action == "stop_move" or action == "stop":
-            return self._grpc.set_speed(0.0, 0.0, 0.0)
+            try:
+                vx = self._speed(args.get("vx", 0.0), "vx", self._max_vx)
+                vy = self._speed(args.get("vy", 0.0), "vy", self._max_vy)
+                vyaw = self._speed(args.get("vyaw", 0.0), "vyaw", self._max_vyaw)
+            except ValueError as exc:
+                return {"error": str(exc)}
+            result = self._grpc.set_speed(vx, vy, vyaw)
+            if "error" not in result:
+                self._arm_watchdog()
+            return {
+                **result,
+                "command": {"vx": vx, "vy": vy, "vyaw": vyaw},
+                "watchdog_timeout_s": self._command_timeout_s,
+            }
         if action == "stand_motion":
             return self._grpc.set_stand_motion(args.get("motion_id", 0))
         if action == "stand_action":
@@ -790,7 +868,15 @@ class LocoPlugin:
         if action == "carry_box":
             return self._grpc.set_carry_box(args.get("enable", False))
         if action == "info":
-            return {"state": "ready"}
+            return {
+                "state": "ready",
+                "limits": {
+                    "vx_mps": self._max_vx,
+                    "vy_mps": self._max_vy,
+                    "vyaw_radps": self._max_vyaw,
+                    "command_timeout_s": self._command_timeout_s,
+                },
+            }
         return None
 
 
