@@ -79,6 +79,22 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
 
         self.client = FakeClient()
         self.plugin = self.device.GripperPlugin(self.client, {}, namespace="rm75")
+        # 单测不碰网络：ACP 回调替换为记录器
+        self.acp_events = []
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+    def _wait_for(self, condition, timeout=2.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if condition():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_plugin_prefix_contract(self):
+        self.assertEqual("gripper", self.device.GripperPlugin.PREFIX)
 
     def test_tool_schema_exposes_1_to_1000_and_safety_contract(self):
         tools = self.plugin.get_tools()
@@ -91,20 +107,29 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.assertIs(True, tools[0]["inputSchema"]["x-is-dangerous"])
         self.assertIn("confirm_motion", tools[0]["inputSchema"]["properties"])
         self.assertIn("confirm_motion", tools[0]["inputSchema"]["x-action-params"]["set_position"]["params"])
+        completion = tools[0]["inputSchema"]["x-completion"]
+        self.assertEqual(["set_position"], completion["actions"])
+        self.assertGreater(completion["timeout"], 0)
 
-    def test_set_position_calls_two_finger_gripper_api(self):
+    def test_set_position_returns_action_id_and_calls_two_finger_api(self):
         result = self.plugin.dispatch(
             "set_position", {"position": 500, "confirm_motion": True}
         )
 
+        self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("rm75_gripper_"))
+        # SDK 阻塞调用在 worker 线程里发生
+        self.assertTrue(self._wait_for(lambda: len(self.client.calls) == 1))
         self.assertEqual(
-            {"success": True, "message": "夹爪目标位置已下发: 500"},
-            result,
-        )
-        self.assertEqual(
-            [("rm_set_gripper_position", (500, False, self.device.GRIPPER_ACK_TIMEOUT))],
+            [("rm_set_gripper_position", (500, True, self.device.GRIPPER_COMPLETION_TIMEOUT))],
             self.client.calls,
         )
+        # 完成后 ACP 上报 completed
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        action_id, status, payload = self.acp_events[0]
+        self.assertEqual(result["action_id"], action_id)
+        self.assertEqual("completed", status)
+        self.assertEqual("target_reached", payload["reason"])
 
     def test_out_of_range_position_is_rejected(self):
         for value in (-1, 0, 1001, float("nan"), float("inf")):
@@ -126,10 +151,20 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
                     self.plugin.dispatch("set_position", args)
         self.assertEqual([], self.client.calls)
 
+    def test_concurrent_gripper_motion_is_rejected(self):
+        self.plugin._gripper_lock.acquire()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "another gripper motion is active"):
+                self.plugin.dispatch("set_position", {"position": 500, "confirm_motion": True})
+        finally:
+            self.plugin._gripper_lock.release()
+
     def test_canvas_lifecycle_actions(self):
         self.assertEqual({"state": "ready"}, self.plugin.dispatch("start", {}))
         self.assertEqual({"state": "idle"}, self.plugin.dispatch("stop", {}))
-        self.assertEqual({"state": "connected"}, self.plugin.dispatch("info", {}))
+        info = self.plugin.dispatch("info", {})
+        self.assertEqual("connected", info["state"])
+        self.assertIn("active_action_id", info)
 
     def test_unknown_action_returns_none(self):
         self.assertIsNone(self.plugin.dispatch("something_else", {}))
