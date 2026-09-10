@@ -25,7 +25,7 @@ is rejected; repeating the same configuration is accepted.
 
 | Action | Result |
 | --- | --- |
-| `capture_photo` | Wait for a new JPEG frame, save it, return `file_path` and source metadata. |
+| `capture_photo` | Wait for a new JPEG frame, save it, return `file_path` synchronously (no ACP). |
 | `record_video` | Queue a 1–30-second recording, default 5 seconds, and return `action_id`. |
 | `list_cameras` | List the built-in source and running external RGB instances. |
 | `info` | Report source freshness, output directories, active recording and latest terminal result. |
@@ -42,40 +42,36 @@ Example MCP arguments for tool `vision_capture`:
 {"action": "record_video", "camera": "external", "duration_s": 5}
 ```
 
-Omit `camera` to use the saved card configuration. `queued` is an admission
-response, not completion. The terminal result is posted to Core's
-`/api/acp/complete` and remains available in `info.last_recording` until restart.
-Only one recording may be active. Camera previews keep running when recording
-is cancelled. Missing, stale or stalled input produces an error.
+Omit `duration_s` to use the default of 5 seconds. `maximum` is 30 seconds.
+Omit `camera` to use the saved card configuration.
 
-A successful video result includes `file_name`, the full `file_path`, and a
-human-readable `message` naming the saved file. These fields are added only
-after encoding and file validation succeed; cancellation does not advertise an
-incomplete file as a saved result.
+`queued` is an admission response, not completion. The terminal result is posted
+once to Core's `/api/acp/complete` and also remains in `info.last_recording`
+until restart. Only one recording may be active. Camera previews keep running
+when recording is cancelled. Missing, stale or stalled input produces an error.
 
-The queued response includes `queued_at`. A successful ACP completion is sent
-only after FFmpeg exits successfully and ffprobe verifies the completed MP4's
-duration and frame count. The result separates media duration from elapsed time:
+The result contract matches the Q5 vision_capture card. A successful
+`record_video` completion carries only the Q5 slim field set, and the honored
+requested duration is returned after encoding:
 
 | Field | Meaning |
 | --- | --- |
-| `requested_duration_s` | Requested video length. |
+| `ok` / `media_type` | Success flag and `video` media type. |
+| `file_path` | Absolute path to the completed MP4 on the Go2 host. |
 | `recorded_duration_s` | Completed MP4 duration measured by ffprobe. |
-| `capture_elapsed_s` | Actual time spent collecting source frames, measured with a monotonic clock. |
-| `finalize_elapsed_s` | Time spent finalizing and validating the file after collection ends. |
-| `elapsed_s` | Total time from queue admission to terminal result, excluding callback network delivery. |
-| `queued_at`, `capture_started_at`, `capture_finished_at`, `completed_at` | Millisecond ISO timestamps with explicit timezone offsets. |
+| `frames` | Fresh source frames encoded. |
+| `captured_at` | Filesystem stamp ISO timestamp with timezone offset when encoding finished. |
 
-For a 5-second recording, the MP4 must measure 5 seconds; the total elapsed time
-can be longer due to waiting for the first frame and finalizing the file.
-Failed/cancelled results still include request, queue, completion and total-time
-fields. The single ACP terminal callback follows validation or failure cleanup.
+Failure and cancellation result carry only `ok`, `code` and `message` — no extra
+timing/display fields. `capture_photo` returns `file_path` synchronously and
+never posts ACP, as on Q5. No extra display/verification fields are added so the
+saved file is rendered by Core through the existing ACP `file_path` rendering
+with zero Core changes.
 
-Video timestamps preserve capture timing. Output uses the configured frame
-rate and extends the final frame to the requested endpoint. At 15 fps, a
-5-second video contains 75 encoded frames. `frames` counts fresh source frames;
-`encoded_frames` includes repeats used to preserve timing. Padding does not
-replace camera freshness checks or make a stalled capture succeed.
+Video output preserves capture timing and extends the last frame to the exact
+requested endpoint, so a 5-second recording at 15 fps contains 75 encoded frames.
+`frames` counts fresh source frames received. Padding does not replace camera
+freshness checks or make a stalled capture succeed.
 
 ## Files and deployment
 
@@ -88,44 +84,27 @@ The Dockerfile includes FFmpeg and copies the plugin. Configuration under
 `fps` (1–15) and `max_duration_s` (1–30).
 
 As with Q5, the card returns saved paths; it does not add inline media previews.
-Download files to inspect them, for example:
+Download files to inspect them:
 
 ```bash
 mkdir -p ~/Downloads/go2-photos
 scp 'unitree@GO2_IP:/opt/phanthy-motus/data/vision_capture/photos/*.jpg' ~/Downloads/go2-photos/
 ```
 
-No Core modification is required for the driver's completion protocol or timing
-fields: it uses the existing ACP endpoint and `info` result. Core's optional
-activity-log forwarding is a separate observability fix, not a prerequisite for
-recording or correct terminal signaling.
-For automatic user-facing file receipts, Core must retain the file-result fields
-when compacting ACP events. Legacy Core versions discard all `result` data and
-cannot deliver the saved path. A separate minimal Core fix preserves file receipts
-and sends their filename/path through the existing activity `trigger` renderer;
-it does not modify frontend files or change the capture protocol.
+No Core modification is required for the driver's completion protocol: single
+ACP terminal callback, `file_path` in the result, and no display-only fields.
 
 ## Validation
 
 On 2026-09-08, Go2's built-in camera and an external D435i RGB source each
 produced valid 1280x720 JPGs and 5.000000-second H.264 videos with 75 decoded
-frames at 15 fps. Cancellation removed partial MP4s. Concurrent camera sampling
-verified valid front/RGB/depth/infrared data and nonzero ROS publishers.
-ACP completion and cancellation were also observed through the separately
-updated Core activity stream and browser.
+frames. Cancellation removed partial MP4s. Concurrent sampling verified valid
+front/RGB/depth/infrared data and nonzero ROS publishers.
 
-Local and ARM64-image checks covered selection, stale input, duration validation,
-exact output timing at slow source rates, encoder failures and cancellation.
-Local verification scripts are intentionally not included in this driver change.
-On 2026-09-09, the timing metadata and ffprobe completion gate passed real Go2
-verification on both sources. Each MP4 measured 5.000000 seconds and decoded to
-75 frames. Measured collection time was 5.001 seconds for each source; queue
-admission to file readiness took 5.335 seconds (front) and 5.328 seconds (external).
-ACP reached Core 0.095 and 0.141 seconds after file readiness, respectively.
-Cancellation also reported ordered timestamps and elapsed time. The Core dropdown
-title patch was rolled back, and the temporary external test instance was stopped.
-All 27 capture checks passed in the ARM64 image; 63 local Go2 checks passed before
-deployment. Verification scripts remain local and are not part of this change.
-The file receipt was subsequently verified with a real 5-second recording: the
-existing browser log displayed the complete filename and path immediately from
-the ACP callback, and frontend JavaScript matched the original Core image.
+On 2026-09-09 the contract was aligned to the Q5 card: `duration_s` default is
+5 (maximum 30), `record_video` posts a single ACP `completed` whose result
+carries only `file_path`/`recorded_duration_s`/`frames`/`captured_at`, and the
+previous extra timing/display fields were removed. All 28 local capture checks
+(including real FFmpeg/ffprobe media) pass; ARM64-image verification on the Go2
+runs after the release image deploys.
+'''

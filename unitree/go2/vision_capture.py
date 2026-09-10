@@ -69,7 +69,7 @@ class VisionCapturePlugin:
                     "camera": camera_property,
                     "duration_s": {"type": "integer", "minimum": 1,
                                    "maximum": self._max_duration_s,
-                                   "default": min(5, self._max_duration_s)},
+                                   "default": 5},
                 },
                 "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
@@ -81,7 +81,7 @@ class VisionCapturePlugin:
                     "stop": {"params": [], "description": "取消当前录像并删除未完成文件。"},
                 },
                 "x-completion": {"actions": ["record_video"],
-                                 "timeout": self._max_duration_s + 25},
+                                 "timeout": self._max_duration_s + 15},
             },
             "configSchema": {"type": "object", "properties": {
                 "camera": {**camera_property, "default": "front"},
@@ -289,7 +289,6 @@ class VisionCapturePlugin:
                 with self._recording_lock:
                     active["process"] = process
                 started = time.monotonic()
-                capture_started_at = _timestamp()
                 deadline = started + active["duration_s"]
                 frames = 0
                 while True:
@@ -310,8 +309,6 @@ class VisionCapturePlugin:
                                 and time.monotonic() - frame[1] < _MAX_FRAME_AGE_S):
                             break
                         raise
-                capture_finished = time.monotonic()
-                capture_finished_at = _timestamp()
                 if frames < min(2, self._fps * active["duration_s"]):
                     raise RuntimeError("Not enough fresh frames to record video")
                 process.stdin.close()
@@ -328,15 +325,8 @@ class VisionCapturePlugin:
             if cancel.is_set():
                 raise RuntimeError("Video recording was cancelled")
             completed = True
-            return {"ok": True, "media_type": "video", "file_path": str(path), "source": source,
-                    "file_name": path.name,
-                    "message": f"视频录制完成。文件名：{path.name}；完整保存地址：{path}",
+            return {"ok": True, "media_type": "video", "file_path": str(path),
                     "recorded_duration_s": media["duration_s"], "frames": frames,
-                    "encoded_frames": media["frames"],
-                    "capture_started_at": capture_started_at,
-                    "capture_finished_at": capture_finished_at,
-                    "capture_elapsed_s": round(capture_finished - started, 3),
-                    "finalize_elapsed_s": round(time.monotonic() - capture_finished, 3),
                     "captured_at": _timestamp()}
         except Exception as exc:
             return {"ok": False, "code": "RECORD_CANCELLED" if cancel.is_set() else "RECORD_FAILED",
@@ -402,9 +392,6 @@ class VisionCapturePlugin:
                     result["cleanup_error"] = cleanup_error
             status = "completed" if result.get("ok") else (
                 "cancelled" if result.get("code") == "RECORD_CANCELLED" else "error")
-            result.update({"requested_duration_s": active["duration_s"],
-                           "queued_at": active["queued_at"], "completed_at": _timestamp(),
-                           "elapsed_s": round(time.monotonic() - active["queued_mono"], 3)})
             self._last_recording = {"action_id": active["action_id"], "status": status, "result": result}
             active["state"] = status
             active["finished"] = True
@@ -416,7 +403,7 @@ class VisionCapturePlugin:
                 self._active_recording = None
 
     def _start_video_recording(self, args):
-        requested = args.get("duration_s", min(5, self._max_duration_s))
+        requested = args.get("duration_s", 5)
         if type(requested) is not int or not 1 <= requested <= self._max_duration_s:
             return {"ok": False, "code": "INVALID_DURATION",
                     "message": f"duration_s must be an integer between 1 and {self._max_duration_s}"}
