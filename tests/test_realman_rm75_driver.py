@@ -159,6 +159,64 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         finally:
             self.plugin._gripper_lock.release()
 
+    def test_stop_waits_for_safe_terminal_state(self):
+        # SDK 无夹爪停止 API：stop 必须等命令走到安全终态（夹爪走完目标位）才返回，
+        # 且 ACP 如实上报 completed 而不是谎报 cancelled。
+        released = threading.Event()
+
+        class BlockingClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+
+            def command(self, method, *args):
+                released.wait(5.0)
+                return 0
+
+        plugin = self.device.GripperPlugin(BlockingClient(), {}, namespace="rm75")
+        plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        started = plugin.dispatch("set_position", {"position": 500, "confirm_motion": True})
+        stop_thread = threading.Thread(target=lambda: plugin.dispatch("stop", {}))
+        stop_thread.start()
+        time.sleep(0.1)
+        # 命令仍在途时 stop 不得返回
+        self.assertTrue(stop_thread.is_alive())
+        released.set()
+        stop_thread.join(5.0)
+        self.assertFalse(stop_thread.is_alive())
+        action_id, status, payload = self.acp_events[0]
+        self.assertEqual(started["action_id"], action_id)
+        self.assertEqual("completed", status)
+        self.assertTrue(payload["interrupted"])
+
+    def test_plugin_stop_waits_for_worker_before_teardown(self):
+        released = threading.Event()
+
+        class BlockingClient:
+            def __init__(self):
+                self.connected = True
+                self.motion_enabled = True
+
+            def command(self, method, *args):
+                released.wait(5.0)
+                return 0
+
+        plugin = self.device.GripperPlugin(BlockingClient(), {}, namespace="rm75")
+        plugin._acp_callback = lambda action_id, status, result: None
+        plugin.dispatch("set_position", {"position": 500, "confirm_motion": True})
+        self.assertTrue(plugin._worker_thread.is_alive())
+
+        stop_done = threading.Event()
+        threading.Thread(target=lambda: (plugin.stop(), stop_done.set()), daemon=True).start()
+        time.sleep(0.1)
+        self.assertFalse(stop_done.is_set())
+        released.set()
+        self.assertTrue(stop_done.wait(5.0))
+        self.assertFalse(plugin._worker_thread.is_alive())
+
     def test_canvas_lifecycle_actions(self):
         self.assertEqual({"state": "ready"}, self.plugin.dispatch("start", {}))
         self.assertEqual({"state": "idle"}, self.plugin.dispatch("stop", {}))

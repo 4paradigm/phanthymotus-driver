@@ -547,6 +547,7 @@ class RM75Plugin:
 GRIPPER_POSITION_MIN = 1   # SDK 契约：手爪开口位置 1~1000
 GRIPPER_POSITION_MAX = 1000
 GRIPPER_COMPLETION_TIMEOUT = 30  # SDK 阻塞模式下等待夹爪到位的秒数上限（ACP 完成窗口取 +10）
+GRIPPER_STOP_WAIT_MARGIN = 5     # stop 等待在途命令到达安全终态的额外余量
 
 
 def _gripper_position(value) -> int:
@@ -574,7 +575,8 @@ class GripperPlugin:
         self._gripper_lock = threading.Lock()
         self._action_lock = threading.Lock()
         self._active_action_id = None
-        self._cancelled = set()
+        self._interrupted = set()
+        self._worker_thread = None
         self._last_completion = None
 
     def get_tools(self):
@@ -608,10 +610,21 @@ class GripperPlugin:
         pass
 
     def stop(self):
+        # SDK 没有夹爪中途停止 API：请求停止时等待在途命令到达安全终态
+        # （夹爪走完目标位），再允许共享 SDK 连接被上层销毁。
+        self._mark_interrupted()
+        self._wait_for_worker()
+
+    def _mark_interrupted(self):
         with self._action_lock:
             action_id = self._active_action_id
             if action_id:
-                self._cancelled.add(action_id)
+                self._interrupted.add(action_id)
+
+    def _wait_for_worker(self):
+        thread = self._worker_thread
+        if thread is not None and thread.is_alive():
+            thread.join(GRIPPER_COMPLETION_TIMEOUT + GRIPPER_STOP_WAIT_MARGIN)
 
     def dispatch(self, action, args):
         if action == "info":
@@ -624,6 +637,8 @@ class GripperPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
+            self._mark_interrupted()
+            self._wait_for_worker()
             return {"state": "idle"}
         if action != "set_position":
             return None
@@ -637,29 +652,33 @@ class GripperPlugin:
         action_id = f"rm75_gripper_{uuid4().hex[:10]}"
         with self._action_lock:
             self._active_action_id = action_id
-        threading.Thread(
+            self._interrupted.discard(action_id)
+        self._worker_thread = threading.Thread(
             target=self._gripper_worker,
             args=(action_id, position),
             daemon=True,
-        ).start()
+        )
+        self._worker_thread.start()
         print(f"[rm75 ACP] {action_id}: started", flush=True)
         return {"state": "running", "action_id": action_id}
 
     def _gripper_worker(self, action_id, position):
         try:
-            # 阻塞模式：SDK 等待夹爪到位（上限 GRIPPER_COMPLETION_TIMEOUT 秒）后返回状态码
+            # 阻塞模式：SDK 等待夹爪到位（上限 GRIPPER_COMPLETION_TIMEOUT 秒）后返回状态码。
+            # SDK 没有夹爪中途停止 API，收到停止请求后夹爪仍会走完目标位 —— 这是唯一
+            # 确定的安全终态，因此如实上报 completed/target_reached，并附 interrupted 标记。
             self.client.command("rm_set_gripper_position", position, True, GRIPPER_COMPLETION_TIMEOUT)
-            if action_id in self._cancelled:
-                status, result = "cancelled", {"reason": "cancelled", "position": position}
-            else:
-                status, result = "completed", {"reason": "target_reached", "position": position}
+            interrupted = action_id in self._interrupted
+            status, result = "completed", {
+                "reason": "target_reached", "position": position, "interrupted": interrupted,
+            }
         except Exception as exc:
             status, result = "failed", {"reason": str(exc), "position": position}
         finally:
             with self._action_lock:
                 if self._active_action_id == action_id:
                     self._active_action_id = None
-                self._cancelled.discard(action_id)
+                self._interrupted.discard(action_id)
             self._gripper_lock.release()
             self._acp_callback(action_id, status, result)
 
