@@ -14,13 +14,14 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# module path -> child entry function spawned by the bundle
+# module path -> child entry functions spawned by the bundle
 CHILD_ENTRIES = {
-    "unitree/go2/rpc_proxy.py": "_rpc_worker",
-    "unitree/go2/device.py": "_speaker_worker",
-    "unitree/go2/realsense.py": "_capture",
-    "unitree/go2/spatial.py": "_slam_rpc_worker",
-    "unitree/go2/controlled_spatial.py": "_slam_rpc_worker",
+    "unitree/go2/rpc_proxy.py": ["_rpc_worker"],
+    "unitree/go2/device.py": ["_speaker_worker", "_run_camera_process"],
+    "unitree/go2/realsense.py": ["_capture"],
+    "unitree/go2/spatial.py": ["_slam_rpc_worker"],
+    "unitree/go2/controlled_spatial.py": ["_slam_rpc_worker"],
+    "unitree/go2/ext_devices.py": ["_run_ext_camera_process"],
 }
 
 
@@ -34,16 +35,17 @@ def installs_logsafe(func_node):
 
 class LogsafeChildInstallTest(unittest.TestCase):
     def test_every_multiprocessing_child_entry_installs_logsafe(self):
-        for rel_path, func_name in CHILD_ENTRIES.items():
-            with self.subTest(entry=f"{rel_path}:{func_name}"):
-                tree = ast.parse((ROOT / rel_path).read_text())
-                fn = next((node for node in ast.walk(tree)
-                           if isinstance(node, ast.FunctionDef) and node.name == func_name), None)
-                self.assertIsNotNone(fn, f"{func_name} not found in {rel_path}")
-                self.assertTrue(
-                    installs_logsafe(fn),
-                    f"{rel_path}:{func_name} must call logsafe.install(check_fd=False); "
-                    "a spawned child does not inherit the parent's protected sys.stdout")
+        for rel_path, func_names in CHILD_ENTRIES.items():
+            for func_name in func_names:
+                with self.subTest(entry=f"{rel_path}:{func_name}"):
+                    tree = ast.parse((ROOT / rel_path).read_text())
+                    fn = next((node for node in ast.walk(tree)
+                               if isinstance(node, ast.FunctionDef) and node.name == func_name), None)
+                    self.assertIsNotNone(fn, f"{func_name} not found in {rel_path}")
+                    self.assertTrue(
+                        installs_logsafe(fn),
+                        f"{rel_path}:{func_name} must call logsafe.install(check_fd=False); "
+                        "a spawned child does not inherit the parent's protected sys.stdout")
 
 
 if __name__ == "__main__":
