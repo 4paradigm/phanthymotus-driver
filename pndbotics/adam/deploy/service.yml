@@ -25,6 +25,7 @@ pndbotics-adam:
     # overrides so another deployment topology can replace them.
     - GRPC_HOST=10.10.20.127
     - GRPC_PORT=50051
+    - GRPC_API=rl
     - NVIDIA_VISIBLE_DEVICES=all
     - NVIDIA_DRIVER_CAPABILITIES=all
     - ZED_PYTHON_PATH=/opt/pyzed

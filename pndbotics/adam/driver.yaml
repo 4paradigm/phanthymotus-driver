@@ -6,7 +6,7 @@ hardware_model: "adam"
 image_name: pndbotics-adam
 port: 15722
 mcp_url: "http://localhost:15722/mcp"
-description: "PNDbotics Adam — 状态感知 + 实体急停 + ZED拍照 + 手部/步行/手臂控制 + 3D模型"
+description: "PNDbotics Adam — RL gRPC运动控制 + 状态感知 + 实体急停 + ZED拍照 + 手部/步行/手臂控制 + 3D模型"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.

@@ -4,7 +4,7 @@ ros_namespace: ""  # auto-detect from hostname
 # Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
 variant: "pro"
 
-# gRPC endpoint for locomotion control (PC1)
+# gRPC endpoint for RL locomotion control (fixed service port is 50051)
 grpc_host: "10.10.20.127"
 grpc_port: 50051
 
@@ -27,6 +27,7 @@ plugins:
     http_timeout_sec: 2
   loco:
     enabled: true
+    grpc_api: "rl"
   camera:
     enabled: true
     # The ZED Mini is connected to this Jetson. Keep the local SDK path; the
