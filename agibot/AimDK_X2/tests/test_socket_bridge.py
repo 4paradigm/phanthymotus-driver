@@ -8,6 +8,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -144,6 +145,45 @@ class SocketBridgeIntegrationTests(unittest.TestCase):
             ("resolved:std_msgs/msg/String", b"first-frame"),
             ("resolved:std_msgs/msg/String", b"second-frame"),
         ])
+
+    def test_concurrent_same_topic_clients_create_one_handler(self):
+        bridge, _ = import_socket_bridge()
+        server = bridge.Server()
+        original_handler = bridge.TopicHandler
+
+        class RacingHandler(original_handler):
+            created = 0
+
+            def __init__(self, *args, **kwargs):
+                type(self).created += 1
+                # Widen the race: without handlers_lock both client threads
+                # observe the missing topic and construct a handler.
+                time.sleep(0.05)
+                super().__init__(*args, **kwargs)
+
+        metadata = json.dumps({
+            "topic": "/agibot_x2/state/joints",
+            "msg_type": "std_msgs/msg/String",
+        }).encode()
+        clients = []
+        workers = []
+        with mock.patch.object(bridge, "TopicHandler", RacingHandler):
+            for _ in range(2):
+                client, accepted = socket.socketpair()
+                worker = threading.Thread(target=server.client, args=(accepted,))
+                worker.start()
+                clients.append(client)
+                workers.append(worker)
+            for client in clients:
+                client.sendall(struct.pack("<I", len(metadata)) + metadata)
+                client.shutdown(socket.SHUT_WR)
+            for client, worker in zip(clients, workers):
+                worker.join(timeout=3)
+                client.close()
+                self.assertFalse(worker.is_alive())
+
+        self.assertEqual(RacingHandler.created, 1)
+        self.assertEqual(list(server.handlers), ["/agibot_x2/state/joints"])
 
 
 if __name__ == "__main__":

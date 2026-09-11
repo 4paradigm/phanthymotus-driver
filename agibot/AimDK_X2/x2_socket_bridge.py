@@ -66,6 +66,7 @@ class Server:
         rclpy.init(context=self.context, domain_id=42)
         self.executor = rclpy.executors.MultiThreadedExecutor(context=self.context)
         self.handlers = {}
+        self.handlers_lock = threading.Lock()
         self.stop_event = threading.Event()
         os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
         try:
@@ -84,11 +85,12 @@ class Server:
                 return
             metadata = json.loads(metadata_raw)
             topic, type_name = metadata["topic"], metadata["msg_type"]
-            handler = self.handlers.get(topic)
-            if handler is None:
-                handler = self.handlers[topic] = TopicHandler(
-                    topic, type_name, self.context, self.executor
-                )
+            with self.handlers_lock:
+                handler = self.handlers.get(topic)
+                if handler is None:
+                    handler = self.handlers[topic] = TopicHandler(
+                        topic, type_name, self.context, self.executor
+                    )
             while not self.stop_event.is_set():
                 raw_len = _read_exact(conn, 4)
                 if raw_len is None:

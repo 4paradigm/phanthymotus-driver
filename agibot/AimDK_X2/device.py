@@ -461,8 +461,10 @@ class JointStatePlugin:
 
     def dispatch(self, action, args):
         topic_out = _stream_topic_out(self.nodes.streams["joint_state"])
+        if action == "start":
+            return {"state": "running", "topic_out": topic_out}
         if action == "stop":
-            return {"state": "running", "always_on": True, "topic_out": topic_out}
+            return {"state": "idle", "topic_out": topic_out}
         return {**self.nodes.joint_state_snapshot(), "topic_out": topic_out}
 
 
@@ -486,8 +488,10 @@ class JointsPlugin:
 
     def dispatch(self, action, args):
         topic_out = _stream_topic_out(self.nodes.streams["joints"])
+        if action == "start":
+            return {"state": "running", "topic_out": topic_out}
         if action == "stop":
-            return {"state": "running", "always_on": True, "topic_out": topic_out}
+            return {"state": "idle", "topic_out": topic_out}
         return {**self.nodes.skeleton_snapshot(), "topic_out": topic_out}
 
 

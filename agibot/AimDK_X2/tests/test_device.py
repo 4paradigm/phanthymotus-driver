@@ -397,12 +397,17 @@ class JointsPluginTests(unittest.TestCase):
         self.assertFalse(joints["available"])
         self.assertEqual(joints["joints"], [])
 
-    def test_stop_reports_always_on_instead_of_false_idle_state(self):
+    def test_lifecycle_reports_canvas_state_without_stopping_subscriptions(self):
         plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})
         for name in ("joint_state", "joints"):
-            result = find_plugin(plugins, name).dispatch("stop", {})
-            self.assertEqual(result["state"], "running")
-            self.assertTrue(result["always_on"])
+            plugin = find_plugin(plugins, name)
+            self.assertEqual(plugin.dispatch("start", {})["state"], "running")
+            self.assertEqual(plugin.dispatch("stop", {})["state"], "idle")
+
+        nodes = plugins[0].nodes
+        subscribed_topics = {topic for topic, _ in nodes.robot.subscriptions}
+        for area in device.JOINT_AREAS:
+            self.assertIn(f"/aima/hal/joint/{area}/state", subscribed_topics)
 
 
 class DispatchSmokeTests(unittest.TestCase):
