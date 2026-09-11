@@ -12,6 +12,10 @@ import threading
 import time
 from typing import Any
 
+from common import logsafe
+
+logsafe.install(check_fd=False)
+
 import rclpy
 from rclpy.context import Context
 from rclpy.node import Node
