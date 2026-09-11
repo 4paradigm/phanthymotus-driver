@@ -45,9 +45,10 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("RM_DRIVER_ENABLED=1", service)
         self.assertIn("RM_MOTION_ENABLED=1", service)
         self.assertIn("RM_ARM_IP=${RM75_ARM_IP:-192.168.1.18}", service)
-        self.assertNotIn("AGENT_CORE_CA_CERT", service)
+        # ACP 完成回调走 CA 校验的 TLS：必须挂载 Agent Core CA 并注入路径
+        self.assertIn("AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}", service)
         self.assertNotIn("AGENT_CORE_TOKEN", service)
-        self.assertNotIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
+        self.assertIn("${RM75_CA_DIR:-/opt/phanthy-motus/data}:/opt/phanthy-motus/data:ro", service)
         self.assertIn("network_mode: host", service)
         self.assertNotIn("privileged: true", service)
         self.assertNotIn("/dev:/dev", service)
@@ -232,6 +233,418 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.assertIn("name: gripper", manifest)
 
 
+class RealManRM75CartesianPluginTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = load_device()
+
+    FAST_SAFETY = {
+        "start_grace_seconds": 0.05,
+        "stall_timeout_seconds": 0.3,
+        "poll_interval_seconds": 0.05,
+        "progress_threshold_mm": 0.5,
+        "max_motion_seconds": 2.0,
+        "position_tolerance_mm": 5.0,
+        "euler_tolerance_deg": 2.0,
+        "max_speed_percent": 10,
+        "default_speed_percent": 5,
+    }
+
+    class FakeClient:
+        def __init__(self, pose_mm_deg=None):
+            self.calls = []
+            self.connected = True
+            self.motion_enabled = True
+            self.pose_mm_deg = list(pose_mm_deg or [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+        def command(self, method, *args):
+            self.calls.append((method, args))
+            return 0
+
+        def call(self, method):
+            self.calls.append((method,))
+            if method == "rm_get_current_arm_state":
+                x, y, z, rx, ry, rz = self.pose_mm_deg
+                return {"pose": [x / 1000.0, y / 1000.0, z / 1000.0,
+                                 math.radians(rx), math.radians(ry), math.radians(rz)],
+                        "joint": [0.0] * 7, "err": {}}
+            if method == "rm_get_arm_all_state":
+                return {"joint_err_code": [0] * 7, "err": {"err": []}, "joint_en_flag": [1] * 7}
+            raise RuntimeError(method)
+
+    def setUp(self):
+        self.client = self.FakeClient()
+        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {
+                "safety": dict(self.FAST_SAFETY),
+                "cartesian": {"enabled": True, "max_radius_mm": 610, "max_position_abs_mm": 610},
+            },
+            arm_plugin=self.arm, namespace="rm75",
+        )
+        self.acp_events = []
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+    def _wait_for(self, condition, timeout=3.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if condition():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _movel_args(self, **overrides):
+        args = {"x_mm": 100, "y_mm": 0, "z_mm": 0, "rx_deg": 90, "ry_deg": 0, "rz_deg": 0,
+                "speed_percent": 5, "confirm_motion": True}
+        args.update(overrides)
+        return args
+
+    def test_plugin_prefix_contract(self):
+        self.assertEqual("cartesian_control", self.device.CartesianPlugin.PREFIX)
+
+    def test_tool_schema_declares_safety_contract(self):
+        tools = self.plugin.get_tools()
+        self.assertEqual(1, len(tools))
+        self.assertEqual("cartesian_control", tools[0]["name"])
+        self.assertEqual("actuator", tools[0]["type"])
+        schema = tools[0]["inputSchema"]
+        self.assertIs(True, schema["x-is-dangerous"])
+        self.assertEqual(["movel", "move_offset", "movep"], schema["x-completion"]["actions"])
+        self.assertIn("confirm_motion", schema["properties"])
+        self.assertEqual(10, schema["properties"]["speed_percent"]["maximum"])
+        self.assertIn("movel", schema["x-action-params"])
+        self.assertIn("movep", schema["x-action-params"])
+        self.assertEqual(["tool"], schema["properties"]["frame_type"]["enum"])
+        self.assertIn("工具系偏移", tools[0]["description"])
+
+    def test_cartesian_motion_is_disabled_until_workspace_validation(self):
+        plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY)},
+            arm_plugin=self.arm, namespace="rm75",
+        )
+
+        with self.assertRaisesRegex(PermissionError, "pending supervised workspace validation"):
+            plugin.dispatch("movel", self._movel_args())
+
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+        self.assertFalse(plugin._motion_lock.locked())
+
+    def test_movel_converts_units_and_reports_completion(self):
+        result = self.plugin.dispatch("movel", self._movel_args())
+
+        self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("rm75_cart_"))
+        # 毫米/度 → 米/弧度转换后非阻塞下发（connect=0, block=0）
+        self.assertIn(
+            ("rm_movel", ([0.1, 0.0, 0.0, math.pi / 2, 0.0, 0.0], 5, 0, 0, 0)),
+            self.client.calls,
+        )
+        # 到位后 ACP 上报 completed
+        self.client.pose_mm_deg = [100.0, 0.0, 0.0, 90.0, 0.0, 0.0]
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        action_id, status, payload = self.acp_events[0]
+        self.assertEqual(result["action_id"], action_id)
+        self.assertEqual("completed", status)
+        self.assertLessEqual(payload["position_error_mm"], 5.0)
+        self.assertLessEqual(payload["euler_error_deg"], 2.0)
+
+    def test_move_offset_maps_frame_and_computes_target(self):
+        self.client.pose_mm_deg = [300.0, 0.0, 200.0, 0.0, 0.0, 0.0]
+        result = self.plugin.dispatch("move_offset", {
+            "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
+            "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
+            "frame_type": "tool", "speed_percent": 5, "confirm_motion": True,
+        })
+
+        self.assertEqual("running", result["state"])
+        # 工具坐标系 frame_type=1，偏移转换为米/弧度
+        self.assertIn(
+            ("rm_movel_offset", ([0.05, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 1, 0)),
+            self.client.calls,
+        )
+        self.client.pose_mm_deg = [350.0, 0.0, 200.0, 0.0, 0.0, 0.0]
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        _, status, payload = self.acp_events[0]
+        self.assertEqual("completed", status)
+        self.assertEqual([350.0, 0.0, 200.0, 0.0, 0.0, 0.0], payload["target_pose_mm_deg"])
+
+    def test_move_offset_rotated_tool_frame_transforms_target(self):
+        # reviewer 示例：90° yaw 下工具系 +X 偏移应沿基系 +Y 移动，监控目标必须经旋转变换
+        self.client.pose_mm_deg = [0.0, 0.0, 0.0, 0.0, 0.0, 90.0]
+        self.plugin.dispatch("move_offset", {
+            "dx_mm": 100, "dy_mm": 0, "dz_mm": 0,
+            "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
+            "frame_type": "tool", "speed_percent": 5, "confirm_motion": True,
+        })
+        self.client.pose_mm_deg = [0.0, 100.0, 0.0, 0.0, 0.0, 90.0]
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        _, status, payload = self.acp_events[0]
+        self.assertEqual("completed", status)
+        self.assertAlmostEqual(100.0, payload["target_pose_mm_deg"][1], places=3)
+        self.assertAlmostEqual(0.0, payload["target_pose_mm_deg"][0], places=3)
+
+    def test_work_frame_offset_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "frame_type must be 'tool'"):
+            self.plugin.dispatch("move_offset", {
+                "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
+                "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
+                "frame_type": "work", "speed_percent": 5, "confirm_motion": True,
+            })
+
+    def test_workspace_limits_reject_unreachable_poses(self):
+        # 位置半径、单轴绝对值、姿态角超出配置上限时在下发前拒绝
+        cases = [
+            {"x_mm": 1200, "y_mm": 0, "z_mm": 0, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
+            {"x_mm": 700, "y_mm": 700, "z_mm": 700, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
+            {"x_mm": 0, "y_mm": 0, "z_mm": 0, "rx_deg": 0, "ry_deg": 0, "rz_deg": 400},
+        ]
+        for pose in cases:
+            with self.subTest(pose=pose):
+                with self.assertRaisesRegex(ValueError, "exceeds"):
+                    self.plugin.dispatch("movel", {**pose, "speed_percent": 5, "confirm_motion": True})
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+
+    def test_movep_validates_every_waypoint(self):
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            self.plugin.dispatch("movep", {
+                "waypoints": [[100, 0, 0, 0, 0, 0], [2000, 0, 0, 0, 0, 0]],
+                "speed_percent": 5, "confirm_motion": True,
+            })
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+
+    def test_idle_lifecycle_stop_does_not_interrupt_joint_motion(self):
+        self.arm._active_action_id = "rm75_joint_active"
+
+        self.assertEqual({"state": "idle"}, self.plugin.dispatch("stop", {}))
+
+        self.assertNotIn("rm_set_arm_slow_stop", [entry[0] for entry in self.client.calls])
+        self.assertEqual("rm75_joint_active", self.arm._active_action_id)
+
+    def test_active_lifecycle_stop_requests_slow_stop(self):
+        with self.plugin._action_lock:
+            self.plugin._active_action_id = "rm75_cart_active"
+
+        self.assertEqual({"state": "idle"}, self.plugin.dispatch("stop", {}))
+
+        self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
+        self.assertIn("rm75_cart_active", self.plugin._cancelled)
+
+    def test_stop_joins_monitor_before_teardown(self):
+        # 容器关闭时 stop 必须等监控线程收尾（ACP 终态上报），再允许共享 SDK 销毁
+        released = threading.Event()
+
+        class SlowPoseClient(self.FakeClient):
+            def call(self, method):
+                if method == "rm_get_current_arm_state":
+                    if not released.is_set():
+                        released.wait(2.0)
+                return super().call(method)
+
+        self.client = SlowPoseClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}}, arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+        self.plugin.dispatch("movel", self._movel_args())
+        self.assertTrue(self.plugin._monitor_thread.is_alive())
+
+        stop_done = threading.Event()
+        threading.Thread(target=lambda: (self.plugin.stop(), stop_done.set()), daemon=True).start()
+        time.sleep(0.1)
+        self.assertFalse(stop_done.is_set())  # 监控未收尾前 stop 不得返回
+        released.set()
+        self.assertTrue(stop_done.wait(5.0))
+        self.assertFalse(self.plugin._monitor_thread.is_alive())
+        # 终态已上报（cancelled 或 completed，取决于取消与到位的先后）
+        self.assertEqual(1, len(self.acp_events))
+
+    def test_acp_complete_requires_ca_cert(self):
+        with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": ""}), \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            self.device._acp_complete("test-noca", "completed", {"reason": "x"}, "cartesian_control")
+        urlopen.assert_not_called()
+
+    def test_acp_complete_verifies_with_provided_ca(self):
+        real_ctx = ssl.create_default_context()
+        with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": "/tmp/ca.pem",
+                                          "AGENT_CORE_URL": "https://phanthy-motus:15678/"}), \
+                mock.patch("ssl.create_default_context") as mkctx, \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            mkctx.return_value = real_ctx
+            urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"action_id":"test-ca"}'
+            self.device._acp_complete("test-ca", "completed", {"reason": "x"}, "cartesian_control")
+        mkctx.assert_called_once_with(cafile="/tmp/ca.pem")
+        urlopen.assert_called_once()
+
+    def test_movep_chains_waypoints_with_connect_flags(self):
+        waypoints = [
+            [100, 0, 0, 0, 0, 0],
+            [100, 100, 0, 0, 0, 0],
+            [100, 100, 100, 0, 0, 0],
+        ]
+        result = self.plugin.dispatch("movep", {
+            "waypoints": waypoints, "speed_percent": 5, "confirm_motion": True,
+        })
+
+        self.assertEqual("running", result["state"])
+        movel_calls = [entry[1] for entry in self.client.calls if entry[0] == "rm_movel"]
+        self.assertEqual(3, len(movel_calls))
+        # rm_movel(pose, v, r, connect, block)：前 N-1 个点 connect=1（联合规划），末点 connect=0（立即执行）
+        self.assertEqual(1, movel_calls[0][3])
+        self.assertEqual(1, movel_calls[1][3])
+        self.assertEqual(0, movel_calls[2][3])
+        self.assertEqual([0.1, 0.1, 0.1, 0.0, 0.0, 0.0], movel_calls[2][0])
+
+    def test_monitor_stall_sends_slow_stop(self):
+        # 位姿一直不前进 → stall 检测触发受控停止并如实上报 motion_stalled
+        self.plugin.dispatch("movel", self._movel_args())
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1, timeout=5.0))
+        action_id, status, payload = self.acp_events[0]
+        self.assertEqual("error", status)
+        self.assertEqual("motion_stalled", payload["reason"])
+        self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
+
+    def test_stopmotion_cancels_and_slow_stops(self):
+        started = self.plugin.dispatch("movel", self._movel_args())
+        stop = self.plugin.dispatch("stopmotion", {})
+
+        self.assertEqual("stop_requested", stop["state"])
+        self.assertEqual(started["action_id"], stop["action_id"])
+        self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        action_id, status, payload = self.acp_events[0]
+        self.assertEqual(started["action_id"], action_id)
+        self.assertEqual("cancelled", status)
+        self.assertEqual("stopmotion", payload["reason"])
+
+    def test_submission_race_with_stopmotion_orders_slow_stop_after_submit(self):
+        # 竞态回归：急停必须等下发完成才能拿到 _action_lock —— SDK 调用顺序
+        # rm_movel 在前、rm_set_arm_slow_stop 在后，监控如实上报 cancelled。
+        gate = threading.Event()
+
+        class GatedClient(self.FakeClient):
+            def command(self, method, *args):
+                if method == "rm_movel" and not gate.is_set():
+                    gate.wait(2.0)
+                return super().command(method, *args)
+
+        self.client = GatedClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}}, arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        mover = threading.Thread(target=lambda: self.plugin.dispatch("movel", self._movel_args()))
+        mover.start()
+        time.sleep(0.1)  # 让 movel 卡在 rm_movel 下发过程中
+        stop_done = threading.Event()
+        stopper = threading.Thread(target=lambda: (self.plugin.dispatch("stopmotion", {}), stop_done.set()))
+        stopper.start()
+        time.sleep(0.1)
+        self.assertFalse(stop_done.is_set())  # 下发完成前急停不得返回
+        gate.set()
+        stopper.join(5.0)
+        mover.join(5.0)
+        self.assertTrue(stop_done.is_set())
+        order = [entry[0] for entry in self.client.calls]
+        self.assertLess(order.index("rm_movel"), order.index("rm_set_arm_slow_stop"))
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        _, status, payload = self.acp_events[0]
+        self.assertEqual("cancelled", status)
+
+    def test_pose_query_failure_submits_nothing(self):
+        # 位姿查询在下发之前：查询失败时不得下发任何运动命令、不得启动监控
+        class NoPoseClient(self.FakeClient):
+            def call(self, method):
+                if method == "rm_get_current_arm_state":
+                    raise RuntimeError("pose query failed")
+                return super().call(method)
+
+        self.client = NoPoseClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}}, arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "pose query failed"):
+            self.plugin.dispatch("movel", self._movel_args())
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+        self.assertEqual([], self.acp_events)
+        self.assertFalse(self.plugin._motion_lock.locked())  # 运动锁已释放
+
+    def test_arrival_device_mismatch_error_is_actionable(self):
+        class MismatchClient(self.FakeClient):
+            def command(self, method, *args):
+                if method in ("rm_movel", "rm_movel_offset"):
+                    raise RuntimeError("rm_movel failed with RealMan SDK code -4")
+                return super().command(method, *args)
+
+        self.client = MismatchClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}}, arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "到位设备"):
+            self.plugin.dispatch("movel", self._movel_args())
+        self.assertEqual([], self.acp_events)
+        self.assertFalse(self.plugin._motion_lock.locked())
+
+    def test_motion_guards(self):
+        self.client.motion_enabled = False
+        with self.assertRaisesRegex(PermissionError, "motion is locked"):
+            self.plugin.dispatch("movel", self._movel_args())
+        self.client.motion_enabled = True
+
+        with self.assertRaisesRegex(ValueError, "confirm_motion must be true"):
+            self.plugin.dispatch("movel", self._movel_args(confirm_motion=False))
+
+        for bad_speed in (0, 11):
+            with self.subTest(speed=bad_speed):
+                with self.assertRaisesRegex(ValueError, "speed_percent"):
+                    self.plugin.dispatch("movel", self._movel_args(speed_percent=bad_speed))
+
+        with self.assertRaisesRegex(ValueError, "x_mm must be a number"):
+            self.plugin.dispatch("movel", self._movel_args(x_mm="bad"))
+
+        with self.assertRaisesRegex(ValueError, "waypoint 0"):
+            self.plugin.dispatch("movep", {
+                "waypoints": [[1, 2, 3]], "speed_percent": 5, "confirm_motion": True,
+            })
+
+    def test_concurrent_motion_with_joint_control_is_rejected(self):
+        self.arm._motion_lock.acquire()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "another motion is active"):
+                self.plugin.dispatch("movel", self._movel_args())
+        finally:
+            self.arm._motion_lock.release()
+
+    def test_info_returns_motion_status(self):
+        info = self.plugin.dispatch("info", {})
+        self.assertEqual("ready", info["state"])
+        self.assertIsNone(info["active_action_id"])
+        self.assertEqual(10, info["max_speed_percent"])
+
+    def test_cartesian_card_is_advertised(self):
+        manifest = (DRIVER / "driver.yaml").read_text()
+        self.assertIn("name: cartesian_control", manifest)
+
+
 class RealManRM75SDKClientTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -391,18 +804,30 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "code -2"):
             client.call_dict("rm_get_controller_state")
 
+    def test_joint_acp_requires_ca_cert(self):
+        client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+        plugin = self.device.RM75Plugin(client, {})
+        with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": ""}, clear=True), \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            plugin._acp_callback("action-noca", "completed", {"max_error_deg": 0.1})
+        urlopen.assert_not_called()
+        completion = plugin._motion_status()["last_completion"]
+        self.assertEqual("failed", completion["callback"])
+        self.assertEqual("AGENT_CORE_CA_CERT is required", completion["callback_error"])
+
     def test_acp_posts_standard_completion_from_worker_context(self):
         client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
         plugin = self.device.RM75Plugin(client, {})
-        context = mock.Mock()
+        context = ssl.create_default_context()
         with mock.patch.dict(os.environ, {
                 "AGENT_CORE_URL": "https://phanthy-motus:15678",
+                "AGENT_CORE_CA_CERT": "/tmp/ca.pem",
             }, clear=True), \
                 mock.patch("ssl.create_default_context", return_value=context) as create_context, \
                 mock.patch("urllib.request.urlopen") as urlopen:
             urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"action_id":"action-2"}'
             plugin._acp_callback("action-2", "completed", {"max_error_deg": 0.1})
-            create_context.assert_called_once_with()
+            create_context.assert_called_once_with(cafile="/tmp/ca.pem")
             urlopen.assert_called_once()
             acp_call = urlopen.call_args
             self.assertEqual(
@@ -410,8 +835,8 @@ class RealManRM75SDKClientTests(unittest.TestCase):
                 acp_call.args[0].full_url,
             )
             self.assertIs(context, acp_call.kwargs["context"])
-            self.assertIs(False, context.check_hostname)
-            self.assertEqual(ssl.CERT_NONE, context.verify_mode)
+            self.assertTrue(context.check_hostname)
+            self.assertEqual(ssl.CERT_REQUIRED, context.verify_mode)
             request_payload = json.loads(acp_call.args[0].data)
             self.assertEqual("action-2", request_payload["action_id"])
             self.assertEqual("completed", request_payload["status"])
@@ -427,7 +852,9 @@ class RealManRM75SDKClientTests(unittest.TestCase):
             with self.subTest(reply=reply):
                 plugin, _ = self._motion_plugin()
                 callback = self.device.RM75Plugin._acp_callback
-                with mock.patch("urllib.request.urlopen") as urlopen:
+                with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": "/tmp/ca.pem"}), \
+                        mock.patch("ssl.create_default_context"), \
+                        mock.patch("urllib.request.urlopen") as urlopen:
                     urlopen.return_value.__enter__.return_value.read.return_value = reply
                     callback(plugin, "test-ack", "completed", {"actual_degree": [0]*7})
                 info = plugin._motion_status()["last_completion"]
@@ -438,7 +865,9 @@ class RealManRM75SDKClientTests(unittest.TestCase):
 
     def test_acp_transport_error_preserves_terminal_status(self):
         plugin, _ = self._motion_plugin()
-        with mock.patch("urllib.request.urlopen", side_effect=TimeoutError("timeout")):
+        with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": "/tmp/ca.pem"}), \
+                mock.patch("ssl.create_default_context"), \
+                mock.patch("urllib.request.urlopen", side_effect=TimeoutError("timeout")):
             self.device.RM75Plugin._acp_callback(plugin, "test-timeout", "error", {"reason": "motion_stalled"})
         last = plugin._motion_status()["last_completion"]
         self.assertEqual("error", last["status"])
@@ -449,7 +878,10 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         for status in ("error", "cancelled"):
             with self.subTest(status=status):
                 plugin, _ = self._motion_plugin()
-                with mock.patch.dict(os.environ, {"AGENT_CORE_URL": "https://localhost:15678/"}), mock.patch("urllib.request.urlopen") as urlopen:
+                with mock.patch.dict(os.environ, {
+                        "AGENT_CORE_URL": "https://localhost:15678/",
+                        "AGENT_CORE_CA_CERT": "/tmp/ca.pem",
+                    }), mock.patch("ssl.create_default_context"), mock.patch("urllib.request.urlopen") as urlopen:
                     urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"action_id":"test-error"}'
                     self.device.RM75Plugin._acp_callback(plugin, "test-error", status, {"reason": "stopmotion", "actual_degree": [0]*7})
                 self.assertEqual(1, urlopen.call_count)

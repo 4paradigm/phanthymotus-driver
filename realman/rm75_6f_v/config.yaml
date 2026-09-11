@@ -13,6 +13,13 @@ safety:
   stall_timeout_seconds: 10
   progress_threshold_deg: 0.05
   max_motion_seconds: 300
+cartesian:
+  # 完成真机标定并配置安装现场禁入区之前，不允许笛卡尔运动下发。
+  enabled: false
+  # RM75-6F 标称最大工作半径；真机启用前仍须按安装环境进一步收紧。
+  max_radius_mm: 610
+  max_position_abs_mm: 610
+  max_euler_abs_deg: 360
 ros:
   robot_domain_id: 42
   core_domain_id: 42

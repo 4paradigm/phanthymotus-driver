@@ -368,49 +368,15 @@ class RM75Plugin:
 
     def _acp_callback(self, action_id: str, status: str, result: dict):
         """POST action completion to Agent Core."""
-        import urllib.request as _urllib
-        import ssl as _ssl
-        import json
-        import os as _os
-
-        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-        ctx = _ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
-        # Keep full motion evidence in info; the completion event stays small.
-        summary = {}
-        if status == "completed":
-            summary = {"reason": "target_reached"}
-        elif "reason" in result:
-            summary = {"reason": str(result["reason"])[:240]}
-        body = {"action_id": action_id, "status": status, "result": summary,
-                "tool": self.PREFIX, "ts": time.time()}
         record = {"action_id": action_id, "status": status, "result": dict(result),
                   "callback": "sending"}
         with self._action_lock:
             self._last_completion = record
-        try:
-            req = _urllib.Request(
-                f"{agent_core_url.rstrip('/')}/api/acp/complete",
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with _urllib.urlopen(req, timeout=5, context=ctx) as response:
-                acknowledgement = json.loads(response.read())
-            if (not isinstance(acknowledgement, dict)
-                    or acknowledgement.get("ok") is not True
-                    or acknowledgement.get("action_id") != action_id):
-                raise RuntimeError("Agent Core did not acknowledge this action_id")
-            with self._action_lock:
-                record["callback"] = "accepted"
-            # Acceptance proves receipt, not that Core matched a pending action.
-            print(f"[rm75 ACP] {action_id} {status}: accepted", flush=True)
-        except Exception as exc:
-            with self._action_lock:
-                record["callback"] = "failed"
-                record["callback_error"] = str(exc)
-            print(f"[rm75 ACP] {action_id} {status}: callback failed: {exc}", flush=True)
+        callback, error = _acp_complete(action_id, status, result, self.PREFIX)
+        with self._action_lock:
+            record["callback"] = callback
+            if error is not None:
+                record["callback_error"] = error
 
     def _monitor_motion(self, action_id, start, target, max_duration):
         started = time.monotonic()
@@ -548,6 +514,7 @@ GRIPPER_POSITION_MIN = 1   # SDK 契约：手爪开口位置 1~1000
 GRIPPER_POSITION_MAX = 1000
 GRIPPER_COMPLETION_TIMEOUT = 30  # SDK 阻塞模式下等待夹爪到位的秒数上限（ACP 完成窗口取 +10）
 GRIPPER_STOP_WAIT_MARGIN = 5     # stop 等待在途命令到达安全终态的额外余量
+CARTESIAN_STOP_JOIN_MARGIN = 10  # 笛卡尔 stop 等待监控线程收尾的额外余量（秒）
 
 
 def _gripper_position(value) -> int:
@@ -683,52 +650,493 @@ class GripperPlugin:
             self._acp_callback(action_id, status, result)
 
     def _acp_callback(self, action_id, status, result):
-        """POST action completion to Agent Core（与 RM75Plugin 同协议）。
-
-        TLS 校验关闭是有意为之：本驱动的部署契约不带 CA 证书
-        （见 deploy/service.yml 与镜像契约测试对 AGENT_CORE_CA_CERT 的断言），
-        与 RM75Plugin._acp_callback 及 common/vendor_runtime.start_registration
-        的既有实现保持一致。
-        """
-        import json
-        import os as _os
-        import ssl as _ssl
-        import urllib.request as _urllib
-
-        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-        ctx = _ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
-        summary = {}
-        if status == "completed":
-            summary = {"reason": "target_reached"}
-        elif "reason" in result:
-            summary = {"reason": str(result["reason"])[:240]}
-        body = {"action_id": action_id, "status": status, "result": summary,
-                "tool": self.PREFIX, "ts": time.time()}
+        """记录完成事件并上报 Agent Core（网络部分见共享的 _acp_complete）。"""
         with self._action_lock:
             self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
-        try:
-            req = _urllib.Request(
-                f"{agent_core_url.rstrip('/')}/api/acp/complete",
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
+        _acp_complete(action_id, status, result, self.PREFIX)
+
+
+def _acp_complete(action_id, status, result, tool_name):
+    """POST action completion to Agent Core（与 RM75Plugin 同协议）。
+
+    TLS 证书校验保持开启：部署通过 AGENT_CORE_CA_CERT 挂载 Agent Core 的 CA
+    （见 deploy/service.yml），缺失时不发送 —— 不回退到关闭校验。
+    """
+    import json
+    import os as _os
+    import ssl as _ssl
+    import urllib.request as _urllib
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
+    if not ca_cert:
+        error = "AGENT_CORE_CA_CERT is required"
+        print(f"[rm75 ACP] {action_id} {status}: callback failed: {error}", flush=True)
+        return "failed", error
+    ctx = _ssl.create_default_context(cafile=ca_cert)
+    summary = {}
+    if status == "completed":
+        summary = {"reason": "target_reached"}
+    elif "reason" in result:
+        summary = {"reason": str(result["reason"])[:240]}
+    body = {"action_id": action_id, "status": status, "result": summary,
+            "tool": tool_name, "ts": time.time()}
+    try:
+        req = _urllib.Request(
+            f"{agent_core_url.rstrip('/')}/api/acp/complete",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _urllib.urlopen(req, timeout=5, context=ctx) as response:
+            acknowledgement = json.loads(response.read())
+        if (not isinstance(acknowledgement, dict)
+                or acknowledgement.get("ok") is not True
+                or acknowledgement.get("action_id") != action_id):
+            raise RuntimeError("Agent Core did not acknowledge this action_id")
+        print(f"[rm75 ACP] {action_id} {status}: accepted", flush=True)
+        return "accepted", None
+    except Exception as exc:
+        print(f"[rm75 ACP] {action_id} {status}: callback failed: {exc}", flush=True)
+        return "failed", str(exc)
+
+
+class CartesianPlugin:
+    """笛卡尔空间运动卡片：movel 直线 / move_offset 偏移 / movep 多路径点轨迹。
+
+    位姿单位面向画布：位置毫米、姿态度（SDK 内部为米/弧度，转换封装在插件内）。
+    与 joint_control 共享运动锁（同一时刻只允许一个运动流），安全守卫、
+    stall 检测与 ACP 异步完成与 joint_control 保持一致。
+    """
+
+    PREFIX = "cartesian_control"
+
+    def __init__(self, client, config, namespace="rm75", ros2=None, arm_plugin=None):
+        self.client = client
+        self._arm = arm_plugin  # 共享运动锁与 preflight
+        self._motion_lock = arm_plugin._motion_lock if arm_plugin is not None else threading.Lock()
+        self._action_lock = threading.Lock()
+        self._active_action_id = None
+        self._cancelled = set()
+        self._monitor_thread = None
+        self._last_completion = None
+        safety = config.get("safety", {})
+        self.max_speed_percent = min(int(safety.get("max_speed_percent", 10)), 10)
+        self.default_speed_percent = min(int(safety.get("default_speed_percent", 5)), self.max_speed_percent)
+        self.position_tolerance_mm = float(safety.get("position_tolerance_mm", 5.0))
+        self.euler_tolerance_deg = float(safety.get("euler_tolerance_deg", 2.0))
+        self.poll_interval_seconds = float(safety.get("poll_interval_seconds", 0.2))
+        self.start_grace_seconds = float(safety.get("start_grace_seconds", 2.0))
+        self.stall_timeout_seconds = float(safety.get("stall_timeout_seconds", 10.0))
+        self.progress_threshold_mm = float(safety.get("progress_threshold_mm", 1.0))
+        self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
+        cartesian = config.get("cartesian", {})
+        self.cartesian_enabled = cartesian.get("enabled", False) is True
+        self.max_radius_mm = float(cartesian.get("max_radius_mm", 610.0))
+        self.max_position_abs_mm = float(cartesian.get("max_position_abs_mm", 610.0))
+        self.max_euler_abs_deg = float(cartesian.get("max_euler_abs_deg", 360.0))
+
+    def get_tools(self):
+        position_props = {
+            field: {"type": "number", "description": desc}
+            for field, desc in (
+                ("x_mm", "目标位置 X，毫米（基座坐标系）"),
+                ("y_mm", "目标位置 Y，毫米（基座坐标系）"),
+                ("z_mm", "目标位置 Z，毫米（基座坐标系）"),
+                ("rx_deg", "目标姿态 Roll，度"),
+                ("ry_deg", "目标姿态 Pitch，度"),
+                ("rz_deg", "目标姿态 Yaw，度"),
             )
-            with _urllib.urlopen(req, timeout=5, context=ctx) as response:
-                acknowledgement = json.loads(response.read())
-            if (not isinstance(acknowledgement, dict)
-                    or acknowledgement.get("ok") is not True
-                    or acknowledgement.get("action_id") != action_id):
-                raise RuntimeError("Agent Core did not acknowledge this action_id")
-            print(f"[rm75 ACP] {action_id} {status}: accepted", flush=True)
+        }
+        offset_props = {
+            field: {"type": "number", "description": desc}
+            for field, desc in (
+                ("dx_mm", "位置偏移 X，毫米"),
+                ("dy_mm", "位置偏移 Y，毫米"),
+                ("dz_mm", "位置偏移 Z，毫米"),
+                ("drx_deg", "姿态偏移 Roll，度"),
+                ("dry_deg", "姿态偏移 Pitch，度"),
+                ("drz_deg", "姿态偏移 Yaw，度"),
+            )
+        }
+        properties = {
+            **position_props,
+            **offset_props,
+            "frame_type": {"type": "string", "enum": ["tool"], "default": "tool",
+                           "description": "偏移参考坐标系：目前仅支持 tool 工具系（工作坐标系偏移需控制器激活坐标系位姿，暂不开放）"},
+            "waypoints": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"type": "number"}},
+                "description": "路径点序列，每个点 [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]",
+            },
+            "speed_percent": {"type": "integer", "minimum": 1, "maximum": self.max_speed_percent,
+                              "default": self.default_speed_percent},
+            "confirm_motion": {"type": "boolean", "description": "Must be true for every movement request"},
+        }
+        schema = action_schema(
+            {
+                "movel": (["x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg", "speed_percent", "confirm_motion"],
+                          "笛卡尔直线运动到绝对位姿（位置毫米、姿态度，相对基座坐标系）"),
+                "move_offset": (["dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg", "frame_type", "speed_percent", "confirm_motion"],
+                                "沿工具坐标系做直线偏移（相对当前位姿）"),
+                "movep": (["waypoints", "speed_percent", "confirm_motion"],
+                          "依次经过多个路径点的轨迹运动"),
+                "stopmotion": ([], "请求受控减速停止"),
+                "info": ([], "读取运动状态与安全配置"),
+            },
+            properties,
+        )
+        schema["x-completion"] = {"actions": ["movel", "move_offset", "movep"], "timeout": 305}
+        schema["x-hooks"] = {"on_interrupt_motion": {"action": "stopmotion"}}
+        schema["x-is-dangerous"] = True
+        return [
+            tool(
+                "cartesian_control",
+                "actuator",
+                "笛卡尔空间运动：直线(movel)、工具系偏移(move_offset)、多路径点轨迹(movep)。位置毫米、姿态度。",
+                schema,
+            )
+        ]
+
+    def start(self):
+        pass
+
+    def stop(self):
+        with self._action_lock:
+            action_id = self._active_action_id
+            if action_id:
+                self._cancelled.add(action_id)
+        if action_id and self.client.connected:
+            try:
+                self.client.command("rm_set_arm_slow_stop")
+            except Exception as exc:
+                print(f"[rm75] cartesian shutdown stop failed: {exc}", flush=True)
+        # 监控线程在下一轮询看到 cancelled 后立即收尾；join 保证共享 SDK 连接
+        # 被上层（RM75Plugin.stop）销毁前，ACP 终态已上报完成。
+        thread = self._monitor_thread
+        if thread is not None and thread.is_alive():
+            thread.join(self.poll_interval_seconds * 5 + CARTESIAN_STOP_JOIN_MARGIN)
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            self._stop_motion()
+            return {"state": "idle"}
+        if action == "info":
+            return self._motion_status()
+        if action == "stopmotion":
+            return self._stop_motion()
+        if action in ("movel", "move_offset", "movep"):
+            return self._start_cartesian(action, args)
+        return None
+
+    def _motion_status(self):
+        with self._action_lock:
+            active_action_id = self._active_action_id
+            last = self._last_completion
+        return {
+            "state": "moving" if active_action_id else "ready",
+            "active_action_id": active_action_id,
+            "last_completion": jsonable(last),
+            "motion_enabled": self.client.motion_enabled and self.cartesian_enabled,
+            "read_only": not (self.client.motion_enabled and self.cartesian_enabled),
+            "cartesian_enabled": self.cartesian_enabled,
+            "position_tolerance_mm": self.position_tolerance_mm,
+            "euler_tolerance_deg": self.euler_tolerance_deg,
+            "max_speed_percent": self.max_speed_percent,
+            "max_radius_mm": self.max_radius_mm,
+            "max_position_abs_mm": self.max_position_abs_mm,
+            "max_euler_abs_deg": self.max_euler_abs_deg,
+        }
+
+    def _start_cartesian(self, motion_type, args):
+        if not self.cartesian_enabled:
+            raise PermissionError(
+                "cartesian motion is disabled pending supervised workspace validation; "
+                "set cartesian.enabled=true only after configuring installation-specific limits"
+            )
+        if not self.client.motion_enabled:
+            raise PermissionError("motion is locked; set RM_MOTION_ENABLED=1 only for supervised hardware testing")
+        if args.get("confirm_motion") is not True:
+            raise ValueError("confirm_motion must be true")
+        speed_percent = int(args.get("speed_percent", self.default_speed_percent))
+        if not 1 <= speed_percent <= self.max_speed_percent:
+            raise ValueError(f"speed_percent must be within 1~{self.max_speed_percent}")
+        if not self._motion_lock.acquire(blocking=False):
+            raise RuntimeError(f"another motion is active: {self._active_action_id}")
+        action_id = f"rm75_cart_{uuid4().hex[:10]}"
+        # 在 _action_lock 内完成 preflight → 位姿查询 → 目标计算 → 命令下发：
+        # stopmotion 必须等下发完成后才能拿到锁，不会出现「急停先到、轨迹后发」的竞态；
+        # 且任何一步失败都发生在命令下发之前或下发当下，不会留下无人监控的在途运动。
+        try:
+            with self._action_lock:
+                self._active_action_id = action_id
+                self._cancelled.discard(action_id)
+                try:
+                    if self._arm is not None:
+                        self._arm._preflight()
+                    current = self._current_pose_mm_deg()
+                    target = self._plan_target(motion_type, args, current)
+                    max_duration = self._motion_deadline_seconds(current, target, speed_percent)
+                    self._submit(motion_type, args, speed_percent)
+                except Exception:
+                    self._active_action_id = None
+                    raise
+        except Exception:
+            self._motion_lock.release()
+            raise
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_cartesian,
+            args=(action_id, target, max_duration),
+            daemon=True,
+        )
+        self._monitor_thread.start()
+        print(f"[rm75 ACP] {action_id}: started ({motion_type})", flush=True)
+        return {"state": "running", "action_id": action_id}
+
+    def _plan_target(self, motion_type, args, current):
+        """纯计算：校验参数并返回监控用的基系绝对目标位姿（毫米/度），不做任何 SDK 调用。"""
+        if motion_type == "movel":
+            target = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
+        elif motion_type == "move_offset":
+            offset_mm_deg = self._pose_from_fields(args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"))
+            frame = args.get("frame_type", "tool")
+            if frame != "tool":
+                # 工作坐标系偏移的监控目标需要控制器当前激活的工作坐标系位姿，
+                # SDK 未提供无歧义的查询接口 —— 先只支持工具系（最常用的直觉语义）。
+                raise ValueError("frame_type must be 'tool'（工作坐标系偏移暂不支持）")
+            # 工具系偏移 ≠ 基系直接相加：平移需按当前工具姿态旋转、姿态右乘组合
+            target = self._compose_tool_offset(current, offset_mm_deg)
+        elif motion_type == "movep":
+            waypoints = args.get("waypoints")
+            if not isinstance(waypoints, list) or not 1 <= len(waypoints) <= 20:
+                raise ValueError("waypoints must be a list of 1~20 poses")
+            poses = [self._waypoint_pose(item, index) for index, item in enumerate(waypoints)]
+            # 路径上的每个点都要在工作空间内，而不是只校验末点
+            for pose in poses:
+                self._validate_workspace(pose)
+            return poses[-1]
+        else:
+            raise ValueError(f"unknown motion type: {motion_type}")
+        self._validate_workspace(target)
+        return target
+
+    def _validate_workspace(self, pose_mm_deg):
+        x, y, z, rx, ry, rz = pose_mm_deg
+        radius = math.sqrt(x * x + y * y + z * z)
+        if radius > self.max_radius_mm:
+            raise ValueError(
+                f"pose radius {radius:.0f} mm exceeds cartesian.max_radius_mm {self.max_radius_mm:g}")
+        for value, label in ((x, "x"), (y, "y"), (z, "z")):
+            if abs(value) > self.max_position_abs_mm:
+                raise ValueError(
+                    f"{label} {value:.0f} mm exceeds cartesian.max_position_abs_mm {self.max_position_abs_mm:g}")
+        for value, label in ((rx, "rx"), (ry, "ry"), (rz, "rz")):
+            if abs(value) > self.max_euler_abs_deg:
+                raise ValueError(
+                    f"{label} {value:.0f} deg exceeds cartesian.max_euler_abs_deg {self.max_euler_abs_deg:g}")
+
+    def _submit(self, motion_type, args, speed_percent):
+        """下发 SDK 运动命令（非阻塞）。-4 表示控制器到位设备模式不匹配，转成可操作错误。"""
+        try:
+            if motion_type == "movel":
+                pose = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
+                self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 0, 0)
+            elif motion_type == "move_offset":
+                offset = self._pose_from_fields(args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"))
+                self.client.command("rm_movel_offset", self._to_sdk_pose(offset), speed_percent, 0, 0, 1, 0)
+            elif motion_type == "movep":
+                waypoints = args.get("waypoints")
+                poses = [self._waypoint_pose(item, index) for index, item in enumerate(waypoints)]
+                # 前 N-1 个点 connect=1（与下一条轨迹联合规划），末点 connect=0 立即执行
+                for pose in poses[:-1]:
+                    self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 1, 0)
+                self.client.command("rm_movel", self._to_sdk_pose(poses[-1]), speed_percent, 0, 0, 0)
+            else:
+                raise ValueError(f"unknown motion type: {motion_type}")
+        except RuntimeError as exc:
+            if "code -4" in str(exc):
+                raise RuntimeError(
+                    "控制器到位设备模式不是笛卡尔（SDK -4）：请在示教器/控制箱把到位设备切到笛卡尔模式后重试"
+                ) from exc
+            raise
+
+    def _pose_from_fields(self, args, fields):
+        pose = []
+        for field in fields:
+            value = args.get(field)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{field} must be a number") from exc
+            if not math.isfinite(numeric):
+                raise ValueError(f"{field} must be finite")
+            pose.append(numeric)
+        return pose
+
+    def _waypoint_pose(self, item, index):
+        if not isinstance(item, (list, tuple)) or len(item) != 6:
+            raise ValueError(f"waypoint {index} must have exactly 6 numbers")
+        try:
+            numeric = [float(value) for value in item]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"waypoint {index} must contain numbers") from exc
+        if not all(math.isfinite(value) for value in numeric):
+            raise ValueError(f"waypoint {index} must be finite")
+        return numeric
+
+    @staticmethod
+    def _to_sdk_pose(pose_mm_deg):
+        x, y, z, rx, ry, rz = pose_mm_deg
+        return [x / 1000.0, y / 1000.0, z / 1000.0,
+                math.radians(rx), math.radians(ry), math.radians(rz)]
+
+    def _current_pose_mm_deg(self):
+        state = self.client.call("rm_get_current_arm_state")
+        pose = [float(value) for value in state.get("pose", [])]
+        if len(pose) != 6 or not all(math.isfinite(value) for value in pose):
+            raise RuntimeError(f"invalid arm pose: {pose!r}")
+        x, y, z, rx, ry, rz = pose
+        return [x * 1000.0, y * 1000.0, z * 1000.0,
+                math.degrees(rx), math.degrees(ry), math.degrees(rz)]
+
+    @staticmethod
+    def _pose_error(current, target):
+        position_error = max(abs(a - b) for a, b in zip(current[:3], target[:3]))
+        euler_error = max(abs((a - b + 180.0) % 360.0 - 180.0) for a, b in zip(current[3:], target[3:]))
+        return position_error, euler_error
+
+    @staticmethod
+    def _euler_to_matrix(rx_deg, ry_deg, rz_deg):
+        """ZYX 欧拉角（度）→ 旋转矩阵，R = Rz·Ry·Rx。"""
+        rx, ry, rz = math.radians(rx_deg), math.radians(ry_deg), math.radians(rz_deg)
+        cx, sx = math.cos(rx), math.sin(rx)
+        cy, sy = math.cos(ry), math.sin(ry)
+        cz, sz = math.cos(rz), math.sin(rz)
+        return [
+            [cy * cz, cz * sx * sy - cx * sz, cx * cz * sy + sx * sz],
+            [cy * sz, cx * cz + sx * sy * sz, -cz * sx + cx * sy * sz],
+            [-sy, cy * sx, cx * cy],
+        ]
+
+    @staticmethod
+    def _matrix_to_euler(matrix):
+        sy = max(-1.0, min(1.0, -matrix[2][0]))
+        ry = math.degrees(math.asin(sy))
+        if abs(sy) < 0.999999:
+            rx = math.degrees(math.atan2(matrix[2][1], matrix[2][2]))
+            rz = math.degrees(math.atan2(matrix[1][0], matrix[0][0]))
+        else:
+            rz = 0.0
+            rx = math.degrees(math.atan2(-matrix[0][1], matrix[1][1]))
+        return [rx, ry, rz]
+
+    @staticmethod
+    def _mat_mul(left, right):
+        return [[sum(left[i][k] * right[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+    @staticmethod
+    def _mat_vec(matrix, vector):
+        return [sum(matrix[i][k] * vector[k] for k in range(3)) for i in range(3)]
+
+    @classmethod
+    def _compose_tool_offset(cls, current_mm_deg, offset_mm_deg):
+        """工具系偏移 → 基系绝对目标：平移按当前工具姿态旋转，姿态右乘组合。"""
+        cx, cy, cz, crx, cry, crz = current_mm_deg
+        dx, dy, dz, drx, dry, drz = offset_mm_deg
+        r_cur = cls._euler_to_matrix(crx, cry, crz)
+        tx, ty, tz = cls._mat_vec(r_cur, (dx, dy, dz))
+        r_off = cls._euler_to_matrix(drx, dry, drz)
+        nx, ny, nz = cls._matrix_to_euler(cls._mat_mul(r_cur, r_off))
+        return [cx + tx, cy + ty, cz + tz, nx, ny, nz]
+
+    def _motion_deadline_seconds(self, current, target, speed_percent):
+        distance_mm = math.sqrt(sum((a - b) ** 2 for a, b in zip(current[:3], target[:3])))
+        # RM75 最大直线速度按 600 mm/s 粗估，速度百分比按比例折算，留 3 倍余量；
+        # stall 检测是真正的安全网，此估算只用于给 ACP 完成窗口一个上界。
+        speed_mm_s = 600.0 * speed_percent / 100.0
+        return min(self.max_motion_seconds, max(30.0, distance_mm / speed_mm_s * 3.0 + 10.0))
+
+    def _monitor_cartesian(self, action_id, target, max_duration):
+        started = time.monotonic()
+        deadline = started + max_duration
+        last_progress = started + self.start_grace_seconds
+        best_position_error = None
+        status, result = "error", {"reason": "unknown"}
+        try:
+            while time.monotonic() < deadline:
+                with self._action_lock:
+                    cancelled = action_id in self._cancelled
+                if cancelled:
+                    status, result = "cancelled", {"reason": "stopmotion"}
+                    break
+                if self._arm is not None:
+                    self._arm._preflight()
+                current = self._current_pose_mm_deg()
+                position_error, euler_error = self._pose_error(current, target)
+                now = time.monotonic()
+                if position_error <= self.position_tolerance_mm and euler_error <= self.euler_tolerance_deg:
+                    status = "completed"
+                    result = {"target_pose_mm_deg": target, "actual_pose_mm_deg": current,
+                              "position_error_mm": position_error, "euler_error_deg": euler_error,
+                              "elapsed_seconds": now - started}
+                    break
+                if (best_position_error is None
+                        or best_position_error - position_error >= self.progress_threshold_mm):
+                    best_position_error = position_error
+                    last_progress = now
+                elif (now >= started + self.start_grace_seconds
+                        and now - last_progress >= self.stall_timeout_seconds):
+                    self.client.command("rm_set_arm_slow_stop")
+                    result = {"reason": "motion_stalled",
+                              "stall_seconds": self.stall_timeout_seconds,
+                              "target_pose_mm_deg": target, "actual_pose_mm_deg": current,
+                              "position_error_mm": position_error, "euler_error_deg": euler_error,
+                              "elapsed_seconds": now - started}
+                    break
+                time.sleep(self.poll_interval_seconds)
+            else:
+                self.client.command("rm_set_arm_slow_stop")
+                result = {"reason": "motion_deadline_exceeded",
+                          "max_motion_seconds": max_duration,
+                          "elapsed_seconds": time.monotonic() - started}
         except Exception as exc:
-            print(f"[rm75 ACP] {action_id} {status}: callback failed: {exc}", flush=True)
+            try:
+                self.client.command("rm_set_arm_slow_stop")
+            except Exception:
+                pass
+            result = {"reason": str(exc)}
+        finally:
+            with self._action_lock:
+                if action_id in self._cancelled:
+                    status, result = "cancelled", {"reason": "stopmotion"}
+                self._cancelled.discard(action_id)
+                if self._active_action_id == action_id:
+                    self._active_action_id = None
+                self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
+            self._motion_lock.release()
+            self._acp_callback(action_id, status, result)
+
+    def _stop_motion(self):
+        with self._action_lock:
+            action_id = self._active_action_id
+            if action_id:
+                self._cancelled.add(action_id)
+                self.client.command("rm_set_arm_slow_stop")
+        return {"state": "stop_requested", "action_id": action_id}
+
+    def _acp_callback(self, action_id, status, result):
+        _acp_complete(action_id, status, result, self.PREFIX)
 
 
 def build_plugins(config, namespace, ros2):
     client = RM75SDKClient(config)
+    arm = RM75Plugin(client, config, namespace=namespace, ros2=ros2)
     return [
-        RM75Plugin(client, config, namespace=namespace, ros2=ros2),
+        arm,
         GripperPlugin(client, config, namespace=namespace, ros2=ros2),
+        CartesianPlugin(client, config, arm_plugin=arm, namespace=namespace, ros2=ros2),
     ]
