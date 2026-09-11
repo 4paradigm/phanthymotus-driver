@@ -6,7 +6,7 @@ hardware_model: "go2"
 image_name: go2
 port: 15703
 mcp_url: "http://localhost:15703/mcp"
-description: "Unitree Go2 — 运动控制 + 避障 + 语音 + 视频 + RealSense 深度/红外 + 导航"
+description: "Unitree Go2 — 运动控制 + 避障 + 语音 + 视频 + 拍照/录像采集 + RealSense 深度/红外 + 导航"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.

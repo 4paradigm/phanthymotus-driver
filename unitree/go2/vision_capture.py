@@ -80,6 +80,8 @@ class VisionCapturePlugin:
                     "info": {"params": [], "description": "查看图像来源、保存目录和录像结果。"},
                     "stop": {"params": [], "description": "取消当前录像并删除未完成文件。"},
                 },
+                "x-completion": {"actions": ["record_video"],
+                                 "timeout": self._max_duration_s + 15},
             },
             "configSchema": {"type": "object", "properties": {
                 "camera": {**camera_property, "default": "front"},
@@ -394,10 +396,31 @@ class VisionCapturePlugin:
             self._last_recording = {"action_id": active["action_id"], "status": status, "result": result}
             active["state"] = status
             active["finished"] = True
-            # The terminal outcome lives in info.last_recording; no ACP posts a
-            # file_path-based completion. The queued response already returned
-            # the destination path synchronously, like capture_photo.
-            self._active_recording = None
+        # ACP completion is for orchestration only: it releases Core's pending
+        # barrier. The admission response already returned the destination
+        # file_path synchronously, like capture_photo, and info.last_recording
+        # keeps the terminal outcome for the info card.
+        try:
+            self._notify_complete(active["action_id"], status, result)
+        finally:
+            with self._recording_lock:
+                self._active_recording = None
+
+    def _notify_complete(self, action_id, status, result):
+        payload = json.dumps({"action_id": action_id, "status": status,
+                              "result": result, "tool": self.PREFIX, "ts": time.time()}).encode()
+        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        ctx = ssl.create_default_context()
+        if url.startswith(("https://localhost:", "https://127.0.0.1:")):
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        try:
+            request = urllib.request.Request(url + "/api/acp/complete", data=payload,
+                                             headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=3, context=ctx):
+                pass
+        except Exception as exc:
+            log.warning("[vision_capture] ACP completion delivery failed: %s", exc)
 
     def _start_video_recording(self, args):
         requested = args.get("duration_s", 5)
