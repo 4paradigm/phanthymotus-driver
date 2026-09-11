@@ -257,6 +257,10 @@ def find_plugin(plugins, tool_name):
 
 
 class ToolInventoryTests(unittest.TestCase):
+    def test_main_installs_logsafe_before_driver_imports(self):
+        main = (DEVICE_DIR / "main.py").read_text(encoding="utf-8")
+        self.assertLess(main.index("logsafe.install()"), main.index("from common.vendor_runtime"))
+
     def test_container_disables_native_ros_colorized_logs(self):
         dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("RCUTILS_COLORIZED_OUTPUT=0", dockerfile)
@@ -372,6 +376,21 @@ class JointsPluginTests(unittest.TestCase):
             "idx": nodes.skeleton_joint_indices[leg_name],
             "name": leg_name, "q": 0.25, "dq": 0.5, "tau": 0.75,
         }])
+
+    def test_all_urdf_variants_map_every_skeleton_joint_exactly_once(self):
+        for variant in ("fist", "hand", "ultra"):
+            groups, indices = device.skeleton_layout(variant)
+            names = [name for group in groups.values() for name in group]
+            self.assertEqual(len(names), len(set(names)), variant)
+            self.assertTrue(names, variant)
+            self.assertTrue(all(name in indices for name in names), variant)
+
+    def test_fastdds_template_uses_runtime_interface_ipv4(self):
+        template = (DEVICE_DIR / "resource" / "fastdds_develop0.xml").read_text(encoding="utf-8")
+        entrypoint = (DEVICE_DIR / "x2_bundle_entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn("__ROBOT_INTERFACE_IPV4__", template)
+        self.assertIn("ip -4 -o addr show dev", entrypoint)
+        self.assertIn("ROBOT_INTERFACE_IPV4", entrypoint)
 
     def test_unknown_joint_name_is_diagnostic_not_fabricated_skeleton_data(self):
         plugins = build_bundle_plugins({"end_effector": "fist", "plugins": {}})

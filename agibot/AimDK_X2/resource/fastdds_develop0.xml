@@ -6,7 +6,7 @@
         <transport_id>x2_develop0_udp</transport_id>
         <type>UDPv4</type>
         <interfaceWhiteList>
-          <address>10.0.1.41</address>
+          <address>__ROBOT_INTERFACE_IPV4__</address>
           <address>127.0.0.1</address>
         </interfaceWhiteList>
       </transport_descriptor>
