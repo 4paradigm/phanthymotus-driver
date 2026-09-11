@@ -19,3 +19,4 @@ cards:
   - { name: controller_state, type: sensor }
   - { name: joint_control,    type: actuator }
   - { name: gripper,          type: actuator }
+  - { name: cartesian_control, type: actuator }
