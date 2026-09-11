@@ -731,8 +731,9 @@ class CartesianPlugin:
         self.progress_threshold_mm = float(safety.get("progress_threshold_mm", 1.0))
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
         cartesian = config.get("cartesian", {})
-        self.max_radius_mm = float(cartesian.get("max_radius_mm", 1000.0))
-        self.max_position_abs_mm = float(cartesian.get("max_position_abs_mm", 1000.0))
+        self.cartesian_enabled = cartesian.get("enabled", False) is True
+        self.max_radius_mm = float(cartesian.get("max_radius_mm", 610.0))
+        self.max_position_abs_mm = float(cartesian.get("max_position_abs_mm", 610.0))
         self.max_euler_abs_deg = float(cartesian.get("max_euler_abs_deg", 360.0))
 
     def get_tools(self):
@@ -840,8 +841,9 @@ class CartesianPlugin:
             "state": "moving" if active_action_id else "ready",
             "active_action_id": active_action_id,
             "last_completion": jsonable(last),
-            "motion_enabled": self.client.motion_enabled,
-            "read_only": not self.client.motion_enabled,
+            "motion_enabled": self.client.motion_enabled and self.cartesian_enabled,
+            "read_only": not (self.client.motion_enabled and self.cartesian_enabled),
+            "cartesian_enabled": self.cartesian_enabled,
             "position_tolerance_mm": self.position_tolerance_mm,
             "euler_tolerance_deg": self.euler_tolerance_deg,
             "max_speed_percent": self.max_speed_percent,
@@ -851,6 +853,11 @@ class CartesianPlugin:
         }
 
     def _start_cartesian(self, motion_type, args):
+        if not self.cartesian_enabled:
+            raise PermissionError(
+                "cartesian motion is disabled pending supervised workspace validation; "
+                "set cartesian.enabled=true only after configuring installation-specific limits"
+            )
         if not self.client.motion_enabled:
             raise PermissionError("motion is locked; set RM_MOTION_ENABLED=1 only for supervised hardware testing")
         if args.get("confirm_motion") is not True:
