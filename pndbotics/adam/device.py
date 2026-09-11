@@ -891,6 +891,91 @@ class LocoPlugin:
 
 
 # ===========================================================================
+# RlLocoPlugin — extended reinforcement-learning gRPC locomotion control
+# ===========================================================================
+
+class RlLocoPlugin:
+    """Adam RL high-level control using the pnd.robot API (port 50051)."""
+
+    PREFIX = "loco"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 grpc_client, **kwargs):
+        self._grpc = grpc_client
+        self._namespace = namespace
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "loco",
+            "type": "actuator",
+            "description": "Adam RL locomotion — FSM, velocity, motions and control mode",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": [
+                        "set_mode", "move", "set_height", "motion",
+                        "tracking_motion", "get_state", "set_control_mode",
+                        "get_control_state", "shutdown", "stop",
+                    ]},
+                    "target_state": {"type": "string"},
+                    "vx": {"type": "number"}, "vy": {"type": "number"},
+                    "vyaw": {"type": "number"}, "height": {"type": "number"},
+                    "command": {"type": "string", "enum": ["PLAY", "STOP"]},
+                    "motion_file": {"type": "string"},
+                    "domain_id": {"type": "integer", "enum": [0, 1]},
+                    "force": {"type": "boolean"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "set_mode": {"params": ["target_state"]},
+                    "move": {"params": ["vx", "vy", "vyaw"]},
+                    "set_height": {"params": ["height"]},
+                    "motion": {"params": ["command", "motion_file"]},
+                    "tracking_motion": {"params": ["motion_file"]},
+                    "get_state": {"params": []},
+                    "set_control_mode": {"params": ["domain_id"]},
+                    "get_control_state": {"params": []},
+                    "shutdown": {"params": ["force"]},
+                    "stop": {"params": []},
+                },
+            },
+        }
+
+    def start(self):
+        return None
+
+    def stop(self):
+        # A plugin stop is a local lifecycle event; an explicit shutdown action
+        # is required before asking the robot controller to exit.
+        return None
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "ready"}
+        if action in ("stop", "info"):
+            return {"state": "idle" if action == "stop" else "ready"}
+        if action == "set_mode":
+            return self._grpc.set_mode(args.get("target_state", ""))
+        if action == "move":
+            return self._grpc.set_velocity(args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0))
+        if action == "set_height":
+            return self._grpc.set_height(args.get("height", 0.0))
+        if action == "motion":
+            return self._grpc.set_motion(args.get("command", "STOP"), args.get("motion_file", ""))
+        if action == "tracking_motion":
+            return self._grpc.set_tracking_motion(args.get("motion_file", ""))
+        if action == "get_state":
+            return self._grpc.get_robot_state()
+        if action == "set_control_mode":
+            return self._grpc.set_control_mode(args.get("domain_id", 1))
+        if action == "get_control_state":
+            return self._grpc.get_control_state()
+        if action == "shutdown":
+            return self._grpc.shutdown(args.get("force", False))
+        return None
+
+
+# ===========================================================================
 # ArmPlugin — ROS2 JointState upper body control
 # ===========================================================================
 
@@ -2949,10 +3034,12 @@ class AdamDeviceBundle:
             )
             self._plugins.append(p)
 
-        # LocoPlugin
-        if plugins_cfg.get("loco", {}).get("enabled", True):
-            p = LocoPlugin(
-                plugins_cfg.get("loco", {}), namespace, executor,
+        # The default LocoPlugin preserves the historic dashboard contract;
+        # the RL variant exposes the full pnd.robot gRPC API.
+        loco_cfg = plugins_cfg.get("loco", {})
+        if loco_cfg.get("enabled", True):
+            p = RlLocoPlugin(
+                loco_cfg, namespace, executor,
                 grpc_client=grpc_client,
             )
             self._plugins.append(p)
