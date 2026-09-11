@@ -313,6 +313,8 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual(10, schema["properties"]["speed_percent"]["maximum"])
         self.assertIn("movel", schema["x-action-params"])
         self.assertIn("movep", schema["x-action-params"])
+        self.assertEqual(["tool"], schema["properties"]["frame_type"]["enum"])
+        self.assertIn("工具系偏移", tools[0]["description"])
 
     def test_movel_converts_units_and_reports_completion(self):
         result = self.plugin.dispatch("movel", self._movel_args())
@@ -396,6 +398,23 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 "speed_percent": 5, "confirm_motion": True,
             })
         self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+
+    def test_idle_lifecycle_stop_does_not_interrupt_joint_motion(self):
+        self.arm._active_action_id = "rm75_joint_active"
+
+        self.assertEqual({"state": "idle"}, self.plugin.dispatch("stop", {}))
+
+        self.assertNotIn("rm_set_arm_slow_stop", [entry[0] for entry in self.client.calls])
+        self.assertEqual("rm75_joint_active", self.arm._active_action_id)
+
+    def test_active_lifecycle_stop_requests_slow_stop(self):
+        with self.plugin._action_lock:
+            self.plugin._active_action_id = "rm75_cart_active"
+
+        self.assertEqual({"state": "idle"}, self.plugin.dispatch("stop", {}))
+
+        self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
+        self.assertIn("rm75_cart_active", self.plugin._cancelled)
 
     def test_stop_joins_monitor_before_teardown(self):
         # 容器关闭时 stop 必须等监控线程收尾（ACP 终态上报），再允许共享 SDK 销毁
@@ -770,18 +789,30 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "code -2"):
             client.call_dict("rm_get_controller_state")
 
+    def test_joint_acp_requires_ca_cert(self):
+        client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+        plugin = self.device.RM75Plugin(client, {})
+        with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": ""}, clear=True), \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            plugin._acp_callback("action-noca", "completed", {"max_error_deg": 0.1})
+        urlopen.assert_not_called()
+        completion = plugin._motion_status()["last_completion"]
+        self.assertEqual("failed", completion["callback"])
+        self.assertEqual("AGENT_CORE_CA_CERT is required", completion["callback_error"])
+
     def test_acp_posts_standard_completion_from_worker_context(self):
         client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
         plugin = self.device.RM75Plugin(client, {})
-        context = mock.Mock()
+        context = ssl.create_default_context()
         with mock.patch.dict(os.environ, {
                 "AGENT_CORE_URL": "https://phanthy-motus:15678",
+                "AGENT_CORE_CA_CERT": "/tmp/ca.pem",
             }, clear=True), \
                 mock.patch("ssl.create_default_context", return_value=context) as create_context, \
                 mock.patch("urllib.request.urlopen") as urlopen:
             urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"action_id":"action-2"}'
             plugin._acp_callback("action-2", "completed", {"max_error_deg": 0.1})
-            create_context.assert_called_once_with()
+            create_context.assert_called_once_with(cafile="/tmp/ca.pem")
             urlopen.assert_called_once()
             acp_call = urlopen.call_args
             self.assertEqual(
@@ -789,8 +820,8 @@ class RealManRM75SDKClientTests(unittest.TestCase):
                 acp_call.args[0].full_url,
             )
             self.assertIs(context, acp_call.kwargs["context"])
-            self.assertIs(False, context.check_hostname)
-            self.assertEqual(ssl.CERT_NONE, context.verify_mode)
+            self.assertTrue(context.check_hostname)
+            self.assertEqual(ssl.CERT_REQUIRED, context.verify_mode)
             request_payload = json.loads(acp_call.args[0].data)
             self.assertEqual("action-2", request_payload["action_id"])
             self.assertEqual("completed", request_payload["status"])
@@ -806,7 +837,9 @@ class RealManRM75SDKClientTests(unittest.TestCase):
             with self.subTest(reply=reply):
                 plugin, _ = self._motion_plugin()
                 callback = self.device.RM75Plugin._acp_callback
-                with mock.patch("urllib.request.urlopen") as urlopen:
+                with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": "/tmp/ca.pem"}), \
+                        mock.patch("ssl.create_default_context"), \
+                        mock.patch("urllib.request.urlopen") as urlopen:
                     urlopen.return_value.__enter__.return_value.read.return_value = reply
                     callback(plugin, "test-ack", "completed", {"actual_degree": [0]*7})
                 info = plugin._motion_status()["last_completion"]
@@ -817,7 +850,9 @@ class RealManRM75SDKClientTests(unittest.TestCase):
 
     def test_acp_transport_error_preserves_terminal_status(self):
         plugin, _ = self._motion_plugin()
-        with mock.patch("urllib.request.urlopen", side_effect=TimeoutError("timeout")):
+        with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": "/tmp/ca.pem"}), \
+                mock.patch("ssl.create_default_context"), \
+                mock.patch("urllib.request.urlopen", side_effect=TimeoutError("timeout")):
             self.device.RM75Plugin._acp_callback(plugin, "test-timeout", "error", {"reason": "motion_stalled"})
         last = plugin._motion_status()["last_completion"]
         self.assertEqual("error", last["status"])
@@ -828,7 +863,10 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         for status in ("error", "cancelled"):
             with self.subTest(status=status):
                 plugin, _ = self._motion_plugin()
-                with mock.patch.dict(os.environ, {"AGENT_CORE_URL": "https://localhost:15678/"}), mock.patch("urllib.request.urlopen") as urlopen:
+                with mock.patch.dict(os.environ, {
+                        "AGENT_CORE_URL": "https://localhost:15678/",
+                        "AGENT_CORE_CA_CERT": "/tmp/ca.pem",
+                    }), mock.patch("ssl.create_default_context"), mock.patch("urllib.request.urlopen") as urlopen:
                     urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"action_id":"test-error"}'
                     self.device.RM75Plugin._acp_callback(plugin, "test-error", status, {"reason": "stopmotion", "actual_degree": [0]*7})
                 self.assertEqual(1, urlopen.call_count)

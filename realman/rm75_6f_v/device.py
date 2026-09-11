@@ -368,49 +368,15 @@ class RM75Plugin:
 
     def _acp_callback(self, action_id: str, status: str, result: dict):
         """POST action completion to Agent Core."""
-        import urllib.request as _urllib
-        import ssl as _ssl
-        import json
-        import os as _os
-
-        agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-        ctx = _ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
-        # Keep full motion evidence in info; the completion event stays small.
-        summary = {}
-        if status == "completed":
-            summary = {"reason": "target_reached"}
-        elif "reason" in result:
-            summary = {"reason": str(result["reason"])[:240]}
-        body = {"action_id": action_id, "status": status, "result": summary,
-                "tool": self.PREFIX, "ts": time.time()}
         record = {"action_id": action_id, "status": status, "result": dict(result),
                   "callback": "sending"}
         with self._action_lock:
             self._last_completion = record
-        try:
-            req = _urllib.Request(
-                f"{agent_core_url.rstrip('/')}/api/acp/complete",
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with _urllib.urlopen(req, timeout=5, context=ctx) as response:
-                acknowledgement = json.loads(response.read())
-            if (not isinstance(acknowledgement, dict)
-                    or acknowledgement.get("ok") is not True
-                    or acknowledgement.get("action_id") != action_id):
-                raise RuntimeError("Agent Core did not acknowledge this action_id")
-            with self._action_lock:
-                record["callback"] = "accepted"
-            # Acceptance proves receipt, not that Core matched a pending action.
-            print(f"[rm75 ACP] {action_id} {status}: accepted", flush=True)
-        except Exception as exc:
-            with self._action_lock:
-                record["callback"] = "failed"
-                record["callback_error"] = str(exc)
-            print(f"[rm75 ACP] {action_id} {status}: callback failed: {exc}", flush=True)
+        callback, error = _acp_complete(action_id, status, result, self.PREFIX)
+        with self._action_lock:
+            record["callback"] = callback
+            if error is not None:
+                record["callback_error"] = error
 
     def _monitor_motion(self, action_id, start, target, max_duration):
         started = time.monotonic()
@@ -704,8 +670,9 @@ def _acp_complete(action_id, status, result, tool_name):
     agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
     ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
     if not ca_cert:
-        print(f"[rm75 ACP] {action_id} {status}: callback failed: AGENT_CORE_CA_CERT is required", flush=True)
-        return
+        error = "AGENT_CORE_CA_CERT is required"
+        print(f"[rm75 ACP] {action_id} {status}: callback failed: {error}", flush=True)
+        return "failed", error
     ctx = _ssl.create_default_context(cafile=ca_cert)
     summary = {}
     if status == "completed":
@@ -728,8 +695,10 @@ def _acp_complete(action_id, status, result, tool_name):
                 or acknowledgement.get("action_id") != action_id):
             raise RuntimeError("Agent Core did not acknowledge this action_id")
         print(f"[rm75 ACP] {action_id} {status}: accepted", flush=True)
+        return "accepted", None
     except Exception as exc:
         print(f"[rm75 ACP] {action_id} {status}: callback failed: {exc}", flush=True)
+        return "failed", str(exc)
 
 
 class CartesianPlugin:
@@ -825,7 +794,7 @@ class CartesianPlugin:
             tool(
                 "cartesian_control",
                 "actuator",
-                "笛卡尔空间运动：直线(movel)、偏移(move_offset)、多路径点轨迹(movep)。位置毫米、姿态度。",
+                "笛卡尔空间运动：直线(movel)、工具系偏移(move_offset)、多路径点轨迹(movep)。位置毫米、姿态度。",
                 schema,
             )
         ]
@@ -1149,7 +1118,7 @@ class CartesianPlugin:
             action_id = self._active_action_id
             if action_id:
                 self._cancelled.add(action_id)
-            self.client.command("rm_set_arm_slow_stop")
+                self.client.command("rm_set_arm_slow_stop")
         return {"state": "stop_requested", "action_id": action_id}
 
     def _acp_callback(self, action_id, status, result):
