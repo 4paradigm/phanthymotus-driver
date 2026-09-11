@@ -13,6 +13,13 @@ safety:
   stall_timeout_seconds: 10
   progress_threshold_deg: 0.05
   max_motion_seconds: 300
+cartesian:
+  # 工作空间兜底校验（下发前的最后一道闸）：
+  # 默认值按 RM75-6F 规格（最大工作半径 610mm，姿态任意）放宽设置，
+  # 真机标定后按实际工作空间收紧。
+  max_radius_mm: 1000
+  max_position_abs_mm: 1000
+  max_euler_abs_deg: 360
 ros:
   robot_domain_id: 42
   core_domain_id: 42

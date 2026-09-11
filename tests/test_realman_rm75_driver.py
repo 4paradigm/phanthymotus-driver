@@ -45,9 +45,10 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("RM_DRIVER_ENABLED=1", service)
         self.assertIn("RM_MOTION_ENABLED=1", service)
         self.assertIn("RM_ARM_IP=${RM75_ARM_IP:-192.168.1.18}", service)
-        self.assertNotIn("AGENT_CORE_CA_CERT", service)
+        # ACP 完成回调走 CA 校验的 TLS：必须挂载 Agent Core CA 并注入路径
+        self.assertIn("AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}", service)
         self.assertNotIn("AGENT_CORE_TOKEN", service)
-        self.assertNotIn("/opt/phanthy-motus/data:/opt/phanthy-motus/data:ro", service)
+        self.assertIn("${RM75_CA_DIR:-/opt/phanthy-motus/data}:/opt/phanthy-motus/data:ro", service)
         self.assertIn("network_mode: host", service)
         self.assertNotIn("privileged: true", service)
         self.assertNotIn("/dev:/dev", service)
@@ -374,6 +375,77 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
                 "frame_type": "work", "speed_percent": 5, "confirm_motion": True,
             })
+
+    def test_workspace_limits_reject_unreachable_poses(self):
+        # 位置半径、单轴绝对值、姿态角超出配置上限时在下发前拒绝
+        cases = [
+            {"x_mm": 1200, "y_mm": 0, "z_mm": 0, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
+            {"x_mm": 700, "y_mm": 700, "z_mm": 700, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
+            {"x_mm": 0, "y_mm": 0, "z_mm": 0, "rx_deg": 0, "ry_deg": 0, "rz_deg": 400},
+        ]
+        for pose in cases:
+            with self.subTest(pose=pose):
+                with self.assertRaisesRegex(ValueError, "exceeds"):
+                    self.plugin.dispatch("movel", {**pose, "speed_percent": 5, "confirm_motion": True})
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+
+    def test_movep_validates_every_waypoint(self):
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            self.plugin.dispatch("movep", {
+                "waypoints": [[100, 0, 0, 0, 0, 0], [2000, 0, 0, 0, 0, 0]],
+                "speed_percent": 5, "confirm_motion": True,
+            })
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+
+    def test_stop_joins_monitor_before_teardown(self):
+        # 容器关闭时 stop 必须等监控线程收尾（ACP 终态上报），再允许共享 SDK 销毁
+        released = threading.Event()
+
+        class SlowPoseClient(self.FakeClient):
+            def call(self, method):
+                if method == "rm_get_current_arm_state":
+                    if not released.is_set():
+                        released.wait(2.0)
+                return super().call(method)
+
+        self.client = SlowPoseClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY)}, arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+        self.plugin.dispatch("movel", self._movel_args())
+        self.assertTrue(self.plugin._monitor_thread.is_alive())
+
+        stop_done = threading.Event()
+        threading.Thread(target=lambda: (self.plugin.stop(), stop_done.set()), daemon=True).start()
+        time.sleep(0.1)
+        self.assertFalse(stop_done.is_set())  # 监控未收尾前 stop 不得返回
+        released.set()
+        self.assertTrue(stop_done.wait(5.0))
+        self.assertFalse(self.plugin._monitor_thread.is_alive())
+        # 终态已上报（cancelled 或 completed，取决于取消与到位的先后）
+        self.assertEqual(1, len(self.acp_events))
+
+    def test_acp_complete_requires_ca_cert(self):
+        with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": ""}), \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            self.device._acp_complete("test-noca", "completed", {"reason": "x"}, "cartesian_control")
+        urlopen.assert_not_called()
+
+    def test_acp_complete_verifies_with_provided_ca(self):
+        real_ctx = ssl.create_default_context()
+        with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": "/tmp/ca.pem",
+                                          "AGENT_CORE_URL": "https://phanthy-motus:15678/"}), \
+                mock.patch("ssl.create_default_context") as mkctx, \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            mkctx.return_value = real_ctx
+            urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"action_id":"test-ca"}'
+            self.device._acp_complete("test-ca", "completed", {"reason": "x"}, "cartesian_control")
+        mkctx.assert_called_once_with(cafile="/tmp/ca.pem")
+        urlopen.assert_called_once()
 
     def test_movep_chains_waypoints_with_connect_flags(self):
         waypoints = [
