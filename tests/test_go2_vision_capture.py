@@ -227,10 +227,14 @@ class CaptureTest(CaptureHarness):
         self.assertTrue(self.plugin.dispatch("info", {})["ok"])
         json.dumps(self.plugin.dispatch("info", {}))
 
-    def test_tool_does_not_advertise_async_completion(self):
-        # record_video is admission-synchronous: without x-completion, Agent
-        # Core never registers a pending action nor awaits /api/acp/complete.
-        self.assertNotIn("x-completion", self.plugin.get_tool()["inputSchema"])
+    def test_record_video_declares_completion_for_orchestration(self):
+        # ACP exists for orchestration only: Core registers the pending action
+        # from the admission result's action_id and holds the actuator barrier
+        # until the driver POSTs the terminal outcome. file_path stays visible
+        # in the synchronous admission response, so no Core change is needed.
+        completion = self.plugin.get_tool()["inputSchema"]["x-completion"]
+        self.assertIn("record_video", completion["actions"])
+        self.assertEqual(completion["timeout"], self.plugin._max_duration_s + 15)
 
     def test_driver_yaml_marketplace_lists_vision_capture(self):
         # config.yaml enables the card, so driver.yaml's hand-synced
@@ -307,6 +311,10 @@ class CaptureTest(CaptureHarness):
         self.assertEqual(record["action_id"], started["action_id"])
         self.assertEqual(record["status"], "cancelled")
         self.assertEqual(record["result"]["code"], "RECORD_CANCELLED")
+        action_id, status, result = self.wait_recording()
+        self.assertEqual(action_id, started["action_id"])
+        self.assertEqual(status, "cancelled")
+        self.assertEqual(result["code"], "RECORD_CANCELLED")
 
     def test_no_camera_reports_async_error_without_action_id(self):
         with mock.patch.object(capture.shutil, "which", return_value="ffmpeg"), \
@@ -374,17 +382,23 @@ class EncoderTest(CaptureHarness):
         self.assertAlmostEqual(float(probe["format"]["duration"]), 1, delta=0.001)
         self.assertGreater(result["frames"], 8)
         self.assertEqual(self.plugin._info()["last_recording"]["status"], "completed")
-        # The destination path was already returned synchronously on admission.
-        self.assertEqual(self.notifications, [])
+        # capture_photo posted nothing; record_video posted exactly one
+        # completed ACP outcome for the orchestration barrier.
+        self.assertEqual(len(self.notifications), 1)
+        self.assertEqual(self.notifications[0][1], "completed")
 
-    def test_no_notify_for_record_video(self):
-        # No ACP terminal notification is posted for record_video any more;
-        # the destination path is returned synchronously like capture_photo.
+    def test_record_video_posts_acp_terminal_outcome(self):
+        # The terminal outcome is POSTed to Core's ACP endpoint so the pending
+        # barrier releases; the admission response already carried file_path.
         self.source()
-        self.plugin.dispatch("record_video", {"duration_s": 1})
+        started = self.plugin.dispatch("record_video", {"duration_s": 1})
+        self.assertTrue(started["ok"])
+        self.assertIn("file_path", started)
         record = self.wait_last_recording()
-        self.assertEqual(self.notifications, [])
-        self.assertEqual(record["status"], "completed")
+        action_id, status, result = self.wait_recording()
+        self.assertEqual(action_id, started["action_id"])
+        self.assertEqual(status, record["status"])
+        self.assertEqual(result, record["result"])
 
     def test_video_result_matches_q5_contract(self):
         # The completed video result is retained for the info card; no ACP

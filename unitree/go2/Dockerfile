@@ -26,6 +26,10 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     ldconfig && \
     rm -rf /var/lib/apt/lists/*
 
+# FFmpeg CLI + ffprobe: required by the vision_capture card to encode H.264
+# MP4s and validate the completed files on-device (the base image ships
+# neither). This is the only consumer; the package and its libav* dependency
+# chain do grow this Go2-only image.
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         libasound2-dev \
