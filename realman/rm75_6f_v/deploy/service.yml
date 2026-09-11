@@ -2,13 +2,6 @@ realman-rm75-6f-v:
   container_name: embodied-realman-rm75-6f-v
   image: __IMAGE__
   network_mode: host
-  devices:
-    - ${RM75_CAMERA_VIDEO0:-/dev/video0}:${RM75_CAMERA_VIDEO0:-/dev/video0}:rw
-    - ${RM75_CAMERA_VIDEO1:-/dev/video1}:${RM75_CAMERA_VIDEO1:-/dev/video1}:rw
-    - ${RM75_CAMERA_VIDEO2:-/dev/video2}:${RM75_CAMERA_VIDEO2:-/dev/video2}:rw
-    - ${RM75_CAMERA_VIDEO3:-/dev/video3}:${RM75_CAMERA_VIDEO3:-/dev/video3}:rw
-    - ${RM75_CAMERA_VIDEO4:-/dev/video4}:${RM75_CAMERA_VIDEO4:-/dev/video4}:rw
-    - ${RM75_CAMERA_VIDEO5:-/dev/video5}:${RM75_CAMERA_VIDEO5:-/dev/video5}:rw
   device_cgroup_rules:
     - "c 189:* rmw"
   extra_hosts:

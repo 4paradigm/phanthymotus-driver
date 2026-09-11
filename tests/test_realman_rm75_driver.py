@@ -53,6 +53,10 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         camera = (DRIVER / "camera.py").read_text()
         self.assertNotIn("v4l2-ctl", camera)
         self.assertNotIn("import subprocess", camera)
+        self.assertNotIn("ExtMicPlugin", camera)
+        self.assertNotIn("TOOLS_EXT_MIC", camera)
+        self.assertNotIn("_enumerate_ext_mics", camera)
+        self.assertNotIn("_ExtMicNode", camera)
         self.assertFalse((DRIVER / "entrypoint.sh").exists())
 
     def test_vendor_shared_libraries_are_not_committed(self):
@@ -72,9 +76,9 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertNotIn("/dev:/dev", service)
         self.assertIn("/dev/bus/usb:/dev/bus/usb", service)
         self.assertIn('"c 189:* rmw"', service)
-        for index in range(6):
-            variable = f"RM75_CAMERA_VIDEO{index}"
-            self.assertIn(f"${{{variable}:-/dev/video{index}}}", service)
+        self.assertNotIn("devices:", service)
+        self.assertNotIn("/dev/video", service)
+        self.assertNotIn("RM75_CAMERA_VIDEO", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
         self.assertIn(
