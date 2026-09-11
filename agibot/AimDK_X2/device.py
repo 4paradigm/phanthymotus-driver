@@ -1458,7 +1458,11 @@ class LocomotionPlugin:
             result = call_service(
                 self.nodes.set_mc_input_source,
                 build_request(),
-                timeout=max(2.0, attempt_timeout * attempts),
+                # Keep the fda5f38 behavior (5 s minimum).  The vendor MC
+                # service can acknowledge input-source changes slowly; a 4 s
+                # client deadline made a previously working card fail before
+                # it ever published velocity.
+                timeout=max(5.0, attempt_timeout * attempts),
             )
             return jsonable(result.response)
 
