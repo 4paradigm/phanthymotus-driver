@@ -18,6 +18,8 @@ import json
 import os
 import math
 import struct
+import subprocess
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -1090,6 +1092,14 @@ class ModelPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running"}
         return {"urdf": self.nodes.urdf_text(args.get("variant"))}
 
 
@@ -1532,7 +1542,17 @@ class LocomotionPlugin:
         # dispatch process can crash the vendor Fast DDS binding (SIGSEGV on the
         # live X2).  A timeout is recoverable and will be surfaced to the card;
         # taking down the whole driver is not.
+        # Production config opts into the isolated helper explicitly; retain a
+        # shared-client default for embedded callers and ROS-free unit tests.
         transport = str(plugin_cfg.get("input_source_transport", "shared")).lower()
+        if transport == "process":
+            return self._set_input_source_process(
+                action=mc_input_action,
+                name=name,
+                priority=priority,
+                timeout_ms=source_timeout_ms,
+                timeout_sec=max(8.0, attempt_timeout * attempts + 2.0),
+            )
         if transport != "ephemeral":
             with self._input_source_lock:
                 result = call_service(
@@ -1552,6 +1572,40 @@ class LocomotionPlugin:
             action=mc_input_action,
             name=name,
         )
+
+    @staticmethod
+    def _set_input_source_process(*, action, name, priority, timeout_ms, timeout_sec):
+        """Call SetMcInputSource in a short-lived child process.
+
+        The X2 vendor service is reliable from a standalone domain-0 ROS
+        participant but can hang (or previously segfault) when called from the
+        long-running driver participant. Isolating this probe keeps locomotion
+        debuggable without taking down the MCP server.
+        """
+        helper = Path(__file__).with_name("x2_input_source_helper.py")
+        command = [
+            sys.executable, str(helper),
+            "--action", str(int(action)),
+            "--name", str(name),
+            "--priority", str(int(priority)),
+            "--timeout-ms", str(int(timeout_ms)),
+            "--timeout-sec", str(float(timeout_sec)),
+        ]
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True,
+                timeout=timeout_sec + 2.0, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(f"SetMcInputSource helper exceeded {timeout_sec + 2.0:.1f}s") from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "helper exited without detail").strip()
+            raise RuntimeError(f"SetMcInputSource helper failed (exit {completed.returncode}): {detail[-500:]}")
+        for line in reversed((completed.stdout or "").splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                return json.loads(line)
+        raise RuntimeError("SetMcInputSource helper returned no JSON response")
 
     def _set_input_source_ephemeral(self, *, build_request, attempts, attempt_timeout, action, name):
         import rclpy

@@ -73,6 +73,9 @@ plugins:
     # rc is priority 80.  81 owns the base only while a Motus action is active;
     # cancel, timeout, and driver stop delete this source immediately.
     input_source_priority: 81
+    # Vendor SetMcInputSource is stable from an isolated ROS participant but
+    # can hang inside the long-running driver process.
+    input_source_transport: process
   preset_motion:
     enabled: true
   joint_command:

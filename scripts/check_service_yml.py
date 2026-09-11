@@ -56,6 +56,9 @@ DOMAIN = '42'
 # for the process — and the fleet's loopback-only one cuts the body link. These drivers ship their
 # own, so they do not need the mount either: requiring it would only suggest it is in use.
 OWN_PROFILE = {
+    'agibot/AimDK_X2': 'two-process architecture: the vendor driver runs on domain 0 with its '
+                       'robot profile, while the separate socket bridge selects the mounted '
+                       'loopback-only domain-42 profile; a process-wide default cannot serve both.',
     'x-humanoid/tianyi2.0': 'two FastDDS contexts in one process (DualDomainROS2 in main.py, '
                             'BridgeROS2 in joints_bridge.py); runs the vendor profile '
                             '/work/dds_profile.xml process-wide, whose whitelist excludes the '

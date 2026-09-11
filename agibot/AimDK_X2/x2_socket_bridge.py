@@ -12,6 +12,13 @@ import threading
 import time
 from typing import Any
 
+try:
+    from common import logsafe
+    logsafe.install()
+except Exception as exc:  # pragma: no cover - only relevant outside the image
+    import sys
+    sys.stderr.write(f"[x2-socket-bridge] logsafe unavailable ({exc})\n")
+
 import rclpy
 from rclpy.context import Context
 from rclpy.node import Node

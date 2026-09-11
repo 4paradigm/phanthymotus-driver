@@ -589,6 +589,12 @@ class ToolInventoryTests(unittest.TestCase):
 
 
 class ModelPluginTests(unittest.TestCase):
+    def test_lifecycle_actions_return_framework_states(self):
+        plugin = find_plugin(build_bundle_plugins(), "model")
+        self.assertEqual(plugin.dispatch("start", {}), {"state": "running"})
+        self.assertEqual(plugin.dispatch("info", {}), {"state": "running"})
+        self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
+
     def test_urdf_served_for_each_vendored_variant(self):
         for variant in ("fist", "hand", "ultra"):
             plugins = build_bundle_plugins({"end_effector": variant, "plugins": {}})
@@ -683,6 +689,18 @@ class X2BridgeTests(unittest.TestCase):
 
 
 class DispatchSmokeTests(unittest.TestCase):
+    def test_input_source_process_transport_parses_json(self):
+        completed = SimpleNamespace(returncode=0, stdout='noise\n{"response": {"code": 0}}\n', stderr='')
+        with mock.patch.object(device.subprocess, "run", return_value=completed) as run:
+            result = device.LocomotionPlugin._set_input_source_process(
+                action=1001, name="motus_x2", priority=81,
+                timeout_ms=1000, timeout_sec=5.0,
+            )
+        self.assertEqual(result, {"response": {"code": 0}})
+        command = run.call_args.args[0]
+        self.assertIn("x2_input_source_helper.py", command[1])
+        self.assertIn("--priority", command)
+
     """Exercise a couple of simple service-backed dispatch() calls end-to-end against the
     fake ROS client, to catch request/response field mismatches (as opposed to only
     checking tool metadata)."""

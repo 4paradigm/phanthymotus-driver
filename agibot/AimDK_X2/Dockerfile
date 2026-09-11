@@ -17,7 +17,7 @@ RUN . /opt/ros/humble/setup.sh && cd /aimdk_x2_ws && colcon build --packages-sel
 WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py x2_camera_frame.py config.yaml driver.yaml /work/agibot/AimDK_X2/
-COPY x2_bus_bridge.py x2_bridged_publisher.py x2_socket_bridge.py x2_bundle_entrypoint.sh /work/agibot/AimDK_X2/
+COPY x2_bus_bridge.py x2_bridged_publisher.py x2_socket_bridge.py x2_input_source_helper.py x2_bundle_entrypoint.sh /work/agibot/AimDK_X2/
 COPY resource/ /work/agibot/AimDK_X2/resource/
 COPY deploy/ /deploy/
 RUN chmod +x /work/agibot/AimDK_X2/x2_bundle_entrypoint.sh
