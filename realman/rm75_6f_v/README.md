@@ -38,12 +38,12 @@ not to the RM75 controller. Camera capture and arm control therefore have
 independent data paths:
 
 ```text
-ext_camera -> V4L2 / pyrealsense2 -> upper-computer USB camera
+ext_camera -> pyrealsense2 -> upper-computer RealSense USB camera
 joint_control -> RealMan API2 -> RM75 controller TCP port 8080
 ```
 
 `ext_camera` is a multi-instance sensor. Configure each card with an
-`instance_id`, an enumerated `device_path`, and one `channel`:
+`instance_id`, a RealSense selected by serial number, and one `channel`:
 
 | channel | topic | format |
 | --- | --- | --- |
@@ -51,43 +51,42 @@ joint_control -> RealMan API2 -> RM75 controller TCP port 8080
 | `depth` | `/{namespace}/ext_camera/{instance_id}/depth` | `image/depth-zlib` |
 | `infrared` | `/{namespace}/ext_camera/{instance_id}/infrared` | `image/jpeg` |
 
-Hyphens in `instance_id` become underscores in the ROS topic. RGB uses the
-selected V4L2 color node; depth and infrared use `pyrealsense2` and bind the
-SDK device to the same physical USB ancestor. The Driver does not hard-code a
-`/dev/videoN` number because Linux may renumber nodes after a USB reconnect.
+Hyphens in `instance_id` become underscores in the ROS topic. Discovery and
+capture use `pyrealsense2` through `/dev/bus/usb`; the selected camera is bound
+by its stable serial number rather than a dynamic `/dev/videoN` path. Existing
+single-camera Canvas projects that saved an old `/dev/videoN` selection are
+migrated automatically when they next start.
 
 Depth is 640x480 little-endian uint16 millimetres compressed with zlib. Zero
 is invalid/unrepresentable depth. Infrared is the left Y8 stream rendered as a
 grayscale JPEG; it is reflected near-infrared intensity, not temperature.
-Depth and infrared instances on one camera share a stereo session, while one
-V4L2 color node has only one RGB owner.
+RGB, depth and infrared instances on one camera share one SDK pipeline. The
+pipeline captures each physical stream once and fans it out to every card that
+selected that channel, so three cards do not compete for the D435.
 
 The image pins `pyrealsense2==2.56.5.9235`, matching the repository's verified
-Linux ARM64 / Python 3.10 runtime. Camera discovery calls the Linux V4L2 ioctl
-ABI directly, so the image does not install the `v4l-utils` command-line package.
-Do not run `realsense-viewer` or another capture process against the same D435
-while the card is active.
+Linux ARM64 / Python 3.10 runtime. The image does not install the `v4l-utils`
+command-line package. Do not run `realsense-viewer` or another capture process
+against the same D435 while the card is active.
 
-The deployment is not privileged and does not mount the host's complete `/dev`.
-It maps the observed D435 UVC nodes `/dev/video0` through `/dev/video5` and the
-USB device filesystem used by `pyrealsense2`. Each video-node source can be
-overridden with `RM75_CAMERA_VIDEO0` through `RM75_CAMERA_VIDEO5` when another
-camera or an earlier-created video device changes the numbering. Only the
-selected video character devices and USB character-device major 189 are allowed;
-the arm's API2 TCP connection needs neither grant. The USB-bus mount necessarily
-exposes connected USB descriptors to the container because librealsense must
-enumerate and reconnect the selected physical camera. It does not grant access
-to unrelated host block, input, serial, GPU, or media devices.
+The deployment is not privileged and does not mount the host's complete `/dev`
+or any `/dev/videoN` node. It mounts `/dev/bus/usb` and allows USB character
+device major 189 so librealsense can enumerate, capture and reconnect the
+selected camera. The arm's API2 TCP connection needs neither grant. With no
+camera attached, the container still starts and all arm/gripper cards remain
+available; `ext_camera` reports an empty device list until a RealSense is
+connected. The USB-bus mount exposes connected USB descriptors to the container
+but does not grant access to unrelated host block, input, serial, GPU or media
+devices.
 
-The observed target hardware is an Intel RealSense D435 (USB ID `8086:0b07`)
-on a 5 Gbit/s USB 3 link. Its six V4L2 nodes comprise depth, infrared and RGB
-capture nodes plus their metadata companions; discovery exposes the RGB node
-and excludes depth/infrared/metadata nodes from ordinary OpenCV RGB capture.
+The observed target hardware is an Intel RealSense D435 (USB ID `8086:0b07`).
+On USB 3, the shared pipeline uses RGB 1280x720 and depth/infrared 640x480 at
+15 fps. A USB 2 connection falls back to 640x480 at 6 fps for all streams.
 
 For a supervised hardware check, create separate RGB, depth and infrared card
-instances, start them, then confirm that `info.frames` increases and the three
-topics render independently. USB disconnect must become an explicit error;
-after reconnect, reselect the currently enumerated device path before restart.
+instances, start them, then confirm that `frames_published` increases and the
+three topics render independently. USB disconnect becomes an explicit error;
+after reconnect the same serial-number selection can be started again.
 
 The deployment enables its motion capability, and every `set` call must still
 include `confirm_motion=true`. `joint1_deg` through `joint7_deg` are absolute
@@ -155,15 +154,15 @@ own RealSense implementation but dynamically loads `libusb-1.0.so.0`. The build
 downloads Ubuntu's signed `libusb-1.0-0` runtime package and extracts only that
 shared object into `/opt/realman/libusb`; it does not execute or suppress package
 maintainer scripts and does not claim the package is installed in dpkg. Direct
-V4L2 ioctl discovery avoids `v4l-utils`; no compiler, desktop OpenCV backend or
+The SDK USB backend avoids `v4l-utils`; no compiler, desktop OpenCV backend or
 ROS build tooling is installed. Every download/extraction step must succeed and
 the apt layer must finish with an empty `dpkg --audit`; package-install failures
 and partially configured package states are never accepted.
 See `vendor/SOURCE.md` for provenance notes.
 
 The RM75 API2 TCP path itself does not require privileged mode or host devices.
-The bundled upper-computer camera receives only its configured V4L2 nodes and
-the USB bus required by RealSense enumeration, as described above.
+The bundled upper-computer camera receives only the USB bus access required by
+RealSense enumeration and capture, as described above.
 Skeleton publication skips disconnected/busy SDK clients, retries failed samples
 at most every two seconds, and logs once per outage until a successful sample.
 An already-running SDK TCP query still holds the SDK lock until it returns.
