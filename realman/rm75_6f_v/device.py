@@ -548,6 +548,7 @@ GRIPPER_POSITION_MIN = 1   # SDK 契约：手爪开口位置 1~1000
 GRIPPER_POSITION_MAX = 1000
 GRIPPER_COMPLETION_TIMEOUT = 30  # SDK 阻塞模式下等待夹爪到位的秒数上限（ACP 完成窗口取 +10）
 GRIPPER_STOP_WAIT_MARGIN = 5     # stop 等待在途命令到达安全终态的额外余量
+CARTESIAN_STOP_JOIN_MARGIN = 10  # 笛卡尔 stop 等待监控线程收尾的额外余量（秒）
 
 
 def _gripper_position(value) -> int:
@@ -692,10 +693,8 @@ class GripperPlugin:
 def _acp_complete(action_id, status, result, tool_name):
     """POST action completion to Agent Core（与 RM75Plugin 同协议）。
 
-    TLS 校验关闭是有意为之：本驱动的部署契约不带 CA 证书
-    （见 deploy/service.yml 与镜像契约测试对 AGENT_CORE_CA_CERT 的断言），
-    与 RM75Plugin._acp_callback 及 common/vendor_runtime.start_registration
-    的既有实现保持一致。
+    TLS 证书校验保持开启：部署通过 AGENT_CORE_CA_CERT 挂载 Agent Core 的 CA
+    （见 deploy/service.yml），缺失时不发送 —— 不回退到关闭校验。
     """
     import json
     import os as _os
@@ -703,9 +702,11 @@ def _acp_complete(action_id, status, result, tool_name):
     import urllib.request as _urllib
 
     agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
-    ctx = _ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = _ssl.CERT_NONE
+    ca_cert = _os.environ.get("AGENT_CORE_CA_CERT")
+    if not ca_cert:
+        print(f"[rm75 ACP] {action_id} {status}: callback failed: AGENT_CORE_CA_CERT is required", flush=True)
+        return
+    ctx = _ssl.create_default_context(cafile=ca_cert)
     summary = {}
     if status == "completed":
         summary = {"reason": "target_reached"}
@@ -748,6 +749,7 @@ class CartesianPlugin:
         self._action_lock = threading.Lock()
         self._active_action_id = None
         self._cancelled = set()
+        self._monitor_thread = None
         self._last_completion = None
         safety = config.get("safety", {})
         self.max_speed_percent = min(int(safety.get("max_speed_percent", 10)), 10)
@@ -759,6 +761,10 @@ class CartesianPlugin:
         self.stall_timeout_seconds = float(safety.get("stall_timeout_seconds", 10.0))
         self.progress_threshold_mm = float(safety.get("progress_threshold_mm", 1.0))
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
+        cartesian = config.get("cartesian", {})
+        self.max_radius_mm = float(cartesian.get("max_radius_mm", 1000.0))
+        self.max_position_abs_mm = float(cartesian.get("max_position_abs_mm", 1000.0))
+        self.max_euler_abs_deg = float(cartesian.get("max_euler_abs_deg", 360.0))
 
     def get_tools(self):
         position_props = {
@@ -804,7 +810,7 @@ class CartesianPlugin:
                 "movel": (["x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg", "speed_percent", "confirm_motion"],
                           "笛卡尔直线运动到绝对位姿（位置毫米、姿态度，相对基座坐标系）"),
                 "move_offset": (["dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg", "frame_type", "speed_percent", "confirm_motion"],
-                                "沿工具/工作坐标系做直线偏移（相对当前位姿）"),
+                                "沿工具坐标系做直线偏移（相对当前位姿）"),
                 "movep": (["waypoints", "speed_percent", "confirm_motion"],
                           "依次经过多个路径点的轨迹运动"),
                 "stopmotion": ([], "请求受控减速停止"),
@@ -837,6 +843,11 @@ class CartesianPlugin:
                 self.client.command("rm_set_arm_slow_stop")
             except Exception as exc:
                 print(f"[rm75] cartesian shutdown stop failed: {exc}", flush=True)
+        # 监控线程在下一轮询看到 cancelled 后立即收尾；join 保证共享 SDK 连接
+        # 被上层（RM75Plugin.stop）销毁前，ACP 终态已上报完成。
+        thread = self._monitor_thread
+        if thread is not None and thread.is_alive():
+            thread.join(self.poll_interval_seconds * 5 + CARTESIAN_STOP_JOIN_MARGIN)
 
     def dispatch(self, action, args):
         if action == "start":
@@ -865,6 +876,9 @@ class CartesianPlugin:
             "position_tolerance_mm": self.position_tolerance_mm,
             "euler_tolerance_deg": self.euler_tolerance_deg,
             "max_speed_percent": self.max_speed_percent,
+            "max_radius_mm": self.max_radius_mm,
+            "max_position_abs_mm": self.max_position_abs_mm,
+            "max_euler_abs_deg": self.max_euler_abs_deg,
         }
 
     def _start_cartesian(self, motion_type, args):
@@ -898,19 +912,20 @@ class CartesianPlugin:
         except Exception:
             self._motion_lock.release()
             raise
-        threading.Thread(
+        self._monitor_thread = threading.Thread(
             target=self._monitor_cartesian,
             args=(action_id, target, max_duration),
             daemon=True,
-        ).start()
+        )
+        self._monitor_thread.start()
         print(f"[rm75 ACP] {action_id}: started ({motion_type})", flush=True)
         return {"state": "running", "action_id": action_id}
 
     def _plan_target(self, motion_type, args, current):
         """纯计算：校验参数并返回监控用的基系绝对目标位姿（毫米/度），不做任何 SDK 调用。"""
         if motion_type == "movel":
-            return self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
-        if motion_type == "move_offset":
+            target = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
+        elif motion_type == "move_offset":
             offset_mm_deg = self._pose_from_fields(args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"))
             frame = args.get("frame_type", "tool")
             if frame != "tool":
@@ -918,14 +933,35 @@ class CartesianPlugin:
                 # SDK 未提供无歧义的查询接口 —— 先只支持工具系（最常用的直觉语义）。
                 raise ValueError("frame_type must be 'tool'（工作坐标系偏移暂不支持）")
             # 工具系偏移 ≠ 基系直接相加：平移需按当前工具姿态旋转、姿态右乘组合
-            return self._compose_tool_offset(current, offset_mm_deg)
-        if motion_type == "movep":
+            target = self._compose_tool_offset(current, offset_mm_deg)
+        elif motion_type == "movep":
             waypoints = args.get("waypoints")
             if not isinstance(waypoints, list) or not 1 <= len(waypoints) <= 20:
                 raise ValueError("waypoints must be a list of 1~20 poses")
             poses = [self._waypoint_pose(item, index) for index, item in enumerate(waypoints)]
+            # 路径上的每个点都要在工作空间内，而不是只校验末点
+            for pose in poses:
+                self._validate_workspace(pose)
             return poses[-1]
-        raise ValueError(f"unknown motion type: {motion_type}")
+        else:
+            raise ValueError(f"unknown motion type: {motion_type}")
+        self._validate_workspace(target)
+        return target
+
+    def _validate_workspace(self, pose_mm_deg):
+        x, y, z, rx, ry, rz = pose_mm_deg
+        radius = math.sqrt(x * x + y * y + z * z)
+        if radius > self.max_radius_mm:
+            raise ValueError(
+                f"pose radius {radius:.0f} mm exceeds cartesian.max_radius_mm {self.max_radius_mm:g}")
+        for value, label in ((x, "x"), (y, "y"), (z, "z")):
+            if abs(value) > self.max_position_abs_mm:
+                raise ValueError(
+                    f"{label} {value:.0f} mm exceeds cartesian.max_position_abs_mm {self.max_position_abs_mm:g}")
+        for value, label in ((rx, "rx"), (ry, "ry"), (rz, "rz")):
+            if abs(value) > self.max_euler_abs_deg:
+                raise ValueError(
+                    f"{label} {value:.0f} deg exceeds cartesian.max_euler_abs_deg {self.max_euler_abs_deg:g}")
 
     def _submit(self, motion_type, args, speed_percent):
         """下发 SDK 运动命令（非阻塞）。-4 表示控制器到位设备模式不匹配，转成可操作错误。"""
