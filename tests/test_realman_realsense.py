@@ -277,7 +277,7 @@ class RGBDCaptureTests(unittest.TestCase):
     """Exercise pipeline selection and health timing without RealSense hardware."""
 
     def capture(
-        self, samples, usb_type="3.2", serial="serial-1234", routes=None,
+        self, samples, usb_type="3.2", serial="serial-1234", routes=None, reconnect=False,
     ):
         clock = [100.0]
         quit_event = threading.Event()
@@ -350,10 +350,36 @@ class RGBDCaptureTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, modules), mock.patch.object(
             rs.time, "monotonic", side_effect=lambda: clock[0]
         ):
-            rs._capture(
-                "robot_a", serial, routes or {}, queue.Queue(), quit_event, statuses)
+            worker = rs._capture if reconnect else rs._capture_once
+            with mock.patch.object(quit_event, "wait", side_effect=lambda _: quit_event.is_set()):
+                worker("robot_a", serial, routes or {}, queue.Queue(), quit_event, statuses)
         errors = [item["error"] for item in list(statuses.queue) if item.get("error")]
         return errors, config, pipeline, ros.create_node.call_args.args[0], node
+
+    def test_stalled_camera_reconnects_and_resumes_all_three_routes(self):
+        routes = {"rgb-card": "rgb", "depth-card": "depth", "ir-card": "infrared"}
+        errors, config, pipeline, _, node = self.capture([
+            (0.1, rs.STREAMS), (3.2, ()), (3.3, rs.STREAMS),
+        ], routes=routes, reconnect=True)
+        self.assertEqual(errors, ["RealSense RGB/depth/infrared frames stopped arriving"])
+        self.assertEqual(pipeline.start.call_count, 2)
+        self.assertEqual(pipeline.stop.call_count, 2)
+        self.assertEqual(config.device, "serial-1234")
+        self.assertEqual(len(node.publishers), 3)
+        for publisher in node.publishers.values():
+            self.assertEqual(len(publisher.messages), 1)
+
+    def test_stop_during_reconnect_backoff_prevents_another_attempt(self):
+        quit_event = threading.Event()
+        def stop(_):
+            quit_event.set()
+            return True
+        with mock.patch.object(rs, "_capture_once") as attempt, mock.patch.object(
+            quit_event, "wait", side_effect=stop
+        ) as backoff:
+            rs._capture("robot_a", "wanted", {}, queue.Queue(), quit_event, queue.Queue())
+        attempt.assert_called_once()
+        backoff.assert_called_once_with(2.0)
 
     def test_usb3_pipeline_enables_rgb_depth_and_infrared_once(self):
         errors, config, pipeline, node_name, _ = self.capture([

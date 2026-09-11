@@ -19,9 +19,9 @@ RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${APT_MIRROR}|g" /etc/a
 
 # pyrealsense2 dynamically loads libusb. Only that shared object is extracted
 # from Ubuntu's signed runtime package above; no target-architecture maintainer
-# script or libc trigger is bypassed. RealSense discovery and all three streams
-# use the SDK USB backend, so V4L2 utilities and a compiler are unnecessary.
-# OpenCV only encodes JPEG frames; it does not need a GUI backend.
+# script or libc trigger is bypassed. The target wheel uses the Linux V4L2
+# backend, but only the kernel ABI is needed: v4l-utils and a compiler remain
+# unnecessary. OpenCV only encodes JPEG frames; it needs no GUI backend.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=:all: \
     numpy==1.23.5 opencv-python-headless==4.11.0.86 pyrealsense2==2.56.5.9235
 

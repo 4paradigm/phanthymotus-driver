@@ -52,10 +52,12 @@ joint_control -> RealMan API2 -> RM75 controller TCP port 8080
 | `infrared` | `/{namespace}/ext_camera/{instance_id}/infrared` | `image/jpeg` |
 
 Hyphens in `instance_id` become underscores in the ROS topic. Discovery and
-capture use `pyrealsense2` through `/dev/bus/usb`; the selected camera is bound
-by its stable serial number rather than a dynamic `/dev/videoN` path. Existing
-single-camera Canvas projects that saved an old `/dev/videoN` selection are
-migrated automatically when they next start.
+capture use `pyrealsense2`; the selected camera is bound by its stable serial
+number rather than a dynamic `/dev/videoN` path in Canvas. The target Linux
+ARM64 wheel uses its V4L2 backend internally, so deployment must expose the
+current video nodes as described below. Existing single-camera
+Canvas projects that saved an old `/dev/videoN` selection are migrated
+automatically when they next start.
 
 Depth is 640x480 little-endian uint16 millimetres compressed with zlib. Zero
 is invalid/unrepresentable depth. Infrared is the left Y8 stream rendered as a
@@ -69,15 +71,27 @@ Linux ARM64 / Python 3.10 runtime. The image does not install the `v4l-utils`
 command-line package. Do not run `realsense-viewer` or another capture process
 against the same D435 while the card is active.
 
-The deployment is not privileged and does not mount the host's complete `/dev`
-or any `/dev/videoN` node. It mounts `/dev/bus/usb` and allows USB character
-device major 189 so librealsense can enumerate, capture and reconnect the
-selected camera. The arm's API2 TCP connection needs neither grant. With no
-camera attached, the container still starts and all arm/gripper cards remain
-available; `ext_camera` reports an empty device list until a RealSense is
-connected. The USB-bus mount exposes connected USB descriptors to the container
-but does not grant access to unrelated host block, input, serial, GPU or media
-devices.
+Deployment binds `/dev:/dev:ro` and grants character-device read/write access
+for V4L2 major 81 and USB major 189, including newly allocated minor numbers.
+No `/dev/videoN` or USB bus address is configured. Docker can start without a
+camera; later connections and node renumbering are visible through the directory
+bind. The service does not use privileged mode and drops MKNOD. The read-only
+mount protects directory entries; device I/O is still read/write under cgroup
+rules. This deliberately exposes host device names and permits access to all
+video/USB devices, not just one camera; the SDK selection remains serial-bound.
+
+Both Web Console and `deploy/run-pr-image.sh` use this same service fragment.
+Redeploy the new image once to replace older exact-node mappings; no per-node
+environment variables or host scanning script are needed afterwards.
+
+Each tools-list request refreshes camera discovery, so a camera connected after
+Driver startup can appear in its configuration schema. Existing active cards
+keep their serial number: after a disconnect or frame timeout the worker closes
+its pipeline, waits two seconds, then recreates the SDK context and retries the
+same camera. It never substitutes another connected serial. Errors remain
+visible and `fresh` stays false until new frames arrive. Stopping the last card
+cancels retries. Frame counters restart when a new capture session is opened.
+A UI which caches tool schemas may need its device/tool list refreshed.
 
 The observed target hardware is an Intel RealSense D435 (USB ID `8086:0b07`).
 On USB 3, the shared pipeline uses RGB 1280x720 and depth/infrared 640x480 at
@@ -85,8 +99,7 @@ On USB 3, the shared pipeline uses RGB 1280x720 and depth/infrared 640x480 at
 
 For a supervised hardware check, create separate RGB, depth and infrared card
 instances, start them, then confirm that `frames_published` increases and the
-three topics render independently. USB disconnect becomes an explicit error;
-after reconnect the same serial-number selection can be started again.
+three topics render independently. USB disconnect becomes an explicit error until the same camera reconnects.
 
 The deployment enables its motion capability, and every `set` call must still
 include `confirm_motion=true`. `joint1_deg` through `joint7_deg` are absolute
@@ -153,8 +166,8 @@ NumPy 1.23.5 and headless OpenCV 4.11.0.86 through pip. The wheel supplies its
 own RealSense implementation but dynamically loads `libusb-1.0.so.0`. The build
 downloads Ubuntu's signed `libusb-1.0-0` runtime package and extracts only that
 shared object into `/opt/realman/libusb`; it does not execute or suppress package
-maintainer scripts and does not claim the package is installed in dpkg. Direct
-The SDK USB backend avoids `v4l-utils`; no compiler, desktop OpenCV backend or
+maintainer scripts and does not claim the package is installed in dpkg.
+The SDK uses V4L2 directly without `v4l-utils`; no compiler, desktop OpenCV backend or
 ROS build tooling is installed. Every download/extraction step must succeed and
 the apt layer must finish with an empty `dpkg --audit`; package-install failures
 and partially configured package states are never accepted.
