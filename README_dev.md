@@ -1192,6 +1192,7 @@ Driver declares x-hooks in tool schema
   → Agent Core registers bindings at device init/heartbeat
   → System event occurs (ASR arrives, LLM starts, error...)
   → Agent Core fires hook: call_tool_direct() → bypasses barrier + ACP
+    (on_notify is the one exception — see the table below)
   → Driver executes action immediately
 ```
 
@@ -1236,15 +1237,25 @@ Each hook entry maps a `hook_id` to an action + params that will be called direc
 "notify_blink"}}` — the unused `text` key in the merged args is harmless (hook calls skip schema
 validation) and the LED just blinks per its own fixed pattern.
 
+`on_notify` is **not** a true interrupt, and unlike every other hook here it does not fully bypass
+the barrier: it narrates so the user isn't left in silence during a long tool-calling turn, so it
+must not talk over whatever the robot is already saying, and it must not itself get talked over by
+the very next LLM-issued tool call. Agent Core fires it with `barrier_aware=True`, which (1) skips
+the call outright if the bound tool's `x-resource` is already held by a pending action, and (2)
+registers any `action_id` the call returns as pending, same as a normal ACP dispatch — so a
+subsequent `speak`/`navigate`/etc. from the LLM waits for it like it would for any other pending
+action. If your `on_notify` binding declares `x-completion` and `x-resource` like a normal action
+(Tianyi's `tts` does), this happens automatically; no driver-side change is needed to opt in.
+
 ### Key Differences from Normal Tools
 
-| Aspect | Normal Tool Call | Hook Call |
-|--------|----------------|-----------|
-| Triggered by | LLM decision | System event |
-| Barrier | Waits for pending | Bypasses |
-| ACP | Registers pending | Does not |
-| Latency | 1-5s (LLM round) | <50ms |
-| Schema validation | Yes | No |
+| Aspect | Normal Tool Call | Interrupt Hook (`on_interrupt_*`, LED hooks) | `on_notify` |
+|--------|----------------|-----------------------------------------------|-------------|
+| Triggered by | LLM decision | System event | LLM wrote non-empty content |
+| Barrier | Waits for pending | Bypasses | Skips the call if resource busy, else registers pending |
+| ACP | Registers pending | Does not | Registers pending (if the tool declares `x-completion`) |
+| Latency | 1-5s (LLM round) | <50ms | <50ms, or skipped entirely if busy |
+| Schema validation | Yes | No | No |
 
 ### Manual Triggering (API)
 
