@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from common import logsafe
+
+logsafe.install()
+
 import json
 import os
 import signal
