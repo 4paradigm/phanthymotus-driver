@@ -13,6 +13,7 @@ Environment variables:
     AGENT_CORE_URL — Agent Core URL (default: https://localhost:15678)
     GRPC_HOST — gRPC host override (default from config.yaml)
     GRPC_PORT — gRPC port override (default from config.yaml)
+    GRPC_API — "rl" for the reinforcement-learning API, otherwise legacy API
 """
 
 from __future__ import annotations
@@ -299,11 +300,16 @@ def main():
 
     # gRPC client
     grpc_host = os.environ.get("GRPC_HOST", cfg.get("grpc_host", "localhost"))
+    loco_cfg = cfg.get("plugins", {}).get("loco", {})
+    grpc_api = os.environ.get("GRPC_API", loco_cfg.get("grpc_api", "rl")).lower()
+    if grpc_api != "rl":
+        raise ValueError(
+            "Adam bundle supports the RL gRPC API only; set GRPC_API=rl")
     grpc_port = int(os.environ.get("GRPC_PORT", cfg.get("grpc_port", 50051)))
     from grpc_client import AdamGrpcClient
     grpc_client = AdamGrpcClient(grpc_host, grpc_port)
     grpc_client.connect()
-    print(f"[adam] gRPC client → {grpc_host}:{grpc_port}")
+    print(f"[adam] gRPC {grpc_api} client → {grpc_host}:{grpc_port}")
 
     # ROS2 — init after DDS to avoid CycloneDDS participant conflict.
     # The MCP server can still expose DDS-only cards when ROS2 is unavailable.
