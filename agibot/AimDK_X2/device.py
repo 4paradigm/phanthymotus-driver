@@ -454,15 +454,20 @@ class AimdkNodes:
 
     @classmethod
     def _fixed_float_fields(cls, prefix, values, length):
-        """Preserve every ROS fixed-size numeric array as top-level JSON values."""
+        """Preserve fixed-size numeric arrays without spamming empty covariances.
+
+        Vendor often leaves covariance unset (all zeros). Those collapse into one
+        nested list field so the canvas stays readable. Any non-zero content is
+        still expanded to top-level scalars so nothing is dropped.
+        """
         try:
             values = list(values)
         except TypeError:
             values = []
-        return {
-            f"{prefix}_{index:02d}": cls._float(values[index] if index < len(values) else 0.0)
-            for index in range(length)
-        }
+        floats = [cls._float(values[index] if index < len(values) else 0.0) for index in range(length)]
+        if all(abs(item) <= 1e-12 for item in floats):
+            return {prefix: floats}
+        return {f"{prefix}_{index:02d}": floats[index] for index in range(length)}
 
     @classmethod
     def _quaternion_rpy_deg(cls, quaternion):

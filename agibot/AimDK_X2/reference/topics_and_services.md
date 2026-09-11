@@ -9,8 +9,8 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 
 | Catalog entry | Driver tool | Notes |
 |---|---|---|
-| `/aima/hal/imu/chest/state`, `/aima/hal/imu/torso/state` | `imu` | merged into one flat `data/json` stream (`chest_*`/`torso_*` scalar fields; roll/pitch/yaw in degrees). Quaternion and all 3x3 covariance elements are retained as scalar fields. |
-| `/aima/mc/leg_odometry` | `leg_odometry` | `nav_msgs/msg/Odometry`, flattened as position (m), quaternion and roll/pitch/yaw (deg), linear velocity (m/s), angular velocity (rad/s/deg/s), and all 6x6 pose/twist covariance elements; locomotion/leg odometry, not SLAM localization |
+| `/aima/hal/imu/chest/state`, `/aima/hal/imu/torso/state` | `imu` | merged into one flat `data/json` stream (`chest_*`/`torso_*` scalar fields; roll/pitch/yaw in degrees). Quaternion retained as scalars; covariance is one nested list when unset (all zeros), otherwise expanded scalars. |
+| `/aima/mc/leg_odometry` | `leg_odometry` | `nav_msgs/msg/Odometry`, flattened as position (m), quaternion and roll/pitch/yaw (deg), linear velocity (m/s), angular velocity (rad/s/deg/s), and 6x6 pose/twist covariance (nested list if unset/all zeros, else expanded scalars); locomotion/leg odometry, not SLAM localization |
 | `/aima/hal/joint/hand/state` | `hand_state` (optional) | `HandStateArray`, includes touch sensors. Disabled by default: the verified X2 reports `HandType.NONE` and empty joint arrays on both sides. |
 | `/aima/hal/sensor/touch_head` | `head_touch` | `TouchState`, confirmed publisher on the X2 unit |
 | `/aima/hal/pmu/state` | `pmu_state` | `PmuState`, confirmed publisher on the X2 unit |

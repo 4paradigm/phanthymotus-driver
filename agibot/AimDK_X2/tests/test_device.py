@@ -431,6 +431,43 @@ class ToolInventoryTests(unittest.TestCase):
         self.assertEqual(payload["chest_orientation_z"], 0.0)
         self.assertFalse(any(isinstance(value, dict) for value in payload.values()))
 
+    def test_imu_unset_covariance_is_one_nested_list_field(self):
+        message = SimpleNamespace(
+            header=SimpleNamespace(frame_id="chest", stamp=SimpleNamespace(sec=1, nanosec=2)),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            angular_velocity=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            linear_acceleration=SimpleNamespace(x=0.0, y=0.0, z=9.8),
+            orientation_covariance=[0.0] * 9,
+            angular_velocity_covariance=[0.0] * 9,
+            linear_acceleration_covariance=[0.0] * 9,
+        )
+        payload = device.AimdkNodes._imu_payload("chest", message)
+        self.assertEqual(payload["chest_orientation_covariance"], [0.0] * 9)
+        self.assertEqual(payload["chest_angular_velocity_covariance"], [0.0] * 9)
+        self.assertEqual(payload["chest_linear_acceleration_covariance"], [0.0] * 9)
+        self.assertFalse(any(key.startswith("chest_orientation_covariance_") for key in payload))
+
+    def test_leg_odometry_unset_twist_covariance_is_nested_list(self):
+        message = SimpleNamespace(
+            header=SimpleNamespace(frame_id="leg_odom", stamp=SimpleNamespace(sec=1, nanosec=0)),
+            child_frame_id="base_link",
+            pose=SimpleNamespace(pose=SimpleNamespace(
+                position=SimpleNamespace(x=1.0, y=2.0, z=0.9),
+                orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            ), covariance=[0.001 if i in (0, 7) else 0.0 for i in range(36)]),
+            twist=SimpleNamespace(twist=SimpleNamespace(
+                linear=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                angular=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            ), covariance=[0.0] * 36),
+        )
+        payload = device.AimdkNodes._leg_odometry_payload(message)
+        self.assertEqual(payload["pose_covariance_00"], 0.001)
+        self.assertEqual(payload["pose_covariance_07"], 0.001)
+        self.assertEqual(sum(1 for key in payload if key.startswith("pose_covariance_")), 36)
+        self.assertEqual(payload["twist_covariance"], [0.0] * 36)
+        self.assertFalse(any(key.startswith("twist_covariance_") for key in payload))
+
+
     def test_joints_skeleton_topic_and_payload_contract(self):
         plugins = build_bundle_plugins()
         nodes = plugins[0].nodes
