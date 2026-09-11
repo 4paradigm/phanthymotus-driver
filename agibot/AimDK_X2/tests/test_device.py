@@ -220,8 +220,8 @@ _install_ros_stubs()
 # those publications in memory so payload assertions do not require ROS
 # serialization or a running bridge process.
 bridge_stub = types.ModuleType("x2_bridged_publisher")
-bridge_stub.create_bridged_publisher = lambda msg_type, topic: FakePublisher(
-    msg_type, topic, 10
+bridge_stub.create_bridged_publisher = lambda msg_type, topic, qos: FakePublisher(
+    msg_type, topic, qos
 )
 sys.modules["x2_bridged_publisher"] = bridge_stub
 

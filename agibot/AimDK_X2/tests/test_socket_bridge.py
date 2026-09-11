@@ -94,10 +94,14 @@ def import_socket_bridge():
     module("rclpy.node", Node=FakeNode)
     module(
         "rclpy.qos",
-        DurabilityPolicy=types.SimpleNamespace(VOLATILE="volatile"),
+        DurabilityPolicy=types.SimpleNamespace(
+            VOLATILE="volatile", TRANSIENT_LOCAL="transient_local"
+        ),
         HistoryPolicy=types.SimpleNamespace(KEEP_LAST="keep_last"),
         QoSProfile=FakeQoSProfile,
-        ReliabilityPolicy=types.SimpleNamespace(BEST_EFFORT="best_effort"),
+        ReliabilityPolicy=types.SimpleNamespace(
+            RELIABLE="reliable", BEST_EFFORT="best_effort"
+        ),
     )
     module(
         "rclpy.serialization",
@@ -114,6 +118,26 @@ def import_socket_bridge():
 
 
 class SocketBridgeIntegrationTests(unittest.TestCase):
+    QOS = {
+        "reliability": "reliable",
+        "durability": "volatile",
+        "history": "keep_last",
+        "depth": 5,
+    }
+
+    def send_registration(self, server, metadata, payload=None):
+        client, accepted = socket.socketpair()
+        worker = threading.Thread(target=server.client, args=(accepted,))
+        worker.start()
+        encoded = json.dumps(metadata).encode()
+        client.sendall(struct.pack("<I", len(encoded)) + encoded)
+        if payload is not None:
+            client.sendall(struct.pack("<I", len(payload)) + payload)
+        client.shutdown(socket.SHUT_WR)
+        worker.join(timeout=2)
+        client.close()
+        self.assertFalse(worker.is_alive())
+
     def test_registration_frame_and_reconnect_publish_to_same_ros_topic(self):
         bridge, fake_logsafe = import_socket_bridge()
         server = bridge.Server()
@@ -125,6 +149,7 @@ class SocketBridgeIntegrationTests(unittest.TestCase):
             metadata = json.dumps({
                 "topic": "/agibot_x2/state/joints",
                 "msg_type": "std_msgs/msg/String",
+                "qos": self.QOS,
             }).encode()
             client.sendall(struct.pack("<I", len(metadata)) + metadata)
             client.sendall(struct.pack("<I", len(payload)) + payload)
@@ -141,6 +166,8 @@ class SocketBridgeIntegrationTests(unittest.TestCase):
         handler = server.handlers["/agibot_x2/state/joints"]
         self.assertEqual(handler.msg_class, "resolved:std_msgs/msg/String")
         self.assertEqual(handler.publisher.topic, "/agibot_x2/state/joints")
+        self.assertEqual(handler.publisher.qos.settings["reliability"], "reliable")
+        self.assertEqual(handler.publisher.qos.settings["depth"], 5)
         self.assertEqual(handler.publisher.published, [
             ("resolved:std_msgs/msg/String", b"first-frame"),
             ("resolved:std_msgs/msg/String", b"second-frame"),
@@ -164,6 +191,7 @@ class SocketBridgeIntegrationTests(unittest.TestCase):
         metadata = json.dumps({
             "topic": "/agibot_x2/state/joints",
             "msg_type": "std_msgs/msg/String",
+            "qos": self.QOS,
         }).encode()
         clients = []
         workers = []
@@ -184,6 +212,40 @@ class SocketBridgeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(RacingHandler.created, 1)
         self.assertEqual(list(server.handlers), ["/agibot_x2/state/joints"])
+
+    def test_conflicting_qos_registration_does_not_replace_handler(self):
+        bridge, _ = import_socket_bridge()
+        server = bridge.Server()
+        metadata = {
+            "topic": "/agibot_x2/state/joints",
+            "msg_type": "std_msgs/msg/String",
+            "qos": self.QOS,
+        }
+        self.send_registration(server, metadata, b"accepted")
+        original = server.handlers[metadata["topic"]]
+
+        conflicting = dict(metadata)
+        conflicting["qos"] = {**self.QOS, "reliability": "best_effort"}
+        self.send_registration(server, conflicting, b"rejected")
+
+        self.assertIs(server.handlers[metadata["topic"]], original)
+        self.assertEqual(original.publisher.published, [
+            ("resolved:std_msgs/msg/String", b"accepted"),
+        ])
+
+    def test_oversized_metadata_is_rejected_before_allocation(self):
+        bridge, _ = import_socket_bridge()
+        server = bridge.Server()
+        client, accepted = socket.socketpair()
+        worker = threading.Thread(target=server.client, args=(accepted,))
+        worker.start()
+        client.sendall(struct.pack("<I", bridge.MAX_METADATA_BYTES + 1))
+        client.shutdown(socket.SHUT_WR)
+        worker.join(timeout=2)
+        client.close()
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(server.handlers, {})
 
 
 if __name__ == "__main__":

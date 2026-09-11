@@ -27,7 +27,7 @@ def core_publisher(node, msg_type, topic, qos):
     """Route Agent Core output through the isolated domain-42 bridge."""
     from x2_bridged_publisher import create_bridged_publisher
 
-    return create_bridged_publisher(msg_type, topic)
+    return create_bridged_publisher(msg_type, topic, qos)
 
 
 HAND_TYPES = {0: "none", 1: "nimble_hands", 2: "claw", 3: "leisai_nimble_hands", 255: "error"}
