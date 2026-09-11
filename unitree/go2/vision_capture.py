@@ -69,7 +69,8 @@ class VisionCapturePlugin:
                     "camera": camera_property,
                     "duration_s": {"type": "integer", "minimum": 1,
                                    "maximum": self._max_duration_s,
-                                   "default": min(5, self._max_duration_s)},
+                                   "default": min(5, self._max_duration_s),
+                                   "description": "默认5s,最大30s"},
                 },
                 "required": ["action"], "additionalProperties": False,
                 "x-action-params": {

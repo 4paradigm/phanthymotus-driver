@@ -279,6 +279,8 @@ class CaptureTest(CaptureHarness):
         schema = self.plugin.get_tool()["inputSchema"]
         self.assertEqual(schema["properties"]["duration_s"]["maximum"], 30)
         self.assertEqual(schema["properties"]["duration_s"]["default"], 5)
+        # The dashboard shows this caption under the duration_s field.
+        self.assertEqual(schema["properties"]["duration_s"]["description"], "默认5s,最大30s")
         for value in (True, 1.5, "2", None, 0, 31):
             self.assertEqual(self.plugin.dispatch("record_video", {"duration_s": value})["code"], "INVALID_DURATION")
         # The schema default clamps to the configured cap, so an omitted or
