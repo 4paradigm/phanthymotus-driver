@@ -1600,6 +1600,7 @@ class LocomotionPlugin:
             "--priority", str(int(priority)),
             "--timeout-ms", str(int(timeout_ms)),
             "--timeout-sec", str(float(timeout_sec)),
+            "--attempts", "2",
         ]
         try:
             completed = subprocess.run(

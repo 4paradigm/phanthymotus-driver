@@ -76,6 +76,10 @@ plugins:
     # Vendor SetMcInputSource is stable from an isolated ROS participant but
     # can hang inside the long-running driver process.
     input_source_transport: process
+    # Empirical X2 calibration: a 0.2 m/s command tracks near 1.94x on this
+    # unit. Keep a conservative fixed scale until twist odometry is reliable.
+    velocity_command_scale: 0.52
+    adaptive_velocity_scale: false
   preset_motion:
     enabled: true
   joint_command:

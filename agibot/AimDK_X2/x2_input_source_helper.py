@@ -33,6 +33,7 @@ def main() -> int:
     parser.add_argument("--priority", type=int, required=True)
     parser.add_argument("--timeout-ms", type=int, required=True)
     parser.add_argument("--timeout-sec", type=float, default=5.0)
+    parser.add_argument("--attempts", type=int, default=2)
     args = parser.parse_args()
 
     rclpy.init()
@@ -47,20 +48,21 @@ def main() -> int:
         request.input_source.name = args.name
         request.input_source.priority = args.priority
         request.input_source.timeout = args.timeout_ms
-        future = client.call_async(request)
-        deadline = time.monotonic() + args.timeout_sec
-        while not future.done() and time.monotonic() < deadline:
-            rclpy.spin_once(node, timeout_sec=0.05)
-        if not future.done():
-            # Some vendor FastDDS builds segfault while tearing down a client
-            # after an unanswered request.  Let the kernel reap this tiny
-            # helper; the parent will treat 124 as a retryable timeout.
-            import sys
-            print(f"service response timed out after {args.timeout_sec:.1f}s", file=sys.stderr, flush=True)
-            os._exit(124)
-        result = future.result()
-        print(json.dumps(jsonable(result.response), ensure_ascii=False), flush=True)
-        return 0
+        for attempt in range(max(1, args.attempts)):
+            future = client.call_async(request)
+            deadline = time.monotonic() + args.timeout_sec / max(1, args.attempts)
+            while not future.done() and time.monotonic() < deadline:
+                rclpy.spin_once(node, timeout_sec=0.05)
+            if future.done():
+                result = future.result()
+                print(json.dumps(jsonable(result.response), ensure_ascii=False), flush=True)
+                return 0
+            if attempt + 1 < max(1, args.attempts):
+                print(f"service response delayed; retrying ({attempt + 2}/{args.attempts})", file=__import__('sys').stderr, flush=True)
+        # Avoid vendor FastDDS teardown, which can segfault after an unanswered
+        # request. The parent treats 124 as a retryable timeout.
+        print(f"service response timed out after {args.timeout_sec:.1f}s", file=__import__('sys').stderr, flush=True)
+        os._exit(124)
     finally:
         node.destroy_node()
         rclpy.shutdown()
