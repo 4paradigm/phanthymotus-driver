@@ -202,7 +202,7 @@ class DriverBundle:
 def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, driver_id: str):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
-            msg = fmt % args
+            msg = (fmt % args).encode("unicode_escape").decode("ascii")[:200]
             if '"POST /mcp' not in msg or "200" not in msg:
                 print(f"[mcp] {self.address_string()} {msg}")
 

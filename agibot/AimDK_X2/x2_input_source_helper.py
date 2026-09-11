@@ -9,7 +9,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
+
+try:
+    from common import logsafe
+    logsafe.install()
+except Exception as exc:  # pragma: no cover
+    import sys
+    sys.stderr.write(f"[x2-input-helper] logsafe unavailable ({exc})\n")
 
 import rclpy
 from rclpy.node import Node
@@ -44,7 +52,12 @@ def main() -> int:
         while not future.done() and time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=0.05)
         if not future.done():
-            raise TimeoutError(f"service response timed out after {args.timeout_sec:.1f}s")
+            # Some vendor FastDDS builds segfault while tearing down a client
+            # after an unanswered request.  Let the kernel reap this tiny
+            # helper; the parent will treat 124 as a retryable timeout.
+            import sys
+            print(f"service response timed out after {args.timeout_sec:.1f}s", file=sys.stderr, flush=True)
+            os._exit(124)
         result = future.result()
         print(json.dumps(jsonable(result.response), ensure_ascii=False), flush=True)
         return 0

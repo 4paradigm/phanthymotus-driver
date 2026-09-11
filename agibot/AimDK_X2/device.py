@@ -1598,6 +1598,9 @@ class LocomotionPlugin:
             )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(f"SetMcInputSource helper exceeded {timeout_sec + 2.0:.1f}s") from exc
+        if completed.returncode in (124, -11):
+            detail = (completed.stderr or completed.stdout or "helper timed out").strip()
+            raise TimeoutError(f"SetMcInputSource helper timed out: {detail[-500:]}")
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "helper exited without detail").strip()
             raise RuntimeError(f"SetMcInputSource helper failed (exit {completed.returncode}): {detail[-500:]}")
