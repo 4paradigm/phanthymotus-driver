@@ -36,3 +36,4 @@ cards:
   - { name: asr,           type: sensor }
   - { name: ext_mic,       type: sensor }
   - { name: ext_camera,    type: sensor }
+  - { name: vision_capture, type: actuator }
