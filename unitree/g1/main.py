@@ -155,6 +155,18 @@ class G1DeviceBundle:
             self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))
             print("[bundle] LidarPlugin loaded")
 
+        if plugins_cfg.get("navigation_sensors", {}).get("enabled", False):
+            from navigation_sensor_bridge import NavigationSensorPlugin
+            self._plugins.append(
+                NavigationSensorPlugin(
+                    plugins_cfg["navigation_sensors"],
+                    namespace,
+                    executor,
+                    network_iface,
+                )
+            )
+            print("[bundle] NavigationSensorPlugin loaded")
+
         if plugins_cfg.get("slam", {}).get("enabled", False):
             from device import SpatialPlugin
             self._plugins.append(SpatialPlugin(plugins_cfg["slam"], namespace, executor, slam_client, smart_motion=smart_motion))
@@ -222,8 +234,18 @@ class G1DeviceBundle:
         print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
-        for p in self._plugins:
-            p.stop()
+        ordered_plugins = sorted(
+            enumerate(self._plugins),
+            key=lambda item: getattr(item[1], "STOP_PRIORITY", 100),
+        )
+        for i, p in ordered_plugins:
+            try:
+                p.stop()
+            except Exception as exc:
+                print(
+                    f"[bundle] Plugin {i} ({type(p).__name__}) stop() FAILED: {exc}",
+                    flush=True,
+                )
         print("[bundle] All plugins stopped")
 
     def get_all_tools(self) -> list:
@@ -406,7 +428,14 @@ def main():
     print("[bundle] AudioClient ready")
 
     # LocoClient (locomotion control) — via subprocess proxy to avoid GIL contention
-    loco_client = RpcProxy(network_iface)
+    proposal_cfg = cfg.get("plugins", {}).get("loco", {})
+    loco_client = RpcProxy(
+        network_iface,
+        motion_rpc_timeout=proposal_cfg.get(
+            "velocity_proposal_rpc_timeout",
+            0.5,
+        ),
+    )
     print("[bundle] LocoClient ready (subprocess proxy)")
 
     # G1ArmActionClient (arm gestures)
@@ -436,7 +465,15 @@ def main():
     harness_cfg = cfg.get("safety_harness", {})
     if harness_cfg.get("enabled", True):
         from safety_harness import SmartMotionProxy
-        smart_motion = SmartMotionProxy(namespace, harness_cfg, network_iface)
+        smart_motion = SmartMotionProxy(
+            namespace,
+            harness_cfg,
+            network_iface,
+            proposal_config=proposal_cfg,
+            fallback_stop=loco_client.StopMove,
+            parent_apply_velocity_proposal=loco_client.ApplyVelocityProposal,
+            parent_get_fsm_id=loco_client.GetFsmId,
+        )
         print("[bundle] SmartMotion safety harness active (subprocess)")
 
     _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion, network_iface=network_iface)
@@ -454,12 +491,29 @@ def main():
     server = ThreadingHTTPServer(("", mcp_port), make_handler())
     print(f"[bundle] MCP server → http://localhost:{mcp_port}")
 
+    shutdown_lock = threading.RLock()
+    shutdown_started = False
+
+    def _stop_runtime():
+        nonlocal shutdown_started
+        with shutdown_lock:
+            if shutdown_started:
+                return
+            shutdown_started = True
+            # LocoPlugin must StopMove/unbind while both motion subprocesses
+            # are still available; only then terminate those subprocesses.
+            try:
+                _bundle.stop_all()
+            finally:
+                try:
+                    if smart_motion:
+                        smart_motion.shutdown()
+                finally:
+                    loco_client.stop()
+
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
-        if smart_motion:
-            smart_motion.shutdown()
-        _bundle.stop_all()
-        loco_client.stop()
+        _stop_runtime()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -468,7 +522,7 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _bundle.stop_all()
+        _stop_runtime()
         executor.shutdown()
         rclpy.shutdown()
 

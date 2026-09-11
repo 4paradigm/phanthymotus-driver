@@ -539,8 +539,35 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `sensor/skeleton` | 3D Skeleton (URDF) | `hint === 'sensor/skeleton'` |
 | `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
 | `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
+| `sensor/imu` | IMU orientation/velocity/acceleration | `hint === 'sensor/imu'` |
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
 | (no hint) | Activity stream | Fallback when no format specified |
+
+### IMU Rendering — `sensor/imu`
+
+`sensor/imu` is the platform format for a native `sensor_msgs/msg/Imu` topic.
+The topic descriptor must also declare `ros_type: sensor_msgs/msg/Imu`, its QoS,
+timestamp source, and `frame_id`. Agent Core subscribes using the native ROS
+type and exposes the following JSON representation to dashboard renderers:
+
+```json
+{
+  "schema": "phanthy.sensor.imu.v1",
+  "frame_id": "livox_frame",
+  "stamp_ns": 1780000000000000000,
+  "orientation": {"x": 0, "y": 0, "z": 0, "w": 1},
+  "orientation_covariance": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  "angular_velocity_rad_s": {"x": 0, "y": 0, "z": 0},
+  "angular_velocity_covariance": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+  "linear_acceleration_m_s2": {"x": 0, "y": 0, "z": 9.80665},
+  "linear_acceleration_covariance": [0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+```
+
+Quaternion components are unitless, angular velocity is rad/s, linear
+acceleration is m/s², and the covariance arrays retain ROS row-major order and
+units. Do not publish JSON in place of the native ROS topic; this JSON is only
+the Agent Core WebSocket representation.
 
 ### Depth Rendering — `image/depth-z16` vs `image/depth-zlib`
 
