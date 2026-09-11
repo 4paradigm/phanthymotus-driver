@@ -1420,16 +1420,98 @@ class LocomotionPlugin:
         return name
 
     def _set_input_source(self, mc_input_action):
+        """Register/modify/delete the locomotion input source.
+
+        AimDK's own DirectVelocityControl example retries SetMcInputSource because
+        "remote peer is NOT handled well by ROS". On the live X2 driver the dual-domain
+        MultiThreadedExecutor is also fed by high-rate sensor callbacks via spin_once,
+        so a single 5s poll on the shared client often times out even though the MC
+        service itself answers instantly on a dedicated node (verified on-robot).
+        Production calls therefore use a short-lived domain-0 node that
+        spin_until_future_complete's the request, matching the vendor example.
+        """
         from aimdk_msgs.srv import SetMcInputSource
         plugin_cfg = self._plugin_cfg()
-        request = SetMcInputSource.Request()
-        request.request = self.nodes.request_header()
-        request.action.value = mc_input_action
-        request.input_source.name = self._source_name()
-        request.input_source.priority = int(plugin_cfg.get("input_source_priority", 81))
-        request.input_source.timeout = 1000
-        result = call_service(self.nodes.set_mc_input_source, request)
-        return jsonable(result.response)
+        name = self._source_name()
+        priority = int(plugin_cfg.get("input_source_priority", 81))
+        source_timeout_ms = int(plugin_cfg.get("input_source_watchdog_ms", 1000))
+        attempts = max(1, int(plugin_cfg.get("input_source_attempts", 8)))
+        attempt_timeout = float(plugin_cfg.get("input_source_attempt_timeout_sec", 0.5))
+
+        def build_request():
+            request = SetMcInputSource.Request()
+            request.request = self.nodes.request_header()
+            request.action.value = mc_input_action
+            request.input_source.name = name
+            request.input_source.priority = priority
+            request.input_source.timeout = source_timeout_ms
+            return request
+
+        # Unit tests install FakeNode clients; keep the shared call_service path there.
+        if type(self.nodes.robot).__name__ == "FakeNode":
+            result = call_service(
+                self.nodes.set_mc_input_source,
+                build_request(),
+                timeout=max(5.0, attempt_timeout * attempts),
+            )
+            return jsonable(result.response)
+
+        return self._set_input_source_ephemeral(
+            build_request=build_request,
+            attempts=attempts,
+            attempt_timeout=attempt_timeout,
+            action=mc_input_action,
+            name=name,
+        )
+
+    def _set_input_source_ephemeral(self, *, build_request, attempts, attempt_timeout, action, name):
+        import rclpy
+        from rclpy.context import Context
+        from rclpy.node import Node
+        from aimdk_msgs.srv import SetMcInputSource
+
+        domain_id = int(os.environ.get("ROBOT_DOMAIN_ID", self.nodes.config.get("ros", {}).get("robot_domain_id", 0)))
+        ctx = Context()
+        node = None
+        last_error = None
+        try:
+            rclpy.init(context=ctx, domain_id=domain_id)
+            node = Node(f"agibot_x2_mc_input_{action}", context=ctx)
+            client = node.create_client(SetMcInputSource, "/aimdk_5Fmsgs/srv/SetMcInputSource")
+            if not client.wait_for_service(timeout_sec=max(2.0, attempt_timeout * 2)):
+                raise TimeoutError("service /aimdk_5Fmsgs/srv/SetMcInputSource unavailable")
+            for attempt in range(attempts):
+                request = build_request()
+                # Refresh stamp each attempt like the AimDK example.
+                request.request = self.nodes.request_header()
+                future = client.call_async(request)
+                rclpy.spin_until_future_complete(node, future, timeout_sec=attempt_timeout)
+                if not future.done():
+                    last_error = TimeoutError(
+                        f"SetMcInputSource action={action} name={name!r} attempt {attempt + 1}/{attempts} timed out"
+                    )
+                    continue
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001 - surface vendor/DDS failures
+                    last_error = exc
+                    continue
+                return jsonable(result.response)
+            raise TimeoutError(
+                f"service /aimdk_5Fmsgs/srv/SetMcInputSource timed out after {attempts} attempts "
+                f"(action={action}, name={name!r}): {last_error}"
+            )
+        finally:
+            if node is not None:
+                try:
+                    node.destroy_node()
+                except Exception:
+                    pass
+            if rclpy.ok(context=ctx):
+                try:
+                    rclpy.shutdown(context=ctx)
+                except Exception:
+                    pass
 
     @staticmethod
     def _input_source_accepted(response):
