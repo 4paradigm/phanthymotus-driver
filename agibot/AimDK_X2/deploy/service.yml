@@ -14,7 +14,7 @@ agibot-x2:
     - ROBOT_DOMAIN_ID=0
     - CORE_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - NETWORK_INTERFACE=eth0
+    - NETWORK_INTERFACE=develop0
     - ROBOT_INTERFACE_IP=10.0.1.41
     # Required deployment contract; the bundle entrypoint overrides this per
     # subprocess so the robot side can use its eth0-specific profile.

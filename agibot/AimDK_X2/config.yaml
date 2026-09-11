@@ -17,7 +17,7 @@ ros:
   # Fast DDS profiles are process-wide. The driver remains on the robot
   # network; a separate socket bridge process owns Agent Core domain 42.
   core_transport: "socket"
-  robot_interface: "eth0"
+  robot_interface: "develop0"
 
 plugins:
   mc_state:

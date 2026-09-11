@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+# ROS Humble's generated setup files probe variables that may be unset. Enable
+# nounset only after all setup files have been sourced.
+set -Ee -o pipefail
 
 source /opt/ros/humble/setup.bash
 if [[ -f /ros_ws/install/setup.bash ]]; then
   source /ros_ws/install/setup.bash
 fi
 source /aimdk_x2_ws/install/setup.bash
+set -u
 
 socket_path="${X2_BRIDGE_SOCKET:-/tmp/agibot_x2_bridge/bridge_main.sock}"
 robot_profile="${ROBOT_FASTRTPS_DEFAULT_PROFILES_FILE:-}"
