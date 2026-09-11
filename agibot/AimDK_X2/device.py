@@ -1546,13 +1546,17 @@ class LocomotionPlugin:
         # shared-client default for embedded callers and ROS-free unit tests.
         transport = str(plugin_cfg.get("input_source_transport", "shared")).lower()
         if transport == "process":
-            return self._set_input_source_process(
-                action=mc_input_action,
-                name=name,
-                priority=priority,
-                timeout_ms=source_timeout_ms,
-                timeout_sec=max(8.0, attempt_timeout * attempts + 2.0),
-            )
+            # The helper is isolated for DDS stability, but calls must still be
+            # serialized: a timed stop/delete racing the next add is rejected
+            # intermittently by the vendor input-source registry.
+            with self._input_source_lock:
+                return self._set_input_source_process(
+                    action=mc_input_action,
+                    name=name,
+                    priority=priority,
+                    timeout_ms=source_timeout_ms,
+                    timeout_sec=max(8.0, attempt_timeout * attempts + 2.0),
+                )
         if transport != "ephemeral":
             with self._input_source_lock:
                 result = call_service(
