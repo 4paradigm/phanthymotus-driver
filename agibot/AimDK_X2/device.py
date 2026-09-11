@@ -1389,7 +1389,6 @@ class LocomotionPlugin:
         if velocity_timer is not None:
             velocity_timer.cancel()
         self._publish_velocity()
-        self._release_input_source()
         payload = {
             "reason": reason,
             "topic": "/aima/mc/locomotion/velocity",
@@ -1405,7 +1404,14 @@ class LocomotionPlugin:
             payload["measured"] = measured
         if extra:
             payload.update(extra)
+        # Notify ACP immediately after the velocity stop.  Vendor DELETE can
+        # block for several seconds; it must not delay or suppress the action
+        # completion event seen by the caller.
         _acp_notify(action_id, status, payload, "locomotion")
+        try:
+            self._release_input_source()
+        except Exception as exc:
+            print(f"[locomotion] input source cleanup failed: {str(exc)[:200]}", flush=True)
         return True
 
     def _publish_velocity(self, forward=0.0, lateral=0.0, angular=0.0):
