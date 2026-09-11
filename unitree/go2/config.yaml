@@ -18,6 +18,12 @@ plugins:
     stream_addr: "230.1.1.1"
     stream_port: 1720
     multicast_iface: "eth0"
+  vision_capture:
+    enabled: true
+    camera: front  # front or external (RGB only); also selectable on the card.
+    output_dir: /opt/phanthy-motus/data/vision_capture
+    fps: 15
+    max_duration_s: 30
   state:
     enabled: true
   motion_switcher:

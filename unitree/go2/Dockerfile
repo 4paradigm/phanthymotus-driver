@@ -26,10 +26,15 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     ldconfig && \
     rm -rf /var/lib/apt/lists/*
 
+# FFmpeg CLI + ffprobe: required by the vision_capture card to encode H.264
+# MP4s and validate the completed files on-device (the base image ships
+# neither). This is the only consumer; the package and its libav* dependency
+# chain do grow this Go2-only image.
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         libasound2-dev \
         libportaudio2 \
+        ffmpeg \
         v4l-utils && \
     rm -rf /var/lib/apt/lists/*
 
@@ -72,6 +77,7 @@ COPY path_planner.py /work/path_planner.py
 COPY icp.py /work/icp.py
 COPY global_registration.py /work/global_registration.py
 COPY ext_devices.py /work/ext_devices.py
+COPY vision_capture.py /work/vision_capture.py
 COPY realsense.py /work/realsense.py
 COPY lidar.py /work/lidar.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py

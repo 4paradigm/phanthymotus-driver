@@ -55,6 +55,9 @@ def _rpc_error(action: str, code: int, resp=None) -> dict:
 def _slam_rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue,
                      network_iface: str):
     """Subprocess: holds a dedicated SlamClient, processes RPC commands."""
+    # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
+    from common import logsafe
+    logsafe.install(check_fd=False)
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     try:
         from unitree_sdk2py.g1.slam.slam_client import SlamClient

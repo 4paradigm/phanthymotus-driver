@@ -179,6 +179,9 @@ _SPEAKER_MERGE_MS = 2000  # flush timeout: send after 2s of silence
 
 def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
     """Subprocess: accumulates PCM-16k, sends as single WAV via AudioHub megaphone on stream end."""
+    # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
+    from common import logsafe
+    logsafe.install(check_fd=False)
     import base64
     import io
     import wave
@@ -1046,6 +1049,9 @@ class _CameraNode:
 
 def _run_camera_process(topic: str, stream_addr: str, stream_port: int, multicast_iface: str = "eth0") -> None:
     """Camera subprocess — receives Go2 H264 UDP multicast, decodes to JPEG, publishes to ROS2."""
+    # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
+    from common import logsafe
+    logsafe.install(check_fd=False)
     import subprocess as _subprocess
     import threading as _threading
     import rclpy
