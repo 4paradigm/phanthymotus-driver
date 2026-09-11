@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import math
+import struct
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -581,18 +582,35 @@ class AimdkNodes:
         info = getattr(msg, "info", None)
         rate = int(getattr(info, "sample_rate", 16000) or 16000)
         channels = int(getattr(info, "channels", 1) or 1)
+        mic_channels = int(getattr(msg, "mic_channels", channels) or channels)
+        mic_channels = max(1, min(channels, mic_channels))
         sample_format = str(getattr(info, "sample_format", "S16LE") or "S16LE").upper()
         raw = getattr(getattr(msg, "data", None), "data", ())
         try:
             payload = bytes(int(value) & 0xFF for value in raw)
         except (TypeError, ValueError):
             return
-        if rate != 16000 or channels != 1 or sample_format not in {"S16LE", "PCM_S16LE", ""}:
+        if rate != 16000 or sample_format not in {"S16LE", "PCM_S16LE", ""}:
             with self._mic_audio_lock:
                 self._mic_capture_stats.update({"sample_rate": rate, "channels": channels, "sample_format": sample_format})
             return
+        # X2 currently exposes six interleaved S16LE channels (mic + reference
+        # channels).  The shared ASR contract is mono, so average the physical
+        # microphone channels and discard only the reference channels.
+        if channels > 1:
+            sample_count = len(payload) // (2 * channels)
+            try:
+                samples = struct.unpack(f"<{sample_count * channels}h", payload[:sample_count * channels * 2])
+            except struct.error:
+                return
+            mono = bytearray(sample_count * 2)
+            for index in range(sample_count):
+                start = index * channels
+                value = round(sum(samples[start:start + mic_channels]) / mic_channels)
+                struct.pack_into("<h", mono, index * 2, max(-32768, min(32767, value)))
+            payload = bytes(mono)
         with self._mic_audio_lock:
-            self._mic_capture_stats.update({"sample_rate": rate, "channels": channels})
+            self._mic_capture_stats.update({"sample_rate": rate, "channels": channels, "mic_channels": mic_channels})
             self._mic_audio_buffer.extend(payload)
             chunks = []
             while len(self._mic_audio_buffer) >= 1024:

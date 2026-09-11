@@ -10,7 +10,7 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | Catalog entry | Driver tool | Notes |
 |---|---|---|
 | `/aima/hal/imu/chest/state`, `/aima/hal/imu/torso/state` | `imu` | merged into one flat `data/json` stream (`chest_*`/`torso_*` scalar fields; roll/pitch/yaw in degrees). Quaternion retained as scalars; covariance is one nested list when unset (all zeros), otherwise expanded scalars. |
-| `/aima/hal/audio/capture` | `mic` | `aimdk_msgs/msg/AudioCapture` converted to `audio_msgs/msg/AudioChunk` at `/agibot_x2/agibot_x2/mic/audio`; publishes 1024-byte PCM S16LE 16 kHz mono chunks for ASR. |
+| `/aima/hal/audio/capture` | `mic` | `aimdk_msgs/msg/AudioCapture` (currently 6-channel S16LE/16 kHz on X2) is downmixed across microphone channels and converted to `audio_msgs/msg/AudioChunk` at `/agibot_x2/agibot_x2/mic/audio`; publishes 1024-byte mono chunks for ASR. |
 | `/aima/mc/leg_odometry` | `leg_odometry` | `nav_msgs/msg/Odometry`, flattened as position (m), quaternion and roll/pitch/yaw (deg), linear velocity (m/s), angular velocity (rad/s/deg/s), and 6x6 pose/twist covariance (nested list if unset/all zeros, else expanded scalars); locomotion/leg odometry, not SLAM localization |
 | `/aima/hal/joint/hand/state` | `hand_state` (optional) | `HandStateArray`, includes touch sensors. Disabled by default: the verified X2 reports `HandType.NONE` and empty joint arrays on both sides. |
 | `/aima/hal/sensor/touch_head` | `head_touch` | `TouchState`, confirmed publisher on the X2 unit |

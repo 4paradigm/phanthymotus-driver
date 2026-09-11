@@ -13,6 +13,7 @@ import types
 import unittest
 import json
 import math
+import struct
 from unittest import mock
 from types import SimpleNamespace
 from pathlib import Path
@@ -316,6 +317,25 @@ class ToolInventoryTests(unittest.TestCase):
         self.assertEqual(mic["type"], "sensor")
         self.assertEqual(mic["topic_out"][0]["format"], "audio/pcm-16k")
         self.assertEqual(mic["topic_out"][0]["ros_type"], "audio_msgs/msg/AudioChunk")
+
+    def test_mic_six_channel_capture_is_downmixed_to_mono_chunks(self):
+        nodes = build_bundle_plugins()[0].nodes
+        nodes.mic_audio_pub = FakePublisher(FakeMsg, "/mic", 20)
+        callback = next(cb for topic, cb in nodes.robot.subscriptions if topic == "/aima/hal/audio/capture")
+        values = []
+        for _ in range(512):
+            values.extend((1000, 3000, 5000, 7000, 9000, 11000))
+        message = SimpleNamespace(
+            info=SimpleNamespace(sample_rate=16000, channels=6, sample_format="S16LE"),
+            mic_channels=4,
+            ref_channels=2,
+            data=SimpleNamespace(data=list(struct.pack(f"<{len(values)}h", *values))),
+        )
+        callback(message)
+        audio = nodes.mic_audio_pub.published[0]
+        self.assertEqual(audio.format, "audio/pcm-16k")
+        self.assertEqual(len(audio.data), 1024)
+        self.assertEqual(struct.unpack("<h", bytes(audio.data[:2]))[0], 4000)
 
     def test_unavailable_hardware_cards_are_not_registered_by_default(self):
         names = {definition["name"] for definition in tool_definitions(build_bundle_plugins())}

@@ -15,6 +15,9 @@ end_effector: "fist"   # fist | hand | ultra
 ros:
   robot_domain_id: 0
   core_domain_id: 42
+  # Agent Core traffic is bridged over the Unix socket; keep the driver process
+  # on the vendor domain only. The standalone bridge owns domain 42.
+  core_transport: socket
   # The X2 vendor ROS processes use the host's develop0 interface (10.0.1.41).
   robot_interface: "develop0"
 

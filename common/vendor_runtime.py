@@ -57,7 +57,7 @@ def configure_cyclonedds(config: dict) -> str:
 class DualDomainROS2:
     """Separate vendor and Agent Core DDS domains with independent executors."""
 
-    def __init__(self, robot_domain_id: int, core_domain_id: int):
+    def __init__(self, robot_domain_id: int, core_domain_id: int, *, core_transport: str = "dds"):
         import rclpy
         import rclpy.executors
         from rclpy.context import Context
@@ -66,9 +66,18 @@ class DualDomainROS2:
         self.ctx_robot = Context()
         rclpy.init(context=self.ctx_robot, domain_id=robot_domain_id)
         self.executor_robot = rclpy.executors.MultiThreadedExecutor(context=self.ctx_robot)
-        self.ctx_core = Context()
-        rclpy.init(context=self.ctx_core, domain_id=core_domain_id)
-        self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
+        # X2 routes all Agent Core traffic through its Unix-socket bridge.  Do
+        # not create a second domain-42 DDS participant in the driver process:
+        # FastDDS reads one process-global profile, so that participant would
+        # otherwise join the robot LAN with the domain-0 develop0 profile.
+        self.core_is_robot = str(core_transport).lower() == "socket"
+        if self.core_is_robot:
+            self.ctx_core = self.ctx_robot
+            self.executor_core = self.executor_robot
+        else:
+            self.ctx_core = Context()
+            rclpy.init(context=self.ctx_core, domain_id=core_domain_id)
+            self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)
         self._threads: list[threading.Thread] = []
 
     def start_spin(self) -> None:
@@ -79,20 +88,21 @@ class DualDomainROS2:
             except Exception as exc:
                 print(f"[ros2] {label} executor stopped: {exc}", flush=True)
 
-        for executor, context, label in (
-            (self.executor_robot, self.ctx_robot, "robot"),
-            (self.executor_core, self.ctx_core, "core"),
-        ):
+        pairs = [(self.executor_robot, self.ctx_robot, "robot")]
+        if not self.core_is_robot:
+            pairs.append((self.executor_core, self.ctx_core, "core"))
+        for executor, context, label in pairs:
             thread = threading.Thread(target=spin, args=(executor, context, label), daemon=True)
             thread.start()
             self._threads.append(thread)
 
     def shutdown(self) -> None:
         self.executor_robot.shutdown()
-        self.executor_core.shutdown()
+        if not self.core_is_robot:
+            self.executor_core.shutdown()
         if self.rclpy.ok(context=self.ctx_robot):
             self.rclpy.shutdown(context=self.ctx_robot)
-        if self.rclpy.ok(context=self.ctx_core):
+        if not self.core_is_robot and self.rclpy.ok(context=self.ctx_core):
             self.rclpy.shutdown(context=self.ctx_core)
 
 
@@ -324,7 +334,8 @@ def run_driver(
     core_domain = int(ros_cfg.get("core_domain_id", 42))
     print(f"[bundle] {driver_id} namespace={namespace} domains={robot_domain}->{core_domain} interface={interface} port={port}")
 
-    ros2 = DualDomainROS2(robot_domain, core_domain)
+    core_transport = str(ros_cfg.get("core_transport", "dds"))
+    ros2 = DualDomainROS2(robot_domain, core_domain, core_transport=core_transport)
     ros2.start_spin()
     bundle = DriverBundle(build_plugins(config, namespace, ros2))
     bundle.start_all()
