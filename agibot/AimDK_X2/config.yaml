@@ -28,6 +28,9 @@ plugins:
     enabled: false
   imu:
     enabled: true
+  mic:
+    # AimDK AudioCapture -> audio_msgs/AudioChunk PCM-16kHz stream.
+    enabled: true
   leg_odometry:
     # X2's locomotion odometry; this is not SLAM/localization pose.
     enabled: true

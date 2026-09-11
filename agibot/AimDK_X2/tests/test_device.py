@@ -203,6 +203,8 @@ def _install_ros_stubs():
     module("geometry_msgs.msg", Pose=FakeMsg)
     module("nav_msgs")
     module("nav_msgs.msg", Odometry=FakeMsg)
+    module("audio_msgs")
+    module("audio_msgs.msg", AudioChunk=FakeMsg)
 
     module("aimdk_msgs")
     module(
@@ -218,6 +220,7 @@ def _install_ros_stubs():
         JointCommand=FakeMsg,
         JointCommandArray=FakeMsg,
         McLocomotionVelocity=FakeMsg,
+        AudioCapture=FakeMsg,
     )
     srv_names = [
         "ExecuteActionResource", "GetAllJointState", "GetCurrentInputSource", "GetHandType",
@@ -304,8 +307,15 @@ class ToolInventoryTests(unittest.TestCase):
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
         self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "joints", "joint_state", "imu", "leg_odometry", "camera_rgb", "camera_rgb_frame", "head_touch", "pmu_state", "system_state", "linkcraft_catalog"):
+        for name in ("mc_state", "joints", "joint_state", "imu", "mic", "leg_odometry", "camera_rgb", "camera_rgb_frame", "head_touch", "pmu_state", "system_state", "linkcraft_catalog"):
             self.assertEqual(by_name[name], "sensor")
+
+    def test_mic_stream_uses_audio_chunk_contract(self):
+        definitions = {item["name"]: item for item in tool_definitions(build_bundle_plugins())}
+        mic = definitions["mic"]
+        self.assertEqual(mic["type"], "sensor")
+        self.assertEqual(mic["topic_out"][0]["format"], "audio/pcm-16k")
+        self.assertEqual(mic["topic_out"][0]["ros_type"], "audio_msgs/msg/AudioChunk")
 
     def test_unavailable_hardware_cards_are_not_registered_by_default(self):
         names = {definition["name"] for definition in tool_definitions(build_bundle_plugins())}

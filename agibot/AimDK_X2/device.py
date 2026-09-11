@@ -206,6 +206,8 @@ class AimdkNodes:
             JointStateArray,
             McLocomotionVelocity,
         )
+        from audio_msgs.msg import AudioChunk
+        from aimdk_msgs.msg import AudioCapture
 
         self._msg = {
             "CommonRequest": CommonRequest, "String": String, "Pose": Pose,
@@ -216,6 +218,7 @@ class AimdkNodes:
         self._JointCommand = JointCommand
         self._JointCommandArray = JointCommandArray
         self._McLocomotionVelocity = McLocomotionVelocity
+        self._AudioChunk = AudioChunk
 
         self.config = config
         self.end_effector = str(config.get("end_effector", "hand")).lower()
@@ -268,6 +271,24 @@ class AimdkNodes:
         self.robot.create_subscription(Imu, "/aima/hal/imu/chest/state", self._imu_callback("chest", imu_pub), sensor_qos)
         self.robot.create_subscription(Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos)
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
+
+        # AimDK's internal microphone publishes AudioCapture. Convert its raw
+        # PCM payload to the shared AudioChunk contract used by Agent Core/ASR.
+        mic_topic = f"/{namespace}/agibot_x2/mic/audio"
+        self.mic_audio_pub = core_publisher(self.core, AudioChunk, mic_topic, 20)
+        self._mic_audio_buffer = bytearray()
+        self._mic_audio_lock = threading.Lock()
+        self._mic_capture_stats = {"chunks": 0, "bytes": 0, "sample_rate": None, "channels": None}
+        self.robot.create_subscription(
+            AudioCapture, "/aima/hal/audio/capture", self._audio_capture_callback, sensor_qos,
+        )
+        self.streams["mic"] = {
+            "robot_topic": "/aima/hal/audio/capture",
+            "topic": mic_topic,
+            "format": "audio/pcm-16k",
+            "ros_type": "audio_msgs/msg/AudioChunk",
+            "source_ros_type": "aimdk_msgs/msg/AudioCapture",
+        }
 
         # Locomotion odometry is available on X2 even when SLAM is disabled. Keep this
         # separate from slam_odom: it reports leg/body-integrated motion, not map pose.
@@ -554,6 +575,37 @@ class AimdkNodes:
             **cls._fixed_float_fields("pose_covariance", getattr(pose, "covariance", ()), 36),
             **cls._fixed_float_fields("twist_covariance", getattr(getattr(msg, "twist", None), "covariance", ()), 36),
         }
+
+    def _audio_capture_callback(self, msg):
+        """Forward vendor AudioCapture PCM in ASR-compatible 1 KiB chunks."""
+        info = getattr(msg, "info", None)
+        rate = int(getattr(info, "sample_rate", 16000) or 16000)
+        channels = int(getattr(info, "channels", 1) or 1)
+        sample_format = str(getattr(info, "sample_format", "S16LE") or "S16LE").upper()
+        raw = getattr(getattr(msg, "data", None), "data", ())
+        try:
+            payload = bytes(int(value) & 0xFF for value in raw)
+        except (TypeError, ValueError):
+            return
+        if rate != 16000 or channels != 1 or sample_format not in {"S16LE", "PCM_S16LE", ""}:
+            with self._mic_audio_lock:
+                self._mic_capture_stats.update({"sample_rate": rate, "channels": channels, "sample_format": sample_format})
+            return
+        with self._mic_audio_lock:
+            self._mic_capture_stats.update({"sample_rate": rate, "channels": channels})
+            self._mic_audio_buffer.extend(payload)
+            chunks = []
+            while len(self._mic_audio_buffer) >= 1024:
+                chunks.append(bytes(self._mic_audio_buffer[:1024]))
+                del self._mic_audio_buffer[:1024]
+        for chunk in chunks:
+            output = self._AudioChunk()
+            output.format = "audio/pcm-16k"
+            output.data = list(chunk)
+            self.mic_audio_pub.publish(output)
+            with self._mic_audio_lock:
+                self._mic_capture_stats["chunks"] += 1
+                self._mic_capture_stats["bytes"] += len(chunk)
 
     def _camera_info_callback(self, msg):
         from x2_camera_frame import calibration_from_camera_info
@@ -2206,6 +2258,8 @@ def build_plugins(config, namespace, ros2):
     if "hand_state" in nodes.streams:
         add("hand_state", HandStatePlugin(nodes), default=False)
     add("imu", ImuPlugin(nodes))
+    if "mic" in nodes.streams:
+        add("mic", ReadOnlyStreamPlugin(nodes, "mic", "X2 内置麦克风 PCM-16kHz 单声道音频流"))
     if "leg_odometry" in nodes.streams:
         add("leg_odometry", ReadOnlyStreamPlugin(nodes, "leg_odometry", "X2 腿部/机体里程计（非 SLAM 定位）"))
     add("camera", CameraPlugin(nodes))
