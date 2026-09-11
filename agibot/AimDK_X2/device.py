@@ -1468,16 +1468,23 @@ class LocomotionPlugin:
     def _set_input_source_ephemeral(self, *, build_request, attempts, attempt_timeout, action, name):
         import rclpy
         from rclpy.context import Context
+        from rclpy.executors import SingleThreadedExecutor
         from rclpy.node import Node
         from aimdk_msgs.srv import SetMcInputSource
 
         domain_id = int(os.environ.get("ROBOT_DOMAIN_ID", self.nodes.config.get("ros", {}).get("robot_domain_id", 0)))
         ctx = Context()
         node = None
+        executor = None
         last_error = None
         try:
             rclpy.init(context=ctx, domain_id=domain_id)
             node = Node(f"agibot_x2_mc_input_{action}", context=ctx)
+            # Do not call rclpy.spin_until_future_complete(node, ...): on Humble
+            # it uses the global executor, which is bound to the default context.
+            # This driver owns two explicit contexts, so bind the executor explicitly.
+            executor = SingleThreadedExecutor(context=ctx)
+            executor.add_node(node)
             client = node.create_client(SetMcInputSource, "/aimdk_5Fmsgs/srv/SetMcInputSource")
             if not client.wait_for_service(timeout_sec=max(2.0, attempt_timeout * 2)):
                 raise TimeoutError("service /aimdk_5Fmsgs/srv/SetMcInputSource unavailable")
@@ -1486,7 +1493,9 @@ class LocomotionPlugin:
                 # Refresh stamp each attempt like the AimDK example.
                 request.request = self.nodes.request_header()
                 future = client.call_async(request)
-                rclpy.spin_until_future_complete(node, future, timeout_sec=attempt_timeout)
+                deadline = time.monotonic() + attempt_timeout
+                while not future.done() and time.monotonic() < deadline:
+                    executor.spin_once(timeout_sec=min(0.05, max(0.0, deadline - time.monotonic())))
                 if not future.done():
                     last_error = TimeoutError(
                         f"SetMcInputSource action={action} name={name!r} attempt {attempt + 1}/{attempts} timed out"
@@ -1503,6 +1512,15 @@ class LocomotionPlugin:
                 f"(action={action}, name={name!r}): {last_error}"
             )
         finally:
+            if executor is not None:
+                try:
+                    executor.remove_node(node)
+                except Exception:
+                    pass
+                try:
+                    executor.shutdown()
+                except Exception:
+                    pass
             if node is not None:
                 try:
                     node.destroy_node()
