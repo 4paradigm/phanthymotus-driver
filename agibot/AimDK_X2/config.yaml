@@ -78,7 +78,9 @@ plugins:
     input_source_transport: process
     # Empirical X2 calibration: a 0.2 m/s command tracks near 1.94x on this
     # unit. Keep a conservative fixed scale until twist odometry is reliable.
-    velocity_command_scale: 0.52
+    # 0.52 produced only a gait-state transition on this unit (0.104 m/s
+    # command, no forward travel), indicating a vendor startup dead-zone.
+    velocity_command_scale: 0.70
     adaptive_velocity_scale: false
   preset_motion:
     enabled: true
