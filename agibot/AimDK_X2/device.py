@@ -1602,16 +1602,28 @@ class LocomotionPlugin:
             )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(f"SetMcInputSource helper exceeded {timeout_sec + 2.0:.1f}s") from exc
+        # FastDDS on this vendor image can segfault during rclpy shutdown even
+        # after the service response has already arrived. Parse stdout first so
+        # an acknowledged request is not reported as a locomotion failure.
+        parsed = None
+        for line in reversed((completed.stdout or "").splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    pass
+                break
+        if parsed is not None and completed.returncode in (0, -11):
+            return parsed
         if completed.returncode in (124, -11):
             detail = (completed.stderr or completed.stdout or "helper timed out").strip()
             raise TimeoutError(f"SetMcInputSource helper timed out: {detail[-500:]}")
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "helper exited without detail").strip()
             raise RuntimeError(f"SetMcInputSource helper failed (exit {completed.returncode}): {detail[-500:]}")
-        for line in reversed((completed.stdout or "").splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                return json.loads(line)
+        if parsed is not None:
+            return parsed
         raise RuntimeError("SetMcInputSource helper returned no JSON response")
 
     def _set_input_source_ephemeral(self, *, build_request, attempts, attempt_timeout, action, name):

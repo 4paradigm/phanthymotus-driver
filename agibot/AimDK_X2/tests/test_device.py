@@ -701,6 +701,15 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertIn("x2_input_source_helper.py", command[1])
         self.assertIn("--priority", command)
 
+    def test_input_source_process_accepts_response_before_fastdds_shutdown_crash(self):
+        completed = SimpleNamespace(returncode=-11, stdout='{"header": {"code": 0}}\n', stderr='shutdown crash')
+        with mock.patch.object(device.subprocess, "run", return_value=completed):
+            result = device.LocomotionPlugin._set_input_source_process(
+                action=1001, name="motus_x2", priority=81,
+                timeout_ms=1000, timeout_sec=5.0,
+            )
+        self.assertEqual(result["header"]["code"], 0)
+
     """Exercise a couple of simple service-backed dispatch() calls end-to-end against the
     fake ROS client, to catch request/response field mismatches (as opposed to only
     checking tool metadata)."""
