@@ -18,6 +18,6 @@ COPY main.py device.py x2_bridged_publisher.py x2_socket_bridge.py x2_bundle_ent
 COPY resource/ /work/agibot/AimDK_X2/resource/
 COPY deploy/service.yml /deploy/service.yml
 RUN chmod +x /work/agibot/AimDK_X2/x2_bundle_entrypoint.sh
-ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 RCUTILS_COLORIZED_OUTPUT=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
 EXPOSE 15717
 CMD ["/bin/bash", "/work/agibot/AimDK_X2/x2_bundle_entrypoint.sh"]

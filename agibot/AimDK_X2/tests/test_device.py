@@ -257,6 +257,10 @@ def find_plugin(plugins, tool_name):
 
 
 class ToolInventoryTests(unittest.TestCase):
+    def test_container_disables_native_ros_colorized_logs(self):
+        dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("RCUTILS_COLORIZED_OUTPUT=0", dockerfile)
+
     def test_tool_names_and_types_match_driver_yaml(self):
         plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
         definitions = tool_definitions(plugins)
