@@ -1152,6 +1152,10 @@ class LocomotionPlugin:
         self._motion_duration = None
         self._adaptive_scale = 1.0
         self._last_measured = None
+        # The vendor input-source registry is not re-entrant.  Serialize
+        # ADD/MODIFY/ENABLE/DELETE, especially when a duration timer releases
+        # the previous action while a new turn command is arriving.
+        self._input_source_lock = threading.Lock()
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
@@ -1455,15 +1459,12 @@ class LocomotionPlugin:
         # taking down the whole driver is not.
         transport = str(plugin_cfg.get("input_source_transport", "shared")).lower()
         if transport != "ephemeral":
-            result = call_service(
-                self.nodes.set_mc_input_source,
-                build_request(),
-                # Keep the fda5f38 behavior (5 s minimum).  The vendor MC
-                # service can acknowledge input-source changes slowly; a 4 s
-                # client deadline made a previously working card fail before
-                # it ever published velocity.
-                timeout=max(5.0, attempt_timeout * attempts),
-            )
+            with self._input_source_lock:
+                result = call_service(
+                    self.nodes.set_mc_input_source,
+                    build_request(),
+                    timeout=max(5.0, attempt_timeout * attempts),
+                )
             return jsonable(result.response)
 
         # Kept as an explicit opt-in for controlled experiments only.  It is not
@@ -1568,7 +1569,11 @@ class LocomotionPlugin:
                 )
             restored_entry = True
         self._registered = True
-        if restored_entry:
+        # On this firmware MODIFY keeps the stale custom entry usable.  ENABLE
+        # is an optional extra round-trip and has been observed to hang after a
+        # previous DELETE timeout (the common turn-after-straight case).  Keep
+        # it opt-in for vendor images that explicitly require it.
+        if restored_entry and bool(self._plugin_cfg().get("enable_after_modify", False)):
             # MODIFY changes configuration but does not promise to reactivate a
             # source left behind by a previous driver instance.
             result = self._set_input_source(2001)  # INPUTACTION_ENABLE
