@@ -226,7 +226,6 @@ class AimdkNodes:
         self.config = config
         self.end_effector = str(config.get("end_effector", "hand")).lower()
         self.skeleton_joints, self.skeleton_joint_indices = skeleton_layout(self.end_effector)
-        self._unknown_joint_indices = {}
         self.namespace = namespace
         self.robot = Node("agibot_x2_driver_robot", context=ros2.ctx_robot)
         self.core = Node("agibot_x2_driver_core", context=ros2.ctx_core)
@@ -712,7 +711,6 @@ class AimdkNodes:
     def _skeleton_snapshot_locked(self):
         joints = []
         unknown_names = []
-        fallback_idx = len(self.skeleton_joint_indices)
         for area in self.skeleton_joints:
             msg = self.joint_groups.get(area)
             if msg is None:
@@ -721,16 +719,9 @@ class AimdkNodes:
                 name = getattr(state, "name", "")
                 idx = self.skeleton_joint_indices.get(name)
                 if idx is None:
-                    # Keep vendor feedback visible even when a firmware image
-                    # uses a joint spelling not present in the vendored URDF.
-                    # Previously these states were dropped entirely, making
-                    # the joints card look frozen/empty despite live updates.
-                    if not name:
-                        continue
-                    unknown_names.append(name)
-                    idx = self._unknown_joint_indices.setdefault(name, fallback_idx)
-                    if idx == fallback_idx:
-                        fallback_idx += 1
+                    if name:
+                        unknown_names.append(name)
+                    continue
                 item = {
                     "idx": idx,
                     "name": name,
