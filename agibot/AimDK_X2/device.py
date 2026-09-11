@@ -1448,15 +1448,23 @@ class LocomotionPlugin:
             request.input_source.timeout = source_timeout_ms
             return request
 
-        # Unit tests install FakeNode clients; keep the shared call_service path there.
-        if type(self.nodes.robot).__name__ == "FakeNode":
+        # Reuse the driver's already-running robot executor by default.  Creating
+        # and tearing down a second rclpy Context/participant from inside the
+        # dispatch process can crash the vendor Fast DDS binding (SIGSEGV on the
+        # live X2).  A timeout is recoverable and will be surfaced to the card;
+        # taking down the whole driver is not.
+        transport = str(plugin_cfg.get("input_source_transport", "shared")).lower()
+        if transport != "ephemeral":
             result = call_service(
                 self.nodes.set_mc_input_source,
                 build_request(),
-                timeout=max(5.0, attempt_timeout * attempts),
+                timeout=max(2.0, attempt_timeout * attempts),
             )
             return jsonable(result.response)
 
+        # Kept as an explicit opt-in for controlled experiments only.  It is not
+        # the production default because the live SDK has demonstrated native
+        # crashes when this context is repeatedly initialized and destroyed.
         return self._set_input_source_ephemeral(
             build_request=build_request,
             attempts=attempts,
