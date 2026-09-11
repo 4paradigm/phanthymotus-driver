@@ -19,11 +19,10 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `dji/mavic4e` | DJI Mavic 4E/4T | 15703 | Flight control, camera, gimbal, waypoint missions, telemetry, perception |
 | `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
 | `noetix/bumi` | Noetix Bumi-EDU Humanoid | 15704 | Mic, speaker, locomotion, RealSense camera, state monitoring |
-| `x-humanoid/tianyi2.0` | Tianyi 2.0 Pro Humanoid | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
+| `x-humanoid/tianyi2.0` | X-humanoid Tianyi 2.0 Pro Bundle | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
-| `pndbotics/adam` | PNDbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
-| `booster/k1` | Booster K1 Humanoid | 15705 | State (IMU/joints/battery/odom/fall-detection + URDF), camera, locomotion, upper-body joint control, actions/get-up (ACP), audio |
-| `brainco/revo2` | BrainCo Revo 2 Dexterous Hand | 15706 | Finger position/gesture/LED control, state telemetry, tactile telemetry (touch variant only) |
+| `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
+| `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 
 ## Quick Start
 
