@@ -225,6 +225,15 @@ class CameraChannelTests(unittest.TestCase):
 
 
 class CameraAbsentTests(unittest.TestCase):
+    def test_tools_refresh_after_camera_connected_or_renumbered(self):
+        device = {"path": "realsense://1234", "name": "D435", "serial_number": "1234"}
+        with mock.patch.object(ext, "_enumerate_ext_cameras", side_effect=[[], [device], [device]]):
+            plugin = ext.ExtCameraPlugin({}, "robot_a", None)
+            first = plugin.get_tools()[0]["configSchema"]["properties"]["device_path"]["oneOf"]
+            second = plugin.get_tools()[0]["configSchema"]["properties"]["device_path"]["oneOf"]
+        self.assertEqual(first, [{"const": "realsense://1234", "title": "D435 (1234)"}])
+        self.assertEqual(first, second)
+
     def test_plugin_loads_without_camera_and_start_reports_unavailable(self):
         with mock.patch.object(ext, "_enumerate_ext_cameras", return_value=[]):
             plugin = ext.ExtCameraPlugin({}, "robot_a", None)

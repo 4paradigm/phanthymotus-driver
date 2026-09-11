@@ -2,12 +2,17 @@ realman-rm75-6f-v:
   container_name: embodied-realman-rm75-6f-v
   image: __IMAGE__
   network_mode: host
+  # Directory binding exposes newly enumerated nodes without recreating Docker.
+  # Allow V4L2 (81) and USB (189), including future minor numbers.
   device_cgroup_rules:
-    - "c 189:* rmw"
+    - "c 81:* rw"
+    - "c 189:* rw"
+  cap_drop:
+    - MKNOD
   extra_hosts:
     - "${RM75_AGENT_CORE_HOSTNAME:-phanthy-motus}:${RM75_AGENT_CORE_ADDRESS:-127.0.0.1}"
   volumes:
-    - /dev/bus/usb:/dev/bus/usb
+    - /dev:/dev:ro
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - ${RM_API2_LIB_DIR:-/opt/realman/rm_api2/libs/linux_arm}:/work/Robotic_Arm/libs/linux_arm:ro
   environment:

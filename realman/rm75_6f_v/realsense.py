@@ -76,6 +76,15 @@ def _report(status_queue, status):
 
 
 def _capture(namespace, serial_number, routes, commands, quit_event, status_queue):
+    """Reconnect the same serial after unplug/re-enumeration, until stopped."""
+    while not quit_event.is_set():
+        _capture_once(namespace, serial_number, routes, commands, quit_event, status_queue)
+        # Interruptible backoff: camera absence must not spin or prevent stop.
+        if quit_event.wait(2.0):
+            break
+
+
+def _capture_once(namespace, serial_number, routes, commands, quit_event, status_queue):
     """Own one SDK pipeline and fan all three channels out to card instances."""
     from common import logsafe
 
@@ -145,7 +154,9 @@ def _capture(namespace, serial_number, routes, commands, quit_event, status_queu
         while not quit_event.is_set():
             while True:
                 try:
-                    routes = commands.get_nowait()
+                    updated_routes = commands.get_nowait()
+                    routes.clear()
+                    routes.update(updated_routes)
                 except queue.Empty:
                     break
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """RealSense camera card for the RealMan RM75 upper-computer Driver.
 
-Discovery and capture use pyrealsense2 through /dev/bus/usb.  No V4L2 node is
-required, so Linux /dev/video numbering cannot prevent the arm Driver from
-starting.  RGB, depth and infrared instances share one SDK session per camera.
+Discovery and capture use pyrealsense2 with the Linux V4L2 backend. Deployment
+exposes dynamically enumerated video/USB nodes; cards select stable serials.
+RGB, depth and infrared instances share one SDK session per camera.
 """
 
 import logging
@@ -43,7 +43,7 @@ def _device_info(device, field, default=""):
 
 
 def _enumerate_ext_cameras() -> list[dict]:
-    """Enumerate RealSense devices by stable serial number via the RSUSB API."""
+    """Enumerate RealSense devices by stable serial number via the SDK."""
     try:
         import pyrealsense2 as rs
     except (ImportError, OSError) as exc:
@@ -108,6 +108,7 @@ class ExtCameraPlugin:
         self._available_devices = _enumerate_ext_cameras()
 
     def get_tools(self) -> list:
+        self._available_devices = _enumerate_ext_cameras()
         devices = [
             {
                 "const": device["path"],
