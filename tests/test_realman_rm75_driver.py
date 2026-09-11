@@ -337,13 +337,13 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         result = self.plugin.dispatch("move_offset", {
             "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
-            "frame_type": "work", "speed_percent": 5, "confirm_motion": True,
+            "frame_type": "tool", "speed_percent": 5, "confirm_motion": True,
         })
 
         self.assertEqual("running", result["state"])
-        # 工作坐标系 frame_type=0，偏移转换为米/弧度
+        # 工具坐标系 frame_type=1，偏移转换为米/弧度
         self.assertIn(
-            ("rm_movel_offset", ([0.05, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 0, 0)),
+            ("rm_movel_offset", ([0.05, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 1, 0)),
             self.client.calls,
         )
         self.client.pose_mm_deg = [350.0, 0.0, 200.0, 0.0, 0.0, 0.0]
@@ -351,6 +351,29 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         _, status, payload = self.acp_events[0]
         self.assertEqual("completed", status)
         self.assertEqual([350.0, 0.0, 200.0, 0.0, 0.0, 0.0], payload["target_pose_mm_deg"])
+
+    def test_move_offset_rotated_tool_frame_transforms_target(self):
+        # reviewer 示例：90° yaw 下工具系 +X 偏移应沿基系 +Y 移动，监控目标必须经旋转变换
+        self.client.pose_mm_deg = [0.0, 0.0, 0.0, 0.0, 0.0, 90.0]
+        self.plugin.dispatch("move_offset", {
+            "dx_mm": 100, "dy_mm": 0, "dz_mm": 0,
+            "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
+            "frame_type": "tool", "speed_percent": 5, "confirm_motion": True,
+        })
+        self.client.pose_mm_deg = [0.0, 100.0, 0.0, 0.0, 0.0, 90.0]
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        _, status, payload = self.acp_events[0]
+        self.assertEqual("completed", status)
+        self.assertAlmostEqual(100.0, payload["target_pose_mm_deg"][1], places=3)
+        self.assertAlmostEqual(0.0, payload["target_pose_mm_deg"][0], places=3)
+
+    def test_work_frame_offset_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "frame_type must be 'tool'"):
+            self.plugin.dispatch("move_offset", {
+                "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
+                "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
+                "frame_type": "work", "speed_percent": 5, "confirm_motion": True,
+            })
 
     def test_movep_chains_waypoints_with_connect_flags(self):
         waypoints = [
@@ -392,6 +415,88 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual(started["action_id"], action_id)
         self.assertEqual("cancelled", status)
         self.assertEqual("stopmotion", payload["reason"])
+
+    def test_submission_race_with_stopmotion_orders_slow_stop_after_submit(self):
+        # 竞态回归：急停必须等下发完成才能拿到 _action_lock —— SDK 调用顺序
+        # rm_movel 在前、rm_set_arm_slow_stop 在后，监控如实上报 cancelled。
+        gate = threading.Event()
+
+        class GatedClient(self.FakeClient):
+            def command(self, method, *args):
+                if method == "rm_movel" and not gate.is_set():
+                    gate.wait(2.0)
+                return super().command(method, *args)
+
+        self.client = GatedClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY)}, arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        mover = threading.Thread(target=lambda: self.plugin.dispatch("movel", self._movel_args()))
+        mover.start()
+        time.sleep(0.1)  # 让 movel 卡在 rm_movel 下发过程中
+        stop_done = threading.Event()
+        stopper = threading.Thread(target=lambda: (self.plugin.dispatch("stopmotion", {}), stop_done.set()))
+        stopper.start()
+        time.sleep(0.1)
+        self.assertFalse(stop_done.is_set())  # 下发完成前急停不得返回
+        gate.set()
+        stopper.join(5.0)
+        mover.join(5.0)
+        self.assertTrue(stop_done.is_set())
+        order = [entry[0] for entry in self.client.calls]
+        self.assertLess(order.index("rm_movel"), order.index("rm_set_arm_slow_stop"))
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        _, status, payload = self.acp_events[0]
+        self.assertEqual("cancelled", status)
+
+    def test_pose_query_failure_submits_nothing(self):
+        # 位姿查询在下发之前：查询失败时不得下发任何运动命令、不得启动监控
+        class NoPoseClient(self.FakeClient):
+            def call(self, method):
+                if method == "rm_get_current_arm_state":
+                    raise RuntimeError("pose query failed")
+                return super().call(method)
+
+        self.client = NoPoseClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY)}, arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "pose query failed"):
+            self.plugin.dispatch("movel", self._movel_args())
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+        self.assertEqual([], self.acp_events)
+        self.assertFalse(self.plugin._motion_lock.locked())  # 运动锁已释放
+
+    def test_arrival_device_mismatch_error_is_actionable(self):
+        class MismatchClient(self.FakeClient):
+            def command(self, method, *args):
+                if method in ("rm_movel", "rm_movel_offset"):
+                    raise RuntimeError("rm_movel failed with RealMan SDK code -4")
+                return super().command(method, *args)
+
+        self.client = MismatchClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY)}, arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "到位设备"):
+            self.plugin.dispatch("movel", self._movel_args())
+        self.assertEqual([], self.acp_events)
+        self.assertFalse(self.plugin._motion_lock.locked())
 
     def test_motion_guards(self):
         self.client.motion_enabled = False

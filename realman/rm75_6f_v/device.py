@@ -786,8 +786,8 @@ class CartesianPlugin:
         properties = {
             **position_props,
             **offset_props,
-            "frame_type": {"type": "string", "enum": ["tool", "work"], "default": "tool",
-                           "description": "偏移参考坐标系：tool 工具系 / work 工作系"},
+            "frame_type": {"type": "string", "enum": ["tool"], "default": "tool",
+                           "description": "偏移参考坐标系：目前仅支持 tool 工具系（工作坐标系偏移需控制器激活坐标系位姿，暂不开放）"},
             "waypoints": {
                 "type": "array",
                 "minItems": 1,
@@ -878,54 +878,79 @@ class CartesianPlugin:
         if not self._motion_lock.acquire(blocking=False):
             raise RuntimeError(f"another motion is active: {self._active_action_id}")
         action_id = f"rm75_cart_{uuid4().hex[:10]}"
-        with self._action_lock:
-            self._active_action_id = action_id
-            self._cancelled.discard(action_id)
+        # 在 _action_lock 内完成 preflight → 位姿查询 → 目标计算 → 命令下发：
+        # stopmotion 必须等下发完成后才能拿到锁，不会出现「急停先到、轨迹后发」的竞态；
+        # 且任何一步失败都发生在命令下发之前或下发当下，不会留下无人监控的在途运动。
         try:
-            if self._arm is not None:
-                self._arm._preflight()
-            target = self._plan_target(motion_type, args, speed_percent)
-            max_duration = self._motion_deadline_seconds(target, speed_percent)
-            threading.Thread(
-                target=self._monitor_cartesian,
-                args=(action_id, target, max_duration),
-                daemon=True,
-            ).start()
-            print(f"[rm75 ACP] {action_id}: started ({motion_type})", flush=True)
-            return {"state": "running", "action_id": action_id}
-        except Exception:
             with self._action_lock:
-                if self._active_action_id == action_id:
+                self._active_action_id = action_id
+                self._cancelled.discard(action_id)
+                try:
+                    if self._arm is not None:
+                        self._arm._preflight()
+                    current = self._current_pose_mm_deg()
+                    target = self._plan_target(motion_type, args, current)
+                    max_duration = self._motion_deadline_seconds(current, target, speed_percent)
+                    self._submit(motion_type, args, speed_percent)
+                except Exception:
                     self._active_action_id = None
+                    raise
+        except Exception:
             self._motion_lock.release()
             raise
+        threading.Thread(
+            target=self._monitor_cartesian,
+            args=(action_id, target, max_duration),
+            daemon=True,
+        ).start()
+        print(f"[rm75 ACP] {action_id}: started ({motion_type})", flush=True)
+        return {"state": "running", "action_id": action_id}
 
-    def _plan_target(self, motion_type, args, speed_percent):
+    def _plan_target(self, motion_type, args, current):
+        """纯计算：校验参数并返回监控用的基系绝对目标位姿（毫米/度），不做任何 SDK 调用。"""
         if motion_type == "movel":
-            pose_mm_deg = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
-            self.client.command("rm_movel", self._to_sdk_pose(pose_mm_deg), speed_percent, 0, 0, 0)
-            return pose_mm_deg
+            return self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
         if motion_type == "move_offset":
             offset_mm_deg = self._pose_from_fields(args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"))
             frame = args.get("frame_type", "tool")
-            if frame not in ("tool", "work"):
-                raise ValueError("frame_type must be 'tool' or 'work'")
-            frame_type = 1 if frame == "tool" else 0
-            current = self._current_pose_mm_deg()
-            target = [a + b for a, b in zip(current, offset_mm_deg)]
-            self.client.command("rm_movel_offset", self._to_sdk_pose(offset_mm_deg), speed_percent, 0, 0, frame_type, 0)
-            return target
+            if frame != "tool":
+                # 工作坐标系偏移的监控目标需要控制器当前激活的工作坐标系位姿，
+                # SDK 未提供无歧义的查询接口 —— 先只支持工具系（最常用的直觉语义）。
+                raise ValueError("frame_type must be 'tool'（工作坐标系偏移暂不支持）")
+            # 工具系偏移 ≠ 基系直接相加：平移需按当前工具姿态旋转、姿态右乘组合
+            return self._compose_tool_offset(current, offset_mm_deg)
         if motion_type == "movep":
             waypoints = args.get("waypoints")
             if not isinstance(waypoints, list) or not 1 <= len(waypoints) <= 20:
                 raise ValueError("waypoints must be a list of 1~20 poses")
             poses = [self._waypoint_pose(item, index) for index, item in enumerate(waypoints)]
-            # 前 N-1 个点 connect=1（与下一条轨迹联合规划），末点 connect=0 立即执行
-            for pose in poses[:-1]:
-                self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 1, 0)
-            self.client.command("rm_movel", self._to_sdk_pose(poses[-1]), speed_percent, 0, 0, 0)
             return poses[-1]
         raise ValueError(f"unknown motion type: {motion_type}")
+
+    def _submit(self, motion_type, args, speed_percent):
+        """下发 SDK 运动命令（非阻塞）。-4 表示控制器到位设备模式不匹配，转成可操作错误。"""
+        try:
+            if motion_type == "movel":
+                pose = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
+                self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 0, 0)
+            elif motion_type == "move_offset":
+                offset = self._pose_from_fields(args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"))
+                self.client.command("rm_movel_offset", self._to_sdk_pose(offset), speed_percent, 0, 0, 1, 0)
+            elif motion_type == "movep":
+                waypoints = args.get("waypoints")
+                poses = [self._waypoint_pose(item, index) for index, item in enumerate(waypoints)]
+                # 前 N-1 个点 connect=1（与下一条轨迹联合规划），末点 connect=0 立即执行
+                for pose in poses[:-1]:
+                    self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 1, 0)
+                self.client.command("rm_movel", self._to_sdk_pose(poses[-1]), speed_percent, 0, 0, 0)
+            else:
+                raise ValueError(f"unknown motion type: {motion_type}")
+        except RuntimeError as exc:
+            if "code -4" in str(exc):
+                raise RuntimeError(
+                    "控制器到位设备模式不是笛卡尔（SDK -4）：请在示教器/控制箱把到位设备切到笛卡尔模式后重试"
+                ) from exc
+            raise
 
     def _pose_from_fields(self, args, fields):
         pose = []
@@ -972,8 +997,51 @@ class CartesianPlugin:
         euler_error = max(abs((a - b + 180.0) % 360.0 - 180.0) for a, b in zip(current[3:], target[3:]))
         return position_error, euler_error
 
-    def _motion_deadline_seconds(self, target, speed_percent):
-        current = self._current_pose_mm_deg()
+    @staticmethod
+    def _euler_to_matrix(rx_deg, ry_deg, rz_deg):
+        """ZYX 欧拉角（度）→ 旋转矩阵，R = Rz·Ry·Rx。"""
+        rx, ry, rz = math.radians(rx_deg), math.radians(ry_deg), math.radians(rz_deg)
+        cx, sx = math.cos(rx), math.sin(rx)
+        cy, sy = math.cos(ry), math.sin(ry)
+        cz, sz = math.cos(rz), math.sin(rz)
+        return [
+            [cy * cz, cz * sx * sy - cx * sz, cx * cz * sy + sx * sz],
+            [cy * sz, cx * cz + sx * sy * sz, -cz * sx + cx * sy * sz],
+            [-sy, cy * sx, cx * cy],
+        ]
+
+    @staticmethod
+    def _matrix_to_euler(matrix):
+        sy = max(-1.0, min(1.0, -matrix[2][0]))
+        ry = math.degrees(math.asin(sy))
+        if abs(sy) < 0.999999:
+            rx = math.degrees(math.atan2(matrix[2][1], matrix[2][2]))
+            rz = math.degrees(math.atan2(matrix[1][0], matrix[0][0]))
+        else:
+            rz = 0.0
+            rx = math.degrees(math.atan2(-matrix[0][1], matrix[1][1]))
+        return [rx, ry, rz]
+
+    @staticmethod
+    def _mat_mul(left, right):
+        return [[sum(left[i][k] * right[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+    @staticmethod
+    def _mat_vec(matrix, vector):
+        return [sum(matrix[i][k] * vector[k] for k in range(3)) for i in range(3)]
+
+    @classmethod
+    def _compose_tool_offset(cls, current_mm_deg, offset_mm_deg):
+        """工具系偏移 → 基系绝对目标：平移按当前工具姿态旋转，姿态右乘组合。"""
+        cx, cy, cz, crx, cry, crz = current_mm_deg
+        dx, dy, dz, drx, dry, drz = offset_mm_deg
+        r_cur = cls._euler_to_matrix(crx, cry, crz)
+        tx, ty, tz = cls._mat_vec(r_cur, (dx, dy, dz))
+        r_off = cls._euler_to_matrix(drx, dry, drz)
+        nx, ny, nz = cls._matrix_to_euler(cls._mat_mul(r_cur, r_off))
+        return [cx + tx, cy + ty, cz + tz, nx, ny, nz]
+
+    def _motion_deadline_seconds(self, current, target, speed_percent):
         distance_mm = math.sqrt(sum((a - b) ** 2 for a, b in zip(current[:3], target[:3])))
         # RM75 最大直线速度按 600 mm/s 粗估，速度百分比按比例折算，留 3 倍余量；
         # stall 检测是真正的安全网，此估算只用于给 ACP 完成窗口一个上界。
