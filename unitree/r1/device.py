@@ -262,6 +262,7 @@ class NativeTtsPlugin:
                     "volume": {"type": "integer", "description": "Volume 0-100"},
                 },
                 "required": ["action"],
+                "x-resource": "mouth",
                 "x-action-params": {
                     "speak":      {"params": ["text", "voice"],  "description": "Synthesize text to speech on the robot"},
                     "get_volume": {"params": [],                 "description": "Get current speaker volume"},
