@@ -9,8 +9,8 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 
 | Catalog entry | Driver tool | Notes |
 |---|---|---|
-| `/aima/hal/imu/chest/state`, `/aima/hal/imu/torso/state` | `imu` | merged into one `data/json` stream |
-| `/aima/mc/leg_odometry` | `leg_odometry` | `nav_msgs/msg/Odometry`, mirrored as `data/json`; locomotion/leg odometry, not SLAM localization |
+| `/aima/hal/imu/chest/state`, `/aima/hal/imu/torso/state` | `imu` | merged into one flat `data/json` stream (`chest_*`/`torso_*` scalar fields; roll/pitch/yaw in degrees). Quaternion and all 3x3 covariance elements are retained as scalar fields. |
+| `/aima/mc/leg_odometry` | `leg_odometry` | `nav_msgs/msg/Odometry`, flattened as position (m), quaternion and roll/pitch/yaw (deg), linear velocity (m/s), angular velocity (rad/s/deg/s), and all 6x6 pose/twist covariance elements; locomotion/leg odometry, not SLAM localization |
 | `/aima/hal/joint/hand/state` | `hand_state` (optional) | `HandStateArray`, includes touch sensors. Disabled by default: the verified X2 reports `HandType.NONE` and empty joint arrays on both sides. |
 | `/aima/hal/sensor/touch_head` | `head_touch` | `TouchState`, confirmed publisher on the X2 unit |
 | `/aima/hal/pmu/state` | `pmu_state` | `PmuState`, confirmed publisher on the X2 unit |
@@ -29,7 +29,7 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/aimdk_5Fmsgs/srv/GetMcAction`, `/aima/mc/common/state` | `mc_state`, `mc_mode` ACP confirmation | `GetMcAction` remains call-on-demand; the verified X2 also broadcasts `McCommonState`, whose `action_info.action_desc/status` confirms a requested mode has become active. |
 | `/aimdk_5Fmsgs/srv/SetMcAction` | `mc_mode` | SDK enum is not a firmware capability list. This X2 rejected `STAND_UP_DEFAULT` and `ZERO_TORQUE_DEFAULT` with `can not find action`; `PASSIVE_DEFAULT`/`STAND_DEFAULT` only acknowledged the request, while `DAMPING_DEFAULT` is the sole observed end-to-end working mode. The driver exposes only `DAMPING_DEFAULT` by default and confirms activation from `/aima/mc/common/state`. |
 | `/aimdk_5Fmsgs/srv/SetMcPresetMotion` | `preset_motion` | |
-| `/aimdk_5Fmsgs/srv/SetMcInputSource`, `GetCurrentInputSource` | `locomotion` | AimDK requires external locomotion to register and publish with a distinct source name. The driver registers `motus_x2` at priority 81 (one above `rc=80`), publishes at 50 Hz, and deletes it on cancel/completion/stop so native control immediately regains arbitration. `move.angular` is exposed as deg/s for human use and converted to the ROS field's rad/s. |
+| `/aimdk_5Fmsgs/srv/SetMcInputSource`, `GetCurrentInputSource` | `locomotion` | AimDK requires external locomotion to register and publish with a distinct source name. The driver registers `motus_x2` at priority 81 (one above `rc=80`), publishes at 50 Hz, and deletes it on cancel/completion/stop so native control immediately regains arbitration. `move.angular` is deg/s → rad/s. Timed `move` stops on **duration** (not distance). Field evidence of ~2× travel is treated as velocity tracking gain: `plugins.locomotion.velocity_command_scale` plus optional adaptive scale from `leg_odometry` twist; odom displacement is only a safety abort if travel ≫ speed×time. |
 | `/aimdk_5Fmsgs/srv/GetSystemState` | `system_state` | |
 | `/aimdk_5Fmsgs/srv/GetRobotResources` | `linkcraft_catalog` | |
 | `/aimdk_5Fmsgs/srv/ExecuteActionResource` | `linkcraft` | |

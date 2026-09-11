@@ -371,6 +371,66 @@ class ToolInventoryTests(unittest.TestCase):
         self.assertEqual(odometry.dispatch("stop", {}), {"state": "idle"})
         self.assertNotIn("slam_odom", nodes.streams)
 
+    def test_leg_odometry_payload_is_flat_and_uses_human_units(self):
+        message = SimpleNamespace(
+            header=SimpleNamespace(frame_id="leg_odom", stamp=SimpleNamespace(sec=12, nanosec=34)),
+            child_frame_id="base_link",
+            pose=SimpleNamespace(pose=SimpleNamespace(
+                position=SimpleNamespace(x=2.0, y=-1.0, z=0.9),
+                orientation=SimpleNamespace(x=0.0, y=0.0, z=math.sqrt(0.5), w=math.sqrt(0.5)),
+            ), covariance=list(range(36))),
+            twist=SimpleNamespace(twist=SimpleNamespace(
+                linear=SimpleNamespace(x=0.2, y=0.0, z=0.0),
+                angular=SimpleNamespace(x=0.0, y=0.0, z=math.pi / 2),
+            ), covariance=list(range(36, 72))),
+        )
+        payload = device.AimdkNodes._leg_odometry_payload(message)
+        self.assertEqual(payload["position_x_m"], 2.0)
+        self.assertEqual(payload["position_y_m"], -1.0)
+        self.assertAlmostEqual(payload["yaw_deg"], 90.0)
+        self.assertAlmostEqual(payload["yaw_rate_deg_s"], 90.0)
+        self.assertEqual(payload["orientation_w"], math.sqrt(0.5))
+        self.assertEqual(payload["pose_covariance_00"], 0.0)
+        self.assertEqual(payload["pose_covariance_35"], 35.0)
+        self.assertEqual(payload["twist_covariance_00"], 36.0)
+        self.assertEqual(payload["twist_covariance_35"], 71.0)
+        self.assertEqual(sum(1 for key in payload if key.startswith("pose_covariance_")), 36)
+        self.assertEqual(sum(1 for key in payload if key.startswith("twist_covariance_")), 36)
+        self.assertEqual(payload["orientation_x"], 0.0)
+        self.assertEqual(payload["orientation_y"], 0.0)
+        self.assertEqual(payload["orientation_z"], math.sqrt(0.5))
+        self.assertEqual(payload["linear_x_m_s"], 0.2)
+        self.assertEqual(payload["angular_z_rad_s"], math.pi / 2)
+        self.assertNotIn("pose", payload)
+        self.assertNotIn("twist", payload)
+
+    def test_imu_payload_is_flat_and_keeps_chest_and_torso_separate(self):
+        message = SimpleNamespace(
+            header=SimpleNamespace(frame_id="chest", stamp=SimpleNamespace(sec=1, nanosec=2)),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            angular_velocity=SimpleNamespace(x=0.1, y=0.2, z=0.3),
+            linear_acceleration=SimpleNamespace(x=1.0, y=2.0, z=3.0),
+            orientation_covariance=list(range(9)),
+            angular_velocity_covariance=list(range(9, 18)),
+            linear_acceleration_covariance=list(range(18, 27)),
+        )
+        payload = device.AimdkNodes._imu_payload("chest", message)
+        self.assertEqual(payload["chest_frame_id"], "chest")
+        self.assertEqual(payload["chest_roll_deg"], 0.0)
+        self.assertEqual(payload["chest_angular_z_rad_s"], 0.3)
+        self.assertEqual(payload["chest_accel_z_m_s2"], 3.0)
+        self.assertEqual(payload["chest_orientation_w"], 1.0)
+        self.assertEqual(payload["chest_orientation_covariance_08"], 8.0)
+        self.assertEqual(payload["chest_angular_velocity_covariance_08"], 17.0)
+        self.assertEqual(payload["chest_linear_acceleration_covariance_08"], 26.0)
+        self.assertEqual(sum(1 for key in payload if key.startswith("chest_orientation_covariance_")), 9)
+        self.assertEqual(sum(1 for key in payload if key.startswith("chest_angular_velocity_covariance_")), 9)
+        self.assertEqual(sum(1 for key in payload if key.startswith("chest_linear_acceleration_covariance_")), 9)
+        self.assertEqual(payload["chest_orientation_x"], 0.0)
+        self.assertEqual(payload["chest_orientation_y"], 0.0)
+        self.assertEqual(payload["chest_orientation_z"], 0.0)
+        self.assertFalse(any(isinstance(value, dict) for value in payload.values()))
+
     def test_joints_skeleton_topic_and_payload_contract(self):
         plugins = build_bundle_plugins()
         nodes = plugins[0].nodes
@@ -709,6 +769,73 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertEqual(locomotion.nodes.set_mc_input_source.last_request.action.value, 1003)
         self.assertEqual(notify.call_args.args[0], action_id)
         self.assertEqual(notify.call_args.args[1], "cancelled")
+
+    def test_locomotion_static_velocity_scale_is_applied_to_publish(self):
+        plugins = build_bundle_plugins({"plugins": {"locomotion": {
+            "velocity_command_scale": 0.5,
+            "adaptive_velocity_scale": False,
+        }}})
+        locomotion = find_plugin(plugins, "locomotion")
+        locomotion.nodes.set_mc_input_source.response = FakeMsg()
+        result = locomotion.dispatch("move", {"forward": 0.2, "duration": -1})
+        self.assertEqual(result["stop_mode"], "continuous")
+        self.assertAlmostEqual(result["command"]["forward_m_s"], 0.2)
+        self.assertAlmostEqual(result["published"]["forward_m_s"], 0.1)
+        self.assertAlmostEqual(locomotion.nodes.locomotion_pub.published[-1].forward_velocity, 0.1)
+
+    def test_locomotion_adaptive_scale_reduces_command_when_odom_is_fast(self):
+        plugins = build_bundle_plugins({"plugins": {"locomotion": {
+            "velocity_command_scale": 1.0,
+            "adaptive_velocity_scale": True,
+        }}})
+        locomotion = find_plugin(plugins, "locomotion")
+        locomotion.nodes.set_mc_input_source.response = FakeMsg()
+        locomotion.nodes.values["leg_odometry"] = {
+            "position_x_m": 0.0,
+            "position_y_m": 0.0,
+            "yaw_deg": 0.0,
+            "linear_x_m_s": 0.4,
+            "linear_y_m_s": 0.0,
+            "angular_z_rad_s": 0.0,
+        }
+        with mock.patch.object(device.threading, "Timer") as timer_cls:
+            result = locomotion.dispatch("move", {"forward": 0.2, "duration": 5.0})
+        self.assertEqual(result["stop_mode"], "duration")
+        self.assertAlmostEqual(result["expected_distance_m"], 1.0)
+        # First heartbeat sees measured 0.4 vs command 0.2 and pulls scale down.
+        heartbeat = next(call for call in timer_cls.call_args_list if call.args[0] == 0.02)
+        heartbeat.args[1]()
+        published = locomotion.nodes.locomotion_pub.published[-1].forward_velocity
+        self.assertLess(published, 0.2)
+        self.assertGreater(published, 0.05)
+
+    def test_locomotion_odom_safety_aborts_only_on_large_overshoot(self):
+        plugins = build_bundle_plugins({"plugins": {"locomotion": {
+            "adaptive_velocity_scale": False,
+        }}})
+        locomotion = find_plugin(plugins, "locomotion")
+        locomotion.nodes.set_mc_input_source.response = FakeMsg()
+        locomotion.nodes.values["leg_odometry"] = {
+            "position_x_m": 0.0,
+            "position_y_m": 0.0,
+            "yaw_deg": 0.0,
+            "linear_x_m_s": 0.2,
+            "linear_y_m_s": 0.0,
+            "angular_z_rad_s": 0.0,
+        }
+        with mock.patch.object(device.threading, "Timer") as timer_cls:
+            locomotion.dispatch("move", {"forward": 0.2, "duration": 5.0})
+        # 1.0 m expected; 1.2 m is over 1.35? 1.2 < 1.35, keep going.
+        locomotion.nodes.values["leg_odometry"]["position_x_m"] = 1.20
+        heartbeat = next(call for call in timer_cls.call_args_list if call.args[0] == 0.02)
+        heartbeat.args[1]()
+        self.assertGreater(locomotion.nodes.locomotion_pub.published[-1].forward_velocity, 0.0)
+        # 1.4 m >= 1.35 * 1.0 -> safety stop.
+        locomotion.nodes.values["leg_odometry"]["position_x_m"] = 1.40
+        with mock.patch.object(device, "_acp_notify") as notify:
+            timer_cls.call_args_list[-1].args[1]()
+        self.assertEqual(notify.call_args.args[1], "completed")
+        self.assertEqual(notify.call_args.args[2]["stop_mode"], "odom_safety")
 
     def test_locomotion_requires_duration_and_defaults_forward_speed(self):
         plugins = build_bundle_plugins()

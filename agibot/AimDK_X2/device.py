@@ -93,6 +93,17 @@ CAMERA_RGB_MAX_HZ = 10.0
 # watchdog is 1000 ms, but matching the reference cadence also keeps control
 # latency bounded under DDS packet loss.
 LOCOMOTION_HEARTBEAT_HZ = 50.0
+# X2 field evidence: command forward=0.2 m/s for 5s produced ~2.0 m leg_odometry
+# travel while ACP completed on time. That points at effective tracking gain, not a
+# late stop timer. Scale outgoing velocity using config and/or odom twist feedback.
+LOCOMOTION_VEL_SCALE_MIN = 0.35
+LOCOMOTION_VEL_SCALE_MAX = 1.25
+LOCOMOTION_VEL_SCALE_EMA = 0.15
+LOCOMOTION_VEL_SCALE_MIN_SPEED = 0.05
+# Safety only: abort if odom travel far exceeds speed*duration expectation.
+LOCOMOTION_ODOM_SAFETY_FACTOR = 1.35
+LOCOMOTION_ODOM_SAFETY_MIN_M = 0.15
+LOCOMOTION_ODOM_SAFETY_MIN_DEG = 15.0
 
 
 def skeleton_layout(variant):
@@ -262,7 +273,7 @@ class AimdkNodes:
         if stream_enabled("leg_odometry", default=True):
             mirror(
                 "leg_odometry", Odometry, "/aima/mc/leg_odometry", "data/json",
-                qos=sensor_qos,
+                qos=sensor_qos, transform=self._leg_odometry_payload,
             )
 
         if stream_enabled("hand_state", default=False):
@@ -420,12 +431,123 @@ class AimdkNodes:
         def callback(msg):
             with self.lock:
                 combined = self.values.setdefault("imu", {})
-                combined[source] = jsonable(msg)
+                combined.update(self._imu_payload(source, msg))
                 snapshot = dict(combined)
             output = String()
             output.data = json.dumps(snapshot, ensure_ascii=False)
             publisher.publish(output)
         return callback
+
+    @staticmethod
+    def _float(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _int(value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _fixed_float_fields(cls, prefix, values, length):
+        """Preserve every ROS fixed-size numeric array as top-level JSON values."""
+        try:
+            values = list(values)
+        except TypeError:
+            values = []
+        return {
+            f"{prefix}_{index:02d}": cls._float(values[index] if index < len(values) else 0.0)
+            for index in range(length)
+        }
+
+    @classmethod
+    def _quaternion_rpy_deg(cls, quaternion):
+        x = cls._float(getattr(quaternion, "x", 0.0))
+        y = cls._float(getattr(quaternion, "y", 0.0))
+        z = cls._float(getattr(quaternion, "z", 0.0))
+        w = cls._float(getattr(quaternion, "w", 1.0), 1.0)
+        roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+        pitch_term = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
+        pitch = math.asin(pitch_term)
+        yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        return tuple(math.degrees(angle) for angle in (roll, pitch, yaw))
+
+    @classmethod
+    def _imu_payload(cls, source, msg):
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        orientation = getattr(msg, "orientation", None)
+        angular = getattr(msg, "angular_velocity", None)
+        acceleration = getattr(msg, "linear_acceleration", None)
+        roll, pitch, yaw = cls._quaternion_rpy_deg(orientation)
+        return {
+            f"{source}_frame_id": str(getattr(header, "frame_id", "")),
+            f"{source}_stamp_sec": cls._int(getattr(stamp, "sec", 0)),
+            f"{source}_stamp_nanosec": cls._int(getattr(stamp, "nanosec", 0)),
+            f"{source}_orientation_x": cls._float(getattr(orientation, "x", 0.0)),
+            f"{source}_orientation_y": cls._float(getattr(orientation, "y", 0.0)),
+            f"{source}_orientation_z": cls._float(getattr(orientation, "z", 0.0)),
+            f"{source}_orientation_w": cls._float(getattr(orientation, "w", 1.0), 1.0),
+            f"{source}_roll_deg": roll,
+            f"{source}_pitch_deg": pitch,
+            f"{source}_yaw_deg": yaw,
+            f"{source}_angular_x_rad_s": cls._float(getattr(angular, "x", 0.0)),
+            f"{source}_angular_y_rad_s": cls._float(getattr(angular, "y", 0.0)),
+            f"{source}_angular_z_rad_s": cls._float(getattr(angular, "z", 0.0)),
+            f"{source}_accel_x_m_s2": cls._float(getattr(acceleration, "x", 0.0)),
+            f"{source}_accel_y_m_s2": cls._float(getattr(acceleration, "y", 0.0)),
+            f"{source}_accel_z_m_s2": cls._float(getattr(acceleration, "z", 0.0)),
+            **cls._fixed_float_fields(
+                f"{source}_orientation_covariance", getattr(msg, "orientation_covariance", ()), 9,
+            ),
+            **cls._fixed_float_fields(
+                f"{source}_angular_velocity_covariance", getattr(msg, "angular_velocity_covariance", ()), 9,
+            ),
+            **cls._fixed_float_fields(
+                f"{source}_linear_acceleration_covariance", getattr(msg, "linear_acceleration_covariance", ()), 9,
+            ),
+        }
+
+    @classmethod
+    def _leg_odometry_payload(cls, msg):
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        pose = getattr(msg, "pose", None)
+        position = getattr(getattr(pose, "pose", None), "position", None)
+        orientation = getattr(getattr(pose, "pose", None), "orientation", None)
+        twist = getattr(getattr(msg, "twist", None), "twist", None)
+        linear = getattr(twist, "linear", None)
+        angular = getattr(twist, "angular", None)
+        roll, pitch, yaw = cls._quaternion_rpy_deg(orientation)
+        return {
+            "frame_id": str(getattr(header, "frame_id", "")),
+            "child_frame_id": str(getattr(msg, "child_frame_id", "")),
+            "stamp_sec": cls._int(getattr(stamp, "sec", 0)),
+            "stamp_nanosec": cls._int(getattr(stamp, "nanosec", 0)),
+            "position_x_m": cls._float(getattr(position, "x", 0.0)),
+            "position_y_m": cls._float(getattr(position, "y", 0.0)),
+            "position_z_m": cls._float(getattr(position, "z", 0.0)),
+            "orientation_x": cls._float(getattr(orientation, "x", 0.0)),
+            "orientation_y": cls._float(getattr(orientation, "y", 0.0)),
+            "orientation_z": cls._float(getattr(orientation, "z", 0.0)),
+            "orientation_w": cls._float(getattr(orientation, "w", 1.0), 1.0),
+            "roll_deg": roll,
+            "pitch_deg": pitch,
+            "yaw_deg": yaw,
+            "linear_x_m_s": cls._float(getattr(linear, "x", 0.0)),
+            "linear_y_m_s": cls._float(getattr(linear, "y", 0.0)),
+            "linear_z_m_s": cls._float(getattr(linear, "z", 0.0)),
+            "angular_x_rad_s": cls._float(getattr(angular, "x", 0.0)),
+            "angular_y_rad_s": cls._float(getattr(angular, "y", 0.0)),
+            "angular_z_rad_s": cls._float(getattr(angular, "z", 0.0)),
+            "yaw_rate_deg_s": math.degrees(cls._float(getattr(angular, "z", 0.0))),
+            **cls._fixed_float_fields("pose_covariance", getattr(pose, "covariance", ()), 36),
+            **cls._fixed_float_fields("twist_covariance", getattr(getattr(msg, "twist", None), "covariance", ()), 36),
+        }
 
     def _camera_info_callback(self, msg):
         from x2_camera_frame import calibration_from_camera_info
@@ -1004,7 +1126,8 @@ class McModePlugin:
 
 class LocomotionPlugin:
     ACTIONS = {
-        "move": (["forward", "lateral", "angular", "duration"], "移动；duration=-1 持续移动，否则到时自动刹停"),
+        "move": (["forward", "lateral", "angular", "duration"],
+                 "移动；duration=-1 持续移动，否则按时长刹停。速度按 m/s 与 °/s 下发，可用配置/里程计测速标定，避免只靠距离闭环掩盖速度误差"),
         "cancel": ([], "立即停止当前行走速度并取消定时动作"),
     }
 
@@ -1016,22 +1139,30 @@ class LocomotionPlugin:
         self._velocity_timer = None
         self._motion_generation = 0
         self._active_action_id = None
+        self._command_forward = 0.0
+        self._command_lateral = 0.0
+        self._command_angular = 0.0
+        self._motion_started_mono = None
+        self._motion_duration = None
+        self._adaptive_scale = 1.0
+        self._last_measured = None
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
             "forward": {"type": "number", "default": 0.2,
-                        "description": "前进速度 m/s，+前进/-后退；默认 0.2"},
+                        "description": "前进速度 m/s，+前进/-后退；默认 0.2（厂商单位，经 velocity 标定后下发）"},
             "lateral": {"type": "number", "description": "侧移速度 m/s，+左移/-右移"},
             "angular": {"type": "number", "description": "转向角速度 °/s，+左转/-右转；驱动内部换算为 rad/s"},
             "duration": {"type": "number", "minimum": -1, "maximum": 60, "default": -1,
-                         "description": "持续时间（秒）。-1 为持续移动，0.1-60 到时自动发布零速度。"},
+                         "description": "持续时间（秒）。-1 持续移动；有限时长到点发零速。位移应约等于速度×时间；若明显偏离，检查速度标定而非只改刹停。"},
         })
         schema["allOf"] = [{
             "if": {"properties": {"action": {"const": "move"}}, "required": ["action"]},
             "then": {"required": ["duration"]},
         }]
         return tool("locomotion", "actuator", "MC 行走速度控制：动作开始时自动注册独立输入源，在稳定站立下直接进入走跑。动作期间该源优先于遥控器；"
-                    "取消、定时完成和驱动停止都会删除它并把控制权还给遥控器。",
+                    "取消、定时完成和驱动停止都会删除它并把控制权还给遥控器。"
+                    "有限 duration 以时钟为准刹停；用 leg_odometry 的 twist 标定实际跟踪增益，里程计位移仅作安全上限。",
                     _with_actuation_contract(schema, ["base", "leg"]))
 
     def start(self):
@@ -1040,6 +1171,147 @@ class LocomotionPlugin:
     def stop(self):
         self._cancel_motion("driver_stopped", send_stop=True)
         self._release_input_source()
+
+    def _plugin_cfg(self):
+        return self.nodes.config.get("plugins", {}).get("locomotion", {}) or {}
+
+    def _configured_velocity_scale(self):
+        raw = self._plugin_cfg().get("velocity_command_scale", 1.0)
+        try:
+            scale = float(raw)
+        except (TypeError, ValueError):
+            scale = 1.0
+        return max(LOCOMOTION_VEL_SCALE_MIN, min(LOCOMOTION_VEL_SCALE_MAX, scale))
+
+    def _adaptive_scale_enabled(self):
+        return bool(self._plugin_cfg().get("adaptive_velocity_scale", True))
+
+    @staticmethod
+    def _wrap_angle_deg(delta):
+        while delta > 180.0:
+            delta -= 360.0
+        while delta < -180.0:
+            delta += 360.0
+        return delta
+
+    def _leg_odom_snapshot(self):
+        snapshot = self.nodes.snapshot("leg_odometry") or {}
+        if not snapshot:
+            return None
+        try:
+            return {
+                "x": float(snapshot["position_x_m"]),
+                "y": float(snapshot["position_y_m"]),
+                "yaw_deg": float(snapshot["yaw_deg"]),
+                "linear_x": float(snapshot.get("linear_x_m_s", 0.0)),
+                "linear_y": float(snapshot.get("linear_y_m_s", 0.0)),
+                "angular_z": float(snapshot.get("angular_z_rad_s", 0.0)),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _effective_scale(self):
+        scale = self._configured_velocity_scale()
+        if self._adaptive_scale_enabled():
+            scale *= self._adaptive_scale
+        return max(LOCOMOTION_VEL_SCALE_MIN, min(LOCOMOTION_VEL_SCALE_MAX, scale))
+
+    def _scaled_command(self, forward, lateral, angular):
+        scale = self._effective_scale()
+        return forward * scale, lateral * scale, angular * scale, scale
+
+    def _update_adaptive_scale(self, forward, lateral, angular):
+        if not self._adaptive_scale_enabled():
+            return
+        odom = self._leg_odom_snapshot()
+        if odom is None:
+            return
+        cmd_lin = math.hypot(float(forward), float(lateral))
+        meas_lin = math.hypot(odom["linear_x"], odom["linear_y"])
+        cmd_ang = abs(float(angular))
+        meas_ang = abs(odom["angular_z"])
+        ratios = []
+        # Prefer linear ratio when both are moving; angular is secondary.
+        if cmd_lin >= LOCOMOTION_VEL_SCALE_MIN_SPEED and meas_lin >= LOCOMOTION_VEL_SCALE_MIN_SPEED:
+            ratios.append(cmd_lin / meas_lin)
+        elif cmd_ang >= 0.05 and meas_ang >= 0.05:
+            ratios.append(cmd_ang / meas_ang)
+        if not ratios:
+            self._last_measured = {
+                "linear_speed_m_s": meas_lin,
+                "angular_z_rad_s": odom["angular_z"],
+            }
+            return
+        sample = sum(ratios) / len(ratios)
+        sample = max(LOCOMOTION_VEL_SCALE_MIN, min(LOCOMOTION_VEL_SCALE_MAX, sample))
+        alpha = LOCOMOTION_VEL_SCALE_EMA
+        self._adaptive_scale = (1.0 - alpha) * self._adaptive_scale + alpha * sample
+        self._adaptive_scale = max(LOCOMOTION_VEL_SCALE_MIN, min(LOCOMOTION_VEL_SCALE_MAX, self._adaptive_scale))
+        self._last_measured = {
+            "linear_speed_m_s": meas_lin,
+            "angular_z_rad_s": odom["angular_z"],
+            "scale_sample": sample,
+            "adaptive_scale": self._adaptive_scale,
+        }
+
+    def _safety_should_stop(self, start_pose, duration, forward, lateral, angular):
+        if start_pose is None or duration is None or duration <= 0:
+            return None
+        odom = self._leg_odom_snapshot()
+        if odom is None:
+            return None
+        distance = math.hypot(odom["x"] - start_pose["x"], odom["y"] - start_pose["y"])
+        yaw_delta = abs(self._wrap_angle_deg(odom["yaw_deg"] - start_pose["yaw_deg"]))
+        expect_m = abs(math.hypot(forward, lateral) * duration)
+        expect_deg = abs(math.degrees(angular) * duration)
+        over_m = expect_m >= LOCOMOTION_ODOM_SAFETY_MIN_M and distance >= expect_m * LOCOMOTION_ODOM_SAFETY_FACTOR
+        over_yaw = expect_deg >= LOCOMOTION_ODOM_SAFETY_MIN_DEG and yaw_delta >= expect_deg * LOCOMOTION_ODOM_SAFETY_FACTOR
+        if not (over_m or over_yaw):
+            return None
+        return {
+            "distance_m": distance,
+            "yaw_delta_deg": self._wrap_angle_deg(odom["yaw_deg"] - start_pose["yaw_deg"]),
+            "expected_distance_m": expect_m,
+            "expected_yaw_delta_deg": math.degrees(angular) * duration,
+        }
+
+    def _complete_motion(self, action_id, *, status, reason, extra=None):
+        with self._lock:
+            if self._active_action_id != action_id:
+                return False
+            self._motion_generation += 1
+            self._active_action_id = None
+            timer, self._stop_timer = self._stop_timer, None
+            velocity_timer, self._velocity_timer = self._velocity_timer, None
+            started = self._motion_started_mono
+            duration = self._motion_duration
+            measured = dict(self._last_measured) if self._last_measured else None
+            scale = self._effective_scale()
+            self._motion_started_mono = None
+            self._motion_duration = None
+        if timer is not None:
+            timer.cancel()
+        if velocity_timer is not None:
+            velocity_timer.cancel()
+        self._publish_velocity()
+        self._release_input_source()
+        payload = {
+            "reason": reason,
+            "topic": "/aima/mc/locomotion/velocity",
+            "final_velocity": {"forward": 0.0, "lateral": 0.0, "angular": 0.0},
+            "velocity_command_scale": scale,
+            "adaptive_scale": self._adaptive_scale,
+        }
+        if duration is not None:
+            payload["duration"] = duration
+        if started is not None:
+            payload["elapsed_s"] = max(0.0, time.monotonic() - started)
+        if measured:
+            payload["measured"] = measured
+        if extra:
+            payload.update(extra)
+        _acp_notify(action_id, status, payload, "locomotion")
+        return True
 
     def _publish_velocity(self, forward=0.0, lateral=0.0, angular=0.0):
         msg = self.nodes._McLocomotionVelocity()
@@ -1056,6 +1328,8 @@ class LocomotionPlugin:
             timer, self._stop_timer = self._stop_timer, None
             velocity_timer, self._velocity_timer = self._velocity_timer, None
             action_id, self._active_action_id = self._active_action_id, None
+            self._motion_started_mono = None
+            self._motion_duration = None
         if timer is not None:
             timer.cancel()
         if velocity_timer is not None:
@@ -1080,20 +1354,12 @@ class LocomotionPlugin:
             with self._lock:
                 if generation != self._motion_generation:
                     return
-                self._stop_timer = None
-                if self._active_action_id != action_id:
-                    return
-                self._active_action_id = None
-                velocity_timer, self._velocity_timer = self._velocity_timer, None
-            if velocity_timer is not None:
-                velocity_timer.cancel()
-            self._publish_velocity()
-            self._release_input_source()
-            _acp_notify(action_id, "completed", {
-                "duration": duration,
-                "topic": "/aima/mc/locomotion/velocity",
-                "final_velocity": {"forward": 0.0, "lateral": 0.0, "angular": 0.0},
-            }, "locomotion")
+            self._complete_motion(
+                action_id,
+                status="completed",
+                reason="duration_elapsed",
+                extra={"stop_mode": "duration"},
+            )
 
         timer = threading.Timer(duration, finish)
         timer.daemon = True
@@ -1103,7 +1369,7 @@ class LocomotionPlugin:
             self._stop_timer = timer
         timer.start()
 
-    def _start_velocity_stream(self, action_id, forward, lateral, angular):
+    def _start_velocity_stream(self, action_id, forward, lateral, angular, start_pose, duration):
         """Refresh the vendor input before its 1000 ms watchdog expires."""
         period = 1.0 / LOCOMOTION_HEARTBEAT_HZ
         with self._lock:
@@ -1113,9 +1379,24 @@ class LocomotionPlugin:
             with self._lock:
                 if generation != self._motion_generation or self._active_action_id != action_id:
                     return
-                self._publish_velocity(forward, lateral, angular)
-                timer = threading.Timer(period, tick)
-                timer.daemon = True
+            # Root-cause path: compare commanded vs odom twist, adapt scale, then publish.
+            self._update_adaptive_scale(forward, lateral, angular)
+            safety = self._safety_should_stop(start_pose, duration, forward, lateral, angular)
+            if safety is not None:
+                self._complete_motion(
+                    action_id,
+                    status="completed",
+                    reason="odom_safety_limit",
+                    extra={"stop_mode": "odom_safety", **safety},
+                )
+                return
+            pub_f, pub_l, pub_a, scale = self._scaled_command(forward, lateral, angular)
+            self._publish_velocity(pub_f, pub_l, pub_a)
+            timer = threading.Timer(period, tick)
+            timer.daemon = True
+            with self._lock:
+                if generation != self._motion_generation or self._active_action_id != action_id:
+                    return
                 self._velocity_timer = timer
             timer.start()
 
@@ -1128,14 +1409,14 @@ class LocomotionPlugin:
         timer.start()
 
     def _source_name(self):
-        name = str(self.nodes.config.get("plugins", {}).get("locomotion", {}).get("input_source_name", "motus_x2"))
+        name = str(self._plugin_cfg().get("input_source_name", "motus_x2"))
         if not name or name in {"rc", "vr", "app_proxy", "interaction", "pnc"}:
             raise ValueError("locomotion: input_source_name must be a non-empty custom source name")
         return name
 
     def _set_input_source(self, mc_input_action):
         from aimdk_msgs.srv import SetMcInputSource
-        plugin_cfg = self.nodes.config.get("plugins", {}).get("locomotion", {})
+        plugin_cfg = self._plugin_cfg()
         request = SetMcInputSource.Request()
         request.request = self.nodes.request_header()
         request.action.value = mc_input_action
@@ -1194,7 +1475,13 @@ class LocomotionPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "ready", "registered": self._registered}
+            return {
+                "state": "ready",
+                "registered": self._registered,
+                "velocity_command_scale": self._configured_velocity_scale(),
+                "adaptive_velocity_scale": self._adaptive_scale_enabled(),
+                "adaptive_scale": self._adaptive_scale,
+            }
         if action == "cancel":
             self._cancel_motion("cancel_requested", send_stop=True)
             self._release_input_source()
@@ -1213,21 +1500,53 @@ class LocomotionPlugin:
         self._cancel_motion("superseded")
         if not self._registered:
             self._register_input_source()
-        forward = args.get("forward", 0.2)
-        lateral = args.get("lateral", 0.0)
+        forward = float(args.get("forward", 0.2))
+        lateral = float(args.get("lateral", 0.0))
         angular_deg = float(args.get("angular", 0.0))
         angular = math.radians(angular_deg)
-        self._publish_velocity(forward, lateral, angular)
+        # Reset adaptive scale each move so a stale 0.5 from a previous run cannot
+        # permanently starve a correctly tracking firmware after restart.
+        self._adaptive_scale = 1.0
+        self._last_measured = None
+        start_pose = self._leg_odom_snapshot()
+        pub_f, pub_l, pub_a, scale = self._scaled_command(forward, lateral, angular)
+        self._publish_velocity(pub_f, pub_l, pub_a)
         action_id = f"x2_locomotion_{uuid4().hex[:12]}"
         with self._lock:
             self._active_action_id = action_id
+            self._command_forward = forward
+            self._command_lateral = lateral
+            self._command_angular = angular
+            self._motion_started_mono = time.monotonic()
+            self._motion_duration = None if duration == -1 else duration
         if duration != -1:
             self._schedule_stop(duration, action_id)
-        self._start_velocity_stream(action_id, forward, lateral, angular)
+        self._start_velocity_stream(
+            action_id, forward, lateral, angular,
+            None if start_pose is None else {
+                "x": start_pose["x"], "y": start_pose["y"], "yaw_deg": start_pose["yaw_deg"],
+            },
+            None if duration == -1 else duration,
+        )
         return {
             "state": "accepted", "action_id": action_id, "duration": duration,
             "topic": "/aima/mc/locomotion/velocity",
             "angular_input_unit": "deg/s",
+            "stop_mode": "continuous" if duration == -1 else "duration",
+            "command": {
+                "forward_m_s": forward,
+                "lateral_m_s": lateral,
+                "angular_deg_s": angular_deg,
+                "angular_rad_s": angular,
+            },
+            "published": {
+                "forward_m_s": pub_f,
+                "lateral_m_s": pub_l,
+                "angular_rad_s": pub_a,
+            },
+            "velocity_command_scale": scale,
+            "expected_distance_m": None if duration == -1 else abs(math.hypot(forward, lateral) * duration),
+            "expected_yaw_delta_deg": None if duration == -1 else angular_deg * duration,
         }
 
 
