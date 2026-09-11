@@ -728,7 +728,13 @@ class GripperPlugin:
 
 def build_plugins(config, namespace, ros2):
     client = RM75SDKClient(config)
-    return [
+    plugins = [
         RM75Plugin(client, config, namespace=namespace, ros2=ros2),
         GripperPlugin(client, config, namespace=namespace, ros2=ros2),
     ]
+    camera_config = config.get("ext_camera", {})
+    if camera_config.get("enabled", False):
+        from camera import ExtCameraPlugin
+
+        plugins.append(ExtCameraPlugin(camera_config, namespace, ros2.executor_core))
+    return plugins
