@@ -42,8 +42,9 @@ Example MCP arguments for tool `vision_capture`:
 {"action": "record_video", "camera": "external", "duration_s": 5}
 ```
 
-Omit `duration_s` to use the default of 5 seconds. `maximum` is 30 seconds.
-Omit `camera` to use the saved card configuration.
+Omit `duration_s` to use the default of 5 seconds, clamped down to the
+configured `max_duration_s` cap so the schema default is always usable.
+`maximum` is 30 seconds. Omit `camera` to use the saved card configuration.
 
 `record_video` returns `state: recording` with the destination `file_path`
 immediately, like `capture_photo` — no Core rendering change is needed to see
