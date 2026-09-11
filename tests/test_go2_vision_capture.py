@@ -281,13 +281,26 @@ class CaptureTest(CaptureHarness):
         self.assertEqual(schema["properties"]["duration_s"]["default"], 5)
         for value in (True, 1.5, "2", None, 0, 31):
             self.assertEqual(self.plugin.dispatch("record_video", {"duration_s": value})["code"], "INVALID_DURATION")
-        # The literal default stays 5 even when the configured cap changes;
-        # the validation cap follows the config independently.
+        # The schema default clamps to the configured cap, so an omitted or
+        # schema-applied duration_s is always within the validation range.
         self.plugin._max_duration_s = 2
         schema = self.plugin.get_tool()["inputSchema"]
         self.assertEqual(schema["properties"]["duration_s"]["maximum"], 2)
-        self.assertEqual(schema["properties"]["duration_s"]["default"], 5)
+        self.assertEqual(schema["properties"]["duration_s"]["default"], 2)
         self.assertEqual(self.plugin.dispatch("record_video", {"duration_s": 6})["code"], "INVALID_DURATION")
+
+    def test_cap_below_default_clamps_schema_and_dispatch_default(self):
+        # A configured cap below 5 must never advertise an unusable default:
+        # both the schema default and the dispatch fallback clamp to the cap.
+        plugin = capture.VisionCapturePlugin(
+            {"output_dir": self.directory.name, "max_duration_s": 3}, "go2", self.executor)
+        self.addCleanup(plugin.stop)
+        schema = plugin.get_tool()["inputSchema"]["properties"]["duration_s"]
+        self.assertEqual(schema["default"], 3)
+        with mock.patch.object(capture.shutil, "which", return_value="ffmpeg"):
+            started = plugin.dispatch("record_video", {})
+        self.assertTrue(started["ok"])
+        self.assertEqual(started["requested_duration_s"], 3)
 
     def test_missing_encoder_is_immediate_error(self):
         with mock.patch.object(capture.shutil, "which", return_value=None):
