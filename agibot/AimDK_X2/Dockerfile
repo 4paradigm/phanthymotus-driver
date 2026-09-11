@@ -17,10 +17,12 @@ RUN echo "${AIMDK_MSGS_SHA256}  /tmp/aimdk_msgs.zip" | sha256sum -c - && \
     rm -rf /tmp/aimdk_msgs.zip
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py config.yaml driver.yaml /work/agibot/AimDK_X2/
+COPY main.py device.py config.yaml driver.yaml x2_fastdds_profile.py /work/agibot/AimDK_X2/
+COPY x2_bridged_publisher.py x2_socket_bridge.py x2_bundle_entrypoint.sh /work/agibot/AimDK_X2/
 COPY resource/ /work/agibot/AimDK_X2/resource/
 # deploy/run-pr-image.sh reads this service fragment directly from the image.
 COPY deploy/ /deploy/
+RUN chmod +x /work/agibot/AimDK_X2/x2_bundle_entrypoint.sh
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work RCUTILS_COLORIZED_OUTPUT=0
 EXPOSE 15717
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /aimdk_x2_ws/install/setup.bash && python3 /work/agibot/AimDK_X2/main.py"]
+CMD ["/bin/bash", "/work/agibot/AimDK_X2/x2_bundle_entrypoint.sh"]

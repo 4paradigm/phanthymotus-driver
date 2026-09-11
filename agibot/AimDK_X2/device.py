@@ -22,6 +22,15 @@ from pathlib import Path
 from common.vendor_runtime import action_schema, jsonable, tool
 
 
+def core_publisher(node, msg_type, topic, qos, *, transport="dds"):
+    """Create an Agent Core publisher on DDS or the isolated socket bridge."""
+    if str(transport).lower() == "socket":
+        from x2_bridged_publisher import create_bridged_publisher
+
+        return create_bridged_publisher(msg_type, topic)
+    return node.create_publisher(msg_type, topic, qos)
+
+
 HAND_TYPES = {0: "none", 1: "nimble_hands", 2: "claw", 3: "leisai_nimble_hands", 255: "error"}
 
 MC_ACTIONS = {
@@ -213,10 +222,14 @@ class AimdkNodes:
         self.config = config
         self.end_effector = str(config.get("end_effector", "hand")).lower()
         self.namespace = namespace
+        self.core_transport = str(config.get("ros", {}).get("core_transport", "dds")).lower()
+        if self.core_transport not in {"dds", "socket"}:
+            raise ValueError("ros.core_transport must be 'dds' or 'socket'")
         self.robot = Node("agibot_x2_driver_robot", context=ros2.ctx_robot)
         self.core = Node("agibot_x2_driver_core", context=ros2.ctx_core)
         ros2.executor_robot.add_node(self.robot)
         ros2.executor_core.add_node(self.core)
+        self._bridged_publishers = []
 
         self.lock = threading.RLock()
         self.values = {}
@@ -236,11 +249,19 @@ class AimdkNodes:
 
         self.streams = {}
 
+        def publish_to_core(msg_type, topic, qos):
+            publisher = core_publisher(
+                self.core, msg_type, topic, qos, transport=self.core_transport,
+            )
+            if self.core_transport == "socket":
+                self._bridged_publishers.append(publisher)
+            return publisher
+
         def mirror(key, msg_type, robot_topic, fmt, depth=10, qos=None):
             core_topic = f"/{namespace}/agibot_x2/{key}"
             as_json = fmt == "data/json"
             core_msg_type = String if as_json else msg_type
-            pub = self.core.create_publisher(core_msg_type, core_topic, depth)
+            pub = publish_to_core(core_msg_type, core_topic, depth)
             self.robot.create_subscription(
                 msg_type, robot_topic, self._callback(key, pub, as_json=as_json), qos or depth,
             )
@@ -250,7 +271,7 @@ class AimdkNodes:
         # lists one imu card, so both raw readings are merged into one data/json stream rather
         # than exposed as two separate tools.
         imu_topic = f"/{namespace}/agibot_x2/imu"
-        imu_pub = self.core.create_publisher(String, imu_topic, 5)
+        imu_pub = publish_to_core(String, imu_topic, 5)
         self.robot.create_subscription(Imu, "/aima/hal/imu/chest/state", self._imu_callback("chest", imu_pub), sensor_qos)
         self.robot.create_subscription(Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos)
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
@@ -298,7 +319,7 @@ class AimdkNodes:
                 "last_error": "",
             }
             mic_topic = f"/{namespace}/mic/audio"
-            self._mic_pub = self.core.create_publisher(AudioChunk, mic_topic, audio_output_qos)
+            self._mic_pub = publish_to_core(AudioChunk, mic_topic, audio_output_qos)
             self.robot.create_subscription(
                 AudioCapture, MIC_SOURCE_TOPIC, self._mic_callback(), audio_source_qos,
             )
@@ -432,16 +453,22 @@ class AimdkNodes:
                     # Keep extraction and publication atomic with respect to a
                     # channel switch: once config returns, no old-channel chunk
                     # can still be waiting to publish.
+                    published_chunks = 0
+                    published_bytes = 0
                     for chunk in chunks:
                         output = self._AudioChunk()
                         output.header.stamp = self.core.get_clock().now().to_msg()
                         output.format = MIC_OUTPUT_FORMAT
                         output.data = chunk
-                        self._mic_pub.publish(output)
+                        # rclpy Publisher.publish() returns None. The socket
+                        # bridge returns False only when a frame was dropped.
+                        if self._mic_pub.publish(output) is not False:
+                            published_chunks += 1
+                            published_bytes += len(chunk)
                     self._mic_stats["source_messages"] += 1
                     self._mic_stats["source_bytes"] += len(payload)
-                    self._mic_stats["published_chunks"] += len(chunks)
-                    self._mic_stats["published_bytes"] += sum(map(len, chunks))
+                    self._mic_stats["published_chunks"] += published_chunks
+                    self._mic_stats["published_bytes"] += published_bytes
                     self._mic_stats["input_channels"] = channels
                     self._mic_stats["mic_channels"] = mic_channels
                     self._mic_stats["ref_channels"] = ref_channels
@@ -459,6 +486,8 @@ class AimdkNodes:
         with self.lock:
             stats = dict(self._mic_stats)
             pending_bytes = self._mic_extractor.pending_bytes
+        bridge_snapshot = getattr(self._mic_pub, "snapshot", None)
+        bridge_stats = bridge_snapshot() if callable(bridge_snapshot) else {}
         last_frame_at = stats.pop("last_frame_at")
         age = None if last_frame_at is None else max(0.0, time.monotonic() - last_frame_at)
         if stats["last_error"]:
@@ -479,6 +508,8 @@ class AimdkNodes:
             "sample_format": "S16LE",
             "age_sec": age,
             "pending_bytes": pending_bytes,
+            "core_transport": self.core_transport,
+            **bridge_stats,
             **stats,
         }
 
@@ -502,6 +533,9 @@ class AimdkNodes:
         return path.read_text(encoding="utf-8")
 
     def close(self):
+        for publisher in self._bridged_publishers:
+            publisher.destroy()
+        self._bridged_publishers.clear()
         self.robot.destroy_node()
         self.core.destroy_node()
 

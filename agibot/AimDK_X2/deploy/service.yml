@@ -10,9 +10,13 @@ agibot-x2:
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
-    - ROS_DOMAIN_ID=42
+    - ROBOT_DOMAIN_ID=0
+    - CORE_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - NETWORK_INTERFACE=eth0
+    - ROBOT_INTERFACE_IP=10.0.1.41
+    - CORE_FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - ROS_LOCALHOST_ONLY=0
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

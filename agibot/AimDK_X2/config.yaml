@@ -14,6 +14,9 @@ end_effector: "hand"   # fist | hand | ultra
 ros:
   robot_domain_id: 0
   core_domain_id: 42
+  # Fast DDS profiles are process-wide. The driver remains on the robot
+  # network; a separate socket bridge process owns Agent Core domain 42.
+  core_transport: "socket"
   robot_interface: "eth0"
 
 plugins:
