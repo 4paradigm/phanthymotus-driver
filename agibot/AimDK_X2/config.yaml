@@ -34,6 +34,9 @@ plugins:
   mic:
     # AimDK AudioCapture -> audio_msgs/AudioChunk PCM-16kHz stream.
     enabled: true
+    # The X2 vendor capture levels are very low (roughly -50 dBFS); apply a
+    # bounded digital gain after downmixing, with int16 clipping protection.
+    gain: 4.0
   leg_odometry:
     # X2's locomotion odometry; this is not SLAM/localization pose.
     enabled: true

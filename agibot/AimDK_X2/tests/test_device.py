@@ -335,7 +335,7 @@ class ToolInventoryTests(unittest.TestCase):
         audio = nodes.mic_audio_pub.published[0]
         self.assertEqual(audio.format, "audio/pcm-16k")
         self.assertEqual(len(audio.data), 1024)
-        self.assertEqual(struct.unpack("<h", bytes(audio.data[:2]))[0], 4000)
+        self.assertEqual(struct.unpack("<h", bytes(audio.data[:2]))[0], 16000)
 
     def test_unavailable_hardware_cards_are_not_registered_by_default(self):
         names = {definition["name"] for definition in tool_definitions(build_bundle_plugins())}

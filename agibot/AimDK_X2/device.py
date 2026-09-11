@@ -607,6 +607,11 @@ class AimdkNodes:
             for index in range(sample_count):
                 start = index * channels
                 value = round(sum(samples[start:start + mic_channels]) / mic_channels)
+                try:
+                    gain = float(self.config.get("plugins", {}).get("mic", {}).get("gain", 4.0))
+                except (TypeError, ValueError):
+                    gain = 4.0
+                value = round(value * max(0.5, min(8.0, gain)))
                 struct.pack_into("<h", mono, index * 2, max(-32768, min(32767, value)))
             payload = bytes(mono)
         with self._mic_audio_lock:
@@ -1624,7 +1629,17 @@ class LocomotionPlugin:
             return True
 
     def _register_input_source(self):
-        result = self._set_input_source(1001)  # INPUTACTION_ADD
+        try:
+            result = self._set_input_source(1001)  # INPUTACTION_ADD
+        except TimeoutError:
+            # A lost response can leave the vendor registry with a half-created
+            # custom source.  DELETE is idempotent for this source and is known
+            # to respond even when a subsequent ADD hangs; clean it and retry.
+            try:
+                self._set_input_source(1003)  # INPUTACTION_DELETE
+            except Exception:
+                pass
+            result = self._set_input_source(1001)
         restored_entry = False
         if not self._input_source_accepted(result):
             # The MC input-source registry outlives this container.  Reconfigure
