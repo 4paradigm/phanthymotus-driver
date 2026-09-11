@@ -12,6 +12,12 @@ plugins:
     enabled: true
   camera:
     enabled: true
+    # Bumi supports either official App video transfer or Phanthy's direct
+    # camera/depth Cards. To use these Cards, the Bumi deployment enters the
+    # host mount namespace and runs:
+    #   systemctl disable --now noetix-video-capture.service
+    # Set false only when official App video transfer must retain the camera.
+    disable_vendor_capture_service: true
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.
