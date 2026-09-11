@@ -29,7 +29,7 @@ is rejected; repeating the same configuration is accepted.
 | `record_video` | Start a 1–30-second recording, default 5 seconds; return the destination `file_path` synchronously. |
 | `list_cameras` | List the built-in source and running external RGB instances. |
 | `info` | Report source freshness, output directories, active recording and latest terminal result. |
-| `start` | Subscribe to the configured source; report readiness based on actual frames. |
+| `start` | Return the actuator lifecycle response (`{"state": "ready"}`); camera freshness stays on `info`. |
 | `stop` | Cancel recording, remove incomplete output and record the cancellation outcome. |
 
 Example MCP arguments for tool `vision_capture`:
@@ -46,9 +46,11 @@ Omit `duration_s` to use the default of 5 seconds. `maximum` is 30 seconds.
 Omit `camera` to use the saved card configuration.
 
 `record_video` returns `state: recording` with the destination `file_path`
-immediately, like `capture_photo`. The completed outcome (including the
-measured MP4 duration) is available in `info.last_recording` until restart;
-no ACP terminal notification is posted. Only one recording may be active.
+immediately, like `capture_photo`. The tool schema declares no `x-completion`,
+so Core treats every call as an ordinary synchronous action and never holds a
+pending-action barrier awaiting an ACP callback. The completed outcome
+(including the measured MP4 duration) is available in `info.last_recording`
+until restart. Only one recording may be active.
 Camera previews keep running when recording is cancelled. Missing, stale or
 stalled input produces an error.
 
@@ -116,4 +118,10 @@ terminal notification is posted, and the completed/error/cancelled outcome is
 retained in `info.last_recording`. All 28 local capture checks (including real
 FFmpeg/ffprobe media) pass; ARM64-image verification on the Go2 runs after the
 release image deploys.
-'''
+
+On 2026-09-11 review feedback was applied: `start` returns the bare actuator
+lifecycle response (`{"state": "ready"}`) with camera freshness exposed on
+`info`; the `record_video` schema no longer advertises `x-completion`, so Core
+never waits on `/api/acp/complete` for an admission-only call; and
+`driver.yaml`'s marketplace `cards` list gained the `vision_capture` entry.
+All 30 local capture checks pass.
