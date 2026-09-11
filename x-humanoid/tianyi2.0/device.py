@@ -5030,13 +5030,21 @@ class TtsPlugin:
                             self._play_event_buffer.pop(seg_sid, None)
                             print(f"[TtsPlugin] cancelled (PlayEvent STOPPED) seg {i+1}/{len(segments)}")
                             break
-                        # event_code: 1=COMPLETED, 2=STOPPED (也算完成), 3=CANCELLED, 4=FAILED
-                        seg_status = "completed" if event_code <= 2 else "error"
-                        if event_code > 2:
+                        # event_code: 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED.
+                        # STOPPED here means something *other* than our own cancel_event
+                        # stopped it — that path already broke out above as "cancelled".
+                        # This used to collapse STOPPED into "completed", which hid every
+                        # such interruption from ACP and the LLM: a segment cut short by
+                        # an external stop looked identical to one that played in full.
+                        if event_code == 1:
+                            seg_status = "completed"
+                        elif event_code == 2:
+                            seg_status = "interrupted"
+                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED externally (not our own cancel)")
+                        else:
+                            seg_status = "error"
                             event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
                             print(f"[TtsPlugin] seg {i+1}/{len(segments)} failed: {event_name} (code={event_code})")
-                        elif event_code == 2:
-                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED (treated as completed)")
                     self._pending_play.pop(seg_sid, None)
                     self._pending_play_status.pop(seg_sid, None)
                 self._pending_play_duration.pop(seg_sid, None)
@@ -5048,6 +5056,11 @@ class TtsPlugin:
                     continue
                 elif seg_status == "error" and is_last:
                     overall_status = "error"
+                elif seg_status == "interrupted":
+                    # Something external stopped this segment — later segments would just
+                    # be talking over whatever stopped it, so don't keep playing.
+                    overall_status = "interrupted"
+                    break
             elif no_response:
                 # Do not sleep-then-claim-success. This path used to fall into the
                 # fallback below and report ACP completed, so a silent robot looked
