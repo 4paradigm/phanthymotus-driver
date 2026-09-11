@@ -226,6 +226,7 @@ class AimdkNodes:
         self.config = config
         self.end_effector = str(config.get("end_effector", "hand")).lower()
         self.skeleton_joints, self.skeleton_joint_indices = skeleton_layout(self.end_effector)
+        self._unknown_joint_indices = {}
         self.namespace = namespace
         self.robot = Node("agibot_x2_driver_robot", context=ros2.ctx_robot)
         self.core = Node("agibot_x2_driver_core", context=ros2.ctx_core)
@@ -727,8 +728,9 @@ class AimdkNodes:
                     if not name:
                         continue
                     unknown_names.append(name)
-                    idx = fallback_idx
-                    fallback_idx += 1
+                    idx = self._unknown_joint_indices.setdefault(name, fallback_idx)
+                    if idx == fallback_idx:
+                        fallback_idx += 1
                 item = {
                     "idx": idx,
                     "name": name,

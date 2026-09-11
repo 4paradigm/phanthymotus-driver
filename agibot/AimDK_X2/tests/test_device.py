@@ -544,7 +544,7 @@ class ToolInventoryTests(unittest.TestCase):
 
         payload = json.loads(nodes.skeleton_pub.published[-1].data)
         self.assertEqual(payload["format"], "sensor/skeleton")
-        self.assertEqual(payload["joint_count"], 3)
+        self.assertEqual(payload["joint_count"], 4)
         self.assertEqual(payload["joints"][0], {
             "idx": nodes.skeleton_joint_indices[leg_names[0]],
             "name": leg_names[0], "q": 0.1, "dq": 0.2, "tau": 0.3,
@@ -573,7 +573,7 @@ class ToolInventoryTests(unittest.TestCase):
         ]))
 
         payload = json.loads(nodes.skeleton_pub.published[-1].data)
-        self.assertEqual(payload["joint_count"], 2)
+        self.assertEqual(payload["joint_count"], 3)
         self.assertEqual([joint["name"] for joint in payload["joints"]], [leg_names[1], leg_names[0]])
         self.assertEqual(payload["joints"][0]["idx"], nodes.skeleton_joint_indices[leg_names[1]])
         self.assertEqual(payload["joints"][1]["idx"], nodes.skeleton_joint_indices[leg_names[0]])
