@@ -8,10 +8,12 @@ agibot-x2:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
-    - ROS_DOMAIN_ID=42
+    - ROBOT_DOMAIN_ID=0
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - NETWORK_INTERFACE=develop0
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/work/agibot/AimDK_X2/resource/fastdds_develop0.xml
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

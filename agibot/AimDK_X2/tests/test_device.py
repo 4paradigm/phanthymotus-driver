@@ -216,6 +216,15 @@ def _install_ros_stubs():
 
 _install_ros_stubs()
 
+# Production routes Agent Core output through a Unix socket.  Unit tests keep
+# those publications in memory so payload assertions do not require ROS
+# serialization or a running bridge process.
+bridge_stub = types.ModuleType("x2_bridged_publisher")
+bridge_stub.create_bridged_publisher = lambda msg_type, topic: FakePublisher(
+    msg_type, topic, 10
+)
+sys.modules["x2_bridged_publisher"] = bridge_stub
+
 import yaml  # noqa: E402
 
 import device  # noqa: E402

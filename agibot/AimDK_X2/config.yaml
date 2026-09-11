@@ -13,7 +13,8 @@ end_effector: "fist"   # fist | hand | ultra
 ros:
   robot_domain_id: 0
   core_domain_id: 42
-  robot_interface: "eth0"
+  # The X2 vendor ROS graph is exposed on develop0 (10.0.1.41).
+  robot_interface: "develop0"
 
 plugins:
   mc_state:
