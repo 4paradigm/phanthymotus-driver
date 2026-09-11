@@ -276,7 +276,10 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.client = self.FakeClient()
         self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
         self.plugin = self.device.CartesianPlugin(
-            self.client, {"safety": dict(self.FAST_SAFETY)},
+            self.client, {
+                "safety": dict(self.FAST_SAFETY),
+                "cartesian": {"enabled": True, "max_radius_mm": 610, "max_position_abs_mm": 610},
+            },
             arm_plugin=self.arm, namespace="rm75",
         )
         self.acp_events = []
@@ -315,6 +318,18 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertIn("movep", schema["x-action-params"])
         self.assertEqual(["tool"], schema["properties"]["frame_type"]["enum"])
         self.assertIn("工具系偏移", tools[0]["description"])
+
+    def test_cartesian_motion_is_disabled_until_workspace_validation(self):
+        plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY)},
+            arm_plugin=self.arm, namespace="rm75",
+        )
+
+        with self.assertRaisesRegex(PermissionError, "pending supervised workspace validation"):
+            plugin.dispatch("movel", self._movel_args())
+
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+        self.assertFalse(plugin._motion_lock.locked())
 
     def test_movel_converts_units_and_reports_completion(self):
         result = self.plugin.dispatch("movel", self._movel_args())
@@ -430,7 +445,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.client = SlowPoseClient()
         arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
         self.plugin = self.device.CartesianPlugin(
-            self.client, {"safety": dict(self.FAST_SAFETY)}, arm_plugin=arm, namespace="rm75",
+            self.client, {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}}, arm_plugin=arm, namespace="rm75",
         )
         self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
             (action_id, status, result)
@@ -521,7 +536,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.client = GatedClient()
         arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
         self.plugin = self.device.CartesianPlugin(
-            self.client, {"safety": dict(self.FAST_SAFETY)}, arm_plugin=arm, namespace="rm75",
+            self.client, {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}}, arm_plugin=arm, namespace="rm75",
         )
         self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
             (action_id, status, result)
@@ -556,7 +571,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.client = NoPoseClient()
         arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
         self.plugin = self.device.CartesianPlugin(
-            self.client, {"safety": dict(self.FAST_SAFETY)}, arm_plugin=arm, namespace="rm75",
+            self.client, {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}}, arm_plugin=arm, namespace="rm75",
         )
         self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
             (action_id, status, result)
@@ -578,7 +593,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.client = MismatchClient()
         arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
         self.plugin = self.device.CartesianPlugin(
-            self.client, {"safety": dict(self.FAST_SAFETY)}, arm_plugin=arm, namespace="rm75",
+            self.client, {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}}, arm_plugin=arm, namespace="rm75",
         )
         self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
             (action_id, status, result)
