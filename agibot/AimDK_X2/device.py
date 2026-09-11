@@ -711,6 +711,7 @@ class AimdkNodes:
     def _skeleton_snapshot_locked(self):
         joints = []
         unknown_names = []
+        fallback_idx = len(self.skeleton_joint_indices)
         for area in self.skeleton_joints:
             msg = self.joint_groups.get(area)
             if msg is None:
@@ -719,9 +720,15 @@ class AimdkNodes:
                 name = getattr(state, "name", "")
                 idx = self.skeleton_joint_indices.get(name)
                 if idx is None:
-                    if name:
-                        unknown_names.append(name)
-                    continue
+                    # Keep vendor feedback visible even when a firmware image
+                    # uses a joint spelling not present in the vendored URDF.
+                    # Previously these states were dropped entirely, making
+                    # the joints card look frozen/empty despite live updates.
+                    if not name:
+                        continue
+                    unknown_names.append(name)
+                    idx = fallback_idx
+                    fallback_idx += 1
                 item = {
                     "idx": idx,
                     "name": name,
@@ -731,7 +738,8 @@ class AimdkNodes:
                 }
                 if getattr(state, "error_code", 0):
                     item["error_code"] = int(state.error_code)
-                joints.append(item)
+            joints.append(item)
+        joints.sort(key=lambda item: item["idx"])
         payload = {"format": "sensor/skeleton", "joints": joints, "joint_count": len(joints), "position_unit": "rad"}
         if unknown_names:
             payload["diagnostics"] = {"unknown_joint_names": unknown_names}
