@@ -74,6 +74,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("network_mode: host", service)
         self.assertNotIn("privileged:", service)
         self.assertIn("/dev:/dev:ro", service)
+        self.assertIn("tmpfs:\n    - /dev/shm:rw,nosuid,nodev,noexec,size=128m,mode=1777", service)
         self.assertIn('"c 81:* rw"', service)
         self.assertIn('"c 189:* rw"', service)
         self.assertIn("cap_drop:\n    - MKNOD", service)

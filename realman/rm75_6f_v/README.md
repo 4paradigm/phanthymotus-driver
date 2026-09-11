@@ -77,7 +77,11 @@ No `/dev/videoN` or USB bus address is configured. Docker can start without a
 camera; later connections and node renumbering are visible through the directory
 bind. The service does not use privileged mode and drops MKNOD. The read-only
 mount protects directory entries; device I/O is still read/write under cgroup
-rules. This deliberately exposes host device names and permits access to all
+rules. A separate writable, container-private 128 MiB tmpfs is mounted at
+`/dev/shm` for Python multiprocessing semaphores and DDS shared memory. Without
+this override, a read-only `/dev` can cause camera start to fail with
+`[Errno 30] Read-only file system` before the capture process starts.
+This deliberately exposes host device names and permits access to all
 video/USB devices, not just one camera; the SDK selection remains serial-bound.
 
 Both Web Console and `deploy/run-pr-image.sh` use this same service fragment.

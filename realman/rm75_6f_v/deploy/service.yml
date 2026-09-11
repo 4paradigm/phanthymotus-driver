@@ -7,6 +7,10 @@ realman-rm75-6f-v:
   device_cgroup_rules:
     - "c 81:* rw"
     - "c 189:* rw"
+  # multiprocessing semaphores and DDS need writable, container-private shm.
+  # Override the read-only /dev parent mount only at this subdirectory.
+  tmpfs:
+    - /dev/shm:rw,nosuid,nodev,noexec,size=128m,mode=1777
   cap_drop:
     - MKNOD
   extra_hosts:
