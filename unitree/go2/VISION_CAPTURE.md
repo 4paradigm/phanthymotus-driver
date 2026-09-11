@@ -46,11 +46,14 @@ Omit `duration_s` to use the default of 5 seconds. `maximum` is 30 seconds.
 Omit `camera` to use the saved card configuration.
 
 `record_video` returns `state: recording` with the destination `file_path`
-immediately, like `capture_photo`. The tool schema declares no `x-completion`,
-so Core treats every call as an ordinary synchronous action and never holds a
-pending-action barrier awaiting an ACP callback. The completed outcome
-(including the measured MP4 duration) is available in `info.last_recording`
-until restart. Only one recording may be active.
+immediately, like `capture_photo` — no Core rendering change is needed to see
+it. For orchestration the schema declares
+`x-completion: {"actions": ["record_video"], "timeout": max_duration_s + 15}`:
+Core registers the pending action from the admission `action_id` and holds the
+actuator barrier until the worker POSTs one terminal `completed`/`cancelled`/
+`error` completion to `/api/acp/complete`. The completed outcome (including
+the measured MP4 duration) is also available in `info.last_recording` until
+restart. Only one recording may be active.
 Camera previews keep running when recording is cancelled. Missing, stale or
 stalled input produces an error.
 
@@ -69,8 +72,9 @@ is returned after encoding:
 Failure and cancellation records carry only `ok`, `code` and `message` — no
 extra timing/display fields. `capture_photo` returns `file_path` synchronously
 and never posts ACP, as on Q5. `record_video` returns the destination path
-synchronously too and does not post ACP, so the saved file is visible to the
-caller immediately without depending on Core's ACP `file_path` rendering.
+synchronously too, so the saved destination is visible immediately without
+depending on Core's ACP `file_path` rendering; its single terminal ACP
+completion exists for orchestration only.
 
 Video output preserves capture timing and extends the last frame to the exact
 requested endpoint, so a 5-second recording at 15 fps contains 75 encoded frames.
@@ -97,8 +101,8 @@ scp 'unitree@GO2_IP:/opt/phanthy-motus/data/vision_capture/photos/*.jpg' ~/Downl
 
 No Core modification is required for the driver's completion protocol: the
 destination `file_path` is returned synchronously on admission, the terminal
-outcome carries the slim field set in `info.last_recording`, and no ACP or
-display-only fields are used.
+outcome carries the slim field set in `info.last_recording` and in the ACP
+completion result, and no display-only fields are used.
 
 ## Validation
 
@@ -121,7 +125,9 @@ release image deploys.
 
 On 2026-09-11 review feedback was applied: `start` returns the bare actuator
 lifecycle response (`{"state": "ready"}`) with camera freshness exposed on
-`info`; the `record_video` schema no longer advertises `x-completion`, so Core
-never waits on `/api/acp/complete` for an admission-only call; and
-`driver.yaml`'s marketplace `cards` list gained the `vision_capture` entry.
-All 30 local capture checks pass.
+`info`; `driver.yaml`'s marketplace `cards` list gained the `vision_capture`
+entry; and ACP was restored as pure orchestration — the schema advertises
+`x-completion` for `record_video` (timeout `max_duration_s + 15`) and the
+worker POSTs one terminal completion, while the admission response keeps the
+synchronous `file_path` so no Core change is involved. All 30 local capture
+checks pass.
