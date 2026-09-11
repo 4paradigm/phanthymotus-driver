@@ -12,7 +12,10 @@ end_effector: "fist"   # fist | hand | ultra
 
 ros:
   robot_domain_id: 0
-  core_domain_id: 42
+  # Agent Core output is published only by x2_socket_bridge.py, which runs in
+  # domain 42 with the loopback-only DDS profile.  Do not create a second
+  # domain-42 participant in the robot-facing driver process.
+  core_domain_id: null
   # The X2 vendor ROS graph is exposed on develop0 (10.0.1.41).
   robot_interface: "develop0"
 

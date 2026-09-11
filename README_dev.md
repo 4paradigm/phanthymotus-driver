@@ -594,7 +594,7 @@ def _model_tool(self) -> dict:
 # In dispatch:
 if tool_name == "model":
     urdf_path = Path(__file__).parent / "resource" / "my_robot.urdf"
-    return [{"type": "text", "text": json.dumps({"urdf": urdf_path.read_text()})}]
+    return {"urdf": urdf_path.read_text(encoding="utf-8")}
 ```
 
 **2. `joints` tool (type: `sensor`)**

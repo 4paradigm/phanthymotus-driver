@@ -23,7 +23,7 @@ from pathlib import Path
 from common.vendor_runtime import action_schema, jsonable, tool
 
 
-def core_publisher(node, msg_type, topic, qos):
+def core_publisher(msg_type, topic, qos):
     """Route Agent Core output through the isolated domain-42 bridge."""
     from x2_bridged_publisher import create_bridged_publisher
 
@@ -165,9 +165,7 @@ class AimdkNodes:
         self.skeleton_joints, self.skeleton_joint_indices = skeleton_layout(self.end_effector)
         self.namespace = namespace
         self.robot = Node("agibot_x2_driver_robot", context=ros2.ctx_robot)
-        self.core = Node("agibot_x2_driver_core", context=ros2.ctx_core)
         ros2.executor_robot.add_node(self.robot)
-        ros2.executor_core.add_node(self.core)
 
         self.lock = threading.RLock()
         self.values = {}
@@ -183,7 +181,7 @@ class AimdkNodes:
             core_topic = f"/{namespace}/agibot_x2/{key}"
             as_json = fmt == "data/json"
             core_msg_type = String if as_json else msg_type
-            pub = core_publisher(self.core, core_msg_type, core_topic, depth)
+            pub = core_publisher(core_msg_type, core_topic, depth)
             self.robot.create_subscription(
                 msg_type, robot_topic, self._callback(key, pub, as_json=as_json), qos or depth,
             )
@@ -193,13 +191,13 @@ class AimdkNodes:
         # lists one imu card, so both raw readings are merged into one data/json stream rather
         # than exposed as two separate tools.
         imu_topic = f"/{namespace}/agibot_x2/imu"
-        imu_pub = core_publisher(self.core, String, imu_topic, 5)
+        imu_pub = core_publisher(String, imu_topic, 5)
         self.robot.create_subscription(Imu, "/aima/hal/imu/chest/state", self._imu_callback("chest", imu_pub), sensor_qos)
         self.robot.create_subscription(Imu, "/aima/hal/imu/torso/state", self._imu_callback("torso", imu_pub), sensor_qos)
         self.streams["imu"] = {"robot_topic": "/aima/hal/imu/{chest,torso}/state", "topic": imu_topic, "format": "data/json"}
 
         joint_state_topic = f"/{namespace}/agibot_x2/joint_state"
-        self.joint_state_pub = core_publisher(self.core, String, joint_state_topic, 5)
+        self.joint_state_pub = core_publisher(String, joint_state_topic, 5)
         self.streams["joint_state"] = {
             "robot_topic": "/aima/hal/joint/{leg,waist,arm,head}/state",
             "topic": joint_state_topic,
@@ -207,7 +205,7 @@ class AimdkNodes:
         }
 
         joints_topic = f"/{namespace}/{SKELETON_TOPIC}"
-        self.joints_pub = core_publisher(self.core, String, joints_topic, 5)
+        self.joints_pub = core_publisher(String, joints_topic, 5)
         self.streams["joints"] = {
             "robot_topic": "/aima/hal/joint/{leg,waist,arm,head}/state",
             "topic": joints_topic,
@@ -402,7 +400,6 @@ class AimdkNodes:
 
     def close(self):
         self.robot.destroy_node()
-        self.core.destroy_node()
 
 
 def _stream_topic_out(stream):

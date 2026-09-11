@@ -157,9 +157,7 @@ class FakeExecutor:
 class FakeROS2:
     def __init__(self):
         self.ctx_robot = object()
-        self.ctx_core = object()
         self.executor_robot = FakeExecutor()
-        self.executor_core = FakeExecutor()
 
 
 def _install_ros_stubs():
@@ -264,6 +262,27 @@ class ToolInventoryTests(unittest.TestCase):
     def test_container_disables_native_ros_colorized_logs(self):
         dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("RCUTILS_COLORIZED_OUTPUT=0", dockerfile)
+
+    def test_x2_keeps_domain_42_in_the_loopback_only_bridge_process(self):
+        """The robot-profile process must never create an Agent Core DDS participant."""
+        config = (DEVICE_DIR / "config.yaml").read_text(encoding="utf-8")
+        source = (DEVICE_DIR / "device.py").read_text(encoding="utf-8")
+        entrypoint = (DEVICE_DIR / "x2_bundle_entrypoint.sh").read_text(encoding="utf-8")
+
+        self.assertIn("core_domain_id: null", config)
+        self.assertNotIn("ctx_core", source)
+        self.assertNotIn("agibot_x2_driver_core", source)
+        self.assertIn('exec python3 /work/agibot/AimDK_X2/main.py', entrypoint)
+        self.assertIn('FASTRTPS_DEFAULT_PROFILES_FILE="$robot_profile"', entrypoint)
+        self.assertIn('ROS_DOMAIN_ID="${CORE_ROS_DOMAIN_ID:-42}"', entrypoint)
+        self.assertIn('/opt/phanthy-motus/dds-local.xml', entrypoint)
+        self.assertIn('exec python3 /work/agibot/AimDK_X2/x2_socket_bridge.py', entrypoint)
+
+    def test_model_resource_documentation_returns_a_plain_dict(self):
+        readme = (REPO_ROOT / "README_dev.md").read_text(encoding="utf-8")
+        self.assertIn('return {"urdf": urdf_path.read_text(encoding="utf-8")}', readme)
+        model_example = readme[readme.index('**1. `model` tool'):readme.index('**2. `joints` tool')]
+        self.assertNotIn('return [{"type": "text"', model_example)
 
     def test_tool_names_and_types_match_driver_yaml(self):
         plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"slam": {"enabled": True}}})
