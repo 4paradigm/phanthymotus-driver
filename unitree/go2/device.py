@@ -179,6 +179,9 @@ _SPEAKER_MERGE_MS = 2000  # flush timeout: send after 2s of silence
 
 def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
     """Subprocess: accumulates PCM-16k, sends as single WAV via AudioHub megaphone on stream end."""
+    # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
+    from common import logsafe
+    logsafe.install(check_fd=False)
     import base64
     import io
     import wave
