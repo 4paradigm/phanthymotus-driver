@@ -217,11 +217,26 @@ class CaptureTest(CaptureHarness):
         finally:
             instance.stop_all()
 
-    def test_start_requires_actual_fresh_data_and_info_is_serializable(self):
-        self.assertFalse(self.plugin.start()["ok"])
+    def test_start_returns_lifecycle_state_and_info_tracks_freshness(self):
+        # The actuator contract requires the start action to return the bare
+        # lifecycle state; camera freshness stays on the info action.
+        self.assertEqual(self.plugin.start(), {"state": "ready"})
+        self.assertEqual(self.plugin.dispatch("start", {}), {"state": "ready"})
+        self.assertFalse(self.plugin.dispatch("info", {})["ok"])
         self.feed()
-        self.assertTrue(self.plugin.start()["ok"])
+        self.assertTrue(self.plugin.dispatch("info", {})["ok"])
         json.dumps(self.plugin.dispatch("info", {}))
+
+    def test_tool_does_not_advertise_async_completion(self):
+        # record_video is admission-synchronous: without x-completion, Agent
+        # Core never registers a pending action nor awaits /api/acp/complete.
+        self.assertNotIn("x-completion", self.plugin.get_tool()["inputSchema"])
+
+    def test_driver_yaml_marketplace_lists_vision_capture(self):
+        # config.yaml enables the card, so driver.yaml's hand-synced
+        # marketplace list must expose it too.
+        text = (ROOT / "unitree" / "go2" / "driver.yaml").read_text()
+        self.assertIn("{ name: vision_capture, type: actuator }", text)
 
     def test_photo_bytes_and_persistence_across_plugin_restart(self):
         data = b"\xff\xd8photo\xff\xd9"

@@ -80,7 +80,6 @@ class VisionCapturePlugin:
                     "info": {"params": [], "description": "查看图像来源、保存目录和录像结果。"},
                     "stop": {"params": [], "description": "取消当前录像并删除未完成文件。"},
                 },
-                "x-completion": {"actions": ["record_video"]},
             },
             "configSchema": {"type": "object", "properties": {
                 "camera": {**camera_property, "default": "front"},
@@ -199,7 +198,8 @@ class VisionCapturePlugin:
 
     def start(self):
         # Bundle startup precedes executor spinning: do not wait here for DDS.
-        return self._info()
+        # The lifecycle response is always ready; camera freshness stays on info.
+        return {"state": "ready"}
 
     def _new_path(self, directory, prefix, suffix):
         target = self._output_dir / directory
