@@ -1089,6 +1089,7 @@ class TtsPlugin:
                 "interrupt": {"type": "boolean", "default": False, "description": "是否打断同等优先级播报"},
             },
             "required": ["text"],
+            "x-hooks": {"on_notify": {}},
         })
 
     def start(self):
