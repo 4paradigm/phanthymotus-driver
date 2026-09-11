@@ -2,6 +2,31 @@
 
 The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
 
+## App 图传与 Phanthy Camera Card
+
+Bumi 的官方 App 图传服务 `noetix-video-capture.service` 会占用 RealSense。
+因此，官方 App 图传与本 Driver 的 `camera` / `depth` Card 不能同时使用。
+
+要让 Phanthy Dashboard 直接调用相机，设定
+`plugins.camera.disable_vendor_capture_service: true`（提供的 Bumi 配置已
+开启）。Driver 在初始化相机前，会利用部署配置中的宿主机 PID namespace 和
+特权能力，在机器人宿主机执行：
+
+```bash
+systemctl disable --now noetix-video-capture.service
+```
+
+该设置会跨机器人重启生效：Phanthy 的 `camera` / `depth` Card 优先使用
+RealSense，但官方 App 图传不可用。操作失败只会记录日志，不会阻止其他 Bumi
+Card 启动。
+
+要恢复官方 App 图传，请在机器人宿主机显式执行：
+
+```bash
+sudo systemctl enable noetix-video-capture.service
+sudo systemctl start noetix-video-capture.service
+```
+
 ## `vision_capture` card
 
 Persistent RGB photo/video capture, with the card/action names and file layout

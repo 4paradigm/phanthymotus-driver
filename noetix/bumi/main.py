@@ -56,6 +56,65 @@ def _resolve_namespace(cfg: dict) -> str:
 
 # ── Bundle ────────────────────────────────────────────────────────────────────
 
+# The factory App video-transfer service opens Bumi's RealSense device before
+# this driver starts. librealsense then cannot negotiate the RGB+depth profile
+# and the camera worker exits with "Couldn't resolve requests". Bumi supports
+# either App video transfer or this driver's direct camera Card, not both. The
+# service deployment shares the host PID namespace and is privileged, so nsenter
+# can invoke the host's systemctl rather than a non-existent systemd here.
+_VENDOR_VIDEO_CAPTURE_SERVICE = "noetix-video-capture.service"
+
+
+def _disable_vendor_video_capture_service(cfg: dict) -> None:
+    """Stop and disable the host service that monopolizes the RealSense camera.
+
+    This is best-effort: failing to access the host's systemd must not prevent
+    the non-camera Bumi cards from registering. The service name is fixed in
+    code instead of accepting an arbitrary command from YAML.
+    """
+    camera_cfg = cfg.get("plugins", {}).get("camera", {})
+    if not camera_cfg.get("enabled", False):
+        return
+    if not camera_cfg.get("disable_vendor_capture_service", False):
+        return
+
+    command = [
+        "nsenter", "--target", "1", "--mount", "--",
+        "systemctl", "disable", "--now", "--no-ask-password",
+        _VENDOR_VIDEO_CAPTURE_SERVICE,
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=15, check=False,
+        )
+    except FileNotFoundError:
+        print(
+            "[camera] WARNING: nsenter is unavailable; cannot release host "
+            f"camera service {_VENDOR_VIDEO_CAPTURE_SERVICE}", flush=True,
+        )
+        return
+    except subprocess.TimeoutExpired:
+        print(
+            "[camera] WARNING: timed out while releasing host camera service "
+            f"{_VENDOR_VIDEO_CAPTURE_SERVICE}", flush=True,
+        )
+        return
+
+    if result.returncode == 0:
+        print(
+            "[camera] App video-transfer service stopped and disabled; "
+            "Phanthy camera/depth Cards may now use the RealSense directly: "
+            f"{_VENDOR_VIDEO_CAPTURE_SERVICE}", flush=True,
+        )
+        return
+
+    detail = (result.stderr or result.stdout).strip()
+    print(
+        "[camera] WARNING: could not stop/disable host camera service "
+        f"{_VENDOR_VIDEO_CAPTURE_SERVICE} (exit {result.returncode}): {detail}",
+        flush=True,
+    )
+
 class BumiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
         self._plugins: list = []
@@ -275,6 +334,9 @@ def main():
     mcp_port  = int(cfg.get("mcp_port", 15704))
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
+
+    # Must happen before the CameraPlugin creates its RealSense pipeline.
+    _disable_vendor_video_capture_service(cfg)
 
     # ── Initialize Noetix SDK ──
     high_ctrl = None
