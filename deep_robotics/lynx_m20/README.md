@@ -30,14 +30,77 @@ Dockerfile 会在解压和编译前再次校验 SHA256。归档内保留上游 `
 - 选配自主充电：开始、退出和异常强制复位。
 - 设备与状态：前后灯、常规/导航/辅助模式、休眠与自动休眠、16 关节反馈、双电池、温度和错误列表。
 - 双路相机：返回官方 H.265 RTSP 地址 `video1`/`video2`；文档明确相机不发布 ROS 2/DDS 话题。
-- M20 Pro：将 `model_variant` 改为 `pro` 后，额外开放里程计、定位初始化、单点导航、取消和状态查询。
+- M20 Pro：默认开放里程计、定位初始化、单点导航、取消、状态查询，以及 `mapping_view` 建图视图。建图期间将 `/grid_map_3d` 的 `base_link` 点云通过 `/SLAM_ODOM` 转换并累积到 `map` 坐标，停止后切换到最终 `/GRID_MAP`。
 
 ## 型号边界
 
-默认 `model_variant: standard`。供应商文档明确建图、定位和内置导航仅 M20 Pro 支持，因此标准版不会注册导航工具。建图由 Pro 机载 `drmap` 命令管理，不通过本 Driver 远程执行高权限 shell。
+本镜像面向当前 M20 Pro Web Console 部署，默认使用 `model_variant: pro`。供应商文档明确建图、定位和内置导航仅 M20 Pro 支持；部署到标准版 M20 时必须通过外部配置显式覆盖为 `model_variant: standard`，此时不会注册导航和建图工具。
+
+M20 Pro 的建图控制卡片默认启用，以便不挂载外部配置的 Web Console 部署也能发现 `mapping` 与 `mapping_view`。Driver 使用专用 SSH 密钥连接 NOS，并通过根用户安装的受限入口 `/usr/local/sbin/phanthy-m20-mapping` 只调用固定的 `drmap mapping`、`drmap stop_mapping` 及只读状态命令；密码和私钥不会写入配置或镜像。缺少 SSH Secret 时卡片仍会显示，但控制调用会明确失败。`start_mapping` 和 `stop_mapping` 会立即返回 `action_id`，实际 SSH 操作在后台执行，最终结果通过 Agent Core ACP completion 回调返回。
+
+在 NOS 上创建受限助手，并只放行该固定入口：
+
+```bash
+sudo tee /usr/local/sbin/phanthy-m20-mapping >/dev/null <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+    echo "usage: phanthy-m20-mapping start <map_name> <true|false> | stop" >&2
+    exit 64
+}
+
+action="${1:-}"
+case "${action}" in
+    start)
+        [ "$#" -eq 3 ] || usage
+        map_name="$2"
+        activate="$3"
+        [[ "${map_name}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || {
+            echo "invalid map name" >&2
+            exit 65
+        }
+        case "${activate}" in
+            true)
+                exec /usr/local/bin/drmap mapping -s -n "${map_name}"
+                ;;
+            false)
+                exec /usr/local/bin/drmap mapping -s -n "${map_name}" -b
+                ;;
+            *) usage ;;
+        esac
+        ;;
+    stop)
+        [ "$#" -eq 1 ] || usage
+        exec /usr/local/bin/drmap stop_mapping
+        ;;
+    *) usage ;;
+esac
+EOF
+sudo chown root:root /usr/local/sbin/phanthy-m20-mapping
+sudo chmod 0755 /usr/local/sbin/phanthy-m20-mapping
+echo 'user ALL=(root) NOPASSWD: /usr/local/sbin/phanthy-m20-mapping *' \
+  | sudo tee /etc/sudoers.d/phanthy-m20-mapping >/dev/null
+sudo chmod 0440 /etc/sudoers.d/phanthy-m20-mapping
+sudo visudo -cf /etc/sudoers.d/phanthy-m20-mapping
+```
+
+该 SSH 控制方式定位为单台真机预配置测试：每台机器都必须在 103 单独生成专用私钥，并在对应 106 的 `authorized_keys` 中安装公钥。私钥不得提交到 Git 或复制进 Driver 镜像。部署 Driver 时必须以只读方式挂载专用私钥和预先人工核验的 `known_hosts` 文件，例如 Compose 覆盖项：
+
+```yaml
+services:
+  m20-driver:
+    volumes:
+      - /home/user/.ssh/m20_mapping_ed25519:/run/secrets/m20_nos_ssh_key:ro
+      - /home/user/.ssh/m20_nos_known_hosts:/run/secrets/m20_nos_known_hosts:ro
+```
+
+助手会再次校验动作、参数数量和地图名，并为非交互 SSH 设置 `TERM=xterm`，避免 `drmap` 输出无终端警告。不要给 SSH 用户放行 `drmap`、shell 或其他任意 sudo 命令。测试结束后，应从 106 的 `authorized_keys` 删除该专用公钥并删除 103 上的测试私钥。
+
+`mapping_view` 不依赖 SSH 开关；Pro 型号会始终注册该只读 Sensor。实时点云按 `voxel_size` 去重、受 `max_buffer_points` 约束，并按 `publish_hz` 和 `max_points` 限制 Canvas 负载。数据包元数据和 `mapping_view.info` 会公布 `state`、`requested_map`、`active_map`、数据源、坐标系、更新时间、更新次数及点数。最终二维地图只发布占据值大于等于 `occupied_threshold` 的栅格中心点。
 
 供应商文档未提供舞蹈、自定义特技或关节位置控制接口，本 Driver 不虚构这些能力。
 
 ## 验证状态
 
-机器人目前还没到位。协议编解码、能力契约、配置和 Python 语法已在开发机验证；Fast DDS 发现、真实状态机、速度方向、选配件存在性、充电及 Pro 导航仍需真机验真。首次联调前请确认系统版本为 V1.1.8、外接主机接入 `10.21.31.x` 或 `10.21.33.x` 网段，并确保没有与 `planner` 或 `charge_manager` 并发发布 `/NAV_CMD`。
+已在 M20 Pro 真机验证专用密钥和固定主机密钥 SSH、建图状态/地图列表、Canvas 启停建图、停止后生成地图目录，以及 `/grid_map_3d` 与 `/SLAM_ODOM` 均约 10 Hz；同时确认 `/grid_map_3d` 为 `base_link` 坐标、XYZ float32、16 字节点步长，`/SLAM_ODOM` 为 `map` 坐标。实时坐标转换、点云累积、地图名称元数据和 ACP 异步完成回调已通过开发机契约测试，仍需用包含本次提交的新镜像在 Agent Core/Canvas 上复测。速度方向、选配件存在性、充电及 Pro 导航仍未完成真机验证。首次联调前请确认系统版本为 V1.1.8、外接主机接入 `10.21.31.x` 或 `10.21.33.x` 网段，并确保没有与 `planner` 或 `charge_manager` 并发发布 `/NAV_CMD`。
