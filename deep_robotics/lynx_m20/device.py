@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import json
+import math
+import struct
 import threading
 import time
+from array import array
 
 from basic_server import BasicServerClient
 from common.vendor_runtime import action_schema, jsonable, tool
@@ -15,12 +18,108 @@ GAITS = {"basic": 0x1001, "standard_stairs": 0x1003, "agile_flat": 0x3002, "agil
 MOTION_STATES = {"idle": 0, "stand": 1, "soft_estop": 2, "damping": 3, "lie": 4, "rl_control": 17}
 
 
+def pointcloud_xyz(msg):
+    """Return finite non-zero XYZ points from a little-endian PointCloud2."""
+    if bool(getattr(msg, "is_bigendian", False)):
+        raise ValueError("sensor/pointcloud requires little-endian PointCloud2 data")
+    point_step = int(getattr(msg, "point_step", 0))
+    width = int(getattr(msg, "width", 0))
+    height = int(getattr(msg, "height", 0))
+    if point_step <= 0 or width <= 0 or height <= 0:
+        raise ValueError("PointCloud2 layout must have positive point_step, width and height")
+
+    fields = {getattr(field, "name", ""): field for field in getattr(msg, "fields", ())}
+    for name, offset in (("x", 0), ("y", 4), ("z", 8)):
+        field = fields.get(name)
+        if field is None or int(getattr(field, "offset", -1)) != offset or int(getattr(field, "datatype", -1)) != 7:
+            raise ValueError("sensor/pointcloud requires float32 x/y/z fields at offsets 0/4/8")
+
+    data = bytes(getattr(msg, "data", b""))
+    row_size = width * point_step
+    row_step = int(getattr(msg, "row_step", 0)) or row_size
+    if row_step < row_size:
+        raise ValueError("PointCloud2 row_step is smaller than its packed row")
+    required = (height - 1) * row_step + row_size
+    if len(data) < required:
+        raise ValueError("PointCloud2 data is shorter than its declared layout")
+
+    points = []
+    for row in range(height):
+        row_base = row * row_step
+        for column in range(width):
+            base = row_base + column * point_step
+            x, y, z = struct.unpack_from("<fff", data, base)
+            if not all(math.isfinite(value) for value in (x, y, z)):
+                continue
+            if abs(x) + abs(y) + abs(z) < 1e-6:
+                continue
+            points.append((x, y, z))
+    if not points:
+        raise ValueError("PointCloud2 contains no finite non-zero XYZ points")
+    return points
+
+
+def encode_xyz_points(points):
+    """Encode ROS/map XYZ coordinates in the Canvas display convention."""
+    packed = bytearray()
+    for x, y, z in points:
+        # ROS is X-forward/Y-left/Z-up. Canvas matches the existing G1/Go2
+        # cards: X-back/Y-left/Z-down.
+        packed.extend(struct.pack("<fff", -x, y, -z))
+    return struct.pack("<II", 12, len(points)) + packed, len(points)
+
+
+def encode_pointcloud(msg):
+    """Filter and encode ROS PointCloud2 for the Canvas renderer."""
+    return encode_xyz_points(pointcloud_xyz(msg))
+
+
+def evenly_sample_points(points, total, limit):
+    """Select at most limit points across the complete insertion-ordered map."""
+    if total <= limit:
+        return list(points)
+    selected = []
+    for index, point in enumerate(points):
+        target = len(selected) * total // limit
+        if index == target:
+            selected.append(point)
+            if len(selected) == limit:
+                break
+    return selected
+
+
+def lidar_point_limits(visualization, min_points):
+    """Resolve limits while migrating the legacy 50000-point configuration."""
+    configured_max = int(visualization.get("max_points", 500000))
+    legacy_migrated = configured_max == 50000 and "publish_max_points" not in visualization
+    max_points = max(min_points, 500000 if legacy_migrated else configured_max)
+    publish_max_points = max(
+        min_points,
+        min(max_points, int(visualization.get("publish_max_points", 80000))),
+    )
+    return max_points, publish_max_points, legacy_migrated
+
+
+def transform_point(point, pose):
+    """Transform a base_link point into the fixed map frame."""
+    x, y, z = point
+    qx, qy, qz, qw = (float(pose[key]) for key in ("qx", "qy", "qz", "qw"))
+    xx, yy, zz = qx * qx, qy * qy, qz * qz
+    xy, xz, yz = qx * qy, qx * qz, qy * qz
+    wx, wy, wz = qw * qx, qw * qy, qw * qz
+    return (
+        float(pose["x"]) + (1 - 2 * (yy + zz)) * x + 2 * (xy - wz) * y + 2 * (xz + wy) * z,
+        float(pose["y"]) + 2 * (xy + wz) * x + (1 - 2 * (xx + zz)) * y + 2 * (yz - wx) * z,
+        float(pose.get("z", 0.0)) + 2 * (xz - wy) * x + 2 * (yz + wx) * y + (1 - 2 * (xx + yy)) * z,
+    )
+
+
 class M20Nodes:
     def __init__(self, config, namespace, ros2):
         from drdds.msg import Gait, JointsData, MotionInfo, MotionState, NavCmd, NavSat, StdMsgInt32, StdStatus
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import Imu, PointCloud2
-        from std_msgs.msg import String
+        from std_msgs.msg import String, UInt8MultiArray
         from rclpy.node import Node
 
         self.config = config
@@ -41,6 +140,11 @@ class M20Nodes:
         self._header_lock = threading.Lock()
         self.values = {}
         self.streams = {}
+        self._pointcloud_lock = threading.Lock()
+        self._pointcloud_frames = {}
+        self._pointcloud_last_publish = {}
+        self._lidar_pose = None
+        self._lidar_voxels = {}
         self.frame_id = 0
         self.native_velocity_command = 25
         self._motion_condition = threading.Condition(threading.Lock())
@@ -66,8 +170,10 @@ class M20Nodes:
         streams = [
             ("motion_info", MotionInfo, "/MOTION_INFO", "data/json", 20),
             ("imu", Imu, "/IMU", "data/json", 50),
-            ("lidar", PointCloud2, "/LIDAR/POINTS", "pointcloud/ros2", 10),
-            ("lidar_rear", PointCloud2, "/LIDAR/POINTS2", "pointcloud/ros2", 10),
+            # This firmware's two raw RoboSense writers use vendor bare DDS
+            # endpoints that do not match rclpy despite sharing the ROS topic
+            # names.  /grid_map_3d is the live, ROS-compatible fused cloud.
+            ("lidar", PointCloud2, "/grid_map_3d", "sensor/pointcloud", 10),
             ("hard_estop", StdMsgInt32, "/HES_STATUS", "data/json", 10),
             ("charge_status", StdStatus, "/CHARGE_STATUS", "data/json", 10),
             ("gps", NavSat, "/GPS", "data/json", 10),
@@ -79,24 +185,153 @@ class M20Nodes:
             robot_topic = topics.get(key, default)
             core_topic = f"/{namespace}/lynx_m20/{key}"
             as_json = fmt == "data/json"
-            core_msg_type = String if as_json else msg_type
+            as_pointcloud = fmt == "sensor/pointcloud"
+            core_msg_type = String if as_json else UInt8MultiArray if as_pointcloud else msg_type
             pub = self.core.create_publisher(core_msg_type, core_topic, depth)
             self.robot.create_subscription(
                 msg_type,
                 robot_topic,
-                self._callback(key, pub, as_json=as_json, string_type=String),
+                self._callback(
+                    key,
+                    pub,
+                    as_json=as_json,
+                    string_type=String,
+                    as_pointcloud=as_pointcloud,
+                    pointcloud_type=UInt8MultiArray,
+                ),
                 depth,
             )
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
+        if self.is_pro:
+            self.robot.create_subscription(
+                Odometry,
+                topics.get("slam_odometry", "/ODOM"),
+                self._lidar_odometry_callback,
+                10,
+            )
 
-    def _callback(self, key, publisher, *, as_json=False, string_type=None):
+    def _lidar_odometry_callback(self, msg):
+        frame_id = str(getattr(msg.header, "frame_id", ""))
+        if not frame_id or frame_id in {"base_link", "base_footprint"}:
+            return
+        pose = msg.pose.pose
+        orientation = pose.orientation
+        value = {
+            "x": float(pose.position.x),
+            "y": float(pose.position.y),
+            "z": float(pose.position.z),
+            "qx": float(orientation.x),
+            "qy": float(orientation.y),
+            "qz": float(orientation.z),
+            "qw": float(orientation.w),
+            "frame_id": frame_id,
+        }
+        with self._pointcloud_lock:
+            self._lidar_pose = value
+
+    def reset_lidar_accumulation(self):
+        with self._pointcloud_lock:
+            self._lidar_voxels.clear()
+            self._pointcloud_frames.pop("lidar", None)
+            self._pointcloud_last_publish.pop("lidar", None)
+
+    def _callback(
+        self,
+        key,
+        publisher,
+        *,
+        as_json=False,
+        string_type=None,
+        as_pointcloud=False,
+        pointcloud_type=None,
+    ):
         def callback(msg):
-            if key.startswith("lidar"):
+            if as_pointcloud:
+                if pointcloud_type is None:
+                    raise RuntimeError("point cloud streams require std_msgs/msg/UInt8MultiArray")
+                try:
+                    points = pointcloud_xyz(msg)
+                    point_count = len(points)
+                except ValueError as exc:
+                    with self.lock:
+                        self.values[key] = {"received": False, "error": str(exc), "timestamp": time.time()}
+                    return
+                visualization = self.config.get("lidar_visualization", {})
+                min_points = max(1, int(visualization.get("min_points", 32)))
+                if point_count < min_points:
+                    with self.lock:
+                        self.values[key] = {
+                            "received": False,
+                            "error": f"only {point_count} valid points",
+                            "timestamp": time.time(),
+                        }
+                    return
+                frame_count = max(1, int(visualization.get("accumulate_frames", 5)))
+                max_points, publish_max_points, legacy_migrated = lidar_point_limits(
+                    visualization, min_points,
+                )
+                publish_hz = max(0.1, float(visualization.get("publish_hz", 5.0)))
+                voxel_size = max(0.01, float(visualization.get("voxel_size", 0.08)))
+                now = time.monotonic()
+                with self._pointcloud_lock:
+                    pose = dict(self._lidar_pose) if self._lidar_pose else None
+                    if pose is not None:
+                        for point in points:
+                            mapped = transform_point(point, pose)
+                            voxel = tuple(math.floor(value / voxel_size) for value in mapped)
+                            if voxel in self._lidar_voxels:
+                                continue
+                            if len(self._lidar_voxels) >= max_points:
+                                break
+                            self._lidar_voxels[voxel] = mapped
+                        accumulated_count = len(self._lidar_voxels)
+                        output_frame = str(pose.get("frame_id", "map"))
+                    else:
+                        payload, _ = encode_xyz_points(points)
+                        frames = self._pointcloud_frames.setdefault(key, [])
+                        frames.append(payload[8:])
+                        del frames[:-frame_count]
+                        accumulated_count = min(
+                            max_points, sum(len(frame) // 12 for frame in frames),
+                        )
+                        output_frame = str(getattr(getattr(msg, "header", None), "frame_id", ""))
+                    if now - self._pointcloud_last_publish.get(key, float("-inf")) < 1.0 / publish_hz:
+                        return
+                    self._pointcloud_last_publish[key] = now
+                    if pose is not None:
+                        output_points = evenly_sample_points(
+                            self._lidar_voxels.values(), accumulated_count, publish_max_points,
+                        )
+                    else:
+                        merged = b"".join(frames)
+                        if len(merged) // 12 > max_points:
+                            merged = merged[-max_points * 12:]
+                        output_points = [
+                            (-x, y, -z)
+                            for x, y, z in struct.iter_unpack("<fff", merged)
+                        ]
+                payload, published_count = encode_xyz_points(output_points)
+                output = pointcloud_type()
+                output.data = array("B", payload)
+                publisher.publish(output)
                 header = getattr(msg, "header", None)
-                value = {"received": True, "frame_id": getattr(header, "frame_id", ""), "timestamp": time.time()}
+                value = {
+                    "received": True,
+                    "frame_id": output_frame,
+                    "point_count": accumulated_count,
+                    "published_point_count": published_count,
+                    "accumulation_max_points": max_points,
+                    "publish_max_points": publish_max_points,
+                    "legacy_config_migrated": legacy_migrated,
+                    "source_point_count": point_count,
+                    "point_step": 12,
+                    "timestamp": time.time(),
+                }
             else:
                 value = jsonable(msg)
-            if as_json:
+            if as_pointcloud:
+                pass
+            elif as_json:
                 if string_type is None:
                     raise RuntimeError("JSON state streams require std_msgs/msg/String")
                 output = string_type()
@@ -359,7 +594,12 @@ class M20StatePlugin:
                     "topic_out": [{"topic": stream["url"], "format": stream["format"]}],
                 }
             return {"state": "ready"}
-        if action in ("start", "stop"): return {"state": "ready" if action == "start" else "idle"}
+        if action == "start":
+            if name == "lidar":
+                self.nodes.reset_lidar_accumulation()
+            return {"state": "running" if name in self.nodes.streams else "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if name == "state": return self.nodes.snapshot()
         if name in self.nodes.streams: return {"state": "running", **self.nodes.streams[name]}
         if name in self.nodes.rtsp_streams: return {"state": "ready", **self.nodes.rtsp_streams[name]}
