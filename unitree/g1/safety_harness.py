@@ -53,6 +53,10 @@ class SpeedZone(enum.Enum):
     STOPPED = "stopped"
 
 
+# unitree_sdk2py.rpc.internal.RPC_ERR_CLIENT_API_TIMEOUT
+RPC_ERR_CLIENT_API_TIMEOUT = 3104
+
+
 @dataclass
 class SpeedLimits:
     vx_normal: float = 1.0
@@ -101,15 +105,14 @@ class SmartMotionProxy:
             try:
                 item = self._result_queue.get(timeout=1.0)
                 req_id = item.pop("_req_id", None) if isinstance(item, dict) else None
-                if req_id and req_id in self._pending:
-                    self._pending[req_id].put(item)
+                with self._dispatch_lock:
+                    target = self._pending.get(req_id) if req_id else None
+                if target:
+                    target.put(item)
                 else:
-                    # Fallback: shouldn't happen, but don't lose the result
-                    # Put it in any waiting queue (legacy behavior)
-                    with self._dispatch_lock:
-                        for q in self._pending.values():
-                            q.put(item)
-                            break
+                    # A caller can time out before the child finishes. Never
+                    # deliver that late result to an unrelated newer command.
+                    print(f"[SmartMotionProxy] dropping late/unmatched result req_id={req_id}", flush=True)
             except queue.Empty:
                 continue
             except Exception:
@@ -140,7 +143,7 @@ class SmartMotionProxy:
     def navigate_to(self, x: float, y: float, yaw: float, target_name: str = "",
                     speed: float = 0.5, mode: int = 1) -> dict:
         return self._call("navigate_to", x=x, y=y, yaw=yaw, target_name=target_name,
-                          speed=speed, mode=mode)
+                          speed=speed, mode=mode, timeout=30.0)
 
     def pause_nav(self, reason: str = "command") -> dict:
         return self._call("pause_nav", reason=reason)
@@ -149,7 +152,11 @@ class SmartMotionProxy:
         return self._call("resume_nav")
 
     def stop_nav(self) -> dict:
-        return self._call("stop_nav")
+        return self._call("stop_nav", timeout=30.0)
+
+    def complete_nav(self) -> dict:
+        """Mark a pose-confirmed route as complete without another SLAM RPC."""
+        return self._call("complete_nav", timeout=2.0)
 
     def wait_nav_done(self, stall_timeout: float = 60) -> dict:
         return self._call("wait_nav_done", stall_timeout=stall_timeout,
@@ -248,6 +255,13 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     # ── Config ──
     decel_threshold = config.get("decel_threshold", 2.0)
     stop_threshold = config.get("stop_threshold", 0.8)
+    lateral_threshold = config.get("lateral_threshold", stop_threshold)
+    # Navigation must pass doorway frames.  Keep its stop zone centered on the
+    # travel direction instead of reusing the wider manual-motion cone.
+    nav_stop_threshold = config.get("nav_stop_threshold", stop_threshold)
+    nav_cone_half_angle = math.radians(config.get("nav_cone_half_angle", 15))
+    nav_min_points = config.get("nav_min_points", 5)
+    nav_confirm_frames_required = config.get("nav_confirm_frames", 2)
     cone_half_angle = math.radians(config.get("cone_half_angle", 30))
     z_min = config.get("z_min", 0.1)
     z_max = config.get("z_max", 1.8)
@@ -265,7 +279,13 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
     obstacle_dist = float("inf")
     obstacle_angle = 0.0
     lateral_obstacle = False
-    fwd_log_n = 0  # decel-zone log counter, reset on leaving the zone
+    nav_obstacle_dist = float("inf")
+    nav_obstacle_angle = 0.0
+    nav_obstacle_xyz = None
+    nav_close_points = 0
+    nav_confirm_frames = 0
+    fwd_log_n = 0
+    nav_pause_reason = None
 
     # Nav arrival state (updated by rt/slam_info DDS callback in this subprocess)
     slam_info_lock = threading.Lock()
@@ -311,7 +331,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         return {"ret": 0, "state": "idle", "reason": reason_str}
 
     def do_stop_nav():
-        nonlocal state, nav_cmd, speed_zone
+        nonlocal state, nav_cmd, speed_zone, nav_pause_reason
         try:
             slam_client.PauseNav()
         except Exception:
@@ -320,6 +340,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         state = MotionState.IDLE
         nav_cmd = None
         speed_zone = SpeedZone.NORMAL
+        nav_pause_reason = None
         if was_nav:
             publish_event("nav_stopped", {"reason": "command"})
         return {"status": "stopped"}
@@ -332,7 +353,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
     # ── LiDAR DDS Subscription ──
     def on_cloud(msg):
-        nonlocal obstacle_dist, obstacle_angle, lateral_obstacle, fwd_log_n
+        nonlocal obstacle_dist, obstacle_angle, lateral_obstacle, nav_obstacle_dist, nav_obstacle_angle, nav_obstacle_xyz, nav_close_points, nav_confirm_frames, fwd_log_n
 
         # Get heading
         if state == MotionState.MOVING and current_cmd:
@@ -372,6 +393,11 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 obstacle_dist = float("inf")
                 obstacle_angle = 0.0
                 lateral_obstacle = False
+                nav_obstacle_dist = float("inf")
+                nav_obstacle_angle = 0.0
+                nav_obstacle_xyz = None
+                nav_close_points = 0
+                nav_confirm_frames = 0
             return
 
         vx_pts = px[valid]
@@ -412,16 +438,47 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 # Left the decel zone — reset so re-entry logs immediately.
                 fwd_log_n = 0
 
-        # Lateral (45°-90°, within stop_threshold)
+        # Navigation has a separate, narrower center corridor.  Do not derive
+        # this from min_fwd_dist: a closer door frame at 20-30 degrees must not
+        # hide an object directly in front of the robot.
+        nav_forward_mask = angle_diffs <= nav_cone_half_angle
+        min_nav_dist = float("inf")
+        min_nav_angle = 0.0
+        if np.any(nav_forward_mask):
+            nav_dists = vdist[nav_forward_mask]
+            nav_idx = np.argmin(nav_dists)
+            min_nav_dist = float(nav_dists[nav_idx])
+            min_nav_angle = float(point_angles[nav_forward_mask][nav_idx])
+            nav_x = float(vx_pts[nav_forward_mask][nav_idx])
+            nav_y = float(vy_pts[nav_forward_mask][nav_idx])
+            nav_z = float(pz[valid][nav_forward_mask][nav_idx])
+            nav_xyz = (nav_x, nav_y, nav_z)
+        else:
+            nav_xyz = None
+
+        nav_close_count = int(np.count_nonzero(
+            nav_forward_mask & (vdist <= nav_stop_threshold)))
+        if state == MotionState.NAVIGATING and nav_close_count >= nav_min_points:
+            nav_confirm_frames += 1
+        elif state == MotionState.NAVIGATING:
+            nav_confirm_frames = 0
+
+        # Lateral (45°-90°, within its independently configurable threshold).
+        # This remains relevant for manually commanded motion, but deliberately
+        # does not stop SLAM navigation: doorway frames belong in this region.
         lat_mask = (angle_diffs >= math.radians(45)) & \
                    (angle_diffs <= math.radians(90)) & \
-                   (vdist < stop_threshold)
+                   (vdist < lateral_threshold)
         lat_detected = bool(np.any(lat_mask))
 
         with obstacle_lock:
             obstacle_dist = min_fwd_dist
             obstacle_angle = min_fwd_angle
             lateral_obstacle = lat_detected
+            nav_obstacle_dist = min_nav_dist
+            nav_obstacle_angle = min_nav_angle
+            nav_obstacle_xyz = nav_xyz
+            nav_close_points = nav_close_count
 
     try:
         event_node.create_subscription(
@@ -661,11 +718,12 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 "duration": duration, "state": state.value}
 
     def handle_navigate_to(x, y, yaw, target_name, speed=0.5, mode=1, stall_timeout=60):
-        nonlocal state, nav_cmd, speed_zone, nav_arrived_flag, nav_arrived_error
+        nonlocal state, nav_cmd, speed_zone, nav_arrived_flag, nav_arrived_error, nav_pause_reason, nav_confirm_frames
 
+        resume_required = state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED)
         if state == MotionState.MOVING:
             do_stop("command")
-        elif state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
+        elif resume_required:
             do_stop_nav()
 
         # Reset arrival state for this navigation session
@@ -675,27 +733,42 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
 
         q_z = math.sin(yaw / 2)
         q_w = math.cos(yaw / 2)
-        # Clear any paused state before starting new navigation.
-        # If previous nav was paused (by obstacle or user), SLAM service may still
-        # be in paused state — NavigateTo would fail with code=3104.
-        try:
-            slam_client.ResumeNav()
-        except Exception:
-            pass
+        # A route replaced while it is active needs a resume after PauseNav.
+        # A route marked complete is already IDLE and must start directly.
+        if resume_required:
+            try:
+                slam_client.ResumeNav()
+            except Exception:
+                pass
         code, resp = slam_client.NavigateTo(x, y, 0, 0, 0, q_z, q_w,
                                               speed=speed, mode=mode)
 
-        if code != 0:
+        # On this firmware NavigateTo can execute successfully while the DDS
+        # response misses the 10s client deadline. Treat that response timeout
+        # as an accepted-but-unconfirmed command so safety and arrival tracking
+        # remain active; a route that never starts still fails via stall timeout.
+        rpc_timeout = code == RPC_ERR_CLIENT_API_TIMEOUT
+        if code != 0 and not rpc_timeout:
             return {"error": f"NavigateTo failed, code={code}", "response": resp}
 
         label = target_name or f"({x:.1f}, {y:.1f})"
         nav_cmd = {"target_name": label, "target_pose": {"x": x, "y": y, "yaw": yaw}, "start_time": time.time()}
         state = MotionState.NAVIGATING
         speed_zone = SpeedZone.NORMAL
+        nav_pause_reason = None
+        nav_confirm_frames = 0
 
-        publish_event("nav_start", {"target_name": label, "target_pose": {"x": x, "y": y, "yaw": yaw}})
+        event_data = {"target_name": label, "target_pose": {"x": x, "y": y, "yaw": yaw}}
+        if rpc_timeout:
+            event_data["warning"] = "NavigateTo response timed out; monitoring command as active"
+            print(f"[SmartMotion] NavigateTo response timeout for {label}; "
+                  "treating command as active", flush=True)
+        publish_event("nav_start", event_data)
         # Return immediately — non-blocking. wait_navigation_done handles arrival detection.
-        return {"status": "navigating", "target": label, "pose": {"x": x, "y": y, "yaw": yaw}}
+        result = {"status": "navigating", "target": label, "pose": {"x": x, "y": y, "yaw": yaw}}
+        if rpc_timeout:
+            result["warning"] = "NavigateTo response timed out; command may already be running"
+        return result
 
     def handle_wait_nav_done(stall_timeout=60):
         """Block until navigation completes or robot is stuck.
@@ -788,24 +861,63 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         return {"status": "stopped", "state": state.value}
 
     def handle_pause_nav(reason_str):
-        nonlocal state
+        nonlocal state, nav_pause_reason, stop_repeat_count
         if state != MotionState.NAVIGATING:
             return {"error": f"Cannot pause nav: state is {state.value}"}
-        code, _ = slam_client.PauseNav()
-        state = MotionState.NAV_PAUSED
+        # The direct velocity command must go first. PauseNav has been observed
+        # to take several seconds to acknowledge on this firmware.
+        brake_started = time.monotonic()
+        stop_code = None
+        stop_error = None
+        try:
+            stop_code = loco_client.StopMove()
+            stop_repeat_count = 3
+        except Exception as exc:
+            stop_error = str(exc)
+        stop_elapsed_ms = round((time.monotonic() - brake_started) * 1000)
+
+        pause_started = time.monotonic()
+        try:
+            code, _ = slam_client.PauseNav()
+        except Exception:
+            code = -1
+        print(f"[SmartMotion:nav_brake] PauseNav={code} StopMove={stop_code} "
+              f"stop_ms={stop_elapsed_ms} pause_ms={round((time.monotonic() - pause_started) * 1000)}"
+              + (f" StopMove_error={stop_error}" if stop_error else ""), flush=True)
+        if code == 0 or reason_str == "obstacle":
+            state = MotionState.NAV_PAUSED
+            nav_pause_reason = reason_str
         event_data = {"reason": reason_str}
         if reason_str == "obstacle":
             with obstacle_lock:
                 event_data["obstacle_distance"] = round(obstacle_dist, 2)
         publish_event("nav_paused", event_data)
-        return {"status": "paused"} if code == 0 else {"error": f"PauseNav failed, code={code}"}
+        return {"status": "paused"} if code == 0 else {
+            "status": "paused",
+            "warning": f"PauseNav failed, code={code}; local StopMove applied",
+        }
+
+    def handle_complete_nav():
+        nonlocal state, nav_cmd, speed_zone, nav_pause_reason, nav_confirm_frames
+        if state not in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
+            return {"status": "ignored", "state": state.value}
+        state = MotionState.IDLE
+        nav_cmd = None
+        speed_zone = SpeedZone.NORMAL
+        nav_pause_reason = None
+        nav_confirm_frames = 0
+        return {"status": "completed"}
 
     def handle_resume_nav():
-        nonlocal state
+        nonlocal state, nav_pause_reason, stop_repeat_count, nav_confirm_frames
         if state != MotionState.NAV_PAUSED:
             return {"error": f"Cannot resume nav: state is {state.value}"}
         code, _ = slam_client.ResumeNav()
-        state = MotionState.NAVIGATING
+        if code == 0:
+            state = MotionState.NAVIGATING
+            nav_pause_reason = None
+            stop_repeat_count = 0
+            nav_confirm_frames = 0
         publish_event("nav_resumed", {})
         return {"status": "resumed"} if code == 0 else {"error": f"ResumeNav failed, code={code}"}
 
@@ -815,14 +927,19 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             result["motion"] = current_cmd.copy()
         if nav_cmd and state in (MotionState.NAVIGATING, MotionState.NAV_PAUSED):
             result["navigation"] = nav_cmd.copy()
+        with slam_info_lock:
+            if nav_current_pose:
+                result["pose"] = dict(nav_current_pose)
         with obstacle_lock:
             result["obstacle_distance"] = round(obstacle_dist, 2) if obstacle_dist != float("inf") else None
             result["lateral_obstacle"] = lateral_obstacle
+            result["nav_obstacle_distance"] = round(nav_obstacle_dist, 2) if nav_obstacle_dist != float("inf") else None
+            result["nav_close_points"] = nav_close_points
         return result
 
     # ── Safety checks (inline in main loop) ──
     def process_safety_checks():
-        nonlocal state, speed_zone
+        nonlocal state, speed_zone, nav_pause_reason, stop_repeat_count, nav_confirm_frames
 
         # 1. Communication timeout
         with safety_lock:
@@ -855,6 +972,11 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
         with obstacle_lock:
             dist = obstacle_dist
             lateral = lateral_obstacle
+            nav_dist = nav_obstacle_dist
+            nav_angle = nav_obstacle_angle
+            nav_xyz = nav_obstacle_xyz
+            nav_points = nav_close_points
+            nav_frames = nav_confirm_frames
 
         if state == MotionState.MOVING:
             cmd = current_cmd  # snapshot to avoid race condition
@@ -888,23 +1010,36 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                         publish_event("motion_resume", {"speed": {"vx": cvx, "vy": cvy, "vyaw": cvyaw}})
 
         elif state == MotionState.NAVIGATING:
-            # In mode=1 (stop-on-obstacle), SLAM service handles obstacle stopping.
-            # No local PauseNav/ResumeNav needed — avoids conflicts with SLAM state.
-            pass
+            # SLAM navigation uses mode=0; local LiDAR safety owns stopping.
+            # A narrow, centered cone catches an obstacle in the robot's path
+            # while allowing close side walls and doorway frames to pass.
+            if (nav_dist <= nav_stop_threshold
+                    and nav_points >= nav_min_points
+                    and nav_frames >= nav_confirm_frames_required):
+                if speed_zone != SpeedZone.STOPPED:
+                    speed_zone = SpeedZone.STOPPED
+                    print(f"[SmartMotion:nav_obstacle] PAUSE — dist={nav_dist:.2f}m "
+                          f"angle={math.degrees(nav_angle):.1f}° points={nav_points} "
+                          f"frames={nav_frames} xyz={nav_xyz}", flush=True)
+                    handle_pause_nav("obstacle")
 
         elif state == MotionState.NAV_PAUSED:
             # Obstacle cleared — resume navigation.
-            # Only resume if we were paused by local obstacle detection.
-            if dist > decel_threshold and not lateral:
+            if (nav_pause_reason == "obstacle"
+                    and nav_dist > decel_threshold):
                 try:
-                    slam_client.ResumeNav()
+                    code, _ = slam_client.ResumeNav()
                 except Exception:
-                    pass
-                state = MotionState.NAVIGATING
-                speed_zone = SpeedZone.NORMAL
-                publish_event("nav_resumed", {})
-                print(f"[SmartMotion:nav_obstacle] RESUME NAV — "
-                      f"dist={dist:.2f}m, obstacle cleared", flush=True)
+                    code = -1
+                if code == 0:
+                    state = MotionState.NAVIGATING
+                    speed_zone = SpeedZone.NORMAL
+                    nav_pause_reason = None
+                    stop_repeat_count = 0
+                    nav_confirm_frames = 0
+                    publish_event("nav_resumed", {})
+                    print(f"[SmartMotion:nav_obstacle] RESUME NAV — "
+                          f"dist={dist:.2f}m, obstacle cleared", flush=True)
 
     # ── Main loop ──
     print(f"[SmartMotion:pid={os.getpid()}] entering main loop")
@@ -935,6 +1070,8 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 result = handle_resume_nav()
             elif method == "stop_nav":
                 result = do_stop_nav()
+            elif method == "complete_nav":
+                result = handle_complete_nav()
             elif method == "wait_nav_done":
                 result = handle_wait_nav_done(cmd.get("stall_timeout", 60))
             elif method == "get_state":
@@ -982,7 +1119,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
             process_safety_checks()
 
             # Repeat StopMove after emergency_stop to ensure controller receives it
-            if stop_repeat_count > 0 and state == MotionState.IDLE:
+            if stop_repeat_count > 0 and state in (MotionState.IDLE, MotionState.NAV_PAUSED):
                 loco_client.StopMove()
                 stop_repeat_count -= 1
 
