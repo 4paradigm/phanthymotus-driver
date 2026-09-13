@@ -753,10 +753,10 @@ class JointCommandPlugin:
 
 class HandCommandPlugin:
     ACTIONS = {
-        "open": ([], "张开手掌（左右手可分别指定）"),
-        "close": ([], "握拳（左右手可分别指定）"),
+        "open": (["side"], "张开指定一侧或双侧手掌"),
+        "close": (["side"], "握拳指定一侧或双侧手掌"),
         "set_positions": (["left", "right"], "自定义左右手各手指的位置数组"),
-        "get_state": ([], "查询手部关节最新状态快照"),
+        "get_state": ([], "查询手部关节状态快照和当前左右手型"),
     }
     # Modeled after BrainCo Revo2's finger-joint naming as a generic reference (X2's own
     # HandType enum has no BrainCo entry — this is a naming-convention analogy only).
@@ -771,6 +771,7 @@ class HandCommandPlugin:
         return tool("hand_command", "actuator", "手部指令：张开/握拳/自定义手指位置（HandCommandArray）", action_schema(
             self.ACTIONS,
             {
+                "side": {"type": "string", "enum": ["left", "right", "both"], "description": "要控制的手：left=左手，right=右手，both=双手"},
                 "left": {"type": "array", "items": {"type": "number"}, "description": "左手各手指位置 [thumb, index, middle, ring, little]"},
                 "right": {"type": "array", "items": {"type": "number"}, "description": "右手各手指位置 [thumb, index, middle, ring, little]"},
             },
@@ -782,6 +783,32 @@ class HandCommandPlugin:
     def stop(self):
         pass
 
+    def _get_hand_types(self):
+        """Return the actual left/right hand types reported by the robot.
+
+        HandCommandArray carries a HandType for each side.  Leaving those fields at
+        their generated-message default (NONE) makes a command ambiguous to the
+        EtherCAT hand controller, even when the robot has dexterous hands fitted.
+        Query the source of truth immediately before publishing rather than assuming
+        the configured URDF variant matches the installed hardware.
+        """
+        from aimdk_msgs.srv import GetHandType
+
+        request = GetHandType.Request()
+        request.request = self.nodes.request_header()
+        result = call_service(self.nodes.get_hand_type, request)
+        status = int(result.reponse.status.value)
+        if status != 1:  # CommonState.SUCCESS
+            raise RuntimeError(
+                "hand_command: GetHandType failed "
+                f"(status={status}, message={result.reponse.message!r})"
+            )
+        return int(result.left_hands_type.value), int(result.right_hands_type.value)
+
+    @staticmethod
+    def _is_controllable_hand(hand_type):
+        return hand_type in (1, 2, 3)
+
     def dispatch(self, action, args):
         from aimdk_msgs.msg import HandCommand
 
@@ -792,20 +819,42 @@ class HandCommandPlugin:
         if action == "info":
             return {"state": "ready"}
         if action == "get_state":
-            return self.nodes.snapshot("hand_state")
+            left_type, right_type = self._get_hand_types()
+            return {
+                **self.nodes.snapshot("hand_state"),
+                "left_hand_type": HAND_TYPES.get(left_type, "unknown"),
+                "left_hand_type_value": left_type,
+                "right_hand_type": HAND_TYPES.get(right_type, "unknown"),
+                "right_hand_type_value": right_type,
+            }
 
         if action in ("open", "close"):
+            side = args.get("side")
+            if side not in ("left", "right", "both"):
+                raise ValueError("hand_command: side must be left, right, or both")
             value = self.OPEN_POSITION if action == "open" else self.CLOSE_POSITION
-            left = [value] * len(self.FINGERS)
-            right = [value] * len(self.FINGERS)
+            left = [value] * len(self.FINGERS) if side in ("left", "both") else []
+            right = [value] * len(self.FINGERS) if side in ("right", "both") else []
         elif action == "set_positions":
             left = args.get("left", [])
             right = args.get("right", [])
         else:
             raise ValueError(f"hand_command: unknown action {action!r}")
 
+        left_type, right_type = self._get_hand_types()
+        if left and not self._is_controllable_hand(left_type):
+            raise ValueError(
+                f"hand_command: left hand is not controllable (type={HAND_TYPES.get(left_type, 'unknown')})"
+            )
+        if right and not self._is_controllable_hand(right_type):
+            raise ValueError(
+                f"hand_command: right hand is not controllable (type={HAND_TYPES.get(right_type, 'unknown')})"
+            )
+
         msg = self.nodes._HandCommandArray()
         msg.header.stamp = self.nodes.robot.get_clock().now().to_msg()
+        msg.left_hand_type.value = left_type
+        msg.right_hand_type.value = right_type
         for finger, position in zip(self.FINGERS, left):
             cmd = HandCommand()
             cmd.name = finger
