@@ -6,20 +6,22 @@ hardware_model: "x2"
 image_name: agibot-x2
 port: 15717
 mcp_url: "http://localhost:15717/mcp"
-description: "AgiBot X2 humanoid — AimDK SDK (plain rclpy) MC mode/locomotion/preset motion, per-area joint control, dexterous hand, Linkcraft dynamic motion library, camera/lidar/IMU/SLAM, TTS/emoji/LED"
+description: "AgiBot X2 humanoid — AimDK SDK (plain rclpy) MC mode/locomotion/preset motion, per-area joint control, self-describing RGB camera/IMU/head touch/PMU, Linkcraft, TTS/emoji/LED"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
 # Kept in sync by hand with config.yaml's plugin enabled flags and end_effector variant.
 cards:
   - { name: mc_state,           type: sensor }
+  - { name: joints,             type: sensor }
   - { name: joint_state,        type: sensor }
-  - { name: hand_state,         type: sensor }
   - { name: imu,                type: sensor }
+  - { name: mic,                type: sensor }
+  - { name: leg_odometry,       type: sensor }
   - { name: camera_rgb,         type: sensor }
-  - { name: camera_depth,       type: sensor }
-  - { name: lidar,              type: sensor }
-  - { name: slam_pose,          type: sensor }
+  - { name: camera_rgb_frame,   type: sensor }
+  - { name: head_touch,         type: sensor }
+  - { name: pmu_state,          type: sensor }
   - { name: system_state,       type: sensor }
   - { name: linkcraft_catalog,  type: sensor }
   - { name: model,              type: resource }
@@ -27,11 +29,9 @@ cards:
   - { name: locomotion,         type: actuator }
   - { name: preset_motion,      type: actuator }
   - { name: joint_command,      type: actuator }
-  - { name: hand_command,       type: actuator }
   - { name: linkcraft,          type: actuator }
   - { name: pmu_led,            type: actuator }
   - { name: tts,                type: actuator }
   - { name: emoji,              type: actuator }
   - { name: mic_source,         type: actuator }
-  - { name: slam_control,       type: actuator }
   - { name: map_get,            type: processor }
