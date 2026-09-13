@@ -163,7 +163,13 @@ class G1DeviceBundle:
         if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
             controlled_cfg = dict(plugins_cfg["controlled_spatial"])
             controlled_cfg["network_iface"] = network_iface
+            # 默认插件运行于主进程，通过 SmartMotionProxy 委托 SmartMotion
+            # 子进程进行位姿到达检测（dist < 0.3m），检测不在主进程执行。
+            # 独立模式则在 ControlledSpatial 子进程内使用位姿轮询 fallback。
             if controlled_cfg.get("isolated_process", False):
+                print("[WARNING] controlled_spatial 独立子进程使用位姿轮询 fallback "
+                      "(dist<0.3m)，不通过 SmartMotionProxy 使用 SmartMotion 子进程的到达检测。",
+                      flush=True)
                 from controlled_spatial import ControlledSpatialIsolatedProxy
                 self._plugins.append(ControlledSpatialIsolatedProxy(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
                 print("[bundle] ControlledSpatialPlugin loaded (isolated process)")
@@ -234,6 +240,13 @@ class G1DeviceBundle:
             else:
                 tools.append(p.get_tool())
         return tools
+
+    def has_tool(self, tool_name: str) -> bool:
+        for p in self._plugins:
+            plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
+            if any(tool_def["name"] == tool_name for tool_def in plugin_tools):
+                return True
+        return False
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
         for p in self._plugins:
@@ -327,9 +340,13 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    if not _bundle.has_tool(name):
+                        err(-32601, f"Unknown tool: {name}")
+                        return
+                    requested_action = args.get("action", name)
                     result = _bundle.dispatch(name, args)
                     if result is None:
-                        err(-32601, f"Unknown tool: {name}")
+                        err(-32601, f"Unknown action for tool {name}: {requested_action}")
                     else:
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:

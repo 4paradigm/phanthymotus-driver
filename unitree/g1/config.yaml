@@ -27,7 +27,7 @@ plugins:
     db_path: /opt/phanthy-motus/data/spatial.db
   controlled_spatial:
     enabled: true
-    isolated_process: true
+    isolated_process: false
     native_slam_pcd_dir: /home/unitree
     native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
   controlled_spatial_map:
