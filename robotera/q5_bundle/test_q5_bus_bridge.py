@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import unittest
 from unittest import mock
 
 import q5_bus_bridge
+import q5_media_bridge
 from sensor_contract import topic_out
 
 
@@ -50,6 +52,68 @@ class Q5BusBridgeTests(unittest.TestCase):
         self.assertIn('"pointcloud": self._ctx.Queue(maxsize=2)', source)
         self.assertIn("for media_q in media_qs.values():", source)
         self.assertIn("media_q.get_nowait()", source)
+
+    def test_main_defers_rclpy_import_for_spawned_media_bridge(self):
+        source = Path(__file__).with_name("main.py").read_text()
+        tree = ast.parse(source)
+        module_imports = [
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        ]
+        module_from_imports = [
+            node.module
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom)
+        ]
+        self.assertNotIn("rclpy", module_imports)
+        self.assertNotIn("rclpy", module_from_imports)
+        self.assertIn("def _load_rclpy()", source)
+        self.assertIn("if _load_rclpy():", source)
+
+    def test_media_bridge_sets_fastdds_before_importing_rclpy(self):
+        source = Path(q5_media_bridge.__file__).read_text()
+        worker_start = source.index("def _run_bridge_subprocess")
+        worker_source = source[worker_start:]
+        self.assertLess(worker_source.index('os.environ["ROS_DOMAIN_ID"] = "42"'),
+                        worker_source.index("import rclpy"))
+        self.assertLess(worker_source.index('os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"'),
+                        worker_source.index("import rclpy"))
+        self.assertLess(worker_source.index("configure_fastdds_transport()"),
+                        worker_source.index("import rclpy"))
+
+    def test_media_bridge_uses_bundled_udp_profile_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            profile = q5_media_bridge.configure_fastdds_transport()
+            self.assertEqual(profile, str(q5_media_bridge.DEFAULT_FASTDDS_PROFILE))
+            self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], profile)
+            self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
+
+    def test_media_bridge_promotes_legacy_profile_to_canonical_name(self):
+        with mock.patch.dict(os.environ, {
+            "FASTRTPS_DEFAULT_PROFILES_FILE": "/etc/fastdds/legacy.xml",
+        }, clear=True):
+            profile = q5_media_bridge.configure_fastdds_transport()
+            self.assertEqual(profile, "/etc/fastdds/legacy.xml")
+            self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], profile)
+            self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
+
+    def test_media_bridge_prefers_canonical_profile_over_stale_legacy_value(self):
+        with mock.patch.dict(os.environ, {
+            "FASTDDS_DEFAULT_PROFILES_FILE": "/etc/fastdds/canonical.xml",
+            "FASTRTPS_DEFAULT_PROFILES_FILE": "/etc/fastdds/stale.xml",
+        }, clear=True):
+            profile = q5_media_bridge.configure_fastdds_transport()
+            self.assertEqual(profile, "/etc/fastdds/canonical.xml")
+            self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
+
+    def test_media_bridge_rejects_missing_default_udp_profile(self):
+        missing = Path("/missing/q5-fastdds-udp.xml")
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(q5_media_bridge, "DEFAULT_FASTDDS_PROFILE", missing):
+            with self.assertRaisesRegex(RuntimeError, "Fast DDS UDP profile is missing"):
+                q5_media_bridge.configure_fastdds_transport()
 
     def test_sensor_topic_contract_does_not_depend_on_vendor_side_publisher(self):
         declared = topic_out("/nvidia_desktop/q5/battery", "data/json")
