@@ -39,12 +39,28 @@ import yaml
 
 from control_contract import prepare_call_args
 
-try:
-    import rclpy
-    import rclpy.executors
-    _HAS_ROS2 = True
-except Exception:
-    _HAS_ROS2 = False
+rclpy = None
+_HAS_ROS2 = None
+
+
+def _load_rclpy() -> bool:
+    """Import rclpy only in the vendor-side parent process.
+
+    BridgeWorker uses multiprocessing's spawn context, which re-imports this
+    module in its child. Delaying this import lets that child select Fast DDS
+    before its own first rclpy import.
+    """
+    global rclpy, _HAS_ROS2
+    if _HAS_ROS2 is not None:
+        return _HAS_ROS2
+    try:
+        import rclpy as _rclpy
+        import rclpy.executors
+        rclpy = _rclpy
+        _HAS_ROS2 = True
+    except Exception:
+        _HAS_ROS2 = False
+    return _HAS_ROS2
 
 
 def _load_config() -> dict:
@@ -231,7 +247,7 @@ def main():
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
     executor = None
-    if _HAS_ROS2:
+    if _load_rclpy():
         try:
             if not rclpy.ok():
                 rclpy.init()

@@ -29,6 +29,23 @@ import queue
 import sys
 import threading
 import time
+from pathlib import Path
+
+
+DEFAULT_FASTDDS_PROFILE = Path(__file__).with_name("resource") / "fastdds_udp_only.xml"
+
+
+def configure_fastdds_transport() -> str:
+    """Select one UDP-capable Fast DDS profile for the typed media bridge."""
+    profile = (os.environ.get("FASTDDS_DEFAULT_PROFILES_FILE")
+               or os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE"))
+    if not profile:
+        if not DEFAULT_FASTDDS_PROFILE.is_file():
+            raise RuntimeError(f"Fast DDS UDP profile is missing: {DEFAULT_FASTDDS_PROFILE}")
+        profile = str(DEFAULT_FASTDDS_PROFILE)
+    os.environ["FASTDDS_DEFAULT_PROFILES_FILE"] = profile
+    os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
+    return profile
 
 
 class BridgeWorker:
@@ -134,8 +151,11 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     os.environ["ROS_DOMAIN_ID"] = "42"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
-    # UDP-only transport for Docker host networking (shared-memory won't work)
-    os.environ.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "DEFAULT")
+    # The bridge is in a separate Docker process from Agent Core. Fast DDS's
+    # default shared-memory transport discovers a topic but cannot receive its
+    # samples across that boundary, so select one UDP-capable profile before
+    # importing rclpy.
+    profile = configure_fastdds_transport()
 
     import hashlib
     import json
