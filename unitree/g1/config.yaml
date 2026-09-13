@@ -17,6 +17,9 @@ plugins:
     enabled: true
   state:
     enabled: true
+  network_dds_health:
+    enabled: true
+    publish_hz: 2.0
   camera:
     enabled: true
   lidar:
