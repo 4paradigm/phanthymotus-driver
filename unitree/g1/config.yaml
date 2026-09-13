@@ -15,6 +15,14 @@ plugins:
     enabled: true
   arm:
     enabled: true
+  arm_trajectory:
+    enabled: true
+    lowcmd_topic: "rt/lowcmd"
+    lowstate_topic: "rt/lowstate"
+    motor_mode: 10
+    default_kp: 20.0
+    default_kd: 1.0
+    control_freq_hz: 50
   state:
     enabled: true
   camera:
