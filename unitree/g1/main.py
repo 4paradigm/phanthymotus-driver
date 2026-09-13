@@ -145,6 +145,11 @@ class G1DeviceBundle:
                 self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
                 print("[bundle] StatePlugin loaded")
 
+        if plugins_cfg.get("foot_contact_slip", {}).get("enabled", False):
+            from device import FootContactSlipPlugin
+            self._plugins.append(FootContactSlipPlugin(plugins_cfg["foot_contact_slip"], namespace, executor))
+            print("[bundle] FootContactSlipPlugin loaded")
+
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
             self._plugins.append(RealSensePlugin(plugins_cfg["camera"], namespace, executor))

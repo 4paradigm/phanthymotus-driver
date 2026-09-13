@@ -17,6 +17,13 @@ plugins:
     enabled: true
   state:
     enabled: true
+  foot_contact_slip:
+    enabled: true
+    contact_force_threshold: 10
+    fresh_timeout_sec: 0.5
+    history_sec: 0.6
+    left_force_indices: [0, 1]
+    right_force_indices: [2, 3]
   camera:
     enabled: true
   lidar:
