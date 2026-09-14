@@ -1,0 +1,92 @@
+mcp_port: 15722
+ros_namespace: ""  # auto-detect from hostname
+
+# Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
+variant: "pro"
+
+# gRPC endpoint for locomotion control (PC1)
+grpc_host: "10.10.20.127"
+grpc_port: 50051
+
+# DDS domain ID (must match the robot controller).  The deployed Adam
+# controller publishes rt/lowstate on domain 0.
+dds_domain_id: 0
+# Adam's rt/lowstate DDS traffic is on the robot-facing Ethernet LAN, not the
+# Jetson's Wi-Fi management network.
+dds_interface: "eno1"
+
+plugins:
+  state:
+    enabled: true
+    publish_rate_hz: 50
+  estop:
+    enabled: true
+    poll_rate_hz: 2
+    state_timeout_sec: 5
+    pac_url: "http://10.10.20.127:8626"
+    http_timeout_sec: 2
+  loco:
+    enabled: true
+  camera:
+    enabled: true
+    # The ZED Mini is connected to this Jetson. Keep the local SDK path; the
+    # separate network streaming sender is not required.
+    resolution: "VGA"
+    fps: 15
+    depth_mode: "PERFORMANCE"
+    # The head-mounted ZED Mini is installed upside down. Keep RGB, depth and
+    # point-cloud data aligned by applying the SDK's native image flip.
+    camera_flip: true
+    rgb_hz: 15
+    depth_hz: 8
+    jpeg_quality: 70
+    pointcloud:
+      # Keep the advertised point-cloud card live. Its 2Hz/10k-point cap
+      # bounds GPU and network usage while allowing a newly opened card to
+      # receive data immediately.
+      enabled: true
+      hz: 2
+      max_points: 10000
+      max_distance_m: 8.0
+      # Static camera-mount compensation in the renderer frame, applied after
+      # camera_flip. Values are calibrated for Adam's current ZED Mini mount.
+      mount_rotation_deg:
+        x: -14.2
+        y: 0.0
+        z: 0.8
+      mount_translation_m:
+        x: 0.0
+        y: 1.8
+        z: 0.0
+  vision_capture:
+    enabled: true
+    # The host data mount makes captures survive container replacement.
+    output_dir: "/opt/phanthy-motus/data/images"
+    # Maximum wait for a fresh ZED frame after the card is triggered.
+    timeout_s: 5
+    video_fps: 15
+    default_video_seconds: 5
+    max_video_seconds: 60
+  arm:
+    enabled: true
+    publish_rate_hz: 100
+  hand:
+    enabled: true
+    # Verified on Adam: all 12 hand channels move in the effective 0..1000
+    # range. Values from 1000..1800 are a dead band; 1800 equals 1000.
+    hand_type: "adam_client"
+    position_max: 1000
+    control_rate_hz: 400
+    state_timeout_sec: 1.0
+    # Close the four non-thumb fingers while rotating the thumb to 1000 and
+    # flexing it to 100 at the same time. Lower flexion values mean more closed.
+    thumb_close_positions: [100, 1000, 100, 1000]  # left flex/rotate, right flex/rotate
+    thumb_close_min_flex_position: 100
+    open_positions: [1000, 1000, 1000, 1000, 1000, 0, 1000, 1000, 1000, 1000, 1000, 0]
+    close_positions: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  hand_state:
+    enabled: true
+    publish_rate_hz: 50
+    state_timeout_sec: 1.0
+  model:
+    enabled: true

@@ -9,6 +9,9 @@ tianyi2:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /home/nvidia/data/param/dds_profile.xml:/work/dds_profile.xml:ro
+    # Vendor DDS profile whitelist: {192.168.41.2, 127.0.0.1}
+    # - 192.168.41.2: body controller network (domain 0 for本体通信)
+    # - 127.0.0.1: agent-core bridge (domain 42 for 与 agent-core 通信)
   environment:
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - PYTHONUNBUFFERED=1

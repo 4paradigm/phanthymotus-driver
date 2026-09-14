@@ -90,6 +90,7 @@ declare -a DRIVER_CATS
 declare -a DRIVER_PROVIDERS
 declare -a DRIVER_MODELS
 declare -a DRIVER_BUILDABLE   # "yes" / "no (no Dockerfile)"
+declare -a DRIVER_CARDS       # JSON array, e.g. [{"name":"base_drive","type":"actuator"}]
 
 _parse_yaml_field() {
     local file="$1" field="$2" val
@@ -103,6 +104,34 @@ _parse_yaml_list() {
     # Extract items under a YAML list key (simple single-level list)
     local file="$1" field="$2"
     awk "/^${field}:/{found=1; next} found && /^  - /{print \$2; next} found && !/^  /{exit}" "${file}" 2>/dev/null || true
+}
+
+_parse_yaml_cards_json() {
+    # Extract the optional `cards:` list into a compact JSON array for
+    # resource-center's driver marketplace listing. Entries must be flow-style,
+    # one per line: `- { name: base_drive, type: actuator }` — no PyYAML
+    # dependency, kept in the same bash-parsing style as the helpers above.
+    # Absent/empty field -> "[]".
+    local file="$1" items
+    items=$(awk '
+        /^cards:/ { found=1; next }
+        found && /^[[:space:]]*-/ {
+            line=$0
+            name=""; type=""
+            if (match(line, /name:[[:space:]]*[A-Za-z0-9_]+/)) {
+                name=substr(line, RSTART, RLENGTH); sub(/^name:[[:space:]]*/, "", name)
+            }
+            if (match(line, /type:[[:space:]]*[A-Za-z0-9_]+/)) {
+                type=substr(line, RSTART, RLENGTH); sub(/^type:[[:space:]]*/, "", type)
+            }
+            if (name != "") {
+                printf "%s{\"name\":\"%s\",\"type\":\"%s\"}", (n++ ? "," : ""), name, type
+            }
+            next
+        }
+        found && !/^[[:space:]]*-/ { exit }
+    ' "${file}" 2>/dev/null) || true
+    echo "[${items}]"
 }
 
 for yaml_file in "${SCRIPT_DIR}"/*/*/driver.yaml "${SCRIPT_DIR}"/*/driver.yaml; do
@@ -122,6 +151,7 @@ for yaml_file in "${SCRIPT_DIR}"/*/*/driver.yaml "${SCRIPT_DIR}"/*/driver.yaml; 
     DRIVER_PROVIDERS+=("$(_parse_yaml_field "${yaml_file}" hardware_provider)")
     DRIVER_MODELS+=("$(_parse_yaml_field "${yaml_file}" hardware_model)")
     DRIVER_BUILDABLE+=("${has_dockerfile}")
+    DRIVER_CARDS+=("$(_parse_yaml_cards_json "${yaml_file}")")
 done
 
 if [ ${#DRIVER_DIRS[@]} -eq 0 ]; then
@@ -329,6 +359,7 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
             desc="${DRIVER_DESCS[$idx]}"
             hw_provider="${DRIVER_PROVIDERS[$idx]:-}"
             hw_model="${DRIVER_MODELS[$idx]:-}"
+            cards="${DRIVER_CARDS[$idx]:-[]}"
             FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${hw_provider}/${hw_model}:${TAG}"
 
             # 架构 facet（resource-center 据此过滤目录，见 resource-center/lib/arch.ts）。
@@ -346,7 +377,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
   \"hardware_model\": \"${hw_model}\",
   \"name\": \"${name}\",
   \"description\": \"${desc}\",
-  \"port\": ${port:-null}
+  \"port\": ${port:-null},
+  \"cards\": ${cards}
 }"
 
             http_code=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \

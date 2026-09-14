@@ -1,0 +1,4 @@
+pyyaml
+grpcio>=1.76.0
+protobuf>=6.31.1
+numpy

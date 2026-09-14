@@ -1,11 +1,25 @@
 mcp_port: 15707
 ros_namespace: ""   # 留空则自动使用 hostname
-name: "Tianyi 2.0 Pro"
+name: "X-humanoid Tianyi 2.0 Pro Bundle"
 
+# Forward all topics from domain 0 (body controller) to domain 42 (agent-core)
+# via socket bridge. This enables proper DDS isolation.
+domain_bridge:
+  enabled: true
+
+# DEPRECATED: Use domain_bridge instead. Left for backward compatibility.
 # Run the skeleton publisher in its own ROS process. The main bundle keeps
 # the other cards but does not publish a competing joints topic.
 joints_bridge:
+  enabled: false
+
+# Make power-on self-check automatic on the robot's x86 motion-control board.
+auto_self_check:
   enabled: true
+  ssh_host: "192.168.41.1"
+  ssh_user: "ubuntu"
+  ssh_password: "123"
+  timeout: 15
 
 slamtec:
   base_url: "http://192.168.11.1:1448"
@@ -15,6 +29,15 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  camera_snapshot:
+    enabled: true
+    output_dir: "/opt/phanthy-motus/data/images"
+    # The channel-visible path is derived from the persistent mount. Set
+    # PHANTHY_CHANNEL_OUTPUT_DIR only when deployment uses another mount.
+    jpeg_quality: 90
+    video_fps: 20
+    default_video_seconds: 5
+    max_video_seconds: 60
   imu:
     enabled: true
   camera_depth:
@@ -58,8 +81,6 @@ plugins:
   nav:
     enabled: true
   home:
-    enabled: true
-  chat:
     enabled: true
   voice_chat:
     enabled: true

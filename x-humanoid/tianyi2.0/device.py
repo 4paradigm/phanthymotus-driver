@@ -29,7 +29,6 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   VoicePlayActuatorPlugin (actuator)      — 音频播放控制(文件/URL/TTS)
   NavPlugin           (actuator)           — 底盘导航控制
   HomePlugin          (actuator)           — 充电桩管理与回桩
-  ChatPlugin          (actuator)           — 语音交互开关
   VoiceChatActuatorPlugin (actuator)      — 语音对话开关
   MotorStatePlugin    (sensor)             — 全身21电机状态(2Hz)
   HandStatePlugin     (sensor)             — 灵巧手状态(10Hz, tool name=hand_state)
@@ -52,7 +51,6 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   HandPlugin       (actuator)           — 灵巧手控制
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
-  ChatPlugin       (actuator)           — 语音交互开关
   ControlledSpatialPlugin (actuator)    — 人工控制建图与导航 (Slamtec REST API)
 """
 
@@ -955,6 +953,17 @@ class CameraPlugin:
         self._running = False
         self._frame_queue = None  # Will hold latest frame only
 
+        # Built here rather than in start(), so stop() and _on_image_grab are
+        # safe to call before the first start and across a restart.
+        self._latest_frame = None  # Only keep latest frame
+        self._frame_lock = threading.Lock()
+        self._pub = None
+        self._subscription = None
+        self._encode_thread = None
+        # Serializes start/stop. Every tools/call runs on its own thread of the
+        # ThreadingHTTPServer, and the canvas issues stop→start within seconds.
+        self._lifecycle_lock = threading.RLock()
+
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
@@ -971,37 +980,81 @@ class CameraPlugin:
         }
 
     def start(self):
-        self._running = True
+        """Arm the stream. Idempotent, and callable again after ``stop()``.
 
-        # Ensure Orbbec camera service is running
-        self._ensure_orbbec_service()
+        main.py's lazy start only ever calls this for the *first* ``action=start``
+        (the plugin then stays in its ``_started_plugins`` set forever), so a
+        restart has to come through here from ``dispatch``.
 
-        try:
-            from sensor_msgs.msg import Image, CompressedImage
-            import numpy as np
-            import cv2
+        Both ROS endpoints are created once and kept for the process lifetime;
+        only the encode thread is rebuilt, because ``stop()`` is what ends it.
+        Neither endpoint may be recycled per start:
+
+        * the publisher is a ``BridgedPublisher`` owning a Unix socket to the
+          socket_bridge process, and a second one for the same topic is exactly
+          the duplicate connection its connection lock exists to prevent;
+        * destroying and recreating the subscription on a node that a live
+          executor is spinning does not reliably re-deliver. Measured on Tianyi:
+          one slow cycle worked, then three quick stop→start cycles left the
+          subscription present in the graph, the executor healthy (other
+          domain-0 sensors kept publishing) and the callback never firing again.
+          A stopped camera therefore keeps deserializing raw frames it drops —
+          that waste is the price of a stream that always comes back.
+        """
+        with self._lifecycle_lock:
+            if self._running:
+                return
+
+            # Re-checked on every arm, not just the first: a restart should also
+            # recover a host service that died while the card was stopped.
+            self._ensure_orbbec_service()
+
+            try:
+                from sensor_msgs.msg import Image, CompressedImage
+                import numpy as np
+                import cv2
+            except ImportError as e:
+                print(f"[CameraPlugin] WARNING: import failed ({e})")
+                return
 
             self._np = np
             self._cv2 = cv2
-            self._latest_frame = None  # Only keep latest frame
-            self._frame_lock = threading.Lock()
+
+            # A worker from the previous stop may still be inside its 5 ms poll.
+            # Join it *before* re-arming the flag — otherwise it sees _running
+            # True again and keeps publishing beside its replacement, doubling
+            # the frame rate on the topic.
+            previous = self._encode_thread
+            if previous is not None and previous is not threading.current_thread():
+                previous.join(timeout=2.0)
+
+            with self._frame_lock:
+                self._latest_frame = None  # never publish a frame from before the stop
 
             # Publish JPEG as CompressedImage
-            self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
+            if self._pub is None:
+                self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
 
             # Subscribe - callback just grabs the frame, doesn't encode
-            self._sub_node.create_subscription(
-                Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
+            if self._subscription is None:
+                self._subscription = self._sub_node.create_subscription(
+                    Image, "/ob_camera_head/color/image_raw", self._on_image_grab, _RELIABLE_QOS)
+
+            self._running = True
 
             # Separate encoding thread - avoids blocking executor
-            self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
-            self._encode_thread.start()
+            if previous is not None and previous.is_alive():
+                # Refused to exit within the grace period. It observes the flag
+                # we just re-armed and resumes, so don't stack a second one.
+                print("[CameraPlugin] WARNING: previous encode thread still running, reusing it")
+            else:
+                self._encode_thread = threading.Thread(target=self._encode_loop, daemon=True)
+                self._encode_thread.start()
 
-            print("[CameraPlugin] subscription + encode thread created")
-        except ImportError as e:
-            print(f"[CameraPlugin] WARNING: import failed ({e})")
+            print("[CameraPlugin] subscription + encode thread created", flush=True)
 
-    def _ensure_orbbec_service(self):
+    @staticmethod
+    def _ensure_orbbec_service():
         """Configure and start the host's Orbbec service through ``nsenter``.
 
         The camera runs on the host because it owns the USB device.  Each
@@ -1013,7 +1066,7 @@ class CameraPlugin:
         """
         import subprocess
         try:
-            changed = self._configure_orbbec_startup()
+            changed = CameraPlugin._configure_orbbec_startup()
             # Use nsenter to run systemctl on host PID 1's namespace
             result = subprocess.run(
                 ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
@@ -1076,7 +1129,17 @@ class CameraPlugin:
         return changed
 
     def stop(self):
-        self._running = False
+        """Disarm the stream, leaving it restartable by ``start()``.
+
+        Only the flag and the buffered frame are touched. Both ROS endpoints
+        survive on purpose — see ``start`` for why neither may be recycled. The
+        encode thread ends on the cleared flag, and ``_on_image_grab`` drops
+        every frame that arrives meanwhile.
+        """
+        with self._lifecycle_lock:
+            self._running = False
+            with self._frame_lock:
+                self._latest_frame = None
 
     def _on_image_grab(self, msg):
         """Callback: just grab the latest frame, don't encode here (non-blocking)."""
@@ -1114,12 +1177,360 @@ class CameraPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
+            # Call start() here rather than leaning on main.py's lazy start:
+            # that only fires once per process, so trusting it left a camera
+            # that had been stopped dark for the rest of the container's life
+            # while still reporting a healthy-looking state.
+            self.start()
+            if not self._running:
+                return {"state": "error",
+                        "error": "camera start failed, see driver log"}
             return {"state": "running"}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
-        return {"state": "running"}
+            state = "running" if self._running else "idle"
+            return {"state": state, "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
+        return {"state": "running" if self._running else "idle"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CameraSnapshotPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CameraSnapshotPlugin:
+    """保存头部 RGB 相机最新一帧，供 channel_reply 作为 JPEG 附件发送。"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._config = plugin_config
+        self._ros2 = ros2
+        self._running = False
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._subscription = None
+        self._sub_node = Node("tianyi2_camera_snapshot_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._native_dir = Path(plugin_config.get(
+            "output_dir", "/opt/phanthy-motus/data/images"))
+        self._channel_dir = self._derive_channel_dir(self._native_dir)
+        self._jpeg_quality = max(1, min(100, int(plugin_config.get("jpeg_quality", 90))))
+        self._video_fps = max(1.0, min(30.0, float(plugin_config.get("video_fps", 15))))
+        self._max_video_seconds = max(1.0, min(60.0, float(plugin_config.get("max_video_seconds", 60))))
+        self._default_video_seconds = max(1.0, min(self._max_video_seconds, float(plugin_config.get("default_video_seconds", 5))))
+        self._recording_lock = threading.Lock()
+        self._recording_stop = None
+        self._recording_thread = None
+        self._recording_path = None
+
+    @staticmethod
+    def _derive_channel_dir(native_dir: Path) -> str:
+        """Map persistent media mount to the channel-visible mount."""
+        import os
+        override = os.environ.get("PHANTHY_CHANNEL_OUTPUT_DIR")
+        if override:
+            return str(Path(override))
+        try:
+            return str(Path("/work/resource") / native_dir.relative_to(Path("/opt/phanthy-motus/data")))
+        except ValueError:
+            return str(native_dir)
+
+    @staticmethod
+    def _default_stem(prefix: str) -> str:
+        """Generate a unique conventional media name when no name is given."""
+        return f"{prefix}_{time.time_ns()}"
+
+    @staticmethod
+    def _file_stem(args: dict, key: str) -> str | None:
+        import re
+        value = args.get(key)
+        if value is None or value == "":
+            return None
+        value = str(value).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", value):
+            raise ValueError("name must be 1-100 chars: letters, numbers, '.', '_' or '-' only")
+        return value
+
+    def _decode_frame(self, msg):
+        image = self._np.frombuffer(msg.data, dtype=self._np.uint8)
+        expected = msg.height * msg.width * 3
+        if image.size != expected:
+            raise ValueError(f"unexpected RGB frame size: {image.size}, expected {expected}")
+        image = image.reshape(msg.height, msg.width, 3)
+        if msg.encoding.lower() == "rgb8":
+            image = self._cv2.cvtColor(image, self._cv2.COLOR_RGB2BGR)
+        return image
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "vision_capture",
+            "type": "actuator",
+            "description": (
+                "拍照、录制视频以及管理 /opt/phanthy-motus/data/images 中的媒体文件。"
+                "照片 name 不含 .jpg，视频 name 不含 .mp4；拍摄成功后可使用返回的 channel_reply_path 通过消息渠道发送。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["capture_image", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "start", "stop"],
+                        "description": "操作类型",
+                    },
+                    "image_name": {"type": "string", "description": "照片文件名（不含 .jpg），该项可以不填"},
+                    "video_name": {"type": "string", "description": "视频文件名（不含 .mp4），该项可以不填"},
+                    "name": {"type": "string", "description": "删除时填写完整文件名，必须包含 .jpg 或 .mp4"},
+                    "duration": {"type": "number", "description": "视频时长（秒），默认 5，最大 60"},
+                },
+                "required": ["action"],
+                "x-completion": {"actions": ["record_video"], "timeout": 60},
+                "x-action-params": {
+                    "capture_image": {"params": ["image_name"], "description": "拍照；不填 image_name 则使用 IMG_时间戳.jpg"},
+                    "record_video": {"params": ["video_name", "duration"], "description": "录制指定时长的视频；不填 video_name 则使用 VID_时间戳.mp4；duration 默认 5 秒、最大 60 秒"},
+                    "start_recording": {"params": ["video_name"], "description": "开始持续录制；不填 video_name 则使用 VID_时间戳.mp4"},
+                    "stop_recording": {"params": [], "description": "结束当前持续录制并保存视频"},
+                    "list": {"params": [], "description": "查询已保存的照片和视频"},
+                    "delete": {"params": ["name"], "description": "删除指定媒体；name 必须填写完整文件名，例如 test.jpg 或 test.mp4"},
+                    "info": {"params": [], "description": "查看相机和录制状态"},
+                    "start": {"params": [], "description": "启动相机订阅"},
+                    "stop": {"params": [], "description": "停止相机订阅"},
+                },
+            },
+        }
+
+    def start(self):
+        if self._running:
+            return
+        try:
+            from sensor_msgs.msg import Image
+            import cv2
+            import numpy as np
+
+            # The raw topic is produced by the host Orbbec service, so make
+            # sure it is available even when the preview card was not started.
+            CameraPlugin._ensure_orbbec_service()
+            self._cv2 = cv2
+            self._np = np
+            self._native_dir.mkdir(parents=True, exist_ok=True)
+            self._subscription = self._sub_node.create_subscription(
+                Image, "/ob_camera_head/color/image_raw",
+                self._on_image, _RELIABLE_QOS)
+            self._running = True
+            print("[CameraSnapshotPlugin] subscribed to head RGB camera")
+        except Exception as e:
+            raise RuntimeError(f"camera snapshot initialization failed: {e}") from e
+
+    def stop(self):
+        self._stop_recording()
+        self._running = False
+        with self._frame_lock:
+            self._latest_frame = None
+        if self._subscription is not None:
+            self._sub_node.destroy_subscription(self._subscription)
+            self._subscription = None
+
+    def _on_image(self, msg):
+        if not self._running:
+            return
+        with self._frame_lock:
+            self._latest_frame = msg
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            try:
+                self.start()
+            except Exception as e:
+                return {"error": str(e), "state": "error"}
+            return {"state": "ready"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "info":
+            with self._frame_lock:
+                available = self._latest_frame is not None
+            return {
+                "state": "running" if self._running else "idle",
+                "frame_available": available,
+                "source_topic": "/ob_camera_head/color/image_raw",
+                "output_dir": str(self._native_dir),
+                "channel_output_dir": self._channel_dir,
+            }
+        if action == "list":
+            if not self._native_dir.exists():
+                return {"state": "listed", "files": []}
+            files = sorted((p for p in self._native_dir.iterdir() if p.is_file() and p.suffix.lower() in (".jpg", ".mp4")), key=lambda p: p.stat().st_mtime, reverse=True)
+            return {"state": "listed", "files": [{"filename": p.name, "path": str(p), "size": p.stat().st_size, "mime": "image/jpeg" if p.suffix.lower() == ".jpg" else "video/mp4"} for p in files]}
+        if action == "delete":
+            filename = args.get("name")
+            if not isinstance(filename, str) or not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|mp4)", filename, _re.IGNORECASE):
+                return {"error": "name is required and must be a complete .jpg or .mp4 filename"}
+            if not self._native_dir.exists():
+                return {"error": f"file not found: {filename}"}
+            path = self._native_dir / filename
+            if not path.is_file() or path.suffix.lower() not in (".jpg", ".mp4"):
+                return {"error": f"file not found: {filename}"}
+            path.unlink()
+            return {"state": "deleted", "filename": [filename]}
+        if action == "start_recording":
+            try:
+                stem = self._file_stem(args, "video_name") or self._default_stem("VID")
+            except ValueError as e:
+                return {"error": str(e)}
+            with self._recording_lock:
+                if self._recording_thread and self._recording_thread.is_alive():
+                    return {"error": f"recording already active: {Path(self._recording_path).name}"}
+                with self._frame_lock:
+                    first = self._latest_frame
+                if first is None:
+                    return {"error": "no camera frame received yet"}
+                path = self._native_dir / f"{stem}.mp4"
+                if path.exists():
+                    return {"error": f"file already exists: {path.name}"}
+                self._recording_stop = threading.Event()
+                self._recording_path = path
+                self._recording_thread = threading.Thread(target=self._record_loop, args=(path, self._recording_stop), daemon=True)
+                self._recording_thread.start()
+            return {"state": "recording", "filename": path.name, "path": str(path), "channel_reply_path": str(Path(self._channel_dir) / path.name), "mime": "video/mp4"}
+        if action == "stop_recording":
+            result = self._stop_recording()
+            return result or {"state": "idle", "message": "no active recording"}
+        if action == "record_video" and not args.get("_background"):
+            from uuid import uuid4
+            action_id = f"camera_record_video_{uuid4().hex[:8]}"
+            background_args = dict(args)
+            background_args["_background"] = True
+            def _record_async():
+                try:
+                    result = self.dispatch("record_video", background_args)
+                    status = "completed" if result.get("state") == "recorded" else "error"
+                    _acp_notify(action_id, status, result, "vision_capture")
+                except Exception as exc:
+                    _acp_notify(action_id, "error", {"action": "record_video", "error": str(exc)}, "vision_capture")
+            threading.Thread(target=_record_async, daemon=True, name="camera-record-video").start()
+            return {"state": "recording", "action_id": action_id, "video_name": args.get("video_name"), "duration": args.get("duration", self._default_video_seconds)}
+        if action == "record_video":
+            try:
+                stem = self._file_stem(args, "video_name") or self._default_stem("VID")
+                duration = max(1.0, min(self._max_video_seconds, float(args.get("duration", self._default_video_seconds))))
+            except (TypeError, ValueError) as e:
+                return {"error": str(e)}
+            if not self._running:
+                try:
+                    self.start()
+                except Exception as e:
+                    return {"error": f"camera snapshot initialization failed: {e}"}
+            with self._frame_lock:
+                first = self._latest_frame
+            if first is None:
+                return {"error": "no camera frame received yet"}
+            writer = None
+            try:
+                first_image = self._decode_frame(first)
+                path = self._native_dir / f"{stem}.mp4"
+                if path.exists():
+                    return {"error": f"file already exists: {path.name}"}
+                writer = self._cv2.VideoWriter(str(path), self._cv2.VideoWriter_fourcc(*"mp4v"), self._video_fps, (first_image.shape[1], first_image.shape[0]))
+                if not writer.isOpened():
+                    return {"error": "MP4 video writer initialization failed"}
+                total_frames = max(1, int(round(duration * self._video_fps)))
+                record_start = time.monotonic()
+                last_image = first_image
+                for frame_index in range(total_frames):
+                    with self._frame_lock:
+                        current = self._latest_frame
+                    if current is not None:
+                        last_image = self._decode_frame(current)
+                    # Always write one frame per target slot. Reusing the last
+                    # decoded frame keeps the MP4 duration stable if encoding
+                    # or camera delivery briefly falls behind the target FPS.
+                    writer.write(last_image)
+                    target_time = record_start + (frame_index + 1) / self._video_fps
+                    time.sleep(max(0.0, target_time - time.monotonic()))
+                writer.release()
+                writer = None
+                return {"state": "recorded", "filename": path.name, "path": str(path), "channel_reply_path": str(Path(self._channel_dir) / path.name), "mime": "video/mp4", "size": path.stat().st_size, "duration": duration}
+            except Exception as e:
+                if writer is not None:
+                    writer.release()
+                return {"error": f"failed to save MP4: {e}"}
+        if action != "capture_image":
+            return {"error": f"unknown action: {action}"}
+        if not self._running:
+            try:
+                self.start()
+            except Exception as e:
+                return {"error": f"camera snapshot initialization failed: {e}"}
+
+        with self._frame_lock:
+            msg = self._latest_frame
+        if msg is None:
+            return {
+                "error": "no camera frame received yet",
+                "source_topic": "/ob_camera_head/color/image_raw",
+            }
+
+        try:
+            image = self._decode_frame(msg)
+            ok, encoded = self._cv2.imencode(
+                ".jpg", image, [self._cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality])
+            if not ok:
+                return {"error": "JPEG encoding failed"}
+
+            try:
+                stem = self._file_stem(args, "image_name") or self._default_stem("IMG")
+            except ValueError as e:
+                return {"error": str(e)}
+            filename = f"{stem}.jpg"
+            native_path = self._native_dir / filename
+            if native_path.exists():
+                return {"error": f"file already exists: {filename}"}
+            native_path.write_bytes(encoded.tobytes())
+            channel_path = str(Path(self._channel_dir) / filename)
+            return {
+                "state": "captured",
+                "filename": filename,
+                "path": str(native_path),
+                "channel_reply_path": channel_path,
+                "mime": "image/jpeg",
+                "size": native_path.stat().st_size,
+            }
+        except Exception as e:
+            return {"error": f"failed to save JPEG: {e}"}
+
+    def _record_loop(self, path: Path, stop_event: threading.Event):
+        writer = None
+        try:
+            while not stop_event.is_set():
+                with self._frame_lock:
+                    msg = self._latest_frame
+                if msg is not None:
+                    image = self._decode_frame(msg)
+                    if writer is None:
+                        writer = self._cv2.VideoWriter(str(path), self._cv2.VideoWriter_fourcc(*"mp4v"), self._video_fps, (image.shape[1], image.shape[0]))
+                        if not writer.isOpened():
+                            raise RuntimeError("MP4 video writer initialization failed")
+                    writer.write(image)
+                stop_event.wait(1.0 / self._video_fps)
+        finally:
+            if writer is not None:
+                writer.release()
+
+    def _stop_recording(self):
+        with self._recording_lock:
+            thread = self._recording_thread
+            path = self._recording_path
+            stop_event = self._recording_stop
+            self._recording_thread = None
+            self._recording_path = None
+            self._recording_stop = None
+        if not thread or not stop_event:
+            return None
+        stop_event.set()
+        thread.join(timeout=5)
+        if path and path.exists() and path.stat().st_size > 0:
+            return {"state": "recorded", "filename": path.name, "path": str(path), "channel_reply_path": str(Path(self._channel_dir) / path.name), "mime": "video/mp4", "size": path.stat().st_size}
+        return {"error": "recording produced no video frames"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2093,6 +2504,8 @@ class HeadPlugin:
                                "description": "预设方向"},
                 },
                 "required": ["action"],
+                # 头部 3DOF —— 与 head_gesture 同一通道
+                "x-resource": "head",
                 "x-action-params": {
                     "move_pos": {"params": ["yaw", "pitch", "roll"],
                                  "description": "移动头部到指定角度(度)"},
@@ -2246,6 +2659,7 @@ class HeadGesturePlugin:
                     "actions": ["scan", "shake"],
                     "timeout": 30,
                 },
+                "x-resource": "head",
                 "x-action-params": {
                     "tilt": {"params": ["side", "tilt_amplitude", "speed", "hold"], "description": "向指定方向歪头、保持后回正"},
                     "reset": {"params": ["speed"], "description": "取消序列并将头部回正"},
@@ -2710,6 +3124,8 @@ class ArmPlugin:
                            )},
                 },
                 "required": ["action"],
+                # 双臂关节 —— 与 arm_gesture 同一通道。side 按调用变化而 schema 是静态的，只声明一侧会让双臂动作与单臂动作并发抢同一批关节
+                "x-resource": ["arm_l", "arm_r"],
                 "x-action-params": {
                     "move_pos": {"params": ["left_positions", "right_positions", "speed"],
                                  "description": (
@@ -3240,6 +3656,10 @@ class ArmGesturePlugin:
                     "actions": ["salute", "welcome", "shake_hands"],
                     "timeout": 30,
                 },
+                # Both arms: the gestures are static per schema and some are
+                # two-handed, so claiming one side could let them overlap on shared
+                # joints. See README_dev.md § Physical Resources.
+                "x-resource": ["arm_l", "arm_r"],
                 "x-action-params": {
                     "salute": {"params": ["salute_side", "speed"], "description": "抬起小臂、将手靠近额侧、停留后回正"},
                     "welcome": {"params": ["side", "cycles", "speed"], "description": "在身体侧上方抬起手掌并左右摆动后回正"},
@@ -3729,6 +4149,8 @@ class WaistPlugin:
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                 },
                 "required": ["action"],
+                # 腰部偏航 + 腿部升降 —— 没有别的工具碰这两个自由度
+                "x-resource": "waist",
                 "x-action-params": {
                     "move_waist": {"params": ["yaw", "speed"],
                                  "description": "腰部偏航: 控制yaw角度(-120°~120°)"},
@@ -3935,6 +4357,8 @@ class HandPlugin:
                                        "description": "thumb rotation"},
                 },
                 "required": ["action"],
+                # 灵巧手指关节 —— 与手臂是独立自由度，可以同时动
+                "x-resource": ["hand_l", "hand_r"],
                 "x-action-params": {
                     **{g: {"params": ["side"],
                            "description": f"预设手势: {self._GESTURE_LABELS[g]}"}
@@ -4150,6 +4574,10 @@ class TtsPlugin:
                 },
                 "required": ["action"],
                 "x-completion": {"actions": ["speak"], "timeout": 180},
+                # Same speaker as voice_play below — one physical channel, two tools,
+                # so they must serialise against each other while leaving the chassis
+                # and arms free.
+                "x-resource": "mouth",
                 "x-action-params": {
                     "speak": {"params": ["text", "force"], "description": "合成并播放文本"},
                     "interrupt": {"params": [], "description": "立即停止播放并丢弃剩余内容，无需再调 pause"},
@@ -4158,6 +4586,7 @@ class TtsPlugin:
                 },
                 "x-hooks": {
                     "on_interrupt_speak": {"action": "interrupt"},
+                    "on_notify": {"action": "speak"},
                 },
             },
         }
@@ -4184,77 +4613,192 @@ class TtsPlugin:
         # Health check: verify PlayEvent pipeline is working
         self._startup_error = self._lyre_health_check()
 
-    def _lyre_health_check(self) -> str | None:
-        """Call play_text and verify PlayEvent arrives. Returns error message or None."""
+    # lyre is a host systemd unit; the driver reaches it through PID 1's namespaces.
+    _LYRE_UNIT = "lyre"
+    _NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
+    # Discovery of play_text measured 2.0–2.9 s on a settled robot, but start() runs
+    # while ~35 plugins are initialising. A generous window costs nothing when things
+    # work and avoids the misdiagnosis below; the first version allowed 5 s.
+    _DISCOVERY_WAIT_S = 20.0
+    # `systemctl restart lyre` stops a ros2 launch tree and starts it again. The first
+    # version capped the subprocess at 15 s and reported the restart as *failed* while
+    # it was in fact still working.
+    _RESTART_CMD_TIMEOUT_S = 90
+    _RESTART_DISCOVERY_WAIT_S = 60.0
+
+    def _lyre_unit_state(self) -> str:
+        """systemd's view of lyre, which does not depend on DDS at all.
+
+        This is what separates "lyre is down" from "lyre is fine but our participant
+        has not discovered it": the two need opposite responses, and DDS visibility
+        alone cannot tell them apart.
+        """
         import subprocess as _sp
+        try:
+            r = _sp.run(self._NSENTER + ["systemctl", "is-active", self._LYRE_UNIT],
+                        capture_output=True, timeout=10, text=True)
+            return ((r.stdout or "") + (r.stderr or "")).strip() or "unknown"
+        except Exception as e:
+            return f"unknown ({e})"
+
+    def _restart_lyre(self) -> str | None:
+        """Restart lyre. Returns an error string, or None on success."""
+        import subprocess as _sp
+        print(f"[TtsPlugin] restarting lyre (unit state was "
+              f"{self._lyre_unit_state()!r})", flush=True)
+        try:
+            r = _sp.run(self._NSENTER + ["systemctl", "restart", self._LYRE_UNIT],
+                        capture_output=True, timeout=self._RESTART_CMD_TIMEOUT_S, text=True)
+        except Exception as e:
+            return f"重启 lyre 失败：{e}"
+        if r.returncode != 0:
+            return f"重启 lyre 失败：{((r.stderr or r.stdout) or '').strip()[:200]}"
+        state = self._lyre_unit_state()
+        print(f"[TtsPlugin] lyre restarted, unit state now {state!r}", flush=True)
+        return None
+
+    def _wait_service(self, timeout_s: float) -> bool:
+        """Poll for the play_text server. No spinning needed — graph discovery happens
+        in the DDS threads, and the executor thread may not be running yet."""
+        import time as _time
+        deadline = _time.time() + timeout_s
+        while _time.time() < deadline:
+            if self._play_client.service_is_ready():
+                return True
+            _time.sleep(0.2)
+        return False
+
+    def _lyre_health_check(self) -> str | None:
+        """Verify the whole TTS chain: service discoverable → call accepted → PlayEvent
+        arrives. Returns an error message, or None when healthy.
+
+        Each failure mode gets its own message. The first version returned
+        "播放成功但无法收到完成事件" for all five of them, including the case where the
+        service was never discovered and nothing was ever played — which pointed the
+        investigation at the audio hardware for a while. It also restarted lyre on any
+        failure, so a discovery problem in this driver was "fixed" by killing a
+        perfectly healthy service, and the retry then ran before lyre could come back.
+        """
         import time as _time
 
         for attempt in range(2):
-            if attempt > 0:
-                # Restart lyre via nsenter on second attempt
-                print("[TtsPlugin] health check failed, restarting lyre...", flush=True)
-                try:
-                    _sp.run(["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
-                             "systemctl", "restart", "lyre"],
-                            capture_output=True, timeout=15)
-                    _time.sleep(5)
-                except Exception as e:
-                    print(f"[TtsPlugin] lyre restart failed: {e}", flush=True)
+            if not self._wait_service(self._DISCOVERY_WAIT_S):
+                state = self._lyre_unit_state()
+                if state != "active":
+                    # lyre really is down — restarting it is the right recovery, and
+                    # this is the only path where a restart is warranted up front.
+                    print(f"[TtsPlugin] play_text not found and lyre is {state!r} "
+                          f"— restarting", flush=True)
+                    err = self._restart_lyre()
+                    if err:
+                        return (f"Lyre 服务未运行（systemd: {state}），自动重启失败。{err} "
+                                f"请在机器人上执行 sudo systemctl restart lyre。")
+                    if not self._wait_service(self._RESTART_DISCOVERY_WAIT_S):
+                        return (f"Lyre 服务原为 {state}，已自动重启并恢复运行，但 "
+                                f"{self._RESTART_DISCOVERY_WAIT_S:.0f}s 内仍未发现 "
+                                f"/audio_play/play_text 服务。请检查 lyre 日志："
+                                f"journalctl -u lyre -n 100。")
+                    print("[TtsPlugin] play_text found after lyre restart", flush=True)
+                else:
+                    # lyre is up but we cannot see it. Restarting lyre would destroy a
+                    # working service without touching the actual fault, which is on
+                    # our side of the link (DDS domain / profile / interface).
+                    print(f"[TtsPlugin] play_text not discovered in "
+                          f"{self._DISCOVERY_WAIT_S:.0f}s, but lyre is active "
+                          f"— not restarting it", flush=True)
+                    return (f"Lyre 服务正在运行（systemd: active），但 "
+                            f"{self._DISCOVERY_WAIT_S:.0f}s 内发现不到 "
+                            f"/audio_play/play_text。问题在驱动到 lyre 的 DDS 链路，"
+                            f"不在 lyre 本身：请核对 domain 0 与 FastDDS profile "
+                            f"（本驱动应使用厂商 profile /work/dds_profile.xml，"
+                            f"需能绑到 192.168.41.x）。重启 lyre 不会有帮助。")
 
-            # Wait for service to be available (poll without spinning — executor thread handles it)
-            service_ready = False
-            deadline = _time.time() + 5
-            while _time.time() < deadline:
-                if self._play_client.service_is_ready():
-                    service_ready = True
-                    break
-                _time.sleep(0.2)
-            if not service_ready:
-                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text service not available", flush=True)
-                continue
-
-            # Send a silent test (single dot — minimal TTS)
+            # Service is there — send a minimal test and require a real response.
             from lyre_msgs.srv import PlayText
             req = PlayText.Request()
             req.text = "."
             req.force = True
             future = self._play_client.call_async(req)
-
-            # Wait for response (max 3s) — executor spin thread delivers it
-            deadline = _time.time() + 3
+            deadline = _time.time() + 5
             while not future.done() and _time.time() < deadline:
                 _time.sleep(0.1)
-
             if not future.done():
-                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text call timeout", flush=True)
-                continue
+                print(f"[TtsPlugin] health check attempt {attempt+1}: "
+                      f"play_text 调用无响应", flush=True)
+                if attempt == 0:
+                    err = self._restart_lyre()
+                    if err:
+                        return f"play_text 服务可见但调用无响应，且{err}"
+                    continue
+                return ("Lyre 的 play_text 服务可见，但调用 5s 无响应，重启后依旧。"
+                        "lyre 进程可能已卡死：请查看 journalctl -u lyre -n 100。")
 
             resp = future.result()
             if resp is None or resp.code != 0:
-                print(f"[TtsPlugin] health check attempt {attempt+1}: play_text returned error", flush=True)
-                continue
+                msg = getattr(resp, "message", "") if resp is not None else "no response"
+                print(f"[TtsPlugin] health check attempt {attempt+1}: "
+                      f"play_text 返回错误 code={getattr(resp, 'code', '?')}", flush=True)
+                if attempt == 0:
+                    if self._restart_lyre() is None:
+                        continue
+                return (f"Lyre 拒绝了合成请求：code="
+                        f"{getattr(resp, 'code', '?')} message={msg!r}。"
+                        f"请检查 lyre 的 TTS 引擎与授权状态。")
 
             sid = resp.sid
-            # Wait for PlayEvent with this sid (3s timeout)
-            # The executor spin thread will call _on_play_event which populates _play_event_buffer
-            deadline = _time.time() + 3
+            if not sid:
+                # lyre generates a sid when the request omits one, so an empty sid
+                # means we cannot correlate PlayEvent and every playback would fall
+                # back to a fixed sleep.
+                return ("Lyre 接受了请求但未返回 sid，无法与 PlayEvent 关联，"
+                        "播放完成时间将不可知。请检查 lyre 版本是否匹配 lyre_msgs。")
+
+            deadline = _time.time() + 5
             while _time.time() < deadline:
                 if sid in self._play_event_buffer:
                     break
                 _time.sleep(0.1)
 
             if sid in self._play_event_buffer:
-                # Cleanup test sid from buffers
                 self._play_event_buffer.pop(sid, None)
                 self._pending_play.pop(sid, None)
                 self._pending_play_status.pop(sid, None)
                 self._pending_play_duration.pop(sid, None)
                 print(f"[TtsPlugin] health check passed (attempt {attempt+1})", flush=True)
-                return None  # success
-            else:
-                print(f"[TtsPlugin] health check attempt {attempt+1}: PlayEvent not received for sid={sid}", flush=True)
+                return None
 
-        return "Lyre TTS PlayEvent 链路异常：播放成功但无法收到完成事件。已尝试重启 lyre 仍未恢复，请检查 lyre 服务状态。"
+            # Call accepted, no event. This is the one case the original message
+            # described, and the one where restarting lyre is genuinely indicated.
+            print(f"[TtsPlugin] health check attempt {attempt+1}: "
+                  f"PlayEvent not received for sid={sid}", flush=True)
+            if attempt == 0:
+                err = self._restart_lyre()
+                if err:
+                    return f"播放成功但收不到 PlayEvent 完成事件，且{err}"
+                continue
+
+        return ("Lyre TTS 事件链路异常：合成请求被接受，但收不到 /audio_play/event "
+                "的完成事件，已自动重启 lyre 仍未恢复。播放时长将只能按字数估算。"
+                "请检查 lyre 服务：journalctl -u lyre -n 100。")
+
+    def _recheck_health(self) -> str | None:
+        """Cheap re-check for start/info: is the service there, and what does systemd
+        say? Plays nothing.
+
+        The startup result used to be latched forever, so once the check had failed
+        the dashboard kept reporting a fault long after the chain recovered.
+        """
+        if not self._play_client:
+            return "Lyre TTS 客户端未创建（lyre_msgs 导入失败）。"
+        if self._wait_service(3.0):
+            return None
+        state = self._lyre_unit_state()
+        if state != "active":
+            return (f"Lyre 服务未运行（systemd: {state}）。"
+                    f"请执行 sudo systemctl restart lyre，或重启本驱动容器以自动恢复。")
+        return (f"Lyre 服务正在运行，但当前发现不到 /audio_play/play_text。"
+                f"这是驱动到 lyre 的 DDS 链路问题（domain 0 / FastDDS profile），"
+                f"重启 lyre 无用。")
 
     # PlayEvent event codes
     _EVENT_NAMES = {0: "STARTED", 1: "COMPLETED", 2: "STOPPED", 3: "CANCELLED", 4: "FAILED"}
@@ -4305,8 +4849,20 @@ class TtsPlugin:
         elif action == "resume":
             return self._call_empty_service(self._resume_client, "resume")
         elif action in ("start", "info"):
-            if hasattr(self, '_startup_error') and self._startup_error:
-                return {"state": "error", "message": self._startup_error}
+            # Re-check rather than replay the startup verdict. The startup result used
+            # to be latched for the life of the process, so a chain that recovered
+            # (lyre finished restarting, discovery converged) still reported a fault
+            # on every start/info — and the operator had no way to clear it short of
+            # restarting the container.
+            if getattr(self, "_startup_error", None):
+                current = self._recheck_health()
+                if current is None:
+                    print("[TtsPlugin] startup error cleared — chain is healthy now",
+                          flush=True)
+                    self._startup_error = None
+                    return {"state": "ready"}
+                self._startup_error = current
+                return {"state": "error", "message": current}
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
 
@@ -4401,10 +4957,20 @@ class TtsPlugin:
                 break
 
             seg_sid = None
+            no_response = False
             if future.done():
                 result = future.result()
                 if result:
                     seg_sid = getattr(result, 'sid', None)
+                else:
+                    no_response = True
+            else:
+                # The call never came back. Nothing is playing: lyre either is not
+                # there or is wedged. Distinguished from "responded without a sid"
+                # because that one may well be audible, whereas this one is silence.
+                no_response = True
+                print(f"[TtsPlugin] no response from play_text in "
+                      f"{timeout_service:.0f}s seg {i+1}/{len(segments)}", flush=True)
             if seg_sid:
                 sid = seg_sid
 
@@ -4464,13 +5030,21 @@ class TtsPlugin:
                             self._play_event_buffer.pop(seg_sid, None)
                             print(f"[TtsPlugin] cancelled (PlayEvent STOPPED) seg {i+1}/{len(segments)}")
                             break
-                        # event_code: 1=COMPLETED, 2=STOPPED (也算完成), 3=CANCELLED, 4=FAILED
-                        seg_status = "completed" if event_code <= 2 else "error"
-                        if event_code > 2:
+                        # event_code: 1=COMPLETED, 2=STOPPED, 3=CANCELLED, 4=FAILED.
+                        # STOPPED here means something *other* than our own cancel_event
+                        # stopped it — that path already broke out above as "cancelled".
+                        # This used to collapse STOPPED into "completed", which hid every
+                        # such interruption from ACP and the LLM: a segment cut short by
+                        # an external stop looked identical to one that played in full.
+                        if event_code == 1:
+                            seg_status = "completed"
+                        elif event_code == 2:
+                            seg_status = "interrupted"
+                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED externally (not our own cancel)")
+                        else:
+                            seg_status = "error"
                             event_name = self._EVENT_NAMES.get(event_code, f"UNKNOWN({event_code})")
                             print(f"[TtsPlugin] seg {i+1}/{len(segments)} failed: {event_name} (code={event_code})")
-                        elif event_code == 2:
-                            print(f"[TtsPlugin] seg {i+1}/{len(segments)} STOPPED (treated as completed)")
                     self._pending_play.pop(seg_sid, None)
                     self._pending_play_status.pop(seg_sid, None)
                 self._pending_play_duration.pop(seg_sid, None)
@@ -4482,6 +5056,22 @@ class TtsPlugin:
                     continue
                 elif seg_status == "error" and is_last:
                     overall_status = "error"
+                elif seg_status == "interrupted":
+                    # Something external stopped this segment — later segments would just
+                    # be talking over whatever stopped it, so don't keep playing.
+                    overall_status = "interrupted"
+                    break
+            elif no_response:
+                # Do not sleep-then-claim-success. This path used to fall into the
+                # fallback below and report ACP completed, so a silent robot looked
+                # like a successful utterance — verified on the robot, lyre had
+                # received nothing at all while the driver reported completion.
+                overall_status = "error"
+                print(f"[TtsPlugin] seg {i+1}/{len(segments)}: play_text 无响应，"
+                      f"未发声，报错而非假成功", flush=True)
+                self._startup_error = self._recheck_health() or (
+                    "play_text 调用无响应。")
+                break
             elif not seg_sid:
                 # 没拿到 sid，fallback 按字数估算（但也要检查 cancel）
                 fallback_s = len(seg_text) / 2.5 + 5.0
@@ -4506,9 +5096,14 @@ class TtsPlugin:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            acp_result = {"action": "speak", "sid": sid or "unknown",
+                          "segments": len(segments)}
+            # Carry the reason, not just the verdict — "error" with no detail sends the
+            # reader to the logs, and this is the field the dashboard already shows.
+            if overall_status == "error" and getattr(self, "_startup_error", None):
+                acp_result["error"] = self._startup_error
             p = _json.dumps({"action_id": action_id, "status": overall_status,
-                             "result": {"action": "speak", "sid": sid or "unknown",
-                                        "segments": len(segments)}}).encode()
+                             "result": acp_result}).encode()
             r = urllib.request.Request(f"{url}/api/acp/complete", data=p,
                                       headers={"Content-Type": "application/json"}, method="POST")
             urllib.request.urlopen(r, timeout=5, context=ctx)
@@ -4607,6 +5202,8 @@ class VoicePlayActuatorPlugin:
                     "actions": ["play_text", "play_file", "play_url"],
                     "timeout": 60
                 },
+                # lyre audio output — the same speaker the tts tool uses.
+                "x-resource": "mouth",
                 "x-action-params": {
                     "play_file": {"params": ["path", "force"], "description": "播放本地音频文件"},
                     "play_url":  {"params": ["url", "force"],  "description": "播放远程URL音频"},
@@ -4816,6 +5413,8 @@ class NavPlugin:
                     "actions": ["move_to", "rotate", "rotate_to"],
                     "timeout": 180,
                 },
+                # Slamtec chassis. Same channel as home and chassis_raw.
+                "x-resource": "base",
                 "x-action-params": {
                     "move_to": {"params": ["x", "y", "speed"],
                                 "description": "自主导航到目标点(带避障)，系统自动等待到达"},
@@ -5050,6 +5649,7 @@ class HomePlugin:
                     "actions": ["go_home"],
                     "timeout": 180,
                 },
+                "x-resource": "base",
                 "x-action-params": {
                     "list_docks": {"params": [], "description": "列出当前地图已注册的全部充电桩，返回名称、dock_id 与位姿；可据此选择或删除充电桩"},
                     "register_dock": {"params": ["display_name"], "description": "将机器人当前定位位姿保存为一个新充电桩，并自动设为当前回桩目标。执行前应让机器人停在实际充电桩的对接位置并确认定位正常；成功后可直接执行 go_home"},
@@ -5184,6 +5784,19 @@ class HomePlugin:
                 if result_code == 0:
                     _acp_notify(action_id, "completed", {"action": action, "elapsed": round(elapsed, 1), **context}, "home")
                 else:
+                    if action == "go_home":
+                        try:
+                            power = self._slamtec.get_power_status()
+                            if (power.get("dockingStatus") == "on_dock"
+                                    or power.get("isCharging") is True):
+                                _acp_notify(action_id, "completed", {
+                                    "action": action, "elapsed": round(elapsed, 1),
+                                    "completion": "power_status", "power_status": power,
+                                    **context,
+                                }, "home")
+                                return
+                        except Exception:
+                            pass
                     _acp_notify(action_id, "error", {"action": action, "error": current.get("reason") or f"result_code={result_code}", "elapsed": round(elapsed, 1), **context}, "home")
                 return
             if state == 3:
@@ -5195,6 +5808,19 @@ class HomePlugin:
                 # A successful action is reported as Done/result=0. Never infer
                 # success merely because the chassis no longer exposes an action.
                 if elapsed > self._MISSING_ACTION_TIMEOUT:
+                    if action == "go_home":
+                        try:
+                            power = self._slamtec.get_power_status()
+                            if (power.get("dockingStatus") == "on_dock"
+                                    or power.get("isCharging") is True):
+                                _acp_notify(action_id, "completed", {
+                                    "action": action, "elapsed": round(elapsed, 1),
+                                    "completion": "power_status", "power_status": power,
+                                    **context,
+                                }, "home")
+                                return
+                        except Exception:
+                            pass
                     _acp_notify(action_id, "error", {"action": action, "error": "action_disappeared", "elapsed": round(elapsed, 1), **context}, "home")
                     return
             if action == "go_home":
@@ -5215,61 +5841,6 @@ class HomePlugin:
             if elapsed > self._ACTION_TIMEOUT:
                 _acp_notify(action_id, "error", {"action": action, "error": "timeout", "elapsed": self._ACTION_TIMEOUT, **context}, "home")
                 return
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ChatPlugin (actuator)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ChatPlugin:
-    """语音交互开关"""
-
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
-        self._ns = namespace
-        self._ros2 = ros2
-        self._pub_node = Node("tianyi2_chat_pub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "chat",
-            "type": "actuator",
-            "description": "天轶2.0 语音交互模式 — 开启/关闭内置语音对话功能",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["enable", "disable"],
-                               "description": "开启或关闭"},
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "enable": {"params": [], "description": "开启语音交互"},
-                    "disable": {"params": [], "description": "关闭语音交互"},
-                },
-            },
-        }
-
-    def start(self):
-        self._publisher = self._pub_node.create_publisher(Bool, "/audio_chat/enable", _RELIABLE_QOS)
-        print("[ChatPlugin] publisher created")
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("enable", "disable"):
-            if self._publisher:
-                msg = Bool()
-                msg.data = (action == "enable")
-                self._publisher.publish(msg)
-                return {"state": action + "d"}
-            return {"error": "publisher not initialized"}
-        elif action in ("start", "info"):
-            return {"state": "ready"}
-        elif action == "stop":
-            return {"state": "idle"}
-        return {"error": f"unknown action: {action}"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6694,6 +7265,7 @@ class ChassisRawPlugin:
                     "actions": ["move", "rotate"],
                     "timeout": 60
                 },
+                "x-resource": "base",
                 "x-action-params": {
                     "move":   {"params": ["direction", "duration"],
                                "description": "前进/后退, 固定速率 0.3 m/s, duration=-1 持续运动"},

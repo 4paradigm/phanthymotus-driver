@@ -1,0 +1,37 @@
+pndbotics-adam:
+  image: __IMAGE__
+  container_name: embodied-pndbotics-adam
+  runtime: nvidia
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    # ZED SDK binaries and the Jetson/aarch64 pyzed extension are provided by
+    # the host rather than baked into the driver image.
+    - /usr/local/zed:/usr/local/zed:ro
+    - /home/pnd-humanoid/.local/lib/python3.10/site-packages/pyzed:/opt/pyzed:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - DDS_NETWORK_INTERFACE=eno1
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - PYTHONUNBUFFERED=1
+    # Adam's RL server runs on the x86 controller. These remain environment
+    # overrides so another deployment topology can replace them.
+    - GRPC_HOST=10.10.20.127
+    - GRPC_PORT=50051
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=all
+    - ZED_PYTHON_PATH=/opt/pyzed
+    - LD_LIBRARY_PATH=/usr/local/zed/lib:/opt/cyclonedds/lib
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

@@ -60,6 +60,7 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
         method = cmd.get("method")
         args = cmd.get("args", [])
         kwargs = cmd.get("kwargs", {})
+        seq = cmd.get("seq")
 
         try:
             client = clients.get(client_name, loco)
@@ -68,44 +69,86 @@ def _rpc_worker(cmd_queue: multiprocessing.Queue, result_queue: multiprocessing.
             if method == "__run_fsm_sequence":
                 steps_spec, interval, step_timeout, settle_delay = args
                 completed = []
+                # Every distinct FSM value seen while waiting, per step. The caller
+                # uses it to tell a controlled transition from a fall: a healthy
+                # standup2lie passes through 702 for ~6s, lie2standup through 701 for
+                # ~3s, so arriving at the target without them means the robot did not
+                # move through the posture.
+                fsm_seen: dict = {}
+                t_seq = time.monotonic()
+                code0, fsm0 = client.GetFsmId()
+                print(f"[RpcWorker] fsm_sequence start: steps={[s[2] for s in steps_spec]} "
+                      f"fsm_now={fsm0} (code={code0}) interval={interval}s "
+                      f"step_timeout={step_timeout}s settle={settle_delay}s", flush=True)
                 for method_name, target_fsm, step_name in steps_spec:
                     fn = getattr(client, method_name)
+                    t_step = time.monotonic()
+                    print(f"[RpcWorker] fsm_step '{step_name}': calling {method_name}() "
+                          f"target_fsm={target_fsm}", flush=True)
                     ret = fn()
+                    print(f"[RpcWorker] fsm_step '{step_name}': {method_name}() -> ret={ret} "
+                          f"({time.monotonic() - t_step:.2f}s)", flush=True)
                     if ret != 0:
-                        result_queue.put({"result": {
+                        print(f"[RpcWorker] fsm_step '{step_name}': FAILED, aborting sequence",
+                              flush=True)
+                        result_queue.put({"seq": seq, "result": {
                             "error": f"Step '{step_name}' failed: code={ret}",
-                            "step": step_name, "completed": completed}})
+                            "step": step_name, "completed": completed,
+                            "fsm_seen": fsm_seen}})
                         break  # abort sequence on failure
                     # Poll FSM until target reached or timeout
                     elapsed = 0.0
                     ok = False
+                    seen = fsm_seen.setdefault(step_name, [])
                     while elapsed < step_timeout:
                         time.sleep(interval)
                         elapsed += interval
                         code, fsm_id = client.GetFsmId()
+                        if code == 0 and fsm_id not in seen:
+                            seen.append(fsm_id)
+                        print(f"[RpcWorker] fsm_step '{step_name}': poll t={elapsed:.1f}s "
+                              f"fsm={fsm_id} (code={code}) want={target_fsm}", flush=True)
                         if code == 0 and fsm_id == target_fsm:
                             ok = True
                             break
                     if not ok:
                         _, current = client.GetFsmId()
-                        result_queue.put({"result": {
+                        print(f"[RpcWorker] fsm_step '{step_name}': TIMEOUT after {elapsed:.1f}s, "
+                              f"fsm={current} want={target_fsm}", flush=True)
+                        result_queue.put({"seq": seq, "result": {
                             "error": f"Timeout '{step_name}' (expected={target_fsm}, got={current})",
-                            "step": step_name, "fsm_id": current, "completed": completed}})
+                            "step": step_name, "fsm_id": current, "completed": completed,
+                            "fsm_seen": fsm_seen}})
                         break  # abort sequence on timeout
                     completed.append(step_name)
                     # Wait for physical motion to settle before next step
+                    print(f"[RpcWorker] fsm_step '{step_name}': reached target in {elapsed:.1f}s "
+                          f"(saw {seen}), settling {settle_delay}s", flush=True)
                     time.sleep(settle_delay)
                 else:
                     # Only reached if loop completed without break (all steps succeeded)
-                    result_queue.put({"result": {"ret": 0, "steps": completed,
-                                                 "fsm_id": steps_spec[-1][1]}})
+                    # Report the FSM we actually measure, not the target we aimed at --
+                    # otherwise "completed" carries no evidence about the real robot.
+                    code_f, fsm_final = client.GetFsmId()
+                    print(f"[RpcWorker] fsm_sequence done: steps={completed} "
+                          f"fsm_final={fsm_final} (code={code_f}) target={steps_spec[-1][1]} "
+                          f"total={time.monotonic() - t_seq:.2f}s", flush=True)
+                    result_queue.put({"seq": seq, "result": {
+                        "ret": 0, "steps": completed,
+                        "fsm_id": fsm_final if code_f == 0 else steps_spec[-1][1],
+                        "fsm_target": steps_spec[-1][1],
+                        "fsm_measured": code_f == 0,
+                        "fsm_seen": fsm_seen,
+                        "elapsed_s": round(time.monotonic() - t_seq, 2)}})
                 continue  # next cmd
 
             fn = getattr(client, method)
             result = fn(*args, **kwargs)
-            result_queue.put({"result": result})
+            result_queue.put({"seq": seq, "result": result})
         except Exception as e:
-            result_queue.put({"error": str(e)})
+            print(f"[RpcWorker] {client_name}.{method} raised: {e}", flush=True)
+            result_queue.put({"seq": seq, "error": str(e)})
+
 
 
 class RpcProxy:
@@ -122,18 +165,49 @@ class RpcProxy:
         )
         self._proc.start()
         self._lock = threading.Lock()
+        self._seq = 0
 
     def _call(self, client: str, method: str, *args, timeout: float = 15.0, **kwargs):
+        # One lock over one command/result queue pair, shared by loco + arm + audio.
+        # A long call (RunFsmSequence holds it for the whole sequence) blocks every
+        # other plugin, so log the wait when it is long enough to matter.
+        t_want = time.monotonic()
         with self._lock:
-            self._cmd_q.put({"client": client, "method": method, "args": args, "kwargs": kwargs})
-            try:
-                r = self._result_q.get(timeout=timeout)
-            except Exception:
-                return None  # caller handles based on method type
+            waited = time.monotonic() - t_want
+            if waited > 0.5:
+                print(f"[RpcProxy] {client}.{method} waited {waited:.2f}s for the RPC lock",
+                      flush=True)
+            self._seq += 1
+            seq = self._seq
+            self._cmd_q.put({"client": client, "method": method, "args": args,
+                             "kwargs": kwargs, "seq": seq})
+            t0 = time.monotonic()
+            while True:
+                remaining = timeout - (time.monotonic() - t0)
+                if remaining <= 0:
+                    # The command is still in flight. Its reply will land in the queue
+                    # later and would be handed to the *next* caller, desyncing every
+                    # subsequent call by one -- which silently corrupts GetFsmId() and
+                    # therefore the "don't damp while standing" guard. The seq tag lets
+                    # the next caller drop it instead.
+                    print(f"[RpcProxy] {client}.{method} TIMEOUT after {timeout:.1f}s "
+                          f"(seq={seq}); its late reply will be discarded", flush=True)
+                    return None
+                try:
+                    r = self._result_q.get(timeout=remaining)
+                except Exception:
+                    continue  # re-check the deadline
+                r_seq = r.get("seq")
+                if r_seq is not None and r_seq != seq:
+                    print(f"[RpcProxy] discarding stale reply seq={r_seq} "
+                          f"while waiting for seq={seq}", flush=True)
+                    continue
+                break
             if "error" in r:
                 print(f"[RpcProxy] {client}.{method} error: {r['error']}", flush=True)
                 return None  # caller handles based on method type
             return r["result"]
+
 
     def _call_code(self, client: str, method: str, *args, **kwargs) -> int:
         """For methods that return a single int code."""

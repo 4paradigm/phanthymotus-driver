@@ -134,10 +134,16 @@ class _ControlledSpatialDB:
         return [dict(r) for r in rows]
 
     def find_poi(self, query: str, map_name: str) -> dict | None:
+        # Prefer an exact tag name so P1 cannot resolve to P10.
         row = self._conn.execute(
-            "SELECT name, description, x, y, yaw FROM poi WHERE map_name = ? AND name LIKE ?",
-            (map_name, f"%{query}%")
+            "SELECT name, description, x, y, yaw FROM poi WHERE map_name = ? AND name = ?",
+            (map_name, query)
         ).fetchone()
+        if not row:
+            row = self._conn.execute(
+                "SELECT name, description, x, y, yaw FROM poi WHERE map_name = ? AND name LIKE ?",
+                (map_name, f"%{query}%")
+            ).fetchone()
         return dict(row) if row else None
 
 
@@ -332,6 +338,18 @@ class ControlledSpatialPlugin:
                     "actions": ["navigate_to_tag", "navigate_to_pose"],
                     "timeout": 180
                 },
+                # Drives the chassis — same channel as the nav / home / chassis_raw
+                # tools in device.py.
+                "x-resource": "base",
+                # Without this, stop_nav is an ordinary barrier-respecting actuator call:
+                # it wants the same `base` resource as whatever navigate_to_tag/_pose is
+                # already running, so it queues behind — waiting for the very navigation
+                # it was called to cancel to finish on its own first. Measured on a live
+                # session: 5-7s here, but nothing bounds it below the target action's own
+                # duration, which elsewhere in the same session ran to 100+s. `nav.cancel`
+                # and `home.cancel` in device.py already carry this same binding — this
+                # tool superseded `nav` for actual navigation and never picked it up.
+                "x-hooks": {"on_interrupt_motion": {"action": "stop_nav"}},
                 "x-action-params": {
                     "start_mapping": {"params": ["map_name", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Start SLAM mapping with given map name."},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},
@@ -374,6 +392,8 @@ class ControlledSpatialPlugin:
         }
 
     def start(self) -> None:
+        if self._poll_running:
+            return
         self._poll_running = True
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
@@ -670,6 +690,12 @@ class ControlledSpatialPlugin:
         return None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        # Agent Core 在 start 前会自动下发一次 action:config（卡片里存过配置时），
+        # 少了这个分支就会 return None，被 main.py 翻译成 "Unknown tool"。
+        if action == "config":
+            if "password" in args:
+                self._password = str(args["password"])
+            return {"status": "configured"}
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -685,7 +711,9 @@ class ControlledSpatialPlugin:
 
         # ── Mapping ────────────────────────────────────────────────────────
 
-        elif action == "start_mapping":
+        # 独立的 if（不是 elif）：上面的密码块只在校验失败时 return，
+        # 挂成 elif 会让所有通过校验的受保护操作直接跳过整条分支链。
+        if action == "start_mapping":
             map_name = args.get("map_name", "")
             if not map_name:
                 return {"error": "map_name is required"}

@@ -1,0 +1,22 @@
+booster-k1:
+  image: __IMAGE__
+  container_name: embodied-booster-k1
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

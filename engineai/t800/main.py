@@ -127,7 +127,7 @@ class DualDomainROS2:
 
 class T800DeviceBundle:
     _MOTION_OUTPUT_TOOLS = frozenset({
-        "loco", "motion_mode", "dance", "joint_plan", "gesture",
+        "loco", "safe_motion_mode", "dance", "joint_plan", "gesture",
         "joint_override", "joint_bridge", "virtual_gamepad", "gait",
         "motion_recorder", "head", "speaker",
     })
@@ -155,7 +155,7 @@ class T800DeviceBundle:
             MotionInterruptGroup,
             MotionRecorderPlugin,
             MicPlugin,
-            MotionModePlugin,
+            SafeMotionModePlugin,
             MotorPowerPlugin,
             NativeInterfaceProbePlugin,
             NativeNodeControlPlugin,
@@ -202,7 +202,7 @@ class T800DeviceBundle:
             ("motion_command_trace", MotionCommandTracePlugin, (config, namespace, ros2)),
             ("native_interface_probe", NativeInterfaceProbePlugin, (config, namespace, ros2)),
             ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
-            ("motion_mode", MotionModePlugin, (config, namespace, ros2, state)),
+            ("safe_motion_mode", SafeMotionModePlugin, (config, namespace, ros2, state)),
             ("joint_plan", JointPlanPlugin, (config, namespace, ros2, state)),
             ("joint_override", JointOverridePlugin, (config, namespace, ros2, state)),
             ("joint_bridge", JointBridgePlugin, (config, namespace, ros2, state)),
@@ -240,8 +240,8 @@ class T800DeviceBundle:
                 "speaker", speaker.halt, speaker.motion_active
             )
 
-        if plugins.get("dance", {}).get("enabled", True) and "motion_mode" in instances:
-            instance = DancePlugin(instances["motion_mode"], state)
+        if plugins.get("dance", {}).get("enabled", True) and "safe_motion_mode" in instances:
+            instance = DancePlugin(instances["safe_motion_mode"], state)
             instances["dance"] = instance
             self._plugins.append(instance)
 
@@ -257,9 +257,9 @@ class T800DeviceBundle:
         # Gait selector — delegates to the public Native SDK motion-state API.
         if (
             plugins.get("gait", {}).get("enabled", False)
-            and "motion_mode" in instances
+            and "safe_motion_mode" in instances
         ):
-            instance = GaitPlugin(config, instances["motion_mode"], state)
+            instance = GaitPlugin(config, instances["safe_motion_mode"], state)
             instance.set_interrupt_group(motion_interrupt_group)
             motion_interrupt_group.register(
                 "gait", instance.halt, instance.motion_active
@@ -275,7 +275,7 @@ class T800DeviceBundle:
             self._plugins.append(motion_recorder)
             if "joint_plan" in instances:
                 motion_recorder.set_joint_plan(instances["joint_plan"])
-            motion_recorder.set_reset_controls(state, instances.get("motion_mode"))
+            motion_recorder.set_reset_controls(state, instances.get("safe_motion_mode"))
             motion_recorder.set_interrupt_group(motion_interrupt_group)
             motion_interrupt_group.register(
                 "motion_recorder",
