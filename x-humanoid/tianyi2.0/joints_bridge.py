@@ -19,13 +19,23 @@ from device import StatePlugin
 
 class BridgeROS2:
     def __init__(self):
+        # One profile for the whole process: FastDDS caches XML profiles, so switching
+        # FASTRTPS_DEFAULT_PROFILES_FILE between the two contexts cannot give them
+        # different ones — it only decides which single profile both use, and getting
+        # that wrong silently cut the body link. Full account in main.py's
+        # DualDomainROS2._select_profile. The vendor whitelist
+        # {192.168.41.2, 127.0.0.1} keeps the body reachable and excludes the office
+        # LAN, which is what the domain-42 isolation is for.
         dds_profile = "/work/dds_profile.xml"
         if os.path.exists(dds_profile):
             os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = dds_profile
+        else:
+            os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+            print(f"[joints-bridge] WARNING {dds_profile} missing — both domains will "
+                  f"use every interface, including the office LAN", flush=True)
         self.ctx_tianyi = Context()
         rclpy.init(context=self.ctx_tianyi, domain_id=0)
         self.executor_tianyi = rclpy.executors.MultiThreadedExecutor(context=self.ctx_tianyi)
-        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
         self.ctx_core = Context()
         rclpy.init(context=self.ctx_core, domain_id=42)
         self.executor_core = rclpy.executors.MultiThreadedExecutor(context=self.ctx_core)

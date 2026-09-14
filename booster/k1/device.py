@@ -715,6 +715,7 @@ class AudioPlugin:
                     "actions": ["play_sound"],
                     "timeout": 60,
                 },
+                "x-resource": "mouth",
             },
         }
 
