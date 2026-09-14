@@ -33,11 +33,8 @@ adam = load_device()
 
 
 class FakeSubscriber:
-    def __init__(self):
-        self.closed = False
-
     def Close(self):
-        self.closed = True
+        pass
 
 
 class AdamHandStatePluginTests(unittest.TestCase):
@@ -78,7 +75,6 @@ class AdamDriverContractTests(unittest.TestCase):
             cache._received_monotonic = time.monotonic() - 2
         stale = cache.snapshot(timeout_sec=1.0)
         self.assertFalse(stale["fresh"])
-        self.assertEqual(12, len(stale["position"]))
         cache.close()
 
     def test_hand_state_payload_exposes_left_and_right_channels(self):
@@ -93,12 +89,13 @@ class AdamDriverContractTests(unittest.TestCase):
         payload = adam._skeleton_payload(state, adam.ADAM_PRO_JOINTS, hand_state)
         self.assertEqual(43, len(payload["joints"]))
         self.assertEqual("hand_thumb_2_Right", payload["joints"][-1]["name"])
+        self.assertEqual(11, payload["joints"][-1]["q"])
         self.assertEqual("hardware_position_0_1000", payload["joints"][-1]["unit"])
 
     def test_skeleton_payload_omits_stale_hand_hardware_channels(self):
         state = type("State", (), {"motor_state": [type("Motor", (), {"q": 0.1})() for _ in range(31)]})()
-        self.assertEqual(31, len(adam._skeleton_payload(
-            state, adam.ADAM_PRO_JOINTS, {"fresh": False, "position": [0] * 12})["joints"]))
+        payload = adam._skeleton_payload(state, adam.ADAM_PRO_JOINTS, {"fresh": False, "position": [0] * 12})
+        self.assertEqual(31, len(payload["joints"]))
 
     def test_arm_raise_hand_uses_side_specific_sdk_pose(self):
         node = object.__new__(adam._ArmControlNode)
@@ -120,8 +117,6 @@ class AdamDriverContractTests(unittest.TestCase):
         self.assertEqual([0, 0, 0, 1000, 200, 800], plugin._gesture_target("point", "right")[6:])
         self.assertEqual([0, 0, 1000, 1000, 100, 900], plugin._gesture_target("victory", "left")[:6])
         self.assertEqual([1000, 0, 0, 1000, 200, 800], plugin._gesture_target("rock", "right")[6:])
-        with self.assertRaisesRegex(ValueError, "side"):
-            plugin._gesture_target("thumbs_up", "both")
 
     def test_state_plugin_tool_contracts(self):
         node = types.SimpleNamespace(

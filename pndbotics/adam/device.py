@@ -160,6 +160,12 @@ HAND_CHANNEL_LABELS = {
 HAND_POSITION_COUNT = 12
 HAND_POSITION_MIN = 0
 HAND_POSITION_MAX = 1000
+HAND_SKELETON_CHANNEL_NAMES = (
+    "hand_pinky_Left", "hand_ring_Left", "hand_middle_Left",
+    "hand_index_Left", "hand_thumb_1_Left", "hand_thumb_2_Left",
+    "hand_pinky_Right", "hand_ring_Right", "hand_middle_Right",
+    "hand_index_Right", "hand_thumb_1_Right", "hand_thumb_2_Right",
+)
 HAND_DEFAULT_OPEN = [
     HAND_POSITION_MAX, HAND_POSITION_MAX, HAND_POSITION_MAX, HAND_POSITION_MAX,
     HAND_POSITION_MAX, HAND_POSITION_MIN,
@@ -271,6 +277,31 @@ def _hand_status_payload(cache, timeout_sec: float) -> dict:
         **({"last_read_error": status["last_read_error"]}
            if "last_read_error" in status else {}),
     }
+
+
+def _skeleton_payload(state, joint_names, hand_state=None) -> dict:
+    joints = []
+    motor_state = getattr(state, "motor_state", [])
+    for idx, name in enumerate(joint_names):
+        if idx < len(motor_state):
+            joints.append({
+                "idx": idx,
+                "name": name,
+                "q": float(motor_state[idx].q),
+                "unit": "rad",
+                "source": "rt/lowstate",
+            })
+    if hand_state is not None and hand_state.get("fresh"):
+        for offset, (name, position) in enumerate(zip(
+                HAND_SKELETON_CHANNEL_NAMES, hand_state["position"])):
+            joints.append({
+                "idx": len(joint_names) + offset,
+                "name": name,
+                "q": int(position),
+                "unit": "hardware_position_0_1000",
+                "source": "rt/handstate",
+            })
+    return {"joints": joints}
 
 
 def _state_health_payload(state, received_monotonic: float | None) -> dict:
@@ -484,6 +515,37 @@ ROS2_UPPER_BODY_JOINTS = [
     "dof_pos/hand_thumb_1_Right", "dof_pos/hand_thumb_2_Right",
 ]
 
+# SDK 示例 open_arm.py 已验证的单侧抬臂目标。关节仅包含 ArmPlugin
+# 负责的腰部与上肢通道，避免改写头部或底盘状态。
+ARM_RAISE_POSE = {
+    "left": {
+        "shoulderPitch_Left": -1.6,
+        "shoulderRoll_Left": 2.06,
+        "shoulderYaw_Left": -1.65,
+        "elbow_Left": -1.77,
+        "wristYaw_Left": 0.32,
+        "wristPitch_Left": 0.0,
+        "wristRoll_Left": 0.0,
+    },
+    "right": {
+        "shoulderPitch_Right": -1.6,
+        "shoulderRoll_Right": -2.06,
+        "shoulderYaw_Right": 1.65,
+        "elbow_Right": -1.77,
+        "wristYaw_Right": 0.32,
+        "wristPitch_Right": 0.0,
+        "wristRoll_Right": 0.0,
+    },
+}
+
+
+def _reliable_qos():
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+
 
 def _best_effort_qos():
     """Shallow best-effort queue for high-rate optional telemetry."""
@@ -595,17 +657,6 @@ class _StatePublisherNode(Node):
         if not active or state is None:
             return
 
-        robot_data = {
-            "mode_pr": int(state.mode_pr),
-            "control_topology": _state_health_payload(
-                state, state_monotonic)["control_topology"],
-            "tick": int(state.tick),
-            "wireless_remote": list(state.wireless_remote),
-        }
-        msg_robot = String()
-        msg_robot.data = json.dumps(robot_data)
-        self._pub_robot_state.publish(msg_robot)
-
         # Hand values are hardware positions, not URDF joint angles.
         hand_state = (
             self._hand_state_cache.snapshot(timeout_sec=1.0)
@@ -615,8 +666,18 @@ class _StatePublisherNode(Node):
         msg.data = json.dumps(_skeleton_payload(state, self._joints, hand_state))
         self._pub_skeleton.publish(msg)
 
+        msg_robot = String()
+        msg_robot.data = json.dumps({
+            "mode_pr": int(getattr(state, "mode_pr", 0)),
+            "control_topology": _state_health_payload(
+                state, state_monotonic)["control_topology"],
+            "tick": int(getattr(state, "tick", 0)),
+            "wireless_remote": list(getattr(state, "wireless_remote", [])),
+        })
+        self._pub_robot_state.publish(msg_robot)
+
         motor_states = []
-        for idx, motor in enumerate(state.motor_state):
+        for idx, motor in enumerate(getattr(state, "motor_state", [])):
             if idx >= len(self._joints):
                 break
             motor_states.append({
@@ -743,7 +804,7 @@ class StatePlugin:
             {
                 "name": "robot_state",
                 "type": "sensor",
-                "description": "Adam low-level state — mode, tick and wireless remote channels",
+                "description": "Adam readable low-level state — control topology, tick and remote channels",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [
                     {"topic": self._node._topic_robot_state, "format": "data/json"}
@@ -830,6 +891,12 @@ class StatePlugin:
             return {"state": "idle"}
         if action == "info":
             tool_name = args.get("_tool_name", "joints")
+            if tool_name == "motor_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_motor_state, "format": "data/json"}]}
+            if tool_name == "robot_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_robot_state, "format": "data/json"}]}
             if tool_name == "imu":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_imu, "format": "data/json"}]}
@@ -1050,6 +1117,13 @@ class _ArmControlNode(Node):
             self._positions[:17] = 0.0
             self._positions[17] = 1.0  # keep standing height
 
+    def run_gesture(self, gesture: str, side: str):
+        if side not in ("left", "right"):
+            raise ValueError("side must be either left or right")
+        if gesture != "raise_hand":
+            raise ValueError("unsupported arm gesture")
+        self.set_joints(ARM_RAISE_POSE[side])
+
 
 class ArmPlugin:
     """Upper body control via ROS2 JointState publishing at 100Hz."""
@@ -1075,7 +1149,10 @@ class ArmPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["enable", "disable", "set_joints", "set_height", "zero"],
+                        "enum": [
+                            "enable", "disable", "set_joints", "set_height", "zero",
+                            "gesture",
+                        ],
                     },
                     "joints": {
                         "type": "object",
@@ -1084,6 +1161,23 @@ class ArmPlugin:
                     "height": {
                         "type": "number",
                         "description": "Body height 0.6-1.0m",
+                    },
+                    "gesture": {
+                        "type": "string",
+                        "enum": ["raise_hand"],
+                        "oneOf": [
+                            {"const": "raise_hand", "title": "举手"},
+                        ],
+                        "description": "使用 SDK 已验证的单侧抬臂姿势；动作保持直到 disable 或其他 arm 命令。",
+                    },
+                    "side": {
+                        "type": "string",
+                        "enum": ["left", "right"],
+                        "oneOf": [
+                            {"const": "left", "title": "左侧"},
+                            {"const": "right", "title": "右侧"},
+                        ],
+                        "description": "选择执行语义手势的手臂。",
                     },
                 },
                 "required": ["action"],
@@ -1107,6 +1201,10 @@ class ArmPlugin:
                     "zero": {
                         "params": [],
                         "description": "Reset all arm joints to zero (neutral position)",
+                    },
+                    "gesture": {
+                        "params": ["gesture", "side"],
+                        "description": "执行单侧举手姿势",
                     },
                 },
             },
@@ -1141,6 +1239,15 @@ class ArmPlugin:
         if action == "zero":
             self._node.zero_arms()
             return {"state": "active", "message": "Arms zeroed"}
+        if action == "gesture":
+            gesture = args.get("gesture")
+            side = args.get("side")
+            try:
+                self._node.run_gesture(gesture, side)
+            except ValueError as exc:
+                return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
+            self._node._active = True
+            return {"state": "active", "gesture": gesture, "side": side}
         if action == "info":
             return {"state": "active" if self._node._active else "idle"}
         return None
@@ -1270,8 +1377,9 @@ class HandPlugin:
                     "action": {
                         "type": "string",
                         "enum": [
-                            "open", "close", "set_fingers", "start", "stop", "info",
-                            "get_state",
+                            "open", "close", "thumbs_up", "wave_open", "handshake",
+                            "point", "victory", "rock", "set_fingers", "start", "stop",
+                            "info", "get_state",
                         ],
                     },
                     "side": {
@@ -1314,6 +1422,30 @@ class HandPlugin:
                             "Close pinky/ring/middle/index while simultaneously "
                             "rotating and flexing the thumb to its safe target"
                         ),
+                    },
+                    "thumbs_up": {
+                        "params": ["side"],
+                        "description": "指定手点赞：四指合拢，拇指保持张开位置",
+                    },
+                    "wave_open": {
+                        "params": ["side"],
+                        "description": "指定手张开，可与 arm 举手姿势组合为挥手姿态",
+                    },
+                    "handshake": {
+                        "params": ["side"],
+                        "description": "指定手握拳，可与 arm 举手姿势组合为握手姿态",
+                    },
+                    "point": {
+                        "params": ["side"],
+                        "description": "指定手食指伸出、其余手指收拢的指向手势",
+                    },
+                    "victory": {
+                        "params": ["side"],
+                        "description": "指定手食指和中指伸出、其余手指收拢的 V 手势",
+                    },
+                    "rock": {
+                        "params": ["side"],
+                        "description": "指定手食指和小指伸出、其余手指收拢的摇滚手势",
                     },
                     "set_fingers": {
                         "params": ["side", "channel", "value"],
@@ -1518,15 +1650,54 @@ class HandPlugin:
     def _close_target(self) -> list[int]:
         """Build one close target for all four fingers and both thumb axes."""
         target = list(self._close_positions)
-        for side_offset, thumb_offset in ((0, 0), (6, 2)):
-            # The current Adam client mapping becomes more closed as the
-            # flexion position decreases. Send both thumb axes in the same
-            # target as the four non-thumb fingers so they move concurrently.
-            target[side_offset + 4] = max(
-                self._thumb_close_positions[thumb_offset],
-                self._thumb_close_min_flex_position,
-            )
-            target[side_offset + 5] = self._thumb_close_positions[thumb_offset + 1]
+        for side in ("left", "right"):
+            self._apply_closed_hand(target, side)
+        return target
+
+    def _side_target(self, side: str) -> list[int]:
+        if side not in ("left", "right"):
+            raise ValueError("side must be either left or right")
+        return self._base_positions()
+
+    def _side_offset(self, side: str) -> int:
+        if side not in ("left", "right"):
+            raise ValueError("side must be either left or right")
+        return 0 if side == "left" else 6
+
+    def _apply_closed_hand(self, target: list[int], side: str):
+        offset = self._side_offset(side)
+        thumb_offset = 0 if side == "left" else 2
+        target[offset:offset + 4] = self._close_positions[offset:offset + 4]
+        target[offset + 4] = max(
+            self._thumb_close_positions[thumb_offset],
+            self._thumb_close_min_flex_position,
+        )
+        target[offset + 5] = self._thumb_close_positions[thumb_offset + 1]
+
+    def _gesture_target(self, gesture: str, side: str) -> list[int]:
+        target = self._side_target(side)
+        offset = self._side_offset(side)
+        if gesture == "thumbs_up":
+            self._apply_closed_hand(target, side)
+            target[offset + 4] = self._open_positions[offset + 4]
+            target[offset + 5] = self._open_positions[offset + 5]
+        elif gesture == "wave_open":
+            target[offset:offset + 6] = self._open_positions[offset:offset + 6]
+        elif gesture == "handshake":
+            self._apply_closed_hand(target, side)
+        elif gesture == "point":
+            self._apply_closed_hand(target, side)
+            target[offset + 3] = self._open_positions[offset + 3]
+        elif gesture == "victory":
+            self._apply_closed_hand(target, side)
+            target[offset + 2] = self._open_positions[offset + 2]
+            target[offset + 3] = self._open_positions[offset + 3]
+        elif gesture == "rock":
+            self._apply_closed_hand(target, side)
+            target[offset] = self._open_positions[offset]
+            target[offset + 3] = self._open_positions[offset + 3]
+        else:
+            raise ValueError("unsupported hand gesture")
         return target
 
     def _activate(self, positions: list[int], action: str) -> dict:
@@ -1568,6 +1739,14 @@ class HandPlugin:
             return self._activate(self._open_positions, "open")
         if action == "close":
             return self._activate(self._close_target(), "close")
+        if action in (
+                "thumbs_up", "wave_open", "handshake", "point", "victory", "rock"):
+            side = args.get("side")
+            try:
+                target = self._gesture_target(action, side)
+            except ValueError as exc:
+                return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
+            return self._activate(target, action)
         if action == "set_fingers":
             side = args.get("side")
             channel = args.get("channel")
