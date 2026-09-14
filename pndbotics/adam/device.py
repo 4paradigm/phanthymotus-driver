@@ -2,18 +2,23 @@
 
 Plugins:
   StatePlugin  — DDS rt/lowstate → ROS2 skeleton/IMU/battery
+  EStopPlugin  — read-only PAC physical emergency-stop state
   LocoPlugin   — gRPC locomotion control
   ArmPlugin    — ROS2 JointState upper body control
   HandPlugin   — DDS rt/handcmd finger control and hand-state query
   ModelPlugin  — URDF resource for 3D visualization
 """
 
+from __future__ import annotations
+
 import json
 import io
 import math
 import os
 import queue
+import re
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -21,6 +26,8 @@ import zlib
 from pathlib import Path
 
 import numpy as np
+
+from estop import EStopPlugin
 
 try:
     import rclpy
@@ -63,6 +70,30 @@ try:
     HAS_PND_SDK = True
 except Exception:
     HAS_PND_SDK = False
+
+
+def _notify_action_completion(action_id, status, result, tool):
+    """Report completion of a long-running MCP action to Agent Core."""
+    import ssl
+    import urllib.request
+
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    request = urllib.request.Request(
+        f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete",
+        data=payload, headers={"Content-Type": "application/json"})
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        urllib.request.urlopen(request, context=context, timeout=5).close()
+    except Exception as exc:
+        print(f"[vision_capture] ACP completion callback failed: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +437,7 @@ ROS2_UPPER_BODY_JOINTS = [
 
 
 def _best_effort_qos():
+    """Shallow best-effort queue for high-rate optional telemetry."""
     return QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
         history=HistoryPolicy.KEEP_LAST,
@@ -413,12 +445,50 @@ def _best_effort_qos():
     )
 
 
+def _battery_payload(battery, timestamp_ms: int | None = None) -> dict:
+    """Normalize Adam's embedded DDS BMS sample for the battery card.
+
+    The BMS is carried inside ``rt/lowstate``.  Keep this conversion separate
+    from joint/IMU serialization so an incomplete sample from either of those
+    sensors cannot stop the battery card's data flow.
+    """
+    def number(name: str) -> float | None:
+        try:
+            value = float(getattr(battery, name))
+            return value if math.isfinite(value) else None
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    status = getattr(battery, "status", None)
+    data = {
+        "timestamp_ms": int(timestamp_ms or time.time() * 1000),
+        "voltage": number("voltage"),
+        "current": number("current"),
+        "power": number("power"),
+        "wh_accumulated": number("wh_accumulated"),
+        "status": str(status) if status not in (None, "") else "unknown",
+        "source_topic": "rt/lowstate",
+    }
+    return data
+
+
 # ===========================================================================
 # StatePlugin — subscribes DDS rt/lowstate, publishes to ROS2
 # ===========================================================================
 
+def _reliable_qos():
+    """QoS for Dashboard-facing state and camera streams."""
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+
+
 class _StatePublisherNode(Node):
-    """ROS2 node that publishes skeleton, IMU, and battery data."""
+    """ROS2 node that publishes skeleton, motor, robot, IMU, and battery data."""
+
+    _BATTERY_INTERVAL_S = 1.0
 
     def __init__(self, namespace: str, variant: str, publish_rate_hz: float):
         super().__init__("adam_state_publisher")
@@ -426,30 +496,34 @@ class _StatePublisherNode(Node):
         self._variant = variant
         self._joints = VARIANT_JOINTS[variant]
 
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+        qos = _reliable_qos()
 
         self._topic_skeleton = f"/{namespace}/state/joints"
         self._topic_imu = f"/{namespace}/state/imu"
         self._topic_battery = f"/{namespace}/state/battery"
+        self._topic_robot_state = f"/{namespace}/state/robot"
+        self._topic_motor_state = f"/{namespace}/state/motors"
 
         self._pub_skeleton = self.create_publisher(String, self._topic_skeleton, qos)
         self._pub_imu = self.create_publisher(String, self._topic_imu, qos)
         self._pub_battery = self.create_publisher(String, self._topic_battery, qos)
+        self._pub_robot_state = self.create_publisher(String, self._topic_robot_state, qos)
+        self._pub_motor_state = self.create_publisher(String, self._topic_motor_state, qos)
 
         self._latest_state = None
+        self._latest_state_at_ms = None
         self._active = False
         self._lock = threading.Lock()
 
         interval = 1.0 / publish_rate_hz
         self._timer = self.create_timer(interval, self._publish)
+        self._battery_timer = self.create_timer(
+            self._BATTERY_INTERVAL_S, self._publish_battery)
 
     def update_state(self, state):
         with self._lock:
             self._latest_state = state
+            self._latest_state_at_ms = int(time.time() * 1000)
 
     def set_active(self, active: bool):
         with self._lock:
@@ -462,6 +536,15 @@ class _StatePublisherNode(Node):
 
         if not active or state is None:
             return
+
+        robot_data = {
+            "mode_pr": int(state.mode_pr),
+            "tick": int(state.tick),
+            "wireless_remote": list(state.wireless_remote),
+        }
+        msg_robot = String()
+        msg_robot.data = json.dumps(robot_data)
+        self._pub_robot_state.publish(msg_robot)
 
         # Skeleton (joints)
         joints = []
@@ -476,6 +559,24 @@ class _StatePublisherNode(Node):
         msg.data = json.dumps({"joints": joints})
         self._pub_skeleton.publish(msg)
 
+        motor_states = []
+        for idx, motor in enumerate(state.motor_state):
+            if idx >= len(self._joints):
+                break
+            motor_states.append({
+                "idx": idx,
+                "name": self._joints[idx],
+                "mode": int(motor.mode),
+                "q": float(motor.q),
+                "dq": float(motor.dq),
+                "ddq": float(motor.ddq),
+                "tau_est": float(motor.tau_est),
+                "state": int(motor.state),
+            })
+        msg_motor = String()
+        msg_motor.data = json.dumps({"motors": motor_states})
+        self._pub_motor_state.publish(msg_motor)
+
         # IMU
         imu = state.imu_state
         imu_data = {
@@ -489,15 +590,23 @@ class _StatePublisherNode(Node):
         msg_imu.data = json.dumps(imu_data)
         self._pub_imu.publish(msg_imu)
 
-        # Battery
-        bat = state.battery_data
-        bat_data = {
-            "voltage": float(bat.voltage),
-            "current": float(bat.current),
-            "power": float(bat.power),
-            "wh_accumulated": float(bat.wh_accumulated),
-            "status": str(bat.status) if hasattr(bat, "status") else "unknown",
-        }
+    def _publish_battery(self):
+        """Publish BMS independently at 1Hz.
+
+        Adam's low-state message contains all three state classes.  A malformed
+        joint or IMU reading must not prevent the dashboard from receiving the
+        BMS stream, and a 50Hz battery stream is unnecessary for this card.
+        """
+        with self._lock:
+            state = self._latest_state
+            received_at_ms = self._latest_state_at_ms
+            active = self._active
+
+        if not active or state is None:
+            return
+
+        bat_data = _battery_payload(
+            getattr(state, "battery_data", None), received_at_ms)
         msg_bat = String()
         msg_bat.data = json.dumps(bat_data)
         self._pub_battery.publish(msg_bat)
@@ -549,6 +658,24 @@ class StatePlugin:
                 ],
             },
             {
+                "name": "motor_state",
+                "type": "sensor",
+                "description": "Adam motor feedback — position, velocity, acceleration, torque estimate and state",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_motor_state, "format": "data/json"}
+                ],
+            },
+            {
+                "name": "robot_state",
+                "type": "sensor",
+                "description": "Adam low-level state — mode, tick and wireless remote channels",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_robot_state, "format": "data/json"}
+                ],
+            },
+            {
                 "name": "imu",
                 "type": "sensor",
                 "description": "Adam IMU — quaternion, gyroscope, accelerometer",
@@ -560,7 +687,7 @@ class StatePlugin:
             {
                 "name": "battery",
                 "type": "sensor",
-                "description": "Adam battery — voltage, current, power, status",
+                "description": f"Adam BMS battery — voltage, current, power, accumulated energy and status. Publishes at 1Hz to {self._node._topic_battery}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [
                     {"topic": self._node._topic_battery, "format": "data/json"}
@@ -614,6 +741,12 @@ class StatePlugin:
             if tool_name == "imu":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_imu, "format": "data/json"}]}
+            if tool_name == "motor_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_motor_state, "format": "data/json"}]}
+            if tool_name == "robot_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_robot_state, "format": "data/json"}]}
             if tool_name == "battery":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
@@ -627,7 +760,7 @@ class StatePlugin:
 # ===========================================================================
 
 class LocoPlugin:
-    """High-level locomotion via gRPC on port 6666."""
+    """High-level locomotion via the Adam RL gRPC service."""
 
     PREFIX = "loco"
 
@@ -652,7 +785,11 @@ class LocoPlugin:
                             "list_actions", "clear_error", "carry_box",
                         ],
                     },
-                    "mode": {"type": "integer", "description": "Mode ID"},
+                    "mode": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Target state name returned by get_state.switchable_states",
+                    },
                     "vx": {"type": "number", "description": "Forward velocity (m/s)"},
                     "vy": {"type": "number", "description": "Lateral velocity (m/s)"},
                     "vyaw": {"type": "number", "description": "Yaw angular velocity (rad/s)"},
@@ -722,7 +859,7 @@ class LocoPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "set_mode":
-            return self._grpc.set_mode(args.get("mode", 0))
+            return self._grpc.set_mode(args.get("mode", ""))
         if action == "move":
             return self._grpc.set_speed(
                 args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0)
@@ -1372,6 +1509,100 @@ class HandPlugin:
 
 
 # ---------------------------------------------------------------------------
+# Hand-state sensor card
+# ---------------------------------------------------------------------------
+
+class _HandStatePublisherNode(Node):
+    """Publishes the shared DDS hand-state cache as JSON."""
+
+    def __init__(self, namespace: str, state_cache: HandStateCache,
+                 publish_rate_hz: float, state_timeout_sec: float):
+        super().__init__("adam_hand_state_publisher")
+        self._state_cache = state_cache
+        self._state_timeout_sec = state_timeout_sec
+        self._topic = f"/{namespace}/state/hand"
+        self._active = False
+        self._lock = threading.Lock()
+        self._publisher = self.create_publisher(String, self._topic, _best_effort_qos())
+        self._timer = self.create_timer(1.0 / publish_rate_hz, self._publish)
+
+    def set_active(self, active: bool):
+        with self._lock:
+            self._active = bool(active)
+
+    def _publish(self):
+        with self._lock:
+            active = self._active
+        if not active:
+            return
+        payload = self._state_cache.snapshot(self._state_timeout_sec)
+        if payload is None:
+            return
+        message = String()
+        message.data = json.dumps(payload)
+        self._publisher.publish(message)
+
+
+class HandStatePlugin:
+    """Exposes actual 12-channel hand positions as a read-only sensor."""
+
+    PREFIX = "hand_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 state_cache: HandStateCache, **kwargs):
+        self._executor = executor
+        self._state_cache = state_cache
+        self._state_timeout_sec = float(plugin_config.get("state_timeout_sec", 1.0))
+        rate = float(plugin_config.get("publish_rate_hz", 50))
+        self._node = _HandStatePublisherNode(
+            namespace, state_cache, rate, self._state_timeout_sec)
+        executor.add_node(self._node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand_state",
+            "type": "sensor",
+            "description": "Adam hand state — actual positions for both 6-channel hands",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._state_cache.start()
+        self._node.set_active(True)
+
+    def stop(self):
+        self._node.set_active(False)
+
+    def close(self):
+        self.stop()
+        _destroy_ros_node(self._executor, self._node)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action in ("info", "hand_state"):
+            payload = self._state_cache.snapshot(self._state_timeout_sec)
+            if payload is not None:
+                return {
+                    **payload,
+                    "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+                }
+            status = self._state_cache.status(self._state_timeout_sec)
+            return {
+                "state": "unavailable" if not status["reader_available"] else "waiting",
+                "fresh": False,
+                "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+                **status,
+            }
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Local ZED Mini camera cards
 # ---------------------------------------------------------------------------
 
@@ -1436,14 +1667,17 @@ class ZedCameraPlugin:
         self._pointcloud_config = pointcloud_config
         self._pointcloud_enabled = bool(
             pointcloud_config.get(
-                "enabled", self._config.get("pointcloud_enabled", False)))
+                "enabled", self._config.get("pointcloud_enabled", True)))
         # The three cards share one ZED capture thread, but each card has its
-        # own publication lifecycle.  RGB and depth are opt-in because they
-        # are expensive image streams, matching the point-cloud card's
-        # on-demand behaviour.
+        # own publication lifecycle.  Keep every advertised card live by
+        # default: dashboard card creation is not guaranteed to invoke a
+        # separate legacy start action.
         self._card_enabled = {
-            "camera_head": False,
-            "camera_depth": False,
+            # The dashboard treats these as live sensor cards. Start the RGB
+            # and depth flows with the driver so opening a card never depends
+            # on a separate, legacy MCP start request succeeding first.
+            "camera_head": True,
+            "camera_depth": True,
             "camera_pointcloud": self._pointcloud_enabled,
         }
         self._rgb_hz = max(1.0, min(float(self._config.get("rgb_hz", 15)), 30.0))
@@ -1499,6 +1733,13 @@ class ZedCameraPlugin:
         self._depth_pub = None
         self._pointcloud_pub = None
         self._lock = threading.Lock()
+        # A one-shot photo card shares this capture loop rather than opening a
+        # second ZED SDK handle.  The condition protects the JPEG cache and
+        # lets a caller wait specifically for a frame newer than its request.
+        self._photo_condition = threading.Condition(self._lock)
+        self._photo_waiters = 0
+        self._latest_rgb = None
+        self._rgb_sequence = 0
         self._state = {
             "state": "idle",
             "available": False,
@@ -1576,7 +1817,7 @@ class ZedCameraPlugin:
                 from sensor_msgs.msg import CompressedImage
                 from std_msgs.msg import UInt8MultiArray
 
-                qos = _best_effort_qos()
+                qos = _reliable_qos()
                 self._CompressedImage = CompressedImage
                 self._UInt8MultiArray = UInt8MultiArray
                 self._rgb_pub = self._pub_node.create_publisher(
@@ -1956,7 +2197,9 @@ class ZedCameraPlugin:
                 now = time.monotonic()
 
                 with self._lock:
-                    rgb_enabled = self._card_enabled["camera_head"]
+                    rgb_enabled = (
+                        self._card_enabled["camera_head"]
+                        or self._photo_waiters > 0)
                     depth_enabled = self._card_enabled["camera_depth"]
                     pointcloud_enabled = (
                         self._card_enabled["camera_pointcloud"]
@@ -2021,11 +2264,19 @@ class ZedCameraPlugin:
                 continue
             if not self._capture_active():
                 break
-            with self._lock:
-                if not self._card_enabled["camera_head"]:
-                    continue
             try:
                 jpeg = self._encode_jpeg(image, np, PillowImage)
+                with self._photo_condition:
+                    self._rgb_sequence += 1
+                    self._latest_rgb = {
+                        "data": jpeg,
+                        "timestamp_ms": int(time.time() * 1000),
+                        "sequence": self._rgb_sequence,
+                    }
+                    self._photo_condition.notify_all()
+                    publish_rgb = self._card_enabled["camera_head"]
+                if not publish_rgb:
+                    continue
                 msg = self._CompressedImage()
                 msg.format = "jpeg"
                 msg.data = jpeg
@@ -2230,6 +2481,34 @@ class ZedCameraPlugin:
         if should_stop:
             self.stop()
 
+    def capture_photo(self, timeout_s=5.0):
+        """Return a JPEG captured after this call starts.
+
+        The ZED remains lazy while only the photo card is installed: a raw RGB
+        frame is retrieved only while at least one caller is waiting here.
+        """
+        timeout_s = max(0.1, min(float(timeout_s), 15.0))
+        deadline = time.monotonic() + timeout_s
+        with self._photo_condition:
+            if not self._running:
+                if not self.start():
+                    raise RuntimeError("Adam ZED camera could not be started")
+            start_sequence = self._rgb_sequence
+            self._photo_waiters += 1
+            try:
+                while True:
+                    frame = self._latest_rgb
+                    if frame is not None and frame["sequence"] > start_sequence:
+                        return dict(frame)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        detail = self._state.get("error") or "no fresh RGB frame arrived"
+                        raise RuntimeError(detail)
+                    self._photo_condition.wait(remaining)
+            finally:
+                self._photo_waiters -= 1
+
+
     def dispatch(self, action, args):
         tool_name = args.get("_tool_name", action)
         if tool_name not in self._CARD_NAMES:
@@ -2273,6 +2552,305 @@ class ZedCameraPlugin:
 # ---------------------------------------------------------------------------
 # Resource card and bundle
 # ---------------------------------------------------------------------------
+
+class VisionCapturePlugin:
+    """Capture and manage Adam ZED media with the Tianyi card contract."""
+
+    CARD = "vision_capture"
+
+    def __init__(self, plugin_config, camera):
+        self._camera = camera
+        config = dict(plugin_config or {})
+        self._output_dir = Path(str(config.get(
+            "output_dir", "/opt/phanthy-motus/data/images"))).expanduser()
+        self._channel_dir = self._derive_channel_dir(self._output_dir)
+        self._timeout_s = max(1, min(int(config.get("timeout_s", 5)), 15))
+        self._video_fps = max(1.0, min(30.0, float(config.get("video_fps", 15))))
+        self._max_video_seconds = max(1.0, min(60.0, float(config.get("max_video_seconds", 60))))
+        self._default_video_seconds = max(
+            1.0, min(self._max_video_seconds, float(config.get("default_video_seconds", 5))))
+        self._recording_lock = threading.Lock()
+        self._recording_stop = None
+        self._recording_thread = None
+        self._recording_path = None
+        self._recording_error = None
+
+    @staticmethod
+    def _derive_channel_dir(native_dir):
+        override = os.environ.get("PHANTHY_CHANNEL_OUTPUT_DIR")
+        if override:
+            return str(Path(override))
+        try:
+            return str(Path("/work/resource") / native_dir.relative_to(
+                Path("/opt/phanthy-motus/data")))
+        except ValueError:
+            return str(native_dir)
+
+    @staticmethod
+    def _default_stem(prefix):
+        return f"{prefix}_{time.time_ns()}"
+
+    @staticmethod
+    def _file_stem(args, key):
+        value = args.get(key)
+        if value is None or value == "":
+            return None
+        value = str(value).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", value):
+            raise ValueError("name must be 1-100 chars: letters, numbers, '.', '_' or '-' only")
+        return value
+
+    def get_tool(self):
+        return {
+            "name": self.CARD,
+            "type": "actuator",
+            "description": (
+                "拍照、录制视频以及管理 /opt/phanthy-motus/data/images 中的媒体文件。"
+                "照片 name 不含 .jpg，视频 name 不含 .mp4；拍摄成功后可使用返回的 "
+                "channel_reply_path 通过消息渠道发送。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["capture_image", "record_video", "start_recording",
+                                 "stop_recording", "list", "delete", "info", "start", "stop"],
+                        "description": "操作类型",
+                    },
+                    "image_name": {"type": "string", "description": "照片文件名（不含 .jpg），该项可以不填"},
+                    "video_name": {"type": "string", "description": "视频文件名（不含 .mp4），该项可以不填"},
+                    "name": {"type": "string", "description": "删除时填写完整文件名，必须包含 .jpg 或 .mp4"},
+                    "duration": {"type": "number", "description": "视频时长（秒），默认 5，最大 60"},
+                },
+                "required": ["action"],
+                "x-completion": {"actions": ["record_video"], "timeout": 60},
+                "x-action-params": {
+                    "capture_image": {"params": ["image_name"], "description": "拍照；不填 image_name 则使用 IMG_时间戳.jpg"},
+                    "record_video": {"params": ["video_name", "duration"], "description": "录制指定时长的视频；不填 video_name 则使用 VID_时间戳.mp4；duration 默认 5 秒、最大 60 秒"},
+                    "start_recording": {"params": ["video_name"], "description": "开始持续录制；不填 video_name 则使用 VID_时间戳.mp4"},
+                    "stop_recording": {"params": [], "description": "结束当前持续录制并保存视频"},
+                    "list": {"params": [], "description": "查询已保存的照片和视频"},
+                    "delete": {"params": ["name"], "description": "删除指定媒体；name 必须填写完整文件名，例如 test.jpg 或 test.mp4"},
+                    "info": {"params": [], "description": "查看相机和录制状态"},
+                    "start": {"params": [], "description": "启动相机"},
+                    "stop": {"params": [], "description": "停止相机"},
+                },
+            },
+        }
+
+    def start(self):
+        return {"state": "ready"}
+
+    def stop(self):
+        self._stop_recording()
+        return {"state": "idle"}
+
+    def _info(self):
+        with self._camera._lock:
+            state = dict(self._camera._state)
+        return {
+            "state": "running" if state.get("available") else state.get("state", "idle"),
+            "frame_available": bool(state.get("available")),
+            "source": "adam-zed-sdk-local",
+            "output_dir": str(self._output_dir),
+            "channel_output_dir": self._channel_dir,
+            "recording": bool(self._recording_thread and self._recording_thread.is_alive()),
+            "error": state.get("error"),
+        }
+
+    def _capture_image(self, args):
+        try:
+            stem = self._file_stem(args, "image_name") or self._default_stem("IMG")
+            frame = self._camera.capture_photo(self._timeout_s)
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{stem}.jpg"
+            path = self._output_dir / filename
+            if path.exists():
+                return {"error": f"file already exists: {filename}"}
+            path.write_bytes(frame["data"])
+            return {
+                "state": "captured", "filename": filename, "path": str(path),
+                "channel_reply_path": str(Path(self._channel_dir) / filename),
+                "mime": "image/jpeg", "size": path.stat().st_size,
+            }
+        except Exception as exc:
+            return {"error": f"failed to save JPEG: {exc}"}
+
+    def _list(self):
+        if not self._output_dir.exists():
+            return {"state": "listed", "files": []}
+        files = sorted(
+            (p for p in self._output_dir.iterdir()
+             if p.is_file() and p.suffix.lower() in (".jpg", ".mp4")),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+        return {"state": "listed", "files": [
+            {"filename": p.name, "path": str(p), "size": p.stat().st_size,
+             "mime": "image/jpeg" if p.suffix.lower() == ".jpg" else "video/mp4"}
+            for p in files]}
+
+    def _delete(self, args):
+        filename = args.get("name")
+        if not isinstance(filename, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|mp4)", filename, re.IGNORECASE):
+            return {"error": "name is required and must be a complete .jpg or .mp4 filename"}
+        path = self._output_dir / filename
+        if not path.is_file():
+            return {"error": f"file not found: {filename}"}
+        path.unlink()
+        return {"state": "deleted", "filename": [filename]}
+
+    def _video_result(self, path, duration=None):
+        result = {
+            "state": "recorded", "filename": path.name, "path": str(path),
+            "channel_reply_path": str(Path(self._channel_dir) / path.name),
+            "mime": "video/mp4", "size": path.stat().st_size,
+        }
+        if duration is not None:
+            result["duration"] = duration
+        return result
+
+    def _target_frame_count(self, elapsed_s, current_count):
+        """Keep encoded duration aligned with wall time if camera frames lag."""
+        return max(current_count + 1, int(round(elapsed_s * self._video_fps)))
+
+    def _record_loop(self, path, stop_event, duration=None):
+        command = [
+            "ffmpeg", "-loglevel", "error", "-y", "-f", "mjpeg",
+            "-framerate", str(self._video_fps), "-i", "pipe:0", "-an",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(path),
+        ]
+        process = None
+        started = time.monotonic()
+        frames_written = 0
+        error = None
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            while not stop_event.is_set():
+                if duration is not None and time.monotonic() - started >= duration:
+                    break
+                frame = self._camera.capture_photo(self._timeout_s)
+                elapsed = time.monotonic() - started
+                if duration is not None:
+                    elapsed = min(elapsed, duration)
+                # ZED frame delivery can be a little slower than the declared
+                # MP4 frame rate. Duplicate the newest frame when needed so a
+                # requested two-second recording remains two seconds instead
+                # of being shortened by the encoder's fixed frame timestamps.
+                target_count = self._target_frame_count(elapsed, frames_written)
+                while frames_written < target_count:
+                    process.stdin.write(frame["data"])
+                    frames_written += 1
+                process.stdin.flush()
+            process.stdin.close()
+            process.stdin = None
+            _, stderr = process.communicate(timeout=10)
+            if process.returncode:
+                error = stderr.decode("utf-8", "replace").strip() or f"ffmpeg exited {process.returncode}"
+        except Exception as exc:
+            error = str(exc)
+            if process is not None:
+                process.kill()
+                process.communicate()
+        finally:
+            self._recording_error = error
+
+    def _start_recording(self, args, duration=None):
+        try:
+            stem = self._file_stem(args, "video_name") or self._default_stem("VID")
+        except ValueError as exc:
+            return {"error": str(exc)}
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        path = self._output_dir / f"{stem}.mp4"
+        if path.exists():
+            return {"error": f"file already exists: {path.name}"}
+        with self._recording_lock:
+            if self._recording_thread and self._recording_thread.is_alive():
+                return {"error": f"recording already active: {self._recording_path.name}"}
+            self._recording_stop = threading.Event()
+            self._recording_path = path
+            self._recording_error = None
+            self._recording_thread = threading.Thread(
+                target=self._record_loop, args=(path, self._recording_stop, duration),
+                daemon=True, name="adam-vision-record")
+            self._recording_thread.start()
+        return {"state": "recording", "filename": path.name, "path": str(path),
+                "channel_reply_path": str(Path(self._channel_dir) / path.name), "mime": "video/mp4"}
+
+    def _stop_recording(self):
+        with self._recording_lock:
+            thread = self._recording_thread
+            path = self._recording_path
+            stop_event = self._recording_stop
+        if not thread or not stop_event:
+            return None
+        stop_event.set()
+        thread.join(timeout=self._timeout_s + 12)
+        with self._recording_lock:
+            if thread.is_alive():
+                return {"error": "timed out while stopping video recording"}
+            error = self._recording_error
+            self._recording_thread = self._recording_stop = self._recording_path = None
+        if error:
+            return {"error": f"failed to save MP4: {error}"}
+        if path and path.is_file() and path.stat().st_size:
+            return self._video_result(path)
+        return {"error": "recording produced no video frames"}
+
+    def dispatch(self, action, args):
+        args = args or {}
+        if action == "capture_image":
+            return self._capture_image(args)
+        if action == "list":
+            return self._list()
+        if action == "delete":
+            return self._delete(args)
+        if action == "start_recording":
+            return self._start_recording(args)
+        if action == "stop_recording":
+            return self._stop_recording() or {"state": "idle", "message": "no active recording"}
+        if action == "record_video" and not args.get("_background"):
+            from uuid import uuid4
+            action_id = f"camera_record_video_{uuid4().hex[:8]}"
+            background_args = dict(args, _background=True)
+            threading.Thread(target=self._record_video_async,
+                             args=(action_id, background_args), daemon=True,
+                             name="adam-record-video-action").start()
+            return {"state": "recording", "action_id": action_id,
+                    "video_name": args.get("video_name"),
+                    "duration": args.get("duration", self._default_video_seconds)}
+        if action == "record_video":
+            return self._record_video(args)
+        if action == "info":
+            return self._info()
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
+        return {"error": f"unknown action: {action}"}
+
+    def _record_video(self, args):
+        try:
+            duration = max(1.0, min(self._max_video_seconds, float(
+                args.get("duration", self._default_video_seconds))))
+        except (TypeError, ValueError) as exc:
+            return {"error": str(exc)}
+        started = self._start_recording(args, duration)
+        if started.get("state") != "recording":
+            return started
+        thread = self._recording_thread
+        thread.join(duration + self._timeout_s + 12)
+        result = self._stop_recording()
+        if result and result.get("state") == "recorded":
+            result["duration"] = duration
+        return result or {"error": "recording did not finish"}
+
+    def _record_video_async(self, action_id, args):
+        result = self._record_video(args)
+        status = "completed" if result.get("state") == "recorded" else "error"
+        _notify_action_completion(action_id, status, result, self.CARD)
+
 
 class ModelPlugin:
     """Returns URDF for 3D skeleton visualization on dashboard."""
@@ -2346,9 +2924,10 @@ class AdamDeviceBundle:
             and (ros2_enabled is None or ros2_enabled)
         )
         hand_enabled = plugins_cfg.get("hand", {}).get("enabled", True)
+        hand_state_enabled = plugins_cfg.get("hand_state", {}).get("enabled", True)
         self._hand_state_cache = (
             HandStateCache(dds_handstate_sub)
-            if hand_enabled else None
+            if hand_enabled or hand_state_enabled else None
         )
 
         # StatePlugin
@@ -2357,6 +2936,16 @@ class AdamDeviceBundle:
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
+            )
+            self._plugins.append(p)
+
+        # Physical emergency-stop sensor. This is intentionally read-only and
+        # observes PAC actuator/RCU power; the software FSM remains STOP both
+        # before and after Adam's physical emergency-stop button is pressed.
+        if plugins_cfg.get("estop", {}).get("enabled", True):
+            p = EStopPlugin(
+                plugins_cfg.get("estop", {}), namespace, executor,
+                grpc_client=grpc_client,
             )
             self._plugins.append(p)
 
@@ -2369,10 +2958,18 @@ class AdamDeviceBundle:
             self._plugins.append(p)
 
         # CameraPlugin
+        camera_plugin = None
         if plugins_cfg.get("camera", {}).get("enabled", False) and self._ros2_enabled:
-            p = ZedCameraPlugin(
+            camera_plugin = ZedCameraPlugin(
                 plugins_cfg.get("camera", {}), namespace, executor)
-            self._plugins.append(p)
+            self._plugins.append(camera_plugin)
+
+        # Capture is intentionally a separate card, while sharing the single
+        # locally attached ZED SDK instance owned by ``camera_plugin``.
+        if (plugins_cfg.get("vision_capture", {}).get("enabled", False)
+                and camera_plugin is not None):
+            self._plugins.append(VisionCapturePlugin(
+                plugins_cfg.get("vision_capture", {}), camera_plugin))
 
         # ArmPlugin
         if plugins_cfg.get("arm", {}).get("enabled", True) and self._ros2_enabled:
@@ -2382,11 +2979,16 @@ class AdamDeviceBundle:
             )
             self._plugins.append(p)
 
-        # HandPlugin
+        # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
+            self._plugins.append(p)
+        if hand_state_enabled and self._hand_state_cache is not None and self._ros2_enabled:
+            p = HandStatePlugin(
+                plugins_cfg.get("hand_state", {}), namespace, executor,
+                state_cache=self._hand_state_cache)
             self._plugins.append(p)
 
         # ModelPlugin

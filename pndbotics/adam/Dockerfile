@@ -5,15 +5,19 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip cmake build-essential curl git \
+RUN sed -i 's|http://mirrors.tencentyun.com/ubuntu-ports|http://ports.ubuntu.com/ubuntu-ports|g' /etc/apt/sources.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip cmake build-essential curl git ffmpeg \
     libturbojpeg libusb-1.0-0 libegl1 libgles2 libv4l-0 \
     libx11-6 libxext6 libbsd0 python3-pil && \
     rm -rf /var/lib/apt/lists/*
 
-# Python dependencies
+# Python dependencies. Keep the deployed runtime identical to local installs;
+# generated protobuf/gRPC modules enforce the minimum versions listed here.
+COPY requirements.txt /tmp/adam-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml numpy grpcio protobuf
+    -r /tmp/adam-requirements.txt && \
+    rm -f /tmp/adam-requirements.txt
 
 # CycloneDDS 0.10.2 (required by pnd_sdk_python)
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
@@ -40,6 +44,7 @@ COPY resource/      /work/resource/
 COPY common/ /work/common/
 COPY main.py        /work/main.py
 COPY device.py      /work/device.py
+COPY estop.py       /work/estop.py
 COPY grpc_client.py /work/grpc_client.py
 COPY config.yaml    /work/config.yaml
 COPY deploy/        /deploy/
@@ -47,11 +52,12 @@ COPY deploy/        /deploy/
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+ENV RCUTILS_COLORIZED_OUTPUT=0
 ENV PYTHONPATH=/work:/opt/pyzed
 ENV PYTHONUNBUFFERED=1
 ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 ENV ZED_PYTHON_PATH=/opt/pyzed
 
-EXPOSE 15702
+EXPOSE 15722
 
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]

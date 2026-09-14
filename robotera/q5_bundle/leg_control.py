@@ -122,7 +122,10 @@ class Plugin:
                                 "x-completion": {
                                     "actions": ["set", "zero"],
                                     "timeout": 30,
-                                }}}
+                                },
+                                # Hip/knee/ankle. Independent of the arms, the waist
+                                # and the speaker.
+                                "x-resource": "leg"}}
 
     @staticmethod
     def _wait_future(future, timeout):

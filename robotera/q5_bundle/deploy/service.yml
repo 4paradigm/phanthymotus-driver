@@ -6,6 +6,7 @@ robotera-q5:
   env_file:
     - /opt/phanthy-motus/.env
   volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /home/nvidia/teleop_client/install:/opt/teleop_client/install:ro
     - /home/nvidia/cyclonedds-orin.xml:/etc/cyclonedds/q5.xml:ro
@@ -13,6 +14,10 @@ robotera-q5:
     - Q5_ROS_DOMAIN_ID=211
     - AGENT_CORE_ROS_DOMAIN_ID=42
     - Q5_CYCLONEDDS_URI=file:///etc/cyclonedds/q5.xml
+    # 只作用于 FastDDS，即 domain 42 上与 agent-core 的那一侧（q5_media_bridge.py）。
+    # 本体走 CycloneDDS + domain 211（Q5_CYCLONEDDS_URI / rmw_cyclonedds_cpp），
+    # 不受本文件影响。
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - ROS_LOCALHOST_ONLY=0
     - PYTHONUNBUFFERED=1
   logging:

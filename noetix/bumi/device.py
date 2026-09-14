@@ -5,6 +5,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 插件列表：
   - StatePlugin: joints (21-DOF skeleton), imu, battery, model (URDF resource)
   - StateRecordPlugin: one-click persistent JSON snapshots of selectable states
+  - VisionCapturePlugin: persistent RGB photos and videos
   - LocoPlugin: locomotion, stand-up/prone storage, semantic actions and action recording
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
@@ -18,8 +19,11 @@ import copy
 import json
 import math
 import os
-import re
 import struct
+import select
+import ssl
+import tempfile
+import urllib.request
 import subprocess
 import threading
 import time
@@ -262,6 +266,7 @@ class _BumiStateNode(Node):
         return entry
 
 
+
 class StatePlugin:
     PREFIX = "state"
 
@@ -312,11 +317,6 @@ class StatePlugin:
 
     def stop(self) -> None:
         self._node.stop_polling()
-
-    def snapshot(self, source: str, max_age_s: float) -> dict:
-        if source not in {"imu", "battery", "joints"}:
-            raise ValueError(f"Unsupported state source: {source}")
-        return self._node.snapshot(source, max_age_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -954,6 +954,11 @@ class LocoPlugin:
 
 def _mic_subprocess(namespace: str):
     """Mic capture subprocess — polls MediaController, publishes AudioChunk."""
+    # A fresh interpreter does not inherit the parent's atomic log writer.
+    # Idempotent when the launcher has already installed it before importing device.
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     import os as _os
     _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
     import sys as _sys
@@ -1047,7 +1052,10 @@ class MicPlugin:
         import sys
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
-             f"import sys; sys.path.insert(0, '/work'); from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
+             # Protect import-time output as well as the child entry point.
+             "import sys; sys.path.insert(0, '/work'); "
+             "from common import logsafe; logsafe.install(check_fd=False); "
+             f"from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         # Forward subprocess stdout in background
@@ -1799,6 +1807,11 @@ class SpeakerPlugin:
 
 def _camera_subprocess(namespace: str):
     """Camera subprocess — captures Realsense D435i color+depth, publishes to ROS2."""
+    # Match the Q5 camera worker's child-process logging protection.
+    # Idempotent when the launcher has already installed it before importing device.
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     import time as _time
     import numpy as _np
 
@@ -1896,6 +1909,61 @@ def _camera_subprocess(namespace: str):
         pipeline.stop()
 
 
+class _CameraFrameNode(Node):
+    """Caches the existing color JPEG stream for persistent vision capture."""
+
+    def __init__(self, color_topic: str):
+        super().__init__("bumi_camera_frame_cache")
+        self._color_topic = color_topic
+        self._condition = threading.Condition()
+        self._sequence = 0
+        self._latest: dict | None = None
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._sub = self.create_subscription(
+            CompressedImage, color_topic, self._on_frame, qos)
+
+    def _on_frame(self, msg: CompressedImage) -> None:
+        received_at = datetime.now().astimezone()
+        frame = {
+            "topic": self._color_topic,
+            "format": msg.format or "jpeg",
+            "width": 640,
+            "height": 480,
+            "ros_timestamp": {
+                "sec": int(msg.header.stamp.sec),
+                "nanosec": int(msg.header.stamp.nanosec),
+            },
+            "received_at": received_at.isoformat(),
+            "timestamp_ms": received_at.timestamp() * 1000,
+            "received_monotonic": time.monotonic(),
+            "data": bytes(msg.data),
+        }
+        with self._condition:
+            self._sequence += 1
+            frame["frame_sequence"] = self._sequence
+            self._latest = frame
+            self._condition.notify_all()
+
+    def wait_for_frame(self, after_sequence=None, timeout_s=5.0):
+        """Read a cached frame, or wait for a strictly later sequence."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with self._condition:
+            if after_sequence is None and self._latest is not None:
+                return dict(self._latest), self._sequence
+            baseline = self._sequence if after_sequence is None else after_sequence
+            while self._sequence <= baseline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, self._sequence
+                self._condition.wait(remaining)
+            return dict(self._latest), self._sequence
+
+
 class CameraPlugin:
     PREFIX = "camera"
 
@@ -1904,6 +1972,8 @@ class CameraPlugin:
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._proc: subprocess.Popen | None = None
+        self._frame_node = _CameraFrameNode(self._color_topic)
+        executor.add_node(self._frame_node)
 
     def get_tools(self) -> list:
         return [
@@ -1929,7 +1999,10 @@ class CameraPlugin:
         import sys
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
-             f"import sys; sys.path.insert(0, '/work'); from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
+             # Protect import-time output as well as the child entry point.
+             "import sys; sys.path.insert(0, '/work'); "
+             "from common import logsafe; logsafe.install(check_fd=False); "
+             f"from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         def _fwd():
@@ -1941,6 +2014,12 @@ class CameraPlugin:
         if self._proc:
             self._proc.terminate()
             self._proc = None
+
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
+        return self._frame_node.wait_for_frame(after_sequence, timeout_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -2209,9 +2288,6 @@ class MotionStatePlugin:
     def stop(self):
         self._node.stop_polling()
 
-    def snapshot(self, max_age_s: float) -> dict:
-        return self._node.snapshot(max_age_s)
-
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "running"}
@@ -2232,7 +2308,7 @@ class StateRecordPlugin:
         "record_joints": ("joints",),
         "record_motion_state": ("motion_state",),
         "record_all": ("imu", "battery", "joints", "motion_state"),
-        # Reserved contract only. No camera topic or bytes are consumed in v1.
+        # Reserved contract only. Use vision_capture for real photos/video.
         "record_camera": ("camera",),
     }
 
@@ -2255,7 +2331,7 @@ class StateRecordPlugin:
             "record_joints": "保存最新 21 个关节状态、IMU 四元数和工作模式。",
             "record_motion_state": "保存最新整机运动状态、关节统计和故障信息。",
             "record_all": "把 IMU、电池、关节和整机运动状态保存到同一个 JSON 文件。",
-            "record_camera": "预留的相机记录接口；第一版未接入图像数据流，调用会明确返回未实现且不会创建文件。",
+            "record_camera": "相机记录的兼容预留项；请使用 vision_capture 卡片保存照片或视频。",
         }
         return {
             "name": "state_record",
@@ -2263,7 +2339,7 @@ class StateRecordPlugin:
             "multiInstance": False,
             "description": (
                 "Bumi 状态记录：选择一种状态或全部状态，点击执行后把当前最新快照保存成可直接查看的 JSON 文件。"
-                "相机选项仅预留接口，第一版不读取或保存照片。"
+                "照片和视频请使用 vision_capture 卡片。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -2289,8 +2365,6 @@ class StateRecordPlugin:
         }
 
     def start(self) -> None:
-        # Create lazily on the first record too, but doing it here surfaces a
-        # bad mount or permissions early in the container logs.
         self._storage_dir.mkdir(parents=True, exist_ok=True)
 
     def stop(self) -> None:
@@ -2313,7 +2387,7 @@ class StateRecordPlugin:
                 "saved": False,
                 "source": "camera",
                 "interface_reserved": True,
-                "error": "Camera recording is reserved but not connected to the image stream in version 1.",
+                "error": "Use the vision_capture card to save photos or videos.",
             }
         return self._record(action, args.get("label", ""))
 
@@ -2356,7 +2430,7 @@ class StateRecordPlugin:
             "camera": {
                 "interface_reserved": True,
                 "connected": False,
-                "description": "Version 1 does not consume the camera image stream.",
+                "description": "Use the independent vision_capture card for camera media.",
             },
         }
         serialized = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
@@ -2400,5 +2474,335 @@ class StateRecordPlugin:
                 raise RuntimeError("MotionStatePlugin is disabled or unavailable")
             return self._motion_state_plugin.snapshot(self._max_age_s)
         if source == "camera":
-            raise NotImplementedError("Camera recording interface is not connected in version 1")
+            raise NotImplementedError("Use the vision_capture card for camera media")
         raise ValueError(f"Unsupported state source: {source}")
+
+
+# ── VisionCapturePlugin (persistent RGB photos and videos) ──────────────────
+
+CARD = "vision_capture"
+_FIRST_FRAME_TIMEOUT_S = 5.0
+
+
+def _vision_acp_notify(action_id, status, result, tool):
+    """Report the asynchronous terminal result using the same ACP API as Q5."""
+    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    payload = json.dumps({"action_id": action_id, "status": status,
+                          "result": result, "tool": tool, "ts": time.time()}).encode()
+    request = urllib.request.Request(
+        f"{url}/api/acp/complete", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    # The local Agent Core endpoint uses a self-signed certificate.
+    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    try:
+        with urllib.request.urlopen(request, timeout=5, context=context) as response:
+            response.read()
+    except Exception as exc:
+        print(f"[Bumi ACP] callback failed for {action_id}: {exc}", flush=True)
+
+
+class VisionCapturePlugin:
+    PREFIX = "vision_capture"
+
+    def __init__(self, plugin_config, camera_plugin):
+        self._worker = camera_plugin
+        self._output_dir = Path(str(plugin_config.get(
+            "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
+        self._fps = max(1, min(15, int(plugin_config.get("fps", 15))))
+        self._max_duration_s = max(1, min(30, int(plugin_config.get("max_duration_s", 30))))
+        self._recording_lock = threading.Lock()
+        self._active_recording = None
+
+    def get_tool(self):
+        return {
+            "name": CARD, "type": "actuator", "multiInstance": False,
+            "description": "Capture a Bumi RGB photo or record a video (1–30 seconds) to persistent storage.",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "info", "stop"]},
+                "duration_s": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5,
+                               "description": "默认值为5秒（可填写1–30秒）"},
+            }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {
+                    "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
+                    "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
+                    "record_video": {"params": ["duration_s"], "description": "录制并保存 1–30 秒 RGB 视频，默认 5 秒。"},
+                    "info": {"params": [], "description": "查看保存目录与相机状态。"},
+                    "stop": {"params": [], "description": "取消当前录像并删除未完成的视频。"},
+                },
+                "x-completion": {
+                    "actions": ["record_video"],
+                    "timeout": self._max_duration_s + 15,
+                }},
+        }
+
+    def get_tools(self):
+        return [self.get_tool()]
+
+    def start(self):
+        return {"state": "ready" if self._camera_ready() else "error"}
+
+    def stop(self):
+        # ``BumiDeviceBundle.stop_all`` calls this during SIGTERM/redeploy. Completing
+        # the ACP action here prevents Agent Core from retaining a pending
+        # recording while the daemon thread and its encoder are torn down.
+        return self._stop_recording()
+
+    def _camera_ready(self):
+        return self._worker is not None and self._worker.is_running()
+
+    def _info(self):
+        frame = None
+        if self._camera_ready():
+            try:
+                frame, _ = self._frame(timeout_s=0)
+            except RuntimeError:
+                pass
+        timestamp_ms = (frame or {}).get("timestamp_ms", 0)
+        age = round(max(0.0, time.time() - timestamp_ms / 1000), 2) if timestamp_ms else None
+        with self._recording_lock:
+            active = ({key: self._active_recording.get(key) for key in
+                       ("action_id", "state", "duration_s", "started_at", "path")}
+                      if self._active_recording else None)
+        return {"ok": self._camera_ready(), "output_dir": str(self._output_dir),
+                "photos_dir": str(self._output_dir / "photos"),
+                "videos_dir": str(self._output_dir / "videos"), "fps": self._fps,
+                "max_duration_s": self._max_duration_s, "latest_frame_age_s": age,
+                "source": "bumi_camera", "active_recording": active}
+
+    def _frame(self, after_sequence=None, timeout_s=_FIRST_FRAME_TIMEOUT_S):
+        if not self._camera_ready():
+            raise RuntimeError("Bumi camera worker is unavailable")
+        frame, sequence = self._worker.wait_for_color_frame(after_sequence, timeout_s)
+        if not isinstance(frame, dict) or not frame.get("data"):
+            raise RuntimeError("No RGB frame has arrived yet")
+        timestamp_ms = frame.get("timestamp_ms", 0)
+        if timestamp_ms and time.time() - timestamp_ms / 1000 > 3.0:
+            frame, sequence = self._worker.wait_for_color_frame(sequence, timeout_s)
+            if (not isinstance(frame, dict) or not frame.get("data") or
+                    (frame.get("timestamp_ms") and
+                     time.time() - frame["timestamp_ms"] / 1000 > 3.0)):
+                raise RuntimeError("No fresh RGB frame has arrived yet")
+        return frame, sequence
+
+    def _capture_photo(self, args):
+        try:
+            frame, _ = self._frame()
+            directory = self._output_dir / "photos"
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = directory / f"IMG_{stamp}.jpg"
+            # Exclusive creation protects an existing photo from a timestamp collision.
+            with path.open("xb") as output:
+                try:
+                    output.write(frame["data"])
+                except Exception:
+                    path.unlink(missing_ok=True)
+                    raise
+            return {"ok": True, "media_type": "photo", "file_path": str(path),
+                    "captured_at": datetime.now().isoformat(timespec="seconds"),
+                    "frame_age_s": round(max(0.0, time.time() - frame.get("timestamp_ms", 0) / 1000), 2)}
+        except Exception as exc:
+            return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
+
+    @staticmethod
+    def _cancelled_result():
+        return {"ok": False, "code": "RECORD_CANCELLED",
+                "message": "Video recording was cancelled"}
+
+    def _set_recording_value(self, active, key, value):
+        if active is None:
+            return
+        with self._recording_lock:
+            if self._active_recording is active:
+                active[key] = value
+
+    def _finish_recording(self, active, status, result):
+        """Send one ACP terminal event and release the active-recording slot."""
+        with self._recording_lock:
+            if active.get("finished"):
+                return False
+            active["finished"] = True
+            if self._active_recording is active:
+                self._active_recording = None
+            action_id = active["action_id"]
+        _vision_acp_notify(action_id, status, result, CARD)
+        return True
+
+    @staticmethod
+    def _terminate_encoder(process):
+        if process is None:
+            return
+        try:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2)
+        except Exception:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _write_video_frame(process, data, cancel_event):
+        # A stalled encoder must not block stop/shutdown indefinitely.
+        fd = process.stdin.fileno()
+        pending = memoryview(data)
+        deadline = time.monotonic() + 5.0
+        while pending:
+            if cancel_event.is_set():
+                return False
+            if process.poll() is not None:
+                raise RuntimeError("ffmpeg exited while encoding")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("ffmpeg input timed out")
+            if not select.select([], [fd], [], 0.1)[1]:
+                continue
+            try:
+                written = os.write(fd, pending)
+                pending = pending[written:]
+            except BlockingIOError:
+                continue
+        return True
+
+    def _record_video(self, requested, cancel_event, active=None):
+        process = None
+        path = None
+        completed = False
+        try:
+            _, sequence = self._frame()
+            if cancel_event.is_set():
+                return self._cancelled_result()
+            directory = self._output_dir / "videos"
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            candidate = directory / f"video_{stamp}.mp4"
+            # Reserve this exact name; cleanup may only remove our own file.
+            with candidate.open("xb"):
+                pass
+            path = candidate
+            self._set_recording_value(active, "path", str(path))
+            # A file avoids the stderr pipe filling up and deadlocking ffmpeg.
+            with tempfile.TemporaryFile() as error_log:
+                process = subprocess.Popen([
+                    "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg",
+                    "-r", str(self._fps), "-i", "-", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(path),
+                ], stdin=subprocess.PIPE, stderr=error_log, bufsize=0)
+                self._set_recording_value(active, "process", process)
+                os.set_blocking(process.stdin.fileno(), False)
+                frames, deadline = 0, time.monotonic() + requested
+                while time.monotonic() < deadline and not cancel_event.is_set():
+                    tick = time.monotonic()
+                    frame, sequence = self._frame(
+                        after_sequence=sequence,
+                        timeout_s=max(0.25, 2.0 / self._fps),
+                    )
+                    if not self._write_video_frame(process, frame["data"], cancel_event):
+                        break
+                    frames += 1
+                    cancel_event.wait(min(
+                        max(0.0, 1.0 / self._fps - (time.monotonic() - tick)),
+                        max(0.0, deadline - time.monotonic())))
+                if cancel_event.is_set():
+                    return self._cancelled_result()
+                process.stdin.close()
+                if process.wait(timeout=10) != 0 or not frames or not path.stat().st_size:
+                    error_log.seek(0)
+                    message = error_log.read(4096).decode("utf-8", "replace")
+                    raise RuntimeError(message.strip() or "ffmpeg failed to create MP4")
+                if cancel_event.is_set():
+                    return self._cancelled_result()
+                completed = True
+                return {"ok": True, "media_type": "video", "file_path": str(path),
+                        "recorded_duration_s": requested, "frames": frames,
+                        "captured_at": datetime.now().isoformat(timespec="seconds")}
+        except Exception as exc:
+            if cancel_event.is_set():
+                return self._cancelled_result()
+            return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
+        finally:
+            self._terminate_encoder(process)
+            self._set_recording_value(active, "process", None)
+            if not completed and path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    print(f"[vision_capture] could not remove partial video {path}: {exc}", flush=True)
+
+    def _record_video_async(self, active, requested):
+        result = self._record_video(requested, active["cancel_event"], active)
+        if result.get("ok"):
+            status = "completed"
+        elif result.get("code") == "RECORD_CANCELLED":
+            status = "cancelled"
+        else:
+            status = "error"
+        self._finish_recording(active, status, result)
+
+    def _start_video_recording(self, args):
+        try:
+            requested = args.get("duration_s", 5)
+            if isinstance(requested, bool) or not isinstance(requested, int):
+                raise ValueError("duration_s must be an integer")
+        except (TypeError, ValueError):
+            return {"ok": False, "code": "INVALID_DURATION", "message": "duration_s must be an integer"}
+        if not 1 <= requested <= self._max_duration_s:
+            return {"ok": False, "code": "INVALID_DURATION", "message": f"duration_s must be between 1 and {self._max_duration_s}"}
+        if not self._camera_ready():
+            return {"ok": False, "code": "RECORD_FAILED", "message": "Bumi camera worker is unavailable"}
+        with self._recording_lock:
+            if self._active_recording:
+                return {"ok": False, "code": "RECORD_IN_PROGRESS", "message": "A video recording is already in progress",
+                        "action_id": self._active_recording["action_id"]}
+            action_id = f"vision_capture_record_video_{time.time_ns()}"
+            cancel_event = threading.Event()
+            active = {"action_id": action_id, "state": "recording", "duration_s": requested,
+                      "started_at": datetime.now().isoformat(timespec="seconds"),
+                      "cancel_event": cancel_event, "process": None, "path": None,
+                      "finished": False}
+            thread = threading.Thread(target=self._record_video_async,
+                                      args=(active, requested), daemon=True,
+                                      name="bumi_vision_capture_record_video")
+            active["thread"] = thread
+            self._active_recording = active
+            thread.start()
+        return {"ok": True, "state": "queued", "action_id": action_id, "media_type": "video",
+                "requested_duration_s": requested, "message": "Video recording started; completion will be reported asynchronously."}
+
+    def _stop_recording(self):
+        with self._recording_lock:
+            active = self._active_recording
+            if not active:
+                return {"state": "idle", "message": "No video recording is in progress"}
+            active["state"] = "stopping"
+            active["cancel_event"].set()
+            process = active.get("process")
+        self._terminate_encoder(process)
+        # Keep the slot until the worker has removed its partial output. A new
+        # recording must not race cleanup of a cancelled recording.
+        active["thread"].join(timeout=6)
+        state = "stopping" if active["thread"].is_alive() else "idle"
+        return {"ok": True, "state": state, "action_id": active["action_id"],
+                "message": "Video recording cancelled" if state == "idle"
+                else "Waiting for video recording to cancel"}
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready" if self._camera_ready() else "error",
+                    "message": "" if self._camera_ready() else "Bumi camera worker is unavailable"}
+        if action == "info":
+            return self._info()
+        if action == "capture_photo":
+            return self._capture_photo(args)
+        if action == "record_video":
+            return self._start_video_recording(args)
+        if action == "stop":
+            return self._stop_recording()
+        return None

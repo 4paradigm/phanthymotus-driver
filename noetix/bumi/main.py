@@ -56,12 +56,72 @@ def _resolve_namespace(cfg: dict) -> str:
 
 # ── Bundle ────────────────────────────────────────────────────────────────────
 
+# The factory App video-transfer service opens Bumi's RealSense device before
+# this driver starts. librealsense then cannot negotiate the RGB+depth profile
+# and the camera worker exits with "Couldn't resolve requests". Bumi supports
+# either App video transfer or this driver's direct camera Card, not both. The
+# service deployment shares the host PID namespace and is privileged, so nsenter
+# can invoke the host's systemctl rather than a non-existent systemd here.
+_VENDOR_VIDEO_CAPTURE_SERVICE = "noetix-video-capture.service"
+
+
+def _disable_vendor_video_capture_service(cfg: dict) -> None:
+    """Stop and disable the host service that monopolizes the RealSense camera.
+
+    This is best-effort: failing to access the host's systemd must not prevent
+    the non-camera Bumi cards from registering. The service name is fixed in
+    code instead of accepting an arbitrary command from YAML.
+    """
+    camera_cfg = cfg.get("plugins", {}).get("camera", {})
+    if not camera_cfg.get("enabled", False):
+        return
+    if not camera_cfg.get("disable_vendor_capture_service", False):
+        return
+
+    command = [
+        "nsenter", "--target", "1", "--mount", "--",
+        "systemctl", "disable", "--now", "--no-ask-password",
+        _VENDOR_VIDEO_CAPTURE_SERVICE,
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=15, check=False,
+        )
+    except FileNotFoundError:
+        print(
+            "[camera] WARNING: nsenter is unavailable; cannot release host "
+            f"camera service {_VENDOR_VIDEO_CAPTURE_SERVICE}", flush=True,
+        )
+        return
+    except subprocess.TimeoutExpired:
+        print(
+            "[camera] WARNING: timed out while releasing host camera service "
+            f"{_VENDOR_VIDEO_CAPTURE_SERVICE}", flush=True,
+        )
+        return
+
+    if result.returncode == 0:
+        print(
+            "[camera] App video-transfer service stopped and disabled; "
+            "Phanthy camera/depth Cards may now use the RealSense directly: "
+            f"{_VENDOR_VIDEO_CAPTURE_SERVICE}", flush=True,
+        )
+        return
+
+    detail = (result.stderr or result.stdout).strip()
+    print(
+        "[camera] WARNING: could not stop/disable host camera service "
+        f"{_VENDOR_VIDEO_CAPTURE_SERVICE} (exit {result.returncode}): {detail}",
+        flush=True,
+    )
+
 class BumiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
         state_plugin = None
         motion_state_plugin = None
+        camera_plugin = None
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
@@ -86,7 +146,8 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
-            self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, executor))
+            camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
+            self._plugins.append(camera_plugin)
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
@@ -102,6 +163,12 @@ class BumiDeviceBundle:
                 plugins_cfg["state_record"], state_plugin, motion_state_plugin))
             print("[bundle] StateRecordPlugin loaded")
 
+        if plugins_cfg.get("vision_capture", {}).get("enabled", False):
+            from device import VisionCapturePlugin
+            self._plugins.append(VisionCapturePlugin(
+                plugins_cfg["vision_capture"], camera_plugin))
+            print("[bundle] VisionCapturePlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:
@@ -113,7 +180,8 @@ class BumiDeviceBundle:
         print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
-        for p in self._plugins:
+        # Stop media consumers before tearing down the camera producer.
+        for p in reversed(self._plugins):
             p.stop()
         print("[bundle] All plugins stopped")
 
@@ -274,6 +342,9 @@ def main():
     mcp_port  = int(cfg.get("mcp_port", 15704))
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
+
+    # Must happen before the CameraPlugin creates its RealSense pipeline.
+    _disable_vendor_video_capture_service(cfg)
 
     # ── Initialize Noetix SDK ──
     high_ctrl = None
