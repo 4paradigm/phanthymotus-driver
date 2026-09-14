@@ -15,6 +15,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 
 class FakeClock:
@@ -178,7 +179,7 @@ class FakeMedia:
             self.config_calls.append(("set_volume", start, self.clock.monotonic()))
 
 
-def load_speaker(clock):
+def load_speaker(clock, acp_notify=lambda *_: None):
     path = Path(__file__).resolve().parents[1] / "device.py"
     source = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     selected = [node for node in source.body if (
@@ -192,6 +193,7 @@ def load_speaker(clock):
     namespace = {
         "time": clock, "threading": threading, "copy": copy, "struct": struct,
         "Node": FakeNode, "AudioChunk": SimpleNamespace, "_LOW_LAT_QOS": object(),
+        "uuid4": uuid4, "_acp_notify": acp_notify,
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
     return namespace["SpeakerPlugin"]
@@ -201,7 +203,14 @@ class SpeakerTest(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
         self.media = FakeMedia(self.clock)
-        self.speaker = load_speaker(self.clock)(
+        self.acp_notifications = []
+        self.acp_event = threading.Event()
+
+        def notify(action_id, status, result, tool):
+            self.acp_notifications.append((action_id, status, result, tool))
+            self.acp_event.set()
+
+        self.speaker = load_speaker(self.clock, notify)(
             {}, "bumi", SimpleNamespace(add_node=lambda _: None), self.media,
         )
         self.node = self.speaker._node
@@ -209,6 +218,8 @@ class SpeakerTest(unittest.TestCase):
         patch.dict(sys.modules, {"mediacontrol_py": SimpleNamespace(AudioStream=SimpleNamespace)}).start()
 
     def action(self, action, **args):
+        if action in self.speaker._LONG_ACTIONS:
+            return self.speaker._run_long_action(action, args)
         return self.speaker.dispatch(action, args)
 
     def names(self):
@@ -239,6 +250,72 @@ class SpeakerTest(unittest.TestCase):
         self.assertEqual(actions, {"start", "play", "stop", "info", "get_volume", "set_volume", "wakeup", "sleep", "reset"})
         self.assertEqual(actions, set(schema["x-action-params"]))
         self.assertEqual(schema["x-action-params"]["play"]["params"], ["input_topic"])
+        self.assertEqual(
+            set(schema["x-completion"]["actions"]),
+            {"start", "play", "wakeup", "sleep", "reset"},
+        )
+        self.assertEqual(schema["x-completion"]["timeout"], 60)
+        self.assertEqual(schema["x-resource"], "mouth")
+
+    def test_long_action_is_queued_and_conflicting_writes_return_busy(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def block_first_set(name, enabled):
+            if not entered.is_set():
+                entered.set()
+                if not release.wait(2):
+                    raise RuntimeError("test gate timed out")
+
+        self.media.on_set = block_first_set
+        queued = self.speaker.dispatch("wakeup", {})
+        self.assertEqual(queued["state"], "queued")
+        self.assertTrue(queued["action_id"].startswith("speaker_wakeup_"))
+        self.assertTrue(entered.wait(1))
+        active = self.speaker._active_action
+        try:
+            info = self.speaker.dispatch("info", {})
+            self.assertEqual(info["active_action"]["action_id"], queued["action_id"])
+            for action, args in (
+                ("play", {"input_topic": "/new"}),
+                ("stop", {}),
+                ("set_volume", {"volume": 120}),
+            ):
+                with self.subTest(action=action):
+                    busy = self.speaker.dispatch(action, args)
+                    self.assertEqual(busy["state"], "busy")
+                    self.assertEqual(busy["active_action_id"], queued["action_id"])
+            self.assertEqual(self.speaker.dispatch("get_volume", {}), {"volume": 100})
+        finally:
+            release.set()
+            active["thread"].join(2)
+        self.assertFalse(active["thread"].is_alive())
+        self.assertEqual(len(self.acp_notifications), 1)
+        action_id, status, result, tool = self.acp_notifications[0]
+        self.assertEqual((action_id, status, tool), (queued["action_id"], "completed", "speaker"))
+        self.assertEqual(result["state"], "awake")
+        self.assertIsNone(self.speaker._active_action)
+
+    def test_failed_long_action_posts_one_error_completion(self):
+        self.media.hold_wakeup = True
+        queued = self.speaker.dispatch("wakeup", {})
+        self.assertEqual(queued["state"], "queued")
+        self.assertTrue(self.acp_event.wait(1))
+        self.assertEqual(len(self.acp_notifications), 1)
+        action_id, status, result, tool = self.acp_notifications[0]
+        self.assertEqual((action_id, status, tool), (queued["action_id"], "error", "speaker"))
+        self.assertEqual(result["stage"], "wakeup")
+        active = self.speaker._active_action
+        if active is not None:
+            active["thread"].join(1)
+        self.assertIsNone(self.speaker._active_action)
+
+    def test_invalid_async_play_request_is_rejected_before_queueing(self):
+        result = self.speaker.dispatch("play", {"input_topic": "  "})
+        self.assertEqual(result["state"], "error")
+        self.assertNotIn("action_id", result)
+        self.assertIsNone(self.speaker._active_action)
+        self.assertEqual(self.acp_notifications, [])
 
     def test_used_media_apis_exist_in_bundled_vendor_bindings(self):
         path = Path(__file__).resolve().parents[1] / "noetix_sdk_bumi/examples_py/mediacontrol_py.pyi"
@@ -464,6 +541,42 @@ class SpeakerTest(unittest.TestCase):
             self.speaker._destroy_subscription()
         self.assertIs(self.speaker._sub, subscription)
         self.assertEqual(self.node.subscriptions, [subscription])
+
+    def test_wakeup_destroy_failure_best_effort_closes_external_route(self):
+        self.action("start", input_topic="/tts")
+        old_callback = self.speaker._sub.callback
+        self.node.destroy_failures = 1
+        result = self.action("wakeup")
+        self.assertEqual(result["state"], "error")
+        self.assertEqual(result["stage"], "stop_previous_playback")
+        self.assertTrue(result["cleanup"]["external_route_closed"])
+        self.assertTrue(result["cleanup"]["stale_callbacks_invalidated"])
+        self.assertFalse(self.media.routes[self.speaker._EXTERNAL_PLAYBACK_ROUTE])
+        self.assertTrue(any(
+            step["step"] == "destroy_subscription"
+            for step in result["errors"]
+        ))
+        route_step = next(
+            step for step in result["steps"]
+            if step["step"] == self.speaker._EXTERNAL_PLAYBACK_ROUTE
+        )
+        self.assertEqual(route_step["phase"], "failure_cleanup")
+        old_callback(self.chunk())
+        self.assertEqual(self.media.published, [])
+
+    def test_wakeup_destroy_and_route_failures_are_both_reported(self):
+        self.action("start", input_topic="/tts")
+        self.node.destroy_exceptions = 1
+        route = self.speaker._EXTERNAL_PLAYBACK_ROUTE
+        self.media.failures[f"set_{route}_enable"] = -1
+        result = self.action("wakeup")
+        self.assertEqual(result["state"], "error")
+        self.assertFalse(result["cleanup"]["external_route_closed"])
+        self.assertEqual(
+            {step["step"] for step in result["errors"]},
+            {"destroy_subscription", route},
+        )
+        self.assertTrue(self.media.routes[route])
 
     def test_sleep_preserves_external_subscription_and_playback(self):
         self.action("play", input_topic="/tts")

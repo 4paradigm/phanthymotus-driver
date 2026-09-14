@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 import rclpy
 from rclpy.node import Node
@@ -1052,6 +1053,7 @@ class MicPlugin:
 
 class SpeakerPlugin:
     PREFIX = "speaker"
+    _LONG_ACTIONS = frozenset(("start", "play", "wakeup", "sleep", "reset"))
     _AGENT_ROUTES = (
         "internal_capture_audio_data_to_agent",
         "external_custom_audio_data_to_agent",
@@ -1077,6 +1079,11 @@ class SpeakerPlugin:
         # which change the shared MediaController audio state so a
         # start/stop sequence cannot interleave.
         self._control_lock = threading.RLock()
+        # Long media transitions are reported through ACP. Keep a separate
+        # short lock for their lifecycle so conflicting MCP requests return
+        # ``busy`` instead of waiting behind a multi-second control operation.
+        self._action_lock = threading.Lock()
+        self._active_action = None
         self._audio_mode = "idle"
         self._desired_routes = {}
         self._last_system_status = {}
@@ -1487,7 +1494,23 @@ class SpeakerPlugin:
             detached, _ = self._detach_external_subscription_locked()
             self._audio_mode = "unknown"
             if not detached:
-                return self._finish_control("error", "stop_previous_playback")
+                # Generation invalidation already prevents stale callbacks
+                # from submitting PCM. Still close the shared SDK playback
+                # route best-effort before returning so local ROS cleanup and
+                # MediaController routing cannot remain inconsistent.
+                cleanup_start = len(self._control_steps)
+                external_closed = self._write_route(
+                    self._EXTERNAL_PLAYBACK_ROUTE, False,
+                )
+                for step in self._control_steps[cleanup_start:]:
+                    step["phase"] = "failure_cleanup"
+                return self._finish_control(
+                    "error", "stop_previous_playback",
+                    cleanup={
+                        "external_route_closed": external_closed,
+                        "stale_callbacks_invalidated": True,
+                    },
+                )
 
             # Validate the current state before changing routes. Do not
             # automatically restart ERROR_SLEEPED here: explicit reset keeps
@@ -1667,6 +1690,11 @@ class SpeakerPlugin:
                         "description": "Set volume (0-200)",
                     },
                 },
+                "x-completion": {
+                    "actions": sorted(self._LONG_ACTIONS),
+                    "timeout": 60,
+                },
+                "x-resource": "mouth",
             },
             "topic_in": [{
                 "format": "audio/pcm-16k",
@@ -1684,18 +1712,13 @@ class SpeakerPlugin:
     def dispatch(self, action: str, args: dict) -> dict | None:
         args.pop('_tool_name', None)
 
-        # The canvas starts a card with 'start' plus the resolved input_topic
-        # (web/js/canvas.js). Explicit play and canvas start share one path.
-        if action in ("start", "play"):
-            return self._start_playback(args, action=action)
+        if action in self._LONG_ACTIONS:
+            return self._queue_long_action(action, args)
         if action == "stop":
-            return self._stop_playback()
-        if action == "wakeup":
-            return self._do_wakeup()
-        if action == "sleep":
-            return self._do_sleep()
-        if action == "reset":
-            return self._do_reset()
+            with self._action_lock:
+                if self._active_action is not None:
+                    return self._busy_result(self._active_action)
+                return self._stop_playback()
         if action == "info":
             topic_in = [{
                 "format": "audio/pcm-16k",
@@ -1721,6 +1744,7 @@ class SpeakerPlugin:
                 "state": "playing" if self._playing else self._audio_mode,
                 "audio_mode": self._audio_mode,
                 "operation_in_progress": self._operation,
+                "active_action": self._active_action_info(),
                 "subscription_present": self._sub is not None,
                 "subscription_active": self._sub is not None and self._playing,
                 "topic_in": topic_in,
@@ -1750,21 +1774,128 @@ class SpeakerPlugin:
                     raise ValueError("volume must be between 0 and 200")
             except (TypeError, ValueError) as exc:
                 return {"state": "error", "error": str(exc)}
-            with self._control_lock:
-                self._begin_control("set_volume")
-                try:
-                    with self._config_lock:
-                        self._wait_for_config_slot()
-                        try:
-                            self._media_ctrl.set_volume(vol)
-                        finally:
-                            self._last_config_change = time.monotonic()
-                except Exception as exc:
-                    self._record_step("set_volume", "failed", message=str(exc))
-                    return self._finish_control("error", "set_volume")
-                self._record_step("set_volume", "submitted", volume=vol)
-                return self._finish_control("set", "complete", volume=vol)
+            with self._action_lock:
+                if self._active_action is not None:
+                    return self._busy_result(self._active_action)
+                with self._control_lock:
+                    self._begin_control("set_volume")
+                    try:
+                        with self._config_lock:
+                            self._wait_for_config_slot()
+                            try:
+                                self._media_ctrl.set_volume(vol)
+                            finally:
+                                self._last_config_change = time.monotonic()
+                    except Exception as exc:
+                        self._record_step("set_volume", "failed", message=str(exc))
+                        return self._finish_control("error", "set_volume")
+                    self._record_step("set_volume", "submitted", volume=vol)
+                    return self._finish_control("set", "complete", volume=vol)
         return None
+
+    @staticmethod
+    def _busy_result(active: dict) -> dict:
+        return {
+            "state": "busy",
+            "active_action": active["action"],
+            "active_action_id": active["action_id"],
+            "message": "Another Speaker transition is still running",
+        }
+
+    def _active_action_info(self) -> dict | None:
+        with self._action_lock:
+            active = self._active_action
+            if active is None:
+                return None
+            return {
+                "action": active["action"],
+                "action_id": active["action_id"],
+                "state": active["state"],
+                "started_at": active["started_at"],
+            }
+
+    def _run_long_action(self, action: str, args: dict) -> dict:
+        # The canvas starts a card with 'start' plus the resolved input_topic
+        # (web/js/canvas.js). Explicit play and canvas start share one path.
+        if action in ("start", "play"):
+            return self._start_playback(args, action=action)
+        if action == "wakeup":
+            return self._do_wakeup()
+        if action == "sleep":
+            return self._do_sleep()
+        if action == "reset":
+            return self._do_reset()
+        return {"state": "error", "error": f"Unsupported long action: {action}"}
+
+    def _finish_async_action(self, active: dict, status: str, result: dict) -> None:
+        try:
+            _acp_notify(active["action_id"], status, result, self.PREFIX)
+        finally:
+            with self._action_lock:
+                if self._active_action is active:
+                    self._active_action = None
+
+    def _run_long_action_async(self, active: dict, args: dict) -> None:
+        try:
+            result = self._run_long_action(active["action"], args)
+            status = (
+                "error"
+                if result.get("state") in {"error", "resetting"}
+                else "completed"
+            )
+        except Exception as exc:
+            result = {
+                "state": "error",
+                "stage": "worker",
+                "action": active["action"],
+                "error": str(exc),
+            }
+            status = "error"
+        self._finish_async_action(active, status, result)
+
+    def _queue_long_action(self, action: str, args: dict) -> dict:
+        if action in ("start", "play") and not str(
+            args.get("input_topic") or ""
+        ).strip():
+            return {
+                "state": "error",
+                "error": "input_topic is required",
+                "audio_mode": self._audio_mode,
+            }
+
+        with self._action_lock:
+            if self._active_action is not None:
+                return self._busy_result(self._active_action)
+            action_id = f"speaker_{action}_{uuid4().hex}"
+            active = {
+                "action": action,
+                "action_id": action_id,
+                "state": "running",
+                "started_at": time.time(),
+            }
+            thread = threading.Thread(
+                target=self._run_long_action_async,
+                args=(active, dict(args)),
+                daemon=True,
+                name=f"bumi_speaker_{action}",
+            )
+            active["thread"] = thread
+            self._active_action = active
+            try:
+                thread.start()
+            except Exception as exc:
+                self._active_action = None
+                return {
+                    "state": "error",
+                    "action": action,
+                    "error": f"Could not start Speaker worker: {exc}",
+                }
+        return {
+            "state": "queued",
+            "action": action,
+            "action_id": action_id,
+            "message": "Speaker transition started; completion will be reported asynchronously.",
+        }
 
     def _stop_playback(self) -> dict:
         with self._control_lock:
@@ -2335,8 +2466,8 @@ CARD = "vision_capture"
 _FIRST_FRAME_TIMEOUT_S = 5.0
 
 
-def _vision_acp_notify(action_id, status, result, tool):
-    """Report the asynchronous terminal result using the same ACP API as Q5."""
+def _acp_notify(action_id, status, result, tool):
+    """Report an asynchronous terminal result to Agent Core."""
     url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
     payload = json.dumps({"action_id": action_id, "status": status,
                           "result": result, "tool": tool, "ts": time.time()}).encode()
@@ -2476,7 +2607,7 @@ class VisionCapturePlugin:
             if self._active_recording is active:
                 self._active_recording = None
             action_id = active["action_id"]
-        _vision_acp_notify(action_id, status, result, CARD)
+        _acp_notify(action_id, status, result, CARD)
         return True
 
     @staticmethod

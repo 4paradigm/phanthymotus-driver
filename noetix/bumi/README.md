@@ -157,6 +157,16 @@ The canvas already sends `start` with its resolved input topic; explicit `play`
 now appears in the schema and uses exactly the same implementation. Merely
 constructing/starting the driver bundle does not select a Speaker mode.
 
+`start`, `play`, `wakeup`, `sleep` and `reset` are multi-second physical
+transitions. They return immediately with `state=queued` and a unique
+`action_id`; their final result is posted to Agent Core's ACP completion
+endpoint. The schema declares a 60-second completion timeout and the `mouth`
+physical resource. Only one such Speaker transition may run at a time. While
+one is active, another mode-changing action, `stop`, or `set_volume` returns
+`state=busy` with the active action ID instead of blocking the MCP request.
+`info` and `get_volume` remain available; `info.active_action` exposes the
+running action and ID.
+
 `audio_mode` tracks this Speaker instance's selected policy (`idle`,
 `external_playback`, `vendor_agent`, or `unknown`), separately from the SDK's
 `work_status`. It is not a hardware-wide ownership guarantee. `wakeup` hands the
@@ -200,7 +210,11 @@ command as a completed switch.
   send `sleep`, or append a secondary error. Its two Agent prerequisites remain
   enabled, while the old external subscription stays detached and cannot send
   PCM even though the external SDK route has not yet been closed. The mode is
-  reported as `unknown` until a later successful action establishes it.
+  reported as `unknown` until a later successful action establishes it. An
+  earlier subscription-destruction failure is handled more conservatively:
+  stale callbacks are invalidated and the external playback route is closed
+  best-effort before returning; destruction and route-cleanup errors are both
+  retained when both operations fail.
 - Activation failure prevents a new subscription (or removes it if creation
   fails), stops external delivery and attempts all Agent isolation steps.
   It does not restore the previous stream or Agent mode. Failed isolation
