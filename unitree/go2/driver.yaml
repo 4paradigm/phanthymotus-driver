@@ -26,6 +26,7 @@ cards:
   - { name: imu,           type: sensor }
   - { name: battery,       type: sensor }
   - { name: joints,        type: sensor }
+  - { name: remote_controller, type: sensor }
   - { name: motion_switcher, type: actuator }
   - { name: lidar_cloud,   type: sensor }
   - { name: pos_tag,       type: sensor }
