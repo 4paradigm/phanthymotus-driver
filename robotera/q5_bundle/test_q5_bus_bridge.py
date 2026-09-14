@@ -94,22 +94,22 @@ class Q5BusBridgeTests(unittest.TestCase):
         self.assertIn("<interfaceWhiteList>", profile_source)
         self.assertIn("<address>127.0.0.1</address>", profile_source)
 
-    def test_media_bridge_promotes_legacy_profile_to_canonical_name(self):
+    def test_media_bridge_ignores_inherited_legacy_profile(self):
         with mock.patch.dict(os.environ, {
-            "FASTRTPS_DEFAULT_PROFILES_FILE": __file__,
+            "FASTRTPS_DEFAULT_PROFILES_FILE": "/opt/phanthy-motus/dds-local.xml",
         }, clear=True):
             profile = q5_media_bridge.configure_fastdds_transport()
-            self.assertEqual(profile, __file__)
+            self.assertEqual(profile, str(q5_media_bridge.DEFAULT_FASTDDS_PROFILE))
             self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], profile)
             self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
 
-    def test_media_bridge_prefers_canonical_profile_over_stale_legacy_value(self):
+    def test_media_bridge_ignores_inherited_canonical_profile(self):
         with mock.patch.dict(os.environ, {
-            "FASTDDS_DEFAULT_PROFILES_FILE": __file__,
-            "FASTRTPS_DEFAULT_PROFILES_FILE": "/etc/fastdds/stale.xml",
+            "FASTDDS_DEFAULT_PROFILES_FILE": "/etc/fastdds/canonical.xml",
+            "FASTRTPS_DEFAULT_PROFILES_FILE": "/opt/phanthy-motus/dds-local.xml",
         }, clear=True):
             profile = q5_media_bridge.configure_fastdds_transport()
-            self.assertEqual(profile, __file__)
+            self.assertEqual(profile, str(q5_media_bridge.DEFAULT_FASTDDS_PROFILE))
             self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
 
     def test_media_bridge_rejects_missing_default_loopback_profile(self):
@@ -119,17 +119,15 @@ class Q5BusBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Fast DDS loopback profile is missing"):
                 q5_media_bridge.configure_fastdds_transport()
 
-    def test_media_bridge_rejects_missing_configured_profile(self):
-        missing = "/missing/custom-fastdds.xml"
-        with mock.patch.dict(os.environ, {
-            "FASTDDS_DEFAULT_PROFILES_FILE": missing,
-        }, clear=True):
-            with self.assertRaisesRegex(RuntimeError, missing):
-                q5_media_bridge.configure_fastdds_transport()
-
     def test_media_bridge_child_installs_logsafe_before_ros(self):
         source = Path(q5_media_bridge.__file__).read_text()
         worker_source = source[source.index("def _run_bridge_subprocess"):]
+        self.assertLess(worker_source.index("logsafe.install(check_fd=False)"),
+                        worker_source.index("import rclpy"))
+
+    def test_camera_worker_child_installs_logsafe_before_ros(self):
+        source = Path(__file__).with_name("q5_camera_worker.py").read_text()
+        worker_source = source[source.index("def _run_camera_worker"):]
         self.assertLess(worker_source.index("logsafe.install(check_fd=False)"),
                         worker_source.index("import rclpy"))
 
