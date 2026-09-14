@@ -1208,12 +1208,18 @@ _REMOTE_BUTTONS_BYTE3 = (
     ("Y", 3), ("X", 2), ("B", 1), ("A", 0),
 )
 _AXIS_DEADZONE = 0.1
+_REMOTE_CONTROL_LEVEL = "LOWLEVEL"
+_REMOTE_STALE_AFTER = 0.5
 
 
 def _parse_wireless_remote(raw) -> dict:
     """Decode Go2 LowState_.wireless_remote into one stateless card snapshot."""
     if raw is None or len(raw) < 24:
-        return {"available": False}
+        return {
+            "available": False,
+            "fresh": False,
+            "control_level": _REMOTE_CONTROL_LEVEL,
+        }
 
     b2, b3 = int(raw[2]), int(raw[3])
     buttons = {
@@ -1227,6 +1233,8 @@ def _parse_wireless_remote(raw) -> dict:
     }
     return {
         "available": True,
+        "fresh": True,
+        "control_level": _REMOTE_CONTROL_LEVEL,
         "buttons": buttons,
         "axes": axes,
         "active": any(buttons.values()) or any(abs(value) > _AXIS_DEADZONE for value in axes.values()),
@@ -1324,10 +1332,10 @@ class _LowStateNode(Node):
 
         # Remote controller: throttle to 10 Hz.
         if now - self._last_remote_time >= self._REMOTE_INTERVAL:
-            self._last_remote_time = now
             remote = _parse_wireless_remote(getattr(msg, "wireless_remote", None))
             remote["timestamp_ms"] = int(time.time() * 1000)
             with self._remote_lock:
+                self._last_remote_time = now
                 self._last_remote = remote
             remote_out = String()
             remote_out.data = json.dumps(remote)
@@ -1336,7 +1344,11 @@ class _LowStateNode(Node):
     @property
     def last_remote(self) -> dict | None:
         with self._remote_lock:
-            return copy.deepcopy(self._last_remote)
+            remote = copy.deepcopy(self._last_remote)
+            last_remote_time = self._last_remote_time
+        if remote is not None and remote["available"]:
+            remote["fresh"] = time.monotonic() - last_remote_time <= _REMOTE_STALE_AFTER
+        return remote
 
 
 class StatePlugin:

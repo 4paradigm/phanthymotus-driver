@@ -40,6 +40,8 @@ def test_parse_all_zero():
     result = device._parse_wireless_remote(remote_bytes())
 
     assert result["available"] is True
+    assert result["fresh"] is True
+    assert result["control_level"] == "LOWLEVEL"
     assert result["active"] is False
     assert len(result["buttons"]) == 13
     assert "back" not in result["buttons"]
@@ -56,6 +58,22 @@ def test_parse_button_a_uses_sdk_wire_bit_layout():
     assert result["buttons"]["A"] is True
     assert sum(result["buttons"].values()) == 1
     assert result["active"] is True
+
+
+def test_parse_full_sdk_button_mapping():
+    mapping = (
+        (2, 5, "LT"), (2, 4, "RT"), (2, 2, "start"),
+        (2, 1, "LB"), (2, 0, "RB"),
+        (3, 7, "left"), (3, 6, "down"), (3, 5, "right"), (3, 4, "up"),
+        (3, 3, "Y"), (3, 2, "X"), (3, 1, "B"), (3, 0, "A"),
+    )
+
+    for byte_index, bit, name in mapping:
+        raw = remote_bytes()
+        raw[byte_index] = 1 << bit
+        result = device._parse_wireless_remote(raw)
+        assert {key for key, pressed in result["buttons"].items() if pressed} == {name}
+        assert result["active"] is True
 
 
 def test_parse_ignores_reserved_back_bit():
@@ -79,7 +97,11 @@ def test_parse_axis_lx_and_deadzone():
 
 
 def test_parse_none_is_unavailable():
-    assert device._parse_wireless_remote(None) == {"available": False}
+    assert device._parse_wireless_remote(None) == {
+        "available": False,
+        "fresh": False,
+        "control_level": "LOWLEVEL",
+    }
 
 
 def test_lowstate_publishes_and_caches_remote_snapshot():
@@ -100,10 +122,16 @@ def test_lowstate_publishes_and_caches_remote_snapshot():
          mock.patch.object(device.time, "time", return_value=123.456):
         node._on_state(types.SimpleNamespace(wireless_remote=raw))
 
-    assert node.last_remote["timestamp_ms"] == 123456
-    assert node.last_remote["buttons"]["A"] is True
+    with mock.patch.object(device.time, "monotonic", return_value=100.1):
+        cached = node.last_remote
+    assert cached["timestamp_ms"] == 123456
+    assert cached["buttons"]["A"] is True
+    assert cached["fresh"] is True
+    assert cached["control_level"] == "LOWLEVEL"
     published = node._remote_pub.publish.call_args.args[0]
     assert '"active": true' in published.data
+    with mock.patch.object(device.time, "monotonic", return_value=100.51):
+        assert node.last_remote["fresh"] is False
 
 
 def state_plugin():
