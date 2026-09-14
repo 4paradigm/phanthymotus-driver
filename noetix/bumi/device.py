@@ -318,6 +318,10 @@ class StatePlugin:
     def stop(self) -> None:
         self._node.stop_polling()
 
+    def snapshot(self, source: str, max_age_s: float) -> dict:
+        """Expose the state node's latest sample to sibling plugins."""
+        return self._node.snapshot(source, max_age_s)
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "running"}
@@ -2287,6 +2291,10 @@ class MotionStatePlugin:
 
     def stop(self):
         self._node.stop_polling()
+
+    def snapshot(self, max_age_s: float) -> dict:
+        """Expose the motion node's latest sample to sibling plugins."""
+        return self._node.snapshot(max_age_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
