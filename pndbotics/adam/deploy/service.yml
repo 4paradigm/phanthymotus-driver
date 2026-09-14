@@ -7,6 +7,7 @@ pndbotics-adam:
   pid: host
   privileged: true
   volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     # ZED SDK binaries and the Jetson/aarch64 pyzed extension are provided by
@@ -16,10 +17,14 @@ pndbotics-adam:
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - DDS_NETWORK_INTERFACE=eno1
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - RCUTILS_COLORIZED_OUTPUT=0
     - PYTHONUNBUFFERED=1
-    - GRPC_HOST=localhost
-    - GRPC_PORT=6666
+    # Adam's RL server runs on the x86 controller. These remain environment
+    # overrides so another deployment topology can replace them.
+    - GRPC_HOST=10.10.20.127
+    - GRPC_PORT=50051
     - NVIDIA_VISIBLE_DEVICES=all
     - NVIDIA_DRIVER_CAPABILITIES=all
     - ZED_PYTHON_PATH=/opt/pyzed

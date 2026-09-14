@@ -1,5 +1,5 @@
 id: tianyi2-driver
-name: Tianyi 2.0 Pro Bundle
+name: X-humanoid Tianyi 2.0 Pro Bundle
 category: driver
 hardware_provider: x-humanoid
 hardware_model: "tianyi2.0"
@@ -40,7 +40,6 @@ cards:
   - { name: voice_play,         type: actuator }
   - { name: nav,                type: actuator }
   - { name: home,               type: actuator }
-  - { name: chat,               type: actuator }
   - { name: voice_chat,         type: actuator }
   - { name: controlled_spatial, type: actuator }
   - { name: spatial_map,        type: actuator }
