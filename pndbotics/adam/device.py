@@ -765,6 +765,10 @@ class LocoPlugin:
     """Adam locomotion state-machine card backed by the RL gRPC service."""
 
     PREFIX = "loco"
+    # JSON Schema enums render as a selector in the Dashboard.  The server
+    # remains authoritative: it rejects a state that is not currently listed
+    # by GetRobotState.switchable_states.
+    MODE_OPTIONS = ["STOP", "ZERO", "STAND_WALK", "MULTI_AGENT", "MOTION_TRACK"]
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  grpc_client, **kwargs):
@@ -787,8 +791,12 @@ class LocoPlugin:
                     },
                     "mode": {
                         "type": "string",
+                        "enum": self.MODE_OPTIONS,
                         "minLength": 1,
-                        "description": "Target state name returned by get_state.switchable_states",
+                        "description": (
+                            "Choose a state returned by get_state.switchable_states; "
+                            "unavailable transitions are rejected by the robot"
+                        ),
                     },
                 },
                 "required": ["action"],

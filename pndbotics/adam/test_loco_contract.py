@@ -27,6 +27,10 @@ class LocoContractTests(unittest.TestCase):
 
         mode_schema = plugin.get_tool()["inputSchema"]["properties"]["mode"]
         self.assertEqual(mode_schema["type"], "string")
+        self.assertEqual(
+            mode_schema["enum"],
+            ["STOP", "ZERO", "STAND_WALK", "MULTI_AGENT", "MOTION_TRACK"],
+        )
         actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(actions, ["set_mode", "get_state", "list_actions", "info"])
 
