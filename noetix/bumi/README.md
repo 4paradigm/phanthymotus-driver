@@ -146,10 +146,10 @@ The tool schema exposes these actions through the existing card action controls:
 | Action | Behaviour |
 | --- | --- |
 | `start` / `play` | Require `input_topic`, disable vendor Agent routes, sleep an awake Agent, then enable external PCM playback and subscribe. Sound begins when upstream AudioChunk data arrives; this is not a test-tone or file-playback action. |
-| `wakeup` | Stop external PCM, close its playback route, enable internal microphone → vendor Agent and vendor Agent → speaker, resume capture/playback, then wake the Agent if needed. External custom audio → Agent stays disabled. |
+| `wakeup` | If external PCM is active, detach its subscription, close only that route, and let the change settle. Confirm a healthy media state and wake the Agent first; only after WAKEUPED configure internal microphone → Agent and Agent → speaker, keep both external-audio routes disabled, wait for configuration to settle, then resume capture/playback. An already-idle card does not send a leading pause or route write. |
 | `sleep` | Close all three vendor Agent routes and sleep an awake Agent. Leave any external PCM subscription and playback route untouched; never pause capture/playback here. |
 | `stop` | Stop external PCM only. In `vendor_agent` mode this is a no-op, including when the Agent itself is temporarily SLEEPED. Canvas stop and driver lifecycle stop do not explicitly disable that mode; use `sleep` to exit it. |
-| `reset` | Map to `MediaController.restart()`, not a robot/factory reset. Stop PCM, wait for CMD_RESET followed by healthy READY/SLEEPED, then reapply route isolation. Leave idle; do not automatically wake or resume PCM. |
+| `reset` | Map to `MediaController.restart()`, not a robot/factory reset. Detach PCM locally, wait for CMD_RESET followed by healthy READY/SLEEPED, and only then reapply route isolation. Leave idle; do not automatically wake or resume PCM. If the media module is still at EXIT/CMD_RESET when the bounded wait ends, return `state=resetting`, `stage=pending`, without writing routes during that transition. |
 | `info` | Report mode, in-progress operation, external PCM statistics, media status/error, desired routes, cached SDK readback and the last control result. |
 | `get_volume` / `set_volume` | Read / set volume (0–200). Volume changes do not select a mode. |
 
@@ -180,17 +180,26 @@ recovery can interrupt microphone capture even though no Mic code changes.
 
 Speaker serializes mode changes and volume writes. Every configuration setter
 attempt, including a failed attempt and a volume write, leaves at least **0.8 s**
-before the next setter. The PCM callback does not acquire the control/config
-locks, so `sleep` configuration waits do not block an existing external stream.
-Allow several seconds for a normal mode switch and longer for recovery; do not
-interpret the first submitted command as a completed switch.
+before the next setter. `wakeup` and completed `reset` also wait 0.8 s after the
+last route setter before sending subsequent media commands or returning. The PCM
+callback does not acquire the control/config locks, so `sleep` configuration
+waits do not block an existing external stream. Allow several seconds for a
+normal mode switch and longer for recovery; do not interpret the first submitted
+command as a completed switch.
 
 - Route setters get one retry per step. Wake/sleep/restart commands are not
   blindly repeated within an action. Wake/sleep status waits are bounded at
   8 s; reset waits are bounded at 20 s and require observing CMD_RESET before
   accepting a subsequent healthy READY/SLEEPED sample.
-- `start`/`play`/`wakeup` retain automatic restart recovery for ERROR_SLEEPED.
-  Ordinary `sleep` never starts a reset, avoiding disruption of external PCM.
+- `start`/`play` retain automatic restart recovery for ERROR_SLEEPED. `wakeup`
+  does not hide that fault behind an automatic restart: it reports the original
+  status and requires an explicit `reset`. Ordinary `sleep` never starts a
+  reset, avoiding disruption of external PCM.
+- A failed/timed-out `wakeup` stops at the original failure. It does not invoke
+  generic activation cleanup, write Agent routes, send `sleep`, or append a
+  secondary error. If external PCM was active, its local subscription remains
+  detached and its playback route remains closed; the mode is reported as
+  `unknown` until a later successful action establishes it.
 - Activation failure prevents a new subscription (or removes it if creation
   fails), stops external delivery and attempts all Agent isolation steps.
   It does not restore the previous stream or Agent mode. Failed isolation
@@ -199,8 +208,9 @@ interpret the first submitted command as a completed switch.
   subscription state, SDK status/error and suggested next action. Cleanup
   errors are retained alongside the initial failure. Inspect connectivity and
   the errors, then retry the desired action, or use explicit `reset` for a
-  media-module fault. Explicit reset still attempts recovery if its pre-reset
-  cleanup fails, and rechecks isolation afterward.
+  media-module fault. A reset command failure reports the first failure without
+  route cleanup. A reset that remains at EXIT/CMD_RESET reports `pending`; route
+  isolation is applied only after a complete recovery is observed.
 - Desired routes are intentions. SDK route setters submit commands and their
   getters may return cached values, not per-command acknowledgements. `info`
   exposes both separately. Other SDK clients/processes are not serialized by

@@ -1156,6 +1156,14 @@ class SpeakerPlugin:
         if remaining > 0:
             time.sleep(remaining)
 
+    def _settle_after_config(self) -> None:
+        """Wait one full config interval before non-config media commands."""
+        with self._config_lock:
+            self._wait_for_config_slot()
+        self._record_step(
+            "route_settle", "observed", minimum_interval_s=_AUDIO_CONFIG_INTERVAL_S,
+        )
+
     def _set_config(
         self, getter_name: str, setter_name: str, enabled: bool, force: bool = False
     ) -> bool:
@@ -1397,9 +1405,20 @@ class SpeakerPlugin:
         slept = self._sleep_agent()
         return routes_closed and slept
 
-    def _stop_external_locked(self) -> bool:
-        """Internal transition helper; public stop must preserve Agent mode."""
+    def _detach_external_subscription_locked(self) -> tuple[bool, bool]:
+        """Stop local PCM delivery without changing any MediaController state.
+
+        Returns ``(detached, had_external_playback)``.  Keeping this separate
+        lets wakeup/reset avoid global pause or route commands when the card is
+        already idle, and lets reset detach ROS before issuing ``restart()``
+        without writing configuration during the reset transition.
+        """
         with self._frame_lock:
+            had_external_playback = (
+                self._playing
+                or self._sub is not None
+                or self._audio_mode in {"external_playback", "unknown"}
+            )
             self._playing = False
             self._subscription_generation += 1
         detached = True
@@ -1409,6 +1428,11 @@ class SpeakerPlugin:
             detached = False
             self._record_step("destroy_subscription", "failed", message=str(exc))
         self._input_topic = ""
+        return detached, had_external_playback
+
+    def _stop_external_locked(self) -> bool:
+        """Internal transition helper; public stop must preserve Agent mode."""
+        detached, _ = self._detach_external_subscription_locked()
         paused = self._call_control("pause_audio_playback")
         closed = self._write_route(self._EXTERNAL_PLAYBACK_ROUTE, False)
         return detached and paused and closed
@@ -1460,36 +1484,65 @@ class SpeakerPlugin:
     def _do_wakeup(self) -> dict:
         with self._control_lock:
             self._begin_control("wakeup")
-            if not self._stop_external_locked():
-                return self._activation_failed("stop_previous_playback")
+            detached, had_external_playback = self._detach_external_subscription_locked()
             self._audio_mode = "unknown"
-            if not self._ensure_media_ready():
-                return self._activation_failed("media_recovery")
-            # Reassert external-off after recovery; restart may reset routes.
-            external_off = self._write_route(self._EXTERNAL_PLAYBACK_ROUTE, False)
-            input_off = self._write_route("external_custom_audio_data_to_agent", False)
-            if not (external_off and input_off):
-                return self._activation_failed("agent_routes")
-            for route in ("internal_capture_audio_data_to_agent", "internal_agent_audio_data_to_playback"):
-                if not self._write_route(route, True):
-                    return self._activation_failed("agent_routes")
-            if not self._call_control("resume_audio_capture"):
-                return self._activation_failed("resume_capture")
-            if not self._call_control("resume_audio_playback"):
-                return self._activation_failed("resume_playback")
+            if not detached:
+                return self._finish_control("error", "stop_previous_playback")
+
+            # Only touch the external route when this card actually owned an
+            # external stream.  An idle wakeup reaches the vendor wakeup call
+            # without a preceding pause or route write.
+            external_route_closed = False
+            if had_external_playback:
+                if not self._write_route(self._EXTERNAL_PLAYBACK_ROUTE, False):
+                    return self._finish_control("error", "stop_previous_playback")
+                external_route_closed = True
+                self._settle_after_config()
+
+            # Wakeup is a state transition, not a route-setting side effect.
+            # Do not automatically restart ERROR_SLEEPED here and do not send
+            # cleanup commands after a failed wakeup; preserving the first
+            # failure is more useful than cascading route/sleep errors.
             status = self._stable_status()
-            if status is None or self._is_error_status(status):
-                if status is not None:
-                    self._record_step("wakeup", "failed", message="Media module entered ERROR_SLEEPED", observed=status)
-                return self._activation_failed("wakeup")
+            if status is None:
+                return self._finish_control("error", "media_ready")
+            if self._is_error_status(status):
+                self._record_step(
+                    "media_ready", "failed",
+                    message="Media module is in ERROR_SLEEPED; use reset before wakeup",
+                    observed=status,
+                )
+                return self._finish_control("error", "media_ready")
+            self._record_step("media_ready", "observed", observed=status)
             if status["work_status"] != "WAKEUPED":
                 if not self._call_control("wakeup"):
-                    return self._activation_failed("wakeup")
+                    return self._finish_control("error", "wakeup")
                 status, awake = self._wait_for_status({"WAKEUPED"}, _AUDIO_AGENT_TRANSITION_TIMEOUT_S)
                 if not awake:
                     self._record_step("wait_wakeup", "failed", message="Agent did not enter WAKEUPED", observed=status)
-                    return self._activation_failed("wakeup")
+                    return self._finish_control("error", "wakeup")
+            else:
+                self._record_step("wakeup", "not_needed", observed=status)
             self._record_step("wait_wakeup", "observed", observed=status)
+
+            # The state transition succeeded.  Configure the Agent data path
+            # afterwards, with the SDK-required gap between every setter and
+            # one additional interval before resume calls.
+            route_plan = [
+                ("internal_capture_audio_data_to_agent", True),
+                ("external_custom_audio_data_to_agent", False),
+                ("internal_agent_audio_data_to_playback", True),
+            ]
+            if not external_route_closed:
+                route_plan.append((self._EXTERNAL_PLAYBACK_ROUTE, False))
+            for route, enabled in route_plan:
+                if not self._write_route(route, enabled):
+                    return self._finish_control("error", "agent_routes")
+            self._settle_after_config()
+            if not self._call_control("resume_audio_capture"):
+                return self._finish_control("error", "resume_capture")
+            if not self._call_control("resume_audio_playback"):
+                return self._finish_control("error", "resume_playback")
             self._audio_mode = "vendor_agent"
             return self._finish_control("awake", "complete")
 
@@ -1509,20 +1562,39 @@ class SpeakerPlugin:
     def _do_reset(self) -> dict:
         with self._control_lock:
             self._begin_control("reset")
-            self._stop_external_locked()
-            self._close_agent_routes()
-            # Explicit reset must remain usable when pre-reset cleanup fails.
-            for step in self._control_steps:
-                if step["status"] == "failed":
-                    step["status"] = "warning"
-                    step["phase"] = "pre_reset_cleanup"
+            # Invalidate PCM callbacks and detach ROS locally first, but do not
+            # send pause/route commands before restart.  More importantly, do
+            # not write any configuration while the SDK reports CMD_RESET.
+            detached, _ = self._detach_external_subscription_locked()
+            if not detached:
+                for step in self._control_steps:
+                    if step["status"] == "failed":
+                        step["status"] = "warning"
+                        step["phase"] = "pre_reset_detach"
             self._audio_mode = "unknown"
             if not self._restart_agent():
-                return self._activation_failed("reset")
-            external_closed = self._stop_external_locked()
-            isolated = self._isolate_vendor_agent()
-            if not (external_closed and isolated):
-                return self._finish_control("error", "post_reset_cleanup")
+                status = self._last_system_status
+                if status.get("work_status") == "EXIT" or status.get("reason") == "CMD_RESET":
+                    for step in reversed(self._control_steps):
+                        if step["step"] == "wait_reset" and step["status"] == "failed":
+                            step["status"] = "pending"
+                            step["message"] = "Media module is still resetting; no route commands were sent"
+                            break
+                    return self._finish_control(
+                        "resetting", "pending", pending=True,
+                        next_action="Wait for READY/SLEEPED, then retry reset or the desired audio action.",
+                    )
+                return self._finish_control("error", "reset")
+
+            # A reset can restore SDK defaults.  Only after the complete
+            # CMD_RESET -> READY/SLEEPED transition do we reapply isolation.
+            if self._sub is not None:
+                detached, _ = self._detach_external_subscription_locked()
+            external_closed = self._write_route(self._EXTERNAL_PLAYBACK_ROUTE, False)
+            isolated = self._close_agent_routes()
+            self._settle_after_config()
+            if not (detached and external_closed and isolated):
+                return self._finish_control("error", "post_reset_isolation")
             self._audio_mode = "idle"
             return self._finish_control("idle", "complete")
 
@@ -1565,7 +1637,7 @@ class SpeakerPlugin:
                     },
                     "wakeup": {
                         "params": [],
-                        "description": "Stop external playback and enable the vendor voice Agent using the robot microphone and speaker",
+                        "description": "Stop external playback, wake the vendor Agent, then enable its robot microphone and speaker routes",
                     },
                     "sleep": {
                         "params": [],
@@ -1573,7 +1645,7 @@ class SpeakerPlugin:
                     },
                     "reset": {
                         "params": [],
-                        "description": "Restart the shared media module, then isolate the Agent and leave external playback stopped; may interrupt microphone capture",
+                        "description": "Restart the shared media module, wait for recovery, then isolate the Agent and leave external playback stopped; may return resetting while recovery is pending",
                     },
                     "info": {
                         "params": [],

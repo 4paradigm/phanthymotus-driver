@@ -74,6 +74,7 @@ class FakeMedia:
     def __init__(self, clock):
         self.clock = clock
         self.calls = []
+        self.timed_calls = []
         self.config_calls = []
         self.routes = dict.fromkeys(self.ROUTES, True)
         self.work, self.reason = "READY", "NONE"
@@ -84,11 +85,13 @@ class FakeMedia:
         self.published = []
         self.hold_wakeup = False
         self.hold_sleep = False
+        self.hold_reset = False
         self.reset_ack = True
         self.on_set = None
 
     def _record(self, name, *args):
         self.calls.append((name, args))
+        self.timed_calls.append((name, self.clock.monotonic()))
         specific = (name, *args)
         key = specific if specific in self.failures else name
         count = self.failures.get(key, 0)
@@ -150,6 +153,10 @@ class FakeMedia:
     def restart(self):
         self._record("restart")
         self.routes = dict.fromkeys(self.ROUTES, True)
+        if self.hold_reset:
+            self.work, self.reason = "EXIT", "CMD_RESET"
+            self.status_queue = []
+            return
         self.status_queue = [("EXIT", "CMD_RESET")] if self.reset_ack else []
         self.status_queue.append(("READY", "NONE"))
 
@@ -285,6 +292,9 @@ class SpeakerTest(unittest.TestCase):
     def test_wakeup_stops_pcm_and_preserves_agent_on_both_stop_paths(self):
         self.action("play", input_topic="/audio")
         old_callback = self.speaker._sub.callback
+        self.media.calls.clear()
+        self.media.timed_calls.clear()
+        self.media.config_calls.clear()
         result = self.action("wakeup")
         self.assertEqual(result["audio_mode"], "vendor_agent")
         self.assertEqual(result["state"], "awake")
@@ -292,6 +302,16 @@ class SpeakerTest(unittest.TestCase):
         self.assertTrue(self.media.routes["internal_capture_audio_data_to_agent"])
         self.assertTrue(self.media.routes["internal_agent_audio_data_to_playback"])
         self.assertFalse(self.media.routes["external_custom_audio_data_to_agent"])
+        self.assertNotIn("pause_audio_playback", self.names())
+        wakeup_index = self.names().index("wakeup")
+        external_off = ("set_external_custom_audio_data_to_playback_enable", (False,))
+        self.assertLess(self.media.calls.index(external_off), wakeup_index)
+        self.assertEqual(self.media.calls.count(external_off), 1)
+        external_config_end = self.media.config_calls[0][2]
+        wakeup_time = next(
+            timestamp for name, timestamp in self.media.timed_calls if name == "wakeup"
+        )
+        self.assertGreaterEqual(wakeup_time - external_config_end + 1e-9, 0.8)
         old_callback(self.chunk())
         self.assertEqual(self.media.published, [])
         # The policy is a mode, not synonymous with the SDK's work_status.
@@ -302,6 +322,52 @@ class SpeakerTest(unittest.TestCase):
         self.assertEqual(stopped["audio_mode"], "vendor_agent")
         self.assertTrue(stopped["unchanged"])
         self.assertEqual(self.media.calls, [])
+
+    def test_idle_wakeup_changes_state_before_configuring_routes(self):
+        result = self.action("wakeup")
+        self.assertEqual(result["state"], "awake")
+        names = self.names()
+        wakeup_index = names.index("wakeup")
+        self.assertNotIn("pause_audio_playback", names)
+        self.assertFalse(any(name.startswith("set_") for name in names[:wakeup_index]))
+        expected_routes = [
+            "set_internal_capture_audio_data_to_agent_enable",
+            "set_external_custom_audio_data_to_agent_enable",
+            "set_internal_agent_audio_data_to_playback_enable",
+            "set_external_custom_audio_data_to_playback_enable",
+        ]
+        self.assertEqual(
+            [name for name in names[wakeup_index + 1:] if name.startswith("set_")],
+            expected_routes,
+        )
+        last_config_end = self.media.config_calls[-1][2]
+        resume_time = next(
+            timestamp for name, timestamp in self.media.timed_calls
+            if name == "resume_audio_capture"
+        )
+        self.assertGreaterEqual(resume_time - last_config_end + 1e-9, 0.8)
+        self.assert_config_gap()
+
+    def test_wakeup_transition_failure_sends_no_route_or_cleanup_commands(self):
+        self.media.hold_wakeup = True
+        result = self.action("wakeup")
+        self.assertEqual(result["state"], "error")
+        self.assertEqual(result["stage"], "wakeup")
+        self.assertEqual(result["desired_routes"], {})
+        self.assertEqual(self.names().count("wakeup"), 1)
+        self.assertFalse(any(name.startswith("set_") for name in self.names()))
+        for forbidden in ("pause_audio_playback", "resume_audio_capture", "resume_audio_playback", "sleep", "restart"):
+            self.assertNotIn(forbidden, self.names())
+
+    def test_error_sleeped_wakeup_requires_explicit_reset(self):
+        self.media.work, self.media.reason = "SLEEPED", "ERROR_SLEEPED"
+        result = self.action("wakeup")
+        self.assertEqual(result["state"], "error")
+        self.assertEqual(result["stage"], "media_ready")
+        self.assertEqual(result["desired_routes"], {})
+        for forbidden in ("wakeup", "sleep", "restart", "pause_audio_playback"):
+            self.assertNotIn(forbidden, self.names())
+        self.assertFalse(any(name.startswith("set_") for name in self.names()))
 
     def test_wakeup_when_already_awake_does_not_send_duplicate_wakeup(self):
         self.media.work = "WAKEUPED"
@@ -377,15 +443,21 @@ class SpeakerTest(unittest.TestCase):
 
     def test_reset_reasserts_routes_after_reset_defaults(self):
         self.action("wakeup")
+        self.media.calls.clear()
+        self.media.timed_calls.clear()
+        self.media.config_calls.clear()
         result = self.action("reset")
         self.assertEqual(result["state"], "idle")
         self.assert_isolated()
         self.assert_no_stream()
         reset_index = self.names().index("restart")
+        self.assertEqual(reset_index, 0)
         post_calls = self.media.calls[reset_index + 1:]
         for route in self.media.ROUTES:
             self.assertIn((f"set_{route}_enable", (False,)), post_calls)
         self.assertNotIn(("wakeup", ()), post_calls)
+        self.assertNotIn("pause_audio_playback", self.names())
+        self.assertNotIn("sleep", self.names())
         self.assert_config_gap()
 
     def test_error_sleeped_start_recovers_then_isolates(self):
@@ -405,24 +477,43 @@ class SpeakerTest(unittest.TestCase):
         result = self.action("reset")
         self.assertEqual(result["state"], "error")
         self.assertTrue(any(s["step"] == "wait_reset" for s in result["errors"]))
-        self.assert_no_stream()
-        self.assert_isolated()
+        self.assertFalse(self.speaker._playing)
+        self.assertIsNone(self.speaker._sub)
+        restart_index = self.names().index("restart")
+        self.assertFalse(any(name.startswith("set_") for name in self.names()[restart_index + 1:]))
 
-    def test_reset_still_attempted_when_pre_cleanup_fails(self):
+    def test_reset_route_failure_is_reported_without_secondary_cleanup(self):
         self.media.failures["set_internal_capture_audio_data_to_agent_enable"] = 2
         result = self.action("reset")
-        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["state"], "error")
+        self.assertEqual(result["stage"], "post_reset_isolation")
         self.assertIn("restart", self.names())
-        self.assertTrue(any(s["status"] == "warning" for s in result["steps"]))
-        self.assert_isolated()
+        self.assertNotIn("pause_audio_playback", self.names())
+        self.assertNotIn("sleep", self.names())
+        self.assertEqual(self.names().count("restart"), 1)
 
-    def test_failed_restart_still_attempts_cleanup_and_reports_failure(self):
+    def test_failed_restart_reports_first_failure_without_route_cleanup(self):
         self.media.failures["restart"] = 1
         result = self.action("reset")
         self.assertEqual(result["state"], "error")
         self.assertEqual(self.names().count("restart"), 1)
-        self.assert_no_stream()
-        self.assert_isolated()
+        self.assertFalse(self.speaker._playing)
+        self.assertIsNone(self.speaker._sub)
+        self.assertFalse(any(name.startswith("set_") for name in self.names()))
+        self.assertNotIn("pause_audio_playback", self.names())
+        self.assertNotIn("sleep", self.names())
+
+    def test_reset_timeout_reports_pending_without_writing_routes(self):
+        self.media.hold_reset = True
+        result = self.action("reset")
+        self.assertEqual(result["state"], "resetting")
+        self.assertEqual(result["stage"], "pending")
+        self.assertTrue(result["pending"])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["system_status"], {"work_status": "EXIT", "reason": "CMD_RESET"})
+        self.assertFalse(any(name.startswith("set_") for name in self.names()))
+        self.assertNotIn("pause_audio_playback", self.names())
+        self.assertNotIn("sleep", self.names())
 
     def test_config_failure_retries_once_with_full_gap(self):
         self.media.failures["set_internal_capture_audio_data_to_agent_enable"] = 1
@@ -485,12 +576,21 @@ class SpeakerTest(unittest.TestCase):
 
     def test_wakeup_failure_does_not_restore_old_stream_or_leave_open_agent_routes(self):
         self.action("play", input_topic="/old")
+        self.media.calls.clear()
+        self.media.timed_calls.clear()
+        self.media.config_calls.clear()
         self.media.hold_wakeup = True
         result = self.action("wakeup")
         self.assertEqual(result["state"], "error")
         self.assert_no_stream()
         self.assert_isolated()
         self.assertEqual(self.names().count("wakeup"), 1)
+        self.assertEqual(
+            [call for call in self.media.calls if call[0].startswith("set_")],
+            [("set_external_custom_audio_data_to_playback_enable", (False,))],
+        )
+        self.assertNotIn("sleep", self.names())
+        self.assertNotIn("pause_audio_playback", self.names())
 
     def test_sleep_error_does_not_automatically_restart_or_stop_pcm(self):
         self.action("start", input_topic="/audio")
