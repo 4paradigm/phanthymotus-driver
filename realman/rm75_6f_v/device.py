@@ -871,6 +871,7 @@ class CartesianPlugin:
         # 在 _action_lock 内完成 preflight → 位姿查询 → 目标计算 → 命令下发：
         # stopmotion 必须等下发完成后才能拿到锁，不会出现「急停先到、轨迹后发」的竞态；
         # 且任何一步失败都发生在命令下发之前或下发当下，不会留下无人监控的在途运动。
+        submitted = False
         try:
             with self._action_lock:
                 self._active_action_id = action_id
@@ -881,9 +882,17 @@ class CartesianPlugin:
                     current = self._current_pose_mm_deg()
                     target = self._plan_target(motion_type, args, current)
                     max_duration = self._motion_deadline_seconds(current, target, speed_percent)
+                    submitted = True
                     self._submit(motion_type, args, speed_percent)
                 except Exception:
                     self._active_action_id = None
+                    if submitted:
+                        # movep 可能已部分下发（前段 connect=1 轨迹已入控制器队列）：
+                        # 失败路径明确慢停，不留无看护的排队轨迹，再放锁。
+                        try:
+                            self.client.command("rm_set_arm_slow_stop")
+                        except Exception:
+                            pass
                     raise
         except Exception:
             self._motion_lock.release()
@@ -1129,7 +1138,12 @@ class CartesianPlugin:
         return {"state": "stop_requested", "action_id": action_id}
 
     def _acp_callback(self, action_id, status, result):
-        _acp_complete(action_id, status, result, self.PREFIX)
+        outcome, error = _acp_complete(action_id, status, result, self.PREFIX)
+        with self._action_lock:
+            if self._last_completion and self._last_completion.get("action_id") == action_id:
+                self._last_completion["callback"] = outcome
+                if error is not None:
+                    self._last_completion["callback_error"] = error
 
 
 def build_plugins(config, namespace, ros2):
