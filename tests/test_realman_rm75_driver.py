@@ -622,6 +622,58 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         _, status, payload = self.acp_events[0]
         self.assertEqual("cancelled", status)
 
+    def test_movep_partial_submission_failure_slow_stops(self):
+        # 回归：第 2 个路径点下发失败时，不得留下无看护的已排队轨迹 ——
+        # 异常路径必须明确慢停，且不启动监控、不放任动作悬挂。
+        class PartialFailClient(self.FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.movel_count = 0
+
+            def command(self, method, *args):
+                if method == "rm_movel":
+                    self.movel_count += 1
+                    if self.movel_count == 2:
+                        raise RuntimeError("rm_movel failed with RealMan SDK code 1")
+                return super().command(method, *args)
+
+        self.client = PartialFailClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "code 1"):
+            self.plugin.dispatch("movep", {
+                "waypoints": [[100, 0, 0, 0, 0, 0], [100, 100, 0, 0, 0, 0], [100, 100, 100, 0, 0, 0]],
+                "speed_percent": 5, "confirm_motion": True,
+            })
+        order = [entry[0] for entry in self.client.calls]
+        # 部分下发后失败 → 慢停在失败的 movel 之后发出
+        self.assertIn("rm_set_arm_slow_stop", order)
+        self.assertLess(order.index("rm_movel"), order.index("rm_set_arm_slow_stop"))
+        # 没有孤儿监控、没有 ACP 事件、运动锁已释放
+        self.assertEqual([], self.acp_events)
+        self.assertIsNone(self.plugin._monitor_thread)
+        self.assertFalse(self.plugin._motion_lock.locked())
+
+    def test_acp_callback_records_outcome_in_last_completion(self):
+        plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            namespace="rm75",
+        )
+        plugin._last_completion = {"action_id": "a1", "status": "completed", "result": {}}
+        with mock.patch.object(self.device, "_acp_complete", return_value=("failed", "boom")):
+            plugin._acp_callback("a1", "completed", {"reason": "target_reached"})
+        self.assertEqual("failed", plugin._last_completion["callback"])
+        self.assertEqual("boom", plugin._last_completion["callback_error"])
+
     def test_pose_query_failure_submits_nothing(self):
         # 位姿查询在下发之前：查询失败时不得下发任何运动命令、不得启动监控
         class NoPoseClient(self.FakeClient):
