@@ -112,14 +112,14 @@ class RealManRM75ImageContractTests(unittest.TestCase):
                 {"ext_camera": {"enabled": True}}, "rm75", ros2
             )
         self.assertEqual(
-            [device.RM75Plugin, device.GripperPlugin, FakeCamera],
+            [device.RM75Plugin, device.GripperPlugin, device.CartesianPlugin, FakeCamera],
             [type(plugin) for plugin in enabled],
         )
         self.assertIs(enabled[0].client, enabled[1].client)
         self.assertEqual(({"enabled": True}, "rm75", ros2.executor_core), calls[0])
         disabled = device.build_plugins({}, "rm75", ros2)
         self.assertEqual(
-            [device.RM75Plugin, device.GripperPlugin],
+            [device.RM75Plugin, device.GripperPlugin, device.CartesianPlugin],
             [type(plugin) for plugin in disabled],
         )
 
