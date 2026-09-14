@@ -451,6 +451,11 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+        if plugins_cfg.get("fall", {}).get("enabled", False):
+            from fall import FallPlugin
+            self._plugins.append(FallPlugin(plugins_cfg["fall"], namespace, ros2))
+            print("[bundle] FallPlugin loaded")
+
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
     _ALWAYS_START = {'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin', 'ExtMicPlugin'}
 
