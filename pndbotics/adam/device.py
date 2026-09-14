@@ -682,7 +682,7 @@ class LocoPlugin:
             "name": "loco",
             "type": "actuator",
             "description": (
-                "Adam RL locomotion state machine — query available states and "
+                "Adam RL locomotion state machine — inspect supported states and "
                 "switch only to a state returned by get_state"),
             "inputSchema": {
                 "type": "object",
@@ -723,8 +723,6 @@ class LocoPlugin:
         return None
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "start":
-            return {"state": "ready"}
         if action == "set_mode":
             return self._grpc.set_mode(args.get("mode", ""))
         if action == "get_state":

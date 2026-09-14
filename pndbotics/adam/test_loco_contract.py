@@ -27,6 +27,8 @@ class LocoContractTests(unittest.TestCase):
 
         mode_schema = plugin.get_tool()["inputSchema"]["properties"]["mode"]
         self.assertEqual(mode_schema["type"], "string")
+        actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        self.assertEqual(actions, ["set_mode", "get_state", "list_actions", "info"])
 
         result = plugin.dispatch("set_mode", {"mode": "walk"})
         self.assertEqual(grpc.mode, "walk")
