@@ -113,6 +113,11 @@ class CameraProxy:
 
 
 def _run_camera_worker(commands, media, configs):
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:
+        pass
     os.environ["ROS_DOMAIN_ID"] = str(os.environ.get("ROS_DOMAIN_ID", "211"))
     os.environ["RMW_IMPLEMENTATION"] = os.environ.get("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
     import rclpy
