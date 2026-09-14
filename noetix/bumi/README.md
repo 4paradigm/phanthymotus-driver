@@ -30,10 +30,8 @@ sudo systemctl start noetix-video-capture.service
 ## `vision_capture` card
 
 Persistent RGB photo/video capture, with the card/action names and file layout
-from Q5 PR #220. This replaces `state_record`; existing workflows must select
-the new card. State scopes, JSON snapshots, labels and interval logging are no
-longer supported. Historical files under `/opt/phanthy-motus/data/bumi/state-records`
-are left untouched.
+from Q5 PR #220. This replaces the retired JSON state snapshot card; state
+snapshots, labels and interval logging are no longer supported.
 
 - `start`: check whether the camera process is ready (does not take a photo).
 - `capture_photo`: save one current RGB JPEG.
@@ -142,18 +140,99 @@ unexposed.
 ## `speaker`
 
 Plays the PCM audio of its connected input topic (`audio_msgs/AudioChunk`, mono
-16 kHz S16LE) on the robot speaker. Actions: `start` / `stop` / `info` /
-`get_volume` / `set_volume`.
+16 kHz S16LE) on the robot speaker, or switches to the vendor voice Agent.
+The tool schema exposes these actions through the existing card action controls:
 
-`start` **is** the playback action — the canvas starts a card by sending `start`
-with the resolved `input_topic`, so there is no separate `play`. A card whose
-`start` only answers `{"state": "ready"}` shows as running while the driver
-holds no subscription at all, which is silence that looks like success.
+| Action | Behaviour |
+| --- | --- |
+| `start` / `play` | Require `input_topic`, disable vendor Agent routes, sleep an awake Agent, then enable external PCM playback and subscribe. Sound begins when upstream AudioChunk data arrives; this is not a test-tone or file-playback action. |
+| `wakeup` | Detach external PCM locally, but temporarily leave its SDK routes unchanged because no frames can arrive after subscription invalidation. Confirm a healthy state, enable internal microphone → Agent and Agent → speaker, let those setters settle, resume capture/playback, and wait another 0.8 s before calling `wakeup`. After WAKEUPED, disable external audio → Agent and external audio → speaker, then enter `vendor_agent` mode. |
+| `sleep` | Close all three vendor Agent routes and sleep an awake Agent. Leave any external PCM subscription and playback route untouched; never pause capture/playback here. |
+| `stop` | Stop external PCM only. In `vendor_agent` mode this is a no-op, including when the Agent itself is temporarily SLEEPED. Canvas stop and driver lifecycle stop do not explicitly disable that mode; use `sleep` to exit it. |
+| `reset` | Map to `MediaController.restart()`, not a robot/factory reset. Detach PCM locally, wait for CMD_RESET followed by healthy READY/SLEEPED, and only then reapply route isolation. Leave idle; do not automatically wake or resume PCM. If the media module is still at EXIT/CMD_RESET when the bounded wait ends, return `state=resetting`, `stage=pending`, without writing routes during that transition. |
+| `info` | Report mode, in-progress operation, external PCM statistics, media status/error, desired routes, cached SDK readback and the last control result. |
+| `get_volume` / `set_volume` | Read / set volume (0–200). Volume changes do not select a mode. |
 
-The vendor voice agent (`MediaController.wakeup()` / `sleep()` / `restart()`) is
-deliberately **not** exposed. Waking it would hand the robot's microphone to the
-vendor's own model and let it talk over this stack through the same speaker.
-Two behaviours verified on hardware and worth not re-deriving:
+The canvas already sends `start` with its resolved input topic; explicit `play`
+now appears in the schema and uses exactly the same implementation. Merely
+constructing/starting the driver bundle does not select a Speaker mode.
+
+`start`, `play`, `wakeup`, `sleep` and `reset` are multi-second physical
+transitions. They return immediately with `state=queued` and a unique
+`action_id`; their final result is posted to Agent Core's ACP completion
+endpoint. The schema declares a 60-second completion timeout and the `mouth`
+physical resource. Only one such Speaker transition may run at a time. While
+one is active, another mode-changing action, `stop`, or `set_volume` returns
+`state=busy` with the active action ID instead of blocking the MCP request.
+`info` and `get_volume` remain available; `info.active_action` exposes the
+running action and ID.
+
+`audio_mode` tracks this Speaker instance's selected policy (`idle`,
+`external_playback`, `vendor_agent`, or `unknown`), separately from the SDK's
+`work_status`. It is not a hardware-wide ownership guarantee. `wakeup` hands the
+robot microphone and speaker to the vendor's own model. Starting Speaker again
+switches back to external PCM and disables these three Agent routes:
+
+```python
+set_internal_capture_audio_data_to_agent_enable(False)
+set_external_custom_audio_data_to_agent_enable(False)
+set_internal_agent_audio_data_to_playback_enable(False)
+```
+
+Mic, its capture subprocess and `main.py` are unchanged. PCM still travels
+directly from the ROS AudioChunk subscription to
+`publish_external_audio_playback_stream`, with mono samples duplicated to stereo
+as before. There is no AudioRouteCoordinator or audio-forwarding layer. The
+media module is shared hardware, however: explicit reset or automatic fault
+recovery can interrupt microphone capture even though no Mic code changes.
+
+### Timing and failures
+
+Speaker serializes mode changes and volume writes. Every configuration setter
+attempt, including a failed attempt and a volume write, leaves at least **0.8 s**
+before the next setter. `wakeup` and completed `reset` also wait 0.8 s after the
+last route setter before sending subsequent media commands or returning. The PCM
+callback does not acquire the control/config locks, so `sleep` configuration
+waits do not block an existing external stream. Allow several seconds for a
+normal mode switch and longer for recovery; do not interpret the first submitted
+command as a completed switch.
+
+- Route setters get one retry per step. Wake/sleep/restart commands are not
+  blindly repeated within an action. Wake/sleep status waits are bounded at
+  8 s; reset waits are bounded at 20 s and require observing CMD_RESET before
+  accepting a subsequent healthy READY/SLEEPED sample.
+- `start`/`play` retain automatic restart recovery for ERROR_SLEEPED. `wakeup`
+  does not hide that fault behind an automatic restart: it reports the original
+  status and requires an explicit `reset`. Ordinary `sleep` never starts a
+  reset, avoiding disruption of external PCM.
+- A failed/timed-out `wakeup` stops at the original failure. It does not invoke
+  generic activation cleanup, perform post-wakeup external-route isolation,
+  send `sleep`, or append a secondary error. Its two Agent prerequisites remain
+  enabled, while the old external subscription stays detached and cannot send
+  PCM even though the external SDK route has not yet been closed. The mode is
+  reported as `unknown` until a later successful action establishes it. An
+  earlier subscription-destruction failure is handled more conservatively:
+  stale callbacks are invalidated and the external playback route is closed
+  best-effort before returning; destruction and route-cleanup errors are both
+  retained when both operations fail.
+- Activation failure prevents a new subscription (or removes it if creation
+  fails), stops external delivery and attempts all Agent isolation steps.
+  It does not restore the previous stream or Agent mode. Failed isolation
+  reports `audio_mode=unknown`, not a claim that the Agent has stopped.
+- Results return `state=error`, the failing stage, individual steps/errors,
+  subscription state, SDK status/error and suggested next action. Cleanup
+  errors are retained alongside the initial failure. Inspect connectivity and
+  the errors, then retry the desired action, or use explicit `reset` for a
+  media-module fault. A reset command failure reports the first failure without
+  route cleanup. A reset that remains at EXIT/CMD_RESET reports `pending`; route
+  isolation is applied only after a complete recovery is observed.
+- Desired routes are intentions. SDK route setters submit commands and their
+  getters may return cached values, not per-command acknowledgements. `info`
+  exposes both separately. Other SDK clients/processes are not serialized by
+  this instance's locks and can change the shared hardware state.
+
+Previous hardware observations recorded for this driver (the new switching
+behaviour still needs on-device acceptance testing):
 
 - **`work_status=SLEEPED` does not block playback.** A full TTS utterance played
   while the agent sat at `SLEEPED/CMD_SLEEPED`. Only `ERROR_SLEEPED` means the
@@ -167,6 +246,22 @@ Two behaviours verified on hardware and worth not re-deriving:
 Likewise `frames_submitted` in `info` counts frames handed to the SDK, not
 frames heard: `publish_external_audio_playback_stream` is fire-and-forget, so a
 rising count proves the subscription works and nothing more.
+These counters cover only this instance's external PCM stream, never vendor
+Agent speech; the last stream's counters remain visible after a mode switch.
+
+### Local tests and device acceptance
+
+Run the hardware-free ROS/SDK-double tests without starting the robot:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+On the robot, check `play` with a connected PCM source, `wakeup` → `stop`
+(Agent remains available), `wakeup` → `play` (only external PCM plays), and
+`play` → `sleep` (external PCM continues). Check `reset` separately because
+it restarts the shared media module. Inspect `info` and listen to actual output;
+local tests and SDK submissions alone cannot confirm on-device routing.
 
 Useful observations while the driver is running:
 
