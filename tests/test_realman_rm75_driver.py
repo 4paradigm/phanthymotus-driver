@@ -571,6 +571,37 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("motion_stalled", payload["reason"])
         self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
 
+    def test_stopmotion_does_not_hold_action_lock_during_sdk_call(self):
+        # SDK 慢停无超时上限：阻塞期间 _action_lock 必须保持空闲，否则后续请求全部堵死
+        gate = threading.Event()
+
+        class SlowStopClient(self.FakeClient):
+            def command(self, method, *args):
+                if method == "rm_set_arm_slow_stop" and not gate.is_set():
+                    gate.wait(2.0)
+                return super().command(method, *args)
+
+        self.client = SlowStopClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: None
+
+        self.plugin.dispatch("movel", self._movel_args())
+        self.assertTrue(self._wait_for(lambda: self.plugin._active_action_id is not None))
+
+        stopper = threading.Thread(target=lambda: self.plugin.dispatch("stopmotion", {}))
+        stopper.start()
+        time.sleep(0.1)  # stopmotion 卡在 SDK 慢停里
+        start = time.time()
+        self.plugin.dispatch("info", {})  # 慢停阻塞期间 info 应立即可达
+        self.assertLess(time.time() - start, 1.0)
+        gate.set()
+        stopper.join(5.0)
+
     def test_stopmotion_cancels_and_slow_stops(self):
         started = self.plugin.dispatch("movel", self._movel_args())
         stop = self.plugin.dispatch("stopmotion", {})
