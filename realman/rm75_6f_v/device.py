@@ -1130,11 +1130,17 @@ class CartesianPlugin:
             self._acp_callback(action_id, status, result)
 
     def _stop_motion(self):
+        # SDK 慢停调用无超时上限，不得在 _action_lock 内执行：
+        # 控制器不应答时锁内调用会永久占锁，拖死后续所有请求。
         with self._action_lock:
             action_id = self._active_action_id
             if action_id:
                 self._cancelled.add(action_id)
+        if action_id and self.client.connected:
+            try:
                 self.client.command("rm_set_arm_slow_stop")
+            except Exception as exc:
+                print(f"[rm75] cartesian slow-stop failed: {exc}", flush=True)
         return {"state": "stop_requested", "action_id": action_id}
 
     def _acp_callback(self, action_id, status, result):
