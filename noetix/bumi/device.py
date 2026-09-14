@@ -1484,25 +1484,14 @@ class SpeakerPlugin:
     def _do_wakeup(self) -> dict:
         with self._control_lock:
             self._begin_control("wakeup")
-            detached, had_external_playback = self._detach_external_subscription_locked()
+            detached, _ = self._detach_external_subscription_locked()
             self._audio_mode = "unknown"
             if not detached:
                 return self._finish_control("error", "stop_previous_playback")
 
-            # Only touch the external route when this card actually owned an
-            # external stream.  An idle wakeup reaches the vendor wakeup call
-            # without a preceding pause or route write.
-            external_route_closed = False
-            if had_external_playback:
-                if not self._write_route(self._EXTERNAL_PLAYBACK_ROUTE, False):
-                    return self._finish_control("error", "stop_previous_playback")
-                external_route_closed = True
-                self._settle_after_config()
-
-            # Wakeup is a state transition, not a route-setting side effect.
-            # Do not automatically restart ERROR_SLEEPED here and do not send
-            # cleanup commands after a failed wakeup; preserving the first
-            # failure is more useful than cascading route/sleep errors.
+            # Validate the current state before changing routes. Do not
+            # automatically restart ERROR_SLEEPED here: explicit reset keeps
+            # the first media fault visible to the caller.
             status = self._stable_status()
             if status is None:
                 return self._finish_control("error", "media_ready")
@@ -1514,6 +1503,32 @@ class SpeakerPlugin:
                 )
                 return self._finish_control("error", "media_ready")
             self._record_step("media_ready", "observed", observed=status)
+
+            # start/play deliberately disable these routes. The vendor sample
+            # prepares capture before wakeup, so restore the two prerequisites
+            # first. Keep both external routes untouched for now: the ROS
+            # subscription is already detached and its generation invalidated,
+            # therefore no external PCM can reach either destination.
+            for route in (
+                "internal_capture_audio_data_to_agent",
+                "internal_agent_audio_data_to_playback",
+            ):
+                if not self._write_route(route, True):
+                    return self._finish_control("error", "agent_prerequisites")
+            self._settle_after_config()
+            if not self._call_control("resume_audio_capture"):
+                return self._finish_control("error", "resume_capture")
+            if not self._call_control("resume_audio_playback"):
+                return self._finish_control("error", "resume_playback")
+            time.sleep(_AUDIO_CONFIG_INTERVAL_S)
+            self._record_step(
+                "media_settle", "observed",
+                minimum_interval_s=_AUDIO_CONFIG_INTERVAL_S,
+            )
+
+            # Only request the state transition after its input/output path is
+            # ready. If wakeup fails, stop immediately: do not append route or
+            # sleep commands that would obscure the original ERROR_SLEEPED.
             if status["work_status"] != "WAKEUPED":
                 if not self._call_control("wakeup"):
                     return self._finish_control("error", "wakeup")
@@ -1525,24 +1540,16 @@ class SpeakerPlugin:
                 self._record_step("wakeup", "not_needed", observed=status)
             self._record_step("wait_wakeup", "observed", observed=status)
 
-            # The state transition succeeded.  Configure the Agent data path
-            # afterwards, with the SDK-required gap between every setter and
-            # one additional interval before resume calls.
-            route_plan = [
-                ("internal_capture_audio_data_to_agent", True),
+            # WAKEUPED is now established. Close the two external routes; no
+            # external frames were forwarded during the transition because
+            # local delivery was detached at the beginning of the action.
+            for route, enabled in (
                 ("external_custom_audio_data_to_agent", False),
-                ("internal_agent_audio_data_to_playback", True),
-            ]
-            if not external_route_closed:
-                route_plan.append((self._EXTERNAL_PLAYBACK_ROUTE, False))
-            for route, enabled in route_plan:
+                (self._EXTERNAL_PLAYBACK_ROUTE, False),
+            ):
                 if not self._write_route(route, enabled):
-                    return self._finish_control("error", "agent_routes")
+                    return self._finish_control("error", "external_isolation")
             self._settle_after_config()
-            if not self._call_control("resume_audio_capture"):
-                return self._finish_control("error", "resume_capture")
-            if not self._call_control("resume_audio_playback"):
-                return self._finish_control("error", "resume_playback")
             self._audio_mode = "vendor_agent"
             return self._finish_control("awake", "complete")
 
@@ -1637,7 +1644,7 @@ class SpeakerPlugin:
                     },
                     "wakeup": {
                         "params": [],
-                        "description": "Stop external playback, wake the vendor Agent, then enable its robot microphone and speaker routes",
+                        "description": "Detach external PCM, prepare the vendor Agent microphone/speaker routes, wake it, then close external routes",
                     },
                     "sleep": {
                         "params": [],
