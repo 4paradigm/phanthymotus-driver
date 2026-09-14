@@ -136,10 +136,18 @@ class Go2DeviceBundle:
             self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, executor))
             print("[bundle] ExtMicPlugin loaded")
 
+        external_camera = None
         if plugins_cfg.get("ext_camera", {}).get("enabled", False):
             from ext_devices import ExtCameraPlugin
-            self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
+            external_camera = ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor)
+            self._plugins.append(external_camera)
             print("[bundle] ExtCameraPlugin loaded")
+
+        if plugins_cfg.get("vision_capture", {}).get("enabled", False):
+            from vision_capture import VisionCapturePlugin
+            self._plugins.append(VisionCapturePlugin(
+                plugins_cfg["vision_capture"], namespace, executor, external_camera))
+            print("[bundle] VisionCapturePlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):

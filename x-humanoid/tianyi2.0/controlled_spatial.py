@@ -341,6 +341,15 @@ class ControlledSpatialPlugin:
                 # Drives the chassis — same channel as the nav / home / chassis_raw
                 # tools in device.py.
                 "x-resource": "base",
+                # Without this, stop_nav is an ordinary barrier-respecting actuator call:
+                # it wants the same `base` resource as whatever navigate_to_tag/_pose is
+                # already running, so it queues behind — waiting for the very navigation
+                # it was called to cancel to finish on its own first. Measured on a live
+                # session: 5-7s here, but nothing bounds it below the target action's own
+                # duration, which elsewhere in the same session ran to 100+s. `nav.cancel`
+                # and `home.cancel` in device.py already carry this same binding — this
+                # tool superseded `nav` for actual navigation and never picked it up.
+                "x-hooks": {"on_interrupt_motion": {"action": "stop_nav"}},
                 "x-action-params": {
                     "start_mapping": {"params": ["map_name", "password"], "description": "🔒 向操作者索取密码后传入 password 字段。Start SLAM mapping with given map name."},
                     "stop_mapping": {"params": [], "description": "Stop mapping and save the map"},
