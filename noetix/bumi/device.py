@@ -4,7 +4,6 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 
 插件列表：
   - StatePlugin: joints (21-DOF skeleton), imu, battery, model (URDF resource)
-  - StateRecordPlugin: one-click persistent JSON snapshots of selectable states
   - VisionCapturePlugin: persistent RGB photos and videos
   - LocoPlugin: locomotion, stand-up/prone storage, semantic actions and action recording
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
@@ -27,9 +26,8 @@ import urllib.request
 import subprocess
 import threading
 import time
-import uuid
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 import rclpy
@@ -160,8 +158,6 @@ class _BumiStateNode(Node):
         self._battery_pub = self.create_publisher(String, self._battery_topic, _LOW_LAT_QOS)
         self._joints_pub  = self.create_publisher(String, self._joints_topic,  _LOW_LAT_QOS)
 
-        self._latest: dict[str, dict] = {}
-        self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -191,8 +187,6 @@ class _BumiStateNode(Node):
                         "angular_vel":   [imu.angular_vel[i] for i in range(3)],
                         "linear_acc":    [imu.linear_acc[i] for i in range(3)],
                     }
-                    with self._lock:
-                        self._latest["imu"] = self._snapshot_entry(imu_data)
                     msg = String()
                     msg.data = json.dumps(imu_data)
                     self._imu_pub.publish(msg)
@@ -219,8 +213,6 @@ class _BumiStateNode(Node):
                         "imu_quat": [float(imu.ori[3]), float(imu.ori[0]), float(imu.ori[1]), float(imu.ori[2])],  # SDK [x,y,z,w] → renderer [w,x,y,z]
                         "workmode": workmode,
                     }
-                    with self._lock:
-                        self._latest["joints"] = self._snapshot_entry(joints_data)
                     joints_out = String()
                     joints_out.data = json.dumps(joints_data)
                     self._joints_pub.publish(joints_out)
@@ -235,8 +227,6 @@ class _BumiStateNode(Node):
                         "temperature": int(bms.battery_temp),
                         "alarm": int(bms.battery_alarm),
                     }
-                    with self._lock:
-                        self._latest["battery"] = self._snapshot_entry(bms_data)
                     msg = String()
                     msg.data = json.dumps(bms_data)
                     self._battery_pub.publish(msg)
@@ -245,27 +235,6 @@ class _BumiStateNode(Node):
             except Exception as e:
                 self.get_logger().warn(f"State poll error: {e}")
                 time.sleep(0.5)
-
-    @staticmethod
-    def _snapshot_entry(payload: dict) -> dict:
-        return {
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-            "captured_monotonic": time.monotonic(),
-            "payload": payload,
-        }
-
-    def snapshot(self, source: str, max_age_s: float) -> dict:
-        """Return a thread-safe copy of the latest sample and its freshness."""
-        with self._lock:
-            entry = copy.deepcopy(self._latest.get(source))
-        if entry is None:
-            raise RuntimeError(f"No {source} sample is available yet")
-        age_s = max(0.0, time.monotonic() - entry.pop("captured_monotonic"))
-        entry["age_s"] = round(age_s, 3)
-        entry["fresh"] = age_s <= max_age_s
-        return entry
-
-
 
 class StatePlugin:
     PREFIX = "state"
@@ -317,10 +286,6 @@ class StatePlugin:
 
     def stop(self) -> None:
         self._node.stop_polling()
-
-    def snapshot(self, source: str, max_age_s: float) -> dict:
-        """Expose the state node's latest sample to sibling plugins."""
-        return self._node.snapshot(source, max_age_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -1172,7 +1137,10 @@ class SpeakerPlugin:
     def _destroy_subscription(self) -> None:
         if self._sub is None:
             return
-        if self._node.destroy_subscription(self._sub) is False:
+        result = self._node.destroy_subscription(self._sub)
+        # ROS 2 Humble returns bool; tolerate void-style wrappers returning
+        # None, but preserve the handle when rclpy explicitly reports False.
+        if result is False:
             raise RuntimeError("ROS2 could not destroy the audio subscription")
         # Keep a failed handle available for cleanup to retry. Its generation
         # has already been invalidated, so it can no longer publish PCM.
@@ -2121,8 +2089,6 @@ class _MotionStateNode(Node):
         self._activity_velocity_threshold = activity_velocity_threshold
         self._running = False
         self._thread = None
-        self._latest: dict | None = None
-        self._latest_lock = threading.Lock()
 
     @property
     def topic(self) -> str:
@@ -2144,12 +2110,6 @@ class _MotionStateNode(Node):
         while self._running:
             try:
                 payload = self._read_once()
-                with self._latest_lock:
-                    self._latest = {
-                        "captured_at": datetime.now(timezone.utc).isoformat(),
-                        "captured_monotonic": time.monotonic(),
-                        "payload": payload,
-                    }
                 msg = String()
                 msg.data = json.dumps(payload, ensure_ascii=False)
                 self._pub.publish(msg)
@@ -2163,16 +2123,6 @@ class _MotionStateNode(Node):
                 msg.data = json.dumps(error, ensure_ascii=False)
                 self._pub.publish(msg)
                 time.sleep(max(0.5, self._interval_s))
-
-    def snapshot(self, max_age_s: float) -> dict:
-        with self._latest_lock:
-            entry = copy.deepcopy(self._latest)
-        if entry is None:
-            raise RuntimeError("No motion_state sample is available yet")
-        age_s = max(0.0, time.monotonic() - entry.pop("captured_monotonic"))
-        entry["age_s"] = round(age_s, 3)
-        entry["fresh"] = age_s <= max_age_s
-        return entry
 
     def _read_once(self) -> dict:
         mode = int(self._high_ctrl.get_mode())
@@ -2292,198 +2242,12 @@ class MotionStatePlugin:
     def stop(self):
         self._node.stop_polling()
 
-    def snapshot(self, max_age_s: float) -> dict:
-        """Expose the motion node's latest sample to sibling plugins."""
-        return self._node.snapshot(max_age_s)
-
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         return None
-
-
-# ── StateRecordPlugin (actuator, persistent one-click snapshots) ──────────
-
-class StateRecordPlugin:
-    """Save one selected state snapshot as a human-readable JSON file."""
-
-    PREFIX = "state_record"
-    _SOURCE_ACTIONS = {
-        "record_imu": ("imu",),
-        "record_battery": ("battery",),
-        "record_joints": ("joints",),
-        "record_motion_state": ("motion_state",),
-        "record_all": ("imu", "battery", "joints", "motion_state"),
-        # Reserved contract only. Use vision_capture for real photos/video.
-        "record_camera": ("camera",),
-    }
-
-    def __init__(self, plugin_config: dict, state_plugin: StatePlugin | None,
-                 motion_state_plugin: MotionStatePlugin | None):
-        self._state_plugin = state_plugin
-        self._motion_state_plugin = motion_state_plugin
-        self._storage_dir = Path(plugin_config.get(
-            "storage_dir", "/opt/phanthy-motus/data/bumi/state-records"))
-        self._max_age_s = _finite_number(
-            plugin_config.get("max_age_s", 3.0), "state_record.max_age_s")
-        if not 0.1 <= self._max_age_s <= 60.0:
-            raise ValueError("state_record.max_age_s must be in [0.1, 60.0]")
-        self._write_lock = threading.Lock()
-
-    def get_tool(self) -> dict:
-        action_descriptions = {
-            "record_imu": "保存最新 IMU 姿态、角速度和线性加速度。",
-            "record_battery": "保存最新电量、健康度、温度和告警。",
-            "record_joints": "保存最新 21 个关节状态、IMU 四元数和工作模式。",
-            "record_motion_state": "保存最新整机运动状态、关节统计和故障信息。",
-            "record_all": "把 IMU、电池、关节和整机运动状态保存到同一个 JSON 文件。",
-            "record_camera": "相机记录的兼容预留项；请使用 vision_capture 卡片保存照片或视频。",
-        }
-        return {
-            "name": "state_record",
-            "type": "actuator",
-            "multiInstance": False,
-            "description": (
-                "Bumi 状态记录：选择一种状态或全部状态，点击执行后把当前最新快照保存成可直接查看的 JSON 文件。"
-                "照片和视频请使用 vision_capture 卡片。"
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": list(self._SOURCE_ACTIONS),
-                        "description": "选择本次要保存的状态内容。",
-                    },
-                    "label": {
-                        "type": "string",
-                        "maxLength": 80,
-                        "description": "可选备注，会写入 JSON，并以安全形式追加到文件名。",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    action: {"params": ["label"], "description": description}
-                    for action, description in action_descriptions.items()
-                },
-            },
-            "topic_out": [],
-        }
-
-    def start(self) -> None:
-        self._storage_dir.mkdir(parents=True, exist_ok=True)
-
-    def stop(self) -> None:
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "ready", "storage_dir": str(self._storage_dir)}
-        if action == "stop":
-            return {"state": "idle"}
-        if action not in self._SOURCE_ACTIONS:
-            return {
-                "state": "error",
-                "saved": False,
-                "error": f"Unsupported state record action: {action}",
-            }
-        if action == "record_camera":
-            return {
-                "state": "unavailable",
-                "saved": False,
-                "source": "camera",
-                "interface_reserved": True,
-                "error": "Use the vision_capture card to save photos or videos.",
-            }
-        return self._record(action, args.get("label", ""))
-
-    def _record(self, action: str, label_value: Any) -> dict:
-        if not isinstance(label_value, str):
-            return {"state": "error", "saved": False, "error": "label must be a string"}
-        label = label_value.strip()
-        if len(label) > 80:
-            return {"state": "error", "saved": False, "error": "label must be at most 80 characters"}
-
-        sources: dict[str, dict] = {}
-        errors: dict[str, str] = {}
-        for source in self._SOURCE_ACTIONS[action]:
-            try:
-                sources[source] = self._read_source(source)
-            except Exception as exc:
-                errors[source] = str(exc)
-
-        if not sources:
-            return {
-                "state": "error",
-                "saved": False,
-                "requested_sources": list(self._SOURCE_ACTIONS[action]),
-                "errors": errors,
-            }
-
-        now = datetime.now(timezone.utc)
-        record_id = f"{now.strftime('%Y%m%dT%H%M%S.%fZ')}-{uuid.uuid4().hex[:8]}"
-        safe_label = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "-", label).strip("-")[:40]
-        filename = record_id + (f"-{safe_label}" if safe_label else "") + ".json"
-        path = self._storage_dir / filename
-        record = {
-            "schema_version": 1,
-            "record_id": record_id,
-            "captured_at": now.isoformat(),
-            "label": label or None,
-            "requested_sources": list(self._SOURCE_ACTIONS[action]),
-            "sources": sources,
-            "errors": errors,
-            "camera": {
-                "interface_reserved": True,
-                "connected": False,
-                "description": "Use the independent vision_capture card for camera media.",
-            },
-        }
-        serialized = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
-        temp_path = path.with_suffix(".json.tmp")
-        try:
-            with self._write_lock:
-                self._storage_dir.mkdir(parents=True, exist_ok=True)
-                temp_path.write_text(serialized, encoding="utf-8")
-                os.replace(temp_path, path)
-        except Exception as exc:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return {
-                "state": "error", "saved": False,
-                "error": f"Failed to save state record: {exc}",
-                "storage_dir": str(self._storage_dir),
-            }
-
-        fresh = all(item.get("fresh", False) for item in sources.values())
-        return {
-            "state": "completed" if not errors else "partial",
-            "saved": True,
-            "record_id": record_id,
-            "label": label or None,
-            "sources": list(sources),
-            "fresh": fresh,
-            "errors": errors,
-            "file": str(path),
-            "storage_dir": str(self._storage_dir),
-        }
-
-    def _read_source(self, source: str) -> dict:
-        if source in {"imu", "battery", "joints"}:
-            if self._state_plugin is None:
-                raise RuntimeError("StatePlugin is disabled or unavailable")
-            return self._state_plugin.snapshot(source, self._max_age_s)
-        if source == "motion_state":
-            if self._motion_state_plugin is None:
-                raise RuntimeError("MotionStatePlugin is disabled or unavailable")
-            return self._motion_state_plugin.snapshot(self._max_age_s)
-        if source == "camera":
-            raise NotImplementedError("Use the vision_capture card for camera media")
-        raise ValueError(f"Unsupported state source: {source}")
 
 
 # ── VisionCapturePlugin (persistent RGB photos and videos) ──────────────────

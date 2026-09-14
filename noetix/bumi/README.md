@@ -30,8 +30,8 @@ sudo systemctl start noetix-video-capture.service
 ## `vision_capture` card
 
 Persistent RGB photo/video capture, with the card/action names and file layout
-from Q5 PR #220. It coexists with `state_record`: use `vision_capture` for RGB
-photos/video and `state_record` for current telemetry JSON snapshots.
+from Q5 PR #220. This replaces the retired JSON state snapshot card; state
+snapshots, labels and interval logging are no longer supported.
 
 - `start`: check whether the camera process is ready (does not take a photo).
 - `capture_photo`: save one current RGB JPEG.
@@ -73,15 +73,6 @@ Configuration is under `plugins.vision_capture`: `output_dir`, `fps`
 (default/max 15), and `max_duration_s` (default/max 30). Rebuild the driver
 image to install the new FFmpeg dependency. All runtime implementation remains
 in `device.py`; no extra runtime Python file is required.
-
-## `state_record` card
-
-Preserves the fork's one-click JSON snapshot card alongside `vision_capture`.
-It records the latest IMU, battery, joint or combined motion-state telemetry,
-or all four in one file, with an optional label and freshness metadata. Files
-remain under `/opt/phanthy-motus/data/bumi/state-records`. The legacy
-`record_camera` action now directs callers to the independent `vision_capture`
-card and does not create a file.
 
 ## New cards
 
