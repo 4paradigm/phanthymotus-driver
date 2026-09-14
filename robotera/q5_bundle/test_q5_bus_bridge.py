@@ -83,37 +83,55 @@ class Q5BusBridgeTests(unittest.TestCase):
         self.assertLess(worker_source.index("configure_fastdds_transport()"),
                         worker_source.index("import rclpy"))
 
-    def test_media_bridge_uses_bundled_udp_profile_by_default(self):
+    def test_media_bridge_uses_loopback_only_profile_by_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             profile = q5_media_bridge.configure_fastdds_transport()
             self.assertEqual(profile, str(q5_media_bridge.DEFAULT_FASTDDS_PROFILE))
             self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], profile)
             self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
 
+        profile_source = q5_media_bridge.DEFAULT_FASTDDS_PROFILE.read_text()
+        self.assertIn("<interfaceWhiteList>", profile_source)
+        self.assertIn("<address>127.0.0.1</address>", profile_source)
+
     def test_media_bridge_promotes_legacy_profile_to_canonical_name(self):
         with mock.patch.dict(os.environ, {
-            "FASTRTPS_DEFAULT_PROFILES_FILE": "/etc/fastdds/legacy.xml",
+            "FASTRTPS_DEFAULT_PROFILES_FILE": __file__,
         }, clear=True):
             profile = q5_media_bridge.configure_fastdds_transport()
-            self.assertEqual(profile, "/etc/fastdds/legacy.xml")
+            self.assertEqual(profile, __file__)
             self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], profile)
             self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
 
     def test_media_bridge_prefers_canonical_profile_over_stale_legacy_value(self):
         with mock.patch.dict(os.environ, {
-            "FASTDDS_DEFAULT_PROFILES_FILE": "/etc/fastdds/canonical.xml",
+            "FASTDDS_DEFAULT_PROFILES_FILE": __file__,
             "FASTRTPS_DEFAULT_PROFILES_FILE": "/etc/fastdds/stale.xml",
         }, clear=True):
             profile = q5_media_bridge.configure_fastdds_transport()
-            self.assertEqual(profile, "/etc/fastdds/canonical.xml")
+            self.assertEqual(profile, __file__)
             self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
 
-    def test_media_bridge_rejects_missing_default_udp_profile(self):
+    def test_media_bridge_rejects_missing_default_loopback_profile(self):
         missing = Path("/missing/q5-fastdds-udp.xml")
         with mock.patch.dict(os.environ, {}, clear=True), \
                 mock.patch.object(q5_media_bridge, "DEFAULT_FASTDDS_PROFILE", missing):
-            with self.assertRaisesRegex(RuntimeError, "Fast DDS UDP profile is missing"):
+            with self.assertRaisesRegex(RuntimeError, "Fast DDS loopback profile is missing"):
                 q5_media_bridge.configure_fastdds_transport()
+
+    def test_media_bridge_rejects_missing_configured_profile(self):
+        missing = "/missing/custom-fastdds.xml"
+        with mock.patch.dict(os.environ, {
+            "FASTDDS_DEFAULT_PROFILES_FILE": missing,
+        }, clear=True):
+            with self.assertRaisesRegex(RuntimeError, missing):
+                q5_media_bridge.configure_fastdds_transport()
+
+    def test_media_bridge_child_installs_logsafe_before_ros(self):
+        source = Path(q5_media_bridge.__file__).read_text()
+        worker_source = source[source.index("def _run_bridge_subprocess"):]
+        self.assertLess(worker_source.index("logsafe.install(check_fd=False)"),
+                        worker_source.index("import rclpy"))
 
     def test_sensor_topic_contract_does_not_depend_on_vendor_side_publisher(self):
         declared = topic_out("/nvidia_desktop/q5/battery", "data/json")

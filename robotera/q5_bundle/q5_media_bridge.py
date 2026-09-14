@@ -36,13 +36,13 @@ DEFAULT_FASTDDS_PROFILE = Path(__file__).with_name("resource") / "fastdds_udp_on
 
 
 def configure_fastdds_transport() -> str:
-    """Select one UDP-capable Fast DDS profile for the typed media bridge."""
+    """Select the deployment's loopback-only Fast DDS profile."""
     profile = (os.environ.get("FASTDDS_DEFAULT_PROFILES_FILE")
                or os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE"))
-    if not profile:
-        if not DEFAULT_FASTDDS_PROFILE.is_file():
-            raise RuntimeError(f"Fast DDS UDP profile is missing: {DEFAULT_FASTDDS_PROFILE}")
-        profile = str(DEFAULT_FASTDDS_PROFILE)
+    profile_path = Path(profile) if profile else DEFAULT_FASTDDS_PROFILE
+    if not profile_path.is_file():
+        raise RuntimeError(f"Fast DDS loopback profile is missing: {profile_path}")
+    profile = str(profile_path)
     os.environ["FASTDDS_DEFAULT_PROFILES_FILE"] = profile
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
     return profile
@@ -147,6 +147,13 @@ class BridgeWorker:
 def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[str, mp.Queue],
                            audio_q: mp.Queue, speaker_q: mp.Queue, debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError as exc:
+        sys.stderr.write(
+            f"[BridgeWorker] logsafe unavailable ({exc}); stdout unprotected\n")
+
     # ── Environment: Force Domain 42 + FastDDS in subprocess ────────────────────
     os.environ["ROS_DOMAIN_ID"] = "42"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
