@@ -123,7 +123,8 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
-            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl))
+            state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl)
+            self._plugins.append(state_plugin)
             print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
@@ -149,8 +150,9 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
-            self._plugins.append(MotionStatePlugin(
-                plugins_cfg["motion_state"], namespace, executor, high_ctrl))
+            motion_state_plugin = MotionStatePlugin(
+                plugins_cfg["motion_state"], namespace, executor, high_ctrl)
+            self._plugins.append(motion_state_plugin)
             print("[bundle] MotionStatePlugin loaded")
 
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
