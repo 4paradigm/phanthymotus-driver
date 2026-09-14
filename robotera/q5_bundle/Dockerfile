@@ -90,6 +90,7 @@ COPY odom.py /work/odom.py
 COPY teleop_state.py /work/teleop_state.py
 COPY robot_status.py /work/robot_status.py
 COPY config.yaml /work/config.yaml
+COPY trend_processor.py /work/trend_processor.py
 COPY resource/q5_model.urdf /work/resource/q5_model.urdf
 COPY resource/fastdds_udp_only.xml /work/resource/fastdds_udp_only.xml
 COPY resource/startup_beep.pcm /work/resource/startup_beep.pcm
