@@ -651,6 +651,30 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("cancelled", status)
         self.assertEqual("stopmotion", payload["reason"])
 
+    def test_joint_stopmotion_cancels_active_cartesian_action(self):
+        started = self.plugin.dispatch("movel", self._movel_args())
+        stop = self.arm.dispatch("stopmotion", {"_tool_name": "joint_control"})
+
+        self.assertEqual("stop_requested", stop["state"])
+        self.assertEqual(started["action_id"], stop["action_id"])
+        self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        action_id, status, payload = self.acp_events[0]
+        self.assertEqual(started["action_id"], action_id)
+        self.assertEqual("cancelled", status)
+        self.assertEqual("stopmotion", payload["reason"])
+
+    def test_cartesian_stopmotion_stops_active_joint_action(self):
+        action_id = "rm75_joint_active"
+        with self.arm._action_lock:
+            self.arm._active_action_id = action_id
+            self.arm._motion_state["active_action_id"] = action_id
+        stop = self.plugin.dispatch("stopmotion", {})
+
+        self.assertEqual({"state": "stop_requested", "action_id": action_id}, stop)
+        self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
+        self.assertIn(action_id, self.arm._cancelled)
+
     def test_info_remains_available_while_submission_is_blocked(self):
         gate = threading.Event()
 
