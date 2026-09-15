@@ -375,23 +375,50 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertIs(True, schema["x-is-dangerous"])
         self.assertEqual(["movel", "move_offset", "movep"], schema["x-completion"]["actions"])
         self.assertIn("confirm_motion", schema["properties"])
+        self.assertEqual(False, schema["properties"]["cartesian_enabled"]["default"])
+        self.assertIn("cartesian_enabled", schema["x-action-params"]["movel"]["params"])
+        self.assertIn("cartesian_enabled", schema["x-action-params"]["move_offset"]["params"])
+        self.assertIn("cartesian_enabled", schema["x-action-params"]["movep"]["params"])
         self.assertEqual(10, schema["properties"]["speed_percent"]["maximum"])
         self.assertIn("movel", schema["x-action-params"])
         self.assertIn("movep", schema["x-action-params"])
         self.assertEqual(["tool"], schema["properties"]["frame_type"]["enum"])
         self.assertIn("工具系偏移", tools[0]["description"])
 
-    def test_cartesian_motion_is_disabled_until_workspace_validation(self):
+    def test_cartesian_motion_requires_card_enable(self):
         plugin = self.device.CartesianPlugin(
             self.client, {"safety": dict(self.FAST_SAFETY)},
             arm_plugin=self.arm, namespace="rm75",
         )
 
-        with self.assertRaisesRegex(PermissionError, "pending supervised workspace validation"):
-            plugin.dispatch("movel", self._movel_args())
+        for cartesian_enabled in (None, False):
+            with self.subTest(cartesian_enabled=cartesian_enabled):
+                args = self._movel_args()
+                if cartesian_enabled is not None:
+                    args["cartesian_enabled"] = cartesian_enabled
+                with self.assertRaisesRegex(PermissionError, "disabled for this request"):
+                    plugin.dispatch("movel", args)
 
         self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
         self.assertFalse(plugin._motion_lock.locked())
+
+    def test_card_can_enable_cartesian_motion_with_workspace_guards(self):
+        plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY)},
+            arm_plugin=self.arm, namespace="rm75",
+        )
+        events = []
+        plugin._acp_callback = lambda action_id, status, result: events.append((action_id, status, result))
+
+        result = plugin.dispatch("movel", self._movel_args(cartesian_enabled=True))
+
+        self.assertEqual("running", result["state"])
+        self.assertIn(
+            ("rm_movel", ([0.1, 0.0, 0.0, math.pi / 2, 0.0, 0.0], 5, 0, 0, 0)),
+            self.client.calls,
+        )
+        self.client.pose_mm_deg = [100.0, 0.0, 0.0, 90.0, 0.0, 0.0]
+        self.assertTrue(self._wait_for(lambda: len(events) == 1))
 
     def test_movel_converts_units_and_reports_completion(self):
         result = self.plugin.dispatch("movel", self._movel_args())

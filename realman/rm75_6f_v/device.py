@@ -780,15 +780,20 @@ class CartesianPlugin:
             },
             "speed_percent": {"type": "integer", "minimum": 1, "maximum": self.max_speed_percent,
                               "default": self.default_speed_percent},
+            "cartesian_enabled": {
+                "type": "boolean",
+                "default": False,
+                "description": "本次是否允许笛卡尔运动；必须显式设为 true",
+            },
             "confirm_motion": {"type": "boolean", "description": "Must be true for every movement request"},
         }
         schema = action_schema(
             {
-                "movel": (["x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg", "speed_percent", "confirm_motion"],
+                "movel": (["x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg", "speed_percent", "cartesian_enabled", "confirm_motion"],
                           "笛卡尔直线运动到绝对位姿（位置毫米、姿态度，相对基座坐标系）"),
-                "move_offset": (["dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg", "frame_type", "speed_percent", "confirm_motion"],
+                "move_offset": (["dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg", "frame_type", "speed_percent", "cartesian_enabled", "confirm_motion"],
                                 "沿工具坐标系做直线偏移（相对当前位姿）"),
-                "movep": (["waypoints", "speed_percent", "confirm_motion"],
+                "movep": (["waypoints", "speed_percent", "cartesian_enabled", "confirm_motion"],
                           "依次经过多个路径点的轨迹运动"),
                 "stopmotion": ([], "请求受控减速停止"),
                 "info": ([], "读取运动状态与安全配置"),
@@ -860,10 +865,11 @@ class CartesianPlugin:
         }
 
     def _start_cartesian(self, motion_type, args):
-        if not self.cartesian_enabled:
+        request_enabled = args.get("cartesian_enabled", self.cartesian_enabled)
+        if request_enabled is not True:
             raise PermissionError(
-                "cartesian motion is disabled pending supervised workspace validation; "
-                "set cartesian.enabled=true only after configuring installation-specific limits"
+                "cartesian motion is disabled for this request; "
+                "set cartesian_enabled=true on the card after validating the workspace limits"
             )
         if not self.client.motion_enabled:
             raise PermissionError("motion is locked; set RM_MOTION_ENABLED=1 only for supervised hardware testing")
