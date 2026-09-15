@@ -724,7 +724,7 @@ class CartesianPlugin:
         self._action_lock = threading.Lock()
         self._submission_lock = threading.Lock()
         self._active_action_id = None
-        self._cancelled = set()
+        self._cancelled = arm_plugin._cancelled if arm_plugin is not None else set()
         self._monitor_thread = None
         self._last_completion = None
         safety = config.get("safety", {})
@@ -1157,10 +1157,10 @@ class CartesianPlugin:
             self._acp_callback(action_id, status, result)
 
     def _stop_motion(self):
-        # SDK 慢停调用无超时上限，不得在 _action_lock 内执行：
-        # 控制器不应答时锁内调用会永久占锁，拖死后续所有请求。
+        # 运动锁和动作 ID 在两张卡之间共享；任一 stop 卡都必须能停止实际持有者。
+        # SDK 慢停调用无超时上限，不得在 _action_lock 内执行。
         with self._action_lock:
-            action_id = self._active_action_id
+            action_id = self._motion_state["active_action_id"] or self._active_action_id
             if action_id:
                 self._cancelled.add(action_id)
         if action_id and self.client.connected:
