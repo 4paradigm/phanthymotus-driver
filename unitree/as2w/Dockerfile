@@ -14,7 +14,7 @@ ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} pyyaml && \
     pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
-COPY main.py device.py lidar.py spatial_action.py rpc_proxy.py config.yaml /work/
+COPY main.py device.py lidar.py controlled_spatial.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 \
