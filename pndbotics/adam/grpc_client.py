@@ -68,7 +68,10 @@ class AdamGrpcClient:
             return response
         result = {
             "success": bool(response.success),
-            "message": response.message,
+            # Older Adam controller builds omit ``message`` from some
+            # response messages (notably GetRobotState).  Keep the adapter
+            # wire-compatible instead of failing while decoding a valid RPC.
+            "message": getattr(response, "message", ""),
         }
         for field in fields:
             result[field] = getattr(response, field)
