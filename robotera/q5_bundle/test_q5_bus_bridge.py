@@ -63,8 +63,23 @@ class Q5BusBridgeTests(unittest.TestCase):
                         worker_source.index("import rclpy"))
         self.assertLess(worker_source.index('os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"'),
                         worker_source.index("import rclpy"))
-        self.assertLess(worker_source.index("configure_fastdds_transport()"),
+        self.assertLess(worker_source.index("configure_bundled_fastdds_transport()"),
                         worker_source.index("import rclpy"))
+
+    def test_media_bridge_forces_bundled_profile(self):
+        with tempfile.NamedTemporaryFile() as configured, \
+                mock.patch.dict(os.environ, {
+                    "FASTRTPS_DEFAULT_PROFILES_FILE": configured.name,
+                    "FASTDDS_DEFAULT_PROFILES_FILE": configured.name,
+                    "FASTDDS_BUILTIN_TRANSPORTS": "DEFAULT",
+                }, clear=True):
+            profile = q5_media_bridge.configure_bundled_fastdds_transport()
+
+            bundled = str(fastdds_transport.DEFAULT_FASTDDS_PROFILE)
+            self.assertEqual(profile, bundled)
+            self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], bundled)
+            self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], bundled)
+            self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS", os.environ)
 
     def test_fastdds_transport_uses_existing_deployment_profile(self):
         with tempfile.NamedTemporaryFile() as configured, \
@@ -132,9 +147,9 @@ class Q5BusBridgeTests(unittest.TestCase):
         self.assertIsNotNone(builtin)
         self.assertEqual(builtin.text.strip().lower(), "false")
 
-    def test_both_bridges_use_shared_fastdds_selector(self):
-        self.assertIs(q5_media_bridge.configure_fastdds_transport,
-                      fastdds_transport.configure_fastdds_transport)
+    def test_bridges_use_their_expected_fastdds_selectors(self):
+        self.assertIs(q5_media_bridge.configure_bundled_fastdds_transport,
+                      fastdds_transport.configure_bundled_fastdds_transport)
         self.assertIs(q5_bus_bridge.configure_fastdds_transport,
                       fastdds_transport.configure_fastdds_transport)
 

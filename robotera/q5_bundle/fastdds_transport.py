@@ -15,10 +15,24 @@ _PROFILE_ENV_VARS = (
 )
 
 
+def _apply_profile(profile: Path) -> str:
+    os.environ.pop("FASTDDS_BUILTIN_TRANSPORTS", None)
+    selected = str(profile)
+    for name in _PROFILE_ENV_VARS:
+        os.environ[name] = selected
+    print(f"[q5-dds] using Fast DDS profile: {selected}", flush=True)
+    return selected
+
+
+def configure_bundled_fastdds_transport() -> str:
+    """Force the loopback-only UDP profile used by the media bridge."""
+    if not DEFAULT_FASTDDS_PROFILE.is_file():
+        raise RuntimeError(f"Fast DDS profile unavailable: {DEFAULT_FASTDDS_PROFILE}")
+    return _apply_profile(DEFAULT_FASTDDS_PROFILE)
+
+
 def configure_fastdds_transport() -> str:
     """Select an existing deployment profile, falling back to the bundled copy."""
-    os.environ.pop("FASTDDS_BUILTIN_TRANSPORTS", None)
-
     configured_paths = [os.environ.get(name) for name in _PROFILE_ENV_VARS]
     profile = next((Path(path) for path in configured_paths if path and Path(path).is_file()), None)
     if profile is None:
@@ -36,8 +50,4 @@ def configure_fastdds_transport() -> str:
             )
         profile = DEFAULT_FASTDDS_PROFILE
 
-    selected = str(profile)
-    for name in _PROFILE_ENV_VARS:
-        os.environ[name] = selected
-    print(f"[q5-dds] using Fast DDS profile: {selected}", flush=True)
-    return selected
+    return _apply_profile(profile)

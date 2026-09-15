@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 
-from fastdds_transport import configure_fastdds_transport
+from fastdds_transport import configure_bundled_fastdds_transport
 
 
 class BridgeWorker:
@@ -143,11 +143,11 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     os.environ["ROS_DOMAIN_ID"] = "42"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
-    # The bridge is in a separate Docker process from Agent Core. Fast DDS's
-    # default shared-memory transport discovers a topic but cannot receive its
-    # samples across that boundary, so select one UDP-capable profile before
-    # importing rclpy.
-    profile = configure_fastdds_transport()
+    # The bridge is in a separate Docker process from Agent Core. Force the
+    # bundled loopback-only UDP profile that is verified to carry live PCM
+    # across that boundary, regardless of the fleet profile inherited by the
+    # container.
+    profile = configure_bundled_fastdds_transport()
 
     import hashlib
     import json
