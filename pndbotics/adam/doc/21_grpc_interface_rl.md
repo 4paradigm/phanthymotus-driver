@@ -34,14 +34,14 @@ plugins:
 
 只读状态卡（如 `joints`、`imu`、`battery`、`estop`）不需要开发者模式，但仍依赖
 机器人 Demo、DDS/ROS2 或 PAC 服务已经启动。实体急停始终使用遥控器 `LB + RB`，
-不能用 `safety` 卡冒充。
+不能由软件动作卡冒充。
 
 也可以通过 `GRPC_HOST`、`GRPC_PORT` 和 `GRPC_API=rl` 覆盖配置。兼容的 `loco`
 聚合卡提供 `GetRobotState`、`SetMode`、`SetVelocity`、`SetHeight`、`SetMotion`、
 `SetTrackingMotion`、`SetControlMode`、`GetControlState` 和 `Shutdown`；驱动还提供
-职责拆分的执行卡：`motion`（上半身动作文件）、`tracking_motion`（全身轨迹文件）
-和 `safety`（停止动作、关闭控制器）。动作卡会在内部自动选择 RL 控制域，并切换到
-所需 FSM 状态；`posture` 和 `control_mode` 不作为外部卡片暴露。
+职责拆分的执行卡：`motion`（上半身动作文件）和 `tracking_motion`（全身轨迹文件）。
+动作卡会在内部自动选择 RL 控制域，并切换到所需 FSM 状态；`posture`、`control_mode`
+和 `safety` 不作为外部卡片暴露。
 
 下发动作前先调用 `get_state`，只使用返回的 `switchable_states` 和
 `available_actions`。动作卡会先校验目标状态，再轮询 `fsm_state` 确认异步切换完成；
@@ -52,7 +52,6 @@ plugins:
 成功响应。
 
 `SetControlMode` 的 `domain_id=0` 为传统控制，`1` 为 RL 控制。动作卡固定选择
-`domain_id=1`，不要求上层显式管理控制域。`safety.stop_motion` 只调用官方
-`SetMotion(STOP)`，不宣称能够触发实体急停；实体急停仍由 `estop` 只读卡提供。驱动
-停止时不会自动关闭机器人控制器，必须显式调用 `safety.shutdown`（或兼容卡的
-`loco.shutdown`）。
+`domain_id=1`，不要求上层显式管理控制域。普通动作停止使用 `motion.stop`，不宣称
+能够触发实体急停；实体急停仍由 `estop` 只读卡和遥控器 `LB + RB` 提供。控制器关闭
+仍只保留在兼容 `loco.shutdown` 动作中，不作为独立卡暴露。

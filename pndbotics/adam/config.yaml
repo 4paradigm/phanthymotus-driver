@@ -34,8 +34,6 @@ plugins:
     enabled: true
   tracking_motion:
     enabled: true
-  safety:
-    enabled: true
   camera:
     enabled: true
     # The ZED Mini is connected to this Jetson. Keep the local SDK path; the
