@@ -99,8 +99,19 @@ class LocoPlugin:
         return {"name": "loco", "type": "actuator", "multiInstance": False,
                 "description": "Unitree AS2 locomotion via SportClient", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions}, "vx": {"type": "number"}, "vy": {"type": "number"}, "vyaw": {"type": "number"},
-                    "duration": {"type": "number"}, "roll": {"type": "number"}, "pitch": {"type": "number"}, "yaw": {"type": "number"},
-                    "level": {"type": "integer"}, "height": {"type": "number"}, "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}, "flag": {"type": "boolean"}}, "required": ["action"]}}
+                    "duration": {"type": "number", "minimum": -1, "maximum": 30}, "roll": {"type": "number"}, "pitch": {"type": "number"}, "yaw": {"type": "number"},
+                    "level": {"type": "integer"}, "height": {"type": "number"}, "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}, "flag": {"type": "boolean"}}, "required": ["action"],
+                "x-action-params": {
+                    "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with optional duration (-1 for continuous)."},
+                    "stop_move": {"params": [], "description": "Stop movement."},
+                    "stand_up": {"params": [], "description": "Stand up."}, "stand_down": {"params": [], "description": "Stand down."},
+                    "balance_stand": {"params": [], "description": "Balance stand."}, "recovery_stand": {"params": [], "description": "Recovery stand."},
+                    "damp": {"params": [], "description": "Damp motors."}, "euler": {"params": ["roll", "pitch", "yaw"], "description": "Set body attitude."},
+                    "speed_level": {"params": ["level"], "description": "Set speed level."}, "body_height": {"params": ["height"], "description": "Set body height."},
+                    "body_position": {"params": ["x", "y", "z", "yaw"], "description": "Set body position."}, "switch_gait": {"params": ["level"], "description": "Switch gait."},
+                    "switch_joystick": {"params": ["flag"], "description": "Enable or disable joystick."}, "left_side_gait": {"params": ["flag"], "description": "Enable left-side gait."},
+                    "right_side_gait": {"params": ["flag"], "description": "Enable right-side gait."}, "auto_recovery": {"params": ["flag"], "description": "Enable or disable auto recovery."},
+                    "get_state": {"params": [], "description": "Read sport state."}}}}
     def start(self): pass
     def stop(self):
         self._stop_continuous()
@@ -124,6 +135,8 @@ class LocoPlugin:
             duration = args.get("duration")
             if duration is None: return {"ret": self.proxy.Move(vx, vy, yaw), "vx": vx, "vy": vy, "vyaw": yaw}
             duration = float(duration)
+            if not math.isfinite(duration) or duration > 30:
+                return {"ret": -1, "message": "duration must be at most 30 seconds"}
             if duration == -1:
                 self._continuous(vx, vy, yaw); return {"ret": 0, "status": "running", "duration": -1}
             if duration < 0: return {"ret": -1, "message": "duration must be -1, 0, or positive"}
@@ -159,8 +172,14 @@ class SpecialActionPlugin:
                 "description": "AS2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions},
-                    "enter": {"type": "boolean", "description": "Enter or exit a sustained posture."}},
-                    "required": ["action"]}}
+                    "enter": {"type": "boolean", "description": "Enter or exit a sustained posture."},
+                    "confirm": {"type": "boolean", "description": "Required true for hazardous motions."}},
+                    "required": ["action"],
+                    "x-action-params": {
+                        "front_flip": {"params": ["confirm"], "description": "DANGEROUS forward flip; requires confirm=true."},
+                        "back_flip": {"params": ["confirm"], "description": "DANGEROUS backward flip; requires confirm=true."},
+                        "handstand": {"params": ["enter", "confirm"], "description": "DANGEROUS handstand; requires confirm=true."},
+                        "biped_stand": {"params": ["enter", "confirm"], "description": "DANGEROUS biped stand; requires confirm=true."}}}}
 
     def start(self): pass
     def stop(self): pass
@@ -168,6 +187,8 @@ class SpecialActionPlugin:
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop": return {"state": "idle"}
+        if action in ("front_flip", "back_flip", "handstand", "biped_stand") and not args.get("confirm", False):
+            return {"error": "special action requires confirm=true"}
         if action == "front_flip": return {"ret": self.proxy.FrontFlip()}
         if action == "back_flip": return {"ret": self.proxy.BackFlip()}
         if action == "handstand": return {"ret": self.proxy.HandStand(1 if args.get("enter", True) else 0)}

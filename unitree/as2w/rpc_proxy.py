@@ -2,8 +2,16 @@
 import multiprocessing
 import threading
 
+def _install_logsafe():
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except (ImportError, TypeError):
+        pass
+
 
 def _worker(commands, results, interface):
+    _install_logsafe()
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     from unitree_sdk2py.as2.sport.sport_client import SportClient
     ChannelFactoryInitialize(0, interface)

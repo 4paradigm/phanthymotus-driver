@@ -7,6 +7,13 @@ import json
 import multiprocessing
 import threading
 
+def _install_logsafe():
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except (ImportError, TypeError):
+        pass
+
 _SERVICE = "slam_operate"
 _VERSION = "1.0.0.1"
 _APIS = {"start_mapping": 1801, "stop_mapping": 1802, "init_pose": 1804,
@@ -28,6 +35,7 @@ class _SlamClient:
 
 
 def _worker(commands, results, interface):
+    _install_logsafe()
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     ChannelFactoryInitialize(0, interface)
     client = _SlamClient()
@@ -79,7 +87,15 @@ class ControlledSpatialPlugin:
                     "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
                     "q_x": {"type": "number"}, "q_y": {"type": "number"}, "q_z": {"type": "number"}, "q_w": {"type": "number"},
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5},
-                    "mode": {"type": "integer", "enum": [0, 1]}}, "required": ["action"]}}
+                    "mode": {"type": "integer", "enum": [0, 1]}}, "required": ["action"],
+                "x-action-params": {
+                    "start_mapping": {"params": [], "description": "Start indoor SLAM mapping."},
+                    "stop_mapping": {"params": ["address"], "description": "Stop mapping and save PCD."},
+                    "init_pose": {"params": ["address", "x", "y", "z", "q_x", "q_y", "q_z", "q_w"], "description": "Load map and initialize pose."},
+                    "navigate_to": {"params": ["x", "y", "z", "q_x", "q_y", "q_z", "q_w", "speed", "mode"], "description": "Navigate to a target pose."},
+                    "pause_navigation": {"params": [], "description": "Pause navigation."},
+                    "resume_navigation": {"params": [], "description": "Resume navigation."},
+                    "shutdown": {"params": [], "description": "Close vendor SLAM service."}}}}
 
     def start(self): pass
     def stop(self): self._client.stop()
