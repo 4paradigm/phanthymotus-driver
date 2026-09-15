@@ -1,6 +1,6 @@
-unitree-as2:
+unitree-as2w:
   image: __IMAGE__
-  container_name: embodied-unitree-as2
+  container_name: embodied-unitree-as2w
   network_mode: host
   ipc: host
   pid: host

@@ -1,4 +1,4 @@
-"""Unitree AS2 driver plugins (AS2 SDK uses the vendored A2 SportClient)."""
+"""Unitree AS2W driver plugins (official AS2 SDK SportClient)."""
 import json
 import math
 import threading
@@ -19,7 +19,7 @@ def _number(value, default=0.0):
 class _StateNode:
     def __init__(self, namespace, executor):
         from rclpy.node import Node
-        self.node = Node("as2_state")
+        self.node = Node("as2w_state")
         self.imu = self.node.create_publisher(String, f"/{namespace}/state/imu", 10)
         self.joints = self.node.create_publisher(String, f"/{namespace}/state/joints", 10)
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", 10)
@@ -149,8 +149,8 @@ class LocoPlugin:
 
 
 _AS2_JOINT_NAMES = [
-    "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
-    "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
-    "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
-    "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+    "FR_hip", "FR_thigh", "FR_calf", "FR_foot",
+    "FL_hip", "FL_thigh", "FL_calf", "FL_foot",
+    "RR_hip", "RR_thigh", "RR_calf", "RR_foot",
+    "RL_hip", "RL_thigh", "RL_calf", "RL_foot",
 ]

@@ -1,12 +1,12 @@
-id: as2-driver
-name: Unitree AS2 Bundle
+id: as2w-driver
+name: Unitree AS2W Bundle
 category: driver
 hardware_provider: unitree
-hardware_model: "as2"
-image_name: as2
+hardware_model: "as2w"
+image_name: as2w
 port: 15704
 mcp_url: "http://localhost:15704/mcp"
-description: "Unitree AS2 — 基于 AS2 SDK 的运动控制与状态感知"
+description: "Unitree AS2W — 基于 AS2W SDK 的轮足运动控制、状态感知与雷达"
 build_context_extras:
   - ../../common
 cards:
@@ -18,3 +18,4 @@ cards:
   - { name: battery, type: sensor }
   - { name: loco_state, type: sensor }
   - { name: lidar_cloud, type: sensor }
+  - { name: lidar_state, type: sensor }
