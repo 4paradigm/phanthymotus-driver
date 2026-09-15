@@ -115,10 +115,41 @@ class SocketBridgeServer:
 
     SOCKET_DIR = "/tmp/tianyi_bridge"
 
+    # Loopback-only profile every other container on domain 42 loads. Set here
+    # rather than inherited from the environment, for two reasons:
+    #
+    #  * Inheriting is what broke. This process only ever *read* the variable
+    #    and printed it; the container never set it, because setting it in
+    #    compose would apply to main.py too and confine the body context to
+    #    127.0.0.1, cutting the vendor link on 192.168.41.x. So the bridge fell
+    #    back to FastDDS's default transport, bound every interface, and stopped
+    #    matching the loopback-only readers in agent-core and perception.
+    #  * Setting it per process is the documented way out of "one profile per
+    #    process": this is a separate process from main.py, so its profile is
+    #    its own. joints_bridge_v2.run_publisher already does exactly this.
+    #
+    # The symptom was size-dependent and therefore misleading: small topics
+    # (joints, ext_mic) still got through often enough to look healthy, while
+    # 47 KB camera frames were dropped almost entirely — so the camera looked
+    # broken and everything else looked fine.
+    DDS_LOCAL_PROFILE = "/opt/phanthy-motus/dds-local.xml"
+
     def __init__(self):
-        # Setup domain 42 with default DDS config (same as agent-core)
-        # Agent-core and socket bridge must use the same DDS configuration
-        # to communicate. They inherit from main process environment.
+        # Must precede rclpy.init: FastDDS reads the variable when the
+        # participant is created and caches the parsed profile process-wide.
+        if os.path.exists(self.DDS_LOCAL_PROFILE):
+            os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = self.DDS_LOCAL_PROFILE
+            print(f"[socket-bridge] using DDS profile {self.DDS_LOCAL_PROFILE}", flush=True)
+        else:
+            # Loud, because the failure it precedes is not: the bridge would
+            # publish happily onto a transport nothing else is listening on.
+            print(
+                f"[socket-bridge] WARNING: {self.DDS_LOCAL_PROFILE} not found — "
+                "falling back to FastDDS defaults, which bind every interface "
+                "and will NOT match agent-core's loopback-only readers",
+                flush=True,
+            )
+
         self.ctx = Context()
         rclpy.init(context=self.ctx, domain_id=42)
         self.executor = rclpy.executors.MultiThreadedExecutor(context=self.ctx)
