@@ -4020,6 +4020,12 @@ def run_realsense_process(namespace: str) -> None:
     All heavy imports (cv2, numpy, pyrealsense2, sensor_msgs) happen here
     so the main process is not affected if these packages are missing.
     """
+    # ``spawn`` starts a fresh interpreter, so the parent process's atomic
+    # Docker-log writer is not inherited.  Install it before heavy imports,
+    # ROS/native initialization, or any child-process output.
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     import os
     import cv2
     import numpy as np
