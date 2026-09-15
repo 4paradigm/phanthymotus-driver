@@ -15,6 +15,27 @@ plugins:
     grpc_api: "rl"
 ```
 
+## 真机执行前置条件
+
+根据厂商的真机开发和遥控器说明，凡是通过 DDS/ROS2 向机器人发送执行器
+指令（包括 `hand`、`arm` 以及未来的 `rt/lowcmd` 关节控制），应先人工让机器人
+进入开发者模式：机器人悬挂并处于阻尼模式时，短按遥控器 `LO + RO`，确认 RCU
+指示灯变为蓝色慢速呼吸。退出时短按 `LT + B`，回到阻尼模式。
+
+这一步不是 MCP 或 gRPC API 能完成的操作；驱动不会模拟按键，也不会在启动卡片时
+自动切换开发者模式。执行前仍需满足具体控制链路的条件：
+
+- RL gRPC：确认 `GetRobotState` 成功，并按 `switchable_states` 切换到允许的 FSM 状态；
+  `SetControlMode(domain_id=1)` 表示选择 RL 控制域。
+- ROS2 上肢控制：机器人还必须处于站立状态，并通过遥控器开启实时遥操接收，直到
+  控制台显示 `real time retarget start`；退出上肢外部控制后再停止卡片。
+- DDS 手指/底层控制：开发者模式只代表允许外部 SDK，仍必须确认对应 `rt/*` 通道已
+  发现且发送周期正常。
+
+只读状态卡（如 `joints`、`imu`、`battery`、`estop`）不需要开发者模式，但仍依赖
+机器人 Demo、DDS/ROS2 或 PAC 服务已经启动。实体急停始终使用遥控器 `LB + RB`，
+不能用 `safety` 卡冒充。
+
 也可以通过 `GRPC_HOST`、`GRPC_PORT` 和 `GRPC_API=rl` 覆盖配置。兼容的 `loco`
 聚合卡提供 `GetRobotState`、`SetMode`、`SetVelocity`、`SetHeight`、`SetMotion`、
 `SetTrackingMotion`、`SetControlMode`、`GetControlState` 和 `Shutdown`；驱动还提供
