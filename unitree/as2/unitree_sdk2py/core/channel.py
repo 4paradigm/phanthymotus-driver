@@ -1,4 +1,3 @@
-import logging
 import time
 from typing import Any, Callable
 import threading
@@ -29,9 +28,6 @@ from ..utils.bqueue import BQueue
 """
 " class Channel
 """
-
-_log = logging.getLogger(__name__)
-
 class Channel:
     
     """
@@ -67,11 +63,11 @@ class Channel:
                 else:
                     sample = self.__reader.take_one(timeout=duration(seconds=timeout))
             except DDSException as e:
-                _log.warning("[Reader] DDSException: %s", e.msg)
+                print("[Reader] catch DDSException msg:", e.msg)
             except TimeoutError as e:
-                _log.debug("[Reader] take sample timeout")
+                print("[Reader] take sample timeout")
             except:
-                _log.warning("[Reader] take sample error", exc_info=True)
+                print("[Reader] take sample error")
 
             return sample
 
@@ -90,13 +86,13 @@ class Channel:
             try:
                 samples = reader.take(1)
             except DDSException as e:
-                _log.warning("[Reader] DDSException: %s", e.msg)
+                print("[Reader] catch DDSException error. msg:", e.msg)
                 return
             except TimeoutError as e:
-                _log.debug("[Reader] take sample timeout")
+                print("[Reader] take sample timeout")
                 return
             except:
-                _log.warning("[Reader] take sample error", exc_info=True)
+                print("[Reader] take sample error")
                 return
 
             if samples is None:
@@ -126,13 +122,9 @@ class Channel:
         def __init__(self):
             self.__writer = None
             self.__publication_matched_count = 0
-            self.__topic_name = ''
-            self.__unmatched_warns = 0
         
-        def Init(self, participant: DomainParticipant, topic: Topic, qos: Qos = None,
-                 topic_name: str = ''):
+        def Init(self, participant: DomainParticipant, topic: Topic, qos: Qos = None):
             self.__writer = DataWriter(participant, topic, qos, Listener(on_publication_matched=self.__OnPublicationMatched))
-            self.__topic_name = topic_name
             time.sleep(0.2)
 
         def Write(self, sample: Any, timeout: float = None):
@@ -146,26 +138,15 @@ class Channel:
 
             # check waitsec
             if timeout is not None and waitsec <= 0.0:
-                # Nothing on the other side ever matched this writer, so the sample
-                # was never sent. Callers only surface a generic "send error", which
-                # made a persistent failure here look like a mystery: say what is
-                # actually wrong. Throttled — the caller already logs every attempt.
-                self.__unmatched_warns += 1
-                if self.__unmatched_warns == 1 or self.__unmatched_warns % 100 == 0:
-                    _log.warning(
-                        "[Writer] no subscriber matched %s after %.1fs, sample dropped "
-                        "(occurrence %d) — is the peer service running?",
-                        self.__topic_name or '<unknown topic>', timeout,
-                        self.__unmatched_warns)
                 return False
 
             try:
                 self.__writer.write(sample)
             except DDSException as e:
-                _log.warning("[Writer] DDSException: %s", e.msg)
+                print("[Writer] catch DDSException error. msg:", e.msg)
                 return False
             except Exception as e:
-                _log.warning("[Writer] write sample error: %r", e)
+                print("[Writer] write sample error. msg:", e.args())
                 return False
 
             return True
@@ -175,11 +156,6 @@ class Channel:
                 del self.__writer
         
         def __OnPublicationMatched(self, writer: DataWriter, status: dds_c_t.publication_matched_status):
-            if status.current_count > 0 and self.__publication_matched_count == 0:
-                if self.__unmatched_warns:
-                    _log.warning("[Writer] subscriber matched %s, resuming",
-                                 self.__topic_name or '<unknown topic>')
-                self.__unmatched_warns = 0
             self.__publication_matched_count = status.current_count
 
 
@@ -188,11 +164,10 @@ class Channel:
         self.__reader = self.__Reader()
         self.__writer = self.__Writer()
         self.__participant = participant
-        self.__name = name
         self.__topic = Topic(self.__participant, name, type, qos)
 
     def SetWriter(self, qos: Qos = None):
-        self.__writer.Init(self.__participant, self.__topic, qos, self.__name)
+        self.__writer.Init(self.__participant, self.__topic, qos)
 
     def SetReader(self, qos: Qos = None, handler: Callable = None, queueLen: int = 0):
         self.__reader.Init(self.__participant, self.__topic, qos, handler, queueLen)
@@ -242,19 +217,19 @@ class ChannelFactory(Singleton):
             try:
                 self.__class__.__domain = Domain(id, config)
             except DDSException as e:
-                _log.error("[ChannelFactory] create domain error: %s", e.msg)
+                print("[ChannelFactory] create domain error. msg:", e.msg)
                 return False
             except:
-                _log.error("[ChannelFactory] create domain error")
+                print("[ChannelFactory] create domain error.")
                 return False
 
             try:
                 self.__class__.__participant = DomainParticipant(id)
             except DDSException as e:
-                _log.error("[ChannelFactory] create domain participant error: %s", e.msg)
+                print("[ChannelFactory] create domain participant error. msg:", e.msg)
                 return False
             except:
-                _log.error("[ChannelFactory] create domain participant error")
+                print("[ChannelFactory] create domain participant error")
                 return False
 
             self.__class__.__qos = qos

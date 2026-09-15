@@ -49,7 +49,9 @@ class _StateNode:
                    "tau": _number(getattr(m, "tau_est", getattr(m, "tau", 0))),
                    "temperature": int(getattr(m, "temperature", 0))} for i, m in enumerate(motors)]
         self._publish(self.joint_state, {"joint_states": states})
-        self._publish(self.joints, {"joints": [{"idx": s["idx"], "q": s["q"]} for s in states]})
+        self._publish(self.joints, {"joints": [{"idx": s["idx"], "name": _AS2_JOINT_NAMES[s["idx"]], "q": s["q"]}
+                                               for s in states[:len(_AS2_JOINT_NAMES)]],
+                                    "imu_quat": list(getattr(imu, "quaternion", [])) if imu else []})
         bms = getattr(msg, "bms_state", None)
         if bms is not None:
             self._publish(self.battery, {"soc": int(getattr(bms, "soc", 0)),
@@ -71,14 +73,19 @@ class StatePlugin:
         self._namespace = namespace
         self._state = _StateNode(namespace, executor)
     def get_tools(self):
-        return [{"name": name, "type": "sensor", "multiInstance": False,
-                 "description": f"AS2 {name} state stream", "inputSchema": {"type": "object", "properties": {}},
-                 "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": "data/json"}]}
-                for name, path in (("imu", "state/imu"), ("joint_state", "state/joint_state"), ("battery", "state/battery"), ("loco_state", "loco/state"))]
+        specs = (("imu", "state/imu", "data/json", "AS2 IMU state"),
+                 ("joints", "state/joints", "sensor/skeleton", "AS2 12-joint skeleton for model animation"),
+                 ("joint_state", "state/joint_state", "data/json", "AS2 raw motor position, velocity, torque, and temperature"),
+                 ("battery", "state/battery", "data/json", "AS2 BMS state"),
+                 ("loco_state", "loco/state", "data/json", "AS2 high-level locomotion state"))
+        return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
+                 "inputSchema": {"type": "object", "properties": {}},
+                 "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+                for name, path, fmt, desc in specs]
     def start(self): pass
     def stop(self): pass
     def dispatch(self, action, args):
-        return {"state": "running"} if action in ("start", "info", "imu", "joint_state", "battery", "loco_state") else ({"state": "idle"} if action == "stop" else None)
+        return {"state": "running"} if action in ("start", "info", "imu", "joints", "joint_state", "battery", "loco_state") else ({"state": "idle"} if action == "stop" else None)
 
 
 class LocoPlugin:
@@ -88,7 +95,7 @@ class LocoPlugin:
         self._lock = threading.Lock()
         self._stop = None
     def get_tool(self):
-        actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_gait", "left_side_gait", "right_side_gait", "handstand", "biped_stand", "auto_recovery", "front_flip", "back_flip", "get_state"]
+        actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_gait", "switch_joystick", "left_side_gait", "right_side_gait", "handstand", "biped_stand", "auto_recovery", "front_flip", "back_flip", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
                 "description": "Unitree AS2 locomotion via SportClient", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions}, "vx": {"type": "number"}, "vy": {"type": "number"}, "vyaw": {"type": "number"},
@@ -130,6 +137,7 @@ class LocoPlugin:
         if action == "body_position": return {"ret": self.proxy.BodyPosition(float(args.get("x", 0)), float(args.get("y", 0)), float(args.get("z", 0)), float(args.get("yaw", 0)))}
         if action == "switch_gait": return {"ret": self.proxy.SwitchGait(int(args.get("level", 0)))}
         if action == "auto_recovery": return {"ret": self.proxy.SetAutoRecovery(1 if args.get("flag", True) else 0)}
+        if action == "switch_joystick": return {"ret": self.proxy.SwitchJoystick(1 if args.get("flag", True) else 0)}
         if action == "left_side_gait": return {"ret": self.proxy.LeftSideGait(1 if args.get("flag", True) else 0)}
         if action == "right_side_gait": return {"ret": self.proxy.RightSideGait(1 if args.get("flag", True) else 0)}
         if action == "handstand": return {"ret": self.proxy.HandStand(1 if args.get("flag", True) else 0)}
@@ -138,3 +146,11 @@ class LocoPlugin:
             code, state = self.proxy.GetState()
             return {"ret": code, "state": state}
         return None
+
+
+_AS2_JOINT_NAMES = [
+    "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+    "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+    "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+    "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+]

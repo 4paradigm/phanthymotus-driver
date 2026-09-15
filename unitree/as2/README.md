@@ -1,11 +1,12 @@
 # Unitree AS2 driver
 
 This bundle targets the Unitree **AS2** SDK service documented in the Unitree
-SDK guide. The SDK package currently exposes this service as
-`unitree_sdk2py.a2.sport.SportClient` (the same API names and service version
-used by the AS2 firmware): `Move`, `StopMove`, `StandUp`, `StandDown`,
+SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
+`65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5` and uses its dedicated
+`unitree_sdk2py.as2.sport.SportClient`: `Move`, `StopMove`, `StandUp`, `StandDown`,
 `BalanceStand`, `RecoveryStand`, `Damp`, `Euler`, `BodyHeight`, `BodyPosition`,
-`SwitchGait`, `SpeedLevel`, `SetAutoRecovery`, `FrontFlip`, and `BackFlip`.
+`SwitchGait`, `SpeedLevel`, `SwitchJoystick`, `SetAutoRecovery`, `GetState`,
+`FrontFlip`, and `BackFlip`.
 
 Run `python3 main.py <robot-interface>` on the robot network (normally the
 interface with a `192.168.123.x` address). The bundle exposes MCP on port
@@ -21,3 +22,10 @@ be invoked with a clear area and appropriate operator approval.
 The checked-in `resource/as2_model.urdf` is a kinematic 12-joint quadruped
 descriptor for visualization. Replace it with the calibrated model supplied by
 the robot deployment when available.
+
+The official AS2 SDK currently does not include an AS2 SLAM or navigation
+client. Therefore this bundle intentionally does not advertise `controlled_spatial`:
+the Go2 implementation depends on a different `g1.slam.SlamClient` plus host
+`unitree_slam` binaries, neither of which is an AS2 SDK contract. `lidar_cloud`
+is available for consuming the AS2 LiDAR stream; add controlled mapping only
+after an AS2 firmware deployment supplies and validates a compatible SLAM service.

@@ -38,6 +38,8 @@ class SportClient(Client):
         self._RegistApi(ROBOT_SPORT_API_ID_FRONTFLIP, 0)
         self._RegistApi(ROBOT_SPORT_API_ID_BACKFLIP, 0)
 
+        self._RegistApi(ROBOT_SPORT_API_ID_SWITCHJOYSTICK, 0)
+
         self._RegistApi(ROBOT_SPORT_API_ID_GETSTATE, 0)
 
     def Damp(self) -> int:
@@ -172,6 +174,13 @@ class SportClient(Client):
         code, data = self._Call(ROBOT_SPORT_API_ID_SETAUTORECOVERY, parameter)
         return code
 
+    def SwitchJoystick(self, switch_on: int) -> int:
+        p = {}
+        p["data"] = switch_on
+        parameter = json.dumps(p)
+        code, data = self._Call(ROBOT_SPORT_API_ID_SWITCHJOYSTICK, parameter)
+        return code
+
     def GetState(self, state_map: Dict[str, str]) -> int:
         p = {}
         parameter = json.dumps(p)
@@ -179,4 +188,3 @@ class SportClient(Client):
         if data:
             state_map.update(json.loads(data))
         return code
-

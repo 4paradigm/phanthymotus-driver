@@ -27,15 +27,12 @@ class Bundle:
     def tools(self):
         out = [
             {"name": "model", "type": "resource", "description": "Unitree AS2 quadruped URDF model", "inputSchema": {"type": "object", "properties": {}}},
-            {"name": "joints", "type": "resource", "description": "AS2 joint skeleton mapping for model visualization", "inputSchema": {"type": "object", "properties": {}}},
         ]
         for plugin in self.plugins: out.extend(plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()])
         return out
     def call(self, name, args):
         if name == "model":
             return {"path": str(Path(__file__).with_name("resource") / "as2_model.urdf"), "format": "urdf"}
-        if name == "joints":
-            return {"format": "sensor/skeleton", "joint_names": [f"{side}_{joint}_joint" for side in ("FR", "FL", "RR", "RL") for joint in ("hip", "thigh", "calf")], "model": "as2_model.urdf"}
         for plugin in self.plugins:
             defs = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
             if any(item["name"] == name for item in defs):
