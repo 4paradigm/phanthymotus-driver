@@ -1225,6 +1225,8 @@ class ArmGesturePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "ready"}
         if action == "stop":
             return self._arm.dispatch("disable", {})
         if action != "raise_hand" or args.get("side") not in ("left", "right"):
@@ -1759,6 +1761,8 @@ class HandGesturePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "ready"}
         if action == "stop":
             return self._hand.dispatch("stop", {})
         if action not in self.ACTIONS:

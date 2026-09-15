@@ -94,6 +94,7 @@ class AdamDriverContractTests(unittest.TestCase):
         arm = mock.Mock()
         arm.dispatch.return_value = {"state": "active", "joints_set": 7}
         gesture = adam.ArmGesturePlugin(arm)
+        self.assertEqual({"state": "ready"}, gesture.dispatch("start", {}))
         result = gesture.dispatch("raise_hand", {"side": "left"})
         self.assertEqual([
             mock.call("set_joints", {"joints": adam.ARM_RAISE_POSE["left"]}),
@@ -114,6 +115,7 @@ class AdamDriverContractTests(unittest.TestCase):
         hand._base_positions = lambda: [500] * 12
         hand._activate = mock.Mock(return_value={"state": "active"})
         gesture = adam.HandGesturePlugin(hand)
+        self.assertEqual({"state": "ready"}, gesture.dispatch("start", {}))
         self.assertNotIn("point", hand.get_tool()["inputSchema"]["properties"]["action"]["enum"])
         result = gesture.dispatch("point", {"side": "right"})
         self.assertEqual("active", result["state"])
@@ -148,6 +150,10 @@ class AdamDriverContractTests(unittest.TestCase):
             )
         tools = {tool["name"] for tool in bundle.get_all_tools()}
         self.assertEqual({"arm", "arm_gesture", "hand", "hand_gesture"}, tools)
+
+        manifest = (DRIVER / "driver.yaml").read_text()
+        self.assertIn("name: arm_gesture", manifest)
+        self.assertIn("name: hand_gesture", manifest)
 
     def test_hand_gestures_only_change_the_selected_hand(self):
         plugin = object.__new__(adam.HandPlugin)
