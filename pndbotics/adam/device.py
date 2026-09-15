@@ -699,7 +699,21 @@ class _StatePublisherNode(Node):
             state_monotonic = self._latest_state_monotonic
             active = self._active
 
-        if not active or state is None:
+        if not active:
+            return
+
+        if self._hand_state_cache is not None:
+            hand_state = self._hand_state_cache.snapshot(timeout_sec=1.0)
+            hand_payload = (
+                hand_state
+                if hand_state is not None
+                else _hand_status_payload(self._hand_state_cache, 1.0)
+            )
+            msg_hand = String()
+            msg_hand.data = json.dumps(hand_payload)
+            self._pub_hand.publish(msg_hand)
+
+        if state is None:
             return
 
         bat_data = _battery_payload(
@@ -712,17 +726,6 @@ class _StatePublisherNode(Node):
         msg_health.data = json.dumps(
             _state_health_payload(state, state_monotonic))
         self._pub_health.publish(msg_health)
-
-        if self._hand_state_cache is not None:
-            hand_state = self._hand_state_cache.snapshot(timeout_sec=1.0)
-            hand_payload = (
-                hand_state
-                if hand_state is not None
-                else _hand_status_payload(self._hand_state_cache, 1.0)
-            )
-            msg_hand = String()
-            msg_hand.data = json.dumps(hand_payload)
-            self._pub_hand.publish(msg_hand)
 
 
 class StatePlugin:
@@ -1229,6 +1232,8 @@ class ArmGesturePlugin:
             return {"state": "ready"}
         if action == "stop":
             return self._arm.dispatch("disable", {})
+        if action == "info":
+            return self._arm.dispatch("info", {})
         if action != "raise_hand" or args.get("side") not in ("left", "right"):
             return {"state": "error", "error": "INVALID_ARGUMENT", "message": "raise_hand requires left or right side"}
         side = args["side"]
@@ -1765,6 +1770,8 @@ class HandGesturePlugin:
             return {"state": "ready"}
         if action == "stop":
             return self._hand.dispatch("stop", {})
+        if action == "info":
+            return self._hand.dispatch("info", {})
         if action not in self.ACTIONS:
             return {"state": "error", "error": "INVALID_ARGUMENT", "message": "unsupported hand gesture action"}
         try:
@@ -1803,7 +1810,8 @@ class _HandStatePublisherNode(Node):
             return
         payload = self._state_cache.snapshot(self._state_timeout_sec)
         if payload is None:
-            return
+            payload = _hand_status_payload(
+                self._state_cache, self._state_timeout_sec)
         message = String()
         message.data = json.dumps(payload)
         self._publisher.publish(message)

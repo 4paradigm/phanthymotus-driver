@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import threading
 import time
 import types
 import unittest
@@ -83,6 +85,26 @@ class AdamDriverContractTests(unittest.TestCase):
         self.assertEqual([6, 7, 8, 9, 10, 11], payload["right"]["position"])
         self.assertEqual(1000, payload["position_max"])
 
+    def test_hand_state_node_publishes_waiting_status_without_sample(self):
+        cache = mock.Mock()
+        cache.snapshot.return_value = None
+        cache.status.return_value = {
+            "reader_available": True,
+            "last_sample_age_ms": None,
+            "fresh": False,
+        }
+        publisher = mock.Mock()
+        node = object.__new__(adam._HandStatePublisherNode)
+        node._lock = threading.Lock()
+        node._active = True
+        node._state_cache = cache
+        node._state_timeout_sec = 1.0
+        node._publisher = publisher
+        with mock.patch.object(adam, "String", side_effect=lambda: types.SimpleNamespace(data="")):
+            node._publish()
+        payload = json.loads(publisher.publish.call_args.args[0].data)
+        self.assertEqual("waiting", payload["state"])
+
     def test_skeleton_payload_contains_only_urdf_joints(self):
         state = type("State", (), {"motor_state": [type("Motor", (), {"q": 0.1})() for _ in range(31)]})()
         payload = adam._skeleton_payload(state, adam.ADAM_PRO_JOINTS)
@@ -95,6 +117,8 @@ class AdamDriverContractTests(unittest.TestCase):
         arm.dispatch.return_value = {"state": "active", "joints_set": 7}
         gesture = adam.ArmGesturePlugin(arm)
         self.assertEqual({"state": "ready"}, gesture.dispatch("start", {}))
+        self.assertEqual("active", gesture.dispatch("info", {})["state"])
+        arm.dispatch.reset_mock()
         result = gesture.dispatch("raise_hand", {"side": "left"})
         self.assertEqual([
             mock.call("set_joints", {"joints": adam.ARM_RAISE_POSE["left"]}),
@@ -116,6 +140,8 @@ class AdamDriverContractTests(unittest.TestCase):
         hand._activate = mock.Mock(return_value={"state": "active"})
         gesture = adam.HandGesturePlugin(hand)
         self.assertEqual({"state": "ready"}, gesture.dispatch("start", {}))
+        hand.dispatch = mock.Mock(return_value={"state": "idle"})
+        self.assertEqual({"state": "idle"}, gesture.dispatch("info", {}))
         self.assertNotIn("point", hand.get_tool()["inputSchema"]["properties"]["action"]["enum"])
         result = gesture.dispatch("point", {"side": "right"})
         self.assertEqual("active", result["state"])
