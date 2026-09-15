@@ -17,6 +17,10 @@ COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY main.py device.py lidar.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
-ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 \
+    ROS_DOMAIN_ID=42 \
+    RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+    FASTDDS_BUILTIN_TRANSPORTS=DEFAULT \
+    CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 EXPOSE 15704
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]

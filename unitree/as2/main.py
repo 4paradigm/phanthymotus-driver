@@ -57,6 +57,13 @@ def handler(bundle):
 
 def main():
     cfg, interface = load_config(), sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NETWORK_INTERFACE", "")
+    profile = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", "")
+    if os.environ.get("ROS_DOMAIN_ID") != "42" or os.environ.get("RMW_IMPLEMENTATION") != "rmw_fastrtps_cpp":
+        print("[as2] WARNING: ROS2 is not configured for agent-core Domain 42/FastDDS", flush=True)
+    elif not profile or not os.path.isfile(profile):
+        print(f"[as2] WARNING: FastDDS profile is missing: {profile or '(unset)'}", flush=True)
+    else:
+        print(f"[as2] ROS2 isolation profile: {profile} (Domain 42, FastDDS); Unitree SDK: CycloneDDS Domain 0 on {interface or '(auto)'}", flush=True)
     try: ChannelFactoryInitialize(0, interface)
     except Exception as exc: print(f"[as2] DDS init failed: {exc}")
     namespace = re.sub(r"[^a-zA-Z0-9_]", "_", cfg.get("ros_namespace") or socket.gethostname())

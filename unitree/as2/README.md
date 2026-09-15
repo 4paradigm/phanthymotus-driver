@@ -14,6 +14,11 @@ interface with a `192.168.123.x` address). The bundle exposes MCP on port
 uses a dedicated process for RPC calls so ROS callbacks cannot starve SDK
 responses.
 
+Deployment follows agent-core's DDS isolation contract: ROS2 uses FastDDS
+Domain 42 and the mounted `/opt/phanthy-motus/dds-local.xml` loopback profile;
+the Unitree SDK uses CycloneDDS Domain 0 and binds to the robot interface passed
+to `main.py`. These are deliberately separate DDS implementations and domains.
+
 `duration=-1` starts a 10 Hz velocity command loop; `stop_move`, shutdown, and
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
 attitude inputs are clamped before reaching the robot. Acrobatics should only
