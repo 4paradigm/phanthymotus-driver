@@ -13,13 +13,16 @@ def load_config():
 
 class Bundle:
     def __init__(self, cfg, namespace, executor, proxy):
-        from device import StatePlugin, LocoPlugin
+        from device import StatePlugin, LocoPlugin, AcrobaticsPlugin
         from lidar import LidarPlugin
+        from spatial_action import SpatialActionPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
         if p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
+        if p.get("acrobatics", {}).get("enabled", True): self.plugins.append(AcrobaticsPlugin(p.get("acrobatics", {}), namespace, executor, proxy))
         if p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
+        if p.get("spatial_action", {}).get("enabled", True): self.plugins.append(SpatialActionPlugin(p.get("spatial_action", {}), namespace, executor, interface))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):

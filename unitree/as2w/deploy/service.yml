@@ -9,6 +9,10 @@ unitree-as2w:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    # The vendor-provided SLAM service runs on the robot/extension host. These
+    # mounts expose its maps/configuration; this driver never starts binaries.
+    - /unitree/module:/unitree/module:ro
+    - /home/unitree/maps:/home/unitree/maps
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp

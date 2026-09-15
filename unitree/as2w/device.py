@@ -95,7 +95,7 @@ class LocoPlugin:
         self._lock = threading.Lock()
         self._stop = None
     def get_tool(self):
-        actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_gait", "switch_joystick", "left_side_gait", "right_side_gait", "handstand", "biped_stand", "auto_recovery", "front_flip", "back_flip", "get_state"]
+        actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_gait", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
                 "description": "Unitree AS2 locomotion via SportClient", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions}, "vx": {"type": "number"}, "vy": {"type": "number"}, "vyaw": {"type": "number"},
@@ -129,7 +129,7 @@ class LocoPlugin:
             if duration < 0: return {"ret": -1, "message": "duration must be -1, 0, or positive"}
             self._stop_continuous(); ret = self.proxy.Move(vx, vy, yaw); time.sleep(duration); self.proxy.StopMove(); return {"ret": ret, "duration": duration}
         if action == "stop_move": self._stop_continuous(); return {"ret": self.proxy.StopMove()}
-        methods = {"stand_up": "StandUp", "stand_down": "StandDown", "balance_stand": "BalanceStand", "recovery_stand": "RecoveryStand", "damp": "Damp", "front_flip": "FrontFlip", "back_flip": "BackFlip"}
+        methods = {"stand_up": "StandUp", "stand_down": "StandDown", "balance_stand": "BalanceStand", "recovery_stand": "RecoveryStand", "damp": "Damp"}
         if action in methods: return {"ret": getattr(self.proxy, methods[action])()}
         if action == "euler": return {"ret": self.proxy.Euler(float(args.get("roll", 0)), float(args.get("pitch", 0)), float(args.get("yaw", 0)))}
         if action == "speed_level": return {"ret": self.proxy.SpeedLevel(max(-1, min(1, int(args.get("level", 0)))))}
@@ -140,11 +140,38 @@ class LocoPlugin:
         if action == "switch_joystick": return {"ret": self.proxy.SwitchJoystick(1 if args.get("flag", True) else 0)}
         if action == "left_side_gait": return {"ret": self.proxy.LeftSideGait(1 if args.get("flag", True) else 0)}
         if action == "right_side_gait": return {"ret": self.proxy.RightSideGait(1 if args.get("flag", True) else 0)}
-        if action == "handstand": return {"ret": self.proxy.HandStand(1 if args.get("flag", True) else 0)}
-        if action == "biped_stand": return {"ret": self.proxy.BipedStand(1 if args.get("flag", True) else 0)}
         if action == "get_state":
             code, state = self.proxy.GetState()
             return {"ret": code, "state": state}
+        return None
+
+
+class AcrobaticsPlugin:
+    """AS2W-specific discrete motions provided by the official SportClient."""
+    PREFIX = "acrobatics"
+
+    def __init__(self, config, namespace, executor, proxy):
+        self.proxy = proxy
+
+    def get_tool(self):
+        actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
+        return {"name": "acrobatics", "type": "actuator", "multiInstance": False,
+                "description": "AS2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": actions},
+                    "enter": {"type": "boolean", "description": "Enter or exit a sustained posture."}},
+                    "required": ["action"]}}
+
+    def start(self): pass
+    def stop(self): pass
+
+    def dispatch(self, action, args):
+        if action in ("start", "info"): return {"state": "ready"}
+        if action == "stop": return {"state": "idle"}
+        if action == "front_flip": return {"ret": self.proxy.FrontFlip()}
+        if action == "back_flip": return {"ret": self.proxy.BackFlip()}
+        if action == "handstand": return {"ret": self.proxy.HandStand(1 if args.get("enter", True) else 0)}
+        if action == "biped_stand": return {"ret": self.proxy.BipedStand(1 if args.get("enter", True) else 0)}
         return None
 
 

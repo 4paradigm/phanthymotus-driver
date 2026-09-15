@@ -29,9 +29,13 @@ Unitree's official `unitree_ros/robots/as2w_description`; AS2W has 16 movable
 joints (12 leg joints plus 4 continuous wheel-foot joints) and the fixed JT128
 sensor mount.
 
-The official AS2W SDK currently does not include an AS2W SLAM or navigation
-client. Therefore this bundle intentionally does not advertise `controlled_spatial`:
-the Go2 implementation depends on a different `g1.slam.SlamClient` plus host
-`unitree_slam` binaries, neither of which is an AS2 SDK contract. `lidar_cloud`
-is available for consuming the AS2 LiDAR stream; add controlled mapping only
-after an AS2 firmware deployment supplies and validates a compatible SLAM service.
+`spatial_action` is a thin adapter for Unitree's documented `slam_operate`
+service: mapping, relocalization, and point-goal navigation. The latest AS2
+SDK does not package a model-specific SLAM client, so the driver implements the
+documented common RPC contract directly in an isolated CycloneDDS process. It
+requires the vendor `unitree_slam` service to be installed and already running
+on the robot or extension host; the driver does not start that service.
+
+`acrobatics` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
+`HandStand`, and `BipedStand` actions. It is intentionally separate from the
+continuous `loco` control card.
