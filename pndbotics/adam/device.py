@@ -924,8 +924,7 @@ class RlLocoPlugin:
                 "properties": {
                     "action": {"type": "string", "enum": [
                         "set_mode", "move", "set_height", "motion",
-                        "tracking_motion", "get_state", "set_control_mode",
-                        "get_control_state", "shutdown", "stop",
+                        "tracking_motion", "get_state", "shutdown", "stop",
                     ]},
                     "target_state": {"type": "string"},
                     "vx": {"type": "number"}, "vy": {"type": "number"},
@@ -943,8 +942,6 @@ class RlLocoPlugin:
                     "motion": {"params": ["command", "motion_file"]},
                     "tracking_motion": {"params": ["motion_file"]},
                     "get_state": {"params": []},
-                    "set_control_mode": {"params": ["domain_id"]},
-                    "get_control_state": {"params": []},
                     "shutdown": {"params": ["force"]},
                     "stop": {"params": []},
                 },
@@ -977,10 +974,6 @@ class RlLocoPlugin:
             return self._grpc.set_tracking_motion(args.get("motion_file", ""))
         if action == "get_state":
             return self._grpc.get_robot_state()
-        if action == "set_control_mode":
-            return self._grpc.set_control_mode(args.get("domain_id", 1))
-        if action == "get_control_state":
-            return self._grpc.get_control_state()
         if action == "shutdown":
             return self._grpc.shutdown(args.get("force", False))
         return None
@@ -1001,6 +994,32 @@ class _RlActionPlugin:
 
     def _state(self):
         return self._grpc.get_robot_state()
+
+    def _ensure_rl_state(self, target_state=None):
+        """Acquire RL control and enter the state required by an action card."""
+        control = self._grpc.set_control_mode(1)
+        if not control.get("success", False):
+            return {"success": False, "code": "RL_CONTROL_UNAVAILABLE",
+                    "message": "unable to select RL control domain", "details": control}
+        state = self._state()
+        if not state.get("success", False):
+            return state
+        if not target_state or state.get("fsm_state") == target_state:
+            return state
+        denied = self._allowed(state, "switchable_states", target_state)
+        if denied:
+            return denied
+        result = self._grpc.set_mode(target_state)
+        if not result.get("success", False):
+            return result
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            state = self._state()
+            if state.get("fsm_state") == target_state:
+                return state
+            time.sleep(0.2)
+        return {"success": False, "code": "FSM_TIMEOUT",
+                "message": f"timed out entering {target_state}", "state": state}
 
     @staticmethod
     def _allowed(state, key, value):
@@ -1084,7 +1103,9 @@ class MotionPlugin(_RlActionPlugin):
         if action in ("get_state", "info"):
             return self._state()
         if action == "play":
-            state = self._state()
+            state = self._ensure_rl_state("MULTI_AGENT")
+            if not state.get("success", False):
+                return state
             denied = self._allowed(state, "available_actions", "SetMotion")
             if denied:
                 return denied
@@ -1109,7 +1130,9 @@ class TrackingMotionPlugin(_RlActionPlugin):
         if action in ("get_state", "info"):
             return self._state()
         if action == "play":
-            state = self._state()
+            state = self._ensure_rl_state("MOTION_TRACK")
+            if not state.get("success", False):
+                return state
             denied = self._allowed(state, "available_actions", "SetTrackingMotion")
             return denied or self._grpc.set_tracking_motion(args.get("motion_file", ""))
         return None
@@ -3237,13 +3260,9 @@ class AdamDeviceBundle:
         # available as a backwards-compatible aggregate card, while these
         # cards make state transitions, motions, control ownership and safety
         # actions independently discoverable to an agent.
-        rl_cards = (
-            ("posture", PosturePlugin),
-            ("motion", MotionPlugin),
-            ("tracking_motion", TrackingMotionPlugin),
-            ("control_mode", ControlModePlugin),
-            ("safety", SafetyPlugin),
-        )
+        rl_cards = (("motion", MotionPlugin),
+                    ("tracking_motion", TrackingMotionPlugin),
+                    ("safety", SafetyPlugin))
         for card_name, card_class in rl_cards:
             card_cfg = plugins_cfg.get(card_name, {})
             if card_cfg.get("enabled", True):

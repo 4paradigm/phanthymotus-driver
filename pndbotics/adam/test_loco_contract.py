@@ -78,12 +78,9 @@ class LocoContractTests(unittest.TestCase):
         plugin = RlLocoPlugin({}, "adam", None, grpc)
 
         actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
-        self.assertTrue({"motion", "tracking_motion", "set_control_mode",
-                         "get_control_state", "shutdown"}.issubset(actions))
+        self.assertTrue({"motion", "tracking_motion", "shutdown"}.issubset(actions))
         plugin.dispatch("motion", {"command": "PLAY", "motion_file": "Sources/motion/Greeting.txt"})
-        plugin.dispatch("set_control_mode", {"domain_id": 1})
         self.assertEqual(("PLAY", "Sources/motion/Greeting.txt"), grpc.motion)
-        self.assertEqual(1, grpc.domain_id)
 
     def test_focused_execution_cards_are_registered_contracts(self):
         grpc = _Grpc()
