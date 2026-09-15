@@ -4,6 +4,8 @@ Plugins:
   StatePlugin  — DDS rt/lowstate → ROS2 skeleton/IMU/battery
   EStopPlugin  — read-only PAC physical emergency-stop state
   LocoPlugin   — gRPC locomotion control
+  PosturePlugin / MotionPlugin / TrackingMotionPlugin — focused RL execution cards
+  ControlModePlugin / SafetyPlugin — control ownership and safe stop cards
   ArmPlugin    — ROS2 JointState upper body control
   HandPlugin   — DDS rt/handcmd finger control and hand-state query
   ModelPlugin  — URDF resource for 3D visualization
@@ -952,9 +954,10 @@ class RlLocoPlugin:
     def start(self):
         return None
 
+
     def stop(self):
-        # A plugin stop is a local lifecycle event; an explicit shutdown action
-        # is required before asking the robot controller to exit.
+        # A plugin stop is a local lifecycle event; explicit shutdown is
+        # required before asking the robot controller to exit.
         return None
 
     def dispatch(self, action: str, args: dict) -> dict:
@@ -980,6 +983,176 @@ class RlLocoPlugin:
             return self._grpc.get_control_state()
         if action == "shutdown":
             return self._grpc.shutdown(args.get("force", False))
+        return None
+
+
+class _RlActionPlugin:
+    """Small, responsibility-focused cards over the RL gRPC contract."""
+    PREFIX = ""
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, grpc_client, **kwargs):
+        self._grpc = grpc_client
+
+    def start(self):
+        return None
+
+    def stop(self):
+        return None
+
+    def _state(self):
+        return self._grpc.get_robot_state()
+
+    @staticmethod
+    def _allowed(state, key, value):
+        if not isinstance(state, dict) or not state.get("success", False):
+            return {"success": False, "code": "STATE_UNAVAILABLE",
+                    "message": "GetRobotState did not return a usable state", "state": state}
+        if key not in state:
+            return {"success": False, "code": "STATE_UNAVAILABLE",
+                    "message": f"GetRobotState did not return {key}", "state": state}
+        values = state.get(key) or []
+        # Firmware revisions have reported either RPC names (SetMotion) or
+        # short action names (motion); accept both spellings while still
+        # refusing commands absent from the robot's advertised capability.
+        aliases = {value, value.removeprefix("Set").lower()}
+        if not any(item in values for item in aliases):
+            return {"success": False, "code": "NOT_ALLOWED", "message":
+                    f"{value!r} is not present in robot {key}", key: values}
+        return None
+
+
+class PosturePlugin(_RlActionPlugin):
+    PREFIX = "posture"
+
+    def get_tool(self):
+        return {"name": "posture", "type": "actuator",
+                "description": "Adam FSM posture and state transitions",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["get_state", "set_mode", "wait_mode", "info"]},
+                    "target_state": {"type": "string", "minLength": 1},
+                    "timeout_s": {"type": "number", "minimum": 0, "maximum": 60},
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {"get_state": {"params": []},
+                    "set_mode": {"params": ["target_state"]},
+                    "wait_mode": {"params": ["target_state", "timeout_s"]},
+                    "info": {"params": []}}}}
+
+    def dispatch(self, action, args):
+        if action in ("get_state", "info"):
+            return self._state()
+        if action == "set_mode":
+            target = args.get("target_state", "")
+            state = self._state()
+            denied = self._allowed(state, "switchable_states", target)
+            return denied or self._grpc.set_mode(target)
+        if action == "wait_mode":
+            target = args.get("target_state", "")
+            try:
+                timeout = max(0.0, min(60.0, float(args.get("timeout_s", 10.0))))
+            except (TypeError, ValueError):
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": "timeout_s must be a number"}
+            started = time.monotonic()
+            state = self._state()
+            denied = self._allowed(state, "switchable_states", target)
+            if denied:
+                return denied
+            result = self._grpc.set_mode(target)
+            if not result.get("success", False):
+                return result
+            while time.monotonic() - started < timeout:
+                state = self._state()
+                if state.get("fsm_state") == target:
+                    return {"success": True, "state": state, "completed": True}
+                time.sleep(0.2)
+            return {"success": False, "code": "TIMEOUT", "state": state, "completed": False}
+        return None
+
+
+class MotionPlugin(_RlActionPlugin):
+    def get_tool(self):
+        return {"name": "motion", "type": "actuator",
+                "description": "Play or stop a robot-side upper-body .txt motion",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["play", "stop", "get_state", "info"]},
+                    "motion_file": {"type": "string", "pattern": r".+\\.txt$"},
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {"play": {"params": ["motion_file"]}, "stop": {"params": []},
+                    "get_state": {"params": []}, "info": {"params": []}}}}
+
+    def dispatch(self, action, args):
+        if action in ("get_state", "info"):
+            return self._state()
+        if action == "play":
+            state = self._state()
+            denied = self._allowed(state, "available_actions", "SetMotion")
+            if denied:
+                return denied
+            return self._grpc.set_motion("PLAY", args.get("motion_file", ""))
+        if action == "stop":
+            return self._grpc.set_motion("STOP", "")
+        return None
+
+
+class TrackingMotionPlugin(_RlActionPlugin):
+    def get_tool(self):
+        return {"name": "tracking_motion", "type": "actuator",
+                "description": "Execute a robot-side full-body tracking motion .txt file",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["play", "get_state", "info"]},
+                    "motion_file": {"type": "string", "pattern": r".+\\.txt$"},
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {"play": {"params": ["motion_file"]},
+                    "get_state": {"params": []}, "info": {"params": []}}}}
+
+    def dispatch(self, action, args):
+        if action in ("get_state", "info"):
+            return self._state()
+        if action == "play":
+            state = self._state()
+            denied = self._allowed(state, "available_actions", "SetTrackingMotion")
+            return denied or self._grpc.set_tracking_motion(args.get("motion_file", ""))
+        return None
+
+
+class ControlModePlugin(_RlActionPlugin):
+    def get_tool(self):
+        return {"name": "control_mode", "type": "actuator",
+                "description": "Switch Adam between Traditional and RL control domains",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["set_rl", "set_traditional", "get_state", "info"]},
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {"set_rl": {"params": []}, "set_traditional": {"params": []},
+                    "get_state": {"params": []}, "info": {"params": []}}}}
+
+    def dispatch(self, action, args):
+        if action in ("get_state", "info"):
+            return self._grpc.get_control_state()
+        if action == "set_rl":
+            return self._grpc.set_control_mode(1)
+        if action == "set_traditional":
+            return self._grpc.set_control_mode(0)
+        return None
+
+
+class SafetyPlugin(_RlActionPlugin):
+    def get_tool(self):
+        return {"name": "safety", "type": "actuator",
+                "description": "Stop active motion or shut down the Adam controller",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["stop_motion", "shutdown", "get_state", "info"]},
+                    "force": {"type": "boolean"},
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {"stop_motion": {"params": []}, "shutdown": {"params": ["force"]},
+                    "get_state": {"params": []}, "info": {"params": []}}}}
+
+    def dispatch(self, action, args):
+        if action in ("get_state", "info"):
+            return self._state()
+        if action == "stop_motion":
+            return self._grpc.set_motion("STOP", "")
+        if action == "shutdown":
+            return self._grpc.shutdown(bool(args.get("force", False)))
         return None
 
 
@@ -3051,6 +3224,24 @@ class AdamDeviceBundle:
                 grpc_client=grpc_client,
             )
             self._plugins.append(p)
+
+        # RL execution is also exposed as focused cards.  ``loco`` remains
+        # available as a backwards-compatible aggregate card, while these
+        # cards make state transitions, motions, control ownership and safety
+        # actions independently discoverable to an agent.
+        rl_cards = (
+            ("posture", PosturePlugin),
+            ("motion", MotionPlugin),
+            ("tracking_motion", TrackingMotionPlugin),
+            ("control_mode", ControlModePlugin),
+            ("safety", SafetyPlugin),
+        )
+        for card_name, card_class in rl_cards:
+            card_cfg = plugins_cfg.get(card_name, {})
+            if card_cfg.get("enabled", True):
+                self._plugins.append(card_class(
+                    card_cfg, namespace, executor, grpc_client=grpc_client,
+                ))
 
         # CameraPlugin
         camera_plugin = None
