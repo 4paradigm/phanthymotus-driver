@@ -29,27 +29,8 @@ import queue
 import sys
 import threading
 import time
-from pathlib import Path
 
-
-DEFAULT_FASTDDS_PROFILE = Path(__file__).with_name("resource") / "fastdds_udp_only.xml"
-
-
-def configure_fastdds_transport() -> str:
-    """Pin this subprocess to the bundled loopback-only Fast DDS profile.
-
-    The compose environment may inject FASTRTPS_DEFAULT_PROFILES_FILE pointing
-    at Agent Core's host-wide /opt/phanthy-motus/dds-local.xml. That profile is
-    managed outside this bundle and is not guaranteed to be loopback-only, so
-    an inherited deployment profile must not override the isolation the
-    bundled profile provides for this cross-domain bridge.
-    """
-    if not DEFAULT_FASTDDS_PROFILE.is_file():
-        raise RuntimeError(f"Fast DDS loopback profile is missing: {DEFAULT_FASTDDS_PROFILE}")
-    profile = str(DEFAULT_FASTDDS_PROFILE)
-    os.environ["FASTDDS_DEFAULT_PROFILES_FILE"] = profile
-    os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
-    return profile
+from fastdds_transport import configure_fastdds_transport
 
 
 class BridgeWorker:
