@@ -25,8 +25,8 @@ plugins:
 这一步不是 MCP 或 gRPC API 能完成的操作；驱动不会模拟按键，也不会在启动卡片时
 自动切换开发者模式。执行前仍需满足具体控制链路的条件：
 
-- RL gRPC：确认 `GetRobotState` 成功，并按 `switchable_states` 切换到允许的 FSM 状态；
-  `SetControlMode(domain_id=1)` 表示选择 RL 控制域。
+- RL gRPC：动作卡会确认 `GetRobotState` 成功，按 `switchable_states` 自动切换到所需
+  FSM 状态，并固定选择 `SetControlMode(domain_id=1)`。
 - ROS2 上肢控制：机器人还必须处于站立状态，并通过遥控器开启实时遥操接收，直到
   控制台显示 `real time retarget start`；退出上肢外部控制后再停止卡片。
 - DDS 手指/底层控制：开发者模式只代表允许外部 SDK，仍必须确认对应 `rt/*` 通道已
@@ -39,20 +39,20 @@ plugins:
 也可以通过 `GRPC_HOST`、`GRPC_PORT` 和 `GRPC_API=rl` 覆盖配置。兼容的 `loco`
 聚合卡提供 `GetRobotState`、`SetMode`、`SetVelocity`、`SetHeight`、`SetMotion`、
 `SetTrackingMotion`、`SetControlMode`、`GetControlState` 和 `Shutdown`；驱动还提供
-职责拆分的执行卡：`posture`（FSM 状态切换）、`motion`（上半身动作文件）、
-`tracking_motion`（全身轨迹文件）、`control_mode`（传统/RL 控制权）和 `safety`
-（停止动作、关闭控制器）。
+职责拆分的执行卡：`motion`（上半身动作文件）、`tracking_motion`（全身轨迹文件）
+和 `safety`（停止动作、关闭控制器）。动作卡会在内部自动选择 RL 控制域，并切换到
+所需 FSM 状态；`posture` 和 `control_mode` 不作为外部卡片暴露。
 
 下发动作前先调用 `get_state`，只使用返回的 `switchable_states` 和
-`available_actions`。`posture.wait_mode` 会先校验目标状态，再轮询 `fsm_state` 确认
-异步切换完成；`motion.play` 和 `tracking_motion.play` 会分别校验
+`available_actions`。动作卡会先校验目标状态，再轮询 `fsm_state` 确认异步切换完成；
+`motion.play` 和 `tracking_motion.play` 会分别校验
 `SetMotion`/`SetTrackingMotion` 出现在 `available_actions` 中。动作和轨迹文件必须是
 机器人侧的 `.txt` 路径。速度和站高按接口约定限制在 `[-1, 1]`。当前机器人
 服务端把 `SetVelocity` 与 `SetHeight` 标为预留接口，驱动会如实返回不支持状态，不会伪造
 成功响应。
 
-`set_control_mode` 的 `domain_id=0` 为传统控制，`1` 为 RL 控制。`control_mode` 卡将其
-封装为 `set_traditional`/`set_rl`，避免上层传错枚举。`safety.stop_motion` 只调用官方
+`SetControlMode` 的 `domain_id=0` 为传统控制，`1` 为 RL 控制。动作卡固定选择
+`domain_id=1`，不要求上层显式管理控制域。`safety.stop_motion` 只调用官方
 `SetMotion(STOP)`，不宣称能够触发实体急停；实体急停仍由 `estop` 只读卡提供。驱动
 停止时不会自动关闭机器人控制器，必须显式调用 `safety.shutdown`（或兼容卡的
 `loco.shutdown`）。

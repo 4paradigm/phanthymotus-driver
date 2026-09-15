@@ -30,13 +30,9 @@ plugins:
     grpc_api: "rl"
   # Focused RL execution cards. Keep ``loco`` enabled for the backwards-
   # compatible aggregate card; each focused card can be disabled separately.
-  posture:
-    enabled: true
   motion:
     enabled: true
   tracking_motion:
-    enabled: true
-  control_mode:
     enabled: true
   safety:
     enabled: true
