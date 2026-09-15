@@ -12,8 +12,8 @@ build_context_extras:
 cards:
   - { name: model, type: resource }
   - { name: loco, type: actuator }
-  - { name: acrobatics, type: actuator }
-  - { name: spatial_action, type: actuator }
+  - { name: special_action, type: actuator }
+  - { name: controlled_spatial, type: actuator }
   - { name: imu, type: sensor }
   - { name: joints, type: sensor }
   - { name: joint_state, type: sensor }

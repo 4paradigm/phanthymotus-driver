@@ -21,7 +21,7 @@ to `main.py`. These are deliberately separate DDS implementations and domains.
 
 `duration=-1` starts a 10 Hz velocity command loop; `stop_move`, shutdown, and
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
-attitude inputs are clamped before reaching the robot. Acrobatics should only
+attitude inputs are clamped before reaching the robot. Special actions should only
 be invoked with a clear area and appropriate operator approval.
 
 The checked-in `resource/as2w.urdf` and `resource/meshes/` are copied from
@@ -29,13 +29,13 @@ Unitree's official `unitree_ros/robots/as2w_description`; AS2W has 16 movable
 joints (12 leg joints plus 4 continuous wheel-foot joints) and the fixed JT128
 sensor mount.
 
-`spatial_action` is a thin adapter for Unitree's documented `slam_operate`
+`controlled_spatial` is a thin adapter for Unitree's documented `slam_operate`
 service: mapping, relocalization, and point-goal navigation. The latest AS2
 SDK does not package a model-specific SLAM client, so the driver implements the
 documented common RPC contract directly in an isolated CycloneDDS process. It
 requires the vendor `unitree_slam` service to be installed and already running
 on the robot or extension host; the driver does not start that service.
 
-`acrobatics` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
+`special_action` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
 continuous `loco` control card.

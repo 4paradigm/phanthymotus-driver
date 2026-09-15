@@ -146,16 +146,16 @@ class LocoPlugin:
         return None
 
 
-class AcrobaticsPlugin:
+class SpecialActionPlugin:
     """AS2W-specific discrete motions provided by the official SportClient."""
-    PREFIX = "acrobatics"
+    PREFIX = "special_action"
 
     def __init__(self, config, namespace, executor, proxy):
         self.proxy = proxy
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
-        return {"name": "acrobatics", "type": "actuator", "multiInstance": False,
+        return {"name": "special_action", "type": "actuator", "multiInstance": False,
                 "description": "AS2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions},

@@ -63,15 +63,15 @@ class _SpatialRpcProxy:
         self._process.join(timeout=3)
 
 
-class SpatialActionPlugin:
+class ControlledSpatialPlugin:
     """Low-level map, relocalization, and navigation backed by vendor SLAM."""
-    PREFIX = "spatial_action"
+    PREFIX = "controlled_spatial"
 
     def __init__(self, config, namespace, executor, interface):
         self._client = _SpatialRpcProxy(interface)
 
     def get_tool(self):
-        return {"name": "spatial_action", "type": "actuator", "multiInstance": False,
+        return {"name": "controlled_spatial", "type": "actuator", "multiInstance": False,
                 "description": "AS2W SLAM map, relocalization, and point-goal navigation. Requires the vendor unitree_slam service already running.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": list(_APIS)},
