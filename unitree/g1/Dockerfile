@@ -16,6 +16,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         libusb-1.0-0 \
         libportaudio2 \
         libasound2-dev \
+        ffmpeg \
         v4l-utils && \
     rm -rf /var/lib/apt/lists/*
 
