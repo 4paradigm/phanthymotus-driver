@@ -79,6 +79,7 @@ class G1DeviceBundle:
         self._plugins: list = []
         self._smart_motion = smart_motion
         plugins_cfg = cfg.get("plugins", {})
+        camera_plugin = None
 
         if plugins_cfg.get("mic", {}).get("enabled", False):
             from device import MicPlugin
@@ -147,8 +148,15 @@ class G1DeviceBundle:
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import RealSensePlugin
-            self._plugins.append(RealSensePlugin(plugins_cfg["camera"], namespace, executor))
+            camera_plugin = RealSensePlugin(plugins_cfg["camera"], namespace, executor)
+            self._plugins.append(camera_plugin)
             print("[bundle] RealSensePlugin loaded")
+
+        if plugins_cfg.get("vision_capture", {}).get("enabled", False):
+            from device import VisionCapturePlugin
+            self._plugins.append(VisionCapturePlugin(
+                plugins_cfg["vision_capture"], namespace, executor, camera_plugin))
+            print("[bundle] VisionCapturePlugin loaded")
 
         if plugins_cfg.get("lidar", {}).get("enabled", False):
             from device import LidarPlugin
@@ -222,7 +230,12 @@ class G1DeviceBundle:
         print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
 
     def stop_all(self) -> None:
-        for p in self._plugins:
+        # Cancel capture consumers before stopping the shared RealSense producer.
+        capture_plugins = [
+            p for p in self._plugins if getattr(p, "PREFIX", "") == "vision_capture"]
+        other_plugins = [
+            p for p in self._plugins if getattr(p, "PREFIX", "") != "vision_capture"]
+        for p in capture_plugins + other_plugins:
             p.stop()
         print("[bundle] All plugins stopped")
 

@@ -16,16 +16,26 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
   LocoPlugin         (actuator)  — 运动控制
   ArmActionPlugin    (actuator)  — 手臂动作
   StatePlugin        (sensor)    — DDS LowState → IMU/battery ROS2 topic
+  VisionCapturePlugin (actuator) — 复用 camera_rgb 保存照片/视频
 """
 
+from datetime import datetime
 import json
 import math
+import os
+from pathlib import Path
 import queue
+import select
+import shutil
 import socket
+import ssl
 import struct
 import subprocess
+import tempfile
 import threading
 import time
+import urllib.request
+from uuid import uuid4
 
 import rclpy
 from rclpy.node import Node
@@ -3869,6 +3879,53 @@ RS_JPEG_QUALITY  = 80
 RS_DIST_INTERVAL = 0.1  # 10 Hz for distance JSON
 
 
+class _CameraFrameNode(Node):
+    """Cache the existing camera_rgb JPEG stream for persistent capture."""
+
+    def __init__(self, color_topic: str):
+        from sensor_msgs.msg import CompressedImage
+
+        super().__init__("g1_camera_frame_cache")
+        self._condition = threading.Condition()
+        self._sequence = 0
+        self._latest = None
+        self._subscription = self.create_subscription(
+            CompressedImage, color_topic, self._on_frame, QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                durability=DurabilityPolicy.VOLATILE,
+            ))
+
+    def _on_frame(self, msg) -> None:
+        data = bytes(msg.data)
+        image_format = str(msg.format or "jpeg").lower()
+        if (("jpeg" not in image_format and "jpg" not in image_format)
+                or not data.startswith(b"\xff\xd8") or not data.endswith(b"\xff\xd9")):
+            return
+        with self._condition:
+            self._sequence += 1
+            self._latest = {
+                "data": data,
+                "received_monotonic": time.monotonic(),
+                "frame_sequence": self._sequence,
+            }
+            self._condition.notify_all()
+
+    def wait_for_frame(self, after_sequence=None, timeout_s=5.0):
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with self._condition:
+            while True:
+                frame = self._latest
+                if frame is not None and (
+                        after_sequence is None or self._sequence > after_sequence):
+                    return dict(frame), self._sequence
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, self._sequence
+                self._condition.wait(remaining)
+
+
 class RealSensePlugin:
     PREFIX = "camera"
 
@@ -3877,7 +3934,18 @@ class RealSensePlugin:
         self._color_topic = f"/{namespace}/camera/rgb"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._dist_topic  = f"/{namespace}/camera/distance"
+        self._executor = executor
         self._proc = None
+        self._frame_node = None
+        self._ensure_frame_node()
+
+    def _ensure_frame_node(self) -> None:
+        """Create the cache subscription once for this plugin lifecycle."""
+        if self._frame_node is not None:
+            return
+        node = _CameraFrameNode(self._color_topic)
+        self._executor.add_node(node)
+        self._frame_node = node
 
     def get_tools(self) -> list:
         return [self._color_tool(), self._depth_tool(), self._dist_tool()]
@@ -3914,6 +3982,9 @@ class RealSensePlugin:
 
     def start(self) -> None:
         import multiprocessing as mp
+        # A stopped plugin may be started again in the same driver process.
+        # Recreate the cache node that stop() explicitly destroyed.
+        self._ensure_frame_node()
         if self._proc is not None and self._proc.is_alive():
             return
         ctx = mp.get_context("spawn")
@@ -3932,6 +4003,29 @@ class RealSensePlugin:
                 self._proc.kill()
                 self._proc.join(timeout=2.0)
         self._proc = None
+        node = self._frame_node
+        self._frame_node = None
+        if node is not None:
+            try:
+                self._executor.remove_node(node)
+            except Exception as exc:
+                print(f"[bundle] Could not remove RealSense cache node: {exc}",
+                      flush=True)
+            try:
+                node.destroy_node()
+            except Exception as exc:
+                print(f"[bundle] Could not destroy RealSense cache node: {exc}",
+                      flush=True)
+
+    def is_running(self) -> bool:
+        """Whether the one RealSense producer used by all camera cards is alive."""
+        return self._proc is not None and self._proc.is_alive()
+
+    def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
+        node = self._frame_node
+        if node is None:
+            return None, 0
+        return node.wait_for_frame(after_sequence, timeout_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -3954,6 +4048,12 @@ def run_realsense_process(namespace: str) -> None:
     All heavy imports (cv2, numpy, pyrealsense2, sensor_msgs) happen here
     so the main process is not affected if these packages are missing.
     """
+    # ``spawn`` starts a fresh interpreter, so the parent process's atomic
+    # Docker-log writer is not inherited.  Install it before heavy imports,
+    # ROS/native initialization, or any child-process output.
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     import os
     import cv2
     import numpy as np
@@ -4149,3 +4249,372 @@ def run_realsense_process(namespace: str) -> None:
             except Exception:
                 pass
         print("[realsense-proc] stopped", flush=True)
+
+
+# ── VisionCapturePlugin (persistent RGB photos and videos) ──────────────────
+
+_VISION_FIRST_FRAME_TIMEOUT_S = 5.0
+_VISION_MAX_FRAME_AGE_S = 3.0
+
+
+def _vision_acp_notify(action_id, status, result):
+    """Report an asynchronous terminal result using Agent Core's ACP API."""
+    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    payload = json.dumps({
+        "action_id": action_id, "status": status, "result": result,
+        "tool": "vision_capture", "ts": time.time(),
+    }).encode()
+    request = urllib.request.Request(
+        url + "/api/acp/complete", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    context = ssl.create_default_context()
+    if url.startswith(("https://localhost:", "https://127.0.0.1:")):
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(request, timeout=3, context=context):
+            pass
+    except Exception as exc:
+        print(f"[vision_capture] ACP callback failed: {exc}", flush=True)
+
+
+class VisionCapturePlugin:
+    """Persist media while sharing the camera_rgb RealSense producer."""
+
+    PREFIX = "vision_capture"
+
+    def __init__(self, plugin_config, namespace, executor, camera_plugin=None):
+        del namespace, executor
+        self._camera = camera_plugin
+        self._output_dir = Path(str(plugin_config.get(
+            "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
+        self._fps = max(1, min(15, int(plugin_config.get("fps", 15))))
+        self._max_duration_s = max(
+            1, min(30, int(plugin_config.get("max_duration_s", 30))))
+        self._recording_lock = threading.Lock()
+        self._active_recording = None
+        self._last_recording = None
+
+    def get_tool(self):
+        return {
+            "name": self.PREFIX, "type": "actuator", "multiInstance": False,
+            "description": (
+                "Capture a G1 RGB photo or record a silent H.264 MP4 video "
+                "(1–30 seconds) to persistent storage. Requires the camera "
+                "card to remain enabled (plugins.camera.enabled=true)."),
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": [
+                    "start", "capture_photo", "record_video", "info", "stop"]},
+                "duration_s": {
+                    "type": "integer", "minimum": 1,
+                    "maximum": self._max_duration_s,
+                    "default": min(5, self._max_duration_s),
+                    "description": "默认5s,最大30s",
+                },
+            }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {
+                    "start": {"params": [], "description": "检查 RGB 相机是否就绪。"},
+                    "capture_photo": {"params": [], "description": "保存当前 RGB 照片为 JPG。"},
+                    "record_video": {"params": ["duration_s"],
+                                     "description": "录制 RGB 视频，默认 5 秒。"},
+                    "info": {"params": [], "description": "查看保存目录与相机状态。"},
+                    "stop": {"params": [], "description": "取消录像并删除未完成文件。"},
+                },
+                "x-completion": {"actions": ["record_video"],
+                                 "timeout": self._max_duration_s + 15}},
+        }
+
+    def _camera_ready(self):
+        return self._camera is not None and self._camera.is_running()
+
+    @staticmethod
+    def _precondition_error():
+        return {"ok": False, "code": "PRECONDITION_FAILED",
+                "message": ("vision_capture requires the camera card; set "
+                            "plugins.camera.enabled=true")}
+
+    def _frame(self, after_sequence=None,
+               timeout_s=_VISION_FIRST_FRAME_TIMEOUT_S):
+        if not self._camera_ready():
+            raise RuntimeError("G1 camera_rgb worker is unavailable")
+        frame, sequence = self._camera.wait_for_color_frame(
+            after_sequence, timeout_s)
+        if not isinstance(frame, dict) or not frame.get("data"):
+            raise RuntimeError("No RGB frame has arrived yet")
+        age = time.monotonic() - frame["received_monotonic"]
+        if age > _VISION_MAX_FRAME_AGE_S:
+            frame, sequence = self._camera.wait_for_color_frame(sequence, timeout_s)
+            if (not isinstance(frame, dict) or not frame.get("data")
+                    or time.monotonic() - frame["received_monotonic"]
+                    > _VISION_MAX_FRAME_AGE_S):
+                raise RuntimeError("No fresh RGB frame has arrived yet")
+        return frame, sequence
+
+    def _info(self):
+        frame = None
+        if self._camera_ready():
+            try:
+                frame, _ = self._frame(timeout_s=0)
+            except RuntimeError:
+                pass
+        age = (time.monotonic() - frame["received_monotonic"]
+               if frame else None)
+        with self._recording_lock:
+            active = ({key: self._active_recording.get(key) for key in (
+                "action_id", "state", "duration_s", "started_at", "path")}
+                if self._active_recording else None)
+            last = self._last_recording
+        ready = self._camera_ready() and age is not None
+        result = {
+            "ok": ready, "state": "ready" if ready else "waiting_for_camera",
+            "source": "g1_camera_rgb", "topic": self._camera._color_topic
+            if self._camera else None,
+            "output_dir": str(self._output_dir),
+            "photos_dir": str(self._output_dir / "photos"),
+            "videos_dir": str(self._output_dir / "videos"),
+            "fps": self._fps, "max_duration_s": self._max_duration_s,
+            "latest_frame_age_s": round(age, 3) if age is not None else None,
+            "encoder_available": shutil.which("ffmpeg") is not None,
+            "active_recording": active, "last_recording": last,
+        }
+        if self._camera is None:
+            result.update(self._precondition_error())
+            result["state"] = "error"
+        return result
+
+    def start(self):
+        if self._camera is None:
+            return {"state": "error", **self._precondition_error()}
+        return {"state": "ready" if self._camera_ready() else "error"}
+
+    def _capture_photo(self):
+        if self._camera is None:
+            return self._precondition_error()
+        path = None
+        try:
+            frame, _ = self._frame()
+            directory = self._output_dir / "photos"
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = directory / f"IMG_{stamp}.jpg"
+            with path.open("xb") as output:
+                output.write(frame["data"])
+            return {
+                "ok": True, "media_type": "photo", "file_path": str(path),
+                "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "frame_age_s": round(
+                    time.monotonic() - frame["received_monotonic"], 3),
+            }
+        except Exception as exc:
+            if path is not None:
+                self._remove_partial(path)
+            return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
+
+    @staticmethod
+    def _remove_partial(path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[vision_capture] could not remove partial file {path}: {exc}",
+                  flush=True)
+            return str(exc)
+        return None
+
+    @staticmethod
+    def _write_video_frame(process, data, cancel_event):
+        pending = memoryview(data)
+        deadline = time.monotonic() + 5.0
+        while pending:
+            if cancel_event.is_set():
+                return False
+            if process.poll() is not None:
+                raise RuntimeError("ffmpeg exited while encoding")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("ffmpeg input timed out")
+            if not select.select([], [process.stdin], [], 0.1)[1]:
+                continue
+            try:
+                pending = pending[os.write(process.stdin.fileno(), pending):]
+            except BlockingIOError:
+                pass
+        return True
+
+    @staticmethod
+    def _terminate_encoder(process):
+        if process is None:
+            return
+        try:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2)
+        except Exception:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+            except Exception:
+                pass
+
+    def _record_video(self, active):
+        process = None
+        path = None
+        completed = False
+        cancel = active["cancel_event"]
+        try:
+            _, sequence = self._frame()
+            if cancel.is_set():
+                raise RuntimeError("Video recording was cancelled")
+            directory = self._output_dir / "videos"
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = directory / f"video_{stamp}.mp4"
+            with path.open("xb"):
+                pass
+            with self._recording_lock:
+                active["path"] = str(path)
+            with tempfile.TemporaryFile() as errors:
+                process = subprocess.Popen([
+                    "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
+                    "-f", "mjpeg", "-r", str(self._fps), "-i", "-", "-an",
+                    "-c:v", "libx264", "-preset", "ultrafast",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(path),
+                ], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=errors, bufsize=0)
+                os.set_blocking(process.stdin.fileno(), False)
+                with self._recording_lock:
+                    active["process"] = process
+                frames = 0
+                deadline = time.monotonic() + active["duration_s"]
+                while time.monotonic() < deadline and not cancel.is_set():
+                    tick = time.monotonic()
+                    frame, sequence = self._frame(
+                        sequence, max(0.25, 2.0 / self._fps))
+                    if not self._write_video_frame(process, frame["data"], cancel):
+                        break
+                    frames += 1
+                    cancel.wait(min(
+                        max(0.0, 1.0 / self._fps - (time.monotonic() - tick)),
+                        max(0.0, deadline - time.monotonic())))
+                if cancel.is_set():
+                    raise RuntimeError("Video recording was cancelled")
+                process.stdin.close()
+                if process.wait(timeout=10) != 0 or not frames or not path.stat().st_size:
+                    errors.seek(0)
+                    message = errors.read(4096).decode("utf-8", "replace")
+                    raise RuntimeError(message.strip() or "ffmpeg failed to create MP4")
+            completed = True
+            return {
+                "ok": True, "media_type": "video", "file_path": str(path),
+                "recorded_duration_s": active["duration_s"], "frames": frames,
+                "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        except Exception as exc:
+            return {"ok": False,
+                    "code": "RECORD_CANCELLED" if cancel.is_set() else "RECORD_FAILED",
+                    "message": str(exc)}
+        finally:
+            self._terminate_encoder(process)
+            with self._recording_lock:
+                active["process"] = None
+            if not completed and path is not None:
+                self._remove_partial(path)
+
+    def _record_video_async(self, active):
+        try:
+            result = self._record_video(active)
+        except Exception as exc:
+            result = {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
+        with self._recording_lock:
+            # stop() and terminal classification share this lock.  Cancellation
+            # wins until the terminal state is committed; if encoding already
+            # produced a valid file, remove it before reporting cancellation.
+            if active["cancel_event"].is_set():
+                cleanup_error = None
+                if result.get("ok"):
+                    cleanup_error = self._remove_partial(Path(result["file_path"]))
+                result = {"ok": False, "code": "RECORD_CANCELLED",
+                          "message": "Video recording was cancelled"}
+                if cleanup_error:
+                    result["cleanup_error"] = cleanup_error
+            status = ("completed" if result.get("ok") else
+                      "cancelled" if result.get("code") == "RECORD_CANCELLED" else
+                      "error")
+            self._last_recording = {
+                "action_id": active["action_id"], "status": status, "result": result}
+            active["state"] = status
+            active["finished"] = True
+        try:
+            _vision_acp_notify(active["action_id"], status, result)
+        finally:
+            with self._recording_lock:
+                if self._active_recording is active:
+                    self._active_recording = None
+
+    def _start_video_recording(self, args):
+        requested = args.get("duration_s", min(5, self._max_duration_s))
+        if type(requested) is not int or not 1 <= requested <= self._max_duration_s:
+            return {"ok": False, "code": "INVALID_DURATION", "message":
+                    f"duration_s must be an integer between 1 and {self._max_duration_s}"}
+        if self._camera is None:
+            return self._precondition_error()
+        if not self._camera_ready():
+            return {"ok": False, "code": "RECORD_FAILED",
+                    "message": "G1 camera_rgb worker is unavailable"}
+        if shutil.which("ffmpeg") is None:
+            return {"ok": False, "code": "RECORD_FAILED",
+                    "message": "ffmpeg is required"}
+        with self._recording_lock:
+            if self._active_recording:
+                return {"ok": False, "code": "RECORD_IN_PROGRESS",
+                        "message": "A video recording is already in progress",
+                        "action_id": self._active_recording["action_id"]}
+            action_id = f"vision_capture_record_video_{uuid4().hex}"
+            active = {
+                "action_id": action_id, "state": "recording",
+                "duration_s": requested,
+                "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "cancel_event": threading.Event(), "process": None,
+                "path": None, "finished": False,
+            }
+            thread = threading.Thread(
+                target=self._record_video_async, args=(active,), daemon=True,
+                name="g1_vision_capture_record_video")
+            active["thread"] = thread
+            self._active_recording = active
+            thread.start()
+        return {"ok": True, "state": "queued", "action_id": action_id,
+                "media_type": "video", "requested_duration_s": requested,
+                "message": "Video recording started; completion will be reported asynchronously."}
+
+    def stop(self):
+        with self._recording_lock:
+            active = self._active_recording
+            if not active:
+                return {"ok": True, "state": "idle"}
+            if not active.get("finished"):
+                active["state"] = "stopping"
+                active["cancel_event"].set()
+            process = active.get("process")
+        self._terminate_encoder(process)
+        active["thread"].join(timeout=6)
+        return {"ok": True,
+                "state": "stopping" if active["thread"].is_alive() else "idle",
+                "action_id": active["action_id"]}
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "info":
+            return self._info()
+        if action == "capture_photo":
+            return self._capture_photo()
+        if action == "record_video":
+            return self._start_video_recording(args)
+        if action == "stop":
+            return self.stop()
+        return None
