@@ -19,6 +19,12 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  vision_capture:
+    enabled: true
+    # The existing host bind mount preserves captures across container updates.
+    output_dir: /opt/phanthy-motus/data/vision_capture
+    fps: 15
+    max_duration_s: 30
   lidar:
     enabled: true
   slam:
