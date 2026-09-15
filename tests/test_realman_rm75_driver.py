@@ -421,11 +421,12 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         })
 
         self.assertEqual("running", result["state"])
-        # 工具坐标系 frame_type=1，偏移转换为米/弧度
+        # 工具系偏移先换算成基座系绝对目标，再走三/四代均支持的 rm_movel。
         self.assertIn(
-            ("rm_movel_offset", ([0.05, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 1, 0)),
+            ("rm_movel", ([0.35, 0.0, 0.2, 0.0, 0.0, 0.0], 5, 0, 0, 0)),
             self.client.calls,
         )
+        self.assertNotIn("rm_movel_offset", [entry[0] for entry in self.client.calls])
         self.client.pose_mm_deg = [350.0, 0.0, 200.0, 0.0, 0.0, 0.0]
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         _, status, payload = self.acp_events[0]
@@ -440,6 +441,11 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
             "frame_type": "tool", "speed_percent": 5, "confirm_motion": True,
         })
+        movel_calls = [entry[1] for entry in self.client.calls if entry[0] == "rm_movel"]
+        self.assertEqual(1, len(movel_calls))
+        self.assertAlmostEqual(0.0, movel_calls[0][0][0], places=6)
+        self.assertAlmostEqual(0.1, movel_calls[0][0][1], places=6)
+        self.assertAlmostEqual(math.pi / 2, movel_calls[0][0][5], places=6)
         self.client.pose_mm_deg = [0.0, 100.0, 0.0, 0.0, 0.0, 90.0]
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         _, status, payload = self.acp_events[0]
@@ -615,8 +621,35 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("cancelled", status)
         self.assertEqual("stopmotion", payload["reason"])
 
+    def test_info_remains_available_while_submission_is_blocked(self):
+        gate = threading.Event()
+
+        class GatedClient(self.FakeClient):
+            def command(self, method, *args):
+                if method == "rm_movel" and not gate.is_set():
+                    gate.wait(2.0)
+                return super().command(method, *args)
+
+        self.client = GatedClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client, {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}}, arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: None
+
+        mover = threading.Thread(target=lambda: self.plugin.dispatch("movel", self._movel_args()))
+        mover.start()
+        self.assertTrue(self._wait_for(lambda: self.plugin._active_action_id is not None))
+        start = time.time()
+        info = self.plugin.dispatch("info", {})
+        self.assertLess(time.time() - start, 1.0)
+        self.assertEqual("moving", info["state"])
+        self.assertIsNotNone(info["active_action_id"])
+        gate.set()
+        mover.join(5.0)
+
     def test_submission_race_with_stopmotion_orders_slow_stop_after_submit(self):
-        # 竞态回归：急停必须等下发完成才能拿到 _action_lock —— SDK 调用顺序
+        # 竞态回归：急停必须等下发完成；SDK 调用顺序
         # rm_movel 在前、rm_set_arm_slow_stop 在后，监控如实上报 cancelled。
         gate = threading.Event()
 

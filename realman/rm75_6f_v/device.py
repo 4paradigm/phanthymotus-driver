@@ -155,6 +155,7 @@ class RM75Plugin:
         self.progress_threshold_deg = float(safety.get("progress_threshold_deg", 0.05))
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
         self._motion_lock = threading.Lock()
+        self._motion_state = {"active_action_id": None}
         self._action_lock = threading.Lock()
         self._active_action_id = None
         self._cancelled = set()
@@ -294,7 +295,7 @@ class RM75Plugin:
 
     def _motion_status(self):
         with self._action_lock:
-            active_action_id = self._active_action_id
+            active_action_id = self._motion_state["active_action_id"]
             last_completion = dict(self._last_completion) if self._last_completion else None
         return {
             **self.client.status(),
@@ -433,6 +434,8 @@ class RM75Plugin:
                 self._cancelled.discard(action_id)
                 if self._active_action_id == action_id:
                     self._active_action_id = None
+                if self._motion_state["active_action_id"] == action_id:
+                    self._motion_state["active_action_id"] = None
             self._motion_lock.release()
             self._acp_callback(action_id, status, result)
 
@@ -442,7 +445,7 @@ class RM75Plugin:
         if args.get("confirm_motion") is not True:
             raise ValueError("confirm_motion must be true")
         if not self._motion_lock.acquire(blocking=False):
-            raise RuntimeError(f"another motion is active: {self._active_action_id}")
+            raise RuntimeError(f"another motion is active: {self._motion_state['active_action_id']}")
         try:
             self._preflight()
             current, target, speed = self._prepare_target(args)
@@ -452,10 +455,12 @@ class RM75Plugin:
             # An interrupt must see either no submitted move or its actual ID.
             with self._action_lock:
                 self._active_action_id = action_id
+                self._motion_state["active_action_id"] = action_id
                 try:
                     self.client.command("rm_movej", target, speed, 0, 0, 0)
                 except Exception:
                     self._active_action_id = None
+                    self._motion_state["active_action_id"] = None
                     raise
             threading.Thread(
                 target=self._monitor_motion,
@@ -472,7 +477,7 @@ class RM75Plugin:
         # Keep the action-state lock across the SDK stop request. The monitor
         # cannot select a terminal state between cancellation and slow-stop.
         with self._action_lock:
-            action_id = self._active_action_id
+            action_id = self._motion_state["active_action_id"] or self._active_action_id
             if action_id:
                 self._cancelled.add(action_id)
             self.client.command("rm_set_arm_slow_stop")
@@ -713,9 +718,11 @@ class CartesianPlugin:
 
     def __init__(self, client, config, namespace="rm75", ros2=None, arm_plugin=None):
         self.client = client
-        self._arm = arm_plugin  # 共享运动锁与 preflight
+        self._arm = arm_plugin  # 共享运动锁、动作状态与 preflight
         self._motion_lock = arm_plugin._motion_lock if arm_plugin is not None else threading.Lock()
+        self._motion_state = arm_plugin._motion_state if arm_plugin is not None else {"active_action_id": None}
         self._action_lock = threading.Lock()
+        self._submission_lock = threading.Lock()
         self._active_action_id = None
         self._cancelled = set()
         self._monitor_thread = None
@@ -866,16 +873,18 @@ class CartesianPlugin:
         if not 1 <= speed_percent <= self.max_speed_percent:
             raise ValueError(f"speed_percent must be within 1~{self.max_speed_percent}")
         if not self._motion_lock.acquire(blocking=False):
-            raise RuntimeError(f"another motion is active: {self._active_action_id}")
+            active = self._motion_state["active_action_id"] or "joint/cartesian motion"
+            raise RuntimeError(f"another motion is active: {active}")
         action_id = f"rm75_cart_{uuid4().hex[:10]}"
-        # 在 _action_lock 内完成 preflight → 位姿查询 → 目标计算 → 命令下发：
-        # stopmotion 必须等下发完成后才能拿到锁，不会出现「急停先到、轨迹后发」的竞态；
-        # 且任何一步失败都发生在命令下发之前或下发当下，不会留下无人监控的在途运动。
+        # 状态锁不能覆盖无超时上限的 SDK 调用，否则 info 也会被控制器故障拖死。
+        # submission_lock 只负责保证 stopmotion 排在运动下发之后。
         submitted = False
         try:
             with self._action_lock:
                 self._active_action_id = action_id
+                self._motion_state["active_action_id"] = action_id
                 self._cancelled.discard(action_id)
+            with self._submission_lock:
                 try:
                     if self._arm is not None:
                         self._arm._preflight()
@@ -883,9 +892,13 @@ class CartesianPlugin:
                     target = self._plan_target(motion_type, args, current)
                     max_duration = self._motion_deadline_seconds(current, target, speed_percent)
                     submitted = True
-                    self._submit(motion_type, args, speed_percent)
+                    self._submit(motion_type, args, target, speed_percent)
                 except Exception:
-                    self._active_action_id = None
+                    with self._action_lock:
+                        if self._active_action_id == action_id:
+                            self._active_action_id = None
+                        if self._motion_state["active_action_id"] == action_id:
+                            self._motion_state["active_action_id"] = None
                     if submitted:
                         # movep 可能已部分下发（前段 connect=1 轨迹已入控制器队列）：
                         # 失败路径明确慢停，不留无看护的排队轨迹，再放锁。
@@ -948,15 +961,16 @@ class CartesianPlugin:
                 raise ValueError(
                     f"{label} {value:.0f} deg exceeds cartesian.max_euler_abs_deg {self.max_euler_abs_deg:g}")
 
-    def _submit(self, motion_type, args, speed_percent):
-        """下发 SDK 运动命令（非阻塞）。-4 表示控制器到位设备模式不匹配，转成可操作错误。"""
+    def _submit(self, motion_type, args, target, speed_percent):
+        """下发 SDK 运动命令（非阻塞）。"""
         try:
             if motion_type == "movel":
                 pose = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
                 self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 0, 0)
             elif motion_type == "move_offset":
-                offset = self._pose_from_fields(args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"))
-                self.client.command("rm_movel_offset", self._to_sdk_pose(offset), speed_percent, 0, 0, 1, 0)
+                # rm_movel_offset 仅四代控制器支持。目标已按当前工具姿态换算到
+                # 基座坐标系，使用 rm_movel 可在三代和四代控制器上保持同一语义。
+                self.client.command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, 0)
             elif motion_type == "movep":
                 waypoints = args.get("waypoints")
                 poses = [self._waypoint_pose(item, index) for index, item in enumerate(waypoints)]
@@ -969,7 +983,7 @@ class CartesianPlugin:
         except RuntimeError as exc:
             if "code -4" in str(exc):
                 raise RuntimeError(
-                    "控制器到位设备模式不是笛卡尔（SDK -4）：请在示教器/控制箱把到位设备切到笛卡尔模式后重试"
+                    "控制器到位设备校验失败（SDK -4）：请确认没有夹爪、灵巧手、升降机构或其他客户端并发占用运动通道"
                 ) from exc
             raise
 
@@ -1125,6 +1139,8 @@ class CartesianPlugin:
                 self._cancelled.discard(action_id)
                 if self._active_action_id == action_id:
                     self._active_action_id = None
+                if self._motion_state["active_action_id"] == action_id:
+                    self._motion_state["active_action_id"] = None
                 self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
             self._motion_lock.release()
             self._acp_callback(action_id, status, result)
@@ -1137,10 +1153,11 @@ class CartesianPlugin:
             if action_id:
                 self._cancelled.add(action_id)
         if action_id and self.client.connected:
-            try:
-                self.client.command("rm_set_arm_slow_stop")
-            except Exception as exc:
-                print(f"[rm75] cartesian slow-stop failed: {exc}", flush=True)
+            with self._submission_lock:
+                try:
+                    self.client.command("rm_set_arm_slow_stop")
+                except Exception as exc:
+                    print(f"[rm75] cartesian slow-stop failed: {exc}", flush=True)
         return {"state": "stop_requested", "action_id": action_id}
 
     def _acp_callback(self, action_id, status, result):
