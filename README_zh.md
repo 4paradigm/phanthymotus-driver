@@ -11,6 +11,7 @@
 | 驱动 | 硬件 | 端口 | 说明 |
 |------|------|------|------|
 | `unitree/g1` | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态监控 |
+| [`generic/teleopit`](generic/teleopit/README.md) | Teleopit G1 29DoF 仿真 | 15719 | BVH/PICO 全身输入、MuJoCo 画面和关节诊断；不含真机输出 |
 | `engineai/t800` | 众擎 T800 开发版 | 15708 | ROS2/Native SDK、全身状态、舞蹈/手势序列、虚拟手柄、运动与高低层控制 |
 | `deep_robotics/lynx_m20` | 云深处山猫 M20 | 15716 | 官方 ROS 2/Fast DDS 接口与 basic_server TCP/UDP 原生控制，隔离标准版和 Pro 能力 |
 | `chasing/qianjiao_p200_pro` | 潜行科技潜鲛 P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF 运动控制、锁定/解锁、心跳和连接状态 |
