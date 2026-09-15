@@ -50,6 +50,7 @@ COPY --from=interface-builder /q5_ws/install /q5_ws/install
 COPY common/ /work/common/
 COPY main.py /work/main.py
 COPY q5_bus_bridge.py /work/q5_bus_bridge.py
+COPY fastdds_transport.py /work/fastdds_transport.py
 COPY q5_bundle_entrypoint.sh /work/q5_bundle_entrypoint.sh
 COPY sensor_contract.py /work/sensor_contract.py
 COPY control_contract.py /work/control_contract.py
