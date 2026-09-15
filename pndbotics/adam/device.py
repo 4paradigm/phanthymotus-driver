@@ -5,7 +5,6 @@ Plugins:
   EStopPlugin  — read-only PAC physical emergency-stop state
   LocoPlugin   — gRPC locomotion control
   PosturePlugin / MotionPlugin / TrackingMotionPlugin — focused RL execution cards
-  ControlModePlugin / SafetyPlugin — control ownership and safe stop cards
   ArmPlugin    — ROS2 JointState upper body control
   HandPlugin   — DDS rt/handcmd finger control and hand-state query
   ModelPlugin  — URDF resource for 3D visualization
@@ -1155,27 +1154,6 @@ class ControlModePlugin(_RlActionPlugin):
             return self._grpc.set_control_mode(1)
         if action == "set_traditional":
             return self._grpc.set_control_mode(0)
-        return None
-
-
-class SafetyPlugin(_RlActionPlugin):
-    def get_tool(self):
-        return {"name": "safety", "type": "actuator",
-                "description": "Stop active motion or shut down the Adam controller",
-                "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["stop_motion", "shutdown", "get_state", "info"]},
-                    "force": {"type": "boolean"},
-                }, "required": ["action"], "additionalProperties": False,
-                "x-action-params": {"stop_motion": {"params": []}, "shutdown": {"params": ["force"]},
-                    "get_state": {"params": []}, "info": {"params": []}}}}
-
-    def dispatch(self, action, args):
-        if action in ("get_state", "info"):
-            return self._state()
-        if action == "stop_motion":
-            return self._grpc.set_motion("STOP", "")
-        if action == "shutdown":
-            return self._grpc.shutdown(bool(args.get("force", False)))
         return None
 
 
@@ -3261,8 +3239,7 @@ class AdamDeviceBundle:
         # cards make state transitions, motions, control ownership and safety
         # actions independently discoverable to an agent.
         rl_cards = (("motion", MotionPlugin),
-                    ("tracking_motion", TrackingMotionPlugin),
-                    ("safety", SafetyPlugin))
+                    ("tracking_motion", TrackingMotionPlugin))
         for card_name, card_class in rl_cards:
             card_cfg = plugins_cfg.get(card_name, {})
             if card_cfg.get("enabled", True):

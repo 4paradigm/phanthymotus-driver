@@ -15,7 +15,6 @@ from device import (
     MotionPlugin,
     PosturePlugin,
     RlLocoPlugin,
-    SafetyPlugin,
     TrackingMotionPlugin,
 )
 
@@ -89,10 +88,9 @@ class LocoContractTests(unittest.TestCase):
             MotionPlugin({}, "adam", None, grpc),
             TrackingMotionPlugin({}, "adam", None, grpc),
             ControlModePlugin({}, "adam", None, grpc),
-            SafetyPlugin({}, "adam", None, grpc),
         ]
         self.assertEqual(
-            {"posture", "motion", "tracking_motion", "control_mode", "safety"},
+            {"posture", "motion", "tracking_motion", "control_mode"},
             {card.get_tool()["name"] for card in cards},
         )
 
@@ -118,14 +116,11 @@ class LocoContractTests(unittest.TestCase):
         motion.dispatch("stop", {})
         self.assertEqual(("STOP", ""), grpc.motion)
 
-    def test_control_mode_and_safety_cards_map_to_explicit_rpcs(self):
+    def test_control_mode_maps_to_explicit_rpc(self):
         grpc = _Grpc()
         control = ControlModePlugin({}, "adam", None, grpc)
-        safety = SafetyPlugin({}, "adam", None, grpc)
         control.dispatch("set_traditional", {})
         self.assertEqual(0, grpc.domain_id)
-        safety.dispatch("shutdown", {"force": True})
-        self.assertTrue(grpc.shutdown_force)
 
 
 if __name__ == "__main__":

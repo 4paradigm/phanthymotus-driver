@@ -26,7 +26,6 @@ cards:
   - { name: loco,               type: actuator }
   - { name: motion,             type: actuator }
   - { name: tracking_motion,    type: actuator }
-  - { name: safety,             type: actuator }
   - { name: arm,                type: actuator }
   - { name: hand,                type: actuator }
   - { name: hand_state,          type: sensor }
