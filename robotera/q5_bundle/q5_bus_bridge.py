@@ -19,8 +19,9 @@ import os
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Any, Callable
+
+from fastdds_transport import configure_fastdds_transport
 
 
 DEFAULT_DRIVER_URL = "http://127.0.0.1:15793/mcp"
@@ -29,29 +30,6 @@ DEFAULT_DRIVER_URL = "http://127.0.0.1:15793/mcp"
 DEFAULT_POLL_HZ = 10.0
 DEFAULT_REFRESH_SECONDS = 30.0
 DEFAULT_TIMEOUT_SECONDS = 2.0
-DEFAULT_FASTDDS_PROFILE = Path(__file__).with_name("resource") / "fastdds_udp_only.xml"
-
-
-def configure_fastdds_transport() -> str | None:
-    """Use UDP for the bridge when no deployment profile was supplied.
-
-    Fast DDS discovery can succeed across Docker host networking while its
-    default shared-memory data transport cannot cross private IPC namespaces.
-    The bridge is the only Domain 42 process controlled by this bundle, so it
-    advertises UDP-only locators instead of changing the shared Agent Core.
-    """
-    if os.environ.get("RMW_IMPLEMENTATION") != "rmw_fastrtps_cpp":
-        return None
-    configured = os.environ.get("FASTDDS_DEFAULT_PROFILES_FILE")
-    if configured:
-        return configured
-    if not DEFAULT_FASTDDS_PROFILE.is_file():
-        return None
-    profile = str(DEFAULT_FASTDDS_PROFILE)
-    os.environ["FASTDDS_DEFAULT_PROFILES_FILE"] = profile
-    # Humble images may still read the legacy spelling.
-    os.environ.setdefault("FASTRTPS_DEFAULT_PROFILES_FILE", profile)
-    return profile
 
 
 def select_sensor_tools(tools: Any) -> dict[str, list[str]]:
