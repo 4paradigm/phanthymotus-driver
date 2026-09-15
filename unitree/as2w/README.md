@@ -1,6 +1,6 @@
-# Unitree AS2 driver
+# Unitree AS2W driver
 
-This bundle targets the Unitree **AS2** SDK service documented in the Unitree
+This bundle targets the Unitree **AS2W** wheel-legged robot and its SDK service documented in the Unitree
 SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5` and uses its dedicated
 `unitree_sdk2py.as2.sport.SportClient`: `Move`, `StopMove`, `StandUp`, `StandDown`,
@@ -24,11 +24,12 @@ any plugin stop path terminate that loop and issue `StopMove`. Velocity and
 attitude inputs are clamped before reaching the robot. Acrobatics should only
 be invoked with a clear area and appropriate operator approval.
 
-The checked-in `resource/as2_model.urdf` is a kinematic 12-joint quadruped
-descriptor for visualization. Replace it with the calibrated model supplied by
-the robot deployment when available.
+The checked-in `resource/as2w.urdf` and `resource/meshes/` are copied from
+Unitree's official `unitree_ros/robots/as2w_description`; AS2W has 16 movable
+joints (12 leg joints plus 4 continuous wheel-foot joints) and the fixed JT128
+sensor mount.
 
-The official AS2 SDK currently does not include an AS2 SLAM or navigation
+The official AS2W SDK currently does not include an AS2W SLAM or navigation
 client. Therefore this bundle intentionally does not advertise `controlled_spatial`:
 the Go2 implementation depends on a different `g1.slam.SlamClient` plus host
 `unitree_slam` binaries, neither of which is an AS2 SDK contract. `lidar_cloud`
