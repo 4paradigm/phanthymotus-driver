@@ -678,7 +678,6 @@ def _acp_complete(action_id, status, result, tool_name):
         error = "AGENT_CORE_CA_CERT is required"
         print(f"[rm75 ACP] {action_id} {status}: callback failed: {error}", flush=True)
         return "failed", error
-    ctx = _ssl.create_default_context(cafile=ca_cert)
     summary = {}
     if status == "completed":
         summary = {"reason": "target_reached"}
@@ -687,6 +686,7 @@ def _acp_complete(action_id, status, result, tool_name):
     body = {"action_id": action_id, "status": status, "result": summary,
             "tool": tool_name, "ts": time.time()}
     try:
+        ctx = _ssl.create_default_context(cafile=ca_cert)
         req = _urllib.Request(
             f"{agent_core_url.rstrip('/')}/api/acp/complete",
             data=json.dumps(body).encode(),
@@ -865,11 +865,15 @@ class CartesianPlugin:
         }
 
     def _start_cartesian(self, motion_type, args):
-        request_enabled = args.get("cartesian_enabled", self.cartesian_enabled)
-        if request_enabled is not True:
+        if not self.cartesian_enabled:
+            raise PermissionError(
+                "cartesian motion is disabled by deployment configuration; "
+                "set cartesian.enabled=true only after supervised workspace validation"
+            )
+        if args.get("cartesian_enabled") is not True:
             raise PermissionError(
                 "cartesian motion is disabled for this request; "
-                "set cartesian_enabled=true on the card after validating the workspace limits"
+                "set cartesian_enabled=true on the card"
             )
         if not self.client.motion_enabled:
             raise PermissionError("motion is locked; set RM_MOTION_ENABLED=1 only for supervised hardware testing")
@@ -989,7 +993,8 @@ class CartesianPlugin:
         except RuntimeError as exc:
             if "code -4" in str(exc):
                 raise RuntimeError(
-                    "控制器到位设备校验失败（SDK -4）：请确认没有夹爪、灵巧手、升降机构或其他客户端并发占用运动通道"
+                    "控制器到位设备校验失败（SDK -4）：请在 RealMan Studio/控制器中将当前到位设备设为笛卡尔设备；"
+                    "同时确认没有其他客户端占用运动通道"
                 ) from exc
             raise
 

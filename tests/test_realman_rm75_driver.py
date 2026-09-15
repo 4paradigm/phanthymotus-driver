@@ -359,7 +359,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
     def _movel_args(self, **overrides):
         args = {"x_mm": 100, "y_mm": 0, "z_mm": 0, "rx_deg": 90, "ry_deg": 0, "rz_deg": 0,
-                "speed_percent": 5, "confirm_motion": True}
+                "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True}
         args.update(overrides)
         return args
 
@@ -385,32 +385,27 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual(["tool"], schema["properties"]["frame_type"]["enum"])
         self.assertIn("工具系偏移", tools[0]["description"])
 
-    def test_cartesian_motion_requires_card_enable(self):
+    def test_cartesian_motion_requires_deployment_enable(self):
         plugin = self.device.CartesianPlugin(
             self.client, {"safety": dict(self.FAST_SAFETY)},
             arm_plugin=self.arm, namespace="rm75",
         )
 
-        for cartesian_enabled in (None, False):
-            with self.subTest(cartesian_enabled=cartesian_enabled):
-                args = self._movel_args()
-                if cartesian_enabled is not None:
-                    args["cartesian_enabled"] = cartesian_enabled
-                with self.assertRaisesRegex(PermissionError, "disabled for this request"):
-                    plugin.dispatch("movel", args)
+        with self.assertRaisesRegex(PermissionError, "disabled by deployment configuration"):
+            plugin.dispatch("movel", self._movel_args(cartesian_enabled=True))
 
         self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
         self.assertFalse(plugin._motion_lock.locked())
 
-    def test_card_can_enable_cartesian_motion_with_workspace_guards(self):
-        plugin = self.device.CartesianPlugin(
-            self.client, {"safety": dict(self.FAST_SAFETY)},
-            arm_plugin=self.arm, namespace="rm75",
-        )
-        events = []
-        plugin._acp_callback = lambda action_id, status, result: events.append((action_id, status, result))
+    def test_cartesian_motion_requires_card_enable(self):
+        with self.assertRaisesRegex(PermissionError, "disabled for this request"):
+            self.plugin.dispatch("movel", self._movel_args(cartesian_enabled=False))
 
-        result = plugin.dispatch("movel", self._movel_args(cartesian_enabled=True))
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+        self.assertFalse(self.plugin._motion_lock.locked())
+
+    def test_card_can_enable_cartesian_motion_with_workspace_guards(self):
+        result = self.plugin.dispatch("movel", self._movel_args(cartesian_enabled=True))
 
         self.assertEqual("running", result["state"])
         self.assertIn(
@@ -418,7 +413,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             self.client.calls,
         )
         self.client.pose_mm_deg = [100.0, 0.0, 0.0, 90.0, 0.0, 0.0]
-        self.assertTrue(self._wait_for(lambda: len(events) == 1))
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
 
     def test_movel_converts_units_and_reports_completion(self):
         result = self.plugin.dispatch("movel", self._movel_args())
@@ -444,7 +439,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         result = self.plugin.dispatch("move_offset", {
             "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
-            "frame_type": "tool", "speed_percent": 5, "confirm_motion": True,
+            "frame_type": "tool", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
         })
 
         self.assertEqual("running", result["state"])
@@ -466,7 +461,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.plugin.dispatch("move_offset", {
             "dx_mm": 100, "dy_mm": 0, "dz_mm": 0,
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
-            "frame_type": "tool", "speed_percent": 5, "confirm_motion": True,
+            "frame_type": "tool", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
         })
         movel_calls = [entry[1] for entry in self.client.calls if entry[0] == "rm_movel"]
         self.assertEqual(1, len(movel_calls))
@@ -485,7 +480,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             self.plugin.dispatch("move_offset", {
                 "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
                 "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
-                "frame_type": "work", "speed_percent": 5, "confirm_motion": True,
+                "frame_type": "work", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
             })
 
     def test_workspace_limits_reject_unreachable_poses(self):
@@ -498,14 +493,14 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         for pose in cases:
             with self.subTest(pose=pose):
                 with self.assertRaisesRegex(ValueError, "exceeds"):
-                    self.plugin.dispatch("movel", {**pose, "speed_percent": 5, "confirm_motion": True})
+                    self.plugin.dispatch("movel", {**pose, "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True})
         self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
 
     def test_movep_validates_every_waypoint(self):
         with self.assertRaisesRegex(ValueError, "exceeds"):
             self.plugin.dispatch("movep", {
                 "waypoints": [[100, 0, 0, 0, 0, 0], [2000, 0, 0, 0, 0, 0]],
-                "speed_percent": 5, "confirm_motion": True,
+                "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
             })
         self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
 
@@ -576,6 +571,14 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         mkctx.assert_called_once_with(cafile="/tmp/ca.pem")
         urlopen.assert_called_once()
 
+    def test_acp_complete_reports_ca_context_failure(self):
+        with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": "/tmp/empty.pem"}), \
+                mock.patch("ssl.create_default_context", side_effect=ValueError("invalid CA")), \
+                mock.patch("urllib.request.urlopen") as urlopen:
+            result = self.device._acp_complete("test-bad-ca", "completed", {"reason": "x"}, "cartesian_control")
+        self.assertEqual(("failed", "invalid CA"), result)
+        urlopen.assert_not_called()
+
     def test_movep_chains_waypoints_with_connect_flags(self):
         waypoints = [
             [100, 0, 0, 0, 0, 0],
@@ -583,7 +586,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             [100, 100, 100, 0, 0, 0],
         ]
         result = self.plugin.dispatch("movep", {
-            "waypoints": waypoints, "speed_percent": 5, "confirm_motion": True,
+            "waypoints": waypoints, "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
         })
 
         self.assertEqual("running", result["state"])
@@ -742,7 +745,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "code 1"):
             self.plugin.dispatch("movep", {
                 "waypoints": [[100, 0, 0, 0, 0, 0], [100, 100, 0, 0, 0, 0], [100, 100, 100, 0, 0, 0]],
-                "speed_percent": 5, "confirm_motion": True,
+                "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
             })
         order = [entry[0] for entry in self.client.calls]
         # 部分下发后失败 → 慢停在失败的 movel 之后发出
@@ -804,7 +807,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             (action_id, status, result)
         )
 
-        with self.assertRaisesRegex(RuntimeError, "到位设备"):
+        with self.assertRaisesRegex(RuntimeError, "笛卡尔设备"):
             self.plugin.dispatch("movel", self._movel_args())
         self.assertEqual([], self.acp_events)
         self.assertFalse(self.plugin._motion_lock.locked())
@@ -828,7 +831,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "waypoint 0"):
             self.plugin.dispatch("movep", {
-                "waypoints": [[1, 2, 3]], "speed_percent": 5, "confirm_motion": True,
+                "waypoints": [[1, 2, 3]], "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
             })
 
     def test_concurrent_motion_with_joint_control_is_rejected(self):
