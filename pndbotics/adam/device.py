@@ -484,6 +484,8 @@ ARM_POSES = {
     }),
 }
 
+ARM_ACTIONS = {f"set_{control}": control for control in ARM_JOINT_CONTROLS}
+
 
 def _arm_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
     """Validate a human-facing upper-body request and return ROS target."""
@@ -611,11 +613,10 @@ class _StatePublisherNode(Node):
         if not active or state is None:
             return
 
-        robot_data = {
-            "mode_pr": int(state.mode_pr),
-            "tick": int(state.tick),
-            "wireless_remote": list(state.wireless_remote),
-        }
+        robot_data = {"mode_pr": int(state.mode_pr), "tick": int(state.tick)}
+        for index, value in enumerate(state.wireless_remote):
+            if float(value) != 0.0:
+                robot_data[f"wireless_remote_{index:02d}"] = float(value)
         msg_robot = String()
         msg_robot.data = json.dumps(robot_data)
         self._pub_robot_state.publish(msg_robot)
@@ -633,33 +634,39 @@ class _StatePublisherNode(Node):
         msg.data = json.dumps({"joints": joints})
         self._pub_skeleton.publish(msg)
 
-        motor_states = []
+        motor_data = {}
         for idx, motor in enumerate(state.motor_state):
             if idx >= len(self._joints):
                 break
-            motor_states.append({
-                "idx": idx,
-                "name": self._joints[idx],
-                "mode": int(motor.mode),
-                "q": float(motor.q),
-                "dq": float(motor.dq),
-                "ddq": float(motor.ddq),
-                "tau_est": float(motor.tau_est),
-                "state": int(motor.state),
-            })
+            # Flat scalar fields let the dashboard render one signal per cell
+            # instead of requiring it to understand a nested motor array.
+            prefix = f"motor_{idx:02d}_{self._joints[idx]}"
+            motor_data[f"{prefix}_position_rad"] = float(motor.q)
+            motor_data[f"{prefix}_velocity_rad_s"] = float(motor.dq)
+            motor_data[f"{prefix}_torque_nm"] = float(motor.tau_est)
+            # ``ddq`` is commonly an all-zero firmware placeholder. Omit it
+            # until a meaningful acceleration estimate is available.
+            if float(motor.ddq) != 0.0:
+                motor_data[f"{prefix}_acceleration_rad_s2"] = float(motor.ddq)
+            if int(motor.mode) != 0:
+                motor_data[f"{prefix}_mode"] = int(motor.mode)
+            if int(motor.state) != 0:
+                motor_data[f"{prefix}_state"] = int(motor.state)
         msg_motor = String()
-        msg_motor.data = json.dumps({"motors": motor_states})
+        msg_motor.data = json.dumps(motor_data)
         self._pub_motor_state.publish(msg_motor)
 
         # IMU
         imu = state.imu_state
-        imu_data = {
-            "quaternion": list(imu.quaternion),
-            "gyroscope": list(imu.gyroscope),
-            "accelerometer": list(imu.accelerometer),
-            "ypr": list(imu.ypr),
-            "temperature": int(imu.temperature),
-        }
+        imu_data = {"temperature": int(imu.temperature)}
+        for prefix, values, names in (
+                ("quaternion", list(imu.quaternion), ("w", "x", "y", "z")),
+                ("gyroscope_rad_s", list(imu.gyroscope), ("x", "y", "z")),
+                ("accelerometer_m_s2", list(imu.accelerometer), ("x", "y", "z")),
+                ("ypr_rad", list(imu.ypr), ("yaw", "pitch", "roll"))):
+            for index, value in enumerate(values):
+                label = names[index] if index < len(names) else str(index)
+                imu_data[f"{prefix}_{label}"] = float(value)
         msg_imu = String()
         msg_imu.data = json.dumps(imu_data)
         self._pub_imu.publish(msg_imu)
@@ -1286,6 +1293,13 @@ class _ArmControlNode(Node):
             self._positions[:17] = 0.0
             self._positions[17] = 1.0  # keep standing height
 
+    def receiver_count(self) -> int:
+        """Number of discovered retarget subscribers on ``joint_states``."""
+        try:
+            return int(self._pub.get_subscription_count())
+        except Exception:
+            return 0
+
 
 class ArmPlugin:
     """Human-facing Adam Pro upper-body control via ROS2 JointState."""
@@ -1302,66 +1316,56 @@ class ArmPlugin:
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
-        joint_options = [
-            {"const": control, "title": label}
-            for control, (label, _, _, _) in ARM_JOINT_CONTROLS.items()
-        ]
         pose_options = [
             {"const": pose, "title": label}
             for pose, (label, _) in ARM_POSES.items()
         ]
+        actions = [*ARM_ACTIONS, "preset", "set_height", "stop", "info"]
+        action_options = [
+            {"const": action, "title": f"设置{ARM_JOINT_CONTROLS[control][0]}"}
+            for action, control in ARM_ACTIONS.items()
+        ] + [
+            {"const": "preset", "title": "执行预设姿态"},
+            {"const": "set_height", "title": "设置站立高度"},
+            {"const": "stop", "title": "停止上肢指令"},
+            {"const": "info", "title": "查看状态"},
+        ]
+        properties = {
+            "action": {"type": "string", "enum": actions, "oneOf": action_options},
+            "pose": {"type": "string", "title": "预设姿态", "enum": list(ARM_POSES),
+                     "oneOf": pose_options},
+            "height_m": {"type": "number", "title": "站立高度（米）", "minimum": 0.6,
+                         "maximum": 1.0, "multipleOf": 0.01,
+                         "description": "站立高度，范围 0.60-1.00 米。"},
+        }
+        action_params = {
+            "preset": {"params": ["pose"], "description": "执行保守的双臂预设姿态。"},
+            "set_height": {"params": ["height_m"], "description": "设置站立高度（米）。"},
+            "stop": {"params": [], "description": "停止发布上肢目标并保持机器人当前状态。"},
+            "info": {"params": [], "description": "查看上肢指令是否已启用。"},
+        }
+        for action, control in ARM_ACTIONS.items():
+            label, _, minimum, maximum = ARM_JOINT_CONTROLS[control]
+            field = f"{control}_deg"
+            properties[field] = {
+                "type": "number", "title": f"{label}目标角度（度）",
+                "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
+                "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+            action_params[action] = {
+                "params": [field],
+                "description": f"设置{label}，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
         return {
             "name": "arm",
             "type": "actuator",
             "description": "Adam upper body — choose a named waist/arm joint and an angle in degrees, or use a safe preset pose",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["move_joint", "preset", "set_height", "stop", "info"],
-                        "oneOf": [
-                            {"const": "move_joint", "title": "调整一个关节"},
-                            {"const": "preset", "title": "执行预设姿态"},
-                            {"const": "set_height", "title": "设置站立高度"},
-                            {"const": "stop", "title": "停止上肢指令"},
-                            {"const": "info", "title": "查看状态"},
-                        ],
-                    },
-                    "joint": {
-                        "type": "string", "title": "关节", "enum": list(ARM_JOINT_CONTROLS),
-                        "oneOf": joint_options,
-                        "description": "选择要调整的身体部位；系统按该部位的厂商限位校验。",
-                    },
-                    "angle_deg": {
-                        "type": "number", "title": "目标角度（度）",
-                        "minimum": -207.0, "maximum": 160.0, "multipleOf": 1.0,
-                        "description": "目标绝对角度，单位为度；每个关节会按自己的安全范围再次校验。",
-                    },
-                    "pose": {
-                        "type": "string", "title": "预设姿态", "enum": list(ARM_POSES),
-                        "oneOf": pose_options,
-                    },
-                    "height_m": {
-                        "type": "number", "title": "站立高度（米）",
-                        "minimum": 0.6, "maximum": 1.0, "multipleOf": 0.01,
-                        "description": "站立高度，范围 0.60-1.00 米。",
-                    },
-                },
+                "properties": properties,
                 "required": ["action"],
                 "additionalProperties": False,
-                "x-action-params": {
-                    "move_joint": {
-                        "params": ["joint", "angle_deg"],
-                        "description": "以度为单位调整所选关节；会自动启用上肢指令并检查厂商限位。",
-                    },
-                    "preset": {"params": ["pose"], "description": "执行保守的双臂预设姿态。"},
-                    "set_height": {
-                        "params": ["height_m"], "description": "设置站立高度（米）。",
-                    },
-                    "stop": {"params": [], "description": "停止发布上肢目标并保持机器人当前状态。"},
-                    "info": {"params": [], "description": "查看上肢指令是否已启用。"},
-                },
+                "x-action-params": action_params,
                 "x-resource": ["adam_upper_body"],
             },
         }
@@ -1381,17 +1385,23 @@ class ArmPlugin:
         if action in ("stop", "disable"):
             self._node._active = False
             return {"state": "idle", "message": "Upper body command publishing stopped"}
-        if action == "move_joint":
+        if action in ARM_ACTIONS:
             try:
-                control = args.get("joint")
-                ros_name, radians = _arm_target_radians(control, args.get("angle_deg"))
+                control = ARM_ACTIONS[action]
+                field = f"{control}_deg"
+                ros_name, radians = _arm_target_radians(control, args.get(field))
                 self._node.set_joints({ros_name: radians})
             except (TypeError, ValueError) as exc:
                 return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+            receivers = self._node.receiver_count()
+            if receivers < 1:
+                return {"success": False, "code": "ROS_RECEIVER_UNAVAILABLE",
+                        "message": "No Adam retarget receiver is subscribed to joint_states; command was not activated",
+                        "receiver_count": receivers}
             self._node._active = True
             _, _, minimum, maximum = ARM_JOINT_CONTROLS[control]
             return {"success": True, "state": "active", "joint": control,
-                    "angle_deg": float(args["angle_deg"]),
+                    "angle_deg": float(args[field]), "receiver_count": receivers,
                     "limits_deg": {"minimum": minimum, "maximum": maximum}}
         if action == "preset":
             pose = args.get("pose")
@@ -1405,19 +1415,33 @@ class ArmPlugin:
                 self._node.zero_arms() if pose == "neutral" else self._node.set_joints(targets)
             except (TypeError, ValueError) as exc:
                 return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+            receivers = self._node.receiver_count()
+            if receivers < 1:
+                return {"success": False, "code": "ROS_RECEIVER_UNAVAILABLE",
+                        "message": "No Adam retarget receiver is subscribed to joint_states; command was not activated",
+                        "receiver_count": receivers}
             self._node._active = True
             return {"success": True, "state": "active", "pose": pose,
-                    "joints_set": len(targets_deg)}
+                    "joints_set": len(targets_deg), "receiver_count": receivers}
         if action == "set_height":
             h = args.get("height_m")
             if isinstance(h, bool) or not isinstance(h, (int, float)) or not 0.6 <= h <= 1.0:
                 return {"success": False, "code": "INVALID_ARGUMENT",
                         "message": "height_m must be a number in [0.6, 1.0]"}
             self._node.set_height(h)
+            receivers = self._node.receiver_count()
+            if receivers < 1:
+                return {"success": False, "code": "ROS_RECEIVER_UNAVAILABLE",
+                        "message": "No Adam retarget receiver is subscribed to joint_states; command was not activated",
+                        "receiver_count": receivers}
             self._node._active = True
-            return {"success": True, "state": "active", "height_m": h}
+            return {"success": True, "state": "active", "height_m": h,
+                    "receiver_count": receivers}
         if action == "info":
-            return {"state": "active" if self._node._active else "idle"}
+            receivers = self._node.receiver_count()
+            return {"state": "active" if self._node._active else "idle",
+                    "receiver_count": receivers,
+                    "receiver_ready": receivers > 0}
         return None
 
 

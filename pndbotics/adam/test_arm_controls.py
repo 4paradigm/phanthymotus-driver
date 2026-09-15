@@ -9,7 +9,7 @@ import unittest
 
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
-from device import ARM_JOINT_CONTROLS, ARM_POSES, _arm_target_radians
+from device import ARM_ACTIONS, ARM_JOINT_CONTROLS, ARM_POSES, _arm_target_radians
 
 
 class ArmControlTests(unittest.TestCase):
@@ -18,6 +18,11 @@ class ArmControlTests(unittest.TestCase):
         self.assertIn("right_wrist_roll", ARM_JOINT_CONTROLS)
         self.assertNotIn("shoulderPitch_Left", ARM_JOINT_CONTROLS)
         self.assertIn("neutral", ARM_POSES)
+
+    def test_each_joint_has_a_distinct_action_and_angle_field(self):
+        self.assertEqual("left_elbow", ARM_ACTIONS["set_left_elbow"])
+        self.assertEqual("right_wrist_roll", ARM_ACTIONS["set_right_wrist_roll"])
+        self.assertEqual(len(ARM_JOINT_CONTROLS), len(ARM_ACTIONS))
 
     def test_degrees_convert_to_the_ros_joint_target(self):
         name, target = _arm_target_radians("left_shoulder_pitch", -90)
