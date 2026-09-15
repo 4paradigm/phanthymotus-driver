@@ -13,7 +13,7 @@ cards:
   - { name: model, type: resource }
   - { name: loco, type: actuator }
   - { name: imu, type: sensor }
-  - { name: joints, type: resource }
+  - { name: joints, type: sensor }
   - { name: joint_state, type: sensor }
   - { name: battery, type: sensor }
   - { name: loco_state, type: sensor }

@@ -8,5 +8,4 @@
 from . import PointField_Constants
 from ._PointCloud2_ import PointCloud2_
 from ._PointField_ import PointField_
-from ._Imu_ import Imu_
-__all__ = ["PointField_Constants", "PointCloud2_", "PointField_", "Imu_", ]
+__all__ = ["PointField_Constants", "PointCloud2_", "PointField_", ]

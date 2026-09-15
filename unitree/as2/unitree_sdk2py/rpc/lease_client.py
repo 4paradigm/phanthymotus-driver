@@ -1,4 +1,3 @@
-import logging
 import time
 import socket
 import os
@@ -8,8 +7,6 @@ from threading import Thread, Lock
 
 from .client_base import ClientBase
 from .internal import *
-
-_log = logging.getLogger(__name__)
 
 
 """
@@ -43,8 +40,7 @@ class LeaseClient(ClientBase):
         self.__thread = None
         self.__lock = Lock()
         super().__init__(self.__name)
-        _log.info("[LeaseClient] lease name: %s, context name: %s", self.__name, self.__contextName)
-        self.__fail_warns = 0
+        print("[LeaseClient] lease name:", self.__name, ", context name:", self.__contextName)
     
     def Init(self):
         self.SetTimeout(1.0)
@@ -73,13 +69,7 @@ class LeaseClient(ClientBase):
 
         c, d = self._CallBase(RPC_API_ID_LEASE_APPLY, p)
         if c != 0:
-            # The keepalive thread retries forever, so an unavailable service would
-            # otherwise emit this every cycle. Warn once, then every 100th.
-            self.__fail_warns += 1
-            if self.__fail_warns == 1 or self.__fail_warns % 100 == 0:
-                _log.warning("[LeaseClient] apply lease error on %s, code=%s (occurrence %d) "
-                             "— is the peer service running?",
-                             self.__name, c, self.__fail_warns)
+            print("[LeaseClient] apply lease error. code:", c)
             return
 
         data = json.loads(d)
@@ -87,11 +77,7 @@ class LeaseClient(ClientBase):
         id = data["id"]
         term = data["term"]
 
-        if self.__fail_warns:
-            _log.warning("[LeaseClient] %s acquired after %d failed attempts",
-                         self.__name, self.__fail_warns)
-            self.__fail_warns = 0
-        _log.info("[LeaseClient] lease applied id: %s, term: %s", id, term)
+        print("[LeaseClient] lease applied id:", id, ", term:", term)
 
         with self.__lock:
             self.__context.Update(id, float(term/1000000))
@@ -102,10 +88,7 @@ class LeaseClient(ClientBase):
 
         c, d = self._CallBase(RPC_API_ID_LEASE_RENEWAL, p, 0, self.__context.id)
         if c != 0:
-            self.__fail_warns += 1
-            if self.__fail_warns == 1 or self.__fail_warns % 100 == 0:
-                _log.warning("[LeaseClient] renewal lease error on %s, code=%s (occurrence %d)",
-                             self.__name, c, self.__fail_warns)
+            print("[LeaseClient] renewal lease error. code:", c)
             if c == RPC_ERR_SERVER_LEASE_NOT_EXIST:
                 with self.__lock:
                     self.__context.Reset()

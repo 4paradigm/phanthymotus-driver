@@ -5,7 +5,7 @@ import threading
 
 def _worker(commands, results, interface):
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-    from unitree_sdk2py.a2.sport.sport_client import SportClient
+    from unitree_sdk2py.as2.sport.sport_client import SportClient
     ChannelFactoryInitialize(0, interface)
     client = SportClient()
     client.SetTimeout(10.0)
@@ -15,7 +15,12 @@ def _worker(commands, results, interface):
         if command is None:
             return
         try:
-            results.put({"result": getattr(client, command[0])(*command[1])})
+            if command[0] == "GetState":
+                state = {}
+                code = client.GetState(state)
+                results.put({"result": (code, state)})
+            else:
+                results.put({"result": getattr(client, command[0])(*command[1])})
         except Exception as exc:
             results.put({"error": str(exc)})
 
