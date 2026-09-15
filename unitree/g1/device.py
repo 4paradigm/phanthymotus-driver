@@ -4374,6 +4374,8 @@ class VisionCapturePlugin:
         except OSError as exc:
             print(f"[vision_capture] could not remove partial file {path}: {exc}",
                   flush=True)
+            return str(exc)
+        return None
 
     @staticmethod
     def _write_video_frame(process, data, cancel_event):
@@ -4480,11 +4482,25 @@ class VisionCapturePlugin:
                 self._remove_partial(path)
 
     def _record_video_async(self, active):
-        result = self._record_video(active)
-        status = ("completed" if result.get("ok") else
-                  "cancelled" if result.get("code") == "RECORD_CANCELLED" else
-                  "error")
+        try:
+            result = self._record_video(active)
+        except Exception as exc:
+            result = {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
         with self._recording_lock:
+            # stop() and terminal classification share this lock.  Cancellation
+            # wins until the terminal state is committed; if encoding already
+            # produced a valid file, remove it before reporting cancellation.
+            if active["cancel_event"].is_set():
+                cleanup_error = None
+                if result.get("ok"):
+                    cleanup_error = self._remove_partial(Path(result["file_path"]))
+                result = {"ok": False, "code": "RECORD_CANCELLED",
+                          "message": "Video recording was cancelled"}
+                if cleanup_error:
+                    result["cleanup_error"] = cleanup_error
+            status = ("completed" if result.get("ok") else
+                      "cancelled" if result.get("code") == "RECORD_CANCELLED" else
+                      "error")
             self._last_recording = {
                 "action_id": active["action_id"], "status": status, "result": result}
             active["state"] = status
@@ -4535,8 +4551,9 @@ class VisionCapturePlugin:
             active = self._active_recording
             if not active:
                 return {"ok": True, "state": "idle"}
-            active["state"] = "stopping"
-            active["cancel_event"].set()
+            if not active.get("finished"):
+                active["state"] = "stopping"
+                active["cancel_event"].set()
             process = active.get("process")
         self._terminate_encoder(process)
         active["thread"].join(timeout=6)
