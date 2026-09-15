@@ -50,7 +50,9 @@ class AdamGrpcClient:
 
     @staticmethod
     def _rpc_error(exc):
-        return {"success": False, "error": exc.details(), "code": exc.code().name}
+        detail = exc.details() or "gRPC request failed"
+        return {"success": False, "error": detail, "message": detail,
+                "code": exc.code().name}
 
     @staticmethod
     def _unsupported(message):
@@ -187,7 +189,14 @@ class AdamGrpcClient:
     def get_control_state(self) -> dict:
         response = self._call(
             "GetControlState", pb2.GetControlStateRequest())
-        return self._response(response, ("domain_id",))
+        result = self._response(response, ("domain_id",))
+        if not result.get("success", False):
+            result.setdefault("code", "CONTROL_STATE_UNAVAILABLE")
+            result.setdefault("message", "control mode state is unavailable; no rt/control_mode_state feedback")
+        elif result.get("domain_id", -1) not in (0, 1):
+            result.update({"success": False, "code": "CONTROL_STATE_UNAVAILABLE",
+                           "message": "control mode state returned no valid domain_id"})
+        return result
 
     def shutdown(self, force: bool = False) -> dict:
         response = self._call(

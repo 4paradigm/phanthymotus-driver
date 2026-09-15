@@ -1518,7 +1518,14 @@ class HandPlugin:
         }
 
     def _publisher_available(self) -> bool:
-        if not HAS_PND_SDK or self._hand_pub is None:
+        # A DDS writer is usable immediately after Init().  IsMatched() can
+        # remain false while the robot-side subscriber is starting, and must
+        # not turn a transient discovery delay into a permanently unavailable
+        # card.  Write() below is the authoritative health check.
+        return bool(HAS_PND_SDK and self._hand_pub is not None)
+
+    def _publisher_matched(self):
+        if not self._publisher_available():
             return False
         is_matched = getattr(self._hand_pub, "IsMatched", None)
         if not callable(is_matched):
@@ -1613,6 +1620,7 @@ class HandPlugin:
             ),
             "closed": self._closed,
             "publisher_available": self._publisher_available(),
+            "publisher_matched": self._publisher_matched(),
             "control_rate_hz": self._control_rate_hz,
             "position_max": self._max_val,
             "open_positions": list(self._open_positions),
