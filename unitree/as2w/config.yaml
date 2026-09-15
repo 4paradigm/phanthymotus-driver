@@ -2,5 +2,7 @@ mcp_port: 15704
 ros_namespace: ""
 plugins:
   loco: {enabled: true}
+  acrobatics: {enabled: true}
   state: {enabled: true}
   lidar: {enabled: true}
+  spatial_action: {enabled: true}
