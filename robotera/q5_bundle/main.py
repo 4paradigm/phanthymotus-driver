@@ -39,12 +39,21 @@ import yaml
 
 from control_contract import prepare_call_args
 
-try:
-    import rclpy
-    import rclpy.executors
+_HAS_ROS2 = False
+
+
+def _load_rclpy():
+    """Load ROS 2 only in the driver process, never during spawn re-import."""
+    global _HAS_ROS2, rclpy
+    try:
+        import rclpy as _rclpy
+        import rclpy.executors
+    except Exception:
+        _HAS_ROS2 = False
+        return None
+    rclpy = _rclpy
     _HAS_ROS2 = True
-except Exception:
-    _HAS_ROS2 = False
+    return _rclpy
 
 
 def _load_config() -> dict:
@@ -224,6 +233,7 @@ def _start_registration(mcp_port, name, category):
 
 def main():
     global _bundle
+    _load_rclpy()
     cfg = _load_config()
     namespace = _resolve_namespace(cfg)
     mcp_port = int(cfg.get("mcp_port", 15793))
