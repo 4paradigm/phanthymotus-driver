@@ -1190,6 +1190,8 @@ class _ArmControlNode(Node):
 
     def set_joints(self, joints_dict: dict):
         """Set joint positions by name. Keys are short names like 'shoulderPitch_Left'."""
+        if not isinstance(joints_dict, dict):
+            raise ValueError("joints must be an object mapping joint names to radians")
         with self._lock:
             for name, value in joints_dict.items():
                 # Try to find matching joint
@@ -1293,7 +1295,10 @@ class ArmPlugin:
             return {"state": "idle", "message": "Upper body retarget mode disabled"}
         if action == "set_joints":
             joints = args.get("joints", {})
-            self._node.set_joints(joints)
+            try:
+                self._node.set_joints(joints)
+            except (TypeError, ValueError) as exc:
+                return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
             return {"state": "active", "joints_set": len(joints)}
         if action == "set_height":
             h = args.get("height", 1.0)
