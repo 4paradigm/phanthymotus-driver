@@ -279,13 +279,17 @@ if docker buildx version >/dev/null 2>&1; then
     DOCKER_BUILD=(docker buildx build --platform linux/arm64)
     DOCKER_BUILD_OUTPUT=$(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker")
 else
+    if [ "${HOST_ARCH}" != "arm64" ] && [ "${HOST_ARCH}" != "aarch64" ]; then
+        echo "错误：当前 Docker 不支持 buildx，且主机架构 ${HOST_ARCH} 不是 ARM64，无法生成 linux/arm64 driver 镜像。"
+        exit 1
+    fi
     DOCKER_BUILD=(docker build)
     DOCKER_BUILD_OUTPUT=""
     if ${PUSH_ENABLED}; then
         echo "错误：当前 Docker 不支持 buildx，无法直接构建并推送多架构镜像。"
         exit 1
     fi
-    echo "[info] Docker buildx unavailable — using native docker build."
+    echo "[info] Docker buildx unavailable — using native ARM64 docker build."
 fi
 
 for idx in "${SELECTED_INDICES[@]}"; do

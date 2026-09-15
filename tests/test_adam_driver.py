@@ -83,19 +83,12 @@ class AdamDriverContractTests(unittest.TestCase):
         self.assertEqual([6, 7, 8, 9, 10, 11], payload["right"]["position"])
         self.assertEqual(1000, payload["position_max"])
 
-    def test_skeleton_payload_includes_fresh_hand_hardware_channels(self):
+    def test_skeleton_payload_contains_only_urdf_joints(self):
         state = type("State", (), {"motor_state": [type("Motor", (), {"q": 0.1})() for _ in range(31)]})()
-        hand_state = adam._hand_state_payload(list(range(12)), int(time.time() * 1000), fresh=True)
-        payload = adam._skeleton_payload(state, adam.ADAM_PRO_JOINTS, hand_state)
-        self.assertEqual(43, len(payload["joints"]))
-        self.assertEqual("hand_thumb_2_Right", payload["joints"][-1]["name"])
-        self.assertEqual(11, payload["joints"][-1]["q"])
-        self.assertEqual("hardware_position_0_1000", payload["joints"][-1]["unit"])
-
-    def test_skeleton_payload_omits_stale_hand_hardware_channels(self):
-        state = type("State", (), {"motor_state": [type("Motor", (), {"q": 0.1})() for _ in range(31)]})()
-        payload = adam._skeleton_payload(state, adam.ADAM_PRO_JOINTS, {"fresh": False, "position": [0] * 12})
+        payload = adam._skeleton_payload(state, adam.ADAM_PRO_JOINTS)
         self.assertEqual(31, len(payload["joints"]))
+        self.assertEqual(list(adam.ADAM_PRO_JOINTS), [joint["name"] for joint in payload["joints"]])
+        self.assertTrue(all(joint["unit"] == "rad" for joint in payload["joints"]))
 
     def test_arm_raise_hand_uses_side_specific_sdk_pose(self):
         node = object.__new__(adam._ArmControlNode)

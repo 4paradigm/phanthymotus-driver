@@ -160,12 +160,6 @@ HAND_CHANNEL_LABELS = {
 HAND_POSITION_COUNT = 12
 HAND_POSITION_MIN = 0
 HAND_POSITION_MAX = 1000
-HAND_SKELETON_CHANNEL_NAMES = (
-    "hand_pinky_Left", "hand_ring_Left", "hand_middle_Left",
-    "hand_index_Left", "hand_thumb_1_Left", "hand_thumb_2_Left",
-    "hand_pinky_Right", "hand_ring_Right", "hand_middle_Right",
-    "hand_index_Right", "hand_thumb_1_Right", "hand_thumb_2_Right",
-)
 HAND_DEFAULT_OPEN = [
     HAND_POSITION_MAX, HAND_POSITION_MAX, HAND_POSITION_MAX, HAND_POSITION_MAX,
     HAND_POSITION_MAX, HAND_POSITION_MIN,
@@ -279,7 +273,7 @@ def _hand_status_payload(cache, timeout_sec: float) -> dict:
     }
 
 
-def _skeleton_payload(state, joint_names, hand_state=None) -> dict:
+def _skeleton_payload(state, joint_names) -> dict:
     joints = []
     motor_state = getattr(state, "motor_state", [])
     for idx, name in enumerate(joint_names):
@@ -290,16 +284,6 @@ def _skeleton_payload(state, joint_names, hand_state=None) -> dict:
                 "q": float(motor_state[idx].q),
                 "unit": "rad",
                 "source": "rt/lowstate",
-            })
-    if hand_state is not None and hand_state.get("fresh"):
-        for offset, (name, position) in enumerate(zip(
-                HAND_SKELETON_CHANNEL_NAMES, hand_state["position"])):
-            joints.append({
-                "idx": len(joint_names) + offset,
-                "name": name,
-                "q": int(position),
-                "unit": "hardware_position_0_1000",
-                "source": "rt/handstate",
             })
     return {"joints": joints}
 
@@ -657,13 +641,8 @@ class _StatePublisherNode(Node):
         if not active or state is None:
             return
 
-        # Hand values are hardware positions, not URDF joint angles.
-        hand_state = (
-            self._hand_state_cache.snapshot(timeout_sec=1.0)
-            if self._hand_state_cache is not None else None
-        )
         msg = String()
-        msg.data = json.dumps(_skeleton_payload(state, self._joints, hand_state))
+        msg.data = json.dumps(_skeleton_payload(state, self._joints))
         self._pub_skeleton.publish(msg)
 
         msg_robot = String()
