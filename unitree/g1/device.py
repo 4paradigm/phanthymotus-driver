@@ -3934,9 +3934,18 @@ class RealSensePlugin:
         self._color_topic = f"/{namespace}/camera/rgb"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._dist_topic  = f"/{namespace}/camera/distance"
+        self._executor = executor
         self._proc = None
-        self._frame_node = _CameraFrameNode(self._color_topic)
-        executor.add_node(self._frame_node)
+        self._frame_node = None
+        self._ensure_frame_node()
+
+    def _ensure_frame_node(self) -> None:
+        """Create the cache subscription once for this plugin lifecycle."""
+        if self._frame_node is not None:
+            return
+        node = _CameraFrameNode(self._color_topic)
+        self._executor.add_node(node)
+        self._frame_node = node
 
     def get_tools(self) -> list:
         return [self._color_tool(), self._depth_tool(), self._dist_tool()]
@@ -3973,6 +3982,9 @@ class RealSensePlugin:
 
     def start(self) -> None:
         import multiprocessing as mp
+        # A stopped plugin may be started again in the same driver process.
+        # Recreate the cache node that stop() explicitly destroyed.
+        self._ensure_frame_node()
         if self._proc is not None and self._proc.is_alive():
             return
         ctx = mp.get_context("spawn")
@@ -3991,13 +4003,29 @@ class RealSensePlugin:
                 self._proc.kill()
                 self._proc.join(timeout=2.0)
         self._proc = None
+        node = self._frame_node
+        self._frame_node = None
+        if node is not None:
+            try:
+                self._executor.remove_node(node)
+            except Exception as exc:
+                print(f"[bundle] Could not remove RealSense cache node: {exc}",
+                      flush=True)
+            try:
+                node.destroy_node()
+            except Exception as exc:
+                print(f"[bundle] Could not destroy RealSense cache node: {exc}",
+                      flush=True)
 
     def is_running(self) -> bool:
         """Whether the one RealSense producer used by all camera cards is alive."""
         return self._proc is not None and self._proc.is_alive()
 
     def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
-        return self._frame_node.wait_for_frame(after_sequence, timeout_s)
+        node = self._frame_node
+        if node is None:
+            return None, 0
+        return node.wait_for_frame(after_sequence, timeout_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -4272,7 +4300,8 @@ class VisionCapturePlugin:
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": (
                 "Capture a G1 RGB photo or record a silent H.264 MP4 video "
-                "(1–30 seconds) to persistent storage."),
+                "(1–30 seconds) to persistent storage. Requires the camera "
+                "card to remain enabled (plugins.camera.enabled=true)."),
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
                     "start", "capture_photo", "record_video", "info", "stop"]},
@@ -4297,6 +4326,12 @@ class VisionCapturePlugin:
 
     def _camera_ready(self):
         return self._camera is not None and self._camera.is_running()
+
+    @staticmethod
+    def _precondition_error():
+        return {"ok": False, "code": "PRECONDITION_FAILED",
+                "message": ("vision_capture requires the camera card; set "
+                            "plugins.camera.enabled=true")}
 
     def _frame(self, after_sequence=None,
                timeout_s=_VISION_FIRST_FRAME_TIMEOUT_S):
@@ -4330,7 +4365,7 @@ class VisionCapturePlugin:
                 if self._active_recording else None)
             last = self._last_recording
         ready = self._camera_ready() and age is not None
-        return {
+        result = {
             "ok": ready, "state": "ready" if ready else "waiting_for_camera",
             "source": "g1_camera_rgb", "topic": self._camera._color_topic
             if self._camera else None,
@@ -4342,11 +4377,19 @@ class VisionCapturePlugin:
             "encoder_available": shutil.which("ffmpeg") is not None,
             "active_recording": active, "last_recording": last,
         }
+        if self._camera is None:
+            result.update(self._precondition_error())
+            result["state"] = "error"
+        return result
 
     def start(self):
+        if self._camera is None:
+            return {"state": "error", **self._precondition_error()}
         return {"state": "ready" if self._camera_ready() else "error"}
 
     def _capture_photo(self):
+        if self._camera is None:
+            return self._precondition_error()
         path = None
         try:
             frame, _ = self._frame()
@@ -4517,6 +4560,8 @@ class VisionCapturePlugin:
         if type(requested) is not int or not 1 <= requested <= self._max_duration_s:
             return {"ok": False, "code": "INVALID_DURATION", "message":
                     f"duration_s must be an integer between 1 and {self._max_duration_s}"}
+        if self._camera is None:
+            return self._precondition_error()
         if not self._camera_ready():
             return {"ok": False, "code": "RECORD_FAILED",
                     "message": "G1 camera_rgb worker is unavailable"}
