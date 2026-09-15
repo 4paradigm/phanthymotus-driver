@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError:
+    pass
+
 import json, os, re, signal, socket, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -12,7 +18,7 @@ def load_config():
     return yaml.safe_load(open(os.environ.get("CONFIG_PATH", Path(__file__).with_name("config.yaml"))))
 
 class Bundle:
-    def __init__(self, cfg, namespace, executor, proxy):
+    def __init__(self, cfg, namespace, executor, proxy, interface):
         from device import StatePlugin, LocoPlugin, SpecialActionPlugin
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
@@ -35,7 +41,7 @@ class Bundle:
         return out
     def call(self, name, args):
         if name == "model":
-            return {"path": str(Path(__file__).with_name("resource") / "as2w.urdf"), "format": "urdf"}
+            return {"urdf": (Path(__file__).with_name("resource") / "as2w.urdf").read_text()}
         for plugin in self.plugins:
             defs = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
             if any(item["name"] == name for item in defs):
@@ -58,6 +64,27 @@ def handler(bundle):
             body = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode(); self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     return Handler
 
+
+def _start_registration(mcp_port, name, category):
+    import ssl
+    import urllib.request
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    payload = json.dumps({"name": name, "url": f"http://localhost:{mcp_port}/mcp", "category": category}).encode()
+    context = ssl._create_unverified_context()
+    def run():
+        import time
+        while True:
+            try:
+                request = urllib.request.Request(f"{agent_core_url}/api/mcp", data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(request, timeout=3, context=context):
+                    pass
+                time.sleep(30)
+            except Exception as exc:
+                print(f"[register] failed: {exc}; retrying in 5s", flush=True)
+                time.sleep(5)
+    threading.Thread(target=run, daemon=True, name="agent-core-registration").start()
+
 def main():
     cfg, interface = load_config(), sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NETWORK_INTERFACE", "")
     profile = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", "")
@@ -70,9 +97,11 @@ def main():
     try: ChannelFactoryInitialize(0, interface)
     except Exception as exc: print(f"[as2w] DDS init failed: {exc}")
     namespace = re.sub(r"[^a-zA-Z0-9_]", "_", cfg.get("ros_namespace") or socket.gethostname())
-    proxy = RpcProxy(interface); rclpy.init(); executor = rclpy.executors.MultiThreadedExecutor(); bundle = Bundle(cfg, namespace, executor, proxy); bundle.start_all()
+    proxy = RpcProxy(interface); rclpy.init(); executor = rclpy.executors.MultiThreadedExecutor(); bundle = Bundle(cfg, namespace, executor, proxy, interface); bundle.start_all()
     threading.Thread(target=lambda: executor.spin(), daemon=True).start()
-    server = ThreadingHTTPServer(("", int(cfg.get("mcp_port", 15704))), handler(bundle))
+    mcp_port = int(cfg.get("mcp_port", 15705))
+    server = ThreadingHTTPServer(("", mcp_port), handler(bundle))
+    _start_registration(mcp_port, "Unitree AS2W Bundle", "driver")
     def shutdown(*_):
         bundle.stop_all(); proxy.stop()
         threading.Thread(target=server.shutdown, daemon=True).start()

@@ -10,7 +10,7 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 
 Run `python3 main.py <robot-interface>` on the robot network (normally the
 interface with a `192.168.123.x` address). The bundle exposes MCP on port
-`15704`, publishes JSON state streams under the resolved ROS namespace, and
+`15705`, publishes JSON state streams under the resolved ROS namespace, and
 uses a dedicated process for RPC calls so ROS callbacks cannot starve SDK
 responses.
 
@@ -24,10 +24,12 @@ any plugin stop path terminate that loop and issue `StopMove`. Velocity and
 attitude inputs are clamped before reaching the robot. Special actions should only
 be invoked with a clear area and appropriate operator approval.
 
-The checked-in `resource/as2w.urdf` and `resource/meshes/` are copied from
-Unitree's official `unitree_ros/robots/as2w_description`; AS2W has 16 movable
-joints (12 leg joints plus 4 continuous wheel-foot joints) and the fixed JT128
-sensor mount.
+The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
+official `unitree_ros/robots/as2w_description`; it retains inertial and joint
+limits but omits the vendor STL visual/collision meshes. The driver only needs
+the kinematic chain for the `joints` skeleton card, avoiding large binary
+assets in the repository. AS2W has 16 movable joints (12 leg joints plus 4
+continuous wheel-foot joints) and the fixed JT128 sensor mount.
 
 `controlled_spatial` is a thin adapter for Unitree's documented `slam_operate`
 service: mapping, relocalization, and point-goal navigation. The latest AS2
