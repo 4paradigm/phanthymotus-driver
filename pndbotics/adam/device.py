@@ -444,6 +444,65 @@ ROS2_UPPER_BODY_JOINTS = [
     "dof_pos/hand_thumb_1_Right", "dof_pos/hand_thumb_2_Right",
 ]
 
+# Human-facing Adam Pro upper-body controls. Limits come from the vendor's
+# product overview, converted from radians to degrees. The card deliberately
+# uses stable semantic ids rather than leaking ROS topic/joint names.
+ARM_JOINT_CONTROLS = {
+    "waist_roll": ("腰部侧倾", "waistRoll", -16.0, 16.0),
+    "waist_pitch": ("腰部前后俯仰", "waistPitch", -48.0, 78.0),
+    "waist_yaw": ("腰部左右转动", "waistYaw", -47.0, 47.0),
+    "left_shoulder_pitch": ("左肩前后摆", "shoulderPitch_Left", -207.0, 117.0),
+    "right_shoulder_pitch": ("右肩前后摆", "shoulderPitch_Right", -207.0, 117.0),
+    "left_shoulder_roll": ("左肩向内/外摆", "shoulderRoll_Left", -36.0, 160.0),
+    "right_shoulder_roll": ("右肩向内/外摆", "shoulderRoll_Right", -160.0, 36.0),
+    "left_shoulder_yaw": ("左上臂旋转", "shoulderYaw_Left", -148.0, 148.0),
+    "right_shoulder_yaw": ("右上臂旋转", "shoulderYaw_Right", -148.0, 148.0),
+    "left_elbow": ("左肘弯曲", "elbow_Left", -143.0, 12.0),
+    "right_elbow": ("右肘弯曲", "elbow_Right", -143.0, 12.0),
+    "left_wrist_yaw": ("左手腕旋转", "wristYaw_Left", -153.0, 153.0),
+    "right_wrist_yaw": ("右手腕旋转", "wristYaw_Right", -153.0, 153.0),
+    "left_wrist_pitch": ("左手腕俯仰", "wristPitch_Left", -55.0, 55.0),
+    "right_wrist_pitch": ("右手腕俯仰", "wristPitch_Right", -55.0, 55.0),
+    "left_wrist_roll": ("左手腕侧摆", "wristRoll_Left", -55.0, 55.0),
+    "right_wrist_roll": ("右手腕侧摆", "wristRoll_Right", -55.0, 55.0),
+}
+
+ARM_POSES = {
+    "neutral": ("自然下垂", {}),
+    "arms_forward": ("双臂向前", {
+        "left_shoulder_pitch": -30.0, "right_shoulder_pitch": -30.0,
+        "left_elbow": -45.0, "right_elbow": -45.0,
+    }),
+    "arms_open": ("双臂张开", {
+        "left_shoulder_pitch": -15.0, "right_shoulder_pitch": -15.0,
+        "left_shoulder_roll": 35.0, "right_shoulder_roll": -35.0,
+        "left_elbow": -25.0, "right_elbow": -25.0,
+    }),
+    "hands_up": ("双手举起", {
+        "left_shoulder_pitch": -95.0, "right_shoulder_pitch": -95.0,
+        "left_elbow": -30.0, "right_elbow": -30.0,
+    }),
+}
+
+
+def _arm_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
+    """Validate a human-facing upper-body request and return ROS target."""
+    if control not in ARM_JOINT_CONTROLS:
+        raise ValueError("joint must be one of the advertised Adam upper-body controls")
+    if isinstance(angle_deg, bool):
+        raise ValueError("angle_deg must be a finite number")
+    try:
+        value = float(angle_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("angle_deg must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ValueError("angle_deg must be a finite number")
+    _, ros_name, minimum, maximum = ARM_JOINT_CONTROLS[control]
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
+    return ros_name, math.radians(value)
+
 
 def _best_effort_qos():
     """Shallow best-effort queue for high-rate optional telemetry."""
@@ -475,6 +534,12 @@ def _battery_payload(battery, timestamp_ms: int | None = None) -> dict:
         "current": number("current"),
         "power": number("power"),
         "wh_accumulated": number("wh_accumulated"),
+        # The vendor's BatteryData_ DDS definition has no SOC/capacity field.
+        # Do not invent a percentage from voltage: its discharge curve changes
+        # under load and would make this safety-relevant card misleading.
+        "percentage": None,
+        "percentage_available": False,
+        "percentage_message": "The Adam DDS BMS message does not provide state of charge",
         "status": str(status) if status not in (None, "") else "unknown",
         "source_topic": "rt/lowstate",
     }
@@ -696,7 +761,7 @@ class StatePlugin:
             {
                 "name": "battery",
                 "type": "sensor",
-                "description": f"Adam BMS battery — voltage, current, power, accumulated energy and status. Publishes at 1Hz to {self._node._topic_battery}",
+                "description": f"Adam BMS battery — voltage, current, power, accumulated energy and status. The vendor DDS message has no SOC percentage. Publishes at 1Hz to {self._node._topic_battery}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [
                     {"topic": self._node._topic_battery, "format": "data/json"}
@@ -1223,7 +1288,7 @@ class _ArmControlNode(Node):
 
 
 class ArmPlugin:
-    """Upper body control via ROS2 JointState publishing at 100Hz."""
+    """Human-facing Adam Pro upper-body control via ROS2 JointState."""
 
     PREFIX = "arm"
 
@@ -1237,49 +1302,67 @@ class ArmPlugin:
         executor.add_node(self._node)
 
     def get_tool(self) -> dict:
+        joint_options = [
+            {"const": control, "title": label}
+            for control, (label, _, _, _) in ARM_JOINT_CONTROLS.items()
+        ]
+        pose_options = [
+            {"const": pose, "title": label}
+            for pose, (label, _) in ARM_POSES.items()
+        ]
         return {
             "name": "arm",
             "type": "actuator",
-            "description": "Adam upper body — waist, arms, wrists via ROS2 JointState at 100Hz",
+            "description": "Adam upper body — choose a named waist/arm joint and an angle in degrees, or use a safe preset pose",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["enable", "disable", "set_joints", "set_height", "zero"],
+                        "enum": ["move_joint", "preset", "set_height", "stop", "info"],
+                        "oneOf": [
+                            {"const": "move_joint", "title": "调整一个关节"},
+                            {"const": "preset", "title": "执行预设姿态"},
+                            {"const": "set_height", "title": "设置站立高度"},
+                            {"const": "stop", "title": "停止上肢指令"},
+                            {"const": "info", "title": "查看状态"},
+                        ],
                     },
-                    "joints": {
-                        "type": "object",
-                        "description": "Joint name → radian value pairs (e.g., {\"shoulderPitch_Left\": 0.5})",
+                    "joint": {
+                        "type": "string", "title": "关节", "enum": list(ARM_JOINT_CONTROLS),
+                        "oneOf": joint_options,
+                        "description": "选择要调整的身体部位；系统按该部位的厂商限位校验。",
                     },
-                    "height": {
-                        "type": "number",
-                        "description": "Body height 0.6-1.0m",
+                    "angle_deg": {
+                        "type": "number", "title": "目标角度（度）",
+                        "minimum": -207.0, "maximum": 160.0, "multipleOf": 1.0,
+                        "description": "目标绝对角度，单位为度；每个关节会按自己的安全范围再次校验。",
+                    },
+                    "pose": {
+                        "type": "string", "title": "预设姿态", "enum": list(ARM_POSES),
+                        "oneOf": pose_options,
+                    },
+                    "height_m": {
+                        "type": "number", "title": "站立高度（米）",
+                        "minimum": 0.6, "maximum": 1.0, "multipleOf": 0.01,
+                        "description": "站立高度，范围 0.60-1.00 米。",
                     },
                 },
                 "required": ["action"],
+                "additionalProperties": False,
                 "x-action-params": {
-                    "enable": {
-                        "params": [],
-                        "description": "Activate upper body retarget mode (robot must be standing)",
+                    "move_joint": {
+                        "params": ["joint", "angle_deg"],
+                        "description": "以度为单位调整所选关节；会自动启用上肢指令并检查厂商限位。",
                     },
-                    "disable": {
-                        "params": [],
-                        "description": "Deactivate upper body retarget mode",
-                    },
-                    "set_joints": {
-                        "params": ["joints"],
-                        "description": "Set arm/waist joint angles in radians",
-                    },
+                    "preset": {"params": ["pose"], "description": "执行保守的双臂预设姿态。"},
                     "set_height": {
-                        "params": ["height"],
-                        "description": "Set body height (0.6-1.0m)",
+                        "params": ["height_m"], "description": "设置站立高度（米）。",
                     },
-                    "zero": {
-                        "params": [],
-                        "description": "Reset all arm joints to zero (neutral position)",
-                    },
+                    "stop": {"params": [], "description": "停止发布上肢目标并保持机器人当前状态。"},
+                    "info": {"params": [], "description": "查看上肢指令是否已启用。"},
                 },
+                "x-resource": ["adam_upper_body"],
             },
         }
 
@@ -1295,26 +1378,44 @@ class ArmPlugin:
         if action == "stop":
             self._node._active = False
             return {"state": "idle"}
-        if action == "enable":
-            self._node._active = True
-            return {"state": "active", "message": "Upper body retarget mode enabled"}
-        if action == "disable":
+        if action in ("stop", "disable"):
             self._node._active = False
-            return {"state": "idle", "message": "Upper body retarget mode disabled"}
-        if action == "set_joints":
-            joints = args.get("joints", {})
+            return {"state": "idle", "message": "Upper body command publishing stopped"}
+        if action == "move_joint":
             try:
-                self._node.set_joints(joints)
+                control = args.get("joint")
+                ros_name, radians = _arm_target_radians(control, args.get("angle_deg"))
+                self._node.set_joints({ros_name: radians})
             except (TypeError, ValueError) as exc:
                 return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
-            return {"state": "active", "joints_set": len(joints)}
+            self._node._active = True
+            _, _, minimum, maximum = ARM_JOINT_CONTROLS[control]
+            return {"success": True, "state": "active", "joint": control,
+                    "angle_deg": float(args["angle_deg"]),
+                    "limits_deg": {"minimum": minimum, "maximum": maximum}}
+        if action == "preset":
+            pose = args.get("pose")
+            if pose not in ARM_POSES:
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": "pose must be one of the advertised Adam upper-body poses"}
+            _, targets_deg = ARM_POSES[pose]
+            try:
+                targets = dict(_arm_target_radians(control, degrees)
+                               for control, degrees in targets_deg.items())
+                self._node.zero_arms() if pose == "neutral" else self._node.set_joints(targets)
+            except (TypeError, ValueError) as exc:
+                return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+            self._node._active = True
+            return {"success": True, "state": "active", "pose": pose,
+                    "joints_set": len(targets_deg)}
         if action == "set_height":
-            h = args.get("height", 1.0)
+            h = args.get("height_m")
+            if isinstance(h, bool) or not isinstance(h, (int, float)) or not 0.6 <= h <= 1.0:
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": "height_m must be a number in [0.6, 1.0]"}
             self._node.set_height(h)
-            return {"state": "active", "height": h}
-        if action == "zero":
-            self._node.zero_arms()
-            return {"state": "active", "message": "Arms zeroed"}
+            self._node._active = True
+            return {"success": True, "state": "active", "height_m": h}
         if action == "info":
             return {"state": "active" if self._node._active else "idle"}
         return None
