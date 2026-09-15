@@ -90,14 +90,64 @@ class AdamDriverContractTests(unittest.TestCase):
         self.assertEqual(list(adam.ADAM_PRO_JOINTS), [joint["name"] for joint in payload["joints"]])
         self.assertTrue(all(joint["unit"] == "rad" for joint in payload["joints"]))
 
-    def test_arm_raise_hand_uses_side_specific_sdk_pose(self):
-        node = object.__new__(adam._ArmControlNode)
-        targets = []
-        node.set_joints = targets.append
-        node.run_gesture("raise_hand", "left")
-        self.assertEqual([adam.ARM_RAISE_POSE["left"]], targets)
-        with self.assertRaisesRegex(ValueError, "unsupported"):
-            node.run_gesture("wave", "left")
+    def test_arm_gesture_uses_base_arm_control(self):
+        arm = mock.Mock()
+        arm.dispatch.return_value = {"state": "active", "joints_set": 7}
+        gesture = adam.ArmGesturePlugin(arm)
+        result = gesture.dispatch("raise_hand", {"side": "left"})
+        self.assertEqual([
+            mock.call("set_joints", {"joints": adam.ARM_RAISE_POSE["left"]}),
+            mock.call("enable", {}),
+        ], arm.dispatch.call_args_list)
+        self.assertEqual("raise_hand", result["gesture"])
+        self.assertEqual("left", result["side"])
+        self.assertNotIn("gesture", adam.ArmPlugin.get_tool(object.__new__(adam.ArmPlugin))["inputSchema"]["properties"]["action"]["enum"])
+        self.assertEqual("error", gesture.dispatch("raise_hand", {"side": "both"})["state"])
+
+    def test_hand_gesture_shares_control_but_is_not_on_base_tool(self):
+        hand = object.__new__(adam.HandPlugin)
+        hand._open_positions = [1000] * 12
+        hand._close_positions = [0] * 12
+        hand._thumb_close_positions = [100, 900, 200, 800]
+        hand._thumb_close_min_flex_position = 100
+        hand._max_val = 1000
+        hand._base_positions = lambda: [500] * 12
+        hand._activate = mock.Mock(return_value={"state": "active"})
+        gesture = adam.HandGesturePlugin(hand)
+        self.assertNotIn("point", hand.get_tool()["inputSchema"]["properties"]["action"]["enum"])
+        result = gesture.dispatch("point", {"side": "right"})
+        self.assertEqual("active", result["state"])
+        self.assertEqual([500] * 6, hand._activate.call_args.args[0][:6])
+        self.assertEqual("error", gesture.dispatch("point", {"side": "both"})["state"])
+
+    def test_bundle_registers_gesture_tools_separately(self):
+        config = {
+            "plugins": {
+                "state": {"enabled": False},
+                "estop": {"enabled": False},
+                "loco": {"enabled": False},
+                "camera": {"enabled": False},
+                "vision_capture": {"enabled": False},
+                "arm": {"enabled": True},
+                "hand": {"enabled": True},
+                "hand_state": {"enabled": False},
+                "model": {"enabled": False},
+            },
+        }
+        arm = types.SimpleNamespace(
+            get_tool=lambda: {"name": "arm"}, dispatch=mock.Mock(),
+        )
+        hand = types.SimpleNamespace(
+            get_tool=lambda: {"name": "hand"}, dispatch=mock.Mock(),
+        )
+        with mock.patch.object(adam, "HAS_ROS2", True), \
+                mock.patch.object(adam, "ArmPlugin", return_value=arm), \
+                mock.patch.object(adam, "HandPlugin", return_value=hand):
+            bundle = adam.AdamDeviceBundle(
+                config, "adam", mock.Mock(), mock.Mock(), ros2_enabled=True,
+            )
+        tools = {tool["name"] for tool in bundle.get_all_tools()}
+        self.assertEqual({"arm", "arm_gesture", "hand", "hand_gesture"}, tools)
 
     def test_hand_gestures_only_change_the_selected_hand(self):
         plugin = object.__new__(adam.HandPlugin)

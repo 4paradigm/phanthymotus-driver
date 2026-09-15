@@ -1096,14 +1096,6 @@ class _ArmControlNode(Node):
             self._positions[:17] = 0.0
             self._positions[17] = 1.0  # keep standing height
 
-    def run_gesture(self, gesture: str, side: str):
-        if side not in ("left", "right"):
-            raise ValueError("side must be either left or right")
-        if gesture != "raise_hand":
-            raise ValueError("unsupported arm gesture")
-        self.set_joints(ARM_RAISE_POSE[side])
-
-
 class ArmPlugin:
     """Upper body control via ROS2 JointState publishing at 100Hz."""
 
@@ -1128,10 +1120,7 @@ class ArmPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": [
-                            "enable", "disable", "set_joints", "set_height", "zero",
-                            "gesture",
-                        ],
+                        "enum": ["enable", "disable", "set_joints", "set_height", "zero"],
                     },
                     "joints": {
                         "type": "object",
@@ -1140,23 +1129,6 @@ class ArmPlugin:
                     "height": {
                         "type": "number",
                         "description": "Body height 0.6-1.0m",
-                    },
-                    "gesture": {
-                        "type": "string",
-                        "enum": ["raise_hand"],
-                        "oneOf": [
-                            {"const": "raise_hand", "title": "举手"},
-                        ],
-                        "description": "使用 SDK 已验证的单侧抬臂姿势；动作保持直到 disable 或其他 arm 命令。",
-                    },
-                    "side": {
-                        "type": "string",
-                        "enum": ["left", "right"],
-                        "oneOf": [
-                            {"const": "left", "title": "左侧"},
-                            {"const": "right", "title": "右侧"},
-                        ],
-                        "description": "选择执行语义手势的手臂。",
                     },
                 },
                 "required": ["action"],
@@ -1180,10 +1152,6 @@ class ArmPlugin:
                     "zero": {
                         "params": [],
                         "description": "Reset all arm joints to zero (neutral position)",
-                    },
-                    "gesture": {
-                        "params": ["gesture", "side"],
-                        "description": "执行单侧举手姿势",
                     },
                 },
             },
@@ -1218,15 +1186,6 @@ class ArmPlugin:
         if action == "zero":
             self._node.zero_arms()
             return {"state": "active", "message": "Arms zeroed"}
-        if action == "gesture":
-            gesture = args.get("gesture")
-            side = args.get("side")
-            try:
-                self._node.run_gesture(gesture, side)
-            except ValueError as exc:
-                return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
-            self._node._active = True
-            return {"state": "active", "gesture": gesture, "side": side}
         if action == "info":
             return {"state": "active" if self._node._active else "idle"}
         return None
@@ -1235,6 +1194,46 @@ class ArmPlugin:
 # ===========================================================================
 # HandPlugin — DDS rt/handcmd finger control
 # ===========================================================================
+
+class ArmGesturePlugin:
+    PREFIX = "arm_gesture"
+
+    def __init__(self, arm: ArmPlugin):
+        self._arm = arm
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "arm_gesture", "type": "actuator",
+            "description": "Adam 单侧举手；须确认站立并进入上肢实时接收模式。",
+            "inputSchema": {
+                "type": "object", "required": ["action"],
+                "properties": {
+                    "action": {"type": "string", "enum": ["raise_hand", "stop"]},
+                    "side": {"type": "string", "enum": ["left", "right"]},
+                },
+                "x-action-params": {
+                    "raise_hand": {"params": ["side"], "description": "单侧举手"},
+                    "stop": {"params": [], "description": "停止上肢目标发布"},
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "stop":
+            return self._arm.dispatch("disable", {})
+        if action != "raise_hand" or args.get("side") not in ("left", "right"):
+            return {"state": "error", "error": "INVALID_ARGUMENT", "message": "raise_hand requires left or right side"}
+        side = args["side"]
+        result = self._arm.dispatch("set_joints", {"joints": ARM_RAISE_POSE[side]})
+        self._arm.dispatch("enable", {})
+        return {**result, "gesture": "raise_hand", "side": side}
+
 
 class HandPlugin:
     """Continuous finger position control via DDS ``rt/handcmd``.
@@ -1355,11 +1354,7 @@ class HandPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": [
-                            "open", "close", "thumbs_up", "wave_open", "handshake",
-                            "point", "victory", "rock", "set_fingers", "start", "stop",
-                            "info", "get_state",
-                        ],
+                        "enum": ["open", "close", "set_fingers", "start", "stop", "info", "get_state"],
                     },
                     "side": {
                         "type": "string",
@@ -1401,30 +1396,6 @@ class HandPlugin:
                             "Close pinky/ring/middle/index while simultaneously "
                             "rotating and flexing the thumb to its safe target"
                         ),
-                    },
-                    "thumbs_up": {
-                        "params": ["side"],
-                        "description": "指定手点赞：四指合拢，拇指保持张开位置",
-                    },
-                    "wave_open": {
-                        "params": ["side"],
-                        "description": "指定手张开，可与 arm 举手姿势组合为挥手姿态",
-                    },
-                    "handshake": {
-                        "params": ["side"],
-                        "description": "指定手握拳，可与 arm 举手姿势组合为握手姿态",
-                    },
-                    "point": {
-                        "params": ["side"],
-                        "description": "指定手食指伸出、其余手指收拢的指向手势",
-                    },
-                    "victory": {
-                        "params": ["side"],
-                        "description": "指定手食指和中指伸出、其余手指收拢的 V 手势",
-                    },
-                    "rock": {
-                        "params": ["side"],
-                        "description": "指定手食指和小指伸出、其余手指收拢的摇滚手势",
                     },
                     "set_fingers": {
                         "params": ["side", "channel", "value"],
@@ -1718,14 +1689,6 @@ class HandPlugin:
             return self._activate(self._open_positions, "open")
         if action == "close":
             return self._activate(self._close_target(), "close")
-        if action in (
-                "thumbs_up", "wave_open", "handshake", "point", "victory", "rock"):
-            side = args.get("side")
-            try:
-                target = self._gesture_target(action, side)
-            except ValueError as exc:
-                return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
-            return self._activate(target, action)
         if action == "set_fingers":
             side = args.get("side")
             channel = args.get("channel")
@@ -1762,6 +1725,49 @@ class HandPlugin:
         if action == "info":
             return self._status()
         return None
+
+
+class HandGesturePlugin:
+    PREFIX = "hand_gesture"
+    ACTIONS = ("thumbs_up", "wave_open", "handshake", "point", "victory", "rock")
+
+    def __init__(self, hand: HandPlugin):
+        self._hand = hand
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand_gesture", "type": "actuator",
+            "description": "Adam 单手语义手势；共用 hand 控制线程及 rt/handcmd。",
+            "inputSchema": {
+                "type": "object", "required": ["action"],
+                "properties": {
+                    "action": {"type": "string", "enum": [*self.ACTIONS, "stop"]},
+                    "side": {"type": "string", "enum": ["left", "right"]},
+                },
+                "x-action-params": {
+                    **{name: {"params": ["side"], "description": f"执行单手 {name} 手势"}
+                       for name in self.ACTIONS},
+                    "stop": {"params": [], "description": "停止发送手部目标"},
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "stop":
+            return self._hand.dispatch("stop", {})
+        if action not in self.ACTIONS:
+            return {"state": "error", "error": "INVALID_ARGUMENT", "message": "unsupported hand gesture action"}
+        try:
+            target = self._hand._gesture_target(action, args.get("side"))
+        except ValueError as exc:
+            return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
+        return self._hand._activate(target, action)
 
 
 # ---------------------------------------------------------------------------
@@ -3235,6 +3241,7 @@ class AdamDeviceBundle:
                 grpc_client=grpc_client,
             )
             self._plugins.append(p)
+            self._plugins.append(ArmGesturePlugin(p))
 
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:
@@ -3242,6 +3249,7 @@ class AdamDeviceBundle:
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
             self._plugins.append(p)
+            self._plugins.append(HandGesturePlugin(p))
         if hand_state_enabled and self._hand_state_cache is not None and self._ros2_enabled:
             p = HandStatePlugin(
                 plugins_cfg.get("hand_state", {}), namespace, executor,
