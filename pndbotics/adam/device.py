@@ -293,20 +293,21 @@ def _state_health_payload(state, received_monotonic: float | None) -> dict:
     age_ms = None
     if received_monotonic is not None:
         age_ms = max(0, int((time.monotonic() - received_monotonic) * 1000))
-    mode_pr = int(getattr(state, "mode_pr", 0))
+    mode_pr = int(getattr(state, "mode_pr", 0)) if state is not None else None
     mode_pr_label = {
         0: "PR 串联关节控制",
         1: "AB 并联关节控制",
-    }.get(mode_pr, "未知控制拓扑")
-    motor_state = getattr(state, "motor_state", [])
+    }.get(mode_pr) if mode_pr is not None else None
+    motor_state = getattr(state, "motor_state", []) if state is not None else []
+    status = "waiting" if state is None else "online" if age_ms is not None and age_ms <= 500 else "stale"
     return {
-        "status": "online" if age_ms is not None and age_ms <= 500 else "stale",
-        "status_text": "状态流正常" if age_ms is not None and age_ms <= 500 else "状态流延迟",
+        "status": status,
+        "status_text": {"waiting": "等待状态首帧", "online": "状态流正常", "stale": "状态流延迟"}[status],
         "state_age_ms": age_ms,
         "body_joint_count": len(motor_state),
         "control_topology": mode_pr_label,
         "raw_mode_pr": mode_pr,
-        "tick": int(getattr(state, "tick", 0)),
+        "tick": int(getattr(state, "tick", 0)) if state is not None else None,
     }
 
 
@@ -713,6 +714,11 @@ class _StatePublisherNode(Node):
             msg_hand.data = json.dumps(hand_payload)
             self._pub_hand.publish(msg_hand)
 
+        msg_health = String()
+        msg_health.data = json.dumps(
+            _state_health_payload(state, state_monotonic))
+        self._pub_health.publish(msg_health)
+
         if state is None:
             return
 
@@ -721,11 +727,6 @@ class _StatePublisherNode(Node):
         msg_bat = String()
         msg_bat.data = json.dumps(bat_data)
         self._pub_battery.publish(msg_bat)
-
-        msg_health = String()
-        msg_health.data = json.dumps(
-            _state_health_payload(state, state_monotonic))
-        self._pub_health.publish(msg_health)
 
 
 class StatePlugin:
@@ -1213,9 +1214,11 @@ class ArmGesturePlugin:
                 "properties": {
                     "action": {"type": "string", "enum": ["raise_hand", "stop"]},
                     "side": {"type": "string", "enum": ["left", "right"]},
+                    "confirm": {"type": "boolean", "description": "现场确认站立、实时接收模式和周围安全"},
                 },
+                "x-is-dangerous": True,
                 "x-action-params": {
-                    "raise_hand": {"params": ["side"], "description": "单侧举手"},
+                    "raise_hand": {"params": ["side", "confirm"], "description": "确认站立和实时接收模式后单侧举手"},
                     "stop": {"params": [], "description": "停止上肢目标发布"},
                 },
             },
@@ -1236,6 +1239,9 @@ class ArmGesturePlugin:
             return self._arm.dispatch("info", {})
         if action != "raise_hand" or args.get("side") not in ("left", "right"):
             return {"state": "error", "error": "INVALID_ARGUMENT", "message": "raise_hand requires left or right side"}
+        if args.get("confirm") is not True:
+            return {"state": "error", "error": "PRECONDITION_FAILED",
+                    "message": "Confirm standing, real-time retarget mode and clear surroundings before raising an arm"}
         side = args["side"]
         result = self._arm.dispatch("set_joints", {"joints": ARM_RAISE_POSE[side]})
         self._arm.dispatch("enable", {})

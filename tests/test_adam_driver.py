@@ -68,6 +68,24 @@ class AdamDriverContractTests(unittest.TestCase):
         self.assertEqual(31, payload["body_joint_count"])
         self.assertEqual(123, payload["tick"])
 
+    def test_health_publishes_waiting_without_lowstate_sample(self):
+        node = object.__new__(adam._StatePublisherNode)
+        node._lock = threading.Lock()
+        node._latest_state = None
+        node._latest_state_monotonic = None
+        node._latest_state_at_ms = None
+        node._active = True
+        node._hand_state_cache = None
+        node._pub_health = mock.Mock()
+        with mock.patch.object(adam, "String", side_effect=lambda: types.SimpleNamespace(data="")):
+            node._publish_battery()
+        payload = json.loads(node._pub_health.publish.call_args.args[0].data)
+        self.assertEqual("waiting", payload["status"])
+        self.assertIsNone(payload["state_age_ms"])
+        self.assertIsNone(payload["control_topology"])
+        self.assertIsNone(payload["raw_mode_pr"])
+        self.assertIsNone(payload["tick"])
+
     def test_hand_cache_status_distinguishes_waiting_and_stale(self):
         cache = adam.HandStateCache(FakeSubscriber())
         self.assertEqual("waiting", adam._hand_status_payload(cache, 1.0)["state"])
@@ -119,7 +137,12 @@ class AdamDriverContractTests(unittest.TestCase):
         self.assertEqual({"state": "ready"}, gesture.dispatch("start", {}))
         self.assertEqual("active", gesture.dispatch("info", {})["state"])
         arm.dispatch.reset_mock()
-        result = gesture.dispatch("raise_hand", {"side": "left"})
+        schema = gesture.get_tool()["inputSchema"]
+        self.assertIs(True, schema["x-is-dangerous"])
+        self.assertEqual(["side", "confirm"], schema["x-action-params"]["raise_hand"]["params"])
+        self.assertEqual("PRECONDITION_FAILED", gesture.dispatch("raise_hand", {"side": "left"})["error"])
+        arm.dispatch.assert_not_called()
+        result = gesture.dispatch("raise_hand", {"side": "left", "confirm": True})
         self.assertEqual([
             mock.call("set_joints", {"joints": adam.ARM_RAISE_POSE["left"]}),
             mock.call("enable", {}),
