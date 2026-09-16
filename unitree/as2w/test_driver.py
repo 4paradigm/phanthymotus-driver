@@ -120,6 +120,12 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(3, len(published))
         self.assertEqual(16, len(__import__("json").loads(published[1])["joint_states"]))
 
+    def test_mcp_supports_sse_and_never_falls_back_to_wifi(self):
+        source = (ROOT / "main.py").read_text()
+        self.assertIn('parsed.path != "/mcp/sse"', source)
+        self.assertIn('"/mcp/messages"', source)
+        self.assertIn("must never silently bind to the office Wi-Fi", source)
+
 
 if __name__ == "__main__":
     unittest.main()
