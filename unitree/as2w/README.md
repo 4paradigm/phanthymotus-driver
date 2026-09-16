@@ -8,10 +8,13 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `SwitchGait`, `SpeedLevel`, `SwitchJoystick`, `SetAutoRecovery`, `GetState`,
 `FrontFlip`, and `BackFlip`.
 
-Run `python3 main.py <robot-interface>` on the robot network (normally the
-interface with a `192.168.123.x` address). If the supplied interface is absent,
-the entry point tries available container interfaces and then starts MCP in a
-degraded mode without DDS publishers. The bundle exposes MCP on port
+Run `python3 main.py <robot-interface>` on the robot network (normally `eth0`,
+the interface with a `192.168.123.x` address). The deployment explicitly sets
+`NETWORK_INTERFACE=eth0`; override it for a differently named robot adapter.
+If that interface is absent or CycloneDDS cannot bind to it, the entry point
+starts MCP in degraded mode without DDS publishers. It never falls back to
+Wi-Fi, because that would register a driver that cannot talk to the robot. The
+bundle exposes MCP on port
 `15709`, publishes JSON state streams under the resolved ROS namespace, and
 uses a dedicated process for RPC calls so ROS callbacks cannot starve SDK
 responses.
