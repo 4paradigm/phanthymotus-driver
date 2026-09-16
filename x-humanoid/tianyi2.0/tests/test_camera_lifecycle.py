@@ -84,7 +84,15 @@ class _Ros2:
 
 
 def _install_vision_stubs():
-    """numpy/cv2 as start() and _encode_loop import them, without the real ones."""
+    """numpy/cv2 as start() and _encode_loop import them, without the real ones.
+
+    The caller is responsible for putting the real ones back — see the autouse
+    fixture below. A fake `numpy` left in sys.modules is inherited by every test
+    file that runs afterwards, and pytest's own `approx` reaches into
+    `sys.modules['numpy']`, so the next file to compare two floats fails with
+    `module 'numpy' has no attribute 'isscalar'` — a message that points
+    nowhere near here.
+    """
     numpy = types.ModuleType("numpy")
     numpy.uint8 = "uint8"
     numpy.frombuffer = lambda data, dtype=None: types.SimpleNamespace(
@@ -139,7 +147,34 @@ def _load_device_module():
     return module
 
 
+# Names this file replaces in sys.modules. Restored both right after the load
+# below and after every test, so the fakes cannot outlive the file that needs
+# them: pytest imports every test module before running anything, so a stub
+# installed here and left in place is inherited by tests in *other* files that
+# have not run yet.
+_STUBBED_MODULES = ("numpy", "cv2", "rclpy", "rclpy.node", "rclpy.qos",
+                    "std_msgs", "std_msgs.msg", "sensor_msgs", "sensor_msgs.msg")
+
+
+def _snapshot_modules():
+    return {name: sys.modules.get(name) for name in _STUBBED_MODULES}
+
+
+def _restore_modules(saved):
+    for name, module in saved.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+
+_REAL_MODULES = _snapshot_modules()
 device = _load_device_module()
+# Keep what the load installed — the tests need exactly these back while they
+# run — then put the real modules back. device.py's own `from … import` bindings
+# are made by now, so restoring cannot affect it.
+_STUB_MODULES = _snapshot_modules()
+_restore_modules(_REAL_MODULES)
 
 
 def _raw_frame(width=4, height=2, encoding="bgr8"):
@@ -192,6 +227,22 @@ def _live_encode_loops():
     return {t for t in threading.enumerate()
             if t.is_alive()
             and getattr(getattr(t, "_target", None), "__name__", "") == "_encode_loop"}
+
+
+@pytest.fixture(autouse=True)
+def _stubbed_modules():
+    """The load's stubs, for the duration of one test only.
+
+    `start()` and `_encode_loop` import rclpy, numpy and cv2 lazily, and several
+    tests reach into `sys.modules` to break one of them on purpose — so the
+    fakes have to be present while a test runs, and absent the rest of the time.
+    """
+    saved = _snapshot_modules()
+    _restore_modules(_STUB_MODULES)
+    try:
+        yield
+    finally:
+        _restore_modules(saved)
 
 
 @pytest.fixture

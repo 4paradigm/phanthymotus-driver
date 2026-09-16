@@ -74,6 +74,17 @@ plugins:
     enabled: true
   hand:
     enabled: true
+  servo:
+    # 执行模型（VLA 等）的连续控制入口：26 维 = 14 臂(rad) + 12 指(0 张开..1 握紧)。
+    # 默认关闭 —— 打开之后还要在画布上把一路 control/joint 源连到它，并在
+    # start 时显式 confirm_motion，才会真的开始驱动。
+    enabled: false
+    expected_hz: 30
+    # 每条指令下发给关节的角速度，厂商允许区间 [0.2, 1.5] rad/s。
+    arm_speed: 0.5
+    # 指令断流时是否张开双手。默认否：松手会把正在搬的东西摔到下面的东西上，
+    # 而"继续攥着"和"松开"哪个更糟取决于机器人在干什么。见 servo.py 的 _hold。
+    release_hands_on_watchdog: false
   tts:
     enabled: true
   voice_play:
