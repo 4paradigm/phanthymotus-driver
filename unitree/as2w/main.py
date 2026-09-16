@@ -50,7 +50,12 @@ class Bundle:
 
 def handler(bundle):
     class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_): pass
+        def log_message(self, fmt, *args):
+            message = fmt % args
+            if '"POST /mcp' in message and "200" in message:
+                return
+            safe = message.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}", flush=True)
         def do_POST(self):
             try: request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
             except Exception: self.send_error(400); return
@@ -99,7 +104,7 @@ def main():
     namespace = re.sub(r"[^a-zA-Z0-9_]", "_", cfg.get("ros_namespace") or socket.gethostname())
     proxy = RpcProxy(interface); rclpy.init(); executor = rclpy.executors.MultiThreadedExecutor(); bundle = Bundle(cfg, namespace, executor, proxy, interface); bundle.start_all()
     threading.Thread(target=lambda: executor.spin(), daemon=True).start()
-    mcp_port = int(cfg.get("mcp_port", 15705))
+    mcp_port = int(cfg.get("mcp_port", 15709))
     server = ThreadingHTTPServer(("", mcp_port), handler(bundle))
     _start_registration(mcp_port, "Unitree AS2W Bundle", "driver")
     def shutdown(*_):

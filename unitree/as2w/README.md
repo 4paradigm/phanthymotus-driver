@@ -10,7 +10,7 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 
 Run `python3 main.py <robot-interface>` on the robot network (normally the
 interface with a `192.168.123.x` address). The bundle exposes MCP on port
-`15705`, publishes JSON state streams under the resolved ROS namespace, and
+`15709`, publishes JSON state streams under the resolved ROS namespace, and
 uses a dedicated process for RPC calls so ROS callbacks cannot starve SDK
 responses.
 
