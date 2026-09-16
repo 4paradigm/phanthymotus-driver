@@ -39,7 +39,14 @@ import sys
 import threading
 import time
 
-import lifecycle as _lifecycle
+try:
+    from common import lifecycle as _lifecycle
+except ImportError:  # a checkout rather than the container image, where
+    # common/ is copied in beside this file. Load-bearing, so it resolves the
+    # repo root rather than degrading to a no-op the way logsafe does.
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
+    from common import lifecycle as _lifecycle
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -648,11 +655,9 @@ class TianyiDeviceBundle:
                         return {"state": "error",
                                 "error": f"Unknown action: {action} (tool={tool_name})"}
                     # A plugin that only knows its own verbs declines these
-                    # rather than failing at them — see lifecycle.py.
-                    if action in _lifecycle.LIFECYCLE_ACTIONS and \
-                            _lifecycle.is_unknown_action(result):
-                        return _lifecycle.lifecycle_reply(
-                            action, p in self._started_plugins)
+                    # rather than failing at them — see common/lifecycle.py.
+                    if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
+                        return _lifecycle.reply(action, p in self._started_plugins)
                     return result
         return None
 
