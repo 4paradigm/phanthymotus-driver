@@ -146,6 +146,15 @@ class ProductionPluginTests(unittest.TestCase):
         p2._on_distance(1.0)
         self.assertFalse(p2._controller._armed)  # triggered, _armed set to False
 
+    def test_stop_resets_controller_and_led(self):
+        self.plugin.dispatch("start", {})
+        self.plugin._on_distance(1.0)
+        self.assertFalse(self.plugin._controller._armed)
+        self.plugin.dispatch("stop", {})
+        self.assertEqual(self.plugin.dispatch("stop", {}), {"state": "idle"})
+        self.assertTrue(self.plugin._controller._armed)
+        self.plugin.stubs["led"].dispatch.assert_any_call("state", {"state": "idle"})
+
     def test_status_returns_enabled_and_topic(self):
         self.plugin.dispatch("start", {})
         status = self.plugin.dispatch("status", {})

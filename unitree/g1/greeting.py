@@ -214,6 +214,11 @@ class Plugin:
             return {"state": "ready"}
         if action == "stop":
             self._enabled = False
+            self._controller.reset()
+            try:
+                self._led.dispatch("state", {"state": "idle"})
+            except Exception:
+                pass
             return {"state": "idle"}
         if action == "enable":
             self._enabled = True
@@ -221,6 +226,10 @@ class Plugin:
         if action == "disable":
             self._enabled = False
             self._controller.reset()
+            try:
+                self._led.dispatch("state", {"state": "idle"})
+            except Exception:
+                pass
             return {"state": "disabled"}
         if action == "status":
             result = self._controller.status()
