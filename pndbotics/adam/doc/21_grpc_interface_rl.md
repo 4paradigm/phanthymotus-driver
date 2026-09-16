@@ -27,8 +27,8 @@ plugins:
 
 - RL gRPC：动作卡会确认 `GetRobotState` 成功，按 `switchable_states` 自动切换到所需
   FSM 状态，并固定选择 `SetControlMode(domain_id=1)`。
-- ROS2 上肢控制：机器人还必须处于站立状态，并通过遥控器开启实时遥操接收，直到
-  控制台显示 `real time retarget start`；退出上肢外部控制后再停止卡片。
+- DDS 上肢控制：手臂卡在开发者模式下读取 `rt/lowstate` 并连续发送完整
+  `rt/lowcmd`；一次只能有一个低层控制者，退出卡片会先将手臂增益平滑降为零。
 - DDS 手指/底层控制：开发者模式只代表允许外部 SDK，仍必须确认对应 `rt/*` 通道已
   发现且发送周期正常。
 
@@ -36,22 +36,25 @@ plugins:
 机器人 Demo、DDS/ROS2 或 PAC 服务已经启动。实体急停始终使用遥控器 `LB + RB`，
 不能由软件动作卡冒充。
 
-也可以通过 `GRPC_HOST`、`GRPC_PORT` 和 `GRPC_API=rl` 覆盖配置。兼容的 `loco`
-聚合卡提供 `GetRobotState`、`SetMode`、`SetVelocity`、`SetHeight`、`SetMotion`、
-`SetTrackingMotion`、`SetControlMode`、`GetControlState` 和 `Shutdown`；驱动还提供
-职责拆分的执行卡：`motion`（上半身动作文件）和 `tracking_motion`（全身轨迹文件）。
-动作卡会在内部自动选择 RL 控制域，并切换到所需 FSM 状态；`posture`、`control_mode`
-和 `safety` 不作为外部卡片暴露。
+也可以通过 `GRPC_HOST`、`GRPC_PORT` 和 `GRPC_API=rl` 覆盖配置。`loco` 只提供
+`move`、`set_height` 和 `stop`：执行移动或高度设置时，驱动在内部自动选择 RL 控制域
+并切换到 `STAND_WALK`。`move` 必须指定 `duration_s`（0.1-30 秒），到时自动发送
+零速度；新的移动或显式停止会取消先前的定时停止。速度、角速度及高度目标均限制为
+`[-1, 1]`。
+
+驱动另提供职责拆分的执行卡：`motion` 用于播放机器人端已有的上半身 `.txt` 动作文件
+（例如 `Sources/motion/Wave.txt`）；`tracking_motion` 用于执行机器人端已有的全身
+`.txt` 轨迹文件（例如 `Sources/tracking/Walk.txt`）。两类文件路径均指机器人侧文件，
+不是运行驱动的容器内任意本地文件。动作卡会在内部自动选择 RL 控制域，并切换到所需
+FSM 状态；`posture`、`control_mode` 和 `safety` 不作为外部卡片暴露。
 
 下发动作前先调用 `get_state`，只使用返回的 `switchable_states` 和
 `available_actions`。动作卡会先校验目标状态，再轮询 `fsm_state` 确认异步切换完成；
 `motion.play` 和 `tracking_motion.play` 会分别校验
 `SetMotion`/`SetTrackingMotion` 出现在 `available_actions` 中。动作和轨迹文件必须是
-机器人侧的 `.txt` 路径。速度和站高按接口约定限制在 `[-1, 1]`。当前机器人
-服务端把 `SetVelocity` 与 `SetHeight` 标为预留接口，驱动会如实返回不支持状态，不会伪造
-成功响应。
+机器人侧的 `.txt` 路径。速度和站高按接口约定限制在 `[-1, 1]`。
 
 `SetControlMode` 的 `domain_id=0` 为传统控制，`1` 为 RL 控制。动作卡固定选择
-`domain_id=1`，不要求上层显式管理控制域。普通动作停止使用 `motion.stop`，不宣称
-能够触发实体急停；实体急停仍由 `estop` 只读卡和遥控器 `LB + RB` 提供。控制器关闭
-仍只保留在兼容 `loco.shutdown` 动作中，不作为独立卡暴露。
+`domain_id=1`，不要求上层显式管理控制域。普通动作停止使用 `loco.stop` 或
+`motion.stop`，不宣称能够触发实体急停；实体急停仍由 `estop` 只读卡和遥控器
+`LB + RB` 提供。
