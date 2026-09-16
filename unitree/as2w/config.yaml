@@ -1,0 +1,12 @@
+mcp_port: 15709
+ros_namespace: ""
+plugins:
+  loco: {enabled: true}
+  trajectory_motion: {enabled: true}
+  motion_recorder:
+    enabled: true
+    recordings_dir: /opt/phanthy-motus/data/as2w-motion-recordings
+  special_action: {enabled: true}
+  state: {enabled: true}
+  lidar: {enabled: true}
+  controlled_spatial: {enabled: true}
