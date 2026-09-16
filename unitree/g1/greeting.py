@@ -89,6 +89,13 @@ class GreetingController:
             return True
         return False
 
+    def reset(self) -> None:
+        """Clear all internal debounce and cooldown state."""
+        self._inside_count = 0
+        self._armed = True
+        self._cooldown_until = 0.0
+        self._last_distance_m = None
+
     def status(self, now: Optional[float] = None) -> dict:
         now = time.monotonic() if now is None else now
         return {
@@ -165,7 +172,7 @@ class Plugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["enable", "disable", "status"],
+                        "enum": ["enable", "disable", "status", "info"],
                     },
                 },
                 "required": ["action"],
@@ -174,6 +181,7 @@ class Plugin:
                     "enable": {"params": []},
                     "disable": {"params": []},
                     "status": {"params": []},
+                    "info": {"params": []},
                 },
             },
         }
@@ -183,6 +191,7 @@ class Plugin:
 
     def stop(self) -> None:
         self._enabled = False
+        self._controller.reset()
         try:
             self._executor.remove_node(self._node)
         except Exception:
@@ -205,12 +214,15 @@ class Plugin:
             return {"state": "enabled"}
         if action == "disable":
             self._enabled = False
+            self._controller.reset()
             return {"state": "disabled"}
         if action == "status":
             result = self._controller.status()
             result["enabled"] = self._enabled
             result["topic"] = self._topic
             return result
+        if action == "info":
+            return {"topic_in": [{"topic": self._topic, "format": "data/json"}]}
         return None
 
     def _on_distance(self, distance_m: float) -> None:

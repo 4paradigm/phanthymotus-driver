@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import unittest
 
@@ -8,6 +9,40 @@ if str(_base) not in sys.path:
     sys.path.insert(0, str(_base))
 
 from greeting import GreetingController, GreetingObservation
+
+
+class _FakeNode:
+    """Dummy ROS2 node placeholder."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def destroy_node(self):
+        pass
+
+
+class _FakeExecutor:
+    """In-memory executor that tracks added/removed nodes."""
+
+    def __init__(self):
+        self.nodes = []
+
+    def add_node(self, node):
+        self.nodes.append(node)
+
+    def remove_node(self, node):
+        self.nodes.remove(node)
+
+
+def _make_stubs(**kwargs):
+    """Return stub dependencies, overriding individual defaults."""
+    stubs = {
+        "led": MagicMock(),
+        "tts": MagicMock(),
+        "arm": MagicMock(),
+    }
+    stubs.update(kwargs)
+    return stubs
 
 
 class GreetingControllerTests(unittest.TestCase):
@@ -38,86 +73,113 @@ class GreetingControllerTests(unittest.TestCase):
         self.assertFalse(controller.update(GreetingObservation(0), now=1))
         self.assertFalse(controller.update(GreetingObservation(2.1), now=2))
 
-
-class MockPlugin:
-    """Minimal stand-in for the Plugin class that exposes dispatch."""
-
-    def __init__(self):
-        self._controller = GreetingController(
-            threshold_m=2.0, consecutive_frames=1, cooldown_s=0
-        )
-        self._enabled = False
-        self._tts_result = {"ret": 0}
-        self._arm_result = {"ret": 0}
-
-    @property
-    def tts_result(self):
-        return self._tts_result
-
-    @property
-    def arm_result(self):
-        return self._arm_result
-
-    # expose dispatch directly; start/stop mirror Plugin behaviour
-    def dispatch(self, action: str, args: dict) -> dict:
-        del args
-        if action == "start":
-            self._enabled = True
-            return {"state": "ready"}
-        if action == "stop":
-            self._enabled = False
-            return {"state": "idle"}
-        if action == "enable":
-            self._enabled = True
-            return {"state": "enabled"}
-        if action == "disable":
-            self._enabled = False
-            return {"state": "disabled"}
-        if action == "status":
-            result = self._controller.status()
-            result["enabled"] = self._enabled
-            return result
-        return {}
+    def test_reset_clears_all_state(self):
+        controller = GreetingController(threshold_m=2.0, consecutive_frames=1, cooldown_s=0)
+        controller.update(GreetingObservation(1.0))
+        self.assertFalse(controller._armed)
+        controller.reset()
+        self.assertTrue(controller._armed)
+        self.assertEqual(controller._inside_count, 0)
+        self.assertEqual(controller._cooldown_until, 0.0)
+        self.assertIsNone(controller._last_distance_m)
 
 
-class PluginLifecycleTests(unittest.TestCase):
+class ProductionPluginTests(unittest.TestCase):
+
+    def setUp(self):
+        self.executor = _FakeExecutor()
+        self.stubs = _make_stubs()
+        self.plugin_config = {
+            "threshold_m": 2.0,
+            "consecutive_frames": 1,
+            "cooldown_s": 0,
+            "distance_topic": "/test/camera/distance",
+        }
+        self.plugin = self._make_plugin()
+
+    def _make_plugin(self):
+        # Patch the ROS2 node class so Plugin doesn't spawn a real rclpy node
+        import greeting as g
+        original = g.GreetingDistanceNode
+        try:
+            g.GreetingDistanceNode = _FakeNode
+            return g.make_plugin(
+                self.plugin_config, "test", self.executor, self.stubs
+            )
+        finally:
+            g.GreetingDistanceNode = original
+
+    # -- lifecycle / schema tests --
 
     def test_start_returns_ready(self):
-        plugin = MockPlugin()
-        self.assertEqual(plugin.dispatch("start", {}), {"state": "ready"})
+        self.assertEqual(self.plugin.dispatch("start", {}), {"state": "ready"})
 
-    def test_stop_returns_idle(self):
-        plugin = MockPlugin()
-        plugin.dispatch("start", {})
-        self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
+    def test_stop_returns_idle_and_resets_controller(self):
+        self.plugin.dispatch("start", {})
+        # prime controller state
+        self.plugin._on_distance(1.0)
+        self.assertFalse(self.plugin._controller._armed)
+        self.plugin.dispatch("stop", {})
+        self.assertEqual(self.plugin.dispatch("stop", {}), {"state": "idle"})
+        self.assertTrue(self.plugin._controller._armed)
+        self.assertEqual(self.plugin._controller._inside_count, 0)
 
-    def test_status_returns_enabled_flag(self):
-        plugin = MockPlugin()
-        plugin.dispatch("start", {})
-        status = plugin.dispatch("status", {})
+    def test_disable_resets_controller(self):
+        self.plugin.dispatch("enable", {})
+        self.plugin._on_distance(1.0)
+        self.assertFalse(self.plugin._controller._armed)
+        self.plugin.dispatch("disable", {})
+        self.assertTrue(self.plugin._controller._armed)
+        self.assertEqual(self.plugin._controller._inside_count, 0)
+
+    def test_disable_then_enable_does_not_automatically_fire(self):
+        """After disable resets state, one sample must reach consecutive_frames again."""
+        self.plugin._config["consecutive_frames"] = 2
+        p2 = self._make_plugin()
+        p2.dispatch("enable", {})
+        p2._on_distance(1.0)
+        p2.dispatch("disable", {})
+        p2.dispatch("enable", {})
+        p2._on_distance(1.0)
+        self.assertFalse(p2._controller._armed)  # need 2 frames, only 1
+        p2._on_distance(1.0)
+        self.assertTrue(p2._controller._armed)  # now armed again (cooldown or re-armed)
+
+    def test_status_returns_enabled_and_topic(self):
+        self.plugin.dispatch("start", {})
+        status = self.plugin.dispatch("status", {})
         self.assertTrue(status["enabled"])
+        self.assertEqual(status["topic"], "/test/camera/distance")
 
+    def test_info_returns_topic_in(self):
+        info = self.plugin.dispatch("info", {})
+        self.assertIn("topic_in", info)
+        topics = info["topic_in"]
+        self.assertEqual(len(topics), 1)
+        self.assertEqual(topics[0]["topic"], "/test/camera/distance")
+        self.assertEqual(topics[0]["format"], "data/json")
 
-class PluginChildDispatchTests(unittest.TestCase):
-    """Verify that non-zero ret from child plugins is surfaced."""
+    # -- child dispatch failure tests --
 
-    def test_tts_non_zero_ret_collected(self):
-        plugin = MockPlugin()
-        plugin._tts_result = {"ret": 1}
-        plugin.dispatch("start", {})
-        # _on_distance would be triggered by real ROS2; exercise
-        # _welcome directly by mocking the distance observation.
-        controller = plugin._controller
-        controller.update(GreetingObservation(1.0))
-        # The controller already fired; we cannot easily call _welcome
-        # without a real TTS/arm, so we just assert the ret path exists.
-        self.assertEqual(plugin.tts_result.get("ret"), 1)
+    def test_tts_non_zero_ret_marks_error(self):
+        self.stubs["tts"].dispatch.return_value = {"ret": 1}
+        self.plugin.dispatch("start", {})
+        self.plugin._on_distance(1.0)
+        self.plugin._controller._armed = True  # prevent cooldown check in _welcome
+        # Force a second trigger so _welcome runs
+        self.stubs["tts"].dispatch.assert_called()
 
-    def test_arm_non_zero_ret_collected(self):
-        plugin = MockPlugin()
-        plugin._arm_result = {"ret": -1}
-        plugin.dispatch("start", {})
-        self.assertEqual(plugin.arm_result.get("ret"), -1)
+    def test_arm_non_zero_ret_marks_error(self):
+        self.stubs["arm"].dispatch.return_value = {"ret": -1}
+        self.plugin.dispatch("start", {})
+        self.plugin._on_distance(1.0)
+        self.stubs["arm"].dispatch.assert_called()
+
+    def test_tts_error_field_marks_error(self):
+        self.stubs["tts"].dispatch.return_value = {"error": "device busy"}
+        self.plugin.dispatch("start", {})
+        self.plugin._on_distance(1.0)
+        self.stubs["tts"].dispatch.assert_called()
 
 
 if __name__ == "__main__":
