@@ -56,3 +56,17 @@ with the button and axis layout defined by the vendored official AS2 SDK. It
 publishes 14 buttons, 4 axes, activity and freshness state at up to 10 Hz on
 `/{namespace}/state/remote_controller`; MCP `info` and `read` are also
 supported.
+
+`trajectory_motion` generates bounded 10 Hz velocity trajectories through the
+official `SportClient.Move` API. Its atomic actions are `circle`,
+`figure_eight`, and `slalom`; each has a finite duration, publishes an action
+identifier, and can be interrupted immediately with `stop`.
+
+`motion_recorder` records timestamped velocity samples submitted through its
+own `drive` action and stores them under
+`/opt/phanthy-motus/data/as2w-motion-recordings`. It supports
+`record_start`, `record_stop`, `play`, `stop_playback`, `list`, `delete`, and
+`status`. Playback is mutually exclusive with generated trajectories and always
+ends with `StopMove`. Calls made directly to the separate `loco` card are not
+implicitly recorded; a workflow that needs recording must route velocity
+commands through `motion_recorder.drive`.

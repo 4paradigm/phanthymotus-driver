@@ -69,6 +69,17 @@ class TestDriverContracts(unittest.TestCase):
         self.assertGreaterEqual(proxy.stops, 1)
         self.assertIsNone(plugin._stop)
 
+    def test_loco_preempts_external_background_motion(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        preemptions = []
+        plugin.set_external_motion_stop(lambda: preemptions.append(True))
+
+        result = plugin.dispatch("move", {"vx": 0.1, "vy": 0, "vyaw": 0})
+
+        self.assertEqual(0, result["ret"])
+        self.assertEqual([True], preemptions)
+
     def test_special_actions_are_schema_marked_and_confirmed(self):
         proxy = _Proxy()
         plugin = self.device.SpecialActionPlugin({}, "test", None, proxy)

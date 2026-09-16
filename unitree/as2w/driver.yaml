@@ -12,6 +12,8 @@ build_context_extras:
 cards:
   - { name: model, type: resource }
   - { name: loco, type: actuator }
+  - { name: trajectory_motion, type: actuator }
+  - { name: motion_recorder, type: actuator }
   - { name: special_action, type: actuator }
   - { name: controlled_spatial, type: actuator }
   - { name: imu, type: sensor }

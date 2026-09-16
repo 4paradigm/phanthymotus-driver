@@ -28,11 +28,22 @@ class Bundle:
         from device import StatePlugin, LocoPlugin, SpecialActionPlugin
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
+        from motion_tools import MotionExecutor, MotionRecorderPlugin, TrajectoryMotionPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
-        if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
-        if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy))
+        motion_executor = MotionExecutor(proxy)
+        loco = LocoPlugin(p.get("loco", {}), namespace, executor, proxy)
+        loco.set_external_motion_stop(motion_executor.stop)
+        if p.get("loco", {}).get("enabled", True): self.plugins.append(loco)
+        def stop_loco():
+            motion_executor.stop()
+            loco.interrupt_motion()
+        if p.get("trajectory_motion", {}).get("enabled", True):
+            self.plugins.append(TrajectoryMotionPlugin(p.get("trajectory_motion", {}), proxy, motion_executor, stop_loco))
+        if p.get("motion_recorder", {}).get("enabled", True):
+            self.plugins.append(MotionRecorderPlugin(p.get("motion_recorder", {}), proxy, motion_executor, stop_loco))
+        if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy, stop_loco))
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
     def start_all(self):

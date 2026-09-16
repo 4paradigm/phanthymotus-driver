@@ -113,7 +113,7 @@ class _StateNode:
                                          "current": _number(getattr(bms, "current", 0)),
                                          "cycle": int(getattr(bms, "cycle", 0))})
         now = time.monotonic()
-        if now - self._last_remote_time >= self._REMOTE_INTERVAL:
+        if self._last_remote is None or now - self._last_remote_time >= self._REMOTE_INTERVAL:
             remote = _parse_wireless_remote(getattr(msg, "wireless_remote", None))
             remote["timestamp_ms"] = int(time.time() * 1000)
             with self._remote_lock:
@@ -184,6 +184,9 @@ class LocoPlugin:
         self.proxy = proxy
         self._lock = threading.Lock()
         self._stop = None
+        self._stop_external_motion = None
+    def set_external_motion_stop(self, callback):
+        self._stop_external_motion = callback
     def get_tool(self):
         actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_gait", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
@@ -206,6 +209,9 @@ class LocoPlugin:
     def stop(self):
         self._stop_continuous()
         self.proxy.StopMove()
+    def interrupt_motion(self):
+        self._stop_continuous()
+        return self.proxy.StopMove()
     def _stop_continuous(self):
         event = self._stop
         self._stop = None
@@ -220,8 +226,12 @@ class LocoPlugin:
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
+            if self._stop_external_motion:
+                self._stop_external_motion()
             self._stop_continuous()
             return {"state": "idle", "ret": self.proxy.StopMove()}
+        if action != "get_state" and self._stop_external_motion:
+            self._stop_external_motion()
         if action == "move":
             vx, vy, yaw = max(-1.5, min(1.5, float(args.get("vx", 0)))), max(-1, min(1, float(args.get("vy", 0)))), max(-2, min(2, float(args.get("vyaw", 0))))
             duration = args.get("duration")
@@ -255,8 +265,9 @@ class SpecialActionPlugin:
     """AS2W-specific discrete motions provided by the official SportClient."""
     PREFIX = "special_action"
 
-    def __init__(self, config, namespace, executor, proxy):
+    def __init__(self, config, namespace, executor, proxy, prepare_motion=None):
         self.proxy = proxy
+        self._prepare_motion = prepare_motion
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
@@ -282,6 +293,8 @@ class SpecialActionPlugin:
         if action == "stop": return {"state": "idle"}
         if action in ("front_flip", "back_flip", "handstand", "biped_stand") and not args.get("confirm", False):
             return {"error": "special action requires confirm=true"}
+        if action in ("front_flip", "back_flip", "handstand", "biped_stand") and self._prepare_motion:
+            self._prepare_motion()
         if action == "front_flip": return {"ret": self.proxy.FrontFlip()}
         if action == "back_flip": return {"ret": self.proxy.BackFlip()}
         if action == "handstand": return {"ret": self.proxy.HandStand(1 if args.get("enter", True) else 0)}
