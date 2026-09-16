@@ -75,11 +75,24 @@ class LocoContractTests(unittest.TestCase):
         self.assertEqual(["move", "set_height", "stop"], schema["properties"]["action"]["enum"])
         self.assertNotIn("target_state", schema["properties"])
         self.assertNotIn("set_mode", schema["x-action-params"])
+        self.assertEqual(0.1, schema["properties"]["duration_s"]["minimum"])
+        self.assertEqual(30.0, schema["properties"]["duration_s"]["maximum"])
+        self.assertEqual(-1.0, schema["properties"]["vx"]["minimum"])
+        self.assertEqual(1.0, schema["properties"]["height"]["maximum"])
 
-        result = plugin.dispatch("move", {"vx": 0.2, "vy": 0.0, "vyaw": -0.1})
+        result = plugin.dispatch("move", {
+            "vx": 0.2, "vy": 0.0, "vyaw": -0.1, "duration_s": 1.0,
+        })
         self.assertEqual(grpc.mode, "STAND_WALK")
         self.assertEqual((0.2, 0.0, -0.1), grpc.velocity)
         self.assertTrue(result["success"])
+        self.assertTrue(result["auto_stop"])
+
+    def test_loco_rejects_unbounded_move(self):
+        grpc = _Grpc()
+        plugin = RlLocoPlugin({}, "adam", None, grpc)
+        result = plugin.dispatch("move", {"vx": 0.2, "vy": 0.0, "vyaw": 0.0})
+        self.assertEqual("INVALID_ARGUMENT", result["code"])
 
     def test_loco_height_and_stop_use_direct_motion_requests(self):
         grpc = _Grpc()
@@ -100,6 +113,8 @@ class LocoContractTests(unittest.TestCase):
             {"motion", "tracking_motion"},
             {card.get_tool()["name"] for card in cards},
         )
+        self.assertIn("上半身", cards[0].get_tool()["description"])
+        self.assertIn("全身轨迹", cards[1].get_tool()["description"])
 
     def test_motion_and_tracking_cards_use_robot_side_files(self):
         grpc = _Grpc()
