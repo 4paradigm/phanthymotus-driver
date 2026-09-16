@@ -194,6 +194,39 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn("stand_up", schema["x-completion"]["actions"])
         self.assertNotIn("switch_gait", schema["properties"]["action"]["enum"])
 
+    def test_state_stop_then_start_recreates_shared_node(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        old_state = types.SimpleNamespace(close=lambda: setattr(plugin, "closed", True))
+        plugin._namespace = "test"
+        plugin._executor = object()
+        plugin._state = old_state
+        plugin.closed = False
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+        self.assertTrue(plugin.closed)
+        self.assertIsNone(plugin._state)
+        replacement = object()
+        with patch.object(self.device, "_StateNode", return_value=replacement) as node:
+            self.assertEqual("running", plugin.dispatch("start", {})["state"])
+        node.assert_called_once_with("test", plugin._executor)
+        self.assertIs(replacement, plugin._state)
+
+    def test_lidar_stop_then_start_recreates_node(self):
+        lidar = _load("as2w_lidar_lifecycle_test", ROOT / "lidar.py")
+        plugin = lidar.LidarPlugin.__new__(lidar.LidarPlugin)
+        plugin.topic = "/test/lidar/cloud"
+        plugin._executor = object()
+        plugin._config = {"source_topics": ["rt/test"]}
+        plugin.node = types.SimpleNamespace(close=lambda: setattr(plugin, "closed", True))
+        plugin.closed = False
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+        self.assertTrue(plugin.closed)
+        self.assertIsNone(plugin.node)
+        replacement = object()
+        with patch.object(lidar, "_LidarNode", return_value=replacement) as node:
+            self.assertEqual("running", plugin.dispatch("start", {})["state"])
+        node.assert_called_once_with("/test/lidar/cloud", plugin._executor, ["rt/test"])
+        self.assertIs(replacement, plugin.node)
+
     def test_mcp_supports_sse_and_never_falls_back_to_wifi(self):
         source = (ROOT / "main.py").read_text()
         self.assertIn('parsed.path != "/mcp/sse"', source)

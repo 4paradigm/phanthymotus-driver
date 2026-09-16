@@ -20,6 +20,7 @@ _DEFAULT_SOURCE_TOPICS = (
     "rt/utlidar/cloud_jt128",
 )
 _SOURCE_TIMEOUT_SECONDS = 3.0
+_MAX_RENDER_POINTS = 40000
 _LIDAR_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -83,17 +84,20 @@ class _LidarNode:
                 point_step, point_count, data, offsets, endian = self._cloud_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            data = self._to_xyz(data, point_step, point_count, offsets, endian)
-            if not data:
-                continue
-            # The dashboard renderer intentionally consumes compact XYZ points
-            # (it reads float32 x/y/z at offsets 0/4/8).  Do not forward the
-            # vendor's intensity/line/timestamp fields or their offsets.
-            payload = struct.pack("<II", 12, len(data) // 12) + data
-            out = UInt8MultiArray()
-            # This avoids constructing millions of boxed Python ints per frame.
-            out.data = array.array("B", payload)
-            self.pub.publish(out)
+            try:
+                data = self._to_xyz(data, point_step, point_count, offsets, endian)
+                if not data:
+                    continue
+                # The dashboard renderer intentionally consumes compact XYZ points
+                # (it reads float32 x/y/z at offsets 0/4/8).  Do not forward the
+                # vendor's intensity/line/timestamp fields or their offsets.
+                payload = struct.pack("<II", 12, len(data) // 12) + data
+                out = UInt8MultiArray()
+                # This avoids constructing millions of boxed Python ints per frame.
+                out.data = array.array("B", payload)
+                self.pub.publish(out)
+            except Exception as exc:
+                self.node.get_logger().warning(f"AS2W lidar publish failed; continuing: {exc}")
 
     @staticmethod
     def _to_xyz(data, point_step, point_count, offsets, endian):
@@ -110,11 +114,18 @@ class _LidarNode:
             offsets = {"x": 0, "y": 4, "z": 8}
         raw = memoryview(data)
         fmt = ">f" if endian else "<f"
-        out = bytearray(point_count * 12)
+        count = min(point_count, _MAX_RENDER_POINTS)
+        stride = max(1, point_count // count)
+        selected = min(count, (point_count + stride - 1) // stride)
+        if (not endian and point_step == 12 and
+                offsets == {"x": 0, "y": 4, "z": 8} and stride == 1):
+            return bytes(raw[:selected * 12])
+        out = bytearray(selected * 12)
         try:
-            for index in range(point_count):
+            for target_index in range(selected):
+                index = target_index * stride
                 base = index * point_step
-                target = index * 12
+                target = target_index * 12
                 x = struct.unpack_from(fmt, raw, base + offsets["x"])[0]
                 y = struct.unpack_from(fmt, raw, base + offsets["y"])[0]
                 z = struct.unpack_from(fmt, raw, base + offsets["z"])[0]
@@ -125,13 +136,17 @@ class _LidarNode:
         return bytes(out)
 
     def _on_cloud(self, source, msg):
-        data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
-        point_step = int(msg.point_step)
-        point_count = int(msg.width) * int(msg.height)
-        if point_step <= 0 or point_count <= 0 or not data:
-            return
-        point_count = min(point_count, len(data) // point_step)
-        if point_count <= 0:
+        try:
+            data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
+            point_step = int(msg.point_step)
+            point_count = int(msg.width) * int(msg.height)
+            if point_step <= 0 or point_count <= 0 or not data:
+                return
+            point_count = min(point_count, len(data) // point_step)
+            if point_count <= 0:
+                return
+        except Exception as exc:
+            self.node.get_logger().warning(f"AS2W lidar dropped malformed frame: {exc}")
             return
         with self._lock:
             self._frames[source] += 1
@@ -183,6 +198,8 @@ class LidarPlugin:
 
     def __init__(self, config, namespace, executor):
         self.topic = f"/{namespace}/lidar/cloud"
+        self._config = config
+        self._executor = executor
         self.node = _LidarNode(self.topic, executor, config.get("source_topics"))
 
     def get_tools(self):
@@ -195,14 +212,21 @@ class LidarPlugin:
                 "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
 
     def start(self):
-        pass
+        if self.node is None:
+            self.node = _LidarNode(self.topic, self._executor, self._config.get("source_topics"))
 
     def stop(self):
-        self.node.close()
+        if self.node is not None:
+            self.node.close()
+            self.node = None
 
     def dispatch(self, action, args):
-        if action in ("start", "info", "lidar_cloud"):
+        if action == "start":
+            self.start()
             return {"state": "running", "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
+        if action in ("start", "info", "lidar_cloud"):
+            return {"state": "running", "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
         return None
