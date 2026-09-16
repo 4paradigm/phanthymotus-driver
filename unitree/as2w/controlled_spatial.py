@@ -1,4 +1,4 @@
-"""AS2W adapter for Unitree's documented ``slam_operate`` DDS service.
+"""As2W adapter for Unitree's documented ``slam_operate`` DDS service.
 
 The SDK currently publishes no AS2-specific SLAM wrapper. The service itself
 uses Unitree's common RPC protocol, so this module owns the documented client.
@@ -124,7 +124,7 @@ class ControlledSpatialPlugin:
 
     def get_tool(self):
         return {"name": "controlled_spatial", "type": "actuator", "multiInstance": False,
-                "description": "AS2W SLAM map, relocalization, and point-goal navigation. Requires the vendor unitree_slam service already running.",
+                "description": "As2W SLAM map, relocalization, and point-goal navigation. Requires the vendor unitree_slam service already running.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": list(_APIS)},
                     "address": {"type": "string", "description": "Absolute PCD path for stop_mapping or init_pose."},

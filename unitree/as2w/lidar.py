@@ -1,4 +1,4 @@
-"""AS2W lidar bridge from Unitree DDS PointCloud2 to sensor/pointcloud."""
+"""As2W lidar bridge from Unitree DDS PointCloud2 to sensor/pointcloud."""
 import array
 import queue
 import struct
@@ -11,7 +11,7 @@ from unitree_sdk2py.core.channel import ChannelSubscriber
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
 
 
-# AS2W firmware revisions have used different names for the direct lidar
+# As2W firmware revisions have used different names for the direct lidar
 # stream. Map/relocation clouds are conditional SLAM products, not live lidar.
 _DEFAULT_SOURCE_TOPICS = (
     "rt/utlidar/cloud_livox_mid360",
@@ -24,15 +24,15 @@ _SOURCE_TIMEOUT_SECONDS = 1.5
 # useful visual benefit from all source points, while a smaller uniform sample
 # makes it substantially more likely that the displayed frame is the latest.
 _MAX_RENDER_POINTS = 12000
-# Official AS2W URDF JT128 fixed joint: rpy=(-pi, 1.4661, -pi).
-# This maps points from the lidar frame into the AS2W base frame.  Keeping the
+# Official As2W URDF JT128 fixed joint: rpy=(-pi, 1.4661, -pi).
+# This maps points from the lidar frame into the As2W base frame.  Keeping the
 # values explicit avoids pulling numpy into the latency-sensitive bridge.
 _JT128_R = (
     (-0.1045051633, 0.0, 0.9945243440),
     (0.0, 1.0, 0.0),
     (-0.9945243440, 0.0, -0.1045051633),
 )
-# The AS2W visual alignment verified on hardware is the base-frame ordering.
+# The As2W visual alignment verified on hardware is the base-frame ordering.
 # Agent-core maps wire coordinates as display=(wire_y, -wire_z, -wire_x), so
 # use this preimage to produce display=(base_x, base_y, base_z).
 _LIDAR_QOS = QoSProfile(
@@ -61,7 +61,7 @@ class _LidarNode:
         self._processing_seconds = 0.0
         # A live Livox frame can exceed 1 MiB. Do not serialize and publish it
         # from the CycloneDDS callback; that starves the DDS reader and causes
-        # the intermittent one-frame behaviour observed on AS2W.
+        # the intermittent one-frame behaviour observed on As2W.
         self._cloud_queue = queue.Queue(maxsize=1)
         self._stopped = threading.Event()
         self._worker = threading.Thread(target=self._publish_loop, daemon=True,
@@ -72,9 +72,9 @@ class _LidarNode:
                 sub = ChannelSubscriber(source_topic, PointCloud2_)
                 sub.Init(lambda msg, source=source_topic: self._on_cloud(source, msg), 1)
                 self.subs.append(sub)
-                self.node.get_logger().info(f"AS2W lidar listening on {source_topic}")
+                self.node.get_logger().info(f"As2W lidar listening on {source_topic}")
             except Exception as exc:
-                self.node.get_logger().warning(f"AS2W lidar could not subscribe {source_topic}: {exc}")
+                self.node.get_logger().warning(f"As2W lidar could not subscribe {source_topic}: {exc}")
         self.node.create_timer(15.0, self._report)
         executor.add_node(self.node)
 
@@ -84,7 +84,7 @@ class _LidarNode:
             if (self._active_source and
                     now - self._last_seen[self._active_source] > _SOURCE_TIMEOUT_SECONDS):
                 self.node.get_logger().warning(
-                    f"AS2W lidar source {self._active_source} timed out; waiting for another source")
+                    f"As2W lidar source {self._active_source} timed out; waiting for another source")
                 self._active_source = None
             frames, sizes, active = dict(self._frames), dict(self._bytes), self._active_source
             published, dropped = self._published, self._dropped
@@ -92,10 +92,10 @@ class _LidarNode:
         summary = ", ".join(f"{source}={frames[source]} frames/{sizes[source]} B" for source in self.source_topics)
         timing = f"published={published}, dropped={dropped}, avg_convert={processing / published * 1000:.1f}ms" if published else "published=0"
         if active:
-            self.node.get_logger().info(f"AS2W lidar active source {active}; {summary}; {timing}")
+            self.node.get_logger().info(f"As2W lidar active source {active}; {summary}; {timing}")
         else:
             self.node.get_logger().warning(
-                "AS2W lidar has received no PointCloud2 frames. "
+                "As2W lidar has received no PointCloud2 frames. "
                 f"Candidates: {summary}. Set plugins.lidar.source_topics for this firmware.")
 
     def _publish_loop(self):
@@ -121,7 +121,7 @@ class _LidarNode:
                     self._published += 1
                     self._processing_seconds += time.monotonic() - start
             except Exception as exc:
-                self.node.get_logger().warning(f"AS2W lidar publish failed; continuing: {exc}")
+                self.node.get_logger().warning(f"As2W lidar publish failed; continuing: {exc}")
 
     @staticmethod
     def _to_xyz(data, point_step, point_count, offsets, endian):
@@ -150,7 +150,7 @@ class _LidarNode:
                 x = struct.unpack_from(fmt, raw, base + offsets["x"])[0]
                 y = struct.unpack_from(fmt, raw, base + offsets["y"])[0]
                 z = struct.unpack_from(fmt, raw, base + offsets["z"])[0]
-                # Convert JT128 lidar coordinates to AS2W base coordinates.
+                # Convert JT128 lidar coordinates to As2W base coordinates.
                 bx = _JT128_R[0][0] * x + _JT128_R[0][1] * y + _JT128_R[0][2] * z
                 by = _JT128_R[1][0] * x + _JT128_R[1][1] * y + _JT128_R[1][2] * z
                 bz = _JT128_R[2][0] * x + _JT128_R[2][1] * y + _JT128_R[2][2] * z
@@ -172,7 +172,7 @@ class _LidarNode:
             if point_count <= 0:
                 return
         except Exception as exc:
-            self.node.get_logger().warning(f"AS2W lidar dropped malformed frame: {exc}")
+            self.node.get_logger().warning(f"As2W lidar dropped malformed frame: {exc}")
             return
         with self._lock:
             self._frames[source] += 1
@@ -184,7 +184,7 @@ class _LidarNode:
                 previous = self._active_source
                 self._active_source = source
                 self.node.get_logger().info(
-                    f"AS2W lidar selected live source {source}"
+                    f"As2W lidar selected live source {source}"
                     + (f" (replacing {previous})" if previous else ""))
             if source != self._active_source:
                 return
@@ -235,7 +235,7 @@ class LidarPlugin:
 
     def _cloud_tool(self):
         return {"name": "lidar_cloud", "type": "sensor", "multiInstance": False,
-                "description": f"AS2W live lidar PointCloud2 passthrough. Binary format [uint32 point_step][uint32 point_count][raw data], published to {self.topic}",
+                "description": f"As2W live lidar PointCloud2 passthrough. Binary format [uint32 point_step][uint32 point_count][raw data], published to {self.topic}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
 

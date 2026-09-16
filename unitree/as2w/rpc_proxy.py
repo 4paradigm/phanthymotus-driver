@@ -1,4 +1,4 @@
-"""Dedicated process for Unitree AS2W RPC calls."""
+"""Dedicated process for Unitree As2W RPC calls."""
 import multiprocessing
 import threading
 

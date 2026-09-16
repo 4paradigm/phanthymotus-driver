@@ -1,4 +1,4 @@
-"""Unitree AS2W driver plugins (official AS2 SDK SportClient)."""
+"""Unitree As2W driver plugins (official AS2 SDK SportClient)."""
 import json
 import math
 import threading
@@ -48,7 +48,7 @@ class _StateNode:
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", 10)
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
-        # AS2/AS2W's official sport-state example uses the lf namespace.
+        # AS2/As2W's official sport-state example uses the lf namespace.
         self._sport = ChannelSubscriber("rt/lf/sportmodestate", SportModeState_)
         self._low.Init(self._on_low, 10)
         self._bms.Init(self._on_bms, 10)
@@ -126,11 +126,11 @@ class StatePlugin:
         self._executor = executor
         self._state = _StateNode(namespace, executor)
     def get_tools(self):
-        specs = (("imu", "state/imu", "data/json", "AS2W IMU state"),
-                 ("joints", "state/joints", "sensor/skeleton", "AS2W 16-joint skeleton for model animation"),
-                 ("joint_state", "state/joint_state", "data/json", "AS2W raw motor position, velocity, torque, and temperature"),
-                 ("battery", "state/battery", "data/json", "AS2W BMS state; current_ma is mA"),
-                 ("loco_state", "loco/state", "data/json", "AS2W high-level locomotion state"))
+        specs = (("imu", "state/imu", "data/json", "As2W IMU state"),
+                 ("joints", "state/joints", "sensor/skeleton", "As2W 16-joint skeleton for model animation"),
+                 ("joint_state", "state/joint_state", "data/json", "As2W raw motor position, velocity, torque, and temperature"),
+                 ("battery", "state/battery", "data/json", "As2W BMS state; current_ma is mA"),
+                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"))
         return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
                  "inputSchema": {"type": "object", "properties": {}},
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
@@ -179,7 +179,7 @@ class LocoPlugin:
     def get_tool(self):
         actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
-                "description": "AS2W locomotion. Velocity is clamped to vx [-1.5, 1.5] m/s, vy [-1, 1] m/s, yaw [-2, 2] rad/s. Stand actions are accepted first and report completion through ACP.", "inputSchema": {"type": "object", "properties": {
+                "description": "As2W locomotion. Velocity is clamped to vx [-1.5, 1.5] m/s, vy [-1, 1] m/s, yaw [-2, 2] rad/s. Stand actions are accepted first and report completion through ACP.", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity rad/s [-2, 2]"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
                     "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Enable or disable the selected feature"}}, "required": ["action"],
@@ -272,7 +272,7 @@ class LocoPlugin:
 
 
 class SpecialActionPlugin:
-    """AS2W-specific discrete motions provided by the official SportClient."""
+    """As2W-specific discrete motions provided by the official SportClient."""
     PREFIX = "special_action"
 
     def __init__(self, config, namespace, executor, proxy):
@@ -281,7 +281,7 @@ class SpecialActionPlugin:
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
         return {"name": "special_action", "type": "actuator", "multiInstance": False,
-                "description": "AS2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
+                "description": "As2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions},
                     "enter": {"type": "boolean", "description": "Enter or exit a sustained posture."},

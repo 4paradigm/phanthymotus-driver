@@ -1,4 +1,4 @@
-"""No-hardware contract tests for the AS2W driver cards.
+"""No-hardware contract tests for the As2W driver cards.
 
 Run with: python3 -m unittest unitree/as2w/test_driver.py
 """
@@ -130,7 +130,7 @@ class TestDriverContracts(unittest.TestCase):
 
     def test_model_resource_is_textual_urdf(self):
         urdf = (ROOT / "resource" / "as2w.urdf").read_text()
-        self.assertIn('<robot name="AS2W">', urdf)
+        self.assertIn('<robot name="As2W">', urdf)
         self.assertNotIn("meshes/", urdf)
         for name in ("FL_foot", "FR_foot", "RL_foot", "RR_foot"):
             self.assertIn(f'<joint name="{name}" type="continuous">', urdf)
