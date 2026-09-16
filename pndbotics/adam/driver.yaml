@@ -25,7 +25,6 @@ cards:
   - { name: estop,              type: sensor }
   - { name: loco,               type: actuator }
   - { name: motion,             type: actuator }
-  - { name: tracking_motion,    type: actuator }
   - { name: arm_control,        type: actuator }
   - { name: arm_gesture,        type: actuator }
   - { name: hand,               type: actuator }

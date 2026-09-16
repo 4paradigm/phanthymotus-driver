@@ -42,17 +42,18 @@ plugins:
 零速度；新的移动或显式停止会取消先前的定时停止。速度、角速度及高度目标均限制为
 `[-1, 1]`。
 
-驱动另提供职责拆分的执行卡：`motion` 用于播放机器人端已有的上半身 `.txt` 动作文件
-（例如 `Sources/motion/Wave.txt`）；`tracking_motion` 用于执行机器人端已有的全身
-`.txt` 轨迹文件（例如 `Sources/tracking/Walk.txt`）。两类文件路径均指机器人侧文件，
-不是运行驱动的容器内任意本地文件。动作卡会在内部自动选择 RL 控制域，并切换到所需
-FSM 状态；`posture`、`control_mode` 和 `safety` 不作为外部卡片暴露。
+驱动另提供 `motion` 执行卡，用于播放机器人端已有的上半身 `.txt` 动作文件（例如
+`Sources/motion/Wave.txt`）。这类文件通常由遥控器在站立模式下按 `RT + 十字键↓`
+录制，保存到 `/etc/pndbotics/pnd_adam_dds/Sources/motion`；当前 gRPC 没有文件列表或
+示教录制 RPC，因此驱动无法安全地凭空生成动作名。文件路径指机器人侧文件，不是运行
+驱动的容器内任意本地文件。动作卡会在内部自动选择 RL 控制域并切换到所需 FSM 状态；
+`tracking_motion` 暂不暴露，因为当前没有可用的全身轨迹录制/发现接口；`posture`、
+`control_mode` 和 `safety` 也不作为外部卡片暴露。
 
 下发动作前先调用 `get_state`，只使用返回的 `switchable_states` 和
 `available_actions`。动作卡会先校验目标状态，再轮询 `fsm_state` 确认异步切换完成；
-`motion.play` 和 `tracking_motion.play` 会分别校验
-`SetMotion`/`SetTrackingMotion` 出现在 `available_actions` 中。动作和轨迹文件必须是
-机器人侧的 `.txt` 路径。速度和站高按接口约定限制在 `[-1, 1]`。
+`motion.play` 会校验 `SetMotion` 出现在 `available_actions` 中。动作文件必须是机器人
+侧的 `.txt` 路径。速度和站高按接口约定限制在 `[-1, 1]`。
 
 `SetControlMode` 的 `domain_id=0` 为传统控制，`1` 为 RL 控制。动作卡固定选择
 `domain_id=1`，不要求上层显式管理控制域。普通动作停止使用 `loco.stop` 或

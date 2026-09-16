@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from device import (
     MotionPlugin,
     RlLocoPlugin,
-    TrackingMotionPlugin,
 )
 
 
@@ -107,23 +106,18 @@ class LocoContractTests(unittest.TestCase):
         grpc = _Grpc()
         cards = [
             MotionPlugin({}, "adam", None, grpc),
-            TrackingMotionPlugin({}, "adam", None, grpc),
         ]
         self.assertEqual(
-            {"motion", "tracking_motion"},
+            {"motion"},
             {card.get_tool()["name"] for card in cards},
         )
         self.assertIn("上半身", cards[0].get_tool()["description"])
-        self.assertIn("全身轨迹", cards[1].get_tool()["description"])
 
-    def test_motion_and_tracking_cards_use_robot_side_files(self):
+    def test_motion_card_uses_robot_side_files(self):
         grpc = _Grpc()
         motion = MotionPlugin({}, "adam", None, grpc)
-        tracking = TrackingMotionPlugin({}, "adam", None, grpc)
         motion.dispatch("play", {"motion_file": "Sources/motion/Wave.txt"})
-        tracking.dispatch("play", {"motion_file": "Sources/tracking/Walk.txt"})
         self.assertEqual(("PLAY", "Sources/motion/Wave.txt"), grpc.motion)
-        self.assertEqual("Sources/tracking/Walk.txt", grpc.tracking_motion)
         motion.dispatch("stop", {})
         self.assertEqual(("STOP", ""), grpc.motion)
 
