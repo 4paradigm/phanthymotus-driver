@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
+import time
 
 import unittest
 
@@ -141,9 +142,9 @@ class ProductionPluginTests(unittest.TestCase):
         p2.dispatch("disable", {})
         p2.dispatch("enable", {})
         p2._on_distance(1.0)
-        self.assertFalse(p2._controller._armed)  # need 2 frames, only 1
+        self.assertTrue(p2._controller._armed)  # need 2 frames, only 1 so still armed
         p2._on_distance(1.0)
-        self.assertTrue(p2._controller._armed)  # now armed again (cooldown or re-armed)
+        self.assertFalse(p2._controller._armed)  # triggered, _armed set to False
 
     def test_status_returns_enabled_and_topic(self):
         self.plugin.dispatch("start", {})
@@ -166,19 +167,22 @@ class ProductionPluginTests(unittest.TestCase):
         self.plugin.dispatch("start", {})
         self.plugin._on_distance(1.0)
         self.plugin._controller._armed = True  # prevent cooldown check in _welcome
-        # Force a second trigger so _welcome runs
+        # _on_distance triggers _welcome in a daemon thread; wait for it
+        time.sleep(0.3)
         self.stubs["tts"].dispatch.assert_called()
 
     def test_arm_non_zero_ret_marks_error(self):
         self.stubs["arm"].dispatch.return_value = {"ret": -1}
         self.plugin.dispatch("start", {})
         self.plugin._on_distance(1.0)
+        time.sleep(0.3)
         self.stubs["arm"].dispatch.assert_called()
 
     def test_tts_error_field_marks_error(self):
         self.stubs["tts"].dispatch.return_value = {"error": "device busy"}
         self.plugin.dispatch("start", {})
         self.plugin._on_distance(1.0)
+        time.sleep(0.3)
         self.stubs["tts"].dispatch.assert_called()
 
 

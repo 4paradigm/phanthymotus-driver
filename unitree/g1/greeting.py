@@ -190,6 +190,12 @@ class Plugin:
         self._enabled = bool(self._config.get("auto_start", True))
 
     def stop(self) -> None:
+        """Soft stop: disable the card but keep the ROS2 subscription alive."""
+        self._enabled = False
+        self._controller.reset()
+
+    def teardown(self) -> None:
+        """Hard stop: permanently remove the ROS2 node (called when plugin is discarded)."""
         self._enabled = False
         self._controller.reset()
         try:
@@ -254,6 +260,8 @@ class Plugin:
                     errors.append(f"TTS: {exc}")
 
             try:
+                if not self._enabled:
+                    return
                 self._led.dispatch("state", {"state": "speaking"})
                 speech_thread = threading.Thread(target=speak, daemon=True)
                 speech_thread.start()
@@ -268,7 +276,8 @@ class Plugin:
                 speech_thread.join()
                 if errors:
                     raise RuntimeError("; ".join(errors))
-                self._led.dispatch("state", {"state": "idle"})
+                if self._enabled:
+                    self._led.dispatch("state", {"state": "idle"})
             except Exception as exc:
                 print(f"[greeting] welcome action failed: {exc}", flush=True)
                 try:
