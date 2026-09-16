@@ -33,7 +33,6 @@ from common import lifecycle  # noqa: E402
 # ── declined vs. failed ──────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("result", [
-    None,                                        # answered nothing at all
     {"error": "unknown action: start"},
     {"error": "Unknown action: start (tool=home)"},
     {"error": "Unknown action 'start' for tool 'arm'"},

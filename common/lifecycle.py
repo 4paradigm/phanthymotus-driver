@@ -26,19 +26,25 @@ LIFECYCLE_ACTIONS = ("start", "stop", "info")
 
 
 def is_declined(result) -> bool:
-    """Did the plugin decline the action rather than fail at it?
+    """Did the plugin explicitly decline the action rather than fail at it?
 
-    The two must be told apart, and the distinction is the whole point:
+    Only an `unknown action` error with no `state` counts. The plugin has to
+    *say* it does not know the verb.
 
-    - **Declined** — no reply at all, or an `unknown action` error with no
-      `state`. The plugin is saying it does not know the verb.
-    - **Failed** — anything carrying `state`, and any other error text. This is
-      what agent-core now exists to surface and must pass through untouched. A
-      speaker answering `Missing input_topic` really is bound to nothing and
-      still fails.
+    `None` deliberately does not count, though an earlier version of this
+    accepted it. A plugin that returns nothing has fallen off the end of its
+    dispatch — a bug — and every bundle here already surfaces that, either as
+    an explicit error or by letting the HTTP layer reject it. Treating it as a
+    polite decline turned it into `{"state": "running"}` in five of the six
+    bundles, because their `result is None` guard runs *after* this check or
+    does not exist. That is precisely the silent success that made agent-core
+    start reading these replies in the first place, so accepting `None` here
+    would have put it back.
+
+    Anything carrying `state`, and any other error text, is a failure and must
+    pass through untouched — a speaker answering `Missing input_topic` really
+    is bound to nothing.
     """
-    if result is None:
-        return True
     if not isinstance(result, dict) or "state" in result:
         return False
     return str(result.get("error", "")).strip().lower().startswith("unknown action")
