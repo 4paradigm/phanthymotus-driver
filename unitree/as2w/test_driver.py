@@ -3,7 +3,10 @@
 Run with: python3 -m unittest unitree/as2w/test_driver.py
 """
 import importlib.util
+import math
 import sys
+import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -42,6 +45,7 @@ class _Proxy:
     def __init__(self):
         self.moves = []
         self.stops = 0
+        self.calls = []
 
     def Move(self, *args):
         self.moves.append(args)
@@ -51,12 +55,33 @@ class _Proxy:
         self.stops += 1
         return 0
 
+    def Euler(self, *args):
+        self.calls.append(("Euler", args))
+        return 0
+
+    def SpeedLevel(self, *args):
+        self.calls.append(("SpeedLevel", args))
+        return 0
+
+    def BodyHeight(self, *args):
+        self.calls.append(("BodyHeight", args))
+        return 0
+
+    def BodyPosition(self, *args):
+        self.calls.append(("BodyPosition", args))
+        return 0
+
+    def SwitchGait(self, *args):
+        self.calls.append(("SwitchGait", args))
+        return 0
+
 
 class TestDriverContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _install_device_stubs()
         cls.device = _load("as2w_device_under_test", ROOT / "device.py")
+        cls.motion = _load("as2w_motion_under_test", ROOT / "motion_tools.py")
         cls.spatial = _load("as2w_spatial_under_test", ROOT / "controlled_spatial.py")
 
     def test_card_stop_cancels_continuous_move(self):
@@ -79,6 +104,81 @@ class TestDriverContracts(unittest.TestCase):
 
         self.assertEqual(0, result["ret"])
         self.assertEqual([True], preemptions)
+
+    def test_timed_move_returns_action_id_and_notifies_acp(self):
+        proxy = _Proxy()
+        notifications = []
+        executor = self.motion.MotionExecutor(
+            proxy, notifier=lambda *args: notifications.append(args),
+        )
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        plugin.set_motion_executor(executor)
+
+        started_at = time.monotonic()
+        result = plugin.dispatch("move", {
+            "vx": 0.1, "vy": 0, "vyaw": 0, "duration": 0.03,
+        })
+
+        self.assertLess(time.monotonic() - started_at, 0.2)
+        self.assertEqual("running", result["state"])
+        self.assertTrue(result["action_id"].startswith("as2w_loco_"))
+        deadline = time.monotonic() + 1
+        while not notifications and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(1, len(notifications))
+        self.assertEqual("completed", notifications[0][1])
+        self.assertGreaterEqual(proxy.stops, 2)
+
+    def test_timed_move_cancellation_notifies_acp_once(self):
+        proxy = _Proxy()
+        notifications = []
+        executor = self.motion.MotionExecutor(
+            proxy, notifier=lambda *args: notifications.append(args),
+        )
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        plugin.set_motion_executor(executor)
+
+        result = plugin.dispatch("move", {
+            "vx": 0.1, "vy": 0, "vyaw": 0, "duration": 1.0,
+        })
+        deadline = time.monotonic() + 1
+        while not proxy.moves and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stopped = plugin.dispatch("stop_move", {})
+
+        self.assertEqual(0, stopped["ret"])
+        self.assertEqual(1, len(notifications))
+        self.assertEqual(result["action_id"], notifications[0][0])
+        self.assertEqual("cancelled", notifications[0][1])
+        self.assertEqual("cancelled", notifications[0][2]["state"])
+        time.sleep(0.02)
+        self.assertEqual(1, len(notifications))
+
+    def test_loco_schema_declares_timed_move_completion(self):
+        plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
+        completion = plugin.get_tool()["inputSchema"]["x-completion"]
+        self.assertIn("move", completion["actions"])
+        self.assertEqual(40, completion["timeout"])
+
+    def test_loco_rejects_nonfinite_and_out_of_range_controls(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        cases = (
+            ("move", {"vx": math.inf}),
+            ("euler", {"roll": 0.21}),
+            ("euler", {"pitch": math.nan}),
+            ("body_height", {"height": 0.31}),
+            ("body_position", {"x": 0.21}),
+            ("switch_gait", {"level": 1}),
+            ("speed_level", {"level": 2}),
+        )
+
+        for action, args in cases:
+            with self.subTest(action=action, args=args):
+                result = plugin.dispatch(action, args)
+                self.assertEqual("INVALID_ARGUMENT", result["code"])
+        self.assertEqual([], proxy.moves)
+        self.assertEqual([], proxy.calls)
 
     def test_special_actions_are_schema_marked_and_confirmed(self):
         proxy = _Proxy()
@@ -111,6 +211,20 @@ class TestDriverContracts(unittest.TestCase):
         urdf = (ROOT / "resource" / "as2w.urdf").read_text()
         self.assertIn('<robot name="AS2W">', urdf)
         self.assertNotIn("meshes/", urdf)
+
+    def test_sdk_crc_library_is_selected_and_verified_during_image_build(self):
+        self.assertEqual([], list((ROOT / "unitree_sdk2py").rglob("crc_*.so")))
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        for expected in (
+            "ARG TARGETARCH",
+            "crc_amd64.so",
+            "crc_aarch64.so",
+            "65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5",
+            "b136a91a7e99c5cf914f465e131f63c897a17107939184a6f85d1a57cf315ade",
+            "a4db103653db78540d141ff4dc55216b83e5298280e639b2ad54a84ac2fae9a5",
+            "sha256sum -c -",
+        ):
+            self.assertIn(expected, dockerfile)
 
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)

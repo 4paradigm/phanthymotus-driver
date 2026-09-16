@@ -22,13 +22,20 @@ the Unitree SDK uses CycloneDDS Domain 0 and binds to the robot interface passed
 to `main.py`. These are deliberately separate DDS implementations and domains.
 The image installs the small CMake toolchain because the SDK's pinned
 `cyclonedds==0.10.5` Python binding must link against a matching CycloneDDS
-build; the vendored CRC `.so` files are the official SDK's architecture-specific
-runtime dependencies and are required on both amd64 and aarch64.
+build. During the image build, Docker selects the target architecture, downloads
+only its CRC `.so` from the pinned official Unitree SDK commit, and verifies the
+artifact against a fixed SHA-256 digest. Architecture-specific binaries are not
+stored in this repository.
 
 `duration=-1` starts a 10 Hz velocity command loop; `stop_move`, shutdown, and
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
-attitude inputs are clamped before reaching the robot. Special actions should only
-be invoked with a clear area and appropriate operator approval.
+attitude inputs outside the documented bounds are rejected before reaching the
+robot. A positive `duration` runs asynchronously, returns an ACP `action_id`,
+and reports completion after `StopMove`; it never blocks the MCP request thread.
+Special actions should only be invoked with a clear area and appropriate
+operator approval. Conservative AS2 limits are enforced for Euler attitude
+(roll ±0.2 rad, pitch/yaw ±0.3 rad), body height (±0.3 m), body position
+(x/y/z ±0.2 m), speed level (-1/0/1), and the SDK-documented gait type 0.
 
 The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint

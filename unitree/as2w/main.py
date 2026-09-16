@@ -34,7 +34,7 @@ class Bundle:
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         motion_executor = MotionExecutor(proxy)
         loco = LocoPlugin(p.get("loco", {}), namespace, executor, proxy)
-        loco.set_external_motion_stop(motion_executor.stop)
+        loco.set_motion_executor(motion_executor)
         if p.get("loco", {}).get("enabled", True): self.plugins.append(loco)
         def stop_loco():
             motion_executor.stop()

@@ -15,6 +15,20 @@ COPY requirements.txt /work/requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt && \
     pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
+ARG TARGETARCH
+ARG UNITREE_SDK_COMMIT=65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5
+RUN set -eu; \
+    case "${TARGETARCH}" in \
+      amd64) crc_file=crc_amd64.so; crc_sha=b136a91a7e99c5cf914f465e131f63c897a17107939184a6f85d1a57cf315ade ;; \
+      arm64) crc_file=crc_aarch64.so; crc_sha=a4db103653db78540d141ff4dc55216b83e5298280e639b2ad54a84ac2fae9a5 ;; \
+      *) echo "unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    crc_dir=/work/unitree_sdk2py/utils/lib; \
+    mkdir -p "${crc_dir}"; \
+    curl -fsSL \
+      "https://raw.githubusercontent.com/unitreerobotics/unitree_sdk2_python/${UNITREE_SDK_COMMIT}/unitree_sdk2py/utils/lib/${crc_file}" \
+      -o "${crc_dir}/${crc_file}"; \
+    echo "${crc_sha}  ${crc_dir}/${crc_file}" | sha256sum -c -
 COPY main.py device.py lidar.py controlled_spatial.py motion_tools.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/

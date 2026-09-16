@@ -18,6 +18,27 @@ def _number(value, default=0.0):
         return default
 
 
+def _bounded_argument(args, name, minimum, maximum):
+    value = args.get(name, 0)
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number")
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        raise ValueError(f"{name} must be finite and between {minimum} and {maximum}")
+    return value
+
+
+def _integer_argument(args, name, allowed):
+    value = args.get(name, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value not in allowed:
+        choices = ", ".join(str(item) for item in sorted(allowed))
+        raise ValueError(f"{name} must be one of: {choices}")
+    return value
+
+
 _REMOTE_BUTTONS_BYTE2 = (
     ("LT", 5), ("RT", 4), ("back", 3), ("start", 2), ("LB", 1), ("RB", 0),
 )
@@ -180,20 +201,42 @@ class StatePlugin:
 
 class LocoPlugin:
     PREFIX = "loco"
+    _ROLL_LIMITS = (-0.2, 0.2)
+    _PITCH_LIMITS = (-0.3, 0.3)
+    _YAW_LIMITS = (-0.3, 0.3)
+    _BODY_HEIGHT_LIMITS = (-0.3, 0.3)
+    _BODY_POSITION_LIMITS = (-0.2, 0.2)
+    _GAIT_TYPES = {0}
     def __init__(self, config, namespace, executor, proxy):
         self.proxy = proxy
         self._lock = threading.Lock()
         self._stop = None
         self._stop_external_motion = None
+        self._motion_executor = None
     def set_external_motion_stop(self, callback):
         self._stop_external_motion = callback
+    def set_motion_executor(self, executor):
+        self._motion_executor = executor
+        self._stop_external_motion = executor.stop
     def get_tool(self):
         actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_gait", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
                 "description": "Unitree AS2 locomotion via SportClient", "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": actions}, "vx": {"type": "number"}, "vy": {"type": "number"}, "vyaw": {"type": "number"},
-                    "duration": {"type": "number", "minimum": -1, "maximum": 30}, "roll": {"type": "number"}, "pitch": {"type": "number"}, "yaw": {"type": "number"},
-                    "level": {"type": "integer"}, "height": {"type": "number"}, "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}, "flag": {"type": "boolean"}}, "required": ["action"],
+                    "action": {"type": "string", "enum": actions},
+                    "vx": {"type": "number", "minimum": -1.5, "maximum": 1.5},
+                    "vy": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+                    "vyaw": {"type": "number", "minimum": -2.0, "maximum": 2.0},
+                    "duration": {"type": "number", "minimum": -1, "maximum": 30},
+                    "roll": {"type": "number", "minimum": -0.2, "maximum": 0.2},
+                    "pitch": {"type": "number", "minimum": -0.3, "maximum": 0.3},
+                    "yaw": {"type": "number", "minimum": -0.3, "maximum": 0.3},
+                    "level": {"type": "integer", "enum": [-1, 0, 1]},
+                    "height": {"type": "number", "minimum": -0.3, "maximum": 0.3},
+                    "x": {"type": "number", "minimum": -0.2, "maximum": 0.2},
+                    "y": {"type": "number", "minimum": -0.2, "maximum": 0.2},
+                    "z": {"type": "number", "minimum": -0.2, "maximum": 0.2},
+                    "flag": {"type": "boolean"}}, "required": ["action"],
+                "x-completion": {"actions": ["move"], "timeout": 40},
                 "x-action-params": {
                     "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with optional duration (-1 for continuous)."},
                     "stop_move": {"params": [], "description": "Stop movement."},
@@ -207,9 +250,13 @@ class LocoPlugin:
                     "get_state": {"params": [], "description": "Read sport state."}}}}
     def start(self): pass
     def stop(self):
+        if self._motion_executor:
+            self._motion_executor.stop(self.PREFIX)
         self._stop_continuous()
         self.proxy.StopMove()
     def interrupt_motion(self):
+        if self._motion_executor:
+            self._motion_executor.stop(self.PREFIX)
         self._stop_continuous()
         return self.proxy.StopMove()
     def _stop_continuous(self):
@@ -223,6 +270,28 @@ class LocoPlugin:
                 if self.proxy.Move(vx, vy, yaw) != 0: break
                 event.wait(.1)
         threading.Thread(target=run, daemon=True).start()
+    def _timed_move(self, vx, vy, yaw, duration):
+        if self._motion_executor is None:
+            return {"error": "timed motion executor is unavailable", "code": "UNAVAILABLE"}
+        def worker(stop_event):
+            started = time.monotonic()
+            samples = 0
+            while not stop_event.is_set():
+                elapsed = time.monotonic() - started
+                if elapsed >= duration:
+                    break
+                ret = self.proxy.Move(vx, vy, yaw)
+                if ret != 0:
+                    return {"state": "failed", "ret": ret, "samples": samples}
+                samples += 1
+                stop_event.wait(0.1)
+            return {"state": "cancelled" if stop_event.is_set() else "completed",
+                    "samples": samples, "duration": round(time.monotonic() - started, 3),
+                    "vx": vx, "vy": vy, "vyaw": yaw}
+        result = self._motion_executor.start(self.PREFIX, worker)
+        if "error" not in result:
+            result.update({"vx": vx, "vy": vy, "vyaw": yaw, "duration": duration})
+        return result
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
@@ -233,24 +302,50 @@ class LocoPlugin:
         if action != "get_state" and self._stop_external_motion:
             self._stop_external_motion()
         if action == "move":
-            vx, vy, yaw = max(-1.5, min(1.5, float(args.get("vx", 0)))), max(-1, min(1, float(args.get("vy", 0)))), max(-2, min(2, float(args.get("vyaw", 0))))
-            duration = args.get("duration")
+            try:
+                vx = _bounded_argument(args, "vx", -1.5, 1.5)
+                vy = _bounded_argument(args, "vy", -1.0, 1.0)
+                yaw = _bounded_argument(args, "vyaw", -2.0, 2.0)
+                duration = args.get("duration")
+                if duration is not None:
+                    duration = _bounded_argument(args, "duration", -1.0, 30.0)
+            except ValueError as exc:
+                return {"error": str(exc), "code": "INVALID_ARGUMENT"}
             if duration is None: return {"ret": self.proxy.Move(vx, vy, yaw), "vx": vx, "vy": vy, "vyaw": yaw}
-            duration = float(duration)
-            if not math.isfinite(duration) or duration > 30:
-                return {"ret": -1, "message": "duration must be at most 30 seconds"}
             if duration == -1:
                 self._continuous(vx, vy, yaw); return {"ret": 0, "status": "running", "duration": -1}
-            if duration < 0: return {"ret": -1, "message": "duration must be -1, 0, or positive"}
-            self._stop_continuous(); ret = self.proxy.Move(vx, vy, yaw); time.sleep(duration); self.proxy.StopMove(); return {"ret": ret, "duration": duration}
+            if duration < 0:
+                return {"error": "duration must be -1, 0, or positive", "code": "INVALID_ARGUMENT"}
+            if duration == 0:
+                return {"state": "idle", "ret": self.proxy.StopMove(), "duration": 0}
+            self._stop_continuous()
+            return self._timed_move(vx, vy, yaw, duration)
         if action == "stop_move": self._stop_continuous(); return {"ret": self.proxy.StopMove()}
         methods = {"stand_up": "StandUp", "stand_down": "StandDown", "balance_stand": "BalanceStand", "recovery_stand": "RecoveryStand", "damp": "Damp"}
         if action in methods: return {"ret": getattr(self.proxy, methods[action])()}
-        if action == "euler": return {"ret": self.proxy.Euler(float(args.get("roll", 0)), float(args.get("pitch", 0)), float(args.get("yaw", 0)))}
-        if action == "speed_level": return {"ret": self.proxy.SpeedLevel(max(-1, min(1, int(args.get("level", 0)))))}
-        if action == "body_height": return {"ret": self.proxy.BodyHeight(float(args.get("height", 0)))}
-        if action == "body_position": return {"ret": self.proxy.BodyPosition(float(args.get("x", 0)), float(args.get("y", 0)), float(args.get("z", 0)), float(args.get("yaw", 0)))}
-        if action == "switch_gait": return {"ret": self.proxy.SwitchGait(int(args.get("level", 0)))}
+        try:
+            if action == "euler":
+                roll = _bounded_argument(args, "roll", *self._ROLL_LIMITS)
+                pitch = _bounded_argument(args, "pitch", *self._PITCH_LIMITS)
+                yaw = _bounded_argument(args, "yaw", *self._YAW_LIMITS)
+                return {"ret": self.proxy.Euler(roll, pitch, yaw)}
+            if action == "speed_level":
+                level = _integer_argument(args, "level", {-1, 0, 1})
+                return {"ret": self.proxy.SpeedLevel(level)}
+            if action == "body_height":
+                height = _bounded_argument(args, "height", *self._BODY_HEIGHT_LIMITS)
+                return {"ret": self.proxy.BodyHeight(height)}
+            if action == "body_position":
+                x = _bounded_argument(args, "x", *self._BODY_POSITION_LIMITS)
+                y = _bounded_argument(args, "y", *self._BODY_POSITION_LIMITS)
+                z = _bounded_argument(args, "z", *self._BODY_POSITION_LIMITS)
+                yaw = _bounded_argument(args, "yaw", *self._YAW_LIMITS)
+                return {"ret": self.proxy.BodyPosition(x, y, z, yaw)}
+            if action == "switch_gait":
+                level = _integer_argument(args, "level", self._GAIT_TYPES)
+                return {"ret": self.proxy.SwitchGait(level)}
+        except ValueError as exc:
+            return {"error": str(exc), "code": "INVALID_ARGUMENT"}
         if action == "auto_recovery": return {"ret": self.proxy.SetAutoRecovery(1 if args.get("flag", True) else 0)}
         if action == "switch_joystick": return {"ret": self.proxy.SwitchJoystick(1 if args.get("flag", True) else 0)}
         if action == "left_side_gait": return {"ret": self.proxy.LeftSideGait(1 if args.get("flag", True) else 0)}
