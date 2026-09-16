@@ -61,6 +61,8 @@ supported.
 official `SportClient.Move` API. Its atomic actions are `circle`,
 `figure_eight`, and `slalom`; each has a finite duration, publishes an action
 identifier, and can be interrupted immediately with `stop`.
+Starting any generated trajectory requires an explicit `confirm=true`. Terminal
+success, cancellation, and error states are reported to Agent Core through ACP.
 
 `motion_recorder` records timestamped velocity samples submitted through its
 own `drive` action and stores them under
@@ -70,3 +72,5 @@ own `drive` action and stores them under
 ends with `StopMove`. Calls made directly to the separate `loco` card are not
 implicitly recorded; a workflow that needs recording must route velocity
 commands through `motion_recorder.drive`.
+Both `drive` and `play` require `confirm=true`; playback also reports its
+terminal state through ACP so the physical-action barrier is released promptly.

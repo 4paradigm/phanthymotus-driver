@@ -17,6 +17,31 @@ _MAX_RECORDING_FRAMES = 6000
 _DEFAULT_RECORDINGS_DIR = "/opt/phanthy-motus/data/as2w-motion-recordings"
 
 
+def _acp_notify(action_id, status, result, tool):
+    """Report one terminal asynchronous-motion result to Agent Core."""
+    import ssl
+    import urllib.request
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        request = urllib.request.Request(
+            f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(
+            request, timeout=5, context=ssl._create_unverified_context()
+        )
+    except Exception as exc:
+        print(f"[{tool}] ACP callback failed for {action_id}: {exc}", flush=True)
+
+
 def _finite(value, name):
     try:
         result = float(value)
@@ -45,8 +70,9 @@ def _velocity(args):
 class MotionExecutor:
     """Own the one background SportClient velocity stream allowed at a time."""
 
-    def __init__(self, proxy):
+    def __init__(self, proxy, notifier=None):
         self._proxy = proxy
+        self._notifier = notifier or _acp_notify
         self._lock = threading.RLock()
         self._thread = None
         self._stop_event = None
@@ -69,13 +95,25 @@ class MotionExecutor:
                 result = {"state": "failed", "error": str(exc)}
             finally:
                 stop_ret = self._proxy.StopMove()
+                if stop_ret != 0 and result.get("state") == "completed":
+                    result = {**result, "state": "failed",
+                              "error": "StopMove failed", "stop_ret": stop_ret}
+                final_result = {**result, "stop_ret": stop_ret}
                 with self._lock:
                     if self._action_id == action_id:
-                        self._last_result = {**result, "stop_ret": stop_ret}
+                        self._last_result = final_result
                         self._thread = None
                         self._stop_event = None
                         self._owner = None
                         self._action_id = None
+                completion = {
+                    "completed": "completed",
+                    "cancelled": "cancelled",
+                }.get(result.get("state"), "error")
+                try:
+                    self._notifier(action_id, completion, final_result, owner)
+                except Exception as exc:
+                    print(f"[{owner}] ACP notifier failed for {action_id}: {exc}", flush=True)
 
         thread = threading.Thread(target=run, daemon=True, name=action_id)
         with self._lock:
@@ -150,13 +188,14 @@ class TrajectoryMotionPlugin:
                     "duration": {"type": "number", "minimum": 1.0, "maximum": 30.0},
                     "yaw_amplitude": {"type": "number", "minimum": 0.1, "maximum": 1.2},
                     "period": {"type": "number", "minimum": 1.0, "maximum": 10.0},
+                    "confirm": {"type": "boolean", "description": "Must be true to start motion."},
                 },
                 "required": ["action"],
                 "x-is-dangerous": True,
                 "x-action-params": {
-                    "circle": {"params": ["radius", "speed", "loops", "direction"]},
-                    "figure_eight": {"params": ["radius", "speed", "loops", "direction"]},
-                    "slalom": {"params": ["speed", "duration", "yaw_amplitude", "period"]},
+                    "circle": {"params": ["radius", "speed", "loops", "direction", "confirm"]},
+                    "figure_eight": {"params": ["radius", "speed", "loops", "direction", "confirm"]},
+                    "slalom": {"params": ["speed", "duration", "yaw_amplitude", "period", "confirm"]},
                     "status": {"params": []},
                     "stop": {"params": []},
                 },
@@ -198,6 +237,9 @@ class TrajectoryMotionPlugin:
             return self._executor.status(self.PREFIX)
         if action == "stop":
             return self.stop()
+        if action in ("circle", "figure_eight", "slalom") and args.get("confirm") is not True:
+            return {"error": "trajectory motion requires confirm=true",
+                    "code": "CONFIRMATION_REQUIRED"}
         try:
             speed = _bounded(args.get("speed", 0.25), "speed", 0.05, 0.6)
             if action in ("circle", "figure_eight"):
@@ -272,14 +314,15 @@ class MotionRecorderPlugin:
                     "vx": {"type": "number", "minimum": -1.5, "maximum": 1.5},
                     "vy": {"type": "number", "minimum": -1.0, "maximum": 1.0},
                     "vyaw": {"type": "number", "minimum": -2.0, "maximum": 2.0},
+                    "confirm": {"type": "boolean", "description": "Must be true for drive and play."},
                 },
                 "required": ["action"],
                 "x-is-dangerous": True,
                 "x-action-params": {
                     "record_start": {"params": ["label", "duration"]},
-                    "drive": {"params": ["vx", "vy", "vyaw"]},
+                    "drive": {"params": ["vx", "vy", "vyaw", "confirm"]},
                     "record_stop": {"params": []},
-                    "play": {"params": ["name", "speed_scale"]},
+                    "play": {"params": ["name", "speed_scale", "confirm"]},
                     "stop_playback": {"params": []},
                     "list": {"params": []},
                     "delete": {"params": ["name"]},
@@ -338,6 +381,9 @@ class MotionRecorderPlugin:
             return {"state": "recording", "name": self._record_name, "frames": 0}
 
     def _drive(self, args):
+        if args.get("confirm") is not True:
+            return {"error": "recorded drive requires confirm=true",
+                    "code": "CONFIRMATION_REQUIRED"}
         try:
             velocity = _velocity(args)
         except ValueError as exc:
@@ -397,7 +443,7 @@ class MotionRecorderPlugin:
         frames = payload.get("frames")
         if payload.get("version") != 1 or not isinstance(frames, list):
             raise ValueError("unsupported recording format")
-        if not frames or len(frames) > _MAX_RECORDING_FRAMES:
+        if len(frames) < 2 or len(frames) > _MAX_RECORDING_FRAMES:
             raise ValueError("recording has an invalid frame count")
         normalized = []
         previous = -1
@@ -408,11 +454,16 @@ class MotionRecorderPlugin:
             velocity = _velocity(frame)
             normalized.append((timestamp, velocity))
             previous = timestamp
+        if normalized[-1][0] <= 0:
+            raise ValueError("recording duration must be positive")
         return payload, normalized
 
     def _play(self, args):
         if self._recording:
             return {"error": "cannot play while recording", "code": "RECORDING_ACTIVE"}
+        if args.get("confirm") is not True:
+            return {"error": "motion playback requires confirm=true",
+                    "code": "CONFIRMATION_REQUIRED"}
         try:
             name = str(args.get("name", ""))
             speed_scale = _bounded(args.get("speed_scale", 1), "speed_scale", 0.25, 2.0)

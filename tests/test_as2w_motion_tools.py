@@ -59,7 +59,8 @@ def wait_until(predicate, timeout=1.0):
 
 def test_motion_executor_cancels_worker_and_stops_robot():
     proxy = FakeProxy()
-    executor = motion_tools.MotionExecutor(proxy)
+    notifications = []
+    executor = motion_tools.MotionExecutor(proxy, notifier=lambda *args: notifications.append(args))
     entered = threading.Event()
 
     def worker(stop_event):
@@ -75,6 +76,28 @@ def test_motion_executor_cancels_worker_and_stops_robot():
     assert stopped["state"] == "idle"
     assert proxy.stops >= 2
     assert executor.status()["state"] == "idle"
+    assert wait_until(lambda: len(notifications) == 1)
+    assert notifications[0][1] == "cancelled"
+    assert notifications[0][3] == "trajectory_motion"
+
+
+def test_motion_executor_notifies_completed_and_failed_terminal_states():
+    proxy = FakeProxy()
+    notifications = []
+    executor = motion_tools.MotionExecutor(proxy, notifier=lambda *args: notifications.append(args))
+
+    executor.start("trajectory_motion", lambda _: {"state": "completed", "samples": 2})
+    assert wait_until(lambda: len(notifications) == 1)
+    assert notifications[0][1] == "completed"
+    assert notifications[0][2]["samples"] == 2
+
+    def fail(_):
+        raise RuntimeError("worker failed")
+
+    executor.start("motion_recorder", fail)
+    assert wait_until(lambda: len(notifications) == 2)
+    assert notifications[1][1] == "error"
+    assert notifications[1][2]["error"] == "worker failed"
 
 
 def test_trajectory_contract_and_circle_math():
@@ -87,9 +110,14 @@ def test_trajectory_contract_and_circle_math():
     schema = plugin.get_tool()["inputSchema"]
     assert schema["x-is-dangerous"] is True
     assert set(schema["x-completion"]["actions"]) == {"circle", "figure_eight", "slalom"}
+    assert "confirm" in schema["x-action-params"]["circle"]["params"]
+    rejected = plugin.dispatch("circle", {"radius": 1.0, "speed": 0.5})
+    assert rejected["code"] == "CONFIRMATION_REQUIRED"
+    assert executor.worker is None
 
     result = plugin.dispatch("circle", {
         "radius": 1.0, "speed": 0.5, "loops": 1, "direction": "right",
+        "confirm": True,
     })
     assert result["state"] == "running"
     assert loco_stops == [True]
@@ -114,7 +142,7 @@ def test_trajectory_rejects_unbounded_duration():
         {}, FakeProxy(), CapturingExecutor(), lambda: None,
     )
     result = plugin.dispatch("figure_eight", {
-        "radius": 3.0, "speed": 0.05, "loops": 3,
+        "radius": 3.0, "speed": 0.05, "loops": 3, "confirm": True,
     })
     assert result["code"] == "INVALID_ARGUMENT"
     assert "60 seconds" in result["error"]
@@ -130,21 +158,31 @@ def test_record_drive_save_list_play_and_delete(tmp_path):
 
     started = plugin.dispatch("record_start", {"label": "demo"})
     assert started["state"] == "recording"
-    assert plugin.dispatch("drive", {"vx": 0.2, "vy": -0.1, "vyaw": 0.3})["ret"] == 0
+    assert plugin.dispatch("drive", {
+        "vx": 0.2, "vy": -0.1, "vyaw": 0.3, "confirm": True,
+    })["ret"] == 0
+    time.sleep(0.002)
+    assert plugin.dispatch("drive", {
+        "vx": 0.1, "vy": 0.0, "vyaw": 0.0, "confirm": True,
+    })["ret"] == 0
     saved = plugin.dispatch("record_stop", {})
 
     assert saved["state"] == "saved"
-    assert saved["frames"] == 1
+    assert saved["frames"] == 2
     path = tmp_path / f"{saved['name']}.json"
     payload = json.loads(path.read_text())
     assert payload["frames"][0]["vx"] == 0.2
     assert plugin.dispatch("list", {})["recordings"][0]["name"] == saved["name"]
 
-    playing = plugin.dispatch("play", {"name": saved["name"], "speed_scale": 1})
+    rejected = plugin.dispatch("play", {"name": saved["name"]})
+    assert rejected["code"] == "CONFIRMATION_REQUIRED"
+    playing = plugin.dispatch("play", {
+        "name": saved["name"], "speed_scale": 1, "confirm": True,
+    })
     assert playing["state"] == "running"
     assert executor.owner == "motion_recorder"
     playback_result = executor.worker(threading.Event())
-    assert playback_result == {"state": "completed", "name": saved["name"], "frames_sent": 1}
+    assert playback_result == {"state": "completed", "name": saved["name"], "frames_sent": 2}
 
     deleted = plugin.dispatch("delete", {"name": saved["name"]})
     assert deleted == {"state": "deleted", "name": saved["name"]}
@@ -157,8 +195,11 @@ def test_recorder_requires_session_and_rejects_path_names(tmp_path):
     )
     plugin.start()
 
-    assert plugin.dispatch("drive", {"vx": 0.1})["code"] == "NOT_RECORDING"
-    assert plugin.dispatch("play", {"name": "../secret"})["code"] == "INVALID_RECORDING"
+    assert plugin.dispatch("drive", {"vx": 0.1})["code"] == "CONFIRMATION_REQUIRED"
+    assert plugin.dispatch("drive", {"vx": 0.1, "confirm": True})["code"] == "NOT_RECORDING"
+    assert plugin.dispatch("play", {
+        "name": "../secret", "confirm": True,
+    })["code"] == "INVALID_RECORDING"
     assert plugin.dispatch("delete", {"name": "../secret"})["code"] == "INVALID_RECORDING"
 
 
