@@ -71,6 +71,10 @@ class _Proxy:
         self.calls.append(("Euler", args))
         return 0
 
+    def FrontFlip(self):
+        self.calls.append(("FrontFlip", ()))
+        return 0
+
     def SpeedLevel(self, *args):
         self.calls.append(("SpeedLevel", args))
         return 0
@@ -135,6 +139,34 @@ class TestDriverContracts(unittest.TestCase):
 
         self.assertEqual(0, result["ret"])
         self.assertEqual([True], preemptions)
+
+    def test_non_move_loco_action_stops_continuous_velocity_stream(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+        deadline = time.monotonic() + 1
+        while not proxy.moves and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        result = plugin.dispatch("euler", {"roll": 0, "pitch": 0, "yaw": 0})
+        move_count = len(proxy.moves)
+        time.sleep(0.12)
+
+        self.assertEqual(0, result["ret"])
+        self.assertIsNone(plugin._stop)
+        self.assertEqual(move_count, len(proxy.moves))
+
+    def test_special_action_prepares_by_stopping_loco_motion(self):
+        proxy = _Proxy()
+        prepared = []
+        plugin = self.device.SpecialActionPlugin(
+            {}, "test", None, proxy, prepare_motion=lambda: prepared.append(True),
+        )
+
+        result = plugin.dispatch("front_flip", {"confirm": True})
+
+        self.assertEqual(0, result["ret"])
+        self.assertEqual([True], prepared)
 
     def test_timed_move_returns_action_id_and_notifies_acp(self):
         proxy = _Proxy()
@@ -304,6 +336,15 @@ class TestDriverContracts(unittest.TestCase):
             ["eth_robot", ""],
             self.main._network_candidates("", names, addresses.__getitem__),
         )
+
+    def test_channel_initialization_rejects_explicit_false(self):
+        with self.assertRaisesRegex(RuntimeError, "returned false"):
+            self.main._initialize_channel(lambda *_: False, "eth_robot")
+        self.assertIsNone(self.main._initialize_channel(lambda *_: None, "eth_robot"))
+
+        for path in (ROOT / "rpc_proxy.py", ROOT / "controlled_spatial.py"):
+            self.assertIn("ChannelFactoryInitialize(0, interface or None) is False",
+                          path.read_text())
 
     def test_agent_core_tls_is_verified_by_default(self):
         for path in (ROOT / "main.py", ROOT / "motion_tools.py", ROOT / "controlled_spatial.py"):

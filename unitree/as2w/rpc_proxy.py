@@ -15,7 +15,8 @@ def _worker(commands, results, interface):
     try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
         from unitree_sdk2py.as2.sport.sport_client import SportClient
-        ChannelFactoryInitialize(0, interface or None)
+        if ChannelFactoryInitialize(0, interface or None) is False:
+            raise RuntimeError("ChannelFactoryInitialize returned false")
         client = SportClient()
         client.SetTimeout(10.0)
         client.Init()

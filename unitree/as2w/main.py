@@ -56,6 +56,12 @@ def _network_candidates(configured="", interface_names=None, address_lookup=None
     return candidates
 
 
+def _initialize_channel(factory, interface):
+    result = factory(0, interface or None)
+    if result is False:
+        raise RuntimeError("ChannelFactoryInitialize returned false")
+
+
 class _UnavailableProxy:
     """Preserve MCP availability when the robot DDS interface is absent."""
     def __getattr__(self, name):
@@ -166,7 +172,7 @@ def main():
     dds_ready = False
     for candidate in _network_candidates(interface):
         try:
-            ChannelFactoryInitialize(0, candidate or None)
+            _initialize_channel(ChannelFactoryInitialize, candidate)
             dds_ready = True
         except Exception as exc:
             print(f"[as2w] DDS init failed on {candidate or '(auto)'}: {exc}", flush=True)

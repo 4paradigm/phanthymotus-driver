@@ -317,6 +317,8 @@ class LocoPlugin:
             return {"state": "idle", "ret": self.proxy.StopMove()}
         if action != "get_state" and self._stop_external_motion:
             self._stop_external_motion()
+        if action != "get_state":
+            self._stop_continuous()
         if action in ("move", "timed_move"):
             try:
                 vx = _bounded_argument(args, "vx", -1.5, 1.5)

@@ -92,7 +92,8 @@ def _worker(commands, results, interface):
     _install_logsafe()
     try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-        ChannelFactoryInitialize(0, interface or None)
+        if ChannelFactoryInitialize(0, interface or None) is False:
+            raise RuntimeError("ChannelFactoryInitialize returned false")
         client = _SlamClient()
         results.put({"ready": True})
     except Exception as exc:
