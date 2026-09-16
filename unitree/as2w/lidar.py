@@ -1,4 +1,6 @@
 """AS2W lidar bridge from Unitree DDS PointCloud2 to sensor/pointcloud."""
+import array
+import queue
 import struct
 import threading
 import time
@@ -32,6 +34,14 @@ class _LidarNode:
         self._last_seen = {source: 0.0 for source in self.source_topics}
         self._frames = {source: 0 for source in self.source_topics}
         self._bytes = {source: 0 for source in self.source_topics}
+        # A live Livox frame can exceed 1 MiB. Do not serialize and publish it
+        # from the CycloneDDS callback; that starves the DDS reader and causes
+        # the intermittent one-frame behaviour observed on AS2W.
+        self._cloud_queue = queue.Queue(maxsize=1)
+        self._stopped = threading.Event()
+        self._worker = threading.Thread(target=self._publish_loop, daemon=True,
+                                        name="as2w_lidar_publish")
+        self._worker.start()
         for source_topic in self.source_topics:
             try:
                 sub = ChannelSubscriber(source_topic, PointCloud2_)
@@ -60,6 +70,18 @@ class _LidarNode:
                 "AS2W lidar has received no PointCloud2 frames. "
                 f"Candidates: {summary}. Set plugins.lidar.source_topics for this firmware.")
 
+    def _publish_loop(self):
+        while not self._stopped.is_set():
+            try:
+                point_step, point_count, data = self._cloud_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            payload = struct.pack("<II", point_step, point_count) + data
+            out = UInt8MultiArray()
+            # This avoids constructing millions of boxed Python ints per frame.
+            out.data = array.array("B", payload)
+            self.pub.publish(out)
+
     def _on_cloud(self, source, msg):
         data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
         point_step = int(msg.point_step)
@@ -80,10 +102,28 @@ class _LidarNode:
                     + (f" (replacing {previous})" if previous else ""))
             if source != self._active_source:
                 return
-        payload = struct.pack("<II", point_step, point_count) + data
-        out = UInt8MultiArray()
-        out.data = list(payload)
-        self.pub.publish(out)
+        try:
+            self._cloud_queue.put_nowait((point_step, point_count, data))
+        except queue.Full:
+            # A dashboard should receive the latest scan, never a stale backlog.
+            try:
+                self._cloud_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._cloud_queue.put_nowait((point_step, point_count, data))
+            except queue.Full:
+                pass
+
+    def close(self):
+        self._stopped.set()
+        for sub in self.subs:
+            try:
+                sub.Close()
+            except Exception:
+                pass
+        self._worker.join(timeout=1)
+        self.node.destroy_node()
 
 
 class LidarPlugin:
@@ -106,12 +146,7 @@ class LidarPlugin:
         pass
 
     def stop(self):
-        for sub in getattr(self.node, "subs", []):
-            try:
-                sub.Close()
-            except Exception:
-                pass
-        self.node.node.destroy_node()
+        self.node.close()
 
     def dispatch(self, action, args):
         if action in ("start", "info", "lidar_cloud"):
