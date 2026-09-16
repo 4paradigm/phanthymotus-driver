@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cma
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
 RUN curl -fsSL ${CYCLONEDDS_URL} | tar xz -C /tmp && \
     cmake -S /tmp/cyclonedds-0.10.5 -B /tmp/cyclonedds-0.10.5/build -DCMAKE_INSTALL_PREFIX=/opt/cyclonedds && \
-    cmake --build /tmp/cyclonedds-0.10.5/build --parallel --target install && \
+    cmake --build /tmp/cyclonedds-0.10.5/build --parallel 2 --target install && \
     rm -rf /tmp/cyclonedds-0.10.5
 ENV CYCLONEDDS_HOME=/opt/cyclonedds
 ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
