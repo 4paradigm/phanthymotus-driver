@@ -747,12 +747,21 @@ class CartesianPlugin:
         self.start_grace_seconds = float(safety.get("start_grace_seconds", 2.0))
         self.stall_timeout_seconds = float(safety.get("stall_timeout_seconds", 10.0))
         self.progress_threshold_mm = float(safety.get("progress_threshold_mm", 1.0))
+        self.euler_progress_threshold_deg = float(safety.get("euler_progress_threshold_deg", 0.5))
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
         cartesian = config.get("cartesian", {})
         self.cartesian_enabled = cartesian.get("enabled", False) is True
-        self.max_radius_mm = float(cartesian.get("max_radius_mm", 610.0))
-        self.max_position_abs_mm = float(cartesian.get("max_position_abs_mm", 610.0))
+        # 水平工作半径（基座轴线到 TCP 的水平距离，RM75-6F 官方标称 638.5mm）
+        self.max_radius_mm = float(cartesian.get("max_radius_mm", 640.0))
+        # 肩关节（joint2）距基座平面的高度，取自 resource/rm75_6f_v.urdf：0.16 + 0.18 = 0.34m
+        self.shoulder_height_mm = float(cartesian.get("shoulder_height_mm", 340.0))
+        # 肩部到末端 TCP 的最大直线臂展，取自 URDF 连杆长度：sqrt(0.88^2 + 0.18^2) ≈ 0.898m
+        self.max_reach_mm = float(cartesian.get("max_reach_mm", 900.0))
         self.max_euler_abs_deg = float(cartesian.get("max_euler_abs_deg", 360.0))
+        # 夹爪 TCP 相对法兰的伸出量（沿工具 +X 方向，正对齐法兰安装）。
+        # 机械臂关节直接约束的是法兰中心，故可达性校验需把夹爪 TCP 目标换算回法兰位置。
+        # 仅当控制器已将工具坐标系设为夹爪 TCP 时才应配置非零值；否则保持 0（法兰即 TCP）。
+        self.tool_length_mm = float(cartesian.get("tool_length_mm", 0.0))
 
     def get_tools(self):
         position_props = {
@@ -873,8 +882,10 @@ class CartesianPlugin:
             "euler_tolerance_deg": self.euler_tolerance_deg,
             "max_speed_percent": self.max_speed_percent,
             "max_radius_mm": self.max_radius_mm,
-            "max_position_abs_mm": self.max_position_abs_mm,
+            "shoulder_height_mm": self.shoulder_height_mm,
+            "max_reach_mm": self.max_reach_mm,
             "max_euler_abs_deg": self.max_euler_abs_deg,
+            "tool_length_mm": self.tool_length_mm,
         }
 
     def _start_cartesian(self, motion_type, args):
@@ -971,18 +982,34 @@ class CartesianPlugin:
 
     def _validate_workspace(self, pose_mm_deg):
         x, y, z, rx, ry, rz = pose_mm_deg
-        radius = math.sqrt(x * x + y * y + z * z)
-        if radius > self.max_radius_mm:
+        # 关节直接约束的是法兰中心。若控制器把工具坐标系设为夹爪 TCP，
+        # 需把 TCP 目标沿当前工具 +X 方向回退 tool_length_mm 得到法兰位置再校验。
+        fx, fy, fz = self._flange_from_tcp(x, y, z, rx, ry, rz)
+        # 水平工作半径：基座轴线到法兰的水平距离，而非到原点的 3D 距离。
+        # RM75-6F 标称工作半径 638.5mm，竖直臂展由肩高 + 臂长决定（可远大于水平半径）。
+        horizontal_radius = math.sqrt(fx * fx + fy * fy)
+        if horizontal_radius > self.max_radius_mm:
             raise ValueError(
-                f"pose radius {radius:.0f} mm exceeds cartesian.max_radius_mm {self.max_radius_mm:g}")
-        for value, label in ((x, "x"), (y, "y"), (z, "z")):
-            if abs(value) > self.max_position_abs_mm:
-                raise ValueError(
-                    f"{label} {value:.0f} mm exceeds cartesian.max_position_abs_mm {self.max_position_abs_mm:g}")
+                f"pose horizontal radius {horizontal_radius:.0f} mm exceeds cartesian.max_radius_mm {self.max_radius_mm:g}")
+        # 竖直方向用肩关节几何模型校验：以肩部为球心、臂长为半径。
+        # 这是仿人构型的自然约束，覆盖「竖直臂展大、水平半径小」的真实工作空间。
+        shoulder_radius = math.sqrt(fx * fx + fy * fy + (fz - self.shoulder_height_mm) ** 2)
+        if shoulder_radius > self.max_reach_mm:
+            raise ValueError(
+                f"pose distance {shoulder_radius:.0f} mm from shoulder exceeds cartesian.max_reach_mm {self.max_reach_mm:g}")
         for value, label in ((rx, "rx"), (ry, "ry"), (rz, "rz")):
             if abs(value) > self.max_euler_abs_deg:
                 raise ValueError(
                     f"{label} {value:.0f} deg exceeds cartesian.max_euler_abs_deg {self.max_euler_abs_deg:g}")
+
+    def _flange_from_tcp(self, x, y, z, rx, ry, rz):
+        """夹爪 TCP → 法兰中心：沿工具 +X 方向回退 tool_length_mm。"""
+        if self.tool_length_mm <= 0.0:
+            return x, y, z
+        col_x = self._euler_to_matrix(rx, ry, rz)[0]  # 基座系中工具 +X 轴的单位向量
+        return x - self.tool_length_mm * col_x[0], \
+               y - self.tool_length_mm * col_x[1], \
+               z - self.tool_length_mm * col_x[2]
 
     def _submit(self, motion_type, args, target, speed_percent):
         """下发 SDK 运动命令（非阻塞）。"""
@@ -1131,9 +1158,21 @@ class CartesianPlugin:
                               "position_error_mm": position_error, "euler_error_deg": euler_error,
                               "elapsed_seconds": now - started}
                     break
-                if (best_position_error is None
-                        or best_position_error - position_error >= self.progress_threshold_mm):
+                # 进度检测必须同时看位置与姿态：纯旋转运动位置误差恒为 0，
+                # 只看位置会把正常旋转误判为 stall 而中途慢停。
+                progress = False
+                if best_position_error is None:
                     best_position_error = position_error
+                    best_euler_error = euler_error
+                    progress = True
+                else:
+                    if best_position_error - position_error >= self.progress_threshold_mm:
+                        best_position_error = position_error
+                        progress = True
+                    if best_euler_error - euler_error >= self.euler_progress_threshold_deg:
+                        best_euler_error = euler_error
+                        progress = True
+                if progress:
                     last_progress = now
                 elif (now >= started + self.start_grace_seconds
                         and now - last_progress >= self.stall_timeout_seconds):
