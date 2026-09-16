@@ -1,12 +1,15 @@
-ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
-FROM ${ROS_BASE_IMAGE}
+# The internal ros-base image on Jetson contains the setup scripts but neither
+# rclpy nor its APT sources. Use the complete official multi-arch Humble base.
+FROM ros:humble-ros-base
 ARG PYPI_MIRROR=https://pypi.org/simple/
 WORKDIR /work
 ARG PYPI_MIRROR
 # Fail the image build early when the selected base image is not a ROS image.
 # Otherwise a bad `ros-base:latest` silently reaches the device and only fails
 # in the container restart loop while sourcing setup.bash.
-RUN test -f /opt/ros/humble/setup.bash || test -f /opt/ros/humble/setup.sh
+RUN test -f /opt/ros/humble/setup.bash && \
+    . /opt/ros/humble/setup.bash && \
+    python3 -c 'import rclpy; from std_msgs.msg import String'
 RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl && rm -rf /var/lib/apt/lists/*
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
 RUN curl -fsSL ${CYCLONEDDS_URL} | tar xz -C /tmp && \
