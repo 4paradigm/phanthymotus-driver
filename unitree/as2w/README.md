@@ -1,6 +1,6 @@
-# Unitree AS2W driver
+# Unitree As2W driver
 
-This bundle targets the Unitree **AS2W** wheel-legged robot and its SDK service documented in the Unitree
+This bundle targets the Unitree **As2W** wheel-legged robot and its SDK service documented in the Unitree
 SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5` and uses its dedicated
 `unitree_sdk2py.as2.sport.SportClient`: `Move`, `StopMove`, `StandUp`, `StandDown`,
@@ -37,7 +37,7 @@ The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint
 limits but omits the vendor STL visual/collision meshes. The driver only needs
 the kinematic chain for the `joints` skeleton card, avoiding large binary
-assets in the repository. AS2W has 16 movable joints (12 leg joints plus 4
+assets in the repository. As2W has 16 movable joints (12 leg joints plus 4
 continuous wheel-foot joints) and the fixed JT128 sensor mount.
 
 `controlled_spatial` is a thin adapter for Unitree's documented `slam_operate`

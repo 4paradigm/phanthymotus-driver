@@ -1,4 +1,4 @@
-<robot name="AS2W">
+<robot name="As2W">
   <link name="base_link">
     <inertial>
       <origin xyz="0.035002 -0.0007562 0.017521" rpy="0 0 0"/>

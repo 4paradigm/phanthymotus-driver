@@ -42,7 +42,7 @@ class Bundle:
         for plugin in self.plugins: plugin.stop()
     def tools(self):
         out = [
-            {"name": "model", "type": "resource", "description": "Unitree AS2W wheel-legged robot URDF model", "inputSchema": {"type": "object", "properties": {}}},
+            {"name": "model", "type": "resource", "description": "Unitree As2W wheel-legged robot URDF model", "inputSchema": {"type": "object", "properties": {}}},
         ]
         for plugin in self.plugins: out.extend(plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()])
         return out
@@ -186,7 +186,7 @@ def main():
     threading.Thread(target=lambda: executor.spin(), daemon=True).start()
     mcp_port = int(cfg.get("mcp_port", 15709))
     server = ThreadingHTTPServer(("", mcp_port), handler(bundle))
-    _start_registration(mcp_port, "Unitree AS2W Bundle", "driver")
+    _start_registration(mcp_port, "Unitree As2W Bundle", "driver")
     def shutdown(*_):
         bundle.stop_all()
         if hasattr(proxy, "stop"): proxy.stop()
