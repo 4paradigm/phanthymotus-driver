@@ -129,7 +129,9 @@ class LocoPlugin:
         threading.Thread(target=run, daemon=True).start()
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
-        if action == "stop": return {"state": "idle"}
+        if action == "stop":
+            self._stop_continuous()
+            return {"state": "idle", "ret": self.proxy.StopMove()}
         if action == "move":
             vx, vy, yaw = max(-1.5, min(1.5, float(args.get("vx", 0)))), max(-1, min(1, float(args.get("vy", 0)))), max(-2, min(2, float(args.get("vyaw", 0))))
             duration = args.get("duration")
@@ -175,6 +177,7 @@ class SpecialActionPlugin:
                     "enter": {"type": "boolean", "description": "Enter or exit a sustained posture."},
                     "confirm": {"type": "boolean", "description": "Required true for hazardous motions."}},
                     "required": ["action"],
+                    "x-is-dangerous": True,
                     "x-action-params": {
                         "front_flip": {"params": ["confirm"], "description": "DANGEROUS forward flip; requires confirm=true."},
                         "back_flip": {"params": ["confirm"], "description": "DANGEROUS backward flip; requires confirm=true."},

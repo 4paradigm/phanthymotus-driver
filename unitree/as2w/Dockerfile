@@ -24,5 +24,5 @@ ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 \
     RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
     RCUTILS_COLORIZED_OUTPUT=0 \
     CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
-EXPOSE 15705
+EXPOSE 15709
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]
