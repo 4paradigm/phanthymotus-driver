@@ -132,6 +132,8 @@ class TestDriverContracts(unittest.TestCase):
         urdf = (ROOT / "resource" / "as2w.urdf").read_text()
         self.assertIn('<robot name="AS2W">', urdf)
         self.assertNotIn("meshes/", urdf)
+        for name in ("FL_foot", "FR_foot", "RL_foot", "RR_foot"):
+            self.assertIn(f'<joint name="{name}" type="revolute">', urdf)
 
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
