@@ -7,6 +7,10 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 WORKDIR /work
 ARG PYPI_MIRROR
+# Fail the image build early when the selected base image is not a ROS image.
+# Otherwise a bad `ros-base:latest` silently reaches the device and only fails
+# in the container restart loop while sourcing setup.bash.
+RUN test -f /opt/ros/humble/setup.bash || test -f /opt/ros/humble/setup.sh
 RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl && rm -rf /var/lib/apt/lists/*
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
 RUN curl -fsSL ${CYCLONEDDS_URL} | tar xz -C /tmp && \
@@ -25,10 +29,13 @@ COPY main.py device.py lidar.py controlled_spatial.py rpc_proxy.py config.yaml /
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY deploy/ /deploy/
+COPY deploy/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 \
     ROS_DOMAIN_ID=42 \
     RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
     RCUTILS_COLORIZED_OUTPUT=0 \
     CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 EXPOSE 15709
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-}"]
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["python3", "/work/main.py"]
