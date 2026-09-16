@@ -14,21 +14,27 @@ import rclpy.executors
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from rpc_proxy import RpcProxy
 
+
+class _UnavailableProxy:
+    """Preserve MCP availability when the robot DDS interface is absent."""
+    def __getattr__(self, name):
+        return lambda *args: (3104, {}) if name == "GetState" else 3104
+
 def load_config():
     return yaml.safe_load(open(os.environ.get("CONFIG_PATH", Path(__file__).with_name("config.yaml"))))
 
 class Bundle:
-    def __init__(self, cfg, namespace, executor, proxy, interface):
+    def __init__(self, cfg, namespace, executor, proxy, interface, dds_ready=True):
         from device import StatePlugin, LocoPlugin, SpecialActionPlugin
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
-        if p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
+        if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
         if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy))
-        if p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
-        if p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
+        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
+        if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):
@@ -99,16 +105,36 @@ def main():
         print(f"[as2w] WARNING: FastDDS profile is missing: {profile or '(unset)'}", flush=True)
     else:
         print(f"[as2w] ROS2 isolation profile: {profile} (Domain 42, FastDDS); Unitree SDK: CycloneDDS Domain 0 on {interface or '(auto)'}", flush=True)
-    try: ChannelFactoryInitialize(0, interface)
-    except Exception as exc: print(f"[as2w] DDS init failed: {exc}")
+    dds_ready = False
+    candidates = [interface] if interface else []
+    try:
+        candidates.extend(name for name in os.listdir("/sys/class/net") if name not in candidates and name != "lo")
+    except OSError:
+        pass
+    candidates.append("")
+    for candidate in candidates:
+        try:
+            ChannelFactoryInitialize(0, candidate or None)
+            dds_ready = True
+        except Exception as exc:
+            print(f"[as2w] DDS init failed on {candidate or '(auto)'}: {exc}", flush=True)
+            dds_ready = False
+        if dds_ready:
+            interface = candidate
+            print(f"[as2w] Unitree DDS initialized on {interface or '(auto)'}", flush=True)
+            break
+    if not dds_ready:
+        print("[as2w] WARNING: Unitree DDS unavailable; starting MCP in degraded mode", flush=True)
     namespace = re.sub(r"[^a-zA-Z0-9_]", "_", cfg.get("ros_namespace") or socket.gethostname())
-    proxy = RpcProxy(interface); rclpy.init(); executor = rclpy.executors.MultiThreadedExecutor(); bundle = Bundle(cfg, namespace, executor, proxy, interface); bundle.start_all()
+    proxy = RpcProxy(interface) if dds_ready else _UnavailableProxy()
+    rclpy.init(); executor = rclpy.executors.MultiThreadedExecutor(); bundle = Bundle(cfg, namespace, executor, proxy, interface, dds_ready); bundle.start_all()
     threading.Thread(target=lambda: executor.spin(), daemon=True).start()
     mcp_port = int(cfg.get("mcp_port", 15709))
     server = ThreadingHTTPServer(("", mcp_port), handler(bundle))
     _start_registration(mcp_port, "Unitree AS2W Bundle", "driver")
     def shutdown(*_):
-        bundle.stop_all(); proxy.stop()
+        bundle.stop_all()
+        if hasattr(proxy, "stop"): proxy.stop()
         threading.Thread(target=server.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, shutdown); signal.signal(signal.SIGINT, shutdown); server.serve_forever()
 

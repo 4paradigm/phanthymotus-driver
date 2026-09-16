@@ -101,6 +101,25 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn('<robot name="AS2W">', urdf)
         self.assertNotIn("meshes/", urdf)
 
+    def test_state_sensor_info_includes_topic(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        for name in ("imu", "joints", "joint_state", "battery", "loco_state"):
+            result = plugin.dispatch(name, {})
+            self.assertEqual("running", result["state"])
+            self.assertTrue(result["topic_out"][0]["topic"].startswith("/test/"))
+
+    def test_lowstate_extra_motor_slots_are_ignored(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.imu = node.joints = node.joint_state = node.battery = types.SimpleNamespace(
+            publish=lambda message: published.append(message.data))
+        motors = [types.SimpleNamespace(q=float(i), dq=0, tau_est=0, temperature=0) for i in range(20)]
+        imu = types.SimpleNamespace(quaternion=[], gyroscope=[], accelerometer=[], rpy=[])
+        node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors, bms_state=None))
+        self.assertEqual(3, len(published))
+        self.assertEqual(16, len(__import__("json").loads(published[1])["joint_states"]))
+
 
 if __name__ == "__main__":
     unittest.main()

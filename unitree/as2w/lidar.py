@@ -39,7 +39,10 @@ class LidarPlugin:
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
     def start(self): pass
-    def stop(self): pass
+    def stop(self):
+        if getattr(self.node, "sub", None):
+            self.node.sub.Close()
+        self.node.node.destroy_node()
     def dispatch(self, action, args):
         if action in ("start", "info", "lidar_cloud"): return {"state": "running", "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
         if action == "stop": return {"state": "idle"}
