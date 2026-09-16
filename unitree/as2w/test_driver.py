@@ -250,8 +250,8 @@ class TestDriverContracts(unittest.TestCase):
         normalized = lidar._LidarNode._to_xyz(raw, 20, 1,
                                                {"x": 4, "y": 8, "z": 12}, False)
         x, y, z = struct.unpack("<fff", normalized)
-        self.assertAlmostEqual(-1.308, x, places=2)
-        self.assertAlmostEqual(-2.0, y, places=3)
+        self.assertAlmostEqual(2.0, x, places=3)
+        self.assertAlmostEqual(-1.308, y, places=2)
         self.assertAlmostEqual(2.879, z, places=2)
 
     def test_lidar_normalizes_big_endian_xyz(self):
@@ -261,8 +261,8 @@ class TestDriverContracts(unittest.TestCase):
         normalized = lidar._LidarNode._to_xyz(raw, 12, 1,
                                                {"x": 0, "y": 4, "z": 8}, True)
         x, y, z = struct.unpack("<fff", normalized)
-        self.assertAlmostEqual(-1.308, x, places=2)
-        self.assertAlmostEqual(2.0, y, places=3)
+        self.assertAlmostEqual(-2.0, x, places=3)
+        self.assertAlmostEqual(-1.308, y, places=2)
         self.assertAlmostEqual(2.879, z, places=2)
 
     def test_lidar_applies_as2w_jt128_mount_rotation(self):
@@ -272,8 +272,8 @@ class TestDriverContracts(unittest.TestCase):
         normalized = lidar._LidarNode._to_xyz(raw, 12, 1,
                                                {"x": 0, "y": 4, "z": 8}, False)
         x, y, z = struct.unpack("<fff", normalized)
-        self.assertAlmostEqual(-0.9945, x, places=3)
-        self.assertAlmostEqual(0.0, y, places=3)
+        self.assertAlmostEqual(0.0, x, places=3)
+        self.assertAlmostEqual(-0.9945, y, places=3)
         self.assertAlmostEqual(-0.1045, z, places=3)
 
 
