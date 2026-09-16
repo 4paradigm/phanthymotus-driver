@@ -38,6 +38,8 @@ import subprocess
 import sys
 import threading
 import time
+
+import lifecycle as _lifecycle
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -637,7 +639,7 @@ class TianyiDeviceBundle:
                             self._started_plugins.add(p)
                             print(f"[bundle] {type(p).__name__} lazy-started via MCP")
                         except Exception as e:
-                            return {"error": f"start failed: {e}"}
+                            return {"state": "error", "error": f"start failed: {e}"}
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
                     # 工具存在但插件不认这个 action：别把 None 冒泡上去，
@@ -645,6 +647,12 @@ class TianyiDeviceBundle:
                     if result is None:
                         return {"state": "error",
                                 "error": f"Unknown action: {action} (tool={tool_name})"}
+                    # A plugin that only knows its own verbs declines these
+                    # rather than failing at them — see lifecycle.py.
+                    if action in _lifecycle.LIFECYCLE_ACTIONS and \
+                            _lifecycle.is_unknown_action(result):
+                        return _lifecycle.lifecycle_reply(
+                            action, p in self._started_plugins)
                     return result
         return None
 
