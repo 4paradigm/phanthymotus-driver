@@ -1,12 +1,10 @@
-# The internal ros-base image on Jetson contains the setup scripts but neither
-# rclpy nor its APT sources. Use the complete official multi-arch Humble base.
-FROM ros:humble-ros-base
+ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
+FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
 WORKDIR /work
 ARG PYPI_MIRROR
-# Fail the image build early when the selected base image is not a ROS image.
-# Otherwise a bad `ros-base:latest` silently reaches the device and only fails
-# in the container restart loop while sourcing setup.bash.
+# Fail at build time if the selected internal base is missing ROS Python.
+# The driver imports rclpy before it can initialize DDS or expose MCP.
 RUN test -f /opt/ros/humble/setup.bash && \
     . /opt/ros/humble/setup.bash && \
     python3 -c 'import rclpy; from std_msgs.msg import String'
