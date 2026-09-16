@@ -196,10 +196,10 @@ class Plugin:
         del args
         if action == "start":
             self._enabled = True
-            return {"state": "enabled"}
+            return {"state": "ready"}
         if action == "stop":
             self._enabled = False
-            return {"state": "disabled"}
+            return {"state": "idle"}
         if action == "enable":
             self._enabled = True
             return {"state": "enabled"}
@@ -233,8 +233,11 @@ class Plugin:
                     result = self._tts.dispatch(
                         "speak", {"text": self._text, "voice": 0}
                     )
-                    if isinstance(result, dict) and result.get("error"):
-                        errors.append(str(result["error"]))
+                    if isinstance(result, dict):
+                        if result.get("error"):
+                            errors.append(str(result["error"]))
+                        elif result.get("ret") and result["ret"] != 0:
+                            errors.append(f"tts ret={result['ret']}")
                 except Exception as exc:
                     errors.append(f"TTS: {exc}")
 
@@ -245,8 +248,11 @@ class Plugin:
                 arm_result = self._arm.dispatch(
                     "execute", {"gesture": self._gesture}
                 )
-                if isinstance(arm_result, dict) and arm_result.get("error"):
-                    errors.append(str(arm_result["error"]))
+                if isinstance(arm_result, dict):
+                    if arm_result.get("error"):
+                        errors.append(str(arm_result["error"]))
+                    elif arm_result.get("ret") and arm_result["ret"] != 0:
+                        errors.append(f"arm ret={arm_result['ret']}")
                 speech_thread.join()
                 if errors:
                     raise RuntimeError("; ".join(errors))
