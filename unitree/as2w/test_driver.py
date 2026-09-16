@@ -27,15 +27,19 @@ def _install_device_stubs():
     sys.modules["std_msgs"] = types.ModuleType("std_msgs")
     sys.modules["std_msgs.msg"] = std_msgs
     for name in ("unitree_sdk2py", "unitree_sdk2py.core", "unitree_sdk2py.idl",
-                 "unitree_sdk2py.idl.unitree_go", "unitree_sdk2py.idl.unitree_go.msg"):
+                 "unitree_sdk2py.idl.unitree_go", "unitree_sdk2py.idl.unitree_go.msg",
+                 "unitree_sdk2py.idl.unitree_hg", "unitree_sdk2py.idl.unitree_hg.msg"):
         sys.modules.setdefault(name, types.ModuleType(name))
     channel = types.ModuleType("unitree_sdk2py.core.channel")
     channel.ChannelSubscriber = type("ChannelSubscriber", (), {})
     sys.modules["unitree_sdk2py.core.channel"] = channel
     dds = types.ModuleType("unitree_sdk2py.idl.unitree_go.msg.dds_")
-    dds.LowState_ = type("LowState_", (), {})
     dds.SportModeState_ = type("SportModeState_", (), {})
     sys.modules["unitree_sdk2py.idl.unitree_go.msg.dds_"] = dds
+    hg_dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    hg_dds.LowState_ = type("LowState_", (), {})
+    hg_dds.BmsState_ = type("BmsState_", (), {})
+    sys.modules["unitree_sdk2py.idl.unitree_hg.msg.dds_"] = hg_dds
 
 
 class _Proxy:
@@ -119,6 +123,13 @@ class TestDriverContracts(unittest.TestCase):
         node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors, bms_state=None))
         self.assertEqual(3, len(published))
         self.assertEqual(16, len(__import__("json").loads(published[1])["joint_states"]))
+
+    def test_loco_uses_presets_and_acp_completion(self):
+        plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual(["slow", "normal", "fast"], schema["properties"]["speed_preset"]["enum"])
+        self.assertIn("stand_up", schema["x-completion"]["actions"])
+        self.assertNotIn("switch_gait", schema["properties"]["action"]["enum"])
 
     def test_mcp_supports_sse_and_never_falls_back_to_wifi(self):
         source = (ROOT / "main.py").read_text()
