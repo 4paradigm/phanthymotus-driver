@@ -67,36 +67,51 @@ class _StateNode:
         message.data = json.dumps(value, separators=(",", ":"))
         publisher.publish(message)
 
+    @staticmethod
+    def _flat(prefix, values):
+        return {f"{prefix}_{i}": float(value) for i, value in enumerate(values)}
+
     def _on_low(self, msg):
         imu = getattr(msg, "imu_state", getattr(msg, "imu", None))
         if imu is not None:
-            self._publish(self.imu, {"quaternion": list(getattr(imu, "quaternion", [])),
-                                     "gyroscope": list(getattr(imu, "gyroscope", [])),
-                                     "accelerometer": list(getattr(imu, "accelerometer", [])),
-                                     "rpy": list(getattr(imu, "rpy", []))})
+            imu_data = {}
+            for key in ("quaternion", "gyroscope", "accelerometer", "rpy"):
+                imu_data.update(self._flat(key, getattr(imu, key, [])))
+            self._publish(self.imu, imu_data)
         motors = getattr(msg, "motor_state", getattr(msg, "motor_states", []))
         motors = list(motors)[:len(_AS2_JOINT_NAMES)]
         states = [{"idx": i, "q": _number(getattr(m, "q", 0)),
                    "dq": _number(getattr(m, "dq", 0)),
                    "tau": _number(getattr(m, "tau_est", getattr(m, "tau", 0))),
                    "temperature": _values(getattr(m, "temperature", []))} for i, m in enumerate(motors)]
-        self._publish(self.joint_state, {"joint_states": states})
+        joint_data = {}
+        for state in states:
+            name = _AS2_JOINT_NAMES[state["idx"]]
+            joint_data[f"{name}_q"] = state["q"]
+            joint_data[f"{name}_dq"] = state["dq"]
+            joint_data[f"{name}_tau"] = state["tau"]
+            for index, temperature in enumerate(state["temperature"]):
+                joint_data[f"{name}_temperature_{index}"] = float(temperature)
+        self._publish(self.joint_state, joint_data)
         self._publish(self.joints, {"joints": [{"idx": s["idx"], "name": _AS2_JOINT_NAMES[s["idx"]], "q": s["q"]}
                                                for s in states[:len(_AS2_JOINT_NAMES)]],
                                     "imu_quat": list(getattr(imu, "quaternion", [])) if imu else []})
     def _on_bms(self, bms):
-        self._publish(self.battery, {"soc": int(getattr(bms, "soc", 0)),
-                                     "current": _number(getattr(bms, "current", 0)),
-                                     "cycle": int(getattr(bms, "cycle", 0)),
-                                     "temperature": _values(getattr(bms, "temperature", []))})
+        battery = {"soc": int(getattr(bms, "soc", 0)),
+                   "current": _number(getattr(bms, "current", 0)),
+                   "cycle": int(getattr(bms, "cycle", 0))}
+        battery.update(self._flat("temperature", getattr(bms, "temperature", [])))
+        self._publish(self.battery, battery)
 
     def _on_sport(self, msg):
         imu = getattr(msg, "imu_state", None)
-        self._publish(self.loco, {"mode": int(getattr(msg, "mode", 0)),
-                                  "velocity": list(getattr(msg, "velocity", [])),
-                                  "position": list(getattr(msg, "position", [])),
-                                  "body_height": _number(getattr(msg, "body_height", 0)),
-                                  "imu_rpy": list(getattr(imu, "rpy", [])) if imu else []})
+        loco = {"mode": int(getattr(msg, "mode", 0)),
+                "body_height": _number(getattr(msg, "body_height", 0))}
+        loco.update(self._flat("velocity", getattr(msg, "velocity", [])))
+        loco.update(self._flat("position", getattr(msg, "position", [])))
+        if imu:
+            loco.update(self._flat("imu_rpy", getattr(imu, "rpy", [])))
+        self._publish(self.loco, loco)
 
 
 class StatePlugin:
@@ -175,12 +190,20 @@ class LocoPlugin:
                 if self.proxy.Move(vx, vy, yaw) != 0: break
                 event.wait(.1)
         threading.Thread(target=run, daemon=True).start()
-    def _await_posture(self, action_id, action, expected_damping):
+    def _await_posture(self, action_id, action, expected_name):
         deadline = time.monotonic() + 20
+        left_old_state = False
+        matches = 0
         while time.monotonic() < deadline:
             code, state = self.proxy.GetState()
-            fsm = str(state.get("fsm_id", "")) if code == 0 else ""
-            if fsm and (fsm == "0") == expected_damping:
+            name = str(state.get("fsm_name", "")) if code == 0 else ""
+            if name and name != "ai_damping":
+                left_old_state = True
+            if left_old_state and name == expected_name:
+                matches += 1
+            else:
+                matches = 0
+            if matches >= 2:
                 _acp_notify(action_id, "completed", {"action": action, "state": state})
                 return
             time.sleep(.25)
@@ -202,13 +225,13 @@ class LocoPlugin:
             if duration < 0: return {"ret": -1, "message": "duration must be -1, 0, or positive"}
             self._stop_continuous(); ret = self.proxy.Move(vx, vy, yaw); time.sleep(duration); self.proxy.StopMove(); return {"ret": ret, "duration": duration}
         if action == "stop_move": self._stop_continuous(); return {"ret": self.proxy.StopMove()}
-        methods = {"stand_up": ("StandUp", False), "stand_down": ("StandDown", True), "balance_stand": ("BalanceStand", False), "recovery_stand": ("RecoveryStand", False)}
+        methods = {"stand_up": ("StandUp", "ai_stand_up"), "stand_down": ("StandDown", "ai_stand_down"), "balance_stand": ("BalanceStand", "ai_balance_stand"), "recovery_stand": ("RecoveryStand", "ai_recovery_stand")}
         if action in methods:
-            method, expected_damping = methods[action]
+            method, expected_name = methods[action]
             ret = getattr(self.proxy, method)()
             if ret != 0: return {"ret": ret, "accepted": False, "action": action}
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
-            threading.Thread(target=self._await_posture, args=(action_id, action, expected_damping), daemon=True).start()
+            threading.Thread(target=self._await_posture, args=(action_id, action, expected_name), daemon=True).start()
             return {"ret": 0, "accepted": True, "status": "running", "action": action, "action_id": action_id}
         if action == "damp": return {"ret": self.proxy.Damp(), "accepted": True, "action": action}
         if action == "euler": return {"ret": self.proxy.Euler(float(args.get("roll", 0)), float(args.get("pitch", 0)), float(args.get("yaw", 0)))}

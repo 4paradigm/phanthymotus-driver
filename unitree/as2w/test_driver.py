@@ -122,7 +122,9 @@ class TestDriverContracts(unittest.TestCase):
         imu = types.SimpleNamespace(quaternion=[], gyroscope=[], accelerometer=[], rpy=[])
         node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors, bms_state=None))
         self.assertEqual(3, len(published))
-        self.assertEqual(16, len(__import__("json").loads(published[1])["joint_states"]))
+        joint_state = __import__("json").loads(published[1])
+        self.assertEqual(16, len([key for key in joint_state if key.endswith("_q")]))
+        self.assertIn("FR_hip_q", joint_state)
 
     def test_loco_uses_presets_and_acp_completion(self):
         plugin = self.device.LocoPlugin({}, "test", None, _Proxy())

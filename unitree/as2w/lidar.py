@@ -10,13 +10,15 @@ class _LidarNode:
         from rclpy.node import Node
         self.node = Node("as2w_lidar")
         self.pub = self.node.create_publisher(UInt8MultiArray, topic, 10)
-        try:
-            self.sub = ChannelSubscriber("rt/utlidar/cloud_deskewed", PointCloud2_)
-            self.sub.Init(self._on_cloud, 1)
-            self.node.get_logger().info("AS2W lidar subscribed to rt/utlidar/cloud_deskewed")
-        except Exception as exc:
-            self.sub = None
-            self.node.get_logger().warning(f"AS2W lidar unavailable: {exc}")
+        self.subs = []
+        for source_topic in ("rt/unitree/slam_mapping/points", "rt/unitree/slam_relocation/points", "rt/utlidar/cloud_deskewed"):
+            try:
+                sub = ChannelSubscriber(source_topic, PointCloud2_)
+                sub.Init(self._on_cloud, 1)
+                self.subs.append(sub)
+                self.node.get_logger().info(f"AS2W lidar subscribed to {source_topic}")
+            except Exception as exc:
+                self.node.get_logger().warning(f"AS2W lidar topic unavailable {source_topic}: {exc}")
         executor.add_node(self.node)
 
     def _on_cloud(self, msg):
@@ -40,8 +42,8 @@ class LidarPlugin:
                 "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
     def start(self): pass
     def stop(self):
-        if getattr(self.node, "sub", None):
-            self.node.sub.Close()
+        for sub in getattr(self.node, "subs", []):
+            sub.Close()
         self.node.node.destroy_node()
     def dispatch(self, action, args):
         if action in ("start", "info", "lidar_cloud"): return {"state": "running", "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
