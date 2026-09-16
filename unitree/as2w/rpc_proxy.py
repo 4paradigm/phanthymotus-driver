@@ -12,12 +12,17 @@ def _install_logsafe():
 
 def _worker(commands, results, interface):
     _install_logsafe()
-    from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-    from unitree_sdk2py.as2.sport.sport_client import SportClient
-    ChannelFactoryInitialize(0, interface)
-    client = SportClient()
-    client.SetTimeout(10.0)
-    client.Init()
+    try:
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        from unitree_sdk2py.as2.sport.sport_client import SportClient
+        ChannelFactoryInitialize(0, interface or None)
+        client = SportClient()
+        client.SetTimeout(10.0)
+        client.Init()
+        results.put({"ready": True})
+    except Exception as exc:
+        results.put({"startup_error": str(exc)})
+        return
     while True:
         command = commands.get()
         if command is None:
@@ -40,8 +45,17 @@ class RpcProxy:
         self._process = context.Process(target=_worker, args=(self._commands, self._results, network_interface), daemon=True)
         self._process.start()
         self._lock = threading.Lock()
+        self._startup_error = None
+        try:
+            result = self._results.get(timeout=5)
+            if result.get("startup_error"):
+                self._startup_error = result["startup_error"]
+        except Exception:
+            self._startup_error = "SportClient worker did not become ready"
 
     def call(self, method, *args):
+        if self._startup_error:
+            return (3104, {}) if method == "GetState" else 3104
         with self._lock:
             self._commands.put((method, args))
             try:

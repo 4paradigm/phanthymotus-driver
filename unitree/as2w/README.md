@@ -9,7 +9,9 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `FrontFlip`, and `BackFlip`.
 
 Run `python3 main.py <robot-interface>` on the robot network (normally the
-interface with a `192.168.123.x` address). The bundle exposes MCP on port
+interface with a `192.168.123.x` address). If the supplied interface is absent,
+the entry point tries available container interfaces and then starts MCP in a
+degraded mode without DDS publishers. The bundle exposes MCP on port
 `15709`, publishes JSON state streams under the resolved ROS namespace, and
 uses a dedicated process for RPC calls so ROS callbacks cannot starve SDK
 responses.
@@ -18,6 +20,10 @@ Deployment follows agent-core's DDS isolation contract: ROS2 uses FastDDS
 Domain 42 and the mounted `/opt/phanthy-motus/dds-local.xml` loopback profile;
 the Unitree SDK uses CycloneDDS Domain 0 and binds to the robot interface passed
 to `main.py`. These are deliberately separate DDS implementations and domains.
+The image installs the small CMake toolchain because the SDK's pinned
+`cyclonedds==0.10.5` Python binding must link against a matching CycloneDDS
+build; the vendored CRC `.so` files are the official SDK's architecture-specific
+runtime dependencies and are required on both amd64 and aarch64.
 
 `duration=-1` starts a 10 Hz velocity command loop; `stop_move`, shutdown, and
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
@@ -41,3 +47,6 @@ on the robot or extension host; the driver does not start that service.
 `special_action` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
 continuous `loco` control card.
+
+No-hardware checks are available with `python3 test_driver.py`; they cover
+action lifecycle, schemas, model resources, and full-size low-state arrays.

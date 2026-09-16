@@ -31,6 +31,14 @@ class _StateNode:
         self._sport.Init(self._on_sport, 10)
         executor.add_node(self.node)
 
+    def close(self):
+        for subscriber in (self._low, self._sport):
+            try:
+                subscriber.Close()
+            except Exception:
+                pass
+        self.node.destroy_node()
+
     def _publish(self, publisher, value):
         message = String()
         message.data = json.dumps(value, separators=(",", ":"))
@@ -44,6 +52,7 @@ class _StateNode:
                                      "accelerometer": list(getattr(imu, "accelerometer", [])),
                                      "rpy": list(getattr(imu, "rpy", []))})
         motors = getattr(msg, "motor_state", getattr(msg, "motor_states", []))
+        motors = list(motors)[:len(_AS2_JOINT_NAMES)]
         states = [{"idx": i, "q": _number(getattr(m, "q", 0)),
                    "dq": _number(getattr(m, "dq", 0)),
                    "tau": _number(getattr(m, "tau_est", getattr(m, "tau", 0))),
@@ -74,7 +83,7 @@ class StatePlugin:
         self._state = _StateNode(namespace, executor)
     def get_tools(self):
         specs = (("imu", "state/imu", "data/json", "AS2 IMU state"),
-                 ("joints", "state/joints", "sensor/skeleton", "AS2 12-joint skeleton for model animation"),
+                 ("joints", "state/joints", "sensor/skeleton", "AS2W 16-joint skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "AS2 raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "AS2 BMS state"),
                  ("loco_state", "loco/state", "data/json", "AS2 high-level locomotion state"))
@@ -83,9 +92,24 @@ class StatePlugin:
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
                 for name, path, fmt, desc in specs]
     def start(self): pass
-    def stop(self): pass
+    def stop(self): self._state.close()
     def dispatch(self, action, args):
-        return {"state": "running"} if action in ("start", "info", "imu", "joints", "joint_state", "battery", "loco_state") else ({"state": "idle"} if action == "stop" else None)
+        if action == "info":
+            name = args.get("_tool_name")
+            paths = {"imu": ("state/imu", "data/json"),
+                     "joints": ("state/joints", "sensor/skeleton"),
+                     "joint_state": ("state/joint_state", "data/json"),
+                     "battery": ("state/battery", "data/json"),
+                     "loco_state": ("loco/state", "data/json")}
+            if name in paths:
+                path, fmt = paths[name]
+                return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+            return {"state": "running"}
+        if action in ("imu", "joints", "joint_state", "battery", "loco_state"):
+            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
+            fmt = "sensor/skeleton" if action == "joints" else "data/json"
+            return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+        return {"state": "running"} if action in ("start", "info") else ({"state": "idle"} if action == "stop" else None)
 
 
 class LocoPlugin:

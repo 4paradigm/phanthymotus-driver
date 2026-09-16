@@ -55,9 +55,14 @@ class _SlamClient:
 
 def _worker(commands, results, interface):
     _install_logsafe()
-    from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-    ChannelFactoryInitialize(0, interface)
-    client = _SlamClient()
+    try:
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        ChannelFactoryInitialize(0, interface or None)
+        client = _SlamClient()
+        results.put({"ready": True})
+    except Exception as exc:
+        results.put({"startup_error": str(exc)})
+        return
     while True:
         command = commands.get()
         if command is None:
@@ -76,8 +81,16 @@ class _SpatialRpcProxy:
         self._process = context.Process(target=_worker, args=(self._commands, self._results, interface), daemon=True)
         self._process.start()
         self._lock = threading.Lock()
+        self._startup_error = None
+        try:
+            result = self._results.get(timeout=5)
+            self._startup_error = result.get("startup_error")
+        except Exception:
+            self._startup_error = "SLAM worker did not become ready"
 
     def call(self, action, data):
+        if self._startup_error:
+            return {"code": 3104, "response": self._startup_error}
         with self._lock:
             self._commands.put({"action": action, "data": data})
             try:
@@ -136,6 +149,11 @@ class ControlledSpatialPlugin:
         if action_id:
             self._client.call("pause_navigation", {})
             _acp_notify(action_id, "cancelled", {"reason": "card stopped"})
+        if self._nav_sub is not None:
+            try:
+                self._nav_sub.Close()
+            except Exception:
+                pass
         self._client.stop()
 
     def _on_slam_key_info(self, message):
