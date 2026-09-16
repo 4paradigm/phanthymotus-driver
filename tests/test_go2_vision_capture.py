@@ -18,6 +18,9 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from common import lifecycle  # noqa: E402
 
 
 class FakeNode:
@@ -203,7 +206,10 @@ class CaptureTest(CaptureHarness):
         tree = ast.parse((ROOT / "unitree/go2/main.py").read_text())
         bundle = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Go2DeviceBundle")
         module = ast.Module(body=[bundle], type_ignores=[])
-        ns = {"RpcProxy": object}
+        # Only the class node is exec'd, so module-level imports never run and
+        # every name the class closes over has to be supplied here — the real
+        # lifecycle helper, so the dispatch path being tested is the real one.
+        ns = {"RpcProxy": object, "_lifecycle": lifecycle}
         with mock.patch.dict(sys.modules, {"vision_capture": capture}):
             exec(compile(module, "go2/main.py", "exec", flags=__future__.annotations.compiler_flag), ns)
             instance = ns["Go2DeviceBundle"]({"plugins": {"vision_capture": {
