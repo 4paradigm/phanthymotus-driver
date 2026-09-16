@@ -24,10 +24,18 @@ def _load(name, path):
 def _install_device_stubs():
     std_msgs = types.ModuleType("std_msgs.msg")
     std_msgs.String = type("String", (), {})
+    std_msgs.UInt8MultiArray = type("UInt8MultiArray", (), {})
     sys.modules["std_msgs"] = types.ModuleType("std_msgs")
     sys.modules["std_msgs.msg"] = std_msgs
+    qos = types.ModuleType("rclpy.qos")
+    qos.DurabilityPolicy = types.SimpleNamespace(VOLATILE=1)
+    qos.HistoryPolicy = types.SimpleNamespace(KEEP_LAST=1)
+    qos.ReliabilityPolicy = types.SimpleNamespace(BEST_EFFORT=1)
+    qos.QoSProfile = lambda **kwargs: kwargs
+    sys.modules["rclpy.qos"] = qos
     for name in ("unitree_sdk2py", "unitree_sdk2py.core", "unitree_sdk2py.idl",
                  "unitree_sdk2py.idl.unitree_go", "unitree_sdk2py.idl.unitree_go.msg",
+                 "unitree_sdk2py.idl.sensor_msgs", "unitree_sdk2py.idl.sensor_msgs.msg",
                  "unitree_sdk2py.idl.unitree_hg", "unitree_sdk2py.idl.unitree_hg.msg"):
         sys.modules.setdefault(name, types.ModuleType(name))
     channel = types.ModuleType("unitree_sdk2py.core.channel")
@@ -36,6 +44,9 @@ def _install_device_stubs():
     dds = types.ModuleType("unitree_sdk2py.idl.unitree_go.msg.dds_")
     dds.SportModeState_ = type("SportModeState_", (), {})
     sys.modules["unitree_sdk2py.idl.unitree_go.msg.dds_"] = dds
+    sensor_dds = types.ModuleType("unitree_sdk2py.idl.sensor_msgs.msg.dds_")
+    sensor_dds.PointCloud2_ = type("PointCloud2_", (), {})
+    sys.modules["unitree_sdk2py.idl.sensor_msgs.msg.dds_"] = sensor_dds
     hg_dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
     hg_dds.LowState_ = type("LowState_", (), {})
     hg_dds.BmsState_ = type("BmsState_", (), {})
@@ -194,6 +205,24 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn('"rt/utlidar/cloud_deskewed"', source)
         self.assertIn('"rt/utlidar/cloud"', source)
         self.assertNotIn('"rt/unitree/slam_mapping/points"', source)
+
+    def test_lidar_normalizes_pointcloud_fields_for_renderer(self):
+        import struct
+        node = self.device  # keep the test module's SDK stubs loaded
+        del node
+        lidar = _load("as2w_lidar_under_test", ROOT / "lidar.py")
+        raw = b"\x00\x00\x00\x00" + struct.pack("<fff", 1.0, 2.0, 3.0) + b"\x00\x00\x00\x00"
+        normalized = lidar._LidarNode._to_xyz(raw, 20, 1,
+                                               {"x": 4, "y": 8, "z": 12}, False)
+        self.assertEqual((1.0, 2.0, 3.0), struct.unpack("<fff", normalized))
+
+    def test_lidar_normalizes_big_endian_xyz(self):
+        import struct
+        lidar = _load("as2w_lidar_endian_test", ROOT / "lidar.py")
+        raw = struct.pack(">fff", 1.0, -2.0, 3.0)
+        normalized = lidar._LidarNode._to_xyz(raw, 12, 1,
+                                               {"x": 0, "y": 4, "z": 8}, True)
+        self.assertEqual((1.0, -2.0, 3.0), struct.unpack("<fff", normalized))
 
 
 if __name__ == "__main__":
