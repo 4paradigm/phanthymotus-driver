@@ -1345,7 +1345,10 @@ class ArmControlPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  grpc_client=None, dds_lowcmd_pub=None,
-                 dds_arm_lowstate_sub=None, **kwargs):
+                 dds_arm_lowstate_sub=None, variant="pro", **kwargs):
+        if str(variant).lower() != "pro":
+            raise ValueError(
+                "arm_control currently supports only Adam Pro's 31-DOF lowcmd layout")
         self._namespace = namespace
         self._publisher = dds_lowcmd_pub
         self._lowstate_sub = dds_arm_lowstate_sub
@@ -1436,7 +1439,8 @@ class ArmControlPlugin:
                 motor.dq = 0.0
                 motor.tau = 0.0
                 kp, kd = self._pd_for_joint(joint_name)
-                is_arm = joint_name.startswith(("shoulder", "elbow", "wrist"))
+                is_arm = joint_name.startswith((
+                    "waist", "shoulder", "elbow", "wrist"))
                 arm_scale = 1.0
                 if is_arm and (soft_arms or release_started_at is not None):
                     arm_scale = 1.0 - release_ratio
@@ -1523,7 +1527,7 @@ class ArmControlPlugin:
 
     def stop(self):
         with self._lock:
-            if self._active:
+            if self._active or self._streaming:
                 self._release_started_at = time.monotonic()
         # Give the official Kp ramp-down sequence a chance to reach zero.
         deadline = time.monotonic() + self._RELEASE_SECONDS + 0.2
@@ -1533,6 +1537,30 @@ class ArmControlPlugin:
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(1.0)
         self._thread = None
+
+    def _stop_and_wait(self):
+        """Stop action lifecycle: ramp gains down, then end lowcmd ownership."""
+        with self._lock:
+            if not (self._active or self._streaming):
+                return {"success": True, "state": "idle"}
+            self._release_started_at = time.monotonic()
+        deadline = time.monotonic() + self._RELEASE_SECONDS + 0.25
+        while time.monotonic() < deadline:
+            with self._lock:
+                releasing = self._release_started_at is not None
+            if not releasing:
+                break
+            time.sleep(0.02)
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(1.0)
+        self._thread = None
+        with self._lock:
+            self._streaming = False
+            self._active = False
+        return {"success": True, "state": "idle",
+                "message": "Arm lowcmd control stopped after gain release"}
 
     def _ready_error(self):
         if self._publisher is None:
@@ -1571,10 +1599,7 @@ class ArmControlPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
-            with self._lock:
-                self._release_started_at = time.monotonic()
-            return {"success": True, "state": "releasing",
-                    "message": "Arm gains are ramping down over 1.5 seconds"}
+            return self._stop_and_wait()
         if action in ARM_ACTIONS:
             try:
                 control = ARM_ACTIONS[action]
@@ -3669,7 +3694,7 @@ class AdamDeviceBundle:
                     ("tracking_motion", TrackingMotionPlugin))
         for card_name, card_class in rl_cards:
             card_cfg = plugins_cfg.get(card_name, {})
-            if card_cfg.get("enabled", True):
+            if card_cfg.get("enabled", False):
                 self._plugins.append(card_class(
                     card_cfg, namespace, executor, grpc_client=grpc_client,
                 ))
@@ -3696,6 +3721,7 @@ class AdamDeviceBundle:
                 grpc_client=grpc_client,
                 dds_lowcmd_pub=dds_lowcmd_pub,
                 dds_arm_lowstate_sub=dds_arm_lowstate_sub,
+                variant=variant,
             )
             self._plugins.append(p)
             if plugins_cfg.get("arm_gesture", {}).get("enabled", True):
