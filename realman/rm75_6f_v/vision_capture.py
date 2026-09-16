@@ -380,7 +380,11 @@ class VisionCapturePlugin:
         url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
         ctx = ssl.create_default_context()
         # Match the existing RM75 ACP transport for the local self-signed Core.
-        if url.startswith("https://") and url.split("/", 3)[2].split(":", 1)[0] in {"localhost", "127.0.0.1", "::1"}:
+        # Agent Core's on-host deployment uses a self-signed certificate for
+        # the stable service hostname. Keep the exception narrowly scoped to
+        # that known local name; all other HTTPS endpoints remain verified.
+        host = url.split("/", 3)[2].split(":", 1)[0] if url.startswith("https://") else ""
+        if url.startswith("https://") and host in {"localhost", "127.0.0.1", "::1", "phanthy-motus"}:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         try:
