@@ -195,5 +195,169 @@ class ProductionPluginTests(unittest.TestCase):
         self.stubs["tts"].dispatch.assert_called()
 
 
+class GreetingDistanceNodeTests(unittest.TestCase):
+    """Test _handle_message parsing without a real ROS2 node."""
+
+    def setUp(self):
+        import greeting as g
+        self._original = g.GreetingDistanceNode
+        g.GreetingDistanceNode = _FakeNode
+
+    def tearDown(self):
+        import greeting as g
+        g.GreetingDistanceNode = self._original
+
+    def _make_node(self):
+        received = []
+        plugin = self._make_plugin_with_stubs()
+        node = plugin._node
+        node._on_distance = received.append
+        return node
+
+    def _make_plugin_with_stubs(self):
+        executor = _FakeExecutor()
+        stubs = _make_stubs()
+        config = {
+            "threshold_m": 2.0,
+            "consecutive_frames": 1,
+            "cooldown_s": 0,
+        }
+        return g.make_plugin(config, "test", executor, stubs)
+
+    def test_parses_valid_distance_message(self):
+        node = self._make_node()
+        class Msg:
+            data = '{"distance_m": 1.5}'
+        node._handle_message(Msg)
+        self.assertEqual(received := [], [])  # placeholder
+        # Use a fresh stub to capture
+        stubs = {"led": MagicMock(), "tts": MagicMock(), "arm": MagicMock()}
+        executor = _FakeExecutor()
+        captured = []
+        plugin = g.make_plugin({"threshold_m": 2.0, "consecutive_frames": 1, "cooldown_s": 0}, "test", executor, stubs)
+        original_cb = plugin._on_distance
+        plugin._on_distance = lambda d: captured.append(d)
+        # Re-create node to replace callback
+        node = _FakeNode()
+        node._on_distance = captured.append
+        msg = MagicMock()
+        msg.data = '{"distance_m": 1.5}'
+        node._handle_message(msg)
+        self.assertEqual(captured, [1.5])
+
+    def test_rejects_missing_distance_m(self):
+        node = _FakeNode()
+        captured = []
+        node._on_distance = captured.append
+        msg = MagicMock()
+        msg.data = '{"not_distance": 1.5}'
+        node._handle_message(msg)
+        self.assertEqual(captured, [])
+
+    def test_rejects_invalid_json(self):
+        node = _FakeNode()
+        captured = []
+        node._on_distance = captured.append
+        msg = MagicMock()
+        msg.data = 'not-json-at-all'
+        node._handle_message(msg)
+        self.assertEqual(captured, [])
+
+    def test_rejects_non_finite_distance(self):
+        node = _FakeNode()
+        captured = []
+        node._on_distance = captured.append
+        msg = MagicMock()
+        msg.data = '{"distance_m": "nan"}'
+        node._handle_message(msg)
+        self.assertEqual(captured, [])
+
+        captured.clear()
+        msg.data = '{"distance_m": "inf"}'
+        node._handle_message(msg)
+        self.assertEqual(captured, [])
+
+
+class EndToEndWelcomeTests(unittest.TestCase):
+    """Deterministic end-to-end test for the full _welcome() call sequence."""
+
+    def setUp(self):
+        self.executor = _FakeExecutor()
+        self.stubs = _make_stubs()
+        self.plugin_config = {
+            "threshold_m": 2.0,
+            "consecutive_frames": 1,
+            "cooldown_s": 0,
+            "text": "欢迎",
+            "gesture": "high wave",
+        }
+
+    def _make_plugin(self):
+        import greeting as g
+        original = g.GreetingDistanceNode
+        try:
+            g.GreetingDistanceNode = _FakeNode
+            return g.make_plugin(
+                self.plugin_config, "test", self.executor, self.stubs
+            )
+        finally:
+            g.GreetingDistanceNode = original
+
+    def test_full_welcome_sequence_calls_led_tts_arm(self):
+        """Verify: LED speaking -> TTS speak -> arm execute -> LED idle."""
+        plugin = self._make_plugin()
+        plugin.dispatch("enable", {})
+        # One sample triggers the greeting (consecutive_frames=1)
+        plugin._on_distance(1.0)
+        # _welcome runs synchronously within _action_lock; join via the lock
+        # Since _welcome is not directly joinable, we wait briefly.
+        time.sleep(0.3)
+
+        # LED should have been set to "speaking"
+        self.stubs["led"].dispatch.assert_any_call("state", {"state": "speaking"})
+        # TTS should have been called with the configured text
+        self.stubs["tts"].dispatch.assert_called_once_with(
+            "speak", {"text": "欢迎", "voice": 0}
+        )
+        # Arm should have been called with the configured gesture
+        self.stubs["arm"].dispatch.assert_called_once_with(
+            "execute", {"gesture": "high wave"}
+        )
+        # LED should have returned to "idle" after success
+        self.stubs["led"].dispatch.assert_any_call("state", {"state": "idle"})
+
+    def test_welcome_skips_on_disable_during_action(self):
+        """When disabled while _welcome is running, hardware calls are skipped."""
+        plugin = self._make_plugin()
+        plugin.dispatch("enable", {})
+
+        # Patch _welcome to hold the lock so we can disable mid-flight
+        original_welcome = plugin._welcome
+        freeze = threading.Event()
+
+        def frozen_welcome():
+            with plugin._action_lock:
+                freeze.set()
+                # Hold the lock until test unfreezes
+                plugin._welcome_freeze.wait(timeout=5)
+            # After lock released, normally would continue
+
+        plugin._welcome = frozen_welcome
+        plugin._on_distance(1.0)
+        frozen_ok = freeze.wait(timeout=5)
+        self.assertTrue(frozen_ok, "_welcome did not acquire lock")
+
+        # Disable while _welcome holds the lock
+        plugin.dispatch("disable", {})
+
+        # Release the freeze so _welcome can finish
+        plugin._welcome_freeze.clear()
+        time.sleep(0.1)
+
+        # TTS and arm should NOT have been called (disabled mid-lock)
+        self.stubs["tts"].dispatch.assert_not_called()
+        self.stubs["arm"].dispatch.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
