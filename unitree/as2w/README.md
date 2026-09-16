@@ -30,8 +30,10 @@ Architecture-specific binaries are not stored in this repository.
 `duration=-1` starts a 10 Hz velocity command loop; `stop_move`, shutdown, and
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
 attitude inputs outside the documented bounds are rejected before reaching the
-robot. A positive `duration` runs asynchronously, returns an ACP `action_id`,
-and reports completion after `StopMove`; it never blocks the MCP request thread.
+robot. `timed_move` requires a positive `duration`, runs asynchronously, returns
+an ACP `action_id`, and reports completion after `StopMove`; it never blocks the
+MCP request thread. Positive durations passed to `move` are rejected so its
+immediate and continuous modes are never mistaken for ACP actions.
 Special actions should only be invoked with a clear area and appropriate
 operator approval. Conservative AS2 limits are enforced for Euler attitude
 (roll ±0.2 rad, pitch/yaw ±0.3 rad), body height (±0.3 m), body position

@@ -219,7 +219,7 @@ class LocoPlugin:
         self._motion_executor = executor
         self._stop_external_motion = executor.stop
     def get_tool(self):
-        actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_gait", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
+        actions = ["move", "timed_move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_gait", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
                 "description": "Unitree AS2 locomotion via SportClient", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions},
@@ -236,9 +236,10 @@ class LocoPlugin:
                     "y": {"type": "number", "minimum": -0.2, "maximum": 0.2},
                     "z": {"type": "number", "minimum": -0.2, "maximum": 0.2},
                     "flag": {"type": "boolean"}}, "required": ["action"],
-                "x-completion": {"actions": ["move"], "timeout": 40},
+                "x-completion": {"actions": ["timed_move"], "timeout": 40},
                 "x-action-params": {
-                    "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with optional duration (-1 for continuous)."},
+                    "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Set velocity once; duration=-1 streams continuously and duration=0 stops. Use timed_move for a finite action."},
+                    "timed_move": {"params": ["vx", "vy", "vyaw", "duration"], "required": ["duration"], "description": "Run a finite, cancellable velocity action for more than 0 and at most 30 seconds."},
                     "stop_move": {"params": [], "description": "Stop movement."},
                     "stand_up": {"params": [], "description": "Stand up."}, "stand_down": {"params": [], "description": "Stand down."},
                     "balance_stand": {"params": [], "description": "Balance stand."}, "recovery_stand": {"params": [], "description": "Recovery stand."},
@@ -301,7 +302,7 @@ class LocoPlugin:
             return {"state": "idle", "ret": self.proxy.StopMove()}
         if action != "get_state" and self._stop_external_motion:
             self._stop_external_motion()
-        if action == "move":
+        if action in ("move", "timed_move"):
             try:
                 vx = _bounded_argument(args, "vx", -1.5, 1.5)
                 vy = _bounded_argument(args, "vy", -1.0, 1.0)
@@ -311,6 +312,12 @@ class LocoPlugin:
                     duration = _bounded_argument(args, "duration", -1.0, 30.0)
             except ValueError as exc:
                 return {"error": str(exc), "code": "INVALID_ARGUMENT"}
+            if action == "timed_move":
+                if duration is None or duration <= 0:
+                    return {"error": "timed_move requires duration greater than 0",
+                            "code": "INVALID_ARGUMENT"}
+                self._stop_continuous()
+                return self._timed_move(vx, vy, yaw, duration)
             if duration is None: return {"ret": self.proxy.Move(vx, vy, yaw), "vx": vx, "vy": vy, "vyaw": yaw}
             if duration == -1:
                 self._continuous(vx, vy, yaw); return {"ret": 0, "status": "running", "duration": -1}
@@ -318,8 +325,8 @@ class LocoPlugin:
                 return {"error": "duration must be -1, 0, or positive", "code": "INVALID_ARGUMENT"}
             if duration == 0:
                 return {"state": "idle", "ret": self.proxy.StopMove(), "duration": 0}
-            self._stop_continuous()
-            return self._timed_move(vx, vy, yaw, duration)
+            return {"error": "positive duration requires action=timed_move",
+                    "code": "INVALID_ARGUMENT"}
         if action == "stop_move": self._stop_continuous(); return {"ret": self.proxy.StopMove()}
         methods = {"stand_up": "StandUp", "stand_down": "StandDown", "balance_stand": "BalanceStand", "recovery_stand": "RecoveryStand", "damp": "Damp"}
         if action in methods: return {"ret": getattr(self.proxy, methods[action])()}

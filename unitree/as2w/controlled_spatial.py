@@ -4,6 +4,7 @@ The SDK currently publishes no AS2-specific SLAM wrapper. The service itself
 uses Unitree's common RPC protocol, so this module owns the documented client.
 """
 import json
+import math
 import multiprocessing
 import threading
 import time
@@ -21,6 +22,30 @@ _VERSION = "1.0.0.1"
 _APIS = {"start_mapping": 1801, "stop_mapping": 1802, "init_pose": 1804,
          "navigate_to": 1102, "pause_navigation": 1201,
          "resume_navigation": 1202, "shutdown": 1901}
+
+
+def _finite_argument(args, name, default, minimum=None, maximum=None):
+    value = args.get(name, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number")
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}")
+    return value
+
+
+def _mode_argument(args):
+    value = args.get("mode", 1)
+    if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+        raise ValueError("mode must be 0 or 1")
+    return value
 
 
 def _acp_notify(action_id, status, result):
@@ -184,7 +209,7 @@ class ControlledSpatialPlugin:
 
     @staticmethod
     def _pose(args):
-        return {key: float(args.get(key, default)) for key, default in {
+        return {key: _finite_argument(args, key, default) for key, default in {
             "x": 0, "y": 0, "z": 0, "q_x": 0, "q_y": 0, "q_z": 0, "q_w": 1}.items()}
 
     def dispatch(self, action, args):
@@ -195,12 +220,16 @@ class ControlledSpatialPlugin:
         if action not in _APIS: return None
         if action in ("stop_mapping", "init_pose") and not args.get("address"):
             return {"error": "address is required for this action"}
-        if action == "start_mapping": data = {"slam_type": "indoor"}
-        elif action == "stop_mapping": data = {"address": args["address"]}
-        elif action == "init_pose": data = {**self._pose(args), "address": args["address"]}
-        elif action == "navigate_to":
-            data = {"targetPose": self._pose(args), "mode": int(args.get("mode", 1)), "speed": float(args.get("speed", 0.5))}
-        else: data = {}
+        try:
+            if action == "start_mapping": data = {"slam_type": "indoor"}
+            elif action == "stop_mapping": data = {"address": args["address"]}
+            elif action == "init_pose": data = {**self._pose(args), "address": args["address"]}
+            elif action == "navigate_to":
+                data = {"targetPose": self._pose(args), "mode": _mode_argument(args),
+                        "speed": _finite_argument(args, "speed", 0.5, 0.2, 1.5)}
+            else: data = {}
+        except ValueError as exc:
+            return {"error": str(exc), "code": "INVALID_ARGUMENT"}
         result = self._client.call(action, data)
         response = result["response"]
         try: response = json.loads(response) if isinstance(response, str) else response

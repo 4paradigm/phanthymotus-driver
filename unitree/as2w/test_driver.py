@@ -83,6 +83,24 @@ class TestDriverContracts(unittest.TestCase):
         cls.device = _load("as2w_device_under_test", ROOT / "device.py")
         cls.motion = _load("as2w_motion_under_test", ROOT / "motion_tools.py")
         cls.spatial = _load("as2w_spatial_under_test", ROOT / "controlled_spatial.py")
+        yaml_stub = types.ModuleType("yaml")
+        yaml_stub.safe_load = lambda *_: {}
+        rclpy_stub = types.ModuleType("rclpy")
+        executors_stub = types.ModuleType("rclpy.executors")
+        executors_stub.MultiThreadedExecutor = object
+        rclpy_stub.executors = executors_stub
+        channel_stub = types.ModuleType("unitree_sdk2py.core.channel")
+        channel_stub.ChannelFactoryInitialize = lambda *_: None
+        rpc_stub = types.ModuleType("rpc_proxy")
+        rpc_stub.RpcProxy = object
+        with patch.dict(sys.modules, {
+            "yaml": yaml_stub,
+            "rclpy": rclpy_stub,
+            "rclpy.executors": executors_stub,
+            "unitree_sdk2py.core.channel": channel_stub,
+            "rpc_proxy": rpc_stub,
+        }):
+            cls.main = _load("as2w_main_under_test", ROOT / "main.py")
 
     def test_card_stop_cancels_continuous_move(self):
         proxy = _Proxy()
@@ -115,7 +133,7 @@ class TestDriverContracts(unittest.TestCase):
         plugin.set_motion_executor(executor)
 
         started_at = time.monotonic()
-        result = plugin.dispatch("move", {
+        result = plugin.dispatch("timed_move", {
             "vx": 0.1, "vy": 0, "vyaw": 0, "duration": 0.03,
         })
 
@@ -138,7 +156,7 @@ class TestDriverContracts(unittest.TestCase):
         plugin = self.device.LocoPlugin({}, "test", None, proxy)
         plugin.set_motion_executor(executor)
 
-        result = plugin.dispatch("move", {
+        result = plugin.dispatch("timed_move", {
             "vx": 0.1, "vy": 0, "vyaw": 0, "duration": 1.0,
         })
         deadline = time.monotonic() + 1
@@ -157,8 +175,25 @@ class TestDriverContracts(unittest.TestCase):
     def test_loco_schema_declares_timed_move_completion(self):
         plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
         completion = plugin.get_tool()["inputSchema"]["x-completion"]
-        self.assertIn("move", completion["actions"])
+        self.assertEqual(["timed_move"], completion["actions"])
         self.assertEqual(40, completion["timeout"])
+
+    def test_loco_move_sync_and_continuous_modes_do_not_claim_completion(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+
+        immediate = plugin.dispatch("move", {"vx": 0.1})
+        continuous = plugin.dispatch("move", {"vx": 0.1, "duration": -1})
+        stopped = plugin.dispatch("move", {"duration": 0})
+        finite = plugin.dispatch("move", {"vx": 0.1, "duration": 1})
+        missing = plugin.dispatch("timed_move", {"vx": 0.1})
+
+        self.assertNotIn("action_id", immediate)
+        self.assertNotIn("action_id", continuous)
+        self.assertNotIn("action_id", stopped)
+        self.assertEqual("INVALID_ARGUMENT", finite["code"])
+        self.assertEqual("INVALID_ARGUMENT", missing["code"])
+        plugin.dispatch("stop_move", {})
 
     def test_loco_rejects_nonfinite_and_out_of_range_controls(self):
         proxy = _Proxy()
@@ -206,6 +241,39 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("navigating", result["status"])
         self.assertTrue(result["action_id"].startswith("as2w_nav_"))
         thread.assert_called_once()
+
+    def test_navigation_rejects_malformed_numeric_arguments(self):
+        plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
+        calls = []
+        plugin._client = types.SimpleNamespace(call=lambda *args: calls.append(args))
+        cases = (
+            ("navigate_to", {"x": "not-a-number"}),
+            ("navigate_to", {"x": math.inf}),
+            ("navigate_to", {"speed": math.nan}),
+            ("navigate_to", {"speed": 0.19}),
+            ("navigate_to", {"speed": 1.51}),
+            ("navigate_to", {"mode": "1"}),
+            ("navigate_to", {"mode": 2}),
+            ("init_pose", {"address": "/tmp/map.pcd", "q_w": math.inf}),
+        )
+
+        for action, args in cases:
+            with self.subTest(action=action, args=args):
+                result = plugin.dispatch(action, args)
+                self.assertEqual("INVALID_ARGUMENT", result["code"])
+        self.assertEqual([], calls)
+
+    def test_bundle_boundary_returns_invalid_argument_for_bad_navigation(self):
+        plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
+        plugin._client = types.SimpleNamespace(call=lambda *_: self.fail("RPC must not be called"))
+        bundle = self.main.Bundle.__new__(self.main.Bundle)
+        bundle.plugins = [plugin]
+
+        result = bundle.call("controlled_spatial", {
+            "action": "navigate_to", "x": "not-a-number",
+        })
+
+        self.assertEqual("INVALID_ARGUMENT", result["code"])
 
     def test_model_resource_is_textual_urdf(self):
         urdf = (ROOT / "resource" / "as2w.urdf").read_text()

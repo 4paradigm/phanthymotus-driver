@@ -81,7 +81,12 @@ def handler(bundle):
             if method == "initialize": result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "as2w-driver", "version": "1.0"}}
             elif method == "tools/list": result = {"tools": bundle.tools()}
             elif method == "tools/call":
-                result = {"content": [{"type": "text", "text": json.dumps(bundle.call(params.get("name", ""), params.get("arguments") or {}))}]}
+                try:
+                    call_result = bundle.call(params.get("name", ""), params.get("arguments") or {})
+                except Exception as exc:
+                    print(f"[mcp] driver dispatch failed: {exc}", flush=True)
+                    call_result = {"error": "driver dispatch failed", "code": "INTERNAL_ERROR"}
+                result = {"content": [{"type": "text", "text": json.dumps(call_result)}]}
             else: self.send_response(200); self.end_headers(); return
             body = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode(); self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     return Handler
