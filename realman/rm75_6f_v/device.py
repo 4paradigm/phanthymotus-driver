@@ -156,6 +156,9 @@ class RM75Plugin:
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
         self._motion_lock = threading.Lock()
         self._motion_state = {"active_action_id": None}
+        # 提交/慢停串行化锁：与 CartesianPlugin 共享，保证任一卡片的 stopmotion
+        # 都排在另一卡片正在进行的 SDK 运动下发之后。
+        self._submission_lock = threading.Lock()
         self._action_lock = threading.Lock()
         self._active_action_id = None
         self._cancelled = set()
@@ -453,11 +456,14 @@ class RM75Plugin:
             action_id = f"rm75_movej_{uuid4().hex[:10]}"
             # Reserve the ID and submit under the same lock used by stopmotion.
             # An interrupt must see either no submitted move or its actual ID.
+            # rm_movej 在共享的 _submission_lock 内下发：任何卡片的 stopmotion
+            # 都必须等它完成后才能发慢停。
             with self._action_lock:
                 self._active_action_id = action_id
                 self._motion_state["active_action_id"] = action_id
                 try:
-                    self.client.command("rm_movej", target, speed, 0, 0, 0)
+                    with self._submission_lock:
+                        self.client.command("rm_movej", target, speed, 0, 0, 0)
                 except Exception:
                     self._active_action_id = None
                     self._motion_state["active_action_id"] = None
@@ -474,13 +480,17 @@ class RM75Plugin:
             raise
 
     def _stop_motion(self):
-        # Keep the action-state lock across the SDK stop request. The monitor
-        # cannot select a terminal state between cancellation and slow-stop.
+        # 运动锁和动作 ID 在两张卡之间共享；任一 stop 卡都必须能停止实际持有者。
+        # SDK 慢停调用无超时上限，不得在 _action_lock 内执行；且必须排在
+        # 共享 _submission_lock 里正在进行的运动下发之后。
         with self._action_lock:
             action_id = self._motion_state["active_action_id"] or self._active_action_id
             if action_id:
                 self._cancelled.add(action_id)
-            self.client.command("rm_set_arm_slow_stop")
+        if self.client.connected:
+            with self._submission_lock:
+                # 失败向上传播：stop 失败不得谎报 idle（见生命周期测试契约）
+                self.client.command("rm_set_arm_slow_stop")
         return {"state": "stop_requested", "action_id": action_id}
 
     def dispatch(self, action, args):
@@ -722,7 +732,8 @@ class CartesianPlugin:
         self._motion_lock = arm_plugin._motion_lock if arm_plugin is not None else threading.Lock()
         self._motion_state = arm_plugin._motion_state if arm_plugin is not None else {"active_action_id": None}
         self._action_lock = threading.Lock()
-        self._submission_lock = threading.Lock()
+        # 与 RM75Plugin 共享：提交/慢停串行化对两张卡片全局生效
+        self._submission_lock = arm_plugin._submission_lock if arm_plugin is not None else threading.Lock()
         self._active_action_id = None
         self._cancelled = arm_plugin._cancelled if arm_plugin is not None else set()
         self._monitor_thread = None
@@ -821,10 +832,12 @@ class CartesianPlugin:
             if action_id:
                 self._cancelled.add(action_id)
         if action_id and self.client.connected:
-            try:
-                self.client.command("rm_set_arm_slow_stop")
-            except Exception as exc:
-                print(f"[rm75] cartesian shutdown stop failed: {exc}", flush=True)
+            # 关闭路径同样受共享提交锁保护：慢停必须排在在途下发之后
+            with self._submission_lock:
+                try:
+                    self.client.command("rm_set_arm_slow_stop")
+                except Exception as exc:
+                    print(f"[rm75] cartesian shutdown stop failed: {exc}", flush=True)
         # 监控线程在下一轮询看到 cancelled 后立即收尾；join 保证共享 SDK 连接
         # 被上层（RM75Plugin.stop）销毁前，ACP 终态已上报完成。
         thread = self._monitor_thread
