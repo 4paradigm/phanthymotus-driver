@@ -1,5 +1,7 @@
 """AS2W remote-controller card contract tests without ROS 2 or DDS."""
 
+import json
+import math
 from pathlib import Path
 import struct
 import sys
@@ -78,10 +80,26 @@ def test_parse_axes_and_deadzone():
 
 
 def test_parse_missing_payload_is_unavailable():
-    assert device._parse_wireless_remote(None) == {"available": False, "fresh": False}
-    assert device._parse_wireless_remote(bytearray(23)) == {
-        "available": False, "fresh": False,
+    assert device._parse_wireless_remote(None) == {
+        "available": False, "fresh": False, "valid": False,
     }
+    assert device._parse_wireless_remote(bytearray(23)) == {
+        "available": False, "fresh": False, "valid": False,
+    }
+
+
+def test_parse_nonfinite_axis_is_valid_json_and_marked_invalid():
+    raw = remote_bytes()
+    raw[4:8] = struct.pack("f", math.nan)
+
+    result = device._parse_wireless_remote(raw)
+
+    assert result["available"] is True
+    assert result["valid"] is False
+    assert result["fresh"] is False
+    assert result["invalid_axes"] == ["lx"]
+    assert result["axes"]["lx"] == 0.0
+    json.dumps(result, allow_nan=False)
 
 
 def test_state_node_publishes_and_caches_remote_snapshot():

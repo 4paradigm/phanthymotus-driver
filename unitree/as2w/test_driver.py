@@ -4,6 +4,8 @@ Run with: python3 -m unittest unitree/as2w/test_driver.py
 """
 import importlib.util
 import math
+import os
+import ssl
 import sys
 import threading
 import time
@@ -285,6 +287,36 @@ class TestDriverContracts(unittest.TestCase):
         })
 
         self.assertEqual("INVALID_ARGUMENT", result["code"])
+
+    def test_network_candidates_prefer_configured_then_unitree_subnet(self):
+        addresses = {
+            "docker0": "172.17.0.1",
+            "eth_robot": "192.168.123.42",
+            "wlan0": "10.0.0.5",
+        }
+        names = ["lo", "docker0", "eth_robot", "wlan0"]
+
+        self.assertEqual(
+            ["manual0", "eth_robot", ""],
+            self.main._network_candidates("manual0", names, addresses.__getitem__),
+        )
+        self.assertEqual(
+            ["eth_robot", ""],
+            self.main._network_candidates("", names, addresses.__getitem__),
+        )
+
+    def test_agent_core_tls_is_verified_by_default(self):
+        for path in (ROOT / "main.py", ROOT / "motion_tools.py", ROOT / "controlled_spatial.py"):
+            source = path.read_text()
+            self.assertNotIn("_create_unverified_context", source)
+            self.assertIn("AGENT_CORE_CA_CERT", source)
+        with patch.dict(os.environ, {}, clear=True):
+            for factory in (
+                self.main._agent_core_ssl_context,
+                self.motion._agent_core_ssl_context,
+                self.spatial._agent_core_ssl_context,
+            ):
+                self.assertEqual(ssl.CERT_REQUIRED, factory().verify_mode)
 
     def test_spatial_stop_start_keeps_rpc_and_completion_resources_alive(self):
         plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)

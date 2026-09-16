@@ -10,8 +10,9 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 
 Run `python3 main.py <robot-interface>` on the robot network (normally the
 interface with a `192.168.123.x` address). If the supplied interface is absent,
-the entry point tries available container interfaces and then starts MCP in a
-degraded mode without DDS publishers. The bundle exposes MCP on port
+the entry point prefers an interface on Unitree's `192.168.123.x` subnet and
+uses SDK autodetection only as a last resort; it never selects an arbitrary
+Docker, VPN, or Wi-Fi interface by enumeration order. The bundle exposes MCP on port
 `15709`, publishes JSON state streams under the resolved ROS namespace, and
 uses a dedicated process for RPC calls so ROS callbacks cannot starve SDK
 responses.
@@ -83,3 +84,8 @@ implicitly recorded; a workflow that needs recording must route velocity
 commands through `motion_recorder.drive`.
 Both `drive` and `play` require `confirm=true`; playback also reports its
 terminal state through ACP so the physical-action barrier is released promptly.
+
+Agent Core HTTPS registration and ACP callbacks verify certificates by default.
+Set `AGENT_CORE_CA_CERT` to the deployment CA bundle when it is not in the system
+trust store. `AGENT_CORE_INSECURE_TLS=1` is an explicit development-only escape
+hatch and must not be used on deployed robots.

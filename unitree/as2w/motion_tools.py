@@ -17,9 +17,18 @@ _MAX_RECORDING_FRAMES = 6000
 _DEFAULT_RECORDINGS_DIR = "/opt/phanthy-motus/data/as2w-motion-recordings"
 
 
+def _agent_core_ssl_context():
+    import ssl
+    ca_file = os.environ.get("AGENT_CORE_CA_CERT") or None
+    context = ssl.create_default_context(cafile=ca_file)
+    if os.environ.get("AGENT_CORE_INSECURE_TLS", "").lower() in ("1", "true", "yes"):
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
 def _acp_notify(action_id, status, result, tool):
     """Report one terminal asynchronous-motion result to Agent Core."""
-    import ssl
     import urllib.request
     payload = json.dumps({
         "action_id": action_id,
@@ -35,9 +44,7 @@ def _acp_notify(action_id, status, result, tool):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        urllib.request.urlopen(
-            request, timeout=5, context=ssl._create_unverified_context()
-        )
+        urllib.request.urlopen(request, timeout=5, context=_agent_core_ssl_context())
     except Exception as exc:
         print(f"[{tool}] ACP callback failed for {action_id}: {exc}", flush=True)
 

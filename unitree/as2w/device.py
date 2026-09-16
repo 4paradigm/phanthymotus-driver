@@ -53,20 +53,28 @@ _REMOTE_STALE_AFTER = 0.5
 def _parse_wireless_remote(raw):
     """Decode AS2W LowState_.wireless_remote using the vendored AS2 SDK layout."""
     if raw is None or len(raw) < 24:
-        return {"available": False, "fresh": False}
+        return {"available": False, "fresh": False, "valid": False}
 
     buttons = {
         name: bool(int(raw[byte_index]) >> bit & 1)
         for byte_index, definitions in ((2, _REMOTE_BUTTONS_BYTE2), (3, _REMOTE_BUTTONS_BYTE3))
         for name, bit in definitions
     }
-    axes = {
-        name: round(struct.unpack("f", bytes(raw[offset:offset + 4]))[0], 4)
+    unpacked_axes = {
+        name: struct.unpack("f", bytes(raw[offset:offset + 4]))[0]
         for name, offset in (("lx", 4), ("rx", 8), ("ry", 12), ("ly", 20))
     }
+    invalid_axes = [name for name, value in unpacked_axes.items() if not math.isfinite(value)]
+    axes = {
+        name: round(value, 4) if math.isfinite(value) else 0.0
+        for name, value in unpacked_axes.items()
+    }
+    valid = not invalid_axes
     return {
         "available": True,
-        "fresh": True,
+        "fresh": valid,
+        "valid": valid,
+        "invalid_axes": invalid_axes,
         "buttons": buttons,
         "axes": axes,
         "active": any(buttons.values()) or any(
@@ -156,7 +164,9 @@ class _StateNode:
             remote = copy.deepcopy(self._last_remote)
             last_remote_time = self._last_remote_time
         if remote is not None and remote["available"]:
-            remote["fresh"] = time.monotonic() - last_remote_time <= _REMOTE_STALE_AFTER
+            remote["fresh"] = remote.get("valid", True) and (
+                time.monotonic() - last_remote_time <= _REMOTE_STALE_AFTER
+            )
         return remote
 
 

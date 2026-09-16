@@ -15,6 +15,47 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from rpc_proxy import RpcProxy
 
 
+def _agent_core_ssl_context():
+    import ssl
+    ca_file = os.environ.get("AGENT_CORE_CA_CERT") or None
+    context = ssl.create_default_context(cafile=ca_file)
+    if os.environ.get("AGENT_CORE_INSECURE_TLS", "").lower() in ("1", "true", "yes"):
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def _interface_ipv4(name):
+    """Return an interface IPv4 address using Linux's dependency-free ioctl."""
+    import fcntl
+    import struct
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        packed = struct.pack("256s", name[:15].encode())
+        return socket.inet_ntoa(fcntl.ioctl(sock.fileno(), 0x8915, packed)[20:24])
+
+
+def _network_candidates(configured="", interface_names=None, address_lookup=None):
+    """Prefer an explicit NIC, then Unitree's subnet, then SDK autodetection."""
+    names = interface_names
+    if names is None:
+        try:
+            names = [name for _, name in socket.if_nameindex()]
+        except OSError:
+            names = []
+    lookup = address_lookup or _interface_ipv4
+    candidates = [configured] if configured else []
+    for name in names:
+        if name == "lo" or name in candidates:
+            continue
+        try:
+            if lookup(name).startswith("192.168.123."):
+                candidates.append(name)
+        except OSError:
+            continue
+    candidates.append("")
+    return candidates
+
+
 class _UnavailableProxy:
     """Preserve MCP availability when the robot DDS interface is absent."""
     def __getattr__(self, name):
@@ -95,11 +136,10 @@ def handler(bundle):
 
 
 def _start_registration(mcp_port, name, category):
-    import ssl
     import urllib.request
     agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
     payload = json.dumps({"name": name, "url": f"http://localhost:{mcp_port}/mcp", "category": category}).encode()
-    context = ssl._create_unverified_context()
+    context = _agent_core_ssl_context()
     def run():
         import time
         while True:
@@ -124,13 +164,7 @@ def main():
     else:
         print(f"[as2w] ROS2 isolation profile: {profile} (Domain 42, FastDDS); Unitree SDK: CycloneDDS Domain 0 on {interface or '(auto)'}", flush=True)
     dds_ready = False
-    candidates = [interface] if interface else []
-    try:
-        candidates.extend(name for name in os.listdir("/sys/class/net") if name not in candidates and name != "lo")
-    except OSError:
-        pass
-    candidates.append("")
-    for candidate in candidates:
+    for candidate in _network_candidates(interface):
         try:
             ChannelFactoryInitialize(0, candidate or None)
             dds_ready = True

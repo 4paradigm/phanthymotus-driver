@@ -24,6 +24,17 @@ _APIS = {"start_mapping": 1801, "stop_mapping": 1802, "init_pose": 1804,
          "resume_navigation": 1202, "shutdown": 1901}
 
 
+def _agent_core_ssl_context():
+    import os
+    import ssl
+    ca_file = os.environ.get("AGENT_CORE_CA_CERT") or None
+    context = ssl.create_default_context(cafile=ca_file)
+    if os.environ.get("AGENT_CORE_INSECURE_TLS", "").lower() in ("1", "true", "yes"):
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
 def _finite_argument(args, name, default, minimum=None, maximum=None):
     value = args.get(name, default)
     if isinstance(value, bool):
@@ -51,7 +62,6 @@ def _mode_argument(args):
 def _acp_notify(action_id, status, result):
     """Report asynchronous navigation completion to Agent Core."""
     import os
-    import ssl
     import urllib.request
     payload = json.dumps({"action_id": action_id, "status": status,
                           "result": result, "tool": "controlled_spatial",
@@ -60,7 +70,7 @@ def _acp_notify(action_id, status, result):
         request = urllib.request.Request(
             f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete",
             data=payload, headers={"Content-Type": "application/json"}, method="POST")
-        urllib.request.urlopen(request, timeout=5, context=ssl._create_unverified_context())
+        urllib.request.urlopen(request, timeout=5, context=_agent_core_ssl_context())
     except Exception as exc:
         print(f"[ACP] callback failed for {action_id}: {exc}", flush=True)
 
