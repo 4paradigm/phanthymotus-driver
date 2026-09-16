@@ -1313,11 +1313,29 @@ class CameraSnapshotPlugin:
             self._cv2 = cv2
             self._np = np
             self._native_dir.mkdir(parents=True, exist_ok=True)
-            self._subscription = self._sub_node.create_subscription(
-                Image, "/ob_camera_head/color/image_raw",
-                self._on_image, _RELIABLE_QOS)
+            # Created once and kept, never recycled per start — the same rule
+            # CameraPlugin.start() documents, and for the same measured reason:
+            # destroying and recreating a subscription on a node a live executor
+            # is spinning does not reliably re-deliver. After a few stop→start
+            # cycles the subscription is still in the graph, QoS still matches,
+            # the executor is still healthy and other domain-0 sensors keep
+            # arriving — and the callback simply never fires again.
+            #
+            # That is what took the head camera down: this plugin recycled its
+            # subscription, and both camera consumers in the process went deaf
+            # to /ob_camera_head/color/image_raw while `ros2 topic hz` from a
+            # fresh process in the same container still read 6-12 Hz. The card
+            # reported `state: running`, the bridge kept its publisher, and the
+            # last frame stayed frozen on screen.
+            #
+            # `_on_image` already drops frames while stopped, so the cost of
+            # keeping it is deserialising frames nobody wants.
+            if self._subscription is None:
+                self._subscription = self._sub_node.create_subscription(
+                    Image, "/ob_camera_head/color/image_raw",
+                    self._on_image, _RELIABLE_QOS)
             self._running = True
-            print("[CameraSnapshotPlugin] subscribed to head RGB camera")
+            print("[CameraSnapshotPlugin] subscribed to head RGB camera", flush=True)
         except Exception as e:
             raise RuntimeError(f"camera snapshot initialization failed: {e}") from e
 
@@ -1326,9 +1344,9 @@ class CameraSnapshotPlugin:
         self._running = False
         with self._frame_lock:
             self._latest_frame = None
-        if self._subscription is not None:
-            self._sub_node.destroy_subscription(self._subscription)
-            self._subscription = None
+        # The subscription deliberately outlives the stop — see start(). Tearing
+        # it down here is what left the camera permanently dark after a few
+        # stop→start cycles, and a stop→start is what every start-project does.
 
     def _on_image(self, msg):
         if not self._running:
