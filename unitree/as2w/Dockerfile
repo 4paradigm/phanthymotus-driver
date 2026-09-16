@@ -25,8 +25,8 @@ RUN set -eu; \
     esac; \
     crc_dir=/work/unitree_sdk2py/utils/lib; \
     mkdir -p "${crc_dir}"; \
-    curl -fsSL \
-      "https://raw.githubusercontent.com/unitreerobotics/unitree_sdk2_python/${UNITREE_SDK_COMMIT}/unitree_sdk2py/utils/lib/${crc_file}" \
+    curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 20 --max-time 120 \
+      "https://cdn.jsdelivr.net/gh/unitreerobotics/unitree_sdk2_python@${UNITREE_SDK_COMMIT}/unitree_sdk2py/utils/lib/${crc_file}" \
       -o "${crc_dir}/${crc_file}"; \
     echo "${crc_sha}  ${crc_dir}/${crc_file}" | sha256sum -c -
 COPY main.py device.py lidar.py controlled_spatial.py motion_tools.py rpc_proxy.py config.yaml /work/

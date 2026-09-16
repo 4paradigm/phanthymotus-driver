@@ -215,8 +215,10 @@ class TestDriverContracts(unittest.TestCase):
     def test_sdk_crc_library_is_selected_and_verified_during_image_build(self):
         self.assertEqual([], list((ROOT / "unitree_sdk2py").rglob("crc_*.so")))
         dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertNotIn("raw.githubusercontent.com", dockerfile)
         for expected in (
             "ARG TARGETARCH",
+            "cdn.jsdelivr.net/gh/unitreerobotics/unitree_sdk2_python@",
             "crc_amd64.so",
             "crc_aarch64.so",
             "65691c8a8bc53b98d3976dba4dbf9d5d20b2e7f5",

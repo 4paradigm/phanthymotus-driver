@@ -23,9 +23,9 @@ to `main.py`. These are deliberately separate DDS implementations and domains.
 The image installs the small CMake toolchain because the SDK's pinned
 `cyclonedds==0.10.5` Python binding must link against a matching CycloneDDS
 build. During the image build, Docker selects the target architecture, downloads
-only its CRC `.so` from the pinned official Unitree SDK commit, and verifies the
-artifact against a fixed SHA-256 digest. Architecture-specific binaries are not
-stored in this repository.
+only its CRC `.so` from the pinned official Unitree SDK commit through jsDelivr's
+GitHub CDN, and verifies the artifact against a fixed SHA-256 digest.
+Architecture-specific binaries are not stored in this repository.
 
 `duration=-1` starts a 10 Hz velocity command loop; `stop_move`, shutdown, and
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
