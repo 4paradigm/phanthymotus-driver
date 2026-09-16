@@ -45,6 +45,14 @@ plugins:
     enabled: true
   ext_camera:
     enabled: true
+  greeting:
+    enabled: true
+    auto_start: true
+    threshold_m: 2.0
+    consecutive_frames: 5
+    cooldown_s: 15.0
+    text: "欢迎参观"
+    gesture: "high wave"
 
 safety_harness:
   enabled: true
