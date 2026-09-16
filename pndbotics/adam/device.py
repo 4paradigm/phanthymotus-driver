@@ -1293,7 +1293,7 @@ class _ArmControlNode(Node):
             return 0
 
 
-class ArmPlugin:
+class ArmControlPlugin:
     """Human-facing Adam Pro upper-body control via ROS2 JointState."""
 
     PREFIX = "arm"
@@ -1312,12 +1312,11 @@ class ArmPlugin:
             {"const": pose, "title": label}
             for pose, (label, _) in ARM_POSES.items()
         ]
-        actions = [*ARM_ACTIONS, "preset", "set_height", "stop", "info"]
+        actions = [*ARM_ACTIONS, "set_height", "stop", "info"]
         action_options = [
             {"const": action, "title": f"设置{ARM_JOINT_CONTROLS[control][0]}"}
             for action, control in ARM_ACTIONS.items()
         ] + [
-            {"const": "preset", "title": "执行预设姿态"},
             {"const": "set_height", "title": "设置站立高度"},
             {"const": "stop", "title": "停止上肢指令"},
             {"const": "info", "title": "查看状态"},
@@ -1331,7 +1330,6 @@ class ArmPlugin:
                          "description": "站立高度，范围 0.60-1.00 米。"},
         }
         action_params = {
-            "preset": {"params": ["pose"], "description": "执行保守的双臂预设姿态。"},
             "set_height": {"params": ["height_m"], "description": "设置站立高度（米）。"},
             "stop": {"params": [], "description": "停止发布上肢目标并保持机器人当前状态。"},
             "info": {"params": [], "description": "查看上肢指令是否已启用。"},
@@ -1349,9 +1347,9 @@ class ArmPlugin:
                 "description": f"设置{label}，范围 [{minimum:g}, {maximum:g}] 度。",
             }
         return {
-            "name": "arm",
+            "name": "arm_control",
             "type": "actuator",
-            "description": "Adam upper body — choose a named waist/arm joint and an angle in degrees, or use a safe preset pose",
+            "description": "Adam upper body joint control — one named joint and its angle in degrees",
             "inputSchema": {
                 "type": "object",
                 "properties": properties,
@@ -1435,6 +1433,73 @@ class ArmPlugin:
                     "receiver_count": receivers,
                     "receiver_ready": receivers > 0}
         return None
+
+
+ArmPlugin = ArmControlPlugin
+
+
+class ArmGesturePlugin:
+    """Common arm gestures using the shared upper-body control publisher."""
+
+    PREFIX = "arm_gesture"
+    _POSES = {
+        "salute": "arms_forward", "welcome": "arms_open", "raise": "hands_up",
+        "shake_hands": "arms_forward", "high_five": "arms_forward", "reset": "neutral",
+    }
+
+    def __init__(self, control: ArmControlPlugin):
+        self._control = control
+
+    def get_tool(self):
+        return {
+            "name": "arm_gesture", "type": "actuator",
+            "description": "Adam arm gestures — salute, welcome, raise, shake hands, high five and reset",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": [*self._POSES, "stop"]},
+                "side": {"type": "string", "enum": ["left", "right", "both"], "default": "right"},
+            }, "required": ["action"], "additionalProperties": False,
+            "x-action-params": {action: {"params": ["side"], "description": action}
+                                for action in self._POSES} | {"stop": {"params": []}},
+            "x-resource": ["adam_upper_body"]},
+        }
+
+    def start(self):
+        return self._control.start()
+
+    def stop(self):
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return self._control.dispatch("stop", {})
+        pose = self._POSES.get(action)
+        if pose is None:
+            return None
+        side = args.get("side", "right")
+        if side not in ("left", "right", "both"):
+            return {"success": False, "code": "INVALID_ARGUMENT", "message": "side must be left, right or both"}
+        _, values = ARM_POSES[pose]
+        selected = {
+            control: degrees for control, degrees in values.items()
+            if side == "both" or control.startswith(f"{side}_")
+        }
+        if action == "reset":
+            selected = {control: 0.0 for control in ARM_JOINT_CONTROLS
+                        if side == "both" or control.startswith(f"{side}_")}
+        try:
+            targets = dict(_arm_target_radians(control, value)
+                           for control, value in selected.items())
+            self._control._node.set_joints(targets)
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+        receivers = self._control._node.receiver_count()
+        if receivers < 1:
+            return {"success": False, "code": "ROS_RECEIVER_UNAVAILABLE",
+                    "message": "No Adam retarget receiver is subscribed to joint_states",
+                    "receiver_count": receivers}
+        self._control._node._active = True
+        return {"success": True, "state": "active", "gesture": action,
+                "side": side, "receiver_count": receivers}
 
 
 # ===========================================================================
@@ -1596,11 +1661,11 @@ class HandPlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "open": {
-                        "params": [],
-                        "description": "Apply the configured open pose to both hands",
+                        "params": ["side"],
+                        "description": "Open the selected left or right hand",
                     },
                     "close": {
-                        "params": [],
+                        "params": ["side"],
                         "description": (
                             "Close pinky/ring/middle/index while simultaneously "
                             "rotating and flexing the thumb to its safe target"
@@ -1864,9 +1929,9 @@ class HandPlugin:
         if action == "get_state":
             return self._get_state()
         if action == "open":
-            return self._activate(self._open_positions, "open")
+            return self._activate_side(args.get("side"), self._open_positions, "open")
         if action == "close":
-            return self._activate(self._close_target(), "close")
+            return self._activate_side(args.get("side"), self._close_target(), "close")
         if action == "set_fingers":
             side = args.get("side")
             channel = args.get("channel")
@@ -1903,6 +1968,64 @@ class HandPlugin:
         if action == "info":
             return self._status()
         return None
+
+    def _activate_side(self, side, source, action):
+        if side not in ("left", "right"):
+            return {"state": "error", "error": "INVALID_ARGUMENT", "message": "side must be either left or right"}
+        positions = self._base_positions()
+        offset = 0 if side == "left" else 6
+        positions[offset:offset + 6] = source[offset:offset + 6]
+        result = self._activate(positions, action)
+        result["side"] = side
+        return result
+
+
+class HandGesturePlugin:
+    """Common Adam hand gestures, composed from the DDS hand controller."""
+
+    PREFIX = "hand_gesture"
+    _GESTURES = {
+        "thumbs_up": [0, 0, 0, 0, 100, 1000],
+        "fist": [0, 0, 0, 0, 100, 1000],
+        "victory": [0, 0, 1000, 1000, 100, 1000],
+        "point": [0, 0, 0, 1000, 100, 1000],
+        "open_palm": [1000, 1000, 1000, 1000, 1000, 0],
+    }
+
+    def __init__(self, control: HandPlugin):
+        self._control = control
+
+    def get_tool(self):
+        return {"name": "hand_gesture", "type": "actuator",
+                "description": "Adam hand gestures — thumbs up, fist, victory, point and open palm",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": list(self._GESTURES)},
+                    "side": {"type": "string", "enum": ["left", "right"], "default": "right"},
+                }, "required": ["action", "side"], "additionalProperties": False,
+                "x-action-params": {gesture: {"params": ["side"], "description": gesture}
+                                    for gesture in self._GESTURES},
+                "x-resource": ["adam_hands"]}}
+
+    def start(self):
+        return self._control.start()
+
+    def stop(self):
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        values = self._GESTURES.get(action)
+        side = args.get("side")
+        if values is None:
+            return None
+        if side not in ("left", "right"):
+            return {"state": "error", "error": "INVALID_ARGUMENT", "message": "side must be either left or right"}
+        positions = self._control._base_positions()
+        offset = 0 if side == "left" else 6
+        positions[offset:offset + 6] = values
+        result = self._control._activate(positions, action)
+        result["side"] = side
+        result["gesture"] = action
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -3383,13 +3506,15 @@ class AdamDeviceBundle:
             self._plugins.append(VisionCapturePlugin(
                 plugins_cfg.get("vision_capture", {}), camera_plugin))
 
-        # ArmPlugin
+        # Direct upper-body control and semantic gestures share one ROS publisher.
         if plugins_cfg.get("arm", {}).get("enabled", True) and self._ros2_enabled:
-            p = ArmPlugin(
+            p = ArmControlPlugin(
                 plugins_cfg.get("arm", {}), namespace, executor,
                 grpc_client=grpc_client,
             )
             self._plugins.append(p)
+            if plugins_cfg.get("arm_gesture", {}).get("enabled", True):
+                self._plugins.append(ArmGesturePlugin(p))
 
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:
@@ -3397,6 +3522,8 @@ class AdamDeviceBundle:
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
             self._plugins.append(p)
+            if plugins_cfg.get("hand_gesture", {}).get("enabled", True):
+                self._plugins.append(HandGesturePlugin(p))
         if hand_state_enabled and self._hand_state_cache is not None and self._ros2_enabled:
             p = HandStatePlugin(
                 plugins_cfg.get("hand_state", {}), namespace, executor,

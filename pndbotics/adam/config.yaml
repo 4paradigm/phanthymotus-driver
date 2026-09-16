@@ -77,6 +77,8 @@ plugins:
   arm:
     enabled: true
     publish_rate_hz: 100
+  arm_gesture:
+    enabled: true
   hand:
     enabled: true
     # Verified on Adam: all 12 hand channels move in the effective 0..1000
@@ -91,6 +93,8 @@ plugins:
     thumb_close_min_flex_position: 100
     open_positions: [1000, 1000, 1000, 1000, 1000, 0, 1000, 1000, 1000, 1000, 1000, 0]
     close_positions: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  hand_gesture:
+    enabled: true
   hand_state:
     enabled: true
     publish_rate_hz: 50

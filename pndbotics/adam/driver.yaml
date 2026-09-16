@@ -26,8 +26,10 @@ cards:
   - { name: loco,               type: actuator }
   - { name: motion,             type: actuator }
   - { name: tracking_motion,    type: actuator }
-  - { name: arm,                type: actuator }
-  - { name: hand,                type: actuator }
+  - { name: arm_control,        type: actuator }
+  - { name: arm_gesture,        type: actuator }
+  - { name: hand,               type: actuator }
+  - { name: hand_gesture,       type: actuator }
   - { name: hand_state,          type: sensor }
   - { name: camera_head,         type: sensor }
   - { name: camera_depth,        type: sensor }
