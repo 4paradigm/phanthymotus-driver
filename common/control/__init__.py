@@ -29,12 +29,13 @@ Design notes and the reasoning behind each check:
 `phanthymotus/docs/vla-integration.md` § "通用控制接口".
 """
 
-from .descriptor import SCHEMA, Descriptor, parse_descriptor
+from .descriptor import SCHEMA, Descriptor, Group, parse_descriptor
 from .sink import ControlSink, Outcome, Verdict
 
 __all__ = [
     "SCHEMA",
     "Descriptor",
+    "Group",
     "parse_descriptor",
     "ControlSink",
     "Outcome",

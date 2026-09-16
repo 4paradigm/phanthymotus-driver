@@ -34,6 +34,32 @@ class DescriptorError(ValueError):
 
 
 @dataclass(frozen=True)
+class Group:
+    """A contiguous slice of the action vector with its own unit and resource.
+
+    A single-arm robot needs none of this: one unit, one physical channel, one
+    `units` dict covers it. A humanoid does not. Tianyi's action vector is
+    fourteen arm joints in radians followed by twelve finger values that are
+    normalised closure — one `units` mapping cannot describe both, and the two
+    halves are separate physical channels that an ACP barrier should be able to
+    tell apart.
+
+    Optional and backward compatible: a descriptor without `groups` is one
+    group covering everything, which is what every existing driver means.
+    """
+
+    name: str
+    offset: int
+    count: int
+    unit: str = ""
+    resource: str = ""
+
+    @property
+    def slice(self) -> slice:
+        return slice(self.offset, self.offset + self.count)
+
+
+@dataclass(frozen=True)
 class Descriptor:
     """A validated action space declaration.
 
@@ -60,11 +86,21 @@ class Descriptor:
     # force-torque sensing — declared explicitly rather than omitted, so that a
     # missing protection is visible instead of assumed. See sink.ControlSink.
     force_torque: tuple[float, ...] | None = None
+    groups: tuple[Group, ...] = ()
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
     def has_force_torque(self) -> bool:
         return self.force_torque is not None
+
+    @property
+    def resources(self) -> tuple[str, ...]:
+        """Physical channels this action space occupies, for `x-resource`."""
+        seen = []
+        for group in self.groups:
+            if group.resource and group.resource not in seen:
+                seen.append(group.resource)
+        return tuple(seen)
 
 
 def _require(source: dict, key: str, where: str):
@@ -194,6 +230,8 @@ def parse_descriptor(raw: dict) -> Descriptor:
     if end_effector is not None and not isinstance(end_effector, dict):
         raise DescriptorError("descriptor.end_effector must be an object or absent")
 
+    groups = _parse_groups(raw.get("groups"), dof=dof)
+
     return Descriptor(
         mode=mode,
         dof=dof,
@@ -210,5 +248,49 @@ def parse_descriptor(raw: dict) -> Descriptor:
         frame=str(raw.get("frame", "") or ""),
         end_effector=end_effector,
         force_torque=force_torque,
+        groups=groups,
         raw=dict(raw),
     )
+
+
+def _parse_groups(raw, *, dof: int) -> tuple:
+    """Validate `groups`, or default to one group covering the whole vector.
+
+    Groups must tile `[0, dof)` exactly, in order and without gaps. A gap would
+    leave dimensions with no declared unit and no owning channel — and since
+    the whole point of a group is to say what a slice *means*, a dimension in
+    no group is a dimension nobody has described.
+    """
+    if raw is None:
+        return (Group(name="all", offset=0, count=dof),)
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise DescriptorError("descriptor.groups must be a non-empty list or absent")
+
+    groups, expected = [], 0
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise DescriptorError(f"descriptor.groups[{i}] must be an object")
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            raise DescriptorError(f"descriptor.groups[{i}].name is required")
+        offset, count = entry.get("offset"), entry.get("count")
+        for key, value in (("offset", offset), ("count", count)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise DescriptorError(
+                    f"descriptor.groups[{i}].{key} must be an integer")
+        if count <= 0:
+            raise DescriptorError(f"descriptor.groups[{i}].count must be positive")
+        if offset != expected:
+            raise DescriptorError(
+                f"descriptor.groups[{i}] ({name}) starts at {offset}, expected "
+                f"{expected} — groups must tile the vector in order with no gaps"
+            )
+        expected = offset + count
+        groups.append(Group(name=name, offset=offset, count=count,
+                            unit=str(entry.get("unit") or ""),
+                            resource=str(entry.get("resource") or "")))
+
+    if expected != dof:
+        raise DescriptorError(
+            f"descriptor.groups cover {expected} dimensions but dof is {dof}")
+    return tuple(groups)
