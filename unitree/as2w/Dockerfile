@@ -1,8 +1,5 @@
-# Do not make this base build-arg configurable. The deployment builder can
-# inject ROS_BASE_IMAGE globally; the internal rolling image it injected on
-# Jetson had an empty /opt/ros/humble prefix and no rclpy. This standalone
-# bundle needs the official complete, multi-architecture Humble runtime.
-FROM ros:humble-ros-base
+ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
+FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
 WORKDIR /work
 ARG PYPI_MIRROR
@@ -18,10 +15,12 @@ RUN curl -fsSL ${CYCLONEDDS_URL} | tar xz -C /tmp && \
     rm -rf /tmp/cyclonedds-0.10.5
 ENV CYCLONEDDS_HOME=/opt/cyclonedds
 ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
+# Do not use apt's --auto-remove here: the ROS base's packages may be marked
+# auto-installed and are required at runtime (rclpy, setup.bash, etc.).
 COPY requirements.txt /work/requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt && \
     pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5 && \
-    apt-get purge -y --auto-remove cmake build-essential curl python3-pip && \
+    apt-get purge -y cmake build-essential curl python3-pip && \
     rm -rf /var/lib/apt/lists/*
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY main.py device.py lidar.py controlled_spatial.py rpc_proxy.py config.yaml /work/
