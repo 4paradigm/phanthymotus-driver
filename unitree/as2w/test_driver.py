@@ -100,6 +100,23 @@ class TestDriverContracts(unittest.TestCase):
         self.assertTrue(result["action_id"].startswith("as2w_nav_"))
         thread.assert_called_once()
 
+    def test_navigation_buffers_task_result_arriving_during_rpc(self):
+        plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
+        plugin._nav_done = self.spatial.threading.Event()
+        plugin._nav_result = None
+        plugin._nav_action_id = None
+        plugin._nav_lock = self.spatial.threading.Lock()
+        def call(action, data):
+            plugin._on_slam_key_info(types.SimpleNamespace(data='{"type":"task_result","errorCode":0,"data":{"is_arrived":true}}'))
+            return {"code": 0, "response": "{}"}
+        plugin._client = types.SimpleNamespace(call=call)
+        with patch.object(self.spatial.threading, "Thread") as thread:
+            result = plugin.dispatch("navigate_to", {"x": 1, "y": 2})
+        self.assertTrue(result["action_id"].startswith("as2w_nav_"))
+        self.assertTrue(plugin._nav_done.is_set())
+        self.assertTrue(plugin._nav_result["data"]["is_arrived"])
+        thread.assert_called_once()
+
     def test_model_resource_is_textual_urdf(self):
         urdf = (ROOT / "resource" / "as2w.urdf").read_text()
         self.assertIn('<robot name="AS2W">', urdf)

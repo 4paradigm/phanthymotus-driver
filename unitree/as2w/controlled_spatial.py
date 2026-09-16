@@ -201,19 +201,32 @@ class ControlledSpatialPlugin:
         elif action == "navigate_to":
             data = {"targetPose": self._pose(args), "mode": int(args.get("mode", 1)), "speed": float(args.get("speed", 0.5))}
         else: data = {}
+        action_id = None
+        previous = None
+        if action == "navigate_to":
+            # Arm completion state before the RPC. The vendor can publish a very
+            # fast task_result before _Call returns, so clearing the event after
+            # the call loses that completion and leaves ACP waiting for 180s.
+            with self._nav_lock:
+                previous = self._nav_action_id
+                action_id = f"as2w_nav_{uuid4().hex[:8]}"
+                self._nav_action_id = action_id
+                self._nav_done.clear()
+                self._nav_result = None
+            if previous:
+                _acp_notify(previous, "cancelled", {"reason": "superseded by new navigation request"})
+
         result = self._client.call(action, data)
         response = result["response"]
         try: response = json.loads(response) if isinstance(response, str) else response
         except json.JSONDecodeError: pass
         if action != "navigate_to" or result["code"] != 0:
+            if action == "navigate_to":
+                with self._nav_lock:
+                    if self._nav_action_id == action_id:
+                        self._nav_action_id = None
+                        self._nav_done.clear()
             return {"ret": result["code"], "response": response}
-        with self._nav_lock:
-            previous = self._nav_action_id
-            self._nav_action_id = action_id = f"as2w_nav_{uuid4().hex[:8]}"
-            self._nav_done.clear()
-            self._nav_result = None
-        if previous:
-            _acp_notify(previous, "cancelled", {"reason": "superseded by new navigation request"})
         threading.Thread(target=self._wait_for_navigation,
                          args=(action_id, data["targetPose"]), daemon=True).start()
         return {"ret": 0, "status": "navigating", "action_id": action_id,
