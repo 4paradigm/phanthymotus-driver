@@ -29,12 +29,11 @@ _JT128_R = (
     (0.0, 1.0, 0.0),
     (-0.9945243440, 0.0, -0.1045051633),
 )
-# The existing dashboard renderer maps incoming (x,y,z) to display axes as
-# display=(y,-z,-x).  After the JT128 mount transform, the requested basis is
-# current up -> backward and current forward -> downward.  The corresponding
-# orthogonal rotation also maps current left -> right; preserving left would
-# make the requested transform mathematically inconsistent.  Its preimage for
-# the unchanged renderer is wire=(-base_z, base_x, -base_y).
+# Agent-core's point-cloud declaration uses Three.js axes: red X=right,
+# green Y=up, blue Z=forward.  It maps wire coordinates as
+# display=(wire_y, -wire_z, -wire_x).  AS2W's URDF follows the ROS base frame
+# (base_x=forward, base_y=left, base_z=up), so wire=-base produces exactly
+# display=(-base_y, base_z, base_x): right/up/forward respectively.
 _LIDAR_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -144,7 +143,7 @@ class _LidarNode:
                 bx = _JT128_R[0][0] * x + _JT128_R[0][1] * y + _JT128_R[0][2] * z
                 by = _JT128_R[1][0] * x + _JT128_R[1][1] * y + _JT128_R[1][2] * z
                 bz = _JT128_R[2][0] * x + _JT128_R[2][1] * y + _JT128_R[2][2] * z
-                rx, ry, rz = -bz, bx, -by
+                rx, ry, rz = -bx, -by, -bz
                 # Output is always little-endian, independent of DDS input.
                 struct.pack_into("<fff", out, target, rx, ry, rz)
         except (IndexError, struct.error, ValueError):
