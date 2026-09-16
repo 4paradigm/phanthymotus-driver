@@ -1,6 +1,8 @@
 """Unitree AS2W driver plugins (official AS2 SDK SportClient)."""
+import copy
 import json
 import math
+import struct
 import threading
 import time
 
@@ -16,7 +18,45 @@ def _number(value, default=0.0):
         return default
 
 
+_REMOTE_BUTTONS_BYTE2 = (
+    ("LT", 5), ("RT", 4), ("back", 3), ("start", 2), ("LB", 1), ("RB", 0),
+)
+_REMOTE_BUTTONS_BYTE3 = (
+    ("left", 7), ("down", 6), ("right", 5), ("up", 4),
+    ("Y", 3), ("X", 2), ("B", 1), ("A", 0),
+)
+_REMOTE_AXIS_DEADZONE = 0.1
+_REMOTE_STALE_AFTER = 0.5
+
+
+def _parse_wireless_remote(raw):
+    """Decode AS2W LowState_.wireless_remote using the vendored AS2 SDK layout."""
+    if raw is None or len(raw) < 24:
+        return {"available": False, "fresh": False}
+
+    buttons = {
+        name: bool(int(raw[byte_index]) >> bit & 1)
+        for byte_index, definitions in ((2, _REMOTE_BUTTONS_BYTE2), (3, _REMOTE_BUTTONS_BYTE3))
+        for name, bit in definitions
+    }
+    axes = {
+        name: round(struct.unpack("f", bytes(raw[offset:offset + 4]))[0], 4)
+        for name, offset in (("lx", 4), ("rx", 8), ("ry", 12), ("ly", 20))
+    }
+    return {
+        "available": True,
+        "fresh": True,
+        "buttons": buttons,
+        "axes": axes,
+        "active": any(buttons.values()) or any(
+            abs(value) > _REMOTE_AXIS_DEADZONE for value in axes.values()
+        ),
+    }
+
+
 class _StateNode:
+    _REMOTE_INTERVAL = 0.1
+
     def __init__(self, namespace, executor):
         from rclpy.node import Node
         self.node = Node("as2w_state")
@@ -24,7 +64,13 @@ class _StateNode:
         self.joints = self.node.create_publisher(String, f"/{namespace}/state/joints", 10)
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", 10)
         self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", 10)
+        self.remote_controller = self.node.create_publisher(
+            String, f"/{namespace}/state/remote_controller", 10
+        )
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", 10)
+        self._last_remote_time = 0.0
+        self._last_remote = None
+        self._remote_lock = threading.Lock()
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._sport = ChannelSubscriber("rt/sportmodestate", SportModeState_)
         self._low.Init(self._on_low, 10)
@@ -66,6 +112,14 @@ class _StateNode:
             self._publish(self.battery, {"soc": int(getattr(bms, "soc", 0)),
                                          "current": _number(getattr(bms, "current", 0)),
                                          "cycle": int(getattr(bms, "cycle", 0))})
+        now = time.monotonic()
+        if now - self._last_remote_time >= self._REMOTE_INTERVAL:
+            remote = _parse_wireless_remote(getattr(msg, "wireless_remote", None))
+            remote["timestamp_ms"] = int(time.time() * 1000)
+            with self._remote_lock:
+                self._last_remote_time = now
+                self._last_remote = remote
+            self._publish(self.remote_controller, remote)
 
     def _on_sport(self, msg):
         imu = getattr(msg, "imu_state", None)
@@ -74,6 +128,15 @@ class _StateNode:
                                   "position": list(getattr(msg, "position", [])),
                                   "body_height": _number(getattr(msg, "body_height", 0)),
                                   "imu_rpy": list(getattr(imu, "rpy", [])) if imu else []})
+
+    @property
+    def last_remote(self):
+        with self._remote_lock:
+            remote = copy.deepcopy(self._last_remote)
+            last_remote_time = self._last_remote_time
+        if remote is not None and remote["available"]:
+            remote["fresh"] = time.monotonic() - last_remote_time <= _REMOTE_STALE_AFTER
+        return remote
 
 
 class StatePlugin:
@@ -86,7 +149,9 @@ class StatePlugin:
                  ("joints", "state/joints", "sensor/skeleton", "AS2W 16-joint skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "AS2 raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "AS2 BMS state"),
-                 ("loco_state", "loco/state", "data/json", "AS2 high-level locomotion state"))
+                 ("loco_state", "loco/state", "data/json", "AS2 high-level locomotion state"),
+                 ("remote_controller", "state/remote_controller", "data/json",
+                  "AS2W wireless remote controller: 14 buttons and 4 axes"))
         return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
                  "inputSchema": {"type": "object", "properties": {}},
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
@@ -94,22 +159,23 @@ class StatePlugin:
     def start(self): pass
     def stop(self): self._state.close()
     def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "read" and args.get("_tool_name") == "remote_controller":
+            return {"state": "running", "data": self._state.last_remote or {"available": False}}
         if action == "info":
-            name = args.get("_tool_name")
-            paths = {"imu": ("state/imu", "data/json"),
-                     "joints": ("state/joints", "sensor/skeleton"),
-                     "joint_state": ("state/joint_state", "data/json"),
-                     "battery": ("state/battery", "data/json"),
-                     "loco_state": ("loco/state", "data/json")}
-            if name in paths:
-                path, fmt = paths[name]
-                return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+            tool_name = args.get("_tool_name")
+        elif action in ("imu", "joints", "joint_state", "battery", "loco_state", "remote_controller"):
+            tool_name = action
+        else:
+            tool_name = None
+        if tool_name:
+            tool = next((item for item in self.get_tools() if item["name"] == tool_name), None)
+            if tool is not None:
+                return {"state": "running", "topic_out": tool["topic_out"]}
+        if action in ("start", "info"):
             return {"state": "running"}
-        if action in ("imu", "joints", "joint_state", "battery", "loco_state"):
-            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
-            fmt = "sensor/skeleton" if action == "joints" else "data/json"
-            return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
-        return {"state": "running"} if action in ("start", "info") else ({"state": "idle"} if action == "stop" else None)
+        return None
 
 
 class LocoPlugin:

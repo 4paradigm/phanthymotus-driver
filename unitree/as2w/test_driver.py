@@ -112,12 +112,15 @@ class TestDriverContracts(unittest.TestCase):
     def test_lowstate_extra_motor_slots_are_ignored(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []
-        node.imu = node.joints = node.joint_state = node.battery = types.SimpleNamespace(
+        node.imu = node.joints = node.joint_state = node.battery = node.remote_controller = types.SimpleNamespace(
             publish=lambda message: published.append(message.data))
+        node._last_remote_time = 0.0
+        node._last_remote = None
+        node._remote_lock = self.device.threading.Lock()
         motors = [types.SimpleNamespace(q=float(i), dq=0, tau_est=0, temperature=0) for i in range(20)]
         imu = types.SimpleNamespace(quaternion=[], gyroscope=[], accelerometer=[], rpy=[])
         node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors, bms_state=None))
-        self.assertEqual(3, len(published))
+        self.assertEqual(4, len(published))
         self.assertEqual(16, len(__import__("json").loads(published[1])["joint_states"]))
 
 

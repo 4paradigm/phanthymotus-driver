@@ -50,3 +50,9 @@ continuous `loco` control card.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.
+
+`remote_controller` decodes the AS2W `LowState_.wireless_remote[40]` payload
+with the button and axis layout defined by the vendored official AS2 SDK. It
+publishes 14 buttons, 4 axes, activity and freshness state at up to 10 Hz on
+`/{namespace}/state/remote_controller`; MCP `info` and `read` are also
+supported.
