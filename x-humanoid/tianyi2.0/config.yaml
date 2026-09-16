@@ -76,9 +76,16 @@ plugins:
     enabled: true
   servo:
     # 执行模型（VLA 等）的连续控制入口：26 维 = 14 臂(rad) + 12 指(0 张开..1 握紧)。
-    # 默认关闭 —— 打开之后还要在画布上把一路 control/joint 源连到它，并在
-    # start 时显式 confirm_motion，才会真的开始驱动。
-    enabled: false
+    #
+    # 和 arm / hand 一样默认打开 —— 这里的 enabled 只决定这张卡片**出不出现**
+    # 在工具列表和侧边栏里，不决定它动不动。真正的门槛有三道，都在别处：
+    #   1. 画布上必须有一路 control/joint 连到它，否则 start 会因为拿不到
+    #      input_topic 而拒绝；
+    #   2. start 必须显式带 confirm_motion: true；
+    #   3. 每一条指令还要过驱动侧 ControlSink 的检查链。
+    # 容器重启也不会让它自己跑起来（bundle 的 start() 是空的）。
+    # 实际上它比 arm 更难被误触发：arm 一次 tools/call 就动。
+    enabled: true
     expected_hz: 30
     # 每条指令下发给关节的角速度，厂商允许区间 [0.2, 1.5] rad/s。
     arm_speed: 0.5
