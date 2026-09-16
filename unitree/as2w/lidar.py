@@ -20,7 +20,10 @@ _DEFAULT_SOURCE_TOPICS = (
     "rt/utlidar/cloud_jt128",
 )
 _SOURCE_TIMEOUT_SECONDS = 1.5
-_MAX_RENDER_POINTS = 40000
+# A large Livox frame is expensive to decode in Python.  The dashboard has no
+# useful visual benefit from all source points, while a smaller uniform sample
+# makes it substantially more likely that the displayed frame is the latest.
+_MAX_RENDER_POINTS = 12000
 # Official AS2W URDF JT128 fixed joint: rpy=(-pi, 1.4661, -pi).
 # This maps points from the lidar frame into the AS2W base frame.  Keeping the
 # values explicit avoids pulling numpy into the latency-sensitive bridge.
@@ -29,11 +32,9 @@ _JT128_R = (
     (0.0, 1.0, 0.0),
     (-0.9945243440, 0.0, -0.1045051633),
 )
-# Agent-core's point-cloud declaration uses Three.js axes: red X=right,
-# green Y=up, blue Z=forward.  It maps wire coordinates as
-# display=(wire_y, -wire_z, -wire_x).  AS2W's URDF follows the ROS base frame
-# (base_x=forward, base_y=left, base_z=up), so wire=-base produces exactly
-# display=(-base_y, base_z, base_x): right/up/forward respectively.
+# The AS2W visual alignment verified on hardware is the base-frame ordering.
+# Agent-core maps wire coordinates as display=(wire_y, -wire_z, -wire_x), so
+# use this preimage to produce display=(base_x, base_y, base_z).
 _LIDAR_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -55,6 +56,9 @@ class _LidarNode:
         self._last_seen = {source: 0.0 for source in self.source_topics}
         self._frames = {source: 0 for source in self.source_topics}
         self._bytes = {source: 0 for source in self.source_topics}
+        self._published = 0
+        self._dropped = 0
+        self._processing_seconds = 0.0
         # A live Livox frame can exceed 1 MiB. Do not serialize and publish it
         # from the CycloneDDS callback; that starves the DDS reader and causes
         # the intermittent one-frame behaviour observed on AS2W.
@@ -83,9 +87,12 @@ class _LidarNode:
                     f"AS2W lidar source {self._active_source} timed out; waiting for another source")
                 self._active_source = None
             frames, sizes, active = dict(self._frames), dict(self._bytes), self._active_source
+            published, dropped = self._published, self._dropped
+            processing = self._processing_seconds
         summary = ", ".join(f"{source}={frames[source]} frames/{sizes[source]} B" for source in self.source_topics)
+        timing = f"published={published}, dropped={dropped}, avg_convert={processing / published * 1000:.1f}ms" if published else "published=0"
         if active:
-            self.node.get_logger().info(f"AS2W lidar active source {active}; {summary}")
+            self.node.get_logger().info(f"AS2W lidar active source {active}; {summary}; {timing}")
         else:
             self.node.get_logger().warning(
                 "AS2W lidar has received no PointCloud2 frames. "
@@ -98,6 +105,7 @@ class _LidarNode:
             except queue.Empty:
                 continue
             try:
+                start = time.monotonic()
                 data = self._to_xyz(data, point_step, point_count, offsets, endian)
                 if not data:
                     continue
@@ -109,6 +117,9 @@ class _LidarNode:
                 # This avoids constructing millions of boxed Python ints per frame.
                 out.data = array.array("B", payload)
                 self.pub.publish(out)
+                with self._lock:
+                    self._published += 1
+                    self._processing_seconds += time.monotonic() - start
             except Exception as exc:
                 self.node.get_logger().warning(f"AS2W lidar publish failed; continuing: {exc}")
 
@@ -143,7 +154,7 @@ class _LidarNode:
                 bx = _JT128_R[0][0] * x + _JT128_R[0][1] * y + _JT128_R[0][2] * z
                 by = _JT128_R[1][0] * x + _JT128_R[1][1] * y + _JT128_R[1][2] * z
                 bz = _JT128_R[2][0] * x + _JT128_R[2][1] * y + _JT128_R[2][2] * z
-                rx, ry, rz = -bx, -by, -bz
+                rx, ry, rz = -bz, bx, -by
                 # Output is always little-endian, independent of DDS input.
                 struct.pack_into("<fff", out, target, rx, ry, rz)
         except (IndexError, struct.error, ValueError):
@@ -187,6 +198,8 @@ class _LidarNode:
             item = (point_step, point_count, data, offsets, endian)
             self._cloud_queue.put_nowait(item)
         except queue.Full:
+            with self._lock:
+                self._dropped += 1
             # A dashboard should receive the latest scan, never a stale backlog.
             try:
                 self._cloud_queue.get_nowait()
