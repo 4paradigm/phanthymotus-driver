@@ -178,7 +178,12 @@ class StatePlugin:
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
                 for name, path, fmt, desc in specs]
     def start(self): pass
-    def stop(self): self._state.close()
+    def stop(self):
+        # These sensor feeds are shared and always on. Canvas lifecycle stops
+        # must not destroy the only DDS subscriptions for all six cards.
+        pass
+    def shutdown(self):
+        self._state.close()
     def dispatch(self, action, args):
         if action == "stop":
             return {"state": "idle"}

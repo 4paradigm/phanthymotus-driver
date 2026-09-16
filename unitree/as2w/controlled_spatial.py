@@ -174,6 +174,9 @@ class ControlledSpatialPlugin:
         if action_id:
             self._client.call("pause_navigation", {})
             _acp_notify(action_id, "cancelled", {"reason": "card stopped"})
+
+    def shutdown(self):
+        self.stop()
         if self._nav_sub is not None:
             try:
                 self._nav_sub.Close()

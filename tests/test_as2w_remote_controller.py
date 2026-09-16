@@ -145,6 +145,23 @@ def test_tool_contract_and_dispatch():
     }
 
 
+def test_stop_start_keeps_remote_controller_state_live():
+    plugin = state_plugin()
+    close = mock.Mock()
+    plugin._state = types.SimpleNamespace(
+        close=close, last_remote={"available": True, "fresh": True},
+    )
+
+    plugin.stop()
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    plugin.start()
+
+    close.assert_not_called()
+    assert plugin.dispatch("read", {"_tool_name": "remote_controller"})["data"] == {
+        "available": True, "fresh": True,
+    }
+
+
 def test_driver_manifest_registers_remote_controller():
     manifest = (ROOT / "unitree/as2w/driver.yaml").read_text()
     assert "- { name: remote_controller, type: sensor }" in manifest

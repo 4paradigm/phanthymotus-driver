@@ -49,7 +49,9 @@ class Bundle:
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):
-        for plugin in self.plugins: plugin.stop()
+        for plugin in self.plugins:
+            shutdown = getattr(plugin, "shutdown", None)
+            shutdown() if shutdown else plugin.stop()
     def tools(self):
         out = [
             {"name": "model", "type": "resource", "description": "Unitree AS2W wheel-legged robot URDF model", "inputSchema": {"type": "object", "properties": {}}},

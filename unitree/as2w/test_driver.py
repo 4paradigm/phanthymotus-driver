@@ -27,6 +27,7 @@ def _load(name, path):
 def _install_device_stubs():
     std_msgs = types.ModuleType("std_msgs.msg")
     std_msgs.String = type("String", (), {})
+    std_msgs.UInt8MultiArray = type("UInt8MultiArray", (), {})
     sys.modules["std_msgs"] = types.ModuleType("std_msgs")
     sys.modules["std_msgs.msg"] = std_msgs
     for name in ("unitree_sdk2py", "unitree_sdk2py.core", "unitree_sdk2py.idl",
@@ -39,6 +40,15 @@ def _install_device_stubs():
     dds.LowState_ = type("LowState_", (), {})
     dds.SportModeState_ = type("SportModeState_", (), {})
     sys.modules["unitree_sdk2py.idl.unitree_go.msg.dds_"] = dds
+    sensor_msgs = types.ModuleType("unitree_sdk2py.idl.sensor_msgs.msg.dds_")
+    sensor_msgs.PointCloud2_ = type("PointCloud2_", (), {})
+    sys.modules["unitree_sdk2py.idl.sensor_msgs"] = types.ModuleType(
+        "unitree_sdk2py.idl.sensor_msgs"
+    )
+    sys.modules["unitree_sdk2py.idl.sensor_msgs.msg"] = types.ModuleType(
+        "unitree_sdk2py.idl.sensor_msgs.msg"
+    )
+    sys.modules["unitree_sdk2py.idl.sensor_msgs.msg.dds_"] = sensor_msgs
 
 
 class _Proxy:
@@ -83,6 +93,7 @@ class TestDriverContracts(unittest.TestCase):
         cls.device = _load("as2w_device_under_test", ROOT / "device.py")
         cls.motion = _load("as2w_motion_under_test", ROOT / "motion_tools.py")
         cls.spatial = _load("as2w_spatial_under_test", ROOT / "controlled_spatial.py")
+        cls.lidar = _load("as2w_lidar_under_test", ROOT / "lidar.py")
         yaml_stub = types.ModuleType("yaml")
         yaml_stub.safe_load = lambda *_: {}
         rclpy_stub = types.ModuleType("rclpy")
@@ -274,6 +285,58 @@ class TestDriverContracts(unittest.TestCase):
         })
 
         self.assertEqual("INVALID_ARGUMENT", result["code"])
+
+    def test_spatial_stop_start_keeps_rpc_and_completion_resources_alive(self):
+        plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
+        plugin._nav_lock = threading.Lock()
+        plugin._nav_action_id = None
+        plugin._nav_sub = types.SimpleNamespace(Close=lambda: self.fail("subscriber closed"))
+        calls = []
+        plugin._client = types.SimpleNamespace(
+            call=lambda *args: calls.append(args) or {"code": 0, "response": "{}"},
+            stop=lambda: self.fail("RPC worker stopped"),
+        )
+
+        plugin.stop()
+        plugin.start()
+        result = plugin.dispatch("start_mapping", {})
+
+        self.assertEqual(0, result["ret"])
+        self.assertEqual([("start_mapping", {"slam_type": "indoor"})], calls)
+
+    def test_state_and_lidar_lifecycle_stop_preserves_shared_resources(self):
+        state_closed = []
+        state = types.SimpleNamespace(
+            close=lambda: state_closed.append(True),
+            last_remote={"available": True, "active": False},
+        )
+        state_plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        state_plugin._namespace = "test"
+        state_plugin._state = state
+        state_plugin.stop()
+        state_plugin.start()
+
+        self.assertEqual([], state_closed)
+        self.assertTrue(state_plugin.dispatch("read", {
+            "_tool_name": "remote_controller",
+        })["data"]["available"])
+
+        lidar_events = []
+        lidar_plugin = self.lidar.LidarPlugin.__new__(self.lidar.LidarPlugin)
+        lidar_plugin.topic = "/test/lidar/cloud"
+        lidar_plugin.node = types.SimpleNamespace(
+            sub=types.SimpleNamespace(Close=lambda: lidar_events.append("subscriber")),
+            node=types.SimpleNamespace(destroy_node=lambda: lidar_events.append("node")),
+        )
+        lidar_plugin.stop()
+        lidar_plugin.start()
+
+        self.assertEqual([], lidar_events)
+        self.assertEqual("running", lidar_plugin.dispatch("lidar_cloud", {})["state"])
+        state_plugin.shutdown()
+        lidar_plugin.shutdown()
+        self.assertEqual([True], state_closed)
+        self.assertEqual(["subscriber", "node"], lidar_events)
 
     def test_model_resource_is_textual_urdf(self):
         urdf = (ROOT / "resource" / "as2w.urdf").read_text()

@@ -40,6 +40,9 @@ class LidarPlugin:
                 "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
     def start(self): pass
     def stop(self):
+        # Keep the always-on DDS subscription alive across canvas stop/start.
+        pass
+    def shutdown(self):
         if getattr(self.node, "sub", None):
             self.node.sub.Close()
         self.node.node.destroy_node()
