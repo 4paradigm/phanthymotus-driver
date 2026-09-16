@@ -340,7 +340,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.plugin = self.device.CartesianPlugin(
             self.client, {
                 "safety": dict(self.FAST_SAFETY),
-                "cartesian": {"enabled": True, "max_radius_mm": 610, "max_position_abs_mm": 610},
+                "cartesian": {"enabled": True, "max_radius_mm": 640, "shoulder_height_mm": 340, "max_reach_mm": 900},
             },
             arm_plugin=self.arm, namespace="rm75",
         )
@@ -484,16 +484,76 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             })
 
     def test_workspace_limits_reject_unreachable_poses(self):
-        # 位置半径、单轴绝对值、姿态角超出配置上限时在下发前拒绝
+        # 水平半径、肩部臂展、姿态角超出配置上限时在下发前拒绝
         cases = [
             {"x_mm": 1200, "y_mm": 0, "z_mm": 0, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
             {"x_mm": 700, "y_mm": 700, "z_mm": 700, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
             {"x_mm": 0, "y_mm": 0, "z_mm": 0, "rx_deg": 0, "ry_deg": 0, "rz_deg": 400},
+            # 竖直臂展超出肩部可达范围（肩高 340 + 臂长 900）
+            {"x_mm": 0, "y_mm": 0, "z_mm": 1600, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
         ]
         for pose in cases:
             with self.subTest(pose=pose):
                 with self.assertRaisesRegex(ValueError, "exceeds"):
                     self.plugin.dispatch("movel", {**pose, "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True})
+        self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
+
+    def test_vertical_reach_pose_is_allowed_within_shoulder_model(self):
+        # 竖直朝上位姿：水平半径 0、肩部距离在臂展内，不得再被 610 球误杀。
+        result = self.plugin.dispatch("movel", {
+            "x_mm": 0, "y_mm": 0, "z_mm": 1100, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0,
+            "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
+        })
+        self.assertEqual("running", result["state"])
+        self.assertIn(
+            ("rm_movel", ([0.0, 0.0, 1.1, 0.0, 0.0, 0.0], 5, 0, 0, 0)),
+            self.client.calls,
+        )
+
+    def test_vertical_offset_down_200mm_is_allowed(self):
+        # 竖直朝上当前位姿，工具系下移 200mm、横移 50mm：目标 (50, 0, ~912)。
+        # 3D 距离 ~914mm 曾触发「radius 914 exceeds 610」误报，现应按肩部模型放行。
+        self.client.pose_mm_deg = [0.0, 0.0, 1112.0, 0.0, 0.0, 0.0]
+        result = self.plugin.dispatch("move_offset", {
+            "dx_mm": 50, "dy_mm": 0, "dz_mm": -200,
+            "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
+            "frame_type": "tool", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
+        })
+        self.assertEqual("running", result["state"])
+
+    def test_gripper_tcp_offset_backs_out_flange_for_workspace(self):
+        # 工具坐标系已设为夹爪 TCP（tool_length_mm=222.5，沿工具 +X 正对齐法兰）。
+        # 水平朝 +X 的 TCP 目标 (700, 0, 340)：法兰实际在 (477.5, 0, 340)，水平半径 477.5 < 640 应放行；
+        # 若不扣除夹爪长度，会被误判为 700 > 640。
+        plugin = self.device.CartesianPlugin(
+            self.client, {
+                "safety": dict(self.FAST_SAFETY),
+                "cartesian": {"enabled": True, "max_radius_mm": 640, "shoulder_height_mm": 340,
+                              "max_reach_mm": 900, "tool_length_mm": 222.5},
+            },
+            arm_plugin=self.arm, namespace="rm75",
+        )
+        result = plugin.dispatch("movel", {
+            "x_mm": 700, "y_mm": 0, "z_mm": 340, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0,
+            "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
+        })
+        self.assertEqual("running", result["state"])
+
+    def test_gripper_tcp_offset_still_rejects_true_flange_overreach(self):
+        # TCP 目标水平朝 +X 到 900：法兰在 (677.5, 0, 340)，水平半径 677.5 > 640，必须拒绝。
+        plugin = self.device.CartesianPlugin(
+            self.client, {
+                "safety": dict(self.FAST_SAFETY),
+                "cartesian": {"enabled": True, "max_radius_mm": 640, "shoulder_height_mm": 340,
+                              "max_reach_mm": 900, "tool_length_mm": 222.5},
+            },
+            arm_plugin=self.arm, namespace="rm75",
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            plugin.dispatch("movel", {
+                "x_mm": 900, "y_mm": 0, "z_mm": 340, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0,
+                "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
+            })
         self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
 
     def test_movep_validates_every_waypoint(self):
@@ -597,6 +657,46 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual(1, movel_calls[1][3])
         self.assertEqual(0, movel_calls[2][3])
         self.assertEqual([0.1, 0.1, 0.1, 0.0, 0.0, 0.0], movel_calls[2][0])
+
+    def test_pure_rotation_move_is_not_misread_as_stall(self):
+        # 回归：纯旋转运动位置误差恒为 0，进度检测必须跟踪欧拉角，
+        # 否则旋转中途被误判 stall 而慢停（真机实锤过的 bug）。
+        class RotatingClient(self.FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.rz = 0.0
+                self.pose_calls = 0
+
+            def call(self, method):
+                if method == "rm_get_current_arm_state":
+                    self.pose_calls += 1
+                    # 第一次查询是下发前的当前位姿读取；之后每轮询转 5°（超过 stall 窗口时长）
+                    if self.pose_calls > 1 and self.rz < 90.0:
+                        self.rz = min(90.0, self.rz + 5.0)
+                    return {"pose": [0.0, 0.0, 0.0, 0.0, 0.0, math.radians(self.rz)],
+                            "joint": [0.0] * 7, "err": {}}
+                return super().call(method)
+
+        self.client = RotatingClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+        self.plugin.dispatch("move_offset", {
+            "dx_mm": 0, "dy_mm": 0, "dz_mm": 0,
+            "drx_deg": 0, "dry_deg": 0, "drz_deg": 90,
+            "frame_type": "tool", "speed_percent": 5,
+            "cartesian_enabled": True, "confirm_motion": True,
+        })
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1, timeout=5.0))
+        _, status, payload = self.acp_events[0]
+        self.assertEqual("completed", status)
+        self.assertLessEqual(payload["euler_error_deg"], 2.0)
 
     def test_monitor_stall_sends_slow_stop(self):
         # 位姿一直不前进 → stall 检测触发受控停止并如实上报 motion_stalled

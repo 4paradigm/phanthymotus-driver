@@ -18,10 +18,16 @@ safety:
 cartesian:
   # 完成真机标定并配置安装现场禁入区之前，不允许笛卡尔运动下发。
   enabled: true
-  # RM75-6F 标称最大工作半径；真机启用前仍须按安装环境进一步收紧。
-  max_radius_mm: 610
-  max_position_abs_mm: 610
+  # 水平工作半径：基座轴线到 TCP 的水平距离。RM75-6F 官方标称 638.5mm，取整 640 留 1.5mm 余量。
+  max_radius_mm: 640
+  # 肩关节（joint2）距基座平面的高度，取自 URDF：0.16 + 0.18 = 0.34m。
+  shoulder_height_mm: 340
+  # 肩部到末端 TCP 的最大臂展，取自 URDF 连杆长度：sqrt(0.18^2 + 0.88^2) ≈ 0.898m，取整 900。
+  max_reach_mm: 900
   max_euler_abs_deg: 360
+  # 夹爪 TCP 相对法兰的伸出量（沿工具 +X 方向，正对齐法兰安装）。
+  # 仅当控制器已把工具坐标系设为夹爪 TCP 时才设为 222.5；否则保持 0（法兰即 TCP）。
+  tool_length_mm: 222.5
 ros:
   robot_domain_id: 42
   core_domain_id: 42
