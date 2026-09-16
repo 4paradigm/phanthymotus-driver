@@ -1327,7 +1327,16 @@ class ArmControlPlugin:
     _RATE_HZ = 50.0
     _MAX_VELOCITY_RAD_S = 0.5
     _RELEASE_SECONDS = 1.5
-    _ARM_PD = {
+    # Official arm_control_config.json gains. LowCmd owns all 31 motors, so
+    # non-arm joints must also be held with their vendor gains while an arm
+    # command is active; zero gains there causes intermittent posture loss.
+    _JOINT_PD = {
+        "hipPitch": (400.0, 6.1), "hipRoll": (700.0, 30.0),
+        "hipYaw": (405.0, 6.1), "kneePitch": (400.0, 8.0),
+        "anklePitch": (40.0, 2.5), "ankleRoll": (0.0, 0.35),
+        "waistRoll": (405.0, 6.1), "waistPitch": (405.0, 6.1),
+        "waistYaw": (205.0, 4.1), "neckYaw": (40.0, 1.0),
+        "neckPitch": (40.0, 1.0),
         "shoulderPitch": (150.0, 4.0), "shoulderRoll": (150.0, 4.0),
         "shoulderYaw": (40.0, 1.0), "elbow": (100.0, 2.0),
         "wristYaw": (15.0, 0.9), "wristPitch": (15.0, 0.9),
@@ -1350,6 +1359,8 @@ class ArmControlPlugin:
         self._current_q = None
         self._target_q = {}
         self._active = False
+        self._streaming = False
+        self._soft_arms = False
         self._release_started_at = None
         self._writes = 0
         self._last_error = None
@@ -1360,7 +1371,7 @@ class ArmControlPlugin:
 
     @classmethod
     def _pd_for_joint(cls, joint_name: str) -> tuple[float, float]:
-        for prefix, gains in cls._ARM_PD.items():
+        for prefix, gains in cls._JOINT_PD.items():
             if joint_name.startswith(prefix):
                 return gains
         return (0.0, 0.0)
@@ -1390,6 +1401,8 @@ class ArmControlPlugin:
                 return
             now = time.monotonic()
             active = self._active
+            streaming = self._streaming
+            soft_arms = self._soft_arms
             release_started_at = self._release_started_at
             targets = self._target_q.copy()
             hold_q = self._hold_q.copy()
@@ -1404,7 +1417,7 @@ class ArmControlPlugin:
                     # stopping before this write would leave the prior PD
                     # gains latched in the robot controller.
                     finish_release = True
-            elif not active:
+            elif not active and not streaming:
                 return
 
             for index, target in targets.items():
@@ -1422,13 +1435,13 @@ class ArmControlPlugin:
                 motor.q = current_q[index] if index in targets else hold_q[index]
                 motor.dq = 0.0
                 motor.tau = 0.0
-                if index in targets:
-                    kp, kd = self._pd_for_joint(joint_name)
-                    motor.kp = kp * (1.0 - release_ratio)
-                    motor.kd = kd * (1.0 - release_ratio)
-                else:
-                    motor.kp = 0.0
-                    motor.kd = 0.0
+                kp, kd = self._pd_for_joint(joint_name)
+                is_arm = joint_name.startswith(("shoulder", "elbow", "wrist"))
+                arm_scale = 1.0
+                if is_arm and (soft_arms or release_started_at is not None):
+                    arm_scale = 1.0 - release_ratio
+                motor.kp = kp * arm_scale
+                motor.kd = kd
                 motor.ki = 0.0
             self._publisher.Write(command)
             self._writes += 1
@@ -1438,6 +1451,7 @@ class ArmControlPlugin:
                     self._release_started_at = None
                     self._active = False
                     self._target_q.clear()
+                    self._soft_arms = True
         except Exception as exc:
             self._last_error = f"rt/lowcmd write failed: {exc}"
 
@@ -1540,6 +1554,8 @@ class ArmControlPlugin:
                 self._target_q[self._joint_index(joint_name)] = radians
             self._release_started_at = None
             self._active = True
+            self._streaming = True
+            self._soft_arms = False
         # The worker may need one 20ms tick. This confirms the protocol write,
         # not physical movement, which DDS does not acknowledge.
         before = self._writes

@@ -33,7 +33,9 @@ plugins:
   motion:
     enabled: true
   tracking_motion:
-    enabled: true
+    # PNDbotics Adam currently has no supported recording or file-discovery
+    # API for this card; leave it hidden until one is available.
+    enabled: false
   camera:
     enabled: true
     # The ZED Mini is connected to this Jetson. Keep the local SDK path; the
