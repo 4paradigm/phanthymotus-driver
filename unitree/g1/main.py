@@ -215,6 +215,19 @@ class G1DeviceBundle:
             self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
             print("[bundle] ExtCameraPlugin loaded")
 
+        if plugins_cfg.get("greeting", {}).get("enabled", False):
+            from greeting import make_plugin
+            led_plugin = next((p for p in self._plugins if getattr(p, "PREFIX", "") == "led"), None)
+            tts_plugin = next((p for p in self._plugins if getattr(p, "PREFIX", "") == "tts"), None)
+            arm_plugin = next((p for p in self._plugins if getattr(p, "PREFIX", "") == "arm"), None)
+            if led_plugin and tts_plugin and arm_plugin and camera_plugin:
+                self._plugins.append(make_plugin(
+                    plugins_cfg["greeting"], namespace, executor,
+                    {"led": led_plugin, "tts": tts_plugin, "arm": arm_plugin}))
+                print("[bundle] GreetingPlugin loaded")
+            else:
+                print("[bundle] GreetingPlugin skipped: requires camera, led, tts, and arm")
+
         # SmartMotion 统一打断控制（放在最后，需要引用其他 plugin）
         if plugins_cfg.get("smart_motion", {}).get("enabled", True):
             from device import SmartMotionPlugin
