@@ -12,12 +12,8 @@ RUN curl -fsSL ${CYCLONEDDS_URL} | tar xz -C /tmp && \
 ENV CYCLONEDDS_HOME=/opt/cyclonedds
 ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 COPY requirements.txt /work/requirements.txt
-# Keep ROS runtime packages installed; --auto-remove deletes them from the
-# internal base image because they are marked as automatic dependencies.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt && \
-    pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5 && \
-    apt-get purge -y cmake build-essential curl python3-pip && \
-    rm -rf /var/lib/apt/lists/*
+    pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY main.py device.py lidar.py controlled_spatial.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
