@@ -1,6 +1,7 @@
 """AS2W lidar bridge from Unitree DDS PointCloud2 to sensor/pointcloud."""
 import struct
 import threading
+import time
 
 from std_msgs.msg import UInt8MultiArray
 from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -15,6 +16,7 @@ _DEFAULT_SOURCE_TOPICS = (
     "rt/utlidar/cloud_livox_mid360",
     "rt/utlidar/cloud_jt128",
 )
+_SOURCE_TIMEOUT_SECONDS = 3.0
 
 
 class _LidarNode:
@@ -27,6 +29,7 @@ class _LidarNode:
         self.subs = []
         self._lock = threading.Lock()
         self._active_source = None
+        self._last_seen = {source: 0.0 for source in self.source_topics}
         self._frames = {source: 0 for source in self.source_topics}
         self._bytes = {source: 0 for source in self.source_topics}
         for source_topic in self.source_topics:
@@ -41,7 +44,13 @@ class _LidarNode:
         executor.add_node(self.node)
 
     def _report(self):
+        now = time.monotonic()
         with self._lock:
+            if (self._active_source and
+                    now - self._last_seen[self._active_source] > _SOURCE_TIMEOUT_SECONDS):
+                self.node.get_logger().warning(
+                    f"AS2W lidar source {self._active_source} timed out; waiting for another source")
+                self._active_source = None
             frames, sizes, active = dict(self._frames), dict(self._bytes), self._active_source
         summary = ", ".join(f"{source}={frames[source]} frames/{sizes[source]} B" for source in self.source_topics)
         if active:
@@ -60,9 +69,15 @@ class _LidarNode:
         with self._lock:
             self._frames[source] += 1
             self._bytes[source] += len(data)
-            if self._active_source is None:
+            now = time.monotonic()
+            self._last_seen[source] = now
+            if (self._active_source is None or
+                    now - self._last_seen[self._active_source] > _SOURCE_TIMEOUT_SECONDS):
+                previous = self._active_source
                 self._active_source = source
-                self.node.get_logger().info(f"AS2W lidar selected live source {source}")
+                self.node.get_logger().info(
+                    f"AS2W lidar selected live source {source}"
+                    + (f" (replacing {previous})" if previous else ""))
             if source != self._active_source:
                 return
         payload = struct.pack("<II", point_step, point_count) + data

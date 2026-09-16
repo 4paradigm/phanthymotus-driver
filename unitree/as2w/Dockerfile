@@ -12,6 +12,8 @@ RUN curl -fsSL ${CYCLONEDDS_URL} | tar xz -C /tmp && \
 ENV CYCLONEDDS_HOME=/opt/cyclonedds
 ENV LD_LIBRARY_PATH=/opt/cyclonedds/lib:${LD_LIBRARY_PATH}
 COPY requirements.txt /work/requirements.txt
+# Keep the ROS base intact after installing CycloneDDS; purging the build
+# packages also purges ros-humble-rclpy under this image's APT dependency graph.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt && \
     pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 COPY unitree_sdk2py/ /work/unitree_sdk2py/

@@ -93,21 +93,19 @@ class _StateNode:
             for index, temperature in enumerate(state["temperature"]):
                 joint_data[f"{name}_temperature_{index}"] = float(temperature)
         self._publish(self.joint_state, joint_data)
-        skeleton = [{"idx": s["idx"], "name": _AS2_JOINT_NAMES[s["idx"]], "q": s["q"]}
+        skeleton = [{"idx": s["idx"], "name": _AS2_JOINT_NAMES[s["idx"]], "q": s["q"],
+                     "dq": s["dq"], "tau": s["tau"],
+                     "temperature": s["temperature"]}
                     for s in states[:len(_AS2_JOINT_NAMES)]]
         # Keep the established Go2/G1 sensor/skeleton contract.  The frontend
         # expects these two top-level fields and does not consume joint_count.
         self._publish(self.joints, {"joints": skeleton,
                                     "imu_quat": list(getattr(imu, "quaternion", [])) if imu else []})
     def _on_bms(self, bms):
-        # Unitree BmsState_.current is milliamps (the SDK does not encode the
-        # unit in the field name). Keep current for compatibility, while the
-        # explicit fields remove the ambiguity for consumers.
+        # Unitree BmsState_.current is milliamps (mA).
         current_ma = _number(getattr(bms, "current", 0))
         battery = {"soc": int(getattr(bms, "soc", 0)),
-                   "current": current_ma,
                    "current_ma": current_ma,
-                   "current_a": current_ma / 1000.0,
                    "cycle": int(getattr(bms, "cycle", 0))}
         battery.update(self._flat("temperature", getattr(bms, "temperature", [])))
         self._publish(self.battery, battery)
@@ -129,7 +127,7 @@ class StatePlugin:
         specs = (("imu", "state/imu", "data/json", "AS2 IMU state"),
                  ("joints", "state/joints", "sensor/skeleton", "AS2W 16-joint skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "AS2 raw motor position, velocity, torque, and temperature"),
-                 ("battery", "state/battery", "data/json", "AS2W BMS state; current_ma is mA and current_a is A"),
+                 ("battery", "state/battery", "data/json", "AS2W BMS state; current_ma is mA"),
                  ("loco_state", "loco/state", "data/json", "AS2 high-level locomotion state"))
         return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
                  "inputSchema": {"type": "object", "properties": {}},
