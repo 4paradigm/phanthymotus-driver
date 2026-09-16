@@ -1,10 +1,9 @@
-# The internal rolling ros-base tag was observed on the Jetson with an empty
-# /opt/ros/humble prefix (including no rclpy), which makes the container exit
-# before this driver starts.  The official image is multi-architecture and
-# supplies the complete Humble runtime required by this standalone bundle.
-ARG ROS_BASE_IMAGE=ros:humble-ros-base
+# Do not make this base build-arg configurable. The deployment builder can
+# inject ROS_BASE_IMAGE globally; the internal rolling image it injected on
+# Jetson had an empty /opt/ros/humble prefix and no rclpy. This standalone
+# bundle needs the official complete, multi-architecture Humble runtime.
+FROM ros:humble-ros-base
 ARG PYPI_MIRROR=https://pypi.org/simple/
-FROM ${ROS_BASE_IMAGE}
 WORKDIR /work
 ARG PYPI_MIRROR
 # Fail the image build early when the selected base image is not a ROS image.
