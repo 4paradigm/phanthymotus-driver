@@ -38,6 +38,7 @@ class VisionCapturePlugin:
 
     def __init__(self, plugin_config, namespace, executor, external_camera=None):
         self._namespace = namespace
+        self._executor = executor
         self._external_camera = external_camera
         self._camera = plugin_config.get("camera", "external")
         self._external_instance_id = plugin_config.get("external_instance_id", "")
@@ -53,8 +54,14 @@ class VisionCapturePlugin:
         self._active_recording = None
         self._last_recording = None
         # The runtime initializes dedicated contexts, not the default context.
-        self._node = Node("realman_vision_capture", context=executor.context)
-        executor.add_node(self._node)
+        self._node = None
+        self._subscriptions = {}
+        self._ensure_node()
+
+    def _ensure_node(self):
+        if self._node is None:
+            self._node = Node("realman_vision_capture", context=self._executor.context)
+            self._executor.add_node(self._node)
 
     def get_tool(self):
         camera_property = {"type": "string", "enum": ["external"],
@@ -110,6 +117,7 @@ class VisionCapturePlugin:
         return sources
 
     def _resolve_source(self, args):
+        self._ensure_node()
         camera = args.get("camera", self._camera)
         if camera == "external":
             instance_id = args.get("external_instance_id", self._external_instance_id)
@@ -134,8 +142,10 @@ class VisionCapturePlugin:
             if topic not in self._streams:
                 self._streams[topic] = {"latest": None, "sequence": 0}
                 try:
-                    self._streams[topic]["subscription"] = self._node.create_subscription(
+                    subscription = self._node.create_subscription(
                         CompressedImage, topic, lambda msg: self._on_frame(topic, msg), qos_profile_sensor_data)
+                    self._streams[topic]["subscription"] = subscription
+                    self._subscriptions[topic] = subscription
                 except Exception:
                     del self._streams[topic]
                     raise
@@ -370,7 +380,7 @@ class VisionCapturePlugin:
         url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
         ctx = ssl.create_default_context()
         # Match the existing RM75 ACP transport for the local self-signed Core.
-        if url.startswith("https://"):
+        if url.startswith("https://") and url.split("/", 3)[2].split(":", 1)[0] in {"localhost", "127.0.0.1", "::1"}:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         try:
@@ -453,6 +463,7 @@ class VisionCapturePlugin:
         with self._recording_lock:
             active = self._active_recording
             if active is None:
+                self._cleanup_ros()
                 return {"ok": True, "state": "idle"}
             if not active.get("finished"):
                 active["cancel"].set()
@@ -468,7 +479,29 @@ class VisionCapturePlugin:
         active["thread"].join(timeout=6)
         with self._recording_lock:
             stopping = self._active_recording is active
+        if not stopping:
+            self._cleanup_ros()
         return {"ok": True, "state": "stopping" if stopping else "idle", "action_id": active["action_id"]}
+
+    def _cleanup_ros(self):
+        if self._node is None:
+            return
+        for subscription in self._subscriptions.values():
+            try:
+                self._node.destroy_subscription(subscription)
+            except Exception:
+                pass
+        self._subscriptions.clear()
+        self._streams.clear()
+        try:
+            self._executor.remove_node(self._node)
+        except Exception:
+            pass
+        try:
+            self._node.destroy_node()
+        except Exception:
+            pass
+        self._node = None
 
     def dispatch(self, action, args):
         if action == "config":
