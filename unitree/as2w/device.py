@@ -48,7 +48,8 @@ class _StateNode:
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", 10)
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
-        self._sport = ChannelSubscriber("rt/sportmodestate", SportModeState_)
+        # AS2/AS2W's official sport-state example uses the lf namespace.
+        self._sport = ChannelSubscriber("rt/lf/sportmodestate", SportModeState_)
         self._low.Init(self._on_low, 10)
         self._bms.Init(self._on_bms, 10)
         self._sport.Init(self._on_sport, 10)
@@ -122,6 +123,7 @@ class StatePlugin:
     PREFIX = "state"
     def __init__(self, config, namespace, executor):
         self._namespace = namespace
+        self._executor = executor
         self._state = _StateNode(namespace, executor)
     def get_tools(self):
         specs = (("imu", "state/imu", "data/json", "AS2 IMU state"),
@@ -133,9 +135,23 @@ class StatePlugin:
                  "inputSchema": {"type": "object", "properties": {}},
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
                 for name, path, fmt, desc in specs]
-    def start(self): pass
-    def stop(self): self._state.close()
+    def start(self):
+        # Sensor cards share one LowState subscription.  Recreate it when a
+        # dashboard stopped the card instead of claiming a dead stream is live.
+        if self._state is None:
+            self._state = _StateNode(self._namespace, self._executor)
+
+    def stop(self):
+        if self._state is not None:
+            self._state.close()
+            self._state = None
     def dispatch(self, action, args):
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
         if action == "info":
             name = args.get("_tool_name")
             paths = {"imu": ("state/imu", "data/json"),
@@ -151,7 +167,7 @@ class StatePlugin:
             path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
             fmt = "sensor/skeleton" if action == "joints" else "data/json"
             return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
-        return {"state": "running"} if action in ("start", "info") else ({"state": "idle"} if action == "stop" else None)
+        return {"state": "running"} if action == "info" else None
 
 
 class LocoPlugin:

@@ -103,7 +103,17 @@ def handler(bundle):
             try: request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
             except Exception:
                 self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}); return
-            method, params, rid = request.get("method", ""), request.get("params") or {}, request.get("id")
+            if not isinstance(request, dict):
+                self._send_json(400, {"jsonrpc": "2.0", "id": None,
+                                      "error": {"code": -32600, "message": "Invalid Request"}})
+                return
+            method = request.get("method", "")
+            params = request.get("params") or {}
+            rid = request.get("id")
+            if not isinstance(method, str) or not isinstance(params, dict):
+                self._send_json(400, {"jsonrpc": "2.0", "id": rid,
+                                      "error": {"code": -32600, "message": "Invalid Request"}})
+                return
             if rid is None: self.send_response(202); self.end_headers(); return
             session_id = parse_qs(parsed.query).get("session_id", [""])[0]
             with sse_lock: sse_client = sse_sessions.get(session_id)
