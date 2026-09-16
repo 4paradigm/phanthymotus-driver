@@ -56,7 +56,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("numpy==1.23.5", dockerfile)
         self.assertIn("opencv-python-headless==4.11.0.86", dockerfile)
         self.assertIn("--only-binary=:all:", dockerfile)
-        self.assertIn("COPY main.py device.py camera.py realsense.py", dockerfile)
+        self.assertIn("COPY main.py device.py servo.py camera.py realsense.py", dockerfile)
         camera = (DRIVER / "camera.py").read_text()
         self.assertNotIn("v4l2-ctl", camera)
         self.assertNotIn("import subprocess", camera)
