@@ -792,6 +792,44 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("failed", plugin._last_completion["callback"])
         self.assertEqual("boom", plugin._last_completion["callback_error"])
 
+    def test_arm_stopmotion_waits_for_cartesian_submission(self):
+        # 回归（reviewer 要求）：臂的 stopmotion 必须排在笛卡尔 rm_movel 下发之后，
+        # 共享提交锁对两张卡片全局生效 —— rm_movel 先于 rm_set_arm_slow_stop 到达 SDK。
+        gate = threading.Event()
+
+        class GatedClient(self.FakeClient):
+            def command(self, method, *args):
+                if method == "rm_movel" and not gate.is_set():
+                    gate.wait(2.0)
+                return super().command(method, *args)
+
+        self.client = GatedClient()
+        arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            arm_plugin=arm, namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: None
+
+        mover = threading.Thread(target=lambda: self.plugin.dispatch("movel", self._movel_args()))
+        mover.start()
+        time.sleep(0.1)  # movel 卡在 rm_movel 下发中（持有共享提交锁）
+
+        stop_done = threading.Event()
+        stopper = threading.Thread(
+            target=lambda: (arm.dispatch("stopmotion", {"_tool_name": "joint_control"}), stop_done.set())
+        )
+        stopper.start()
+        time.sleep(0.1)
+        self.assertFalse(stop_done.is_set())  # 下发完成前臂的慢停不得发出
+        gate.set()
+        stopper.join(5.0)
+        mover.join(5.0)
+        self.assertTrue(stop_done.is_set())
+        order = [entry[0] for entry in self.client.calls]
+        self.assertLess(order.index("rm_movel"), order.index("rm_set_arm_slow_stop"))
+
     def test_pose_query_failure_submits_nothing(self):
         # 位姿查询在下发之前：查询失败时不得下发任何运动命令、不得启动监控
         class NoPoseClient(self.FakeClient):
@@ -1473,10 +1511,10 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         observed = {}
 
         def failing_stop():
-            acquired = plugin._action_lock.acquire(blocking=False)
+            acquired = plugin._submission_lock.acquire(blocking=False)
             if acquired:
-                plugin._action_lock.release()
-            observed["action_lock_held"] = not acquired
+                plugin._submission_lock.release()
+            observed["submission_lock_held"] = not acquired
             observed["cancelled_before_sdk"] = action_id in plugin._cancelled
             return 9
 
@@ -1484,7 +1522,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "SDK code 9"):
             plugin._stop_motion()
 
-        self.assertTrue(observed["action_lock_held"])
+        self.assertTrue(observed["submission_lock_held"])
         self.assertTrue(observed["cancelled_before_sdk"])
         self.assertIn(action_id, plugin._cancelled)
 

@@ -149,9 +149,26 @@ library is absent. Set `RM_API2_LIB_DIR` to override the host directory.
 Following the standard ACP contract in `README_dev.md`, `joint_control.set` immediately returns a
 unique `action_id`; its background monitor later reports exactly one
 `completed`, `error`, or `cancelled` terminal result to `/api/acp/complete`.
-The callback reads `AGENT_CORE_URL` inside the worker-thread function and uses
-the same HTTPS behavior as the documented G1/R1 implementation. Agent Core
+The callback reads `AGENT_CORE_URL` inside the worker-thread function and
+verifies TLS against the Agent Core CA (see the deployment prerequisite
+below); it never falls back to unverified HTTPS. Agent Core
 owns pending-action barrier release and completion-event delivery.
+
+### Agent Core CA prerequisite
+
+Completion callbacks POST over TLS with certificate verification enabled, so
+every RM75 deployment must provide the Agent Core CA on the host at
+
+```text
+/opt/phanthy-motus/data/certs/cert.pem
+```
+
+`service.yml` mounts that directory read-only and points `AGENT_CORE_CA_CERT`
+at the file; override either with `RM75_CA_DIR` / `RM75_AGENT_CORE_CA_CERT`
+when the host layout differs. When the CA file is missing, each asynchronous
+joint/gripper/Cartesian completion callback fails with
+`AGENT_CORE_CA_CERT is required` while motion itself continues — verify the
+path before enabling the deployment.
 
 The immediate card result contains only `state` and `action_id`. Completion
 callbacks keep the standard status and a short reason; full final joint evidence
