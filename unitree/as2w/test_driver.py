@@ -143,6 +143,36 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(16, len([key for key in joint_state if key.endswith("_q")]))
         self.assertIn("FR_hip_q", joint_state)
 
+    def test_joints_payload_keeps_skeleton_contract(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.imu = node.joint_state = node.battery = types.SimpleNamespace(publish=lambda message: None)
+        node.joints = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        motors = [types.SimpleNamespace(q=float(i), dq=0, tau_est=0, temperature=[0, 0]) for i in range(16)]
+        imu = types.SimpleNamespace(quaternion=[1, 0, 0, 0], gyroscope=[], accelerometer=[], rpy=[])
+        node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors))
+        payload = __import__("json").loads(published[0])
+        self.assertEqual({"joints", "imu_quat"}, set(payload))
+        self.assertEqual(16, len(payload["joints"]))
+        self.assertEqual([1, 0, 0, 0], payload["imu_quat"])
+
+    def test_battery_current_is_explicitly_exposed_in_ma_and_a(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.battery = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node._on_bms(types.SimpleNamespace(soc=87, current=325, cycle=4, temperature=[]))
+        payload = __import__("json").loads(published[0])
+        self.assertEqual(325, payload["current_ma"])
+        self.assertAlmostEqual(0.325, payload["current_a"])
+
+    def test_loco_state_does_not_duplicate_imu(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.loco = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node._on_sport(types.SimpleNamespace(mode=2, velocity=[1, 2, 3], position=[4, 5, 6], body_height=0.2,
+                                              imu_state=types.SimpleNamespace(rpy=[7, 8, 9])))
+        self.assertNotIn("imu_rpy_0", __import__("json").loads(published[0]))
+
     def test_loco_uses_presets_and_acp_completion(self):
         plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
         schema = plugin.get_tool()["inputSchema"]
