@@ -38,6 +38,10 @@ class ArmControlTests(unittest.TestCase):
         self.assertNotIn("shoulderPitch_Left", ARM_JOINT_CONTROLS)
         self.assertIn("neutral", ARM_POSES)
 
+    def test_arm_lowcmd_rejects_non_pro_layouts_explicitly(self):
+        with self.assertRaisesRegex(ValueError, "only Adam Pro"):
+            ArmControlPlugin({}, "", None, variant="sp")
+
     def test_each_joint_has_a_distinct_action_and_angle_field(self):
         self.assertEqual("left_elbow", ARM_ACTIONS["set_left_elbow"])
         self.assertEqual("right_wrist_roll", ARM_ACTIONS["set_right_wrist_roll"])
@@ -112,6 +116,28 @@ class ArmControlTests(unittest.TestCase):
 
         self.assertEqual(publisher.commands[-1].motor_cmd[elbow].kp, 0.0)
         self.assertFalse(plugin._active)
+
+    def test_stop_waits_for_release_and_includes_waist(self):
+        publisher = _FakePublisher()
+        plugin = ArmControlPlugin({}, "", None, dds_lowcmd_pub=publisher)
+        plugin._hold_q = [0.0] * 31
+        plugin._current_q = [0.0] * 31
+        plugin._state_ready.set()
+        plugin._active = True
+        plugin._streaming = True
+        waist = ADAM_PRO_JOINTS.index("waistYaw")
+        plugin._target_q[waist] = 0.2
+        original_factory = getattr(device, "pnd_adam_msg_dds__LowCmd_", None)
+        device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
+        try:
+            plugin._release_started_at = __import__("time").monotonic() - 2.0
+            plugin._write_command(0.02)
+        finally:
+            if original_factory is None:
+                del device.pnd_adam_msg_dds__LowCmd_
+            else:
+                device.pnd_adam_msg_dds__LowCmd_ = original_factory
+        self.assertEqual(0.0, publisher.commands[-1].motor_cmd[waist].kp)
 
 
 if __name__ == "__main__":
