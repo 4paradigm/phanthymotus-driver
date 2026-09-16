@@ -3,6 +3,7 @@
 Run with: python3 -m unittest unitree/as2w/test_driver.py
 """
 import importlib.util
+import json
 import math
 import os
 import ssl
@@ -271,8 +272,20 @@ class TestDriverContracts(unittest.TestCase):
     def test_navigation_declares_completion(self):
         plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
         schema = plugin.get_tool()["inputSchema"]
+        self.assertTrue(schema["x-is-dangerous"])
+        self.assertIn("confirm", schema["x-action-params"]["navigate_to"]["params"])
         self.assertIn("navigate_to", schema["x-completion"]["actions"])
         self.assertEqual(180, schema["x-completion"]["timeout"])
+
+    def test_navigation_requires_explicit_confirmation(self):
+        plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
+        calls = []
+        plugin._client = types.SimpleNamespace(call=lambda *args: calls.append(args))
+
+        result = plugin.dispatch("navigate_to", {"x": 1, "y": 2})
+
+        self.assertEqual("CONFIRMATION_REQUIRED", result["code"])
+        self.assertEqual([], calls)
 
     def test_navigation_returns_action_id_without_waiting_for_arrival(self):
         plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
@@ -282,7 +295,7 @@ class TestDriverContracts(unittest.TestCase):
         plugin._nav_action_id = None
         plugin._nav_lock = self.spatial.threading.Lock()
         with patch.object(self.spatial.threading, "Thread") as thread:
-            result = plugin.dispatch("navigate_to", {"x": 1, "y": 2})
+            result = plugin.dispatch("navigate_to", {"x": 1, "y": 2, "confirm": True})
         self.assertEqual("navigating", result["status"])
         self.assertTrue(result["action_id"].startswith("as2w_nav_"))
         thread.assert_called_once()
@@ -292,13 +305,13 @@ class TestDriverContracts(unittest.TestCase):
         calls = []
         plugin._client = types.SimpleNamespace(call=lambda *args: calls.append(args))
         cases = (
-            ("navigate_to", {"x": "not-a-number"}),
-            ("navigate_to", {"x": math.inf}),
-            ("navigate_to", {"speed": math.nan}),
-            ("navigate_to", {"speed": 0.19}),
-            ("navigate_to", {"speed": 1.51}),
-            ("navigate_to", {"mode": "1"}),
-            ("navigate_to", {"mode": 2}),
+            ("navigate_to", {"x": "not-a-number", "confirm": True}),
+            ("navigate_to", {"x": math.inf, "confirm": True}),
+            ("navigate_to", {"speed": math.nan, "confirm": True}),
+            ("navigate_to", {"speed": 0.19, "confirm": True}),
+            ("navigate_to", {"speed": 1.51, "confirm": True}),
+            ("navigate_to", {"mode": "1", "confirm": True}),
+            ("navigate_to", {"mode": 2, "confirm": True}),
             ("init_pose", {"address": "/tmp/map.pcd", "q_w": math.inf}),
         )
 
@@ -315,10 +328,41 @@ class TestDriverContracts(unittest.TestCase):
         bundle.plugins = [plugin]
 
         result = bundle.call("controlled_spatial", {
-            "action": "navigate_to", "x": "not-a-number",
+            "action": "navigate_to", "x": "not-a-number", "confirm": True,
         })
 
         self.assertEqual("INVALID_ARGUMENT", result["code"])
+
+    def test_second_navigation_is_rejected_until_first_result(self):
+        plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
+        calls = []
+        plugin._client = types.SimpleNamespace(
+            call=lambda *args: calls.append(args) or {"code": 0, "response": "{}"},
+        )
+        plugin._nav_done = self.spatial.threading.Event()
+        plugin._nav_result = None
+        plugin._nav_action_id = None
+        plugin._nav_lock = self.spatial.threading.Lock()
+        notifications = []
+
+        with patch.object(self.spatial, "_acp_notify",
+                          side_effect=lambda *args: notifications.append(args)):
+            first = plugin.dispatch("navigate_to", {"x": 1, "confirm": True})
+            second = plugin.dispatch("navigate_to", {"x": 2, "confirm": True})
+            plugin._on_slam_key_info(types.SimpleNamespace(data=json.dumps({
+                "type": "task_result", "errorCode": 0,
+                "data": {"is_arrived": True},
+            })))
+            deadline = time.monotonic() + 1
+            while not notifications and time.monotonic() < deadline:
+                time.sleep(0.005)
+
+        self.assertEqual("navigating", first["status"])
+        self.assertEqual("MOTION_BUSY", second["code"])
+        self.assertEqual(first["action_id"], second["action_id"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual(1, len(notifications))
+        self.assertEqual(first["action_id"], notifications[0][0])
 
     def test_network_candidates_prefer_configured_then_unitree_subnet(self):
         addresses = {

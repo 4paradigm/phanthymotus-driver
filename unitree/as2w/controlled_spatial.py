@@ -167,13 +167,15 @@ class ControlledSpatialPlugin:
                     "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
                     "q_x": {"type": "number"}, "q_y": {"type": "number"}, "q_z": {"type": "number"}, "q_w": {"type": "number"},
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5},
-                    "mode": {"type": "integer", "enum": [0, 1]}}, "required": ["action"],
+                    "mode": {"type": "integer", "enum": [0, 1]},
+                    "confirm": {"type": "boolean", "description": "Must be true to start navigation."}}, "required": ["action"],
+                "x-is-dangerous": True,
                 "x-completion": {"actions": ["navigate_to"], "timeout": 180},
                 "x-action-params": {
                     "start_mapping": {"params": [], "description": "Start indoor SLAM mapping."},
                     "stop_mapping": {"params": ["address"], "description": "Stop mapping and save PCD."},
                     "init_pose": {"params": ["address", "x", "y", "z", "q_x", "q_y", "q_z", "q_w"], "description": "Load map and initialize pose."},
-                    "navigate_to": {"params": ["x", "y", "z", "q_x", "q_y", "q_z", "q_w", "speed", "mode"], "description": "Navigate to a target pose."},
+                    "navigate_to": {"params": ["x", "y", "z", "q_x", "q_y", "q_z", "q_w", "speed", "mode", "confirm"], "description": "Navigate to a target pose; requires confirm=true."},
                     "pause_navigation": {"params": [], "description": "Pause navigation."},
                     "resume_navigation": {"params": [], "description": "Resume navigation."},
                     "shutdown": {"params": [], "description": "Close vendor SLAM service."}}}}
@@ -201,8 +203,11 @@ class ControlledSpatialPlugin:
         except (TypeError, ValueError, AttributeError):
             return
         if payload.get("type") == "task_result":
-            self._nav_result = payload
-            self._nav_done.set()
+            with self._nav_lock:
+                if self._nav_action_id is None:
+                    return
+                self._nav_result = payload
+                self._nav_done.set()
 
     def _wait_for_navigation(self, action_id, target):
         completed = self._nav_done.wait(timeout=180)
@@ -232,6 +237,9 @@ class ControlledSpatialPlugin:
             self.stop()
             return {"state": "idle"}
         if action not in _APIS: return None
+        if action == "navigate_to" and args.get("confirm") is not True:
+            return {"error": "navigation requires confirm=true",
+                    "code": "CONFIRMATION_REQUIRED"}
         if action in ("stop_mapping", "init_pose") and not args.get("address"):
             return {"error": "address is required for this action"}
         try:
@@ -244,19 +252,33 @@ class ControlledSpatialPlugin:
             else: data = {}
         except ValueError as exc:
             return {"error": str(exc), "code": "INVALID_ARGUMENT"}
-        result = self._client.call(action, data)
+        action_id = None
+        if action == "navigate_to":
+            with self._nav_lock:
+                if self._nav_action_id is not None:
+                    return {"error": "a navigation action is already running",
+                            "code": "MOTION_BUSY",
+                            "action_id": self._nav_action_id}
+                action_id = f"as2w_nav_{uuid4().hex[:8]}"
+                self._nav_action_id = action_id
+                self._nav_done.clear()
+                self._nav_result = None
+        try:
+            result = self._client.call(action, data)
+        except Exception:
+            with self._nav_lock:
+                if self._nav_action_id == action_id:
+                    self._nav_action_id = None
+            raise
         response = result["response"]
         try: response = json.loads(response) if isinstance(response, str) else response
         except json.JSONDecodeError: pass
         if action != "navigate_to" or result["code"] != 0:
+            if action_id is not None:
+                with self._nav_lock:
+                    if self._nav_action_id == action_id:
+                        self._nav_action_id = None
             return {"ret": result["code"], "response": response}
-        with self._nav_lock:
-            previous = self._nav_action_id
-            self._nav_action_id = action_id = f"as2w_nav_{uuid4().hex[:8]}"
-            self._nav_done.clear()
-            self._nav_result = None
-        if previous:
-            _acp_notify(previous, "cancelled", {"reason": "superseded by new navigation request"})
         threading.Thread(target=self._wait_for_navigation,
                          args=(action_id, data["targetPose"]), daemon=True).start()
         return {"ret": 0, "status": "navigating", "action_id": action_id,

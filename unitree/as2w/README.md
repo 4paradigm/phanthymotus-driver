@@ -53,6 +53,8 @@ SDK does not package a model-specific SLAM client, so the driver implements the
 documented common RPC contract directly in an isolated CycloneDDS process. It
 requires the vendor `unitree_slam` service to be installed and already running
 on the robot or extension host; the driver does not start that service.
+`navigate_to` requires `confirm=true`, and navigation requests are serialized
+until the active request reports a terminal result or times out.
 
 `special_action` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
