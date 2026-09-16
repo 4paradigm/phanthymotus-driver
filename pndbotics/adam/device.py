@@ -5,7 +5,7 @@ Plugins:
   EStopPlugin  — read-only PAC physical emergency-stop state
   LocoPlugin   — gRPC locomotion control
   PosturePlugin / MotionPlugin / TrackingMotionPlugin — focused RL execution cards
-  ArmPlugin    — ROS2 JointState upper body control
+  ArmPlugin    — DDS rt/lowcmd upper body control
   HandPlugin   — DDS rt/handcmd finger control and hand-state query
   ModelPlugin  — URDF resource for 3D visualization
 """
@@ -66,6 +66,7 @@ try:
     )
     from pndbotics_sdk_py.idl.default import (
         pnd_adam_msg_dds__HandCmd_,
+        pnd_adam_msg_dds__LowCmd_,
     )
 
     HAS_PND_SDK = True
@@ -1222,102 +1223,157 @@ class ControlModePlugin(_RlActionPlugin):
 
 
 # ===========================================================================
-# ArmPlugin — ROS2 JointState upper body control
+# ArmPlugin — DDS rt/lowcmd upper body control
 # ===========================================================================
 
-class _ArmControlNode(Node):
-    """ROS2 node that publishes JointState at 100Hz for upper body control."""
-
-    def __init__(self, namespace: str, publish_rate_hz: float):
-        super().__init__("adam_arm_controller")
-        self._namespace = namespace
-
-        self._pub = self.create_publisher(JointState, "joint_states", 10)
-        self._joint_names = ROS2_UPPER_BODY_JOINTS
-        self._positions = np.zeros(len(self._joint_names), dtype=np.float64)
-        # Default height = 1.0m (standing), hands fully open = 1000
-        self._positions[17] = 1.0  # root_pos/z
-        self._positions[18:24] = 1000.0  # left hand fingers
-        self._positions[24:30] = 1000.0  # right hand fingers
-
-        self._active = False
-        self._lock = threading.Lock()
-
-        interval = 1.0 / publish_rate_hz
-        self._timer = self.create_timer(interval, self._publish)
-
-    def _publish(self):
-        if not self._active:
-            return
-        with self._lock:
-            positions = self._positions.copy()
-
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = self._joint_names
-        msg.position = positions.tolist()
-        msg.velocity = [0.0] * len(self._joint_names)
-        msg.effort = [0.0] * len(self._joint_names)
-        self._pub.publish(msg)
-
-    def set_joints(self, joints_dict: dict):
-        """Set joint positions by name. Keys are short names like 'shoulderPitch_Left'."""
-        if not isinstance(joints_dict, dict):
-            raise ValueError("joints must be an object mapping joint names to radians")
-        with self._lock:
-            for name, value in joints_dict.items():
-                # Try to find matching joint
-                full_name = f"dof_pos/{name}"
-                if full_name in self._joint_names:
-                    idx = self._joint_names.index(full_name)
-                    self._positions[idx] = float(value)
-                elif name in self._joint_names:
-                    idx = self._joint_names.index(name)
-                    self._positions[idx] = float(value)
-
-    def set_height(self, z: float):
-        z = max(0.6, min(1.0, z))
-        with self._lock:
-            self._positions[17] = z
-
-    def zero_arms(self):
-        with self._lock:
-            self._positions[:17] = 0.0
-            self._positions[17] = 1.0  # keep standing height
-
-    def receiver_count(self) -> int:
-        """Number of discovered retarget subscribers on ``joint_states``."""
-        try:
-            return int(self._pub.get_subscription_count())
-        except Exception:
-            return 0
-
-
 class ArmControlPlugin:
-    """Human-facing Adam Pro upper-body control via ROS2 JointState."""
+    """Human-facing Adam Pro arm control over the vendor's DDS lowcmd API.
+
+    The official arm-control example continuously publishes a complete LowCmd:
+    all non-arm joints hold their measured startup positions, while only the
+    fourteen arm joints receive the requested targets.  Sending a sparse
+    command is unsafe because ``rt/lowcmd`` owns the full body.
+    """
 
     PREFIX = "arm"
+    _DOF = 31
+    _RATE_HZ = 50.0
+    _MAX_VELOCITY_RAD_S = 0.5
+    _RELEASE_SECONDS = 1.5
+    _ARM_PD = {
+        "shoulderPitch": (150.0, 4.0), "shoulderRoll": (150.0, 4.0),
+        "shoulderYaw": (40.0, 1.0), "elbow": (100.0, 2.0),
+        "wristYaw": (15.0, 0.9), "wristPitch": (15.0, 0.9),
+        "wristRoll": (15.0, 0.9),
+    }
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 grpc_client=None, **kwargs):
+                 grpc_client=None, dds_lowcmd_pub=None,
+                 dds_arm_lowstate_sub=None, **kwargs):
         self._namespace = namespace
-        self._grpc = grpc_client
+        self._publisher = dds_lowcmd_pub
+        self._lowstate_sub = dds_arm_lowstate_sub
+        self._rate_hz = float(plugin_config.get("control_rate_hz", self._RATE_HZ))
+        self._rate_hz = max(10.0, min(100.0, self._rate_hz))
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._state_ready = threading.Event()
+        self._thread = None
+        self._hold_q = None
+        self._current_q = None
+        self._target_q = {}
+        self._active = False
+        self._release_started_at = None
+        self._writes = 0
+        self._last_error = None
 
-        rate = plugin_config.get("publish_rate_hz", 100)
-        self._node = _ArmControlNode(namespace, rate)
-        executor.add_node(self._node)
+    @staticmethod
+    def _joint_index(joint_name: str) -> int:
+        return ADAM_PRO_JOINTS.index(joint_name)
+
+    @classmethod
+    def _pd_for_joint(cls, joint_name: str) -> tuple[float, float]:
+        for prefix, gains in cls._ARM_PD.items():
+            if joint_name.startswith(prefix):
+                return gains
+        return (0.0, 0.0)
+
+    def _read_initial_state(self):
+        if self._lowstate_sub is None:
+            return
+        while not self._stop_event.is_set() and not self._state_ready.is_set():
+            try:
+                state = self._lowstate_sub.Read(timeout=0.2)
+                motors = getattr(state, "motor_state", None) if state else None
+                if motors is not None and len(motors) >= self._DOF:
+                    hold_q = [float(motors[index].q) for index in range(self._DOF)]
+                    if all(math.isfinite(value) for value in hold_q):
+                        with self._lock:
+                            self._hold_q = hold_q
+                            self._current_q = hold_q.copy()
+                        self._state_ready.set()
+                        return
+            except Exception as exc:
+                self._last_error = f"rt/lowstate read failed: {exc}"
+                self._stop_event.wait(0.1)
+
+    def _write_command(self, dt: float):
+        with self._lock:
+            if not self._state_ready.is_set() or self._hold_q is None:
+                return
+            now = time.monotonic()
+            active = self._active
+            release_started_at = self._release_started_at
+            targets = self._target_q.copy()
+            hold_q = self._hold_q.copy()
+            current_q = self._current_q.copy()
+
+            release_ratio = 0.0
+            finish_release = False
+            if release_started_at is not None:
+                release_ratio = min(1.0, (now - release_started_at) / self._RELEASE_SECONDS)
+                if release_ratio >= 1.0:
+                    # Publish one final complete command with zero arm gains;
+                    # stopping before this write would leave the prior PD
+                    # gains latched in the robot controller.
+                    finish_release = True
+            elif not active:
+                return
+
+            for index, target in targets.items():
+                delta = target - current_q[index]
+                step = self._MAX_VELOCITY_RAD_S * dt
+                current_q[index] += max(-step, min(step, delta))
+            self._current_q = current_q
+
+        try:
+            command = pnd_adam_msg_dds__LowCmd_(self._DOF)
+            command.mode_pr = 0
+            for index, joint_name in enumerate(ADAM_PRO_JOINTS):
+                motor = command.motor_cmd[index]
+                motor.mode = 1
+                motor.q = current_q[index] if index in targets else hold_q[index]
+                motor.dq = 0.0
+                motor.tau = 0.0
+                if index in targets:
+                    kp, kd = self._pd_for_joint(joint_name)
+                    motor.kp = kp * (1.0 - release_ratio)
+                    motor.kd = kd * (1.0 - release_ratio)
+                else:
+                    motor.kp = 0.0
+                    motor.kd = 0.0
+                motor.ki = 0.0
+            self._publisher.Write(command)
+            self._writes += 1
+            self._last_error = None
+            if finish_release:
+                with self._lock:
+                    self._release_started_at = None
+                    self._active = False
+                    self._target_q.clear()
+        except Exception as exc:
+            self._last_error = f"rt/lowcmd write failed: {exc}"
+
+    def _run(self):
+        self._read_initial_state()
+        interval = 1.0 / self._rate_hz
+        previous = time.monotonic()
+        while not self._stop_event.wait(interval):
+            now = time.monotonic()
+            self._write_command(min(0.1, now - previous))
+            previous = now
 
     def get_tool(self) -> dict:
         pose_options = [
             {"const": pose, "title": label}
             for pose, (label, _) in ARM_POSES.items()
         ]
-        actions = [*ARM_ACTIONS, "set_height", "stop", "info"]
+        actions = [*ARM_ACTIONS, "preset", "stop", "info"]
         action_options = [
             {"const": action, "title": f"设置{ARM_JOINT_CONTROLS[control][0]}"}
             for action, control in ARM_ACTIONS.items()
         ] + [
-            {"const": "set_height", "title": "设置站立高度"},
+            {"const": "preset", "title": "执行预设姿态"},
             {"const": "stop", "title": "停止上肢指令"},
             {"const": "info", "title": "查看状态"},
         ]
@@ -1325,12 +1381,9 @@ class ArmControlPlugin:
             "action": {"type": "string", "enum": actions, "oneOf": action_options},
             "pose": {"type": "string", "title": "预设姿态", "enum": list(ARM_POSES),
                      "oneOf": pose_options},
-            "height_m": {"type": "number", "title": "站立高度（米）", "minimum": 0.6,
-                         "maximum": 1.0, "multipleOf": 0.01,
-                         "description": "站立高度，范围 0.60-1.00 米。"},
         }
         action_params = {
-            "set_height": {"params": ["height_m"], "description": "设置站立高度（米）。"},
+            "preset": {"params": ["pose"], "description": "执行预设双臂姿态。"},
             "stop": {"params": [], "description": "停止发布上肢目标并保持机器人当前状态。"},
             "info": {"params": [], "description": "查看上肢指令是否已启用。"},
         }
@@ -1349,7 +1402,7 @@ class ArmControlPlugin:
         return {
             "name": "arm_control",
             "type": "actuator",
-            "description": "Adam upper body joint control — one named joint and its angle in degrees",
+            "description": "Adam Pro arm control through the official developer-mode DDS lowcmd interface",
             "inputSchema": {
                 "type": "object",
                 "properties": properties,
@@ -1361,77 +1414,106 @@ class ArmControlPlugin:
         }
 
     def start(self):
-        pass
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="adam_arm_lowcmd")
+            self._thread.start()
 
     def stop(self):
-        self._node._active = False
+        with self._lock:
+            if self._active:
+                self._release_started_at = time.monotonic()
+        # Give the official Kp ramp-down sequence a chance to reach zero.
+        deadline = time.monotonic() + self._RELEASE_SECONDS + 0.2
+        while self._release_started_at is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self._stop_event.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(1.0)
+        self._thread = None
+
+    def _ready_error(self):
+        if self._publisher is None:
+            return {"success": False, "code": "DDS_UNAVAILABLE",
+                    "message": "rt/lowcmd publisher is unavailable"}
+        if not self._state_ready.is_set():
+            return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
+                    "message": "Waiting for a complete rt/lowstate message in developer mode"}
+        if self._last_error:
+            return {"success": False, "code": "DDS_WRITE_FAILED", "message": self._last_error}
+        return None
+
+    def _set_targets(self, targets: dict[str, float]):
+        error = self._ready_error()
+        if error:
+            return error
+        with self._lock:
+            for joint_name, radians in targets.items():
+                self._target_q[self._joint_index(joint_name)] = radians
+            self._release_started_at = None
+            self._active = True
+        # The worker may need one 20ms tick. This confirms the protocol write,
+        # not physical movement, which DDS does not acknowledge.
+        before = self._writes
+        deadline = time.monotonic() + 0.15
+        while self._writes <= before and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if self._writes <= before:
+            return {"success": False, "code": "DDS_WRITE_FAILED",
+                    "message": self._last_error or "rt/lowcmd was not written"}
+        return None
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
-            self._node._active = False
-            return {"state": "idle"}
-        if action in ("stop", "disable"):
-            self._node._active = False
-            return {"state": "idle", "message": "Upper body command publishing stopped"}
+            with self._lock:
+                self._release_started_at = time.monotonic()
+            return {"success": True, "state": "releasing",
+                    "message": "Arm gains are ramping down over 1.5 seconds"}
         if action in ARM_ACTIONS:
             try:
                 control = ARM_ACTIONS[action]
                 field = f"{control}_deg"
-                ros_name, radians = _arm_target_radians(control, args.get(field))
-                self._node.set_joints({ros_name: radians})
+                joint_name, radians = _arm_target_radians(control, args.get(field))
             except (TypeError, ValueError) as exc:
                 return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
-            receivers = self._node.receiver_count()
-            if receivers < 1:
-                return {"success": False, "code": "ROS_RECEIVER_UNAVAILABLE",
-                        "message": "No Adam retarget receiver is subscribed to joint_states; command was not activated",
-                        "receiver_count": receivers}
-            self._node._active = True
+            error = self._set_targets({joint_name: radians})
+            if error:
+                return error
             _, _, minimum, maximum = ARM_JOINT_CONTROLS[control]
             return {"success": True, "state": "active", "joint": control,
-                    "angle_deg": float(args[field]), "receiver_count": receivers,
+                    "angle_deg": float(args[field]), "protocol": "rt/lowcmd",
                     "limits_deg": {"minimum": minimum, "maximum": maximum}}
         if action == "preset":
             pose = args.get("pose")
             if pose not in ARM_POSES:
                 return {"success": False, "code": "INVALID_ARGUMENT",
                         "message": "pose must be one of the advertised Adam upper-body poses"}
+            error = self._ready_error()
+            if error:
+                return error
             _, targets_deg = ARM_POSES[pose]
             try:
                 targets = dict(_arm_target_radians(control, degrees)
                                for control, degrees in targets_deg.items())
-                self._node.zero_arms() if pose == "neutral" else self._node.set_joints(targets)
+                if pose == "neutral":
+                    targets = {joint: self._hold_q[self._joint_index(joint)]
+                               for _, joint, _, _ in ARM_JOINT_CONTROLS.values()}
             except (TypeError, ValueError) as exc:
                 return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
-            receivers = self._node.receiver_count()
-            if receivers < 1:
-                return {"success": False, "code": "ROS_RECEIVER_UNAVAILABLE",
-                        "message": "No Adam retarget receiver is subscribed to joint_states; command was not activated",
-                        "receiver_count": receivers}
-            self._node._active = True
+            error = self._set_targets(targets)
+            if error:
+                return error
             return {"success": True, "state": "active", "pose": pose,
-                    "joints_set": len(targets_deg), "receiver_count": receivers}
-        if action == "set_height":
-            h = args.get("height_m")
-            if isinstance(h, bool) or not isinstance(h, (int, float)) or not 0.6 <= h <= 1.0:
-                return {"success": False, "code": "INVALID_ARGUMENT",
-                        "message": "height_m must be a number in [0.6, 1.0]"}
-            self._node.set_height(h)
-            receivers = self._node.receiver_count()
-            if receivers < 1:
-                return {"success": False, "code": "ROS_RECEIVER_UNAVAILABLE",
-                        "message": "No Adam retarget receiver is subscribed to joint_states; command was not activated",
-                        "receiver_count": receivers}
-            self._node._active = True
-            return {"success": True, "state": "active", "height_m": h,
-                    "receiver_count": receivers}
+                    "joints_set": len(targets), "protocol": "rt/lowcmd"}
         if action == "info":
-            receivers = self._node.receiver_count()
-            return {"state": "active" if self._node._active else "idle",
-                    "receiver_count": receivers,
-                    "receiver_ready": receivers > 0}
+            return {"state": "active" if self._active else "idle",
+                    "lowstate_ready": self._state_ready.is_set(),
+                    "dds_writer_ready": self._publisher is not None,
+                    "writes": self._writes, "last_error": self._last_error,
+                    "protocol": "rt/lowcmd"}
         return None
 
 
@@ -1489,17 +1571,13 @@ class ArmGesturePlugin:
         try:
             targets = dict(_arm_target_radians(control, value)
                            for control, value in selected.items())
-            self._control._node.set_joints(targets)
         except (TypeError, ValueError) as exc:
             return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
-        receivers = self._control._node.receiver_count()
-        if receivers < 1:
-            return {"success": False, "code": "ROS_RECEIVER_UNAVAILABLE",
-                    "message": "No Adam retarget receiver is subscribed to joint_states",
-                    "receiver_count": receivers}
-        self._control._node._active = True
+        error = self._control._set_targets(targets)
+        if error:
+            return error
         return {"success": True, "state": "active", "gesture": action,
-                "side": side, "receiver_count": receivers}
+                "side": side, "protocol": "rt/lowcmd"}
 
 
 # ===========================================================================
@@ -3432,7 +3510,8 @@ class AdamDeviceBundle:
 
     def __init__(self, config: dict, namespace: str, executor, grpc_client,
                  dds_lowstate_sub=None, dds_handstate_sub=None,
-                 dds_hand_pub=None, ros2_enabled: bool | None = None):
+                 dds_hand_pub=None, dds_lowcmd_pub=None,
+                 dds_arm_lowstate_sub=None, ros2_enabled: bool | None = None):
         self._plugins = []
         self._tool_map = {}  # tool_name → plugin
 
@@ -3506,11 +3585,14 @@ class AdamDeviceBundle:
             self._plugins.append(VisionCapturePlugin(
                 plugins_cfg.get("vision_capture", {}), camera_plugin))
 
-        # Direct upper-body control and semantic gestures share one ROS publisher.
-        if plugins_cfg.get("arm", {}).get("enabled", True) and self._ros2_enabled:
+        # Direct upper-body control is DDS-only and intentionally remains
+        # available when ROS2 is absent or isolated on the Jetson.
+        if plugins_cfg.get("arm", {}).get("enabled", True):
             p = ArmControlPlugin(
                 plugins_cfg.get("arm", {}), namespace, executor,
                 grpc_client=grpc_client,
+                dds_lowcmd_pub=dds_lowcmd_pub,
+                dds_arm_lowstate_sub=dds_arm_lowstate_sub,
             )
             self._plugins.append(p)
             if plugins_cfg.get("arm_gesture", {}).get("enabled", True):
