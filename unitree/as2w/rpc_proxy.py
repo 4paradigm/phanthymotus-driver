@@ -63,7 +63,7 @@ class RpcProxy:
             except Exception:
                 return 3104
         if "error" in result:
-            print(f"[as2-rpc] {method}: {result['error']}", flush=True)
+            print(f"[as2w-rpc] {method}: {result['error']}", flush=True)
             return 3104
         return result["result"]
 

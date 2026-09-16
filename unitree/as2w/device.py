@@ -126,11 +126,11 @@ class StatePlugin:
         self._executor = executor
         self._state = _StateNode(namespace, executor)
     def get_tools(self):
-        specs = (("imu", "state/imu", "data/json", "AS2 IMU state"),
+        specs = (("imu", "state/imu", "data/json", "AS2W IMU state"),
                  ("joints", "state/joints", "sensor/skeleton", "AS2W 16-joint skeleton for model animation"),
-                 ("joint_state", "state/joint_state", "data/json", "AS2 raw motor position, velocity, torque, and temperature"),
+                 ("joint_state", "state/joint_state", "data/json", "AS2W raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "AS2W BMS state; current_ma is mA"),
-                 ("loco_state", "loco/state", "data/json", "AS2 high-level locomotion state"))
+                 ("loco_state", "loco/state", "data/json", "AS2W high-level locomotion state"))
         return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
                  "inputSchema": {"type": "object", "properties": {}},
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
