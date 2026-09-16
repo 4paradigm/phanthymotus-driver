@@ -6,6 +6,7 @@ import threading
 import time
 
 from std_msgs.msg import UInt8MultiArray
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from unitree_sdk2py.core.channel import ChannelSubscriber
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
 
@@ -19,13 +20,19 @@ _DEFAULT_SOURCE_TOPICS = (
     "rt/utlidar/cloud_jt128",
 )
 _SOURCE_TIMEOUT_SECONDS = 3.0
+_LIDAR_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    durability=DurabilityPolicy.VOLATILE,
+)
 
 
 class _LidarNode:
     def __init__(self, topic, executor, source_topics=None):
         from rclpy.node import Node
         self.node = Node("as2w_lidar")
-        self.pub = self.node.create_publisher(UInt8MultiArray, topic, 10)
+        self.pub = self.node.create_publisher(UInt8MultiArray, topic, _LIDAR_QOS)
         configured = source_topics or _DEFAULT_SOURCE_TOPICS
         self.source_topics = tuple(dict.fromkeys(configured))
         self.subs = []
@@ -73,20 +80,58 @@ class _LidarNode:
     def _publish_loop(self):
         while not self._stopped.is_set():
             try:
-                point_step, point_count, data = self._cloud_queue.get(timeout=0.5)
+                point_step, point_count, data, offsets, endian = self._cloud_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            payload = struct.pack("<II", point_step, point_count) + data
+            data = self._to_xyz(data, point_step, point_count, offsets, endian)
+            if not data:
+                continue
+            # The dashboard renderer intentionally consumes compact XYZ points
+            # (it reads float32 x/y/z at offsets 0/4/8).  Do not forward the
+            # vendor's intensity/line/timestamp fields or their offsets.
+            payload = struct.pack("<II", 12, len(data) // 12) + data
             out = UInt8MultiArray()
             # This avoids constructing millions of boxed Python ints per frame.
             out.data = array.array("B", payload)
             self.pub.publish(out)
+
+    @staticmethod
+    def _to_xyz(data, point_step, point_count, offsets, endian):
+        """Extract little-endian compact XYZ for the dashboard renderer.
+
+        Unitree's direct cloud uses the standard lidar frame (x forward, y
+        left, z up).  The renderer applies its own x/y/z axis map, so changing
+        signs here would rotate the cloud twice.  ``PointCloud2`` fields are
+        not guaranteed to start at byte zero; normalize them here instead.
+        """
+        if not all(key in offsets for key in ("x", "y", "z")):
+            if point_step < 12:
+                return b""
+            offsets = {"x": 0, "y": 4, "z": 8}
+        raw = memoryview(data)
+        fmt = ">f" if endian else "<f"
+        out = bytearray(point_count * 12)
+        try:
+            for index in range(point_count):
+                base = index * point_step
+                target = index * 12
+                x = struct.unpack_from(fmt, raw, base + offsets["x"])[0]
+                y = struct.unpack_from(fmt, raw, base + offsets["y"])[0]
+                z = struct.unpack_from(fmt, raw, base + offsets["z"])[0]
+                # Output is always little-endian, independent of DDS input.
+                struct.pack_into("<fff", out, target, x, y, z)
+        except (IndexError, struct.error, ValueError):
+            return b""
+        return bytes(out)
 
     def _on_cloud(self, source, msg):
         data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
         point_step = int(msg.point_step)
         point_count = int(msg.width) * int(msg.height)
         if point_step <= 0 or point_count <= 0 or not data:
+            return
+        point_count = min(point_count, len(data) // point_step)
+        if point_count <= 0:
             return
         with self._lock:
             self._frames[source] += 1
@@ -102,8 +147,15 @@ class _LidarNode:
                     + (f" (replacing {previous})" if previous else ""))
             if source != self._active_source:
                 return
+        offsets = {}
+        for field in getattr(msg, "fields", []) or []:
+            name = str(getattr(field, "name", "")).lower()
+            if name in ("x", "y", "z"):
+                offsets[name] = int(getattr(field, "offset", 0))
+        endian = bool(getattr(msg, "is_bigendian", False))
         try:
-            self._cloud_queue.put_nowait((point_step, point_count, data))
+            item = (point_step, point_count, data, offsets, endian)
+            self._cloud_queue.put_nowait(item)
         except queue.Full:
             # A dashboard should receive the latest scan, never a stale backlog.
             try:
@@ -111,7 +163,7 @@ class _LidarNode:
             except queue.Empty:
                 pass
             try:
-                self._cloud_queue.put_nowait((point_step, point_count, data))
+                self._cloud_queue.put_nowait(item)
             except queue.Full:
                 pass
 
