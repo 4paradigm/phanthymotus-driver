@@ -985,23 +985,45 @@ class RlLocoPlugin:
                  grpc_client, **kwargs):
         self._grpc = grpc_client
         self._namespace = namespace
+        self._move_lock = threading.Lock()
+        self._move_generation = 0
 
     def get_tool(self) -> dict:
         return {
             "name": "loco",
             "type": "actuator",
-            "description": "Adam RL locomotion — walk, turn, stop and set body height",
+            "description": "Adam RL locomotion — limited-duration walking, turning and body-height adjustment",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move", "set_height", "stop"]},
-                    "vx": {"type": "number"}, "vy": {"type": "number"},
-                    "vyaw": {"type": "number"}, "height": {"type": "number"},
+                    "action": {"type": "string", "enum": ["move", "set_height", "stop"],
+                               "oneOf": [
+                                   {"const": "move", "title": "定时移动"},
+                                   {"const": "set_height", "title": "设置机身高度"},
+                                   {"const": "stop", "title": "立即停止移动"},
+                               ]},
+                    "vx": {"type": "number", "title": "前进速度（m/s）", "minimum": -1.0,
+                           "maximum": 1.0, "multipleOf": 0.01,
+                           "description": "正值前进、负值后退；范围 -1.00 至 1.00 m/s。"},
+                    "vy": {"type": "number", "title": "横移速度（m/s）", "minimum": -1.0,
+                           "maximum": 1.0, "multipleOf": 0.01,
+                           "description": "正负方向由机器人坐标系定义；范围 -1.00 至 1.00 m/s。"},
+                    "vyaw": {"type": "number", "title": "转向速度（rad/s）", "minimum": -1.0,
+                             "maximum": 1.0, "multipleOf": 0.01,
+                             "description": "正负方向由机器人坐标系定义；范围 -1.00 至 1.00 rad/s。"},
+                    "duration_s": {"type": "number", "title": "移动时长（秒）", "minimum": 0.1,
+                                   "maximum": 30.0, "multipleOf": 0.1,
+                                   "description": "范围 0.1-30.0 秒；到时自动发送零速度。新的移动或停止会取消此前计时。"},
+                    "height": {"type": "number", "title": "机身高度目标（m）", "minimum": -1.0,
+                               "maximum": 1.0, "multipleOf": 0.01,
+                               "description": "RL SetHeight 的高度目标，范围 -1.00 至 1.00 m。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move": {"params": ["vx", "vy", "vyaw"]},
-                    "set_height": {"params": ["height"]},
+                    "move": {"params": ["vx", "vy", "vyaw", "duration_s"],
+                             "description": "按设定速度移动指定时长，到时自动停止。"},
+                    "set_height": {"params": ["height"],
+                                   "description": "设置 RL 控制下的机身高度目标。"},
                     "stop": {"params": []},
                 },
             },
@@ -1014,7 +1036,24 @@ class RlLocoPlugin:
     def stop(self):
         # A plugin stop is a local lifecycle event; explicit shutdown is
         # required before asking the robot controller to exit.
+        self._cancel_timed_move()
         return None
+
+    def _cancel_timed_move(self):
+        with self._move_lock:
+            self._move_generation += 1
+            return self._move_generation
+
+    def _schedule_stop(self, generation: int, duration_s: float):
+        def stop_when_due():
+            time.sleep(duration_s)
+            with self._move_lock:
+                if generation != self._move_generation:
+                    return
+            self._grpc.set_velocity(0.0, 0.0, 0.0)
+
+        threading.Thread(target=stop_when_due, daemon=True,
+                         name="adam_loco_timed_stop").start()
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
@@ -1025,12 +1064,27 @@ class RlLocoPlugin:
         # This keeps stop usable as the least surprising command when another
         # controller or motion card currently owns the robot.
         if action == "stop":
+            self._cancel_timed_move()
             return self._grpc.set_velocity(0.0, 0.0, 0.0)
         state = _ensure_rl_locomotion(self._grpc)
         if not state.get("success", False):
             return state
         if action == "move":
-            return self._grpc.set_velocity(args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0))
+            try:
+                duration_s = float(args.get("duration_s"))
+                if not math.isfinite(duration_s) or not 0.1 <= duration_s <= 30.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": "duration_s must be a number in [0.1, 30.0]"}
+            generation = self._cancel_timed_move()
+            result = self._grpc.set_velocity(
+                args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0))
+            if result.get("success", False):
+                self._schedule_stop(generation, duration_s)
+                result = dict(result, duration_s=duration_s,
+                              auto_stop=True)
+            return result
         if action == "set_height":
             return self._grpc.set_height(args.get("height", 0.0))
         return None
@@ -1179,12 +1233,17 @@ class PosturePlugin(_RlActionPlugin):
 class MotionPlugin(_RlActionPlugin):
     def get_tool(self):
         return {"name": "motion", "type": "actuator",
-                "description": "Play or stop a robot-side upper-body .txt motion",
+                "description": "播放机器人端上半身动作文件；适用于挥手、招手等动作，不控制行走轨迹。",
                 "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["play", "stop", "get_state", "info"]},
-                    "motion_file": {"type": "string", "pattern": r".+\\.txt$"},
+                    "action": {"type": "string", "enum": ["play", "stop", "get_state", "info"],
+                               "oneOf": [{"const": "play", "title": "播放上半身动作"},
+                                         {"const": "stop", "title": "停止上半身动作"},
+                                         {"const": "get_state", "title": "读取机器人状态"},
+                                         {"const": "info", "title": "读取机器人状态"}]},
+                    "motion_file": {"type": "string", "title": "机器人端动作文件", "pattern": r".+\.txt$",
+                                    "description": "机器人控制器上的 .txt 文件路径，例如 Sources/motion/Wave.txt；文件必须已在机器人端存在。"},
                 }, "required": ["action"], "additionalProperties": False,
-                "x-action-params": {"play": {"params": ["motion_file"]}, "stop": {"params": []},
+                "x-action-params": {"play": {"params": ["motion_file"], "description": "播放机器人端已有的上半身 .txt 动作文件。"}, "stop": {"params": [], "description": "停止当前上半身动作。"},
                     "get_state": {"params": []}, "info": {"params": []}}}}
 
     def dispatch(self, action, args):
@@ -1206,12 +1265,16 @@ class MotionPlugin(_RlActionPlugin):
 class TrackingMotionPlugin(_RlActionPlugin):
     def get_tool(self):
         return {"name": "tracking_motion", "type": "actuator",
-                "description": "Execute a robot-side full-body tracking motion .txt file",
+                "description": "执行机器人端全身轨迹文件；可同时驱动躯干和腿部，执行前须确保周围空间安全。",
                 "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["play", "get_state", "info"]},
-                    "motion_file": {"type": "string", "pattern": r".+\\.txt$"},
+                    "action": {"type": "string", "enum": ["play", "get_state", "info"],
+                               "oneOf": [{"const": "play", "title": "执行全身轨迹"},
+                                         {"const": "get_state", "title": "读取机器人状态"},
+                                         {"const": "info", "title": "读取机器人状态"}]},
+                    "motion_file": {"type": "string", "title": "机器人端全身轨迹文件", "pattern": r".+\.txt$",
+                                    "description": "机器人控制器上的 .txt 轨迹文件，例如 Sources/tracking/Walk.txt；文件必须已在机器人端存在。"},
                 }, "required": ["action"], "additionalProperties": False,
-                "x-action-params": {"play": {"params": ["motion_file"]},
+                "x-action-params": {"play": {"params": ["motion_file"], "description": "执行机器人端已有的全身 .txt 轨迹。"},
                     "get_state": {"params": []}, "info": {"params": []}}}}
 
     def dispatch(self, action, args):
