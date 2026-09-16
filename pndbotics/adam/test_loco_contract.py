@@ -11,9 +11,7 @@ sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from device import (
-    ControlModePlugin,
     MotionPlugin,
-    PosturePlugin,
     RlLocoPlugin,
     TrackingMotionPlugin,
 )
@@ -39,6 +37,14 @@ class _Grpc:
         self.domain_id = domain_id
         return {"success": True, "domain_id": domain_id}
 
+    def set_velocity(self, vx, vy, vyaw):
+        self.velocity = (vx, vy, vyaw)
+        return {"success": True}
+
+    def set_height(self, height):
+        self.height = height
+        return {"success": True}
+
     def get_robot_state(self):
         return dict(self.state)
 
@@ -61,49 +67,39 @@ class _Grpc:
 
 
 class LocoContractTests(unittest.TestCase):
-    def test_set_mode_schema_and_dispatch_use_rl_state_names(self):
+    def test_loco_hides_mode_and_automatically_enters_walking_state(self):
         grpc = _Grpc()
         plugin = RlLocoPlugin({}, "adam", None, grpc)
 
-        mode_schema = plugin.get_tool()["inputSchema"]["properties"]["target_state"]
-        self.assertEqual(mode_schema["type"], "string")
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual(["move", "set_height", "stop"], schema["properties"]["action"]["enum"])
+        self.assertNotIn("target_state", schema["properties"])
+        self.assertNotIn("set_mode", schema["x-action-params"])
 
-        result = plugin.dispatch("set_mode", {"target_state": "STAND_WALK"})
+        result = plugin.dispatch("move", {"vx": 0.2, "vy": 0.0, "vyaw": -0.1})
         self.assertEqual(grpc.mode, "STAND_WALK")
-        self.assertEqual(result["current_state"], "STAND_WALK")
+        self.assertEqual((0.2, 0.0, -0.1), grpc.velocity)
+        self.assertTrue(result["success"])
 
-    def test_full_rl_actions_are_exposed(self):
+    def test_loco_height_and_stop_use_direct_motion_requests(self):
         grpc = _Grpc()
         plugin = RlLocoPlugin({}, "adam", None, grpc)
 
-        actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
-        self.assertTrue({"motion", "tracking_motion", "shutdown"}.issubset(actions))
-        plugin.dispatch("motion", {"command": "PLAY", "motion_file": "Sources/motion/Greeting.txt"})
-        self.assertEqual(("PLAY", "Sources/motion/Greeting.txt"), grpc.motion)
+        plugin.dispatch("set_height", {"height": 0.1})
+        self.assertEqual(0.1, grpc.height)
+        plugin.dispatch("stop", {})
+        self.assertEqual((0.0, 0.0, 0.0), grpc.velocity)
 
     def test_focused_execution_cards_are_registered_contracts(self):
         grpc = _Grpc()
         cards = [
-            PosturePlugin({}, "adam", None, grpc),
             MotionPlugin({}, "adam", None, grpc),
             TrackingMotionPlugin({}, "adam", None, grpc),
-            ControlModePlugin({}, "adam", None, grpc),
         ]
         self.assertEqual(
-            {"posture", "motion", "tracking_motion", "control_mode"},
+            {"motion", "tracking_motion"},
             {card.get_tool()["name"] for card in cards},
         )
-
-    def test_posture_checks_dynamic_switchable_states_and_waits(self):
-        grpc = _Grpc()
-        plugin = PosturePlugin({}, "adam", None, grpc)
-        denied = plugin.dispatch("set_mode", {"target_state": "JOG"})
-        self.assertEqual("NOT_ALLOWED", denied["code"])
-        completed = plugin.dispatch("wait_mode", {
-            "target_state": "STAND_WALK", "timeout_s": 1,
-        })
-        self.assertTrue(completed["completed"])
-        self.assertEqual("STAND_WALK", grpc.mode)
 
     def test_motion_and_tracking_cards_use_robot_side_files(self):
         grpc = _Grpc()
@@ -115,13 +111,6 @@ class LocoContractTests(unittest.TestCase):
         self.assertEqual("Sources/tracking/Walk.txt", grpc.tracking_motion)
         motion.dispatch("stop", {})
         self.assertEqual(("STOP", ""), grpc.motion)
-
-    def test_control_mode_maps_to_explicit_rpc(self):
-        grpc = _Grpc()
-        control = ControlModePlugin({}, "adam", None, grpc)
-        control.dispatch("set_traditional", {})
-        self.assertEqual(0, grpc.domain_id)
-
 
 if __name__ == "__main__":
     unittest.main()

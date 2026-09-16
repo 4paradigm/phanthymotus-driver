@@ -969,7 +969,7 @@ class LocoPlugin:
 # ===========================================================================
 
 class RlLocoPlugin:
-    """Adam RL high-level control using the pnd.robot API (port 50051)."""
+    """Adam RL movement card; controller state is an internal detail."""
 
     PREFIX = "loco"
 
@@ -982,31 +982,18 @@ class RlLocoPlugin:
         return {
             "name": "loco",
             "type": "actuator",
-            "description": "Adam RL locomotion — FSM, velocity, motions and control mode",
+            "description": "Adam RL locomotion — walk, turn, stop and set body height",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": [
-                        "set_mode", "move", "set_height", "motion",
-                        "tracking_motion", "get_state", "shutdown", "stop",
-                    ]},
-                    "target_state": {"type": "string"},
+                    "action": {"type": "string", "enum": ["move", "set_height", "stop"]},
                     "vx": {"type": "number"}, "vy": {"type": "number"},
                     "vyaw": {"type": "number"}, "height": {"type": "number"},
-                    "command": {"type": "string", "enum": ["PLAY", "STOP"]},
-                    "motion_file": {"type": "string"},
-                    "domain_id": {"type": "integer", "enum": [0, 1]},
-                    "force": {"type": "boolean"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set_mode": {"params": ["target_state"]},
                     "move": {"params": ["vx", "vy", "vyaw"]},
                     "set_height": {"params": ["height"]},
-                    "motion": {"params": ["command", "motion_file"]},
-                    "tracking_motion": {"params": ["motion_file"]},
-                    "get_state": {"params": []},
-                    "shutdown": {"params": ["force"]},
                     "stop": {"params": []},
                 },
             },
@@ -1024,23 +1011,52 @@ class RlLocoPlugin:
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             return {"state": "ready"}
-        if action in ("stop", "info"):
-            return {"state": "idle" if action == "stop" else "ready"}
-        if action == "set_mode":
-            return self._grpc.set_mode(args.get("target_state", ""))
+        if action == "info":
+            return {"state": "ready"}
+        # Never transition an FSM merely to issue a zero-velocity request.
+        # This keeps stop usable as the least surprising command when another
+        # controller or motion card currently owns the robot.
+        if action == "stop":
+            return self._grpc.set_velocity(0.0, 0.0, 0.0)
+        state = _ensure_rl_locomotion(self._grpc)
+        if not state.get("success", False):
+            return state
         if action == "move":
             return self._grpc.set_velocity(args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0))
         if action == "set_height":
             return self._grpc.set_height(args.get("height", 0.0))
-        if action == "motion":
-            return self._grpc.set_motion(args.get("command", "STOP"), args.get("motion_file", ""))
-        if action == "tracking_motion":
-            return self._grpc.set_tracking_motion(args.get("motion_file", ""))
-        if action == "get_state":
-            return self._grpc.get_robot_state()
-        if action == "shutdown":
-            return self._grpc.shutdown(args.get("force", False))
         return None
+
+
+def _ensure_rl_locomotion(grpc_client):
+    """Select RL and enter its walking state without exposing FSM controls."""
+    control = grpc_client.set_control_mode(1)
+    if not control.get("success", False):
+        return {"success": False, "code": "RL_CONTROL_UNAVAILABLE",
+                "message": "unable to select RL control domain", "details": control}
+    state = grpc_client.get_robot_state()
+    if not state.get("success", False):
+        return state
+    if state.get("fsm_state") == "STAND_WALK":
+        return state
+    states = state.get("switchable_states")
+    if not isinstance(states, list):
+        return {"success": False, "code": "STATE_UNAVAILABLE",
+                "message": "GetRobotState did not return switchable_states", "state": state}
+    if "STAND_WALK" not in states:
+        return {"success": False, "code": "NOT_ALLOWED",
+                "message": "STAND_WALK is not available on the robot", "switchable_states": states}
+    result = grpc_client.set_mode("STAND_WALK")
+    if not result.get("success", False):
+        return result
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        state = grpc_client.get_robot_state()
+        if state.get("success", False) and state.get("fsm_state") == "STAND_WALK":
+            return state
+        time.sleep(0.2)
+    return {"success": False, "code": "FSM_TIMEOUT",
+            "message": "timed out entering STAND_WALK", "state": state}
 
 
 class _RlActionPlugin:
