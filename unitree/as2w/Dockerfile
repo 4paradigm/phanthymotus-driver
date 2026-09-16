@@ -1,4 +1,8 @@
-ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
+# The internal rolling ros-base tag was observed on the Jetson with an empty
+# /opt/ros/humble prefix (including no rclpy), which makes the container exit
+# before this driver starts.  The official image is multi-architecture and
+# supplies the complete Humble runtime required by this standalone bundle.
+ARG ROS_BASE_IMAGE=ros:humble-ros-base
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 WORKDIR /work

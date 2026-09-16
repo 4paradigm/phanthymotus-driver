@@ -186,6 +186,12 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn('"/mcp/messages"', source)
         self.assertIn("must never silently bind to the office Wi-Fi", source)
 
+    def test_lidar_uses_direct_sensor_topics_not_conditional_slam_clouds(self):
+        source = (ROOT / "lidar.py").read_text()
+        self.assertIn('"rt/utlidar/cloud_deskewed"', source)
+        self.assertIn('"rt/utlidar/cloud"', source)
+        self.assertNotIn('"rt/unitree/slam_mapping/points"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

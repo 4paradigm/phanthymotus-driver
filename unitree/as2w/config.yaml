@@ -5,5 +5,8 @@ plugins:
   loco: {enabled: true}
   special_action: {enabled: true}
   state: {enabled: true}
-  lidar: {enabled: true}
+  lidar:
+    enabled: true
+    # Override only after checking the driver's 15-second lidar diagnostics.
+    # source_topics: ["rt/utlidar/cloud_deskewed"]
   controlled_spatial: {enabled: true}
