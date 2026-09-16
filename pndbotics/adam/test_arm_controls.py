@@ -83,7 +83,8 @@ class ArmControlTests(unittest.TestCase):
         command = publisher.commands[-1]
         hip = ADAM_PRO_JOINTS.index("hipPitch_Left")
         self.assertEqual(command.motor_cmd[hip].q, plugin._hold_q[hip])
-        self.assertEqual(command.motor_cmd[hip].kp, 0.0)
+        self.assertEqual(command.motor_cmd[hip].kp, 400.0)
+        self.assertEqual(command.motor_cmd[hip].kd, 6.1)
         self.assertLess(command.motor_cmd[elbow].q, plugin._hold_q[elbow])
         self.assertEqual(command.motor_cmd[elbow].kp, 100.0)
         self.assertEqual(command.motor_cmd[elbow].kd, 2.0)
