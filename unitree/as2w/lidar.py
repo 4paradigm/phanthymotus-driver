@@ -14,13 +14,21 @@ from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
 # AS2W firmware revisions have used different names for the direct lidar
 # stream. Map/relocation clouds are conditional SLAM products, not live lidar.
 _DEFAULT_SOURCE_TOPICS = (
+    "rt/utlidar/cloud_livox_mid360",
     "rt/utlidar/cloud_deskewed",
     "rt/utlidar/cloud",
-    "rt/utlidar/cloud_livox_mid360",
     "rt/utlidar/cloud_jt128",
 )
-_SOURCE_TIMEOUT_SECONDS = 3.0
+_SOURCE_TIMEOUT_SECONDS = 1.5
 _MAX_RENDER_POINTS = 40000
+# Official AS2W URDF JT128 fixed joint: rpy=(-pi, 1.4661, -pi).
+# This maps points from the lidar frame into the AS2W base frame.  Keeping the
+# values explicit avoids pulling numpy into the latency-sensitive bridge.
+_JT128_R = (
+    (-0.1045051633, 0.0, 0.9945243440),
+    (0.0, 1.0, 0.0),
+    (-0.9945243440, 0.0, -0.1045051633),
+)
 _LIDAR_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -117,9 +125,6 @@ class _LidarNode:
         count = min(point_count, _MAX_RENDER_POINTS)
         stride = max(1, point_count // count)
         selected = min(count, (point_count + stride - 1) // stride)
-        if (not endian and point_step == 12 and
-                offsets == {"x": 0, "y": 4, "z": 8} and stride == 1):
-            return bytes(raw[:selected * 12])
         out = bytearray(selected * 12)
         try:
             for target_index in range(selected):
@@ -129,8 +134,12 @@ class _LidarNode:
                 x = struct.unpack_from(fmt, raw, base + offsets["x"])[0]
                 y = struct.unpack_from(fmt, raw, base + offsets["y"])[0]
                 z = struct.unpack_from(fmt, raw, base + offsets["z"])[0]
+                # Convert JT128 lidar coordinates to AS2W base coordinates.
+                bx = _JT128_R[0][0] * x + _JT128_R[0][1] * y + _JT128_R[0][2] * z
+                by = _JT128_R[1][0] * x + _JT128_R[1][1] * y + _JT128_R[1][2] * z
+                bz = _JT128_R[2][0] * x + _JT128_R[2][1] * y + _JT128_R[2][2] * z
                 # Output is always little-endian, independent of DDS input.
-                struct.pack_into("<fff", out, target, x, y, z)
+                struct.pack_into("<fff", out, target, bx, by, bz)
         except (IndexError, struct.error, ValueError):
             return b""
         return bytes(out)
