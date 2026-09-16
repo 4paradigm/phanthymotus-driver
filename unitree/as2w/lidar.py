@@ -29,6 +29,11 @@ _JT128_R = (
     (0.0, 1.0, 0.0),
     (-0.9945243440, 0.0, -0.1045051633),
 )
+# The existing dashboard renderer maps incoming (x,y,z) to display axes as
+# display=(y,-z,-x).  The requested AS2W display basis is
+# display=(-old_z, old_x, -old_y).  Therefore send this preimage so the
+# unchanged renderer produces the requested red=forward, blue=left,
+# yellow=up convention: wire=(base_z, -base_y, base_x).
 _LIDAR_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -138,8 +143,9 @@ class _LidarNode:
                 bx = _JT128_R[0][0] * x + _JT128_R[0][1] * y + _JT128_R[0][2] * z
                 by = _JT128_R[1][0] * x + _JT128_R[1][1] * y + _JT128_R[1][2] * z
                 bz = _JT128_R[2][0] * x + _JT128_R[2][1] * y + _JT128_R[2][2] * z
+                rx, ry, rz = bz, -by, bx
                 # Output is always little-endian, independent of DDS input.
-                struct.pack_into("<fff", out, target, bx, by, bz)
+                struct.pack_into("<fff", out, target, rx, ry, rz)
         except (IndexError, struct.error, ValueError):
             return b""
         return bytes(out)
