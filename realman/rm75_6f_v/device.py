@@ -751,16 +751,19 @@ class CartesianPlugin:
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
         cartesian = config.get("cartesian", {})
         self.cartesian_enabled = cartesian.get("enabled", False) is True
-        # 水平工作半径（基座轴线到 TCP 的水平距离，RM75-6F 官方标称 638.5mm）
+        # 水平工作半径（基座轴线到 TCP 的水平距离，RM75-6F 官方标称 638.5mm，取整 640 留 1.5mm 余量）
         self.max_radius_mm = float(cartesian.get("max_radius_mm", 640.0))
-        # 肩关节（joint2）距基座平面的高度，取自 resource/rm75_6f_v.urdf：0.16 + 0.18 = 0.34m
-        self.shoulder_height_mm = float(cartesian.get("shoulder_height_mm", 340.0))
-        # 肩部到末端 TCP 的最大直线臂展，取自 URDF 连杆长度：sqrt(0.88^2 + 0.18^2) ≈ 0.898m
-        self.max_reach_mm = float(cartesian.get("max_reach_mm", 900.0))
+        # 肩关节距基座平面的高度，取自官方 RM75 系列 MDH 参数 d1=240.5mm
+        # （develop.realman-robotics.com RM75 本体参数，取代旧展示用 URDF 的 340mm）。
+        self.shoulder_height_mm = float(cartesian.get("shoulder_height_mm", 240.5))
+        # 肩部到法兰的最大直线臂展：MDH d3+d5+d7 = 256+210+184 = 650mm（RM75-6F-V）。
+        self.max_reach_mm = float(cartesian.get("max_reach_mm", 650.0))
         self.max_euler_abs_deg = float(cartesian.get("max_euler_abs_deg", 360.0))
-        # 夹爪 TCP 相对法兰的伸出量（沿工具 +X 方向，正对齐法兰安装）。
-        # 机械臂关节直接约束的是法兰中心，故可达性校验需把夹爪 TCP 目标换算回法兰位置。
-        # 仅当控制器已将工具坐标系设为夹爪 TCP 时才应配置非零值；否则保持 0（法兰即 TCP）。
+        # 夹爪 TCP 相对法兰的伸出量。校验不再用它从姿态反推法兰位置——
+        # 真机竖直位姿上报欧拉角 (0,0,0) 而夹爪实际竖直伸出（TCP z≈1112 =
+        # 240.5+650+222.5），说明上报欧拉角不编码物理工具轴方向。改为把
+        # 工具长度作为包络余量：TCP 距肩部 ≤ 臂展 + 工具长度。
+        # 仅当控制器已把工具坐标系设为夹爪 TCP 时才应配置非零值；否则保持 0（法兰即 TCP）。
         self.tool_length_mm = float(cartesian.get("tool_length_mm", 0.0))
 
     def get_tools(self):
@@ -982,34 +985,27 @@ class CartesianPlugin:
 
     def _validate_workspace(self, pose_mm_deg):
         x, y, z, rx, ry, rz = pose_mm_deg
-        # 关节直接约束的是法兰中心。若控制器把工具坐标系设为夹爪 TCP，
-        # 需把 TCP 目标沿当前工具 +X 方向回退 tool_length_mm 得到法兰位置再校验。
-        fx, fy, fz = self._flange_from_tcp(x, y, z, rx, ry, rz)
-        # 水平工作半径：基座轴线到法兰的水平距离，而非到原点的 3D 距离。
-        # RM75-6F 标称工作半径 638.5mm，竖直臂展由肩高 + 臂长决定（可远大于水平半径）。
-        horizontal_radius = math.sqrt(fx * fx + fy * fy)
-        if horizontal_radius > self.max_radius_mm:
+        # 直接校验 TCP 本身，不从姿态反推法兰位置：控制器上报的欧拉角
+        # 不编码物理工具轴方向（真机竖直位姿上报 (0,0,0) 而夹爪竖直伸出），
+        # 按姿态回退 tool_length 会把法兰算到错误方向，造成可达点被误拒。
+        # 因此把 tool_length 作为包络余量：夹爪沿任意方向伸出都不会被误杀。
+        horizontal_radius = math.sqrt(x * x + y * y)
+        if horizontal_radius > self.max_radius_mm + self.tool_length_mm:
             raise ValueError(
-                f"pose horizontal radius {horizontal_radius:.0f} mm exceeds cartesian.max_radius_mm {self.max_radius_mm:g}")
-        # 竖直方向用肩关节几何模型校验：以肩部为球心、臂长为半径。
+                f"pose horizontal radius {horizontal_radius:.0f} mm exceeds cartesian.max_radius_mm "
+                f"{self.max_radius_mm:g} + tool_length_mm {self.tool_length_mm:g}")
+        # 竖直方向用肩关节几何模型校验：以肩部为球心、臂展+工具长度为半径。
         # 这是仿人构型的自然约束，覆盖「竖直臂展大、水平半径小」的真实工作空间。
-        shoulder_radius = math.sqrt(fx * fx + fy * fy + (fz - self.shoulder_height_mm) ** 2)
-        if shoulder_radius > self.max_reach_mm:
+        # 真实可达性由控制器逆解兜底；本校验只负责在明显不可达时提前给出清晰报错。
+        shoulder_radius = math.sqrt(x * x + y * y + (z - self.shoulder_height_mm) ** 2)
+        if shoulder_radius > self.max_reach_mm + self.tool_length_mm:
             raise ValueError(
-                f"pose distance {shoulder_radius:.0f} mm from shoulder exceeds cartesian.max_reach_mm {self.max_reach_mm:g}")
+                f"pose distance {shoulder_radius:.0f} mm from shoulder exceeds cartesian.max_reach_mm "
+                f"{self.max_reach_mm:g} + tool_length_mm {self.tool_length_mm:g}")
         for value, label in ((rx, "rx"), (ry, "ry"), (rz, "rz")):
             if abs(value) > self.max_euler_abs_deg:
                 raise ValueError(
                     f"{label} {value:.0f} deg exceeds cartesian.max_euler_abs_deg {self.max_euler_abs_deg:g}")
-
-    def _flange_from_tcp(self, x, y, z, rx, ry, rz):
-        """夹爪 TCP → 法兰中心：沿工具 +X 方向回退 tool_length_mm。"""
-        if self.tool_length_mm <= 0.0:
-            return x, y, z
-        col_x = self._euler_to_matrix(rx, ry, rz)[0]  # 基座系中工具 +X 轴的单位向量
-        return x - self.tool_length_mm * col_x[0], \
-               y - self.tool_length_mm * col_x[1], \
-               z - self.tool_length_mm * col_x[2]
 
     def _submit(self, motion_type, args, target, speed_percent):
         """下发 SDK 运动命令（非阻塞）。"""
