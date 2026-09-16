@@ -340,7 +340,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.plugin = self.device.CartesianPlugin(
             self.client, {
                 "safety": dict(self.FAST_SAFETY),
-                "cartesian": {"enabled": True, "max_radius_mm": 640, "shoulder_height_mm": 340, "max_reach_mm": 900},
+                "cartesian": {"enabled": True, "max_radius_mm": 640, "shoulder_height_mm": 240.5, "max_reach_mm": 650},
             },
             arm_plugin=self.arm, namespace="rm75",
         )
@@ -489,7 +489,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             {"x_mm": 1200, "y_mm": 0, "z_mm": 0, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
             {"x_mm": 700, "y_mm": 700, "z_mm": 700, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
             {"x_mm": 0, "y_mm": 0, "z_mm": 0, "rx_deg": 0, "ry_deg": 0, "rz_deg": 400},
-            # 竖直臂展超出肩部可达范围（肩高 340 + 臂长 900）
+            # 竖直臂展超出肩部可达范围（肩高 240.5 + 臂长 650）
             {"x_mm": 0, "y_mm": 0, "z_mm": 1600, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0},
         ]
         for pose in cases:
@@ -498,9 +498,22 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                     self.plugin.dispatch("movel", {**pose, "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True})
         self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
 
+    def _real_cartesian_plugin(self):
+        # 真机配置：官方 MDH 几何（肩高 240.5、臂展 650）+ 夹爪 TCP 工具长度 222.5。
+        return self.device.CartesianPlugin(
+            self.client, {
+                "safety": dict(self.FAST_SAFETY),
+                "cartesian": {"enabled": True, "max_radius_mm": 640, "shoulder_height_mm": 240.5,
+                              "max_reach_mm": 650, "tool_length_mm": 222.5},
+            },
+            arm_plugin=self.arm, namespace="rm75",
+        )
+
     def test_vertical_reach_pose_is_allowed_within_shoulder_model(self):
-        # 竖直朝上位姿：水平半径 0、肩部距离在臂展内，不得再被 610 球误杀。
-        result = self.plugin.dispatch("movel", {
+        # 竖直朝上位姿：水平半径 0、肩部距离在臂展+工具长度包络内，
+        # 不得再被旧「原点 610mm 球」误杀。
+        plugin = self._real_cartesian_plugin()
+        result = plugin.dispatch("movel", {
             "x_mm": 0, "y_mm": 0, "z_mm": 1100, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0,
             "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
         })
@@ -511,44 +524,35 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         )
 
     def test_vertical_offset_down_200mm_is_allowed(self):
-        # 竖直朝上当前位姿，工具系下移 200mm、横移 50mm：目标 (50, 0, ~912)。
-        # 3D 距离 ~914mm 曾触发「radius 914 exceeds 610」误报，现应按肩部模型放行。
+        # 真机回归：竖直朝上当前位姿（上报欧拉角 (0,0,0)，夹爪实际竖直伸出、
+        # TCP z≈1112 = 240.5+650+222.5），工具系下移 200mm、横移 50mm：
+        # 目标 (50, 0, ~912)，旧代码曾报「radius 914 exceeds 610」误拒。
+        plugin = self._real_cartesian_plugin()
         self.client.pose_mm_deg = [0.0, 0.0, 1112.0, 0.0, 0.0, 0.0]
-        result = self.plugin.dispatch("move_offset", {
+        result = plugin.dispatch("move_offset", {
             "dx_mm": 50, "dy_mm": 0, "dz_mm": -200,
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
             "frame_type": "tool", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
         })
         self.assertEqual("running", result["state"])
-
-    def test_gripper_tcp_offset_backs_out_flange_for_workspace(self):
-        # 工具坐标系已设为夹爪 TCP（tool_length_mm=222.5，沿工具 +X 正对齐法兰）。
-        # 水平朝 +X 的 TCP 目标 (700, 0, 340)：法兰实际在 (477.5, 0, 340)，水平半径 477.5 < 640 应放行；
-        # 若不扣除夹爪长度，会被误判为 700 > 640。
-        plugin = self.device.CartesianPlugin(
-            self.client, {
-                "safety": dict(self.FAST_SAFETY),
-                "cartesian": {"enabled": True, "max_radius_mm": 640, "shoulder_height_mm": 340,
-                              "max_reach_mm": 900, "tool_length_mm": 222.5},
-            },
-            arm_plugin=self.arm, namespace="rm75",
+        self.assertIn(
+            ("rm_movel", ([0.05, 0.0, 0.912, 0.0, 0.0, 0.0], 5, 0, 0, 0)),
+            self.client.calls,
         )
+
+    def test_tool_length_extends_tcp_envelope(self):
+        # 校验直接针对 TCP 并把 tool_length 作为包络余量，不再从姿态反推法兰
+        # （上报欧拉角不编码物理工具轴方向）。水平 TCP 700 ≤ 640+222.5 应放行。
+        plugin = self._real_cartesian_plugin()
         result = plugin.dispatch("movel", {
             "x_mm": 700, "y_mm": 0, "z_mm": 340, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0,
             "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
         })
         self.assertEqual("running", result["state"])
 
-    def test_gripper_tcp_offset_still_rejects_true_flange_overreach(self):
-        # TCP 目标水平朝 +X 到 900：法兰在 (677.5, 0, 340)，水平半径 677.5 > 640，必须拒绝。
-        plugin = self.device.CartesianPlugin(
-            self.client, {
-                "safety": dict(self.FAST_SAFETY),
-                "cartesian": {"enabled": True, "max_radius_mm": 640, "shoulder_height_mm": 340,
-                              "max_reach_mm": 900, "tool_length_mm": 222.5},
-            },
-            arm_plugin=self.arm, namespace="rm75",
-        )
+    def test_tool_length_envelope_still_rejects_overreach(self):
+        # TCP 水平 900 > 640+222.5=862.5，超出包络必须拒绝。
+        plugin = self._real_cartesian_plugin()
         with self.assertRaisesRegex(ValueError, "exceeds"):
             plugin.dispatch("movel", {
                 "x_mm": 900, "y_mm": 0, "z_mm": 340, "rx_deg": 0, "ry_deg": 0, "rz_deg": 0,
