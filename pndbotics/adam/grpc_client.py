@@ -15,9 +15,8 @@ import robot_control_pb2_grpc as pb2_grpc
 class AdamGrpcClient:
     """Wrapper for the ``pnd.robot`` service on port 50051.
 
-    The service exposes a few reserved calls (currently SetVelocity and
-    SetHeight).  Those calls intentionally return an explicit unsupported
-    result instead of pretending that a command reached the robot.
+    Velocity and height are direct RL commands once the controller is in its
+    walking state. The execution card takes care of that state transition.
     """
 
     def __init__(self, host: str = "10.10.20.127", port: int = 50051,
@@ -96,9 +95,10 @@ class AdamGrpcClient:
                 return self._invalid("velocity values must be in [-1.0, 1.0]")
         except (TypeError, ValueError):
             return self._invalid("velocity values must be numbers")
-        return self._unsupported(
-            "PNDbotics RL SetVelocity is reserved; use a supported policy/input path"
-        )
+        response = self._call(
+            "SetVelocity", pb2.SetVelocityRequest(
+                vx=float(vx), vy=float(vy), vyaw=float(vyaw)))
+        return self._response(response)
 
     # Name used by the RL tool; keep set_speed for the existing card contract.
     set_velocity = set_speed
@@ -111,9 +111,9 @@ class AdamGrpcClient:
                 return self._invalid("height must be in [-1.0, 1.0]")
         except (TypeError, ValueError):
             return self._invalid("height must be a number")
-        return self._unsupported(
-            "PNDbotics RL SetHeight is reserved and currently not connected"
-        )
+        response = self._call(
+            "SetHeight", pb2.SetHeightRequest(height=float(height)))
+        return self._response(response)
 
     def set_motion(self, command: str, motion_file: str = "") -> dict:
         command = str(command).upper()
@@ -171,9 +171,7 @@ class AdamGrpcClient:
         return self._unsupported("RL does not support traditional stand action IDs")
 
     def set_stand_dynamic(self, **kwargs) -> dict:
-        return self._unsupported(
-            "PNDbotics RL SetHeight is reserved and has no pitch/roll/yaw equivalent"
-        )
+        return self.set_height(kwargs.get("height", 0.0))
 
     def set_error_clear(self) -> dict:
         return self._unsupported("RL protocol has no SetErrorClear RPC")
