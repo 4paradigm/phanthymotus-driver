@@ -155,6 +155,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual({"joints", "imu_quat"}, set(payload))
         self.assertEqual(16, len(payload["joints"]))
         self.assertEqual([1, 0, 0, 0], payload["imu_quat"])
+        self.assertEqual({"idx", "name", "q", "dq", "tau", "temperature"},
+                         set(payload["joints"][0]))
 
     def test_battery_current_is_explicitly_exposed_in_ma_and_a(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
@@ -163,7 +165,8 @@ class TestDriverContracts(unittest.TestCase):
         node._on_bms(types.SimpleNamespace(soc=87, current=325, cycle=4, temperature=[]))
         payload = __import__("json").loads(published[0])
         self.assertEqual(325, payload["current_ma"])
-        self.assertAlmostEqual(0.325, payload["current_a"])
+        self.assertNotIn("current", payload)
+        self.assertNotIn("current_a", payload)
 
     def test_loco_state_does_not_duplicate_imu(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
