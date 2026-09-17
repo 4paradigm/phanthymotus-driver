@@ -44,6 +44,7 @@ class RM75SDKClient:
         self._lock = threading.RLock()
         self._robot = None
         self._handle = None
+        self._last_connection_error = None
         self._trajectory_event = threading.Event()
         self._trajectory_lock = threading.Lock()
         self._trajectory_waiting = False
@@ -61,6 +62,21 @@ class RM75SDKClient:
         if not self.enabled:
             print("[rm75] SDK connection disabled; set RM_DRIVER_ENABLED=1 and RM_ARM_IP after safety checks", flush=True)
             return
+        self.ensure_connected()
+
+    def ensure_connected(self):
+        """Create the one shared SDK handle when a request needs it.
+
+        Driver startup and the arm controller do not always become ready in the
+        same order.  The bundle deliberately keeps serving its MCP tools after
+        a plugin start failure, so a later request must be able to recover that
+        missing initial connection instead of remaining disconnected until the
+        container is restarted.
+        """
+        if not self.enabled:
+            raise ConnectionError(
+                "RM75 SDK connection is disabled; set RM_DRIVER_ENABLED=1"
+            )
         if not self.ip:
             raise ValueError("RM_ARM_IP is required when RM_DRIVER_ENABLED=1")
         if not SDK_LIBRARY_PATH.is_file():
@@ -71,16 +87,25 @@ class RM75SDKClient:
         from Robotic_Arm.rm_robot_interface import RoboticArm, rm_event_callback_ptr, rm_thread_mode_e
 
         with self._lock:
-            self._robot = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
-            self._handle = self._robot.rm_create_robot_arm(self.ip, self.port)
-            if not self.connected:
-                bad_id = getattr(self._handle, "id", None)
+            if self.connected and self._robot is not None:
+                return False
+            robot = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
+            handle = robot.rm_create_robot_arm(self.ip, self.port)
+            if handle is None or int(getattr(handle, "id", -1)) < 0:
+                bad_id = getattr(handle, "id", None)
                 self._handle = None
                 self._robot = None
-                raise ConnectionError(f"RealMan SDK could not connect to {self.ip}:{self.port}; handle={bad_id}")
+                self._last_connection_error = (
+                    f"RealMan SDK could not connect to {self.ip}:{self.port}; handle={bad_id}"
+                )
+                raise ConnectionError(self._last_connection_error)
+            self._robot = robot
+            self._handle = handle
             self._event_callback = rm_event_callback_ptr(self._on_arm_event)
             self._robot.rm_get_arm_event_call_back(self._event_callback)
+            self._last_connection_error = None
             print(f"[rm75] SDK connected to {self.ip}:{self.port} handle={self._handle.id}", flush=True)
+            return True
 
     def stop(self):
         self.cancel_trajectory_wait()
@@ -95,17 +120,22 @@ class RM75SDKClient:
         return {
             "state": "connected" if self.connected else "disabled" if not self.enabled else "disconnected",
             "endpoint": f"{self.ip}:{self.port}" if self.ip else None,
+            "last_connection_error": self._last_connection_error,
             "read_only": not self.motion_enabled,
             "motion_enabled": self.motion_enabled,
         }
 
     def call(self, method):
+        if not self.connected or self._robot is None:
+            self.ensure_connected()
         with self._lock:
             if not self.connected or self._robot is None:
                 raise ConnectionError("RM75 SDK is not connected")
             return _sdk_result(method, getattr(self._robot, method)())
 
     def call_dict(self, method):
+        if not self.connected or self._robot is None:
+            self.ensure_connected()
         with self._lock:
             if not self.connected or self._robot is None:
                 raise ConnectionError("RM75 SDK is not connected")
@@ -125,6 +155,8 @@ class RM75SDKClient:
         return {"name": JOINT_NAMES, "position": radians, "position_unit": "rad", "raw_degree": degrees}
 
     def command(self, method, *args):
+        if not self.connected or self._robot is None:
+            self.ensure_connected()
         with self._lock:
             if not self.connected or self._robot is None:
                 raise ConnectionError("RM75 SDK is not connected")
@@ -167,6 +199,8 @@ class RM75SDKClient:
         # 状态发布或预检可能卡在 SDK 查询并长期持有 _lock。三线程模式的原生
         # block=0 运动不能因此被饿死；只做原子引用快照，生命周期 stop 会先停止
         # 各插件，不会与正常的新运动并发销毁句柄。
+        if not self.connected or self._robot is None:
+            self.ensure_connected()
         robot = self._robot
         if not self.connected or robot is None:
             raise ConnectionError("RM75 SDK is not connected")
@@ -327,9 +361,14 @@ class RM75Plugin:
         return definitions
 
     def start(self):
-        self.client.start()
-        if self.client.connected and self._ros2 is not None:
-            self._start_skeleton_publisher()
+        try:
+            self.client.start()
+        finally:
+            # Keep the state publisher available after a transient startup
+            # connection failure.  A later tool request can reconnect the
+            # shared client, after which this existing publisher resumes.
+            if self._ros2 is not None:
+                self._start_skeleton_publisher()
 
     def stop(self):
         with self._action_lock:
