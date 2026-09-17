@@ -183,10 +183,20 @@ error/degraded，成功重试后恢复 ready。
 转换为固定 640×480 的毫米 `16UC1`；点云到相机坐标系的标定投影、膨胀、
 Sobel 边缘抑制和最近邻上采样均由众擎节点完成。使用 `depth` 前需按众擎
 文档 7.2 节启动该深度图节点。
-点云源可用 `pointcloud` 工具的 `select_source` action 在 `raw`/`slam`
-之间切换。Odin2 topic 带逐设备前缀 `/{topic_prefix}/{model}/device{N}/`，
+点云默认转发 `cloud/slam`。Odin2 的 `cloud/raw` 虽然数据稳定，但处于
+传感器坐标系，设备安装俯角会直接体现在画面中；仅做 z 取反不能消除该倾斜。
+`cloud/slam` 是重力对齐的 odom 标准坐标系，适合作为监控页默认源；仍可用
+`pointcloud` 工具的 `select_source` action 在 `raw`/`slam` 之间切换。Odin2 topic 带逐设备前缀 `/{topic_prefix}/{model}/device{N}/`，
 默认按 `config.yaml:topics.vision_*` 的 `/manifold/ODIN2/device0` 订阅，
 上机前请用 `ros_graph` 工具核对实际前缀。
+
+Odin2 主驱动和标定深度节点由 `deploy/engineai-odin2.service` 与
+`deploy/engineai-odin2-depth.service` 管理，两个单元都必须安装并设为
+`enabled`；depth 节点依赖 `/home/ubuntu/odin-depth-ws/install/setup.bash`
+和当前设备标定文件。系统升级后若这两个单元或 depth 工作区被清理，应先按
+部署文档恢复它们，再启动 T800 driver。
+仓库提供幂等恢复脚本：`sudo bash deploy/install_odin2_services.sh`；脚本会
+重建官方 depth 节点、读取当前 Odin2 标定，并安装/启用两个 systemd 单元。
 
 `speaker` 按众擎飞书《ROS2 接口开发文档》第8章实现：播放走官方 ALSA
 接口 `aplay`（`-t raw -f S16_LE -r 16000 -c 1`，从 stdin 流式播放），

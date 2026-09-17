@@ -137,7 +137,7 @@ plugins:
     enabled: true
   vision:
     enabled: true
-    source: "raw"            # raw | slam —— 转发哪个点云源
+    source: "slam"           # raw | slam —— slam 为重力对齐的 odom 标准坐标系源
   gait:
     enabled: true
     # Native SDK releases use either rl_basic or walk for basic locomotion.
