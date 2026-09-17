@@ -6,6 +6,13 @@ arm_ip: ""
 tcp_port: 8080
 ext_camera:
   enabled: true
+vision_capture:
+  enabled: true
+  camera: external
+  external_instance_id: ""
+  output_dir: /opt/phanthy-motus/data/vision_capture/realman
+  fps: 15
+  max_duration_s: 30
 safety:
   max_speed_percent: 10
   default_speed_percent: 5
