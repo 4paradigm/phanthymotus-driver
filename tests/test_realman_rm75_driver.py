@@ -443,12 +443,12 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         })
 
         self.assertEqual("running", result["state"])
-        # 工具系偏移先换算成基座系绝对目标，再走三/四代均支持的 rm_movel。
+        # 四代控制器直接执行工具系偏移；目标换算仅用于预检和完成监控。
         self.assertIn(
-            ("rm_movel", ([0.35, 0.0, 0.2, 0.0, 0.0, 0.0], 5, 0, 0, 0)),
+            ("rm_movel_offset", ([0.05, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 1, 0)),
             self.client.calls,
         )
-        self.assertNotIn("rm_movel_offset", [entry[0] for entry in self.client.calls])
+        self.assertNotIn("rm_movel", [entry[0] for entry in self.client.calls])
         self.client.pose_mm_deg = [350.0, 0.0, 200.0, 0.0, 0.0, 0.0]
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         _, status, payload = self.acp_events[0]
@@ -463,11 +463,12 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
             "frame_type": "tool", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
         })
-        movel_calls = [entry[1] for entry in self.client.calls if entry[0] == "rm_movel"]
-        self.assertEqual(1, len(movel_calls))
-        self.assertAlmostEqual(0.0, movel_calls[0][0][0], places=6)
-        self.assertAlmostEqual(0.1, movel_calls[0][0][1], places=6)
-        self.assertAlmostEqual(math.pi / 2, movel_calls[0][0][5], places=6)
+        offset_calls = [entry[1] for entry in self.client.calls if entry[0] == "rm_movel_offset"]
+        self.assertEqual(1, len(offset_calls))
+        self.assertAlmostEqual(0.1, offset_calls[0][0][0], places=6)
+        self.assertAlmostEqual(0.0, offset_calls[0][0][1], places=6)
+        self.assertAlmostEqual(0.0, offset_calls[0][0][5], places=6)
+        self.assertEqual((5, 0, 0, 1, 0), offset_calls[0][1:])
         self.client.pose_mm_deg = [0.0, 100.0, 0.0, 0.0, 0.0, 90.0]
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         _, status, payload = self.acp_events[0]
@@ -536,8 +537,40 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         })
         self.assertEqual("running", result["state"])
         self.assertIn(
-            ("rm_movel", ([0.05, 0.0, 0.912, 0.0, 0.0, 0.0], 5, 0, 0, 0)),
+            ("rm_movel_offset", ([0.05, 0.0, -0.2, 0.0, 0.0, 0.0], 5, 0, 0, 1, 0)),
             self.client.calls,
+        )
+
+    def test_move_offset_falls_back_when_controller_does_not_support_native_offset(self):
+        class LegacyClient(self.FakeClient):
+            def command(self, method, *args):
+                self.calls.append((method, args))
+                if method == "rm_movel_offset":
+                    raise RuntimeError("rm_movel_offset failed with RealMan SDK code -7")
+                return 0
+
+        client = LegacyClient([300.0, 0.0, 200.0, 0.0, 0.0, 0.0])
+        arm = self.device.RM75Plugin(client, {}, namespace="rm75")
+        plugin = self.device.CartesianPlugin(
+            client,
+            {"safety": dict(self.FAST_SAFETY),
+             "cartesian": {"enabled": True, "max_radius_mm": 640,
+                           "shoulder_height_mm": 240.5, "max_reach_mm": 650}},
+            arm_plugin=arm, namespace="rm75",
+        )
+
+        result = plugin.dispatch("move_offset", {
+            "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
+            "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
+            "frame_type": "tool", "speed_percent": 5,
+            "cartesian_enabled": True, "confirm_motion": True,
+        })
+
+        self.assertEqual("running", result["state"])
+        self.assertIn("rm_movel_offset", [entry[0] for entry in client.calls])
+        self.assertIn(
+            ("rm_movel", ([0.35, 0.0, 0.2, 0.0, 0.0, 0.0], 5, 0, 0, 0)),
+            client.calls,
         )
 
     def test_tool_length_extends_tcp_envelope(self):
