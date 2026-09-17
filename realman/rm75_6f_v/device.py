@@ -44,6 +44,12 @@ class RM75SDKClient:
         self._lock = threading.RLock()
         self._robot = None
         self._handle = None
+        self._trajectory_event = threading.Event()
+        self._trajectory_lock = threading.Lock()
+        self._trajectory_waiting = False
+        self._trajectory_result = None
+        # ctypes 回调必须由 Python 对象持有，否则可能被 GC 后导致 C SDK 回调失效。
+        self._event_callback = None
 
     @property
     def connected(self):
@@ -60,7 +66,7 @@ class RM75SDKClient:
                 "RealMan API2 ARM64 library is missing; mount RM_API2_LIB_DIR "
                 "to /work/Robotic_Arm/libs/linux_arm"
             )
-        from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
+        from Robotic_Arm.rm_robot_interface import RoboticArm, rm_event_callback_ptr, rm_thread_mode_e
 
         with self._lock:
             self._robot = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
@@ -70,12 +76,16 @@ class RM75SDKClient:
                 self._handle = None
                 self._robot = None
                 raise ConnectionError(f"RealMan SDK could not connect to {self.ip}:{self.port}; handle={bad_id}")
+            self._event_callback = rm_event_callback_ptr(self._on_arm_event)
+            self._robot.rm_get_arm_event_call_back(self._event_callback)
             print(f"[rm75] SDK connected to {self.ip}:{self.port} handle={self._handle.id}", flush=True)
 
     def stop(self):
+        self.cancel_trajectory_wait()
         with self._lock:
             robot, self._robot = self._robot, None
             self._handle = None
+            self._event_callback = None
             if robot is not None:
                 robot.rm_delete_robot_arm()
 
@@ -121,19 +131,74 @@ class RM75SDKClient:
                 raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
             return code
 
-    def command_wait(self, method, *args):
-        """三线程 API2 的阻塞运动调用：允许独立的停止命令同时进入控制器。"""
-        robot = self._robot
-        if not self.connected or robot is None:
-            raise ConnectionError("RM75 SDK is not connected")
-        code = int(getattr(robot, method)(*args))
-        if code != 0:
-            raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
-        return code
+    def _on_arm_event(self, data):
+        """接收三线程 API2 的规划轨迹到位事件。"""
+        try:
+            if int(data.event_type) != 1 or int(data.device) != 0:
+                return
+            handle_id = int(getattr(data, "handle_id", -1))
+            if self.connected and handle_id != int(self._handle.id):
+                return
+            with self._trajectory_lock:
+                if not self._trajectory_waiting:
+                    return
+                self._trajectory_result = bool(data.trajectory_state)
+                self._trajectory_event.set()
+            outcome = "completed" if bool(data.trajectory_state) else "failed"
+            print(f"[rm75] controller trajectory event: {outcome}", flush=True)
+        except Exception as exc:
+            print(f"[rm75] controller trajectory event ignored: {exc}", flush=True)
+
+    def command_trajectory(self, method, *args):
+        """非阻塞下发轨迹，并在下发前准备官方到位事件。"""
+        with self._lock:
+            if not self.connected or self._robot is None:
+                raise ConnectionError("RM75 SDK is not connected")
+            with self._trajectory_lock:
+                if self._trajectory_waiting:
+                    raise RuntimeError("another controller trajectory wait is active")
+                self._trajectory_result = None
+                self._trajectory_event.clear()
+                self._trajectory_waiting = True
+            try:
+                code = int(getattr(self._robot, method)(*args))
+                if code != 0:
+                    raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
+                return code
+            except Exception:
+                self._discard_trajectory_wait()
+                raise
+
+    def wait_trajectory(self, timeout_seconds):
+        """等待官方 current trajectory state 回调；None 表示超时。"""
+        self._trajectory_event.wait(timeout=max(0.0, float(timeout_seconds)))
+        with self._trajectory_lock:
+            # 回调可能恰好在 Event.wait 超时与取得锁之间到达；以锁内结果为准，
+            # 避免把已经收到的成功事件误判为超时。
+            result = self._trajectory_result
+            self._trajectory_waiting = False
+            self._trajectory_result = None
+            self._trajectory_event.clear()
+        return result
+
+    def _discard_trajectory_wait(self):
+        with self._trajectory_lock:
+            self._trajectory_waiting = False
+            self._trajectory_result = None
+            self._trajectory_event.clear()
+
+    def cancel_trajectory_wait(self):
+        """解除 Python 侧事件等待；不会代替控制器慢停命令。"""
+        with self._trajectory_lock:
+            if not self._trajectory_waiting:
+                return False
+            self._trajectory_result = False
+            self._trajectory_event.set()
+            return True
 
     def command_interrupt(self, method, *args):
-        """不等待在途阻塞运动，直接将停止请求发给三线程 API2。"""
-        return self.command_wait(method, *args)
+        """运动命令为非阻塞模式，停止命令可安全使用同一串行 SDK 入口。"""
+        return self.command(method, *args)
 
 
 class RM75Plugin:
@@ -950,22 +1015,23 @@ class CartesianPlugin:
             self._motion_lock.release()
             raise
         if controller_completion:
-            # API2 的 block=1 在控制器“到位或规划失败”时返回，避免非阻塞
-            # 下发后再轮询 rm_get_current_arm_state 可能永久挂起的问题。
+            # 三线程 API2 使用 block=0 下发，再等待官方 current trajectory state
+            # 回调。不能把 block=1 放进后台线程：若 C SDK 不返回，旧线程会继续
+            # 占用同一控制器句柄，使下一次运动和 stopmotion 一起卡住。
             target_fn = self._execute_controller_cartesian
-            target_args = (action_id, motion_type, args, target, speed_percent)
+            target_args = (
+                action_id,
+                motion_type,
+                args,
+                target,
+                speed_percent,
+                self._controller_wait_deadline_seconds(current, target, speed_percent),
+            )
         else:
             target_fn = self._monitor_cartesian
             target_args = (action_id, current, target, max_duration)
         self._monitor_thread = threading.Thread(target=target_fn, args=target_args, daemon=True)
         self._monitor_thread.start()
-        if controller_completion:
-            threading.Thread(
-                target=self._controller_completion_watchdog,
-                args=(action_id, self._controller_wait_deadline_seconds(current, target, speed_percent)),
-                daemon=True,
-                name="rm75-cartesian-completion-watchdog",
-            ).start()
         print(f"[rm75 ACP] {action_id}: started ({motion_type})", flush=True)
         return {"state": "running", "action_id": action_id}
 
@@ -973,10 +1039,12 @@ class CartesianPlugin:
         return (
             motion_type == "move_offset"
             and self.native_tool_offset_enabled
-            and callable(getattr(self.client, "command_wait", None))
+            and callable(getattr(self.client, "command_trajectory", None))
+            and callable(getattr(self.client, "wait_trajectory", None))
         )
 
-    def _execute_controller_cartesian(self, action_id, motion_type, args, target, speed_percent):
+    def _execute_controller_cartesian(
+            self, action_id, motion_type, args, target, speed_percent, timeout_seconds):
         status, result = "error", {"reason": "unknown"}
         try:
             with self._action_lock:
@@ -985,6 +1053,15 @@ class CartesianPlugin:
                 status, result = "cancelled", {"reason": "stopmotion"}
             else:
                 self._submit(motion_type, args, target, speed_percent, wait_for_completion=True)
+                trajectory_state = self.client.wait_trajectory(timeout_seconds)
+                if trajectory_state is None:
+                    self._request_slow_stop()
+                    time.sleep(self.stop_finalize_seconds)
+                    raise RuntimeError(
+                        f"controller completion event timed out after {timeout_seconds:.1f}s"
+                    )
+                if trajectory_state is not True:
+                    raise RuntimeError("controller reported trajectory planning or execution failure")
                 status = "completed"
                 result = {"reason": "controller_target_reached", "target_pose_mm_deg": target}
         except Exception as exc:
@@ -995,20 +1072,7 @@ class CartesianPlugin:
     def _controller_wait_deadline_seconds(self, current, target, speed_percent):
         distance_mm = math.sqrt(sum((a - b) ** 2 for a, b in zip(current[:3], target[:3])))
         speed_mm_s = 600.0 * speed_percent / 100.0
-        return min(self.max_motion_seconds, max(5.0, distance_mm / speed_mm_s * 3.0 + 5.0))
-
-    def _controller_completion_watchdog(self, action_id, timeout_seconds):
-        time.sleep(timeout_seconds)
-        with self._action_lock:
-            active = self._active_action_id == action_id
-        if not active:
-            return
-        self._request_slow_stop()
-        self._finish_after_stop(
-            action_id,
-            "error",
-            {"reason": "controller_completion_timeout", "timeout_seconds": timeout_seconds},
-        )
+        return min(self.max_motion_seconds, max(15.0, distance_mm / speed_mm_s * 4.0 + 10.0))
 
     def _plan_target(self, motion_type, args, current):
         """纯计算：校验参数并返回监控用的基系绝对目标位姿（毫米/度），不做任何 SDK 调用。"""
@@ -1061,10 +1125,11 @@ class CartesianPlugin:
                     f"{label} {value:.0f} deg exceeds cartesian.max_euler_abs_deg {self.max_euler_abs_deg:g}")
 
     def _submit(self, motion_type, args, target, speed_percent, wait_for_completion=False):
-        """下发 SDK 运动命令；原生相对运动可由控制器阻塞等待终态。"""
+        """下发 SDK 运动命令；原生相对运动通过控制器事件等待终态。"""
         try:
-            command = self.client.command_wait if wait_for_completion else self.client.command
-            block = 1 if wait_for_completion else 0
+            command = self.client.command_trajectory if wait_for_completion else self.client.command
+            # command_trajectory 已准备到位回调，实际 SDK 调用必须保持非阻塞。
+            block = 0
             if motion_type == "movel":
                 pose = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
                 command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 0, block)
@@ -1328,12 +1393,12 @@ class CartesianPlugin:
             return None
 
     def _request_slow_stop(self):
-        """请求控制器慢停，但绝不让无超时 SDK 调用阻塞动作终态。"""
+        """在独立线程请求控制器慢停，避免停止接口拖住 MCP 响应。"""
         if not self.client.connected:
             return None
 
         def worker():
-            # 原生 block=1 运动在三线程 API2 中等待到位；停止必须绕过该等待。
+            # 运动使用 block=0；停止走同一个串行 SDK 入口，避免并发访问句柄。
             interrupt = getattr(self.client, "command_interrupt", None)
             if callable(interrupt):
                 try:
@@ -1367,9 +1432,15 @@ class CartesianPlugin:
         return {"state": "stop_requested", "action_id": action_id}
 
     def _finish_after_stop(self, action_id, status, result):
-        """SDK 阻塞调用不返回时也不能让画布和运动锁永久滞留。"""
+        """控制器未返回停止事件时，解除事件等待并保证 ACP 有终态。"""
         def worker():
             time.sleep(self.stop_finalize_seconds)
+            cancel_wait = getattr(self.client, "cancel_trajectory_wait", None)
+            if callable(cancel_wait):
+                cancel_wait()
+            monitor = self._monitor_thread
+            if monitor is not None and monitor is not threading.current_thread():
+                monitor.join(self.poll_interval_seconds * 5 + CARTESIAN_STOP_JOIN_MARGIN)
             self._finish_cartesian(action_id, status, result)
 
         threading.Thread(
