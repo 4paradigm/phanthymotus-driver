@@ -264,7 +264,8 @@ class Plugin:
                         "type": "string",
                         "enum": [
                             "start_meeting", "next_speaker", "pause", "resume",
-                            "add_action_item", "end_meeting", "status", "info",
+                            "add_action_item", "end_meeting", "export_minutes",
+                            "quality_report", "status", "info",
                         ],
                     },
                     "participants": {
@@ -423,6 +424,10 @@ class Plugin:
             return self._status()
         if action == "end_meeting":
             return self._end_meeting()
+        if action == "export_minutes":
+            return self._export_minutes()
+        if action == "quality_report":
+            return self._quality_report()
         if action == "status":
             return self._status()
         if action == "info":
@@ -474,6 +479,99 @@ class Plugin:
         result["active"] = False
         result["remaining_s"] = None
         return result
+
+    def _export_minutes(self) -> dict:
+        with self._lock:
+            if not self._controller.active:
+                return {"error": "no meeting is active"}
+            now = time.monotonic()
+            status = self._controller.status(now)
+            transcript = list(self._controller.transcript)
+            action_items = list(self._controller.action_items)
+            participants = list(self._controller.participants)
+            duration_s = self._controller.duration_s
+        lines = [
+            "# 会议纪要",
+            "",
+            f"**参会人**: {', '.join(participants)}",
+            f"**预计时长**: {int(duration_s)}秒 ({duration_s / 60:.1f}分钟)",
+            f"**状态**: {'进行中' if self._controller.paused else '进行中'}",
+            "",
+            "## 发言记录",
+            "",
+        ]
+        if transcript:
+            for entry in transcript:
+                speaker = entry.get("speaker") or "未知"
+                lines.append(f"- **{speaker}**: {entry.get('text', '')}")
+        else:
+            lines.append("- （暂无语音转文字记录）")
+        lines.extend(["", "## 待办事项", ""])
+        if action_items:
+            for i, item in enumerate(action_items, 1):
+                owner = f" — 负责人: {item.owner}" if item.owner else ""
+                lines.append(f"{i}. {item.description}{owner}")
+        else:
+            lines.append("- （暂无待办事项）")
+        lines.append("")
+        content = "\n".join(lines)
+        return {"minutes": content, "participants": participants, "transcript_count": len(transcript), "action_items_count": len(action_items)}
+
+    def _quality_report(self) -> dict:
+        with self._lock:
+            if not self._controller.active:
+                return {"error": "no meeting is active"}
+            now = time.monotonic()
+            status = self._controller.status(now)
+            action_items = list(self._controller.action_items)
+            participants = list(self._controller.participants)
+            duration_s = self._controller.duration_s
+            remaining = status.get("remaining_s")
+        # Score calculation
+        score = 50  # base
+        tips = []
+        # Action items bonus
+        if action_items:
+            score += 20
+            tips.append("已生成待办事项")
+        else:
+            tips.append("建议生成待办事项以提高会议效率")
+        # Participants bonus
+        if participants:
+            score += 15
+            tips.append(f"参会人齐全 ({len(participants)}人)")
+        else:
+            tips.append("建议记录参会人名单")
+        # Time management bonus
+        if remaining is not None and remaining > 0:
+            score += 10
+            tips.append("时间管理良好")
+        else:
+            tips.append("注意控制发言时间")
+        # Transcript bonus
+        tc = len(self._controller.transcript)
+        if tc > 0:
+            score += 5
+            tips.append(f"已记录{tc}条发言")
+        score = min(score, 100)
+        lines = [
+            "# 会议质量评分",
+            "",
+            f"**综合评分**: {score}/100",
+            "",
+            "## 评分项",
+            "",
+            "- 待办事项" + (": ✓" if action_items else ": ✗"),
+            "- 参会人" + (": ✓" if participants else ": ✗"),
+            "- 时间管理" + (": ✓" if (remaining is not None and remaining > 0) else ": ✗"),
+            "- 发言记录" + (f": ✓ ({tc}条)" if tc > 0 else ": ✗"),
+            "",
+        ]
+        if tips:
+            lines.extend(["## 建议", "", *{f"- {t}" for t in tips}])
+            lines.append("")
+        content = "\n".join(lines)
+        return {"score": score, "report": content}
 
     def _on_text(self, text: str) -> None:
         if not self._enabled:

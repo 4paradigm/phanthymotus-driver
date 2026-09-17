@@ -332,6 +332,49 @@ class PluginTests(unittest.TestCase):
             {"error": "meeting facilitator has been torn down"},
         )
 
+    def test_export_minutes_returns_markdown(self):
+        result = self.plugin.dispatch(
+            "start_meeting", {"participants": ["甲", "乙"], "duration_s": 60}
+        )
+        self.assertTrue(result["active"])
+        self.plugin._node._handle_message(
+            types.SimpleNamespace(data=json.dumps({"text": "本周完成联调"}))
+        )
+        result = self.plugin.dispatch(
+            "add_action_item",
+            {"description": "完成联调", "owner": "甲"},
+        )
+        exp = self.plugin.dispatch("export_minutes", {})
+        self.assertIn("minutes", exp)
+        self.assertIn("甲", exp["minutes"])
+        self.assertIn("本周完成联调", exp["minutes"])
+        self.assertIn("完成联调", exp["minutes"])
+        self.assertEqual(exp["transcript_count"], 1)
+        self.assertEqual(exp["action_items_count"], 1)
+
+    def test_export_minutes_errors_without_active_meeting(self):
+        result = self.plugin.dispatch("export_minutes", {})
+        self.assertIn("error", result)
+
+    def test_quality_report_returns_score(self):
+        result = self.plugin.dispatch(
+            "start_meeting", {"participants": ["甲"], "duration_s": 60}
+        )
+        self.assertTrue(result["active"])
+        self.plugin.dispatch(
+            "add_action_item",
+            {"description": "完成联调", "owner": "甲"},
+        )
+        report = self.plugin.dispatch("quality_report", {})
+        self.assertIn("score", report)
+        self.assertIn("report", report)
+        self.assertIsInstance(report["score"], int)
+        self.assertGreater(report["score"], 0)
+
+    def test_quality_report_errors_without_active_meeting(self):
+        result = self.plugin.dispatch("quality_report", {})
+        self.assertIn("error", result)
+
 
 if __name__ == "__main__":
     unittest.main()
