@@ -1173,6 +1173,20 @@ class CartesianPlugin:
                         "elapsed_seconds": now - started,
                     }
                     break
+                # 控制器可能在 SDK 命令返回成功后才发现该位姿无逆解。此时不会
+                # 产生轨迹、TCP 也不会移动；启动宽限期过后应立刻结束为 error，
+                # 不能继续占用动作锁直到 stall 超时。
+                if (not motion_observed and trajectory_type == 0
+                        and now >= started + self.start_grace_seconds):
+                    result = {
+                        "reason": "controller_rejected_trajectory",
+                        "target_pose_mm_deg": target,
+                        "actual_pose_mm_deg": current,
+                        "position_error_mm": position_error,
+                        "euler_error_deg": euler_error,
+                        "elapsed_seconds": now - started,
+                    }
+                    break
                 # 进度检测必须同时看位置与姿态：纯旋转运动位置误差恒为 0，
                 # 只看位置会把正常旋转误判为 stall 而中途慢停。
                 progress = False
