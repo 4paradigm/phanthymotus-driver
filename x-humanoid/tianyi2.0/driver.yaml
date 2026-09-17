@@ -46,6 +46,7 @@ cards:
   - { name: health_check,       type: actuator }
   - { name: laser_scan,         type: sensor }
   - { name: chassis_raw,        type: actuator }
+  - { name: follow,             type: processor }
   - { name: ext_mic,            type: sensor }
   - { name: light,              type: actuator }
   - { name: vision_capture,     type: actuator }
