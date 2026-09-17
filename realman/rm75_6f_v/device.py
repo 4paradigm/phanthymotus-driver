@@ -765,6 +765,10 @@ class CartesianPlugin:
         # 工具长度作为包络余量：TCP 距肩部 ≤ 臂展 + 工具长度。
         # 仅当控制器已把工具坐标系设为夹爪 TCP 时才应配置非零值；否则保持 0（法兰即 TCP）。
         self.tool_length_mm = float(cartesian.get("tool_length_mm", 0.0))
+        # 四代控制器支持原生工具系偏移。由控制器从当前关节构型规划，
+        # 能避免驱动把相对偏移转换成绝对位姿后在奇异点附近丢失构型信息。
+        # 三代控制器返回 SDK -7 时自动退回 rm_movel 兼容路径。
+        self.native_tool_offset_enabled = cartesian.get("native_tool_offset_enabled", True) is not False
 
     def get_tools(self):
         position_props = {
@@ -889,6 +893,7 @@ class CartesianPlugin:
             "max_reach_mm": self.max_reach_mm,
             "max_euler_abs_deg": self.max_euler_abs_deg,
             "tool_length_mm": self.tool_length_mm,
+            "native_tool_offset_enabled": self.native_tool_offset_enabled,
         }
 
     def _start_cartesian(self, motion_type, args):
@@ -1014,9 +1019,24 @@ class CartesianPlugin:
                 pose = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
                 self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 0, 0)
             elif motion_type == "move_offset":
-                # rm_movel_offset 仅四代控制器支持。目标已按当前工具姿态换算到
-                # 基座坐标系，使用 rm_movel 可在三代和四代控制器上保持同一语义。
-                self.client.command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, 0)
+                offset = self._pose_from_fields(
+                    args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg")
+                )
+                if self.native_tool_offset_enabled:
+                    try:
+                        # frame_type=1 表示工具坐标系。控制器据当前关节构型直接规划，
+                        # 不再把驱动计算的绝对目标当作实际运动命令。
+                        self.client.command(
+                            "rm_movel_offset", self._to_sdk_pose(offset), speed_percent, 0, 0, 1, 0
+                        )
+                    except RuntimeError as exc:
+                        # API2 约定 -7 表示三代控制器不支持 rm_movel_offset；该错误未
+                        # 下发运动，可安全退回旧的 rm_movel 兼容路径。
+                        if "code -7" not in str(exc):
+                            raise
+                        self.client.command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, 0)
+                else:
+                    self.client.command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, 0)
             elif motion_type == "movep":
                 waypoints = args.get("waypoints")
                 poses = [self._waypoint_pose(item, index) for index, item in enumerate(waypoints)]

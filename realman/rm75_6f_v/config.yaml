@@ -30,6 +30,8 @@ cartesian:
   # 真机竖直位姿上报欧拉角 (0,0,0) 而夹爪竖直伸出（TCP z≈1112 = 240.5+650+222.5）。
   # 仅当控制器已把工具坐标系设为夹爪 TCP 时才设为 222.5；否则保持 0（法兰即 TCP）。
   tool_length_mm: 222.5
+  # 四代控制器使用原生工具系相对运动 rm_movel_offset；三代控制器返回 -7 时自动兼容。
+  native_tool_offset_enabled: true
 ros:
   robot_domain_id: 42
   core_domain_id: 42
