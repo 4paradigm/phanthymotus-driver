@@ -114,3 +114,20 @@ plugins:
         sender_path: "/home/ubuntu/audio_sender.py"
   light:
     enabled: true
+
+follow:
+    enabled: true
+    vop_topic: /nvidia_desktop/camera/head/objects
+    target_class: person
+    confidence: 0.35
+    hfov_deg: 60.0
+    deadband: 0.12
+    gain: 0.8
+    min_step_deg: 1.5
+    max_step_deg: 15.0
+    small_hold_sec: 2.0
+    lost_timeout_sec: 1.0
+    stale_sec: 1.0
+    eval_hz: 2.0
+    publish_interval_sec: 30.0
+    
