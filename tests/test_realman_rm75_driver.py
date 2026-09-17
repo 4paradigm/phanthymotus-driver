@@ -482,8 +482,11 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 self.calls.append((method, args))
                 return 0
 
-            def wait_trajectory(self, timeout_seconds):
+            def poll_trajectory(self, timeout_seconds=0.0):
                 return True
+
+            def discard_trajectory_wait(self):
+                pass
 
             def command_interrupt(self, method, *args):
                 self.calls.append((method, args))
@@ -525,9 +528,11 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 self.calls.append((method, args))
                 return 0
 
-            def wait_trajectory(self, timeout_seconds):
-                gate.wait(timeout_seconds)
+            def poll_trajectory(self, timeout_seconds=0.0):
                 return False if gate.is_set() else None
+
+            def discard_trajectory_wait(self):
+                gate.set()
 
             def cancel_trajectory_wait(self):
                 gate.set()
@@ -568,6 +573,46 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("cancelled", status)
         self.assertEqual("stopmotion", result["reason"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
+
+    def test_missing_controller_event_completes_from_actual_pose_and_allows_next_motion(self):
+        class EventlessClient(self.FakeClient):
+            def command_trajectory(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+            def poll_trajectory(self, timeout_seconds=0.0):
+                return None
+
+            def discard_trajectory_wait(self):
+                pass
+
+        self.client = EventlessClient([300.0, 0.0, 200.0, 0.0, 0.0, 0.0])
+        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            arm_plugin=self.arm,
+            namespace="rm75",
+        )
+        self.acp_events = []
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+        args = {
+            "dx_mm": 20, "frame_type": "tool", "speed_percent": 5,
+            "cartesian_enabled": True, "confirm_motion": True,
+        }
+
+        first = self.plugin.dispatch("move_offset", args)
+        self.client.pose_mm_deg = [320.0, 0.0, 200.0, 0.0, 0.0, 0.0]
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        self.assertEqual((first["action_id"], "completed"), self.acp_events[0][:2])
+        self.assertEqual("ready", self.plugin._motion_status()["state"])
+
+        second = self.plugin.dispatch("move_offset", args)
+        self.client.pose_mm_deg = [340.0, 0.0, 200.0, 0.0, 0.0, 0.0]
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
+        self.assertEqual((second["action_id"], "completed"), self.acp_events[1][:2])
 
     def test_move_offset_rotated_tool_frame_transforms_target(self):
         # reviewer 示例：90° yaw 下工具系 +X 偏移应沿基系 +Y 移动，监控目标必须经旋转变换
