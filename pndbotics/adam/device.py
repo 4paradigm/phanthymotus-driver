@@ -28,6 +28,14 @@ from pathlib import Path
 import numpy as np
 
 from estop import EStopPlugin
+try:
+    from common import lifecycle as _lifecycle
+except ImportError:  # a checkout rather than the container image, where
+    # common/ is copied in beside this file. Load-bearing, so it resolves the
+    # repo root rather than degrading to a no-op the way logsafe does.
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
+    from common import lifecycle as _lifecycle
 
 try:
     import rclpy
@@ -3051,6 +3059,11 @@ class AdamDeviceBundle:
         action = args.pop("action", tool_name)
         args["_tool_name"] = tool_name
         result = plugin.dispatch(action, args)
+        # A plugin that only knows its own verbs declines these rather than
+        # failing at them — see common/lifecycle.py. Checked before the None is
+        # turned into an error below, since returning nothing is also a decline.
+        if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
+            return _lifecycle.reply(action)
         if result is None:
             return {"error": f"Unknown action '{action}' for tool '{tool_name}'"}
         return result

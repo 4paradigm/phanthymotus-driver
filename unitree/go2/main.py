@@ -41,6 +41,14 @@ import rclpy.executors
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from rpc_proxy import RpcProxy
+try:
+    from common import lifecycle as _lifecycle
+except ImportError:  # a checkout rather than the container image, where
+    # common/ is copied in beside this file. Load-bearing, so it resolves the
+    # repo root rather than degrading to a no-op the way logsafe does.
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
+    from common import lifecycle as _lifecycle
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -194,6 +202,10 @@ class Go2DeviceBundle:
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
+                    # A plugin that only knows its own verbs declines these
+                    # rather than failing at them — see common/lifecycle.py.
+                    if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
+                        return _lifecycle.reply(action)
                     return result
         return None
 
