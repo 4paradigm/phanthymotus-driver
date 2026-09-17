@@ -47,10 +47,10 @@ class ModelResourceTests(unittest.TestCase):
                          [item["name"] for item in joints[::2]])
         self.assertEqual([item[1] for item in HAND_SKELETON_JOINTS],
                          [item["name"] for item in joints[1::2]])
-        self.assertEqual(1.5533, joints[0]["q"])
-        self.assertEqual(0.0, joints[12]["q"])
+        self.assertEqual(0.0, joints[0]["q"])
+        self.assertEqual(1.5533, joints[12]["q"])
         self.assertAlmostEqual(joints[0]["q"] * 0.6, joints[1]["q"])
-        self.assertAlmostEqual(0.83078, joints[9]["q"])
+        self.assertEqual(0.4538, joints[9]["q"])
         self.assertTrue(all(item["visual_mapping"] for item in joints))
 
 

@@ -198,9 +198,10 @@ def _hand_skeleton_positions(positions) -> list[dict]:
     normalized = _normalize_hand_state_positions(positions)
     result = []
     for index, (name, distal_name, minimum, maximum) in enumerate(HAND_SKELETON_JOINTS):
-        # Adam hand commands use 1000=open and 0=closed, whereas the public
-        # URDF limits use zero as the open/finger-straight end of the range.
-        ratio = 1.0 - normalized[index] / HAND_POSITION_MAX
+        # The hardware command convention is 1000=open and 0=closed.  With
+        # the official mirrored local hand axes, the URDF's upper limit is
+        # the visual open end, so retain that direction in the skeleton map.
+        ratio = normalized[index] / HAND_POSITION_MAX
         angle = minimum + ratio * (maximum - minimum)
         result.append({
             "name": name,
