@@ -23,7 +23,9 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 import zlib
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -170,6 +172,40 @@ HAND_DEFAULT_OPEN = [
 ]
 HAND_DEFAULT_CLOSED = [0] * HAND_POSITION_COUNT
 HAND_DEFAULT_THUMB_CLOSE = [100, 1000, 100, 1000]
+
+# The official Adam Inspire URDF has the correct hand branch geometry but
+# declares its hand joints fixed. These are visual-only correspondences from
+# the documented 12 DDS channels to the first movable link of each finger.
+# They do not claim to be an actuator-space calibration.
+HAND_SKELETON_JOINTS = (
+    ("L_pinky_MCP_joint", 0.0, 1.5533),
+    ("L_ring_MCP_joint", 0.0, 1.5533),
+    ("L_middle_MCP_joint", 0.0, 1.5533),
+    ("L_index_MCP_joint", 0.0, 1.5533),
+    ("L_thumb_MCP_joint1", 0.4538, 1.0821),
+    ("L_thumb_MCP_joint2", 0.0873, 1.5708),
+    ("R_pinky_MCP_joint", 0.0, 1.5533),
+    ("R_ring_MCP_joint", 0.0, 1.5533),
+    ("R_middle_MCP_joint", 0.0, 1.5533),
+    ("R_index_MCP_joint", 0.0, 1.5533),
+    ("R_thumb_MCP_joint1", 0.4538, 1.0821),
+    ("R_thumb_MCP_joint2", 0.0873, 1.5708),
+)
+
+
+def _hand_skeleton_positions(positions) -> list[dict]:
+    """Map documented hand channel positions to visual-only URDF angles."""
+    normalized = _normalize_hand_state_positions(positions)
+    result = []
+    for index, (name, minimum, maximum) in enumerate(HAND_SKELETON_JOINTS):
+        ratio = normalized[index] / HAND_POSITION_MAX
+        result.append({
+            "name": name,
+            "q": minimum + ratio * (maximum - minimum),
+            "source_channel": index,
+            "visual_mapping": True,
+        })
+    return result
 
 
 def _coerce_hand_positions(values, *, limit: int, expected: int = HAND_POSITION_COUNT) -> list[int]:
@@ -463,6 +499,11 @@ WAIST_JOINT_CONTROLS = {
     "yaw": ("腰部左右转动", "waistYaw", -47.0, 47.0),
 }
 
+HEAD_JOINT_CONTROLS = {
+    "yaw": ("头部左右转动", "neckYaw", -60.0, 60.0),
+    "pitch": ("头部上下俯仰", "neckPitch", -60.0, 60.0),
+}
+
 ARM_POSES = {
     # The three positions documented in PNDbotics' arm_control example.
     "default": ("默认姿态", {
@@ -481,6 +522,7 @@ ARM_POSES = {
 
 ARM_ACTIONS = {f"set_{control}": control for control in ARM_JOINT_CONTROLS}
 WAIST_ACTIONS = {f"set_{control}": control for control in WAIST_JOINT_CONTROLS}
+HEAD_ACTIONS = {f"set_{control}": control for control in HEAD_JOINT_CONTROLS}
 
 
 def _arm_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
@@ -514,6 +556,24 @@ def _waist_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
     if not math.isfinite(value):
         raise ValueError("angle_deg must be a finite number")
     _, joint_name, minimum, maximum = WAIST_JOINT_CONTROLS[control]
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
+    return joint_name, math.radians(value)
+
+
+def _head_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
+    if control not in HEAD_JOINT_CONTROLS:
+        raise ValueError("joint must be one of the advertised Adam head controls")
+    if isinstance(angle_deg, bool):
+        raise ValueError("angle_deg must be a finite number")
+    try:
+        value = float(angle_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("angle_deg must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ValueError("angle_deg must be a finite number")
+    _, joint_name, minimum, maximum = HEAD_JOINT_CONTROLS[control]
     if value < minimum or value > maximum:
         raise ValueError(
             f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
@@ -580,11 +640,13 @@ class _StatePublisherNode(Node):
 
     _BATTERY_INTERVAL_S = 1.0
 
-    def __init__(self, namespace: str, variant: str, publish_rate_hz: float):
+    def __init__(self, namespace: str, variant: str, publish_rate_hz: float,
+                 hand_state_cache=None):
         super().__init__("adam_state_publisher")
         self._namespace = namespace
         self._variant = variant
         self._joints = VARIANT_JOINTS[variant]
+        self._hand_state_cache = hand_state_cache
 
         qos = _reliable_qos()
 
@@ -644,6 +706,10 @@ class _StatePublisherNode(Node):
                     "name": name,
                     "q": float(state.motor_state[idx].q),
                 })
+        if self._variant == "pro" and self._hand_state_cache is not None:
+            positions = self._hand_state_cache.fresh_positions(1.0)
+            if positions is not None:
+                joints.extend(_hand_skeleton_positions(positions))
         msg = String()
         msg.data = json.dumps({"joints": joints})
         self._pub_skeleton.publish(msg)
@@ -713,7 +779,7 @@ class StatePlugin:
     PREFIX = "state"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 variant: str, dds_lowstate_sub=None, **kwargs):
+                 variant: str, dds_lowstate_sub=None, hand_state_cache=None, **kwargs):
         self._namespace = namespace
         self._variant = variant
         self._running = False
@@ -723,7 +789,7 @@ class StatePlugin:
         self._poll_stop_event = None
 
         rate = plugin_config.get("publish_rate_hz", 50)
-        self._node = _StatePublisherNode(namespace, variant, rate)
+        self._node = _StatePublisherNode(namespace, variant, rate, hand_state_cache)
         executor.add_node(self._node)
 
         # DDS subscribers (pre-created in main.py before rclpy.init to avoid conflict)
@@ -1729,6 +1795,77 @@ class WaistControlPlugin:
             return None
         try:
             joint, radians = _waist_target_radians(control, args.get(f"{control}_deg"))
+        except ValueError as exc:
+            return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+        error = self._control._set_targets({joint: radians})
+        if error:
+            return error
+        return {"success": True, "state": "active", "joint": control,
+                "angle_deg": float(args[f"{control}_deg"]), "protocol": "rt/lowcmd"}
+
+
+class HeadControlPlugin:
+    """Dedicated Adam Pro head card sharing complete lowcmd ownership."""
+
+    PREFIX = "head_control"
+
+    def __init__(self, control: ArmControlPlugin):
+        self._control = control
+
+    def get_tool(self):
+        properties = {
+            "action": {"type": "string", "enum": [*HEAD_ACTIONS, "reset", "stop", "info"]},
+        }
+        action_params = {
+            "reset": {"params": [], "description": "回到开始控制时的头部角度。"},
+            "stop": {"params": [], "description": "停止头部低层控制。"},
+            "info": {"params": [], "description": "查看头部控制状态。"},
+        }
+        for action, control in HEAD_ACTIONS.items():
+            label, _, minimum, maximum = HEAD_JOINT_CONTROLS[control]
+            field = f"{control}_deg"
+            properties[field] = {
+                "type": "number", "title": f"{label}目标角度（度）",
+                "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
+                "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+            action_params[action] = {"params": [field]}
+        return {"name": "head_control", "type": "actuator",
+                "description": "Adam Pro head yaw and pitch through DDS lowcmd",
+                "inputSchema": {"type": "object", "properties": properties,
+                                "required": ["action"], "additionalProperties": False,
+                                "x-action-params": action_params,
+                                "x-resource": ["adam_upper_body"]}}
+
+    def start(self):
+        self._control.start()
+        return {"state": "ready"}
+
+    def stop(self):
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self._control.dispatch("stop", {})
+        if action == "info":
+            return self._control.dispatch("info", {})
+        if action == "reset":
+            error = self._control._ready_error()
+            if error:
+                return error
+            targets = {
+                joint: self._control._hold_q[self._control._joint_index(joint)]
+                for _, joint, _, _ in HEAD_JOINT_CONTROLS.values()
+            }
+            error = self._control._set_targets(targets)
+            return error or {"success": True, "state": "active", "action": "reset"}
+        control = HEAD_ACTIONS.get(action)
+        if control is None:
+            return None
+        try:
+            joint, radians = _head_target_radians(control, args.get(f"{control}_deg"))
         except ValueError as exc:
             return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
         error = self._control._set_targets({joint: radians})
@@ -3684,6 +3821,66 @@ class VisionCapturePlugin:
         _notify_action_completion(action_id, status, result, self.CARD)
 
 
+@lru_cache(maxsize=1)
+def _pro_skeleton_urdf(model_path: str) -> str:
+    """Augment the official visual model with dashboard-only moving joints.
+
+    PNDbotics publishes the hand geometry with fixed joints and does not publish
+    a Pro head model. The dashboard renderer needs revolute URDF joints, so the
+    added head mount and hand joint types are intentionally visual-only.
+    """
+    root = ET.parse(model_path).getroot()
+    hand_axes = {
+        "L_thumb_MCP_joint1": "0 0 1", "L_thumb_MCP_joint2": "0 1 0",
+        "R_thumb_MCP_joint1": "0 0 1", "R_thumb_MCP_joint2": "0 1 0",
+    }
+    animated = {name: (minimum, maximum) for name, minimum, maximum in HAND_SKELETON_JOINTS}
+    animated.update({
+        "wristYaw_Left": (-2.6704, 2.6704), "wristPitch_Left": (-0.9599, 0.9599),
+        "wristRoll_Left": (-0.9599, 0.9599), "wristYaw_Right": (-2.6704, 2.6704),
+        "wristPitch_Right": (-0.9599, 0.9599), "wristRoll_Right": (-0.9599, 0.9599),
+    })
+    for joint in root.findall("joint"):
+        limits = animated.get(joint.get("name"))
+        if limits is None:
+            continue
+        joint.set("type", "revolute")
+        axis = joint.find("axis")
+        if axis is None:
+            axis = ET.SubElement(joint, "axis")
+        axis.set("xyz", hand_axes.get(joint.get("name"), "0 1 0"))
+        limit = joint.find("limit")
+        if limit is None:
+            limit = ET.SubElement(joint, "limit")
+        limit.set("lower", str(limits[0]))
+        limit.set("upper", str(limits[1]))
+        limit.set("effort", "1")
+        limit.set("velocity", "1")
+
+    # The torso anchor and dimensions are a skeleton-only approximation. It is
+    # intentionally separate from the lowcmd control model and is disclosed in
+    # the resource metadata.
+    for name in ("neck_yaw_link", "neck_pitch_link", "head_link"):
+        ET.SubElement(root, "link", name=name)
+    neck_yaw = ET.SubElement(root, "joint", name="neckYaw", type="revolute")
+    ET.SubElement(neck_yaw, "origin", xyz="0 0 0.34", rpy="0 0 0")
+    ET.SubElement(neck_yaw, "parent", link="torso")
+    ET.SubElement(neck_yaw, "child", link="neck_yaw_link")
+    ET.SubElement(neck_yaw, "axis", xyz="0 0 1")
+    ET.SubElement(neck_yaw, "limit", lower="-1.0472", upper="1.0472", effort="40", velocity="1")
+    neck_pitch = ET.SubElement(root, "joint", name="neckPitch", type="revolute")
+    ET.SubElement(neck_pitch, "origin", xyz="0 0 0.07", rpy="0 0 0")
+    ET.SubElement(neck_pitch, "parent", link="neck_yaw_link")
+    ET.SubElement(neck_pitch, "child", link="neck_pitch_link")
+    ET.SubElement(neck_pitch, "axis", xyz="0 1 0")
+    ET.SubElement(neck_pitch, "limit", lower="-1.0472", upper="1.0472", effort="40", velocity="1")
+    head = ET.SubElement(root, "joint", name="head_visual_mount", type="fixed")
+    ET.SubElement(head, "origin", xyz="0 0 0.12", rpy="0 0 0")
+    ET.SubElement(head, "parent", link="neck_pitch_link")
+    ET.SubElement(head, "child", link="head_link")
+    return ET.tostring(root, encoding="unicode")
+
+
 class ModelPlugin:
     """Returns the vendor URDF used by the dashboard skeleton renderer."""
 
@@ -3705,8 +3902,8 @@ class ModelPlugin:
             "model": "PNDbotics Adam Inspire",
             "source": "https://github.com/pndbotics/pnd_models/tree/main/adam_inspire",
             "hand_visuals": True,
-            "hand_feedback_mapping": False,
-            "neck_kinematics": False,
+            "hand_feedback_mapping": "visual_linear",
+            "neck_kinematics": "visual_approximation",
         },
     }
 
@@ -3745,7 +3942,8 @@ class ModelPlugin:
         if self._urdf_path.exists():
             metadata = self._MODEL_METADATA.get(self._urdf_name, {})
             return {
-                "urdf": self._urdf_path.read_text(),
+                "urdf": (_pro_skeleton_urdf(str(self._urdf_path))
+                         if self._variant == "pro" else self._urdf_path.read_text()),
                 "variant": self._variant,
                 "urdf_file": self._urdf_name,
                 "mesh_assets_included": False,
@@ -3755,11 +3953,11 @@ class ModelPlugin:
                     "visualization."
                 ),
                 "hand_feedback_note": (
-                    "This official URDF includes hand links but declares its "
-                    "finger joints fixed. Adam hand feedback is available from "
-                    "hand_state, but PNDbotics does not publish a position-to-"
-                    "finger-joint mapping for animated hand rendering."
+                    "Adam hand feedback is linearly mapped to the documented "
+                    "finger limits for skeleton animation only; it is not a "
+                    "vendor actuator-space calibration."
                 ),
+                "visual_approximation": self._variant == "pro",
                 **metadata,
             }
         # Try any available URDF as fallback
@@ -3804,6 +4002,7 @@ class AdamDeviceBundle:
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
+                hand_state_cache=self._hand_state_cache,
             )
             self._plugins.append(p)
 
@@ -3869,6 +4068,8 @@ class AdamDeviceBundle:
                 self._plugins.append(ArmGesturePlugin(p))
             if plugins_cfg.get("waist", {}).get("enabled", True):
                 self._plugins.append(WaistControlPlugin(p))
+            if plugins_cfg.get("head", {}).get("enabled", True):
+                self._plugins.append(HeadControlPlugin(p))
 
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:

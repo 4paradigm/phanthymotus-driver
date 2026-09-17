@@ -54,12 +54,13 @@ The Adam driver returns an URDF through its `model` resource.  For the `pro`
 configuration it uses the official `adam_inspire` kinematic tree rather than
 the older `adam_standard` fallback, because the latter does not describe wrist
 roll or either hand. The robot's 12 hand feedback channels remain available
-from the separate `hand_state` sensor. The official `adam_inspire` URDF makes
-its finger joints fixed and does not provide a mapping from the 0..1000 hand
-feedback channels to URDF angles, so the driver does not fabricate animated
-finger positions. PNDbotics has not published an Adam Pro head/neck kinematic
-tree, so the driver keeps `neckYaw` and `neckPitch` as state feedback only
-rather than inventing link dimensions or limits.
+from the separate `hand_state` sensor and are added to the `joints` skeleton
+stream. The driver maps each 0..1000 hand channel linearly to the public finger
+limit for visualization only; it is not a vendor-provided actuator-space
+calibration. PNDbotics has not published an Adam Pro head/neck kinematic tree,
+so the driver adds a clearly marked visual-only neck/head mount using the
+published ±60-degree head limits. `head_control` uses the actual DDS joint
+names and limits; it does not rely on this visual approximation.
 
 The official mesh archives are intentionally not copied into the driver image.
 They are large, while the dashboard resource contract only requires the URDF

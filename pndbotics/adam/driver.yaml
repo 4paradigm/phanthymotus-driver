@@ -28,6 +28,7 @@ cards:
   - { name: arm_control,        type: actuator }
   - { name: arm_gesture,        type: actuator }
   - { name: waist_control,      type: actuator }
+  - { name: head_control,       type: actuator }
   - { name: hand,               type: actuator }
   - { name: hand_gesture,       type: actuator }
   - { name: hand_state,          type: sensor }

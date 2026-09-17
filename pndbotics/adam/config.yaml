@@ -84,6 +84,8 @@ plugins:
     enabled: true
   waist:
     enabled: true
+  head:
+    enabled: true
   hand:
     enabled: true
     # Verified on Adam: all 12 hand channels move in the effective 0..1000
