@@ -1631,6 +1631,66 @@ class RealManRM75SDKClientTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "mount RM_API2_LIB_DIR"):
                 client.start()
 
+    def test_sdk_call_reconnects_after_initial_connection_failure(self):
+        class Handle:
+            def __init__(self, handle_id):
+                self.id = handle_id
+
+        robot = mock.Mock()
+        robot.rm_get_joint_degree.return_value = (0, [0.0] * 7)
+        robot.rm_create_robot_arm.side_effect = [Handle(-1), Handle(12)]
+        callback_factory = mock.Mock(side_effect=lambda callback: callback)
+        sdk_module = type("SDK", (), {
+            "RoboticArm": mock.Mock(return_value=robot),
+            "rm_event_callback_ptr": callback_factory,
+            "rm_thread_mode_e": type("Mode", (), {"RM_TRIPLE_MODE_E": 3}),
+        })
+
+        with mock.patch.dict(os.environ, {
+            "RM_DRIVER_ENABLED": "1", "RM_ARM_IP": "192.0.2.1",
+        }, clear=True), mock.patch.object(
+            self.device, "SDK_LIBRARY_PATH", Path(__file__)
+        ), mock.patch.dict(
+            sys.modules, {"Robotic_Arm.rm_robot_interface": sdk_module}
+        ):
+            client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+            with self.assertRaisesRegex(ConnectionError, "192.0.2.1:8080"):
+                client.start()
+            self.assertEqual("disconnected", client.status()["state"])
+            self.assertIn("handle=-1", client.status()["last_connection_error"])
+            self.assertEqual([0.0] * 7, client.call("rm_get_joint_degree"))
+
+        self.assertTrue(client.connected)
+        self.assertIsNone(client.status()["last_connection_error"])
+        self.assertEqual(2, robot.rm_create_robot_arm.call_count)
+        robot.rm_create_robot_arm.assert_called_with("192.0.2.1", 8080)
+
+    def test_start_is_idempotent_for_shared_sdk_handle(self):
+        class Handle:
+            id = 13
+
+        robot = mock.Mock()
+        robot.rm_create_robot_arm.return_value = Handle()
+        sdk_module = type("SDK", (), {
+            "RoboticArm": mock.Mock(return_value=robot),
+            "rm_event_callback_ptr": mock.Mock(side_effect=lambda callback: callback),
+            "rm_thread_mode_e": type("Mode", (), {"RM_TRIPLE_MODE_E": 3}),
+        })
+
+        with mock.patch.dict(os.environ, {
+            "RM_DRIVER_ENABLED": "1", "RM_ARM_IP": "192.0.2.1",
+        }, clear=True), mock.patch.object(
+            self.device, "SDK_LIBRARY_PATH", Path(__file__)
+        ), mock.patch.dict(
+            sys.modules, {"Robotic_Arm.rm_robot_interface": sdk_module}
+        ):
+            client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+            client.start()
+            client.start()
+
+        sdk_module.RoboticArm.assert_called_once_with(3)
+        robot.rm_create_robot_arm.assert_called_once_with("192.0.2.1", 8080)
+
     def test_tool_start_returns_contract_lifecycle_state(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
@@ -1638,6 +1698,18 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertEqual({"state": "running"}, plugin.dispatch("start", {"_tool_name": "joint_states"}))
         self.assertEqual({"state": "ready"}, plugin.dispatch("start", {"_tool_name": "joint_control"}))
         self.assertEqual({"state": "ready"}, plugin.dispatch("start", {"_tool_name": "model"}))
+
+    def test_state_publisher_starts_when_initial_sdk_connection_fails(self):
+        client = mock.Mock()
+        client.start.side_effect = ConnectionError("controller not ready")
+        ros2 = mock.Mock()
+        plugin = self.device.RM75Plugin(client, {}, ros2=ros2)
+        plugin._start_skeleton_publisher = mock.Mock()
+
+        with self.assertRaisesRegex(ConnectionError, "controller not ready"):
+            plugin.start()
+
+        plugin._start_skeleton_publisher.assert_called_once_with()
 
     def test_joint_degrees_are_converted_to_radians(self):
         class Handle:
