@@ -121,6 +121,20 @@ class RM75SDKClient:
                 raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
             return code
 
+    def command_wait(self, method, *args):
+        """三线程 API2 的阻塞运动调用：允许独立的停止命令同时进入控制器。"""
+        robot = self._robot
+        if not self.connected or robot is None:
+            raise ConnectionError("RM75 SDK is not connected")
+        code = int(getattr(robot, method)(*args))
+        if code != 0:
+            raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
+        return code
+
+    def command_interrupt(self, method, *args):
+        """不等待在途阻塞运动，直接将停止请求发给三线程 API2。"""
+        return self.command_wait(method, *args)
+
 
 class RM75Plugin:
     PREFIX = "joint_control"
@@ -900,6 +914,7 @@ class CartesianPlugin:
         action_id = f"rm75_cart_{uuid4().hex[:10]}"
         # 状态锁不能覆盖无超时上限的 SDK 调用，否则 info 也会被控制器故障拖死。
         # submission_lock 只负责保证 stopmotion 排在运动下发之后。
+        controller_completion = self._uses_controller_completion(motion_type)
         submitted = False
         try:
             with self._action_lock:
@@ -913,8 +928,9 @@ class CartesianPlugin:
                     current = self._current_pose_mm_deg()
                     target = self._plan_target(motion_type, args, current)
                     max_duration = self._motion_deadline_seconds(current, target, speed_percent)
-                    submitted = True
-                    self._submit(motion_type, args, target, speed_percent)
+                    if not controller_completion:
+                        submitted = True
+                        self._submit(motion_type, args, target, speed_percent)
                 except Exception:
                     with self._action_lock:
                         if self._active_action_id == action_id:
@@ -931,14 +947,42 @@ class CartesianPlugin:
         except Exception:
             self._motion_lock.release()
             raise
-        self._monitor_thread = threading.Thread(
-            target=self._monitor_cartesian,
-            args=(action_id, current, target, max_duration),
-            daemon=True,
-        )
+        if controller_completion:
+            # API2 的 block=1 在控制器“到位或规划失败”时返回，避免非阻塞
+            # 下发后再轮询 rm_get_current_arm_state 可能永久挂起的问题。
+            target_fn = self._execute_controller_cartesian
+            target_args = (action_id, motion_type, args, target, speed_percent)
+        else:
+            target_fn = self._monitor_cartesian
+            target_args = (action_id, current, target, max_duration)
+        self._monitor_thread = threading.Thread(target=target_fn, args=target_args, daemon=True)
         self._monitor_thread.start()
         print(f"[rm75 ACP] {action_id}: started ({motion_type})", flush=True)
         return {"state": "running", "action_id": action_id}
+
+    def _uses_controller_completion(self, motion_type):
+        return (
+            motion_type == "move_offset"
+            and self.native_tool_offset_enabled
+            and callable(getattr(self.client, "command_wait", None))
+        )
+
+    def _execute_controller_cartesian(self, action_id, motion_type, args, target, speed_percent):
+        status, result = "error", {"reason": "unknown"}
+        try:
+            with self._submission_lock:
+                with self._action_lock:
+                    cancelled = action_id in self._cancelled
+                if cancelled:
+                    status, result = "cancelled", {"reason": "stopmotion"}
+                else:
+                    self._submit(motion_type, args, target, speed_percent, wait_for_completion=True)
+                    status = "completed"
+                    result = {"reason": "controller_target_reached", "target_pose_mm_deg": target}
+        except Exception as exc:
+            result = {"reason": str(exc), "target_pose_mm_deg": target}
+        finally:
+            self._finish_cartesian(action_id, status, result)
 
     def _plan_target(self, motion_type, args, current):
         """纯计算：校验参数并返回监控用的基系绝对目标位姿（毫米/度），不做任何 SDK 调用。"""
@@ -990,12 +1034,14 @@ class CartesianPlugin:
                 raise ValueError(
                     f"{label} {value:.0f} deg exceeds cartesian.max_euler_abs_deg {self.max_euler_abs_deg:g}")
 
-    def _submit(self, motion_type, args, target, speed_percent):
-        """下发 SDK 运动命令（非阻塞）。"""
+    def _submit(self, motion_type, args, target, speed_percent, wait_for_completion=False):
+        """下发 SDK 运动命令；原生相对运动可由控制器阻塞等待终态。"""
         try:
+            command = self.client.command_wait if wait_for_completion else self.client.command
+            block = 1 if wait_for_completion else 0
             if motion_type == "movel":
                 pose = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
-                self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 0, 0)
+                command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 0, block)
             elif motion_type == "move_offset":
                 offset = self._pose_from_fields(
                     args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"), empty_value=0.0
@@ -1004,17 +1050,17 @@ class CartesianPlugin:
                     try:
                         # frame_type=1 表示工具坐标系。控制器据当前关节构型直接规划，
                         # 不再把驱动计算的绝对目标当作实际运动命令。
-                        self.client.command(
-                            "rm_movel_offset", self._to_sdk_pose(offset), speed_percent, 0, 0, 1, 0
+                        command(
+                            "rm_movel_offset", self._to_sdk_pose(offset), speed_percent, 0, 0, 1, block
                         )
                     except RuntimeError as exc:
                         # API2 约定 -7 表示三代控制器不支持 rm_movel_offset；该错误未
                         # 下发运动，可安全退回绝对位姿兼容路径。
                         if "code -7" not in str(exc):
                             raise
-                        self.client.command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, 0)
+                        command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, block)
                 else:
-                    self.client.command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, 0)
+                    command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, block)
             elif motion_type == "movep":
                 poses = [self._waypoint_pose(item, index) for index, item in enumerate(args["waypoints"])]
                 for pose in poses[:-1]:
@@ -1222,17 +1268,20 @@ class CartesianPlugin:
             self._request_slow_stop()
             result = {"reason": str(exc)}
         finally:
-            with self._action_lock:
-                if action_id in self._cancelled:
-                    status, result = "cancelled", {"reason": "stopmotion"}
-                self._cancelled.discard(action_id)
-                if self._active_action_id == action_id:
-                    self._active_action_id = None
-                if self._motion_state["active_action_id"] == action_id:
-                    self._motion_state["active_action_id"] = None
-                self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
-            self._motion_lock.release()
-            self._acp_callback(action_id, status, result)
+            self._finish_cartesian(action_id, status, result)
+
+    def _finish_cartesian(self, action_id, status, result):
+        with self._action_lock:
+            if action_id in self._cancelled:
+                status, result = "cancelled", {"reason": "stopmotion"}
+            self._cancelled.discard(action_id)
+            if self._active_action_id == action_id:
+                self._active_action_id = None
+            if self._motion_state["active_action_id"] == action_id:
+                self._motion_state["active_action_id"] = None
+            self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
+        self._motion_lock.release()
+        self._acp_callback(action_id, status, result)
 
     def _controller_trajectory_type(self):
         """返回 API2 当前规划类型；不支持或查询失败时保留位姿监控。"""
@@ -1248,7 +1297,15 @@ class CartesianPlugin:
             return None
 
         def worker():
-            # 与运动提交共用锁，确保慢停不会越过一条正在下发的运动命令。
+            # 原生 block=1 运动在三线程 API2 中等待到位；停止必须绕过该等待。
+            interrupt = getattr(self.client, "command_interrupt", None)
+            if callable(interrupt):
+                try:
+                    interrupt("rm_set_arm_slow_stop")
+                except Exception as exc:
+                    print(f"[rm75] cartesian slow-stop failed: {exc}", flush=True)
+                return
+            # 兼容不提供独立停止通道的旧客户端。
             with self._submission_lock:
                 try:
                     self.client.command("rm_set_arm_slow_stop")
