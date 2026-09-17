@@ -745,7 +745,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
 
     def test_stopmotion_does_not_hold_action_lock_during_sdk_call(self):
-        # SDK 慢停无超时上限：阻塞期间 _action_lock 必须保持空闲，否则后续请求全部堵死
+        # SDK 慢停无超时上限：stopmotion 必须立即返回，终态不能被慢停调用堵住。
         gate = threading.Event()
 
         class SlowStopClient(self.FakeClient):
@@ -766,14 +766,15 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.plugin.dispatch("movel", self._movel_args())
         self.assertTrue(self._wait_for(lambda: self.plugin._active_action_id is not None))
 
-        stopper = threading.Thread(target=lambda: self.plugin.dispatch("stopmotion", {}))
-        stopper.start()
-        time.sleep(0.1)  # stopmotion 卡在 SDK 慢停里
+        start = time.time()
+        stop = self.plugin.dispatch("stopmotion", {})
+        self.assertLess(time.time() - start, 1.0)
+        self.assertEqual("stop_requested", stop["state"])
         start = time.time()
         self.plugin.dispatch("info", {})  # 慢停阻塞期间 info 应立即可达
         self.assertLess(time.time() - start, 1.0)
         gate.set()
-        stopper.join(5.0)
+        self.assertTrue(self._wait_for(lambda: self.plugin._active_action_id is None, timeout=5.0))
 
     def test_stopmotion_cancels_and_slow_stops(self):
         started = self.plugin.dispatch("movel", self._movel_args())
@@ -781,7 +782,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
         self.assertEqual("stop_requested", stop["state"])
         self.assertEqual(started["action_id"], stop["action_id"])
-        self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
+        self.assertTrue(self._wait_for(lambda: ("rm_set_arm_slow_stop", ()) in self.client.calls))
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         action_id, status, payload = self.acp_events[0]
         self.assertEqual(started["action_id"], action_id)
@@ -866,7 +867,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         stopper = threading.Thread(target=lambda: (self.plugin.dispatch("stopmotion", {}), stop_done.set()))
         stopper.start()
         time.sleep(0.1)
-        self.assertFalse(stop_done.is_set())  # 下发完成前急停不得返回
+        self.assertTrue(stop_done.is_set())  # 取消请求不得等待在途下发或 SDK 慢停
         gate.set()
         stopper.join(5.0)
         mover.join(5.0)

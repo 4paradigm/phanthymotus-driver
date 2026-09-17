@@ -848,12 +848,7 @@ class CartesianPlugin:
             if action_id:
                 self._cancelled.add(action_id)
         if action_id and self.client.connected:
-            # 关闭路径同样受共享提交锁保护：慢停必须排在在途下发之后
-            with self._submission_lock:
-                try:
-                    self.client.command("rm_set_arm_slow_stop")
-                except Exception as exc:
-                    print(f"[rm75] cartesian shutdown stop failed: {exc}", flush=True)
+            self._request_slow_stop()
         # 监控线程在下一轮询看到 cancelled 后立即收尾；join 保证共享 SDK 连接
         # 被上层（RM75Plugin.stop）销毁前，ACP 终态已上报完成。
         thread = self._monitor_thread
@@ -1192,7 +1187,7 @@ class CartesianPlugin:
                     last_progress = now
                 elif (now >= started + self.start_grace_seconds
                         and now - last_progress >= self.stall_timeout_seconds):
-                    self.client.command("rm_set_arm_slow_stop")
+                    self._request_slow_stop()
                     result = {"reason": "motion_stalled",
                               "stall_seconds": self.stall_timeout_seconds,
                               "target_pose_mm_deg": target, "actual_pose_mm_deg": current,
@@ -1201,15 +1196,12 @@ class CartesianPlugin:
                     break
                 time.sleep(self.poll_interval_seconds)
             else:
-                self.client.command("rm_set_arm_slow_stop")
+                self._request_slow_stop()
                 result = {"reason": "motion_deadline_exceeded",
                           "max_motion_seconds": max_duration,
                           "elapsed_seconds": time.monotonic() - started}
         except Exception as exc:
-            try:
-                self.client.command("rm_set_arm_slow_stop")
-            except Exception:
-                pass
+            self._request_slow_stop()
             result = {"reason": str(exc)}
         finally:
             with self._action_lock:
@@ -1224,6 +1216,23 @@ class CartesianPlugin:
             self._motion_lock.release()
             self._acp_callback(action_id, status, result)
 
+    def _request_slow_stop(self):
+        """请求控制器慢停，但绝不让无超时 SDK 调用阻塞动作终态。"""
+        if not self.client.connected:
+            return None
+
+        def worker():
+            # 与运动提交共用锁，确保慢停不会越过一条正在下发的运动命令。
+            with self._submission_lock:
+                try:
+                    self.client.command("rm_set_arm_slow_stop")
+                except Exception as exc:
+                    print(f"[rm75] cartesian slow-stop failed: {exc}", flush=True)
+
+        thread = threading.Thread(target=worker, daemon=True, name="rm75-cartesian-slow-stop")
+        thread.start()
+        return thread
+
     def _stop_motion(self):
         # 运动锁和动作 ID 在两张卡之间共享；任一 stop 卡都必须能停止实际持有者。
         # SDK 慢停调用无超时上限，不得在 _action_lock 内执行。
@@ -1232,11 +1241,7 @@ class CartesianPlugin:
             if action_id:
                 self._cancelled.add(action_id)
         if action_id and self.client.connected:
-            with self._submission_lock:
-                try:
-                    self.client.command("rm_set_arm_slow_stop")
-                except Exception as exc:
-                    print(f"[rm75] cartesian slow-stop failed: {exc}", flush=True)
+            self._request_slow_stop()
         return {"state": "stop_requested", "action_id": action_id}
 
     def _acp_callback(self, action_id, status, result):
