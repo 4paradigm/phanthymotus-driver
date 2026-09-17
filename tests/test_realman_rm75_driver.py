@@ -765,6 +765,21 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("motion_stalled", payload["reason"])
         self.assertIn(("rm_set_arm_slow_stop", ()), self.client.calls)
 
+    def test_controller_reject_without_trajectory_releases_motion_lock(self):
+        # 控制器接受命令后才判定无逆解：无规划、无运动时必须立即释放卡片。
+        self.client.call_dict = lambda method: {"trajectory_type": 0}
+        started = self.plugin.dispatch("move_offset", {
+            "dx_mm": 20, "frame_type": "tool", "speed_percent": 5,
+            "cartesian_enabled": True, "confirm_motion": True,
+        })
+
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        action_id, status, payload = self.acp_events[0]
+        self.assertEqual(started["action_id"], action_id)
+        self.assertEqual("error", status)
+        self.assertEqual("controller_rejected_trajectory", payload["reason"])
+        self.assertFalse(self.plugin._motion_lock.locked())
+
     def test_stopmotion_does_not_hold_action_lock_during_sdk_call(self):
         # SDK 慢停无超时上限：stopmotion 必须立即返回，终态不能被慢停调用堵住。
         gate = threading.Event()
