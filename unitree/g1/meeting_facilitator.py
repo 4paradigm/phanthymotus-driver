@@ -268,8 +268,18 @@ class Plugin:
                         ],
                     },
                     "participants": {
-                        "type": "array",
-                        "items": {"type": "string"},
+                        "anyOf": [
+                            {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            {
+                                "type": "string",
+                                "description": (
+                                    "JSON array or comma-separated participant names"
+                                ),
+                            },
+                        ],
                     },
                     "duration_s": {"type": "number", "exclusiveMinimum": 0},
                     "description": {"type": "string"},
@@ -341,9 +351,10 @@ class Plugin:
             self.stop()
             return {"state": "idle"}
         if action == "start_meeting":
-            participants = args.get("participants")
-            if not isinstance(participants, list):
-                return {"error": "participants must be an array"}
+            try:
+                participants = self._parse_participants(args.get("participants"))
+            except ValueError as exc:
+                return {"error": str(exc)}
             try:
                 duration_s = float(args.get("duration_s", self._default_duration_s))
                 with self._lock:
@@ -417,6 +428,25 @@ class Plugin:
         if action == "info":
             return {"topic_in": [{"topic": self._topic, "format": "data/json"}]}
         return None
+
+    @staticmethod
+    def _parse_participants(value) -> list[str]:
+        if isinstance(value, list):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("participants must be an array or comma-separated text")
+        text = value.strip()
+        if not text:
+            raise ValueError("participants must contain at least one name")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            if text.startswith(("[", "{")):
+                raise ValueError("participants contains malformed JSON") from exc
+            parsed = [name.strip() for name in text.replace("，", ",").split(",")]
+        if not isinstance(parsed, list):
+            raise ValueError("participants must be an array or comma-separated text")
+        return parsed
 
     def _status(self) -> dict:
         with self._lock:

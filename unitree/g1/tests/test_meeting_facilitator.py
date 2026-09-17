@@ -197,6 +197,40 @@ class PluginTests(unittest.TestCase):
             [{"description": "完成联调", "owner": "甲"}],
         )
 
+    def test_start_accepts_json_string_participants(self):
+        result = self.plugin.dispatch(
+            "start_meeting",
+            {"participants": '["张三", "李四"]', "duration_s": 30},
+        )
+        self.assertEqual(result["participants"], ["张三", "李四"])
+        self.assertEqual(result["current_speaker"], "张三")
+
+    def test_start_accepts_comma_separated_participants(self):
+        for participants in ("张三，李四", "张三, 李四"):
+            result = self.plugin.dispatch(
+                "start_meeting",
+                {"participants": participants, "duration_s": 30},
+            )
+            self.assertEqual(result["participants"], ["张三", "李四"])
+            self.plugin.dispatch("end_meeting", {})
+
+    def test_start_rejects_invalid_participant_text(self):
+        for participants in ("", '"张三"', 1, '["张三",]', '["张三", "李四"'):
+            result = self.plugin.dispatch(
+                "start_meeting",
+                {"participants": participants, "duration_s": 30},
+            )
+            self.assertIn("error", result)
+
+    def test_schema_accepts_array_and_string_participants(self):
+        participants_schema = self.plugin.get_tool()["inputSchema"]["properties"][
+            "participants"
+        ]
+        self.assertEqual(
+            [variant["type"] for variant in participants_schema["anyOf"]],
+            ["array", "string"],
+        )
+
     def test_pause_and_resume_preserve_remaining_time(self):
         self.plugin.dispatch(
             "start_meeting", {"participants": ["甲"], "duration_s": 30}
