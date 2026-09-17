@@ -373,15 +373,15 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("actuator", tools[0]["type"])
         schema = tools[0]["inputSchema"]
         self.assertIs(True, schema["x-is-dangerous"])
-        self.assertEqual(["movel", "move_offset", "movep"], schema["x-completion"]["actions"])
+        self.assertEqual(["move_offset"], schema["x-completion"]["actions"])
         self.assertIn("confirm_motion", schema["properties"])
         self.assertEqual(False, schema["properties"]["cartesian_enabled"]["default"])
-        self.assertIn("cartesian_enabled", schema["x-action-params"]["movel"]["params"])
         self.assertIn("cartesian_enabled", schema["x-action-params"]["move_offset"]["params"])
-        self.assertIn("cartesian_enabled", schema["x-action-params"]["movep"]["params"])
         self.assertEqual(10, schema["properties"]["speed_percent"]["maximum"])
-        self.assertIn("movel", schema["x-action-params"])
-        self.assertIn("movep", schema["x-action-params"])
+        self.assertNotIn("movel", schema["x-action-params"])
+        self.assertNotIn("movep", schema["x-action-params"])
+        self.assertNotIn("x_mm", schema["properties"])
+        self.assertNotIn("waypoints", schema["properties"])
         self.assertEqual(["tool"], schema["properties"]["frame_type"]["enum"])
         self.assertIn("工具系偏移", tools[0]["description"])
 
@@ -454,6 +454,20 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         _, status, payload = self.acp_events[0]
         self.assertEqual("completed", status)
         self.assertEqual([350.0, 0.0, 200.0, 0.0, 0.0, 0.0], payload["target_pose_mm_deg"])
+
+    def test_move_offset_empty_fields_mean_no_offset(self):
+        self.client.pose_mm_deg = [300.0, 0.0, 200.0, 0.0, 0.0, 0.0]
+        result = self.plugin.dispatch("move_offset", {
+            "dx_mm": 50, "dy_mm": "", "drz_deg": None,
+            "frame_type": "tool", "speed_percent": 5,
+            "cartesian_enabled": True, "confirm_motion": True,
+        })
+
+        self.assertEqual("running", result["state"])
+        self.assertIn(
+            ("rm_movel_offset", ([0.05, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 1, 0)),
+            self.client.calls,
+        )
 
     def test_move_offset_rotated_tool_frame_transforms_target(self):
         # reviewer 示例：90° yaw 下工具系 +X 偏移应沿基系 +Y 移动，监控目标必须经旋转变换
