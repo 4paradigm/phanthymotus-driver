@@ -22,8 +22,9 @@ import device
 from device import (ADAM_PRO_JOINTS, ARM_JOINT_CONTROLS, ARM_POSES,
                     HAND_CHANNEL_NAMES, HAND_DEFAULT_CLOSED,
                     HAND_DEFAULT_OPEN, HAND_DEFAULT_THUMB_CLOSE,
+                    HEAD_JOINT_CONTROLS, WAIST_JOINT_CONTROLS,
                     ArmControlPlugin, ArmGesturePlugin, HandGesturePlugin,
-                    HandPlugin)
+                    HandPlugin, HeadControlPlugin, WaistControlPlugin)
 from test_arm_controls import _FakePublisher, _fake_lowcmd, _prime_arm_plugin
 
 
@@ -169,7 +170,9 @@ class ArmPoseLimitTests(unittest.TestCase):
         self.assertEqual(mirrored["left_shoulder_roll"], 22.0)
         self.assertEqual(mirrored["left_shoulder_yaw"], -25.0)
         self.assertEqual(mirrored["left_wrist_roll"], 10.0)
-        # Controls without a side prefix pass through untouched.
+        # A control without a left_/right_ prefix passes through untouched
+        # (the waist now lives on its own card, but the mirror helper still
+        # must not touch non-limbed names).
         self.assertEqual(mirrored["waist_yaw"], 5.0)
 
 
@@ -538,6 +541,81 @@ class HandBulkActionTests(unittest.TestCase):
         target = control.activated[-1][1]
         self.assertEqual(target[0:6], target[6:12])
         self.assertEqual(target[0:6], gestures._shape_for("point", "right"))
+
+
+class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
+    def test_waist_and_head_are_split_out_of_arm_control(self):
+        # The waist joints left arm_control for a dedicated card; the neck was
+        # never there.  Both now have their own controls and actions.
+        self.assertNotIn("waist_roll", ARM_JOINT_CONTROLS)
+        self.assertNotIn("waist_pitch", ARM_JOINT_CONTROLS)
+        self.assertEqual({"roll", "pitch", "yaw"}, set(WAIST_JOINT_CONTROLS))
+        self.assertEqual({"yaw", "pitch"}, set(HEAD_JOINT_CONTROLS))
+
+    def test_waist_schema_advertises_its_actions(self):
+        tool = WaistControlPlugin(self.arm_plugin()).get_tool()
+        schema = tool["inputSchema"]
+        self.assertEqual("waist_control", tool["name"])
+        for action in ("set_roll", "set_pitch", "set_yaw", "reset", "stop", "info"):
+            self.assertIn(action, schema["properties"]["action"]["enum"])
+        self.assertEqual(["pitch_deg", "duration_s"],
+                         schema["x-action-params"]["set_pitch"]["params"])
+
+    def test_head_schema_advertises_its_actions(self):
+        tool = HeadControlPlugin(self.arm_plugin()).get_tool()
+        schema = tool["inputSchema"]
+        self.assertEqual("head_control", tool["name"])
+        for action in ("set_yaw", "set_pitch", "reset", "stop", "info"):
+            self.assertIn(action, schema["properties"]["action"]["enum"])
+
+    def test_head_set_yaw_targets_the_neck_joint(self):
+        control = self.arm_plugin()
+        head = HeadControlPlugin(control)
+        result = head.dispatch("set_yaw", {"yaw_deg": -30})
+        self.assertTrue(result["success"], result)
+        self.assertIn(ADAM_PRO_JOINTS.index("neckYaw"), control._target_q)
+
+    def test_waist_set_pitch_targets_the_waist_joint(self):
+        control = self.arm_plugin()
+        waist = WaistControlPlugin(control)
+        result = waist.dispatch("set_pitch", {"pitch_deg": 20})
+        self.assertTrue(result["success"], result)
+        self.assertIn(ADAM_PRO_JOINTS.index("waistPitch"), control._target_q)
+
+    def test_reset_returns_waist_to_the_hold_position(self):
+        control = self.arm_plugin()
+        waist = WaistControlPlugin(control)
+        waist.dispatch("set_roll", {"roll_deg": 10})
+        result = waist.dispatch("reset", {})
+        self.assertTrue(result["success"], result)
+        hold = control._hold_q
+        for _, joint, _, _ in WAIST_JOINT_CONTROLS.values():
+            index = ADAM_PRO_JOINTS.index(joint)
+            self.assertAlmostEqual(control._target_q[index], hold[index], places=6)
+
+    def test_duration_s_passes_through_to_the_segment(self):
+        control = self.arm_plugin()
+        head = HeadControlPlugin(control)
+        result = head.dispatch("set_yaw", {"yaw_deg": -30, "duration_s": 2.0})
+        self.assertTrue(result["success"], result)
+        self.assertEqual(2.0, result["duration_s"])
+        self.assertGreaterEqual(control._seg_span, 2.0)
+
+    def test_head_rejects_out_of_range_angles(self):
+        head = HeadControlPlugin(self.arm_plugin())
+        result = head.dispatch("set_pitch", {"pitch_deg": 61})
+        self.assertFalse(result["success"])
+        self.assertEqual("INVALID_ARGUMENT", result["code"])
+
+    def test_waist_rejects_an_unknown_action(self):
+        waist = WaistControlPlugin(self.arm_plugin())
+        self.assertIsNone(waist.dispatch("bogus", {}))
+
+    def test_start_and_info_delegate_to_the_controller(self):
+        control = self.arm_plugin()
+        waist = WaistControlPlugin(control)
+        self.assertEqual({"state": "ready"}, waist.dispatch("start", {}))
+        self.assertIn("state", waist.dispatch("info", {}))
 
 
 if __name__ == "__main__":
