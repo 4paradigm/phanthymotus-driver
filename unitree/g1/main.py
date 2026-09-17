@@ -215,6 +215,21 @@ class G1DeviceBundle:
             self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
             print("[bundle] ExtCameraPlugin loaded")
 
+        if plugins_cfg.get("meeting_facilitator", {}).get("enabled", False):
+            from meeting_facilitator import make_plugin
+            led_plugin = next((p for p in self._plugins if getattr(p, "PREFIX", "") == "led"), None)
+            tts_plugin = next((p for p in self._plugins if getattr(p, "PREFIX", "") == "tts"), None)
+            arm_plugin = next((p for p in self._plugins if getattr(p, "PREFIX", "") == "arm"), None)
+            asr_plugin = next((p for p in self._plugins if getattr(p, "PREFIX", "") == "asr"), None)
+            if led_plugin and tts_plugin and asr_plugin:
+                self._plugins.append(make_plugin(
+                    plugins_cfg["meeting_facilitator"], namespace, executor,
+                    {"led": led_plugin, "tts": tts_plugin, "arm": arm_plugin,
+                     "asr": asr_plugin}))
+                print("[bundle] MeetingFacilitatorPlugin loaded")
+            else:
+                print("[bundle] MeetingFacilitatorPlugin skipped: requires asr, led, and tts")
+
         # SmartMotion 统一打断控制（放在最后，需要引用其他 plugin）
         if plugins_cfg.get("smart_motion", {}).get("enabled", True):
             from device import SmartMotionPlugin
@@ -244,7 +259,11 @@ class G1DeviceBundle:
         other_plugins = [
             p for p in self._plugins if getattr(p, "PREFIX", "") != "vision_capture"]
         for p in capture_plugins + other_plugins:
-            p.stop()
+            teardown = getattr(p, "teardown", None)
+            if teardown is not None:
+                teardown()
+            else:
+                p.stop()
         print("[bundle] All plugins stopped")
 
     def get_all_tools(self) -> list:
