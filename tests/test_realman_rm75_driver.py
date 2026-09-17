@@ -383,6 +383,13 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertNotIn("x_mm", schema["properties"])
         self.assertNotIn("waypoints", schema["properties"])
         self.assertEqual(["tool"], schema["properties"]["frame_type"]["enum"])
+        self.assertEqual(
+            {
+                "on_interrupt_motion": {"action": "stopmotion"},
+                "on_interrupt_all": {"action": "stopmotion"},
+            },
+            schema["x-hooks"],
+        )
         self.assertIn("工具系偏移", tools[0]["description"])
 
     def test_cartesian_motion_requires_deployment_enable(self):
@@ -938,6 +945,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
             namespace="rm75",
         )
+        plugin.ACP_RETRY_ATTEMPTS = 0
         plugin._last_completion = {"action_id": "a1", "status": "completed", "result": {}}
         with mock.patch.object(self.device, "_acp_complete", return_value=("failed", "boom")):
             plugin._acp_callback("a1", "completed", {"reason": "target_reached"})
