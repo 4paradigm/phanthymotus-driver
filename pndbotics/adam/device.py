@@ -450,9 +450,6 @@ ROS2_UPPER_BODY_JOINTS = [
 # product overview, converted from radians to degrees. The card deliberately
 # uses stable semantic ids rather than leaking ROS topic/joint names.
 ARM_JOINT_CONTROLS = {
-    "waist_roll": ("腰部侧倾", "waistRoll", -16.0, 16.0),
-    "waist_pitch": ("腰部前后俯仰", "waistPitch", -48.0, 78.0),
-    "waist_yaw": ("腰部左右转动", "waistYaw", -47.0, 47.0),
     "left_shoulder_pitch": ("左肩前后摆", "shoulderPitch_Left", -207.0, 117.0),
     "right_shoulder_pitch": ("右肩前后摆", "shoulderPitch_Right", -207.0, 117.0),
     "left_shoulder_roll": ("左肩向内/外摆", "shoulderRoll_Left", -36.0, 160.0),
@@ -516,6 +513,26 @@ ARM_POSES = {
 
 ARM_ACTIONS = {f"set_{control}": control for control in ARM_JOINT_CONTROLS}
 
+# The waist and neck are split out of ``ARM_JOINT_CONTROLS`` into their own
+# cards so an agent can discover "turn the head" or "bow the waist" without
+# having to know those joints live in the arm controller.  All three cards
+# still share the single safe rt/lowcmd owner below.
+WAIST_JOINT_CONTROLS = {
+    "roll": ("腰部侧倾", "waistRoll", -16.0, 16.0),
+    "pitch": ("腰部前后俯仰", "waistPitch", -48.0, 78.0),
+    "yaw": ("腰部左右转动", "waistYaw", -47.0, 47.0),
+}
+
+# The ZED Mini is mounted on the head, so the neck card is effectively the
+# "camera aiming" card.  Vendor limits are ±60° for both axes.
+HEAD_JOINT_CONTROLS = {
+    "yaw": ("头部左右转动", "neckYaw", -60.0, 60.0),
+    "pitch": ("头部上下俯仰", "neckPitch", -60.0, 60.0),
+}
+
+WAIST_ACTIONS = {f"set_{control}": control for control in WAIST_JOINT_CONTROLS}
+HEAD_ACTIONS = {f"set_{control}": control for control in HEAD_JOINT_CONTROLS}
+
 
 def _arm_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
     """Validate a human-facing upper-body request and return ROS target."""
@@ -534,6 +551,44 @@ def _arm_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
         raise ValueError(
             f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
     return ros_name, math.radians(value)
+
+
+def _waist_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
+    """Validate a waist request against WAIST_JOINT_CONTROLS and return ROS target."""
+    if control not in WAIST_JOINT_CONTROLS:
+        raise ValueError("joint must be one of the advertised Adam waist controls")
+    if isinstance(angle_deg, bool):
+        raise ValueError("angle_deg must be a finite number")
+    try:
+        value = float(angle_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("angle_deg must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ValueError("angle_deg must be a finite number")
+    _, joint_name, minimum, maximum = WAIST_JOINT_CONTROLS[control]
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
+    return joint_name, math.radians(value)
+
+
+def _head_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
+    """Validate a neck request against HEAD_JOINT_CONTROLS and return ROS target."""
+    if control not in HEAD_JOINT_CONTROLS:
+        raise ValueError("joint must be one of the advertised Adam head controls")
+    if isinstance(angle_deg, bool):
+        raise ValueError("angle_deg must be a finite number")
+    try:
+        value = float(angle_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("angle_deg must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ValueError("angle_deg must be a finite number")
+    _, joint_name, minimum, maximum = HEAD_JOINT_CONTROLS[control]
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
+    return joint_name, math.radians(value)
 
 
 def _best_effort_qos():
@@ -1469,7 +1524,8 @@ class ArmControlPlugin:
 
         Lets a pose be written once for the right arm and reused on the left,
         which is why ``ARM_POSES`` keeps a single definition per one-armed
-        pose.  Controls without a side prefix (waist) pass through unchanged.
+        pose.  A control without a ``left_``/``right_`` prefix passes through
+        unchanged (defensive; the arm card currently has none).
         """
         mirrored = {}
         for control, value in targets.items():
@@ -1671,7 +1727,7 @@ class ArmControlPlugin:
             "name": "arm_control",
             "type": "actuator",
             "description": (
-                "Adam Pro 上肢（腰+双臂+手腕，14 个关节）实时位置控制，走厂商 "
+                "Adam Pro 上肢（双臂+手腕，14 个关节）实时位置控制，走厂商 "
                 "DDS rt/lowcmd 通道。角度单位为度(°)，取值为绝对值，"
                 f"关节限位见各字段 minimum/maximum。"
                 "主要用途：1) 用 set_joints 一次设定多个关节做连贯姿态；"
@@ -1964,6 +2020,235 @@ class ArmControlPlugin:
 
 
 ArmPlugin = ArmControlPlugin
+
+
+class WaistControlPlugin:
+    """Dedicated Adam Pro waist card sharing the safe lowcmd controller.
+
+    The waist joints were previously folded into ``arm_control``.  Splitting
+    them out lets an agent discover "bow" or "turn the waist" directly, while
+    every target still routes through the single ``ArmControlPlugin`` that owns
+    ``rt/lowcmd``.
+    """
+
+    PREFIX = "waist_control"
+
+    def __init__(self, control: ArmControlPlugin):
+        self._control = control
+
+    def get_tool(self):
+        actions = [*WAIST_ACTIONS, "reset", "stop", "info"]
+        action_options = [
+            {"const": action, "title": f"设置{WAIST_JOINT_CONTROLS[control][0]}"}
+            for action, control in WAIST_ACTIONS.items()
+        ] + [
+            {"const": "reset", "title": "回到起始腰部角度"},
+            {"const": "stop", "title": "停止腰部指令"},
+            {"const": "info", "title": "查看腰部控制状态"},
+        ]
+        properties = {
+            "action": {"type": "string", "enum": actions, "oneOf": action_options},
+            "duration_s": {
+                "type": "number", "title": "动作时长（秒）",
+                "minimum": 0.1, "maximum": 60.0,
+                "description": (
+                    "可选，本次过渡的期望时长。只能把动作放慢；"
+                    "小于安全限速所需时长时会被驱动自动钳位。省略时使用默认平滑时长。"
+                ),
+            },
+        }
+        action_params = {
+            "reset": {"params": ["duration_s"],
+                      "description": "回到开始控制时的腰部角度。"},
+            "stop": {"params": [], "description": "停止腰部低层控制。"},
+            "info": {"params": [], "description": "查看腰部控制状态。"},
+        }
+        for action, control in WAIST_ACTIONS.items():
+            label, _, minimum, maximum = WAIST_JOINT_CONTROLS[control]
+            field = f"{control}_deg"
+            properties[field] = {
+                "type": "number", "title": f"{label}目标角度（度）",
+                "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
+                "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+            action_params[action] = {
+                "params": [field, "duration_s"],
+                "description": f"设置{label}，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+        return {
+            "name": "waist_control",
+            "type": "actuator",
+            "description": (
+                "Adam Pro 腰部（侧倾/前后俯仰/左右转动，3 个关节）实时位置控制，"
+                "走厂商 DDS rt/lowcmd 通道。角度单位为度(°)。可选 duration_s 放慢动作。"
+                "前置条件：机器人已站立，且没有其它卡片正在占用上肢通道。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["action"],
+                "additionalProperties": False,
+                "x-action-params": action_params,
+                "x-resource": ["adam_upper_body"],
+            },
+        }
+
+    def start(self):
+        return self._control.start()
+
+    def stop(self):
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        # start/stop/info describe the controller this card delegates to.
+        if action in ("start", "stop", "info"):
+            return self._control.dispatch(action, args)
+        if action == "reset":
+            error = self._control._ready_error()
+            if error:
+                return error
+            targets = {
+                joint: self._control._hold_q[self._control._joint_index(joint)]
+                for _, joint, _, _ in WAIST_JOINT_CONTROLS.values()
+            }
+            span, span_error = self._control._preferred_span(args)
+            if span_error:
+                return span_error
+            error = self._control._set_targets(targets, preferred_span=span)
+            return error or {"success": True, "state": "active",
+                             "action": "reset", "duration_s": span}
+        control = WAIST_ACTIONS.get(action)
+        if control is None:
+            return None
+        try:
+            joint, radians = _waist_target_radians(
+                control, args.get(f"{control}_deg"))
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": str(exc)}
+        span, span_error = self._control._preferred_span(args)
+        if span_error:
+            return span_error
+        error = self._control._set_targets({joint: radians}, preferred_span=span)
+        if error:
+            return error
+        return {"success": True, "state": "active", "joint": control,
+                "angle_deg": float(args[f"{control}_deg"]),
+                "duration_s": span, "protocol": "rt/lowcmd"}
+
+
+class HeadControlPlugin:
+    """Dedicated Adam Pro head card sharing the safe lowcmd controller.
+
+    The ZED Mini is mounted on the head, so this card is effectively the
+    "camera aiming" control: neckYaw and neckPitch steer where the robot looks.
+    """
+
+    PREFIX = "head_control"
+
+    def __init__(self, control: ArmControlPlugin):
+        self._control = control
+
+    def get_tool(self):
+        actions = [*HEAD_ACTIONS, "reset", "stop", "info"]
+        action_options = [
+            {"const": action, "title": f"设置{HEAD_JOINT_CONTROLS[control][0]}"}
+            for action, control in HEAD_ACTIONS.items()
+        ] + [
+            {"const": "reset", "title": "回到起始头部角度"},
+            {"const": "stop", "title": "停止头部指令"},
+            {"const": "info", "title": "查看头部控制状态"},
+        ]
+        properties = {
+            "action": {"type": "string", "enum": actions, "oneOf": action_options},
+            "duration_s": {
+                "type": "number", "title": "动作时长（秒）",
+                "minimum": 0.1, "maximum": 60.0,
+                "description": (
+                    "可选，本次过渡的期望时长。只能把动作放慢；"
+                    "小于安全限速所需时长时会被驱动自动钳位。省略时使用默认平滑时长。"
+                ),
+            },
+        }
+        action_params = {
+            "reset": {"params": ["duration_s"],
+                      "description": "回到开始控制时的头部角度。"},
+            "stop": {"params": [], "description": "停止头部低层控制。"},
+            "info": {"params": [], "description": "查看头部控制状态。"},
+        }
+        for action, control in HEAD_ACTIONS.items():
+            label, _, minimum, maximum = HEAD_JOINT_CONTROLS[control]
+            field = f"{control}_deg"
+            properties[field] = {
+                "type": "number", "title": f"{label}目标角度（度）",
+                "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
+                "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+            action_params[action] = {
+                "params": [field, "duration_s"],
+                "description": f"设置{label}，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+        return {
+            "name": "head_control",
+            "type": "actuator",
+            "description": (
+                "Adam Pro 头部（左右转动/上下俯仰，2 个关节）实时位置控制，"
+                "走厂商 DDS rt/lowcmd 通道。头部装有 ZED 相机，因此本卡即"
+                "「相机指向」控制。角度单位为度(°)，限位 ±60°。可选 duration_s 放慢动作。"
+                "前置条件：机器人已站立，且没有其它卡片正在占用上肢通道。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["action"],
+                "additionalProperties": False,
+                "x-action-params": action_params,
+                "x-resource": ["adam_upper_body"],
+            },
+        }
+
+    def start(self):
+        return self._control.start()
+
+    def stop(self):
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        # start/stop/info describe the controller this card delegates to.
+        if action in ("start", "stop", "info"):
+            return self._control.dispatch(action, args)
+        if action == "reset":
+            error = self._control._ready_error()
+            if error:
+                return error
+            targets = {
+                joint: self._control._hold_q[self._control._joint_index(joint)]
+                for _, joint, _, _ in HEAD_JOINT_CONTROLS.values()
+            }
+            span, span_error = self._control._preferred_span(args)
+            if span_error:
+                return span_error
+            error = self._control._set_targets(targets, preferred_span=span)
+            return error or {"success": True, "state": "active",
+                             "action": "reset", "duration_s": span}
+        control = HEAD_ACTIONS.get(action)
+        if control is None:
+            return None
+        try:
+            joint, radians = _head_target_radians(
+                control, args.get(f"{control}_deg"))
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": str(exc)}
+        span, span_error = self._control._preferred_span(args)
+        if span_error:
+            return span_error
+        error = self._control._set_targets({joint: radians}, preferred_span=span)
+        if error:
+            return error
+        return {"success": True, "state": "active", "joint": control,
+                "angle_deg": float(args[f"{control}_deg"]),
+                "duration_s": span, "protocol": "rt/lowcmd"}
 
 
 class ArmGesturePlugin:
@@ -4475,6 +4760,10 @@ class AdamDeviceBundle:
             self._plugins.append(p)
             if plugins_cfg.get("arm_gesture", {}).get("enabled", True):
                 self._plugins.append(ArmGesturePlugin(p))
+            if plugins_cfg.get("waist", {}).get("enabled", True):
+                self._plugins.append(WaistControlPlugin(p))
+            if plugins_cfg.get("head", {}).get("enabled", True):
+                self._plugins.append(HeadControlPlugin(p))
 
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:

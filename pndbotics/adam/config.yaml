@@ -82,6 +82,10 @@ plugins:
     control_rate_hz: 50
   arm_gesture:
     enabled: true
+  waist:
+    enabled: true
+  head:
+    enabled: true
   hand:
     enabled: true
     # Verified on Adam: all 12 hand channels move in the effective 0..1000
