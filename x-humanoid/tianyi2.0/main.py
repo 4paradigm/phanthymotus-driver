@@ -561,8 +561,14 @@ class TianyiDeviceBundle:
 
         if plugins_cfg.get("chassis_raw", {}).get("enabled", False):
             from device import ChassisRawPlugin
-            self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2, slamtec_client))
+            chassis_raw_plugin = ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2, slamtec_client)
+            self._plugins.append(chassis_raw_plugin)
             print("[bundle] ChassisRawPlugin loaded")
+
+        if plugins_cfg.get("follow", {}).get("enabled", False):
+            from follow import FollowPlugin
+            self._plugins.append(FollowPlugin(plugins_cfg["follow"], namespace, ros2, chassis=chassis_raw_plugin))
+            print("[bundle] FollowPlugin loaded")
 
         if plugins_cfg.get("ext_mic", {}).get("enabled", False):
             from ext_devices import ExtMicPlugin
