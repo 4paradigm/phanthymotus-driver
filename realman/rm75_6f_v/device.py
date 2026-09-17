@@ -717,7 +717,7 @@ def _acp_complete(action_id, status, result, tool_name):
 
 
 class CartesianPlugin:
-    """笛卡尔空间运动卡片：movel 直线 / move_offset 偏移 / movep 多路径点轨迹。
+    """笛卡尔空间运动卡片：工具坐标系相对偏移。
 
     位姿单位面向画布：位置毫米、姿态度（SDK 内部为米/弧度，转换封装在插件内）。
     与 joint_control 共享运动锁（同一时刻只允许一个运动流），安全守卫、
@@ -771,40 +771,21 @@ class CartesianPlugin:
         self.native_tool_offset_enabled = cartesian.get("native_tool_offset_enabled", True) is not False
 
     def get_tools(self):
-        position_props = {
-            field: {"type": "number", "description": desc}
-            for field, desc in (
-                ("x_mm", "目标位置 X，毫米（基座坐标系）"),
-                ("y_mm", "目标位置 Y，毫米（基座坐标系）"),
-                ("z_mm", "目标位置 Z，毫米（基座坐标系）"),
-                ("rx_deg", "目标姿态 Roll，度"),
-                ("ry_deg", "目标姿态 Pitch，度"),
-                ("rz_deg", "目标姿态 Yaw，度"),
-            )
-        }
         offset_props = {
             field: {"type": "number", "description": desc}
             for field, desc in (
-                ("dx_mm", "位置偏移 X，毫米"),
-                ("dy_mm", "位置偏移 Y，毫米"),
-                ("dz_mm", "位置偏移 Z，毫米"),
-                ("drx_deg", "姿态偏移 Roll，度"),
-                ("dry_deg", "姿态偏移 Pitch，度"),
-                ("drz_deg", "姿态偏移 Yaw，度"),
+                ("dx_mm", "位置偏移 X，毫米；留空表示不沿 X 偏移"),
+                ("dy_mm", "位置偏移 Y，毫米；留空表示不沿 Y 偏移"),
+                ("dz_mm", "位置偏移 Z，毫米；留空表示不沿 Z 偏移"),
+                ("drx_deg", "姿态偏移 Roll，度；留空表示不旋转"),
+                ("dry_deg", "姿态偏移 Pitch，度；留空表示不旋转"),
+                ("drz_deg", "姿态偏移 Yaw，度；留空表示不旋转"),
             )
         }
         properties = {
-            **position_props,
             **offset_props,
             "frame_type": {"type": "string", "enum": ["tool"], "default": "tool",
                            "description": "偏移参考坐标系：目前仅支持 tool 工具系（工作坐标系偏移需控制器激活坐标系位姿，暂不开放）"},
-            "waypoints": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 20,
-                "items": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"type": "number"}},
-                "description": "路径点序列，每个点 [x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg]",
-            },
             "speed_percent": {"type": "integer", "minimum": 1, "maximum": self.max_speed_percent,
                               "default": self.default_speed_percent},
             "cartesian_enabled": {
@@ -816,25 +797,21 @@ class CartesianPlugin:
         }
         schema = action_schema(
             {
-                "movel": (["x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg", "speed_percent", "cartesian_enabled", "confirm_motion"],
-                          "笛卡尔直线运动到绝对位姿（位置毫米、姿态度，相对基座坐标系）"),
                 "move_offset": (["dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg", "frame_type", "speed_percent", "cartesian_enabled", "confirm_motion"],
-                                "沿工具坐标系做直线偏移（相对当前位姿）"),
-                "movep": (["waypoints", "speed_percent", "cartesian_enabled", "confirm_motion"],
-                          "依次经过多个路径点的轨迹运动"),
+                                "沿工具坐标系做直线偏移（相对当前位姿；未填写的轴不偏移）"),
                 "stopmotion": ([], "请求受控减速停止"),
                 "info": ([], "读取运动状态与安全配置"),
             },
             properties,
         )
-        schema["x-completion"] = {"actions": ["movel", "move_offset", "movep"], "timeout": 305}
+        schema["x-completion"] = {"actions": ["move_offset"], "timeout": 305}
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "stopmotion"}}
         schema["x-is-dangerous"] = True
         return [
             tool(
                 "cartesian_control",
                 "actuator",
-                "笛卡尔空间运动：直线(movel)、工具系偏移(move_offset)、多路径点轨迹(movep)。位置毫米、姿态度。",
+                "笛卡尔空间相对运动：沿工具系偏移执行 move_offset。位置毫米、姿态度。",
                 schema,
             )
         ]
@@ -865,6 +842,8 @@ class CartesianPlugin:
             return self._motion_status()
         if action == "stopmotion":
             return self._stop_motion()
+        # movel/movep 已从卡片定义中移除；仅保留此处兼容已保存的旧流程，
+        # 新建流程只能选择 move_offset。
         if action in ("movel", "move_offset", "movep"):
             return self._start_cartesian(action, args)
         return None
@@ -937,8 +916,7 @@ class CartesianPlugin:
                         if self._motion_state["active_action_id"] == action_id:
                             self._motion_state["active_action_id"] = None
                     if submitted:
-                        # movep 可能已部分下发（前段 connect=1 轨迹已入控制器队列）：
-                        # 失败路径明确慢停，不留无看护的排队轨迹，再放锁。
+                        # 旧 movep 可能已提交部分路径；统一请求慢停，不留无看护的运动。
                         try:
                             self.client.command("rm_set_arm_slow_stop")
                         except Exception:
@@ -961,11 +939,11 @@ class CartesianPlugin:
         if motion_type == "movel":
             target = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
         elif motion_type == "move_offset":
-            offset_mm_deg = self._pose_from_fields(args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"))
+            offset_mm_deg = self._pose_from_fields(
+                args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"), empty_value=0.0
+            )
             frame = args.get("frame_type", "tool")
             if frame != "tool":
-                # 工作坐标系偏移的监控目标需要控制器当前激活的工作坐标系位姿，
-                # SDK 未提供无歧义的查询接口 —— 先只支持工具系（最常用的直觉语义）。
                 raise ValueError("frame_type must be 'tool'（工作坐标系偏移暂不支持）")
             # 工具系偏移 ≠ 基系直接相加：平移需按当前工具姿态旋转、姿态右乘组合
             target = self._compose_tool_offset(current, offset_mm_deg)
@@ -974,7 +952,6 @@ class CartesianPlugin:
             if not isinstance(waypoints, list) or not 1 <= len(waypoints) <= 20:
                 raise ValueError("waypoints must be a list of 1~20 poses")
             poses = [self._waypoint_pose(item, index) for index, item in enumerate(waypoints)]
-            # 路径上的每个点都要在工作空间内，而不是只校验末点
             for pose in poses:
                 self._validate_workspace(pose)
             return poses[-1]
@@ -1015,7 +992,7 @@ class CartesianPlugin:
                 self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 0, 0)
             elif motion_type == "move_offset":
                 offset = self._pose_from_fields(
-                    args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg")
+                    args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"), empty_value=0.0
                 )
                 if self.native_tool_offset_enabled:
                     try:
@@ -1026,16 +1003,14 @@ class CartesianPlugin:
                         )
                     except RuntimeError as exc:
                         # API2 约定 -7 表示三代控制器不支持 rm_movel_offset；该错误未
-                        # 下发运动，可安全退回旧的 rm_movel 兼容路径。
+                        # 下发运动，可安全退回绝对位姿兼容路径。
                         if "code -7" not in str(exc):
                             raise
                         self.client.command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, 0)
                 else:
                     self.client.command("rm_movel", self._to_sdk_pose(target), speed_percent, 0, 0, 0)
             elif motion_type == "movep":
-                waypoints = args.get("waypoints")
-                poses = [self._waypoint_pose(item, index) for index, item in enumerate(waypoints)]
-                # 前 N-1 个点 connect=1（与下一条轨迹联合规划），末点 connect=0 立即执行
+                poses = [self._waypoint_pose(item, index) for index, item in enumerate(args["waypoints"])]
                 for pose in poses[:-1]:
                     self.client.command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 1, 0)
                 self.client.command("rm_movel", self._to_sdk_pose(poses[-1]), speed_percent, 0, 0, 0)
@@ -1049,10 +1024,13 @@ class CartesianPlugin:
                 ) from exc
             raise
 
-    def _pose_from_fields(self, args, fields):
+    def _pose_from_fields(self, args, fields, empty_value=None):
         pose = []
         for field in fields:
             value = args.get(field)
+            if empty_value is not None and (value is None or (isinstance(value, str) and not value.strip())):
+                pose.append(float(empty_value))
+                continue
             try:
                 numeric = float(value)
             except (TypeError, ValueError) as exc:
@@ -1062,7 +1040,8 @@ class CartesianPlugin:
             pose.append(numeric)
         return pose
 
-    def _waypoint_pose(self, item, index):
+    @staticmethod
+    def _waypoint_pose(item, index):
         if not isinstance(item, (list, tuple)) or len(item) != 6:
             raise ValueError(f"waypoint {index} must have exactly 6 numbers")
         try:
