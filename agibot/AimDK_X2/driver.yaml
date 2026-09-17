@@ -12,10 +12,12 @@ build_context_extras:
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
 # Kept in sync by hand with config.yaml's plugin enabled flags and end_effector variant.
 cards:
-  - { name: mc_state,           type: sensor }
-  - { name: joint_state,        type: sensor }
+  - { name: mc_state,                type: sensor }
+  - { name: locomotion_input_source, type: sensor }
+  - { name: joint_state,             type: sensor }
   - { name: hand_state,         type: sensor }
   - { name: imu,                type: sensor }
+  - { name: leg_odometry,       type: sensor }
   - { name: camera_rgb,         type: sensor }
   - { name: camera_depth,       type: sensor }
   - { name: lidar,              type: sensor }

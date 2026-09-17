@@ -216,14 +216,13 @@ def _start_registration(mcp_port: int, name: str, category: str):
 def main():
     global _bundle
 
-    cfg           = _load_config()
+    cfg = _load_config()
     # Adam exposes its low-state DDS bus on the robot-facing Ethernet NIC.
     # Prefer an explicit CLI override, then deployment environment and config,
-    # instead of letting
-    # CycloneDDS pick a Wi-Fi/default-route interface on dual-homed Jetsons.
+    # instead of letting CycloneDDS pick a Wi-Fi/default-route interface.
     network_iface = (
-        sys.argv[1] if len(sys.argv) > 1
-        else os.environ.get("DDS_NETWORK_INTERFACE")
+        (sys.argv[1] if len(sys.argv) > 1 else None)
+        or os.environ.get("DDS_NETWORK_INTERFACE")
         or os.environ.get("DDS_INTERFACE")
         or cfg.get("dds_interface")
         or cfg.get("dds_network_interface")

@@ -254,6 +254,71 @@ def _hand_state_payload(position, received_at_ms: int, *, fresh: bool) -> dict:
     }
 
 
+def _hand_status_payload(cache, timeout_sec: float) -> dict:
+    """Return a stable status payload when hand feedback is unavailable."""
+    status = cache.status(timeout_sec)
+    if not status["reader_available"]:
+        state = "unavailable"
+        state_text = "手部状态读取器不可用"
+    elif status["last_sample_age_ms"] is None:
+        state = "waiting"
+        state_text = "等待手部状态"
+    elif status["fresh"]:
+        state = "fresh"
+        state_text = "手部状态正常"
+    else:
+        state = "stale"
+        state_text = "手部状态延迟"
+    return {
+        "state": state,
+        "state_text": state_text,
+        "fresh": bool(status["fresh"]),
+        "reader_available": bool(status["reader_available"]),
+        "last_sample_age_ms": status["last_sample_age_ms"],
+        "position_max": HAND_POSITION_MAX,
+        **({"last_read_error": status["last_read_error"]}
+           if "last_read_error" in status else {}),
+    }
+
+
+def _skeleton_payload(state, joint_names) -> dict:
+    joints = []
+    motor_state = getattr(state, "motor_state", [])
+    for idx, name in enumerate(joint_names):
+        if idx < len(motor_state):
+            joints.append({
+                "idx": idx,
+                "name": name,
+                "q": float(motor_state[idx].q),
+                "unit": "rad",
+                "source": "rt/lowstate",
+            })
+    return {"joints": joints}
+
+
+def _state_health_payload(state, received_monotonic: float | None) -> dict:
+    """Expose transport health without guessing an operational robot mode."""
+    age_ms = None
+    if received_monotonic is not None:
+        age_ms = max(0, int((time.monotonic() - received_monotonic) * 1000))
+    mode_pr = int(getattr(state, "mode_pr", 0)) if state is not None else None
+    mode_pr_label = {
+        0: "PR 串联关节控制",
+        1: "AB 并联关节控制",
+    }.get(mode_pr) if mode_pr is not None else None
+    motor_state = getattr(state, "motor_state", []) if state is not None else []
+    status = "waiting" if state is None else "online" if age_ms is not None and age_ms <= 500 else "stale"
+    return {
+        "status": status,
+        "status_text": {"waiting": "等待状态首帧", "online": "状态流正常", "stale": "状态流延迟"}[status],
+        "state_age_ms": age_ms,
+        "body_joint_count": len(motor_state),
+        "control_topology": mode_pr_label,
+        "raw_mode_pr": mode_pr,
+        "tick": int(getattr(state, "tick", 0)) if state is not None else None,
+    }
+
+
 def _destroy_ros_node(executor, node):
     if node is None:
         return
@@ -443,6 +508,37 @@ ROS2_UPPER_BODY_JOINTS = [
     "dof_pos/hand_thumb_1_Right", "dof_pos/hand_thumb_2_Right",
 ]
 
+# SDK 示例 open_arm.py 已验证的单侧抬臂目标。关节仅包含 ArmPlugin
+# 负责的腰部与上肢通道，避免改写头部或底盘状态。
+ARM_RAISE_POSE = {
+    "left": {
+        "shoulderPitch_Left": -1.6,
+        "shoulderRoll_Left": 2.06,
+        "shoulderYaw_Left": -1.65,
+        "elbow_Left": -1.77,
+        "wristYaw_Left": 0.32,
+        "wristPitch_Left": 0.0,
+        "wristRoll_Left": 0.0,
+    },
+    "right": {
+        "shoulderPitch_Right": -1.6,
+        "shoulderRoll_Right": -2.06,
+        "shoulderYaw_Right": 1.65,
+        "elbow_Right": -1.77,
+        "wristYaw_Right": 0.32,
+        "wristPitch_Right": 0.0,
+        "wristRoll_Right": 0.0,
+    },
+}
+
+
+def _reliable_qos():
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+
 
 def _best_effort_qos():
     """Shallow best-effort queue for high-rate optional telemetry."""
@@ -498,11 +594,13 @@ class _StatePublisherNode(Node):
 
     _BATTERY_INTERVAL_S = 1.0
 
-    def __init__(self, namespace: str, variant: str, publish_rate_hz: float):
+    def __init__(self, namespace: str, variant: str, publish_rate_hz: float,
+                 hand_state_cache=None):
         super().__init__("adam_state_publisher")
         self._namespace = namespace
         self._variant = variant
         self._joints = VARIANT_JOINTS[variant]
+        self._hand_state_cache = hand_state_cache
 
         qos = _reliable_qos()
 
@@ -511,15 +609,20 @@ class _StatePublisherNode(Node):
         self._topic_battery = f"/{namespace}/state/battery"
         self._topic_robot_state = f"/{namespace}/state/robot"
         self._topic_motor_state = f"/{namespace}/state/motors"
+        self._topic_health = f"/{namespace}/state/health"
+        self._topic_hand = f"/{namespace}/state/hands"
 
         self._pub_skeleton = self.create_publisher(String, self._topic_skeleton, qos)
         self._pub_imu = self.create_publisher(String, self._topic_imu, qos)
         self._pub_battery = self.create_publisher(String, self._topic_battery, qos)
         self._pub_robot_state = self.create_publisher(String, self._topic_robot_state, qos)
         self._pub_motor_state = self.create_publisher(String, self._topic_motor_state, qos)
+        self._pub_health = self.create_publisher(String, self._topic_health, qos)
+        self._pub_hand = self.create_publisher(String, self._topic_hand, qos)
 
         self._latest_state = None
         self._latest_state_at_ms = None
+        self._latest_state_monotonic = None
         self._active = False
         self._lock = threading.Lock()
 
@@ -532,6 +635,7 @@ class _StatePublisherNode(Node):
         with self._lock:
             self._latest_state = state
             self._latest_state_at_ms = int(time.time() * 1000)
+            self._latest_state_monotonic = time.monotonic()
 
     def set_active(self, active: bool):
         with self._lock:
@@ -540,46 +644,39 @@ class _StatePublisherNode(Node):
     def _publish(self):
         with self._lock:
             state = self._latest_state
+            state_monotonic = self._latest_state_monotonic
             active = self._active
 
         if not active or state is None:
             return
 
-        robot_data = {
-            "mode_pr": int(state.mode_pr),
-            "tick": int(state.tick),
-            "wireless_remote": list(state.wireless_remote),
-        }
-        msg_robot = String()
-        msg_robot.data = json.dumps(robot_data)
-        self._pub_robot_state.publish(msg_robot)
-
-        # Skeleton (joints)
-        joints = []
-        for idx, name in enumerate(self._joints):
-            if idx < len(state.motor_state):
-                joints.append({
-                    "idx": idx,
-                    "name": name,
-                    "q": float(state.motor_state[idx].q),
-                })
         msg = String()
-        msg.data = json.dumps({"joints": joints})
+        msg.data = json.dumps(_skeleton_payload(state, self._joints))
         self._pub_skeleton.publish(msg)
 
+        msg_robot = String()
+        msg_robot.data = json.dumps({
+            "mode_pr": int(getattr(state, "mode_pr", 0)),
+            "control_topology": _state_health_payload(
+                state, state_monotonic)["control_topology"],
+            "tick": int(getattr(state, "tick", 0)),
+            "wireless_remote": list(getattr(state, "wireless_remote", [])),
+        })
+        self._pub_robot_state.publish(msg_robot)
+
         motor_states = []
-        for idx, motor in enumerate(state.motor_state):
+        for idx, motor in enumerate(getattr(state, "motor_state", [])):
             if idx >= len(self._joints):
                 break
             motor_states.append({
                 "idx": idx,
                 "name": self._joints[idx],
-                "mode": int(motor.mode),
-                "q": float(motor.q),
-                "dq": float(motor.dq),
-                "ddq": float(motor.ddq),
-                "tau_est": float(motor.tau_est),
-                "state": int(motor.state),
+                "mode": int(getattr(motor, "mode", 0)),
+                "q": float(getattr(motor, "q", 0.0)),
+                "dq": float(getattr(motor, "dq", 0.0)),
+                "ddq": float(getattr(motor, "ddq", 0.0)),
+                "tau_est": float(getattr(motor, "tau_est", 0.0)),
+                "state": int(getattr(motor, "state", 0)),
             })
         msg_motor = String()
         msg_motor.data = json.dumps({"motors": motor_states})
@@ -608,9 +705,29 @@ class _StatePublisherNode(Node):
         with self._lock:
             state = self._latest_state
             received_at_ms = self._latest_state_at_ms
+            state_monotonic = self._latest_state_monotonic
             active = self._active
 
-        if not active or state is None:
+        if not active:
+            return
+
+        if self._hand_state_cache is not None:
+            hand_state = self._hand_state_cache.snapshot(timeout_sec=1.0)
+            hand_payload = (
+                hand_state
+                if hand_state is not None
+                else _hand_status_payload(self._hand_state_cache, 1.0)
+            )
+            msg_hand = String()
+            msg_hand.data = json.dumps(hand_payload)
+            self._pub_hand.publish(msg_hand)
+
+        msg_health = String()
+        msg_health.data = json.dumps(
+            _state_health_payload(state, state_monotonic))
+        self._pub_health.publish(msg_health)
+
+        if state is None:
             return
 
         bat_data = _battery_payload(
@@ -636,7 +753,8 @@ class StatePlugin:
         self._poll_stop_event = None
 
         rate = plugin_config.get("publish_rate_hz", 50)
-        self._node = _StatePublisherNode(namespace, variant, rate)
+        self._node = _StatePublisherNode(
+            namespace, variant, rate, hand_state_cache=kwargs.get("hand_state_cache"))
         executor.add_node(self._node)
 
         # DDS subscribers (pre-created in main.py before rclpy.init to avoid conflict)
@@ -677,7 +795,7 @@ class StatePlugin:
             {
                 "name": "robot_state",
                 "type": "sensor",
-                "description": "Adam low-level state — mode, tick and wireless remote channels",
+                "description": "Adam readable low-level state — control topology, tick and remote channels",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [
                     {"topic": self._node._topic_robot_state, "format": "data/json"}
@@ -699,6 +817,24 @@ class StatePlugin:
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [
                     {"topic": self._node._topic_battery, "format": "data/json"}
+                ],
+            },
+            {
+                "name": "health",
+                "type": "sensor",
+                "description": "Adam state-stream health and confirmed control topology",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_health, "format": "data/json"}
+                ],
+            },
+            {
+                "name": "hands",
+                "type": "sensor",
+                "description": "Adam left and right hand feedback from DDS rt/handstate",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [
+                    {"topic": self._node._topic_hand, "format": "data/json"}
                 ],
             },
         ]
@@ -746,6 +882,12 @@ class StatePlugin:
             return {"state": "idle"}
         if action == "info":
             tool_name = args.get("_tool_name", "joints")
+            if tool_name == "motor_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_motor_state, "format": "data/json"}]}
+            if tool_name == "robot_state":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_robot_state, "format": "data/json"}]}
             if tool_name == "imu":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_imu, "format": "data/json"}]}
@@ -758,6 +900,12 @@ class StatePlugin:
             if tool_name == "battery":
                 return {"state": "running" if self._running else "idle",
                         "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
+            if tool_name == "health":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_health, "format": "data/json"}]}
+            if tool_name == "hands":
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._node._topic_hand, "format": "data/json"}]}
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._node._topic_skeleton, "format": "sensor/skeleton"}]}
         return None
@@ -960,7 +1108,6 @@ class _ArmControlNode(Node):
             self._positions[:17] = 0.0
             self._positions[17] = 1.0  # keep standing height
 
-
 class ArmPlugin:
     """Upper body control via ROS2 JointState publishing at 100Hz."""
 
@@ -1059,6 +1206,55 @@ class ArmPlugin:
 # ===========================================================================
 # HandPlugin — DDS rt/handcmd finger control
 # ===========================================================================
+
+class ArmGesturePlugin:
+    PREFIX = "arm_gesture"
+
+    def __init__(self, arm: ArmPlugin):
+        self._arm = arm
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "arm_gesture", "type": "actuator",
+            "description": "Adam 单侧举手；须确认站立并进入上肢实时接收模式。",
+            "inputSchema": {
+                "type": "object", "required": ["action"],
+                "properties": {
+                    "action": {"type": "string", "enum": ["raise_hand", "stop"]},
+                    "side": {"type": "string", "enum": ["left", "right"]},
+                    "confirm": {"type": "boolean", "description": "现场确认站立、实时接收模式和周围安全"},
+                },
+                "x-is-dangerous": True,
+                "x-action-params": {
+                    "raise_hand": {"params": ["side", "confirm"], "description": "确认站立和实时接收模式后单侧举手"},
+                    "stop": {"params": [], "description": "停止上肢目标发布"},
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return self._arm.dispatch("disable", {})
+        if action == "info":
+            return self._arm.dispatch("info", {})
+        if action != "raise_hand" or args.get("side") not in ("left", "right"):
+            return {"state": "error", "error": "INVALID_ARGUMENT", "message": "raise_hand requires left or right side"}
+        if args.get("confirm") is not True:
+            return {"state": "error", "error": "PRECONDITION_FAILED",
+                    "message": "Confirm standing, real-time retarget mode and clear surroundings before raising an arm"}
+        side = args["side"]
+        result = self._arm.dispatch("set_joints", {"joints": ARM_RAISE_POSE[side]})
+        self._arm.dispatch("enable", {})
+        return {**result, "gesture": "raise_hand", "side": side}
+
 
 class HandPlugin:
     """Continuous finger position control via DDS ``rt/handcmd``.
@@ -1179,10 +1375,7 @@ class HandPlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": [
-                            "open", "close", "set_fingers", "start", "stop", "info",
-                            "get_state",
-                        ],
+                        "enum": ["open", "close", "set_fingers", "start", "stop", "info", "get_state"],
                     },
                     "side": {
                         "type": "string",
@@ -1428,15 +1621,54 @@ class HandPlugin:
     def _close_target(self) -> list[int]:
         """Build one close target for all four fingers and both thumb axes."""
         target = list(self._close_positions)
-        for side_offset, thumb_offset in ((0, 0), (6, 2)):
-            # The current Adam client mapping becomes more closed as the
-            # flexion position decreases. Send both thumb axes in the same
-            # target as the four non-thumb fingers so they move concurrently.
-            target[side_offset + 4] = max(
-                self._thumb_close_positions[thumb_offset],
-                self._thumb_close_min_flex_position,
-            )
-            target[side_offset + 5] = self._thumb_close_positions[thumb_offset + 1]
+        for side in ("left", "right"):
+            self._apply_closed_hand(target, side)
+        return target
+
+    def _side_target(self, side: str) -> list[int]:
+        if side not in ("left", "right"):
+            raise ValueError("side must be either left or right")
+        return self._base_positions()
+
+    def _side_offset(self, side: str) -> int:
+        if side not in ("left", "right"):
+            raise ValueError("side must be either left or right")
+        return 0 if side == "left" else 6
+
+    def _apply_closed_hand(self, target: list[int], side: str):
+        offset = self._side_offset(side)
+        thumb_offset = 0 if side == "left" else 2
+        target[offset:offset + 4] = self._close_positions[offset:offset + 4]
+        target[offset + 4] = max(
+            self._thumb_close_positions[thumb_offset],
+            self._thumb_close_min_flex_position,
+        )
+        target[offset + 5] = self._thumb_close_positions[thumb_offset + 1]
+
+    def _gesture_target(self, gesture: str, side: str) -> list[int]:
+        target = self._side_target(side)
+        offset = self._side_offset(side)
+        if gesture == "thumbs_up":
+            self._apply_closed_hand(target, side)
+            target[offset + 4] = self._open_positions[offset + 4]
+            target[offset + 5] = self._open_positions[offset + 5]
+        elif gesture == "wave_open":
+            target[offset:offset + 6] = self._open_positions[offset:offset + 6]
+        elif gesture == "handshake":
+            self._apply_closed_hand(target, side)
+        elif gesture == "point":
+            self._apply_closed_hand(target, side)
+            target[offset + 3] = self._open_positions[offset + 3]
+        elif gesture == "victory":
+            self._apply_closed_hand(target, side)
+            target[offset + 2] = self._open_positions[offset + 2]
+            target[offset + 3] = self._open_positions[offset + 3]
+        elif gesture == "rock":
+            self._apply_closed_hand(target, side)
+            target[offset] = self._open_positions[offset]
+            target[offset + 3] = self._open_positions[offset + 3]
+        else:
+            raise ValueError("unsupported hand gesture")
         return target
 
     def _activate(self, positions: list[int], action: str) -> dict:
@@ -1516,6 +1748,53 @@ class HandPlugin:
         return None
 
 
+class HandGesturePlugin:
+    PREFIX = "hand_gesture"
+    ACTIONS = ("thumbs_up", "wave_open", "handshake", "point", "victory", "rock")
+
+    def __init__(self, hand: HandPlugin):
+        self._hand = hand
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "hand_gesture", "type": "actuator",
+            "description": "Adam 单手语义手势；共用 hand 控制线程及 rt/handcmd。",
+            "inputSchema": {
+                "type": "object", "required": ["action"],
+                "properties": {
+                    "action": {"type": "string", "enum": [*self.ACTIONS, "stop"]},
+                    "side": {"type": "string", "enum": ["left", "right"]},
+                },
+                "x-action-params": {
+                    **{name: {"params": ["side"], "description": f"执行单手 {name} 手势"}
+                       for name in self.ACTIONS},
+                    "stop": {"params": [], "description": "停止发送手部目标"},
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return self._hand.dispatch("stop", {})
+        if action == "info":
+            return self._hand.dispatch("info", {})
+        if action not in self.ACTIONS:
+            return {"state": "error", "error": "INVALID_ARGUMENT", "message": "unsupported hand gesture action"}
+        try:
+            target = self._hand._gesture_target(action, args.get("side"))
+        except ValueError as exc:
+            return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
+        return self._hand._activate(target, action)
+
+
 # ---------------------------------------------------------------------------
 # Hand-state sensor card
 # ---------------------------------------------------------------------------
@@ -1545,7 +1824,8 @@ class _HandStatePublisherNode(Node):
             return
         payload = self._state_cache.snapshot(self._state_timeout_sec)
         if payload is None:
-            return
+            payload = _hand_status_payload(
+                self._state_cache, self._state_timeout_sec)
         message = String()
         message.data = json.dumps(payload)
         self._publisher.publish(message)
@@ -2944,6 +3224,7 @@ class AdamDeviceBundle:
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
+                hand_state_cache=self._hand_state_cache,
             )
             self._plugins.append(p)
 
@@ -2986,6 +3267,7 @@ class AdamDeviceBundle:
                 grpc_client=grpc_client,
             )
             self._plugins.append(p)
+            self._plugins.append(ArmGesturePlugin(p))
 
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:
@@ -2993,6 +3275,7 @@ class AdamDeviceBundle:
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
             self._plugins.append(p)
+            self._plugins.append(HandGesturePlugin(p))
         if hand_state_enabled and self._hand_state_cache is not None and self._ros2_enabled:
             p = HandStatePlugin(
                 plugins_cfg.get("hand_state", {}), namespace, executor,
