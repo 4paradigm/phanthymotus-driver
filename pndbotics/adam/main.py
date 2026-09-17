@@ -13,6 +13,7 @@ Environment variables:
     AGENT_CORE_URL — Agent Core URL (default: https://localhost:15678)
     GRPC_HOST — gRPC host override (default from config.yaml)
     GRPC_PORT — gRPC port override (default from config.yaml)
+    GRPC_API — "rl" for the reinforcement-learning API, otherwise legacy API
 """
 
 from __future__ import annotations
@@ -250,10 +251,13 @@ def main():
     # participant conflicts. One shared rt/handstate reader feeds the hand
     # card's get_state action and its partial-command logic.
     dds_lowstate_sub = None
+    dds_arm_lowstate_sub = None
     dds_handstate_sub = None
     dds_hand_pub = None
+    dds_lowcmd_pub = None
     plugins_cfg = cfg.get("plugins", {})
     need_lowstate = plugins_cfg.get("state", {}).get("enabled", True)
+    need_arm = plugins_cfg.get("arm", {}).get("enabled", True)
     need_handstate = (
         plugins_cfg.get("hand", {}).get("enabled", True)
         or plugins_cfg.get("hand_state", {}).get("enabled", True)
@@ -261,7 +265,7 @@ def main():
     need_hand_pub = plugins_cfg.get("hand", {}).get("enabled", True)
     try:
         from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher
-        from pndbotics_sdk_py.idl.pnd_adam.msg.dds_ import LowState_, HandState_, HandCmd_
+        from pndbotics_sdk_py.idl.pnd_adam.msg.dds_ import LowState_, LowCmd_, HandState_, HandCmd_
 
         def _init_channel(label, factory):
             channel = None
@@ -284,6 +288,17 @@ def main():
                 "rt/lowstate reader",
                 lambda: ChannelSubscriber("rt/lowstate", LowState_),
             )
+        # Separate reader: DDS readers consume samples independently, and the
+        # arm controller must retain its own startup state for full-body hold.
+        if need_arm:
+            dds_arm_lowstate_sub = _init_channel(
+                "rt/lowstate arm reader",
+                lambda: ChannelSubscriber("rt/lowstate", LowState_),
+            )
+            dds_lowcmd_pub = _init_channel(
+                "rt/lowcmd writer",
+                lambda: ChannelPublisher("rt/lowcmd", LowCmd_),
+            )
         if need_handstate:
             dds_handstate_sub = _init_channel(
                 "rt/handstate reader",
@@ -299,11 +314,16 @@ def main():
 
     # gRPC client
     grpc_host = os.environ.get("GRPC_HOST", cfg.get("grpc_host", "localhost"))
+    loco_cfg = cfg.get("plugins", {}).get("loco", {})
+    grpc_api = os.environ.get("GRPC_API", loco_cfg.get("grpc_api", "rl")).lower()
+    if grpc_api != "rl":
+        raise ValueError(
+            "Adam bundle supports the RL gRPC API only; set GRPC_API=rl")
     grpc_port = int(os.environ.get("GRPC_PORT", cfg.get("grpc_port", 50051)))
     from grpc_client import AdamGrpcClient
     grpc_client = AdamGrpcClient(grpc_host, grpc_port)
     grpc_client.connect()
-    print(f"[adam] gRPC client → {grpc_host}:{grpc_port}")
+    print(f"[adam] gRPC {grpc_api} client → {grpc_host}:{grpc_port}")
 
     # ROS2 — init after DDS to avoid CycloneDDS participant conflict.
     # The MCP server can still expose DDS-only cards when ROS2 is unavailable.
@@ -332,8 +352,10 @@ def main():
     from device import AdamDeviceBundle
     _bundle = AdamDeviceBundle(cfg, namespace, executor, grpc_client,
                                dds_lowstate_sub=dds_lowstate_sub,
+                               dds_arm_lowstate_sub=dds_arm_lowstate_sub,
                                dds_handstate_sub=dds_handstate_sub,
                                dds_hand_pub=dds_hand_pub,
+                               dds_lowcmd_pub=dds_lowcmd_pub,
                                ros2_enabled=ros2_enabled)
     _bundle.start_all()
     print(f"[adam] Bundle loaded ({len(_bundle.get_all_tools())} tools)")
@@ -371,6 +393,8 @@ def main():
         _bundle.close_all()
         for label, channel in (
             ("rt/lowstate reader", dds_lowstate_sub),
+            ("rt/lowstate arm reader", dds_arm_lowstate_sub),
+            ("rt/lowcmd writer", dds_lowcmd_pub),
             ("rt/handcmd writer", dds_hand_pub),
         ):
             if channel is not None:
