@@ -82,6 +82,18 @@ LEFT_HAND = slice(14, 20)
 RIGHT_HAND = slice(20, 26)
 DOF = 26
 
+# 本体反馈的来源，都在域 0（机器人自己的控制器那一侧）。
+# 直接订原始话题，不经 device.py 里的 ArmGesturePlugin / HandStatePlugin ——
+# 这张卡拿不到那两个实例的引用，而且更要紧的是：这样两个方向的单位换算落在
+# 同一个文件里，线上反馈→descriptor 单位 和 descriptor 单位→线上指令 可以并排
+# 读、并排测。它们必须互为逆运算，分散在两处就没人保证得了。
+ARM_STATUS_TOPIC = "/arm/status"
+HAND_STATE_TOPICS = {"left": "/inspire_hand/state/left_hand",
+                     "right": "/inspire_hand/state/right_hand"}
+# 手臂电机 id：左 11..17、右 21..27，与 _publish_arms 里的 base_id 同源。
+ARM_MOTOR_BASE = {"left": 11, "right": 21}
+STATE_MAX_HZ = 30.0
+
 
 def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ) -> dict:
     """The 26-dimension action space, derived from what `arm`/`hand` enforce.
@@ -163,6 +175,17 @@ class TianyiServoPlugin:
         self._release_hands = bool(config.get("release_hands_on_watchdog", False))
         # Paused means subscribed but not applying. See `_halt`.
         self._paused = False
+
+        # 本体状态。独立的锁：状态回调来自域 0 的执行器线程，和指令回调
+        # （域 42）是两条路，共用 _lock 会让一路的回调排在另一路后面。
+        self._state_lock = threading.RLock()
+        self._state_topic = f"/{namespace}/servo/state"
+        self._state_pub = None
+        self._arm_pos: dict = {}
+        self._arm_seen_ms = 0
+        self._hand_closure: dict = {"left": {}, "right": {}}
+        self._hand_seen_ms: dict = {"left": 0, "right": 0}
+        self._last_state_publish_at = 0.0
         self._descriptor_raw = build_descriptor(self._expected_hz)
         self._descriptor = parse_descriptor(self._descriptor_raw)
 
@@ -234,6 +257,16 @@ class TianyiServoPlugin:
             },
             "topic_in": [{"format": "control/joint",
                           "desc": "motus.control/1，26 维（14 臂 rad + 12 指 归一化）"}],
+            # 本体状态和它接受的指令出自**同一份** build_descriptor()：同样的
+            # 关节顺序、同样的单位、同样的极性。想只改一边做不到，因为它们是
+            # 同一个列表。这正是把状态放在这张卡上、而不是另建一张卡的理由 ——
+            # 一致性从"我们保证同步维护"变成结构性的。
+            #
+            # topic 在这里声明而不是等启动后再报：画布上这条线要接回 vla 卡，
+            # 形成 vla → servo →(state)→ vla 的回环，而环里谁都不能从"已经启动
+            # 的上游"学到自己的输入话题，持久化的声明是唯一剩下的东西。
+            "topic_out": [{"topic": self._state_topic, "format": "state/joint",
+                           "desc": "26 维本体状态，与指令同序同单位"}],
         }
 
     def dispatch(self, action: str, args: dict):
@@ -325,6 +358,9 @@ class TianyiServoPlugin:
                 "input": self._input_topic}
 
     def _stop(self):
+        with self._state_lock:
+            self._state_pub = None
+            self._last_state_publish_at = 0.0
         with self._lock:
             sub_node, self._sub_node = self._sub_node, None
             pub_node, self._pub_node = self._pub_node, None
@@ -390,6 +426,9 @@ class TianyiServoPlugin:
             durability=DurabilityPolicy.VOLATILE,
         )
 
+        # 本体反馈订阅在域 0，状态发布在域 42 —— 和指令那条路正好相反。
+        from bodyctrl_msgs.msg import MotorStatusMsg
+
         # Commands arrive on domain 42 …
         sub_node = Node("tianyi2_servo_sub", context=self._ros2.ctx_core)
         sub_node.create_subscription(String, topic, self._on_message, qos)
@@ -406,6 +445,16 @@ class TianyiServoPlugin:
             JointState, "/inspire_hand/ctrl/left_hand", _RELIABLE_QOS)
         right_hand = pub_node.create_publisher(
             JointState, "/inspire_hand/ctrl/right_hand", _RELIABLE_QOS)
+        # 本体反馈：订在域 0（机器人自己发的），发布到域 42（agent-core 那侧）。
+        pub_node.create_subscription(
+            MotorStatusMsg, ARM_STATUS_TOPIC, self._on_arm_status, _RELIABLE_QOS)
+        for side, hand_topic in HAND_STATE_TOPICS.items():
+            pub_node.create_subscription(
+                JointState, hand_topic,
+                lambda message, s=side: self._on_hand_state(s, message),
+                _RELIABLE_QOS)
+        state_pub = sub_node.create_publisher(String, self._state_topic, qos)
+
         self._ros2.executor_tianyi.add_node(pub_node)
 
         with self._lock:
@@ -413,6 +462,8 @@ class TianyiServoPlugin:
             self._arm_pub = arm_pub
             self._left_hand_pub = left_hand
             self._right_hand_pub = right_hand
+        with self._state_lock:
+            self._state_pub = state_pub
 
     def _on_message(self, message):
         sink = self._sink
@@ -491,6 +542,104 @@ class TianyiServoPlugin:
         # object is the dangerous direction.
         message.position = [1.0 - float(value) for value in closure]
         publisher.publish(message)
+
+    # ── 本体状态 ─────────────────────────────────────────────────────────────
+
+    def _on_arm_status(self, message):
+        """域 0 的 MotorStatusMsg。pos 已经是弧度，与 descriptor 同单位。"""
+        with self._state_lock:
+            for motor in message.status:
+                self._arm_pos[int(motor.name)] = float(motor.pos)
+            self._arm_seen_ms = int(time.time() * 1000)
+        self._publish_state()
+
+    def _on_hand_state(self, side, message):
+        """域 0 的 JointState。
+
+        `position` 是**张开比例**（1.0 张开、0.0 闭合），而 descriptor 用的是
+        闭合度（0 张开、1 闭合）—— 所以这里取 1-x，正好是 `_publish_hand` 发出
+        去时做的那次取反的逆运算。两处必须互为逆运算，所以放在同一个文件里，
+        并且有一条测试把这个往返钉住。
+
+        这个极性今天刚在别处咬过人：device.py 的 hand_state 卡把同一个数字读反
+        了，于是 LLM 问"手张开了吗"得到的是相反的答案。
+        """
+        names = list(getattr(message, "name", []) or [])
+        positions = list(getattr(message, "position", []) or [])
+        values = {}
+        for index, raw_name in enumerate(names):
+            if index >= len(positions):
+                break
+            try:
+                finger_id = int(raw_name)
+            except (TypeError, ValueError):
+                finger_id = index + 1
+            values[finger_id] = 1.0 - float(positions[index])
+        with self._state_lock:
+            self._hand_closure[side] = values
+            self._hand_seen_ms[side] = int(time.time() * 1000)
+        self._publish_state()
+
+    def state_vector(self):
+        """26 维本体状态，或 None —— 有任何一路还没到就返回 None。
+
+        缺一路就整个不发，而不是补零：补进去的零在弧度里是"手臂伸直"、在闭合度
+        里是"手张开"，两个都是看着合理的读数，策略无从分辨。宁可让下游拿不到
+        观测（它会因此不发指令），也不给它一个编造的世界。
+
+        公开且不碰 ROS，所以顺序、单位、极性可以脱离机器人测。
+        """
+        with self._state_lock:
+            arm_pos = dict(self._arm_pos)
+            hands = {side: dict(values) for side, values in self._hand_closure.items()}
+
+        values = []
+        for side in ("left", "right"):
+            base = ARM_MOTOR_BASE[side]
+            for offset in range(len(ARM_JOINTS)):
+                position = arm_pos.get(base + offset)
+                if position is None:
+                    return None
+                values.append(position)
+        for side in ("left", "right"):
+            side_values = hands.get(side) or {}
+            for finger_id in range(1, len(FINGER_NAMES) + 1):
+                closure = side_values.get(finger_id)
+                if closure is None:
+                    return None
+                values.append(max(0.0, min(1.0, closure)))
+        return values
+
+    def _publish_state(self):
+        publisher = self._state_pub
+        if publisher is None:
+            return
+        now = time.time()
+        if now - self._last_state_publish_at < 1.0 / STATE_MAX_HZ:
+            return
+        values = self.state_vector()
+        if values is None:
+            return
+        self._last_state_publish_at = now
+
+        from std_msgs.msg import String
+
+        with self._state_lock:
+            stamp_ms = min(self._arm_seen_ms or 0,
+                           *(v for v in self._hand_seen_ms.values() if v)) \
+                if self._arm_seen_ms and any(self._hand_seen_ms.values()) else 0
+        payload = String()
+        # stamp_ms 取各路反馈里**最旧**的那个，不是现在。一个 VLA 用它算观测年龄，
+        # 报现在等于宣称所有通道都刚刚更新过，而实际最旧的那路可能已经很陈旧。
+        payload.data = json.dumps({
+            "schema": "motus.control/1",
+            "kind": "joint_state",
+            "dof": DOF,
+            "joint_names": self._descriptor_raw["joint_names"],
+            "values": values,
+            "stamp_ms": stamp_ms or int(now * 1000),
+        }, ensure_ascii=False)
+        publisher.publish(payload)
 
     def _hold(self):
         """Watchdog and abort both land here. Holds; does not release.

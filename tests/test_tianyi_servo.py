@@ -216,3 +216,106 @@ def test_missing_force_torque_is_declared_not_omitted(servo):
     descriptor = servo.build_descriptor()
     assert "force_torque" in descriptor
     assert descriptor["force_torque"] is None
+
+
+# ── the state this card reports ──────────────────────────────────────────────
+
+def _feed(plugin, servo, *, arms=0.0, left=None, right=None):
+    """Push one round of body feedback in, the way the robot's own topics do."""
+    class _Motor:
+        def __init__(self, name, pos):
+            self.name, self.pos = name, pos
+
+    class _Status:
+        def __init__(self, status):
+            self.status = status
+
+    motors = []
+    for side, base in servo.ARM_MOTOR_BASE.items():
+        for offset in range(7):
+            motors.append(_Motor(base + offset, arms))
+    plugin._on_arm_status(_Status(motors))
+
+    class _JointState:
+        def __init__(self, position):
+            self.name = [str(i + 1) for i in range(6)]
+            self.position = position
+
+    plugin._on_hand_state("left", _JointState(left if left is not None else [1.0] * 6))
+    plugin._on_hand_state("right", _JointState(right if right is not None else [1.0] * 6))
+
+
+def test_the_state_is_the_same_26_dimensions_as_the_commands(servo):
+    """One list defines both, which is the point of putting state on this card.
+
+    A separate card would have to be kept in step by hand; here the order, the
+    units and the polarity cannot drift because they are the same object.
+    """
+    plugin = make_plugin(servo)
+    _feed(plugin, servo)
+
+    values = plugin.state_vector()
+
+    assert len(values) == servo.build_descriptor()["dof"] == 26
+    assert plugin.get_tool()["topic_out"][0]["format"] == "state/joint"
+
+
+def test_the_hands_report_closure_the_way_the_descriptor_defines_it(servo):
+    """Inspire feeds an **open ratio** (1.0 open); the descriptor wants closure
+    (0 open). Getting this backwards tells a policy the hand is shut when it is
+    open — and around an object, closing is the direction that breaks things."""
+    plugin = make_plugin(servo)
+    _feed(plugin, servo, left=[1.0] * 6, right=[0.0] * 6)
+
+    values = plugin.state_vector()
+
+    assert values[servo.LEFT_HAND] == [0.0] * 6      # open ratio 1.0 → closure 0
+    assert values[servo.RIGHT_HAND] == [1.0] * 6     # open ratio 0.0 → closure 1
+
+
+def test_state_and_command_are_inverses_of_each_other(servo):
+    """The two conversions live in one file so they can be checked together.
+
+    `_publish_hand` writes `1 - closure` to the wire; the feedback path reads
+    `1 - position` back. A round trip must be the identity, or the robot's idea
+    of where it is and where it was told to go drift apart silently.
+    """
+    plugin = make_plugin(servo)
+    for closure in (0.0, 0.25, 0.5, 1.0):
+        on_the_wire = 1.0 - closure          # what _publish_hand sends
+        _feed(plugin, servo, left=[on_the_wire] * 6, right=[on_the_wire] * 6)
+        assert plugin.state_vector()[servo.LEFT_HAND] == pytest.approx([closure] * 6)
+
+
+def test_a_missing_channel_reports_nothing_rather_than_zeros(servo):
+    """Zero is a plausible reading in both units — arms straight, hands open —
+    so padding would hand a policy an invented world it cannot question."""
+    plugin = make_plugin(servo)
+
+    assert plugin.state_vector() is None        # nothing at all yet
+
+    class _JointState:
+        name = [str(i + 1) for i in range(6)]
+        position = [1.0] * 6
+
+    plugin._on_hand_state("left", _JointState())
+    assert plugin.state_vector() is None        # arms and right hand still absent
+
+
+def test_the_arms_are_read_from_the_motor_ids_the_commands_use(servo):
+    """11..17 and 21..27 — the same base ids `_publish_arms` writes to."""
+    plugin = make_plugin(servo)
+    assert servo.ARM_MOTOR_BASE == {"left": 11, "right": 21}
+
+    _feed(plugin, servo, arms=0.5)
+    values = plugin.state_vector()
+
+    assert values[servo.LEFT_ARM] == pytest.approx([0.5] * 7)
+    assert values[servo.RIGHT_ARM] == pytest.approx([0.5] * 7)
+
+
+def test_the_state_topic_is_declared_so_a_feedback_loop_can_resolve(servo):
+    """In vla → servo →(state)→ vla neither card can learn its input from a
+    source that has already started, so the declaration is all that is left."""
+    port = make_plugin(servo).get_tool()["topic_out"][0]
+    assert port["topic"] == "/nvidia_desktop/servo/state"
