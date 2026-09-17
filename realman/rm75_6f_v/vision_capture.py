@@ -153,6 +153,8 @@ class VisionCapturePlugin:
         return source
 
     def _on_frame(self, topic, msg):
+        if self._node is None:
+            return
         data = bytes(msg.data)
         if "jpeg" not in msg.format.lower() and "jpg" not in msg.format.lower():
             return
@@ -167,7 +169,9 @@ class VisionCapturePlugin:
         if age > _MAX_FRAME_AGE_S or age < -_MAX_FRAME_AGE_S:
             return
         with self._condition:
-            stream = self._streams[topic]
+            stream = self._streams.get(topic)
+            if stream is None:
+                return
             stream["sequence"] += 1
             stream["latest"] = (data, time.monotonic() - max(0.0, age), stream["sequence"])
             self._condition.notify_all()
@@ -486,6 +490,9 @@ class VisionCapturePlugin:
             stopping = self._active_recording is active
         if not stopping:
             self._cleanup_ros()
+        if stopping:
+            return {"ok": True, "state": "stopping", "action_id": active["action_id"],
+                    "message": "Recording cancellation is still in progress."}
         return {"ok": True, "state": "idle", "action_id": active["action_id"],
                 "message": "Recording cancellation completed."}
 
