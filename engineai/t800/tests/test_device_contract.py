@@ -483,6 +483,18 @@ class DevicePluginContractTests(unittest.TestCase):
         plugin.start()
         self.assertEqual(CONFIG["topics"]["odometry"], plugin._node.subscriptions[0].topic)
 
+    def test_odometer_start_reports_running_before_first_message(self):
+        plugin = self.device.OdometerPlugin(CONFIG, "robot", self.ros)
+        plugin.start()
+        reply = plugin.dispatch("start", {})
+        self.assertEqual("running", reply["state"])
+        self.assertEqual("no_data", reply["data_state"])
+        # 收到首帧后 data_state 转为 running
+        plugin._on_odometry(odometry_message(x=0.5, stamp=1.0))
+        started = plugin.dispatch("start", {})
+        self.assertEqual("running", started["state"])
+        self.assertEqual("running", started["data_state"])
+
     def test_odometer_first_frame_sets_baseline_and_exposes_pose(self):
         plugin = self.device.OdometerPlugin(CONFIG, "robot", self.ros)
         plugin._on_odometry(odometry_message(x=1.25, y=-0.18, z=0.02, stamp=5.0))
@@ -3052,32 +3064,10 @@ class DevicePluginContractTests(unittest.TestCase):
     def test_vision_pointcloud_passthrough_binary_header(self):
         import struct
 
-    def test_vision_pointcloud_passthrough_binary_header(self):
-        import struct
-
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
         plugin.start()
         data = bytes(range(64))  # 4 点 × 16 字节 point_step
-        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
-        out = plugin._cloud_pub.messages[-1]
-        self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
-        self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
-        self.assertEqual(1, plugin._frames["pointcloud"])
-        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
-        plugin.start()
-        data = bytes(range(64))  # 4 点 × 16 字节 point_step
-        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
-        out = plugin._cloud_pub.messages[-1]
-        self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
-        self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
-        self.assertEqual(1, plugin._frames["pointcloud"])
-    def test_vision_pointcloud_passthrough_binary_header(self):
-        import struct
-
-        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
-        plugin.start()
-        data = bytes(range(64))  # 4 点 × 16 字节 point_step
-        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=data))
+        plugin._on_cloud_slam(types.SimpleNamespace(point_step=16, data=data))
         out = plugin._cloud_pub.messages[-1]
         self.assertEqual(struct.pack("<II", 16, 4), bytes(out.data[:8]))
         self.assertEqual(bytes(range(64)), bytes(out.data[8:]))
@@ -3085,6 +3075,21 @@ class DevicePluginContractTests(unittest.TestCase):
         health = plugin.health_sources()["odin2_pointcloud"]
         self.assertEqual("running", health["state"])
         self.assertFalse(health["stale"])
+
+    def test_vision_defaults_to_slam_source(self):
+        plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
+        self.assertEqual("slam", plugin._source)
+        plugin.start()
+        slam = types.SimpleNamespace(point_step=16, data=bytes(range(64)))
+        plugin._on_cloud_slam(slam)
+        self.assertEqual(1, plugin._frames["pointcloud"])
+        # raw 在默认 slam 源下被忽略
+        plugin._on_cloud_raw(types.SimpleNamespace(point_step=16, data=bytes(range(64))))
+        self.assertEqual(1, plugin._frames["pointcloud"])
+        health = plugin.health_sources()["odin2_pointcloud"]
+        self.assertEqual("running", health["state"])
+        self.assertFalse(health["stale"])
+        self.assertEqual("SLAM", health["label"].split()[1])
 
     def test_vision_select_source_switches_cloud(self):
         plugin = self.device.VisionPlugin(CONFIG, "robot", self.ros)
