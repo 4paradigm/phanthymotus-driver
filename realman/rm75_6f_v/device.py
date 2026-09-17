@@ -317,6 +317,7 @@ class RM75Plugin:
         self._active_action_id = None
         self._cancelled = set()
         self._last_completion = None
+        self._cartesian_pose_invalidator = None
 
     def _skeleton_topic_out(self):
         return [{"topic": self._skeleton_topic, "format": "sensor/skeleton"}]
@@ -609,6 +610,9 @@ class RM75Plugin:
         if not self._motion_lock.acquire(blocking=False):
             raise RuntimeError(f"another motion is active: {self._motion_state['active_action_id']}")
         try:
+            # 关节运动会改变 TCP 位姿，笛卡尔偏移不能继续沿用此前确认的目标。
+            if callable(self._cartesian_pose_invalidator):
+                self._cartesian_pose_invalidator()
             self._preflight()
             current, target, speed = self._prepare_target(args)
             max_duration = self._motion_deadline_seconds(current, target, speed)
@@ -913,7 +917,14 @@ class CartesianPlugin:
         self.euler_progress_threshold_deg = float(safety.get("euler_progress_threshold_deg", 0.5))
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
         cartesian = config.get("cartesian", {})
-        self.cartesian_enabled = cartesian.get("enabled", False) is True
+        configured_enabled = cartesian.get("enabled", False) is True
+        environment_enabled = os.environ.get("RM_CARTESIAN_ENABLED")
+        if environment_enabled is None:
+            self.cartesian_enabled = configured_enabled
+        elif environment_enabled in ("0", "1"):
+            self.cartesian_enabled = environment_enabled == "1"
+        else:
+            raise ValueError("RM_CARTESIAN_ENABLED must be 0 or 1")
         # 水平工作半径（基座轴线到 TCP 的水平距离，RM75-6F 官方标称 638.5mm，取整 640 留 1.5mm 余量）
         self.max_radius_mm = float(cartesian.get("max_radius_mm", 640.0))
         # 肩关节距基座平面的高度，取自官方 RM75 系列 MDH 参数 d1=240.5mm
@@ -933,8 +944,13 @@ class CartesianPlugin:
         # 三代控制器返回 SDK -7 时自动退回 rm_movel 兼容路径。
         self.native_tool_offset_enabled = cartesian.get("native_tool_offset_enabled", True) is not False
         self._native_tool_offset_supported = None if self.native_tool_offset_enabled else False
-        self._compat_pose_lock = threading.Lock()
-        self._compat_pose_mm_deg = None
+        # 最近一次由控制器确认完成的 TCP 目标。连续 offset 从这个位姿组合并
+        # 校验，避免每次动作都调用部分真机会卡住的 current-arm-state 查询。
+        self._confirmed_pose_lock = threading.Lock()
+        self._confirmed_pose_mm_deg = None
+        self._confirmed_pose_revision = 0
+        if arm_plugin is not None:
+            arm_plugin._cartesian_pose_invalidator = self._invalidate_confirmed_pose
         self.stop_finalize_seconds = float(cartesian.get("stop_finalize_seconds", 2.0))
 
     def get_tools(self):
@@ -1061,15 +1077,25 @@ class CartesianPlugin:
             raise ValueError(f"speed_percent must be within 1~{self.max_speed_percent}")
         controller_completion = self._uses_controller_completion(motion_type)
         if controller_completion:
-            # 原生相对运动不依赖当前 TCP 位姿。真机 SDK 的状态查询可能在前几次
-            # 运动后永久阻塞；在占用动作锁前只做纯参数校验。
-            target = self._native_tool_offset(args)
+            offset = self._native_tool_offset(args)
+            # 原生 rm_movel_offset 仍需在驱动侧校验最终 TCP：只校验偏移长度会
+            # 允许一个合法起点越过工作空间边界。首次读取当前 TCP，之后使用
+            # 控制器确认完成的目标缓存；查询发生在占用动作锁之前。
+            target, pose_revision = self._validated_offset_target(offset)
             controller_timeout = self._controller_offset_wait_deadline_seconds(
-                target, speed_percent
+                offset, speed_percent
             )
         if not self._motion_lock.acquire(blocking=False):
             active = self._motion_state["active_action_id"] or "joint/cartesian motion"
             raise RuntimeError(f"another motion is active: {active}")
+        if controller_completion:
+            with self._confirmed_pose_lock:
+                pose_changed = pose_revision != self._confirmed_pose_revision
+            if pose_changed:
+                self._motion_lock.release()
+                raise RuntimeError(
+                    "Cartesian reference pose changed during workspace validation; retry"
+                )
         action_id = f"rm75_cart_{uuid4().hex[:10]}"
         # 状态锁不能覆盖无超时上限的 SDK 调用，否则 info 也会被控制器故障拖死。
         # submission_lock 只负责保证 stopmotion 排在运动下发之后。
@@ -1114,6 +1140,7 @@ class CartesianPlugin:
                 action_id,
                 motion_type,
                 args,
+                offset,
                 target,
                 speed_percent,
                 controller_timeout,
@@ -1126,7 +1153,7 @@ class CartesianPlugin:
         if controller_completion:
             threading.Thread(
                 target=self._controller_action_watchdog,
-                args=(action_id, target, controller_timeout),
+                args=(action_id, offset, controller_timeout),
                 daemon=True,
                 name=f"rm75-cartesian-watchdog-{action_id}",
             ).start()
@@ -1141,26 +1168,27 @@ class CartesianPlugin:
         )
 
     def _execute_controller_cartesian(
-            self, action_id, motion_type, args, offset, speed_percent, timeout_seconds):
+            self, action_id, motion_type, args, offset, target, speed_percent,
+            timeout_seconds):
         status, result = "error", {"reason": "unknown", "requested_offset_mm_deg": offset}
-        compatibility_target = {"pose": None}
+        native_submission = {"used": False}
 
         def result_payload(reason, **extra):
-            payload = {"reason": reason, "requested_offset_mm_deg": offset, **extra}
-            if compatibility_target["pose"] is not None:
-                payload["target_pose_mm_deg"] = compatibility_target["pose"]
-            return payload
+            return {
+                "reason": reason,
+                "requested_offset_mm_deg": offset,
+                "target_pose_mm_deg": target,
+                **extra,
+            }
 
         def on_controller_event(trajectory_state):
             if trajectory_state:
-                if compatibility_target["pose"] is not None:
-                    self._set_compat_pose(compatibility_target["pose"])
-                else:
+                if native_submission["used"]:
                     self._native_tool_offset_supported = True
                 event_status = "completed"
                 event_result = result_payload("controller_target_reached")
             else:
-                self._invalidate_compat_pose()
+                self._invalidate_confirmed_pose()
                 event_status = "error"
                 event_result = result_payload(
                     "controller reported trajectory planning or execution failure"
@@ -1181,6 +1209,7 @@ class CartesianPlugin:
                 submitted = False
                 if self._native_tool_offset_supported is not False:
                     try:
+                        native_submission["used"] = True
                         self._submit(
                             motion_type,
                             args,
@@ -1191,6 +1220,7 @@ class CartesianPlugin:
                         )
                         submitted = True
                     except RuntimeError as exc:
+                        native_submission["used"] = False
                         if "SDK -7" not in str(exc):
                             raise
                         self._native_tool_offset_supported = False
@@ -1201,10 +1231,6 @@ class CartesianPlugin:
                 if not submitted:
                     if not self._controller_action_is_active(action_id):
                         return
-                    target = self._compatibility_target(offset)
-                    if not self._controller_action_is_active(action_id):
-                        return
-                    compatibility_target["pose"] = target
                     self.client.command_trajectory(
                         "rm_movel",
                         self._to_sdk_pose(target),
@@ -1232,12 +1258,12 @@ class CartesianPlugin:
                     status = "completed"
                     result = result_payload("controller_target_reached")
                 elif trajectory_state is False:
-                    self._invalidate_compat_pose()
+                    self._invalidate_confirmed_pose()
                     result = result_payload(
                         "controller reported trajectory planning or execution failure"
                     )
                 else:
-                    self._invalidate_compat_pose()
+                    self._invalidate_confirmed_pose()
                     self._request_slow_stop()
                     time.sleep(self.stop_finalize_seconds)
                     result = result_payload(
@@ -1245,7 +1271,7 @@ class CartesianPlugin:
                         timeout_seconds=timeout_seconds,
                     )
         except Exception as exc:
-            self._invalidate_compat_pose()
+            self._invalidate_confirmed_pose()
             result = result_payload(str(exc))
         finally:
             self._finish_cartesian(action_id, status, result)
@@ -1259,22 +1285,30 @@ class CartesianPlugin:
                      or self._motion_state["active_action_id"] == action_id)
             )
 
-    def _compatibility_target(self, offset):
-        with self._compat_pose_lock:
-            current = list(self._compat_pose_mm_deg) if self._compat_pose_mm_deg is not None else None
+    def _validated_offset_target(self, offset):
+        """Compose and validate the absolute TCP target before any offset submit."""
+        with self._confirmed_pose_lock:
+            revision = self._confirmed_pose_revision
+            current = (
+                list(self._confirmed_pose_mm_deg)
+                if self._confirmed_pose_mm_deg is not None
+                else None
+            )
         if current is None:
             current = self._current_pose_mm_deg()
         target = self._compose_tool_offset(current, offset)
         self._validate_workspace(target)
-        return target
+        return target, revision
 
-    def _set_compat_pose(self, pose):
-        with self._compat_pose_lock:
-            self._compat_pose_mm_deg = list(pose)
+    def _set_confirmed_pose(self, pose):
+        with self._confirmed_pose_lock:
+            self._confirmed_pose_mm_deg = list(pose)
+            self._confirmed_pose_revision += 1
 
-    def _invalidate_compat_pose(self):
-        with self._compat_pose_lock:
-            self._compat_pose_mm_deg = None
+    def _invalidate_confirmed_pose(self):
+        with self._confirmed_pose_lock:
+            self._confirmed_pose_mm_deg = None
+            self._confirmed_pose_revision += 1
 
     def _controller_offset_wait_deadline_seconds(self, offset, speed_percent):
         distance_mm = math.sqrt(sum(value * value for value in offset[:3]))
@@ -1292,7 +1326,7 @@ class CartesianPlugin:
             )
         if not active:
             return
-        self._invalidate_compat_pose()
+        self._invalidate_confirmed_pose()
         cancel_wait = getattr(self.client, "cancel_trajectory_wait", None)
         if callable(cancel_wait):
             cancel_wait()
@@ -1650,6 +1684,11 @@ class CartesianPlugin:
                 self._motion_state["active_action_id"] = None
             self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
             release_motion_lock = self._motion_lock.locked()
+        confirmed_target = result.get("target_pose_mm_deg") if status == "completed" else None
+        if isinstance(confirmed_target, list) and len(confirmed_target) == 6:
+            self._set_confirmed_pose(confirmed_target)
+        else:
+            self._invalidate_confirmed_pose()
         if release_motion_lock:
             self._motion_lock.release()
         self._acp_callback(action_id, status, result)
@@ -1697,7 +1736,7 @@ class CartesianPlugin:
             if action_id:
                 self._cancelled.add(action_id)
         if action_id and owns_action:
-            self._invalidate_compat_pose()
+            self._invalidate_confirmed_pose()
         if action_id and self.client.connected:
             self._request_slow_stop()
         if action_id and owns_action:

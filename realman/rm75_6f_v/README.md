@@ -27,6 +27,9 @@ Available tools are:
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
+- `cartesian_control`: tool-frame `move_offset` only. Empty offset fields mean
+  zero movement on that axis. Absolute `movel`, waypoint `movep`, and
+  work-frame offsets are not exposed.
 - `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
   instance can publish RGB, depth, or left infrared without going through the
   RealMan controller.
@@ -151,6 +154,16 @@ at 300 seconds, as a final safeguard.
 The first supervised hardware test should change exactly one joint by no more
 than 1 degree at 1 percent speed. A reachable physical E-stop and a clear work
 area are required. Software interlocks do not replace the robot safety system.
+
+Cartesian motion is disabled in the default deployment. After calibrating the
+active TCP, verifying the configured workspace envelope, and configuring site
+exclusion zones, set `RM75_CARTESIAN_ENABLED=1` on the host deployment. Every
+`cartesian_control.move_offset` request must also set both
+`cartesian_enabled=true` and `confirm_motion=true`. The driver reads the current
+TCP for the first offset, composes the tool-frame offset into an absolute target,
+and validates that target before submitting `rm_movel_offset`. A controller-
+confirmed target is cached for consecutive offsets; joint motion, stop, timeout,
+or execution failure invalidates the cache.
 
 The HTTP service listens on port `15718` and provides `/health` and `/mcp`.
 The normal Agent Core runtime still initializes its ROS/DDS transport, but robot
