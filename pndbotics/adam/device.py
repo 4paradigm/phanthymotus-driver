@@ -324,6 +324,8 @@ class HandStateCache:
         self._latest_position = None
         self._received_at_ms = 0
         self._received_monotonic = None
+        self._commanded_position = None
+        self._commanded_monotonic = None
         self._last_read_error = None
 
     def start(self) -> bool:
@@ -429,12 +431,40 @@ class HandStateCache:
         )
 
     def fresh_positions(self, timeout_sec: float) -> list[int] | None:
+        """Return actual hand feedback only when it is fresh."""
         with self._lock:
             position = list(self._latest_position) if self._latest_position is not None else None
             received_monotonic = self._received_monotonic
         if position is None or not self._fresh(received_monotonic, timeout_sec):
             return None
         return position
+
+    def skeleton_positions(self, timeout_sec: float) -> tuple[list[int] | None, str | None]:
+        """Return feedback, or the latest commanded target for visual continuity.
+
+        Some Adam controller versions accept ``rt/handcmd`` but do not publish
+        ``rt/handstate``. The command mirror makes the dashboard respond to a
+        confirmed hand command in that configuration. Fresh DDS feedback always
+        wins when it is available.
+        """
+        with self._lock:
+            actual = list(self._latest_position) if self._latest_position is not None else None
+            actual_at = self._received_monotonic
+            commanded = (list(self._commanded_position)
+                         if self._commanded_position is not None else None)
+            commanded_at = self._commanded_monotonic
+        if actual is not None and self._fresh(actual_at, timeout_sec):
+            return actual, "rt/handstate"
+        if commanded is not None and self._fresh(commanded_at, timeout_sec):
+            return commanded, "rt/handcmd_target"
+        return None, None
+
+    def set_commanded_positions(self, positions: list[int]):
+        """Record an accepted complete hand command for skeleton fallback."""
+        normalized = _normalize_hand_state_positions(positions)
+        with self._lock:
+            self._commanded_position = normalized
+            self._commanded_monotonic = time.monotonic()
 
     def snapshot(self, timeout_sec: float) -> dict | None:
         with self._lock:
@@ -757,15 +787,17 @@ class _StatePublisherNode(Node):
                     "q": float(state.motor_state[idx].q),
                 })
         hand_state_fresh = False
+        hand_skeleton_source = None
         if self._variant == "pro" and self._hand_state_cache is not None:
-            positions = self._hand_state_cache.fresh_positions(1.0)
+            positions, hand_skeleton_source = self._hand_state_cache.skeleton_positions(2.0)
             if positions is not None:
                 joints.extend(_hand_skeleton_positions(positions))
-                hand_state_fresh = True
+                hand_state_fresh = hand_skeleton_source == "rt/handstate"
         msg = String()
         msg.data = json.dumps({
             "joints": joints,
             "hand_state_fresh": hand_state_fresh,
+            "hand_skeleton_source": hand_skeleton_source,
             "hand_joint_count": sum(1 for joint in joints if joint.get("visual_mapping")),
         })
         self._pub_skeleton.publish(msg)
@@ -2346,6 +2378,8 @@ class HandPlugin:
             self._last_write_ok = ok
             self._last_write_at_ms = int(time.time() * 1000)
             self._last_write_error = error
+        if ok:
+            self._state_cache.set_commanded_positions(positions)
         return ok
 
     def _control_loop(self, stop_event: threading.Event):
@@ -2405,6 +2439,9 @@ class HandPlugin:
         with self._lock:
             self._target_positions = list(positions)
             self._active = True
+        # Update the skeleton immediately. This is superseded by fresh
+        # rt/handstate feedback if the controller publishes it.
+        self._state_cache.set_commanded_positions(positions)
         self._wake_event.set()
         return {
             "state": "active",

@@ -8,7 +8,7 @@ import unittest
 
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
-from device import HandGesturePlugin, HandPlugin
+from device import HandGesturePlugin, HandPlugin, HandStateCache
 
 
 class _StateCache:
@@ -53,6 +53,23 @@ class HandControlTests(unittest.TestCase):
             self.assertIn(name, gestures)
             self.assertEqual(6, len(gestures[name]))
         self.assertNotEqual(gestures["pinch"], gestures["ok_sign"])
+
+    def test_skeleton_uses_commanded_target_when_hand_feedback_is_absent(self):
+        cache = HandStateCache()
+        cache.set_commanded_positions([1000] * 12)
+        positions, source = cache.skeleton_positions(1.0)
+        self.assertEqual([1000] * 12, positions)
+        self.assertEqual("rt/handcmd_target", source)
+
+    def test_skeleton_prefers_fresh_hand_feedback_over_command_target(self):
+        cache = HandStateCache()
+        cache.set_commanded_positions([1000] * 12)
+        with cache._lock:
+            cache._latest_position = [0] * 12
+            cache._received_monotonic = __import__("time").monotonic()
+        positions, source = cache.skeleton_positions(1.0)
+        self.assertEqual([0] * 12, positions)
+        self.assertEqual("rt/handstate", source)
 
 
 if __name__ == "__main__":

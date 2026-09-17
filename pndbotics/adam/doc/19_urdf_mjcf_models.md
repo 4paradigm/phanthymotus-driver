@@ -63,6 +63,11 @@ so the driver adds a clearly marked visual-only neck/head mount using the
 published ±60-degree head limits. `head_control` uses the actual DDS joint
 names and limits; it does not rely on this visual approximation.
 
+On controller versions that do not publish `rt/handstate`, the `joints` card
+temporarily mirrors the accepted `rt/handcmd` target so hand gestures remain
+visible. The skeleton payload exposes `hand_skeleton_source` as either
+`rt/handstate` or `rt/handcmd_target`; fresh feedback always takes priority.
+
 The official mesh archives are intentionally not copied into the driver image.
 They are large, while the dashboard resource contract only requires the URDF
 for skeleton rendering.  The `model` response states this explicitly.
