@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 sys.path.insert(0, str(Path(__file__).parent))
 
+import device
 from device import (
     MotionPlugin,
     RlLocoPlugin,
@@ -120,6 +122,65 @@ class LocoContractTests(unittest.TestCase):
         self.assertEqual(("PLAY", "Sources/motion/Wave.txt"), grpc.motion)
         motion.dispatch("stop", {})
         self.assertEqual(("STOP", ""), grpc.motion)
+
+    def test_motion_card_answers_the_canvas_lifecycle_verbs(self):
+        grpc = _Grpc()
+        motion = MotionPlugin({}, "adam", None, grpc)
+        self.assertEqual({"state": "ready"}, motion.dispatch("start", {}))
+        self.assertIsNotNone(motion.dispatch("info", {}))
+        self.assertIsNotNone(motion.dispatch("stop", {}))
+        # Only the lifecycle verbs are answered; anything else still declines
+        # so the bundle reports it as an unknown action.
+        self.assertIsNone(motion.dispatch("teleport", {}))
+
+    def test_timed_move_declares_and_reports_completion(self):
+        grpc = _Grpc()
+        plugin = RlLocoPlugin({}, "adam", None, grpc)
+
+        completion = plugin.get_tool()["inputSchema"]["x-completion"]
+        self.assertEqual(["move"], completion["actions"])
+        # Must outlast the 30s maximum duration plus the reporting round trip.
+        self.assertGreaterEqual(completion["timeout"], 30)
+
+        reported = []
+        original = device._notify_action_completion
+        device._notify_action_completion = (
+            lambda action_id, status, result, tool:
+            reported.append((action_id, status, tool)))
+        try:
+            result = plugin.dispatch("move", {
+                "vx": 0.2, "vy": 0.0, "vyaw": 0.0, "duration_s": 0.1,
+            })
+            deadline = time.monotonic() + 2.0
+            while not reported and time.monotonic() < deadline:
+                time.sleep(0.02)
+        finally:
+            device._notify_action_completion = original
+
+        self.assertTrue(result["action_id"].startswith("adam_loco_move_"))
+        self.assertEqual([(result["action_id"], "completed", "loco")], reported)
+
+    def test_superseded_timed_move_is_reported_cancelled(self):
+        grpc = _Grpc()
+        plugin = RlLocoPlugin({}, "adam", None, grpc)
+        reported = []
+        original = device._notify_action_completion
+        device._notify_action_completion = (
+            lambda action_id, status, result, tool:
+            reported.append((action_id, status)))
+        try:
+            first = plugin.dispatch("move", {
+                "vx": 0.2, "vy": 0.0, "vyaw": 0.0, "duration_s": 5.0,
+            })
+            # An explicit stop ends the move long before its timer is due;
+            # Agent Core must not keep waiting on the declared timeout.
+            plugin.dispatch("stop", {})
+        finally:
+            device._notify_action_completion = original
+
+        self.assertEqual([(first["action_id"], "cancelled")], reported)
+        self.assertEqual((0.0, 0.0, 0.0), grpc.velocity)
+
 
 if __name__ == "__main__":
     unittest.main()
