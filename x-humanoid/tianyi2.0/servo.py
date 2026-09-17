@@ -161,7 +161,7 @@ class TianyiServoPlugin:
         # Off by default — see _hold for why this is a decision and not a
         # setting with an obvious answer.
         self._release_hands = bool(config.get("release_hands_on_watchdog", False))
-        # Paused means subscribed but not applying. See `pause` in get_tool.
+        # Paused means subscribed but not applying. See `_halt`.
         self._paused = False
         self._descriptor_raw = build_descriptor(self._expected_hz)
         self._descriptor = parse_descriptor(self._descriptor_raw)
@@ -193,24 +193,35 @@ class TianyiServoPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["start", "stop", "pause", "resume", "info"]},
+                               "enum": ["start", "stop", "pause", "resume",
+                                        "info"]},
                     "input_topic": {"type": "string",
                                     "description": "control/joint 指令流话题"},
                 },
                 "required": ["action"],
+                # `start`/`stop` are missing from here on purpose, and that is
+                # what decides who may call them: agent-core splits a tool into
+                # one LLM-callable function per entry (mcp_client.py
+                # `_to_openai_schema`), so an action absent here is reachable by
+                # the canvas and not by the model. `stop` in particular belongs
+                # to the project lifecycle — a model calling it would take the
+                # card out of a running project without the project knowing, and
+                # could not put it back, since `start` needs the input topic and
+                # the downstream descriptor that only agent-core has.
+                #
+                # So `pause` is the model's halt, and it is what the interrupt
+                # hooks fire. It is not a weaker `stop`: the arms stop just as
+                # immediately. It differs in staying subscribed, so the
+                # project's view of what is running stays true and `resume` can
+                # continue.
                 "x-action-params": {
-                    "start": {"params": ["input_topic"],
-                              "description": "订阅指令流并开始驱动双臂与双手"},
                     "pause": {"params": [],
-                              "description": "暂停执行并保持当前姿态，仍然订阅着；"
-                                             "resume 可继续"},
+                              "description": "立即停止执行并保持当前姿态；"
+                                             "仍然订阅着，resume 可继续"},
                     "resume": {"params": [], "description": "继续执行"},
-                    "stop": {"params": [], "description": "停止订阅并让机器人静止"},
-                    "info": {"params": [],
-                             "description": "动作空间 descriptor、检查链计数与最近一次结果"},
                 },
-                "x-hooks": {"on_interrupt_motion": {"action": "stop"},
-                            "on_interrupt_all": {"action": "stop"}},
+                "x-hooks": {"on_interrupt_motion": {"action": "pause"},
+                            "on_interrupt_all": {"action": "pause"}},
                 "x-is-dangerous": True,
                 # Every channel this card occupies. The arms and the hands are
                 # independent degrees of freedom, which is why `hand` already
@@ -231,9 +242,9 @@ class TianyiServoPlugin:
         if action == "stop":
             return self._stop()
         if action == "pause":
-            return self._pause(True)
+            return self._halt(True)
         if action == "resume":
-            return self._pause(False)
+            return self._halt(False)
         if action == "info":
             return self._info()
         return None
@@ -295,27 +306,22 @@ class TianyiServoPlugin:
         return {"state": "running", "input": topic,
                 "control_interface": self._descriptor_raw}
 
-    def _pause(self, paused: bool):
-        """Hold position without giving up the subscription.
+    def _halt(self, halted: bool):
+        """`pause` and `resume`. Stops the arms; keeps the subscription.
 
-        This is the card's answer to "wait" — and the reason it exists rather
-        than telling an LLM to `stop` and `start` again: `start` needs the
-        input topic and the downstream descriptor, which only agent-core knows
-        at project start. A model that stopped this card could not restart it.
-
-        Pausing holds rather than releases, for the same reason the watchdog
-        does (see `_hold`): these joints keep their last target, so not
-        publishing *is* the hold, and a pause that dropped whatever the hands
-        are carrying would be a worse answer to "wait" than stillness.
+        Holds rather than releases, for the same reason the watchdog does (see
+        `_hold`): these joints keep their last target, so not publishing *is*
+        the hold — and a pause that dropped whatever the hands are carrying
+        would put it on whatever is underneath, which is a worse answer to
+        "wait" than stillness.
         """
         with self._lock:
             if not self._running:
-                return {"state": "idle",
-                        "message": "卡片未在运行，无需暂停"}
-            self._paused = bool(paused)
-        if paused:
+                return {"state": "idle", "message": "卡片未在运行"}
+            self._paused = bool(halted)
+        if halted:
             self._hold()
-        return {"state": "paused" if paused else "running",
+        return {"state": "paused" if halted else "running",
                 "input": self._input_topic}
 
     def _stop(self):
@@ -354,9 +360,9 @@ class TianyiServoPlugin:
             rejects = list(self._rejects)
             paused = self._paused
         return {
-            # Paused is reported as its own state, not as running: an operator
-            # reading "running" while the arms sit still would go looking for a
-            # fault that is not there.
+            # Paused is its own state, not running: an operator reading
+            # "running" beside two motionless arms goes looking for a fault
+            # that is not there.
             "state": ("paused" if paused else "running") if running else "idle",
             "input": topic,
             "control_interface": self._descriptor_raw,
@@ -411,9 +417,9 @@ class TianyiServoPlugin:
     def _on_message(self, message):
         sink = self._sink
         if sink is None or self._paused:
-            # Dropped, not queued: a command held during a pause is a command
-            # computed from a world that has moved on, and applying it at
-            # resume would be a jump from stale data.
+            # Dropped, not queued: a command held through a pause was computed
+            # from a world that has moved on, and applying it at resume would
+            # be a jump from stale data.
             return
         try:
             payload = json.loads(message.data)

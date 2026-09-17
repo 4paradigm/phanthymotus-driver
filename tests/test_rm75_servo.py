@@ -156,11 +156,13 @@ def test_tool_consumes_control_joint_and_declares_its_resource():
     assert definition["inputSchema"]["x-is-dangerous"] is True
 
 
-def test_interrupt_hooks_stop_this_card():
+def test_interrupt_hooks_pause_this_card():
     plugin, _ = make_plugin()
     hooks = plugin.get_tools()[0]["inputSchema"]["x-hooks"]
-    assert hooks["on_interrupt_all"]["action"] == "stop"
-    assert hooks["on_interrupt_motion"]["action"] == "stop"
+    # Pause, not stop: the arm stops either way, but a card that unwired
+    # itself could not be resumed by whoever interrupted it.
+    assert hooks["on_interrupt_all"]["action"] == "pause"
+    assert hooks["on_interrupt_motion"]["action"] == "pause"
 
 
 def test_no_completion_is_declared():

@@ -118,7 +118,7 @@ class RM75ServoPlugin:
         self._running = False
         self._last_outcome: dict | None = None
         self._rejects: list[str] = []
-        # Paused means subscribed but not applying. See `pause` in get_tools.
+        # Paused means subscribed but not applying. See `_halt`.
         self._paused = False
 
     # ── tools ────────────────────────────────────────────────────────────────
@@ -126,21 +126,31 @@ class RM75ServoPlugin:
     def get_tools(self):
         schema = action_schema(
             {
-                "start": (["input_topic"],
-                          "Subscribe to a control/joint topic and stream commands to the arm"),
-                "pause": ([], "Hold the current pose and stop applying commands, "
+                "pause": ([], "Stop driving the arm and hold the current pose, "
                               "staying subscribed; resume continues"),
                 "resume": ([], "Continue applying commands"),
-                "stop": ([], "Unsubscribe and bring the arm to a controlled stop"),
-                "info": ([], "Action space descriptor, sink counters and last outcome"),
             },
             {
                 "input_topic": {"type": "string",
                                 "description": "control/joint topic to consume"},
             },
         )
-        schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"},
-                             "on_interrupt_all": {"action": "stop"}}
+        # `start`/`stop`/`info` are deliberately absent from the action list
+        # above, and that is what decides who may call them: agent-core splits a
+        # tool into one LLM-callable function per action (mcp_client.py
+        # `_to_openai_schema`), so an action not listed is reachable by the
+        # canvas and not by the model. `stop` belongs to the project lifecycle —
+        # a model calling it would take this card out of a running project
+        # without the project knowing, and could not put it back, since `start`
+        # needs the input topic and the downstream descriptor that only
+        # agent-core has.
+        #
+        # `pause` is therefore the model's halt, and what the interrupt hooks
+        # fire. It is not a weaker stop: the arm stops just as immediately. It
+        # differs in staying subscribed, so the project's view of what is
+        # running stays true and `resume` can continue.
+        schema["x-hooks"] = {"on_interrupt_motion": {"action": "pause"},
+                             "on_interrupt_all": {"action": "pause"}}
         schema["x-is-dangerous"] = True
         # No x-completion: this card has no end. It streams until stopped, so
         # there is nothing for an ACP pending action to wait for — holding one
@@ -164,9 +174,9 @@ class RM75ServoPlugin:
         if action == "stop":
             return self._stop()
         if action == "pause":
-            return self._pause(True)
+            return self._halt(True)
         if action == "resume":
-            return self._pause(False)
+            return self._halt(False)
         if action == "info":
             return self._info()
         return None
@@ -233,21 +243,15 @@ class RM75ServoPlugin:
         return {"state": "running", "input": topic,
                 "control_interface": self._descriptor_raw}
 
-    def _pause(self, paused: bool):
-        """Hold the current pose without giving up the subscription.
-
-        This is the card's answer to "wait", and the reason it exists rather
-        than telling a model to `stop` and `start` again: `start` needs the
-        input topic and the downstream descriptor, which only agent-core knows
-        at project start. A model that stopped this card could not restart it.
-        """
+    def _halt(self, halted: bool):
+        """`pause` and `resume`. Stops the arm; keeps the subscription."""
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "card is not running"}
-            self._paused = bool(paused)
-        if paused:
+            self._paused = bool(halted)
+        if halted:
             self._slow_stop()
-        return {"state": "paused" if paused else "running",
+        return {"state": "paused" if halted else "running",
                 "input": self._input_topic}
 
     def _stop(self):

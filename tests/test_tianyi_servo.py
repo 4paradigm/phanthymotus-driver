@@ -132,12 +132,32 @@ def test_start_does_not_ask_for_a_confirmation_the_canvas_cannot_give(servo):
     `error` rolls the whole project back, wiring it up stopped this robot's
     ASR, camera and TTS cards too. That is what happened on the real Tianyi.
     """
-    definition = make_plugin(servo).get_tool()
-    properties = definition["inputSchema"]["properties"]
+    properties = make_plugin(servo).get_tool()["inputSchema"]["properties"]
 
     assert set(properties) <= {"action", "input_topic"}
-    for spec in definition["inputSchema"]["x-action-params"].values():
-        assert set(spec["params"]) <= {"input_topic"}
+
+
+def test_the_model_is_given_pause_and_resume_and_not_stop(servo):
+    """agent-core splits a tool into one LLM-callable function per
+    `x-action-params` entry (mcp_client.py `_to_openai_schema`), so this list
+    *is* the model's reach. `stop` belongs to the project lifecycle: a model
+    calling it would take the card out of a running project without the project
+    knowing, and could not put it back — `start` needs the input topic and the
+    downstream descriptor that only agent-core has.
+    """
+    schema = make_plugin(servo).get_tool()["inputSchema"]
+
+    assert set(schema["x-action-params"]) == {"pause", "resume"}
+    # Still dispatchable by the canvas, just not offered to the model.
+    assert {"start", "stop"} <= set(schema["properties"]["action"]["enum"])
+
+
+def test_the_interrupt_hooks_pause_rather_than_tear_the_card_down(servo):
+    """A framework interrupt should stop the arms, not unwire them."""
+    hooks = make_plugin(servo).get_tool()["inputSchema"]["x-hooks"]
+
+    assert hooks["on_interrupt_motion"]["action"] == "pause"
+    assert hooks["on_interrupt_all"]["action"] == "pause"
 
 
 class _Message:
