@@ -24,7 +24,7 @@ safety:
   max_motion_seconds: 300
 cartesian:
   # 完成真机标定并配置安装现场禁入区之前，不允许笛卡尔运动下发。
-  enabled: true
+  enabled: false
   # 水平工作半径：基座轴线到 TCP 的水平距离。RM75-6F 官方标称 638.5mm，取整 640 留 1.5mm 余量。
   max_radius_mm: 640
   # 肩关节距基座平面的高度，取自官方 RM75 系列 MDH 参数 d1=240.5mm。

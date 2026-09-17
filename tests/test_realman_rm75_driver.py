@@ -91,12 +91,17 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertNotIn("RM75_CAMERA_VIDEO", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
+        self.assertIn("RM_CARTESIAN_ENABLED=${RM75_CARTESIAN_ENABLED:-0}", service)
         self.assertIn(
             "${RM_API2_LIB_DIR:-/opt/realman/rm_api2/libs/linux_arm}:/work/Robotic_Arm/libs/linux_arm:ro",
             service,
         )
         self.assertNotIn("/opt/realman/rm_ws", service)
         self.assertNotIn("ipc:", service)
+
+        config = (DRIVER / "config.yaml").read_text()
+        self.assertIn("cartesian:\n", config)
+        self.assertIn("  enabled: false\n", config)
 
     def test_ext_camera_is_enabled_and_advertised(self):
         config = (DRIVER / "config.yaml").read_text()
@@ -447,6 +452,19 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
         self.assertFalse(plugin._motion_lock.locked())
 
+    def test_deployment_environment_must_explicitly_enable_cartesian_motion(self):
+        with mock.patch.dict(os.environ, {"RM_CARTESIAN_ENABLED": "1"}):
+            plugin = self.device.CartesianPlugin(
+                self.client, {"cartesian": {"enabled": False}}, arm_plugin=self.arm
+            )
+        self.assertTrue(plugin.cartesian_enabled)
+
+        with mock.patch.dict(os.environ, {"RM_CARTESIAN_ENABLED": "invalid"}):
+            with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
+                self.device.CartesianPlugin(
+                    self.client, {"cartesian": {"enabled": False}}, arm_plugin=self.arm
+                )
+
     def test_cartesian_motion_requires_card_enable(self):
         with self.assertRaisesRegex(PermissionError, "disabled for this request"):
             self.plugin.dispatch("movel", self._movel_args(cartesian_enabled=False))
@@ -573,9 +591,50 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             [call for call in self.client.calls[submit_index + 1:] if call[0].startswith("rm_get_")],
         )
         self.assertEqual(
-            [],
+            [("rm_get_current_arm_state",)],
             [call for call in self.client.calls if call[0].startswith("rm_get_")],
         )
+
+    def test_native_offset_rejects_composed_target_outside_workspace(self):
+        self.client.command_trajectory = mock.Mock()
+        self.client.wait_trajectory = mock.Mock()
+        plugin = self._real_cartesian_plugin()
+        self.client.pose_mm_deg = [850.0, 0.0, 240.5, 0.0, 0.0, 0.0]
+
+        with self.assertRaisesRegex(ValueError, "horizontal radius 900 mm exceeds"):
+            plugin.dispatch("move_offset", {
+                "dx_mm": 50,
+                "frame_type": "tool",
+                "speed_percent": 5,
+                "cartesian_enabled": True,
+                "confirm_motion": True,
+            })
+
+        self.assertNotIn("rm_movel_offset", [entry[0] for entry in self.client.calls])
+        self.assertFalse(plugin._motion_lock.locked())
+
+    def test_native_offset_rejects_pose_change_during_validation(self):
+        self.client.command_trajectory = mock.Mock()
+        self.client.wait_trajectory = mock.Mock()
+        original = self.plugin._validated_offset_target
+
+        def invalidate_after_validation(offset):
+            target, revision = original(offset)
+            self.plugin._invalidate_confirmed_pose()
+            return target, revision
+
+        self.plugin._validated_offset_target = invalidate_after_validation
+        with self.assertRaisesRegex(RuntimeError, "reference pose changed"):
+            self.plugin.dispatch("move_offset", {
+                "dx_mm": 20,
+                "frame_type": "tool",
+                "speed_percent": 5,
+                "cartesian_enabled": True,
+                "confirm_motion": True,
+            })
+
+        self.assertNotIn("rm_movel_offset", [entry[0] for entry in self.client.calls])
+        self.assertFalse(self.plugin._motion_lock.locked())
 
     def test_sdk_minus_7_switches_to_cached_absolute_movel_compatibility(self):
         class ThirdGenerationClient(self.FakeClient):
