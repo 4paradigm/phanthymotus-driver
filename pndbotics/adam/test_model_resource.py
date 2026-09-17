@@ -22,12 +22,19 @@ class ModelResourceTests(unittest.TestCase):
         self.assertEqual("visual_linear", result["hand_feedback_mapping"])
         self.assertEqual("visual_approximation", result["neck_kinematics"])
         self.assertFalse(result["mesh_assets_included"])
-        joints = {joint.get("name"): joint.get("type")
-                  for joint in ET.fromstring(result["urdf"]).findall("joint")}
+        model_joints = {
+            joint.get("name"): joint
+            for joint in ET.fromstring(result["urdf"]).findall("joint")
+        }
+        joints = {name: joint.get("type") for name, joint in model_joints.items()}
         for name in ("neckYaw", "neckPitch", "L_index_MCP_joint",
                      "L_index_DIP_joint", "R_index_MCP_joint", "R_index_DIP_joint",
                      "wristRoll_Left", "wristRoll_Right"):
             self.assertEqual("revolute", joints[name])
+        # The official axes are mirrored across the hands. A generic axis
+        # splays a finger when the visualization receives a close command.
+        self.assertEqual("-1 0 0", model_joints["L_index_MCP_joint"].find("axis").get("xyz"))
+        self.assertEqual("1 0 0", model_joints["R_index_MCP_joint"].find("axis").get("xyz"))
 
     def test_standard_keeps_standard_model(self):
         plugin = ModelPlugin({}, "", None, variant="standard")
@@ -43,6 +50,7 @@ class ModelResourceTests(unittest.TestCase):
         self.assertEqual(1.5533, joints[0]["q"])
         self.assertEqual(0.0, joints[12]["q"])
         self.assertAlmostEqual(joints[0]["q"] * 0.6, joints[1]["q"])
+        self.assertAlmostEqual(0.83078, joints[9]["q"])
         self.assertTrue(all(item["visual_mapping"] for item in joints))
 
 

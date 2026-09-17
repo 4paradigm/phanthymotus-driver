@@ -209,11 +209,12 @@ def _hand_skeleton_positions(positions) -> list[dict]:
             "visual_mapping": True,
         })
         # The vendor stream exposes one channel per finger. Mirror 60% of the
-        # proximal bend to the distal link so the stick skeleton visibly curls
-        # as a finger rather than rotating only at the palm.
+        # bend beyond each joint's rest angle to the distal link, so a finger
+        # curls instead of yawing from a static open pose. The thumb has a
+        # non-zero rest limit in the official Inspire model.
         result.append({
             "name": distal_name,
-            "q": angle * 0.6,
+            "q": minimum + (angle - minimum) * 0.6,
             "source_channel": index,
             "visual_mapping": True,
             "derived_from": name,
@@ -3944,10 +3945,6 @@ def _pro_skeleton_urdf(model_path: str) -> str:
     added head mount and hand joint types are intentionally visual-only.
     """
     root = ET.parse(model_path).getroot()
-    hand_axes = {
-        "L_thumb_MCP_joint1": "0 0 1", "L_thumb_MCP_joint2": "0 1 0",
-        "R_thumb_MCP_joint1": "0 0 1", "R_thumb_MCP_joint2": "0 1 0",
-    }
     animated = {
         joint_name: (minimum, maximum)
         for name, distal_name, minimum, maximum in HAND_SKELETON_JOINTS
@@ -3966,7 +3963,7 @@ def _pro_skeleton_urdf(model_path: str) -> str:
         axis = joint.find("axis")
         if axis is None:
             axis = ET.SubElement(joint, "axis")
-        axis.set("xyz", hand_axes.get(joint.get("name"), "0 1 0"))
+            axis.set("xyz", "0 1 0")
         limit = joint.find("limit")
         if limit is None:
             limit = ET.SubElement(joint, "limit")
