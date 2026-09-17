@@ -1656,10 +1656,11 @@ class OdometerPlugin:
             "multiInstance": False,
             "readOnly": True,
             "description": (
-                "T800 Odin2 只读里程计：发布 data/json 状态流（位姿、航向、线/角速度、"
-                "累计/单次里程与数据健康）及 sensor/mapping trajectory 鸟瞰流"
-                "（以单次行程起点为原点的轨迹、当前位置和朝向）；仅用于状态感知与可视化，"
-                "不执行移动控制。"
+                "T800 Odin2 只读里程计，提供两项主要能力：status 查询当前位置、航向、"
+                "线/角速度、累计里程、单次行程、静止状态及数据健康；reset_trip 清零单次"
+                "行程的里程与轨迹起点，不修改 Odin2 原始坐标或累计总里程。卡片发布两路"
+                "数据流：data/json 输出实时里程计状态；sensor/mapping 输出单次行程的"
+                "鸟瞰轨迹、当前位置和朝向。"
             ),
             "inputSchema": schema,
             "topic_out": self._topic_out(),
