@@ -3685,31 +3685,48 @@ class VisionCapturePlugin:
 
 
 class ModelPlugin:
-    """Returns URDF for 3D skeleton visualization on dashboard."""
+    """Returns the vendor URDF used by the dashboard skeleton renderer."""
 
     PREFIX = "model"
 
-    # Map variant to available URDF file (repo only has lite, sp, standard)
+    # ``adam_standard.urdf`` has neither wrists nor hands.  Adam Pro publishes
+    # those joints and its hand controller is present on the deployed robot,
+    # so use PNDbotics' official Adam + Inspire-hand kinematic tree instead.
+    # PNDbotics does not publish a Pro head/neck URDF; neck feedback remains in
+    # the joints sensor but is deliberately not represented by guessed links.
     _VARIANT_URDF = {
         "lite": "adam_lite.urdf",
         "sp": "adam_sp.urdf",
-        "pro": "adam_pro.urdf",       # adam_standard used as fallback for pro
+        "pro": "adam_inspire.urdf",
         "standard": "adam_pro.urdf",  # adam_standard stored as adam_pro
+    }
+    _MODEL_METADATA = {
+        "adam_inspire.urdf": {
+            "model": "PNDbotics Adam Inspire",
+            "source": "https://github.com/pndbotics/pnd_models/tree/main/adam_inspire",
+            "hand_visuals": True,
+            "hand_feedback_mapping": False,
+            "neck_kinematics": False,
+        },
     }
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  variant: str, **kwargs):
         self._variant = variant
         self._namespace = namespace
-        # Resolve URDF file path
+        # Resolve URDF file path.
         urdf_name = self._VARIANT_URDF.get(variant, f"adam_{variant}.urdf")
+        self._urdf_name = urdf_name
         self._urdf_path = Path(__file__).parent / "resource" / urdf_name
 
     def get_tool(self) -> dict:
         return {
             "name": "model",
             "type": "resource",
-            "description": f"Adam {self._variant} URDF model for 3D visualization",
+            "description": (
+                f"Adam {self._variant} URDF model for 3D visualization "
+                "(official PNDbotics kinematic source)"
+            ),
             "inputSchema": {"type": "object", "properties": {}},
         }
 
@@ -3726,7 +3743,25 @@ class ModelPlugin:
             return {"state": "idle"}
         # Return URDF content
         if self._urdf_path.exists():
-            return {"urdf": self._urdf_path.read_text()}
+            metadata = self._MODEL_METADATA.get(self._urdf_name, {})
+            return {
+                "urdf": self._urdf_path.read_text(),
+                "variant": self._variant,
+                "urdf_file": self._urdf_name,
+                "mesh_assets_included": False,
+                "mesh_assets_note": (
+                    "The official mesh package is intentionally not bundled in "
+                    "the driver image; the URDF remains usable for skeleton "
+                    "visualization."
+                ),
+                "hand_feedback_note": (
+                    "This official URDF includes hand links but declares its "
+                    "finger joints fixed. Adam hand feedback is available from "
+                    "hand_state, but PNDbotics does not publish a position-to-"
+                    "finger-joint mapping for animated hand rendering."
+                ),
+                **metadata,
+            }
         # Try any available URDF as fallback
         resource_dir = Path(__file__).parent / "resource"
         urdfs = list(resource_dir.glob("adam_*.urdf"))

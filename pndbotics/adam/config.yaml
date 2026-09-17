@@ -106,3 +106,5 @@ plugins:
     state_timeout_sec: 1.0
   model:
     enabled: true
+    # Adam Pro uses PNDbotics' official Adam + Inspire-hand URDF.  The vendor
+    # does not publish a matching Pro head/neck kinematic model.
