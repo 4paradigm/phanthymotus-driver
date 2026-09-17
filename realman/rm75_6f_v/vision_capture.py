@@ -75,7 +75,7 @@ class VisionCapturePlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": [
-                        "start", "capture_photo", "record_video", "list_cameras", "info", "cancel"]},
+                        "start", "capture_photo", "record_video", "list_cameras", "info", "stop", "cancel"]},
                     "camera": camera_property,
                     "external_instance_id": instance_property,
                     "duration_s": {"type": "integer", "minimum": 1,
@@ -91,6 +91,7 @@ class VisionCapturePlugin:
                     "list_cameras": {"params": [], "description": "列出已启动的 RealSense RGB 相机实例。"},
                     "info": {"params": [], "description": "查看图像来源、保存目录和录像结果。"},
                     "cancel": {"params": [], "description": "取消当前录像并删除未完成文件。"},
+                    "stop": {"params": [], "description": "生命周期停止：取消当前录像并释放资源。"},
                 },
                 "x-completion": {"actions": ["record_video"],
                                  "timeout": self._max_duration_s + 15},
@@ -529,7 +530,7 @@ class VisionCapturePlugin:
         if action == "record_video":
             result = self._start_video_recording(args)
             return result if result.get("state") != "recording" else {**result, "ok": True}
-        if action == "cancel":
+        if action in ("stop", "cancel"):
             return self.stop()
         if action == "list_cameras":
             return {"ok": True, "cameras": self._sources()}

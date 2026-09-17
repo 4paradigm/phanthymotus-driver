@@ -336,6 +336,15 @@ class CaptureTest(CaptureHarness):
         self.assertEqual(self.plugin._info()["last_recording"]["status"], "cancelled")
         self.assertIsNone(self.plugin._active_recording)
 
+    def test_stop_dispatch_cancels_recording_and_returns_idle(self):
+        active = {"action_id": "test-stop", "cancel": threading.Event(),
+                  "state": "recording", "process": None}
+        active["thread"] = mock.Mock()
+        self.plugin._active_recording = active
+        active["finished"] = True
+        result = self.plugin.dispatch("stop", {})
+        self.assertEqual(result["state"], "idle")
+
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg integration requires ffmpeg and ffprobe")
 class EncoderTest(CaptureHarness):
