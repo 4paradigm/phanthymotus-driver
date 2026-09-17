@@ -725,6 +725,9 @@ class CartesianPlugin:
     """
 
     PREFIX = "cartesian_control"
+    # Agent Core 短暂重启时，不能让已完成的运动永久停留在画布“执行中”。
+    ACP_RETRY_DELAY_SECONDS = 2.0
+    ACP_RETRY_ATTEMPTS = 30
 
     def __init__(self, client, config, namespace="rm75", ros2=None, arm_plugin=None):
         self.client = client
@@ -805,7 +808,10 @@ class CartesianPlugin:
             properties,
         )
         schema["x-completion"] = {"actions": ["move_offset"], "timeout": 305}
-        schema["x-hooks"] = {"on_interrupt_motion": {"action": "stopmotion"}}
+        schema["x-hooks"] = {
+            "on_interrupt_motion": {"action": "stopmotion"},
+            "on_interrupt_all": {"action": "stopmotion"},
+        }
         schema["x-is-dangerous"] = True
         return [
             tool(
@@ -927,7 +933,7 @@ class CartesianPlugin:
             raise
         self._monitor_thread = threading.Thread(
             target=self._monitor_cartesian,
-            args=(action_id, target, max_duration),
+            args=(action_id, current, target, max_duration),
             daemon=True,
         )
         self._monitor_thread.start()
@@ -1124,11 +1130,12 @@ class CartesianPlugin:
         speed_mm_s = 600.0 * speed_percent / 100.0
         return min(self.max_motion_seconds, max(30.0, distance_mm / speed_mm_s * 3.0 + 10.0))
 
-    def _monitor_cartesian(self, action_id, target, max_duration):
+    def _monitor_cartesian(self, action_id, start_pose, target, max_duration):
         started = time.monotonic()
         deadline = started + max_duration
         last_progress = started + self.start_grace_seconds
         best_position_error = None
+        motion_observed = False
         status, result = "error", {"reason": "unknown"}
         try:
             while time.monotonic() < deadline:
@@ -1147,6 +1154,24 @@ class CartesianPlugin:
                     result = {"target_pose_mm_deg": target, "actual_pose_mm_deg": current,
                               "position_error_mm": position_error, "euler_error_deg": euler_error,
                               "elapsed_seconds": now - started}
+                    break
+                start_position_error, start_euler_error = self._pose_error(current, start_pose)
+                if (start_position_error >= self.progress_threshold_mm
+                        or start_euler_error >= self.euler_progress_threshold_deg):
+                    motion_observed = True
+                # 原生 rm_movel_offset 由控制器根据关节构型规划。若控制器的 TCP
+                # 欧拉角表达与驱动组合结果略有不同，不能因差几毫米一直等待。
+                trajectory_type = self._controller_trajectory_type()
+                if motion_observed and trajectory_type == 0:
+                    status = "completed"
+                    result = {
+                        "reason": "controller_trajectory_finished",
+                        "target_pose_mm_deg": target,
+                        "actual_pose_mm_deg": current,
+                        "position_error_mm": position_error,
+                        "euler_error_deg": euler_error,
+                        "elapsed_seconds": now - started,
+                    }
                     break
                 # 进度检测必须同时看位置与姿态：纯旋转运动位置误差恒为 0，
                 # 只看位置会把正常旋转误判为 stall 而中途慢停。
@@ -1195,6 +1220,14 @@ class CartesianPlugin:
             self._motion_lock.release()
             self._acp_callback(action_id, status, result)
 
+    def _controller_trajectory_type(self):
+        """返回 API2 当前规划类型；不支持或查询失败时保留位姿监控。"""
+        try:
+            state = self.client.call_dict("rm_get_arm_current_trajectory")
+            return int(state.get("trajectory_type"))
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return None
+
     def _request_slow_stop(self):
         """请求控制器慢停，但绝不让无超时 SDK 调用阻塞动作终态。"""
         if not self.client.connected:
@@ -1225,11 +1258,34 @@ class CartesianPlugin:
 
     def _acp_callback(self, action_id, status, result):
         outcome, error = _acp_complete(action_id, status, result, self.PREFIX)
+        retrying = outcome != "accepted" and self.ACP_RETRY_ATTEMPTS > 0
         with self._action_lock:
             if self._last_completion and self._last_completion.get("action_id") == action_id:
-                self._last_completion["callback"] = outcome
+                self._last_completion["callback"] = "retrying" if retrying else outcome
                 if error is not None:
                     self._last_completion["callback_error"] = error
+        if retrying:
+            threading.Thread(
+                target=self._retry_acp_callback,
+                args=(action_id, status, dict(result)),
+                daemon=True,
+                name="rm75-cartesian-acp-retry",
+            ).start()
+
+    def _retry_acp_callback(self, action_id, status, result):
+        for _ in range(self.ACP_RETRY_ATTEMPTS):
+            time.sleep(self.ACP_RETRY_DELAY_SECONDS)
+            outcome, error = _acp_complete(action_id, status, result, self.PREFIX)
+            with self._action_lock:
+                if not self._last_completion or self._last_completion.get("action_id") != action_id:
+                    return
+                self._last_completion["callback"] = outcome
+                if error is None:
+                    self._last_completion.pop("callback_error", None)
+                else:
+                    self._last_completion["callback_error"] = error
+            if outcome == "accepted":
+                return
 
 
 def build_plugins(config, namespace, ros2):
