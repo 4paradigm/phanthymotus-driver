@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import ssl
+import sys
 import threading
 import time
 import unittest
@@ -17,9 +18,15 @@ DRIVER = ROOT / "realman" / "rm75_6f_v"
 
 
 def load_device():
+    # The driver directory goes on sys.path the way main.py puts it there at
+    # runtime: build_plugins imports its siblings by bare name (`camera`,
+    # `servo`), so a loader that skips this tests a module the driver never runs.
+    if str(DRIVER) not in sys.path:
+        sys.path.insert(0, str(DRIVER))
     spec = importlib.util.spec_from_file_location("realman_rm75_device", DRIVER / "device.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    sys.modules.setdefault("device", module)      # servo.py imports `device`
     return module
 
 
@@ -49,7 +56,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("numpy==1.23.5", dockerfile)
         self.assertIn("opencv-python-headless==4.11.0.86", dockerfile)
         self.assertIn("--only-binary=:all:", dockerfile)
-        self.assertIn("COPY main.py device.py camera.py realsense.py", dockerfile)
+        self.assertIn("COPY main.py device.py servo.py camera.py realsense.py", dockerfile)
         camera = (DRIVER / "camera.py").read_text()
         self.assertNotIn("v4l2-ctl", camera)
         self.assertNotIn("import subprocess", camera)
@@ -99,6 +106,11 @@ class RealManRM75ImageContractTests(unittest.TestCase):
 
     def test_build_plugins_registers_camera_only_when_enabled(self):
         device = load_device()
+        # Imported before the patch, not after: mock.patch.dict restores the
+        # whole of sys.modules on exit, so a module first imported inside the
+        # block is discarded, and the same class ends up as two objects.
+        from servo import RM75ServoPlugin
+
         calls = []
 
         class FakeCamera:
@@ -112,14 +124,20 @@ class RealManRM75ImageContractTests(unittest.TestCase):
                 {"ext_camera": {"enabled": True}}, "rm75", ros2
             )
         self.assertEqual(
-            [device.RM75Plugin, device.GripperPlugin, device.CartesianPlugin, FakeCamera],
+            [device.RM75Plugin, device.GripperPlugin, RM75ServoPlugin,
+             device.CartesianPlugin, FakeCamera],
             [type(plugin) for plugin in enabled],
         )
         self.assertIs(enabled[0].client, enabled[1].client)
+        # The servo card shares the one SDK handle too — a second connection to
+        # the same arm is a second thing able to move it.
+        self.assertIs(enabled[0].client, enabled[2].client)
+        self.assertIs(enabled[0].client, enabled[3].client)
         self.assertEqual(({"enabled": True}, "rm75", ros2.executor_core), calls[0])
         disabled = device.build_plugins({}, "rm75", ros2)
         self.assertEqual(
-            [device.RM75Plugin, device.GripperPlugin, device.CartesianPlugin],
+            [device.RM75Plugin, device.GripperPlugin, RM75ServoPlugin,
+             device.CartesianPlugin],
             [type(plugin) for plugin in disabled],
         )
 
