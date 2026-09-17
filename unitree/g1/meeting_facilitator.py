@@ -124,10 +124,12 @@ class MeetingController:
         self.remaining_s = None
         self.paused = False
 
-    def add_transcript(self, text: str, now: float) -> None:
+    def add_transcript(self, text: str, now: float, speaker: str = "") -> None:
         text = text.strip()
         if not self.active or self.paused or not text:
             return
+        if speaker.strip() and speaker.strip() in self.participants:
+            self.speaker_index = self.participants.index(speaker.strip())
         self.transcript.append({
             "speaker": self.current_speaker,
             "text": text,
@@ -264,8 +266,8 @@ class Plugin:
                         "type": "string",
                         "enum": [
                             "start_meeting", "next_speaker", "pause", "resume",
-                            "add_action_item", "end_meeting", "export_minutes",
-                            "quality_report", "status", "info",
+                            "add_action_item", "add_transcript", "end_meeting",
+                            "export_minutes", "quality_report", "status", "info",
                         ],
                     },
                     "participants": {
@@ -285,6 +287,8 @@ class Plugin:
                     "duration_s": {"type": "number", "exclusiveMinimum": 0},
                     "description": {"type": "string"},
                     "owner": {"type": "string"},
+                    "text": {"type": "string"},
+                    "speaker": {"type": "string"},
                 },
                 "required": ["action"],
                 "additionalProperties": False,
@@ -294,6 +298,7 @@ class Plugin:
                     "pause": {"params": []},
                     "resume": {"params": []},
                     "add_action_item": {"params": ["description", "owner"]},
+                    "add_transcript": {"params": ["text", "speaker"]},
                     "end_meeting": {"params": []},
                     "status": {"params": []},
                     "info": {"params": []},
@@ -421,6 +426,20 @@ class Plugin:
                     self._controller.add_action_item(description, owner)
             except ValueError as exc:
                 return {"error": str(exc)}
+            return self._status()
+        if action == "add_transcript":
+            text = args.get("text", "")
+            speaker = args.get("speaker", "")
+            if not isinstance(text, str) or not isinstance(speaker, str):
+                return {"error": "text and speaker must be strings"}
+            if not text.strip():
+                return {"error": "text is required"}
+            with self._lock:
+                if not self._controller.active:
+                    return {"error": "no meeting is active"}
+                self._controller.add_transcript(
+                    text.strip(), time.monotonic(), speaker
+                )
             return self._status()
         if action == "end_meeting":
             return self._end_meeting()

@@ -231,6 +231,31 @@ class PluginTests(unittest.TestCase):
             ["array", "string"],
         )
 
+    def test_add_transcript_records_text_and_switches_speaker(self):
+        self.plugin.dispatch(
+            "start_meeting", {"participants": ["甲", "乙"], "duration_s": 30}
+        )
+        result = self.plugin.dispatch(
+            "add_transcript", {"text": "我先说结论", "speaker": "乙"}
+        )
+        self.assertEqual(result["transcript_count"], 1)
+        self.assertEqual(result["current_speaker"], "乙")
+        exported = self.plugin.dispatch("export_minutes", {})
+        self.assertIn("**乙**: 我先说结论", exported["minutes"])
+
+    def test_add_transcript_requires_active_meeting_and_text(self):
+        self.assertEqual(
+            self.plugin.dispatch("add_transcript", {"text": "你好"}),
+            {"error": "no meeting is active"},
+        )
+        self.plugin.dispatch(
+            "start_meeting", {"participants": ["甲"], "duration_s": 30}
+        )
+        self.assertEqual(
+            self.plugin.dispatch("add_transcript", {"text": "   "}),
+            {"error": "text is required"},
+        )
+
     def test_pause_and_resume_preserve_remaining_time(self):
         self.plugin.dispatch(
             "start_meeting", {"participants": ["甲"], "duration_s": 30}
