@@ -34,6 +34,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `ros_graph` | sensor | 实时发现固件节点、topic、service 和尚未映射的新接口 |
 | `model` | resource | 官方 `serial_t800.urdf` |
 | `loco` | actuator | 100 Hz 速度控制；定时/持续、相对位移、转角和圆弧开环动作 |
+| `odometer` | sensor | Odin2 位置、航向、速度、累计/单次里程，以及运动轨迹和朝向鸟瞰画面 |
 | `safe_motion_mode` | actuator | 仅提供 stand/sit/lie 三种安全姿态；非站立姿态互切时自动经过 stand，返回完整语义转换路径 |
 | `gait` | actuator | 基于 Native SDK motion state 的步态选择；自动适配 `rl_basic`/`walk` 版本差异 |
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
@@ -66,6 +67,10 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 基础运动协议没有供控制闭环使用的定位反馈，因此它们仍是开环动作并返回
 `open_loop: true`。若 Odin2 固件提供配置中的 odometry topic，
 `motion_command_trace` 会把它用于状态显示，但不会据此闭环控制动作。
+
+`odometer` 同时发布 `data/json` 状态面板和 `sensor/mapping` 鸟瞰画面。画面以
+当前单次行程起点为原点，显示运动轨迹、当前位置和朝向箭头；`reset_trip` 会
+清零单次里程并清空画面轨迹，但不会修改 Odin2 原始坐标或累计总里程。
 有限时长动作的用户有效 `duration` 最多 10 秒；Driver 会先额外发送 1 秒
 预备命令，再完整执行用户填写的时长，因此固件起步准备不再消耗有效行动
 时间。预备+行动总时长超过 3 秒的有限动作返回唯一 `action_id`，并在自然
@@ -183,10 +188,20 @@ error/degraded，成功重试后恢复 ready。
 转换为固定 640×480 的毫米 `16UC1`；点云到相机坐标系的标定投影、膨胀、
 Sobel 边缘抑制和最近邻上采样均由众擎节点完成。使用 `depth` 前需按众擎
 文档 7.2 节启动该深度图节点。
-点云源可用 `pointcloud` 工具的 `select_source` action 在 `raw`/`slam`
-之间切换。Odin2 topic 带逐设备前缀 `/{topic_prefix}/{model}/device{N}/`，
+点云默认转发 `cloud/slam`。Odin2 的 `cloud/raw` 虽然数据稳定，但处于
+传感器坐标系，设备安装俯角会直接体现在画面中；仅做 z 取反不能消除该倾斜。
+`cloud/slam` 是重力对齐的 odom 标准坐标系，适合作为监控页默认源；仍可用
+`pointcloud` 工具的 `select_source` action 在 `raw`/`slam` 之间切换。Odin2 topic 带逐设备前缀 `/{topic_prefix}/{model}/device{N}/`，
 默认按 `config.yaml:topics.vision_*` 的 `/manifold/ODIN2/device0` 订阅，
 上机前请用 `ros_graph` 工具核对实际前缀。
+
+Odin2 主驱动和标定深度节点由 `deploy/engineai-odin2.service` 与
+`deploy/engineai-odin2-depth.service` 管理，两个单元都必须安装并设为
+`enabled`；depth 节点依赖 `/home/ubuntu/odin-depth-ws/install/setup.bash`
+和当前设备标定文件。系统升级后若这两个单元或 depth 工作区被清理，应先按
+部署文档恢复它们，再启动 T800 driver。
+仓库提供幂等恢复脚本：`sudo bash deploy/install_odin2_services.sh`；脚本会
+重建官方 depth 节点、读取当前 Odin2 标定，并安装/启用两个 systemd 单元。
 
 `speaker` 按众擎飞书《ROS2 接口开发文档》第8章实现：播放走官方 ALSA
 接口 `aplay`（`-t raw -f S16_LE -r 16000 -c 1`，从 stdin 流式播放），
