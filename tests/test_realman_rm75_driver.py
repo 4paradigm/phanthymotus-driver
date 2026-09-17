@@ -476,17 +476,20 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             self.client.calls,
         )
 
-    def test_native_offset_uses_controller_blocking_completion(self):
-        class BlockingClient(self.FakeClient):
-            def command_wait(self, method, *args):
+    def test_native_offset_uses_controller_event_completion(self):
+        class EventClient(self.FakeClient):
+            def command_trajectory(self, method, *args):
                 self.calls.append((method, args))
                 return 0
+
+            def wait_trajectory(self, timeout_seconds):
+                return True
 
             def command_interrupt(self, method, *args):
                 self.calls.append((method, args))
                 return 0
 
-        self.client = BlockingClient()
+        self.client = EventClient()
         self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
         self.plugin = self.device.CartesianPlugin(
             self.client,
@@ -510,24 +513,31 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("completed", status)
         self.assertEqual("controller_target_reached", result["reason"])
         self.assertIn(
-            ("rm_movel_offset", ([0.02, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 1, 1)),
+            ("rm_movel_offset", ([0.02, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 1, 0)),
             self.client.calls,
         )
 
-    def test_stopmotion_releases_stuck_controller_wait(self):
+    def test_stopmotion_releases_missing_controller_event(self):
         gate = threading.Event()
 
-        class BlockingClient(self.FakeClient):
-            def command_wait(self, method, *args):
+        class EventClient(self.FakeClient):
+            def command_trajectory(self, method, *args):
                 self.calls.append((method, args))
-                gate.wait(5.0)
                 return 0
+
+            def wait_trajectory(self, timeout_seconds):
+                gate.wait(timeout_seconds)
+                return False if gate.is_set() else None
+
+            def cancel_trajectory_wait(self):
+                gate.set()
+                return True
 
             def command_interrupt(self, method, *args):
                 self.calls.append((method, args))
                 return 0
 
-        self.client = BlockingClient()
+        self.client = EventClient()
         self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
         self.plugin = self.device.CartesianPlugin(
             self.client,
@@ -558,7 +568,6 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("cancelled", status)
         self.assertEqual("stopmotion", result["reason"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
-        gate.set()
 
     def test_move_offset_rotated_tool_frame_transforms_target(self):
         # reviewer 示例：90° yaw 下工具系 +X 偏移应沿基系 +Y 移动，监控目标必须经旋转变换
@@ -1217,6 +1226,35 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         }
         for index, (low, high) in enumerate(self.device.JOINT_LIMITS_DEG, 1):
             self.assertEqual(f"[{low:g}°, {high:g}°]", descriptions[f"joint{index}_deg"])
+
+    def test_controller_trajectory_event_completes_nonblocking_command(self):
+        client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+        robot = mock.Mock()
+        robot.rm_movel_offset.return_value = 0
+        client._robot = robot
+        client._handle = mock.Mock(id=7)
+
+        client.command_trajectory("rm_movel_offset", [0.01] + [0.0] * 5, 5, 0, 0, 1, 0)
+        client._on_arm_event(mock.Mock(
+            event_type=1, device=0, handle_id=7, trajectory_state=True,
+        ))
+
+        self.assertIs(True, client.wait_trajectory(0.1))
+        robot.rm_movel_offset.assert_called_once_with([0.01] + [0.0] * 5, 5, 0, 0, 1, 0)
+
+    def test_controller_trajectory_wait_timeout_does_not_poison_next_command(self):
+        client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
+        robot = mock.Mock()
+        robot.rm_movel_offset.return_value = 0
+        client._robot = robot
+        client._handle = mock.Mock(id=8)
+        args = ([0.01] + [0.0] * 5, 5, 0, 0, 1, 0)
+
+        client.command_trajectory("rm_movel_offset", *args)
+        self.assertIsNone(client.wait_trajectory(0.0))
+        client.command_trajectory("rm_movel_offset", *args)
+        self.assertTrue(client.cancel_trajectory_wait())
+        self.assertIs(False, client.wait_trajectory(0.1))
 
     def test_enabled_driver_reports_missing_host_sdk_mount(self):
         with mock.patch.dict(os.environ, {"RM_DRIVER_ENABLED": "1", "RM_ARM_IP": "192.0.2.1"}, clear=True):
