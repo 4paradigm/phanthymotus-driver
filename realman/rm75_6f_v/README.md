@@ -155,10 +155,9 @@ The first supervised hardware test should change exactly one joint by no more
 than 1 degree at 1 percent speed. A reachable physical E-stop and a clear work
 area are required. Software interlocks do not replace the robot safety system.
 
-Cartesian motion is disabled in the default deployment. After calibrating the
-active TCP, verifying the configured workspace envelope, and configuring site
-exclusion zones, set `RM75_CARTESIAN_ENABLED=1` on the host deployment. Every
-`cartesian_control.move_offset` request must also set both
+Cartesian motion is enabled in the default deployment and can be disabled with
+`RM75_CARTESIAN_ENABLED=0`. Verify the active TCP and configured workspace
+envelope before use. Every `cartesian_control.move_offset` request must set both
 `cartesian_enabled=true` and `confirm_motion=true`. The driver reads the current
 TCP for the first offset, composes the tool-frame offset into an absolute target,
 and validates that target before submitting `rm_movel_offset`. A controller-
