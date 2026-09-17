@@ -114,3 +114,14 @@ plugins:
         sender_path: "/home/ubuntu/audio_sender.py"
   light:
     enabled: true
+  fall:
+    enabled: true
+    # 头部深度相机离地高度（米）。与 camera_pointcloud 的 floor_offset_m 同一个量，
+    # 上机标定一次：让机器人平视地面，取一组点算出的高度应当接近 0。
+    camera_height_m: 1.50
+    # 人体最高点低于 fall_top_m 判低位，高于 recover_top_m 判已起身，
+    # 中间区间不作判断。坐在地上时头顶约 0.9 m，站立约 1.6 m。
+    fall_top_m: 0.70
+    recover_top_m: 1.00
+    min_duration_sec: 5.0
+    eval_hz: 2.0
