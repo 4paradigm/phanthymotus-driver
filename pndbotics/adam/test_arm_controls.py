@@ -12,8 +12,8 @@ sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
 import device
 from device import (ADAM_PRO_JOINTS, ARM_ACTIONS, ARM_JOINT_CONTROLS,
-                    ARM_POSES, ArmControlPlugin, HandPlugin,
-                    _arm_target_radians)
+                    ARM_POSES, ArmControlPlugin, ArmGesturePlugin, HandPlugin,
+                    HandGesturePlugin, _arm_target_radians)
 
 
 class _FakePublisher:
@@ -203,6 +203,82 @@ class ArmControlTests(unittest.TestCase):
         # zero at both endpoints.
         self.assertAlmostEqual(ease(0.01), 0.0, places=2)
         self.assertAlmostEqual(ease(0.99), 1.0, places=2)
+
+    def test_segment_span_keeps_the_easing_peak_within_the_velocity_limit(self):
+        publisher = _FakePublisher()
+        plugin = _prime_arm_plugin(publisher)
+        ease = ArmControlPlugin._ease
+        shoulder = ADAM_PRO_JOINTS.index("shoulderPitch_Left")
+        hold = plugin._hold_q[shoulder]
+        samples = 400
+        for distance in (0.2, 0.5, 1.0, 2.0):
+            plugin._set_targets({"shoulderPitch_Left": hold - distance})
+            span = plugin._seg_span
+            peak = 0.0
+            previous = ease(0.0)
+            for step in range(1, samples + 1):
+                current = ease(step / samples)
+                peak = max(peak, (current - previous) * distance * samples / span)
+                previous = current
+            # The ease peaks at 1.875 / span, so sampling the profile is the
+            # honest check: duration / distance alone lets a 1 rad move reach
+            # 0.94 rad/s against a 0.5 rad/s limit.
+            self.assertLessEqual(peak, plugin._MAX_VELOCITY_RAD_S + 1e-6,
+                                 f"{distance} rad moved at {peak} rad/s")
+            if distance >= 1.0:
+                # Past the smoothing floor these spans come from the velocity
+                # budget, so they must not be wastefully long either.
+                self.assertGreater(peak, plugin._MAX_VELOCITY_RAD_S * 0.99)
+
+    def test_small_targets_use_the_configured_minimum_span(self):
+        publisher = _FakePublisher()
+        plugin = _prime_arm_plugin(publisher)
+        shoulder = ADAM_PRO_JOINTS.index("shoulderPitch_Left")
+        plugin._set_targets({"shoulderPitch_Left": plugin._hold_q[shoulder] - 0.05})
+        # The velocity budget only ever lengthens a segment, so a nudge is
+        # smoothed over the configured transition rather than made quicker.
+        self.assertAlmostEqual(plugin._DEFAULT_TRANSITION_SECONDS,
+                               plugin._seg_span)
+
+
+class GestureLifecycleTests(unittest.TestCase):
+    """The canvas sends start/stop/info to every card on the project.
+
+    A card whose dispatch returns None for one of them is reported to Agent
+    Core as an unknown action, and a strict project start then rolls the whole
+    project back — so a delegated gesture card has to forward the verb rather
+    than fall off the end of dispatch.
+    """
+
+    class _Control:
+        def __init__(self):
+            self.actions = []
+
+        def dispatch(self, action, args):
+            self.actions.append(action)
+            return {"state": "ready", "delegated": action}
+
+    def test_gesture_cards_forward_the_lifecycle_verbs(self):
+        control = self._Control()
+        for card in (ArmGesturePlugin(control), HandGesturePlugin(control)):
+            for action in ("start", "info", "stop"):
+                result = card.dispatch(action, {})
+                self.assertIsNotNone(result, f"{type(card).__name__}.{action}")
+                self.assertIn("state", result, f"{type(card).__name__}.{action}")
+        self.assertEqual(["start", "info", "stop"] * 2, control.actions)
+
+    def test_unknown_gesture_still_declines(self):
+        control = self._Control()
+        self.assertIsNone(ArmGesturePlugin(control).dispatch("fly", {}))
+        self.assertIsNone(HandGesturePlugin(control).dispatch("fly", {}))
+        self.assertEqual([], control.actions)
+
+    def test_arm_controller_answers_the_lifecycle_itself(self):
+        publisher = _FakePublisher()
+        control = _prime_arm_plugin(publisher)
+        self.assertEqual({"state": "ready"}, control.dispatch("start", {}))
+        self.assertIn("state", control.dispatch("info", {}))
+        self.assertEqual("idle", control.dispatch("stop", {})["state"])
 
 
 class HandSmoothTests(unittest.TestCase):
