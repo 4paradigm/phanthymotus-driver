@@ -34,6 +34,7 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 | `ros_graph` | sensor | 实时发现固件节点、topic、service 和尚未映射的新接口 |
 | `model` | resource | 官方 `serial_t800.urdf` |
 | `loco` | actuator | 100 Hz 速度控制；定时/持续、相对位移、转角和圆弧开环动作 |
+| `odometer` | sensor | Odin2 位置、航向、速度、累计/单次里程，以及运动轨迹和朝向鸟瞰画面 |
 | `safe_motion_mode` | actuator | 仅提供 stand/sit/lie 三种安全姿态；非站立姿态互切时自动经过 stand，返回完整语义转换路径 |
 | `gait` | actuator | 基于 Native SDK motion state 的步态选择；自动适配 `rl_basic`/`walk` 版本差异 |
 | `dance` | actuator | 舞蹈列表、播放、停止和状态；官方基线为 `dance.mnn` + `dance.npz` |
@@ -66,6 +67,10 @@ Domain 69；Agent Core 数据流使用 Domain 42。驱动兼容两种部署方�
 基础运动协议没有供控制闭环使用的定位反馈，因此它们仍是开环动作并返回
 `open_loop: true`。若 Odin2 固件提供配置中的 odometry topic，
 `motion_command_trace` 会把它用于状态显示，但不会据此闭环控制动作。
+
+`odometer` 同时发布 `data/json` 状态面板和 `sensor/mapping` 鸟瞰画面。画面以
+当前单次行程起点为原点，显示运动轨迹、当前位置和朝向箭头；`reset_trip` 会
+清零单次里程并清空画面轨迹，但不会修改 Odin2 原始坐标或累计总里程。
 有限时长动作的用户有效 `duration` 最多 10 秒；Driver 会先额外发送 1 秒
 预备命令，再完整执行用户填写的时长，因此固件起步准备不再消耗有效行动
 时间。预备+行动总时长超过 3 秒的有限动作返回唯一 `action_id`，并在自然
