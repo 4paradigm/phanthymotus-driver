@@ -484,10 +484,15 @@ ARM_POSES = {
     # One-armed poses are written on the right side only.  A caller that asks
     # for the other arm gets the mirrored target (see
     # ``ArmControlPlugin.mirror_targets``), so no pose is duplicated per side.
-    "salute": ("单手敬礼（抬臂至头侧）", {
-        "right_shoulder_pitch": -105.0, "right_shoulder_roll": -22.0,
-        "right_shoulder_yaw": 25.0, "right_elbow": -118.0,
-        "right_wrist_pitch": 20.0, "right_wrist_roll": -10.0,
+    # A salute brings the hand to the brow, not the crown.  Adam Pro carries a
+    # neck (neckYaw/neckPitch) with the ZED on top, so driving shoulder_pitch
+    # past horizontal together with a deep elbow fold sends the forearm into
+    # the head.  Keep the upper arm at ~90° forward and fold the elbow to ~90°,
+    # which leaves the hand beside the temple while the elbow stays clear.
+    "salute": ("单手敬礼（抬臂至额角）", {
+        "right_shoulder_pitch": -88.0, "right_shoulder_roll": -15.0,
+        "right_shoulder_yaw": 18.0, "right_elbow": -100.0,
+        "right_wrist_pitch": 10.0, "right_wrist_roll": -5.0,
     }),
     "arm_forward_high": ("单手肩高前伸（击掌预备）", {
         "right_shoulder_pitch": -75.0, "right_shoulder_roll": -8.0,
@@ -1939,6 +1944,12 @@ class ArmControlPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
+            # A canvas stop tears the lowcmd worker down (_stop_and_wait sets
+            # the stop event and clears the thread).  A later start must bring
+            # the writer back, or every arm target fails DDS_WRITE_FAILED until
+            # the container restarts.  ``start`` is idempotent: it reuses a
+            # live thread and only spawns one when the previous one exited.
+            self.start()
             return {"state": "ready"}
         if action == "stop":
             return self._stop_and_wait()

@@ -280,6 +280,30 @@ class GestureLifecycleTests(unittest.TestCase):
         self.assertIn("state", control.dispatch("info", {}))
         self.assertEqual("idle", control.dispatch("stop", {})["state"])
 
+    def test_start_after_stop_restarts_the_lowcmd_writer(self):
+        # A canvas stop tears the writer thread down (the stop event is set and
+        # the thread cleared).  A subsequent start used to answer {"state":
+        # "ready"} without bringing the thread back, so every later arm target
+        # failed DDS_WRITE_FAILED until the container restarted.  The start
+        # verb must be idempotent and revive the worker.
+        publisher = _FakePublisher()
+        control = _prime_arm_plugin(publisher)
+        self.assertEqual({"state": "ready"}, control.dispatch("start", {}))
+        first_thread = control._thread
+        self.assertIsNotNone(first_thread)
+        self.assertTrue(first_thread.is_alive())
+        # A real gesture leaves the controller active, which is what makes a
+        # subsequent stop actually tear the writer down.
+        control._active = True
+        control.dispatch("stop", {})
+        self.assertIsNone(control._thread)
+        # Second start must spawn a fresh, live thread.
+        self.assertEqual({"state": "ready"}, control.dispatch("start", {}))
+        self.assertIsNotNone(control._thread)
+        self.assertTrue(control._thread.is_alive())
+        self.assertIsNot(control._thread, first_thread)
+        control.stop()
+
 
 class HandSmoothTests(unittest.TestCase):
     def test_hand_ramps_toward_target_and_converges(self):
