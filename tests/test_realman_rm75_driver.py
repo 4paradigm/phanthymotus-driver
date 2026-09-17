@@ -91,7 +91,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertNotIn("RM75_CAMERA_VIDEO", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
-        self.assertIn("RM_CARTESIAN_ENABLED=${RM75_CARTESIAN_ENABLED:-0}", service)
+        self.assertIn("RM_CARTESIAN_ENABLED=${RM75_CARTESIAN_ENABLED:-1}", service)
         self.assertIn(
             "${RM_API2_LIB_DIR:-/opt/realman/rm_api2/libs/linux_arm}:/work/Robotic_Arm/libs/linux_arm:ro",
             service,
@@ -101,7 +101,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
 
         config = (DRIVER / "config.yaml").read_text()
         self.assertIn("cartesian:\n", config)
-        self.assertIn("  enabled: false\n", config)
+        self.assertIn("  enabled: true\n", config)
 
     def test_ext_camera_is_enabled_and_advertised(self):
         config = (DRIVER / "config.yaml").read_text()
@@ -452,12 +452,18 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual([], [entry for entry in self.client.calls if entry[0] == "rm_movel"])
         self.assertFalse(plugin._motion_lock.locked())
 
-    def test_deployment_environment_must_explicitly_enable_cartesian_motion(self):
+    def test_deployment_environment_can_override_cartesian_motion(self):
         with mock.patch.dict(os.environ, {"RM_CARTESIAN_ENABLED": "1"}):
             plugin = self.device.CartesianPlugin(
                 self.client, {"cartesian": {"enabled": False}}, arm_plugin=self.arm
             )
         self.assertTrue(plugin.cartesian_enabled)
+
+        with mock.patch.dict(os.environ, {"RM_CARTESIAN_ENABLED": "0"}):
+            plugin = self.device.CartesianPlugin(
+                self.client, {"cartesian": {"enabled": True}}, arm_plugin=self.arm
+            )
+        self.assertFalse(plugin.cartesian_enabled)
 
         with mock.patch.dict(os.environ, {"RM_CARTESIAN_ENABLED": "invalid"}):
             with self.assertRaisesRegex(ValueError, "must be 0 or 1"):
