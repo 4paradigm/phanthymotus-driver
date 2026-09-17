@@ -161,6 +161,10 @@ class TianyiServoPlugin:
         # Off by default — see _hold for why this is a decision and not a
         # setting with an obvious answer.
         self._release_hands = bool(config.get("release_hands_on_watchdog", False))
+        # Standing authorisation to move, set from the card's config form.
+        # See the `confirm_motion` note in get_tool for why it lives there and
+        # not only in the start arguments.
+        self._confirm_motion = bool(config.get("confirm_motion", False))
         self._descriptor_raw = build_descriptor(self._expected_hz)
         self._descriptor = parse_descriptor(self._descriptor_raw)
 
@@ -219,11 +223,51 @@ class TianyiServoPlugin:
                 # open for the life of the card would block every other
                 # actuator behind the ACP barrier.
             },
+            # `confirm_motion` is reachable two ways, because this card is
+            # started two ways and one of them cannot pass arguments.
+            #
+            # A direct `tools/call` can send it as an argument — that is the
+            # go1 CONTRIBUTING convention for a dangerous action, and it is
+            # right for a call an operator or an LLM makes.
+            #
+            # The canvas cannot. `start-project` builds the start arguments
+            # itself (agent-core src/api/config.py `_start_and_resolve`) and
+            # sends only action, instance_id, input_topic and
+            # control_interface — there is no path for a per-card flag. With
+            # the argument as the only gate this card could therefore never be
+            # started from the canvas at all, and, because a card that reports
+            # `error` rolls the whole project back, wiring it up took down
+            # every other card on the robot with it. Verified on Tianyi.
+            #
+            # So the standing authorisation lives in the config form, which is
+            # applied before start and is the canvas's authorisation surface
+            # anyway — an operator ticks it deliberately and it persists with
+            # the card. This does not reopen what the class docstring promises:
+            # the driver still never starts this card on its own, so a
+            # container restart does not come up streaming. Only agent-core
+            # starting the project does, which is an operator action.
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "confirm_motion": {
+                        "type": "boolean",
+                        "title": "授权连续运动",
+                        "description": "勾选即授权：这张卡片运行期间持续驱动双臂与双手。",
+                        "default": False,
+                        "scope": "shared",
+                    },
+                },
+            },
             "topic_in": [{"format": "control/joint",
                           "desc": "motus.control/1，26 维（14 臂 rad + 12 指 归一化）"}],
         }
 
     def dispatch(self, action: str, args: dict):
+        if action == "config":
+            if "confirm_motion" in args:
+                self._confirm_motion = bool(args["confirm_motion"])
+            return {"status": "configured",
+                    "confirm_motion": self._confirm_motion}
         if action == "start":
             return self._start(args)
         if action == "stop":
@@ -247,10 +291,13 @@ class TianyiServoPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args: dict):
-        if not args.get("confirm_motion"):
+        # Either gate authorises: the argument for a direct call, the config
+        # for the canvas. Neither is weaker — both are a person saying yes.
+        if not (args.get("confirm_motion") or self._confirm_motion):
             return {"state": "error",
                     "message": "confirm_motion 必须为 true —— 这张卡片在运行期间"
-                               "持续驱动双臂与双手"}
+                               "持续驱动双臂与双手。画布上请在卡片配置里勾选"
+                               "「授权连续运动」。"}
 
         topic = (args.get("input_topic") or "").strip()
         if not topic:

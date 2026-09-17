@@ -140,6 +140,7 @@ def tool(
     *,
     topic_out: list[dict] | None = None,
     topic_in: list[dict] | None = None,
+    configSchema: dict | None = None,
 ) -> dict:
     """One tool definition.
 
@@ -147,6 +148,12 @@ def tool(
     calls — a speaker taking `audio/pcm-16k`, or a command card taking
     `control/joint` (see README_dev § "Continuous Control"). agent-core resolves
     the upstream card's `topic_out` and passes it as `input_topic` to `start`.
+
+    `configSchema` is the card's config form. Settings belong here rather than
+    in `inputSchema` when the canvas has to be able to supply them: agent-core
+    applies a card's saved config before starting it, but builds the `start`
+    arguments itself, so an `inputSchema` property it does not know about can
+    only ever be sent by a direct `tools/call`.
     """
     result = {
         "name": name,
@@ -159,6 +166,8 @@ def tool(
         result["topic_out"] = topic_out
     if topic_in:
         result["topic_in"] = topic_in
+    if configSchema:
+        result["configSchema"] = configSchema
     return result
 
 

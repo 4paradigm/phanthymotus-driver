@@ -252,3 +252,59 @@ def test_slow_stop_is_a_noop_when_disconnected():
     plugin, client = make_plugin(connected=False)
     plugin._slow_stop()
     assert client.stop_calls == []
+
+
+def test_the_canvas_can_authorise_through_the_config_form():
+    """The bug this test exists for: the gate was unreachable from the canvas.
+
+    `start-project` (agent-core src/api/config.py `_start_and_resolve`) builds
+    the start arguments itself and sends only action, instance_id, input_topic
+    and control_interface. A gate read *only* from the arguments therefore
+    could never be satisfied from the canvas — and because a card that answers
+    `error` rolls the whole project back, wiring this card up stopped every
+    other card on the robot. Verified on a real Tianyi before the fix.
+
+    So config must be a real second door, not documentation.
+    """
+    plugin, _ = make_plugin()
+    assert plugin.dispatch("config", {"confirm_motion": True}) == {
+        "status": "configured", "confirm_motion": True}
+
+    # Exactly the arguments start-project sends — note no confirm_motion.
+    result = plugin.dispatch("start", {"input_topic": "/x"})
+
+    # It gets all the way to the subscription, which this fake has no context
+    # for. Reaching that is the proof: the motion gate is behind it.
+    assert "confirm_motion" not in result.get("message", "")
+    assert "ROS" in result["message"]
+
+
+def test_the_config_form_advertises_the_gate():
+    """An operator who cannot see the checkbox cannot tick it."""
+    definition = make_plugin()[0].get_tools()[0]
+    field = definition["configSchema"]["properties"]["confirm_motion"]
+
+    assert field["type"] == "boolean"
+    assert field["default"] is False
+
+
+def test_configuring_it_false_again_closes_the_door():
+    plugin, client = make_plugin()
+    plugin.dispatch("config", {"confirm_motion": True})
+    plugin.dispatch("config", {"confirm_motion": False})
+
+    result = plugin.dispatch("start", {"input_topic": "/x"})
+
+    assert result["state"] == "error"
+    assert "confirm_motion" in result["message"]
+    assert client.calls == []
+
+
+def test_an_unconfigured_card_is_still_refused_the_canvas_way():
+    """The default must be closed, or the fix would have opened the gate."""
+    plugin, client = make_plugin()
+
+    result = plugin.dispatch("start", {"input_topic": "/x"})
+
+    assert result["state"] == "error"
+    assert client.calls == []

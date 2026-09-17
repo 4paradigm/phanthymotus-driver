@@ -118,6 +118,9 @@ class RM75ServoPlugin:
         self._running = False
         self._last_outcome: dict | None = None
         self._rejects: list[str] = []
+        # Standing authorisation to move, set from the card's config form —
+        # see the note beside `configSchema` in get_tools.
+        self._confirm_motion = bool(servo_config.get("confirm_motion", False))
 
     # ── tools ────────────────────────────────────────────────────────────────
 
@@ -154,10 +157,49 @@ class RM75ServoPlugin:
                 schema,
                 topic_in=[{"format": "control/joint",
                            "desc": "motus.control/1 joint_position commands"}],
+                # `confirm_motion` is reachable two ways, because this card is
+                # started two ways and one of them cannot pass arguments.
+                #
+                # A direct `tools/call` sends it as an argument — the go1
+                # CONTRIBUTING convention for a dangerous action, right for a
+                # call an operator or an LLM makes.
+                #
+                # The canvas cannot. `start-project` builds the start arguments
+                # itself (agent-core src/api/config.py `_start_and_resolve`)
+                # and sends only action, instance_id, input_topic and
+                # control_interface. With the argument as the only gate this
+                # card could never be started from the canvas at all — and
+                # since a card reporting `error` rolls the whole project back,
+                # merely wiring it up took every other card down with it.
+                # Verified on a Tianyi, whose servo card had the same gate.
+                #
+                # So the standing authorisation lives in the config form, which
+                # is applied before start and is the canvas's authorisation
+                # surface anyway. This does not reopen what `start()` promises:
+                # the driver still never starts this card itself, so a
+                # container restart does not come up streaming.
+                configSchema={
+                    "type": "object",
+                    "properties": {
+                        "confirm_motion": {
+                            "type": "boolean",
+                            "title": "Authorise continuous motion",
+                            "description": "Tick to authorise: while this card "
+                                           "runs it continuously drives the arm.",
+                            "default": False,
+                            "scope": "shared",
+                        },
+                    },
+                },
             )
         ]
 
     def dispatch(self, action, args):
+        if action == "config":
+            if "confirm_motion" in args:
+                self._confirm_motion = bool(args["confirm_motion"])
+            return {"status": "configured",
+                    "confirm_motion": self._confirm_motion}
         if action == "start":
             return self._start(args)
         if action == "stop":
@@ -182,10 +224,14 @@ class RM75ServoPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args):
-        if not args.get("confirm_motion"):
+        # Either gate authorises: the argument for a direct call, the config
+        # for the canvas. Neither is weaker — both are a person saying yes.
+        if not (args.get("confirm_motion") or self._confirm_motion):
             return {"state": "error",
                     "message": "confirm_motion must be true — this card authorises "
-                               "continuous motion for as long as it runs"}
+                               "continuous motion for as long as it runs. On the "
+                               "canvas, tick 'Authorise continuous motion' in the "
+                               "card's config."}
         if not self.client.motion_enabled:
             return {"state": "error",
                     "message": "RM_MOTION_ENABLED is not set; this driver is read-only"}
