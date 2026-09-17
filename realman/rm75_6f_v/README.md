@@ -122,7 +122,7 @@ opens another RealSense pipeline. RGB/depth/infrared live cards keep running.
    after FFmpeg/ffprobe confirm the MP4's duration and frame count. The terminal
    outcome remains in `info.last_recording`; the destination is not proof of a
    completed file until that outcome is `completed`.
-4. `stop` cancels the recording and removes incomplete output. It does not stop
+4. `cancel` cancels the recording and removes incomplete output. It does not stop
    the source camera. A stale/missing stream fails instead of saving old frames.
 
 The image installs FFmpeg/ffprobe. The service persists only the capture directory
