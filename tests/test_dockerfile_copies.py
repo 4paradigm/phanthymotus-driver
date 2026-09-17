@@ -70,3 +70,64 @@ def test_every_copied_path_exists(dockerfile):
         f'{dockerfile.relative_to(ROOT)} copies paths that do not exist: '
         + '; '.join(f'{s!r} (in: {l}…)' for s, l in missing)
     )
+
+
+def _copied_names(dockerfile: Path) -> set:
+    """Every bare source name a COPY names, plus the directories it copies whole."""
+    names, whole_dirs = set(), set()
+    for _line, src in _copied_sources(dockerfile):
+        if any(ch in src for ch in '*?[') or '$' in src:
+            continue
+        if src.endswith('/'):
+            whole_dirs.add(src.rstrip('/'))
+        else:
+            names.add(Path(src).name)
+    return names | {d + '/' for d in whole_dirs}
+
+
+def _sibling_imports(driver_dir: Path) -> dict:
+    """`{module: [files that import it]}` for bare-name imports of siblings.
+
+    A driver's entry point runs with its own directory on sys.path, so it
+    imports its neighbours by bare name — `from servo import ...`. That reads
+    identically to a third-party import, which is what makes the failure mode
+    here so quiet.
+    """
+    modules = {p.stem for p in driver_dir.glob('*.py')}
+    pattern = re.compile(r'^\s*(?:from|import)\s+([a-z_][a-z0-9_]*)', re.M)
+    found: dict = {}
+    for source in driver_dir.glob('*.py'):
+        for name in pattern.findall(source.read_text(errors='ignore')):
+            if name in modules and name != source.stem:
+                found.setdefault(name, []).append(source.name)
+    return found
+
+
+@pytest.mark.parametrize('dockerfile', DOCKERFILES, ids=lambda p: str(p.relative_to(ROOT)))
+def test_every_imported_sibling_is_copied(dockerfile):
+    """A module the driver imports by bare name has to be in the COPY list.
+
+    The other direction of test_every_copied_path_exists, and the more dangerous
+    one: a COPY naming a file that does not exist fails the build loudly, while a
+    file that exists but is never copied builds a perfectly good image that dies
+    on startup with `ModuleNotFoundError`. That is how `servo.py` shipped — added
+    to two drivers and registered in their bundles, absent from both Dockerfiles,
+    and every test still passed.
+    """
+    driver_dir = dockerfile.parent
+    copied = _copied_names(dockerfile)
+    # A directory copied wholesale covers everything under it.
+    if any(name.endswith('/') and (driver_dir / name.rstrip('/')).is_dir()
+           for name in copied):
+        pass
+    missing = []
+    for module, importers in sorted(_sibling_imports(driver_dir).items()):
+        if f'{module}.py' in copied:
+            continue
+        if not (driver_dir / f'{module}.py').exists():
+            continue
+        missing.append(f'{module}.py (imported by {", ".join(sorted(importers))})')
+    assert not missing, (
+        f'{dockerfile.relative_to(ROOT)} does not copy modules the driver '
+        f'imports: ' + '; '.join(missing)
+    )

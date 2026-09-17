@@ -1268,3 +1268,181 @@ curl -X POST https://localhost:15678/api/hooks/fire \
 # List registered hooks
 curl https://localhost:15678/api/hooks
 ```
+
+---
+
+## Continuous Control (`motus.control/1`)
+
+MCP `tools/call` is the control plane: low frequency, request/response, authorised.
+It is the wrong shape for an execution model — a VLA policy or a navigation stack
+produces tens of commands per second, and each one is not a question.
+
+Those go on the **data plane**: a `control/*` DDS topic, exactly as a speaker
+already takes its audio on `topic_in: audio/pcm-16k` while its start/stop go
+through tools. `motus.control/1` is the agreement about what flows there.
+
+Until this existed, `control/joint` and `control/velocity` were format strings in
+agent-core's topic-inference table and nothing else: no fields, no units, no joint
+order, and no driver subscribing to either.
+
+Design rationale: `phanthymotus/docs/vla-integration.md` § "通用控制接口".
+
+### Two halves
+
+| Half | Where | What |
+|------|-------|------|
+| **Descriptor** | your command card's `info()` | what this driver accepts — the authoritative definition |
+| **Message** | the `control/*` topic | one command, checked against the descriptor before it moves anything |
+
+A **URDF is not the descriptor** and cannot substitute for it. It carries no units,
+no control rate, no statement of whether you take absolute or incremental
+positions, and no normalisation range. Reference it from `urdf_ref` as a
+supplement for FK and collision geometry; do not derive the action interface
+from it.
+
+### Descriptor
+
+```python
+{
+    "control_interface": "motus.control/1",
+    "mode": "joint_position",       # joint_position | joint_velocity | joint_torque
+                                    # | eef_pose | twist
+    "dof": 14,
+    "joint_names": [...],           # order IS the meaning of `values`
+    "units": {"angle": "rad", "linear": "m", "time": "s"},
+    "limits": {
+        "lower": [...], "upper": [...],         # required
+        "max_velocity": [...],                  # optional
+        "max_delta_per_step": [...],            # optional
+    },
+    "frame": "base_link",           # eef_pose / twist only
+    "end_effector": {"type": "gripper_2f", "range": [0.0, 0.09], "units": "m"},
+    "rate": {"max_hz": 100, "expected_hz": 30, "watchdog_ms": 200,
+             "max_obs_age_ms": 300},
+    "force_torque": [30.0, 30.0, 30.0, 5.0, 5.0, 5.0],   # or null — REQUIRED either way
+    "urdf_ref": "mcp__<id>__model",
+}
+```
+
+`force_torque` must be present **even as `null`**. `parse_descriptor` rejects a
+descriptor that omits it, because omitting it is how a robot ends up assumed to
+have a protection it does not have.
+
+### Message
+
+```python
+{
+    "schema": "motus.control/1",
+    "seq": 1024,                    # per source, strictly increasing
+    "stamp_ms": ...,                # when the command was generated
+    "obs_stamp_ms": ...,            # which observation it was computed from
+    "ttl_ms": 100,                  # expired commands are discarded
+    "source": "mcp__actucore__vla", # who sent it — arbitration and audit
+    "priority": 50,
+    "mode": "joint_position",       # reconciled against the descriptor
+    "dof": 14,
+    "values": [...],                # engineering units, descriptor.joint_names order
+    "gripper": 0.04,
+    "chunk": {"index": 3, "size": 50},   # optional, for debugging
+}
+```
+
+`obs_stamp_ms` is separate from `stamp_ms` on purpose. Remote inference routinely
+produces a command that was generated just now from an 800 ms old picture; only
+the observation timestamp catches that.
+
+Carry `mode` and `dof` redundantly. They are the last line against an upstream
+whose action space changed without the driver being told, and the correct answer
+to that is to refuse — not to apply the first `dof` values and hope.
+
+Payload is JSON in a `std_msgs/String`, like the perception cards: 30 Hz x 14 DOF
+is about 30 KB/s, and the dashboard can render it directly.
+
+### Use `common/control.ControlSink` — do not write the checks yourself
+
+There are fourteen bundles here. A safety chain copied fourteen times diverges
+fourteen ways, and the copy that drifts is the one on the robot nobody is
+watching.
+
+```python
+from common.control import ControlSink
+
+self._sink = ControlSink(
+    DESCRIPTOR,
+    self._apply,                       # (values, gripper) -> None
+    on_watchdog=self._decelerate_to_stop,
+    on_abort=self._return_to_safe_pose,
+)
+
+# in your topic callback, after json.loads:
+outcome = self._sink.submit(msg)
+
+# from a timer, at least once per watchdog_ms:
+self._sink.tick()
+
+# if you have force-torque sensing:
+self._sink.force_torque(readings)
+```
+
+The chain, in order:
+
+| # | Check | Failure |
+|---|-------|---------|
+| 1 | schema / mode / dof against the descriptor | **REJECTED** |
+| 2 | ttl expiry, stale observation, seq regression | **DROPPED** |
+| 3 | priority arbitration between sources | **DROPPED** |
+| 4 | `max_delta_per_step` | **CLAMPED** (applied) |
+| 5 | position bounds, `max_velocity` | **REJECTED** |
+| 6 | collision re-validation | *not implemented — see below* |
+| 7 | per-axis force-torque threshold | **ABORTED** |
+| 8 | continuity / committed window | *your controller's job — see below* |
+| 9 | `watchdog_ms` with no valid command | hold |
+| 10 | N consecutive watchdog periods | abort |
+
+**DROPPED vs REJECTED matters.** Dropped is the network being a network — stale,
+out of order, outranked — and is counted, not reported. Rejected means somebody
+wired something up wrong, and has to be visible. Do not collapse the two.
+
+**Clamping vs rejecting matters too, and they go opposite ways.** An oversized
+*step* is clamped: the point still goes where the policy meant, just more slowly,
+and rejecting would break the motion into stutters over one noisy sample. A
+*hard limit* violation rejects the entire command and never clamps to the bound —
+clamping there invents a trajectory that is neither what the policy asked for nor
+anything anyone validated, and every command after it is built on the false
+premise that the robot reached the commanded point.
+
+### Two gaps, stated rather than papered over
+
+**Collision re-validation is not implemented.** MoveIt Pro checks every point of a
+chunk against a planning scene with padding, and keeps watching the scene so an
+object appearing mid-run stops the robot. We have no planning scene — only a URDF,
+with no scene representation and no FK/collision runtime. Until one exists the
+mitigations are procedural: run in simulation until you trust the policy, then
+first real runs at reduced speed, with a person and a physical e-stop.
+
+**Continuity is your controller's job.** Smoothing, densifying and blending chunks,
+and sizing the committed window, happen where a trajectory is executed. One
+consequence belongs here anyway: the committed window must be at least the p99
+inference latency or the robot pauses between chunks, and the larger it is the
+longer e-stop takes to actually stop. Choose it deliberately and report it in
+`info()`.
+
+### A pause is not a safe state
+
+When commands stop arriving the robot holds — and it resumes the moment a valid
+command lands, **without warning**. The `ttl_ms` check is the only thing keeping
+it from resuming on a stale command, so set `ttl_ms` from measured latency: set it
+generously and the protection is gone while still appearing to be there. Announce
+the resume on the activity stream, and never treat a held robot as safe to
+approach.
+
+### Testing
+
+`ControlSink` is ROS-free and takes an injected clock, so the whole chain tests on
+a laptop with a fake `apply` and no robot:
+
+```bash
+python3 -m pytest tests/test_control_sink.py -q
+```
+
+Adding a driver-specific check? Add it there, not in your bundle.

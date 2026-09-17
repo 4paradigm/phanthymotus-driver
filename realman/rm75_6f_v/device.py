@@ -727,10 +727,16 @@ class GripperPlugin:
 
 
 def build_plugins(config, namespace, ros2):
+    from servo import RM75ServoPlugin
+
     client = RM75SDKClient(config)
     plugins = [
         RM75Plugin(client, config, namespace=namespace, ros2=ros2),
         GripperPlugin(client, config, namespace=namespace, ros2=ros2),
+        # Stream-shaped joint control (motus.control/1). Present but inert: it
+        # subscribes to nothing until someone wires it on the canvas and
+        # confirms, and refuses to start at all while the driver is read-only.
+        RM75ServoPlugin(client, config, namespace=namespace, ros2=ros2),
     ]
     external_camera = None
     camera_config = config.get("ext_camera", {})
