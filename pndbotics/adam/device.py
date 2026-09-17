@@ -1811,7 +1811,8 @@ class ArmControlPlugin:
         return None
 
     def _set_targets(self, targets: dict[str, float],
-                     *, preferred_span: float | None = None):
+                     *, preferred_span: float | None = None,
+                     velocity_limit: float | None = None):
         error = self._ready_error()
         if error:
             return error
@@ -1845,8 +1846,14 @@ class ArmControlPlugin:
             # 1.875 * distance / velocity.  The configured transition remains a
             # floor, so short moves are never quicker than the smoothing
             # constant and long moves ease within the velocity limit.
-            peak_span = (self._EASE_PEAK_RATE * max_distance
-                         / self._MAX_VELOCITY_RAD_S)
+            # A caller may hand in a stricter velocity ceiling (semantic arm
+            # gestures use a slower one so a salute or a wave reads as calm
+            # rather than hurried).  When omitted the controller-wide limit
+            # applies, so the raw arm_control/waist/head cards keep their
+            # existing rhythm.
+            limit = (velocity_limit if velocity_limit is not None
+                     else self._MAX_VELOCITY_RAD_S)
+            peak_span = (self._EASE_PEAK_RATE * max_distance / limit)
             if preferred_span is None:
                 self._seg_span = max(
                     0.25, peak_span,
@@ -2276,6 +2283,13 @@ class ArmGesturePlugin:
 
     PREFIX = "arm_gesture"
 
+    # Semantic gestures are performances, not raw positioning: they play at a
+    # slower joint-velocity ceiling than the bare arm_control card so a salute
+    # or a welcome reads calm and deliberate instead of snapping to the pose.
+    # wave keeps the controller-wide limit (its side-to-side rhythm is meant to
+    # be quick), and a caller-chosen duration_s still clamps below this.
+    _GESTURE_VELOCITY_RAD_S = 0.3
+
     # name -> (ARM_POSES key, symmetric, default side)
     _GESTURES = {
         # One-armed poses: the ARM_POSES table defines them on the right arm and
@@ -2494,7 +2508,9 @@ class ArmGesturePlugin:
         except (TypeError, ValueError) as exc:
             return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
         if action != "wave":
-            error = self._control._set_targets(targets, preferred_span=span)
+            error = self._control._set_targets(
+                targets, preferred_span=span,
+                velocity_limit=self._GESTURE_VELOCITY_RAD_S)
             if error:
                 return error
             return {"success": True, "state": "active", "gesture": action,
