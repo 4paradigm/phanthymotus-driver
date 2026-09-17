@@ -755,6 +755,7 @@ class CartesianPlugin:
         self._cancelled = arm_plugin._cancelled if arm_plugin is not None else set()
         self._monitor_thread = None
         self._last_completion = None
+        self._terminal_action_ids = set()
         safety = config.get("safety", {})
         self.max_speed_percent = min(int(safety.get("max_speed_percent", 10)), 10)
         self.default_speed_percent = min(int(safety.get("default_speed_percent", 5)), self.max_speed_percent)
@@ -786,6 +787,7 @@ class CartesianPlugin:
         # 能避免驱动把相对偏移转换成绝对位姿后在奇异点附近丢失构型信息。
         # 三代控制器返回 SDK -7 时自动退回 rm_movel 兼容路径。
         self.native_tool_offset_enabled = cartesian.get("native_tool_offset_enabled", True) is not False
+        self.stop_finalize_seconds = float(cartesian.get("stop_finalize_seconds", 2.0))
 
     def get_tools(self):
         offset_props = {
@@ -957,6 +959,13 @@ class CartesianPlugin:
             target_args = (action_id, current, target, max_duration)
         self._monitor_thread = threading.Thread(target=target_fn, args=target_args, daemon=True)
         self._monitor_thread.start()
+        if controller_completion:
+            threading.Thread(
+                target=self._controller_completion_watchdog,
+                args=(action_id, self._controller_wait_deadline_seconds(current, target, speed_percent)),
+                daemon=True,
+                name="rm75-cartesian-completion-watchdog",
+            ).start()
         print(f"[rm75 ACP] {action_id}: started ({motion_type})", flush=True)
         return {"state": "running", "action_id": action_id}
 
@@ -970,19 +979,36 @@ class CartesianPlugin:
     def _execute_controller_cartesian(self, action_id, motion_type, args, target, speed_percent):
         status, result = "error", {"reason": "unknown"}
         try:
-            with self._submission_lock:
-                with self._action_lock:
-                    cancelled = action_id in self._cancelled
-                if cancelled:
-                    status, result = "cancelled", {"reason": "stopmotion"}
-                else:
-                    self._submit(motion_type, args, target, speed_percent, wait_for_completion=True)
-                    status = "completed"
-                    result = {"reason": "controller_target_reached", "target_pose_mm_deg": target}
+            with self._action_lock:
+                cancelled = action_id in self._cancelled
+            if cancelled:
+                status, result = "cancelled", {"reason": "stopmotion"}
+            else:
+                self._submit(motion_type, args, target, speed_percent, wait_for_completion=True)
+                status = "completed"
+                result = {"reason": "controller_target_reached", "target_pose_mm_deg": target}
         except Exception as exc:
             result = {"reason": str(exc), "target_pose_mm_deg": target}
         finally:
             self._finish_cartesian(action_id, status, result)
+
+    def _controller_wait_deadline_seconds(self, current, target, speed_percent):
+        distance_mm = math.sqrt(sum((a - b) ** 2 for a, b in zip(current[:3], target[:3])))
+        speed_mm_s = 600.0 * speed_percent / 100.0
+        return min(self.max_motion_seconds, max(5.0, distance_mm / speed_mm_s * 3.0 + 5.0))
+
+    def _controller_completion_watchdog(self, action_id, timeout_seconds):
+        time.sleep(timeout_seconds)
+        with self._action_lock:
+            active = self._active_action_id == action_id
+        if not active:
+            return
+        self._request_slow_stop()
+        self._finish_after_stop(
+            action_id,
+            "error",
+            {"reason": "controller_completion_timeout", "timeout_seconds": timeout_seconds},
+        )
 
     def _plan_target(self, motion_type, args, current):
         """纯计算：校验参数并返回监控用的基系绝对目标位姿（毫米/度），不做任何 SDK 调用。"""
@@ -1271,7 +1297,14 @@ class CartesianPlugin:
             self._finish_cartesian(action_id, status, result)
 
     def _finish_cartesian(self, action_id, status, result):
+        release_motion_lock = False
         with self._action_lock:
+            if action_id in self._terminal_action_ids:
+                return False
+            if (self._active_action_id != action_id
+                    and self._motion_state["active_action_id"] != action_id):
+                return False
+            self._terminal_action_ids.add(action_id)
             if action_id in self._cancelled:
                 status, result = "cancelled", {"reason": "stopmotion"}
             self._cancelled.discard(action_id)
@@ -1280,8 +1313,11 @@ class CartesianPlugin:
             if self._motion_state["active_action_id"] == action_id:
                 self._motion_state["active_action_id"] = None
             self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
-        self._motion_lock.release()
+            release_motion_lock = self._motion_lock.locked()
+        if release_motion_lock:
+            self._motion_lock.release()
         self._acp_callback(action_id, status, result)
+        return True
 
     def _controller_trajectory_type(self):
         """返回 API2 当前规划类型；不支持或查询失败时保留位姿监控。"""
@@ -1321,11 +1357,26 @@ class CartesianPlugin:
         # SDK 慢停调用无超时上限，不得在 _action_lock 内执行。
         with self._action_lock:
             action_id = self._motion_state["active_action_id"] or self._active_action_id
+            owns_action = self._active_action_id == action_id
             if action_id:
                 self._cancelled.add(action_id)
         if action_id and self.client.connected:
             self._request_slow_stop()
+        if action_id and owns_action:
+            self._finish_after_stop(action_id, "cancelled", {"reason": "stopmotion"})
         return {"state": "stop_requested", "action_id": action_id}
+
+    def _finish_after_stop(self, action_id, status, result):
+        """SDK 阻塞调用不返回时也不能让画布和运动锁永久滞留。"""
+        def worker():
+            time.sleep(self.stop_finalize_seconds)
+            self._finish_cartesian(action_id, status, result)
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="rm75-cartesian-stop-finalize",
+        ).start()
 
     def _acp_callback(self, action_id, status, result):
         outcome, error = _acp_complete(action_id, status, result, self.PREFIX)
