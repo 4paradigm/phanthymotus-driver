@@ -1675,7 +1675,16 @@ class OdometerPlugin:
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "info":
             return {**self._snapshot(), "topic_out": self._topic_out()}
-        if action in ("odometer", "status", "start"):
+        if action == "start":
+            # Sensor lifecycle start: report the lifecycle as running even
+            # before the first Odin2 sample arrives.  Data availability
+            # (no_data/stale) stays visible in the dedicated field below.
+            return {
+                **self._snapshot(),
+                "state": "running",
+                "data_state": self._snapshot().get("state"),
+            }
+        if action in ("odometer", "status"):
             return self._snapshot()
         if action == "reset_trip":
             with self._lock:
@@ -6294,9 +6303,9 @@ class VisionPlugin:
         self._ns = namespace
         self._topics = config["topics"]
         vision_config = config.get("plugins", {}).get("vision", {}) or {}
-        self._source = vision_config.get("source", "raw")
+        self._source = vision_config.get("source", "slam")
         if self._source not in self._SOURCES:
-            self._source = "raw"
+            self._source = "slam"
         self._cloud_topic = f"/{namespace}/vision/cloud"
         self._cam_left_topic = f"/{namespace}/vision/camera_left"
         self._cam_right_topic = f"/{namespace}/vision/camera_right"
