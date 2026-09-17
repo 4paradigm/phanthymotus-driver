@@ -169,23 +169,34 @@ class RM75SDKClient:
                 self._discard_trajectory_wait()
                 raise
 
-    def wait_trajectory(self, timeout_seconds):
-        """等待官方 current trajectory state 回调；None 表示超时。"""
+    def poll_trajectory(self, timeout_seconds=0.0):
+        """读取官方到位事件；尚未收到时保留等待状态并返回 None。"""
         self._trajectory_event.wait(timeout=max(0.0, float(timeout_seconds)))
         with self._trajectory_lock:
             # 回调可能恰好在 Event.wait 超时与取得锁之间到达；以锁内结果为准，
             # 避免把已经收到的成功事件误判为超时。
             result = self._trajectory_result
-            self._trajectory_waiting = False
-            self._trajectory_result = None
-            self._trajectory_event.clear()
+            if result is not None:
+                self._trajectory_waiting = False
+                self._trajectory_result = None
+                self._trajectory_event.clear()
         return result
 
-    def _discard_trajectory_wait(self):
+    def wait_trajectory(self, timeout_seconds):
+        """等待官方 current trajectory state 回调；None 表示超时。"""
+        result = self.poll_trajectory(timeout_seconds)
+        if result is None:
+            self.discard_trajectory_wait()
+        return result
+
+    def discard_trajectory_wait(self):
         with self._trajectory_lock:
             self._trajectory_waiting = False
             self._trajectory_result = None
             self._trajectory_event.clear()
+
+    # 兼容类内旧调用名称。
+    _discard_trajectory_wait = discard_trajectory_wait
 
     def cancel_trajectory_wait(self):
         """解除 Python 侧事件等待；不会代替控制器慢停命令。"""
@@ -1023,6 +1034,7 @@ class CartesianPlugin:
                 action_id,
                 motion_type,
                 args,
+                current,
                 target,
                 speed_percent,
                 self._controller_wait_deadline_seconds(current, target, speed_percent),
@@ -1040,34 +1052,28 @@ class CartesianPlugin:
             motion_type == "move_offset"
             and self.native_tool_offset_enabled
             and callable(getattr(self.client, "command_trajectory", None))
-            and callable(getattr(self.client, "wait_trajectory", None))
+            and callable(getattr(self.client, "poll_trajectory", None))
         )
 
     def _execute_controller_cartesian(
-            self, action_id, motion_type, args, target, speed_percent, timeout_seconds):
-        status, result = "error", {"reason": "unknown"}
+            self, action_id, motion_type, args, start_pose, target, speed_percent, timeout_seconds):
         try:
             with self._action_lock:
                 cancelled = action_id in self._cancelled
             if cancelled:
-                status, result = "cancelled", {"reason": "stopmotion"}
-            else:
-                self._submit(motion_type, args, target, speed_percent, wait_for_completion=True)
-                trajectory_state = self.client.wait_trajectory(timeout_seconds)
-                if trajectory_state is None:
-                    self._request_slow_stop()
-                    time.sleep(self.stop_finalize_seconds)
-                    raise RuntimeError(
-                        f"controller completion event timed out after {timeout_seconds:.1f}s"
-                    )
-                if trajectory_state is not True:
-                    raise RuntimeError("controller reported trajectory planning or execution failure")
-                status = "completed"
-                result = {"reason": "controller_target_reached", "target_pose_mm_deg": target}
+                self._finish_cartesian(action_id, "cancelled", {"reason": "stopmotion"})
+                return
+            self._submit(motion_type, args, target, speed_percent, wait_for_completion=True)
         except Exception as exc:
-            result = {"reason": str(exc), "target_pose_mm_deg": target}
-        finally:
-            self._finish_cartesian(action_id, status, result)
+            self._finish_cartesian(
+                action_id, "error", {"reason": str(exc), "target_pose_mm_deg": target}
+            )
+            return
+        # 官方事件是主完成信号；同时轮询实际位姿与当前规划类型。部分控制器固件
+        # 不会上报 rm_movel_offset 到位事件，但 TCP 已经到位，不能因此一直占用动作锁。
+        self._monitor_cartesian(
+            action_id, start_pose, target, timeout_seconds, controller_event=True
+        )
 
     def _controller_wait_deadline_seconds(self, current, target, speed_percent):
         distance_mm = math.sqrt(sum((a - b) ** 2 for a, b in zip(current[:3], target[:3])))
@@ -1267,7 +1273,8 @@ class CartesianPlugin:
         speed_mm_s = 600.0 * speed_percent / 100.0
         return min(self.max_motion_seconds, max(30.0, distance_mm / speed_mm_s * 3.0 + 10.0))
 
-    def _monitor_cartesian(self, action_id, start_pose, target, max_duration):
+    def _monitor_cartesian(
+            self, action_id, start_pose, target, max_duration, controller_event=False):
         started = time.monotonic()
         deadline = started + max_duration
         last_progress = started + self.start_grace_seconds
@@ -1281,6 +1288,23 @@ class CartesianPlugin:
                 if cancelled:
                     status, result = "cancelled", {"reason": "stopmotion"}
                     break
+                if controller_event:
+                    trajectory_state = self.client.poll_trajectory(0.0)
+                    if trajectory_state is True:
+                        status = "completed"
+                        result = {
+                            "reason": "controller_target_reached",
+                            "target_pose_mm_deg": target,
+                            "elapsed_seconds": time.monotonic() - started,
+                        }
+                        break
+                    if trajectory_state is False:
+                        result = {
+                            "reason": "controller reported trajectory planning or execution failure",
+                            "target_pose_mm_deg": target,
+                            "elapsed_seconds": time.monotonic() - started,
+                        }
+                        break
                 if self._arm is not None:
                     self._arm._preflight()
                 current = self._current_pose_mm_deg()
@@ -1288,7 +1312,8 @@ class CartesianPlugin:
                 now = time.monotonic()
                 if position_error <= self.position_tolerance_mm and euler_error <= self.euler_tolerance_deg:
                     status = "completed"
-                    result = {"target_pose_mm_deg": target, "actual_pose_mm_deg": current,
+                    result = {"reason": "pose_target_reached",
+                              "target_pose_mm_deg": target, "actual_pose_mm_deg": current,
                               "position_error_mm": position_error, "euler_error_deg": euler_error,
                               "elapsed_seconds": now - started}
                     break
@@ -1359,6 +1384,10 @@ class CartesianPlugin:
             self._request_slow_stop()
             result = {"reason": str(exc)}
         finally:
+            if controller_event:
+                discard_wait = getattr(self.client, "discard_trajectory_wait", None)
+                if callable(discard_wait):
+                    discard_wait()
             self._finish_cartesian(action_id, status, result)
 
     def _finish_cartesian(self, action_id, status, result):
