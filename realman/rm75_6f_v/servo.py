@@ -118,27 +118,25 @@ class RM75ServoPlugin:
         self._running = False
         self._last_outcome: dict | None = None
         self._rejects: list[str] = []
-        # Standing authorisation to move, set from the card's config form —
-        # see the note beside `configSchema` in get_tools.
-        self._confirm_motion = bool(servo_config.get("confirm_motion", False))
+        # Paused means subscribed but not applying. See `pause` in get_tools.
+        self._paused = False
 
     # ── tools ────────────────────────────────────────────────────────────────
 
     def get_tools(self):
         schema = action_schema(
             {
-                "start": (["input_topic", "confirm_motion"],
+                "start": (["input_topic"],
                           "Subscribe to a control/joint topic and stream commands to the arm"),
+                "pause": ([], "Hold the current pose and stop applying commands, "
+                              "staying subscribed; resume continues"),
+                "resume": ([], "Continue applying commands"),
                 "stop": ([], "Unsubscribe and bring the arm to a controlled stop"),
                 "info": ([], "Action space descriptor, sink counters and last outcome"),
             },
             {
                 "input_topic": {"type": "string",
                                 "description": "control/joint topic to consume"},
-                "confirm_motion": {
-                    "type": "boolean",
-                    "description": "Must be true — starting this card authorises continuous motion",
-                },
             },
         )
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"},
@@ -157,53 +155,18 @@ class RM75ServoPlugin:
                 schema,
                 topic_in=[{"format": "control/joint",
                            "desc": "motus.control/1 joint_position commands"}],
-                # `confirm_motion` is reachable two ways, because this card is
-                # started two ways and one of them cannot pass arguments.
-                #
-                # A direct `tools/call` sends it as an argument — the go1
-                # CONTRIBUTING convention for a dangerous action, right for a
-                # call an operator or an LLM makes.
-                #
-                # The canvas cannot. `start-project` builds the start arguments
-                # itself (agent-core src/api/config.py `_start_and_resolve`)
-                # and sends only action, instance_id, input_topic and
-                # control_interface. With the argument as the only gate this
-                # card could never be started from the canvas at all — and
-                # since a card reporting `error` rolls the whole project back,
-                # merely wiring it up took every other card down with it.
-                # Verified on a Tianyi, whose servo card had the same gate.
-                #
-                # So the standing authorisation lives in the config form, which
-                # is applied before start and is the canvas's authorisation
-                # surface anyway. This does not reopen what `start()` promises:
-                # the driver still never starts this card itself, so a
-                # container restart does not come up streaming.
-                configSchema={
-                    "type": "object",
-                    "properties": {
-                        "confirm_motion": {
-                            "type": "boolean",
-                            "title": "Authorise continuous motion",
-                            "description": "Tick to authorise: while this card "
-                                           "runs it continuously drives the arm.",
-                            "default": False,
-                            "scope": "shared",
-                        },
-                    },
-                },
             )
         ]
 
     def dispatch(self, action, args):
-        if action == "config":
-            if "confirm_motion" in args:
-                self._confirm_motion = bool(args["confirm_motion"])
-            return {"status": "configured",
-                    "confirm_motion": self._confirm_motion}
         if action == "start":
             return self._start(args)
         if action == "stop":
             return self._stop()
+        if action == "pause":
+            return self._pause(True)
+        if action == "resume":
+            return self._pause(False)
         if action == "info":
             return self._info()
         return None
@@ -214,8 +177,8 @@ class RM75ServoPlugin:
         """Bundle lifecycle. Deliberately does nothing.
 
         A card that streams motion must not come up streaming because the
-        container restarted. It starts when someone wires it on the canvas and
-        confirms, and not before.
+        container restarted. It starts when agent-core starts the project,
+        which is an operator action, and not before.
         """
 
     def stop(self):
@@ -224,14 +187,6 @@ class RM75ServoPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args):
-        # Either gate authorises: the argument for a direct call, the config
-        # for the canvas. Neither is weaker — both are a person saying yes.
-        if not (args.get("confirm_motion") or self._confirm_motion):
-            return {"state": "error",
-                    "message": "confirm_motion must be true — this card authorises "
-                               "continuous motion for as long as it runs. On the "
-                               "canvas, tick 'Authorise continuous motion' in the "
-                               "card's config."}
         if not self.client.motion_enabled:
             return {"state": "error",
                     "message": "RM_MOTION_ENABLED is not set; this driver is read-only"}
@@ -264,6 +219,7 @@ class RM75ServoPlugin:
             self._sink = sink
             self._input_topic = topic
             self._running = True
+            self._paused = False
 
         try:
             self._subscribe(topic)
@@ -276,6 +232,23 @@ class RM75ServoPlugin:
         print(f"[rm75] servo streaming from {topic}", flush=True)
         return {"state": "running", "input": topic,
                 "control_interface": self._descriptor_raw}
+
+    def _pause(self, paused: bool):
+        """Hold the current pose without giving up the subscription.
+
+        This is the card's answer to "wait", and the reason it exists rather
+        than telling a model to `stop` and `start` again: `start` needs the
+        input topic and the downstream descriptor, which only agent-core knows
+        at project start. A model that stopped this card could not restart it.
+        """
+        with self._lock:
+            if not self._running:
+                return {"state": "idle", "message": "card is not running"}
+            self._paused = bool(paused)
+        if paused:
+            self._slow_stop()
+        return {"state": "paused" if paused else "running",
+                "input": self._input_topic}
 
     def _stop(self):
         with self._lock:
@@ -302,8 +275,12 @@ class RM75ServoPlugin:
             topic = self._input_topic
             last = dict(self._last_outcome) if self._last_outcome else None
             rejects = list(self._rejects)
+            paused = self._paused
         return {
-            "state": "running" if running else "idle",
+            # Paused is its own state, not running: an operator reading
+            # "running" beside a motionless arm goes looking for a fault that
+            # is not there.
+            "state": ("paused" if paused else "running") if running else "idle",
             "input": topic,
             "control_interface": self._descriptor_raw,
             # The window this card commits to the controller before it can be
@@ -343,7 +320,10 @@ class RM75ServoPlugin:
 
     def _on_message(self, message):
         sink = self._sink
-        if sink is None:
+        if sink is None or self._paused:
+            # Dropped, not queued: a command held through a pause was computed
+            # from a world that has moved on, and applying it at resume would
+            # be a jump from stale data.
             return
         try:
             payload = json.loads(message.data)

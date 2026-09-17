@@ -90,63 +90,68 @@ def make_plugin(servo, **config):
     return servo.TianyiServoPlugin(config, namespace="nvidia_desktop", ros2=None)
 
 
-# ── the motion gate ──────────────────────────────────────────────────────────
+# ── pause is the model's lever, not a start gate ─────────────────────────────
 
-def test_start_requires_explicit_confirmation(servo):
+def test_pause_stops_applying_without_dropping_the_subscription(servo):
+    """`stop` is not an answer to "wait": only agent-core knows the input topic
+    and the downstream descriptor, so a model that stopped this card could not
+    start it again."""
     plugin = make_plugin(servo)
-    result = plugin.dispatch("start", {"input_topic": "/x"})
-    assert result["state"] == "error"
-    assert "confirm_motion" in result["message"]
+    plugin._running = True
+    plugin._input_topic = "/x"
+
+    assert plugin.dispatch("pause", {})["state"] == "paused"
+    assert plugin._input_topic == "/x"
+    assert plugin.dispatch("info", {})["state"] == "paused"
+
+    assert plugin.dispatch("resume", {})["state"] == "running"
+    assert plugin.dispatch("info", {})["state"] == "running"
 
 
-def test_the_canvas_can_authorise_through_the_config_form(servo):
-    """The bug this test exists for, found on the real robot.
+def test_a_command_arriving_during_a_pause_is_dropped_not_queued(servo):
+    """Applying it at resume would be a jump computed from a stale world."""
+    plugin = make_plugin(servo)
+    plugin._running = True
+    plugin._sink = _RefusingSink()
+    plugin.dispatch("pause", {})
 
-    `start-project` (agent-core src/api/config.py `_start_and_resolve`) builds
-    the start arguments itself and sends only action, instance_id, input_topic
-    and control_interface. With the gate readable only from the arguments this
-    card could never be started from the canvas — and since a card answering
-    `error` rolls the whole project back, wiring it up stopped the robot's ASR,
-    camera and TTS cards along with it.
+    plugin._on_message(_Message('{"values": [0] * 26}'))
+
+    assert plugin._sink.submitted == []
+
+
+def test_pausing_a_card_that_is_not_running_is_not_an_error(servo):
+    assert make_plugin(servo).dispatch("pause", {})["state"] == "idle"
+
+
+def test_start_does_not_ask_for_a_confirmation_the_canvas_cannot_give(servo):
+    """`start-project` builds the start arguments itself (agent-core
+    src/api/config.py `_start_and_resolve`) and sends only action, instance_id,
+    input_topic and control_interface. A card gating on anything else can never
+    be started the one way it is meant to be — and since a card answering
+    `error` rolls the whole project back, wiring it up stopped this robot's
+    ASR, camera and TTS cards too. That is what happened on the real Tianyi.
     """
-    plugin = make_plugin(servo)
-    assert plugin.dispatch("config", {"confirm_motion": True})["confirm_motion"]
+    definition = make_plugin(servo).get_tool()
+    properties = definition["inputSchema"]["properties"]
 
-    # Exactly the arguments start-project sends — note no confirm_motion.
-    result = plugin.dispatch("start", {"input_topic": "/x"})
-
-    # It reaches the subscription, which has no ROS context here. Reaching it
-    # is the proof: the motion gate is behind it.
-    assert "confirm_motion" not in result.get("message", "")
+    assert set(properties) <= {"action", "input_topic"}
+    for spec in definition["inputSchema"]["x-action-params"].values():
+        assert set(spec["params"]) <= {"input_topic"}
 
 
-def test_configuring_it_false_again_closes_the_door(servo):
-    plugin = make_plugin(servo)
-    plugin.dispatch("config", {"confirm_motion": True})
-    plugin.dispatch("config", {"confirm_motion": False})
-
-    result = plugin.dispatch("start", {"input_topic": "/x"})
-
-    assert result["state"] == "error"
-    assert "confirm_motion" in result["message"]
+class _Message:
+    def __init__(self, data):
+        self.data = data
 
 
-def test_the_default_is_closed(servo):
-    """If the fix had defaulted to true it would have opened every canvas."""
-    field = (make_plugin(servo).get_tool()["configSchema"]
-             ["properties"]["confirm_motion"])
-    assert field["default"] is False
-    assert field["type"] == "boolean"
+class _RefusingSink:
+    def __init__(self):
+        self.submitted = []
 
-
-def test_bundle_start_does_not_begin_streaming(servo):
-    """A restarted container must not come up driving two arms."""
-    plugin = make_plugin(servo)
-    plugin.dispatch("config", {"confirm_motion": True})
-
-    plugin.start()          # the bundle lifecycle hook, not the card's action
-
-    assert plugin.dispatch("info", {})["state"] == "idle"
+    def submit(self, payload):
+        self.submitted.append(payload)
+        raise AssertionError("a paused card must not reach the sink")
 
 
 # ── the action space ─────────────────────────────────────────────────────────
