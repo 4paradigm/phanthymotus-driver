@@ -1,0 +1,27 @@
+unitree-as2w:
+  image: __IMAGE__
+  container_name: embodied-unitree-as2w
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    # The vendor-provided SLAM service runs on the robot/extension host. These
+    # mounts expose its maps/configuration; this driver never starts binaries.
+    - /unitree/module:/unitree/module:ro
+    - /home/unitree/maps:/home/unitree/maps
+  environment:
+    - NETWORK_INTERFACE=eth0
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

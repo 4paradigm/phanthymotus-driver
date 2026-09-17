@@ -1,0 +1,22 @@
+id: as2w-driver
+name: Unitree As2W Bundle
+category: driver
+hardware_provider: unitree
+hardware_model: "as2w"
+image_name: as2w
+port: 15709
+mcp_url: "http://localhost:15709/mcp"
+description: "Unitree As2W — 轮足运动、特技、SLAM 空间动作、状态感知与雷达"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: model, type: resource }
+  - { name: loco, type: actuator }
+  - { name: special_action, type: actuator }
+  - { name: controlled_spatial, type: actuator }
+  - { name: imu, type: sensor }
+  - { name: joints, type: sensor }
+  - { name: joint_state, type: sensor }
+  - { name: battery, type: sensor }
+  - { name: loco_state, type: sensor }
+  - { name: lidar_cloud, type: sensor }
