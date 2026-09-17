@@ -441,9 +441,6 @@ ROS2_UPPER_BODY_JOINTS = [
 # product overview, converted from radians to degrees. The card deliberately
 # uses stable semantic ids rather than leaking ROS topic/joint names.
 ARM_JOINT_CONTROLS = {
-    "waist_roll": ("腰部侧倾", "waistRoll", -16.0, 16.0),
-    "waist_pitch": ("腰部前后俯仰", "waistPitch", -48.0, 78.0),
-    "waist_yaw": ("腰部左右转动", "waistYaw", -47.0, 47.0),
     "left_shoulder_pitch": ("左肩前后摆", "shoulderPitch_Left", -207.0, 117.0),
     "right_shoulder_pitch": ("右肩前后摆", "shoulderPitch_Right", -207.0, 117.0),
     "left_shoulder_roll": ("左肩向内/外摆", "shoulderRoll_Left", -36.0, 160.0),
@@ -460,24 +457,30 @@ ARM_JOINT_CONTROLS = {
     "right_wrist_roll": ("右手腕侧摆", "wristRoll_Right", -55.0, 55.0),
 }
 
+WAIST_JOINT_CONTROLS = {
+    "roll": ("腰部侧倾", "waistRoll", -16.0, 16.0),
+    "pitch": ("腰部前后俯仰", "waistPitch", -48.0, 78.0),
+    "yaw": ("腰部左右转动", "waistYaw", -47.0, 47.0),
+}
+
 ARM_POSES = {
-    "neutral": ("自然下垂", {}),
-    "arms_forward": ("双臂向前", {
-        "left_shoulder_pitch": -30.0, "right_shoulder_pitch": -30.0,
-        "left_elbow": -45.0, "right_elbow": -45.0,
+    # The three positions documented in PNDbotics' arm_control example.
+    "default": ("默认姿态", {
+        "left_shoulder_roll": 5.7, "right_shoulder_roll": -5.7,
+        "left_elbow": -17.2, "right_elbow": -17.2,
     }),
-    "arms_open": ("双臂张开", {
-        "left_shoulder_pitch": -15.0, "right_shoulder_pitch": -15.0,
-        "left_shoulder_roll": 35.0, "right_shoulder_roll": -35.0,
-        "left_elbow": -25.0, "right_elbow": -25.0,
+    "spread": ("双臂水平张开", {
+        "left_shoulder_roll": 85.9, "right_shoulder_roll": -85.9,
+        "left_elbow": 0.0, "right_elbow": 0.0,
     }),
-    "hands_up": ("双手举起", {
-        "left_shoulder_pitch": -95.0, "right_shoulder_pitch": -95.0,
-        "left_elbow": -30.0, "right_elbow": -30.0,
+    "down": ("双臂放下", {
+        "left_shoulder_roll": 0.0, "right_shoulder_roll": 0.0,
+        "left_elbow": 0.0, "right_elbow": 0.0,
     }),
 }
 
 ARM_ACTIONS = {f"set_{control}": control for control in ARM_JOINT_CONTROLS}
+WAIST_ACTIONS = {f"set_{control}": control for control in WAIST_JOINT_CONTROLS}
 
 
 def _arm_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
@@ -497,6 +500,24 @@ def _arm_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
         raise ValueError(
             f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
     return ros_name, math.radians(value)
+
+
+def _waist_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
+    if control not in WAIST_JOINT_CONTROLS:
+        raise ValueError("joint must be one of the advertised Adam waist controls")
+    if isinstance(angle_deg, bool):
+        raise ValueError("angle_deg must be a finite number")
+    try:
+        value = float(angle_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("angle_deg must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ValueError("angle_deg must be a finite number")
+    _, joint_name, minimum, maximum = WAIST_JOINT_CONTROLS[control]
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
+    return joint_name, math.radians(value)
 
 
 def _best_effort_qos():
@@ -1022,14 +1043,17 @@ class RlLocoPlugin:
         }
 
     def start(self):
-        return None
+        return {"state": "ready"}
 
 
     def stop(self):
-        # A plugin stop is a local lifecycle event; explicit shutdown is
-        # required before asking the robot controller to exit.
         self._cancel_timed_move()
-        return None
+        try:
+            result = self._grpc.set_velocity(0.0, 0.0, 0.0)
+        except Exception as exc:
+            return {"state": "idle", "success": False,
+                    "message": f"failed to send zero velocity: {exc}"}
+        return dict(result, state="idle")
 
     def _cancel_timed_move(self):
         with self._move_lock:
@@ -1057,7 +1081,7 @@ class RlLocoPlugin:
         # controller or motion card currently owns the robot.
         if action == "stop":
             self._cancel_timed_move()
-            return self._grpc.set_velocity(0.0, 0.0, 0.0)
+            return dict(self._grpc.set_velocity(0.0, 0.0, 0.0), state="idle")
         state = _ensure_rl_locomotion(self._grpc)
         if not state.get("success", False):
             return state
@@ -1239,6 +1263,8 @@ class MotionPlugin(_RlActionPlugin):
                     "get_state": {"params": []}, "info": {"params": []}}}}
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
         if action in ("get_state", "info"):
             return self._state()
         if action == "play":
@@ -1250,7 +1276,7 @@ class MotionPlugin(_RlActionPlugin):
                 return denied
             return self._grpc.set_motion("PLAY", args.get("motion_file", ""))
         if action == "stop":
-            return self._grpc.set_motion("STOP", "")
+            return dict(self._grpc.set_motion("STOP", ""), state="idle")
         return None
 
 
@@ -1270,6 +1296,10 @@ class TrackingMotionPlugin(_RlActionPlugin):
                     "get_state": {"params": []}, "info": {"params": []}}}}
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action in ("get_state", "info"):
             return self._state()
         if action == "play":
@@ -1431,10 +1461,8 @@ class ArmControlPlugin:
                 motor.dq = 0.0
                 motor.tau = 0.0
                 kp, kd = self._pd_for_joint(joint_name)
-                is_arm = joint_name.startswith((
-                    "waist", "shoulder", "elbow", "wrist"))
                 arm_scale = 1.0
-                if is_arm and (soft_arms or release_started_at is not None):
+                if index in targets and (soft_arms or release_started_at is not None):
                     arm_scale = 1.0 - release_ratio
                 motor.kp = kp * arm_scale
                 motor.kd = kd
@@ -1576,12 +1604,11 @@ class ArmControlPlugin:
             self._active = True
             self._streaming = True
             self._soft_arms = False
-        # The worker may need one 20ms tick. This confirms the protocol write,
-        # not physical movement, which DDS does not acknowledge.
+        # Write the first complete command synchronously. Waiting only for the
+        # restarted 50Hz worker made valid calls fail spuriously during canvas
+        # card switches, even though the DDS writer and lowstate were ready.
         before = self._writes
-        deadline = time.monotonic() + 0.15
-        while self._writes <= before and time.monotonic() < deadline:
-            time.sleep(0.005)
+        self._write_command(0.0)
         if self._writes <= before:
             return {"success": False, "code": "DDS_WRITE_FAILED",
                     "message": self._last_error or "rt/lowcmd was not written"}
@@ -1640,13 +1667,83 @@ class ArmControlPlugin:
 ArmPlugin = ArmControlPlugin
 
 
+class WaistControlPlugin:
+    """Dedicated Adam Pro waist card sharing the safe lowcmd controller."""
+
+    PREFIX = "waist_control"
+
+    def __init__(self, control: ArmControlPlugin):
+        self._control = control
+
+    def get_tool(self):
+        properties = {
+            "action": {"type": "string", "enum": [*WAIST_ACTIONS, "reset", "stop", "info"]},
+        }
+        action_params = {
+            "reset": {"params": [], "description": "回到开始控制时的腰部角度。"},
+            "stop": {"params": [], "description": "停止腰部低层控制。"},
+            "info": {"params": [], "description": "查看腰部控制状态。"},
+        }
+        for action, control in WAIST_ACTIONS.items():
+            label, _, minimum, maximum = WAIST_JOINT_CONTROLS[control]
+            field = f"{control}_deg"
+            properties[field] = {
+                "type": "number", "title": f"{label}目标角度（度）",
+                "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
+                "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+            action_params[action] = {"params": [field]}
+        return {"name": "waist_control", "type": "actuator",
+                "description": "Adam Pro waist roll, pitch and yaw control through DDS lowcmd",
+                "inputSchema": {"type": "object", "properties": properties,
+                                "required": ["action"], "additionalProperties": False,
+                                "x-action-params": action_params,
+                                "x-resource": ["adam_upper_body"]}}
+
+    def start(self):
+        self._control.start()
+        return {"state": "ready"}
+
+    def stop(self):
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self._control.dispatch("stop", {})
+        if action == "info":
+            return self._control.dispatch("info", {})
+        if action == "reset":
+            error = self._control._ready_error()
+            if error:
+                return error
+            targets = {
+                joint: self._control._hold_q[self._control._joint_index(joint)]
+                for _, joint, _, _ in WAIST_JOINT_CONTROLS.values()
+            }
+            error = self._control._set_targets(targets)
+            return error or {"success": True, "state": "active", "action": "reset"}
+        control = WAIST_ACTIONS.get(action)
+        if control is None:
+            return None
+        try:
+            joint, radians = _waist_target_radians(control, args.get(f"{control}_deg"))
+        except ValueError as exc:
+            return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+        error = self._control._set_targets({joint: radians})
+        if error:
+            return error
+        return {"success": True, "state": "active", "joint": control,
+                "angle_deg": float(args[f"{control}_deg"]), "protocol": "rt/lowcmd"}
+
+
 class ArmGesturePlugin:
-    """Common arm gestures using the shared upper-body control publisher."""
+    """Vendor-documented arm positions using the shared lowcmd publisher."""
 
     PREFIX = "arm_gesture"
     _POSES = {
-        "salute": "arms_forward", "welcome": "arms_open", "raise": "hands_up",
-        "shake_hands": "arms_forward", "high_five": "arms_forward", "reset": "neutral",
+        "default": "default", "spread": "spread", "down": "down",
     }
 
     def __init__(self, control: ArmControlPlugin):
@@ -1655,7 +1752,7 @@ class ArmGesturePlugin:
     def get_tool(self):
         return {
             "name": "arm_gesture", "type": "actuator",
-            "description": "Adam arm gestures — salute, welcome, raise, shake hands, high five and reset",
+            "description": "Adam documented arm positions — default, horizontal spread and down",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [*self._POSES, "stop"]},
                 "side": {"type": "string", "enum": ["left", "right", "both"], "default": "right"},
@@ -1666,12 +1763,15 @@ class ArmGesturePlugin:
         }
 
     def start(self):
-        return self._control.start()
+        self._control.start()
+        return {"state": "ready"}
 
     def stop(self):
         return self._control.stop()
 
     def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
         if action == "stop":
             return self._control.dispatch("stop", {})
         pose = self._POSES.get(action)
@@ -1685,9 +1785,6 @@ class ArmGesturePlugin:
             control: degrees for control, degrees in values.items()
             if side == "both" or control.startswith(f"{side}_")
         }
-        if action == "reset":
-            selected = {control: 0.0 for control in ARM_JOINT_CONTROLS
-                        if side == "both" or control.startswith(f"{side}_")}
         try:
             targets = dict(_arm_target_radians(control, value)
                            for control, value in selected.items())
@@ -1800,11 +1897,13 @@ class HandPlugin:
 
         positions = self._state_cache.fresh_positions(self._state_timeout_sec)
         if positions is None:
-            return list(self._open_positions)
+            # A one-sided command must not invent the other side's target.
+            # The old open-pose fallback opened both hands on the first call.
+            return None
         try:
             return _coerce_hand_positions(positions, limit=self._max_val)
         except ValueError:
-            return list(self._open_positions)
+            return None
 
     def get_tool(self) -> dict:
         return {
@@ -2159,6 +2258,9 @@ class HandPlugin:
                 return {"state": "error", "error": "INVALID_ARGUMENT", "message": str(exc)}
 
             base = self._base_positions()
+            if base is None:
+                return {"state": "error", "error": "HANDSTATE_UNAVAILABLE",
+                        "message": "cannot preserve the other hand without fresh rt/handstate"}
             positions = list(base)
             offset = 0 if side == "left" else 6
             positions[offset + HAND_CHANNEL_NAMES.index(channel)] = value
@@ -2171,6 +2273,9 @@ class HandPlugin:
         if side not in ("left", "right"):
             return {"state": "error", "error": "INVALID_ARGUMENT", "message": "side must be either left or right"}
         positions = self._base_positions()
+        if positions is None:
+            return {"state": "error", "error": "HANDSTATE_UNAVAILABLE",
+                    "message": "cannot preserve the other hand without fresh rt/handstate"}
         offset = 0 if side == "left" else 6
         positions[offset:offset + 6] = source[offset:offset + 6]
         result = self._activate(positions, action)
@@ -2205,12 +2310,18 @@ class HandGesturePlugin:
                 "x-resource": ["adam_hands"]}}
 
     def start(self):
-        return self._control.start()
+        self._control.start()
+        return {"state": "ready"}
 
     def stop(self):
         return self._control.stop()
 
     def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            self._control.stop()
+            return {"state": "idle"}
         values = self._GESTURES.get(action)
         side = args.get("side")
         if values is None:
@@ -2218,6 +2329,9 @@ class HandGesturePlugin:
         if side not in ("left", "right"):
             return {"state": "error", "error": "INVALID_ARGUMENT", "message": "side must be either left or right"}
         positions = self._control._base_positions()
+        if positions is None:
+            return {"state": "error", "error": "HANDSTATE_UNAVAILABLE",
+                    "message": "cannot preserve the other hand without fresh rt/handstate"}
         offset = 0 if side == "left" else 6
         positions[offset:offset + 6] = values
         result = self._control._activate(positions, action)
@@ -3718,6 +3832,8 @@ class AdamDeviceBundle:
             self._plugins.append(p)
             if plugins_cfg.get("arm_gesture", {}).get("enabled", True):
                 self._plugins.append(ArmGesturePlugin(p))
+            if plugins_cfg.get("waist", {}).get("enabled", True):
+                self._plugins.append(WaistControlPlugin(p))
 
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:

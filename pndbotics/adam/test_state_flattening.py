@@ -18,6 +18,10 @@ class StateFlatteningTests(unittest.TestCase):
         self.assertEqual(f"{prefix}_position_rad", "motor_00_hipPitch_Left_position_rad")
         self.assertEqual(f"{prefix}_torque_nm", "motor_00_hipPitch_Left_torque_nm")
 
+    def test_pro_body_state_includes_the_two_neck_joints(self):
+        self.assertIn("neckYaw", VARIANT_JOINTS["pro"])
+        self.assertIn("neckPitch", VARIANT_JOINTS["pro"])
+
     def test_zero_placeholder_fields_are_intentionally_omitted(self):
         ddq = 0.0
         mode = 0

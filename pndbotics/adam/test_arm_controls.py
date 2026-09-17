@@ -11,7 +11,9 @@ sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
 import device
 from device import (ADAM_PRO_JOINTS, ARM_ACTIONS, ARM_JOINT_CONTROLS,
-                    ARM_POSES, ArmControlPlugin, _arm_target_radians)
+                    ARM_POSES, WAIST_ACTIONS, WAIST_JOINT_CONTROLS,
+                    ArmControlPlugin, WaistControlPlugin, _arm_target_radians,
+                    _waist_target_radians)
 
 
 class _FakePublisher:
@@ -36,7 +38,17 @@ class ArmControlTests(unittest.TestCase):
         self.assertIn("left_shoulder_pitch", ARM_JOINT_CONTROLS)
         self.assertIn("right_wrist_roll", ARM_JOINT_CONTROLS)
         self.assertNotIn("shoulderPitch_Left", ARM_JOINT_CONTROLS)
-        self.assertIn("neutral", ARM_POSES)
+        self.assertIn("default", ARM_POSES)
+        self.assertNotIn("waist_roll", ARM_JOINT_CONTROLS)
+
+    def test_waist_is_a_separate_control_card(self):
+        self.assertEqual("roll", WAIST_ACTIONS["set_roll"])
+        self.assertIn("yaw", WAIST_JOINT_CONTROLS)
+        name, target = _waist_target_radians("pitch", 30)
+        self.assertEqual("waistPitch", name)
+        self.assertAlmostEqual(math.pi / 6, target)
+        tool = WaistControlPlugin(types.SimpleNamespace()).get_tool()
+        self.assertEqual("waist_control", tool["name"])
 
     def test_arm_lowcmd_rejects_non_pro_layouts_explicitly(self):
         with self.assertRaisesRegex(ValueError, "only Adam Pro"):

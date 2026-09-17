@@ -11,6 +11,8 @@ sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from device import (
+    ArmGesturePlugin,
+    HandGesturePlugin,
     MotionPlugin,
     RlLocoPlugin,
 )
@@ -102,6 +104,12 @@ class LocoContractTests(unittest.TestCase):
         plugin.dispatch("stop", {})
         self.assertEqual((0.0, 0.0, 0.0), grpc.velocity)
 
+    def test_loco_lifecycle_stop_brakes_the_robot(self):
+        grpc = _Grpc()
+        result = RlLocoPlugin({}, "adam", None, grpc).stop()
+        self.assertEqual((0.0, 0.0, 0.0), grpc.velocity)
+        self.assertEqual("idle", result["state"])
+
     def test_focused_execution_cards_are_registered_contracts(self):
         grpc = _Grpc()
         cards = [
@@ -120,6 +128,23 @@ class LocoContractTests(unittest.TestCase):
         self.assertEqual(("PLAY", "Sources/motion/Wave.txt"), grpc.motion)
         motion.dispatch("stop", {})
         self.assertEqual(("STOP", ""), grpc.motion)
+        self.assertEqual("ready", motion.dispatch("start", {})["state"])
+        self.assertEqual("idle", motion.dispatch("stop", {})["state"])
+
+    def test_gesture_cards_answer_lifecycle_actions(self):
+        arm_control = types.SimpleNamespace(
+            start=lambda: None,
+            stop=lambda: None,
+            dispatch=lambda action, args: {"state": "idle"},
+        )
+        hand_control = types.SimpleNamespace(
+            start=lambda: {"state": "ready"},
+            stop=lambda: {"state": "stopped"},
+        )
+        self.assertEqual("ready", ArmGesturePlugin(arm_control).dispatch("start", {})["state"])
+        self.assertEqual("idle", ArmGesturePlugin(arm_control).dispatch("stop", {})["state"])
+        self.assertEqual("ready", HandGesturePlugin(hand_control).dispatch("start", {})["state"])
+        self.assertEqual("idle", HandGesturePlugin(hand_control).dispatch("stop", {})["state"])
 
 if __name__ == "__main__":
     unittest.main()
