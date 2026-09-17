@@ -233,6 +233,49 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
                  in ArmGesturePlugin._GESTURES.items()}
         self.assertEqual(len(set(poses.values())), len(poses), poses)
 
+    def test_semantic_gestures_play_at_a_slower_velocity_ceiling(self):
+        """Semantic gestures budget against 0.3 rad/s, not the raw card's 0.5.
+
+        A salute or welcome is a performance, so the same joint travel must
+        span a longer, calmer duration than a bare ``arm_control`` target.
+        """
+        plugin = self.arm_plugin()
+        shoulder = ADAM_PRO_JOINTS.index("shoulderPitch_Left")
+        hold = plugin._hold_q[shoulder]
+        distance = 1.0  # rad, well past the 2 s smoothing floor
+        plugin._set_targets({"shoulderPitch_Left": hold - distance})
+        default_span = plugin._seg_span
+        plugin._set_targets(
+            {"shoulderPitch_Left": hold - distance},
+            velocity_limit=ArmGesturePlugin._GESTURE_VELOCITY_RAD_S)
+        slow_span = plugin._seg_span
+        self.assertGreater(slow_span, default_span)
+        # Reproduce the exact travel from the segment snapshot so the worker
+        # cannot perturb the comparison.
+        max_distance = max(
+            abs(plugin._target_q[index] - plugin._seg_start[index])
+            for index in plugin._target_q)
+        expected = (ArmControlPlugin._EASE_PEAK_RATE * max_distance
+                    / ArmGesturePlugin._GESTURE_VELOCITY_RAD_S)
+        self.assertAlmostEqual(slow_span, expected, places=6)
+
+    def test_a_caller_duration_still_clamps_below_the_gesture_ceiling(self):
+        """duration_s may only slow a gesture; it cannot beat the 0.3 ceiling."""
+        gestures = self._gesture()
+        control = gestures._control
+        result = gestures.dispatch("salute", {"duration_s": 0.1})
+        self.assertTrue(result["success"], result)
+        span = control._seg_span
+        self.assertGreaterEqual(span, 0.1)
+        # Reproduce the exact travel the controller budgeted: the segment start
+        # is a snapshot, so the worker cannot perturb this measurement.
+        max_distance = max(
+            abs(control._target_q[index] - control._seg_start[index])
+            for index in control._target_q)
+        expected = (ArmControlPlugin._EASE_PEAK_RATE * max_distance
+                    / ArmGesturePlugin._GESTURE_VELOCITY_RAD_S)
+        self.assertAlmostEqual(span, expected, places=6)
+
     def test_reset_returns_the_selected_arm_to_its_zero_target(self):
         gestures = self._gesture()
         control = gestures._control
