@@ -55,9 +55,10 @@ configuration it uses the official `adam_inspire` kinematic tree rather than
 the older `adam_standard` fallback, because the latter does not describe wrist
 roll or either hand. The robot's 12 hand feedback channels remain available
 from the separate `hand_state` sensor and are added to the `joints` skeleton
-stream. The driver maps each 0..1000 hand channel linearly to the public finger
-limit for visualization only; it is not a vendor-provided actuator-space
-calibration. PNDbotics has not published an Adam Pro head/neck kinematic tree,
+stream. Since Adam uses `1000=opened` and `0=closed`, the driver inversely maps
+each channel into the public URDF finger limits so the visual opening direction
+matches the real hand. This is visualization only; it is not a vendor-provided
+actuator-space calibration. PNDbotics has not published an Adam Pro head/neck kinematic tree,
 so the driver adds a clearly marked visual-only neck/head mount using the
 published ±60-degree head limits. `head_control` uses the actual DDS joint
 names and limits; it does not rely on this visual approximation.

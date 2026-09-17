@@ -25,7 +25,8 @@ class ModelResourceTests(unittest.TestCase):
         joints = {joint.get("name"): joint.get("type")
                   for joint in ET.fromstring(result["urdf"]).findall("joint")}
         for name in ("neckYaw", "neckPitch", "L_index_MCP_joint",
-                     "R_index_MCP_joint", "wristRoll_Left", "wristRoll_Right"):
+                     "L_index_DIP_joint", "R_index_MCP_joint", "R_index_DIP_joint",
+                     "wristRoll_Left", "wristRoll_Right"):
             self.assertEqual("revolute", joints[name])
 
     def test_standard_keeps_standard_model(self):
@@ -36,9 +37,12 @@ class ModelResourceTests(unittest.TestCase):
     def test_hand_feedback_maps_to_the_named_revolute_joints(self):
         joints = _hand_skeleton_positions([0] * 6 + [1000] * 6)
         self.assertEqual([item[0] for item in HAND_SKELETON_JOINTS],
-                         [item["name"] for item in joints])
-        self.assertEqual(0.0, joints[0]["q"])
-        self.assertEqual(1.5533, joints[6]["q"])
+                         [item["name"] for item in joints[::2]])
+        self.assertEqual([item[1] for item in HAND_SKELETON_JOINTS],
+                         [item["name"] for item in joints[1::2]])
+        self.assertEqual(1.5533, joints[0]["q"])
+        self.assertEqual(0.0, joints[12]["q"])
+        self.assertAlmostEqual(joints[0]["q"] * 0.6, joints[1]["q"])
         self.assertTrue(all(item["visual_mapping"] for item in joints))
 
 

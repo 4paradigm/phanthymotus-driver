@@ -41,6 +41,13 @@ class ArmControlTests(unittest.TestCase):
         self.assertIn("default", ARM_POSES)
         self.assertNotIn("waist_roll", ARM_JOINT_CONTROLS)
 
+    def test_semantic_gesture_poses_stay_within_advertised_joint_limits(self):
+        for pose in ("salute", "welcome", "raise", "shake_hands", "high_five"):
+            self.assertIn(pose, ARM_POSES)
+            for control, degrees in ARM_POSES[pose][1].items():
+                _, radians = _arm_target_radians(control, degrees)
+                self.assertTrue(math.isfinite(radians))
+
     def test_waist_is_a_separate_control_card(self):
         self.assertEqual("roll", WAIST_ACTIONS["set_roll"])
         self.assertIn("yaw", WAIST_JOINT_CONTROLS)

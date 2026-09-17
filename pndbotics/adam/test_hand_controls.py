@@ -8,7 +8,7 @@ import unittest
 
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
-from device import HandPlugin
+from device import HandGesturePlugin, HandPlugin
 
 
 class _StateCache:
@@ -38,6 +38,21 @@ class HandControlTests(unittest.TestCase):
         plugin = self._plugin()
         result = plugin.dispatch("open", {"side": "left"})
         self.assertEqual("HANDSTATE_UNAVAILABLE", result["error"])
+
+    def test_thumbs_up_and_fist_have_distinct_thumb_targets(self):
+        self.assertNotEqual(
+            HandGesturePlugin._GESTURES["thumbs_up"],
+            HandGesturePlugin._GESTURES["fist"],
+        )
+        self.assertGreater(HandGesturePlugin._GESTURES["thumbs_up"][4],
+                           HandGesturePlugin._GESTURES["fist"][4])
+
+    def test_gesture_catalog_includes_common_semantic_poses(self):
+        gestures = HandGesturePlugin._GESTURES
+        for name in ("light_grip", "pinch", "ok_sign", "handshake_grip", "three", "rock"):
+            self.assertIn(name, gestures)
+            self.assertEqual(6, len(gestures[name]))
+        self.assertNotEqual(gestures["pinch"], gestures["ok_sign"])
 
 
 if __name__ == "__main__":

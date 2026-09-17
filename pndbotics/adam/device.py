@@ -178,18 +178,18 @@ HAND_DEFAULT_THUMB_CLOSE = [100, 1000, 100, 1000]
 # the documented 12 DDS channels to the first movable link of each finger.
 # They do not claim to be an actuator-space calibration.
 HAND_SKELETON_JOINTS = (
-    ("L_pinky_MCP_joint", 0.0, 1.5533),
-    ("L_ring_MCP_joint", 0.0, 1.5533),
-    ("L_middle_MCP_joint", 0.0, 1.5533),
-    ("L_index_MCP_joint", 0.0, 1.5533),
-    ("L_thumb_MCP_joint1", 0.4538, 1.0821),
-    ("L_thumb_MCP_joint2", 0.0873, 1.5708),
-    ("R_pinky_MCP_joint", 0.0, 1.5533),
-    ("R_ring_MCP_joint", 0.0, 1.5533),
-    ("R_middle_MCP_joint", 0.0, 1.5533),
-    ("R_index_MCP_joint", 0.0, 1.5533),
-    ("R_thumb_MCP_joint1", 0.4538, 1.0821),
-    ("R_thumb_MCP_joint2", 0.0873, 1.5708),
+    ("L_pinky_MCP_joint", "L_pinky_DIP_joint", 0.0, 1.5533),
+    ("L_ring_MCP_joint", "L_ring_DIP_joint", 0.0, 1.5533),
+    ("L_middle_MCP_joint", "L_middle_DIP_joint", 0.0, 1.5533),
+    ("L_index_MCP_joint", "L_index_DIP_joint", 0.0, 1.5533),
+    ("L_thumb_MCP_joint1", "L_thumb_PIP_joint", 0.4538, 1.0821),
+    ("L_thumb_MCP_joint2", "L_thumb_DIP_joint", 0.0873, 1.5708),
+    ("R_pinky_MCP_joint", "R_pinky_DIP_joint", 0.0, 1.5533),
+    ("R_ring_MCP_joint", "R_ring_DIP_joint", 0.0, 1.5533),
+    ("R_middle_MCP_joint", "R_middle_DIP_joint", 0.0, 1.5533),
+    ("R_index_MCP_joint", "R_index_DIP_joint", 0.0, 1.5533),
+    ("R_thumb_MCP_joint1", "R_thumb_PIP_joint", 0.4538, 1.0821),
+    ("R_thumb_MCP_joint2", "R_thumb_DIP_joint", 0.0873, 1.5708),
 )
 
 
@@ -197,13 +197,26 @@ def _hand_skeleton_positions(positions) -> list[dict]:
     """Map documented hand channel positions to visual-only URDF angles."""
     normalized = _normalize_hand_state_positions(positions)
     result = []
-    for index, (name, minimum, maximum) in enumerate(HAND_SKELETON_JOINTS):
-        ratio = normalized[index] / HAND_POSITION_MAX
+    for index, (name, distal_name, minimum, maximum) in enumerate(HAND_SKELETON_JOINTS):
+        # Adam hand commands use 1000=open and 0=closed, whereas the public
+        # URDF limits use zero as the open/finger-straight end of the range.
+        ratio = 1.0 - normalized[index] / HAND_POSITION_MAX
+        angle = minimum + ratio * (maximum - minimum)
         result.append({
             "name": name,
-            "q": minimum + ratio * (maximum - minimum),
+            "q": angle,
             "source_channel": index,
             "visual_mapping": True,
+        })
+        # The vendor stream exposes one channel per finger. Mirror 60% of the
+        # proximal bend to the distal link so the stick skeleton visibly curls
+        # as a finger rather than rotating only at the palm.
+        result.append({
+            "name": distal_name,
+            "q": angle * 0.6,
+            "source_channel": index,
+            "visual_mapping": True,
+            "derived_from": name,
         })
     return result
 
@@ -518,6 +531,43 @@ ARM_POSES = {
         "left_shoulder_roll": 0.0, "right_shoulder_roll": 0.0,
         "left_elbow": 0.0, "right_elbow": 0.0,
     }),
+    # Semantic poses follow the same vocabulary as the Tianyi 2.0 and Q5
+    # gesture cards. Angles are validated against Adam's documented limits
+    # before the shared full-body lowcmd controller receives them.
+    "salute": ("敬礼", {
+        "left_shoulder_pitch": -10.0, "left_shoulder_roll": 90.0,
+        "left_shoulder_yaw": 60.0, "left_elbow": -110.0,
+        "left_wrist_yaw": 50.0,
+        "right_shoulder_pitch": -10.0, "right_shoulder_roll": -90.0,
+        "right_shoulder_yaw": -60.0, "right_elbow": -110.0,
+        "right_wrist_yaw": -50.0,
+    }),
+    "welcome": ("欢迎", {
+        "left_shoulder_pitch": -10.0, "left_shoulder_roll": 65.0,
+        "left_shoulder_yaw": 75.0, "left_elbow": -100.0,
+        "right_shoulder_pitch": -10.0, "right_shoulder_roll": -65.0,
+        "right_shoulder_yaw": -75.0, "right_elbow": -100.0,
+    }),
+    "raise": ("举手", {
+        "left_shoulder_pitch": 0.0, "left_shoulder_roll": 120.0,
+        "left_elbow": -15.0,
+        "right_shoulder_pitch": 0.0, "right_shoulder_roll": -120.0,
+        "right_elbow": -15.0,
+    }),
+    "shake_hands": ("握手准备", {
+        "left_shoulder_pitch": -55.0, "left_shoulder_roll": 15.0,
+        "left_shoulder_yaw": 5.0, "left_elbow": -35.0,
+        "right_shoulder_pitch": -55.0, "right_shoulder_roll": -15.0,
+        "right_shoulder_yaw": -5.0, "right_elbow": -35.0,
+    }),
+    "high_five": ("击掌准备", {
+        "left_shoulder_pitch": -40.0, "left_shoulder_roll": 40.0,
+        "left_shoulder_yaw": -20.0, "left_elbow": -80.0,
+        "left_wrist_roll": 50.0,
+        "right_shoulder_pitch": -40.0, "right_shoulder_roll": -40.0,
+        "right_shoulder_yaw": 20.0, "right_elbow": -80.0,
+        "right_wrist_roll": -50.0,
+    }),
 }
 
 ARM_ACTIONS = {f"set_{control}": control for control in ARM_JOINT_CONTROLS}
@@ -706,12 +756,18 @@ class _StatePublisherNode(Node):
                     "name": name,
                     "q": float(state.motor_state[idx].q),
                 })
+        hand_state_fresh = False
         if self._variant == "pro" and self._hand_state_cache is not None:
             positions = self._hand_state_cache.fresh_positions(1.0)
             if positions is not None:
                 joints.extend(_hand_skeleton_positions(positions))
+                hand_state_fresh = True
         msg = String()
-        msg.data = json.dumps({"joints": joints})
+        msg.data = json.dumps({
+            "joints": joints,
+            "hand_state_fresh": hand_state_fresh,
+            "hand_joint_count": sum(1 for joint in joints if joint.get("visual_mapping")),
+        })
         self._pub_skeleton.publish(msg)
 
         motor_data = {}
@@ -1876,12 +1932,10 @@ class HeadControlPlugin:
 
 
 class ArmGesturePlugin:
-    """Vendor-documented arm positions using the shared lowcmd publisher."""
+    """Semantic arm positions using the shared lowcmd publisher."""
 
     PREFIX = "arm_gesture"
-    _POSES = {
-        "default": "default", "spread": "spread", "down": "down",
-    }
+    _POSES = {name: name for name in ARM_POSES}
 
     def __init__(self, control: ArmControlPlugin):
         self._control = control
@@ -1889,12 +1943,16 @@ class ArmGesturePlugin:
     def get_tool(self):
         return {
             "name": "arm_gesture", "type": "actuator",
-            "description": "Adam documented arm positions — default, horizontal spread and down",
+            "description": "Adam arm gestures — default, spread, down, salute, welcome, raise, handshake and high five",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": [*self._POSES, "stop"]},
+                "action": {"type": "string", "enum": [*self._POSES, "stop"],
+                           "oneOf": [
+                               {"const": action, "title": ARM_POSES[action][0]}
+                               for action in self._POSES
+                           ] + [{"const": "stop", "title": "停止上肢指令"}]},
                 "side": {"type": "string", "enum": ["left", "right", "both"], "default": "right"},
             }, "required": ["action"], "additionalProperties": False,
-            "x-action-params": {action: {"params": ["side"], "description": action}
+            "x-action-params": {action: {"params": ["side"], "description": ARM_POSES[action][0]}
                                 for action in self._POSES} | {"stop": {"params": []}},
             "x-resource": ["adam_upper_body"]},
         }
@@ -2424,12 +2482,27 @@ class HandGesturePlugin:
     """Common Adam hand gestures, composed from the DDS hand controller."""
 
     PREFIX = "hand_gesture"
+    # Channel order is pinky, ring, middle, index, thumb flex, thumb lateral.
+    # 0 closes a non-thumb finger and 1000 opens it. Thumb flex and lateral
+    # are independent, which is why ``thumbs_up`` must not share ``fist``.
     _GESTURES = {
-        "thumbs_up": [0, 0, 0, 0, 100, 1000],
         "fist": [0, 0, 0, 0, 100, 1000],
+        "light_grip": [450, 450, 450, 450, 550, 700],
+        "thumbs_up": [0, 0, 0, 0, 1000, 0],
         "victory": [0, 0, 1000, 1000, 100, 1000],
         "point": [0, 0, 0, 1000, 100, 1000],
+        "pinch": [1000, 1000, 1000, 250, 250, 700],
+        "ok_sign": [700, 700, 700, 250, 250, 700],
+        "handshake_grip": [300, 300, 300, 300, 350, 700],
+        "three": [0, 1000, 1000, 1000, 1000, 0],
+        "rock": [1000, 0, 0, 1000, 1000, 0],
         "open_palm": [1000, 1000, 1000, 1000, 1000, 0],
+    }
+    _GESTURE_LABELS = {
+        "fist": "握拳", "light_grip": "轻握", "thumbs_up": "点赞",
+        "victory": "胜利手势", "point": "指向", "pinch": "捏取",
+        "ok_sign": "OK 手势", "three": "比三", "rock": "摇滚手势",
+        "handshake_grip": "握手握姿", "open_palm": "张手",
     }
 
     def __init__(self, control: HandPlugin):
@@ -2437,12 +2510,16 @@ class HandGesturePlugin:
 
     def get_tool(self):
         return {"name": "hand_gesture", "type": "actuator",
-                "description": "Adam hand gestures — thumbs up, fist, victory, point and open palm",
+                "description": "Adam hand gestures — open, grip, fist, thumbs up, point, pinch, victory, OK, handshake, three and rock",
                 "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": list(self._GESTURES)},
+                    "action": {"type": "string", "enum": list(self._GESTURES),
+                               "oneOf": [
+                                   {"const": gesture, "title": label}
+                                   for gesture, label in self._GESTURE_LABELS.items()
+                               ]},
                     "side": {"type": "string", "enum": ["left", "right"], "default": "right"},
                 }, "required": ["action", "side"], "additionalProperties": False,
-                "x-action-params": {gesture: {"params": ["side"], "description": gesture}
+                "x-action-params": {gesture: {"params": ["side"], "description": self._GESTURE_LABELS[gesture]}
                                     for gesture in self._GESTURES},
                 "x-resource": ["adam_hands"]}}
 
@@ -3834,7 +3911,11 @@ def _pro_skeleton_urdf(model_path: str) -> str:
         "L_thumb_MCP_joint1": "0 0 1", "L_thumb_MCP_joint2": "0 1 0",
         "R_thumb_MCP_joint1": "0 0 1", "R_thumb_MCP_joint2": "0 1 0",
     }
-    animated = {name: (minimum, maximum) for name, minimum, maximum in HAND_SKELETON_JOINTS}
+    animated = {
+        joint_name: (minimum, maximum)
+        for name, distal_name, minimum, maximum in HAND_SKELETON_JOINTS
+        for joint_name in (name, distal_name)
+    }
     animated.update({
         "wristYaw_Left": (-2.6704, 2.6704), "wristPitch_Left": (-0.9599, 0.9599),
         "wristRoll_Left": (-0.9599, 0.9599), "wristYaw_Right": (-2.6704, 2.6704),
