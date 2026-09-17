@@ -1034,7 +1034,6 @@ class CartesianPlugin:
                 action_id,
                 motion_type,
                 args,
-                current,
                 target,
                 speed_percent,
                 self._controller_wait_deadline_seconds(current, target, speed_percent),
@@ -1052,28 +1051,50 @@ class CartesianPlugin:
             motion_type == "move_offset"
             and self.native_tool_offset_enabled
             and callable(getattr(self.client, "command_trajectory", None))
-            and callable(getattr(self.client, "poll_trajectory", None))
+            and callable(getattr(self.client, "wait_trajectory", None))
         )
 
     def _execute_controller_cartesian(
-            self, action_id, motion_type, args, start_pose, target, speed_percent, timeout_seconds):
+            self, action_id, motion_type, args, target, speed_percent, timeout_seconds):
+        status, result = "error", {"reason": "unknown", "target_pose_mm_deg": target}
         try:
             with self._action_lock:
                 cancelled = action_id in self._cancelled
             if cancelled:
-                self._finish_cartesian(action_id, "cancelled", {"reason": "stopmotion"})
-                return
-            self._submit(motion_type, args, target, speed_percent, wait_for_completion=True)
+                status, result = "cancelled", {"reason": "stopmotion"}
+            else:
+                self._submit(motion_type, args, target, speed_percent, wait_for_completion=True)
+                # 这里只等待 SDK 三线程模式的官方到位事件，不能再调用
+                # rm_get_current_arm_state/rm_get_arm_current_trajectory。真机上这些
+                # 状态查询偶尔会卡在 C SDK 内，即使到位事件已经收到也无法收尾。
+                trajectory_state = self.client.wait_trajectory(timeout_seconds)
+                with self._action_lock:
+                    cancelled = action_id in self._cancelled
+                if cancelled:
+                    status, result = "cancelled", {"reason": "stopmotion"}
+                elif trajectory_state is True:
+                    status = "completed"
+                    result = {
+                        "reason": "controller_target_reached",
+                        "target_pose_mm_deg": target,
+                    }
+                elif trajectory_state is False:
+                    result = {
+                        "reason": "controller reported trajectory planning or execution failure",
+                        "target_pose_mm_deg": target,
+                    }
+                else:
+                    self._request_slow_stop()
+                    time.sleep(self.stop_finalize_seconds)
+                    result = {
+                        "reason": "controller completion event timed out",
+                        "timeout_seconds": timeout_seconds,
+                        "target_pose_mm_deg": target,
+                    }
         except Exception as exc:
-            self._finish_cartesian(
-                action_id, "error", {"reason": str(exc), "target_pose_mm_deg": target}
-            )
-            return
-        # 官方事件是主完成信号；同时轮询实际位姿与当前规划类型。部分控制器固件
-        # 不会上报 rm_movel_offset 到位事件，但 TCP 已经到位，不能因此一直占用动作锁。
-        self._monitor_cartesian(
-            action_id, start_pose, target, timeout_seconds, controller_event=True
-        )
+            result = {"reason": str(exc), "target_pose_mm_deg": target}
+        finally:
+            self._finish_cartesian(action_id, status, result)
 
     def _controller_wait_deadline_seconds(self, current, target, speed_percent):
         distance_mm = math.sqrt(sum((a - b) ** 2 for a, b in zip(current[:3], target[:3])))
@@ -1273,8 +1294,7 @@ class CartesianPlugin:
         speed_mm_s = 600.0 * speed_percent / 100.0
         return min(self.max_motion_seconds, max(30.0, distance_mm / speed_mm_s * 3.0 + 10.0))
 
-    def _monitor_cartesian(
-            self, action_id, start_pose, target, max_duration, controller_event=False):
+    def _monitor_cartesian(self, action_id, start_pose, target, max_duration):
         started = time.monotonic()
         deadline = started + max_duration
         last_progress = started + self.start_grace_seconds
@@ -1288,23 +1308,6 @@ class CartesianPlugin:
                 if cancelled:
                     status, result = "cancelled", {"reason": "stopmotion"}
                     break
-                if controller_event:
-                    trajectory_state = self.client.poll_trajectory(0.0)
-                    if trajectory_state is True:
-                        status = "completed"
-                        result = {
-                            "reason": "controller_target_reached",
-                            "target_pose_mm_deg": target,
-                            "elapsed_seconds": time.monotonic() - started,
-                        }
-                        break
-                    if trajectory_state is False:
-                        result = {
-                            "reason": "controller reported trajectory planning or execution failure",
-                            "target_pose_mm_deg": target,
-                            "elapsed_seconds": time.monotonic() - started,
-                        }
-                        break
                 if self._arm is not None:
                     self._arm._preflight()
                 current = self._current_pose_mm_deg()
@@ -1384,10 +1387,6 @@ class CartesianPlugin:
             self._request_slow_stop()
             result = {"reason": str(exc)}
         finally:
-            if controller_event:
-                discard_wait = getattr(self.client, "discard_trajectory_wait", None)
-                if callable(discard_wait):
-                    discard_wait()
             self._finish_cartesian(action_id, status, result)
 
     def _finish_cartesian(self, action_id, status, result):
@@ -1469,7 +1468,9 @@ class CartesianPlugin:
                 cancel_wait()
             monitor = self._monitor_thread
             if monitor is not None and monitor is not threading.current_thread():
-                monitor.join(self.poll_interval_seconds * 5 + CARTESIAN_STOP_JOIN_MARGIN)
+                # 官方事件等待被 cancel 后应立即退出；只给很短的收尾窗口，
+                # 绝不能因状态查询/C SDK 异常再次让 stopmotion 长时间占锁。
+                monitor.join(min(0.5, self.poll_interval_seconds + CARTESIAN_STOP_JOIN_MARGIN))
             self._finish_cartesian(action_id, status, result)
 
         threading.Thread(
