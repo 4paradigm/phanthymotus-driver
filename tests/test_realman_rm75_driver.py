@@ -507,7 +507,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 self.calls.append((method, args))
                 return 0
 
-            def poll_trajectory(self, timeout_seconds=0.0):
+            def wait_trajectory(self, timeout_seconds):
                 return True
 
             def discard_trajectory_wait(self):
@@ -544,6 +544,13 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             ("rm_movel_offset", ([0.02, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 1, 0)),
             self.client.calls,
         )
+        submit_index = next(
+            index for index, call in enumerate(self.client.calls) if call[0] == "rm_movel_offset"
+        )
+        self.assertEqual(
+            [],
+            [call for call in self.client.calls[submit_index + 1:] if call[0].startswith("rm_get_")],
+        )
 
     def test_stopmotion_releases_missing_controller_event(self):
         gate = threading.Event()
@@ -553,7 +560,8 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 self.calls.append((method, args))
                 return 0
 
-            def poll_trajectory(self, timeout_seconds=0.0):
+            def wait_trajectory(self, timeout_seconds):
+                gate.wait(timeout_seconds)
                 return False if gate.is_set() else None
 
             def discard_trajectory_wait(self):
@@ -599,13 +607,13 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("stopmotion", result["reason"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
 
-    def test_missing_controller_event_completes_from_actual_pose_and_allows_next_motion(self):
+    def test_missing_controller_event_times_out_and_allows_next_motion(self):
         class EventlessClient(self.FakeClient):
             def command_trajectory(self, method, *args):
                 self.calls.append((method, args))
                 return 0
 
-            def poll_trajectory(self, timeout_seconds=0.0):
+            def wait_trajectory(self, timeout_seconds):
                 return None
 
             def discard_trajectory_wait(self):
@@ -615,7 +623,10 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
         self.plugin = self.device.CartesianPlugin(
             self.client,
-            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            {
+                "safety": {**self.FAST_SAFETY, "max_motion_seconds": 0.05},
+                "cartesian": {"enabled": True, "stop_finalize_seconds": 0.01},
+            },
             arm_plugin=self.arm,
             namespace="rm75",
         )
@@ -629,15 +640,14 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         }
 
         first = self.plugin.dispatch("move_offset", args)
-        self.client.pose_mm_deg = [320.0, 0.0, 200.0, 0.0, 0.0, 0.0]
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
-        self.assertEqual((first["action_id"], "completed"), self.acp_events[0][:2])
+        self.assertEqual((first["action_id"], "error"), self.acp_events[0][:2])
+        self.assertEqual("controller completion event timed out", self.acp_events[0][2]["reason"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
 
         second = self.plugin.dispatch("move_offset", args)
-        self.client.pose_mm_deg = [340.0, 0.0, 200.0, 0.0, 0.0, 0.0]
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
-        self.assertEqual((second["action_id"], "completed"), self.acp_events[1][:2])
+        self.assertEqual((second["action_id"], "error"), self.acp_events[1][:2])
 
     def test_move_offset_rotated_tool_frame_transforms_target(self):
         # reviewer 示例：90° yaw 下工具系 +X 偏移应沿基系 +Y 移动，监控目标必须经旋转变换
