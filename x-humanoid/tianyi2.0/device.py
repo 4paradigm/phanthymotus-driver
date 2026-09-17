@@ -6141,15 +6141,29 @@ _HAND_FINGER_LABELS = {
 
 
 def _hand_position_label(p: float) -> str:
+    """Inspire's feedback is an **open ratio**: 1.0 is open, 0.0 is closed.
+
+    This used to read the other way round, so every label was its own opposite
+    and the LLM asking "is the hand open" was told the reverse. Measured on a
+    Tianyi sitting idle with both hands visibly open: all twelve fingers report
+    0.977-1.0, which the old thresholds called `fully_closed`.
+
+    Two other places in this file already had it right and are what the
+    correction is anchored to — `HandPlugin` inverts on the way out ("Hardware
+    maps position 1.0 -> open"), and `_skeleton_hand_bend_rad` reads the same
+    feedback as an open ratio, which is why the dashboard's hands have always
+    rendered correctly. Only this function and the tool description beside it
+    disagreed.
+    """
     if p >= 0.95:
-        return "fully_closed"
+        return "fully_open"
     if p >= 0.75:
-        return "almost_closed"
+        return "almost_open"
     if p >= 0.25:
         return "half_closed"
     if p >= 0.05:
-        return "almost_open"
-    return "fully_open"
+        return "almost_closed"
+    return "fully_closed"
 
 
 class HandStatePlugin:
@@ -6185,7 +6199,7 @@ class HandStatePlugin:
             "description": (
                 "Tianyi 2.0 Pro Inspire dexterous hand state (6 fingers per hand, 10Hz)."
                 "Finger order: 1=pinky 2=ring 3=middle 4=index 5=thumb_flex 6=thumb_rotate."
-                "position: 0=open 1=closed (normalized), effort: current (A), velocity: normalized speed."
+                "position: 1=open 0=closed (normalized), effort: current (A), velocity: normalized speed."
                 "Each finger has a position_label tag (fully_open/almost_open/half_closed/almost_closed/fully_closed)."
             ),
             "inputSchema": {"type": "object", "properties": {}},

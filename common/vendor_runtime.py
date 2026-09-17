@@ -139,7 +139,15 @@ def tool(
     schema: dict | None = None,
     *,
     topic_out: list[dict] | None = None,
+    topic_in: list[dict] | None = None,
 ) -> dict:
+    """One tool definition.
+
+    `topic_in` marks a card that consumes a stream rather than only answering
+    calls — a speaker taking `audio/pcm-16k`, or a command card taking
+    `control/joint` (see README_dev § "Continuous Control"). agent-core resolves
+    the upstream card's `topic_out` and passes it as `input_topic` to `start`.
+    """
     result = {
         "name": name,
         "type": kind,
@@ -149,6 +157,8 @@ def tool(
     }
     if topic_out:
         result["topic_out"] = topic_out
+    if topic_in:
+        result["topic_in"] = topic_in
     return result
 
 

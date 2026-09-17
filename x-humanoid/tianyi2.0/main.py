@@ -523,6 +523,14 @@ class TianyiDeviceBundle:
             self._plugins.append(HandPlugin(plugins_cfg["hand"], namespace, ros2))
             print("[bundle] HandPlugin loaded")
 
+        if plugins_cfg.get("servo", {}).get("enabled", False):
+            from servo import TianyiServoPlugin
+            # Stream-shaped control of both arms and both hands (motus.control/1).
+            # Present but inert: it subscribes to nothing until someone wires it
+            # on the canvas and confirms.
+            self._plugins.append(TianyiServoPlugin(plugins_cfg["servo"], namespace, ros2))
+            print("[bundle] TianyiServoPlugin loaded")
+
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from device import TtsPlugin
             self._plugins.append(TtsPlugin(plugins_cfg["tts"], namespace, ros2))

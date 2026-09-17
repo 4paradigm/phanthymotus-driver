@@ -68,6 +68,15 @@ plugins:
     enabled: true
   motion_command_trace:
     enabled: true
+  odometer:
+    enabled: true
+    publish_rate_hz: 5.0
+    stationary_enter_m_s: 0.03
+    stationary_exit_m_s: 0.05
+    jump_tolerance_m: 0.25
+    trajectory_spacing_m: 0.025
+    trajectory_max_points: 4000
+    trajectory_view_extent_m: 5.0
   native_interface_probe:
     enabled: true
   locomotion:
@@ -137,7 +146,7 @@ plugins:
     enabled: true
   vision:
     enabled: true
-    source: "raw"            # raw | slam —— 转发哪个点云源
+    source: "slam"           # raw | slam —— slam 为重力对齐的 odom 标准坐标系源
   gait:
     enabled: true
     # Native SDK releases use either rl_basic or walk for basic locomotion.
