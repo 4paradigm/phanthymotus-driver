@@ -1518,9 +1518,17 @@ def build_plugins(config, namespace, ros2):
         GripperPlugin(client, config, namespace=namespace, ros2=ros2),
         CartesianPlugin(client, config, arm_plugin=arm, namespace=namespace, ros2=ros2),
     ]
+    external_camera = None
     camera_config = config.get("ext_camera", {})
     if camera_config.get("enabled", False):
         from camera import ExtCameraPlugin
 
-        plugins.append(ExtCameraPlugin(camera_config, namespace, ros2.executor_core))
+        external_camera = ExtCameraPlugin(camera_config, namespace, ros2.executor_core)
+        plugins.append(external_camera)
+    capture_config = config.get("vision_capture", {})
+    if capture_config.get("enabled", False):
+        from vision_capture import VisionCapturePlugin
+
+        plugins.append(VisionCapturePlugin(
+            capture_config, namespace, ros2.executor_core, external_camera))
     return plugins

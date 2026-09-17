@@ -123,6 +123,31 @@ class RealManRM75ImageContractTests(unittest.TestCase):
             [type(plugin) for plugin in disabled],
         )
 
+    def test_vision_capture_reuses_existing_camera_and_core_executor(self):
+        device = load_device()
+        camera = mock.Mock()
+        capture = mock.Mock()
+        ros2 = type("ROS2", (), {"executor_core": object()})()
+        camera_factory, capture_factory = mock.Mock(return_value=camera), mock.Mock(return_value=capture)
+        with mock.patch.dict("sys.modules", {
+            "camera": type("Module", (), {"ExtCameraPlugin": camera_factory})(),
+            "vision_capture": type("Module", (), {"VisionCapturePlugin": capture_factory})(),
+        }):
+            plugins = device.build_plugins({"ext_camera": {"enabled": True},
+                                           "vision_capture": {"enabled": True}}, "rm75", ros2)
+        self.assertEqual(plugins[-2:], [camera, capture])
+        capture_factory.assert_called_once_with({"enabled": True}, "rm75", ros2.executor_core, camera)
+
+    def test_capture_files_survive_container_replacement(self):
+        service = (DRIVER / "deploy/service.yml").read_text()
+        directory = "/opt/phanthy-motus/data/vision_capture/realman"
+        self.assertIn(f"{directory}:{directory}", service)
+        self.assertNotIn(f"{directory}:{directory}:ro", service)
+        self.assertIn(f"output_dir: {directory}", (DRIVER / "config.yaml").read_text())
+        dockerfile = (DRIVER / "Dockerfile").read_text()
+        self.assertIn("ros-humble-rmw-fastrtps-cpp ffmpeg", dockerfile)
+        self.assertIn("realsense.py vision_capture.py config.yaml", dockerfile)
+
 
 class RealManRM75GripperPluginTests(unittest.TestCase):
     @classmethod
