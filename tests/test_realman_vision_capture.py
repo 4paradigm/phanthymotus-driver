@@ -340,10 +340,28 @@ class CaptureTest(CaptureHarness):
         active = {"action_id": "test-stop", "cancel": threading.Event(),
                   "state": "recording", "process": None}
         active["thread"] = mock.Mock()
+        active["thread"].is_alive.return_value = False
         self.plugin._active_recording = active
         active["finished"] = True
+        active["thread"].join.side_effect = lambda timeout=None: setattr(self.plugin, "_active_recording", None)
         result = self.plugin.dispatch("stop", {})
         self.assertEqual(result["state"], "idle")
+
+    def test_delayed_callback_after_stop_is_ignored(self):
+        self.plugin._resolve_source({})
+        callback = self.plugin._node.callbacks["/go2/ext_camera/color/rgb"]
+        self.plugin.stop()
+        callback(types.SimpleNamespace(format="jpeg", data=b"\xff\xd8x\xff\xd9",
+                                       header=types.SimpleNamespace(stamp=types.SimpleNamespace(sec=0, nanosec=0))))
+
+    def test_stop_reports_stopping_when_worker_exceeds_bound(self):
+        active = {"action_id": "slow-stop", "cancel": threading.Event(),
+                  "state": "recording", "process": None, "finished": False}
+        active["thread"] = mock.Mock()
+        active["thread"].is_alive.return_value = True
+        self.plugin._active_recording = active
+        result = self.plugin.stop()
+        self.assertEqual(result["state"], "stopping")
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg integration requires ffmpeg and ffprobe")
