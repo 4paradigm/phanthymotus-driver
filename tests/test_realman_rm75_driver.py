@@ -577,6 +577,72 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             [call for call in self.client.calls if call[0].startswith("rm_get_")],
         )
 
+    def test_sdk_minus_7_switches_to_cached_absolute_movel_compatibility(self):
+        class ThirdGenerationClient(self.FakeClient):
+            def command_trajectory(self, method, *args, completion_callback=None):
+                self.calls.append((method, args))
+                if method == "rm_movel_offset":
+                    raise RuntimeError("rm_movel_offset failed with RealMan SDK code -7")
+                if completion_callback is not None:
+                    completion_callback(True)
+                return 0
+
+            def wait_trajectory(self, timeout_seconds):
+                return True
+
+            def discard_trajectory_wait(self):
+                pass
+
+            def command_interrupt(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+        self.client = ThirdGenerationClient([300.0, 0.0, 200.0, 0.0, 0.0, 0.0])
+        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            arm_plugin=self.arm,
+            namespace="rm75",
+        )
+        self.acp_events = []
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+        args = {
+            "dx_mm": 50, "frame_type": "tool", "speed_percent": 5,
+            "cartesian_enabled": True, "confirm_motion": True,
+        }
+
+        first = self.plugin.dispatch("move_offset", args)
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        self.assertEqual((first["action_id"], "completed"), self.acp_events[0][:2])
+        self.assertEqual(
+            [350.0, 0.0, 200.0, 0.0, 0.0, 0.0],
+            self.acp_events[0][2]["target_pose_mm_deg"],
+        )
+
+        second = self.plugin.dispatch("move_offset", args)
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
+        self.assertEqual((second["action_id"], "completed"), self.acp_events[1][:2])
+        self.assertEqual(
+            [400.0, 0.0, 200.0, 0.0, 0.0, 0.0],
+            self.acp_events[1][2]["target_pose_mm_deg"],
+        )
+        self.assertEqual(
+            1,
+            len([call for call in self.client.calls if call[0] == "rm_get_current_arm_state"]),
+        )
+        self.assertEqual(
+            1,
+            len([call for call in self.client.calls if call[0] == "rm_movel_offset"]),
+        )
+        movel_calls = [call for call in self.client.calls if call[0] == "rm_movel"]
+        self.assertEqual(2, len(movel_calls))
+        self.assertAlmostEqual(0.35, movel_calls[0][1][0][0], places=6)
+        self.assertAlmostEqual(0.4, movel_calls[1][1][0][0], places=6)
+        self.assertIs(False, self.plugin._motion_status()["native_tool_offset_supported"])
+
     def test_controller_event_releases_action_when_sdk_wrapper_call_stays_blocked(self):
         entered = threading.Event()
         release_sdk = threading.Event()
