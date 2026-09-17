@@ -476,6 +476,44 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             self.client.calls,
         )
 
+    def test_native_offset_uses_controller_blocking_completion(self):
+        class BlockingClient(self.FakeClient):
+            def command_wait(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+            def command_interrupt(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+        self.client = BlockingClient()
+        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            arm_plugin=self.arm,
+            namespace="rm75",
+        )
+        self.acp_events = []
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        started = self.plugin.dispatch("move_offset", {
+            "dx_mm": 20, "frame_type": "tool", "speed_percent": 5,
+            "cartesian_enabled": True, "confirm_motion": True,
+        })
+
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        action_id, status, result = self.acp_events[0]
+        self.assertEqual(started["action_id"], action_id)
+        self.assertEqual("completed", status)
+        self.assertEqual("controller_target_reached", result["reason"])
+        self.assertIn(
+            ("rm_movel_offset", ([0.02, 0.0, 0.0, 0.0, 0.0, 0.0], 5, 0, 0, 1, 1)),
+            self.client.calls,
+        )
+
     def test_move_offset_rotated_tool_frame_transforms_target(self):
         # reviewer 示例：90° yaw 下工具系 +X 偏移应沿基系 +Y 移动，监控目标必须经旋转变换
         self.client.pose_mm_deg = [0.0, 0.0, 0.0, 0.0, 0.0, 90.0]
