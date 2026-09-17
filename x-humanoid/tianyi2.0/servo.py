@@ -161,10 +161,8 @@ class TianyiServoPlugin:
         # Off by default — see _hold for why this is a decision and not a
         # setting with an obvious answer.
         self._release_hands = bool(config.get("release_hands_on_watchdog", False))
-        # Standing authorisation to move, set from the card's config form.
-        # See the `confirm_motion` note in get_tool for why it lives there and
-        # not only in the start arguments.
-        self._confirm_motion = bool(config.get("confirm_motion", False))
+        # Paused means subscribed but not applying. See `pause` in get_tool.
+        self._paused = False
         self._descriptor_raw = build_descriptor(self._expected_hz)
         self._descriptor = parse_descriptor(self._descriptor_raw)
 
@@ -195,18 +193,18 @@ class TianyiServoPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["start", "stop", "info"]},
+                               "enum": ["start", "stop", "pause", "resume", "info"]},
                     "input_topic": {"type": "string",
                                     "description": "control/joint 指令流话题"},
-                    "confirm_motion": {
-                        "type": "boolean",
-                        "description": "必须为 true —— 启动这张卡片即授权持续运动",
-                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "start": {"params": ["input_topic", "confirm_motion"],
+                    "start": {"params": ["input_topic"],
                               "description": "订阅指令流并开始驱动双臂与双手"},
+                    "pause": {"params": [],
+                              "description": "暂停执行并保持当前姿态，仍然订阅着；"
+                                             "resume 可继续"},
+                    "resume": {"params": [], "description": "继续执行"},
                     "stop": {"params": [], "description": "停止订阅并让机器人静止"},
                     "info": {"params": [],
                              "description": "动作空间 descriptor、检查链计数与最近一次结果"},
@@ -223,55 +221,19 @@ class TianyiServoPlugin:
                 # open for the life of the card would block every other
                 # actuator behind the ACP barrier.
             },
-            # `confirm_motion` is reachable two ways, because this card is
-            # started two ways and one of them cannot pass arguments.
-            #
-            # A direct `tools/call` can send it as an argument — that is the
-            # go1 CONTRIBUTING convention for a dangerous action, and it is
-            # right for a call an operator or an LLM makes.
-            #
-            # The canvas cannot. `start-project` builds the start arguments
-            # itself (agent-core src/api/config.py `_start_and_resolve`) and
-            # sends only action, instance_id, input_topic and
-            # control_interface — there is no path for a per-card flag. With
-            # the argument as the only gate this card could therefore never be
-            # started from the canvas at all, and, because a card that reports
-            # `error` rolls the whole project back, wiring it up took down
-            # every other card on the robot with it. Verified on Tianyi.
-            #
-            # So the standing authorisation lives in the config form, which is
-            # applied before start and is the canvas's authorisation surface
-            # anyway — an operator ticks it deliberately and it persists with
-            # the card. This does not reopen what the class docstring promises:
-            # the driver still never starts this card on its own, so a
-            # container restart does not come up streaming. Only agent-core
-            # starting the project does, which is an operator action.
-            "configSchema": {
-                "type": "object",
-                "properties": {
-                    "confirm_motion": {
-                        "type": "boolean",
-                        "title": "授权连续运动",
-                        "description": "勾选即授权：这张卡片运行期间持续驱动双臂与双手。",
-                        "default": False,
-                        "scope": "shared",
-                    },
-                },
-            },
             "topic_in": [{"format": "control/joint",
                           "desc": "motus.control/1，26 维（14 臂 rad + 12 指 归一化）"}],
         }
 
     def dispatch(self, action: str, args: dict):
-        if action == "config":
-            if "confirm_motion" in args:
-                self._confirm_motion = bool(args["confirm_motion"])
-            return {"status": "configured",
-                    "confirm_motion": self._confirm_motion}
         if action == "start":
             return self._start(args)
         if action == "stop":
             return self._stop()
+        if action == "pause":
+            return self._pause(True)
+        if action == "resume":
+            return self._pause(False)
         if action == "info":
             return self._info()
         return None
@@ -282,7 +244,8 @@ class TianyiServoPlugin:
         """Bundle lifecycle. Deliberately does nothing.
 
         A card that streams motion must not come up streaming because the
-        container restarted. It subscribes when someone wires it and confirms.
+        container restarted. It subscribes when agent-core starts the project,
+        which is an operator action, and not before.
         """
 
     def stop(self):
@@ -291,14 +254,6 @@ class TianyiServoPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args: dict):
-        # Either gate authorises: the argument for a direct call, the config
-        # for the canvas. Neither is weaker — both are a person saying yes.
-        if not (args.get("confirm_motion") or self._confirm_motion):
-            return {"state": "error",
-                    "message": "confirm_motion 必须为 true —— 这张卡片在运行期间"
-                               "持续驱动双臂与双手。画布上请在卡片配置里勾选"
-                               "「授权连续运动」。"}
-
         topic = (args.get("input_topic") or "").strip()
         if not topic:
             topics = args.get("input_topics") or [""]
@@ -326,6 +281,7 @@ class TianyiServoPlugin:
             self._sink = sink
             self._input_topic = topic
             self._running = True
+            self._paused = False
 
         try:
             self._open(topic)
@@ -338,6 +294,29 @@ class TianyiServoPlugin:
         print(f"[servo] streaming from {topic}", flush=True)
         return {"state": "running", "input": topic,
                 "control_interface": self._descriptor_raw}
+
+    def _pause(self, paused: bool):
+        """Hold position without giving up the subscription.
+
+        This is the card's answer to "wait" — and the reason it exists rather
+        than telling an LLM to `stop` and `start` again: `start` needs the
+        input topic and the downstream descriptor, which only agent-core knows
+        at project start. A model that stopped this card could not restart it.
+
+        Pausing holds rather than releases, for the same reason the watchdog
+        does (see `_hold`): these joints keep their last target, so not
+        publishing *is* the hold, and a pause that dropped whatever the hands
+        are carrying would be a worse answer to "wait" than stillness.
+        """
+        with self._lock:
+            if not self._running:
+                return {"state": "idle",
+                        "message": "卡片未在运行，无需暂停"}
+            self._paused = bool(paused)
+        if paused:
+            self._hold()
+        return {"state": "paused" if paused else "running",
+                "input": self._input_topic}
 
     def _stop(self):
         with self._lock:
@@ -373,8 +352,12 @@ class TianyiServoPlugin:
             topic = self._input_topic
             last = dict(self._last_outcome) if self._last_outcome else None
             rejects = list(self._rejects)
+            paused = self._paused
         return {
-            "state": "running" if running else "idle",
+            # Paused is reported as its own state, not as running: an operator
+            # reading "running" while the arms sit still would go looking for a
+            # fault that is not there.
+            "state": ("paused" if paused else "running") if running else "idle",
             "input": topic,
             "control_interface": self._descriptor_raw,
             # One command is committed at a time, so the window an e-stop has to
@@ -427,7 +410,10 @@ class TianyiServoPlugin:
 
     def _on_message(self, message):
         sink = self._sink
-        if sink is None:
+        if sink is None or self._paused:
+            # Dropped, not queued: a command held during a pause is a command
+            # computed from a world that has moved on, and applying it at
+            # resume would be a jump from stale data.
             return
         try:
             payload = json.loads(message.data)

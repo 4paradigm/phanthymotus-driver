@@ -8,8 +8,8 @@ would be arm-shaped rather than protocol-shaped:
     enforces, so the two paths cannot disagree about what this arm can do
   - the descriptor is in radians and the SDK takes degrees, and the conversion
     happens once, at the boundary
-  - a card that streams motion does not get to skip the motion gate because the
-    commands are frequent
+  - the levers a model is given mid-motion are pause and stop, and pause holds
+    rather than releases
   - nothing streams because a container restarted
 
 No SDK, no ROS, no arm: the client is a fake that records calls.
@@ -120,19 +120,10 @@ def test_expected_hz_above_the_passthrough_ceiling_is_refused():
 
 
 # ── the motion gate ──────────────────────────────────────────────────────────
-
-def test_start_requires_explicit_confirmation():
-    plugin, client = make_plugin()
-    result = plugin.dispatch("start", {"input_topic": "/x", "confirm_motion": False})
-    assert result["state"] == "error"
-    assert "confirm_motion" in result["message"]
-    assert client.calls == []
-
-
 def test_start_refuses_while_the_driver_is_read_only():
     """Frequent commands do not earn an exemption from RM_MOTION_ENABLED."""
     plugin, client = make_plugin(motion_enabled=False)
-    result = plugin.dispatch("start", {"input_topic": "/x", "confirm_motion": True})
+    result = plugin.dispatch("start", {"input_topic": "/x"})
     assert result["state"] == "error"
     assert "RM_MOTION_ENABLED" in result["message"]
     assert client.calls == []
@@ -140,7 +131,7 @@ def test_start_refuses_while_the_driver_is_read_only():
 
 def test_start_refuses_without_an_input_topic():
     plugin, _ = make_plugin()
-    result = plugin.dispatch("start", {"confirm_motion": True})
+    result = plugin.dispatch("start", {})
     assert result["state"] == "error"
     assert "input_topic" in result["message"]
 
@@ -254,57 +245,50 @@ def test_slow_stop_is_a_noop_when_disconnected():
     assert client.stop_calls == []
 
 
-def test_the_canvas_can_authorise_through_the_config_form():
-    """The bug this test exists for: the gate was unreachable from the canvas.
+# ── pause is the model's lever, not a start gate ─────────────────────────────
 
-    `start-project` (agent-core src/api/config.py `_start_and_resolve`) builds
-    the start arguments itself and sends only action, instance_id, input_topic
-    and control_interface. A gate read *only* from the arguments therefore
-    could never be satisfied from the canvas — and because a card that answers
-    `error` rolls the whole project back, wiring this card up stopped every
-    other card on the robot. Verified on a real Tianyi before the fix.
+def test_pause_stops_applying_without_dropping_the_subscription():
+    """`stop` is not an answer to "wait": only agent-core knows the input topic
+    and the downstream descriptor, so a model that stopped this card could not
+    start it again."""
+    plugin, client = make_plugin()
+    plugin._running = True
+    plugin._input_topic = "/x"
 
-    So config must be a real second door, not documentation.
-    """
+    assert plugin.dispatch("pause", {})["state"] == "paused"
+    assert plugin._input_topic == "/x"
+    assert plugin.dispatch("info", {})["state"] == "paused"
+
+    assert plugin.dispatch("resume", {})["state"] == "running"
+    assert plugin.dispatch("info", {})["state"] == "running"
+
+
+def test_a_command_arriving_during_a_pause_is_dropped_not_queued():
+    """Applying it at resume would be a jump computed from a stale world."""
+    plugin, client = make_plugin()
+    plugin._running = True
+    plugin._sink = _RecordingSink()
+    plugin.dispatch("pause", {})
+
+    plugin._on_message(_Message('{"values": [0, 0, 0, 0, 0, 0, 0]}'))
+
+    assert plugin._sink.submitted == []
+
+
+def test_pausing_a_card_that_is_not_running_is_not_an_error():
     plugin, _ = make_plugin()
-    assert plugin.dispatch("config", {"confirm_motion": True}) == {
-        "status": "configured", "confirm_motion": True}
-
-    # Exactly the arguments start-project sends — note no confirm_motion.
-    result = plugin.dispatch("start", {"input_topic": "/x"})
-
-    # It gets all the way to the subscription, which this fake has no context
-    # for. Reaching that is the proof: the motion gate is behind it.
-    assert "confirm_motion" not in result.get("message", "")
-    assert "ROS" in result["message"]
+    assert plugin.dispatch("pause", {})["state"] == "idle"
 
 
-def test_the_config_form_advertises_the_gate():
-    """An operator who cannot see the checkbox cannot tick it."""
-    definition = make_plugin()[0].get_tools()[0]
-    field = definition["configSchema"]["properties"]["confirm_motion"]
-
-    assert field["type"] == "boolean"
-    assert field["default"] is False
+class _Message:
+    def __init__(self, data):
+        self.data = data
 
 
-def test_configuring_it_false_again_closes_the_door():
-    plugin, client = make_plugin()
-    plugin.dispatch("config", {"confirm_motion": True})
-    plugin.dispatch("config", {"confirm_motion": False})
+class _RecordingSink:
+    def __init__(self):
+        self.submitted = []
 
-    result = plugin.dispatch("start", {"input_topic": "/x"})
-
-    assert result["state"] == "error"
-    assert "confirm_motion" in result["message"]
-    assert client.calls == []
-
-
-def test_an_unconfigured_card_is_still_refused_the_canvas_way():
-    """The default must be closed, or the fix would have opened the gate."""
-    plugin, client = make_plugin()
-
-    result = plugin.dispatch("start", {"input_topic": "/x"})
-
-    assert result["state"] == "error"
-    assert client.calls == []
+    def submit(self, payload):
+        self.submitted.append(payload)
+        raise AssertionError("a paused card must not reach the sink")
