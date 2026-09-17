@@ -48,6 +48,8 @@ class RM75SDKClient:
         self._trajectory_lock = threading.Lock()
         self._trajectory_waiting = False
         self._trajectory_result = None
+        self._trajectory_callback = None
+        self._trajectory_generation = 0
         # ctypes 回调必须由 Python 对象持有，否则可能被 GC 后导致 C SDK 回调失效。
         self._event_callback = None
 
@@ -139,35 +141,53 @@ class RM75SDKClient:
             handle_id = int(getattr(data, "handle_id", -1))
             if self.connected and handle_id != int(self._handle.id):
                 return
+            callback = None
             with self._trajectory_lock:
                 if not self._trajectory_waiting:
                     return
-                self._trajectory_result = bool(data.trajectory_state)
+                trajectory_state = bool(data.trajectory_state)
+                self._trajectory_result = trajectory_state
                 self._trajectory_event.set()
-            outcome = "completed" if bool(data.trajectory_state) else "failed"
+                # 控制器已经给出该轨迹的终态，下一条轨迹可以登记自己的等待者。
+                # 旧的 Python SDK 包装调用即使仍未返回，也不能继续占用逻辑槽位。
+                self._trajectory_waiting = False
+                # 事件可能在 rm_movel_offset(block=0) 的 Python 包装调用返回前到达。
+                # 回调只取一次，实际 ACP 收尾由插件放到独立线程执行，不能阻塞 SDK
+                # 的 ctypes 回调线程。
+                callback, self._trajectory_callback = self._trajectory_callback, None
+            if callback is not None:
+                callback(trajectory_state)
+            outcome = "completed" if trajectory_state else "failed"
             print(f"[rm75] controller trajectory event: {outcome}", flush=True)
         except Exception as exc:
             print(f"[rm75] controller trajectory event ignored: {exc}", flush=True)
 
-    def command_trajectory(self, method, *args):
+    def command_trajectory(self, method, *args, completion_callback=None):
         """非阻塞下发轨迹，并在下发前准备官方到位事件。"""
         with self._lock:
             if not self.connected or self._robot is None:
                 raise ConnectionError("RM75 SDK is not connected")
-            with self._trajectory_lock:
-                if self._trajectory_waiting:
-                    raise RuntimeError("another controller trajectory wait is active")
-                self._trajectory_result = None
-                self._trajectory_event.clear()
-                self._trajectory_waiting = True
-            try:
-                code = int(getattr(self._robot, method)(*args))
-                if code != 0:
-                    raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
-                return code
-            except Exception:
-                self._discard_trajectory_wait()
-                raise
+            robot = self._robot
+        with self._trajectory_lock:
+            if self._trajectory_waiting:
+                raise RuntimeError("another controller trajectory wait is active")
+            self._trajectory_generation += 1
+            generation = self._trajectory_generation
+            self._trajectory_result = None
+            self._trajectory_callback = completion_callback
+            self._trajectory_event.clear()
+            self._trajectory_waiting = True
+        try:
+            # 三线程 SDK 的 block=0 本应立即返回，但部分真机版本会一直停在
+            # Python/C 包装调用中，尽管到位事件已经送达。这里不持有通用 SDK 锁，
+            # 让事件完成后下一条命令仍可进入控制器。
+            code = int(getattr(robot, method)(*args))
+            if code != 0:
+                raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
+            return code
+        except Exception:
+            self._discard_trajectory_wait(generation)
+            raise
 
     def poll_trajectory(self, timeout_seconds=0.0):
         """读取官方到位事件；尚未收到时保留等待状态并返回 None。"""
@@ -179,6 +199,7 @@ class RM75SDKClient:
             if result is not None:
                 self._trajectory_waiting = False
                 self._trajectory_result = None
+                self._trajectory_callback = None
                 self._trajectory_event.clear()
         return result
 
@@ -189,11 +210,16 @@ class RM75SDKClient:
             self.discard_trajectory_wait()
         return result
 
-    def discard_trajectory_wait(self):
+    def discard_trajectory_wait(self, expected_generation=None):
         with self._trajectory_lock:
+            if (expected_generation is not None
+                    and expected_generation != self._trajectory_generation):
+                return False
             self._trajectory_waiting = False
             self._trajectory_result = None
+            self._trajectory_callback = None
             self._trajectory_event.clear()
+            return True
 
     # 兼容类内旧调用名称。
     _discard_trajectory_wait = discard_trajectory_wait
@@ -203,7 +229,9 @@ class RM75SDKClient:
         with self._trajectory_lock:
             if not self._trajectory_waiting:
                 return False
+            self._trajectory_callback = None
             self._trajectory_result = False
+            self._trajectory_waiting = False
             self._trajectory_event.set()
             return True
 
@@ -1063,7 +1091,40 @@ class CartesianPlugin:
             if cancelled:
                 status, result = "cancelled", {"reason": "stopmotion"}
             else:
-                self._submit(motion_type, args, target, speed_percent, wait_for_completion=True)
+                def on_controller_event(trajectory_state):
+                    if trajectory_state:
+                        event_status = "completed"
+                        event_result = {
+                            "reason": "controller_target_reached",
+                            "target_pose_mm_deg": target,
+                        }
+                    else:
+                        event_status = "error"
+                        event_result = {
+                            "reason": "controller reported trajectory planning or execution failure",
+                            "target_pose_mm_deg": target,
+                        }
+                    threading.Thread(
+                        target=self._finish_cartesian,
+                        args=(action_id, event_status, event_result),
+                        daemon=True,
+                        name=f"rm75-cartesian-event-{action_id}",
+                    ).start()
+
+                self._submit(
+                    motion_type,
+                    args,
+                    target,
+                    speed_percent,
+                    wait_for_completion=True,
+                    completion_callback=on_controller_event,
+                )
+                # 到位事件可能在 SDK 包装调用返回前已经直接完成了动作。此时不能
+                # 再读取全局事件槽，否则可能误消费随后动作登记的新事件。
+                with self._action_lock:
+                    already_finished = action_id in self._terminal_action_ids
+                if already_finished:
+                    return
                 # 这里只等待 SDK 三线程模式的官方到位事件，不能再调用
                 # rm_get_current_arm_state/rm_get_arm_current_trajectory。真机上这些
                 # 状态查询偶尔会卡在 C SDK 内，即使到位事件已经收到也无法收尾。
@@ -1151,10 +1212,18 @@ class CartesianPlugin:
                 raise ValueError(
                     f"{label} {value:.0f} deg exceeds cartesian.max_euler_abs_deg {self.max_euler_abs_deg:g}")
 
-    def _submit(self, motion_type, args, target, speed_percent, wait_for_completion=False):
+    def _submit(
+            self, motion_type, args, target, speed_percent, wait_for_completion=False,
+            completion_callback=None):
         """下发 SDK 运动命令；原生相对运动通过控制器事件等待终态。"""
         try:
-            command = self.client.command_trajectory if wait_for_completion else self.client.command
+            if wait_for_completion:
+                def command(method, *command_args):
+                    return self.client.command_trajectory(
+                        method, *command_args, completion_callback=completion_callback
+                    )
+            else:
+                command = self.client.command
             # command_trajectory 已准备到位回调，实际 SDK 调用必须保持非阻塞。
             block = 0
             if motion_type == "movel":
