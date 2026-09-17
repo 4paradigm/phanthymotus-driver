@@ -75,7 +75,7 @@ class VisionCapturePlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": [
-                        "start", "capture_photo", "record_video", "list_cameras", "info", "stop"]},
+                        "start", "capture_photo", "record_video", "list_cameras", "info", "cancel"]},
                     "camera": camera_property,
                     "external_instance_id": instance_property,
                     "duration_s": {"type": "integer", "minimum": 1,
@@ -90,7 +90,7 @@ class VisionCapturePlugin:
                     "record_video": {"params": ["duration_s", "camera", "external_instance_id"], "description": "录制所选相机的 RGB 视频，默认 5 秒。"},
                     "list_cameras": {"params": [], "description": "列出已启动的 RealSense RGB 相机实例。"},
                     "info": {"params": [], "description": "查看图像来源、保存目录和录像结果。"},
-                    "stop": {"params": [], "description": "取消当前录像并删除未完成文件。"},
+                    "cancel": {"params": [], "description": "取消当前录像并删除未完成文件。"},
                 },
                 "x-completion": {"actions": ["record_video"],
                                  "timeout": self._max_duration_s + 15},
@@ -485,7 +485,8 @@ class VisionCapturePlugin:
             stopping = self._active_recording is active
         if not stopping:
             self._cleanup_ros()
-        return {"ok": True, "state": "stopping" if stopping else "idle", "action_id": active["action_id"]}
+        return {"ok": True, "state": "idle", "action_id": active["action_id"],
+                "message": "Recording cancellation completed."}
 
     def _cleanup_ros(self):
         if self._node is None:
@@ -528,7 +529,7 @@ class VisionCapturePlugin:
         if action == "record_video":
             result = self._start_video_recording(args)
             return result if result.get("state") != "recording" else {**result, "ok": True}
-        if action == "stop":
+        if action == "cancel":
             return self.stop()
         if action == "list_cameras":
             return {"ok": True, "cameras": self._sources()}
