@@ -182,14 +182,17 @@ HAND_SKELETON_JOINTS = (
     ("L_ring_MCP_joint", "L_ring_DIP_joint", 0.0, 1.5533),
     ("L_middle_MCP_joint", "L_middle_DIP_joint", 0.0, 1.5533),
     ("L_index_MCP_joint", "L_index_DIP_joint", 0.0, 1.5533),
-    ("L_thumb_MCP_joint1", "L_thumb_PIP_joint", 0.4538, 1.0821),
+    # The documented channel order is thumb flexion (Thumb2), then thumb
+    # rotation/abduction (Thumb1). Keep those actuator semantics aligned with
+    # the official Humanoid Robot mapping.
     ("L_thumb_MCP_joint2", "L_thumb_DIP_joint", 0.0873, 1.5708),
+    ("L_thumb_MCP_joint1", "L_thumb_PIP_joint", 0.4538, 1.0821),
     ("R_pinky_MCP_joint", "R_pinky_DIP_joint", 0.0, 1.5533),
     ("R_ring_MCP_joint", "R_ring_DIP_joint", 0.0, 1.5533),
     ("R_middle_MCP_joint", "R_middle_DIP_joint", 0.0, 1.5533),
     ("R_index_MCP_joint", "R_index_DIP_joint", 0.0, 1.5533),
-    ("R_thumb_MCP_joint1", "R_thumb_PIP_joint", 0.4538, 1.0821),
     ("R_thumb_MCP_joint2", "R_thumb_DIP_joint", 0.0873, 1.5708),
+    ("R_thumb_MCP_joint1", "R_thumb_PIP_joint", 0.4538, 1.0821),
 )
 
 

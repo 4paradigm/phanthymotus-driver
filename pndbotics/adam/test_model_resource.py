@@ -50,7 +50,12 @@ class ModelResourceTests(unittest.TestCase):
         self.assertEqual(0.0, joints[0]["q"])
         self.assertEqual(1.5533, joints[12]["q"])
         self.assertAlmostEqual(joints[0]["q"] * 0.6, joints[1]["q"])
-        self.assertEqual(0.4538, joints[9]["q"])
+        # Channel 4 is thumb flexion (Thumb2), channel 5 is Thumb1
+        # rotation/abduction, per the official humanoid mapping.
+        self.assertEqual("L_thumb_MCP_joint2", joints[8]["name"])
+        self.assertEqual(0.0873, joints[8]["q"])
+        self.assertEqual("L_thumb_MCP_joint1", joints[10]["name"])
+        self.assertEqual(0.4538, joints[10]["q"])
         self.assertTrue(all(item["visual_mapping"] for item in joints))
 
 
