@@ -337,25 +337,29 @@ class RM75ServoPlugin:
             self._node = node
 
     def _on_message(self, message):
-        sink = self._sink
-        if sink is None or self._paused:
-            # Dropped, not queued: a command held through a pause was computed
-            # from a world that has moved on, and applying it at resume would
-            # be a jump from stale data.
-            return
         try:
             payload = json.loads(message.data)
         except Exception as exc:
             self._record(Verdict.REJECTED.value, f"undecodable payload: {exc}")
             return
-        outcome = sink.submit(payload)
+        # Hold the lifecycle lock through admission and application. stop()
+        # and pause() therefore cannot issue slow-stop and return while an
+        # already-admitted callback is still able to command the arm.
+        with self._lock:
+            sink = self._sink
+            if sink is None or self._paused:
+                # Dropped, not queued: a command held through a pause was
+                # computed from a world that has moved on.
+                return
+            outcome = sink.submit(payload)
         self._record(outcome.verdict.value, outcome.reason, outcome.warnings)
 
     def _tick(self):
-        sink = self._sink
-        if sink is None:
-            return
-        outcome = sink.tick()
+        with self._lock:
+            sink = self._sink
+            if sink is None or self._paused:
+                return
+            outcome = sink.tick()
         if outcome is not None:
             self._record(outcome.verdict.value, outcome.reason)
 
