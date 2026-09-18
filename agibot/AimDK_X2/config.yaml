@@ -9,12 +9,17 @@ ros_namespace: "agibot_x2"
 
 # Which end-effector variant this robot is built with — selects the URDF served by the
 # `model` resource tool and the joint layout used by hand_state/hand_command.
-end_effector: "hand"   # fist | hand | ultra
+# This unit reports HandType.NONE on both sides, so serve the matching no-finger model.
+end_effector: "fist"   # fist | hand | ultra
 
 ros:
   robot_domain_id: 0
   core_domain_id: 42
-  robot_interface: "eth0"
+  # Agent Core traffic is bridged over the Unix socket; keep the driver process
+  # on the vendor domain only. The standalone bridge owns domain 42.
+  core_transport: socket
+  # The X2 vendor ROS processes use the host's develop0 interface (10.0.1.41).
+  robot_interface: "develop0"
 
 plugins:
   mc_state:
@@ -22,12 +27,30 @@ plugins:
   joint_state:
     enabled: true
   hand_state:
-    enabled: true
+    # This X2 reports HandType.NONE for both sides; enable after dexterous hands are provisioned.
+    enabled: false
   imu:
+    enabled: true
+  mic:
+    # AimDK AudioCapture -> audio_msgs/AudioChunk PCM-16kHz stream.
+    enabled: true
+    # The X2 vendor capture levels are very low (roughly -50 dBFS); apply a
+    # bounded digital gain after downmixing, with int16 clipping protection.
+    gain: 4.0
+  leg_odometry:
+    # X2's locomotion odometry; this is not SLAM/localization pose.
     enabled: true
   camera:
     enabled: true
+  camera_depth:
+    # No depth publisher exists on the verified X2 firmware.
+    enabled: false
   lidar:
+    # The optional SLAM lidar has no publisher until the vendor enables that module.
+    enabled: false
+  head_touch:
+    enabled: true
+  pmu_state:
     enabled: true
   system_state:
     enabled: true
@@ -35,16 +58,36 @@ plugins:
     enabled: true
   mc_mode:
     enabled: true
+    # Observed end-to-end on this unit: DAMPING_DEFAULT. PASSIVE_DEFAULT and
+    # STAND_DEFAULT only acknowledged the request; do not expose them until their
+    # physical behavior is verified. Never add SDK enum names without validation.
+    allowed_actions: [damping_default]
+    # State transitions such as stand_up_default can take longer than ordinary
+    # query/service calls. This is the response wait only; it does not retry.
+    service_timeout_sec: 20
   locomotion:
     enabled: true
-    input_source_name: "phanthymotus"
-    input_source_priority: 50
+    # AimDK requires a custom input source for external locomotion commands. Do not
+    # reuse rc/app_proxy/etc.: those native modules publish their own zero commands.
+    input_source_name: "motus_x2"
+    # rc is priority 80.  81 owns the base only while a Motus action is active;
+    # cancel, timeout, and driver stop delete this source immediately.
+    input_source_priority: 81
+    # Vendor SetMcInputSource is stable from an isolated ROS participant but
+    # can hang inside the long-running driver process.
+    input_source_transport: process
+    # Empirical X2 calibration: a 0.2 m/s command tracks near 1.94x on this
+    # unit. Keep a conservative fixed scale until twist odometry is reliable.
+    # 0.52 produced only a gait-state transition on this unit (0.104 m/s
+    # command, no forward travel), indicating a vendor startup dead-zone.
+    velocity_command_scale: 0.70
+    adaptive_velocity_scale: false
   preset_motion:
     enabled: true
   joint_command:
     enabled: true
   hand_command:
-    enabled: true
+    enabled: false
   pmu_led:
     enabled: true
   tts:

@@ -3,7 +3,7 @@ FROM ${ROS_BASE_IMAGE}
 ARG AIMDK_MSGS_REV=a424add7
 ARG AIMDK_MSGS_SHA256=4577528a5f4812e06e538ca759a7ef33f535fb70a0a20991b55a2b8b59c5d5a6
 ARG PYPI_MIRROR=https://pypi.org/simple/
-RUN apt-get update && apt-get install -y --no-install-recommends python3-pip python3-colcon-common-extensions ros-humble-rmw-fastrtps-cpp ros-humble-sensor-msgs ros-humble-nav-msgs ros-humble-geometry-msgs && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip python3-colcon-common-extensions ros-humble-rmw-fastrtps-cpp ros-humble-sensor-msgs ros-humble-nav-msgs ros-humble-geometry-msgs ros-humble-rosidl-default-generators && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt /tmp/agibot-x2-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-x2-requirements.txt
 COPY aimdk_msgs-${AIMDK_MSGS_REV}.zip /tmp/aimdk_msgs.zip
@@ -12,10 +12,15 @@ RUN echo "${AIMDK_MSGS_SHA256}  /tmp/aimdk_msgs.zip" | sha256sum -c - && \
     python3 -m zipfile -e /tmp/aimdk_msgs.zip /aimdk_x2_ws/src/aimdk_msgs && \
     . /opt/ros/humble/setup.sh && cd /aimdk_x2_ws && colcon build --packages-select aimdk_msgs && \
     rm -rf /tmp/aimdk_msgs.zip
+COPY vendor/audio_msgs/ /aimdk_x2_ws/src/audio_msgs/
+RUN . /opt/ros/humble/setup.sh && cd /aimdk_x2_ws && colcon build --packages-select audio_msgs
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py config.yaml driver.yaml /work/agibot/AimDK_X2/
+COPY main.py device.py x2_camera_frame.py config.yaml driver.yaml /work/agibot/AimDK_X2/
+COPY x2_bus_bridge.py x2_bridged_publisher.py x2_socket_bridge.py x2_input_source_helper.py x2_bundle_entrypoint.sh /work/agibot/AimDK_X2/
 COPY resource/ /work/agibot/AimDK_X2/resource/
+COPY deploy/ /deploy/
+RUN chmod +x /work/agibot/AimDK_X2/x2_bundle_entrypoint.sh
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 PYTHONPATH=/work
 EXPOSE 15717
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /aimdk_x2_ws/install/setup.bash && python3 /work/agibot/AimDK_X2/main.py"]
+CMD ["/bin/bash", "/work/agibot/AimDK_X2/x2_bundle_entrypoint.sh"]
