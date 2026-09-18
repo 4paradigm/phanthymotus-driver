@@ -14,7 +14,9 @@ from pathlib import Path
 from common.vendor_runtime import action_schema, jsonable, tool
 
 
-JOINT_NAMES = [f"joint{i}" for i in range(1, 8)]
+# Keep the names identical to the official RM75 URDF.  Canvas uses the
+# joint name to associate each q value with the corresponding URDF joint.
+JOINT_NAMES = [f"joint_{i}" for i in range(1, 8)]
 SDK_LIBRARY_PATH = Path("/work/Robotic_Arm/libs/linux_arm/libapi_c.so")
 JOINT_LIMITS_DEG = [(-178.0, 178.0), (-130.0, 130.0), (-178.0, 178.0),
                     (-135.0, 135.0), (-178.0, 178.0), (-128.0, 128.0),
@@ -42,6 +44,7 @@ class RM75SDKClient:
         self.enabled = os.environ.get("RM_DRIVER_ENABLED", "0") == "1"
         self.motion_enabled = os.environ.get("RM_MOTION_ENABLED", "0") == "1"
         self._lock = threading.RLock()
+        self.motion_gate = threading.Lock()
         self._robot = None
         self._handle = None
 
@@ -87,11 +90,36 @@ class RM75SDKClient:
             "motion_enabled": self.motion_enabled,
         }
 
-    def call(self, method):
+    def call(self, method, *args):
         with self._lock:
             if not self.connected or self._robot is None:
                 raise ConnectionError("RM75 SDK is not connected")
-            return _sdk_result(method, getattr(self._robot, method)())
+            return _sdk_result(method, getattr(self._robot, method)(*args))
+
+    def upload_recording(self, path, speed, slot, run=False):
+        from Robotic_Arm.rm_robot_interface import rm_send_project_t
+
+        project = rm_send_project_t(
+            project_path=str(path), plan_speed=speed, only_save=0 if run else 1,
+            save_id=slot, step_flag=0, auto_start=0, project_type=0,
+        )
+        # rm_send_project returns (status, error_line).  Keep the second
+        # value when status is non-zero; the generic call() helper raises
+        # first and otherwise hides the controller's useful line number.
+        with self._lock:
+            if not self.connected or self._robot is None:
+                raise ConnectionError("RM75 SDK is not connected")
+            result = self._robot.rm_send_project(project)
+        if not isinstance(result, tuple) or len(result) < 2:
+            raise RuntimeError(f"rm_send_project returned an invalid SDK result: {result!r}")
+        code, error_line = int(result[0]), int(result[1])
+        if code != 0:
+            raise RuntimeError(
+                f"rm_send_project failed with RealMan SDK code {code}; "
+                f"controller error line={error_line}"
+            )
+        if error_line != -1:
+            raise RuntimeError(f"trajectory project rejected at line {error_line}")
 
     def call_dict(self, method):
         with self._lock:
@@ -136,12 +164,14 @@ class RM75Plugin:
         self.client = client
         self._ros2 = ros2
         self._skeleton_topic = f"/{namespace.strip('/') or 'rm75'}/state/joints"
+        self._angles_topic = f"/{namespace.strip('/') or 'rm75'}/state/joint_angles"
         ros_config = config.get("ros", {})
         self._skeleton_publish_hz = float(ros_config.get("skeleton_publish_hz", 10.0))
         if not math.isfinite(self._skeleton_publish_hz) or self._skeleton_publish_hz <= 0:
             raise ValueError("ros.skeleton_publish_hz must be a positive finite number")
         self._skeleton_node = None
         self._skeleton_pub = None
+        self._angles_pub = None
         self._skeleton_message_type = None
         self._last_skeleton_error = None
         self._skeleton_retry_at = 0.0
@@ -154,14 +184,22 @@ class RM75Plugin:
         self.stall_timeout_seconds = float(safety.get("stall_timeout_seconds", 10.0))
         self.progress_threshold_deg = float(safety.get("progress_threshold_deg", 0.05))
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
-        self._motion_lock = threading.Lock()
+        self._motion_lock = client.motion_gate
         self._action_lock = threading.Lock()
         self._active_action_id = None
         self._cancelled = set()
         self._last_completion = None
+        if __package__:
+            from .action_record import ActionRecord
+        else:
+            from action_record import ActionRecord
+        self.recorder = ActionRecord(self, config.get("action_record", {}), JOINT_LIMITS_DEG)
 
     def _skeleton_topic_out(self):
         return [{"topic": self._skeleton_topic, "format": "sensor/skeleton"}]
+
+    def _angles_topic_out(self):
+        return [{"topic": self._angles_topic, "format": "data/json"}]
 
     def get_tools(self):
         definitions = [
@@ -172,7 +210,11 @@ class RM75Plugin:
                 f"Read and publish seven RM75 joint angles in radians at {self._skeleton_publish_hz:g} Hz",
                 topic_out=self._skeleton_topic_out(),
             ),
-            tool("model", "resource", "RM75-6F-V simplified URDF for skeleton rendering"),
+            # Expose this read-only state as a sensor so Canvas renders a
+            # visible card while keeping the same MCP call contract.
+            tool("joint_angles", "sensor", "Read the current seven RM75 joint angles in degrees and radians",
+                 topic_out=self._angles_topic_out()),
+            tool("model", "resource", "RM75-6F-V URDF for skeleton rendering"),
         ]
         definitions.extend(tool(name, "sensor", f"Read-only RealMan API2 call: {method}") for name, method in self.METHODS.items())
         joint_properties = {
@@ -208,6 +250,7 @@ class RM75Plugin:
             self._start_skeleton_publisher()
 
     def stop(self):
+        self.recorder.shutdown()
         with self._action_lock:
             action_id = self._active_action_id
             if action_id:
@@ -234,6 +277,7 @@ class RM75Plugin:
         node = Node("rm75_skeleton", context=self._ros2.ctx_core)
         self._skeleton_message_type = String
         self._skeleton_pub = node.create_publisher(String, self._skeleton_topic, qos)
+        self._angles_pub = node.create_publisher(String, self._angles_topic, qos)
         node.create_timer(1.0 / self._skeleton_publish_hz, self._publish_skeleton)
         self._ros2.executor_core.add_node(node)
         self._skeleton_node = node
@@ -241,6 +285,7 @@ class RM75Plugin:
     def _stop_skeleton_publisher(self):
         node, self._skeleton_node = self._skeleton_node, None
         self._skeleton_pub = None
+        self._angles_pub = None
         self._skeleton_message_type = None
         if node is None:
             return
@@ -255,17 +300,24 @@ class RM75Plugin:
             "timestamp_ms": int(time.time() * 1000),
             "format": "sensor/skeleton",
             "position_unit": "rad",
+            "angle_unit": "deg",
             "joint_count": len(JOINT_NAMES),
             "joints": [
-                {"idx": index, "name": name, "q": float(position)}
+                {
+                    "idx": index,
+                    "name": name,
+                    "q": float(position),
+                    "degree": float(state["raw_degree"][index]),
+                }
                 for index, (name, position) in enumerate(zip(JOINT_NAMES, state["position"]))
             ],
         }
 
     def _publish_skeleton(self):
         publisher = self._skeleton_pub
+        angles_publisher = self._angles_pub
         message_type = self._skeleton_message_type
-        if publisher is None or message_type is None:
+        if publisher is None or angles_publisher is None or message_type is None:
             return
         # A failed controller is sampled at most once every two seconds.
         # Visualization must not queue behind motion/stop SDK operations.
@@ -278,8 +330,21 @@ class RM75Plugin:
             return
         try:
             message = message_type()
-            message.data = json.dumps(self._skeleton_payload(), ensure_ascii=False)
+            skeleton = self._skeleton_payload()
+            message.data = json.dumps(skeleton, ensure_ascii=False)
             publisher.publish(message)
+            angles = self.client.joint_states()
+            angle_message = message_type()
+            angle_message.data = json.dumps({
+                "timestamp_ms": skeleton["timestamp_ms"],
+                "format": "data/json",
+                "name": JOINT_NAMES,
+                "degree": angles["raw_degree"],
+                "radian": angles["position"],
+                "unit_degree": "deg",
+                "unit_radian": "rad",
+            }, ensure_ascii=False)
+            angles_publisher.publish(angle_message)
             self._last_skeleton_error = None
             self._skeleton_retry_at = 0.0
         except Exception as exc:
@@ -503,6 +568,9 @@ class RM75Plugin:
             raise
 
     def _stop_motion(self):
+        recorded = self.recorder.stop_active()
+        if recorded is not None:
+            return recorded
         # Keep the action-state lock across the SDK stop request. The monitor
         # cannot select a terminal state between cancellation and slow-stop.
         with self._action_lock:
@@ -514,6 +582,8 @@ class RM75Plugin:
 
     def dispatch(self, action, args):
         name = args.get("_tool_name")
+        if name == "action_record":
+            return self.recorder.dispatch(action, args)
         if action == "start":
             return {"state": "ready" if name in ("joint_control", "model") else "running"}
         if action == "stop":
@@ -521,19 +591,41 @@ class RM75Plugin:
                 self._stop_motion()
             return {"state": "idle"}
         if action == "info":
-            topic_out = self._skeleton_topic_out() if name == "joint_states" else []
+            topic_out = (
+                self._skeleton_topic_out() if name == "joint_states"
+                else self._angles_topic_out() if name == "joint_angles" else []
+            )
             return {**self._motion_status(), "topic_out": topic_out}
         if name == "connection":
             return self.client.status()
         if name == "joint_states":
             return self.client.joint_states()
+        if name == "joint_angles":
+            state = self.client.joint_states()
+            return {
+                "name": JOINT_NAMES,
+                "degree": state["raw_degree"],
+                "radian": state["position"],
+                "unit_degree": "deg",
+                "unit_radian": "rad",
+            }
         if name == "model":
             path = Path(__file__).with_name("resource") / "rm75_6f_v.urdf"
             return {"urdf": path.read_text(encoding="utf-8")}
         if name in self.METHODS:
             if name == "controller_state":
                 return self.client.call_dict(self.METHODS[name])
-            return self.client.call(self.METHODS[name])
+            result = self.client.call(self.METHODS[name])
+            if name == "arm_all_state" and isinstance(result, dict):
+                angles = self.client.joint_states()
+                result["joint_angles"] = {
+                    "name": JOINT_NAMES,
+                    "degree": angles["raw_degree"],
+                    "radian": angles["position"],
+                    "unit_degree": "deg",
+                    "unit_radian": "rad",
+                }
+            return result
         if name == "joint_control":
             if action == "set":
                 return self._start_motion(args)
@@ -649,6 +741,9 @@ class GripperPlugin:
         position = _gripper_position(args.get("position"))
         if not self._gripper_lock.acquire(blocking=False):
             raise RuntimeError(f"another gripper motion is active: {self._active_action_id}")
+        if not self.client.motion_gate.acquire(blocking=False):
+            self._gripper_lock.release()
+            raise RuntimeError("another arm operation is active")
         action_id = f"rm75_gripper_{uuid4().hex[:10]}"
         with self._action_lock:
             self._active_action_id = action_id
@@ -680,6 +775,7 @@ class GripperPlugin:
                     self._active_action_id = None
                 self._interrupted.discard(action_id)
             self._gripper_lock.release()
+            self.client.motion_gate.release()
             self._acp_callback(action_id, status, result)
 
     def _acp_callback(self, action_id, status, result):
@@ -727,28 +823,29 @@ class GripperPlugin:
 
 
 def build_plugins(config, namespace, ros2):
-    from servo import RM75ServoPlugin
-
     client = RM75SDKClient(config)
     plugins = [
         RM75Plugin(client, config, namespace=namespace, ros2=ros2),
         GripperPlugin(client, config, namespace=namespace, ros2=ros2),
-        # Stream-shaped joint control (motus.control/1). Present but inert: it
-        # subscribes to nothing until someone wires it on the canvas and
-        # confirms, and refuses to start at all while the driver is read-only.
-        RM75ServoPlugin(client, config, namespace=namespace, ros2=ros2),
     ]
-    external_camera = None
     camera_config = config.get("ext_camera", {})
+    ext_camera_plugin = None
     if camera_config.get("enabled", False):
         from camera import ExtCameraPlugin
 
-        external_camera = ExtCameraPlugin(camera_config, namespace, ros2.executor_core)
-        plugins.append(external_camera)
-    capture_config = config.get("vision_capture", {})
-    if capture_config.get("enabled", False):
+        ext_camera_plugin = ExtCameraPlugin(
+            camera_config, namespace, ros2.executor_core
+        )
+        plugins.append(ext_camera_plugin)
+    vision_config = config.get("vision_capture", {})
+    if vision_config.get("enabled", camera_config.get("enabled", False)):
         from vision_capture import VisionCapturePlugin
 
-        plugins.append(VisionCapturePlugin(
-            capture_config, namespace, ros2.executor_core, external_camera))
+        plugins.append(
+            VisionCapturePlugin(
+                vision_config, namespace, ros2.executor_core,
+                ext_camera=ext_camera_plugin,
+                context=ros2.ctx_core,
+            )
+        )
     return plugins

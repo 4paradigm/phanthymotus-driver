@@ -1,6 +1,6 @@
 mcp_port: 15718
 ros_namespace: ""
-name: "睿尔曼 RM75-6F-V"
+name: "睿曼 RM75-6F-V"
 arm_dof: 7
 arm_ip: ""
 tcp_port: 8080
@@ -27,3 +27,7 @@ ros:
   core_domain_id: 42
   robot_interface: "eth0"
   skeleton_publish_hz: 10
+action_record:
+  directory: /var/lib/realman/rm75-actions
+  speed_percent: 20
+  replay_timeout_seconds: 600
