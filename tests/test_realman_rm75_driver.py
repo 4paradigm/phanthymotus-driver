@@ -654,7 +654,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         plugin, robot = self._motion_plugin()
         plugin._skeleton_pub = mock.Mock()
         plugin._skeleton_message_type = mock.Mock
-        query = mock.Mock(side_effect=[RuntimeError("first"), RuntimeError("different"), {"position": [0]*7}, RuntimeError("new outage")])
+        query = mock.Mock(side_effect=[RuntimeError("first"), RuntimeError("different"), {"position": [0]*7, "raw_degree": [0]*7}, RuntimeError("new outage")])
         plugin.client.joint_states = query
         with mock.patch.object(self.device.time, "monotonic", return_value=10) as clock, mock.patch("builtins.print") as log:
             plugin._publish_skeleton()
@@ -667,6 +667,8 @@ class RealManRM75SDKClientTests(unittest.TestCase):
             clock.return_value = 14
             plugin._publish_skeleton()
             plugin._skeleton_pub.publish.assert_called_once()
+            payload = json.loads(plugin._skeleton_pub.publish.call_args.args[0].data)
+            self.assertEqual([0] * 7, [joint["degree"] for joint in payload["joints"]])
             clock.return_value = 14.1
             plugin._publish_skeleton()
             self.assertEqual(2, log.call_count)
