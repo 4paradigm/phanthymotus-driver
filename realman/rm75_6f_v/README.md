@@ -27,6 +27,10 @@ Available tools are:
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
+- `abs_move`: `move` reads the current TCP as A and moves to
+  the requested base-frame B using
+  joint-space planning by default, with an explicit TCP-linear mode available.
+  Relative `move_offset`, absolute `movel`, and waypoint `movep` are not exposed.
 - `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
   instance can publish RGB, depth, or left infrared without going through the
   RealMan controller.
@@ -126,6 +130,28 @@ The first supervised hardware test should change exactly one joint by no more
 than 1 degree at 1 percent speed. A reachable physical E-stop and a clear work
 area are required. Software interlocks do not replace the robot safety system.
 
+Physical motion and `abs_move` are enabled in the default deployment;
+`abs_move` can be disabled with `RM75_CARTESIAN_ENABLED=0`. Verify the active
+TCP, arrival device, and workspace envelope before use. Every
+`abs_move.move` request must also set both
+`cartesian_enabled=true` and `confirm_motion=true`. `move` reads the
+measured TCP as A and accepts B pose fields (`x/y/z` in millimetres and `rx/ry/rz` in
+degrees). Any omitted B axis keeps the measured A value, so callers
+can provide only `x/y/z` to preserve the current orientation. At least one B
+field is required. It validates the composed B pose against the configured
+workspace envelope. `motion_mode=joint` (the default) submits `rm_movej_p` and
+is intended for general repositioning or large orientation changes;
+`motion_mode=linear` submits `rm_movel` and is intended for a verified straight
+approach or retreat. Planning failure, an unreachable pose, collision stop,
+timeout, or an operator stop ends the action and releases the motion lock.
+After a controller-event timeout or cancellation, `info` may report
+`controller_trajectory_state: draining`. The action is already terminal, but a
+new controller trajectory is rejected until the previous untagged SDK event is
+consumed; this prevents a late event from completing the next action.
+The controller's collision level, electronic fences, virtual walls, and
+physical safety system remain responsible for collision protection; the driver
+has no environment model and does not plan a detour around obstacles.
+
 The HTTP service listens on port `15718` and provides `/health` and `/mcp`.
 The normal Agent Core runtime still initializes its ROS/DDS transport, but robot
 communication itself goes directly through API2 TCP port `8080`.
@@ -149,9 +175,26 @@ library is absent. Set `RM_API2_LIB_DIR` to override the host directory.
 Following the standard ACP contract in `README_dev.md`, `joint_control.set` immediately returns a
 unique `action_id`; its background monitor later reports exactly one
 `completed`, `error`, or `cancelled` terminal result to `/api/acp/complete`.
-The callback reads `AGENT_CORE_URL` inside the worker-thread function and uses
-the same HTTPS behavior as the documented G1/R1 implementation. Agent Core
+The callback reads `AGENT_CORE_URL` inside the worker-thread function and
+verifies TLS against the Agent Core CA (see the deployment prerequisite
+below); it never falls back to unverified HTTPS. Agent Core
 owns pending-action barrier release and completion-event delivery.
+
+### Agent Core CA prerequisite
+
+Completion callbacks POST over TLS with certificate verification enabled, so
+every RM75 deployment must provide the Agent Core CA on the host at
+
+```text
+/opt/phanthy-motus/data/certs/cert.pem
+```
+
+`service.yml` mounts that directory read-only and points `AGENT_CORE_CA_CERT`
+at the file; override either with `RM75_CA_DIR` / `RM75_AGENT_CORE_CA_CERT`
+when the host layout differs. When the CA file is missing, each asynchronous
+joint/gripper/Cartesian completion callback fails with
+`AGENT_CORE_CA_CERT is required` while motion itself continues — verify the
+path before enabling the deployment.
 
 The immediate card result contains only `state` and `action_id`. Completion
 callbacks keep the standard status and a short reason; full final joint evidence

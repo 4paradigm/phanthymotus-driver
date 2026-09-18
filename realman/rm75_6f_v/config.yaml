@@ -22,6 +22,21 @@ safety:
   stall_timeout_seconds: 10
   progress_threshold_deg: 0.05
   max_motion_seconds: 300
+cartesian:
+  # 默认启用；部署方仍可通过 RM75_CARTESIAN_ENABLED=0 显式关闭。
+  enabled: true
+  # 水平工作半径：基座轴线到 TCP 的水平距离。RM75-6F 官方标称 638.5mm，取整 640 留 1.5mm 余量。
+  max_radius_mm: 640
+  # 肩关节距基座平面的高度，取自官方 RM75 系列 MDH 参数 d1=240.5mm。
+  shoulder_height_mm: 240.5
+  # 肩部到法兰的最大直线臂展：MDH d3+d5+d7 = 256+210+184 = 650mm（RM75-6F-V）。
+  max_reach_mm: 650
+  max_euler_abs_deg: 360
+  # 夹爪 TCP 相对法兰的伸出量。校验直接针对 TCP 并把该值作为包络余量
+  # （水平半径 ≤ 640+222.5、肩部球距 ≤ 650+222.5），不从姿态反推法兰——
+  # 真机竖直位姿上报欧拉角 (0,0,0) 而夹爪竖直伸出（TCP z≈1112 = 240.5+650+222.5）。
+  # 仅当控制器已把工具坐标系设为夹爪 TCP 时才设为 222.5；否则保持 0（法兰即 TCP）。
+  tool_length_mm: 222.5
 ros:
   robot_domain_id: 42
   core_domain_id: 42
