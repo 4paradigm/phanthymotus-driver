@@ -4,7 +4,8 @@ Plugins:
   StatePlugin  — DDS rt/lowstate → ROS2 skeleton/IMU/battery
   EStopPlugin  — read-only PAC physical emergency-stop state
   LocoPlugin   — gRPC locomotion control
-  ArmPlugin    — ROS2 JointState upper body control
+  PosturePlugin / MotionPlugin / TrackingMotionPlugin — focused RL execution cards
+  ArmPlugin    — DDS rt/lowcmd upper body control
   HandPlugin   — DDS rt/handcmd finger control and hand-state query
   ModelPlugin  — URDF resource for 3D visualization
 """
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import zlib
 from pathlib import Path
 
@@ -73,6 +75,7 @@ try:
     )
     from pndbotics_sdk_py.idl.default import (
         pnd_adam_msg_dds__HandCmd_,
+        pnd_adam_msg_dds__LowCmd_,
     )
 
     HAS_PND_SDK = True
@@ -101,7 +104,7 @@ def _notify_action_completion(action_id, status, result, tool):
     try:
         urllib.request.urlopen(request, context=context, timeout=5).close()
     except Exception as exc:
-        print(f"[vision_capture] ACP completion callback failed: {exc}", file=sys.stderr)
+        print(f"[{tool}] ACP completion callback failed: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +446,155 @@ ROS2_UPPER_BODY_JOINTS = [
     "dof_pos/hand_thumb_1_Right", "dof_pos/hand_thumb_2_Right",
 ]
 
+# Human-facing Adam Pro upper-body controls. Limits come from the vendor's
+# product overview, converted from radians to degrees. The card deliberately
+# uses stable semantic ids rather than leaking ROS topic/joint names.
+ARM_JOINT_CONTROLS = {
+    "left_shoulder_pitch": ("左肩前后摆", "shoulderPitch_Left", -207.0, 117.0),
+    "right_shoulder_pitch": ("右肩前后摆", "shoulderPitch_Right", -207.0, 117.0),
+    "left_shoulder_roll": ("左肩向内/外摆", "shoulderRoll_Left", -36.0, 160.0),
+    "right_shoulder_roll": ("右肩向内/外摆", "shoulderRoll_Right", -160.0, 36.0),
+    "left_shoulder_yaw": ("左上臂旋转", "shoulderYaw_Left", -148.0, 148.0),
+    "right_shoulder_yaw": ("右上臂旋转", "shoulderYaw_Right", -148.0, 148.0),
+    "left_elbow": ("左肘弯曲", "elbow_Left", -143.0, 12.0),
+    "right_elbow": ("右肘弯曲", "elbow_Right", -143.0, 12.0),
+    "left_wrist_yaw": ("左手腕旋转", "wristYaw_Left", -153.0, 153.0),
+    "right_wrist_yaw": ("右手腕旋转", "wristYaw_Right", -153.0, 153.0),
+    "left_wrist_pitch": ("左手腕俯仰", "wristPitch_Left", -55.0, 55.0),
+    "right_wrist_pitch": ("右手腕俯仰", "wristPitch_Right", -55.0, 55.0),
+    "left_wrist_roll": ("左手腕侧摆", "wristRoll_Left", -55.0, 55.0),
+    "right_wrist_roll": ("右手腕侧摆", "wristRoll_Right", -55.0, 55.0),
+}
+
+ARM_POSES = {
+    "neutral": ("自然下垂", {}),
+    "arms_forward": ("双臂向前", {
+        "left_shoulder_pitch": -30.0, "right_shoulder_pitch": -30.0,
+        "left_elbow": -45.0, "right_elbow": -45.0,
+    }),
+    "arms_open": ("双臂张开", {
+        "left_shoulder_pitch": -15.0, "right_shoulder_pitch": -15.0,
+        "left_shoulder_roll": 35.0, "right_shoulder_roll": -35.0,
+        "left_elbow": -25.0, "right_elbow": -25.0,
+    }),
+    "hands_up": ("双手举起", {
+        "left_shoulder_pitch": -95.0, "right_shoulder_pitch": -95.0,
+        "left_elbow": -30.0, "right_elbow": -30.0,
+    }),
+    # One-armed poses are written on the right side only.  A caller that asks
+    # for the other arm gets the mirrored target (see
+    # ``ArmControlPlugin.mirror_targets``), so no pose is duplicated per side.
+    # A salute brings the hand to the brow, not the crown.  Adam Pro carries a
+    # neck (neckYaw/neckPitch) with the ZED on top, so driving shoulder_pitch
+    # past horizontal together with a deep elbow fold sends the forearm into
+    # the head.  Keep the upper arm at ~90° forward and fold the elbow to ~90°,
+    # which leaves the hand beside the temple while the elbow stays clear.
+    "salute": ("单手敬礼（抬臂至额角）", {
+        "right_shoulder_pitch": -80.0, "right_shoulder_roll": -32.0,
+        "right_shoulder_yaw": -28.0, "right_elbow": -88.0,
+        "right_wrist_pitch": 10.0, "right_wrist_roll": -5.0,
+    }),
+    "arm_forward_high": ("单手肩高前伸（击掌预备）", {
+        "right_shoulder_pitch": -75.0, "right_shoulder_roll": -8.0,
+        "right_elbow": -20.0, "right_wrist_pitch": 15.0,
+    }),
+    "handshake_ready": ("单手屈肘前伸（握手预备）", {
+        "right_shoulder_pitch": -30.0, "right_shoulder_roll": -12.0,
+        "right_shoulder_yaw": -15.0, "right_elbow": -80.0,
+    }),
+    "wave_ready": ("屈肘上抬（挥手起势）", {
+        "right_shoulder_pitch": -85.0, "right_shoulder_roll": -18.0,
+        "right_elbow": -55.0, "right_wrist_pitch": 10.0,
+    }),
+    "wave_out": ("挥手外摆", {
+        "right_shoulder_pitch": -85.0, "right_shoulder_roll": -48.0,
+        "right_elbow": -45.0, "right_wrist_pitch": 10.0,
+    }),
+    "wave_in": ("挥手内摆", {
+        "right_shoulder_pitch": -85.0, "right_shoulder_roll": 12.0,
+        "right_elbow": -65.0, "right_wrist_pitch": 10.0,
+    }),
+}
+
+ARM_ACTIONS = {f"set_{control}": control for control in ARM_JOINT_CONTROLS}
+
+# The waist and neck are split out of ``ARM_JOINT_CONTROLS`` into their own
+# cards so an agent can discover "turn the head" or "bow the waist" without
+# having to know those joints live in the arm controller.  All three cards
+# still share the single safe rt/lowcmd owner below.
+WAIST_JOINT_CONTROLS = {
+    "roll": ("腰部侧倾", "waistRoll", -16.0, 16.0),
+    "pitch": ("腰部前后俯仰", "waistPitch", -48.0, 78.0),
+    "yaw": ("腰部左右转动", "waistYaw", -47.0, 47.0),
+}
+
+# The ZED Mini is mounted on the head, so the neck card is effectively the
+# "camera aiming" card.  Vendor limits are ±60° for both axes.
+HEAD_JOINT_CONTROLS = {
+    "yaw": ("头部左右转动", "neckYaw", -60.0, 60.0),
+    "pitch": ("头部上下俯仰", "neckPitch", -60.0, 60.0),
+}
+
+WAIST_ACTIONS = {f"set_{control}": control for control in WAIST_JOINT_CONTROLS}
+HEAD_ACTIONS = {f"set_{control}": control for control in HEAD_JOINT_CONTROLS}
+
+
+def _arm_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
+    """Validate a human-facing upper-body request and return ROS target."""
+    if control not in ARM_JOINT_CONTROLS:
+        raise ValueError("joint must be one of the advertised Adam upper-body controls")
+    if isinstance(angle_deg, bool):
+        raise ValueError("angle_deg must be a finite number")
+    try:
+        value = float(angle_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("angle_deg must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ValueError("angle_deg must be a finite number")
+    _, ros_name, minimum, maximum = ARM_JOINT_CONTROLS[control]
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
+    return ros_name, math.radians(value)
+
+
+def _waist_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
+    """Validate a waist request against WAIST_JOINT_CONTROLS and return ROS target."""
+    if control not in WAIST_JOINT_CONTROLS:
+        raise ValueError("joint must be one of the advertised Adam waist controls")
+    if isinstance(angle_deg, bool):
+        raise ValueError("angle_deg must be a finite number")
+    try:
+        value = float(angle_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("angle_deg must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ValueError("angle_deg must be a finite number")
+    _, joint_name, minimum, maximum = WAIST_JOINT_CONTROLS[control]
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
+    return joint_name, math.radians(value)
+
+
+def _head_target_radians(control: str, angle_deg: object) -> tuple[str, float]:
+    """Validate a neck request against HEAD_JOINT_CONTROLS and return ROS target."""
+    if control not in HEAD_JOINT_CONTROLS:
+        raise ValueError("joint must be one of the advertised Adam head controls")
+    if isinstance(angle_deg, bool):
+        raise ValueError("angle_deg must be a finite number")
+    try:
+        value = float(angle_deg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("angle_deg must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ValueError("angle_deg must be a finite number")
+    _, joint_name, minimum, maximum = HEAD_JOINT_CONTROLS[control]
+    if value < minimum or value > maximum:
+        raise ValueError(
+            f"{control} angle must be within [{minimum:g}, {maximum:g}] degrees")
+    return joint_name, math.radians(value)
+
 
 def _best_effort_qos():
     """Shallow best-effort queue for high-rate optional telemetry."""
@@ -474,6 +626,12 @@ def _battery_payload(battery, timestamp_ms: int | None = None) -> dict:
         "current": number("current"),
         "power": number("power"),
         "wh_accumulated": number("wh_accumulated"),
+        # The vendor's BatteryData_ DDS definition has no SOC/capacity field.
+        # Do not invent a percentage from voltage: its discharge curve changes
+        # under load and would make this safety-relevant card misleading.
+        "percentage": None,
+        "percentage_available": False,
+        "percentage_message": "The Adam DDS BMS message does not provide state of charge",
         "status": str(status) if status not in (None, "") else "unknown",
         "source_topic": "rt/lowstate",
     }
@@ -545,11 +703,10 @@ class _StatePublisherNode(Node):
         if not active or state is None:
             return
 
-        robot_data = {
-            "mode_pr": int(state.mode_pr),
-            "tick": int(state.tick),
-            "wireless_remote": list(state.wireless_remote),
-        }
+        robot_data = {"mode_pr": int(state.mode_pr), "tick": int(state.tick)}
+        for index, value in enumerate(state.wireless_remote):
+            if float(value) != 0.0:
+                robot_data[f"wireless_remote_{index:02d}"] = float(value)
         msg_robot = String()
         msg_robot.data = json.dumps(robot_data)
         self._pub_robot_state.publish(msg_robot)
@@ -567,33 +724,39 @@ class _StatePublisherNode(Node):
         msg.data = json.dumps({"joints": joints})
         self._pub_skeleton.publish(msg)
 
-        motor_states = []
+        motor_data = {}
         for idx, motor in enumerate(state.motor_state):
             if idx >= len(self._joints):
                 break
-            motor_states.append({
-                "idx": idx,
-                "name": self._joints[idx],
-                "mode": int(motor.mode),
-                "q": float(motor.q),
-                "dq": float(motor.dq),
-                "ddq": float(motor.ddq),
-                "tau_est": float(motor.tau_est),
-                "state": int(motor.state),
-            })
+            # Flat scalar fields let the dashboard render one signal per cell
+            # instead of requiring it to understand a nested motor array.
+            prefix = f"motor_{idx:02d}_{self._joints[idx]}"
+            motor_data[f"{prefix}_position_rad"] = float(motor.q)
+            motor_data[f"{prefix}_velocity_rad_s"] = float(motor.dq)
+            motor_data[f"{prefix}_torque_nm"] = float(motor.tau_est)
+            # ``ddq`` is commonly an all-zero firmware placeholder. Omit it
+            # until a meaningful acceleration estimate is available.
+            if float(motor.ddq) != 0.0:
+                motor_data[f"{prefix}_acceleration_rad_s2"] = float(motor.ddq)
+            if int(motor.mode) != 0:
+                motor_data[f"{prefix}_mode"] = int(motor.mode)
+            if int(motor.state) != 0:
+                motor_data[f"{prefix}_state"] = int(motor.state)
         msg_motor = String()
-        msg_motor.data = json.dumps({"motors": motor_states})
+        msg_motor.data = json.dumps(motor_data)
         self._pub_motor_state.publish(msg_motor)
 
         # IMU
         imu = state.imu_state
-        imu_data = {
-            "quaternion": list(imu.quaternion),
-            "gyroscope": list(imu.gyroscope),
-            "accelerometer": list(imu.accelerometer),
-            "ypr": list(imu.ypr),
-            "temperature": int(imu.temperature),
-        }
+        imu_data = {"temperature": int(imu.temperature)}
+        for prefix, values, names in (
+                ("quaternion", list(imu.quaternion), ("w", "x", "y", "z")),
+                ("gyroscope_rad_s", list(imu.gyroscope), ("x", "y", "z")),
+                ("accelerometer_m_s2", list(imu.accelerometer), ("x", "y", "z")),
+                ("ypr_rad", list(imu.ypr), ("yaw", "pitch", "roll"))):
+            for index, value in enumerate(values):
+                label = names[index] if index < len(names) else str(index)
+                imu_data[f"{prefix}_{label}"] = float(value)
         msg_imu = String()
         msg_imu.data = json.dumps(imu_data)
         self._pub_imu.publish(msg_imu)
@@ -695,7 +858,7 @@ class StatePlugin:
             {
                 "name": "battery",
                 "type": "sensor",
-                "description": f"Adam BMS battery — voltage, current, power, accumulated energy and status. Publishes at 1Hz to {self._node._topic_battery}",
+                "description": f"Adam BMS battery — voltage, current, power, accumulated energy and status. The vendor DDS message has no SOC percentage. Publishes at 1Hz to {self._node._topic_battery}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [
                     {"topic": self._node._topic_battery, "format": "data/json"}
@@ -899,161 +1062,1963 @@ class LocoPlugin:
 
 
 # ===========================================================================
-# ArmPlugin — ROS2 JointState upper body control
+# RlLocoPlugin — extended reinforcement-learning gRPC locomotion control
 # ===========================================================================
 
-class _ArmControlNode(Node):
-    """ROS2 node that publishes JointState at 100Hz for upper body control."""
+class RlLocoPlugin:
+    """Adam RL movement card; controller state is an internal detail."""
 
-    def __init__(self, namespace: str, publish_rate_hz: float):
-        super().__init__("adam_arm_controller")
-        self._namespace = namespace
-
-        self._pub = self.create_publisher(JointState, "joint_states", 10)
-        self._joint_names = ROS2_UPPER_BODY_JOINTS
-        self._positions = np.zeros(len(self._joint_names), dtype=np.float64)
-        # Default height = 1.0m (standing), hands fully open = 1000
-        self._positions[17] = 1.0  # root_pos/z
-        self._positions[18:24] = 1000.0  # left hand fingers
-        self._positions[24:30] = 1000.0  # right hand fingers
-
-        self._active = False
-        self._lock = threading.Lock()
-
-        interval = 1.0 / publish_rate_hz
-        self._timer = self.create_timer(interval, self._publish)
-
-    def _publish(self):
-        if not self._active:
-            return
-        with self._lock:
-            positions = self._positions.copy()
-
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = self._joint_names
-        msg.position = positions.tolist()
-        msg.velocity = [0.0] * len(self._joint_names)
-        msg.effort = [0.0] * len(self._joint_names)
-        self._pub.publish(msg)
-
-    def set_joints(self, joints_dict: dict):
-        """Set joint positions by name. Keys are short names like 'shoulderPitch_Left'."""
-        with self._lock:
-            for name, value in joints_dict.items():
-                # Try to find matching joint
-                full_name = f"dof_pos/{name}"
-                if full_name in self._joint_names:
-                    idx = self._joint_names.index(full_name)
-                    self._positions[idx] = float(value)
-                elif name in self._joint_names:
-                    idx = self._joint_names.index(name)
-                    self._positions[idx] = float(value)
-
-    def set_height(self, z: float):
-        z = max(0.6, min(1.0, z))
-        with self._lock:
-            self._positions[17] = z
-
-    def zero_arms(self):
-        with self._lock:
-            self._positions[:17] = 0.0
-            self._positions[17] = 1.0  # keep standing height
-
-
-class ArmPlugin:
-    """Upper body control via ROS2 JointState publishing at 100Hz."""
-
-    PREFIX = "arm"
+    PREFIX = "loco"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 grpc_client=None, **kwargs):
-        self._namespace = namespace
+                 grpc_client, **kwargs):
         self._grpc = grpc_client
-
-        rate = plugin_config.get("publish_rate_hz", 100)
-        self._node = _ArmControlNode(namespace, rate)
-        executor.add_node(self._node)
+        self._namespace = namespace
+        self._move_lock = threading.Lock()
+        self._move_generation = 0
+        # action_id of the timed stop currently armed, if any.  Agent Core
+        # holds a pending action until this card reports it finished.
+        self._pending_action_id = None
 
     def get_tool(self) -> dict:
         return {
-            "name": "arm",
+            "name": "loco",
             "type": "actuator",
-            "description": "Adam upper body — waist, arms, wrists via ROS2 JointState at 100Hz",
+            "description": "Adam RL locomotion — limited-duration walking, turning and body-height adjustment",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["enable", "disable", "set_joints", "set_height", "zero"],
-                    },
-                    "joints": {
-                        "type": "object",
-                        "description": "Joint name → radian value pairs (e.g., {\"shoulderPitch_Left\": 0.5})",
-                    },
-                    "height": {
-                        "type": "number",
-                        "description": "Body height 0.6-1.0m",
-                    },
+                    "action": {"type": "string", "enum": ["move", "set_height", "stop"],
+                               "oneOf": [
+                                   {"const": "move", "title": "定时移动"},
+                                   {"const": "set_height", "title": "设置机身高度"},
+                                   {"const": "stop", "title": "立即停止移动"},
+                               ]},
+                    "vx": {"type": "number", "title": "前进速度（m/s）", "minimum": -1.0,
+                           "maximum": 1.0, "multipleOf": 0.01,
+                           "description": "正值前进、负值后退；范围 -1.00 至 1.00 m/s。"},
+                    "vy": {"type": "number", "title": "横移速度（m/s）", "minimum": -1.0,
+                           "maximum": 1.0, "multipleOf": 0.01,
+                           "description": "正负方向由机器人坐标系定义；范围 -1.00 至 1.00 m/s。"},
+                    "vyaw": {"type": "number", "title": "转向速度（rad/s）", "minimum": -1.0,
+                             "maximum": 1.0, "multipleOf": 0.01,
+                             "description": "正负方向由机器人坐标系定义；范围 -1.00 至 1.00 rad/s。"},
+                    "duration_s": {"type": "number", "title": "移动时长（秒）", "minimum": 0.1,
+                                   "maximum": 30.0, "multipleOf": 0.1,
+                                   "description": "范围 0.1-30.0 秒；到时自动发送零速度。新的移动或停止会取消此前计时。"},
+                    "height": {"type": "number", "title": "机身高度目标（m）", "minimum": -1.0,
+                               "maximum": 1.0, "multipleOf": 0.01,
+                               "description": "RL SetHeight 的高度目标，范围 -1.00 至 1.00 m。"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "enable": {
-                        "params": [],
-                        "description": "Activate upper body retarget mode (robot must be standing)",
-                    },
-                    "disable": {
-                        "params": [],
-                        "description": "Deactivate upper body retarget mode",
-                    },
-                    "set_joints": {
-                        "params": ["joints"],
-                        "description": "Set arm/waist joint angles in radians",
-                    },
-                    "set_height": {
-                        "params": ["height"],
-                        "description": "Set body height (0.6-1.0m)",
-                    },
-                    "zero": {
-                        "params": [],
-                        "description": "Reset all arm joints to zero (neutral position)",
-                    },
+                    "move": {"params": ["vx", "vy", "vyaw", "duration_s"],
+                             "description": "按设定速度移动指定时长，到时自动停止。"},
+                    "set_height": {"params": ["height"],
+                                   "description": "设置 RL 控制下的机身高度目标。"},
+                    "stop": {"params": []},
                 },
+                # A timed move outlives the call that starts it: the robot keeps
+                # walking after dispatch() returns.  Declaring the completion
+                # keeps Agent Core from treating the accepted velocity as the
+                # finished movement and scheduling dependent work mid-stride.
+                # The timeout covers the 30s maximum plus the reporting round
+                # trip.
+                "x-completion": {"actions": ["move"], "timeout": 45},
             },
         }
 
     def start(self):
-        pass
+        return None
+
 
     def stop(self):
-        self._node._active = False
+        # A plugin stop is a local lifecycle event; explicit shutdown is
+        # required before asking the robot controller to exit.
+        self._cancel_timed_move()
+        return None
+
+    def _cancel_timed_move(self, reason: str | None = None):
+        """Invalidate the armed timed stop and return the new generation.
+
+        When the discarded timer belonged to an action Agent Core is still
+        waiting on, the reason is reported as its completion: a superseded move
+        ends early, and leaving the pending action open would hold the actuator
+        barrier until the declared timeout expired.
+        """
+        with self._move_lock:
+            superseded, self._pending_action_id = self._pending_action_id, None
+            self._move_generation += 1
+            generation = self._move_generation
+        if superseded is not None and reason is not None:
+            _notify_action_completion(superseded, "cancelled",
+                                      {"reason": reason}, self.PREFIX)
+        return generation
+
+    def _schedule_stop(self, generation: int, duration_s: float, action_id: str):
+        def stop_when_due():
+            time.sleep(duration_s)
+            with self._move_lock:
+                if generation != self._move_generation:
+                    return
+                self._pending_action_id = None
+            self._grpc.set_velocity(0.0, 0.0, 0.0)
+            _notify_action_completion(
+                action_id, "completed",
+                {"duration_s": duration_s, "auto_stop": True}, self.PREFIX)
+
+        threading.Thread(target=stop_when_due, daemon=True,
+                         name="adam_loco_timed_stop").start()
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
             return {"state": "ready"}
-        if action == "stop":
-            self._node._active = False
-            return {"state": "idle"}
-        if action == "enable":
-            self._node._active = True
-            return {"state": "active", "message": "Upper body retarget mode enabled"}
-        if action == "disable":
-            self._node._active = False
-            return {"state": "idle", "message": "Upper body retarget mode disabled"}
-        if action == "set_joints":
-            joints = args.get("joints", {})
-            self._node.set_joints(joints)
-            return {"state": "active", "joints_set": len(joints)}
-        if action == "set_height":
-            h = args.get("height", 1.0)
-            self._node.set_height(h)
-            return {"state": "active", "height": h}
-        if action == "zero":
-            self._node.zero_arms()
-            return {"state": "active", "message": "Arms zeroed"}
         if action == "info":
-            return {"state": "active" if self._node._active else "idle"}
+            return {"state": "ready"}
+        # Never transition an FSM merely to issue a zero-velocity request.
+        # This keeps stop usable as the least surprising command when another
+        # controller or motion card currently owns the robot.
+        if action == "stop":
+            self._cancel_timed_move("stopped by request")
+            return self._grpc.set_velocity(0.0, 0.0, 0.0)
+        state = _ensure_rl_locomotion(self._grpc)
+        if not state.get("success", False):
+            return state
+        if action == "move":
+            try:
+                duration_s = float(args.get("duration_s"))
+                if not math.isfinite(duration_s) or not 0.1 <= duration_s <= 30.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": "duration_s must be a number in [0.1, 30.0]"}
+            action_id = f"adam_loco_move_{uuid.uuid4().hex[:8]}"
+            generation = self._cancel_timed_move("superseded by a newer move")
+            result = self._grpc.set_velocity(
+                args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0))
+            if result.get("success", False):
+                with self._move_lock:
+                    self._pending_action_id = action_id
+                self._schedule_stop(generation, duration_s, action_id)
+                result = dict(result, duration_s=duration_s,
+                              auto_stop=True, action_id=action_id)
+            return result
+        if action == "set_height":
+            return self._grpc.set_height(args.get("height", 0.0))
         return None
+
+
+def _ensure_rl_locomotion(grpc_client):
+    """Select RL and enter its walking state without exposing FSM controls."""
+    control = grpc_client.set_control_mode(1)
+    if not control.get("success", False):
+        return {"success": False, "code": "RL_CONTROL_UNAVAILABLE",
+                "message": "unable to select RL control domain", "details": control}
+    state = grpc_client.get_robot_state()
+    if not state.get("success", False):
+        return state
+    if state.get("fsm_state") == "STAND_WALK":
+        return state
+    states = state.get("switchable_states")
+    if not isinstance(states, list):
+        return {"success": False, "code": "STATE_UNAVAILABLE",
+                "message": "GetRobotState did not return switchable_states", "state": state}
+    if "STAND_WALK" not in states:
+        return {"success": False, "code": "NOT_ALLOWED",
+                "message": "STAND_WALK is not available on the robot", "switchable_states": states}
+    result = grpc_client.set_mode("STAND_WALK")
+    if not result.get("success", False):
+        return result
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        state = grpc_client.get_robot_state()
+        if state.get("success", False) and state.get("fsm_state") == "STAND_WALK":
+            return state
+        time.sleep(0.2)
+    return {"success": False, "code": "FSM_TIMEOUT",
+            "message": "timed out entering STAND_WALK", "state": state}
+
+
+class _RlActionPlugin:
+    """Small, responsibility-focused cards over the RL gRPC contract."""
+    PREFIX = ""
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, grpc_client, **kwargs):
+        self._grpc = grpc_client
+
+    def start(self):
+        return None
+
+    def stop(self):
+        return None
+
+    def _state(self):
+        return self._grpc.get_robot_state()
+
+    def _ensure_rl_state(self, target_state=None):
+        """Acquire RL control and enter the state required by an action card."""
+        control = self._grpc.set_control_mode(1)
+        if not control.get("success", False):
+            return {"success": False, "code": "RL_CONTROL_UNAVAILABLE",
+                    "message": "unable to select RL control domain", "details": control}
+        state = self._state()
+        if not state.get("success", False):
+            return state
+        if not target_state or state.get("fsm_state") == target_state:
+            return state
+        denied = self._allowed(state, "switchable_states", target_state)
+        if denied:
+            return denied
+        result = self._grpc.set_mode(target_state)
+        if not result.get("success", False):
+            return result
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            state = self._state()
+            if state.get("fsm_state") == target_state:
+                return state
+            time.sleep(0.2)
+        return {"success": False, "code": "FSM_TIMEOUT",
+                "message": f"timed out entering {target_state}", "state": state}
+
+    @staticmethod
+    def _allowed(state, key, value):
+        if not isinstance(state, dict) or not state.get("success", False):
+            return {"success": False, "code": "STATE_UNAVAILABLE",
+                    "message": "GetRobotState did not return a usable state", "state": state}
+        if key not in state:
+            return {"success": False, "code": "STATE_UNAVAILABLE",
+                    "message": f"GetRobotState did not return {key}", "state": state}
+        values = state.get(key) or []
+        # Firmware revisions have reported either RPC names (SetMotion) or
+        # short action names (motion); accept both spellings while still
+        # refusing commands absent from the robot's advertised capability.
+        aliases = {value, value.removeprefix("Set").lower()}
+        if not any(item in values for item in aliases):
+            return {"success": False, "code": "NOT_ALLOWED", "message":
+                    f"{value!r} is not present in robot {key}", key: values}
+        return None
+
+
+class PosturePlugin(_RlActionPlugin):
+    PREFIX = "posture"
+
+    def get_tool(self):
+        return {"name": "posture", "type": "actuator",
+                "description": "Adam FSM posture and state transitions",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["get_state", "set_mode", "wait_mode", "info"]},
+                    "target_state": {"type": "string", "minLength": 1},
+                    "timeout_s": {"type": "number", "minimum": 0, "maximum": 60},
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {"get_state": {"params": []},
+                    "set_mode": {"params": ["target_state"]},
+                    "wait_mode": {"params": ["target_state", "timeout_s"]},
+                    "info": {"params": []}}}}
+
+    def dispatch(self, action, args):
+        if action in ("get_state", "info"):
+            return self._state()
+        if action == "set_mode":
+            target = args.get("target_state", "")
+            state = self._state()
+            denied = self._allowed(state, "switchable_states", target)
+            return denied or self._grpc.set_mode(target)
+        if action == "wait_mode":
+            target = args.get("target_state", "")
+            try:
+                timeout = max(0.0, min(60.0, float(args.get("timeout_s", 10.0))))
+            except (TypeError, ValueError):
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": "timeout_s must be a number"}
+            started = time.monotonic()
+            state = self._state()
+            denied = self._allowed(state, "switchable_states", target)
+            if denied:
+                return denied
+            result = self._grpc.set_mode(target)
+            if not result.get("success", False):
+                return result
+            while time.monotonic() - started < timeout:
+                state = self._state()
+                if state.get("fsm_state") == target:
+                    return {"success": True, "state": state, "completed": True}
+                time.sleep(0.2)
+            return {"success": False, "code": "TIMEOUT", "state": state, "completed": False}
+        return None
+
+
+class MotionPlugin(_RlActionPlugin):
+    def get_tool(self):
+        return {"name": "motion", "type": "actuator",
+                "description": "播放机器人端上半身动作文件；适用于挥手、招手等动作，不控制行走轨迹。",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["play", "stop", "get_state", "info"],
+                               "oneOf": [{"const": "play", "title": "播放上半身动作"},
+                                         {"const": "stop", "title": "停止上半身动作"},
+                                         {"const": "get_state", "title": "读取机器人状态"},
+                                         {"const": "info", "title": "读取机器人状态"}]},
+                    "motion_file": {"type": "string", "title": "机器人端动作文件", "pattern": r".+\.txt$",
+                                    "description": "机器人控制器上的 .txt 文件路径，例如 Sources/motion/Wave.txt；文件必须已在机器人端存在。"},
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {"play": {"params": ["motion_file"], "description": "播放机器人端已有的上半身 .txt 动作文件。"}, "stop": {"params": [], "description": "停止当前上半身动作。"},
+                    "get_state": {"params": []}, "info": {"params": []}}}}
+
+    def dispatch(self, action, args):
+        # The framework sends start/info to every card on the canvas whatever
+        # the tool does.  Answering start here instead of falling off the end
+        # of dispatch matters: a bare None is reported as an unknown action,
+        # and a strict project start then rolls the whole project back.
+        if action == "start":
+            return {"state": "ready"}
+        if action in ("get_state", "info"):
+            return self._state()
+        if action == "play":
+            state = self._ensure_rl_state("MULTI_AGENT")
+            if not state.get("success", False):
+                return state
+            denied = self._allowed(state, "available_actions", "SetMotion")
+            if denied:
+                return denied
+            return self._grpc.set_motion("PLAY", args.get("motion_file", ""))
+        if action == "stop":
+            return self._grpc.set_motion("STOP", "")
+        return None
+
+
+class TrackingMotionPlugin(_RlActionPlugin):
+    def get_tool(self):
+        return {"name": "tracking_motion", "type": "actuator",
+                "description": "执行机器人端全身轨迹文件；可同时驱动躯干和腿部，执行前须确保周围空间安全。",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["play", "get_state", "info"],
+                               "oneOf": [{"const": "play", "title": "执行全身轨迹"},
+                                         {"const": "get_state", "title": "读取机器人状态"},
+                                         {"const": "info", "title": "读取机器人状态"}]},
+                    "motion_file": {"type": "string", "title": "机器人端全身轨迹文件", "pattern": r".+\.txt$",
+                                    "description": "机器人控制器上的 .txt 轨迹文件，例如 Sources/tracking/Walk.txt；文件必须已在机器人端存在。"},
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {"play": {"params": ["motion_file"], "description": "执行机器人端已有的全身 .txt 轨迹。"},
+                    "get_state": {"params": []}, "info": {"params": []}}}}
+
+    def dispatch(self, action, args):
+        if action in ("get_state", "info"):
+            return self._state()
+        if action == "play":
+            state = self._ensure_rl_state("MOTION_TRACK")
+            if not state.get("success", False):
+                return state
+            denied = self._allowed(state, "available_actions", "SetTrackingMotion")
+            return denied or self._grpc.set_tracking_motion(args.get("motion_file", ""))
+        return None
+
+
+class ControlModePlugin(_RlActionPlugin):
+    def get_tool(self):
+        return {"name": "control_mode", "type": "actuator",
+                "description": "Switch Adam between Traditional and RL control domains",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["set_rl", "set_traditional", "get_state", "info"]},
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {"set_rl": {"params": []}, "set_traditional": {"params": []},
+                    "get_state": {"params": []}, "info": {"params": []}}}}
+
+    def dispatch(self, action, args):
+        if action in ("get_state", "info"):
+            return self._grpc.get_control_state()
+        if action == "set_rl":
+            return self._grpc.set_control_mode(1)
+        if action == "set_traditional":
+            return self._grpc.set_control_mode(0)
+        return None
+
+
+# ===========================================================================
+# ArmPlugin — DDS rt/lowcmd upper body control
+# ===========================================================================
+
+class ArmControlPlugin:
+    """Human-facing Adam Pro arm control over the vendor's DDS lowcmd API.
+
+    The official arm-control example continuously publishes a complete LowCmd:
+    all non-arm joints hold their measured startup positions, while only the
+    fourteen arm joints receive the requested targets.  Sending a sparse
+    command is unsafe because ``rt/lowcmd`` owns the full body.
+    """
+
+    PREFIX = "arm"
+    _DOF = 31
+    _RATE_HZ = 50.0
+    _MAX_VELOCITY_RAD_S = 0.5
+    _DEFAULT_TRANSITION_SECONDS = 2.0
+    _RELEASE_SECONDS = 1.5
+    # Peak derivative of the quintic ease in `_ease`: 30u^2(1-u)^2 reaches
+    # 1.875 at u=0.5.  A segment whose duration came straight from
+    # distance / _MAX_VELOCITY_RAD_S therefore passes 1.875x the configured
+    # limit at its midpoint, so the duration must budget for the peak.
+    _EASE_PEAK_RATE = 1.875
+    # Official arm_control_config.json gains. LowCmd owns all 31 motors, so
+    # non-arm joints must also be held with their vendor gains while an arm
+    # command is active; zero gains there causes intermittent posture loss.
+    _JOINT_PD = {
+        "hipPitch": (400.0, 6.1), "hipRoll": (700.0, 30.0),
+        "hipYaw": (405.0, 6.1), "kneePitch": (400.0, 8.0),
+        "anklePitch": (40.0, 2.5), "ankleRoll": (0.0, 0.35),
+        "waistRoll": (405.0, 6.1), "waistPitch": (405.0, 6.1),
+        "waistYaw": (205.0, 4.1), "neckYaw": (40.0, 1.0),
+        "neckPitch": (40.0, 1.0),
+        "shoulderPitch": (150.0, 4.0), "shoulderRoll": (150.0, 4.0),
+        "shoulderYaw": (40.0, 1.0), "elbow": (100.0, 2.0),
+        "wristYaw": (15.0, 0.9), "wristPitch": (15.0, 0.9),
+        "wristRoll": (15.0, 0.9),
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 grpc_client=None, dds_lowcmd_pub=None,
+                 dds_arm_lowstate_sub=None, variant="pro", **kwargs):
+        if str(variant).lower() != "pro":
+            raise ValueError(
+                "arm_control currently supports only Adam Pro's 31-DOF lowcmd layout")
+        self._namespace = namespace
+        self._publisher = dds_lowcmd_pub
+        self._lowstate_sub = dds_arm_lowstate_sub
+        self._rate_hz = float(plugin_config.get("control_rate_hz", self._RATE_HZ))
+        self._rate_hz = max(10.0, min(100.0, self._rate_hz))
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._state_ready = threading.Event()
+        self._thread = None
+        self._hold_q = None
+        self._current_q = None
+        self._target_q = {}
+        self._active = False
+        self._streaming = False
+        self._soft_arms = False
+        self._release_started_at = None
+        self._writes = 0
+        self._last_error = None
+        # Smooth-segment state. Each _set_targets call opens a segment that
+        # minimum-jerk blends from the pose being written when the call lands
+        # (_seg_start, indexed by joint like _target_q) to the newest targets
+        # over _seg_span seconds, so retargets mid-motion never snap.
+        self._seg_current = [0.0] * self._DOF
+        self._seg_start = {}
+        self._seg_span = self._DEFAULT_TRANSITION_SECONDS
+        self._seg_started_at = time.monotonic()
+
+    @staticmethod
+    def _joint_index(joint_name: str) -> int:
+        return ADAM_PRO_JOINTS.index(joint_name)
+
+    @classmethod
+    def _pd_for_joint(cls, joint_name: str) -> tuple[float, float]:
+        for prefix, gains in cls._JOINT_PD.items():
+            if joint_name.startswith(prefix):
+                return gains
+        return (0.0, 0.0)
+
+    # Axes that invert between the left and the right limb.  The vendor limit
+    # table states the same mirroring rule: left shoulder roll is
+    # [-36, 160] against right [-160, 36], while pitch and elbow keep their
+    # range and sign on both sides.
+    _MIRROR_NEGATED_AXES = ("roll", "yaw")
+
+    @classmethod
+    def mirror_targets(cls, targets: dict[str, float]) -> dict[str, float]:
+        """Mirror a one-sided upper-body target onto the opposite arm.
+
+        Lets a pose be written once for the right arm and reused on the left,
+        which is why ``ARM_POSES`` keeps a single definition per one-armed
+        pose.  A control without a ``left_``/``right_`` prefix passes through
+        unchanged (defensive; the arm card currently has none).
+        """
+        mirrored = {}
+        for control, value in targets.items():
+            if control.startswith("left_"):
+                opposite = "right_" + control[len("left_"):]
+            elif control.startswith("right_"):
+                opposite = "left_" + control[len("right_"):]
+            else:
+                mirrored[control] = value
+                continue
+            axis = control.rsplit("_", 1)[-1]
+            mirrored[opposite] = (
+                -value if axis in cls._MIRROR_NEGATED_AXES else value)
+        return mirrored
+
+    def _read_initial_state(self):
+        if self._lowstate_sub is None:
+            return
+        while not self._stop_event.is_set() and not self._state_ready.is_set():
+            try:
+                state = self._lowstate_sub.Read(timeout=0.2)
+                motors = getattr(state, "motor_state", None) if state else None
+                if motors is not None and len(motors) >= self._DOF:
+                    hold_q = [float(motors[index].q) for index in range(self._DOF)]
+                    if all(math.isfinite(value) for value in hold_q):
+                        with self._lock:
+                            self._hold_q = hold_q
+                            self._current_q = hold_q.copy()
+                            self._seg_current = hold_q.copy()
+                            self._seg_start = {}
+                            self._seg_started_at = time.monotonic()
+                        self._state_ready.set()
+                        return
+            except Exception as exc:
+                self._last_error = f"rt/lowstate read failed: {exc}"
+                self._stop_event.wait(0.1)
+
+    @classmethod
+    def _ease(cls, progress: float) -> float:
+        """Quintic (minimum-jerk) easing: zero velocity/acceleration at both ends.
+
+        Unlike a fixed-step rate limiter, this never introduces a velocity
+        corner, so arm motion starts and ends smoothly instead of creeping at
+        max speed and then stopping dead.
+        """
+        u = max(0.0, min(1.0, progress))
+        return u * u * u * (10.0 + u * (-15.0 + 6.0 * u))
+
+    def _write_command(self, dt: float):
+        with self._lock:
+            if not self._state_ready.is_set() or self._hold_q is None:
+                return
+            now = time.monotonic()
+            active = self._active
+            streaming = self._streaming
+            soft_arms = self._soft_arms
+            release_started_at = self._release_started_at
+            targets = self._target_q.copy()
+            hold_q = self._hold_q.copy()
+
+            release_ratio = 0.0
+            finish_release = False
+            if release_started_at is not None:
+                release_ratio = min(1.0, (now - release_started_at) / self._RELEASE_SECONDS)
+                if release_ratio >= 1.0:
+                    # Publish one final complete command with zero arm gains;
+                    # stopping before this write would leave the prior PD
+                    # gains latched in the robot controller.
+                    finish_release = True
+            elif not active and not streaming:
+                return
+
+            # Sample a minimum-jerk blend between the pose commanded at the
+            # start of the current segment and the newest target.  The span is
+            # the longer of the configured transition and the shortest duration
+            # whose easing peak stays inside the velocity limit, so a full
+            # gesture eases over several seconds — and retargeting mid-motion
+            # starts from the current output rather than jumping back to the
+            # old start.
+            span = max(1e-6, self._seg_span)
+            eased = self._ease((now - self._seg_started_at) / span)
+            current_q = list(self._seg_current)
+            for index, start in self._seg_start.items():
+                current_q[index] = start + (targets[index] - start) * eased
+            self._seg_current = list(current_q)
+
+        try:
+            command = pnd_adam_msg_dds__LowCmd_(self._DOF)
+            command.mode_pr = 0
+            for index, joint_name in enumerate(ADAM_PRO_JOINTS):
+                motor = command.motor_cmd[index]
+                motor.mode = 1
+                motor.q = current_q[index] if index in targets else hold_q[index]
+                motor.dq = 0.0
+                motor.tau = 0.0
+                kp, kd = self._pd_for_joint(joint_name)
+                is_arm = joint_name.startswith((
+                    "waist", "shoulder", "elbow", "wrist"))
+                arm_scale = 1.0
+                if is_arm and (soft_arms or release_started_at is not None):
+                    arm_scale = 1.0 - release_ratio
+                motor.kp = kp * arm_scale
+                motor.kd = kd
+                motor.ki = 0.0
+            self._publisher.Write(command)
+            self._writes += 1
+            self._last_error = None
+            if finish_release:
+                with self._lock:
+                    self._release_started_at = None
+                    self._active = False
+                    self._target_q.clear()
+                    self._soft_arms = True
+        except Exception as exc:
+            self._last_error = f"rt/lowcmd write failed: {exc}"
+
+    def _run(self):
+        self._read_initial_state()
+        interval = 1.0 / self._rate_hz
+        previous = time.monotonic()
+        while not self._stop_event.wait(interval):
+            now = time.monotonic()
+            self._write_command(min(0.1, now - previous))
+            previous = now
+
+    # Grouped moves are the primary way an agent steers one body segment: a
+    # shoulder is pitch+roll+yaw on one side, an elbow is the single bend, a
+    # wrist is yaw+pitch+roll.  They resolve to the same per-joint targets as
+    # the 14 fine-grained ``set_<joint>`` verbs below, which stay available
+    # for calibration and edge cases.
+    _GROUP_JOINTS = {
+        "set_shoulder": (("pitch_deg", "shoulder_pitch"),
+                         ("roll_deg", "shoulder_roll"),
+                         ("yaw_deg", "shoulder_yaw")),
+        "set_elbow": (("bend_deg", "elbow"),),
+        # Field names are namespaced per axis so that merging the three groups
+        # into one property bag stays unambiguous: shoulder owns
+        # pitch/roll/yaw, wrist owns wrist_yaw/wrist_pitch/wrist_roll.
+        "set_wrist": (("wrist_yaw_deg", "wrist_yaw"),
+                      ("wrist_pitch_deg", "wrist_pitch"),
+                      ("wrist_roll_deg", "wrist_roll")),
+    }
+    _GROUP_TITLES = {
+        "set_shoulder": "设置一侧肩膀（前后摆+内外摆+上臂旋转）",
+        "set_elbow": "设置一侧肘部弯曲",
+        "set_wrist": "设置一侧手腕（旋转+俯仰+侧摆）",
+    }
+
+    def get_tool(self) -> dict:
+        pose_options = [
+            {"const": pose, "title": label}
+            for pose, (label, _) in ARM_POSES.items()
+        ]
+        actions = [*self._GROUP_JOINTS, *ARM_ACTIONS,
+                   "set_joints", "preset", "stop", "get_state", "info"]
+        action_options = [
+            {"const": action, "title": title}
+            for action, title in self._GROUP_TITLES.items()
+        ] + [
+            {"const": action,
+             "title": f"设置{ARM_JOINT_CONTROLS[control][0]}（细粒度）"}
+            for action, control in ARM_ACTIONS.items()
+        ] + [
+            {"const": "set_joints", "title": "一次设置多个关节"},
+            {"const": "preset", "title": "执行预设姿态"},
+            {"const": "stop", "title": "停止上肢指令"},
+            {"const": "get_state", "title": "查看关节目标角度"},
+            {"const": "info", "title": "查看上肢控制是否启用"},
+        ]
+        joint_ranges = {
+            control: {
+                "type": "number", "title": f"{label}目标角度（度）",
+                "minimum": minimum, "maximum": maximum,
+                "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+            for control, (label, _, minimum, maximum) in ARM_JOINT_CONTROLS.items()
+        }
+        side_ranges = {
+            side: {
+                "pitch_deg": (-207.0, 117.0, "前后摆"),
+                "roll_deg": ((-36.0, 160.0, "向内/外摆") if side == "left"
+                             else (-160.0, 36.0, "向内/外摆")),
+                "yaw_deg": (-148.0, 148.0, "上臂旋转"),
+                "bend_deg": (-143.0, 12.0, "肘部弯曲"),
+                "wrist_yaw_deg": (-153.0, 153.0, "手腕旋转"),
+                "wrist_pitch_deg": (-55.0, 55.0, "手腕俯仰"),
+                "wrist_roll_deg": (-55.0, 55.0, "手腕侧摆"),
+            }
+            for side in ("left", "right")
+        }
+        side_field_kinds = {
+            "shoulder_pitch": "pitch_deg", "shoulder_roll": "roll_deg",
+            "shoulder_yaw": "yaw_deg",
+            "elbow": "bend_deg",
+            "wrist_yaw": "wrist_yaw_deg",
+            "wrist_pitch": "wrist_pitch_deg",
+            "wrist_roll": "wrist_roll_deg",
+        }
+        group_fields = {}
+        group_params = {}
+        for action, fields in self._GROUP_JOINTS.items():
+            params = ["side"]
+            schemas = {}
+            for field, joint_kind in fields:
+                key = side_field_kinds[joint_kind]
+                left = side_ranges["left"][key]
+                right = side_ranges["right"][key]
+                # The roll axis is asymmetric across sides; use the union that
+                # fits both and let the dispatcher clamp per-side.
+                minimum = min(left[0], right[0])
+                maximum = max(left[1], right[1])
+                label = left[2]
+                schemas[field] = {
+                    "type": "number", "title": f"{label}目标角度（度）",
+                    "minimum": minimum, "maximum": maximum,
+                    "multipleOf": 1.0,
+                    "description": (
+                        f"绝对目标角度。左右两侧限位不同，范围取并集 "
+                        f"[{minimum:g}, {maximum:g}] 度；超出所选侧实际限位时"
+                        f"会被驱动拒绝。"
+                    ),
+                }
+                params.append(field)
+            group_fields[action] = schemas
+            group_params[action] = params
+
+        properties = {
+            "action": {"type": "string", "enum": actions, "oneOf": action_options},
+            "side": {
+                "type": "string", "title": "手臂",
+                "enum": ["left", "right"], "default": "right",
+                "description": "复合动作（set_shoulder/set_elbow/set_wrist）作用的手臂。",
+            },
+            "pose": {"type": "string", "title": "预设姿态", "enum": list(ARM_POSES),
+                     "oneOf": pose_options},
+            **{field: schema for schemas in group_fields.values()
+               for field, schema in schemas.items()},
+            "joints": {
+                "type": "object", "title": "多关节目标",
+                "description": (
+                    "关节名到目标角度的映射，单位度；与 set_joints 搭配使用。"
+                    "关节名取值与下面各 *_deg 字段同名（去掉 _deg 后缀），"
+                    "例如 {\"left_elbow\": -60}。一次下发同一个平滑过渡，"
+                    "比分多次调用单关节动作更连贯。"
+                ),
+                "properties": joint_ranges,
+                "additionalProperties": False,
+                "minProperties": 1,
+            },
+            "duration_s": {
+                "type": "number", "title": "动作时长（秒）",
+                "minimum": 0.1, "maximum": 60.0,
+                "description": (
+                    "可选，本次过渡的期望时长。只能把动作放慢；"
+                    "小于安全限速所需时长时会被驱动自动钳位，不会突破限速。"
+                    "省略时使用默认平滑时长。"
+                ),
+            },
+        }
+        action_params = {
+            **{action: {
+                "params": [*params, "duration_s"],
+                "description": self._GROUP_TITLES[action],
+            } for action, params in group_params.items()},
+            "set_joints": {
+                "params": ["joints", "duration_s"],
+                "description": "一次设置多个上肢关节的目标角度（度），共用一段平滑过渡。",
+            },
+            "preset": {"params": ["pose", "duration_s"],
+                       "description": "执行预设上肢姿态。"},
+            "stop": {"params": [], "description": "停止发布上肢目标并保持机器人当前状态。"},
+            "get_state": {
+                "params": [],
+                "description": "读取各上肢关节的当前指令角度与目标角度（度），以及是否已到位。",
+            },
+            "info": {"params": [], "description": "查看上肢指令是否已启用、DDS 写入是否正常。"},
+        }
+        for action, control in ARM_ACTIONS.items():
+            label, _, minimum, maximum = ARM_JOINT_CONTROLS[control]
+            field = f"{control}_deg"
+            properties[field] = dict(joint_ranges[control], multipleOf=1.0)
+            action_params[action] = {
+                "params": [field, "duration_s"],
+                "description": (
+                    f"设置{label}，范围 [{minimum:g}, {maximum:g}] 度。"
+                    "已保留为细粒度校准接口；日常控制优先用 "
+                    "set_shoulder/set_elbow/set_wrist 或 set_joints。"
+                ),
+            }
+        return {
+            "name": "arm_control",
+            "type": "actuator",
+            "description": (
+                "Adam Pro 上肢（双臂+手腕，14 个关节）实时位置控制，走厂商 "
+                "DDS rt/lowcmd 通道。角度单位为度(°)，取值为绝对值，"
+                f"关节限位见各字段 minimum/maximum。"
+                "主要用途：1) 用 set_shoulder/set_elbow/set_wrist 按语义部位一次设好"
+                "肩/肘/腕；2) 用 set_joints 一次设定多个关节做连贯姿态；"
+                "3) 用 preset 执行内置姿态（自然下垂/双臂向前/双臂张开/双手举起/敬礼等）；"
+                "4) 用 14 个细粒度 set_* 微调单个关节（校准/边缘场景）。"
+                "可选 duration_s 放慢动作，加速请求会被限速自动钳位。"
+                "前置条件：机器人已站立，且没有其它卡片正在占用上肢通道；"
+                "执行前确认手臂活动范围内无人和障碍物。stop 会先按厂商顺序释放增益再停止下发。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["action"],
+                "additionalProperties": False,
+                "x-action-params": action_params,
+                "x-resource": ["adam_upper_body"],
+            },
+        }
+
+    def start(self):
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="adam_arm_lowcmd")
+            self._thread.start()
+
+    def stop(self):
+        with self._lock:
+            if self._active or self._streaming:
+                self._release_started_at = time.monotonic()
+        # Give the official Kp ramp-down sequence a chance to reach zero.
+        deadline = time.monotonic() + self._RELEASE_SECONDS + 0.2
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._release_started_at is None:
+                    break
+            time.sleep(0.02)
+        self._stop_event.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(1.0)
+        self._thread = None
+
+    def _stop_and_wait(self):
+        """Stop action lifecycle: ramp gains down, then end lowcmd ownership."""
+        with self._lock:
+            if not (self._active or self._streaming):
+                return {"success": True, "state": "idle"}
+            self._release_started_at = time.monotonic()
+        deadline = time.monotonic() + self._RELEASE_SECONDS + 0.25
+        while time.monotonic() < deadline:
+            with self._lock:
+                releasing = self._release_started_at is not None
+            if not releasing:
+                break
+            time.sleep(0.02)
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(1.0)
+        self._thread = None
+        with self._lock:
+            self._streaming = False
+            self._active = False
+        return {"success": True, "state": "idle",
+                "message": "Arm lowcmd control stopped after gain release"}
+
+    def _ready_error(self):
+        if self._publisher is None:
+            return {"success": False, "code": "DDS_UNAVAILABLE",
+                    "message": "rt/lowcmd publisher is unavailable"}
+        if not self._state_ready.is_set():
+            return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
+                    "message": "Waiting for a complete rt/lowstate message in developer mode"}
+        if self._last_error:
+            return {"success": False, "code": "DDS_WRITE_FAILED", "message": self._last_error}
+        return None
+
+    def _set_targets(self, targets: dict[str, float],
+                     *, preferred_span: float | None = None,
+                     velocity_limit: float | None = None):
+        error = self._ready_error()
+        if error:
+            return error
+        if not targets:
+            # Activating rt/lowcmd ownership without a single joint target
+            # would take the whole body away from whatever currently owns it
+            # and then hold every joint where it stands, which looks like a
+            # silent freeze to the caller.  Refuse instead.
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": "no upper-body joints were selected"}
+        with self._lock:
+            target_q = self._target_q.copy()
+            target_q.update({self._joint_index(name): value
+                             for name, value in targets.items()})
+            # Start a new smooth segment from the pose currently being written
+            # (not from the previous target), so mid-motion retargets are
+            # continuous and the eased profile always ends exactly at the
+            # newest goal.
+            self._target_q = target_q
+            self._seg_start = {index: self._seg_current[index]
+                               for index in self._target_q}
+            self._seg_started_at = time.monotonic()
+            max_distance = 0.0
+            for index in self._target_q:
+                max_distance = max(
+                    max_distance,
+                    abs(self._target_q[index] - self._seg_current[index]),
+                )
+            # Budget for the easing peak, not the average: the shortest span
+            # whose midpoint stays at or below _MAX_VELOCITY_RAD_S is
+            # 1.875 * distance / velocity.  The configured transition remains a
+            # floor, so short moves are never quicker than the smoothing
+            # constant and long moves ease within the velocity limit.
+            # A caller may hand in a stricter velocity ceiling (semantic arm
+            # gestures use a slower one so a salute or a wave reads as calm
+            # rather than hurried).  When omitted the controller-wide limit
+            # applies, so the raw arm_control/waist/head cards keep their
+            # existing rhythm.
+            limit = (velocity_limit if velocity_limit is not None
+                     else self._MAX_VELOCITY_RAD_S)
+            peak_span = (self._EASE_PEAK_RATE * max_distance / limit)
+            if preferred_span is None:
+                self._seg_span = max(
+                    0.25, peak_span,
+                    self._DEFAULT_TRANSITION_SECONDS if max_distance > 0 else 0.25)
+            else:
+                # A caller-chosen duration may only ever slow a move down: the
+                # request is clamped up to the shortest span whose easing peak
+                # still respects _MAX_VELOCITY_RAD_S, so speed control can
+                # never defeat the limit the default policy enforces.  This is
+                # what makes a short, quick gesture such as a wave possible
+                # without punching through the velocity ceiling.
+                requested = max(0.1, float(preferred_span))
+                self._seg_span = (max(requested, peak_span)
+                                  if max_distance > 0 else 0.25)
+            self._release_started_at = None
+            self._active = True
+            self._streaming = True
+            self._soft_arms = False
+        # The worker may need one 20ms tick. This confirms the protocol write,
+        # not physical movement, which DDS does not acknowledge.
+        before = self._writes
+        deadline = time.monotonic() + 0.15
+        while self._writes <= before and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if self._writes <= before:
+            return {"success": False, "code": "DDS_WRITE_FAILED",
+                    "message": self._last_error or "rt/lowcmd was not written"}
+        return None
+
+    def _preferred_span(self, args: dict) -> tuple[float | None, dict | None]:
+        """Parse the optional ``duration_s`` request into a target span.
+
+        Returns ``(span, error)``; ``span`` is ``None`` when the caller did not
+        ask for a specific duration, which keeps the default smoothing policy.
+        """
+        if args.get("duration_s") is None:
+            return None, None
+        raw = args.get("duration_s")
+        message = "duration_s must be a number in [0.1, 60.0]"
+        if isinstance(raw, bool):
+            return None, {"success": False, "code": "INVALID_ARGUMENT",
+                          "message": message}
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None, {"success": False, "code": "INVALID_ARGUMENT",
+                          "message": message}
+        if not math.isfinite(value) or not 0.1 <= value <= 60.0:
+            return None, {"success": False, "code": "INVALID_ARGUMENT",
+                          "message": message}
+        return value, None
+
+    def _joint_state(self) -> dict:
+        """Report the angles this card is writing, and how far from target.
+
+        These are commanded values, not measured ones: the card only reads
+        ``rt/lowstate`` once to capture its hold pose, so live joint feedback
+        stays on the ``joints`` and ``motor_state`` sensor cards.
+        """
+        with self._lock:
+            targets = dict(self._target_q)
+            commanded = list(self._seg_current)
+            span = self._seg_span
+            started_at = self._seg_started_at
+            active = self._active
+        max_error = 0.0
+        joints = {}
+        for control, (label, joint, minimum, maximum) in ARM_JOINT_CONTROLS.items():
+            index = self._joint_index(joint)
+            target = targets.get(index)
+            error = abs(target - commanded[index]) if target is not None else None
+            if error is not None:
+                max_error = max(max_error, error)
+            joints[control] = {
+                "label": label,
+                "commanded_deg": round(math.degrees(commanded[index]), 2),
+                "target_deg": (round(math.degrees(target), 2)
+                               if target is not None else None),
+                "error_deg": (round(math.degrees(error), 2)
+                              if error is not None else None),
+                "limits_deg": {"minimum": minimum, "maximum": maximum},
+            }
+        tracking = len(targets)
+        return {
+            "state": "active" if active else "idle",
+            "tracking_joint_count": tracking,
+            "settled": bool(tracking) and max_error < math.radians(0.5),
+            "segment": {"span_s": round(span, 3),
+                        "elapsed_s": round(max(0.0, time.monotonic() - started_at), 3)},
+            "joints": joints,
+            "protocol": "rt/lowcmd",
+            "angle_source": "commanded (rt/lowcmd targets); measured feedback is on "
+                            "the joints and motor_state sensor cards",
+        }
+
+    def _group_targets(self, action: str, args: dict) -> dict | None:
+        """Resolve a grouped shoulder/elbow/wrist request into radian targets.
+
+        Returns ``None`` when ``action`` is not one of the compound verbs.
+        Raises ``ValueError`` for a bad side or an out-of-range angle, which the
+        caller turns into the standard INVALID_ARGUMENT reply.
+        """
+        fields = self._GROUP_JOINTS.get(action)
+        if fields is None:
+            return None
+        side = args.get("side", "right")
+        if side not in ("left", "right"):
+            raise ValueError("side must be left or right")
+        targets = {}
+        for field, joint_kind in fields:
+            value = args.get(field)
+            if value is None:
+                continue
+            control = f"{side}_{joint_kind}"
+            joint_name, radians = _arm_target_radians(control, value)
+            targets[joint_name] = radians
+        if not targets:
+            raise ValueError(
+                "provide at least one of the advertised degree fields for "
+                f"{action} (side={side})")
+        return targets
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            # A canvas stop tears the lowcmd worker down (_stop_and_wait sets
+            # the stop event and clears the thread).  A later start must bring
+            # the writer back, or every arm target fails DDS_WRITE_FAILED until
+            # the container restarts.  ``start`` is idempotent: it reuses a
+            # live thread and only spawns one when the previous one exited.
+            self.start()
+            return {"state": "ready"}
+        if action == "stop":
+            return self._stop_and_wait()
+        if action == "get_state":
+            return self._joint_state()
+        # Compound shoulder/elbow/wrist verbs land in the same segment as a
+        # single-joint request, so they smooth together instead of racing.
+        if action in self._GROUP_JOINTS:
+            try:
+                targets = self._group_targets(action, args)
+            except (TypeError, ValueError) as exc:
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": str(exc)}
+            span, error = self._preferred_span(args)
+            if error:
+                return error
+            error = self._set_targets(targets, preferred_span=span)
+            if error:
+                return error
+            return {
+                "success": True, "state": "active", "action": action,
+                "side": args.get("side", "right"),
+                "joints_set": len(targets), "duration_s": span,
+                "protocol": "rt/lowcmd",
+            }
+        if action in ARM_ACTIONS:
+            try:
+                control = ARM_ACTIONS[action]
+                field = f"{control}_deg"
+                joint_name, radians = _arm_target_radians(control, args.get(field))
+            except (TypeError, ValueError) as exc:
+                return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+            span, error = self._preferred_span(args)
+            if error:
+                return error
+            error = self._set_targets({joint_name: radians}, preferred_span=span)
+            if error:
+                return error
+            _, _, minimum, maximum = ARM_JOINT_CONTROLS[control]
+            return {"success": True, "state": "active", "joint": control,
+                    "angle_deg": float(args[field]), "duration_s": span,
+                    "protocol": "rt/lowcmd",
+                    "limits_deg": {"minimum": minimum, "maximum": maximum}}
+        if action == "set_joints":
+            raw = args.get("joints")
+            if not isinstance(raw, dict) or not raw:
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": "joints must be a non-empty mapping of joint "
+                                   "name to absolute target degrees"}
+            try:
+                targets = dict(_arm_target_radians(control, degrees)
+                               for control, degrees in raw.items())
+            except (TypeError, ValueError) as exc:
+                return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+            span, error = self._preferred_span(args)
+            if error:
+                return error
+            error = self._set_targets(targets, preferred_span=span)
+            if error:
+                return error
+            return {"success": True, "state": "active", "action": "set_joints",
+                    "joints_set": len(targets),
+                    "joints_deg": {control: float(degrees)
+                                   for control, degrees in raw.items()},
+                    "duration_s": span, "protocol": "rt/lowcmd"}
+        if action == "preset":
+            pose = args.get("pose")
+            if pose not in ARM_POSES:
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": "pose must be one of the advertised Adam upper-body poses"}
+            error = self._ready_error()
+            if error:
+                return error
+            _, targets_deg = ARM_POSES[pose]
+            try:
+                targets = dict(_arm_target_radians(control, degrees)
+                               for control, degrees in targets_deg.items())
+                if pose == "neutral":
+                    targets = {joint: self._hold_q[self._joint_index(joint)]
+                               for _, joint, _, _ in ARM_JOINT_CONTROLS.values()}
+            except (TypeError, ValueError) as exc:
+                return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+            span, span_error = self._preferred_span(args)
+            if span_error:
+                return span_error
+            error = self._set_targets(targets, preferred_span=span)
+            if error:
+                return error
+            return {"success": True, "state": "active", "pose": pose,
+                    "joints_set": len(targets), "duration_s": span,
+                    "protocol": "rt/lowcmd"}
+        if action == "info":
+            return {"state": "active" if self._active else "idle",
+                    "lowstate_ready": self._state_ready.is_set(),
+                    "dds_writer_ready": self._publisher is not None,
+                    "writes": self._writes, "last_error": self._last_error,
+                    "protocol": "rt/lowcmd"}
+        return None
+
+
+ArmPlugin = ArmControlPlugin
+
+
+class _AxisGesturePlugin:
+    """Shared engine for the waist/head semantic-gesture cards.
+
+    A gesture is a trajectory, not a second controller: every target still goes
+    through ``ArmControlPlugin``, which owns ``rt/lowcmd``.  Single-target
+    gestures are one smoothed segment; sequence gestures walk a background
+    thread through a table of ``(targets, hold_seconds)`` so a nod or a shake
+    reads as deliberate motion instead of a teleport, and each sequence reports
+    its completion because the call returns before the motion finishes.
+    """
+
+    PREFIX = ""
+    _TOOL_NAME = ""
+    _RESOURCE = ["adam_upper_body"]
+    # Slower than the raw control cards so the motion reads calm.
+    _VELOCITY_RAD_S = 0.3
+    _LABELS: dict = {}
+    # name -> {control: degrees} or None for a return-to-hold reset.
+    _POSES: dict = {}
+    # name -> sequence of ({control: degrees} or None, hold_seconds).
+    _SEQUENCES: dict = {}
+    _SEQUENCE_TIMEOUT_S = 30
+
+    def __init__(self, control: ArmControlPlugin):
+        self._control = control
+        self._sequence_lock = threading.Lock()
+        self._sequence_id = None
+
+    # -- target resolution ---------------------------------------------------
+
+    def _targets_deg(self, pose: dict) -> dict:
+        """Resolve a degree table into validated radian targets.
+
+        ``pose is None`` (or an empty table) returns the joints to the hold
+        pose captured when the lowcmd worker first went active, which is also
+        how the base control cards express ``reset``.
+        """
+        targets = {}
+        if pose:
+            for control, degrees in pose.items():
+                joint_name, radians = self._JOINT_RADIANS(control, degrees)
+                targets[joint_name] = radians
+            return targets
+        return {
+            joint: self._control._hold_q[self._control._joint_index(joint)]
+            for _, joint, _, _ in self._JOINT_CONTROLS.values()
+        }
+
+    # -- single-segment gestures ---------------------------------------------
+
+    def _dispatch_pose(self, action, args):
+        span, error = self._control._preferred_span(args)
+        if error:
+            return error
+        try:
+            targets = self._targets_deg(self._POSES[action])
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": str(exc)}
+        error = self._control._set_targets(
+            targets, preferred_span=span,
+            velocity_limit=self._VELOCITY_RAD_S)
+        if error:
+            return error
+        return {"success": True, "state": "active", "gesture": action,
+                "duration_s": span, "protocol": "rt/lowcmd"}
+
+    # -- multi-segment sequences ----------------------------------------------
+
+    def _cancel_sequence(self):
+        """Drop ownership of a running sequence so it reports cancelled."""
+        with self._sequence_lock:
+            self._sequence_id = None
+
+    def _sequence_cancelled(self, action_id: str) -> bool:
+        with self._sequence_lock:
+            return self._sequence_id != action_id
+
+    def _hold_sequence(self, action_id: str, seconds: float) -> bool:
+        """Wait out one segment, returning False as soon as it is cancelled."""
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            if self._sequence_cancelled(action_id):
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.05, remaining))
+
+    def _play_sequence(self, name: str, action_id: str):
+        status = "completed"
+        result = {"gesture": name}
+        try:
+            for pose, hold_seconds in self._SEQUENCES[name]:
+                if self._sequence_cancelled(action_id):
+                    status = "cancelled"
+                    result = {"gesture": name, "reason": "superseded or stopped"}
+                    return
+                error = self._control._set_targets(
+                    self._targets_deg(pose), preferred_span=hold_seconds,
+                    velocity_limit=self._VELOCITY_RAD_S)
+                if error:
+                    status = "failed"
+                    result = {"gesture": name, "error": error}
+                    return
+                if not self._hold_sequence(action_id, hold_seconds):
+                    status = "cancelled"
+                    result = {"gesture": name, "reason": "superseded or stopped"}
+                    return
+        except Exception as exc:
+            status = "failed"
+            result = {"gesture": name, "error": str(exc)}
+        finally:
+            with self._sequence_lock:
+                if self._sequence_id == action_id:
+                    self._sequence_id = None
+            _notify_action_completion(action_id, status, result, self.PREFIX)
+
+    def _dispatch_sequence(self, name: str):
+        action_id = f"adam_{self.PREFIX}_{uuid.uuid4().hex[:8]}"
+        self._cancel_sequence()
+        with self._sequence_lock:
+            self._sequence_id = action_id
+        threading.Thread(target=self._play_sequence, args=(name, action_id),
+                         daemon=True,
+                         name=f"adam_{self.PREFIX}_{name}").start()
+        return {"success": True, "state": "active", "gesture": name,
+                "action_id": action_id,
+                "sequence_segments": len(self._SEQUENCES[name]),
+                "protocol": "rt/lowcmd"}
+
+    # -- tool and dispatch --------------------------------------------------
+
+    def get_tool(self):
+        actions = [*self._POSES, *self._SEQUENCES, "stop", "info"]
+        x_completion = None
+        if self._SEQUENCES:
+            # Sequences return as soon as the first target is accepted, so the
+            # card declares their completion instead of letting Agent Core treat
+            # the accepted target as the finished gesture.
+            x_completion = {"actions": list(self._SEQUENCES),
+                            "timeout": self._SEQUENCE_TIMEOUT_S}
+        schema = {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string", "enum": actions,
+                    "oneOf": [{"const": name, "title": self._LABELS[name]}
+                              for name in actions],
+                },
+                "duration_s": {
+                    "type": "number", "title": "动作时长（秒）",
+                    "minimum": 0.1, "maximum": 60.0,
+                    "description": (
+                        "可选，只能放慢动作；小于安全限速所需时长会被自动钳位。"
+                        "对序列动作为每段的基准时长。"),
+                },
+            },
+            "required": ["action"], "additionalProperties": False,
+            "x-action-params": {
+                **{name: {"params": ["duration_s"],
+                          "description": self._LABELS[name]}
+                   for name in self._POSES},
+                **{name: {"params": [], "description": self._LABELS[name]}
+                   for name in self._SEQUENCES},
+                "stop": {"params": [],
+                         "description": "取消正在进行的序列并停止目标发布。"},
+                "info": {"params": [], "description": "查看目标发布状态。"},
+            },
+            "x-resource": self._RESOURCE,
+        }
+        if x_completion:
+            schema["x-completion"] = x_completion
+        return {
+            "name": self._TOOL_NAME,
+            "type": "actuator",
+            "description": self._DESCRIPTION,
+            "inputSchema": schema,
+        }
+
+    def start(self):
+        return self._control.start()
+
+    def stop(self):
+        self._cancel_sequence()
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            self._cancel_sequence()
+            return self._control.dispatch("stop", args)
+        if action in ("start", "info"):
+            return self._control.dispatch(action, args)
+        if action in self._POSES:
+            return self._dispatch_pose(action, args)
+        if action in self._SEQUENCES:
+            return self._dispatch_sequence(action)
+        return None
+
+
+class WaistGesturePlugin(_AxisGesturePlugin):
+    """Named waist gestures (bow/side_bend/twist) on the shared controller."""
+
+    PREFIX = "waist_gesture"
+    _TOOL_NAME = "waist_gesture"
+    # A waist that slams around destabilises the upper camera view, so the
+    # gestures budget much slower than a bare waist_control target.
+    _VELOCITY_RAD_S = 0.2
+    _JOINT_CONTROLS = WAIST_JOINT_CONTROLS
+    _JOINT_RADIANS = staticmethod(_waist_target_radians)
+    _DESCRIPTION = (
+        "Adam Pro 腰部语义动作：bow 弯腰回正、lean_forward 前倾保持、"
+        "side_bend 左右侧弯各一次回正、twist 左右转腰各一次回正、"
+        "look_down 低头回正、reset 腰部回起始位。"
+        "顺序动作（bow/side_bend/twist/look_down）后台分段执行，"
+        "完成时上报结果；lean_forward/reset 为单段平滑。"
+        "前置条件：机器人已站立，上肢通道没有被其它卡片占用，"
+        "执行前确认机器人周围无磕碰风险。"
+    )
+    _LABELS = {
+        "bow": "弯腰回正（鞠躬）",
+        "lean_forward": "前倾保持",
+        "side_bend": "左右侧弯各一次回正",
+        "twist": "左右转腰各一次回正",
+        "look_down": "低头回正",
+        "reset": "腰部回起始位",
+        "stop": "停止腰部动作",
+        "info": "查看腰部状态",
+    }
+    _POSES = {
+        "lean_forward": {"pitch": 15.0},
+        "reset": None,
+    }
+    _SEQUENCES = {
+        "bow": (({"pitch": 40.0}, 1.6), (None, 1.2)),
+        "side_bend": (({"roll": 12.0}, 1.1), ({"roll": -12.0}, 1.3),
+                      (None, 1.1)),
+        "twist": (({"yaw": 30.0}, 1.4), ({"yaw": -30.0}, 1.6),
+                  (None, 1.4)),
+        "look_down": (({"pitch": -15.0}, 1.0), (None, 0.9)),
+    }
+
+
+class HeadGesturePlugin(_AxisGesturePlugin):
+    """Named head gestures (nod/shake/look_*) on the shared controller.
+
+    The ZED Mini is mounted on the head, so these are also the semantic camera
+    sweeps: ``look_left``/``look_right`` aim the camera at the audience while
+    ``nod``/``shake`` are conversational acknowledgements.
+    """
+
+    PREFIX = "head_gesture"
+    _TOOL_NAME = "head_gesture"
+    _VELOCITY_RAD_S = 0.4
+    _JOINT_CONTROLS = HEAD_JOINT_CONTROLS
+    _JOINT_RADIANS = staticmethod(_head_target_radians)
+    _DESCRIPTION = (
+        "Adam Pro 头部语义动作（头部装有 ZED 相机，即语义化的相机指向）："
+        "nod 点头两次回正、shake 摇头两次回正、look_up/look_down 抬头/低头、"
+        "look_left/look_right 向左/向右看、scan 左右扫视两圈回正、reset 头部回起始位。"
+        "顺序动作（nod/shake/scan）后台分段执行，完成时上报结果；"
+        "look_* 与 reset 为单段平滑。"
+        "前置条件：机器人已站立，上肢通道没有被其它卡片占用，"
+        "执行前确认头部活动范围无磕碰风险。"
+    )
+    _LABELS = {
+        "nod": "点头两次回正",
+        "shake": "摇头两次回正",
+        "scan": "左右扫视两圈回正",
+        "look_left": "向左看",
+        "look_right": "向右看",
+        "look_up": "抬头",
+        "look_down": "低头",
+        "reset": "头部回起始位",
+        "stop": "停止头部动作",
+        "info": "查看头部状态",
+    }
+    _POSES = {
+        "look_left": {"yaw": 45.0},
+        "look_right": {"yaw": -45.0},
+        "look_up": {"pitch": -15.0},
+        "look_down": {"pitch": 15.0},
+        "reset": None,
+    }
+    _SEQUENCES = {
+        "nod": (({"pitch": 12.0}, 0.55), (None, 0.45),
+                ({"pitch": 12.0}, 0.55), (None, 0.45)),
+        "shake": (({"yaw": 30.0}, 0.55), ({"yaw": -30.0}, 0.6),
+                  ({"yaw": 30.0}, 0.6), (None, 0.55)),
+        "scan": (({"yaw": 45.0}, 1.2), ({"yaw": -45.0}, 1.4),
+                 ({"yaw": 45.0}, 1.4), ({"yaw": -45.0}, 1.4),
+                 (None, 1.2)),
+    }
+
+
+class WaistControlPlugin:
+    """Dedicated Adam Pro waist card sharing the safe lowcmd controller.
+
+    The waist joints were previously folded into ``arm_control``.  Splitting
+    them out lets an agent discover "bow" or "turn the waist" directly, while
+    every target still routes through the single ``ArmControlPlugin`` that owns
+    ``rt/lowcmd``.
+    """
+
+    PREFIX = "waist_control"
+
+    def __init__(self, control: ArmControlPlugin):
+        self._control = control
+
+    def get_tool(self):
+        actions = [*WAIST_ACTIONS, "reset", "stop", "info"]
+        action_options = [
+            {"const": action, "title": f"设置{WAIST_JOINT_CONTROLS[control][0]}"}
+            for action, control in WAIST_ACTIONS.items()
+        ] + [
+            {"const": "reset", "title": "回到起始腰部角度"},
+            {"const": "stop", "title": "停止腰部指令"},
+            {"const": "info", "title": "查看腰部控制状态"},
+        ]
+        properties = {
+            "action": {"type": "string", "enum": actions, "oneOf": action_options},
+            "duration_s": {
+                "type": "number", "title": "动作时长（秒）",
+                "minimum": 0.1, "maximum": 60.0,
+                "description": (
+                    "可选，本次过渡的期望时长。只能把动作放慢；"
+                    "小于安全限速所需时长时会被驱动自动钳位。省略时使用默认平滑时长。"
+                ),
+            },
+        }
+        action_params = {
+            "reset": {"params": ["duration_s"],
+                      "description": "回到开始控制时的腰部角度。"},
+            "stop": {"params": [], "description": "停止腰部低层控制。"},
+            "info": {"params": [], "description": "查看腰部控制状态。"},
+        }
+        for action, control in WAIST_ACTIONS.items():
+            label, _, minimum, maximum = WAIST_JOINT_CONTROLS[control]
+            field = f"{control}_deg"
+            properties[field] = {
+                "type": "number", "title": f"{label}目标角度（度）",
+                "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
+                "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+            action_params[action] = {
+                "params": [field, "duration_s"],
+                "description": f"设置{label}，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+        return {
+            "name": "waist_control",
+            "type": "actuator",
+            "description": (
+                "Adam Pro 腰部（侧倾/前后俯仰/左右转动，3 个关节）实时位置控制，"
+                "走厂商 DDS rt/lowcmd 通道。角度单位为度(°)。可选 duration_s 放慢动作。"
+                "前置条件：机器人已站立，且没有其它卡片正在占用上肢通道。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["action"],
+                "additionalProperties": False,
+                "x-action-params": action_params,
+                "x-resource": ["adam_upper_body"],
+            },
+        }
+
+    def start(self):
+        return self._control.start()
+
+    def stop(self):
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        # start/stop/info describe the controller this card delegates to.
+        if action in ("start", "stop", "info"):
+            return self._control.dispatch(action, args)
+        if action == "reset":
+            error = self._control._ready_error()
+            if error:
+                return error
+            targets = {
+                joint: self._control._hold_q[self._control._joint_index(joint)]
+                for _, joint, _, _ in WAIST_JOINT_CONTROLS.values()
+            }
+            span, span_error = self._control._preferred_span(args)
+            if span_error:
+                return span_error
+            error = self._control._set_targets(targets, preferred_span=span)
+            return error or {"success": True, "state": "active",
+                             "action": "reset", "duration_s": span}
+        control = WAIST_ACTIONS.get(action)
+        if control is None:
+            return None
+        try:
+            joint, radians = _waist_target_radians(
+                control, args.get(f"{control}_deg"))
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": str(exc)}
+        span, span_error = self._control._preferred_span(args)
+        if span_error:
+            return span_error
+        error = self._control._set_targets({joint: radians}, preferred_span=span)
+        if error:
+            return error
+        return {"success": True, "state": "active", "joint": control,
+                "angle_deg": float(args[f"{control}_deg"]),
+                "duration_s": span, "protocol": "rt/lowcmd"}
+
+
+class HeadControlPlugin:
+    """Dedicated Adam Pro head card sharing the safe lowcmd controller.
+
+    The ZED Mini is mounted on the head, so this card is effectively the
+    "camera aiming" control: neckYaw and neckPitch steer where the robot looks.
+    """
+
+    PREFIX = "head_control"
+
+    def __init__(self, control: ArmControlPlugin):
+        self._control = control
+
+    def get_tool(self):
+        actions = [*HEAD_ACTIONS, "reset", "stop", "info"]
+        action_options = [
+            {"const": action, "title": f"设置{HEAD_JOINT_CONTROLS[control][0]}"}
+            for action, control in HEAD_ACTIONS.items()
+        ] + [
+            {"const": "reset", "title": "回到起始头部角度"},
+            {"const": "stop", "title": "停止头部指令"},
+            {"const": "info", "title": "查看头部控制状态"},
+        ]
+        properties = {
+            "action": {"type": "string", "enum": actions, "oneOf": action_options},
+            "duration_s": {
+                "type": "number", "title": "动作时长（秒）",
+                "minimum": 0.1, "maximum": 60.0,
+                "description": (
+                    "可选，本次过渡的期望时长。只能把动作放慢；"
+                    "小于安全限速所需时长时会被驱动自动钳位。省略时使用默认平滑时长。"
+                ),
+            },
+        }
+        action_params = {
+            "reset": {"params": ["duration_s"],
+                      "description": "回到开始控制时的头部角度。"},
+            "stop": {"params": [], "description": "停止头部低层控制。"},
+            "info": {"params": [], "description": "查看头部控制状态。"},
+        }
+        for action, control in HEAD_ACTIONS.items():
+            label, _, minimum, maximum = HEAD_JOINT_CONTROLS[control]
+            field = f"{control}_deg"
+            properties[field] = {
+                "type": "number", "title": f"{label}目标角度（度）",
+                "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
+                "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+            action_params[action] = {
+                "params": [field, "duration_s"],
+                "description": f"设置{label}，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+        return {
+            "name": "head_control",
+            "type": "actuator",
+            "description": (
+                "Adam Pro 头部（左右转动/上下俯仰，2 个关节）实时位置控制，"
+                "走厂商 DDS rt/lowcmd 通道。头部装有 ZED 相机，因此本卡即"
+                "「相机指向」控制。角度单位为度(°)，限位 ±60°。可选 duration_s 放慢动作。"
+                "前置条件：机器人已站立，且没有其它卡片正在占用上肢通道。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": ["action"],
+                "additionalProperties": False,
+                "x-action-params": action_params,
+                "x-resource": ["adam_upper_body"],
+            },
+        }
+
+    def start(self):
+        return self._control.start()
+
+    def stop(self):
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        # start/stop/info describe the controller this card delegates to.
+        if action in ("start", "stop", "info"):
+            return self._control.dispatch(action, args)
+        if action == "reset":
+            error = self._control._ready_error()
+            if error:
+                return error
+            targets = {
+                joint: self._control._hold_q[self._control._joint_index(joint)]
+                for _, joint, _, _ in HEAD_JOINT_CONTROLS.values()
+            }
+            span, span_error = self._control._preferred_span(args)
+            if span_error:
+                return span_error
+            error = self._control._set_targets(targets, preferred_span=span)
+            return error or {"success": True, "state": "active",
+                             "action": "reset", "duration_s": span}
+        control = HEAD_ACTIONS.get(action)
+        if control is None:
+            return None
+        try:
+            joint, radians = _head_target_radians(
+                control, args.get(f"{control}_deg"))
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": str(exc)}
+        span, span_error = self._control._preferred_span(args)
+        if span_error:
+            return span_error
+        error = self._control._set_targets({joint: radians}, preferred_span=span)
+        if error:
+            return error
+        return {"success": True, "state": "active", "joint": control,
+                "angle_deg": float(args[f"{control}_deg"]),
+                "duration_s": span, "protocol": "rt/lowcmd"}
+
+
+class ArmGesturePlugin:
+    """Named arm gestures played through the shared upper-body controller.
+
+    A gesture is a trajectory, not a second controller: every target still goes
+    through ``ArmControlPlugin``, which owns ``rt/lowcmd`` and writes the
+    complete 31-motor packet.  Each entry declares the pose it plays, whether
+    that pose is symmetric, and the arm to use when the caller does not choose
+    one — a symmetric pose defaults to both arms while a one-armed pose
+    defaults to the right arm.  The previous flat ``side="right"`` default made
+    ``welcome`` and ``raise`` silently drive one arm only.
+    """
+
+    PREFIX = "arm_gesture"
+
+    # Semantic gestures are performances, not raw positioning: they play at a
+    # slower joint-velocity ceiling than the bare arm_control card so a salute
+    # or a welcome reads calm and deliberate instead of snapping to the pose.
+    # wave keeps the controller-wide limit (its side-to-side rhythm is meant to
+    # be quick), and a caller-chosen duration_s still clamps below this.
+    _GESTURE_VELOCITY_RAD_S = 0.3
+
+    # name -> (ARM_POSES key, symmetric, default side)
+    _GESTURES = {
+        # One-armed poses: the ARM_POSES table defines them on the right arm and
+        # the left is generated by mirroring, so each pose is written once.
+        "salute": ("salute", False, "right"),
+        "high_five": ("arm_forward_high", False, "right"),
+        "handshake": ("handshake_ready", False, "right"),
+        "wave": ("wave_ready", False, "right"),
+        "welcome": ("arms_open", True, "both"),
+        "raise": ("hands_up", True, "both"),
+        "reset": ("neutral", True, "both"),
+    }
+
+    # Three side-to-side cycles, played after the synchronous raise.  Each span
+    # is short on purpose: `_set_targets` clamps it up to the shortest span
+    # whose easing peak stays inside `_MAX_VELOCITY_RAD_S`, so the rhythm is
+    # preserved whenever the safety limit allows it and never breaks it.
+    _WAVE_SEQUENCE = (
+        ("wave_out", 0.7), ("wave_in", 0.7),
+        ("wave_out", 0.7), ("wave_in", 0.7),
+        ("wave_out", 0.7), ("wave_in", 0.7),
+    )
+    _WAVE_LOWER_SECONDS = 0.9
+    _SEQUENCE_TIMEOUT_S = 30
+
+    # A gesture is a whole performance, so the hand shape it demands is part
+    # of the card rather than a second card the caller has to sequence.
+    # `None` means the arm move stands alone (the hand keeps whatever it is
+    # currently doing).
+    _GESTURE_HAND_SHAPES = {
+        "salute": "flat_hand",
+        "high_five": "open_palm",
+        "handshake": "handshake",
+        "wave": "open_palm",
+    }
+
+    def __init__(self, control: ArmControlPlugin, hand=None):
+        self._control = control
+        # Optional hand card.  Keeping it optional preserves the single-argument
+        # construction the contract tests use, and lets a deployment without
+        # hands keep the arm-only gestures working.
+        self._hand = hand
+        self._sequence_lock = threading.Lock()
+        self._sequence_id = None
+
+    @staticmethod
+    def _sides_in(values: dict) -> set:
+        return {control.split("_", 1)[0] for control in values
+                if control.startswith(("left_", "right_"))}
+
+    @classmethod
+    def _symmetric_pose(cls, pose: str) -> bool:
+        """A pose is symmetric when it is written for both arms."""
+        return cls._sides_in(ARM_POSES[pose][1]) == {"left", "right"}
+
+    def _targets_for(self, pose: str, side: str) -> dict:
+        """Resolve one pose plus a requested arm into absolute radian targets."""
+        if pose == "neutral":
+            # `neutral` has no joint table of its own: it means "return the
+            # selected arm axes to their zero target", which is also how
+            # `reset` has always been expressed.
+            selected = {control: 0.0 for control in ARM_JOINT_CONTROLS
+                        if side == "both" or control.startswith(f"{side}_")}
+        else:
+            values = ARM_POSES[pose][1]
+            if self._symmetric_pose(pose):
+                selected = {control: degrees for control, degrees in values.items()
+                            if side == "both" or control.startswith(f"{side}_")}
+            else:
+                if side == "left":
+                    values = self._control.mirror_targets(values)
+                selected = dict(values)
+        return dict(_arm_target_radians(control, value)
+                    for control, value in selected.items())
+
+    def get_tool(self):
+        one_armed = [name for name, (_, symmetric, _) in self._GESTURES.items()
+                     if not symmetric]
+        return {
+            "name": "arm_gesture", "type": "actuator",
+            "description": (
+                "Adam 上肢语义动作：salute 单手敬礼、high_five 单手肩高前伸（击掌预备）、"
+                "handshake 单手屈肘前伸（握手预备）、wave 单手挥手（自动完成抬手-摆动-放下）、"
+                "welcome 双臂张开、raise 双手举起、reset 归位。"
+                f"单臂动作（{'/'.join(one_armed)}）只能选 side=left 或 side=right，"
+                "对称动作（welcome/raise/reset）可用 side=both。"
+                "绑定了手型的动作（salute=flat_hand 并拢伸掌、high_five/wave=open_palm 张开手掌、"
+                "handshake=handshake 握手手型）会在手臂到位的同时把对应手型一并下发；"
+                "未绑定的动作只动手臂。"
+                "前置条件：机器人已站立，上肢通道没有被其它卡片占用，"
+                "执行前确认手臂活动范围内无人和障碍物。"
+            ),
+            "inputSchema": {"type": "object", "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [*self._GESTURES, "stop", "info"],
+                    "oneOf": [{"const": name, "title": title}
+                              for name, title in (
+                                  ("salute", "单手敬礼"),
+                                  ("high_five", "单手肩高前伸（击掌预备）"),
+                                  ("handshake", "单手屈肘前伸（握手预备）"),
+                                  ("wave", "单手挥手（抬手-摆动-放下）"),
+                                  ("welcome", "双臂张开"),
+                                  ("raise", "双手举起"),
+                                  ("reset", "上肢归位"),
+                                  ("stop", "停止发上肢目标"),
+                                  ("info", "查看上肢状态"),
+                              )],
+                },
+                "side": {
+                    "type": "string", "title": "手臂",
+                    "enum": ["left", "right", "both"],
+                    "default": "right",
+                    "description": (
+                        "选择执行动作的手臂。对称动作默认双臂(both)，"
+                        "单臂动作默认右臂(right)；单臂动作不支持 both。"
+                    ),
+                },
+                "duration_s": {
+                    "type": "number", "title": "动作时长（秒）",
+                    "minimum": 0.1, "maximum": 60.0,
+                    "description": "可选，只能放慢动作；小于安全限速所需时长会被自动钳位。",
+                },
+            }, "required": ["action"], "additionalProperties": False,
+            "x-action-params": {
+                **{name: {"params": ["side", "duration_s"],
+                          "description": f"{ARM_POSES[pose][0]}，可选放慢动作"}
+                   for name, (pose, _, _) in self._GESTURES.items()},
+                "stop": {"params": [],
+                         "description": "取消正在进行的挥手序列并停止上肢目标发布。"},
+                "info": {"params": [], "description": "查看上肢目标发布状态。"},
+            },
+            "x-resource": ["adam_upper_body"],
+            # `wave` returns as soon as the arm is raised and then plays in the
+            # background, so the card declares the completion instead of letting
+            # Agent Core treat the accepted target as the finished gesture.
+            "x-completion": {"actions": ["wave"],
+                             "timeout": self._SEQUENCE_TIMEOUT_S},
+            },
+        }
+
+    def start(self):
+        return self._control.start()
+
+    def stop(self):
+        self._cancel_sequence()
+        return self._control.stop()
+
+    def _cancel_sequence(self):
+        """Drop ownership of the running wave so its worker reports cancelled."""
+        with self._sequence_lock:
+            self._sequence_id = None
+
+    def _sequence_cancelled(self, action_id: str) -> bool:
+        with self._sequence_lock:
+            return self._sequence_id != action_id
+
+    def _hold_sequence(self, action_id: str, seconds: float) -> bool:
+        """Wait out one segment, returning False as soon as it is cancelled."""
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            if self._sequence_cancelled(action_id):
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.05, remaining))
+
+    def _apply_gesture_hand(self, action: str, side: str):
+        """Apply the bound hand shape, returning an error dict or ``None``.
+
+        ``side == "both"`` poses keep both hands free, so there is nothing to
+        apply; arm-only gestures (``None`` in the table) are the same.  When a
+        shape is bound the call goes through ``HandGesturePlugin.dispatch`` so
+        the shape still honours the hand card's own side validation and safety
+        ramp.
+        """
+        shape = self._GESTURE_HAND_SHAPES.get(action)
+        if shape is None or self._hand is None or side == "both":
+            return None
+        result = self._hand.dispatch(shape, {"side": side})
+        if isinstance(result, dict) and result.get("state") == "error":
+            return result
+        return None
+
+    def _play_wave(self, side: str, action_id: str):
+        status = "completed"
+        result = {"gesture": "wave", "side": side}
+        # The final step lowers the arm again: a greeting that leaves the hand
+        # in the air would need a second call to clean up, which the canvas does
+        # not make.  Keeping it inside the loop means a stop also stops the
+        # lowering, instead of moving the arm once more after the caller asked
+        # it to stand still.
+        steps = [*self._WAVE_SEQUENCE, ("neutral", self._WAVE_LOWER_SECONDS)]
+        try:
+            for pose, hold_seconds in steps:
+                if self._sequence_cancelled(action_id):
+                    status = "cancelled"
+                    result = {"gesture": "wave", "side": side,
+                              "reason": "superseded or stopped"}
+                    return
+                error = self._control._set_targets(
+                    self._targets_for(pose, side), preferred_span=hold_seconds)
+                if error:
+                    status = "failed"
+                    result = {"gesture": "wave", "side": side, "error": error}
+                    return
+                if not self._hold_sequence(action_id, hold_seconds):
+                    status = "cancelled"
+                    result = {"gesture": "wave", "side": side,
+                              "reason": "superseded or stopped"}
+                    return
+        except Exception as exc:
+            status = "failed"
+            result = {"gesture": "wave", "side": side, "error": str(exc)}
+        finally:
+            with self._sequence_lock:
+                if self._sequence_id == action_id:
+                    self._sequence_id = None
+            _notify_action_completion(action_id, status, result, self.PREFIX)
+
+    def dispatch(self, action, args):
+        # start/stop/info describe the controller this card delegates to.
+        # Forwarding them keeps the card startable from the canvas: a bare None
+        # is reported as an unknown action, and a strict project start then
+        # rolls the whole project back.
+        if action == "stop":
+            self._cancel_sequence()
+            return self._control.dispatch("stop", args)
+        if action in ("start", "info"):
+            return self._control.dispatch(action, args)
+        entry = self._GESTURES.get(action)
+        if entry is None:
+            return None
+        pose, symmetric, default_side = entry
+        side = args.get("side") or default_side
+        if side not in ("left", "right", "both"):
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": "side must be left, right or both"}
+        if not symmetric and side == "both":
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": f"{action} is a one-armed gesture; "
+                               "choose side=left or side=right"}
+        span, error = self._control._preferred_span(args)
+        if error:
+            return error
+        try:
+            targets = self._targets_for(pose, side)
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
+        if action != "wave":
+            error = self._control._set_targets(
+                targets, preferred_span=span,
+                velocity_limit=self._GESTURE_VELOCITY_RAD_S)
+            if error:
+                return error
+            hand_error = self._apply_gesture_hand(action, side)
+            if hand_error:
+                return {
+                    "success": False,
+                    "code": hand_error.get("error", "HAND_FAILED"),
+                    "message": (
+                        f"arm target accepted but the hand shape failed: "
+                        f"{hand_error.get('message', hand_error['error'])}"),
+                }
+            result = {"success": True, "state": "active", "gesture": action,
+                      "side": side, "duration_s": span, "protocol": "rt/lowcmd"}
+            if self._GESTURE_HAND_SHAPES.get(action) is not None and self._hand is not None and side != "both":
+                result["hand_gesture"] = self._GESTURE_HAND_SHAPES[action]
+            return result
+        # Raise synchronously so a DDS or readiness failure is still reported
+        # on the call itself, then let the oscillation run in the background.
+        error = self._control._set_targets(targets, preferred_span=span)
+        if error:
+            return error
+        hand_error = self._apply_gesture_hand(action, side)
+        if hand_error:
+            return {
+                "success": False,
+                "code": hand_error.get("error", "HAND_FAILED"),
+                "message": (
+                    f"arm raised but the hand shape failed: "
+                    f"{hand_error.get('message', hand_error['error'])}"),
+            }
+        action_id = f"adam_arm_wave_{uuid.uuid4().hex[:8]}"
+        self._cancel_sequence()
+        with self._sequence_lock:
+            self._sequence_id = action_id
+        threading.Thread(target=self._play_wave, args=(side, action_id),
+                         daemon=True, name=f"adam_arm_wave_{side}").start()
+        return {"success": True, "state": "active", "gesture": action,
+                "side": side, "action_id": action_id,
+                "sequence_segments": len(self._WAVE_SEQUENCE) + 1,
+                "auto_lower": True, "protocol": "rt/lowcmd"}
 
 
 # ===========================================================================
@@ -1113,6 +3078,16 @@ class HandPlugin:
             self._control_rate_hz = 400.0
         if self._control_rate_hz <= 0:
             self._control_rate_hz = 400.0
+        # Limit the per-channel slew so a new hand target ramps in over
+        # ``transition_seconds`` instead of snapping. The Adam hand firmware
+        # applies no interpolation of its own, so without this every command
+        # step arrives as a discontinuity at 400 Hz.
+        try:
+            self._transition_seconds = float(
+                plugin_config.get("transition_seconds", 0.4))
+        except (TypeError, ValueError):
+            self._transition_seconds = 0.4
+        self._transition_seconds = max(0.02, min(10.0, self._transition_seconds))
         try:
             self._state_timeout_sec = float(plugin_config.get("state_timeout_sec", 1.0))
         except (TypeError, ValueError):
@@ -1125,6 +3100,7 @@ class HandPlugin:
         self._owns_state_cache = state_cache is None
         self._lock = threading.Lock()
         self._target_positions = None
+        self._command_positions = None
         self._active = False
         self._lifecycle_lock = threading.Lock()
         self._control_stop_event = None
@@ -1167,12 +3143,17 @@ class HandPlugin:
             "name": "hand",
             "type": "actuator",
             "description": (
-                f"Adam hand control via DDS rt/handcmd — continuous 12-motor-channel "
-                f"position stream, range 0-{self._max_val}. "
-                "Each hand has 5 fingers; the thumb uses flexion and rotation "
-                "channels. Adam moves only in the 0-1000 range; values above "
-                "1000 are saturated. The default open pose is configurable "
-                "per robot."
+                "Adam 灵巧手抓取控制，走 DDS rt/handcmd，400Hz 持续下发目标位置。"
+                "每只手 5 根手指、6 个电机通道，左右手共 12 个通道；"
+                f"位置范围 0-{self._max_val}，0 为完全合上、{self._max_val} 为完全张开，"
+                "中间值线性对应手指弯曲程度，超范围会被饱和处理。"
+                "拇指有两个通道：屈伸和旋转（拇指旋转用于把拇指收拢到掌心侧）。"
+                "主要用途：1) open/close 整体张开或握紧一只手或双手；"
+                "2) grip 按百分比分级握持；3) set_positions 一次下发整手通道；"
+                "4) set_fingers 微调单个通道。"
+                "需要抓取前先分次合手时，优先用 grip；需要精确手型时用 set_positions。"
+                "get_state 可读取左右手全部通道的当前位置用于确认是否到位。"
+                "执行前确认手指和手掌周围没有障碍物。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -1180,19 +3161,20 @@ class HandPlugin:
                     "action": {
                         "type": "string",
                         "enum": [
-                            "open", "close", "set_fingers", "start", "stop", "info",
-                            "get_state",
+                            "open", "close", "grip", "set_fingers", "set_positions",
+                            "start", "stop", "info", "get_state",
                         ],
                     },
                     "side": {
                         "type": "string",
                         "title": "手",
-                        "enum": ["left", "right"],
+                        "enum": ["left", "right", "both"],
                         "oneOf": [
                             {"const": "left", "title": "左手"},
                             {"const": "right", "title": "右手"},
+                            {"const": "both", "title": "双手"},
                         ],
-                        "description": "选择要控制的手",
+                        "description": "选择要控制的手；open/close/grip 支持双手(both)",
                     },
                     "channel": {
                         "type": "string",
@@ -1211,24 +3193,64 @@ class HandPlugin:
                         "maximum": self._max_val,
                         "description": "该通道的目标位置值，0为合上，1000为张开。",
                     },
+                    "grip_percent": {
+                        "type": "number",
+                        "title": "握持程度（%）",
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": (
+                            "0 为完全张开，100 为完全握紧，中间值按比例插值；"
+                            "用于 grip 动作，比逐通道设值更方便。"
+                        ),
+                    },
+                    "positions": {
+                        "type": "array",
+                        "title": "整手通道目标值",
+                        "items": {"type": "integer", "minimum": 0,
+                                  "maximum": self._max_val},
+                        "minItems": 6,
+                        "maxItems": HAND_POSITION_COUNT,
+                        "description": (
+                            "整只手的通道目标值，顺序为 "
+                            + "、".join(HAND_CHANNEL_LABELS[name]
+                                       for name in HAND_CHANNEL_NAMES)
+                            + "。side=left/right 时传 6 个值；side=both 时传 12 个值"
+                            "（前 6 个左手、后 6 个右手）。"
+                            f"0 为合上，{self._max_val} 为张开。"
+                        ),
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "open": {
-                        "params": [],
-                        "description": "Apply the configured open pose to both hands",
+                        "params": ["side"],
+                        "description": "让左手、右手或双手张开到配置的张开姿势。",
                     },
                     "close": {
-                        "params": [],
+                        "params": ["side"],
                         "description": (
-                            "Close pinky/ring/middle/index while simultaneously "
-                            "rotating and flexing the thumb to its safe target"
+                            "让左手、右手或双手握紧：小指/无名指/中指/食指同时合拢，"
+                            "拇指同步旋转并屈到安全位置。"
+                        ),
+                    },
+                    "grip": {
+                        "params": ["side", "grip_percent"],
+                        "description": (
+                            "按百分比设置握持程度，0 完全张开、100 完全握紧，"
+                            "适合抓取前的分级合手。"
+                        ),
+                    },
+                    "set_positions": {
+                        "params": ["side", "positions"],
+                        "description": (
+                            "一次下发整只手的全部通道目标值，比 set_fingers 逐通道"
+                            "设置更连贯。"
                         ),
                     },
                     "set_fingers": {
                         "params": ["side", "channel", "value"],
                         "description": (
-                            "选择左手或右手的一个通道，持续下发该通道的目标位置值"
+                            "选择一只手的一个通道，持续下发该通道的目标位置值"
                         ),
                     },
                     "start": {"params": [], "description": "Enable the hand control worker"},
@@ -1260,7 +3282,14 @@ class HandPlugin:
         }
 
     def _publisher_available(self) -> bool:
-        if not HAS_PND_SDK or self._hand_pub is None:
+        # A DDS writer is usable immediately after Init().  IsMatched() can
+        # remain false while the robot-side subscriber is starting, and must
+        # not turn a transient discovery delay into a permanently unavailable
+        # card.  Write() below is the authoritative health check.
+        return bool(HAS_PND_SDK and self._hand_pub is not None)
+
+    def _publisher_matched(self):
+        if not self._publisher_available():
             return False
         is_matched = getattr(self._hand_pub, "IsMatched", None)
         if not callable(is_matched):
@@ -1355,6 +3384,7 @@ class HandPlugin:
             ),
             "closed": self._closed,
             "publisher_available": self._publisher_available(),
+            "publisher_matched": self._publisher_matched(),
             "control_rate_hz": self._control_rate_hz,
             "position_max": self._max_val,
             "open_positions": list(self._open_positions),
@@ -1406,16 +3436,38 @@ class HandPlugin:
         period = 1.0 / self._control_rate_hz
         while not stop_event.is_set():
             try:
+                if stop_event.is_set():
+                    break
                 with self._lock:
                     active = self._active
                     target = list(self._target_positions) if self._target_positions is not None else None
+                    command = list(self._command_positions) if self._command_positions is not None else None
                 if active and target is not None:
-                    if stop_event.is_set():
-                        break
-                    if not self._send_hand_cmd(target):
+                    if command is None:
+                        command = list(target)
+                    max_step = max(1.0, self._max_val / (self._transition_seconds * self._control_rate_hz))
+                    converged = True
+                    for i in range(len(command)):
+                        diff = target[i] - command[i]
+                        if diff > max_step:
+                            command[i] += max_step
+                            converged = False
+                        elif diff < -max_step:
+                            command[i] -= max_step
+                            converged = False
+                        elif diff != 0:
+                            command[i] = target[i]
+                    write_positions = [round(p) for p in command]
+                    if not self._send_hand_cmd(write_positions):
                         if self._wake_event.wait(0.1):
                             self._wake_event.clear()
                         continue
+                    with self._lock:
+                        self._command_positions = list(command)
+                        if converged:
+                            # Reached the target; stop actively writing to save
+                            # CPU/bus until a new target arrives.
+                            self._active = False
                 if self._wake_event.wait(period):
                     self._wake_event.clear()
                     if stop_event.is_set():
@@ -1457,6 +3509,18 @@ class HandPlugin:
         if result.get("state") not in ("ready",):
             return result
         with self._lock:
+            if self._command_positions is None:
+                # First activation: start ramping from the current state so the
+                # hand doesn't snap to the new target in one 400Hz step.
+                base = self._state_cache.fresh_positions(self._state_timeout_sec)
+                if base is None:
+                    base = list(self._open_positions)
+                else:
+                    try:
+                        base = _coerce_hand_positions(base, limit=self._max_val)
+                    except ValueError:
+                        base = list(self._open_positions)
+                self._command_positions = list(base)
             self._target_positions = list(positions)
             self._active = True
         self._wake_event.set()
@@ -1475,9 +3539,37 @@ class HandPlugin:
         if action == "get_state":
             return self._get_state()
         if action == "open":
-            return self._activate(self._open_positions, "open")
+            return self._activate_side(args.get("side"), self._open_positions, "open")
         if action == "close":
-            return self._activate(self._close_target(), "close")
+            return self._activate_side(args.get("side"), self._close_target(), "close")
+        if action == "grip":
+            side = args.get("side")
+            if side not in self._SIDES:
+                return self._invalid_side(side)
+            raw_percent = args.get("grip_percent")
+            message = "grip_percent must be a number in [0, 100]"
+            if isinstance(raw_percent, bool) or not isinstance(
+                    raw_percent, (int, float)):
+                return {"state": "error", "error": "INVALID_ARGUMENT",
+                        "message": message}
+            percent = float(raw_percent)
+            if not math.isfinite(percent) or not 0.0 <= percent <= 100.0:
+                return {"state": "error", "error": "INVALID_ARGUMENT",
+                        "message": message}
+            # Interpolate between the configured open and safe-close shapes so
+            # a partial grip still uses the tuned thumb targets rather than a
+            # naive halfway value on both thumb axes.
+            ratio = percent / 100.0
+            shape = [round(open_value + (close_value - open_value) * ratio)
+                     for open_value, close_value
+                     in zip(self._open_positions, self._close_target())]
+            result = self._activate_side(side, shape, "grip")
+            if result.get("state") != "error":
+                result["grip_percent"] = percent
+            return result
+        if action == "set_positions":
+            return self._activate_positions(
+                args.get("side"), args.get("positions"), "set_positions")
         if action == "set_fingers":
             side = args.get("side")
             channel = args.get("channel")
@@ -1514,6 +3606,195 @@ class HandPlugin:
         if action == "info":
             return self._status()
         return None
+
+    _SIDES = ("left", "right", "both")
+
+    @staticmethod
+    def _invalid_side(side):
+        return {"state": "error", "error": "INVALID_ARGUMENT",
+                "message": f"side must be one of {list(HandPlugin._SIDES)}, got {side!r}"}
+
+    def _apply_side(self, positions: list[int], side: str, values: list[int]):
+        """Write a 6-value shape onto the requested hand(s) in place."""
+        if side == "both":
+            positions[0:6] = values[0:6]
+            positions[6:12] = values[6:12]
+        else:
+            offset = 0 if side == "left" else 6
+            positions[offset:offset + 6] = values[offset:offset + 6]
+        return positions
+
+    def _activate_side(self, side, source, action):
+        if side not in self._SIDES:
+            return self._invalid_side(side)
+        positions = self._apply_side(self._base_positions(), side, source)
+        result = self._activate(positions, action)
+        result["side"] = side
+        return result
+
+    def _activate_positions(self, side, raw, action: str):
+        """Validate a caller-supplied channel vector and send it as one target."""
+        if side not in self._SIDES:
+            return self._invalid_side(side)
+        expected = HAND_POSITION_COUNT if side == "both" else 6
+        if not isinstance(raw, (list, tuple)):
+            return {"state": "error", "error": "INVALID_ARGUMENT",
+                    "message": "positions must be an array of channel values"}
+        if len(raw) != expected:
+            return {"state": "error", "error": "INVALID_ARGUMENT",
+                    "message": (f"positions must contain {expected} values for "
+                                f"side={side} (6 per hand, 12 for both)")}
+        try:
+            values = _coerce_hand_positions(raw, limit=self._max_val,
+                                            expected=expected)
+        except ValueError as exc:
+            return {"state": "error", "error": "INVALID_ARGUMENT",
+                    "message": str(exc)}
+        positions = self._apply_side(self._base_positions(), side, values)
+        result = self._activate(positions, action)
+        result["side"] = side
+        return result
+
+
+class HandGesturePlugin:
+    """Named Adam hand shapes, composed from the DDS hand controller.
+
+    Every shape is stored once as a six-value per-hand vector in
+    ``HAND_CHANNEL_NAMES`` order — pinky, ring, middle, index, ``thumb_flex``,
+    ``thumb_rotate`` — so a gesture means the same thing on either hand.  Four
+    fingers and ``thumb_flex`` run 0 (fully curled) to 1000 (fully extended);
+    ``thumb_rotate`` tucks the thumb across the palm.
+    """
+
+    PREFIX = "hand_gesture"
+
+    _CURLED = [0, 0, 0, 0, 100, 1000]
+    _EXTENDED = [1000, 1000, 1000, 1000, 1000, 0]
+    _OPEN_KEY = "open_palm"
+    _CLOSE_KEY = "fist"
+    _GESTURES = {
+        # `open_palm` and `fist` are resolved from the configured open/close
+        # profile at dispatch time (see `_shape_for`) so a retuned robot keeps
+        # its calibrated shapes; the rest are literal.
+        _OPEN_KEY: None,
+        _CLOSE_KEY: None,
+        # A thumbs up folds the four fingers but extends the thumb, which is
+        # the opposite thumb axes from a fist.  The previous definition reused
+        # the fist vector verbatim, so the two were physically identical.
+        "thumbs_up": [0, 0, 0, 0, 1000, 0],
+        "victory": [0, 0, 1000, 1000, 100, 1000],
+        "point": [0, 0, 0, 1000, 100, 1000],
+        "rock": [1000, 0, 0, 1000, 100, 1000],
+        # Half-closed four fingers with the thumb held out and partly rotated,
+        # i.e. the shape that wraps around another hand.
+        "handshake": [300, 300, 300, 300, 1000, 600],
+        # flat_hand: fingers fully extended like open_palm, but the thumb
+        # flexes in to lie alongside the fingers （并拢） instead of spreading
+        # out, so the two shapes stay physically distinguishable.
+        "flat_hand": [1000, 1000, 1000, 1000, 0, 0],
+        "finger_gun": [0, 0, 0, 1000, 1000, 600],
+        "ok_sign": [1000, 1000, 1000, 0, 0, 0],
+        "call_me": [1000, 0, 0, 0, 1000, 0],
+        "claw": [400, 400, 400, 400, 400, 600],
+    }
+    _LABELS = {
+        "open_palm": "张开手掌",
+        "fist": "握拳",
+        "thumbs_up": "点赞（拇指伸出）",
+        "victory": "V 手势（食指+中指）",
+        "point": "指向（食指）",
+        "rock": "摇滚手势（食指+小指）",
+        "handshake": "握手手型（半握+拇指张开）",
+        "flat_hand": "并拢伸掌",
+        "finger_gun": "手枪手型（食指+拇指伸出）",
+        "ok_sign": "OK 手型",
+        "call_me": "打电话手型（拇指+小指伸出）",
+        "claw": "爪型（五指半屈）",
+    }
+
+    def __init__(self, control: HandPlugin):
+        self._control = control
+
+    def _shape_for(self, gesture: str, side: str) -> list[int]:
+        """Return the six per-hand channel values for a gesture."""
+        if gesture == self._CLOSE_KEY:
+            close = self._control._close_target()
+            return close[0:6] if side == "left" else close[6:12]
+        if gesture == self._OPEN_KEY:
+            opened = self._control._open_positions
+            return opened[0:6] if side == "left" else opened[6:12]
+        return list(self._GESTURES[gesture])
+
+    def get_tool(self):
+        return {"name": "hand_gesture", "type": "actuator",
+                "description": (
+                    "Adam 手部语义手型：open_palm 张开手掌、fist 握拳、"
+                    "thumbs_up 点赞（拇指伸出）、victory V 手势、point 指向、"
+                    "rock 摇滚手势、handshake 握手手型。"
+                    "只改变指定手的手指形状，另一只手的当前目标保持不变；"
+                    "位置范围 0-1000，0 为完全弯曲、1000 为完全伸直。"
+                    "需要完整动作而不是静止手型时，配合 arm_gesture 使用"
+                    "（例如迎宾用 arm_gesture.wave + open_palm，握手用 "
+                    "arm_gesture.handshake + handshake）。"
+                    "执行前确认手指和手掌周围没有障碍物。"
+                ),
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [*self._GESTURES, "stop", "info"],
+                        "oneOf": [{"const": name, "title": self._LABELS[name]}
+                                  for name in self._GESTURES],
+                    },
+                    "side": {
+                        "type": "string", "title": "手",
+                        "enum": ["left", "right", "both"],
+                        "default": "right",
+                        "description": "选择执行手型的手；both 表示双手同时做同一手型。",
+                    },
+                }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {
+                    **{gesture: {"params": ["side"],
+                                 "description": self._LABELS[gesture]}
+                       for gesture in self._GESTURES},
+                    "stop": {"params": [],
+                             "description": "停止发送手部目标，保持当前形状。"},
+                    "info": {"params": [], "description": "查看手部控制状态与配置。"},
+                },
+                "x-resource": ["adam_hands"]},
+        }
+
+    def start(self):
+        return self._control.start()
+
+    def stop(self):
+        return self._control.stop()
+
+    def dispatch(self, action, args):
+        # start/stop/info describe the hand controller this card delegates to.
+        # Forwarding them keeps the card startable from the canvas: a bare None
+        # is reported as an unknown action, and a strict project start then
+        # rolls the whole project back.
+        if action in ("start", "info", "stop"):
+            return self._control.dispatch(action, args)
+        if action not in self._GESTURES:
+            return None
+        side = args.get("side") or "right"
+        if side not in self._control._SIDES:
+            return self._control._invalid_side(side)
+        positions = self._control._base_positions()
+        # `both` reuses the same per-hand shape on each side, so it needs the
+        # six channels applied twice rather than one twelve-value vector.
+        if side == "both":
+            shape = self._shape_for(action, "right")
+            positions[0:6] = shape
+            positions[6:12] = shape
+        else:
+            offset = 0 if side == "left" else 6
+            positions[offset:offset + 6] = self._shape_for(action, side)
+        result = self._control._activate(positions, action)
+        result["side"] = side
+        result["gesture"] = action
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -2920,7 +5201,8 @@ class AdamDeviceBundle:
 
     def __init__(self, config: dict, namespace: str, executor, grpc_client,
                  dds_lowstate_sub=None, dds_handstate_sub=None,
-                 dds_hand_pub=None, ros2_enabled: bool | None = None):
+                 dds_hand_pub=None, dds_lowcmd_pub=None,
+                 dds_arm_lowstate_sub=None, ros2_enabled: bool | None = None):
         self._plugins = []
         self._tool_map = {}  # tool_name → plugin
 
@@ -2957,13 +5239,28 @@ class AdamDeviceBundle:
             )
             self._plugins.append(p)
 
-        # LocoPlugin
-        if plugins_cfg.get("loco", {}).get("enabled", True):
-            p = LocoPlugin(
-                plugins_cfg.get("loco", {}), namespace, executor,
+        # The default LocoPlugin preserves the historic dashboard contract;
+        # the RL variant exposes the full pnd.robot gRPC API.
+        loco_cfg = plugins_cfg.get("loco", {})
+        if loco_cfg.get("enabled", True):
+            p = RlLocoPlugin(
+                loco_cfg, namespace, executor,
                 grpc_client=grpc_client,
             )
             self._plugins.append(p)
+
+        # RL execution is also exposed as focused cards.  ``loco`` remains
+        # available as a backwards-compatible aggregate card, while these
+        # cards make state transitions, motions, control ownership and safety
+        # actions independently discoverable to an agent.
+        rl_cards = (("motion", MotionPlugin),
+                    ("tracking_motion", TrackingMotionPlugin))
+        for card_name, card_class in rl_cards:
+            card_cfg = plugins_cfg.get(card_name, {})
+            if card_cfg.get("enabled", False):
+                self._plugins.append(card_class(
+                    card_cfg, namespace, executor, grpc_client=grpc_client,
+                ))
 
         # CameraPlugin
         camera_plugin = None
@@ -2979,20 +5276,54 @@ class AdamDeviceBundle:
             self._plugins.append(VisionCapturePlugin(
                 plugins_cfg.get("vision_capture", {}), camera_plugin))
 
-        # ArmPlugin
-        if plugins_cfg.get("arm", {}).get("enabled", True) and self._ros2_enabled:
-            p = ArmPlugin(
+        # Direct upper-body control is DDS-only and intentionally remains
+        # available when ROS2 is absent or isolated on the Jetson.
+        if plugins_cfg.get("arm", {}).get("enabled", True):
+            p = ArmControlPlugin(
                 plugins_cfg.get("arm", {}), namespace, executor,
                 grpc_client=grpc_client,
+                dds_lowcmd_pub=dds_lowcmd_pub,
+                dds_arm_lowstate_sub=dds_arm_lowstate_sub,
+                variant=variant,
             )
             self._plugins.append(p)
-
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
+        # Build it first: arm_gesture binds its shapes through the hand_gesture
+        # card, so the gesture needs an instance to point at.
+        hand_gesture_plugin = None
         if hand_enabled:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
             self._plugins.append(p)
+            if plugins_cfg.get("hand_gesture", {}).get("enabled", True):
+                hand_gesture_plugin = HandGesturePlugin(p)
+                self._plugins.append(hand_gesture_plugin)
+
+        # Direct upper-body control is DDS-only and intentionally remains
+        # available when ROS2 is absent or isolated on the Jetson.
+        if plugins_cfg.get("arm", {}).get("enabled", True):
+            p = ArmControlPlugin(
+                plugins_cfg.get("arm", {}), namespace, executor,
+                grpc_client=grpc_client,
+                dds_lowcmd_pub=dds_lowcmd_pub,
+                dds_arm_lowstate_sub=dds_arm_lowstate_sub,
+                variant=variant,
+            )
+            self._plugins.append(p)
+            if plugins_cfg.get("arm_gesture", {}).get("enabled", True):
+                self._plugins.append(
+                    ArmGesturePlugin(p, hand=hand_gesture_plugin))
+            if plugins_cfg.get("waist", {}).get("enabled", True):
+                waist_control = WaistControlPlugin(p)
+                self._plugins.append(waist_control)
+                if plugins_cfg.get("waist_gesture", {}).get("enabled", True):
+                    self._plugins.append(WaistGesturePlugin(p))
+            if plugins_cfg.get("head", {}).get("enabled", True):
+                head_control = HeadControlPlugin(p)
+                self._plugins.append(head_control)
+                if plugins_cfg.get("head_gesture", {}).get("enabled", True):
+                    self._plugins.append(HeadGesturePlugin(p))
         if hand_state_enabled and self._hand_state_cache is not None and self._ros2_enabled:
             p = HandStatePlugin(
                 plugins_cfg.get("hand_state", {}), namespace, executor,
