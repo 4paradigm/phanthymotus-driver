@@ -189,11 +189,6 @@ class RM75Plugin:
         self._active_action_id = None
         self._cancelled = set()
         self._last_completion = None
-        if __package__:
-            from .action_record import ActionRecord
-        else:
-            from action_record import ActionRecord
-        self.recorder = ActionRecord(self, config.get("action_record", {}), JOINT_LIMITS_DEG)
 
     def _skeleton_topic_out(self):
         return [{"topic": self._skeleton_topic, "format": "sensor/skeleton"}]
@@ -250,7 +245,6 @@ class RM75Plugin:
             self._start_skeleton_publisher()
 
     def stop(self):
-        self.recorder.shutdown()
         with self._action_lock:
             action_id = self._active_action_id
             if action_id:
@@ -568,9 +562,6 @@ class RM75Plugin:
             raise
 
     def _stop_motion(self):
-        recorded = self.recorder.stop_active()
-        if recorded is not None:
-            return recorded
         # Keep the action-state lock across the SDK stop request. The monitor
         # cannot select a terminal state between cancellation and slow-stop.
         with self._action_lock:
@@ -582,8 +573,6 @@ class RM75Plugin:
 
     def dispatch(self, action, args):
         name = args.get("_tool_name")
-        if name == "action_record":
-            return self.recorder.dispatch(action, args)
         if action == "start":
             return {"state": "ready" if name in ("joint_control", "model") else "running"}
         if action == "stop":
@@ -837,4 +826,17 @@ def build_plugins(config, namespace, ros2):
             camera_config, namespace, ros2.executor_core
         )
         plugins.append(ext_camera_plugin)
+    vision_config = config.get("vision_capture", {})
+    if vision_config.get("enabled", camera_config.get("enabled", False)):
+        from vision_capture import VisionCapturePlugin
+
+        plugins.append(
+            VisionCapturePlugin(
+                vision_config,
+                namespace,
+                ros2.executor_core,
+                ext_camera=ext_camera_plugin,
+                context=ros2.ctx_core,
+            )
+        )
     return plugins
