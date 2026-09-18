@@ -835,8 +835,7 @@ def build_plugins(config, namespace, ros2):
                 vision_config,
                 namespace,
                 ros2.executor_core,
-                ext_camera=ext_camera_plugin,
-                context=ros2.ctx_core,
+                external_camera=ext_camera_plugin,
             )
         )
     return plugins
