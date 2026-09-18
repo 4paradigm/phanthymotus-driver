@@ -84,7 +84,11 @@ plugins:
     enabled: true
   waist:
     enabled: true
+  waist_gesture:
+    enabled: true
   head:
+    enabled: true
+  head_gesture:
     enabled: true
   hand:
     enabled: true

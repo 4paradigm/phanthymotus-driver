@@ -24,7 +24,8 @@ from device import (ADAM_PRO_JOINTS, ARM_JOINT_CONTROLS, ARM_POSES,
                     HAND_DEFAULT_OPEN, HAND_DEFAULT_THUMB_CLOSE,
                     HEAD_JOINT_CONTROLS, WAIST_JOINT_CONTROLS,
                     ArmControlPlugin, ArmGesturePlugin, HandGesturePlugin,
-                    HandPlugin, HeadControlPlugin, WaistControlPlugin)
+                    HandPlugin, HeadControlPlugin, HeadGesturePlugin,
+                    WaistControlPlugin, WaistGesturePlugin)
 from test_arm_controls import _FakePublisher, _fake_lowcmd, _prime_arm_plugin
 
 
@@ -423,6 +424,126 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
         for pose, _, _ in ArmGesturePlugin._GESTURES.values():
             self.assertIn(pose, advertised)
 
+    def test_compound_verbs_are_advertised_with_their_degree_fields(self):
+        plugin = self.arm_plugin()
+        schema = plugin.get_tool()["inputSchema"]
+        properties = schema["properties"]
+        actions = properties["action"]["enum"]
+        for verb in ArmControlPlugin._GROUP_JOINTS:
+            self.assertIn(verb, actions)
+            self.assertIn(verb, schema["x-action-params"])
+        # Every advertised field must exist as a property, otherwise a strict
+        # canvas client rejects the payload before it reaches the driver.
+        for verb, params in schema["x-action-params"].items():
+            if verb not in ArmControlPlugin._GROUP_JOINTS:
+                continue
+            for field in params["params"]:
+                self.assertIn(field, properties, (verb, field))
+        self.assertEqual(["left", "right"], properties["side"]["enum"])
+        self.assertEqual(
+            set(ArmControlPlugin._GROUP_JOINTS),
+            {verb for verb in schema["x-action-params"]
+             if verb in ArmControlPlugin._GROUP_JOINTS})
+
+    def test_compound_verbs_reach_several_joints_in_one_segment(self):
+        plugin = self.arm_plugin()
+        result = plugin.dispatch("set_shoulder", {
+            "side": "left", "pitch_deg": -30, "roll_deg": 20, "yaw_deg": 10})
+        self.assertTrue(result["success"], result)
+        self.assertEqual("left", result["side"])
+        self.assertEqual(3, result["joints_set"])
+        # The compound verbs share the same smoothing segment machinery as
+        # set_joints: every selected joint gets an eased start and the target
+        # register is updated under the worker lock.
+        self.assertEqual(3, len(plugin._seg_start))
+        for name in ("shoulderPitch_Left", "shoulderRoll_Left", "shoulderYaw_Left"):
+            self.assertIn(ADAM_PRO_JOINTS.index(name), plugin._target_q)
+        self.assertAlmostEqual(
+            plugin._target_q[ADAM_PRO_JOINTS.index("shoulderPitch_Left")],
+            math.radians(-30))
+        # The worker interpolates straight away, so only final targets are
+        # asserted, matching what test_set_joints_accepts_several_joints_in_one_segment
+        # pins for the bulk action.
+
+    def test_compound_verbs_default_to_the_right_arm_and_allow_partial_fields(self):
+        plugin = self.arm_plugin()
+        result = plugin.dispatch("set_elbow", {"bend_deg": -45})
+        self.assertTrue(result["success"], result)
+        self.assertEqual("right", result["side"])
+        index = ADAM_PRO_JOINTS.index("elbow_Right")
+        self.assertAlmostEqual(plugin._target_q[index], math.radians(-45))
+
+    def test_compound_verbs_reject_bad_input(self):
+        plugin = self.arm_plugin()
+        cases = (
+            ("set_elbow", {"side": "both", "bend_deg": 0}, "left or right"),
+            ("set_shoulder", {"side": "left"}, "at least one"),
+            ("set_wrist", {}, "at least one"),
+            # The roll axis is mirrored, so a value legal on one side is out of
+            # range on the other; the dispatcher must enforce the chosen side.
+            ("set_shoulder", {"side": "left", "roll_deg": -40}, "left_shoulder_roll"),
+            ("set_shoulder", {"side": "right", "roll_deg": 40}, "right_shoulder_roll"),
+        )
+        for action, payload, fragment in cases:
+            result = plugin.dispatch(action, payload)
+            self.assertFalse(result["success"], (action, payload))
+            self.assertEqual("INVALID_ARGUMENT", result["code"], (action, payload))
+            self.assertIn(fragment, result["message"], (action, payload))
+
+
+class ArmGestureHandBindingTests(RunningArmMixin, unittest.TestCase):
+    """Bound gestures drive the arm and the hand in one call."""
+
+    def _pair(self):
+        control = self.arm_plugin()
+        hand = HandGesturePlugin(_dispatchable_hand_plugin())
+        return control, hand, ArmGesturePlugin(control, hand=hand)
+
+    def test_a_bound_gesture_applies_its_hand_shape(self):
+        _, hand, gestures = self._pair()
+        result = gestures.dispatch("salute", {"side": "right"})
+        self.assertTrue(result["success"], result)
+        self.assertEqual("flat_hand", result["hand_gesture"])
+        # HandGesturePlugin.dispatch(action="flat_hand", {"side": "right"})
+        # lands exactly one recorded activation driven from the bound shape.
+        self.assertEqual(1, len(hand._control.activated))
+        action, positions = hand._control.activated[0]
+        self.assertEqual("flat_hand", action)
+        expected = HandGesturePlugin(hand._control)._shape_for("flat_hand", "right")
+        self.assertEqual(expected, positions[6:12])
+
+    def test_unbound_gestures_leave_the_hand_alone(self):
+        _, hand, gestures = self._pair()
+        result = gestures.dispatch("welcome", {"side": "both"})
+        self.assertTrue(result["success"], result)
+        self.assertNotIn("hand_gesture", result)
+        self.assertEqual([], hand._control.activated)
+
+    def test_the_pairing_is_optional(self):
+        control = self.arm_plugin()
+        gestures = ArmGesturePlugin(control)
+        result = gestures.dispatch("salute", {"side": "right"})
+        self.assertTrue(result["success"], result)
+        self.assertNotIn("hand_gesture", result)
+
+    def test_a_hand_failure_is_reported_after_the_arm_accepts(self):
+        _, hand, gestures = self._pair()
+
+        def _fail(_positions, _action):
+            return {"state": "error", "error": "DDS_UNAVAILABLE",
+                    "message": "rt/handcmd down"}
+
+        hand._control._activate = _fail
+        result = gestures.dispatch("salute", {"side": "right"})
+        self.assertFalse(result["success"], result)
+        self.assertEqual("DDS_UNAVAILABLE", result["code"])
+        self.assertIn("hand shape failed", result["message"])
+
+    def test_every_bound_shape_is_a_real_hand_gesture(self):
+        for gesture, shape in ArmGesturePlugin._GESTURE_HAND_SHAPES.items():
+            self.assertIn(shape, HandGesturePlugin._GESTURES, gesture)
+            self.assertIn(gesture, ArmGesturePlugin._GESTURES, gesture)
+
 
 class ArmWaveTests(RunningArmMixin, unittest.TestCase):
     """`wave` returns before it finishes, so it owes Agent Core a completion."""
@@ -659,6 +780,156 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
         waist = WaistControlPlugin(control)
         self.assertEqual({"state": "ready"}, waist.dispatch("start", {}))
         self.assertIn("state", waist.dispatch("info", {}))
+
+
+class AxisGestureTests(RunningArmMixin, unittest.TestCase):
+    """The waist/head semantic cards share an engine; both are pinned."""
+
+    def _pose_targets(self, control):
+        return {ADAM_PRO_JOINTS[index] for index in control._target_q}
+
+    def test_gesture_schemas_advertise_poses_sequences_and_completion(self):
+        cases = (
+            (WaistGesturePlugin, "waist_gesture",
+             {"bow", "side_bend", "twist", "look_down"},
+             {"lean_forward", "reset"}),
+            (HeadGesturePlugin, "head_gesture",
+             {"nod", "shake", "scan"},
+             {"look_left", "look_right", "look_up", "look_down", "reset"}),
+        )
+        for plugin_class, name, sequences, poses in cases:
+            tool = plugin_class(self.arm_plugin()).get_tool()
+            self.assertEqual(name, tool["name"])
+            schema = tool["inputSchema"]
+            enum = schema["properties"]["action"]["enum"]
+            for action in sequences | poses | {"stop", "info"}:
+                self.assertIn(action, enum, (name, action))
+            # Sequences return before they finish, so they owe Agent Core a
+            # completion declaration; single-target poses do not.
+            self.assertEqual(sorted(sequences),
+                             sorted(schema["x-completion"]["actions"]), name)
+            self.assertEqual(schema["x-completion"]["timeout"],
+                             plugin_class._SEQUENCE_TIMEOUT_S)
+
+    def test_pose_gestures_drive_the_named_axis(self):
+        control = self.arm_plugin()
+        waist = WaistGesturePlugin(control)
+        result = waist.dispatch("lean_forward", {})
+        self.assertTrue(result["success"], result)
+        self.assertAlmostEqual(
+            control._target_q[ADAM_PRO_JOINTS.index("waistPitch")],
+            math.radians(15.0))
+
+        control = self.arm_plugin()
+        head = HeadGesturePlugin(control)
+        result = head.dispatch("look_left", {})
+        self.assertTrue(result["success"], result)
+        self.assertAlmostEqual(
+            control._target_q[ADAM_PRO_JOINTS.index("neckYaw")],
+            math.radians(45.0))
+
+    def test_pose_gestures_stay_inside_the_vendor_limits(self):
+        for plugin_class in (WaistGesturePlugin, HeadGesturePlugin):
+            ranges = {control: (row[2], row[3])
+                      for control, row in plugin_class._JOINT_CONTROLS.items()}
+            for table in (*plugin_class._POSES.values(),
+                          *[step[0] for steps in plugin_class._SEQUENCES.values()
+                            for step in steps]):
+                if table is None:
+                    continue
+                for control, degrees in table.items():
+                    self.assertIn(control, ranges, (plugin_class, control))
+                    minimum, maximum = ranges[control]
+                    self.assertGreaterEqual(degrees, minimum, control)
+                    self.assertLessEqual(degrees, maximum, control)
+
+    def test_pose_gestures_play_at_the_slower_ceiling(self):
+        control = self.arm_plugin()
+        original = control._set_targets
+        captured = {}
+
+        def _spy(targets, preferred_span=None, velocity_limit=None):
+            captured["velocity_limit"] = velocity_limit
+            return original(targets, preferred_span=preferred_span,
+                            velocity_limit=velocity_limit)
+
+        control._set_targets = _spy
+        HeadGesturePlugin(control).dispatch("look_left", {})
+        self.assertEqual(HeadGesturePlugin._VELOCITY_RAD_S,
+                         captured["velocity_limit"])
+
+    def test_sequence_reports_completion_and_leaves_the_axis_centred(self):
+        self.calls = []
+        original_notify = device._notify_action_completion
+        original = HeadGesturePlugin._SEQUENCES
+        device._notify_action_completion = (
+            lambda action_id, status, result, tool:
+            self.calls.append((action_id, status, result, tool)))
+        HeadGesturePlugin._SEQUENCES = {
+            "nod": (({"pitch": 12.0}, 0.05), (None, 0.05)),
+        }
+        try:
+            control = self.arm_plugin()
+            head = HeadGesturePlugin(control)
+            result = head.dispatch("nod", {})
+            self.assertTrue(result["success"], result)
+            action_id = result["action_id"]
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not self.calls:
+                time.sleep(0.02)
+            self.assertEqual(1, len(self.calls), "sequence never completed")
+            _, status, payload, tool = self.calls[0]
+            self.assertEqual("completed", status)
+            self.assertEqual("nod", payload["gesture"])
+            self.assertEqual("head_gesture", tool)
+            hold = control._hold_q
+            for _, joint, _, _ in HEAD_JOINT_CONTROLS.values():
+                index = ADAM_PRO_JOINTS.index(joint)
+                self.assertAlmostEqual(control._target_q[index], hold[index],
+                                       places=6)
+        finally:
+            device._notify_action_completion = original_notify
+            HeadGesturePlugin._SEQUENCES = original
+
+    def test_stop_cancels_a_running_sequence(self):
+        self.calls = []
+        original_notify = device._notify_action_completion
+        original = WaistGesturePlugin._SEQUENCES
+        device._notify_action_completion = (
+            lambda action_id, status, result, tool:
+            self.calls.append((action_id, status, result, tool)))
+        WaistGesturePlugin._SEQUENCES = {
+            "bow": (({"pitch": 40.0}, 0.4), (None, 0.4)),
+        }
+        try:
+            control = self.arm_plugin()
+            waist = WaistGesturePlugin(control)
+            result = waist.dispatch("bow", {})
+            self.assertTrue(result["success"], result)
+            waist.dispatch("stop", {})
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not self.calls:
+                time.sleep(0.02)
+            self.assertEqual(1, len(self.calls), "sequence never reported")
+            _, status, payload, tool = self.calls[0]
+            self.assertEqual("cancelled", status)
+            self.assertEqual("waist_gesture", tool)
+            # `stop` also hands rt/lowcmd back, which clears the active flag.
+            self.assertFalse(control._active)
+        finally:
+            device._notify_action_completion = original_notify
+            WaistGesturePlugin._SEQUENCES = original
+
+    def test_gestures_declare_the_same_upper_body_resource(self):
+        for plugin_class in (WaistGesturePlugin, HeadGesturePlugin):
+            tool = plugin_class(self.arm_plugin()).get_tool()
+            self.assertEqual(["adam_upper_body"],
+                             tool["inputSchema"]["x-resource"])
+
+    def test_unknown_actions_fall_through(self):
+        control = self.arm_plugin()
+        self.assertIsNone(WaistGesturePlugin(control).dispatch("bogus", {}))
+        self.assertIsNone(HeadGesturePlugin(control).dispatch("bogus", {}))
 
 
 if __name__ == "__main__":
