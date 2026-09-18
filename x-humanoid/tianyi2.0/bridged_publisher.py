@@ -17,6 +17,7 @@ The bridge process handles:
 - Publishing to domain 42 with dds-local.xml for agent-core communication
 """
 
+import json
 import os
 import socket
 import struct
@@ -24,8 +25,8 @@ import threading
 from typing import Type, Any
 from rclpy.node import Node
 from rclpy.publisher import Publisher
-from rclpy.qos import QoSProfile
-from rclpy.serialization import serialize_message
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.serialization import deserialize_message, serialize_message
 
 
 class BridgedPublisher:
@@ -165,6 +166,166 @@ class BridgedPublisher:
         return self.topic
 
 
+class BridgedSubscription:
+    """Subscription that receives from the bridge process via Unix socket.
+
+    The mirror of BridgedPublisher, and the half that did not exist. A card on
+    the main process cannot subscribe on domain 42: that participant runs under
+    the vendor DDS profile so the body link on 192.168.41.x survives, and it is
+    invisible to agent-core. The bridge process, which does hold the loopback
+    profile, subscribes on its behalf and ships each message back down the same
+    socket the publishers use.
+
+    Two consequences worth knowing at the call site:
+
+      **The callback runs on this reader thread, not on the rclpy executor.**
+      Anything it touches must be safe to touch from another thread. Nothing is
+      serialised against the node's timers.
+
+      **A dropped connection is silent by design.** The bridge may be starting,
+      restarting, or gone; the reader retries rather than raising, because the
+      alternative is a card that dies because a helper process blinked.
+    """
+
+    SOCKET_DIR = "/tmp/tianyi_bridge"
+    MAIN_SOCKET = "bridge_main.sock"
+    RETRY_S = 1.0
+
+    def __init__(self, node: Node, msg_type: Type, topic: str, callback,
+                 qos: QoSProfile):
+        self.node = node
+        self.msg_type = msg_type
+        self.topic = topic
+        self.callback = callback
+        self.qos = qos
+        self._socket = None
+        self._stop = threading.Event()
+        self._msg_count = 0
+        self.socket_path = os.path.join(self.SOCKET_DIR, self.MAIN_SOCKET)
+
+        self._thread = threading.Thread(
+            target=self._run, name=f"bridged-sub{topic.replace('/', '-')}",
+            daemon=True)
+        self._thread.start()
+
+    # ── the reader ───────────────────────────────────────────────────────────
+
+    def _run(self):
+        while not self._stop.is_set():
+            if not self._connect():
+                self._stop.wait(self.RETRY_S)
+                continue
+            try:
+                self._pump()
+            except Exception as e:      # noqa: BLE001 — reconnect, do not die
+                if not self._stop.is_set():
+                    print(f"[bridged_sub] {self.topic}: link lost ({e}), retrying",
+                          flush=True)
+            finally:
+                self._close_socket()
+            self._stop.wait(self.RETRY_S)
+
+    def _connect(self) -> bool:
+        try:
+            if not os.path.exists(self.socket_path):
+                return False
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(self.socket_path)
+
+            module_parts = self.msg_type.__module__.split(".")
+            msg_type_str = (f"{module_parts[0]}/{module_parts[1]}/{self.msg_type.__name__}"
+                            if len(module_parts) >= 2
+                            else f"{self.msg_type.__module__}/{self.msg_type.__name__}")
+
+            metadata = {
+                "topic": self.topic,
+                "msg_type": msg_type_str,
+                "direction": "in",
+                # Passed rather than assumed: the bridge has to match whatever is
+                # publishing on domain 42, and a QoS mismatch moves no data while
+                # both ends look healthy.
+                "qos": {
+                    "reliability": ("reliable"
+                                    if self.qos.reliability == ReliabilityPolicy.RELIABLE
+                                    else "best_effort"),
+                    "depth": int(getattr(self.qos, "depth", 1) or 1),
+                },
+            }
+            payload = json.dumps(metadata).encode("utf-8")
+            sock.sendall(struct.pack("<I", len(payload)))
+            sock.sendall(payload)
+
+            self._socket = sock
+            print(f"[bridged_sub] {self.topic}: subscribed via bridge", flush=True)
+            return True
+        except Exception as e:      # noqa: BLE001
+            print(f"[bridged_sub] {self.topic}: connect failed: {e}", flush=True)
+            self._close_socket()
+            return False
+
+    def _recv_exactly(self, count: int):
+        buffer = b""
+        while len(buffer) < count:
+            chunk = self._socket.recv(min(count - len(buffer), 65536))
+            if not chunk:
+                return None
+            buffer += chunk
+        return buffer
+
+    def _pump(self):
+        while not self._stop.is_set():
+            header = self._recv_exactly(4)
+            if header is None:
+                return                                  # bridge closed
+            payload = self._recv_exactly(struct.unpack("<I", header)[0])
+            if payload is None:
+                return
+            message = deserialize_message(payload, self.msg_type)
+            self._msg_count += 1
+            try:
+                self.callback(message)
+            except Exception as e:      # noqa: BLE001
+                # A caller's bug must not kill the link, or one bad frame ends
+                # the subscription for good.
+                print(f"[bridged_sub] {self.topic}: callback raised: {e}",
+                      flush=True)
+
+    def _close_socket(self):
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except Exception:       # noqa: BLE001
+                pass
+            self._socket = None
+
+    # ── rclpy.Subscription-shaped surface ────────────────────────────────────
+
+    def destroy(self) -> None:
+        self._stop.set()
+        self._close_socket()
+
+    @property
+    def topic_name(self) -> str:
+        return self.topic
+
+
+def create_bridged_subscription(
+    node: Node,
+    msg_type: Type,
+    topic: str,
+    callback,
+    qos: QoSProfile,
+) -> BridgedSubscription:
+    """Create a bridged subscription (drop-in for node.create_subscription)."""
+    subscription = BridgedSubscription(node, msg_type, topic, callback, qos)
+    # Tracked on the node so destroy_node can close it: rclpy knows nothing
+    # about this object, so without the registry a start/stop cycle leaves the
+    # reader thread and its socket alive — the orphaned-subscription failure
+    # this repo has already paid for once elsewhere.
+    node.__dict__.setdefault("_bridged_subscriptions", []).append(subscription)
+    return subscription
+
+
 def create_bridged_publisher(
     node: Node,
     msg_type: Type,
@@ -197,9 +358,18 @@ def should_use_bridge(topic: str) -> bool:
     Returns:
         True if should use bridge, False for direct publish
     """
-    # Bridge all state/sensor topics that go to agent-core
+    # Bridge all state/sensor topics that go to agent-core.
+    #
+    # `/servo/` is here because the servo card's state output is
+    # `/nvidia_desktop/servo/state`, which does NOT contain "/state/" — the
+    # segment is last, so there is no trailing slash. It therefore published
+    # straight onto the invisible domain-42 participant and agent-core never saw
+    # it, which broke the vla -> servo -> (state) -> vla feedback loop in the
+    # direction nobody was looking at. Substring matching on a path is what made
+    # that possible; the list stays, but this is the trap it sets.
     bridge_patterns = [
         "/state/",
+        "/servo/",
         "/camera/",
         "/asr/",
         "/nav/",
@@ -208,6 +378,23 @@ def should_use_bridge(topic: str) -> bool:
     ]
 
     return any(pattern in topic for pattern in bridge_patterns)
+
+
+def should_bridge_subscription(topic: str) -> bool:
+    """Every domain-42 subscription must be bridged. There is no other path.
+
+    Deliberately not a whitelist, unlike the publisher side. A publisher on the
+    main process's domain-42 participant at least *works* for anything already
+    on that participant, so choosing per topic is meaningful. A subscription
+    there can never receive anything at all — the participant is invisible to
+    agent-core — so a topic left off a list would not fall back to a slower
+    path, it would fall back to silence.
+
+    The `topic` argument is kept so the decision has somewhere to live if a
+    genuine exception ever appears.
+    """
+    del topic
+    return True
 
 
 def create_smart_publisher(
