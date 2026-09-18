@@ -44,6 +44,8 @@ class U1Nodes:
 
         self.robot = Node("u1_pro_driver", context=ros.ctx_robot)
         self.core = Node("u1_pro_bridge", namespace=namespace, context=ros.ctx_core)
+        ros.executor_robot.add_node(self.robot)
+        ros.executor_core.add_node(self.core)
         self.namespace = namespace
         self.mic_topic = f"/{namespace}/mic/audio"
         self.AudioChunk = AudioChunk

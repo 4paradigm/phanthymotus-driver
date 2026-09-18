@@ -12,7 +12,7 @@ def _install_stubs():
     node = types.ModuleType("rclpy.node")
     node.Node = object
     qos = types.ModuleType("rclpy.qos")
-    qos.QoSProfile = object
+    qos.QoSProfile = lambda **kwargs: kwargs
     qos.ReliabilityPolicy = types.SimpleNamespace(RELIABLE=1, BEST_EFFORT=2)
     common.node, common.qos = node, qos
     sys.modules.update({"rclpy": common, "rclpy.node": node, "rclpy.qos": qos})
@@ -63,6 +63,53 @@ class U1CardContractTests(unittest.TestCase):
         self.assertTrue(hasattr(device, "MicPlugin"))
         self.assertTrue(hasattr(device, "SpeakerPlugin"))
         self.assertTrue(hasattr(device, "AudioPlugin"))
+
+    def test_nodes_are_registered_with_the_matching_domain_executors(self):
+        import device
+
+        class FakeExecutor:
+            def __init__(self):
+                self.nodes = []
+
+            def add_node(self, node):
+                self.nodes.append(node)
+
+        class FakeRos:
+            ctx_robot = object()
+            ctx_core = object()
+
+            def __init__(self):
+                self.executor_robot = FakeExecutor()
+                self.executor_core = FakeExecutor()
+
+        class FakeNode:
+            def __init__(self, name, **kwargs):
+                self.name = name
+
+            def create_publisher(self, *args, **kwargs):
+                return types.SimpleNamespace(publish=lambda message: None)
+
+            def create_subscription(self, *args, **kwargs):
+                return types.SimpleNamespace()
+
+            def create_client(self, srv_type, name):
+                return types.SimpleNamespace(srv_name=name)
+
+            def destroy_node(self):
+                pass
+
+            def destroy_subscription(self, subscription):
+                pass
+
+        original_node = sys.modules["rclpy.node"].Node
+        sys.modules["rclpy.node"].Node = FakeNode
+        try:
+            ros = FakeRos()
+            nodes = device.U1Nodes({}, "test", ros)
+            self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
+            self.assertEqual(ros.executor_core.nodes, [nodes.core])
+        finally:
+            sys.modules["rclpy.node"].Node = original_node
 
 
 if __name__ == "__main__":
