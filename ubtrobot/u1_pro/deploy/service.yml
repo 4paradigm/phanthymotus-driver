@@ -1,0 +1,13 @@
+ubtrobot-u1-pro:
+  image: __IMAGE__
+  container_name: embodied-ubtrobot-u1-pro
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - PYTHONUNBUFFERED=1
+  restart: unless-stopped

@@ -1,0 +1,26 @@
+id: ubtrobot-u1-pro-driver
+name: UBTECH U1 Pro Driver
+category: driver
+hardware_provider: ubtrobot
+hardware_model: "u1_pro"
+image_name: ubtrobot-u1-pro
+port: 15723
+mcp_url: "http://localhost:15723/mcp"
+description: "UBTECH U1 Pro public robo_sdk ROS 2 interfaces: authorization, system state, wakeup, vision, audio, video, and events"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: auth, type: actuator }
+  - { name: system, type: actuator }
+  - { name: wakeup, type: actuator }
+  - { name: vision, type: actuator }
+  - { name: audio, type: actuator }
+  - { name: audio_stream, type: actuator }
+  - { name: video_stream, type: actuator }
+  - { name: ready_state, type: sensor }
+  - { name: playback_state, type: sensor }
+  - { name: main_wakeup_word, type: sensor }
+  - { name: wakeup_event, type: sensor }
+  - { name: wakeup_state, type: sensor }
+  - { name: doa_event, type: sensor }
+  - { name: video_metadata, type: sensor }
