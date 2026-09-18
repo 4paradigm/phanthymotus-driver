@@ -128,6 +128,9 @@ class VirtualWorld:
         self._speech_queue: list[Utterance] = []
         self._events: list[dict] = []
         self._manual = (0.0, 0.0)
+        self._trail: list[tuple[float, float]] = []
+        self._trail_step = float(cfg.get("trail_step_m", 0.15))
+        self._trail_max = int(cfg.get("trail_max_points", 4000))
 
         self._on_nav_terminal = None
         self._on_speech_terminal = None
@@ -184,6 +187,7 @@ class VirtualWorld:
             else:
                 self._backend.apply(self._drive_command_locked())
                 self._backend.step(dt)
+                self._record_trail_locked()
                 nav_done = self._update_job_locked()
             speech_done = self._update_speech_locked()
 
@@ -386,6 +390,20 @@ class VirtualWorld:
         self._events.append(record)
         return record
 
+    def _record_trail_locked(self) -> None:
+        """Where the robot has actually been — the map card draws it, and
+        'did it ever enter an occupied cell' is answered from it."""
+        pose: Pose = self._backend.state()["pose"]
+        if self._trail and math.hypot(pose.x - self._trail[-1][0], pose.y - self._trail[-1][1]) < self._trail_step:
+            return
+        self._trail.append((round(pose.x, 3), round(pose.y, 3)))
+        if len(self._trail) > self._trail_max:
+            del self._trail[:len(self._trail) - self._trail_max]
+
+    def trail(self) -> list[tuple[float, float]]:
+        with self._lock:
+            return list(self._trail)
+
     def events(self, since: float | None = None) -> list[dict]:
         with self._lock:
             if since is None:
@@ -420,6 +438,7 @@ class VirtualWorld:
             self._speech_queue = []
             self._events = []
             self._manual = (0.0, 0.0)
+            self._trail = []
 
 
 def _sign(value: float) -> float:
