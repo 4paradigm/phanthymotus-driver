@@ -1044,7 +1044,7 @@ class CartesianPlugin:
         }
         schema = action_schema(
             {
-                "move_a_to_b": ([
+                "move": ([
                     "b_x_mm", "b_y_mm", "b_z_mm", "b_rx_deg", "b_ry_deg", "b_rz_deg",
                     "motion_mode", "speed_percent", "cartesian_enabled", "confirm_motion",
                 ], "自动读取当前 TCP 为 A 点，再以关节空间或 TCP 直线运动到基坐标系 B 点"),
@@ -1053,7 +1053,7 @@ class CartesianPlugin:
             },
             properties,
         )
-        schema["x-completion"] = {"actions": ["move_a_to_b"], "timeout": 305}
+        schema["x-completion"] = {"actions": ["move"], "timeout": 305}
         schema["x-hooks"] = {
             "on_interrupt_motion": {"action": "stopmotion"},
             "on_interrupt_all": {"action": "stopmotion"},
@@ -1094,7 +1094,7 @@ class CartesianPlugin:
             return self._motion_status()
         if action == "stopmotion":
             return self._stop_motion()
-        if action == "move_a_to_b":
+        if action == "move":
             return self._start_a_to_b(args)
         if action == "move_offset":
             raise ValueError("move_offset is no longer supported")
@@ -1263,7 +1263,7 @@ class CartesianPlugin:
             and not (isinstance(args.get(field), str) and not args.get(field).strip())
         ]
         if not supplied_fields:
-            raise ValueError("move_a_to_b requires at least one B pose field")
+            raise ValueError("move requires at least one B pose field")
         if not callable(getattr(self.client, "command_trajectory", None)):
             raise RuntimeError("RM75 SDK client does not support controller trajectory completion")
 
@@ -1316,7 +1316,7 @@ class CartesianPlugin:
             daemon=True,
             name=f"rm75-a-to-b-watchdog-to-b-{action_id}",
         ).start()
-        print(f"[rm75 ACP] {action_id}: started (move_a_to_b)", flush=True)
+        print(f"[rm75 ACP] {action_id}: started (move)", flush=True)
         return {"state": "running", "action_id": action_id}
 
     def _a_to_b_result(self, state, reason, **extra):
@@ -1351,21 +1351,26 @@ class CartesianPlugin:
             ).start()
 
         try:
-            self._submit(
-                "movej_p" if state_snapshot["motion_mode"] == "joint" else "movel",
-                target_args,
-                target,
-                state_snapshot["speed_percent"],
-                wait_for_completion=True,
-                completion_callback=on_controller_event,
-            )
-            # stopmotion may race the very small interval between the final
-            # cancellation check and the SDK call.  Repeat slow-stop after a
-            # late submission so that request cannot leave an untracked move.
-            with self._action_lock:
-                cancelled_after_submit = action_id in self._cancelled
-            if cancelled_after_submit:
-                self._request_slow_stop()
+            # The final cancellation check and SDK submission are one critical
+            # section shared with stopmotion.  If stop marks the action first,
+            # submission exits without moving.  If submission wins, stop waits
+            # here and sends rm_set_arm_slow_stop before it returns.
+            with self._submission_lock:
+                with self._action_lock:
+                    state = self._a_to_b_actions.get(action_id)
+                    if (state is None or state["stage"] != segment
+                            or action_id in self._cancelled
+                            or action_id in self._terminal_action_ids):
+                        return
+                    state_snapshot = dict(state)
+                self._submit(
+                    "movej_p" if state_snapshot["motion_mode"] == "joint" else "movel",
+                    target_args,
+                    target,
+                    state_snapshot["speed_percent"],
+                    wait_for_completion=True,
+                    completion_callback=on_controller_event,
+                )
         except Exception as exc:
             with self._action_lock:
                 state = self._a_to_b_actions.get(action_id)
@@ -2009,24 +2014,23 @@ class CartesianPlugin:
             return None
 
         def worker():
-            # 运动使用 block=0；停止走同一个串行 SDK 入口，避免并发访问句柄。
-            interrupt = getattr(self.client, "command_interrupt", None)
-            if callable(interrupt):
-                try:
-                    interrupt("rm_set_arm_slow_stop")
-                except Exception as exc:
-                    print(f"[rm75] cartesian slow-stop failed: {exc}", flush=True)
-                return
-            # 兼容不提供独立停止通道的旧客户端。
+            # Serialize watchdog/error stops with every motion submission.
             with self._submission_lock:
                 try:
-                    self.client.command("rm_set_arm_slow_stop")
+                    self._send_slow_stop()
                 except Exception as exc:
                     print(f"[rm75] cartesian slow-stop failed: {exc}", flush=True)
 
         thread = threading.Thread(target=worker, daemon=True, name="rm75-cartesian-slow-stop")
         thread.start()
         return thread
+
+    def _send_slow_stop(self):
+        """Send slow-stop while the caller owns _submission_lock."""
+        interrupt = getattr(self.client, "command_interrupt", None)
+        if callable(interrupt):
+            return interrupt("rm_set_arm_slow_stop")
+        return self.client.command("rm_set_arm_slow_stop")
 
     def _stop_motion(self):
         # 运动锁和动作 ID 在两张卡之间共享；任一 stop 卡都必须能停止实际持有者。
@@ -2038,10 +2042,15 @@ class CartesianPlugin:
                 self._cancelled.add(action_id)
         if action_id and owns_action:
             self._invalidate_confirmed_pose()
-        if action_id and self.client.connected:
-            self._request_slow_stop()
-        if action_id and owns_action:
-            self._finish_after_stop(action_id, "cancelled", {"reason": "stopmotion"})
+        try:
+            if action_id and self.client.connected:
+                # Synchronous ordering barrier: stopmotion cannot return while
+                # an already-claimed submission can still start afterwards.
+                with self._submission_lock:
+                    self._send_slow_stop()
+        finally:
+            if action_id and owns_action:
+                self._finish_after_stop(action_id, "cancelled", {"reason": "stopmotion"})
         return {"state": "stop_requested", "action_id": action_id}
 
     def _finish_after_stop(self, action_id, status, result):

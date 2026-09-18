@@ -430,15 +430,16 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("actuator", tools[0]["type"])
         schema = tools[0]["inputSchema"]
         self.assertIs(True, schema["x-is-dangerous"])
-        self.assertEqual(["move_a_to_b"], schema["x-completion"]["actions"])
+        self.assertEqual(["move"], schema["x-completion"]["actions"])
         self.assertIn("confirm_motion", schema["properties"])
         self.assertEqual(False, schema["properties"]["cartesian_enabled"]["default"])
         self.assertNotIn("move_offset", schema["x-action-params"])
-        self.assertIn("move_a_to_b", schema["x-action-params"])
+        self.assertNotIn("move_a_to_b", schema["x-action-params"])
+        self.assertIn("move", schema["x-action-params"])
         self.assertNotIn("a_x_mm", schema["properties"])
-        self.assertNotIn("a_x_mm", schema["x-action-params"]["move_a_to_b"]["params"])
-        self.assertIn("b_rz_deg", schema["x-action-params"]["move_a_to_b"]["params"])
-        self.assertIn("motion_mode", schema["x-action-params"]["move_a_to_b"]["params"])
+        self.assertNotIn("a_x_mm", schema["x-action-params"]["move"]["params"])
+        self.assertIn("b_rz_deg", schema["x-action-params"]["move"]["params"])
+        self.assertIn("motion_mode", schema["x-action-params"]["move"]["params"])
         self.assertEqual(["joint", "linear"], schema["properties"]["motion_mode"]["enum"])
         self.assertEqual("joint", schema["properties"]["motion_mode"]["default"])
         self.assertEqual(10, schema["properties"]["speed_percent"]["maximum"])
@@ -499,7 +500,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             (action_id, status, result)
         )
 
-        started = self.plugin.dispatch("move_a_to_b", self._a_to_b_args())
+        started = self.plugin.dispatch("move", self._a_to_b_args())
         self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
         movej_p_calls = [call for call in self.client.calls if call[0] == "rm_movej_p"]
         self.assertEqual(1, len(movej_p_calls))
@@ -546,7 +547,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             (action_id, status, result)
         )
 
-        self.plugin.dispatch("move_a_to_b", {
+        self.plugin.dispatch("move", {
             "b_x_mm": 150,
             "b_y_mm": 0,
             "b_z_mm": 250,
@@ -587,7 +588,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         )
 
         self.plugin.dispatch(
-            "move_a_to_b",
+            "move",
             self._a_to_b_args(motion_mode="linear"),
         )
         self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
@@ -599,7 +600,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
     def test_move_a_to_b_requires_at_least_one_b_field(self):
         with self.assertRaisesRegex(ValueError, "at least one B pose field"):
-            self.plugin.dispatch("move_a_to_b", {
+            self.plugin.dispatch("move", {
                 "speed_percent": 5,
                 "cartesian_enabled": True,
                 "confirm_motion": True,
@@ -608,7 +609,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
     def test_move_a_to_b_rejects_unknown_motion_mode(self):
         with self.assertRaisesRegex(ValueError, "motion_mode must be 'joint' or 'linear'"):
             self.plugin.dispatch(
-                "move_a_to_b",
+                "move",
                 self._a_to_b_args(motion_mode="curve"),
             )
         self.assertFalse(self.plugin._motion_lock.locked())
@@ -641,7 +642,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             (action_id, status, result)
         )
 
-        self.plugin.dispatch("move_a_to_b", self._a_to_b_args())
+        self.plugin.dispatch("move", self._a_to_b_args())
         self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
         callbacks[0](False)
 
@@ -653,6 +654,81 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual(1, len([call for call in self.client.calls if call[0] == "rm_movej_p"]))
         self.assertEqual("ready", self.plugin._motion_status()["state"])
         self.assertFalse(self.plugin._motion_lock.locked())
+
+    def test_move_a_to_b_stop_waits_for_claimed_submission_then_stops(self):
+        callbacks = []
+
+        class EventClient(self.FakeClient):
+            def command_trajectory(self, method, *args, completion_callback=None):
+                self.calls.append((method, args))
+                callbacks.append(completion_callback)
+                return 0
+
+            def cancel_trajectory_wait(self):
+                self.calls.append(("cancel_trajectory_wait", ()))
+                return True
+
+            def command_interrupt(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+        self.client = EventClient([0.0, 0.0, 200.0, 0.0, 0.0, 0.0])
+        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {
+                "safety": dict(self.FAST_SAFETY),
+                "cartesian": {"enabled": True, "stop_finalize_seconds": 0.01},
+            },
+            arm_plugin=self.arm,
+            namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        submit_claimed = threading.Event()
+        allow_sdk_submit = threading.Event()
+        original_submit = self.plugin._submit
+
+        def gated_submit(*args, **kwargs):
+            # _submit_a_to_b_segment has completed its final cancellation check
+            # and owns _submission_lock, but has not entered the SDK yet.
+            submit_claimed.set()
+            allow_sdk_submit.wait(2.0)
+            return original_submit(*args, **kwargs)
+
+        self.plugin._submit = gated_submit
+        started = self.plugin.dispatch("move", self._a_to_b_args())
+        self.assertTrue(submit_claimed.wait(1.0))
+
+        stop_result = {}
+        stop_done = threading.Event()
+
+        def stop_motion():
+            try:
+                stop_result["value"] = self.plugin.dispatch("stopmotion", {})
+            finally:
+                stop_done.set()
+
+        stop_thread = threading.Thread(target=stop_motion)
+        stop_thread.start()
+        self.assertTrue(self._wait_for(lambda: started["action_id"] in self.plugin._cancelled))
+        self.assertFalse(stop_done.is_set())
+
+        allow_sdk_submit.set()
+        stop_thread.join(2.0)
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(
+            {"state": "stop_requested", "action_id": started["action_id"]},
+            stop_result["value"],
+        )
+        command_order = [call[0] for call in self.client.calls]
+        self.assertLess(command_order.index("rm_movej_p"), command_order.index("rm_set_arm_slow_stop"))
+        self.assertTrue(stop_done.is_set())
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        self.assertEqual((started["action_id"], "cancelled"), self.acp_events[0][:2])
+        self.assertEqual("ready", self.plugin._motion_status()["state"])
 
     def test_move_a_to_b_timeout_releases_lock_for_next_action(self):
         class EventlessClient(self.FakeClient):
@@ -684,13 +760,13 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             (action_id, status, result)
         )
 
-        first = self.plugin.dispatch("move_a_to_b", self._a_to_b_args())
+        first = self.plugin.dispatch("move", self._a_to_b_args())
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         self.assertEqual((first["action_id"], "error"), self.acp_events[0][:2])
         self.assertEqual("to_b", self.acp_events[0][2]["failed_segment"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
 
-        second = self.plugin.dispatch("move_a_to_b", self._a_to_b_args())
+        second = self.plugin.dispatch("move", self._a_to_b_args())
         self.assertNotEqual(first["action_id"], second["action_id"])
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
         self.assertEqual((second["action_id"], "error"), self.acp_events[1][:2])
@@ -699,7 +775,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.client.command_trajectory = mock.Mock()
         with self.assertRaisesRegex(ValueError, "exceeds"):
             self.plugin.dispatch(
-                "move_a_to_b",
+                "move",
                 self._a_to_b_args(b_x_mm=2000),
             )
         self.assertFalse(self.plugin._motion_lock.locked())
@@ -1501,8 +1577,9 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("controller_rejected_trajectory", payload["reason"])
         self.assertFalse(self.plugin._motion_lock.locked())
 
-    def test_stopmotion_does_not_hold_action_lock_during_sdk_call(self):
-        # SDK 慢停无超时上限：stopmotion 必须立即返回，终态不能被慢停调用堵住。
+    def test_stopmotion_waits_for_slow_stop_without_holding_action_lock(self):
+        # Safety ordering may wait for the SDK slow-stop, but it must not hold
+        # _action_lock while waiting: info remains available during the call.
         gate = threading.Event()
 
         class SlowStopClient(self.FakeClient):
@@ -1523,14 +1600,24 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.plugin.dispatch("movel", self._movel_args())
         self.assertTrue(self._wait_for(lambda: self.plugin._active_action_id is not None))
 
-        start = time.time()
-        stop = self.plugin.dispatch("stopmotion", {})
-        self.assertLess(time.time() - start, 1.0)
-        self.assertEqual("stop_requested", stop["state"])
+        stop_result = {}
+        stop_done = threading.Event()
+
+        def stop_motion():
+            stop_result["value"] = self.plugin.dispatch("stopmotion", {})
+            stop_done.set()
+
+        stopper = threading.Thread(target=stop_motion)
+        stopper.start()
+        time.sleep(0.1)
+        self.assertFalse(stop_done.is_set())
         start = time.time()
         self.plugin.dispatch("info", {})  # 慢停阻塞期间 info 应立即可达
         self.assertLess(time.time() - start, 1.0)
         gate.set()
+        stopper.join(5.0)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual("stop_requested", stop_result["value"]["state"])
         self.assertTrue(self._wait_for(lambda: self.plugin._active_action_id is None, timeout=5.0))
 
     def test_stopmotion_cancels_and_slow_stops(self):
@@ -1624,7 +1711,9 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         stopper = threading.Thread(target=lambda: (self.plugin.dispatch("stopmotion", {}), stop_done.set()))
         stopper.start()
         time.sleep(0.1)
-        self.assertTrue(stop_done.is_set())  # 取消请求不得等待在途下发或 SDK 慢停
+        # stopmotion must wait for the claimed submitter, then issue slow-stop;
+        # it cannot return while rm_movel could still begin afterwards.
+        self.assertFalse(stop_done.is_set())
         gate.set()
         stopper.join(5.0)
         mover.join(5.0)
