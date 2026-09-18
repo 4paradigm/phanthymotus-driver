@@ -421,19 +421,19 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         return args
 
     def test_plugin_prefix_contract(self):
-        self.assertEqual("cartesian_control", self.device.CartesianPlugin.PREFIX)
+        self.assertEqual("abs_move", self.device.CartesianPlugin.PREFIX)
 
     def test_tool_schema_declares_safety_contract(self):
         tools = self.plugin.get_tools()
         self.assertEqual(1, len(tools))
-        self.assertEqual("cartesian_control", tools[0]["name"])
+        self.assertEqual("abs_move", tools[0]["name"])
         self.assertEqual("actuator", tools[0]["type"])
         schema = tools[0]["inputSchema"]
         self.assertIs(True, schema["x-is-dangerous"])
-        self.assertEqual(["move_offset", "move_a_to_b"], schema["x-completion"]["actions"])
+        self.assertEqual(["move_a_to_b"], schema["x-completion"]["actions"])
         self.assertIn("confirm_motion", schema["properties"])
         self.assertEqual(False, schema["properties"]["cartesian_enabled"]["default"])
-        self.assertIn("cartesian_enabled", schema["x-action-params"]["move_offset"]["params"])
+        self.assertNotIn("move_offset", schema["x-action-params"])
         self.assertIn("move_a_to_b", schema["x-action-params"])
         self.assertNotIn("a_x_mm", schema["properties"])
         self.assertNotIn("a_x_mm", schema["x-action-params"]["move_a_to_b"]["params"])
@@ -446,7 +446,9 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertNotIn("movep", schema["x-action-params"])
         self.assertNotIn("x_mm", schema["properties"])
         self.assertNotIn("waypoints", schema["properties"])
-        self.assertEqual(["tool"], schema["properties"]["frame_type"]["enum"])
+        for removed_field in (
+                "dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg", "frame_type"):
+            self.assertNotIn(removed_field, schema["properties"])
         self.assertEqual(
             {
                 "on_interrupt_motion": {"action": "stopmotion"},
@@ -454,7 +456,19 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             },
             schema["x-hooks"],
         )
-        self.assertIn("工具系偏移", tools[0]["description"])
+        self.assertEqual("做绝对位置下的移动", tools[0]["description"])
+
+    def test_move_offset_is_rejected_without_submitting_motion(self):
+        with self.assertRaisesRegex(ValueError, "move_offset is no longer supported"):
+            self.plugin.dispatch("move_offset", {
+                "dx_mm": 20,
+                "frame_type": "tool",
+                "speed_percent": 5,
+                "cartesian_enabled": True,
+                "confirm_motion": True,
+            })
+        self.assertEqual([], self.client.calls)
+        self.assertFalse(self.plugin._motion_lock.locked())
 
     def test_move_a_to_b_reads_current_pose_as_a_and_submits_only_b(self):
         callbacks = []
@@ -760,7 +774,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
     def test_move_offset_maps_frame_and_computes_target(self):
         self.client.pose_mm_deg = [300.0, 0.0, 200.0, 0.0, 0.0, 0.0]
-        result = self.plugin.dispatch("move_offset", {
+        result = self.plugin._start_cartesian("move_offset", {
             "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
             "frame_type": "tool", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
@@ -781,7 +795,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
     def test_move_offset_empty_fields_mean_no_offset(self):
         self.client.pose_mm_deg = [300.0, 0.0, 200.0, 0.0, 0.0, 0.0]
-        result = self.plugin.dispatch("move_offset", {
+        result = self.plugin._start_cartesian("move_offset", {
             "dx_mm": 50, "dy_mm": "", "drz_deg": None,
             "frame_type": "tool", "speed_percent": 5,
             "cartesian_enabled": True, "confirm_motion": True,
@@ -824,7 +838,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             (action_id, status, result)
         )
 
-        started = self.plugin.dispatch("move_offset", {
+        started = self.plugin._start_cartesian("move_offset", {
             "dx_mm": 20, "frame_type": "tool", "speed_percent": 5,
             "cartesian_enabled": True, "confirm_motion": True,
         })
@@ -858,7 +872,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.client.pose_mm_deg = [850.0, 0.0, 240.5, 0.0, 0.0, 0.0]
 
         with self.assertRaisesRegex(ValueError, "horizontal radius 900 mm exceeds"):
-            plugin.dispatch("move_offset", {
+            plugin._start_cartesian("move_offset", {
                 "dx_mm": 50,
                 "frame_type": "tool",
                 "speed_percent": 5,
@@ -875,7 +889,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.arm._preflight = mock.Mock(side_effect=RuntimeError("joint 3 is disabled"))
 
         with self.assertRaisesRegex(RuntimeError, "joint 3 is disabled"):
-            self.plugin.dispatch("move_offset", {
+            self.plugin._start_cartesian("move_offset", {
                 "dx_mm": 20,
                 "frame_type": "tool",
                 "speed_percent": 5,
@@ -901,7 +915,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
         self.plugin._validated_offset_target = invalidate_after_validation
         with self.assertRaisesRegex(RuntimeError, "reference pose changed"):
-            self.plugin.dispatch("move_offset", {
+            self.plugin._start_cartesian("move_offset", {
                 "dx_mm": 20,
                 "frame_type": "tool",
                 "speed_percent": 5,
@@ -949,7 +963,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             "cartesian_enabled": True, "confirm_motion": True,
         }
 
-        first = self.plugin.dispatch("move_offset", args)
+        first = self.plugin._start_cartesian("move_offset", args)
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         self.assertEqual((first["action_id"], "completed"), self.acp_events[0][:2])
         self.assertEqual(
@@ -957,7 +971,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             self.acp_events[0][2]["target_pose_mm_deg"],
         )
 
-        second = self.plugin.dispatch("move_offset", args)
+        second = self.plugin._start_cartesian("move_offset", args)
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
         self.assertEqual((second["action_id"], "completed"), self.acp_events[1][:2])
         self.assertEqual(
@@ -976,7 +990,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual(2, len(movel_calls))
         self.assertAlmostEqual(0.35, movel_calls[0][1][0][0], places=6)
         self.assertAlmostEqual(0.4, movel_calls[1][1][0][0], places=6)
-        self.assertIs(False, self.plugin._motion_status()["native_tool_offset_supported"])
+        self.assertIs(False, self.plugin._native_tool_offset_supported)
 
     def test_controller_event_releases_action_when_sdk_wrapper_call_stays_blocked(self):
         entered = threading.Event()
@@ -1015,7 +1029,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             "cartesian_enabled": True, "confirm_motion": True,
         }
 
-        first = self.plugin.dispatch("move_offset", args)
+        first = self.plugin._start_cartesian("move_offset", args)
         self.assertTrue(entered.wait(1.0))
         callbacks[0](True)
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
@@ -1023,7 +1037,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("ready", self.plugin._motion_status()["state"])
 
         entered.clear()
-        second = self.plugin.dispatch("move_offset", args)
+        second = self.plugin._start_cartesian("move_offset", args)
         self.assertTrue(entered.wait(1.0))
         callbacks[1](True)
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
@@ -1072,7 +1086,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             "cartesian_enabled": True, "confirm_motion": True,
         }
 
-        first = self.plugin.dispatch("move_offset", args)
+        first = self.plugin._start_cartesian("move_offset", args)
         self.assertTrue(entered.wait(1.0))
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         self.assertEqual((first["action_id"], "error"), self.acp_events[0][:2])
@@ -1080,7 +1094,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("ready", self.plugin._motion_status()["state"])
 
         entered.clear()
-        second = self.plugin.dispatch("move_offset", args)
+        second = self.plugin._start_cartesian("move_offset", args)
         self.assertTrue(entered.wait(1.0))
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
         self.assertEqual((second["action_id"], "error"), self.acp_events[1][:2])
@@ -1124,7 +1138,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
             (action_id, status, result)
         )
-        started = self.plugin.dispatch("move_offset", {
+        started = self.plugin._start_cartesian("move_offset", {
             "dx_mm": 20, "frame_type": "tool", "speed_percent": 5,
             "cartesian_enabled": True, "confirm_motion": True,
         })
@@ -1173,20 +1187,20 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             "cartesian_enabled": True, "confirm_motion": True,
         }
 
-        first = self.plugin.dispatch("move_offset", args)
+        first = self.plugin._start_cartesian("move_offset", args)
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         self.assertEqual((first["action_id"], "error"), self.acp_events[0][:2])
         self.assertEqual("controller completion event timed out", self.acp_events[0][2]["reason"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
 
-        second = self.plugin.dispatch("move_offset", args)
+        second = self.plugin._start_cartesian("move_offset", args)
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
         self.assertEqual((second["action_id"], "error"), self.acp_events[1][:2])
 
     def test_move_offset_rotated_tool_frame_transforms_target(self):
         # reviewer 示例：90° yaw 下工具系 +X 偏移应沿基系 +Y 移动，监控目标必须经旋转变换
         self.client.pose_mm_deg = [0.0, 0.0, 0.0, 0.0, 0.0, 90.0]
-        self.plugin.dispatch("move_offset", {
+        self.plugin._start_cartesian("move_offset", {
             "dx_mm": 100, "dy_mm": 0, "dz_mm": 0,
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
             "frame_type": "tool", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
@@ -1206,7 +1220,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
     def test_work_frame_offset_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "frame_type must be 'tool'"):
-            self.plugin.dispatch("move_offset", {
+            self.plugin._start_cartesian("move_offset", {
                 "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
                 "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
                 "frame_type": "work", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
@@ -1258,7 +1272,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         # 目标 (50, 0, ~912)，旧代码曾报「radius 914 exceeds 610」误拒。
         plugin = self._real_cartesian_plugin()
         self.client.pose_mm_deg = [0.0, 0.0, 1112.0, 0.0, 0.0, 0.0]
-        result = plugin.dispatch("move_offset", {
+        result = plugin._start_cartesian("move_offset", {
             "dx_mm": 50, "dy_mm": 0, "dz_mm": -200,
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
             "frame_type": "tool", "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
@@ -1287,7 +1301,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             arm_plugin=arm, namespace="rm75",
         )
 
-        result = plugin.dispatch("move_offset", {
+        result = plugin._start_cartesian("move_offset", {
             "dx_mm": 50, "dy_mm": 0, "dz_mm": 0,
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 0,
             "frame_type": "tool", "speed_percent": 5,
@@ -1381,7 +1395,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
     def test_acp_complete_requires_ca_cert(self):
         with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": ""}), \
                 mock.patch("urllib.request.urlopen") as urlopen:
-            self.device._acp_complete("test-noca", "completed", {"reason": "x"}, "cartesian_control")
+            self.device._acp_complete("test-noca", "completed", {"reason": "x"}, "abs_move")
         urlopen.assert_not_called()
 
     def test_acp_complete_verifies_with_provided_ca(self):
@@ -1392,7 +1406,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 mock.patch("urllib.request.urlopen") as urlopen:
             mkctx.return_value = real_ctx
             urlopen.return_value.__enter__.return_value.read.return_value = b'{"ok":true,"action_id":"test-ca"}'
-            self.device._acp_complete("test-ca", "completed", {"reason": "x"}, "cartesian_control")
+            self.device._acp_complete("test-ca", "completed", {"reason": "x"}, "abs_move")
         mkctx.assert_called_once_with(cafile="/tmp/ca.pem")
         urlopen.assert_called_once()
 
@@ -1400,7 +1414,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AGENT_CORE_CA_CERT": "/tmp/empty.pem"}), \
                 mock.patch("ssl.create_default_context", side_effect=ValueError("invalid CA")), \
                 mock.patch("urllib.request.urlopen") as urlopen:
-            result = self.device._acp_complete("test-bad-ca", "completed", {"reason": "x"}, "cartesian_control")
+            result = self.device._acp_complete("test-bad-ca", "completed", {"reason": "x"}, "abs_move")
         self.assertEqual(("failed", "invalid CA"), result)
         urlopen.assert_not_called()
 
@@ -1452,7 +1466,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
             (action_id, status, result)
         )
-        self.plugin.dispatch("move_offset", {
+        self.plugin._start_cartesian("move_offset", {
             "dx_mm": 0, "dy_mm": 0, "dz_mm": 0,
             "drx_deg": 0, "dry_deg": 0, "drz_deg": 90,
             "frame_type": "tool", "speed_percent": 5,
@@ -1475,7 +1489,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
     def test_controller_reject_without_trajectory_releases_motion_lock(self):
         # 控制器接受命令后才判定无逆解：无规划、无运动时必须立即释放卡片。
         self.client.call_dict = lambda method: {"trajectory_type": 0}
-        started = self.plugin.dispatch("move_offset", {
+        started = self.plugin._start_cartesian("move_offset", {
             "dx_mm": 20, "frame_type": "tool", "speed_percent": 5,
             "cartesian_enabled": True, "confirm_motion": True,
         })
@@ -1794,7 +1808,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
     def test_cartesian_card_is_advertised(self):
         manifest = (DRIVER / "driver.yaml").read_text()
-        self.assertIn("name: cartesian_control", manifest)
+        self.assertIn("name: abs_move", manifest)
 
 
 class RealManRM75SDKClientTests(unittest.TestCase):

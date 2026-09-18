@@ -20,5 +20,5 @@ cards:
   - { name: joint_control,    type: actuator }
   - { name: gripper,          type: actuator }
   - { name: ext_camera,       type: sensor }
-  - { name: cartesian_control, type: actuator }
+  - { name: abs_move, type: actuator }
   - { name: vision_capture, type: actuator }
