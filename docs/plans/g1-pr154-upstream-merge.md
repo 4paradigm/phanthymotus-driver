@@ -13,6 +13,9 @@
 3. bundle 先停止 loco，再停止录像消费者，最后停止相机；单插件异常不阻断后续清理。
 4. 保留子进程原子日志初始化，运行全部 G1 本地测试和差异检查。
 5. 推送原 PR 分支，核对远端 head 和冲突状态，再发送 /request_bot_review。
+6. 持续处理 Bot 意见并重新送审，直到最新 head 无问题。首轮移除 G1
+   Dockerfile 的 FASTDDS_BUILTIN_TRANSPORTS，避免与部署 XML 相矛盾；
+   增加镜像源配置回归检查，复用现有 service.yml 契约检查。
 
 ## 文档核对
 
