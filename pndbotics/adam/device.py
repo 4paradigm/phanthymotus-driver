@@ -1111,11 +1111,6 @@ class AxisControlPlugin:
                 "description": "可选，只能放慢动作；安全限速优先。",
             },
         }
-        action_params = {
-            "reset": {"params": ["duration_s"], "description": "回到启动时角度。"},
-            "stop": {"params": [], "description": "停止共享低层控制。"},
-            "info": {"params": [], "description": "查看低层控制状态。"},
-        }
         for axis, (label, _, minimum, maximum) in self.CONTROLS.items():
             field = f"{axis}_deg"
             properties[field] = {
@@ -1123,17 +1118,12 @@ class AxisControlPlugin:
                 "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
                 "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
             }
-            action_params[f"set_{axis}"] = {
-                "params": [field, "duration_s"],
-                "description": f"设置{label}，范围 [{minimum:g}, {maximum:g}] 度。",
-            }
         return {
             "name": self.TOOL_NAME, "type": "actuator",
             "description": self.DESCRIPTION,
             "inputSchema": {
                 "type": "object", "properties": properties,
                 "required": ["action"], "additionalProperties": False,
-                "x-action-params": action_params,
                 "x-resource": ["adam_upper_body"],
             },
         }

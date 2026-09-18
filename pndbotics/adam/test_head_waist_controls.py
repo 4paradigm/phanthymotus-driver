@@ -40,28 +40,27 @@ class _FakeControl:
 
 
 class HeadWaistSchemaTests(unittest.TestCase):
-    def test_head_actions_and_ranges_are_split_by_axis(self):
+    def test_head_angles_are_all_visible_with_real_ranges(self):
         tool = HeadControlPlugin(_FakeControl()).get_tool()
         schema = tool["inputSchema"]
         self.assertEqual(
             schema["properties"]["action"]["enum"],
             ["set_yaw", "set_pitch", "reset", "stop", "info"],
         )
-        self.assertEqual(schema["x-action-params"]["set_yaw"]["params"],
-                         ["yaw_deg", "duration_s"])
-        self.assertEqual(schema["x-action-params"]["set_pitch"]["params"],
-                         ["pitch_deg", "duration_s"])
+        self.assertNotIn("x-action-params", schema)
         for field in ("yaw_deg", "pitch_deg"):
+            self.assertIn(field, schema["properties"])
             self.assertEqual(schema["properties"][field]["minimum"], -60.0)
             self.assertEqual(schema["properties"][field]["maximum"], 60.0)
 
-    def test_waist_actions_and_real_ranges_are_split_by_axis(self):
+    def test_waist_angles_are_all_visible_with_real_ranges(self):
         tool = WaistControlPlugin(_FakeControl()).get_tool()
         schema = tool["inputSchema"]
         self.assertEqual(
             schema["properties"]["action"]["enum"],
             ["set_roll", "set_pitch", "set_yaw", "reset", "stop", "info"],
         )
+        self.assertNotIn("x-action-params", schema)
         expected = {
             "roll_deg": (-16.0, 16.0),
             "pitch_deg": (-48.0, 78.0),
