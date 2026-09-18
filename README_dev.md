@@ -1397,11 +1397,32 @@ The chain, in order:
 | 7 | per-axis force-torque threshold | **ABORTED** |
 | 8 | continuity / committed window | *your controller's job — see below* |
 | 9 | `watchdog_ms` with no valid command | hold |
-| 10 | N consecutive watchdog periods | abort |
+| 10 | N consecutive watchdog periods | **stand down** (recoverable) |
 
 **DROPPED vs REJECTED matters.** Dropped is the network being a network — stale,
 out of order, outranked — and is counted, not reported. Rejected means somebody
 wired something up wrong, and has to be visible. Do not collapse the two.
+
+**Standing down is not aborting, and they need different things from you.**
+Step 7 latches: the arm hit something, so the next command is precisely the one
+that must not run, and only `reset()` clears it (`stats()["aborted"]`). Step 10
+does not latch: nobody has spoken for N periods, so the *response* escalates —
+`on_abort` fires, the arm stops hanging in the air — while the sink stays willing
+to resume on the next command that passes every check above
+(`stats()["stood_down"]`).
+
+Collapsing the two produced a rule that contradicted itself: silence for four
+watchdog periods resumed on its own, silence for five needed an operator to tear
+the card down and rebuild it, though nothing about the robot differs across that
+200 ms. It also broke a routine operation — restarting a policy card upstream
+takes longer than five periods, so reconfiguring a policy left the driver
+refusing every command until somebody noticed. Measured on Tianyi.
+
+Resuming is safe for the same reason an ordinary hold is: step 2 means a
+resuming command was computed from a recent observation, and step 4 still clamps
+against the last applied values, which survive a stand-down. **Announce the
+resumption on the activity stream** — for a stand-down exactly as for a hold,
+since in both cases the robot starts moving again without anyone asking it to.
 
 **Clamping vs rejecting matters too, and they go opposite ways.** An oversized
 *step* is clamped: the point still goes where the policy meant, just more slowly,
