@@ -159,7 +159,7 @@ class ActionRecord:
         return {"state": "running", "action_id": action_id, "name": name}
 
     def _monitor(self, action_id, name):
-        status, result = "failed", {"reason": "replay_timeout"}
+        status, result = "error", {"reason": "replay_timeout"}
         started = time.monotonic()
         seen_running = False
         try:
@@ -177,6 +177,7 @@ class ActionRecord:
                     break
                 time.sleep(1)
         except Exception as exc:
+            status = "error"
             result = {"reason": str(exc), "name": name}
         finally:
             with self._lock:

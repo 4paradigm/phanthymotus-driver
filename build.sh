@@ -332,7 +332,12 @@ for idx in "${SELECTED_INDICES[@]}"; do
             "${BUILD_CTX}"
     else
         echo "[info] Docker buildx unavailable; using native docker build"
+        if ! docker build --help 2>&1 | grep -q -- '--platform'; then
+            echo "错误：当前 Docker native builder 不支持 --platform，无法安全构建 ARM64 Driver 镜像" >&2
+            exit 1
+        fi
         docker build \
+            --platform linux/arm64 \
             ${NO_CACHE} \
             --build-arg "APT_MIRROR=${APT_MIRROR}" \
             --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \

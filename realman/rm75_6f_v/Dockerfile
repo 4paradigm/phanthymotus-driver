@@ -6,7 +6,7 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${APT_MIRROR}|g" /etc/apt/sources.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3-pip python3-yaml ros-humble-rmw-fastrtps-cpp \
+        python3-pip python3-yaml ffmpeg ros-humble-rmw-fastrtps-cpp \
     && cd /tmp \
     && apt-get download libusb-1.0-0 \
     && mkdir -p /opt/realman/libusb /tmp/libusb-root \
