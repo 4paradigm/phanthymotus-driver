@@ -250,10 +250,16 @@ def main():
     # participant conflicts. One shared rt/handstate reader feeds the hand
     # card's get_state action and its partial-command logic.
     dds_lowstate_sub = None
+    dds_upper_body_lowstate_sub = None
     dds_handstate_sub = None
     dds_hand_pub = None
+    dds_lowcmd_pub = None
     plugins_cfg = cfg.get("plugins", {})
     need_lowstate = plugins_cfg.get("state", {}).get("enabled", True)
+    need_upper_body = (
+        plugins_cfg.get("head", {}).get("enabled", False)
+        or plugins_cfg.get("waist", {}).get("enabled", False)
+    )
     need_handstate = (
         plugins_cfg.get("hand", {}).get("enabled", True)
         or plugins_cfg.get("hand_state", {}).get("enabled", True)
@@ -261,7 +267,7 @@ def main():
     need_hand_pub = plugins_cfg.get("hand", {}).get("enabled", True)
     try:
         from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher
-        from pndbotics_sdk_py.idl.pnd_adam.msg.dds_ import LowState_, HandState_, HandCmd_
+        from pndbotics_sdk_py.idl.pnd_adam.msg.dds_ import LowState_, LowCmd_, HandState_, HandCmd_
 
         def _init_channel(label, factory):
             channel = None
@@ -283,6 +289,15 @@ def main():
             dds_lowstate_sub = _init_channel(
                 "rt/lowstate reader",
                 lambda: ChannelSubscriber("rt/lowstate", LowState_),
+            )
+        if need_upper_body:
+            dds_upper_body_lowstate_sub = _init_channel(
+                "rt/lowstate head/waist reader",
+                lambda: ChannelSubscriber("rt/lowstate", LowState_),
+            )
+            dds_lowcmd_pub = _init_channel(
+                "rt/lowcmd head/waist writer",
+                lambda: ChannelPublisher("rt/lowcmd", LowCmd_),
             )
         if need_handstate:
             dds_handstate_sub = _init_channel(
@@ -332,8 +347,10 @@ def main():
     from device import AdamDeviceBundle
     _bundle = AdamDeviceBundle(cfg, namespace, executor, grpc_client,
                                dds_lowstate_sub=dds_lowstate_sub,
+                               dds_upper_body_lowstate_sub=dds_upper_body_lowstate_sub,
                                dds_handstate_sub=dds_handstate_sub,
                                dds_hand_pub=dds_hand_pub,
+                               dds_lowcmd_pub=dds_lowcmd_pub,
                                ros2_enabled=ros2_enabled)
     _bundle.start_all()
     print(f"[adam] Bundle loaded ({len(_bundle.get_all_tools())} tools)")
@@ -371,6 +388,8 @@ def main():
         _bundle.close_all()
         for label, channel in (
             ("rt/lowstate reader", dds_lowstate_sub),
+            ("rt/lowstate head/waist reader", dds_upper_body_lowstate_sub),
+            ("rt/lowcmd head/waist writer", dds_lowcmd_pub),
             ("rt/handcmd writer", dds_hand_pub),
         ):
             if channel is not None:

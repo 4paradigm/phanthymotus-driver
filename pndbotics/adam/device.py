@@ -73,6 +73,7 @@ try:
     )
     from pndbotics_sdk_py.idl.default import (
         pnd_adam_msg_dds__HandCmd_,
+        pnd_adam_msg_dds__LowCmd_,
     )
 
     HAS_PND_SDK = True
@@ -150,6 +151,16 @@ VARIANT_JOINTS = {
 }
 
 VARIANT_DOF = {"lite": 23, "sp": 29, "pro": 31}
+
+WAIST_JOINT_CONTROLS = {
+    "roll": ("腰部侧倾", "waistRoll", -16.0, 16.0),
+    "pitch": ("腰部俯仰", "waistPitch", -48.0, 78.0),
+    "yaw": ("腰部旋转", "waistYaw", -47.0, 47.0),
+}
+HEAD_JOINT_CONTROLS = {
+    "yaw": ("头部左右转动", "neckYaw", -60.0, 60.0),
+    "pitch": ("头部上下俯仰", "neckPitch", -60.0, 60.0),
+}
 
 # Adam hand indices are the same for the two hands.  Each hand has five
 # physical fingers but six motor channels: the thumb has flexion and rotation
@@ -896,6 +907,309 @@ class LocoPlugin:
         if action == "info":
             return {"state": "ready"}
         return None
+
+
+# ===========================================================================
+# Head / waist control — shared DDS rt/lowcmd owner
+# ===========================================================================
+
+class UpperBodyLowcmdController:
+    """Own the single complete-body lowcmd stream used by head and waist."""
+
+    _DOF = 31
+    _RATE_HZ = 50.0
+    _MAX_VELOCITY_RAD_S = 0.5
+    _EASE_PEAK_RATE = 1.875
+    _DEFAULT_TRANSITION_SECONDS = 0.8
+    _GAINS = {
+        "waistRoll": (200.0, 5.0),
+        "waistPitch": (200.0, 5.0),
+        "waistYaw": (200.0, 5.0),
+        "neckYaw": (20.0, 1.0),
+        "neckPitch": (20.0, 1.0),
+    }
+
+    def __init__(self, plugin_config, dds_lowcmd_pub=None,
+                 dds_lowstate_sub=None):
+        self._publisher = dds_lowcmd_pub
+        self._lowstate_sub = dds_lowstate_sub
+        self._rate_hz = max(10.0, min(100.0, float(
+            plugin_config.get("control_rate_hz", self._RATE_HZ))))
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._state_ready = threading.Event()
+        self._thread = None
+        self._hold_q = None
+        self._segment_q = None
+        self._segment_start = {}
+        self._targets = {}
+        self._segment_started_at = 0.0
+        self._segment_span = self._DEFAULT_TRANSITION_SECONDS
+        self._active = False
+        self._writes = 0
+        self._last_error = None
+
+    @staticmethod
+    def _ease(progress):
+        progress = max(0.0, min(1.0, progress))
+        return progress * progress * progress * (10.0 + progress * (-15.0 + 6.0 * progress))
+
+    @staticmethod
+    def _joint_index(joint_name):
+        return ADAM_PRO_JOINTS.index(joint_name)
+
+    def _read_initial_state(self):
+        if self._lowstate_sub is None:
+            return
+        while not self._stop_event.is_set() and not self._state_ready.is_set():
+            try:
+                state = self._lowstate_sub.Read(timeout=0.2)
+                motors = getattr(state, "motor_state", None) if state else None
+                if motors is None or len(motors) < self._DOF:
+                    continue
+                positions = [float(motors[index].q) for index in range(self._DOF)]
+                if not all(math.isfinite(value) for value in positions):
+                    continue
+                with self._lock:
+                    self._hold_q = positions
+                    self._segment_q = list(positions)
+                self._state_ready.set()
+            except Exception as exc:
+                self._last_error = f"rt/lowstate read failed: {exc}"
+                self._stop_event.wait(0.1)
+
+    def _write_command(self):
+        with self._lock:
+            if not self._active or self._hold_q is None:
+                return
+            hold_q = list(self._hold_q)
+            targets = dict(self._targets)
+            starts = dict(self._segment_start)
+            current_q = list(self._segment_q)
+            started_at = self._segment_started_at
+            span = max(1e-6, self._segment_span)
+        eased = self._ease((time.monotonic() - started_at) / span)
+        for index, start in starts.items():
+            current_q[index] = start + (targets[index] - start) * eased
+        try:
+            command = pnd_adam_msg_dds__LowCmd_(self._DOF)
+            command.mode_pr = 0
+            for index, joint_name in enumerate(ADAM_PRO_JOINTS):
+                motor = command.motor_cmd[index]
+                motor.mode = 1
+                motor.q = current_q[index] if index in targets else hold_q[index]
+                motor.dq = 0.0
+                motor.tau = 0.0
+                motor.kp, motor.kd = self._GAINS.get(joint_name, (0.0, 0.0))
+                motor.ki = 0.0
+            self._publisher.Write(command)
+            with self._lock:
+                self._segment_q = current_q
+                self._writes += 1
+                self._last_error = None
+        except Exception as exc:
+            self._last_error = f"rt/lowcmd write failed: {exc}"
+
+    def _run(self):
+        self._read_initial_state()
+        interval = 1.0 / self._rate_hz
+        while not self._stop_event.wait(interval):
+            self._write_command()
+
+    def start(self):
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run, daemon=True, name="adam_head_waist_lowcmd")
+            self._thread.start()
+        return {"state": "ready"}
+
+    def halt(self):
+        with self._lock:
+            self._active = False
+            self._targets.clear()
+        return {"state": "idle"}
+
+    def stop(self):
+        self.halt()
+        self._stop_event.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(1.0)
+        self._thread = None
+        return {"state": "idle"}
+
+    def set_targets(self, targets_by_name, duration_s=None):
+        if self._publisher is None:
+            return {"success": False, "code": "DDS_UNAVAILABLE",
+                    "message": "rt/lowcmd publisher is unavailable"}
+        if not self._state_ready.is_set():
+            return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
+                    "message": "waiting for a complete rt/lowstate message"}
+        updates = {
+            self._joint_index(joint_name): radians
+            for joint_name, radians in targets_by_name.items()
+        }
+        with self._lock:
+            targets = dict(self._targets)
+            targets.update(updates)
+            distance = max(abs(targets[i] - self._segment_q[i]) for i in targets)
+            minimum_span = self._EASE_PEAK_RATE * distance / self._MAX_VELOCITY_RAD_S
+            self._targets = targets
+            self._segment_start = {i: self._segment_q[i] for i in targets}
+            self._segment_started_at = time.monotonic()
+            self._segment_span = max(
+                self._DEFAULT_TRANSITION_SECONDS if duration_s is None else duration_s,
+                minimum_span,
+            )
+            self._active = True
+        return None
+
+    def set_target(self, joint_name, radians, duration_s=None):
+        return self.set_targets({joint_name: radians}, duration_s)
+
+    def reset(self, joints, duration_s=None):
+        if not self._state_ready.is_set():
+            return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
+                    "message": "waiting for a complete rt/lowstate message"}
+        with self._lock:
+            targets = {
+                joint_name: self._hold_q[self._joint_index(joint_name)]
+                for joint_name in joints
+            }
+        return self.set_targets(targets, duration_s)
+
+    def info(self):
+        return {"state": "active" if self._active else "idle",
+                "lowstate_ready": self._state_ready.is_set(),
+                "dds_writer_ready": self._publisher is not None,
+                "writes": self._writes, "last_error": self._last_error,
+                "protocol": "rt/lowcmd"}
+
+
+class AxisControlPlugin:
+    PREFIX = ""
+    TOOL_NAME = ""
+    CONTROLS = {}
+
+    def __init__(self, control):
+        self._control = control
+
+    def get_tool(self):
+        properties = {
+            "action": {
+                "type": "string", "enum": ["reset"],
+                "oneOf": [{"const": "reset", "title": "回到起始角度"}],
+            },
+            "duration_s": {
+                "type": "number", "title": "动作时长（秒）",
+                "minimum": 0.1, "maximum": 60.0,
+                "description": "可选，只能放慢动作；安全限速优先。",
+            },
+        }
+        for axis, (label, _, minimum, maximum) in self.CONTROLS.items():
+            field = f"{axis}_deg"
+            properties[field] = {
+                "type": "number", "title": f"{label}目标角度（度）",
+                "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
+                "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
+            }
+        return {
+            "name": self.TOOL_NAME, "type": "actuator",
+            "description": self.DESCRIPTION,
+            "inputSchema": {
+                "type": "object", "properties": properties,
+                "required": ["action"], "additionalProperties": False,
+                "x-resource": ["adam_upper_body"],
+            },
+        }
+
+    def start(self):
+        return {"state": "ready"}
+
+    def stop(self):
+        return {"state": "ready"}
+
+    @staticmethod
+    def _duration(args):
+        raw = args.get("duration_s")
+        if raw is None:
+            return None, None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None, "duration_s must be a number in [0.1, 60.0]"
+        value = float(raw)
+        if not math.isfinite(value) or not 0.1 <= value <= 60.0:
+            return None, "duration_s must be a number in [0.1, 60.0]"
+        return value, None
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self._control.start()
+        if action == "stop":
+            return self._control.halt()
+        if action == "info":
+            return self._control.info()
+        duration, duration_error = self._duration(args)
+        if duration_error:
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": duration_error}
+        if action == "reset":
+            targets = {}
+            for axis, (_, joint_name, minimum, maximum) in self.CONTROLS.items():
+                field = f"{axis}_deg"
+                if field not in args:
+                    continue
+                raw = args[field]
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    return {"success": False, "code": "INVALID_ARGUMENT",
+                            "message": f"{field} must be a number in [{minimum:g}, {maximum:g}]"}
+                degrees = float(raw)
+                if not math.isfinite(degrees) or not minimum <= degrees <= maximum:
+                    return {"success": False, "code": "INVALID_ARGUMENT",
+                            "message": f"{field} must be a number in [{minimum:g}, {maximum:g}]"}
+                targets[joint_name] = math.radians(degrees)
+            if targets:
+                error = self._control.set_targets(targets, duration)
+                return error or {"success": True, "state": "active",
+                                 "action": "set_angles", "duration_s": duration,
+                                 "protocol": "rt/lowcmd"}
+            error = self._control.reset(
+                [values[1] for values in self.CONTROLS.values()], duration)
+            return error or {"success": True, "state": "active", "action": "reset"}
+        if not action.startswith("set_"):
+            return None
+        axis = action[4:]
+        control = self.CONTROLS.get(axis)
+        if control is None:
+            return None
+        label, joint_name, minimum, maximum = control
+        raw = args.get(f"{axis}_deg")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": f"{axis}_deg must be a number in [{minimum:g}, {maximum:g}]"}
+        degrees = float(raw)
+        if not math.isfinite(degrees) or not minimum <= degrees <= maximum:
+            return {"success": False, "code": "INVALID_ARGUMENT",
+                    "message": f"{axis}_deg must be a number in [{minimum:g}, {maximum:g}]"}
+        error = self._control.set_target(joint_name, math.radians(degrees), duration)
+        return error or {"success": True, "state": "active", "action": action,
+                         "angle_deg": degrees, "duration_s": duration,
+                         "protocol": "rt/lowcmd"}
+
+
+class WaistControlPlugin(AxisControlPlugin):
+    PREFIX = "waist_control"
+    TOOL_NAME = "waist_control"
+    CONTROLS = WAIST_JOINT_CONTROLS
+    DESCRIPTION = ("Adam Pro 腰部基础角度控制。侧倾、俯仰和旋转角度全部直接显示，"
+                   "reset 可回到启动时角度；每个字段均标明真实限位。")
+
+
+class HeadControlPlugin(AxisControlPlugin):
+    PREFIX = "head_control"
+    TOOL_NAME = "head_control"
+    CONTROLS = HEAD_JOINT_CONTROLS
+    DESCRIPTION = ("Adam Pro 头部基础角度控制。偏航与俯仰角度全部直接显示，"
+                   "reset 可回到启动时角度，范围均为 [-60, 60] 度。")
 
 
 # ===========================================================================
@@ -2920,9 +3234,12 @@ class AdamDeviceBundle:
 
     def __init__(self, config: dict, namespace: str, executor, grpc_client,
                  dds_lowstate_sub=None, dds_handstate_sub=None,
-                 dds_hand_pub=None, ros2_enabled: bool | None = None):
+                 dds_hand_pub=None, dds_lowcmd_pub=None,
+                 dds_upper_body_lowstate_sub=None,
+                 ros2_enabled: bool | None = None):
         self._plugins = []
         self._tool_map = {}  # tool_name → plugin
+        self._upper_body_control = None
 
         variant = config.get("variant", "sp")
         plugins_cfg = config.get("plugins", {})
@@ -2987,6 +3304,19 @@ class AdamDeviceBundle:
             )
             self._plugins.append(p)
 
+        head_enabled = plugins_cfg.get("head", {}).get("enabled", False)
+        waist_enabled = plugins_cfg.get("waist", {}).get("enabled", False)
+        if head_enabled or waist_enabled:
+            self._upper_body_control = UpperBodyLowcmdController(
+                plugins_cfg.get("upper_body_control", {}),
+                dds_lowcmd_pub=dds_lowcmd_pub,
+                dds_lowstate_sub=dds_upper_body_lowstate_sub,
+            )
+            if waist_enabled:
+                self._plugins.append(WaistControlPlugin(self._upper_body_control))
+            if head_enabled:
+                self._plugins.append(HeadControlPlugin(self._upper_body_control))
+
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
         if hand_enabled:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
@@ -3019,6 +3349,8 @@ class AdamDeviceBundle:
     def start_all(self):
         if self._hand_state_cache is not None:
             self._hand_state_cache.start()
+        if self._upper_body_control is not None:
+            self._upper_body_control.start()
         for p in self._plugins:
             p.start()
 
@@ -3028,6 +3360,8 @@ class AdamDeviceBundle:
                 p.stop()
             except Exception as exc:
                 print(f"[adam] WARNING: plugin stop failed: {exc}", flush=True)
+        if self._upper_body_control is not None:
+            self._upper_body_control.stop()
         if self._hand_state_cache is not None:
             self._hand_state_cache.stop()
 
