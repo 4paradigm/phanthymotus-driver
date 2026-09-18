@@ -739,7 +739,15 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
-            if self.path.split("?")[0] == "/sse":
+            # `/mcp/sse` is what the client actually asks for. agent-core builds
+            # the URL as `<mcp url>/sse`, and the configured url already ends in
+            # `/mcp` — so this driver's `/sse` has never once been reached, and
+            # every probe since the SSE subscription shipped has 404'd. Four of
+            # the fifteen drivers here serve `/mcp/sse`; that is the convention.
+            #
+            # `/sse` stays accepted: dropping it would be betting that nothing
+            # else ever learned to call it, and the bet buys nothing.
+            if self.path.split("?")[0] in ("/mcp/sse", "/sse"):
                 # SSE streaming endpoint for ACP completion events
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
