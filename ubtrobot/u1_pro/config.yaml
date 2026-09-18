@@ -1,4 +1,4 @@
-mcp_port: 15723
+mcp_port: 15740
 ros_namespace: ""
 ros:
   robot_domain_id: 2

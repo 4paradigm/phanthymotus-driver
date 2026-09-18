@@ -131,6 +131,8 @@ class U1CardContractTests(unittest.TestCase):
 
         schema = device.AuthPlugin(FakeNodes()).get_tool()["inputSchema"]
         self.assertEqual(schema["properties"]["action"]["enum"], ["start", "authorize", "auth_state", "stop", "info"])
+        self.assertNotIn("appid", schema["properties"])
+        self.assertIsNone(device.AuthPlugin(FakeNodes()).dispatch("unknown", {}))
 
     def test_nodes_are_registered_with_the_matching_domain_executors(self):
         import device
@@ -222,6 +224,26 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(nodes.mic_enabled, [True, False])
         self.assertFalse(plugin.running)
 
+    def test_mic_start_failure_returns_error_state(self):
+        import device
+
+        nodes = FakeNodes()
+        nodes.set_mic_enabled = mock.Mock(side_effect=RuntimeError("service unavailable"))
+        plugin = device.MicPlugin(nodes)
+        result = plugin.dispatch("start", {})
+        self.assertEqual(result["state"], "error")
+        self.assertFalse(plugin.running)
+        self.assertFalse(plugin._enable_requested)
+
+    def test_unknown_actions_return_none(self):
+        import device
+
+        nodes = FakeNodes()
+        self.assertIsNone(device.MicPlugin(nodes).dispatch("unknown", {}))
+        self.assertIsNone(device.SpeakerPlugin(nodes).dispatch("unknown", {}))
+        self.assertIsNone(device.AudioPlugin(nodes).dispatch("unknown", {}))
+        self.assertEqual(device.SpeakerPlugin(nodes).dispatch("start", {}), {"state": "ready"})
+
     def test_mic_callback_drops_audio_after_stop(self):
         import device
 
@@ -276,7 +298,11 @@ class U1CardContractTests(unittest.TestCase):
         action = plugin.dispatch("play_action", {"motion_id": "A029", "action_id": "request-1"})
         self.assertEqual(action["state"], "queued")
         self.assertEqual(nodes.string_calls[0][0], "play_action")
-        self.assertEqual(nodes.string_calls[0][1], {"action": "A029", "uuid": "request-1"})
+        self.assertEqual(nodes.string_calls[0][1]["action"], "A029")
+        vendor_uuid = nodes.string_calls[0][1]["uuid"]
+        self.assertTrue(vendor_uuid)
+        self.assertNotEqual(vendor_uuid, "request-1")
+        self.assertEqual(plugin._active["vendor_uuid"], vendor_uuid)
 
     def test_playback_result_completes_only_matching_active_action(self):
         import device
@@ -285,14 +311,18 @@ class U1CardContractTests(unittest.TestCase):
         plugin = device.AudioPlugin(nodes)
         plugin.start()
         plugin.dispatch("play_text", {"text": "hello", "action_id": "request-2"})
+        vendor_uuid = plugin._active["vendor_uuid"]
         with mock.patch.object(device, "_acp_notify") as notify:
             plugin._on_playback_state({"uuid": "old", "phase": "result", "success": True, "state_name": "COMPLETED"})
             notify.assert_not_called()
-            plugin._on_playback_state({"uuid": "request-2", "phase": "feedback", "success": True, "state_name": "COMPLETED"})
+            plugin._on_playback_state({"uuid": vendor_uuid, "phase": "feedback", "success": True, "state_name": "COMPLETED"})
             notify.assert_not_called()
-            plugin._on_playback_state({"uuid": "request-2", "phase": "result", "success": True, "state_name": "COMPLETED"})
+            plugin._on_playback_state({"uuid": vendor_uuid, "phase": "result", "success": True, "state_name": "COMPLETED", "message": "x" * 1000, "unexpected": "drop"})
             notify.assert_called_once()
             self.assertEqual(notify.call_args.args[1], "completed")
+            playback = notify.call_args.args[2]["playback"]
+            self.assertEqual(playback["message"], "x" * 512)
+            self.assertNotIn("unexpected", playback)
 
     def test_speaker_callback_drops_audio_after_stop(self):
         import device

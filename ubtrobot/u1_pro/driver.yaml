@@ -4,8 +4,8 @@ category: driver
 hardware_provider: ubtrobot
 hardware_model: "u1_pro"
 image_name: ubtrobot-u1-pro
-port: 15723
-mcp_url: "http://localhost:15723/mcp"
+port: 15740
+mcp_url: "http://localhost:15740/mcp"
 description: "UBTECH U1 Pro microphone, live speaker PCM, preset audio/motion playback, wakeup events, and sound direction"
 build_context_extras:
   - ../../common

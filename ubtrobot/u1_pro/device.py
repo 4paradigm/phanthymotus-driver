@@ -39,6 +39,17 @@ def _event_json(message: Any) -> str:
     return json.dumps(jsonable(message), ensure_ascii=False)
 
 
+def _bounded_playback(data: dict) -> dict:
+    """Forward only the bounded playback fields needed by Agent Core."""
+    allowed = ("uuid", "request_type", "phase", "state", "state_name", "code", "success", "message")
+    result = {key: data[key] for key in allowed if key in data}
+    if isinstance(result.get("message"), str):
+        result["message"] = result["message"][:512]
+    if isinstance(result.get("uuid"), str):
+        result["uuid"] = result["uuid"][:128]
+    return result
+
+
 def _acp_notify(action_id: str | None, status: str, result: dict, tool_name: str = "audio") -> None:
     if not action_id:
         return
@@ -259,15 +270,17 @@ class MicPlugin:
 
     def start(self):
         if self.running:
-            return
+            return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
         self._enable_requested = True
         try:
             self.nodes.set_mic_enabled(True)
-        except Exception:
+        except Exception as exc:
+            self._enable_requested = False
             self.running = False
-            raise
+            return {"state": "error", "message": f"U1 Pro microphone unavailable: {str(exc)[:256]}", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
         else:
             self.running = True
+            return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
 
     def stop(self):
         if not self._enable_requested:
@@ -275,16 +288,19 @@ class MicPlugin:
         self._enable_requested = False
         try:
             self.nodes.set_mic_enabled(False)
+        except Exception:
+            pass
         finally:
             self.running = False
 
     def dispatch(self, action, args):
         if action == "start":
-            self.start()
+            return self.start()
         elif action == "stop":
             self.stop()
+            return {"state": "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
         elif action != "info":
-            raise ValueError(f"unknown mic action: {action}")
+            return None
         return {"state": "running" if self.running else "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
 
 
@@ -309,6 +325,7 @@ class SpeakerPlugin:
         self.nodes.close_speaker_subscription()
         self.running = False
         self.input_topic = ""
+        return {"state": "ready"}
 
     def stop(self):
         self.nodes.close_speaker_subscription()
@@ -319,7 +336,7 @@ class SpeakerPlugin:
         if action == "start":
             topic = str(args.get("input_topic", "")).strip()
             if not topic:
-                raise ValueError("speaker.start requires input_topic")
+                return self.start()
             self.input_topic = topic
             result = self.nodes.connect_speaker(topic)
             self.running = True
@@ -331,7 +348,7 @@ class SpeakerPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "running" if self.running else "idle", "input_topic": self.input_topic}
-        raise ValueError(f"unknown speaker action: {action}")
+        return None
 
 
 class AudioPlugin:
@@ -384,10 +401,13 @@ class AudioPlugin:
     def _queue(self, kind: str, payload: dict, action_id: str) -> dict:
         with self._lock:
             if self._active:
-                raise RuntimeError(f"audio action already active: {self._active['action_id']}")
-            self._active = {"action_id": action_id, "kind": kind, "payload": payload}
+                return {"state": "error", "message": "another U1 Pro audio action is active", "action_id": self._active["action_id"]}
+            vendor_uuid = str(uuid.uuid4())
+            vendor_payload = dict(payload)
+            vendor_payload["uuid"] = vendor_uuid
+            self._active = {"action_id": action_id, "vendor_uuid": vendor_uuid, "kind": kind}
         try:
-            result = self.nodes.string_call(kind, payload)
+            result = self.nodes.string_call(kind, vendor_payload)
         except Exception as exc:
             with self._lock:
                 if self._active and self._active["action_id"] == action_id:
@@ -403,14 +423,14 @@ class AudioPlugin:
         event_uuid = data.get("uuid")
         with self._lock:
             active = self._active
-            if not active or not event_uuid or event_uuid != active["action_id"]:
+            if not active or not event_uuid or event_uuid != active["vendor_uuid"]:
                 return
             self._active = None
         state_name = str(data.get("state_name", "")).upper()
         failed = state_name == "FAILED" or data.get("success") is False
         success = not failed and (data.get("success") is True or state_name == "COMPLETED")
         status = "completed" if success else "error"
-        _acp_notify(active["action_id"], status, {"state": state_name.lower() or status, "action_id": active["action_id"], "playback": data})
+        _acp_notify(active["action_id"], status, {"state": state_name.lower() or status, "action_id": active["action_id"], "playback": _bounded_playback(data)})
 
     def dispatch(self, action, args):
         if action == "start":
@@ -425,20 +445,20 @@ class AudioPlugin:
             motion_id = str(args.get("motion_id", "")).strip()
             if not motion_id:
                 raise ValueError("audio.play_action requires motion_id")
-            action_id = str(args.get("action_id") or uuid.uuid4())
-            return self._queue("play_action", {"action": motion_id, "uuid": action_id}, action_id)
+            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
+            return self._queue("play_action", {"action": motion_id}, action_id)
         if action == "play_text":
             text = str(args.get("text", "")).strip()
             if not text:
                 raise ValueError("audio.play_text requires text")
-            action_id = str(args.get("action_id") or uuid.uuid4())
-            payload = {"text": text, "uuid": action_id, "save": bool(args.get("save", False))}
+            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
+            payload = {"text": text[:4096], "save": bool(args.get("save", False))}
             if args.get("motion"):
                 payload["motion"] = str(args["motion"])
             return self._queue("play_text", payload, action_id)
         if action == "stop":
             return self.stop()
-        raise ValueError(f"unknown audio action: {action}")
+        return None
 
 
 class AuthPlugin:
@@ -449,19 +469,12 @@ class AuthPlugin:
     def get_tool(self):
         actions = {
             "start": ([], "Prepare the U1 Pro authentication card."),
-            "authorize": (["appid", "api_key", "api_secret", "device_id", "license"], "Authorize protected U1 Pro SDK services with vendor credentials."),
+            "authorize": ([], "Authorize with credentials injected through protected U1_PRO_* environment variables or config."),
             "auth_state": ([], "Query whether the U1 Pro SDK is currently authorized."),
             "stop": ([], "Stop the authentication card without changing the vendor authorization state."),
             "info": ([], "Read the authentication card state."),
         }
-        properties = {
-            "appid": {"type": "string", "description": "Vendor application ID."},
-            "api_key": {"type": "string", "format": "password", "description": "Vendor API key."},
-            "api_secret": {"type": "string", "format": "password", "description": "Vendor API secret."},
-            "device_id": {"type": "string", "description": "U1 Pro device ID."},
-            "license": {"type": "string", "format": "password", "description": "Vendor license text."},
-        }
-        return tool("auth", "actuator", "U1 Pro SDK authentication. Authorize before protected audio or event operations; credentials are never stored by this driver.", action_schema(actions, properties))
+        return tool("auth", "actuator", "U1 Pro SDK authentication. Credentials must be injected through protected U1_PRO_* environment variables or config; they are never accepted as MCP arguments or stored by this driver.", action_schema(actions, {}))
 
     def start(self):
         return {"state": "ready"}
@@ -488,7 +501,7 @@ class AuthPlugin:
             }
             auth_config = self.nodes.config.get("auth", {})
             values = {
-                key: str(args.get(key) or auth_config.get(key) or os.environ.get(env_names[key], ""))
+                key: str(auth_config.get(key) or os.environ.get(env_names[key], ""))
                 for key in env_names
             }
             missing = [key for key, value in values.items() if not value]
@@ -497,7 +510,7 @@ class AuthPlugin:
             return self.nodes.string_call("authorize", values)
         if action == "auth_state":
             return self.nodes.trigger_call("auth_state")
-        raise ValueError(f"unknown auth action: {action}")
+        return None
 
 
 class EventPlugin:
@@ -526,7 +539,7 @@ class EventPlugin:
         elif action == "stop":
             self.stop()
         elif action != "info":
-            raise ValueError(f"unknown event action: {action}")
+            return None
         return {"state": "running" if self.running else "idle", "topic_out": [{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}]}
 
 

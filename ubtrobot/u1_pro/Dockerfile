@@ -30,5 +30,5 @@ ENV RCUTILS_COLORIZED_OUTPUT=0
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/u1_ws/install/audio_msgs/lib/python3.10/site-packages:/u1_ws/install/robo_sdk/lib/python3.10/site-packages:/work
 
-EXPOSE 15723
+EXPOSE 15740
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /u1_ws/install/setup.bash && python3 /work/main.py"]
