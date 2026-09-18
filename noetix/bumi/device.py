@@ -4,6 +4,7 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
 
 插件列表：
   - StatePlugin: joints (21-DOF skeleton), imu, battery, model (URDF resource)
+  - VisionCapturePlugin: persistent RGB photos and videos
   - LocoPlugin: locomotion, stand-up/prone storage, semantic actions and action recording
   - MicPlugin: 8ch mic capture → mono PCM 16kHz
   - SpeakerPlugin: audio playback via MediaController
@@ -11,14 +12,21 @@ drivers/noetix/bumi/device.py — Noetix Bumi-EDU 设备插件实现。
   - MotionStatePlugin: combined whole-body motion state
 """
 
+from __future__ import annotations
+
 import json
 import math
 import os
 import struct
+import select
+import ssl
+import tempfile
+import urllib.request
 import subprocess
 import threading
 import time
 from pathlib import Path
+from datetime import datetime
 from typing import Any
 
 import rclpy
@@ -35,6 +43,26 @@ _LOW_LAT_QOS = QoSProfile(
     depth=200,
     durability=DurabilityPolicy.VOLATILE,
 )
+
+# The ROS audio contract is a mono, little-endian PCM16 stream at 16 kHz.
+# ``pcm_16k_16bit_mono`` is kept as a compatibility alias because the Bumi
+# mic subprocess used that value before the common driver contract was
+# standardized on ``audio/pcm-16k``.
+_AUDIO_PCM_FORMATS = frozenset(("audio/pcm-16k", "pcm_16k_16bit_mono"))
+_AUDIO_SAMPLE_RATE = 16000
+_AUDIO_S16_LE_FORMAT = 2
+_AUDIO_PLAYBACK_CHANNELS = 2
+_AUDIO_CONFIG_INTERVAL_S = 0.5
+# The Bumi audio agent publishes EXIT/CMD_RESET for roughly 10–11 seconds
+# after MediaController.restart() on the tested hardware.  Keep the wait
+# longer than that transition and poll the same MediaController instance;
+# creating another SDK instance is neither necessary nor safe for a live card.
+_AUDIO_AGENT_RESET_TIMEOUT_S = 20.0
+_AUDIO_AGENT_POLL_INTERVAL_S = 0.1
+# Playback works in any of these states — verified on hardware: a full TTS
+# utterance played while the vendor voice agent sat at SLEEPED/CMD_SLEEPED.
+# Only ERROR_SLEEPED means the audio agent itself is down.
+_AUDIO_RESET_RECOVERED_STATUSES = frozenset(("READY", "SLEEPED"))
 
 # ── Joint Mapping ─────────────────────────────────────────────────────────────
 # SDK motor_id order → URDF joint names (must match URDF exactly for skeleton renderer)
@@ -128,9 +156,6 @@ class _BumiStateNode(Node):
         self._battery_pub = self.create_publisher(String, self._battery_topic, _LOW_LAT_QOS)
         self._joints_pub  = self.create_publisher(String, self._joints_topic,  _LOW_LAT_QOS)
 
-        self._last_imu: dict = {}
-        self._last_battery: dict = {}
-        self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -160,8 +185,6 @@ class _BumiStateNode(Node):
                         "angular_vel":   [imu.angular_vel[i] for i in range(3)],
                         "linear_acc":    [imu.linear_acc[i] for i in range(3)],
                     }
-                    with self._lock:
-                        self._last_imu = imu_data
                     msg = String()
                     msg.data = json.dumps(imu_data)
                     self._imu_pub.publish(msg)
@@ -183,12 +206,13 @@ class _BumiStateNode(Node):
                         })
                     imu = self._high_ctrl.get_imu_data()
                     workmode = self._high_ctrl.get_mode()
-                    joints_out = String()
-                    joints_out.data = json.dumps({
+                    joints_data = {
                         "joints": joints,
                         "imu_quat": [float(imu.ori[3]), float(imu.ori[0]), float(imu.ori[1]), float(imu.ori[2])],  # SDK [x,y,z,w] → renderer [w,x,y,z]
                         "workmode": workmode,
-                    })
+                    }
+                    joints_out = String()
+                    joints_out.data = json.dumps(joints_data)
                     self._joints_pub.publish(joints_out)
 
                 # Battery: 1 Hz
@@ -201,8 +225,6 @@ class _BumiStateNode(Node):
                         "temperature": int(bms.battery_temp),
                         "alarm": int(bms.battery_alarm),
                     }
-                    with self._lock:
-                        self._last_battery = bms_data
                     msg = String()
                     msg.data = json.dumps(bms_data)
                     self._battery_pub.publish(msg)
@@ -211,6 +233,7 @@ class _BumiStateNode(Node):
             except Exception as e:
                 self.get_logger().warn(f"State poll error: {e}")
                 time.sleep(0.5)
+
 
 
 class StatePlugin:
@@ -900,6 +923,11 @@ class LocoPlugin:
 
 def _mic_subprocess(namespace: str):
     """Mic capture subprocess — polls MediaController, publishes AudioChunk."""
+    # A fresh interpreter does not inherit the parent's atomic log writer.
+    # Idempotent when the launcher has already installed it before importing device.
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     import os as _os
     _os.environ.setdefault('CYCLONEDDS_URI', 'file:///work/noetix_sdk_bumi/config/dds.xml')
     import sys as _sys
@@ -993,7 +1021,10 @@ class MicPlugin:
         import sys
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
-             f"import sys; sys.path.insert(0, '/work'); from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
+             # Protect import-time output as well as the child entry point.
+             "import sys; sys.path.insert(0, '/work'); "
+             "from common import logsafe; logsafe.install(check_fd=False); "
+             f"from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         # Forward subprocess stdout in background
@@ -1030,23 +1061,268 @@ class SpeakerPlugin:
         executor.add_node(self._node)
         self._playing = False
         self._sub = None
+        self._input_topic = ""
+        self._frames_submitted = 0
+        self._last_audio_time = 0.0
+        self._last_error = None
+        self._last_config_change = 0.0
+        self._config_lock = threading.Lock()
+        # HTTP MCP requests are handled concurrently.  Serialize operations
+        # which change the shared MediaController audio state so a
+        # start/stop sequence cannot interleave.
+        self._control_lock = threading.RLock()
+
+    @staticmethod
+    def _enum_name(value) -> str:
+        """Return a JSON-safe name for a pybind11 enum value."""
+        name = getattr(value, "name", None)
+        if name:
+            return str(name)
+        return str(value).rsplit(".", 1)[-1]
+
+    @staticmethod
+    def _make_playback_stream(msg):
+        """Convert an AudioChunk (mono PCM16) into a Bumi playback stream.
+
+        AudioChunk carries raw bytes.  The MediaController playback API
+        expects a typed AudioStream whose data is interleaved and stereo on
+        Bumi, so each mono sample is duplicated into L/R here.
+        """
+        audio_format = getattr(msg, "format", "")
+        if audio_format not in _AUDIO_PCM_FORMATS:
+            formats = ", ".join(sorted(_AUDIO_PCM_FORMATS))
+            raise ValueError(
+                f"unsupported AudioChunk format {audio_format!r}; expected one of {formats}"
+            )
+
+        pcm_bytes = bytes(msg.data)
+        if not pcm_bytes:
+            return None
+        if len(pcm_bytes) % 2:
+            raise ValueError(f"PCM16 payload has odd byte length: {len(pcm_bytes)}")
+
+        mono_samples = struct.unpack(f"<{len(pcm_bytes) // 2}h", pcm_bytes)
+        stereo_samples = [sample for sample in mono_samples for _ in range(2)]
+
+        from mediacontrol_py import AudioStream
+
+        stream = AudioStream()
+        stream.channels = _AUDIO_PLAYBACK_CHANNELS
+        stream.sample_rate = _AUDIO_SAMPLE_RATE
+        stream.format = _AUDIO_S16_LE_FORMAT
+        stream.duration_ms = max(
+            1,
+            round(len(mono_samples) * 1000 / _AUDIO_SAMPLE_RATE),
+        )
+        stream.timestamp_us = time.time_ns() // 1000
+        stream.audio_data = stereo_samples
+        return stream
+
+    def _destroy_subscription(self) -> None:
+        if self._sub is None:
+            return
+        try:
+            self._node.destroy_subscription(self._sub)
+        finally:
+            self._sub = None
+
+    def _wait_for_config_slot(self) -> None:
+        """Honor the SDK's 500 ms minimum interval between set calls."""
+        remaining = _AUDIO_CONFIG_INTERVAL_S - (
+            time.monotonic() - self._last_config_change
+        )
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _set_config(
+        self, getter_name: str, setter_name: str, enabled: bool, force: bool = False
+    ) -> bool:
+        """Set one MediaController route while honoring its 500 ms limit.
+
+        ``force`` skips the read-back check.  The getter reflects the last
+        config sample the SDK received, so right after a write of the opposite
+        value it can still return the stale one — believing it there would
+        silently skip the write and leave the route closed.  The start path
+        must therefore always write.
+        """
+        with self._config_lock:
+            setter = getattr(self._media_ctrl, setter_name)
+            if not force:
+                getter = getattr(self._media_ctrl, getter_name)
+                if bool(getter()) == enabled:
+                    return False
+            self._wait_for_config_slot()
+            setter(enabled)
+            self._last_config_change = time.monotonic()
+            return True
+
+    def _disable_config(self, getter_name: str, setter_name: str) -> bool:
+        """Disable one MediaController route, only writing when necessary."""
+        return self._set_config(getter_name, setter_name, False)
+
+    def _enable_external_playback(self) -> None:
+        self._set_config(
+            "get_external_custom_audio_data_to_playback_enable",
+            "set_external_custom_audio_data_to_playback_enable",
+            True,
+            force=True,
+        )
+
+    def _disable_external_playback(self) -> None:
+        self._disable_config(
+            "get_external_custom_audio_data_to_playback_enable",
+            "set_external_custom_audio_data_to_playback_enable",
+        )
+
+    def _read_system_status(self) -> dict:
+        status = self._media_ctrl.get_system_status()
+        return {
+            "work_status": self._enum_name(getattr(status, "value", None)),
+            "reason": self._enum_name(getattr(status, "reason", None)),
+        }
+
+    @staticmethod
+    def _is_healthy_status(status: dict, allowed_work_statuses) -> bool:
+        """Return whether the audio agent has left a reset/error transition."""
+        return (
+            status.get("work_status") in allowed_work_statuses
+            and status.get("reason") not in {"CMD_RESET", "ERROR_SLEEPED"}
+        )
+
+    def _wait_for_reset(
+        self,
+        timeout_s: float = _AUDIO_AGENT_RESET_TIMEOUT_S,
+    ) -> tuple[dict, bool]:
+        """Wait for CMD_RESET, then a fresh READY/SLEEPED state.
+
+        The SDK status before the command can still be returned immediately
+        after ``restart()``.  Therefore a healthy status alone is not enough:
+        first observe the reset acknowledgement, then wait for the subsequent
+        healthy sample.  The boolean distinguishes a real completed reset from
+        a timeout whose last sample happened to be healthy.
+        """
+        deadline = time.monotonic() + timeout_s
+        latest = {"work_status": "unknown", "reason": "unknown"}
+        status_error = None
+        reset_acknowledged = False
+        while time.monotonic() < deadline:
+            try:
+                latest = self._read_system_status()
+                status_error = None
+                if latest["reason"] == "CMD_RESET":
+                    reset_acknowledged = True
+                if (
+                    reset_acknowledged
+                    and self._is_healthy_status(latest, _AUDIO_RESET_RECOVERED_STATUSES)
+                ):
+                    return latest, True
+            except Exception as exc:
+                status_error = str(exc)
+            time.sleep(_AUDIO_AGENT_POLL_INTERVAL_S)
+        if status_error:
+            latest["status_error"] = status_error
+        return latest, False
+
+    def _get_system_error(self) -> dict | None:
+        try:
+            error = self._media_ctrl.get_system_error()
+            code = int(getattr(error, "code", 0))
+            message = str(getattr(error, "message", ""))
+            if code or message:
+                return {"code": code, "message": message}
+        except Exception as exc:
+            return {"message": str(exc)}
+        return None
+
+    @staticmethod
+    def _is_error_status(status: dict) -> bool:
+        # EXIT/CMD_RESET is a normal asynchronous reset transition.  Callers
+        # wait for it to settle and only treat ERROR_SLEEPED as a hard error.
+        return status.get("reason") == "ERROR_SLEEPED"
+
+    def _status_error_result(self, requested_state: str, status: dict, recovery: str | None = None) -> dict:
+        result = {"state": "error", "requested_state": requested_state, **status}
+        system_error = self._get_system_error()
+        if system_error:
+            result["system_error"] = system_error
+        if recovery:
+            result["recovery"] = recovery
+        return result
+
+    def _stop_playback_locked(self) -> dict:
+        """Stop ROS playback and release its MediaController route."""
+        self._playing = False
+        self._destroy_subscription()
+        self._input_topic = ""
+        errors = []
+        try:
+            self._media_ctrl.pause_audio_playback()
+        except Exception as exc:
+            errors.append(f"pause_audio_playback: {exc}")
+        try:
+            self._disable_external_playback()
+        except Exception as exc:
+            errors.append(f"disable_external_playback: {exc}")
+        if errors:
+            self._last_error = "; ".join(errors)
+            return {"state": "error", "error": self._last_error}
+        self._last_error = None
+        return {"state": "idle"}
+
+    def _recover_audio_agent_locked(self) -> dict | None:
+        """Restart the vendor audio agent if it is down, before playing.
+
+        ``ERROR_SLEEPED`` is the one state where the robot's audio agent is
+        genuinely dead and no external playback reaches the speaker; the SDK's
+        documented recovery is ``restart()`` ("重启语音模块").  Every other
+        state — including ``SLEEPED``, which is where the agent sits whenever
+        nobody said its wake word — plays fine, verified on hardware.
+
+        This is deliberately not a user-facing action: nobody operating the
+        speaker card should have to know the vendor voice agent exists.
+        Returns an error dict when recovery failed, otherwise ``None``.
+        """
+        try:
+            current = self._read_system_status()
+        except Exception:
+            # A transient status read must not block playback; the frames
+            # themselves are the real test of whether the path works.
+            return None
+        if not self._is_error_status(current):
+            return None
+
+        self._node.get_logger().warn(
+            f"Speaker: audio agent down ({current}); restarting the voice module"
+        )
+        try:
+            self._media_ctrl.restart()
+        except Exception as exc:
+            return self._status_error_result("playing", current, recovery=str(exc))
+        status, reset_completed = self._wait_for_reset()
+        if not reset_completed:
+            return self._status_error_result(
+                "playing", status,
+                recovery="the robot's audio agent did not come back; power-cycle the robot",
+            )
+        self._node.get_logger().info(f"Speaker: audio agent recovered ({status})")
+        return None
 
     def get_tool(self) -> dict:
         return {
             "name": "speaker",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Bumi speaker — play audio from ROS2 topic on robot speaker, volume control, wake/sleep.",
+            "description": "Bumi speaker — plays the PCM audio of its connected input topic on the robot speaker, with volume control.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["play", "stop", "get_volume", "set_volume", "wakeup", "sleep"],
+                        "enum": ["start", "stop", "info", "get_volume", "set_volume"],
                     },
                     "input_topic": {
                         "type": "string",
-                        "description": "ROS2 topic to subscribe for PCM audio data",
+                        "description": "ROS2 topic to subscribe for PCM audio (provided by the canvas connection)",
                     },
                     "volume": {
                         "type": "integer",
@@ -1056,13 +1332,17 @@ class SpeakerPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "play": {
+                    "start": {
                         "params": ["input_topic"],
-                        "description": "Subscribe to audio topic and play through robot speaker",
+                        "description": "Subscribe to the connected audio topic and play it on the robot speaker",
                     },
                     "stop": {
                         "params": [],
                         "description": "Stop audio playback",
+                    },
+                    "info": {
+                        "params": [],
+                        "description": "Get subscription, submitted-frame, volume and audio-agent status",
                     },
                     "get_volume": {
                         "params": [],
@@ -1072,17 +1352,12 @@ class SpeakerPlugin:
                         "params": ["volume"],
                         "description": "Set volume (0-200)",
                     },
-                    "wakeup": {
-                        "params": [],
-                        "description": "Wake up robot audio agent",
-                    },
-                    "sleep": {
-                        "params": [],
-                        "description": "Put robot audio agent to sleep",
-                    },
                 },
             },
-            "topic_in": [{"format": "audio/pcm-16k"}],
+            "topic_in": [{
+                "format": "audio/pcm-16k",
+                "message_type": "audio_msgs/msg/AudioChunk",
+            }],
             "topic_out": [],
         }
 
@@ -1090,78 +1365,149 @@ class SpeakerPlugin:
         pass
 
     def stop(self) -> None:
-        self._playing = False
+        self._stop_playback()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         args.pop('_tool_name', None)
 
-        if action == "start":
-            return {"state": "ready"}
+        # The canvas starts a card with 'start' plus the resolved input_topic
+        # (web/js/canvas.js), so start IS the playback action — an earlier
+        # revision answered start with a bare {"state": "ready"} and only
+        # subscribed on a separate 'play', which no caller ever sent: the card
+        # showed running while the driver had no subscription at all.  'play'
+        # stays accepted, unadvertised, for layouts saved against that build.
+        if action in ("start", "play"):
+            return self._start_playback(args)
         if action == "stop":
-            self._playing = False
-            self._media_ctrl.pause_audio_playback()
-            return {"state": "idle"}
-        if action == "play":
-            return self._do_play(args)
+            return self._stop_playback()
+        if action == "info":
+            topic_in = [{
+                "format": "audio/pcm-16k",
+                "message_type": "audio_msgs/msg/AudioChunk",
+            }]
+            if self._input_topic:
+                topic_in[0]["topic"] = self._input_topic
+            try:
+                system_status = self._read_system_status()
+            except Exception as exc:
+                system_status = {"status_error": str(exc)}
+            try:
+                volume = self._media_ctrl.get_volume()
+            except Exception as exc:
+                volume = {"error": str(exc)}
+            return {
+                "state": "playing" if self._playing else "idle",
+                "topic_in": topic_in,
+                # Frames handed to the SDK, NOT frames heard: publishing is
+                # fire-and-forget, so a rising count alone never proves audio
+                # reached the speaker.
+                "frames_submitted": self._frames_submitted,
+                "last_audio_time": self._last_audio_time or None,
+                "last_error": self._last_error,
+                "volume": volume,
+                "system_status": system_status,
+            }
         if action == "get_volume":
             vol = self._media_ctrl.get_volume()
             return {"volume": vol}
         if action == "set_volume":
             vol = int(args.get("volume", 100))
-            self._media_ctrl.set_volume(vol)
-            return {"volume": vol, "state": "set"}
-        if action == "wakeup":
-            self._media_ctrl.wakeup()
-            return {"state": "awake"}
-        if action == "sleep":
-            self._media_ctrl.sleep()
-            return {"state": "sleeping"}
+            try:
+                with self._config_lock:
+                    self._wait_for_config_slot()
+                    self._media_ctrl.set_volume(vol)
+                    self._last_config_change = time.monotonic()
+                return {"volume": vol, "state": "set"}
+            except Exception as exc:
+                return {"state": "error", "error": str(exc)}
         return None
 
-    def _do_play(self, args: dict) -> dict:
-        input_topic = args.get("input_topic", "")
+    def _stop_playback(self) -> dict:
+        with self._control_lock:
+            return self._stop_playback_locked()
+
+    def _start_playback(self, args: dict) -> dict:
+        input_topic = str(args.get("input_topic") or "").strip()
         if not input_topic:
             return {"error": "input_topic is required"}
 
-        self._playing = True
-        self._media_ctrl.resume_audio_playback()
+        with self._control_lock:
+            # Stop delivering frames from the previous topic before changing
+            # the MediaController route or installing the new subscription.
+            previous = self._stop_playback_locked()
+            if previous["state"] == "error":
+                return previous
 
-        # Subscribe to the audio topic
-        def _on_audio(msg):
-            if not self._playing:
-                return
+            recovery_error = self._recover_audio_agent_locked()
+            if recovery_error is not None:
+                return recovery_error
+
             try:
-                import base64
-                data = json.loads(msg.data)
-                pcm_bytes = base64.b64decode(data["data"])
-                # Convert mono to stereo (duplicate channel) for MediaController (2ch required)
-                mono_samples = struct.unpack(f'<{len(pcm_bytes)//2}h', pcm_bytes)
-                stereo_samples = []
-                for s in mono_samples:
-                    stereo_samples.extend([s, s])  # duplicate L=R
+                # Playback needs this route open and the output unpaused.  It
+                # does NOT need the vendor voice agent awake — a full TTS
+                # utterance was verified playing at SLEEPED/CMD_SLEEPED.
+                self._enable_external_playback()
+                self._media_ctrl.resume_audio_playback()
+            except Exception as exc:
+                self._last_error = str(exc)
+                return {"state": "error", "error": str(exc)}
 
-                # Create AudioStream and publish
-                from mediacontrol_py import AudioStream
-                stream = AudioStream()
-                stream.channels = 2
-                stream.sample_rate = 16000
-                stream.format = 2
-                stream.audio_data = stereo_samples
-                self._media_ctrl.publish_external_audio_playback_stream(stream)
-            except Exception as e:
-                self._node.get_logger().warn(f"Speaker playback error: {e}")
+            self._playing = True
+            self._input_topic = input_topic
+            self._frames_submitted = 0
+            self._last_audio_time = 0.0
+            self._last_error = None
 
-        if self._sub is not None:
-            self._node.destroy_subscription(self._sub)
-        self._sub = self._node.create_subscription(String, input_topic, _on_audio, _LOW_LAT_QOS)
+            # Subscribe to the audio topic
+            def _on_audio(msg: AudioChunk):
+                if not self._playing:
+                    return
+                try:
+                    stream = self._make_playback_stream(msg)
+                    if stream is None:
+                        return
+                    self._media_ctrl.publish_external_audio_playback_stream(stream)
+                    self._frames_submitted += 1
+                    self._last_audio_time = time.time()
+                    if self._frames_submitted == 1 or self._frames_submitted % 100 == 0:
+                        self._node.get_logger().info(
+                            f"Speaker submitted {self._frames_submitted} AudioChunk frame(s) "
+                            f"from {input_topic}"
+                        )
+                except Exception as e:
+                    self._last_error = str(e)
+                    self._node.get_logger().warn(f"Speaker playback error: {e}")
 
-        return {"state": "playing", "input_topic": input_topic}
+            try:
+                self._sub = self._node.create_subscription(
+                    AudioChunk, input_topic, _on_audio, _LOW_LAT_QOS
+                )
+            except Exception as exc:
+                self._playing = False
+                self._input_topic = ""
+                self._last_error = str(exc)
+                return {"state": "error", "error": str(exc)}
+
+            return {
+                "state": "playing",
+                "input_topic": input_topic,
+                "topic_in": [{
+                    "topic": input_topic,
+                    "format": "audio/pcm-16k",
+                    "message_type": "audio_msgs/msg/AudioChunk",
+                }],
+            }
 
 
 # ── CameraPlugin (sensor, subprocess) ────────────────────────────────────────
 
 def _camera_subprocess(namespace: str):
     """Camera subprocess — captures Realsense D435i color+depth, publishes to ROS2."""
+    # Match the Q5 camera worker's child-process logging protection.
+    # Idempotent when the launcher has already installed it before importing device.
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     import time as _time
     import numpy as _np
 
@@ -1259,6 +1605,61 @@ def _camera_subprocess(namespace: str):
         pipeline.stop()
 
 
+class _CameraFrameNode(Node):
+    """Caches the existing color JPEG stream for persistent vision capture."""
+
+    def __init__(self, color_topic: str):
+        super().__init__("bumi_camera_frame_cache")
+        self._color_topic = color_topic
+        self._condition = threading.Condition()
+        self._sequence = 0
+        self._latest: dict | None = None
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._sub = self.create_subscription(
+            CompressedImage, color_topic, self._on_frame, qos)
+
+    def _on_frame(self, msg: CompressedImage) -> None:
+        received_at = datetime.now().astimezone()
+        frame = {
+            "topic": self._color_topic,
+            "format": msg.format or "jpeg",
+            "width": 640,
+            "height": 480,
+            "ros_timestamp": {
+                "sec": int(msg.header.stamp.sec),
+                "nanosec": int(msg.header.stamp.nanosec),
+            },
+            "received_at": received_at.isoformat(),
+            "timestamp_ms": received_at.timestamp() * 1000,
+            "received_monotonic": time.monotonic(),
+            "data": bytes(msg.data),
+        }
+        with self._condition:
+            self._sequence += 1
+            frame["frame_sequence"] = self._sequence
+            self._latest = frame
+            self._condition.notify_all()
+
+    def wait_for_frame(self, after_sequence=None, timeout_s=5.0):
+        """Read a cached frame, or wait for a strictly later sequence."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with self._condition:
+            if after_sequence is None and self._latest is not None:
+                return dict(self._latest), self._sequence
+            baseline = self._sequence if after_sequence is None else after_sequence
+            while self._sequence <= baseline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, self._sequence
+                self._condition.wait(remaining)
+            return dict(self._latest), self._sequence
+
+
 class CameraPlugin:
     PREFIX = "camera"
 
@@ -1267,6 +1668,8 @@ class CameraPlugin:
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._proc: subprocess.Popen | None = None
+        self._frame_node = _CameraFrameNode(self._color_topic)
+        executor.add_node(self._frame_node)
 
     def get_tools(self) -> list:
         return [
@@ -1292,7 +1695,10 @@ class CameraPlugin:
         import sys
         self._proc = subprocess.Popen(
             [sys.executable, "-c",
-             f"import sys; sys.path.insert(0, '/work'); from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
+             # Protect import-time output as well as the child entry point.
+             "import sys; sys.path.insert(0, '/work'); "
+             "from common import logsafe; logsafe.install(check_fd=False); "
+             f"from device import _camera_subprocess; _camera_subprocess({self._namespace!r})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         def _fwd():
@@ -1304,6 +1710,12 @@ class CameraPlugin:
         if self._proc:
             self._proc.terminate()
             self._proc = None
+
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
+        return self._frame_node.wait_for_frame(after_sequence, timeout_s)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -1559,4 +1971,334 @@ class MotionStatePlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        return None
+
+
+# ── VisionCapturePlugin (persistent RGB photos and videos) ──────────────────
+
+CARD = "vision_capture"
+_FIRST_FRAME_TIMEOUT_S = 5.0
+
+
+def _vision_acp_notify(action_id, status, result, tool):
+    """Report the asynchronous terminal result using the same ACP API as Q5."""
+    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    payload = json.dumps({"action_id": action_id, "status": status,
+                          "result": result, "tool": tool, "ts": time.time()}).encode()
+    request = urllib.request.Request(
+        f"{url}/api/acp/complete", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    # The local Agent Core endpoint uses a self-signed certificate.
+    context = ssl._create_unverified_context() if url.startswith("https://") else None
+    try:
+        with urllib.request.urlopen(request, timeout=5, context=context) as response:
+            response.read()
+    except Exception as exc:
+        print(f"[Bumi ACP] callback failed for {action_id}: {exc}", flush=True)
+
+
+class VisionCapturePlugin:
+    PREFIX = "vision_capture"
+
+    def __init__(self, plugin_config, camera_plugin):
+        self._worker = camera_plugin
+        self._output_dir = Path(str(plugin_config.get(
+            "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
+        self._fps = max(1, min(15, int(plugin_config.get("fps", 15))))
+        self._max_duration_s = max(1, min(30, int(plugin_config.get("max_duration_s", 30))))
+        self._recording_lock = threading.Lock()
+        self._active_recording = None
+
+    def get_tool(self):
+        return {
+            "name": CARD, "type": "actuator", "multiInstance": False,
+            "description": "Capture a Bumi RGB photo or record a video (1–30 seconds) to persistent storage.",
+            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "info", "stop"]},
+                "duration_s": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5,
+                               "description": "默认值为5秒（可填写1–30秒）"},
+            }, "required": ["action"], "additionalProperties": False,
+                "x-action-params": {
+                    "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
+                    "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
+                    "record_video": {"params": ["duration_s"], "description": "录制并保存 1–30 秒 RGB 视频，默认 5 秒。"},
+                    "info": {"params": [], "description": "查看保存目录与相机状态。"},
+                    "stop": {"params": [], "description": "取消当前录像并删除未完成的视频。"},
+                },
+                "x-completion": {
+                    "actions": ["record_video"],
+                    "timeout": self._max_duration_s + 15,
+                }},
+        }
+
+    def get_tools(self):
+        return [self.get_tool()]
+
+    def start(self):
+        return {"state": "ready" if self._camera_ready() else "error"}
+
+    def stop(self):
+        # ``BumiDeviceBundle.stop_all`` calls this during SIGTERM/redeploy. Completing
+        # the ACP action here prevents Agent Core from retaining a pending
+        # recording while the daemon thread and its encoder are torn down.
+        return self._stop_recording()
+
+    def _camera_ready(self):
+        return self._worker is not None and self._worker.is_running()
+
+    def _info(self):
+        frame = None
+        if self._camera_ready():
+            try:
+                frame, _ = self._frame(timeout_s=0)
+            except RuntimeError:
+                pass
+        timestamp_ms = (frame or {}).get("timestamp_ms", 0)
+        age = round(max(0.0, time.time() - timestamp_ms / 1000), 2) if timestamp_ms else None
+        with self._recording_lock:
+            active = ({key: self._active_recording.get(key) for key in
+                       ("action_id", "state", "duration_s", "started_at", "path")}
+                      if self._active_recording else None)
+        return {"ok": self._camera_ready(), "output_dir": str(self._output_dir),
+                "photos_dir": str(self._output_dir / "photos"),
+                "videos_dir": str(self._output_dir / "videos"), "fps": self._fps,
+                "max_duration_s": self._max_duration_s, "latest_frame_age_s": age,
+                "source": "bumi_camera", "active_recording": active}
+
+    def _frame(self, after_sequence=None, timeout_s=_FIRST_FRAME_TIMEOUT_S):
+        if not self._camera_ready():
+            raise RuntimeError("Bumi camera worker is unavailable")
+        frame, sequence = self._worker.wait_for_color_frame(after_sequence, timeout_s)
+        if not isinstance(frame, dict) or not frame.get("data"):
+            raise RuntimeError("No RGB frame has arrived yet")
+        timestamp_ms = frame.get("timestamp_ms", 0)
+        if timestamp_ms and time.time() - timestamp_ms / 1000 > 3.0:
+            frame, sequence = self._worker.wait_for_color_frame(sequence, timeout_s)
+            if (not isinstance(frame, dict) or not frame.get("data") or
+                    (frame.get("timestamp_ms") and
+                     time.time() - frame["timestamp_ms"] / 1000 > 3.0)):
+                raise RuntimeError("No fresh RGB frame has arrived yet")
+        return frame, sequence
+
+    def _capture_photo(self, args):
+        try:
+            frame, _ = self._frame()
+            directory = self._output_dir / "photos"
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = directory / f"IMG_{stamp}.jpg"
+            # Exclusive creation protects an existing photo from a timestamp collision.
+            with path.open("xb") as output:
+                try:
+                    output.write(frame["data"])
+                except Exception:
+                    path.unlink(missing_ok=True)
+                    raise
+            return {"ok": True, "media_type": "photo", "file_path": str(path),
+                    "captured_at": datetime.now().isoformat(timespec="seconds"),
+                    "frame_age_s": round(max(0.0, time.time() - frame.get("timestamp_ms", 0) / 1000), 2)}
+        except Exception as exc:
+            return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
+
+    @staticmethod
+    def _cancelled_result():
+        return {"ok": False, "code": "RECORD_CANCELLED",
+                "message": "Video recording was cancelled"}
+
+    def _set_recording_value(self, active, key, value):
+        if active is None:
+            return
+        with self._recording_lock:
+            if self._active_recording is active:
+                active[key] = value
+
+    def _finish_recording(self, active, status, result):
+        """Send one ACP terminal event and release the active-recording slot."""
+        with self._recording_lock:
+            if active.get("finished"):
+                return False
+            active["finished"] = True
+            if self._active_recording is active:
+                self._active_recording = None
+            action_id = active["action_id"]
+        _vision_acp_notify(action_id, status, result, CARD)
+        return True
+
+    @staticmethod
+    def _terminate_encoder(process):
+        if process is None:
+            return
+        try:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=2)
+        except Exception:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _write_video_frame(process, data, cancel_event):
+        # A stalled encoder must not block stop/shutdown indefinitely.
+        fd = process.stdin.fileno()
+        pending = memoryview(data)
+        deadline = time.monotonic() + 5.0
+        while pending:
+            if cancel_event.is_set():
+                return False
+            if process.poll() is not None:
+                raise RuntimeError("ffmpeg exited while encoding")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("ffmpeg input timed out")
+            if not select.select([], [fd], [], 0.1)[1]:
+                continue
+            try:
+                written = os.write(fd, pending)
+                pending = pending[written:]
+            except BlockingIOError:
+                continue
+        return True
+
+    def _record_video(self, requested, cancel_event, active=None):
+        process = None
+        path = None
+        completed = False
+        try:
+            _, sequence = self._frame()
+            if cancel_event.is_set():
+                return self._cancelled_result()
+            directory = self._output_dir / "videos"
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            candidate = directory / f"video_{stamp}.mp4"
+            # Reserve this exact name; cleanup may only remove our own file.
+            with candidate.open("xb"):
+                pass
+            path = candidate
+            self._set_recording_value(active, "path", str(path))
+            # A file avoids the stderr pipe filling up and deadlocking ffmpeg.
+            with tempfile.TemporaryFile() as error_log:
+                process = subprocess.Popen([
+                    "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg",
+                    "-r", str(self._fps), "-i", "-", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(path),
+                ], stdin=subprocess.PIPE, stderr=error_log, bufsize=0)
+                self._set_recording_value(active, "process", process)
+                os.set_blocking(process.stdin.fileno(), False)
+                frames, deadline = 0, time.monotonic() + requested
+                while time.monotonic() < deadline and not cancel_event.is_set():
+                    tick = time.monotonic()
+                    frame, sequence = self._frame(
+                        after_sequence=sequence,
+                        timeout_s=max(0.25, 2.0 / self._fps),
+                    )
+                    if not self._write_video_frame(process, frame["data"], cancel_event):
+                        break
+                    frames += 1
+                    cancel_event.wait(min(
+                        max(0.0, 1.0 / self._fps - (time.monotonic() - tick)),
+                        max(0.0, deadline - time.monotonic())))
+                if cancel_event.is_set():
+                    return self._cancelled_result()
+                process.stdin.close()
+                if process.wait(timeout=10) != 0 or not frames or not path.stat().st_size:
+                    error_log.seek(0)
+                    message = error_log.read(4096).decode("utf-8", "replace")
+                    raise RuntimeError(message.strip() or "ffmpeg failed to create MP4")
+                if cancel_event.is_set():
+                    return self._cancelled_result()
+                completed = True
+                return {"ok": True, "media_type": "video", "file_path": str(path),
+                        "recorded_duration_s": requested, "frames": frames,
+                        "captured_at": datetime.now().isoformat(timespec="seconds")}
+        except Exception as exc:
+            if cancel_event.is_set():
+                return self._cancelled_result()
+            return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
+        finally:
+            self._terminate_encoder(process)
+            self._set_recording_value(active, "process", None)
+            if not completed and path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    print(f"[vision_capture] could not remove partial video {path}: {exc}", flush=True)
+
+    def _record_video_async(self, active, requested):
+        result = self._record_video(requested, active["cancel_event"], active)
+        if result.get("ok"):
+            status = "completed"
+        elif result.get("code") == "RECORD_CANCELLED":
+            status = "cancelled"
+        else:
+            status = "error"
+        self._finish_recording(active, status, result)
+
+    def _start_video_recording(self, args):
+        try:
+            requested = args.get("duration_s", 5)
+            if isinstance(requested, bool) or not isinstance(requested, int):
+                raise ValueError("duration_s must be an integer")
+        except (TypeError, ValueError):
+            return {"ok": False, "code": "INVALID_DURATION", "message": "duration_s must be an integer"}
+        if not 1 <= requested <= self._max_duration_s:
+            return {"ok": False, "code": "INVALID_DURATION", "message": f"duration_s must be between 1 and {self._max_duration_s}"}
+        if not self._camera_ready():
+            return {"ok": False, "code": "RECORD_FAILED", "message": "Bumi camera worker is unavailable"}
+        with self._recording_lock:
+            if self._active_recording:
+                return {"ok": False, "code": "RECORD_IN_PROGRESS", "message": "A video recording is already in progress",
+                        "action_id": self._active_recording["action_id"]}
+            action_id = f"vision_capture_record_video_{time.time_ns()}"
+            cancel_event = threading.Event()
+            active = {"action_id": action_id, "state": "recording", "duration_s": requested,
+                      "started_at": datetime.now().isoformat(timespec="seconds"),
+                      "cancel_event": cancel_event, "process": None, "path": None,
+                      "finished": False}
+            thread = threading.Thread(target=self._record_video_async,
+                                      args=(active, requested), daemon=True,
+                                      name="bumi_vision_capture_record_video")
+            active["thread"] = thread
+            self._active_recording = active
+            thread.start()
+        return {"ok": True, "state": "queued", "action_id": action_id, "media_type": "video",
+                "requested_duration_s": requested, "message": "Video recording started; completion will be reported asynchronously."}
+
+    def _stop_recording(self):
+        with self._recording_lock:
+            active = self._active_recording
+            if not active:
+                return {"state": "idle", "message": "No video recording is in progress"}
+            active["state"] = "stopping"
+            active["cancel_event"].set()
+            process = active.get("process")
+        self._terminate_encoder(process)
+        # Keep the slot until the worker has removed its partial output. A new
+        # recording must not race cleanup of a cancelled recording.
+        active["thread"].join(timeout=6)
+        state = "stopping" if active["thread"].is_alive() else "idle"
+        return {"ok": True, "state": state, "action_id": active["action_id"],
+                "message": "Video recording cancelled" if state == "idle"
+                else "Waiting for video recording to cancel"}
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready" if self._camera_ready() else "error",
+                    "message": "" if self._camera_ready() else "Bumi camera worker is unavailable"}
+        if action == "info":
+            return self._info()
+        if action == "capture_photo":
+            return self._capture_photo(args)
+        if action == "record_video":
+            return self._start_video_recording(args)
+        if action == "stop":
+            return self._stop_recording()
         return None

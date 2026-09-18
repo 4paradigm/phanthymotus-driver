@@ -4,6 +4,19 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
+## Head camera snapshot card
+
+The `vision_capture` card subscribes to `/ob_camera_head/color/image_raw` and
+provides `capture_image`, `record_video`, `start_recording`, `stop_recording`,
+`list`, and `delete` actions. Each capture or recording is saved under
+`/opt/phanthy-motus/data/images` and returns a channel-visible path. The
+driver derives the corresponding `/work/resource/...` path from the persistent
+mount (or uses `PHANTHY_CHANNEL_OUTPUT_DIR` when a deployment uses another
+mount). Use that returned path with `channel_reply(files=[{"path": "..."}])`
+to send media through Feishu or Telegram. Use `image_name` (without `.jpg`)
+for photos and `video_name` (without `.mp4`) for videos. To delete media, pass
+Use `delete` with the complete filename in `name`, including `.jpg` or `.mp4`.
+
 ## Raw arm joint card
 
 `arm` directly commands seven joints per selected arm in this canonical order:

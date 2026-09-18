@@ -26,6 +26,7 @@ import robot_ready
 import simple_action
 import arm_control
 import system_health
+import vision_capture
 
 
 FRESH_JOINT_SNAPSHOT = {
@@ -464,6 +465,51 @@ class Q5BasicSensorTests(unittest.TestCase):
         normal = control_contract.prepare_call_args({"inputSchema": {}}, {"action": "info"})
         self.assertEqual(unchanged, {"action": "move"})
         self.assertEqual(normal, {"action": "info"})
+
+    def test_vision_capture_records_video_asynchronously_with_acp_completion(self):
+        class CameraWorker:
+            _running = True
+
+        class CameraClient:
+            camera_worker = CameraWorker()
+
+        plugin = vision_capture.Plugin({}, "test", None, CameraClient())
+        started = threading.Event()
+        release = threading.Event()
+        notifications = []
+        original_notify = vision_capture._acp_notify
+
+        def fake_record(requested, cancel_event, active=None):
+            del active
+            self.assertEqual(requested, 5)
+            self.assertFalse(cancel_event.is_set())
+            started.set()
+            self.assertTrue(release.wait(1))
+            return {"ok": True, "media_type": "video", "file_path": "/tmp/test.mp4"}
+
+        vision_capture._acp_notify = lambda *args: notifications.append(args)
+        plugin._record_video = fake_record
+        try:
+            queued = plugin.dispatch("record_video", {"duration_s": 5})
+            self.assertTrue(queued["ok"])
+            self.assertEqual(queued["state"], "queued")
+            self.assertTrue(queued["action_id"].startswith("vision_capture_record_video_"))
+            self.assertTrue(started.wait(1))
+            duplicate = plugin.dispatch("record_video", {"duration_s": 5})
+            self.assertEqual(duplicate["code"], "RECORD_IN_PROGRESS")
+            release.set()
+            for _ in range(100):
+                if notifications:
+                    break
+                time.sleep(0.01)
+        finally:
+            release.set()
+            vision_capture._acp_notify = original_notify
+        self.assertEqual(notifications[0][0], queued["action_id"])
+        self.assertEqual(notifications[0][1], "completed")
+        self.assertEqual(notifications[0][3], "vision_capture")
+        schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual(schema["x-completion"]["actions"], ["record_video"])
 
     def test_hand_control_builds_whole_hand_and_single_finger_targets(self):
         snapshot = dict(FRESH_JOINT_SNAPSHOT)

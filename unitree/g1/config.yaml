@@ -58,6 +58,12 @@ plugins:
     clock_reset_confirm_samples: 5
     reconnect_interval_sec: 1.0
     stale_frame_timeout_sec: 2.5
+  vision_capture:
+    enabled: true
+    # The existing host bind mount preserves captures across container updates.
+    output_dir: /opt/phanthy-motus/data/vision_capture
+    fps: 15
+    max_duration_s: 30
   lidar:
     enabled: true
   # MID360 raw DDS -> native ROS 2 topics for navigation consumers. This

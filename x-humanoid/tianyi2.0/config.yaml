@@ -1,11 +1,25 @@
 mcp_port: 15707
 ros_namespace: ""   # 留空则自动使用 hostname
-name: "Tianyi 2.0 Pro"
+name: "X-humanoid Tianyi 2.0 Pro Bundle"
 
+# Forward all topics from domain 0 (body controller) to domain 42 (agent-core)
+# via socket bridge. This enables proper DDS isolation.
+domain_bridge:
+  enabled: true
+
+# DEPRECATED: Use domain_bridge instead. Left for backward compatibility.
 # Run the skeleton publisher in its own ROS process. The main bundle keeps
 # the other cards but does not publish a competing joints topic.
 joints_bridge:
+  enabled: false
+
+# Make power-on self-check automatic on the robot's x86 motion-control board.
+auto_self_check:
   enabled: true
+  ssh_host: "192.168.41.1"
+  ssh_user: "ubuntu"
+  ssh_password: "123"
+  timeout: 15
 
 slamtec:
   base_url: "http://192.168.11.1:1448"
@@ -15,6 +29,15 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  camera_snapshot:
+    enabled: true
+    output_dir: "/opt/phanthy-motus/data/images"
+    # The channel-visible path is derived from the persistent mount. Set
+    # PHANTHY_CHANNEL_OUTPUT_DIR only when deployment uses another mount.
+    jpeg_quality: 90
+    video_fps: 20
+    default_video_seconds: 5
+    max_video_seconds: 60
   imu:
     enabled: true
   camera_depth:
@@ -51,6 +74,24 @@ plugins:
     enabled: true
   hand:
     enabled: true
+  servo:
+    # 执行模型（VLA 等）的连续控制入口：26 维 = 14 臂(rad) + 12 指(0 张开..1 握紧)。
+    #
+    # 和 arm / hand 一样默认打开 —— 这里的 enabled 只决定这张卡片**出不出现**
+    # 在工具列表和侧边栏里，不决定它动不动。真正的门槛有三道，都在别处：
+    #   1. 画布上必须有一路 control/joint 连到它，否则 start 会因为拿不到
+    #      input_topic 而拒绝；
+    #   2. start 必须显式带 confirm_motion: true；
+    #   3. 每一条指令还要过驱动侧 ControlSink 的检查链。
+    # 容器重启也不会让它自己跑起来（bundle 的 start() 是空的）。
+    # 实际上它比 arm 更难被误触发：arm 一次 tools/call 就动。
+    enabled: true
+    expected_hz: 30
+    # 每条指令下发给关节的角速度，厂商允许区间 [0.2, 1.5] rad/s。
+    arm_speed: 0.5
+    # 指令断流时是否张开双手。默认否：松手会把正在搬的东西摔到下面的东西上，
+    # 而"继续攥着"和"松开"哪个更糟取决于机器人在干什么。见 servo.py 的 _hold。
+    release_hands_on_watchdog: false
   tts:
     enabled: true
   voice_play:
@@ -58,8 +99,6 @@ plugins:
   nav:
     enabled: true
   home:
-    enabled: true
-  chat:
     enabled: true
   voice_chat:
     enabled: true

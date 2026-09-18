@@ -729,10 +729,13 @@ unitree-g1:                      # Service name (must be unique)
   privileged: true               # Required: access to /dev and hardware
   volumes:
     - /dev:/dev                  # Required: device access for cameras, sensors, etc.
+    # Required: the loopback-only DDS profile. See "DDS isolation" below —
+    # a driver that skips this cannot talk to Agent Core at all.
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
-    - ROS_DOMAIN_ID=42
+    - ROS_DOMAIN_ID=42           # Same on every robot; do not allocate per-robot
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
   logging:
     driver: local
@@ -749,6 +752,137 @@ unitree-g1:                      # Service name (must be unique)
 - `network_mode`, `ipc`, `pid` are injected by Agent Core during deployment — do not specify them in service.yml
 - The `__IMAGE__` placeholder is automatically replaced with the actual image reference
 - Service name should follow the pattern `{provider}-{model}` (e.g. `unitree-g1`, `phanthy-remote-control`)
+- Do **not** set `FASTDDS_BUILTIN_TRANSPORTS`. It conflicts with the profile's
+  `useBuiltinTransports=false`, and the value cannot be unset from compose once an image bakes it
+  into its `ENV` — the XML wins anyway, so the variable is only a source of confusion.
+
+---
+
+### DDS isolation — load the profile unless the driver manages DDS itself
+
+**Both lines above are mandatory for any driver that reaches Agent Core over FastDDS**, which is all
+of them except the two dual-domain cases listed at the end of this section. A driver container without them is not merely
+unisolated: with `useBuiltinTransports=false` everywhere else, it ends up on a different transport
+from the rest of the machine and **cannot reach Agent Core at all**. The symptom is a device that
+registers over HTTP and shows up in the dashboard, while none of its topics ever carry data.
+
+Why the profile exists: `/remote_control/message` — a *command* topic — was reaching every robot on
+the office LAN. An instruction typed on one robot was executed by a second one too, with the
+identical timestamp in both logs. DDS has no addressing and no authentication; every subscriber on
+the domain receives everything. The fix pins FastDDS to `127.0.0.1`
+(`interfaceWhiteList`), and because containers run with `network_mode: host` they share one
+loopback — the local bus works normally, nothing crosses the machine.
+
+`ROS_DOMAIN_ID` stays **42 everywhere**. Per-robot domain numbers were tried and rejected: the
+usable range is narrow, and cloned images have no way to coordinate a unique number.
+
+**Your robot-body link is unaffected.** Drivers that speak to the hardware over the vendor SDK use
+**CycloneDDS** with an explicitly bound interface (`ChannelFactoryInitialize(0, "eth0")`), and
+`FASTRTPS_DEFAULT_PROFILES_FILE` only affects FastDDS. The two stacks coexist in one process.
+Verified on a real R1: with and without the profile, a read-only `rt/lowstate` probe reported the
+identical packet count and IMU yaw. Raw UDP multicast (R1's microphone uses `239.168.123.161:5555`
+via `IP_ADD_MEMBERSHIP`) is likewise untouched — it is not DDS.
+
+Two things that bite when deploying by hand:
+
+- **A missing file fails silently, and worse.** If the host has no
+  `/opt/phanthy-motus/dds-local.xml`, Docker's bind mount creates a *directory* with that name;
+  FastDDS ignores it and falls back to every interface. Agent Core writes the file from its own
+  image when it is absent — but a container that already mounted the phantom directory must be
+  **recreated**, not restarted (`docker start` cannot change a mount type fixed at creation; it
+  fails with `not a directory: Are you trying to mount a directory onto a file`).
+- **Judge by socket bindings, not by config.** Check that the driver's UDP sockets bind loopback:
+  `sudo ss -lunp | grep 179` should show `127.0.0.1:179xx` (plus a `239.255.0.1` multicast join,
+  which is expected — the whitelist decides which interface it joins on). Agent Core also exposes
+  `GET /api/peer/dds_isolation`.
+
+**Two drivers do not set these lines in `environment`, for two different reasons — and neither is
+"isolated" in the sense the fleet profile means.** If you write a driver in either shape, read the
+row that matches:
+
+| Driver | Why the compose variable does not work | Status |
+|---|---|---|
+| `engineai/t800` | Its `CMD` forces `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, so **both** its domains run on CycloneDDS. `FASTRTPS_DEFAULT_PROFILES_FILE` has no effect at all; CycloneDDS is configured through `CYCLONEDDS_URI`, which this driver pins to the robot interface (`eth1`) — for both contexts. | **Open gap.** Its domain-42 traffic is still on the LAN. Untried: no T800 hardware available. `check_service_yml.py` reports it as `GAP`. |
+| `x-humanoid/tianyi2.0` | It holds **two FastDDS contexts in one process** (`DualDomainROS2` in `main.py`, `BridgeROS2` in `joints_bridge.py`), and the fleet profile would put the body link on loopback and cut it. It therefore selects the **vendor** profile (`/work/dds_profile.xml`) for the whole process, before any participant exists. | **Partly isolated, by whitelist rather than by loopback** — see below. |
+
+### One profile per process — per-participant selection does not work
+
+An earlier version of this section said tianyi "selects a profile per DDS context by setting the
+variable around each `rclpy.init()`", and cited it as proof that per-participant profiles are
+possible. **That was wrong, and shipping it silently cut part of the body link.** Two separate
+reasons, either one fatal:
+
+1. **FastDDS reads `FASTRTPS_DEFAULT_PROFILES_FILE` at participant creation, not at
+   `rclpy.init()`** — and rmw_fastrtps creates the participant lazily, with the first `Node` on the
+   context. Setting the variable around each `rclpy.init()` sets it around the wrong call: by the
+   time the first real Node appears, the variable holds whatever was written last.
+2. **The parsed profiles are cached process-wide**, so switching the variable between contexts
+   cannot give them different profiles at all — it only decides which single profile both use.
+   Measured on the robot: a process that set the vendor profile, created a domain-0 node, then set
+   the loopback profile and created a domain-42 node, ended with *both* domains bound to
+   `127.0.0.1` **and** `192.168.41.2` — the vendor whitelist, for both.
+
+What the wrong profile cost, for calibration on how quiet this failure is: with the loopback-only
+profile in force, the domain-0 participant bound `127.0.0.1` but not `192.168.41.2`, where the
+vendor stack lives. Visible domain-0 topics fell from 77 to 33, all 26 of the driver's own
+`tianyi2_*` nodes vanished from domain 0, and lyre's `/audio_play/play_text` became undiscoverable
+(2.76 s to discover under the vendor profile; nothing after 15 s under the loopback one). Nothing
+was logged. `/arm/status` and `/head/status` survived, so the robot looked healthy — while TTS
+reported success and produced no sound, with lyre's journal confirming it had received nothing.
+
+The earlier "verified" claim was a real measurement, but a one-sided one: it checked that domain 42
+had moved to `127.0.0.1` and did not check what had happened to domain 0. When you verify an
+isolation change, measure **both** sides of the link it runs through.
+
+So tianyi runs the vendor profile process-wide. Its whitelist is
+`{192.168.41.2, 127.0.0.1}`: the body link works, and — the point of the fleet-wide profile — the
+**office LAN is excluded**, so domain 42 cannot carry `/remote_control/message` to another robot.
+Be precise about what that is not: domain 42 is still reachable from the body board on
+`192.168.41.x`. That board runs no Agent Core and is internal to this robot, so nothing there can
+act on a command. Narrowing it to true loopback needs the agent-core-facing publishers moved into
+their own process, one profile each.
+
+Because of this, tianyi does **not** use the `dds-local.xml` mount, and `check_service_yml.py` does
+not require it for that driver. Verified after the fix: both domains bind `127.0.0.1` and
+`192.168.41.2`, **no `10.100.x`**; 26 `tianyi2_*` nodes visible on domain 0; TTS returns `ready`
+and plays with a real sid, `PlayProgress` and a `COMPLETED` `PlayEvent`.
+
+### service.yml checklist for a new driver
+
+Run `./scripts/check_service_yml.py` to verify all of this — it is what a reviewer should run on any
+PR that adds or edits a `deploy/service.yml`. It exits non-zero on a violation, so it also works as
+a CI step.
+
+- [ ] mounts `/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro`
+- [ ] sets `FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml`
+- [ ] does not set `FASTDDS_BUILTIN_TRANSPORTS` — it conflicts with the profile's
+      `useBuiltinTransports=false`, and an image that bakes it into `ENV` cannot be corrected from
+      compose anyway (the XML wins, so the variable only misleads whoever reads the file next)
+- [ ] `ROS_DOMAIN_ID=42` — the same on every robot; there is nothing to allocate. A driver holding
+      a second context may spell it `<PREFIX>_ROS_DOMAIN_ID` for the body and
+      `AGENT_CORE_ROS_DOMAIN_ID` for this one; only the Agent Core side must be 42
+- [ ] `network_mode: host` — isolation works by confining DDS to loopback, and containers share a
+      loopback only under host networking
+
+The first two are the ones that break a robot rather than merely leaving it unisolated: with
+`useBuiltinTransports=false` everywhere else, a container that misses them ends up on a different
+transport from the rest of the machine and **cannot reach Agent Core at all** — the device registers
+over HTTP and appears in the dashboard while none of its topics ever carry data, which sends you
+looking at the driver instead of at compose.
+
+The checker keeps two tables instead of one, so that neither exception quietly becomes a loophole:
+
+- `OWN_PROFILE` — drivers that must **not** set the fleet profile because they ship their own for
+  the whole process (`x-humanoid/tianyi2.0`; see § "One profile per process" above for why per-context
+  selection is not an option). The mount is not required either — requiring it would imply the file
+  is in use. Setting the fleet profile here is a failure, not a pass: it cuts the body link.
+- `KNOWN_GAPS` — drivers a FastDDS profile cannot isolate at all, currently `engineai/t800`, whose
+  RMW is CycloneDDS. It is reported as `GAP` and does not fail the run. Adding a third such driver
+  means editing this table, which is the point: the gap stays visible rather than passing a check
+  named "isolation".
+
+`ipc` and `pid` are deliberately **not** checked — they vary legitimately across drivers (a drone
+does not need `pid: host`), and the profile disables shared memory anyway.
 
 ---
 
@@ -948,6 +1082,123 @@ def _nav_poll_thread(self, action_id, target, stall_timeout=60):
 - Tools without `x-completion` → unchanged behavior (sync return)
 - Tools that don't return `action_id` → no pending registered, barrier passes through
 - Drivers that don't POST completion → barrier will timeout gracefully (uses `x-completion.timeout`)
+- Tools without `x-resource` → treated as exclusive against **everything** (old global
+  barrier behaviour). Safe, but see "Declare it on *every* acting tool" below: a
+  partially-declared driver is the case that behaves worst.
+
+---
+
+## Physical Resources (`x-resource`)
+
+The ACP barrier is scoped by **physical channel**, not by tool type. Declare which
+channel(s) an action occupies, next to `x-completion`:
+
+```python
+"inputSchema": {
+    "type": "object",
+    "properties": { ... },
+    "required": ["action"],
+    "x-completion": {"actions": ["speak"], "timeout": 60},
+    "x-resource": "mouth",                    # or ["base", "arm_l"] for multi-channel
+}
+```
+
+**Why this exists.** The barrier used to block *any* acting tool on *any* pending
+action. That conflates two unrelated things — "I need X's result before Y"
+(causality) and "X and Y both need the mouth" (exclusion) — and implements neither,
+landing on "everyone waits for everyone". Speaking blocked navigating. One
+background agent speaking blocked every other agent's every actuator call, on
+unrelated hardware. `robotera/q5_bundle/` already splits `base_drive`,
+`arm_gesture`, `leg_control` and `waist_control` into separate tools; the global
+barrier serialised all four for no reason.
+
+**Naming.** A resource is a thing there is physically one of. Use the same string
+across every tool that drives the same hardware, and different strings for channels
+that genuinely move independently:
+
+| Channel | Typical tools |
+|---------|---------------|
+| `mouth` | `tts`, `speaker` |
+| `base`  | `loco`, `navigate`, `base_drive` |
+| `arm_l` / `arm_r` | `arm_gesture`, arm IK, gripper |
+| `leg`   | `leg_control`, `switch_mode` |
+| `waist` | `waist_control` |
+| `head`  | gimbal / head pan-tilt |
+
+**Rules.**
+
+- **Undeclared means exclusive against everything.** Omitting `x-resource` is safe;
+  a *wrong* one is not, since it can let two conflicting actions run at once.
+- Malformed values (`{}`, `42`, `""`, `[]`) fall back to undeclared rather than to
+  "conflicts with nothing" — a typo must not silently unlock parallel actuation.
+- One tool may hold several channels: `"x-resource": ["base", "arm_l"]` for an action
+  that drives while pointing. It then conflicts with anything touching either.
+- Two *different* drivers using the same channel name is meaningful and correct —
+  two `tts` tools on one robot are still one speaker.
+- This is orthogonal to `type`. `type` decides whether a tool is barriered at all
+  (`sensor`/`resource` never are); `x-resource` decides *what it waits for*.
+
+### Declare it on *every* acting tool, not only the async ones
+
+The barrier has two sides, and only one of them needs `x-completion`:
+
+| role | what `x-resource` does | needs `x-completion`? |
+|------|------------------------|------------------------|
+| **holder** | tells others what this action blocks while it runs | yes — only an async action has a pending |
+| **requester** | tells the barrier what this call must *wait for* | **no** — every `actuator`/`processor` tool asks |
+
+Miss the requester side and the tool asks with "undeclared", which means *conflicts
+with everything*, so it waits on any pending action anywhere on the robot. Measured
+on Tianyi, where `arm_gesture`/`tts` were declared but the direct-control `arm`/`head`
+were not:
+
+| observed | cause |
+|---|---|
+| head sat idle 5 s before moving | `head` (undeclared) waited on an `arm_gesture` pending |
+| arm sat idle 8 s before moving | `arm` (undeclared) waited on a `tts` pending |
+
+So **a partially-declared driver is worse than an undeclared one**: undeclared is
+uniformly serial and honest about it, partial looks like it should overlap and
+doesn't. It also compounds — with motions serialised behind unrelated channels,
+delegated subagents ran long enough to hit their delegation timeout, got cancelled
+mid-run, and the caller redid work that had already happened.
+
+Three-way summary of getting it wrong:
+
+- **undeclared** → safe, slow. No correctness risk.
+- **partially declared** → safe, slow, and *surprising*. This is the trap.
+- **wrongly declared** → the only case that is unsafe, because it permits
+  concurrency that the hardware does not.
+
+A tool that genuinely occupies no channel cannot say so — an empty `x-resource`
+normalises to "undeclared" on purpose, so a typo fails safe. Such a tool is almost
+always mis-typed: if it only reads state, give it `type: sensor` or `resource`, which
+exempts it from the barrier entirely. (Note that changing `type` also changes who may
+call it: a `viewer`-role peer may call sensor tools. Do not retype a tool casually.)
+
+### It is a vocabulary, not a fixed list — including for non-humanoids
+
+Agent Core contains **no channel names at all**; it only intersects the strings
+drivers declare. The names above are a humanoid convention, nothing more. A drone
+would declare `rotor`, `gimbal`, `camera`; an underwater vehicle `thruster`,
+`ballast`, `rudder`, `manipulator`. Nothing needs to change in the core for either.
+
+Two limits are worth knowing before relying on it:
+
+**It expresses mutual exclusion only.** Not ordering ("announce *before* moving"),
+not simultaneity ("both arms must start together"), not reader/writer sharing, not
+hierarchy (`arm_l` and a wrist-only tool are unrelated strings unless the wrist tool
+also declares `arm_l`), and not capacity (two motors each fine alone but not
+together). If your platform needs those, this is not the mechanism.
+
+**It assumes actions are discrete and bounded** — the same assumption `x-completion`
+makes. A multirotor's rotors are held *continuously* while airborne: hovering is a
+state, not an action that completes. Declaring `rotor` on a takeoff tool that never
+reports completion would hold that channel forever and block everything behind it.
+For continuous-state platforms, either keep the state-entering tool out of ACP
+(no `x-completion`, so no pending is held) or model the *transitions* as the actions.
+`dji/mavic3e` currently declares no `x-completion` at all, so it is in the first
+camp by default.
 
 ---
 
@@ -968,6 +1219,7 @@ Driver declares x-hooks in tool schema
   → Agent Core registers bindings at device init/heartbeat
   → System event occurs (ASR arrives, LLM starts, error...)
   → Agent Core fires hook: call_tool_direct() → bypasses barrier + ACP
+    (on_notify is the one exception — see the table below)
   → Driver executes action immediately
 ```
 
@@ -1003,16 +1255,34 @@ Each hook entry maps a `hook_id` to an action + params that will be called direc
 | `on_interrupt_speak` | User barge-in (speech) | Stop TTS |
 | `on_interrupt_motion` | Emergency stop | Stop locomotion |
 | `on_interrupt_all` | Full interrupt | Stop all outputs |
+| `on_notify` | LLM produced a notify-worthy content string | Speak it (`{"action": "speak"}`), or flash/blink if no speaker |
+
+`on_notify` fires with `extra_params={"text": "..."}` — the text is merged into whatever static
+`action`/`params` your binding declares. A speech-capable tool typically just needs `{"action":
+"speak"}` (the merged `text` key lines up with its own `speak` action). A device with no speaker
+(e.g. a drone) can bind its LED tool instead, e.g. `{"action": "set_effect", "params": {"pattern":
+"notify_blink"}}` — the unused `text` key in the merged args is harmless (hook calls skip schema
+validation) and the LED just blinks per its own fixed pattern.
+
+`on_notify` is **not** a true interrupt, and unlike every other hook here it does not fully bypass
+the barrier: it narrates so the user isn't left in silence during a long tool-calling turn, so it
+must not talk over whatever the robot is already saying, and it must not itself get talked over by
+the very next LLM-issued tool call. Agent Core fires it with `barrier_aware=True`, which (1) skips
+the call outright if the bound tool's `x-resource` is already held by a pending action, and (2)
+registers any `action_id` the call returns as pending, same as a normal ACP dispatch — so a
+subsequent `speak`/`navigate`/etc. from the LLM waits for it like it would for any other pending
+action. If your `on_notify` binding declares `x-completion` and `x-resource` like a normal action
+(Tianyi's `tts` does), this happens automatically; no driver-side change is needed to opt in.
 
 ### Key Differences from Normal Tools
 
-| Aspect | Normal Tool Call | Hook Call |
-|--------|----------------|-----------|
-| Triggered by | LLM decision | System event |
-| Barrier | Waits for pending | Bypasses |
-| ACP | Registers pending | Does not |
-| Latency | 1-5s (LLM round) | <50ms |
-| Schema validation | Yes | No |
+| Aspect | Normal Tool Call | Interrupt Hook (`on_interrupt_*`, LED hooks) | `on_notify` |
+|--------|----------------|-----------------------------------------------|-------------|
+| Triggered by | LLM decision | System event | LLM wrote non-empty content |
+| Barrier | Waits for pending | Bypasses | Skips the call if resource busy, else registers pending |
+| ACP | Registers pending | Does not | Registers pending (if the tool declares `x-completion`) |
+| Latency | 1-5s (LLM round) | <50ms | <50ms, or skipped entirely if busy |
+| Schema validation | Yes | No | No |
 
 ### Manual Triggering (API)
 
@@ -1025,3 +1295,181 @@ curl -X POST https://localhost:15678/api/hooks/fire \
 # List registered hooks
 curl https://localhost:15678/api/hooks
 ```
+
+---
+
+## Continuous Control (`motus.control/1`)
+
+MCP `tools/call` is the control plane: low frequency, request/response, authorised.
+It is the wrong shape for an execution model — a VLA policy or a navigation stack
+produces tens of commands per second, and each one is not a question.
+
+Those go on the **data plane**: a `control/*` DDS topic, exactly as a speaker
+already takes its audio on `topic_in: audio/pcm-16k` while its start/stop go
+through tools. `motus.control/1` is the agreement about what flows there.
+
+Until this existed, `control/joint` and `control/velocity` were format strings in
+agent-core's topic-inference table and nothing else: no fields, no units, no joint
+order, and no driver subscribing to either.
+
+Design rationale: `phanthymotus/docs/vla-integration.md` § "通用控制接口".
+
+### Two halves
+
+| Half | Where | What |
+|------|-------|------|
+| **Descriptor** | your command card's `info()` | what this driver accepts — the authoritative definition |
+| **Message** | the `control/*` topic | one command, checked against the descriptor before it moves anything |
+
+A **URDF is not the descriptor** and cannot substitute for it. It carries no units,
+no control rate, no statement of whether you take absolute or incremental
+positions, and no normalisation range. Reference it from `urdf_ref` as a
+supplement for FK and collision geometry; do not derive the action interface
+from it.
+
+### Descriptor
+
+```python
+{
+    "control_interface": "motus.control/1",
+    "mode": "joint_position",       # joint_position | joint_velocity | joint_torque
+                                    # | eef_pose | twist
+    "dof": 14,
+    "joint_names": [...],           # order IS the meaning of `values`
+    "units": {"angle": "rad", "linear": "m", "time": "s"},
+    "limits": {
+        "lower": [...], "upper": [...],         # required
+        "max_velocity": [...],                  # optional
+        "max_delta_per_step": [...],            # optional
+    },
+    "frame": "base_link",           # eef_pose / twist only
+    "end_effector": {"type": "gripper_2f", "range": [0.0, 0.09], "units": "m"},
+    "rate": {"max_hz": 100, "expected_hz": 30, "watchdog_ms": 200,
+             "max_obs_age_ms": 300},
+    "force_torque": [30.0, 30.0, 30.0, 5.0, 5.0, 5.0],   # or null — REQUIRED either way
+    "urdf_ref": "mcp__<id>__model",
+}
+```
+
+`force_torque` must be present **even as `null`**. `parse_descriptor` rejects a
+descriptor that omits it, because omitting it is how a robot ends up assumed to
+have a protection it does not have.
+
+### Message
+
+```python
+{
+    "schema": "motus.control/1",
+    "seq": 1024,                    # per source, strictly increasing
+    "stamp_ms": ...,                # when the command was generated
+    "obs_stamp_ms": ...,            # which observation it was computed from
+    "ttl_ms": 100,                  # expired commands are discarded
+    "source": "mcp__actucore__vla", # who sent it — arbitration and audit
+    "priority": 50,
+    "mode": "joint_position",       # reconciled against the descriptor
+    "dof": 14,
+    "values": [...],                # engineering units, descriptor.joint_names order
+    "gripper": 0.04,
+    "chunk": {"index": 3, "size": 50},   # optional, for debugging
+}
+```
+
+`obs_stamp_ms` is separate from `stamp_ms` on purpose. Remote inference routinely
+produces a command that was generated just now from an 800 ms old picture; only
+the observation timestamp catches that.
+
+Carry `mode` and `dof` redundantly. They are the last line against an upstream
+whose action space changed without the driver being told, and the correct answer
+to that is to refuse — not to apply the first `dof` values and hope.
+
+Payload is JSON in a `std_msgs/String`, like the perception cards: 30 Hz x 14 DOF
+is about 30 KB/s, and the dashboard can render it directly.
+
+### Use `common/control.ControlSink` — do not write the checks yourself
+
+There are fourteen bundles here. A safety chain copied fourteen times diverges
+fourteen ways, and the copy that drifts is the one on the robot nobody is
+watching.
+
+```python
+from common.control import ControlSink
+
+self._sink = ControlSink(
+    DESCRIPTOR,
+    self._apply,                       # (values, gripper) -> None
+    on_watchdog=self._decelerate_to_stop,
+    on_abort=self._return_to_safe_pose,
+)
+
+# in your topic callback, after json.loads:
+outcome = self._sink.submit(msg)
+
+# from a timer, at least once per watchdog_ms:
+self._sink.tick()
+
+# if you have force-torque sensing:
+self._sink.force_torque(readings)
+```
+
+The chain, in order:
+
+| # | Check | Failure |
+|---|-------|---------|
+| 1 | schema / mode / dof against the descriptor | **REJECTED** |
+| 2 | ttl expiry, stale observation, seq regression | **DROPPED** |
+| 3 | priority arbitration between sources | **DROPPED** |
+| 4 | `max_delta_per_step` | **CLAMPED** (applied) |
+| 5 | position bounds, `max_velocity` | **REJECTED** |
+| 6 | collision re-validation | *not implemented — see below* |
+| 7 | per-axis force-torque threshold | **ABORTED** |
+| 8 | continuity / committed window | *your controller's job — see below* |
+| 9 | `watchdog_ms` with no valid command | hold |
+| 10 | N consecutive watchdog periods | abort |
+
+**DROPPED vs REJECTED matters.** Dropped is the network being a network — stale,
+out of order, outranked — and is counted, not reported. Rejected means somebody
+wired something up wrong, and has to be visible. Do not collapse the two.
+
+**Clamping vs rejecting matters too, and they go opposite ways.** An oversized
+*step* is clamped: the point still goes where the policy meant, just more slowly,
+and rejecting would break the motion into stutters over one noisy sample. A
+*hard limit* violation rejects the entire command and never clamps to the bound —
+clamping there invents a trajectory that is neither what the policy asked for nor
+anything anyone validated, and every command after it is built on the false
+premise that the robot reached the commanded point.
+
+### Two gaps, stated rather than papered over
+
+**Collision re-validation is not implemented.** MoveIt Pro checks every point of a
+chunk against a planning scene with padding, and keeps watching the scene so an
+object appearing mid-run stops the robot. We have no planning scene — only a URDF,
+with no scene representation and no FK/collision runtime. Until one exists the
+mitigations are procedural: run in simulation until you trust the policy, then
+first real runs at reduced speed, with a person and a physical e-stop.
+
+**Continuity is your controller's job.** Smoothing, densifying and blending chunks,
+and sizing the committed window, happen where a trajectory is executed. One
+consequence belongs here anyway: the committed window must be at least the p99
+inference latency or the robot pauses between chunks, and the larger it is the
+longer e-stop takes to actually stop. Choose it deliberately and report it in
+`info()`.
+
+### A pause is not a safe state
+
+When commands stop arriving the robot holds — and it resumes the moment a valid
+command lands, **without warning**. The `ttl_ms` check is the only thing keeping
+it from resuming on a stale command, so set `ttl_ms` from measured latency: set it
+generously and the protection is gone while still appearing to be there. Announce
+the resume on the activity stream, and never treat a held robot as safe to
+approach.
+
+### Testing
+
+`ControlSink` is ROS-free and takes an injected clock, so the whole chain tests on
+a laptop with a fake `apply` and no robot:
+
+```bash
+python3 -m pytest tests/test_control_sink.py -q
+```
+
+Adding a driver-specific check? Add it there, not in your bundle.

@@ -340,6 +340,9 @@ class Plugin:
                     "actions": ["forward", "backward", "turn_left", "turn_right", "move"],
                     "timeout": self._max_duration + (self._stop_repetitions / self._publish_rate) + 1.0,
                 },
+                # The chassis. Independent of the arms, the waist and the speaker —
+                # the old global ACP barrier serialised all of them against this.
+                "x-resource": "base",
             },
         }
 

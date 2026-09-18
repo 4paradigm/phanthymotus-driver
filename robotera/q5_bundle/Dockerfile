@@ -31,6 +31,7 @@ ENV PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-numpy \
     python3-pil \
+    ffmpeg \
     openssh-client \
     sshpass \
     python3-yaml \
@@ -49,6 +50,7 @@ COPY --from=interface-builder /q5_ws/install /q5_ws/install
 COPY common/ /work/common/
 COPY main.py /work/main.py
 COPY q5_bus_bridge.py /work/q5_bus_bridge.py
+COPY fastdds_transport.py /work/fastdds_transport.py
 COPY q5_bundle_entrypoint.sh /work/q5_bundle_entrypoint.sh
 COPY sensor_contract.py /work/sensor_contract.py
 COPY control_contract.py /work/control_contract.py
@@ -80,6 +82,7 @@ COPY audio.py /work/audio.py
 COPY camera_rgb.py /work/camera_rgb.py
 COPY camera_depth.py /work/camera_depth.py
 COPY camera_pointcloud.py /work/camera_pointcloud.py
+COPY vision_capture.py /work/vision_capture.py
 COPY legacy_device.py /work/legacy_device.py
 COPY legacy_direct_control.py /work/legacy_direct_control.py
 COPY q5_media_bridge.py /work/q5_media_bridge.py

@@ -30,6 +30,8 @@ import sys
 import threading
 import time
 
+from fastdds_transport import configure_bundled_fastdds_transport
+
 
 class BridgeWorker:
     """Subprocess bridge that publishes Q5 sensor snapshots to Domain 42 (FastDDS)."""
@@ -130,12 +132,22 @@ class BridgeWorker:
 def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[str, mp.Queue],
                            audio_q: mp.Queue, speaker_q: mp.Queue, debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError as exc:
+        sys.stderr.write(
+            f"[BridgeWorker] logsafe unavailable ({exc}); stdout unprotected\n")
+
     # ── Environment: Force Domain 42 + FastDDS in subprocess ────────────────────
     os.environ["ROS_DOMAIN_ID"] = "42"
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
-    # UDP-only transport for Docker host networking (shared-memory won't work)
-    os.environ.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "DEFAULT")
+    # The bridge is in a separate Docker process from Agent Core. Force the
+    # bundled loopback-only UDP profile that is verified to carry live PCM
+    # across that boundary, regardless of the fleet profile inherited by the
+    # container.
+    profile = configure_bundled_fastdds_transport()
 
     import hashlib
     import json

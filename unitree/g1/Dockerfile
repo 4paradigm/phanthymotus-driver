@@ -25,6 +25,7 @@ RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
         libusb-1.0-0 \
         libportaudio2 \
         libasound2-dev \
+        ffmpeg \
         v4l-utils && \
     rm -rf /var/lib/apt/lists/*
 

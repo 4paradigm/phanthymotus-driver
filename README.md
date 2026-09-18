@@ -19,11 +19,10 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `dji/mavic4e` | DJI Mavic 4E/4T | 15703 | Flight control, camera, gimbal, waypoint missions, telemetry, perception |
 | `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
 | `noetix/bumi` | Noetix Bumi-EDU Humanoid | 15704 | Mic, speaker, locomotion, RealSense camera, state monitoring |
-| `x-humanoid/tianyi2.0` | Tianyi 2.0 Pro Humanoid | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
+| `x-humanoid/tianyi2.0` | X-humanoid Tianyi 2.0 Pro Bundle | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
-| `pndbotics/adam` | PNDbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
-| `booster/k1` | Booster K1 Humanoid | 15705 | State (IMU/joints/battery/odom/fall-detection + URDF), camera, locomotion, upper-body joint control, actions/get-up (ACP), audio |
-| `brainco/revo2` | BrainCo Revo 2 Dexterous Hand | 15706 | Finger position/gesture/LED control, state telemetry, tactile telemetry (touch variant only) |
+| `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
+| `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 
 ## Quick Start
 
@@ -296,6 +295,56 @@ For robot state monitoring, declare `"format": "sensor/skeleton"` in `topic_out`
 - Joint data published as `{"joints": [{"idx": 0, "name": "joint_name", "q": angle}, ...]}`
 - **Joint names in data must match URDF joint names exactly** (e.g., `FL_hip_joint` not `FL_hip`)
 - **`dispatch()` must return a plain dict** (e.g. `{"urdf": "..."}`) — do NOT return pre-wrapped MCP content arrays (see README_dev.md § "dispatch() Return Value Format")
+
+---
+
+## Being Driven by an Execution Model (`motus.control/1`)
+
+A VLA policy, a navigation stack or a grasp policy produces **tens of commands per
+second**, and each one is not a question. MCP `tools/call` is the wrong shape for
+that — it is the control plane: low frequency, request/response, authorised. So
+those commands go on the **data plane** instead: a `control/*` DDS topic, exactly
+as a speaker already takes its audio on `topic_in: audio/pcm-16k` while its
+start/stop go through tools.
+
+To make a robot drivable this way, add a **servo card** to its driver. Two exist
+to copy from: `realman/rm75_6f_v/servo.py` (single 7-DOF arm) and
+`x-humanoid/tianyi2.0/servo.py` (dual arm + hands, using the descriptor's
+`groups`).
+
+A servo card is two things:
+
+| | What | Where |
+|---|---|---|
+| **Descriptor** | what this robot accepts — dof, `joint_names` (the order *is* the meaning of `values`), units, limits, rate, `force_torque` | your card's `info()` |
+| **`ControlSink`** | runs every incoming command through freshness, source arbitration, step clamping, hard limits and the watchdog | `common/control/sink.py` |
+
+**Do not write those checks yourself.** The arm's safety properties come from the
+sink, which is ROS-free, takes an injected clock, and is tested without a robot.
+What belongs in your file is only what is specific to this machine: unit
+conversion at the SDK boundary, the vendor's motion-enable gate, and which call
+stops it.
+
+Four rules that are easy to get wrong:
+
+- **A URDF is not a descriptor.** It has no units, no control rate, no statement of
+  absolute vs incremental, no normalisation range. Reference it via `urdf_ref` for
+  FK and collision geometry; do not derive the action interface from it.
+- **`force_torque` must be present even as `null`.** `parse_descriptor` rejects a
+  descriptor that omits it — omitting it is how a robot ends up assumed to have a
+  protection it does not have.
+- **Build the descriptor from the same source as your feedback.** If the state you
+  publish and the commands you accept come from two hand-written tables, they will
+  eventually disagree about what the machine can do.
+- **A pause is not a safe state.** When commands stop, the robot holds and then
+  resumes *without warning* the moment a valid one lands. `ttl_ms` is the only
+  thing keeping it from resuming on a stale command.
+
+Full field spec, the check chain and its failure verdicts: **README_dev.md
+§ "Continuous Control (`motus.control/1`)"**. Architecture, how a model is
+attached at the other end, and the requirements that will be added to servo cards
+as models get more capable (torque/impedance control, jitter bounds, true sensor
+timestamps, chunk-level acknowledgement): **`phanthymotus/docs/vla-integration.md`**.
 
 ---
 

@@ -36,6 +36,7 @@ cards:
   - { name: motion_events,           type: actuator }
   - { name: heartbeat_status,        type: sensor }
   - { name: motion_command_trace,    type: sensor }
+  - { name: odometer,                type: sensor }
   - { name: native_interface_probe,  type: sensor }
   - { name: loco,                    type: actuator }
   - { name: safe_motion_mode,        type: actuator }

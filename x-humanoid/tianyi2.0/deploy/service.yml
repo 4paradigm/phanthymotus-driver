@@ -9,7 +9,30 @@ tianyi2:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /home/nvidia/data/param/dds_profile.xml:/work/dds_profile.xml:ro
+    # Vendor DDS profile whitelist: {192.168.41.2, 127.0.0.1}
+    # - 192.168.41.2: body controller network (domain 0 for本体通信)
+    # - 127.0.0.1: agent-core bridge (domain 42 for 与 agent-core 通信)
+    #
+    # The fleet's loopback-only profile, which socket_bridge.py loads *in its
+    # own process*. It was being read from this path already; nothing mounted
+    # it, so it only worked where an unrelated deployment had left a copy on
+    # the host. Read-only, like the vendor profile above.
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
+    # No FASTRTPS_DEFAULT_PROFILES_FILE and no ROS_DOMAIN_ID here, unlike every
+    # other driver. This container runs two things with different needs:
+    #
+    #   main.py          two DDS contexts in one process — body on domain 0 via
+    #                    192.168.41.x, which the fleet's loopback-only profile
+    #                    would cut. FastDDS caches profiles process-wide, so one
+    #                    profile is all that process gets: the vendor one above.
+    #   socket_bridge.py a separate process, domain 42 only, which therefore can
+    #                    and does load dds-local.xml itself.
+    #
+    # A container-wide variable would apply to both and break the body link.
+    # That is why this is set in code rather than here — see
+    # SocketBridgeServer.DDS_LOCAL_PROFILE, and joints_bridge_v2.run_publisher
+    # which already did the same.
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - PYTHONUNBUFFERED=1
   logging:

@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from unittest import mock
 
+import fastdds_transport
 import q5_bus_bridge
+import q5_media_bridge
 from sensor_contract import topic_out
 
 
@@ -51,6 +55,116 @@ class Q5BusBridgeTests(unittest.TestCase):
         self.assertIn("for media_q in media_qs.values():", source)
         self.assertIn("media_q.get_nowait()", source)
 
+    def test_media_bridge_sets_fastdds_before_importing_rclpy(self):
+        source = Path(q5_media_bridge.__file__).read_text()
+        worker_start = source.index("def _run_bridge_subprocess")
+        worker_source = source[worker_start:]
+        self.assertLess(worker_source.index('os.environ["ROS_DOMAIN_ID"] = "42"'),
+                        worker_source.index("import rclpy"))
+        self.assertLess(worker_source.index('os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"'),
+                        worker_source.index("import rclpy"))
+        self.assertLess(worker_source.index("configure_bundled_fastdds_transport()"),
+                        worker_source.index("import rclpy"))
+
+    def test_media_bridge_forces_bundled_profile(self):
+        with tempfile.NamedTemporaryFile() as configured, \
+                mock.patch.dict(os.environ, {
+                    "FASTRTPS_DEFAULT_PROFILES_FILE": configured.name,
+                    "FASTDDS_DEFAULT_PROFILES_FILE": configured.name,
+                    "FASTDDS_BUILTIN_TRANSPORTS": "DEFAULT",
+                }, clear=True):
+            profile = q5_media_bridge.configure_bundled_fastdds_transport()
+
+            bundled = str(fastdds_transport.DEFAULT_FASTDDS_PROFILE)
+            self.assertEqual(profile, bundled)
+            self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], bundled)
+            self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], bundled)
+            self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS", os.environ)
+
+    def test_fastdds_transport_uses_existing_deployment_profile(self):
+        with tempfile.NamedTemporaryFile() as configured, \
+                mock.patch.dict(os.environ, {
+                    "FASTRTPS_DEFAULT_PROFILES_FILE": configured.name,
+                    "FASTDDS_BUILTIN_TRANSPORTS": "DEFAULT",
+                }, clear=True):
+            profile = fastdds_transport.configure_fastdds_transport()
+
+            self.assertEqual(profile, configured.name)
+            self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], configured.name)
+            self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], configured.name)
+            self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS", os.environ)
+
+    def test_fastdds_transport_prefers_fleet_legacy_profile(self):
+        with tempfile.NamedTemporaryFile() as legacy, \
+                tempfile.NamedTemporaryFile() as canonical, \
+                mock.patch.dict(os.environ, {
+                    "FASTDDS_DEFAULT_PROFILES_FILE": canonical.name,
+                    "FASTRTPS_DEFAULT_PROFILES_FILE": legacy.name,
+                }, clear=True):
+            profile = fastdds_transport.configure_fastdds_transport()
+
+            self.assertEqual(profile, legacy.name)
+            self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], legacy.name)
+            self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], legacy.name)
+
+    def test_fastdds_transport_falls_back_when_configured_profile_is_missing(self):
+        with mock.patch.dict(os.environ, {
+            "FASTRTPS_DEFAULT_PROFILES_FILE": "/missing/dds-local.xml",
+        }, clear=True), mock.patch("builtins.print") as log:
+            profile = fastdds_transport.configure_fastdds_transport()
+
+            fallback = str(fastdds_transport.DEFAULT_FASTDDS_PROFILE)
+            self.assertEqual(profile, fallback)
+            self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], fallback)
+            self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], fallback)
+            self.assertTrue(any("falling back" in str(call) for call in log.call_args_list))
+
+    def test_fastdds_transport_logs_selected_profile(self):
+        with tempfile.NamedTemporaryFile() as configured, \
+                mock.patch.dict(os.environ, {
+                    "FASTDDS_DEFAULT_PROFILES_FILE": configured.name,
+                }, clear=True), mock.patch("builtins.print") as log:
+            fastdds_transport.configure_fastdds_transport()
+
+            log.assert_called_once_with(
+                f"[q5-dds] using Fast DDS profile: {configured.name}", flush=True)
+
+    def test_fastdds_transport_rejects_missing_fallback(self):
+        missing = Path("/missing/q5-fastdds-udp.xml")
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(fastdds_transport, "DEFAULT_FASTDDS_PROFILE", missing):
+            with self.assertRaisesRegex(RuntimeError, "Fast DDS profile unavailable"):
+                fastdds_transport.configure_fastdds_transport()
+
+    def test_bundled_fastdds_profile_is_loopback_only(self):
+        root = ET.parse(fastdds_transport.DEFAULT_FASTDDS_PROFILE).getroot()
+        namespace = {"dds": root.tag.partition("}")[0].removeprefix("{")}
+        addresses = [element.text for element in root.findall(
+            ".//dds:interfaceWhiteList/dds:address", namespace)]
+        builtin = root.find(".//dds:useBuiltinTransports", namespace)
+
+        self.assertEqual(addresses, ["127.0.0.1"])
+        self.assertIsNotNone(builtin)
+        self.assertEqual(builtin.text.strip().lower(), "false")
+
+    def test_bridges_use_their_expected_fastdds_selectors(self):
+        self.assertIs(q5_media_bridge.configure_bundled_fastdds_transport,
+                      fastdds_transport.configure_bundled_fastdds_transport)
+        self.assertIs(q5_bus_bridge.configure_fastdds_transport,
+                      fastdds_transport.configure_fastdds_transport)
+
+    def test_media_bridge_child_installs_logsafe_before_ros(self):
+        source = Path(q5_media_bridge.__file__).read_text()
+        worker_source = source[source.index("def _run_bridge_subprocess"):]
+        self.assertLess(worker_source.index("logsafe.install(check_fd=False)"),
+                        worker_source.index("import rclpy"))
+
+    def test_camera_worker_child_installs_logsafe_before_ros(self):
+        source = Path(__file__).with_name("q5_camera_worker.py").read_text()
+        worker_source = source[source.index("def _run_camera_worker"):]
+        self.assertLess(worker_source.index("logsafe.install(check_fd=False)"),
+                        worker_source.index("import rclpy"))
+
     def test_sensor_topic_contract_does_not_depend_on_vendor_side_publisher(self):
         declared = topic_out("/nvidia_desktop/q5/battery", "data/json")
         self.assertEqual(declared, [{
@@ -71,21 +185,6 @@ class Q5BusBridgeTests(unittest.TestCase):
         self.assertIn('exec python3 /work/q5_bus_bridge.py', source)
         self.assertIn('media/audio bridge', source)
         self.assertIn('wait -n "$driver_pid" "$bridge_pid"', source)
-
-    def test_fastdds_bridge_uses_its_udp_profile_when_not_overridden(self):
-        with mock.patch.dict(os.environ, {"RMW_IMPLEMENTATION": "rmw_fastrtps_cpp"}, clear=True):
-            profile = q5_bus_bridge.configure_fastdds_transport()
-            self.assertEqual(profile, str(q5_bus_bridge.DEFAULT_FASTDDS_PROFILE))
-            self.assertEqual(os.environ["FASTDDS_DEFAULT_PROFILES_FILE"], profile)
-            self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
-
-    def test_fastdds_bridge_respects_a_deployment_profile(self):
-        with mock.patch.dict(os.environ, {
-            "RMW_IMPLEMENTATION": "rmw_fastrtps_cpp",
-            "FASTDDS_DEFAULT_PROFILES_FILE": "/etc/fastdds/custom.xml",
-        }, clear=True):
-            self.assertEqual(q5_bus_bridge.configure_fastdds_transport(), "/etc/fastdds/custom.xml")
-            self.assertNotIn("FASTRTPS_DEFAULT_PROFILES_FILE", os.environ)
 
     def test_only_sensor_tools_with_topics_are_selected(self):
         selected = q5_bus_bridge.select_sensor_tools(_Mcp().list_tools())

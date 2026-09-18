@@ -16,11 +16,12 @@ drivers/unitree/go2/device.py — Unitree Go2 四足机器狗设备插件。
   LocoPlugin             (actuator)  — 运动控制 (SportClient, 4 tools)
   ObstaclesAvoidPlugin   (actuator)  — 自主避障 (ObstaclesAvoidClient)
   CameraPlugin           (sensor)    — GStreamer H.264 UDP multicast → MJPEG ROS2 topic
-  StatePlugin            (sensor)    — DDS LowState → IMU/battery/joints ROS2 topic
+  StatePlugin            (sensor)    — DDS LowState → IMU/battery/joints/remote ROS2 topic
   MotionSwitcherPlugin   (actuator)  — 运控模式切换 (MotionSwitcherClient)
   AsrPlugin              (sensor)    — DDS ASR results → ROS2 topic
 """
 
+import copy
 import json
 import math
 import multiprocessing
@@ -179,6 +180,9 @@ _SPEAKER_MERGE_MS = 2000  # flush timeout: send after 2s of silence
 
 def _speaker_worker(pcm_queue: multiprocessing.Queue, network_iface: str):
     """Subprocess: accumulates PCM-16k, sends as single WAV via AudioHub megaphone on stream end."""
+    # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
+    from common import logsafe
+    logsafe.install(check_fd=False)
     import base64
     import io
     import wave
@@ -1046,6 +1050,9 @@ class _CameraNode:
 
 def _run_camera_process(topic: str, stream_addr: str, stream_port: int, multicast_iface: str = "eth0") -> None:
     """Camera subprocess — receives Go2 H264 UDP multicast, decodes to JPEG, publishes to ROS2."""
+    # Spawned child: fresh interpreter, does not inherit the parent's sys.stdout.
+    from common import logsafe
+    logsafe.install(check_fd=False)
     import subprocess as _subprocess
     import threading as _threading
     import rclpy
@@ -1188,6 +1195,51 @@ _GO2_JOINT_NAMES = [
     'RL_hip_joint', 'RL_thigh_joint', 'RL_calf_joint',    # 9-11
 ]
 
+# ── wireless_remote decode (Go2 remote controller) ──────────────────────────
+# Bit layout mirrors unitree_sdk2py/utils/joystick.py's extract().  The SDK
+# indexes bits in the binary string from most significant to least significant.
+_REMOTE_BUTTONS_BYTE2 = (
+    # Bit 3 is reserved in Go2's wire format; the physical remote has no
+    # corresponding back button, so it must not be exposed as an input.
+    ("LT", 5), ("RT", 4), ("start", 2), ("LB", 1), ("RB", 0),
+)
+_REMOTE_BUTTONS_BYTE3 = (
+    ("left", 7), ("down", 6), ("right", 5), ("up", 4),
+    ("Y", 3), ("X", 2), ("B", 1), ("A", 0),
+)
+_AXIS_DEADZONE = 0.1
+_REMOTE_CONTROL_LEVEL = "LOWLEVEL"
+_REMOTE_STALE_AFTER = 0.5
+
+
+def _parse_wireless_remote(raw) -> dict:
+    """Decode Go2 LowState_.wireless_remote into one stateless card snapshot."""
+    if raw is None or len(raw) < 24:
+        return {
+            "available": False,
+            "fresh": False,
+            "control_level": _REMOTE_CONTROL_LEVEL,
+        }
+
+    b2, b3 = int(raw[2]), int(raw[3])
+    buttons = {
+        name: bool(byte >> bit & 1)
+        for byte, definitions in ((b2, _REMOTE_BUTTONS_BYTE2), (b3, _REMOTE_BUTTONS_BYTE3))
+        for name, bit in definitions
+    }
+    axes = {
+        name: round(struct.unpack('f', bytes(raw[offset:offset + 4]))[0], 4)
+        for name, offset in (("lx", 4), ("rx", 8), ("ry", 12), ("ly", 20))
+    }
+    return {
+        "available": True,
+        "fresh": True,
+        "control_level": _REMOTE_CONTROL_LEVEL,
+        "buttons": buttons,
+        "axes": axes,
+        "active": any(buttons.values()) or any(abs(value) > _AXIS_DEADZONE for value in axes.values()),
+    }
+
 
 class _LowStateNode(Node):
     """Subscribes to DDS rt/lowstate (Go2 LowState_) and republishes to ROS2."""
@@ -1195,22 +1247,30 @@ class _LowStateNode(Node):
     _JOINTS_INTERVAL = 0.1     # 10 Hz
     _IMU_INTERVAL    = 0.05    # 20 Hz
     _BMS_INTERVAL    = 1.0     # 1 Hz
+    _REMOTE_INTERVAL = 0.1     # 10 Hz
 
-    def __init__(self, imu_topic: str, battery_topic: str, joints_topic: str):
+    def __init__(
+        self, imu_topic: str, battery_topic: str, joints_topic: str, remote_topic: str,
+    ):
         super().__init__("go2_low_state")
         self._imu_pub     = self.create_publisher(String, imu_topic,     _LOW_LAT_QOS)
         self._battery_pub = self.create_publisher(String, battery_topic, _LOW_LAT_QOS)
         self._joints_pub  = self.create_publisher(String, joints_topic,  _LOW_LAT_QOS)
+        self._remote_pub  = self.create_publisher(String, remote_topic,  _LOW_LAT_QOS)
         self._last_joints_time: float = 0.0
         self._last_imu_time:    float = 0.0
         self._last_bms_time:    float = 0.0
+        self._last_remote_time: float = 0.0
+        self._last_remote: dict | None = None
+        self._remote_lock = threading.Lock()
 
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
             self._lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
             self._lowstate_sub.Init(self._on_state, 10)
-            self.get_logger().info(f"LowStateNode subscribed rt/lowstate → {imu_topic}, {joints_topic}")
+            self.get_logger().info(
+                f"LowStateNode subscribed rt/lowstate → {imu_topic}, {joints_topic}, {remote_topic}")
         except Exception as e:
             self.get_logger().warn(f"LowStateNode: failed to subscribe rt/lowstate: {e}")
 
@@ -1270,6 +1330,26 @@ class _LowStateNode(Node):
                 bat_out.data = json.dumps(bms_data)
                 self._battery_pub.publish(bat_out)
 
+        # Remote controller: throttle to 10 Hz.
+        if now - self._last_remote_time >= self._REMOTE_INTERVAL:
+            remote = _parse_wireless_remote(getattr(msg, "wireless_remote", None))
+            remote["timestamp_ms"] = int(time.time() * 1000)
+            with self._remote_lock:
+                self._last_remote_time = now
+                self._last_remote = remote
+            remote_out = String()
+            remote_out.data = json.dumps(remote)
+            self._remote_pub.publish(remote_out)
+
+    @property
+    def last_remote(self) -> dict | None:
+        with self._remote_lock:
+            remote = copy.deepcopy(self._last_remote)
+            last_remote_time = self._last_remote_time
+        if remote is not None and remote["available"]:
+            remote["fresh"] = time.monotonic() - last_remote_time <= _REMOTE_STALE_AFTER
+        return remote
+
 
 class StatePlugin:
     PREFIX = "state"
@@ -1278,11 +1358,13 @@ class StatePlugin:
         self._imu_topic     = f"/{namespace}/state/imu"
         self._battery_topic = f"/{namespace}/state/battery"
         self._joints_topic  = f"/{namespace}/state/joints"
-        self._node = _LowStateNode(self._imu_topic, self._battery_topic, self._joints_topic)
+        self._remote_topic  = f"/{namespace}/state/remote_controller"
+        self._node = _LowStateNode(
+            self._imu_topic, self._battery_topic, self._joints_topic, self._remote_topic)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
-        return [self._imu_tool(), self._battery_tool(), self._joints_tool()]
+        return [self._imu_tool(), self._battery_tool(), self._joints_tool(), self._remote_tool()]
 
     def _imu_tool(self) -> dict:
         return {
@@ -1314,6 +1396,20 @@ class StatePlugin:
             "topic_out": [{"topic": self._joints_topic, "format": "sensor/skeleton"}],
         }
 
+    def _remote_tool(self) -> dict:
+        return {
+            "name": "remote_controller",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": (
+                "Go2 wireless remote controller — 13 buttons + 4 axes. "
+                "active=true signals operator takeover input. "
+                f"Publishes at 10Hz to {self._remote_topic}"
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._remote_topic, "format": "data/json"}],
+        }
+
     def start(self) -> None:
         pass
 
@@ -1331,11 +1427,14 @@ class StatePlugin:
                 'imu':     (self._imu_topic,     'data/json'),
                 'battery': (self._battery_topic, 'data/json'),
                 'joints':  (self._joints_topic,  'sensor/skeleton'),
+                'remote_controller': (self._remote_topic, 'data/json'),
             }
             if tool_name in topic_map:
                 topic, fmt = topic_map[tool_name]
                 return {"state": "running", "topic_out": [{"topic": topic, "format": fmt}]}
             return {"state": "running"}
+        if action == "read" and args.get('_tool_name') == "remote_controller":
+            return {"state": "running", "data": self._node.last_remote or {"available": False}}
         return None
 
 

@@ -29,6 +29,14 @@ import rclpy
 import rclpy.executors
 import yaml
 from rclpy.context import Context
+try:
+    from common import lifecycle as _lifecycle
+except ImportError:  # a checkout rather than the container image, where
+    # common/ is copied in beside this file. Load-bearing, so it resolves the
+    # repo root rather than degrading to a no-op the way logsafe does.
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
+    from common import lifecycle as _lifecycle
 
 
 _REGISTRATION_STATUS_LOCK = threading.Lock()
@@ -160,6 +168,7 @@ class T800DeviceBundle:
             NativeInterfaceProbePlugin,
             NativeNodeControlPlugin,
             NativeSdkPlugin,
+            OdometerPlugin,
             SafetyControlPlugin,
             SpeakerPlugin,
             StatePlugin,
@@ -200,6 +209,7 @@ class T800DeviceBundle:
         plugin_types = (
             ("heartbeat_status", HeartbeatStatusPlugin, (config, namespace, ros2)),
             ("motion_command_trace", MotionCommandTracePlugin, (config, namespace, ros2)),
+            ("odometer", OdometerPlugin, (config, namespace, ros2)),
             ("native_interface_probe", NativeInterfaceProbePlugin, (config, namespace, ros2)),
             ("locomotion", LocomotionPlugin, (config, namespace, ros2, state)),
             ("safe_motion_mode", SafeMotionModePlugin, (config, namespace, ros2, state)),
@@ -473,6 +483,10 @@ class T800DeviceBundle:
                     raise
                 if self._motion_events is not None:
                     self._motion_events.record_tool_call(tool_name, action, args, result)
+                # A plugin that only knows its own verbs declines these rather
+                # than failing at them — see common/lifecycle.py.
+                if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
+                    return _lifecycle.reply(action)
                 return result
         return None
 
