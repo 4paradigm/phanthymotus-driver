@@ -772,8 +772,8 @@ def build_plugins(config, namespace, ros2):
 
     plugins = [
         RM75Plugin(client, config, namespace=namespace, ros2=ros2),
-        RM75ServoPlugin(client, config, namespace=namespace, ros2=ros2),
         GripperPlugin(client, config, namespace=namespace, ros2=ros2),
+        RM75ServoPlugin(client, config, namespace=namespace, ros2=ros2),
     ]
     camera_config = config.get("ext_camera", {})
     ext_camera_plugin = None
@@ -785,7 +785,9 @@ def build_plugins(config, namespace, ros2):
         )
         plugins.append(ext_camera_plugin)
     vision_config = config.get("vision_capture", {})
-    if vision_config.get("enabled", camera_config.get("enabled", False)):
+    # Vision capture is an explicit capability; an enabled RGB camera alone
+    # must not implicitly add an undeclared recording card.
+    if vision_config.get("enabled", False):
         from vision_capture import VisionCapturePlugin
 
         plugins.append(
