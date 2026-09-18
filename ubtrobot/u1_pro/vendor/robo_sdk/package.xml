@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>coze_msgs</name>
+  <name>robo_sdk</name>
   <version>1.0.0</version>
-  <description>U1 Pro audio playback control interfaces.</description>
+  <description>ROS2 service interface used by the UBTECH U1 Pro robo_sdk adapter.</description>
   <maintainer email="dev@example.com">Phanthy</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_cmake</buildtool_depend>

@@ -13,7 +13,7 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
         > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
     python3-pip python3-colcon-common-extensions cmake build-essential \
-    ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
+    ros-humble-rmw-cyclonedds-cpp ros-humble-std-srvs && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt /tmp/u1-requirements.txt
 RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt && rm /tmp/u1-requirements.txt
 WORKDIR /u1_ws
@@ -28,7 +28,7 @@ ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ENV RCUTILS_COLORIZED_OUTPUT=0
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/u1_ws/install/audio_msgs/lib/python3.10/site-packages:/u1_ws/install/uworld_action_msgs/lib/python3.10/site-packages:/u1_ws/install/coze_msgs/lib/python3.10/site-packages:/work
+ENV PYTHONPATH=/u1_ws/install/audio_msgs/lib/python3.10/site-packages:/u1_ws/install/robo_sdk/lib/python3.10/site-packages:/work
 
 EXPOSE 15723
 CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /u1_ws/install/setup.bash && python3 /work/main.py"]

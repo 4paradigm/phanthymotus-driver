@@ -10,6 +10,7 @@ description: "UBTECH U1 Pro microphone, live speaker PCM, preset audio/motion pl
 build_context_extras:
   - ../../common
 cards:
+  - { name: auth, type: actuator }
   - { name: mic, type: sensor }
   - { name: speaker, type: actuator }
   - { name: audio, type: actuator }

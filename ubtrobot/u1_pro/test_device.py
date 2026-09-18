@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 def _install_stubs():
@@ -29,7 +30,7 @@ def _install_stubs():
 
     audio = types.ModuleType("audio_msgs")
     audio_msg = types.ModuleType("audio_msgs.msg")
-    for name in ("AudioChunk", "AudioInData", "AudioOutData", "DoaEvent", "FinishList", "MainWakeupWord", "WakeupEvent", "WakeupState"):
+    for name in ("AudioChunk", "AudioInData", "AudioOutData"):
         setattr(audio_msg, name, message(name))
     audio_srv = types.ModuleType("audio_msgs.srv")
     for name in ("EnableAudioIn", "SetAudioVolume"):
@@ -37,19 +38,19 @@ def _install_stubs():
     audio.msg, audio.srv = audio_msg, audio_srv
     sys.modules.update({"audio_msgs": audio, "audio_msgs.msg": audio_msg, "audio_msgs.srv": audio_srv})
 
-    for package, names in {
-        "coze_msgs.srv": ("InterruptActionAudio", "PlayResources"),
-        "uworld_action_msgs.srv": ("GetMotionInfoList", "PlayMotion"),
-    }.items():
-        module = types.ModuleType(package)
-        for name in names:
-            setattr(module, name, type(name, (), {"Request": message("Request")}))
-        sys.modules[package] = module
+    robo = types.ModuleType("robo_sdk")
+    robo_srv = types.ModuleType("robo_sdk.srv")
+    robo_srv.StringCall = type("StringCall", (), {"Request": type("Request", (), {"__init__": lambda self: setattr(self, "params", "")})})
+    robo.srv = robo_srv
+    sys.modules.update({"robo_sdk": robo, "robo_sdk.srv": robo_srv})
+    std_srv = types.ModuleType("std_srvs.srv")
+    std_srv.Trigger = type("Trigger", (), {"Request": message("Request")})
+    sys.modules.update({"std_srvs.srv": std_srv})
 
 
 _install_stubs()
 
-from device import MIC_TOPIC, SPEAKER_TOPIC  # noqa: E402
+from device import MIC_TOPIC, PLAYBACK_TOPIC, SPEAKER_TOPIC  # noqa: E402
 
 
 class FakePublisher:
@@ -79,6 +80,8 @@ class FakeNodes:
         self.mic_enabled = []
         self.event_enabled = []
         self.interrupts = 0
+        self.string_calls = []
+        self.playback_listener = None
         self.mic_publisher = FakePublisher()
 
     def set_mic_enabled(self, enabled):
@@ -94,6 +97,17 @@ class FakeNodes:
             return {"error_code": 0}
         raise AssertionError(f"unexpected service: {name}")
 
+    def string_call(self, name, params):
+        self.string_calls.append((name, params))
+        return {"ok": True, "code": "OK", "data": {}}
+
+    def trigger_call(self, name):
+        self.interrupts += name == "interrupt"
+        return {"success": True}
+
+    def add_playback_listener(self, listener):
+        self.playback_listener = listener
+
     def close_speaker_subscription(self):
         pass
 
@@ -102,6 +116,7 @@ class U1CardContractTests(unittest.TestCase):
     def test_stream_topics_match_robot_contract(self):
         self.assertEqual(MIC_TOPIC, "/audio/sense/audio_data_to_asr")
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
+        self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
 
     def test_agent_facing_plugins_exist(self):
         import device
@@ -109,6 +124,13 @@ class U1CardContractTests(unittest.TestCase):
         self.assertTrue(hasattr(device, "MicPlugin"))
         self.assertTrue(hasattr(device, "SpeakerPlugin"))
         self.assertTrue(hasattr(device, "AudioPlugin"))
+        self.assertTrue(hasattr(device, "AuthPlugin"))
+
+    def test_auth_card_has_explicit_credential_and_lifecycle_actions(self):
+        import device
+
+        schema = device.AuthPlugin(FakeNodes()).get_tool()["inputSchema"]
+        self.assertEqual(schema["properties"]["action"]["enum"], ["start", "authorize", "auth_state", "stop", "info"])
 
     def test_nodes_are_registered_with_the_matching_domain_executors(self):
         import device
@@ -134,6 +156,7 @@ class U1CardContractTests(unittest.TestCase):
         class FakeNode:
             def __init__(self, name, **kwargs):
                 self.name = name
+                self.clients = {}
 
             def create_publisher(self, *args, **kwargs):
                 return types.SimpleNamespace(publish=lambda message: None)
@@ -142,7 +165,9 @@ class U1CardContractTests(unittest.TestCase):
                 return types.SimpleNamespace()
 
             def create_client(self, srv_type, name):
-                return types.SimpleNamespace(srv_name=name)
+                client = types.SimpleNamespace(srv_name=name)
+                self.clients[name] = client
+                return client
 
             def destroy_node(self):
                 pass
@@ -157,6 +182,8 @@ class U1CardContractTests(unittest.TestCase):
             nodes = device.U1Nodes({}, "test", ros)
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
+            self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name, "/robo/audio/call/play_action")
+            self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
             nodes.close()
             self.assertEqual(ros.executor_robot.nodes, [])
             self.assertEqual(ros.executor_core.nodes, [])
@@ -219,10 +246,53 @@ class U1CardContractTests(unittest.TestCase):
 
         nodes = FakeNodes()
         plugin = device.AudioPlugin(nodes)
-        plugin.start()
-        plugin.stop()
+        self.assertEqual(plugin.dispatch("start", {}), {"state": "ready"})
+        plugin.dispatch("play_action", {"motion_id": "A029"})
+        with mock.patch.object(device, "_acp_notify"):
+            result = plugin.dispatch("stop", {})
         self.assertEqual(nodes.interrupts, 1)
+        self.assertEqual(result["state"], "idle")
         self.assertFalse(plugin.running)
+
+    def test_audio_idle_stop_is_stable(self):
+        import device
+
+        plugin = device.AudioPlugin(FakeNodes())
+        self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
+
+    def test_audio_schema_has_lifecycle_and_completion_contract(self):
+        import device
+
+        schema = device.AudioPlugin(FakeNodes()).get_tool()["inputSchema"]
+        self.assertEqual(schema["properties"]["action"]["enum"], ["start", "list_actions", "play_action", "play_text", "stop", "info"])
+        self.assertEqual(schema["x-completion"]["actions"], ["play_action", "play_text"])
+
+    def test_audio_uses_documented_string_call_payloads(self):
+        import device
+
+        nodes = FakeNodes()
+        plugin = device.AudioPlugin(nodes)
+        plugin.start()
+        action = plugin.dispatch("play_action", {"motion_id": "A029", "action_id": "request-1"})
+        self.assertEqual(action["state"], "queued")
+        self.assertEqual(nodes.string_calls[0][0], "play_action")
+        self.assertEqual(nodes.string_calls[0][1], {"action": "A029", "uuid": "request-1"})
+
+    def test_playback_result_completes_only_matching_active_action(self):
+        import device
+
+        nodes = FakeNodes()
+        plugin = device.AudioPlugin(nodes)
+        plugin.start()
+        plugin.dispatch("play_text", {"text": "hello", "action_id": "request-2"})
+        with mock.patch.object(device, "_acp_notify") as notify:
+            plugin._on_playback_state({"uuid": "old", "phase": "result", "success": True, "state_name": "COMPLETED"})
+            notify.assert_not_called()
+            plugin._on_playback_state({"uuid": "request-2", "phase": "feedback", "success": True, "state_name": "COMPLETED"})
+            notify.assert_not_called()
+            plugin._on_playback_state({"uuid": "request-2", "phase": "result", "success": True, "state_name": "COMPLETED"})
+            notify.assert_called_once()
+            self.assertEqual(notify.call_args.args[1], "completed")
 
     def test_speaker_callback_drops_audio_after_stop(self):
         import device
