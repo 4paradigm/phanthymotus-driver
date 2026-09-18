@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -50,6 +51,7 @@ class FakeClient:
     def __init__(self, *, connected=True, motion_enabled=True):
         self.connected = connected
         self.motion_enabled = motion_enabled
+        self.motion_gate = threading.Lock()
         self.calls: list[tuple] = []
 
     def command(self, method, *args):
