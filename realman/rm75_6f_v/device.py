@@ -371,6 +371,7 @@ class RM75Plugin:
         self._cancelled = set()
         self._last_completion = None
         self._cartesian_pose_invalidator = None
+        self._cartesian_stop_finalizer = None
 
     def _skeleton_topic_out(self):
         return [{"topic": self._skeleton_topic, "format": "sensor/skeleton"}]
@@ -708,6 +709,11 @@ class RM75Plugin:
             with self._submission_lock:
                 # 失败向上传播：stop 失败不得谎报 idle（见生命周期测试契约）
                 self.client.command("rm_set_arm_slow_stop")
+        # joint_control and abs_move share the action ID and motion lock, but
+        # each card owns its own ACP completion state.  Once the physical stop
+        # has been ordered, let abs_move finalize an action that it owns.
+        if action_id and callable(self._cartesian_stop_finalizer):
+            self._cartesian_stop_finalizer(action_id)
         return {"state": "stop_requested", "action_id": action_id}
 
     def dispatch(self, action, args):
@@ -1010,6 +1016,7 @@ class CartesianPlugin:
         self._confirmed_pose_revision = 0
         if arm_plugin is not None:
             arm_plugin._cartesian_pose_invalidator = self._invalidate_confirmed_pose
+            arm_plugin._cartesian_stop_finalizer = self._finalize_shared_stop
         self.stop_finalize_seconds = float(cartesian.get("stop_finalize_seconds", 2.0))
 
     def get_tools(self):
@@ -2159,6 +2166,16 @@ class CartesianPlugin:
             daemon=True,
             name="rm75-cartesian-stop-finalize",
         ).start()
+
+    def _finalize_shared_stop(self, action_id):
+        """Finish an abs_move action stopped through joint_control."""
+        with self._action_lock:
+            owns_action = self._active_action_id == action_id
+        if not owns_action:
+            return False
+        self._invalidate_confirmed_pose()
+        self._finish_after_stop(action_id, "cancelled", {"reason": "stopmotion"})
+        return True
 
     def _acp_callback(self, action_id, status, result):
         outcome, error = _acp_complete(action_id, status, result, self.PREFIX)
