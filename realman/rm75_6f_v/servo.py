@@ -267,20 +267,22 @@ class RM75ServoPlugin:
             self._running = False
             topic, self._input_topic = self._input_topic, ""
 
-        if node is not None:
-            try:
-                self._ros2.executor_core.remove_node(node)
-            finally:
-                node.destroy_node()
-        if was_running:
-            try:
+        try:
+            if node is not None:
+                try:
+                    self._ros2.executor_core.remove_node(node)
+                finally:
+                    node.destroy_node()
+            if was_running:
                 self._slow_stop()
-            finally:
-                with self._lock:
-                    gate_held = self._motion_gate_held
-                    self._motion_gate_held = False
-                if gate_held:
-                    self.client.motion_gate.release()
+        finally:
+            # Teardown can fail; the shared gate must be released even then.
+            with self._lock:
+                gate_held = self._motion_gate_held
+                self._motion_gate_held = False
+            if gate_held:
+                self.client.motion_gate.release()
+        if was_running:
             print(f"[rm75] servo stopped ({topic})", flush=True)
         return {"state": "idle"}
 
