@@ -132,20 +132,31 @@ class VirtualWorld:
         self._trail_step = float(cfg.get("trail_step_m", 0.15))
         self._trail_max = int(cfg.get("trail_max_points", 4000))
 
-        self._on_nav_terminal = None
-        self._on_speech_terminal = None
+        # Lists, not single slots. Several cards submit jobs (`nav`,
+        # `switch_mode`) and several drive the mouth (`tts`, `speaker`); with one
+        # slot the last registrant would receive — and mis-attribute — everyone
+        # else's completions. Each listener filters on the action_ids it owns.
+        self._nav_listeners: list = []
+        self._speech_listeners: list = []
 
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
 
     # ---- wiring -------------------------------------------------------
 
-    def set_nav_callback(self, fn) -> None:
+    def add_nav_listener(self, fn) -> None:
         """Called once per job with its terminal dict. Invoked outside the lock."""
-        self._on_nav_terminal = fn
+        self._nav_listeners.append(fn)
 
-    def set_speech_callback(self, fn) -> None:
-        self._on_speech_terminal = fn
+    def add_speech_listener(self, fn) -> None:
+        self._speech_listeners.append(fn)
+
+    def _emit(self, listeners: list, payload: dict) -> None:
+        for listener in listeners:
+            try:
+                listener(payload)
+            except Exception as exc:  # one bad listener must not swallow the rest
+                print(f"[sim-world] listener failed: {exc}", flush=True)
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -192,11 +203,10 @@ class VirtualWorld:
             speech_done = self._update_speech_locked()
 
         # Callbacks POST over HTTP. They run with no lock held — rule 2.
-        if nav_done is not None and self._on_nav_terminal:
-            self._on_nav_terminal(nav_done)
+        if nav_done is not None:
+            self._emit(self._nav_listeners, nav_done)
         for payload in speech_done:
-            if self._on_speech_terminal:
-                self._on_speech_terminal(payload)
+            self._emit(self._speech_listeners, payload)
 
     # ---- navigation ---------------------------------------------------
 
@@ -290,8 +300,8 @@ class VirtualWorld:
             self._job = job                       # registered...
             job.state = STATE_RUNNING             # ...and only then running
             self._log_locked("nav_start", **job.as_dict())
-        if superseded is not None and self._on_nav_terminal:
-            self._on_nav_terminal(superseded)
+        if superseded is not None:
+            self._emit(self._nav_listeners, superseded)
         return job
 
     def cancel_job(self, reason: str = "cancelled") -> dict | None:
@@ -303,8 +313,8 @@ class VirtualWorld:
         job.cancel_event.set()
         with self._lock:
             payload = self._finish_job_locked(job, RESULT_CANCELLED, reason)
-        if payload is not None and self._on_nav_terminal:
-            self._on_nav_terminal(payload)
+        if payload is not None:
+            self._emit(self._nav_listeners, payload)
         return payload
 
     def set_velocity(self, lin: float, ang: float) -> None:
@@ -373,8 +383,7 @@ class VirtualWorld:
                     done.append(payload)
             self._log_locked("speech_interrupt", reason=reason, count=len(done))
         for payload in done:
-            if self._on_speech_terminal:
-                self._on_speech_terminal(payload)
+            self._emit(self._speech_listeners, payload)
         return done
 
     # ---- events -------------------------------------------------------

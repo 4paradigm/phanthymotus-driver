@@ -62,7 +62,10 @@ class Card:
     ACTIONS: dict[str, tuple[list[str], str]] = {}
     PROPERTIES: dict[str, dict] = {}
     RESOURCES: list[str] = []
-    HOOKS: dict[str, str] = {}
+    # hook_id -> {"action": str, "params": dict}. agent-core's `hooks.register`
+    # reads this straight off the tool schema, so declaring it *is* the binding —
+    # no canvas wiring, no user action.
+    HOOKS: dict[str, dict] = {}
     COMPLETION: dict | None = None
     CONFIG_SCHEMA: dict | None = None
 
@@ -93,14 +96,19 @@ class Card:
             actions.setdefault("stop", ([], "停止发布"))
         schema = (action_schema(actions, dict(self.PROPERTIES)) if actions
                   else {"type": "object", "properties": {}})
+        # All three extension keys go *inside* inputSchema. agent-core reads
+        # them from there and nowhere else — `mcp_client.py:407-408` and
+        # `api/mcp_manage.py:685,725`. Put them beside inputSchema and they are
+        # simply never seen: no hook is registered, no resource conflict is
+        # detected, and nothing anywhere says so.
         if self.COMPLETION:
             schema["x-completion"] = dict(self.COMPLETION)
+        if self.RESOURCES:
+            schema["x-resource"] = list(self.RESOURCES)
+        if self.HOOKS:
+            schema["x-hooks"] = dict(self.HOOKS)
         definition = tool(self.NAME, self.KIND, self.DESCRIPTION, schema,
                           topic_out=self.topic_out() or None)
-        if self.RESOURCES:
-            definition["x-resource"] = list(self.RESOURCES)
-        if self.HOOKS:
-            definition["x-hooks"] = dict(self.HOOKS)
         if self.CONFIG_SCHEMA:
             definition["configSchema"] = self.config_schema()
         return definition

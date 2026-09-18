@@ -78,7 +78,7 @@ def run_until(world, clock, predicate, limit=120.0, dt=DT):
 def test_reaches_target_and_settles_on_final_heading():
     world, clock, _ = make_world()
     done = []
-    world.set_nav_callback(done.append)
+    world.add_nav_listener(done.append)
 
     job = world.submit_job("navigate_to", Pose(3.0, 2.0, math.pi / 2), label="一号展区")
     elapsed = run_until(world, clock, lambda: job.terminal_posted)
@@ -124,7 +124,7 @@ def test_driving_into_an_occupied_cell_fails_the_job():
     grid.fill_rect(2.0, -1.0, 2.2, 1.0, OCCUPIED)          # wall across the path
     world, clock, _ = make_world(grid)
     done = []
-    world.set_nav_callback(done.append)
+    world.add_nav_listener(done.append)
 
     job = world.submit_job("navigate_to", Pose(4.0, 0.0, 0.0))
     run_until(world, clock, lambda: job.terminal_posted)
@@ -158,7 +158,7 @@ def test_outside_the_grid_is_a_wall_not_empty_space():
 def test_cancel_midway_reports_cancelled_with_partial_progress():
     world, clock, _ = make_world()
     done = []
-    world.set_nav_callback(done.append)
+    world.add_nav_listener(done.append)
 
     job = world.submit_job("navigate_to", Pose(12.0, 0.0, 0.0))
     run_for(world, clock, 8.0)
@@ -187,7 +187,7 @@ def test_cancelled_job_stops_the_base():
 def test_a_new_job_supersedes_the_old_one_as_cancelled():
     world, clock, _ = make_world()
     done = []
-    world.set_nav_callback(done.append)
+    world.add_nav_listener(done.append)
 
     first = world.submit_job("navigate_to", Pose(12.0, 0.0, 0.0), label="二号展区")
     run_for(world, clock, 6.0)
@@ -215,7 +215,7 @@ def test_direct_velocity_preempts_navigation():
 def test_terminal_is_posted_exactly_once_when_arrival_races_cancel():
     world, clock, _ = make_world()
     done = []
-    world.set_nav_callback(done.append)
+    world.add_nav_listener(done.append)
 
     job = world.submit_job("navigate_to", Pose(0.4, 0.0, 0.0))
     run_until(world, clock, lambda: job.fraction > 0.5, limit=10.0)
@@ -232,7 +232,7 @@ def test_concurrent_cancels_produce_one_terminal():
     """The real shape of the race: HTTP threads cancelling while the tick runs."""
     world, clock, _ = make_world()
     done = []
-    world.set_nav_callback(done.append)
+    world.add_nav_listener(done.append)
     job = world.submit_job("navigate_to", Pose(12.0, 0.0, 0.0))
     run_for(world, clock, 4.0)
 
@@ -258,7 +258,7 @@ def test_concurrent_cancels_produce_one_terminal():
 def test_cancelling_a_finished_job_is_a_no_op():
     world, clock, _ = make_world()
     done = []
-    world.set_nav_callback(done.append)
+    world.add_nav_listener(done.append)
     job = world.submit_job("navigate_to", Pose(1.0, 0.0, 0.0))
     run_until(world, clock, lambda: job.terminal_posted)
 
@@ -289,7 +289,7 @@ def test_terminal_callback_runs_with_the_lock_released():
         observed["acquired"] = bool(result)
         observed["waited"] = result[0] if result else None
 
-    world.set_nav_callback(callback)
+    world.add_nav_listener(callback)
     job = world.submit_job("navigate_to", Pose(0.6, 0.0, 0.0))
     run_until(world, clock, lambda: job.terminal_posted)
 
@@ -341,7 +341,7 @@ def test_cancel_signals_before_taking_the_lock():
 def test_speech_duration_follows_text_length():
     world, clock, _ = make_world(chars_per_sec=5.0)
     done = []
-    world.set_speech_callback(done.append)
+    world.add_speech_listener(done.append)
 
     world.speak("十二个字的一句讲解词啊")               # 11 chars -> 2.2 s
     run_for(world, clock, 1.0)
@@ -354,7 +354,7 @@ def test_speech_duration_follows_text_length():
 def test_interrupting_speech_reports_cancelled_not_completed():
     world, clock, _ = make_world(chars_per_sec=5.0)
     done = []
-    world.set_speech_callback(done.append)
+    world.add_speech_listener(done.append)
     world.speak("这是一段很长很长的讲解词" * 5)
     run_for(world, clock, 1.0)
 
@@ -368,7 +368,7 @@ def test_interrupting_speech_reports_cancelled_not_completed():
 def test_queued_speech_plays_in_order_and_is_dropped_on_interrupt():
     world, clock, _ = make_world(chars_per_sec=10.0)
     done = []
-    world.set_speech_callback(done.append)
+    world.add_speech_listener(done.append)
 
     world.speak("第一句")
     world.speak("第二句")
@@ -385,7 +385,7 @@ def test_queued_speech_plays_in_order_and_is_dropped_on_interrupt():
 def test_speech_terminal_is_posted_exactly_once():
     world, clock, _ = make_world(chars_per_sec=10.0)
     done = []
-    world.set_speech_callback(done.append)
+    world.add_speech_listener(done.append)
     world.speak("一句话")
     run_for(world, clock, 2.0)
 
