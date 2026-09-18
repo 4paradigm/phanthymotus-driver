@@ -1095,15 +1095,10 @@ class AxisControlPlugin:
         self._control = control
 
     def get_tool(self):
-        actions = [f"set_{axis}" for axis in self.CONTROLS] + ["reset", "stop", "info"]
         properties = {
             "action": {
-                "type": "string", "enum": actions,
-                "oneOf": ([{"const": f"set_{axis}", "title": f"设置{values[0]}"}
-                           for axis, values in self.CONTROLS.items()] +
-                          [{"const": "reset", "title": "回到起始角度"},
-                           {"const": "stop", "title": "停止控制"},
-                           {"const": "info", "title": "查看状态"}]),
+                "type": "string", "enum": ["reset"],
+                "oneOf": [{"const": "reset", "title": "回到起始角度"}],
             },
             "duration_s": {
                 "type": "number", "title": "动作时长（秒）",
@@ -1158,6 +1153,25 @@ class AxisControlPlugin:
             return {"success": False, "code": "INVALID_ARGUMENT",
                     "message": duration_error}
         if action == "reset":
+            targets = {}
+            for axis, (_, joint_name, minimum, maximum) in self.CONTROLS.items():
+                field = f"{axis}_deg"
+                if field not in args:
+                    continue
+                raw = args[field]
+                if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                    return {"success": False, "code": "INVALID_ARGUMENT",
+                            "message": f"{field} must be a number in [{minimum:g}, {maximum:g}]"}
+                degrees = float(raw)
+                if not math.isfinite(degrees) or not minimum <= degrees <= maximum:
+                    return {"success": False, "code": "INVALID_ARGUMENT",
+                            "message": f"{field} must be a number in [{minimum:g}, {maximum:g}]"}
+                targets[joint_name] = math.radians(degrees)
+            if targets:
+                error = self._control.set_targets(targets, duration)
+                return error or {"success": True, "state": "active",
+                                 "action": "set_angles", "duration_s": duration,
+                                 "protocol": "rt/lowcmd"}
             error = self._control.reset(
                 [values[1] for values in self.CONTROLS.values()], duration)
             return error or {"success": True, "state": "active", "action": "reset"}
@@ -1186,16 +1200,16 @@ class WaistControlPlugin(AxisControlPlugin):
     PREFIX = "waist_control"
     TOOL_NAME = "waist_control"
     CONTROLS = WAIST_JOINT_CONTROLS
-    DESCRIPTION = ("Adam Pro 腰部基础角度控制。set_roll/set_pitch/set_yaw 分别控制侧倾、"
-                   "俯仰和旋转；每个角度字段均标明真实限位。")
+    DESCRIPTION = ("Adam Pro 腰部基础角度控制。侧倾、俯仰和旋转角度全部直接显示，"
+                   "reset 可回到启动时角度；每个字段均标明真实限位。")
 
 
 class HeadControlPlugin(AxisControlPlugin):
     PREFIX = "head_control"
     TOOL_NAME = "head_control"
     CONTROLS = HEAD_JOINT_CONTROLS
-    DESCRIPTION = ("Adam Pro 头部基础角度控制。set_yaw 与 set_pitch 分行显示，"
-                   "角度范围均为 [-60, 60] 度。")
+    DESCRIPTION = ("Adam Pro 头部基础角度控制。偏航与俯仰角度全部直接显示，"
+                   "reset 可回到启动时角度，范围均为 [-60, 60] 度。")
 
 
 # ===========================================================================
