@@ -27,10 +27,10 @@ Available tools are:
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
-- `cartesian_control`: tool-frame `move_offset`, plus `move_a_to_b`. The latter
-  reads the current TCP as A and moves to the requested base-frame B using
+- `abs_move`: `move_a_to_b` reads the current TCP as A and moves to
+  the requested base-frame B using
   joint-space planning by default, with an explicit TCP-linear mode available.
-  Absolute `movel`, waypoint `movep`, and work-frame offsets are not exposed.
+  Relative `move_offset`, absolute `movel`, and waypoint `movep` are not exposed.
 - `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
   instance can publish RGB, depth, or left infrared without going through the
   RealMan controller.
@@ -158,13 +158,9 @@ area are required. Software interlocks do not replace the robot safety system.
 
 Cartesian motion is enabled in the default deployment and can be disabled with
 `RM75_CARTESIAN_ENABLED=0`. Verify the active TCP and configured workspace
-envelope before use. Every `cartesian_control.move_offset` request must set both
-`cartesian_enabled=true` and `confirm_motion=true`. The driver reads the current
-TCP for the first offset, composes the tool-frame offset into an absolute target,
-and validates that target before submitting `rm_movel_offset`. A controller-
-confirmed target is cached for consecutive offsets; joint motion, stop, timeout,
-or execution failure invalidates the cache. `move_a_to_b` reads the measured TCP
-as A and accepts B pose fields (`x/y/z` in millimetres and `rx/ry/rz` in
+envelope before use. Every `abs_move.move_a_to_b` request must set both
+`cartesian_enabled=true` and `confirm_motion=true`. `move_a_to_b` reads the
+measured TCP as A and accepts B pose fields (`x/y/z` in millimetres and `rx/ry/rz` in
 degrees). Any omitted B axis keeps the measured A value, so callers
 can provide only `x/y/z` to preserve the current orientation. At least one B
 field is required. It validates the composed B pose against the configured

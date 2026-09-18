@@ -933,14 +933,14 @@ def _acp_complete(action_id, status, result, tool_name):
 
 
 class CartesianPlugin:
-    """笛卡尔空间运动卡片：工具坐标系相对偏移。
+    """绝对位姿运动卡片：从当前 TCP 运动到基坐标系目标位姿。
 
     位姿单位面向画布：位置毫米、姿态度（SDK 内部为米/弧度，转换封装在插件内）。
     与 joint_control 共享运动锁（同一时刻只允许一个运动流），安全守卫、
     stall 检测与 ACP 异步完成与 joint_control 保持一致。
     """
 
-    PREFIX = "cartesian_control"
+    PREFIX = "abs_move"
     # Agent Core 短暂重启时，不能让已完成的运动永久停留在画布“执行中”。
     ACP_RETRY_DELAY_SECONDS = 2.0
     ACP_RETRY_ATTEMPTS = 30
@@ -1011,17 +1011,6 @@ class CartesianPlugin:
         self.stop_finalize_seconds = float(cartesian.get("stop_finalize_seconds", 2.0))
 
     def get_tools(self):
-        offset_props = {
-            field: {"type": "number", "description": desc}
-            for field, desc in (
-                ("dx_mm", "位置偏移 X，毫米；留空表示不沿 X 偏移"),
-                ("dy_mm", "位置偏移 Y，毫米；留空表示不沿 Y 偏移"),
-                ("dz_mm", "位置偏移 Z，毫米；留空表示不沿 Z 偏移"),
-                ("drx_deg", "姿态偏移 Roll，度；留空表示不旋转"),
-                ("dry_deg", "姿态偏移 Pitch，度；留空表示不旋转"),
-                ("drz_deg", "姿态偏移 Yaw，度；留空表示不旋转"),
-            )
-        }
         point_props = {
             f"b_{axis}": {
                 "type": "number",
@@ -1037,10 +1026,7 @@ class CartesianPlugin:
             )
         }
         properties = {
-            **offset_props,
             **point_props,
-            "frame_type": {"type": "string", "enum": ["tool"], "default": "tool",
-                           "description": "偏移参考坐标系：目前仅支持 tool 工具系（工作坐标系偏移需控制器激活坐标系位姿，暂不开放）"},
             "motion_mode": {
                 "type": "string",
                 "enum": ["joint", "linear"],
@@ -1058,8 +1044,6 @@ class CartesianPlugin:
         }
         schema = action_schema(
             {
-                "move_offset": (["dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg", "frame_type", "speed_percent", "cartesian_enabled", "confirm_motion"],
-                                "沿工具坐标系做直线偏移（相对当前位姿；未填写的轴不偏移）"),
                 "move_a_to_b": ([
                     "b_x_mm", "b_y_mm", "b_z_mm", "b_rx_deg", "b_ry_deg", "b_rz_deg",
                     "motion_mode", "speed_percent", "cartesian_enabled", "confirm_motion",
@@ -1069,7 +1053,7 @@ class CartesianPlugin:
             },
             properties,
         )
-        schema["x-completion"] = {"actions": ["move_offset", "move_a_to_b"], "timeout": 305}
+        schema["x-completion"] = {"actions": ["move_a_to_b"], "timeout": 305}
         schema["x-hooks"] = {
             "on_interrupt_motion": {"action": "stopmotion"},
             "on_interrupt_all": {"action": "stopmotion"},
@@ -1077,9 +1061,9 @@ class CartesianPlugin:
         schema["x-is-dangerous"] = True
         return [
             tool(
-                "cartesian_control",
+                "abs_move",
                 "actuator",
-                "位姿运动：工具系偏移，或自动读取当前位置为 A 后以 joint/linear 模式运动到基坐标系 B 点。位置毫米、姿态度。",
+                "做绝对位置下的移动",
                 schema,
             )
         ]
@@ -1112,9 +1096,11 @@ class CartesianPlugin:
             return self._stop_motion()
         if action == "move_a_to_b":
             return self._start_a_to_b(args)
-        # movel/movep 已从卡片定义中移除；仅保留此处兼容已保存的旧流程，
-        # 新建流程只能选择 move_offset。
-        if action in ("movel", "move_offset", "movep"):
+        if action == "move_offset":
+            raise ValueError("move_offset is no longer supported")
+        # movel/movep 已从卡片定义中移除；仅保留此处兼容已保存的旧流程。
+        # move_offset 已完全移除，手工 MCP 调用也不会再下发相对运动。
+        if action in ("movel", "movep"):
             return self._start_cartesian(action, args)
         return None
 
@@ -1164,8 +1150,6 @@ class CartesianPlugin:
             "max_reach_mm": self.max_reach_mm,
             "max_euler_abs_deg": self.max_euler_abs_deg,
             "tool_length_mm": self.tool_length_mm,
-            "native_tool_offset_enabled": self.native_tool_offset_enabled,
-            "native_tool_offset_supported": self._native_tool_offset_supported,
         }
 
     def _start_cartesian(self, motion_type, args):
