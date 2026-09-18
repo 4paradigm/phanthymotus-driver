@@ -410,6 +410,7 @@ class RM75Plugin:
         )
         schema["x-completion"] = {"actions": ["set"], "timeout": 305}
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "stopmotion"}}
+        schema["x-resource"] = "arm"
         schema["x-is-dangerous"] = True
         definitions.append(tool("joint_control", "actuator", "Bounded RM75 joint motion using official API2 movej", schema))
         return definitions
@@ -794,6 +795,7 @@ class GripperPlugin:
             },
         )
         schema["x-completion"] = {"actions": ["set_position"], "timeout": GRIPPER_COMPLETION_TIMEOUT + 10}
+        schema["x-resource"] = "arm"
         schema["x-is-dangerous"] = True
         return [
             tool(
@@ -1058,6 +1060,7 @@ class CartesianPlugin:
             "on_interrupt_motion": {"action": "stopmotion"},
             "on_interrupt_all": {"action": "stopmotion"},
         }
+        schema["x-resource"] = "arm"
         schema["x-is-dangerous"] = True
         return [
             tool(
@@ -1436,17 +1439,102 @@ class CartesianPlugin:
             if state is None or state["stage"] != segment:
                 return
             timeout_seconds = state["timeout_seconds"]
-        time.sleep(timeout_seconds)
-        with self._action_lock:
-            state = self._a_to_b_actions.get(action_id)
-            if (state is None or state["stage"] != segment
-                    or action_id in self._cancelled
-                    or action_id in self._terminal_action_ids):
-                return
-            # Claim this segment before cancelling the global trajectory wait;
-            # a late controller event will see the marker and be ignored.
-            state["stage"] = "timed_out"
-            state_snapshot = dict(state)
+            target = list(state["point_b"])
+
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+        # Match the existing Cartesian monitor: allow the controller a short
+        # startup grace period, then require bounded position or orientation
+        # progress.  The controller event remains the authoritative success
+        # signal, but a jam cannot keep the arm energized until the 300 s
+        # action deadline.
+        last_progress = started + self.start_grace_seconds
+        best_position_error = None
+        best_euler_error = None
+        state_snapshot = None
+        failure_reason = None
+        failure_extra = {}
+
+        while time.monotonic() < deadline:
+            with self._action_lock:
+                state = self._a_to_b_actions.get(action_id)
+                if (state is None or state["stage"] != segment
+                        or action_id in self._cancelled
+                        or action_id in self._terminal_action_ids):
+                    return
+
+            try:
+                if self._arm is not None:
+                    self._arm._preflight()
+                current = self._current_pose_mm_deg()
+                position_error, euler_error = self._pose_error(current, target)
+            except Exception as exc:
+                failure_reason = f"progress monitoring failed: {exc}"
+                failure_extra = {"failed_segment": segment}
+                claim_stage = "monitor_failed"
+            else:
+                now = time.monotonic()
+                if (position_error <= self.position_tolerance_mm
+                        and euler_error <= self.euler_tolerance_deg):
+                    # At the requested pose there is no stall.  Continue to
+                    # wait for the controller's terminal event.
+                    last_progress = now
+                else:
+                    progress = False
+                    if best_position_error is None:
+                        best_position_error = position_error
+                        best_euler_error = euler_error
+                        progress = True
+                    else:
+                        if best_position_error - position_error >= self.progress_threshold_mm:
+                            best_position_error = position_error
+                            progress = True
+                        if best_euler_error - euler_error >= self.euler_progress_threshold_deg:
+                            best_euler_error = euler_error
+                            progress = True
+                    if progress:
+                        last_progress = now
+                    elif (now >= started + self.start_grace_seconds
+                            and now - last_progress >= self.stall_timeout_seconds):
+                        failure_reason = "motion_stalled"
+                        failure_extra = {
+                            "stall_seconds": self.stall_timeout_seconds,
+                            "actual_pose_mm_deg": current,
+                            "position_error_mm": position_error,
+                            "euler_error_deg": euler_error,
+                            "elapsed_seconds": now - started,
+                            "failed_segment": segment,
+                        }
+                        claim_stage = "stalled"
+
+            if failure_reason is not None:
+                with self._action_lock:
+                    state = self._a_to_b_actions.get(action_id)
+                    if (state is None or state["stage"] != segment
+                            or action_id in self._cancelled
+                            or action_id in self._terminal_action_ids):
+                        return
+                    # Claim the action before cancelling the global trajectory
+                    # wait so a simultaneous controller event is ignored.
+                    state["stage"] = claim_stage
+                    state_snapshot = dict(state)
+                break
+            time.sleep(min(self.poll_interval_seconds, max(0.0, deadline - time.monotonic())))
+        else:
+            with self._action_lock:
+                state = self._a_to_b_actions.get(action_id)
+                if (state is None or state["stage"] != segment
+                        or action_id in self._cancelled
+                        or action_id in self._terminal_action_ids):
+                    return
+                state["stage"] = "timed_out"
+                state_snapshot = dict(state)
+            failure_reason = "controller completion event timed out"
+            failure_extra = {
+                "timeout_seconds": timeout_seconds,
+                "failed_segment": segment,
+            }
+
         cancel_wait = getattr(self.client, "cancel_trajectory_wait", None)
         if callable(cancel_wait):
             cancel_wait()
@@ -1457,9 +1545,8 @@ class CartesianPlugin:
             "error",
             self._a_to_b_result(
                 state_snapshot,
-                "controller completion event timed out",
-                timeout_seconds=timeout_seconds,
-                failed_segment=segment,
+                failure_reason,
+                **failure_extra,
             ),
         )
 

@@ -216,6 +216,7 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
         self.assertEqual(1, position["minimum"])
         self.assertEqual(1000, position["maximum"])
         self.assertIs(True, tools[0]["inputSchema"]["x-is-dangerous"])
+        self.assertEqual("arm", tools[0]["inputSchema"]["x-resource"])
         self.assertIn("confirm_motion", tools[0]["inputSchema"]["properties"])
         self.assertIn("confirm_motion", tools[0]["inputSchema"]["x-action-params"]["set_position"]["params"])
         completion = tools[0]["inputSchema"]["x-completion"]
@@ -430,6 +431,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("actuator", tools[0]["type"])
         schema = tools[0]["inputSchema"]
         self.assertIs(True, schema["x-is-dangerous"])
+        self.assertEqual("arm", schema["x-resource"])
         self.assertEqual(["move"], schema["x-completion"]["actions"])
         self.assertIn("confirm_motion", schema["properties"])
         self.assertEqual(False, schema["properties"]["cartesian_enabled"]["default"])
@@ -770,6 +772,60 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertNotEqual(first["action_id"], second["action_id"])
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
         self.assertEqual((second["action_id"], "error"), self.acp_events[1][:2])
+
+    def test_move_a_to_b_stall_stops_before_controller_event_deadline(self):
+        class EventlessClient(self.FakeClient):
+            def command_trajectory(self, method, *args, completion_callback=None):
+                self.calls.append((method, args))
+                return 0
+
+            def cancel_trajectory_wait(self):
+                self.calls.append(("cancel_trajectory_wait", ()))
+                return True
+
+            def command_interrupt(self, method, *args):
+                self.calls.append((method, args))
+                return 0
+
+        self.client = EventlessClient([0.0, 0.0, 200.0, 0.0, 0.0, 0.0])
+        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {
+                "safety": {
+                    **self.FAST_SAFETY,
+                    "start_grace_seconds": 0.01,
+                    "stall_timeout_seconds": 0.05,
+                    "poll_interval_seconds": 0.01,
+                    "max_motion_seconds": 2.0,
+                },
+                "cartesian": {"enabled": True, "stop_finalize_seconds": 0.01},
+            },
+            arm_plugin=self.arm,
+            namespace="rm75",
+        )
+        self.acp_events = []
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        started_at = time.monotonic()
+        started = self.plugin.dispatch("move", self._a_to_b_args())
+
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1, timeout=1.0))
+        action_id, status, result = self.acp_events[0]
+        self.assertEqual(started["action_id"], action_id)
+        self.assertEqual("error", status)
+        self.assertEqual("motion_stalled", result["reason"])
+        self.assertEqual(0.05, result["stall_seconds"])
+        self.assertEqual("to_b", result["failed_segment"])
+        self.assertLess(time.monotonic() - started_at, 1.0)
+        self.assertIn(("cancel_trajectory_wait", ()), self.client.calls)
+        self.assertTrue(self._wait_for(
+            lambda: any(call[0] == "rm_set_arm_slow_stop" for call in self.client.calls)
+        ))
+        self.assertEqual("ready", self.plugin._motion_status()["state"])
+        self.assertFalse(self.plugin._motion_lock.locked())
 
     def test_move_a_to_b_validates_b_before_motion(self):
         self.client.command_trajectory = mock.Mock()
@@ -1925,6 +1981,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
             joint_control["inputSchema"]["x-hooks"],
         )
         self.assertIs(True, joint_control["inputSchema"]["x-is-dangerous"])
+        self.assertEqual("arm", joint_control["inputSchema"]["x-resource"])
         self.assertEqual(10, joint_control["inputSchema"]["properties"]["speed_percent"]["maximum"])
         self.assertNotIn("timeout_seconds", joint_control["inputSchema"]["properties"])
         self.assertEqual(305, joint_control["inputSchema"]["x-completion"]["timeout"])
