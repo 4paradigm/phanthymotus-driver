@@ -988,6 +988,12 @@ class CartesianPlugin:
             **point_props,
             "frame_type": {"type": "string", "enum": ["tool"], "default": "tool",
                            "description": "偏移参考坐标系：目前仅支持 tool 工具系（工作坐标系偏移需控制器激活坐标系位姿，暂不开放）"},
+            "motion_mode": {
+                "type": "string",
+                "enum": ["joint", "linear"],
+                "default": "joint",
+                "description": "到 B 的路径：joint 使用 rm_movej_p 关节空间规划；linear 使用 rm_movel TCP 直线",
+            },
             "speed_percent": {"type": "integer", "minimum": 1, "maximum": self.max_speed_percent,
                               "default": self.default_speed_percent},
             "cartesian_enabled": {
@@ -1003,8 +1009,8 @@ class CartesianPlugin:
                                 "沿工具坐标系做直线偏移（相对当前位姿；未填写的轴不偏移）"),
                 "move_a_to_b": ([
                     "b_x_mm", "b_y_mm", "b_z_mm", "b_rx_deg", "b_ry_deg", "b_rz_deg",
-                    "speed_percent", "cartesian_enabled", "confirm_motion",
-                ], "自动读取当前 TCP 为 A 点，再沿直线运动到基坐标系 B 点"),
+                    "motion_mode", "speed_percent", "cartesian_enabled", "confirm_motion",
+                ], "自动读取当前 TCP 为 A 点，再以关节空间或 TCP 直线运动到基坐标系 B 点"),
                 "stopmotion": ([], "请求受控减速停止"),
                 "info": ([], "读取运动状态与安全配置"),
             },
@@ -1020,7 +1026,7 @@ class CartesianPlugin:
             tool(
                 "cartesian_control",
                 "actuator",
-                "笛卡尔运动：工具系偏移，或自动读取当前位置为 A 后直线运动到基坐标系 B 点。位置毫米、姿态度。",
+                "位姿运动：工具系偏移，或自动读取当前位置为 A 后以 joint/linear 模式运动到基坐标系 B 点。位置毫米、姿态度。",
                 schema,
             )
         ]
@@ -1088,6 +1094,7 @@ class CartesianPlugin:
             "state": "moving" if active_action_id else "ready",
             "active_action_id": active_action_id,
             "active_stage": a_to_b_state.get("stage") if a_to_b_state else None,
+            "active_motion_mode": a_to_b_state.get("motion_mode") if a_to_b_state else None,
             "last_completion": jsonable(last),
             "motion_enabled": self.client.motion_enabled and self.cartesian_enabled,
             "read_only": not (self.client.motion_enabled and self.cartesian_enabled),
@@ -1194,6 +1201,9 @@ class CartesianPlugin:
     def _start_a_to_b(self, args):
         """Read the current TCP as A, then move from A to the requested B."""
         speed_percent = self._motion_speed(args)
+        motion_mode = args.get("motion_mode", "joint")
+        if motion_mode not in ("joint", "linear"):
+            raise ValueError("motion_mode must be 'joint' or 'linear'")
         point_fields = (
             "b_x_mm", "b_y_mm", "b_z_mm", "b_rx_deg", "b_ry_deg", "b_rz_deg"
         )
@@ -1208,7 +1218,7 @@ class CartesianPlugin:
             raise RuntimeError("RM75 SDK client does not support controller trajectory completion")
 
         # 每次调用都读取实际 TCP，并将它作为本次动作的 A 点。B 的真实可达性、
-        # 奇异点和控制器碰撞保护由 rm_movel 的规划结果兜底。
+        # 奇异点和控制器碰撞保护由 rm_movej_p/rm_movel 的规划结果兜底。
         if self._arm is not None:
             self._arm._preflight()
         point_a = self._current_pose_mm_deg()
@@ -1223,7 +1233,11 @@ class CartesianPlugin:
             raise RuntimeError(f"another motion is active: {active}")
 
         action_id = f"rm75_cart_{uuid4().hex[:10]}"
-        timeout_to_b = self._motion_deadline_seconds(point_a, point_b, speed_percent)
+        timeout_to_b = (
+            self.max_motion_seconds
+            if motion_mode == "joint"
+            else self._motion_deadline_seconds(point_a, point_b, speed_percent)
+        )
         with self._action_lock:
             self._active_action_id = action_id
             self._motion_state["active_action_id"] = action_id
@@ -1232,6 +1246,7 @@ class CartesianPlugin:
                 "stage": "to_b",
                 "point_a": point_a,
                 "point_b": point_b,
+                "motion_mode": motion_mode,
                 "speed_percent": speed_percent,
                 "timeout_seconds": timeout_to_b,
             }
@@ -1256,6 +1271,7 @@ class CartesianPlugin:
             "reason": reason,
             "point_a_pose_mm_deg": list(state["point_a"]),
             "target_pose_mm_deg": list(state["point_b"]),
+            "motion_mode": state["motion_mode"],
             **extra,
         }
 
@@ -1283,7 +1299,7 @@ class CartesianPlugin:
 
         try:
             self._submit(
-                "movel",
+                "movej_p" if state_snapshot["motion_mode"] == "joint" else "movel",
                 target_args,
                 target,
                 state_snapshot["speed_percent"],
@@ -1659,9 +1675,10 @@ class CartesianPlugin:
                 command = self.client.command
             # command_trajectory 已准备到位回调，实际 SDK 调用必须保持非阻塞。
             block = 0
-            if motion_type == "movel":
+            if motion_type in ("movel", "movej_p"):
                 pose = self._pose_from_fields(args, ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"))
-                command("rm_movel", self._to_sdk_pose(pose), speed_percent, 0, 0, block)
+                method = "rm_movej_p" if motion_type == "movej_p" else "rm_movel"
+                command(method, self._to_sdk_pose(pose), speed_percent, 0, 0, block)
             elif motion_type == "move_offset":
                 offset = self._pose_from_fields(
                     args, ("dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg"), empty_value=0.0
@@ -1694,8 +1711,9 @@ class CartesianPlugin:
                 raise ValueError(f"unknown motion type: {motion_type}")
         except RuntimeError as exc:
             if "code -4" in str(exc):
+                expected_device = "关节设备" if motion_type == "movej_p" else "笛卡尔设备"
                 raise RuntimeError(
-                    "控制器到位设备校验失败（SDK -4）：请在 RealMan Studio/控制器中将当前到位设备设为笛卡尔设备；"
+                    f"控制器到位设备校验失败（SDK -4）：请在 RealMan Studio/控制器中将当前到位设备设为{expected_device}；"
                     "同时确认没有其他客户端占用运动通道"
                 ) from exc
             raise

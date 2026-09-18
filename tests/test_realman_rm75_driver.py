@@ -438,6 +438,9 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertNotIn("a_x_mm", schema["properties"])
         self.assertNotIn("a_x_mm", schema["x-action-params"]["move_a_to_b"]["params"])
         self.assertIn("b_rz_deg", schema["x-action-params"]["move_a_to_b"]["params"])
+        self.assertIn("motion_mode", schema["x-action-params"]["move_a_to_b"]["params"])
+        self.assertEqual(["joint", "linear"], schema["properties"]["motion_mode"]["enum"])
+        self.assertEqual("joint", schema["properties"]["motion_mode"]["default"])
         self.assertEqual(10, schema["properties"]["speed_percent"]["maximum"])
         self.assertNotIn("movel", schema["x-action-params"])
         self.assertNotIn("movep", schema["x-action-params"])
@@ -484,11 +487,12 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
         started = self.plugin.dispatch("move_a_to_b", self._a_to_b_args())
         self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
-        movel_calls = [call for call in self.client.calls if call[0] == "rm_movel"]
-        self.assertEqual(1, len(movel_calls))
-        self.assertEqual([0.15, 0.0, 0.2, 0.0, 0.0, 0.0], movel_calls[0][1][0])
+        movej_p_calls = [call for call in self.client.calls if call[0] == "rm_movej_p"]
+        self.assertEqual(1, len(movej_p_calls))
+        self.assertEqual([0.15, 0.0, 0.2, 0.0, 0.0, 0.0], movej_p_calls[0][1][0])
         self.assertEqual([], self.acp_events)
         self.assertEqual("to_b", self.plugin._motion_status()["active_stage"])
+        self.assertEqual("joint", self.plugin._motion_status()["active_motion_mode"])
 
         callbacks[0](True)
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
@@ -499,8 +503,10 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 result["point_a_pose_mm_deg"], [25.0, -10.0, 200.0, 1.0, 2.0, 3.0]):
             self.assertAlmostEqual(expected, actual, places=9)
         self.assertEqual([150.0, 0.0, 200.0, 0.0, 0.0, 0.0], result["target_pose_mm_deg"])
+        self.assertEqual("joint", result["motion_mode"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
         self.assertIsNone(self.plugin._motion_status()["active_stage"])
+        self.assertIsNone(self.plugin._motion_status()["active_motion_mode"])
 
     def test_move_a_to_b_omitted_axes_keep_current_a_values(self):
         callbacks = []
@@ -535,12 +541,47 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             "confirm_motion": True,
         })
         self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
-        movel = next(call for call in self.client.calls if call[0] == "rm_movel")
+        movej_p = next(call for call in self.client.calls if call[0] == "rm_movej_p")
         expected = [0.15, 0.0, 0.25, math.radians(10), math.radians(20), math.radians(30)]
-        for actual, target in zip(movel[1][0], expected):
+        for actual, target in zip(movej_p[1][0], expected):
             self.assertAlmostEqual(target, actual, places=9)
         callbacks[0](True)
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+
+    def test_move_a_to_b_linear_mode_uses_movel(self):
+        callbacks = []
+
+        class EventClient(self.FakeClient):
+            def command_trajectory(self, method, *args, completion_callback=None):
+                self.calls.append((method, args))
+                callbacks.append(completion_callback)
+                return 0
+
+            def cancel_trajectory_wait(self):
+                return True
+
+        self.client = EventClient([25.0, -10.0, 200.0, 0.0, 0.0, 0.0])
+        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            arm_plugin=self.arm,
+            namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        self.plugin.dispatch(
+            "move_a_to_b",
+            self._a_to_b_args(motion_mode="linear"),
+        )
+        self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
+        self.assertEqual(1, len([call for call in self.client.calls if call[0] == "rm_movel"]))
+        self.assertEqual(0, len([call for call in self.client.calls if call[0] == "rm_movej_p"]))
+        callbacks[0](True)
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+        self.assertEqual("linear", self.acp_events[0][2]["motion_mode"])
 
     def test_move_a_to_b_requires_at_least_one_b_field(self):
         with self.assertRaisesRegex(ValueError, "at least one B pose field"):
@@ -549,6 +590,15 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 "cartesian_enabled": True,
                 "confirm_motion": True,
             })
+
+    def test_move_a_to_b_rejects_unknown_motion_mode(self):
+        with self.assertRaisesRegex(ValueError, "motion_mode must be 'joint' or 'linear'"):
+            self.plugin.dispatch(
+                "move_a_to_b",
+                self._a_to_b_args(motion_mode="curve"),
+            )
+        self.assertFalse(self.plugin._motion_lock.locked())
+        self.assertEqual("ready", self.plugin._motion_status()["state"])
         self.assertFalse(self.plugin._motion_lock.locked())
         self.assertFalse(any(call[0] == "rm_get_current_arm_state" for call in self.client.calls))
 
@@ -586,7 +636,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("error", status)
         self.assertEqual("to_b", result["failed_segment"])
         self.assertIn("collision failure", result["reason"])
-        self.assertEqual(1, len([call for call in self.client.calls if call[0] == "rm_movel"]))
+        self.assertEqual(1, len([call for call in self.client.calls if call[0] == "rm_movej_p"]))
         self.assertEqual("ready", self.plugin._motion_status()["state"])
         self.assertFalse(self.plugin._motion_lock.locked())
 

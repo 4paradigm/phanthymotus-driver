@@ -28,7 +28,8 @@ Available tools are:
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
 - `cartesian_control`: tool-frame `move_offset`, plus `move_a_to_b`. The latter
-  reads the current TCP as A and moves directly to the requested base-frame B.
+  reads the current TCP as A and moves to the requested base-frame B using
+  joint-space planning by default, with an explicit TCP-linear mode available.
   Absolute `movel`, waypoint `movep`, and work-frame offsets are not exposed.
 - `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
   instance can publish RGB, depth, or left infrared without going through the
@@ -167,8 +168,11 @@ as A and accepts B pose fields (`x/y/z` in millimetres and `rx/ry/rz` in
 degrees). Any omitted B axis keeps the measured A value, so callers
 can provide only `x/y/z` to preserve the current orientation. At least one B
 field is required. It validates the composed B pose against the configured
-workspace envelope and submits one `rm_movel`. Planning failure, an unreachable pose, collision
-stop, timeout, or an operator stop ends the action and releases the motion lock.
+workspace envelope. `motion_mode=joint` (the default) submits `rm_movej_p` and
+is intended for general repositioning or large orientation changes;
+`motion_mode=linear` submits `rm_movel` and is intended for a verified straight
+approach or retreat. Planning failure, an unreachable pose, collision stop,
+timeout, or an operator stop ends the action and releases the motion lock.
 The controller's collision level, electronic fences, virtual walls, and
 physical safety system remain responsible for collision protection; the driver
 has no environment model and does not plan a detour around obstacles.
