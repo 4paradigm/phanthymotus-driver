@@ -13,7 +13,7 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
         > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
     python3-pip python3-colcon-common-extensions cmake build-essential \
-    ros-humble-rmw-cyclonedds-cpp ros-humble-std-srvs && rm -rf /var/lib/apt/lists/*
+    ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt /tmp/u1-requirements.txt
 RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt && rm /tmp/u1-requirements.txt
 WORKDIR /u1_ws
