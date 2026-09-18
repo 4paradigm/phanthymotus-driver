@@ -12,6 +12,7 @@ class FakeClient:
         self.motion_gate = threading.Lock()
         self.run_state = 1
         self.never_finishes = False
+        self.never_starts = False
 
     def command(self, method, *args):
         if method == "rm_set_program_id_run":
@@ -23,6 +24,8 @@ class FakeClient:
             Path(args[0]).write_text("trajectory\n", encoding="utf-8")
             return 1
         if method == "rm_get_program_run_state":
+            if self.never_starts:
+                return {"run_state": 0}
             if self.never_finishes:
                 return {"run_state": 1}
             if self.run_state == 1:
@@ -66,3 +69,17 @@ def test_replay_timeout_reports_error(tmp_path):
     card.dispatch("replay", {"name": "wave", "confirm_motion": True})
     time.sleep(2.2)
     assert plugin.completions and plugin.completions[0][1] == "error"
+
+
+def test_replay_start_timeout_reports_error(tmp_path):
+    plugin = FakePlugin()
+    plugin.client.never_starts = True
+    card = ActionRecord(plugin, {"directory": str(tmp_path), "replay_timeout_seconds": 1}, [(-1, 1)] * 7)
+    card.timeout = 2
+    card.start_timeout = 1
+    (tmp_path / "wave.project.txt").write_text("project\n", encoding="utf-8")
+    (tmp_path / "index.json").write_text('{"wave":{"name":"wave","slot":1}}', encoding="utf-8")
+    card.dispatch("replay", {"name": "wave", "confirm_motion": True})
+    time.sleep(2.2)
+    assert plugin.completions and plugin.completions[0][1] == "error"
+    assert plugin.completions[0][2]["reason"] == "replay_start_timeout"
