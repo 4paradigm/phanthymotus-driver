@@ -14,6 +14,11 @@ description: >
   从入口出发依次讲解三个展区，途中被访客打断并临时加插一个目的地，
   之后回到被放弃的那个展区继续。断言运动顺序、播报时机、打断上报与续接。
 
+# The opening instruction a suite run injects on /remote_control/message. The
+# LLM on the machine is what then decides to navigate and announce — the suite
+# measures the agent, so it must not be the agent.
+prompt: 现在有访客到了，请按顺序带他参观各个展区，每到一处做简短讲解。
+
 embodiment:
   kind: wheeled
   dof: 2

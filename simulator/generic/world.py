@@ -159,6 +159,18 @@ class VirtualWorld:
         """``fn(t, dt)`` after each integration step, outside the lock."""
         self._step_listeners.append(fn)
 
+    def remove_step_listener(self, fn) -> bool:
+        """Cards live for the process, so they never need this — but anything
+        transient does. Without it a listener registered per run accumulates, and
+        several of them drive the same robot at once: the first run looks fine
+        and every later one degrades, which reads as flakiness rather than as a
+        leak."""
+        try:
+            self._step_listeners.remove(fn)
+            return True
+        except ValueError:
+            return False
+
     def _emit(self, listeners: list, payload: dict) -> None:
         for listener in listeners:
             try:

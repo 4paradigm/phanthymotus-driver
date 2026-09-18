@@ -32,6 +32,7 @@ from pathlib import Path
 from simulator.generic import acp, assertions
 from simulator.generic.card_base import Card
 from simulator.generic.scenario import Scenario, discover
+from simulator.generic.suite import SuiteRunner
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_SCENARIO_DIRS = (BUNDLE_DIR / "scenarios", BUNDLE_DIR / "scenarios" / "user")
@@ -56,12 +57,19 @@ class SimScenarioCard(Card):
         "abort": ([], "停止计时，保留事件记录"),
         "reset": ([], "回到场景初始状态并清空记录"),
         "note": (["text"], "往事件记录里写一条备注；打断钩子绑在这里"),
+        "run_suite": (["scenarios", "repeats", "seed"],
+                      "按顺序跑一批场景并逐个评分；立即返回，进度用 sim_report 轮询"),
+        "abort_suite": ([], "中止正在跑的批次，保留已完成的结果"),
         "read": ([], "读取当前场景与进度"),
     }
     PROPERTIES = {
         "scenario": {"type": "string", "description": "场景 slug"},
         "text": {"type": "string"},
         "kind": {"type": "string", "description": "事件类型，默认 user_message"},
+        "scenarios": {"type": "array", "items": {"type": "string"},
+                      "description": "要跑的场景 slug 列表；留空表示全部"},
+        "repeats": {"type": "integer", "description": "每个场景重复次数；LLM 是随机的，n=1 的分数没有意义"},
+        "seed": {"type": "integer"},
     }
     CONFIG_SCHEMA = {}
 
@@ -76,6 +84,7 @@ class SimScenarioCard(Card):
         self._injector = None
         self.refresh()
         world.add_step_listener(self._on_step)
+        self.suite = SuiteRunner(self, world)
         # What actually went to /api/acp/complete, not the world's internal job
         # payload — see `acp.add_observer`.
         acp.add_observer(self.record_acp)
@@ -190,6 +199,21 @@ class SimScenarioCard(Card):
         self.world.log("note", text=str(text) or "interrupt")
         return {"state": "running", "noted": text}
 
+    def do_run_suite(self, scenarios=None, repeats: int = 1, seed: int = 0, **_):
+        available = sorted(self.refresh())
+        chosen = [slug for slug in (scenarios or available) if slug in available]
+        unknown = [slug for slug in (scenarios or []) if slug not in available]
+        if not chosen:
+            return {"error": "no runnable scenario", "available": available, "unknown": unknown}
+        # `suite` is nested, not spread: the card has a `state` and so does the
+        # batch, and spreading let the batch's overwrite the card's — the third
+        # time in this bundle that two different meanings collided under one key.
+        return {"state": "running", "scenarios": chosen, "repeats": max(1, int(repeats)),
+                "unknown": unknown, "suite": self.suite.start(chosen, repeats=repeats, seed=seed)}
+
+    def do_abort_suite(self, **_):
+        return {"state": "idle", "suite": self.suite.abort()}
+
     def do_read(self, **_):
         return self.payload()
 
@@ -235,6 +259,7 @@ class SimScenarioCard(Card):
             "speech": snapshot["speech"],
             "injections_fired": len(self._fired),
             "acp_posts": len(self._acp_posts),
+            "suite": self.suite.status(),
         }
 
 
@@ -258,12 +283,22 @@ class SimReportCard(Card):
         which = args.get("what", "report")
         if which == "list":
             return self.do_list()
+        if which == "suite":
+            return self.do_suite()
         return self.report()
 
     def do_list(self) -> dict:
         scenarios = self._scenario_card.refresh() if self._scenario_card else {}
         return {"scenarios": [scenario.summary() for scenario in sorted(
             scenarios.values(), key=lambda s: s.slug)]}
+
+    def do_suite(self) -> dict:
+        """Batch progress and scores. Readable *while* the suite runs, because
+        this card is a `resource` and `_needs_barrier` exempts those."""
+        card = self._scenario_card
+        if card is None:
+            return {"error": "no scenario card"}
+        return card.suite.summary()
 
     def transcript(self) -> list[dict]:
         """Requested text, start, end, outcome. This is the assertion surface for
