@@ -49,7 +49,7 @@ class ScriptedGuide:
 
     LLM_LATENCY = 0.6          # a decision is not instantaneous
 
-    def __init__(self, nav, tts, scenario, plan, resume=True, announce=True):
+    def __init__(self, nav, tts, scenario, plan, resume=True, announce=True, register=True):
         self.nav, self.tts, self.scenario = nav, tts, scenario
         self.queue = list(plan)
         self.resume = resume
@@ -61,7 +61,10 @@ class ScriptedGuide:
         self._terminals: list[dict] = []
         self._seen_injections = 0
         nav.world.add_nav_listener(self._terminals.append)
-        nav.world.add_step_listener(self.on_step)
+        if register:
+            # A suite constructs one of these per case and steps it itself. Left
+            # self-registered, every past guide keeps driving the same robot.
+            nav.world.add_step_listener(self.on_step)
 
     def on_step(self, t, _dt):
         if t < self.wake_at:
