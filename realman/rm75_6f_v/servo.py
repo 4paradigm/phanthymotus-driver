@@ -215,36 +215,34 @@ class RM75ServoPlugin:
             return {"state": "error", "message": "RM75 SDK is not connected"}
         if self._ros2 is None:
             return {"state": "error", "message": "no ROS context; cannot subscribe"}
-        if not self.client.motion_gate.acquire(blocking=False):
-            return {"state": "error", "message": "another arm operation is active"}
-
         sink = ControlSink(
             self._descriptor,
             self._apply,
             on_watchdog=self._slow_stop,
             on_abort=self._slow_stop,
         )
-        # Registered before it is started, so a concurrent stop can find and
-        # cancel it — common/control and perception's plugins share this rule.
+        # Check, acquire, reserve and subscribe under one lock. This prevents
+        # a duplicate start from leaking the shared gate and prevents stop()
+        # from racing between gate acquisition and _motion_gate_held=true.
         with self._lock:
             if self._running:
                 return {"state": "error", "message": f"already running on {self._input_topic}"}
+            if not self.client.motion_gate.acquire(blocking=False):
+                return {"state": "error", "message": "another arm operation is active"}
             self._sink = sink
             self._input_topic = topic
             self._running = True
             self._paused = False
-
-        try:
-            self._subscribe(topic)
-        except Exception as exc:
-            with self._lock:
+            self._motion_gate_held = True
+            try:
+                self._subscribe(topic)
+            except Exception as exc:
                 self._running = False
                 self._sink = None
-            self.client.motion_gate.release()
-            return {"state": "error", "message": f"subscribe failed: {exc}"}
-
-        with self._lock:
-            self._motion_gate_held = True
+                self._input_topic = ""
+                self._motion_gate_held = False
+                self.client.motion_gate.release()
+                return {"state": "error", "message": f"subscribe failed: {exc}"}
 
         print(f"[rm75] servo streaming from {topic}", flush=True)
         return {"state": "running", "input": topic,
