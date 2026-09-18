@@ -138,6 +138,10 @@ class VirtualWorld:
         # else's completions. Each listener filters on the action_ids it owns.
         self._nav_listeners: list = []
         self._speech_listeners: list = []
+        # Called once per step with (t, dt). The scenario card uses it to fire
+        # scripted injections on *simulated* time, so a tour replays identically
+        # under a fake clock and on a rig.
+        self._step_listeners: list = []
 
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
@@ -150,6 +154,10 @@ class VirtualWorld:
 
     def add_speech_listener(self, fn) -> None:
         self._speech_listeners.append(fn)
+
+    def add_step_listener(self, fn) -> None:
+        """``fn(t, dt)`` after each integration step, outside the lock."""
+        self._step_listeners.append(fn)
 
     def _emit(self, listeners: list, payload: dict) -> None:
         for listener in listeners:
@@ -203,6 +211,11 @@ class VirtualWorld:
             speech_done = self._update_speech_locked()
 
         # Callbacks POST over HTTP. They run with no lock held — rule 2.
+        for listener in self._step_listeners:
+            try:
+                listener(self._clock.now(), dt)
+            except Exception as exc:
+                print(f"[sim-world] step listener failed: {exc}", flush=True)
         if nav_done is not None:
             self._emit(self._nav_listeners, nav_done)
         for payload in speech_done:
