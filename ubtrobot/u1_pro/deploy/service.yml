@@ -11,4 +11,9 @@ ubtrobot-u1-pro:
     - ROS_LOCALHOST_ONLY=1
     - RCUTILS_COLORIZED_OUTPUT=0
     - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
   restart: unless-stopped

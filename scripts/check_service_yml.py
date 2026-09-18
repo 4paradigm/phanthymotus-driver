@@ -65,6 +65,9 @@ OWN_PROFILE = {
 # Drivers a FastDDS profile cannot isolate, with what they would need instead. Reported,
 # not fatal — the point is that the gap stays visible rather than passing as compliant.
 KNOWN_GAPS = {
+    'ubtrobot/u1_pro': 'RMW is rmw_cyclonedds_cpp and the driver binds both ROS contexts to '
+                       'loopback through CYCLONEDDS_URI/config.yaml; the FastDDS fleet profile '
+                       'is inert and must not be applied.',
     'engineai/t800': 'RMW is rmw_cyclonedds_cpp (Dockerfile T800_PREFERRED_RMW), so '
                      'FASTRTPS_DEFAULT_PROFILES_FILE is inert; its CYCLONEDDS_URI binds '
                      'NETWORK_INTERFACE for both contexts, leaving the domain-42 one on '

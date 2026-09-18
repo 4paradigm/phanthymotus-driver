@@ -4,3 +4,4 @@ ros:
   robot_domain_id: 2
   core_domain_id: 42
   robot_interface: "lo"
+  cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/></Interfaces></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
