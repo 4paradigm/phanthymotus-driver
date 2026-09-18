@@ -837,15 +837,4 @@ def build_plugins(config, namespace, ros2):
             camera_config, namespace, ros2.executor_core
         )
         plugins.append(ext_camera_plugin)
-    vision_config = config.get("vision_capture", {})
-    if vision_config.get("enabled", camera_config.get("enabled", False)):
-        from vision_capture import VisionCapturePlugin
-
-        plugins.append(
-            VisionCapturePlugin(
-                vision_config, namespace, ros2.executor_core,
-                ext_camera=ext_camera_plugin,
-                context=ros2.ctx_core,
-            )
-        )
     return plugins

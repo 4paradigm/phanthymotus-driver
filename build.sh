@@ -51,17 +51,14 @@ select_mirror() {
     case "${MIRROR}" in
         tencent)
             PYPI_MIRROR="https://mirrors.tencentyun.com/pypi/simple/"
-            APT_MIRROR="http://mirrors.tencentyun.com/ubuntu-ports"
             BINFMT_IMAGE="mirror.ccs.tencentyun.com/tonistiigi/binfmt"
             ;;
         tuna)
             PYPI_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple/"
-            APT_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports"
             BINFMT_IMAGE="docker.io/tonistiigi/binfmt"
             ;;
         none|*)
             PYPI_MIRROR="https://pypi.org/simple/"
-            APT_MIRROR="http://ports.ubuntu.com"
             BINFMT_IMAGE="docker.io/tonistiigi/binfmt"
             ;;
     esac
@@ -320,34 +317,14 @@ for idx in "${SELECTED_INDICES[@]}"; do
     # Use the builder selected by the active Docker context. Docker Desktop
     # commonly names it desktop-linux; forcing `default` crosses contexts and
     # fails before the build starts.
-    if docker buildx version >/dev/null 2>&1; then
-        docker buildx build \
-            --platform linux/arm64 \
-            ${NO_CACHE} \
-            --build-arg "APT_MIRROR=${APT_MIRROR}" \
-            --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
-            --file "${dir}Dockerfile" \
-            --tag "${FULL_IMAGE}" \
-            $(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker") \
-            "${BUILD_CTX}"
-    else
-        echo "[info] Docker buildx unavailable; using native docker build"
-        if ! docker build --help 2>&1 | grep -q -- '--platform'; then
-            echo "错误：当前 Docker native builder 不支持 --platform，无法安全构建 ARM64 Driver 镜像" >&2
-            exit 1
-        fi
-        docker build \
-            --platform linux/arm64 \
-            ${NO_CACHE} \
-            --build-arg "APT_MIRROR=${APT_MIRROR}" \
-            --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
-            --file "${dir}Dockerfile" \
-            --tag "${FULL_IMAGE}" \
-            "${BUILD_CTX}"
-        if ${PUSH_ENABLED}; then
-            docker push "${FULL_IMAGE}"
-        fi
-    fi
+    docker buildx build \
+        --platform linux/arm64 \
+        ${NO_CACHE} \
+        --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
+        --file "${dir}Dockerfile" \
+        --tag "${FULL_IMAGE}" \
+        $(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker") \
+        "${BUILD_CTX}"
 
     [ -n "${CLEANUP_CTX}" ] && rm -rf "${CLEANUP_CTX}"
 
