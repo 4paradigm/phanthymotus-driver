@@ -31,6 +31,9 @@ def test_servo_holds_motion_gate_for_active_stream():
     second._subscribe = mock.Mock()
 
     assert first.dispatch("start", {"input_topic": "/control/a"})["state"] == "running"
+    duplicate = first.dispatch("start", {"input_topic": "/control/duplicate"})
+    assert duplicate["state"] == "error"
+    assert "already running" in duplicate["message"]
     # joint_control and gripper use this same gate, so neither can acquire it
     # while the stream owns the arm for its active lifetime.
     assert client.motion_gate.acquire(blocking=False) is False
@@ -39,5 +42,7 @@ def test_servo_holds_motion_gate_for_active_stream():
     assert "another arm operation" in blocked["message"]
 
     first.dispatch("stop", {})
+    assert client.motion_gate.acquire(blocking=False) is True
+    client.motion_gate.release()
     assert second.dispatch("start", {"input_topic": "/control/b"})["state"] == "running"
     second.dispatch("stop", {})
