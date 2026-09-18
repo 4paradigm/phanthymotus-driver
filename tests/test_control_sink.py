@@ -410,7 +410,10 @@ def test_repeated_silence_escalates_from_hold_to_abort():
     assert outcomes[2].verdict is Verdict.ABORTED
     assert len(holds) == 2
     assert aborts == [True]
-    assert sink.aborted
+    # Stood down, not aborted: the escalation raises the *response*, it does not
+    # take the sink out of service. Only force-torque does that.
+    assert not sink.aborted
+    assert sink.stats()["stood_down"]
 
 
 def test_strikes_count_periods_not_ticks():
@@ -428,6 +431,93 @@ def test_strikes_count_periods_not_ticks():
 
     assert not sink.aborted
     assert sink.stats()["watchdog_strikes"] == 1
+
+
+# ── standing down vs aborting ────────────────────────────────────────────────
+#
+# These two used to be the same state, and the rule that produced contradicted
+# itself: four watchdog periods of silence resumed on their own, five needed an
+# operator. Measured on Tianyi, restarting the policy card upstream takes longer
+# than five periods, so reconfiguring a policy left the driver refusing every
+# command until somebody rebuilt the card by hand.
+
+def test_a_stood_down_sink_resumes_on_the_next_good_command():
+    """The command is the evidence the silence is over.
+
+    Safe for the same reason an ordinary hold is: freshness means it was
+    computed from a recent observation, and the step clamp still holds against
+    the last applied values, which survive.
+    """
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, escalate_after=3)
+    sink.submit(message(clock, [0.0, 0.0]))
+
+    for _ in range(3):
+        clock.advance(200)
+        sink.tick()
+    assert sink.stats()["stood_down"]
+
+    applied_before = len(apply.calls)
+    outcome = sink.submit(message(clock, [0.01, 0.01], seq=2))
+
+    assert outcome.applied
+    assert len(apply.calls) == applied_before + 1
+    assert not sink.stats()["stood_down"]
+    assert not sink.stats()["holding"]
+
+
+def test_a_stood_down_sink_stops_re_firing_the_abort_handler():
+    """A driver whose abort handler returns to a safe pose would otherwise
+    re-issue that move every watchdog period, forever."""
+    clock, apply = FakeClock(), Recorder()
+    aborts = []
+    sink = make_sink(clock, apply, on_abort=lambda: aborts.append(True),
+                     escalate_after=2)
+    sink.submit(message(clock, [0.0, 0.0]))
+
+    for _ in range(8):
+        clock.advance(200)
+        sink.tick()
+
+    assert aborts == [True]
+
+
+def test_only_an_applied_command_ends_a_stand_down():
+    """A command that is dropped or rejected is not evidence of anything."""
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, escalate_after=2)
+    sink.submit(message(clock, [0.0, 0.0]))
+    for _ in range(2):
+        clock.advance(200)
+        sink.tick()
+    assert sink.stats()["stood_down"]
+
+    stale = message(clock, [0.01, 0.01], seq=2, ttl_ms=1)
+    clock.advance(50)                       # past its ttl
+    assert sink.submit(stale).verdict is Verdict.DROPPED
+    assert sink.stats()["stood_down"]
+
+
+def test_force_torque_still_latches_and_no_command_talks_it_round():
+    """The difference that justifies having two states at all: after an impact
+    the next command is precisely the one that must not run."""
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, descriptor_dict(force_torque=[10.0, 10.0]))
+    sink.submit(message(clock, [0.0, 0.0]))
+
+    assert sink.force_torque([2.0, 25.0]).verdict is Verdict.ABORTED
+    assert sink.aborted
+    assert not sink.stats()["stood_down"]
+
+    applied_before = len(apply.calls)
+    clock.advance(10)
+    assert sink.submit(message(clock, [0.01, 0.01], seq=2)).verdict is Verdict.ABORTED
+    assert len(apply.calls) == applied_before
+    assert sink.aborted
+
+    sink.reset()
+    assert not sink.aborted
+    assert not sink.stats()["stood_down"]
 
 
 # ── 3. priority arbitration ──────────────────────────────────────────────────
