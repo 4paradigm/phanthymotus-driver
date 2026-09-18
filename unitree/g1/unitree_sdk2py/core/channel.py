@@ -86,6 +86,8 @@ class Channel:
                 self.__threadReader.join()
 
         def __OnDataAvailable(self, reader: DataReader):
+            if reader is None:
+                return
             samples = []
             try:
                 samples = reader.take(1)

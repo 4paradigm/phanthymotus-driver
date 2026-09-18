@@ -45,6 +45,14 @@ plugins:
     enabled: true
   ext_camera:
     enabled: true
+  asr:
+    enabled: true
+  meeting_facilitator:
+    enabled: true
+    auto_start: true
+    speaker_duration_s: 120
+    warning_before_s: 15
+    transcript_limit: 200
 
 safety_harness:
   enabled: true
