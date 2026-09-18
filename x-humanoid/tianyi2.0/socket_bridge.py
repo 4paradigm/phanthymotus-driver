@@ -33,7 +33,7 @@ import rclpy
 from rclpy.context import Context
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from rclpy.serialization import deserialize_message
+from rclpy.serialization import deserialize_message, serialize_message
 from rosidl_runtime_py.utilities import get_message
 
 
@@ -175,12 +175,21 @@ class SubscriptionHandler:
             if self.msg_count % 500 == 0:
                 print(f"[socket-bridge] {self.topic}: forwarded {self.msg_count} "
                       f"messages inbound", flush=True)
-        except Exception as e:      # noqa: BLE001 — the client went away
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
             # Marked rather than raised: this runs on the executor thread, and a
             # raise here would take down every other topic sharing it.
             self.failed = True
             print(f"[socket-bridge] inbound {self.topic}: client gone ({e})",
                   flush=True)
+        except Exception as e:      # noqa: BLE001
+            # Anything else is our bug, not the client's departure, and saying
+            # "client gone" about a NameError sends the next person to look at
+            # the socket. Caught for the same reason as above, reported honestly.
+            self.failed = True
+            print(f"[socket-bridge] inbound {self.topic}: forwarding failed "
+                  f"({type(e).__name__}: {e})", flush=True)
+            import traceback
+            traceback.print_exc()
 
     def close(self, executor):
         try:

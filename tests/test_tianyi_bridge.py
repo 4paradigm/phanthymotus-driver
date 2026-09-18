@@ -255,6 +255,90 @@ def test_a_raising_callback_does_not_kill_the_link(bridge):
     subscription.destroy()
 
 
+# ── the server side ──────────────────────────────────────────────────────────
+#
+# These exist because the first version of the inbound path shipped with
+# `serialize_message` used but never imported, and the tests above did not catch
+# it: they only ever exercised the client. The NameError surfaced on hardware,
+# reported as "client gone", which is the wrong place to send the next person.
+
+def _server_module():
+    """socket_bridge.py with its ROS surface stubbed, importable on a laptop."""
+    import importlib
+
+    context_mod = types.ModuleType("rclpy.context")
+    context_mod.Context = type("Context", (), {})
+    executors_mod = types.ModuleType("rclpy.executors")
+    executors_mod.MultiThreadedExecutor = type("MultiThreadedExecutor", (), {})
+    utilities_mod = types.ModuleType("rosidl_runtime_py.utilities")
+    utilities_mod.get_message = lambda name: FakeMsg
+    runtime_pkg = types.ModuleType("rosidl_runtime_py")
+    yaml_mod = types.ModuleType("yaml")
+    yaml_mod.safe_load = lambda *a, **k: {}
+
+    qos = sys.modules["rclpy.qos"]
+    qos.HistoryPolicy = type("HistoryPolicy", (), {"KEEP_LAST": "keep_last"})
+    qos.DurabilityPolicy = type("DurabilityPolicy", (), {"VOLATILE": "volatile"})
+
+    for name, module in (("rclpy.context", context_mod),
+                         ("rclpy.executors", executors_mod),
+                         ("rosidl_runtime_py", runtime_pkg),
+                         ("rosidl_runtime_py.utilities", utilities_mod),
+                         ("yaml", yaml_mod)):
+        sys.modules.setdefault(name, module)
+    return importlib.import_module("socket_bridge")
+
+
+def test_the_server_can_serialize_what_it_forwards():
+    """The import that was missing. `_forward` is the only place the bridge
+    serializes rather than deserializes, so nothing else would have caught it."""
+    server = _server_module()
+
+    assert hasattr(server, "serialize_message"), (
+        "socket_bridge must import serialize_message — the inbound direction "
+        "serializes on the way out, and its absence fails only at runtime")
+
+
+def test_the_server_frames_a_forwarded_message_the_way_the_client_reads_it():
+    """One test across both halves of the protocol: if the two ever disagree on
+    framing, every inbound message is garbage and nothing says why."""
+    server = _server_module()
+    left, right = socket.socketpair()
+
+    handler = server.SubscriptionHandler.__new__(server.SubscriptionHandler)
+    handler.topic = "/actucore/vla/cmd"
+    handler.conn = left
+    handler.msg_count = 0
+    handler.failed = False
+    handler._send_lock = threading.Lock()
+
+    handler._forward(b"a command")
+
+    header = right.recv(4)
+    assert struct.unpack("<I", header)[0] == len(b"a command")
+    assert right.recv(len(b"a command")) == b"a command"
+    assert not handler.failed
+    left.close(); right.close()
+
+
+def test_a_dead_client_is_reported_as_such_and_our_own_bugs_are_not():
+    """"client gone" about a NameError is a lie that costs an afternoon."""
+    server = _server_module()
+    left, right = socket.socketpair()
+    right.close()
+
+    handler = server.SubscriptionHandler.__new__(server.SubscriptionHandler)
+    handler.topic = "/actucore/vla/cmd"
+    handler.conn = left
+    handler.msg_count = 0
+    handler.failed = False
+    handler._send_lock = threading.Lock()
+
+    handler._forward(b"x")          # peer is gone: an OSError path
+    assert handler.failed
+    left.close()
+
+
 # ── teardown ─────────────────────────────────────────────────────────────────
 
 def test_destroy_stops_the_reader_and_closes_the_socket(bridge):
