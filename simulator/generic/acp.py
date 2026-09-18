@@ -28,6 +28,7 @@ import threading
 import time
 
 _transport = None
+_observers: list = []
 _lock = threading.RLock()
 
 
@@ -38,6 +39,26 @@ def set_transport(fn) -> None:
         _transport = fn
 
 
+def add_observer(fn) -> None:
+    """``fn(body)`` for every post, successful or not.
+
+    `sim_report` uses this so the run record holds **what was actually sent to
+    agent-core**, rather than the world's internal job payload. Those are not the
+    same shape and conflating them is a live trap: a job dict has `result` as a
+    Slamtec status code (`-1` for cancelled), while an ACP body has `result` as
+    the whole payload. `-1 or {}` is truthy, so the confusion surfaces as an
+    AttributeError deep inside the oracle rather than as a wrong verdict — but
+    only because the code happened to be strict.
+    """
+    with _lock:
+        _observers.append(fn)
+
+
+def clear_observers() -> None:
+    with _lock:
+        _observers.clear()
+
+
 def notify(action_id: str, status: str, result: dict, tool: str = "") -> dict:
     """POST one terminal transition. Never raises — a failed callback must not
     take down the tick thread that produced it."""
@@ -46,6 +67,12 @@ def notify(action_id: str, status: str, result: dict, tool: str = "") -> dict:
     url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678") + "/api/acp/complete"
     with _lock:
         transport = _transport
+        observers = list(_observers)
+    for observe in observers:
+        try:
+            observe(payload)
+        except Exception as exc:
+            print(f"[acp] observer failed: {exc}", file=sys.stderr, flush=True)
     try:
         (transport or _post)(url, payload)
     except Exception as exc:
