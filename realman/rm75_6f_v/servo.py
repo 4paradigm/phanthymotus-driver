@@ -120,6 +120,7 @@ class RM75ServoPlugin:
         self._rejects: list[str] = []
         # Paused means subscribed but not applying. See `_halt`.
         self._paused = False
+        self._motion_gate_held = False
 
     # ── tools ────────────────────────────────────────────────────────────────
 
@@ -214,6 +215,8 @@ class RM75ServoPlugin:
             return {"state": "error", "message": "RM75 SDK is not connected"}
         if self._ros2 is None:
             return {"state": "error", "message": "no ROS context; cannot subscribe"}
+        if not self.client.motion_gate.acquire(blocking=False):
+            return {"state": "error", "message": "another arm operation is active"}
 
         sink = ControlSink(
             self._descriptor,
@@ -237,7 +240,11 @@ class RM75ServoPlugin:
             with self._lock:
                 self._running = False
                 self._sink = None
+            self.client.motion_gate.release()
             return {"state": "error", "message": f"subscribe failed: {exc}"}
+
+        with self._lock:
+            self._motion_gate_held = True
 
         print(f"[rm75] servo streaming from {topic}", flush=True)
         return {"state": "running", "input": topic,
@@ -268,7 +275,14 @@ class RM75ServoPlugin:
             finally:
                 node.destroy_node()
         if was_running:
-            self._slow_stop()
+            try:
+                self._slow_stop()
+            finally:
+                with self._lock:
+                    gate_held = self._motion_gate_held
+                    self._motion_gate_held = False
+                if gate_held:
+                    self.client.motion_gate.release()
             print(f"[rm75] servo stopped ({topic})", flush=True)
         return {"state": "idle"}
 
