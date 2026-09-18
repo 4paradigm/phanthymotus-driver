@@ -905,6 +905,10 @@ class CartesianPlugin:
         self._monitor_thread = None
         self._last_completion = None
         self._terminal_action_ids = set()
+        # move_a_to_b is a two-stage controller action.  The stage marker is
+        # protected by _action_lock so a trajectory event, stop request and
+        # watchdog cannot all advance or finish the same action.
+        self._a_to_b_actions = {}
         safety = config.get("safety", {})
         self.max_speed_percent = min(int(safety.get("max_speed_percent", 10)), 10)
         self.default_speed_percent = min(int(safety.get("default_speed_percent", 5)), self.max_speed_percent)
@@ -965,8 +969,24 @@ class CartesianPlugin:
                 ("drz_deg", "姿态偏移 Yaw，度；留空表示不旋转"),
             )
         }
+        point_props = {
+            f"{point}_{axis}": {
+                "type": "number",
+                "description": f"{point.upper()} 点 TCP {label}（基坐标系）",
+            }
+            for point in ("a", "b")
+            for axis, label in (
+                ("x_mm", "X，毫米"),
+                ("y_mm", "Y，毫米"),
+                ("z_mm", "Z，毫米"),
+                ("rx_deg", "Roll，度"),
+                ("ry_deg", "Pitch，度"),
+                ("rz_deg", "Yaw，度"),
+            )
+        }
         properties = {
             **offset_props,
+            **point_props,
             "frame_type": {"type": "string", "enum": ["tool"], "default": "tool",
                            "description": "偏移参考坐标系：目前仅支持 tool 工具系（工作坐标系偏移需控制器激活坐标系位姿，暂不开放）"},
             "speed_percent": {"type": "integer", "minimum": 1, "maximum": self.max_speed_percent,
@@ -982,12 +1002,17 @@ class CartesianPlugin:
             {
                 "move_offset": (["dx_mm", "dy_mm", "dz_mm", "drx_deg", "dry_deg", "drz_deg", "frame_type", "speed_percent", "cartesian_enabled", "confirm_motion"],
                                 "沿工具坐标系做直线偏移（相对当前位姿；未填写的轴不偏移）"),
+                "move_a_to_b": ([
+                    "a_x_mm", "a_y_mm", "a_z_mm", "a_rx_deg", "a_ry_deg", "a_rz_deg",
+                    "b_x_mm", "b_y_mm", "b_z_mm", "b_rx_deg", "b_ry_deg", "b_rz_deg",
+                    "speed_percent", "cartesian_enabled", "confirm_motion",
+                ], "先沿直线运动到基坐标系 A 点，控制器确认到达后再沿直线运动到 B 点"),
                 "stopmotion": ([], "请求受控减速停止"),
                 "info": ([], "读取运动状态与安全配置"),
             },
             properties,
         )
-        schema["x-completion"] = {"actions": ["move_offset"], "timeout": 305}
+        schema["x-completion"] = {"actions": ["move_offset", "move_a_to_b"], "timeout": 610}
         schema["x-hooks"] = {
             "on_interrupt_motion": {"action": "stopmotion"},
             "on_interrupt_all": {"action": "stopmotion"},
@@ -997,7 +1022,7 @@ class CartesianPlugin:
             tool(
                 "cartesian_control",
                 "actuator",
-                "笛卡尔空间相对运动：沿工具系偏移执行 move_offset。位置毫米、姿态度。",
+                "笛卡尔运动：工具系偏移，或从当前位置依次直线运动到基坐标系 A、B 点。位置毫米、姿态度。",
                 schema,
             )
         ]
@@ -1028,36 +1053,15 @@ class CartesianPlugin:
             return self._motion_status()
         if action == "stopmotion":
             return self._stop_motion()
+        if action == "move_a_to_b":
+            return self._start_a_to_b(args)
         # movel/movep 已从卡片定义中移除；仅保留此处兼容已保存的旧流程，
         # 新建流程只能选择 move_offset。
         if action in ("movel", "move_offset", "movep"):
             return self._start_cartesian(action, args)
         return None
 
-    def _motion_status(self):
-        with self._action_lock:
-            active_action_id = self._active_action_id
-            last = self._last_completion
-        return {
-            "state": "moving" if active_action_id else "ready",
-            "active_action_id": active_action_id,
-            "last_completion": jsonable(last),
-            "motion_enabled": self.client.motion_enabled and self.cartesian_enabled,
-            "read_only": not (self.client.motion_enabled and self.cartesian_enabled),
-            "cartesian_enabled": self.cartesian_enabled,
-            "position_tolerance_mm": self.position_tolerance_mm,
-            "euler_tolerance_deg": self.euler_tolerance_deg,
-            "max_speed_percent": self.max_speed_percent,
-            "max_radius_mm": self.max_radius_mm,
-            "shoulder_height_mm": self.shoulder_height_mm,
-            "max_reach_mm": self.max_reach_mm,
-            "max_euler_abs_deg": self.max_euler_abs_deg,
-            "tool_length_mm": self.tool_length_mm,
-            "native_tool_offset_enabled": self.native_tool_offset_enabled,
-            "native_tool_offset_supported": self._native_tool_offset_supported,
-        }
-
-    def _start_cartesian(self, motion_type, args):
+    def _motion_speed(self, args):
         if not self.cartesian_enabled:
             raise PermissionError(
                 "cartesian motion is disabled by deployment configuration; "
@@ -1075,6 +1079,35 @@ class CartesianPlugin:
         speed_percent = int(args.get("speed_percent", self.default_speed_percent))
         if not 1 <= speed_percent <= self.max_speed_percent:
             raise ValueError(f"speed_percent must be within 1~{self.max_speed_percent}")
+        return speed_percent
+
+    def _motion_status(self):
+        with self._action_lock:
+            active_action_id = self._active_action_id
+            last = self._last_completion
+            a_to_b_state = self._a_to_b_actions.get(active_action_id)
+        return {
+            "state": "moving" if active_action_id else "ready",
+            "active_action_id": active_action_id,
+            "active_stage": a_to_b_state.get("stage") if a_to_b_state else None,
+            "last_completion": jsonable(last),
+            "motion_enabled": self.client.motion_enabled and self.cartesian_enabled,
+            "read_only": not (self.client.motion_enabled and self.cartesian_enabled),
+            "cartesian_enabled": self.cartesian_enabled,
+            "position_tolerance_mm": self.position_tolerance_mm,
+            "euler_tolerance_deg": self.euler_tolerance_deg,
+            "max_speed_percent": self.max_speed_percent,
+            "max_radius_mm": self.max_radius_mm,
+            "shoulder_height_mm": self.shoulder_height_mm,
+            "max_reach_mm": self.max_reach_mm,
+            "max_euler_abs_deg": self.max_euler_abs_deg,
+            "tool_length_mm": self.tool_length_mm,
+            "native_tool_offset_enabled": self.native_tool_offset_enabled,
+            "native_tool_offset_supported": self._native_tool_offset_supported,
+        }
+
+    def _start_cartesian(self, motion_type, args):
+        speed_percent = self._motion_speed(args)
         controller_completion = self._uses_controller_completion(motion_type)
         if controller_completion:
             offset = self._native_tool_offset(args)
@@ -1159,6 +1192,233 @@ class CartesianPlugin:
             ).start()
         print(f"[rm75 ACP] {action_id}: started ({motion_type})", flush=True)
         return {"state": "running", "action_id": action_id}
+
+    def _start_a_to_b(self, args):
+        """Move from the current TCP to A, then from A to B."""
+        speed_percent = self._motion_speed(args)
+        point_a = self._pose_from_fields(
+            args,
+            ("a_x_mm", "a_y_mm", "a_z_mm", "a_rx_deg", "a_ry_deg", "a_rz_deg"),
+        )
+        point_b = self._pose_from_fields(
+            args,
+            ("b_x_mm", "b_y_mm", "b_z_mm", "b_rx_deg", "b_ry_deg", "b_rz_deg"),
+        )
+        self._validate_workspace(point_a)
+        self._validate_workspace(point_b)
+        if not callable(getattr(self.client, "command_trajectory", None)):
+            raise RuntimeError("RM75 SDK client does not support controller trajectory completion")
+
+        # 当前位姿只用于判断是否已经在 A 点以及估算第一段超时。A、B 的真实
+        # 可达性、奇异点和控制器碰撞保护仍由每一段 rm_movel 的规划结果兜底。
+        if self._arm is not None:
+            self._arm._preflight()
+        current = self._current_pose_mm_deg()
+        position_error, euler_error = self._pose_error(current, point_a)
+        at_point_a = (
+            position_error <= self.position_tolerance_mm
+            and euler_error <= self.euler_tolerance_deg
+        )
+
+        if not self._motion_lock.acquire(blocking=False):
+            active = self._motion_state["active_action_id"] or "joint/cartesian motion"
+            raise RuntimeError(f"another motion is active: {active}")
+
+        action_id = f"rm75_cart_{uuid4().hex[:10]}"
+        first_segment = "to_b" if at_point_a else "to_a"
+        timeout_to_a = self._motion_deadline_seconds(current, point_a, speed_percent)
+        timeout_to_b = self._motion_deadline_seconds(point_a, point_b, speed_percent)
+        with self._action_lock:
+            self._active_action_id = action_id
+            self._motion_state["active_action_id"] = action_id
+            self._cancelled.discard(action_id)
+            self._a_to_b_actions[action_id] = {
+                "stage": first_segment,
+                "point_a": point_a,
+                "point_b": point_b,
+                "speed_percent": speed_percent,
+                "timeout_to_a": timeout_to_a,
+                "timeout_to_b": timeout_to_b,
+                "point_a_already_reached": at_point_a,
+            }
+        self._monitor_thread = threading.Thread(
+            target=self._submit_a_to_b_segment,
+            args=(action_id, first_segment),
+            daemon=True,
+            name=f"rm75-a-to-b-{first_segment}-{action_id}",
+        )
+        self._monitor_thread.start()
+        threading.Thread(
+            target=self._a_to_b_watchdog,
+            args=(action_id, first_segment),
+            daemon=True,
+            name=f"rm75-a-to-b-watchdog-{first_segment}-{action_id}",
+        ).start()
+        print(f"[rm75 ACP] {action_id}: started (move_a_to_b)", flush=True)
+        return {"state": "running", "action_id": action_id}
+
+    def _a_to_b_result(self, state, reason, **extra):
+        return {
+            "reason": reason,
+            "point_a_pose_mm_deg": list(state["point_a"]),
+            "target_pose_mm_deg": list(state["point_b"]),
+            "point_a_already_reached": bool(state["point_a_already_reached"]),
+            **extra,
+        }
+
+    def _submit_a_to_b_segment(self, action_id, segment):
+        with self._action_lock:
+            state = self._a_to_b_actions.get(action_id)
+            if (state is None or state["stage"] != segment
+                    or action_id in self._cancelled
+                    or action_id in self._terminal_action_ids):
+                return
+            state_snapshot = dict(state)
+        target = state_snapshot["point_a"] if segment == "to_a" else state_snapshot["point_b"]
+        target_args = dict(zip(
+            ("x_mm", "y_mm", "z_mm", "rx_deg", "ry_deg", "rz_deg"),
+            target,
+        ))
+
+        def on_controller_event(trajectory_state):
+            threading.Thread(
+                target=self._handle_a_to_b_event,
+                args=(action_id, segment, bool(trajectory_state)),
+                daemon=True,
+                name=f"rm75-a-to-b-event-{segment}-{action_id}",
+            ).start()
+
+        try:
+            self._submit(
+                "movel",
+                target_args,
+                target,
+                state_snapshot["speed_percent"],
+                wait_for_completion=True,
+                completion_callback=on_controller_event,
+            )
+            # stopmotion may race the very small interval between the final
+            # cancellation check and the SDK call.  Repeat slow-stop after a
+            # late submission so that request cannot leave an untracked move.
+            with self._action_lock:
+                cancelled_after_submit = action_id in self._cancelled
+            if cancelled_after_submit:
+                self._request_slow_stop()
+        except Exception as exc:
+            with self._action_lock:
+                state = self._a_to_b_actions.get(action_id)
+                if state is None or state["stage"] != segment:
+                    return
+                state["stage"] = "failed"
+                state_snapshot = dict(state)
+            self._request_slow_stop()
+            self._finish_cartesian(
+                action_id,
+                "error",
+                self._a_to_b_result(
+                    state_snapshot,
+                    str(exc),
+                    failed_segment=segment,
+                ),
+            )
+
+    def _handle_a_to_b_event(self, action_id, segment, trajectory_state):
+        next_segment = None
+        cancelled = False
+        with self._action_lock:
+            state = self._a_to_b_actions.get(action_id)
+            if (state is None or state["stage"] != segment
+                    or action_id in self._terminal_action_ids):
+                return
+            if action_id in self._cancelled:
+                cancelled = True
+                state_snapshot = dict(state)
+            elif not trajectory_state:
+                state["stage"] = "failed"
+                state_snapshot = dict(state)
+            elif segment == "to_a":
+                state["stage"] = "to_b"
+                next_segment = "to_b"
+                state_snapshot = dict(state)
+            else:
+                state["stage"] = "completed"
+                state_snapshot = dict(state)
+
+        if cancelled:
+            self._request_slow_stop()
+            return
+
+        if not trajectory_state:
+            self._finish_cartesian(
+                action_id,
+                "error",
+                self._a_to_b_result(
+                    state_snapshot,
+                    "controller reported trajectory planning, reachability or collision failure",
+                    failed_segment=segment,
+                ),
+            )
+            return
+        if next_segment is None:
+            self._finish_cartesian(
+                action_id,
+                "completed",
+                self._a_to_b_result(
+                    state_snapshot,
+                    "controller_reached_point_b",
+                    completed_segments=["to_a", "to_b"]
+                    if not state_snapshot["point_a_already_reached"] else ["to_b"],
+                ),
+            )
+            return
+
+        # A 的控制器终态已经确认后才允许登记 B 的事件槽和下发 B。
+        self._monitor_thread = threading.Thread(
+            target=self._submit_a_to_b_segment,
+            args=(action_id, next_segment),
+            daemon=True,
+            name=f"rm75-a-to-b-{next_segment}-{action_id}",
+        )
+        self._monitor_thread.start()
+        threading.Thread(
+            target=self._a_to_b_watchdog,
+            args=(action_id, next_segment),
+            daemon=True,
+            name=f"rm75-a-to-b-watchdog-{next_segment}-{action_id}",
+        ).start()
+
+    def _a_to_b_watchdog(self, action_id, segment):
+        with self._action_lock:
+            state = self._a_to_b_actions.get(action_id)
+            if state is None or state["stage"] != segment:
+                return
+            timeout_seconds = state["timeout_to_a" if segment == "to_a" else "timeout_to_b"]
+        time.sleep(timeout_seconds)
+        with self._action_lock:
+            state = self._a_to_b_actions.get(action_id)
+            if (state is None or state["stage"] != segment
+                    or action_id in self._cancelled
+                    or action_id in self._terminal_action_ids):
+                return
+            # Claim this segment before cancelling the global trajectory wait;
+            # a late controller event will see the marker and be ignored.
+            state["stage"] = "timed_out"
+            state_snapshot = dict(state)
+        cancel_wait = getattr(self.client, "cancel_trajectory_wait", None)
+        if callable(cancel_wait):
+            cancel_wait()
+        self._request_slow_stop()
+        time.sleep(self.stop_finalize_seconds)
+        self._finish_cartesian(
+            action_id,
+            "error",
+            self._a_to_b_result(
+                state_snapshot,
+                "controller completion event timed out",
+                timeout_seconds=timeout_seconds,
+                failed_segment=segment,
+            ),
+        )
 
     def _uses_controller_completion(self, motion_type):
         return (
@@ -1682,6 +1942,7 @@ class CartesianPlugin:
                 self._active_action_id = None
             if self._motion_state["active_action_id"] == action_id:
                 self._motion_state["active_action_id"] = None
+            self._a_to_b_actions.pop(action_id, None)
             self._last_completion = {"action_id": action_id, "status": status, "result": dict(result)}
             release_motion_lock = self._motion_lock.locked()
         confirmed_target = result.get("target_pose_mm_deg") if status == "completed" else None

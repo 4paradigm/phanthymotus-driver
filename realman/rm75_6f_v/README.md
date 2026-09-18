@@ -27,9 +27,10 @@ Available tools are:
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
-- `cartesian_control`: tool-frame `move_offset` only. Empty offset fields mean
-  zero movement on that axis. Absolute `movel`, waypoint `movep`, and
-  work-frame offsets are not exposed.
+- `cartesian_control`: tool-frame `move_offset`, plus `move_a_to_b`. The latter
+  moves from the current TCP to base-frame A, waits for the controller's
+  successful trajectory event, and then moves from A to base-frame B. Absolute
+  `movel`, waypoint `movep`, and work-frame offsets are not exposed.
 - `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
   instance can publish RGB, depth, or left infrared without going through the
   RealMan controller.
@@ -162,7 +163,16 @@ envelope before use. Every `cartesian_control.move_offset` request must set both
 TCP for the first offset, composes the tool-frame offset into an absolute target,
 and validates that target before submitting `rm_movel_offset`. A controller-
 confirmed target is cached for consecutive offsets; joint motion, stop, timeout,
-or execution failure invalidates the cache.
+or execution failure invalidates the cache. `move_a_to_b` requires complete A
+and B TCP poses (`x/y/z` in millimetres and `rx/ry/rz` in degrees), validates
+both poses against the configured workspace envelope, and submits two separate
+`rm_movel` stages. B is submitted only after the controller confirms arrival at
+A; planning failure, an unreachable pose, collision stop, timeout, or an
+operator stop ends the action without submitting any remaining stage. If the
+measured TCP is already within 5 mm and 2 degrees of A, the first stage is
+skipped. The controller's collision level, electronic fences, virtual walls,
+and physical safety system remain responsible for collision protection; the
+driver has no environment model and does not plan a detour around obstacles.
 
 The HTTP service listens on port `15718` and provides `/health` and `/mcp`.
 The normal Agent Core runtime still initializes its ROS/DDS transport, but robot
