@@ -6,7 +6,7 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${APT_MIRROR}|g" /etc/apt/sources.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3-pip python3-yaml ros-humble-rmw-fastrtps-cpp ffmpeg \
+        python3-pip python3-yaml ros-humble-rmw-fastrtps-cpp \
     && cd /tmp \
     && apt-get download libusb-1.0-0 \
     && mkdir -p /opt/realman/libusb /tmp/libusb-root \
@@ -28,7 +28,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=:all: \
 WORKDIR /work
 COPY common/ /work/common/
 COPY vendor/Robotic_Arm/ /work/Robotic_Arm/
-COPY main.py device.py servo.py camera.py realsense.py vision_capture.py config.yaml driver.yaml /work/realman/rm75_6f_v/
+COPY main.py device.py action_record.py camera.py realsense.py vision_capture.py config.yaml driver.yaml /work/realman/rm75_6f_v/
 COPY resource/ /work/realman/rm75_6f_v/resource/
 COPY deploy/ /deploy/
 
