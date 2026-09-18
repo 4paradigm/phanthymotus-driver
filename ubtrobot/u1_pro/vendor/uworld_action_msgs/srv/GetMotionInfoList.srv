@@ -1,0 +1,4 @@
+---
+MotionInfo[] motion_info_list
+int32 code
+string message

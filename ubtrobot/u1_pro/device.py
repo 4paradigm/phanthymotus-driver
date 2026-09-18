@@ -1,161 +1,224 @@
-"""ROS 2 adapter for the public UBTECH robo_sdk U1 Pro contract.
+"""UBTECH U1 Pro ROS 2 adapter.
 
-The vendor document exposes JSON envelopes over ``robo_sdk/srv/StringCall``
-and ``std_srvs/srv/Trigger``.  This module deliberately does not invent a
-lower-level joint or actuator protocol; all calls and event topics are the
-ones documented by the vendor SDK.
+The cards in this module are Agent capabilities, not a mirror of every SDK
+management call. The robot's public ROS graph provides useful contracts:
+16 kHz microphone PCM, live speaker PCM input, motion playback, and audio events.
 """
 
 from __future__ import annotations
 
 import json
-import threading
 import time
+import uuid
 from typing import Any
 
-from common.vendor_runtime import DriverBundle, action_schema, jsonable, tool
+from common.vendor_runtime import action_schema, jsonable, tool
 
 
-CALL_TIMEOUT = 3.0
+SERVICE_TIMEOUT = 3.0
+MIC_TOPIC = "/audio/sense/audio_data_to_asr"
+SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 
 
-def _parse_json(value: Any) -> Any:
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
-    return jsonable(value)
+def _sensor_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"]}},
+        "required": ["action"],
+    }
+
+
+def _event_json(message: Any) -> str:
+    return json.dumps(jsonable(message), ensure_ascii=False)
 
 
 class U1Nodes:
     def __init__(self, config: dict, namespace: str, ros) -> None:
-        from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-        from std_msgs.msg import String
-
-        from robo_sdk.srv import StringCall
-        from std_srvs.srv import Trigger
-
         from rclpy.node import Node
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        from std_msgs.msg import String
+        from audio_msgs.msg import AudioChunk, AudioInData, AudioOutData, DoaEvent, FinishList, MainWakeupWord, WakeupEvent, WakeupState
+        from audio_msgs.srv import EnableAudioIn, SetAudioVolume
+        from coze_msgs.srv import InterruptActionAudio, PlayResources
+        from uworld_action_msgs.srv import GetMotionInfoList, PlayMotion
 
         self.robot = Node("u1_pro_driver", context=ros.ctx_robot)
         self.core = Node("u1_pro_bridge", namespace=namespace, context=ros.ctx_core)
-        self._ros = ros
-        self._lock = threading.Lock()
-        self._subscriptions = []
-        self._publishers = {}
-        self._String = String
-        self._topics: dict[str, str] = {}
-        self._services = {}
+        self.namespace = namespace
+        self.mic_topic = f"/{namespace}/mic/audio"
+        self.AudioChunk = AudioChunk
+        self.AudioOutData = AudioOutData
+        self.String = String
+        self._speaker_publisher = self.robot.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
+        self._speaker_subscription = None
+        self._speaker_uuid = ""
 
-        service_types = {"call": StringCall, "trigger": Trigger}
-        self._service_types = service_types
-        for name, kind in SERVICE_TYPES.items():
-            srv_type = service_types[kind]
-            self._services[name] = self.robot.create_client(srv_type, name)
+        reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self._mic_publisher = self.core.create_publisher(AudioChunk, self.mic_topic, best_effort)
+        self._event_publishers = {}
+        self._robot_subscriptions = []
+        for name, msg_type, topic in (
+            ("main_wakeup_word", MainWakeupWord, "/audio/sense/main_wakeup_word"),
+            ("wakeup_event", WakeupEvent, "/audio/sense/wakeup_event"),
+            ("wakeup_state", WakeupState, "/audio/sense/wakeup_state"),
+            ("doa_event", DoaEvent, "/audio/sense/doa_event"),
+            ("playback_state", FinishList, "/sys/device/audio_out/finish_list"),
+        ):
+            output_topic = f"/{namespace}/u1_pro/{name}"
+            self._event_publishers[name] = self.core.create_publisher(String, output_topic, reliable)
+            self._robot_subscriptions.append(self.robot.create_subscription(msg_type, topic, self._event_callback(name), reliable))
+        self._robot_subscriptions.append(self.robot.create_subscription(AudioInData, MIC_TOPIC, self._mic_callback, best_effort))
 
-        self._event_topics = dict(EVENT_TOPICS)
-        event_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        regular_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
-        for event_name, robot_topic in self._event_topics.items():
-            output_topic = f"/{namespace}/ubtrobot_u1_pro/{event_name}"
-            self._topics[event_name] = output_topic
-            self._publishers[event_name] = self.core.create_publisher(String, output_topic, event_qos if event_name == "ready_state" else regular_qos)
-            qos = event_qos if event_name == "ready_state" else regular_qos
-            self._subscriptions.append(
-                self.robot.create_subscription(String, robot_topic, self._forward(event_name), qos)
-            )
+        self._clients = {
+            "mic_enable": self.robot.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
+            "volume": self.robot.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
+            "motion_list": self.robot.create_client(GetMotionInfoList, "/action/controller/get_motion_info_list"),
+            "play_motion": self.robot.create_client(PlayMotion, "/action/controller/pay_motion"),
+            "play_resource": self.robot.create_client(PlayResources, "/audio/stream/coze/play_resources"),
+            "interrupt": self.robot.create_client(InterruptActionAudio, "/audio/stream/coze/interrupt_action_audio"),
+        }
 
-    def _forward(self, event_name: str):
+    def _event_callback(self, name: str):
         def callback(message):
-            output = self._String()
-            output.data = message.data
-            self._publishers[event_name].publish(output)
-
+            output = self.String()
+            output.data = _event_json(message)
+            self._event_publishers[name].publish(output)
         return callback
 
-    def call(self, service: str, params: dict | None = None) -> dict:
-        client = self._services[service]
-        if not client.wait_for_service(timeout_sec=CALL_TIMEOUT):
-            raise RuntimeError(f"service unavailable: {service}")
-        request = self._service_types[SERVICE_TYPES[service]].Request()
-        if SERVICE_TYPES[service] == "call":
-            request.params = json.dumps(params or {}, ensure_ascii=False, separators=(",", ":"))
+    def _mic_callback(self, message) -> None:
+        if message.sample_rate != 16000 or message.channels != 1:
+            return
+        chunk = self.AudioChunk()
+        chunk.format = "audio/pcm-16k"
+        chunk.data = list(message.data.data)
+        self._mic_publisher.publish(chunk)
+
+    def call(self, name: str, request) -> Any:
+        client = self._clients[name]
+        if not client.wait_for_service(timeout_sec=SERVICE_TIMEOUT):
+            raise RuntimeError(f"service unavailable: {client.srv_name}")
         future = client.call_async(request)
-        deadline = time.monotonic() + CALL_TIMEOUT
+        deadline = time.monotonic() + SERVICE_TIMEOUT
         while not future.done() and time.monotonic() < deadline:
             time.sleep(0.01)
         if not future.done():
-            raise TimeoutError(f"service timeout: {service}")
-        response = future.result()
-        if SERVICE_TYPES[service] == "trigger":
-            value = getattr(response, "message", "")
-            return _parse_json(value) if value else {"success": bool(getattr(response, "success", False))}
-        value = getattr(response, "result", None)
-        if value is None:
-            value = getattr(response, "message", "")
-        parsed = _parse_json(value)
-        return parsed if isinstance(parsed, dict) else {"result": parsed}
+            raise TimeoutError(f"service timeout: {client.srv_name}")
+        return future.result()
 
-    def close(self):
+    def set_mic_enabled(self, enabled: bool) -> dict:
+        from std_msgs.msg import Header
+        from audio_msgs.srv import EnableAudioIn
+        request = EnableAudioIn.Request()
+        request.header = Header()
+        request.enable = enabled
+        return jsonable(self.call("mic_enable", request))
+
+    def set_volume(self, volume: int) -> dict:
+        from audio_msgs.srv import SetAudioVolume
+        request = SetAudioVolume.Request()
+        request.volume = max(0, min(100, int(volume)))
+        return jsonable(self.call("volume", request))
+
+    def close_speaker_subscription(self) -> None:
+        if self._speaker_subscription is not None:
+            self.core.destroy_subscription(self._speaker_subscription)
+            self._speaker_subscription = None
+
+    def connect_speaker(self, input_topic: str) -> dict:
+        self.close_speaker_subscription()
+        self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
+        self._speaker_subscription = self.core.create_subscription(self.AudioChunk, input_topic, self._speaker_callback, 10)
+        return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
+
+    def _speaker_callback(self, message) -> None:
+        output = self.AudioOutData()
+        output.uuid = self._speaker_uuid
+        output.data.data = list(message.data)
+        self._speaker_publisher.publish(output)
+
+    def close(self) -> None:
+        self.close_speaker_subscription()
         self.robot.destroy_node()
         self.core.destroy_node()
 
 
-SERVICE_TYPES = {
-    "/robo/auth/call/authorize": "call",
-    "/robo/auth/call/auth_state": "trigger",
-    "/robo/system/call/get_ready_state": "trigger",
-    "/robo/system/call/get_serial_number": "trigger",
-    "/robo/system/call/get_system_version": "trigger",
-    "/robo/system/call/get_soft_version": "trigger",
-    "/robo/system/call/set_wakeup_followup": "call",
-    "/robo/system/call/get_wakeup_followup": "trigger",
-    "/robo/system/call/set_wakeup_enabled": "call",
-    "/robo/system/call/get_wakeup_enabled": "trigger",
-    "/robo/system/call/set_vision_enabled": "call",
-    "/robo/system/call/get_vision_enabled": "trigger",
-    "/robo/system/call/set_face_recognition_enabled": "call",
-    "/robo/system/call/get_face_recognition_enabled": "trigger",
-    "/robo/audio/call/get_motion_info_list": "call",
-    "/robo/audio/call/play_action": "call",
-    "/robo/audio/call/play_text": "call",
-    "/robo/audio/call/interrupt_action_audio": "trigger",
-    "/robo/audio/call/open_stream": "trigger",
-    "/robo/audio/call/stream_state": "trigger",
-    "/robo/audio/call/close_stream": "trigger",
-    "/robo/video/call/open_stream": "trigger",
-    "/robo/video/call/stream_state": "trigger",
-    "/robo/video/call/close_stream": "trigger",
-}
-
-EVENT_TOPICS = {
-    "ready_state": "/robo/system/subscribe/ready_state",
-    "playback_state": "/robo/media/subscribe/playback_state",
-    "main_wakeup_word": "/robo/audio/subscribe/main_wakeup_word",
-    "wakeup_event": "/robo/audio/subscribe/wakeup_event",
-    "wakeup_state": "/robo/audio/subscribe/wakeup_state",
-    "doa_event": "/robo/audio/subscribe/doa_event",
-    "video_metadata": "/robo/video/subscribe/metadata",
-}
-
-
-def _schema(actions: dict[str, tuple[list[str], str]], properties: dict) -> dict:
-    return action_schema(actions, properties)
-
-
-class ServicePlugin:
-    def __init__(self, nodes: U1Nodes, name: str, description: str, actions, properties=None):
-        self.nodes, self.name = nodes, name
-        self.description, self.actions = description, actions
-        self.properties = properties or {}
+class MicPlugin:
+    def __init__(self, nodes: U1Nodes):
+        self.nodes = nodes
+        self.running = False
 
     def get_tool(self):
-        return tool(self.name, "actuator", self.description, _schema(self.actions, self.properties))
+        return tool("mic", "sensor", "U1 Pro microphone array: live 16 kHz mono PCM audio for ASR.", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
+
+    def start(self):
+        self.nodes.set_mic_enabled(True)
+        self.running = True
+
+    def stop(self):
+        self.nodes.set_mic_enabled(False)
+        self.running = False
+
+    def dispatch(self, action, args):
+        if action == "start":
+            self.start()
+        elif action == "stop":
+            self.stop()
+        return {"state": "running" if self.running else "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+
+
+class SpeakerPlugin:
+    def __init__(self, nodes: U1Nodes):
+        self.nodes = nodes
+        self.running = False
+        self.input_topic = ""
+
+    def get_tool(self):
+        actions = {
+            "start": (["input_topic"], "Start playing the connected PCM audio stream."),
+            "set_volume": (["volume"], "Set U1 Pro speaker volume from 0 to 100."),
+            "stop": ([], "Stop consuming the connected audio stream."),
+            "info": ([], "Read speaker connection state."),
+        }
+        return {"name": "speaker", "type": "actuator", "multiInstance": False, "description": "U1 Pro speaker. Connect an audio/pcm-16k stream such as TTS or mic audio, then start playback.", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "Connected audio/pcm-16k input topic"}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self.nodes.close_speaker_subscription()
+        self.running = False
+
+    def dispatch(self, action, args):
+        if action == "start":
+            topic = str(args.get("input_topic", "")).strip()
+            if not topic:
+                raise ValueError("speaker.start requires input_topic")
+            self.input_topic = topic
+            result = self.nodes.connect_speaker(topic)
+            self.running = True
+            return result
+        if action == "set_volume":
+            return self.nodes.set_volume(args.get("volume", 100))
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        return {"state": "running" if self.running else "idle", "input_topic": self.input_topic}
+
+
+class AudioPlugin:
+    def __init__(self, nodes: U1Nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        actions = {
+            "list_actions": ([], "List U1 Pro motions that can be played."),
+            "play_action": (["motion_type", "motion_name"], "Play a named U1 Pro motion."),
+            "play_resource": (["path"], "Play a vendor audio resource directory."),
+            "stop": ([], "Interrupt the current U1 Pro audio or motion."),
+        }
+        properties = {"motion_type": {"type": "integer", "enum": [0, 1, 2], "description": "0 chat, 1 special, 2 command motion"}, "motion_name": {"type": "string", "description": "Motion name returned by list_actions"}, "path": {"type": "string", "description": "Robot audio resource directory"}}
+        return tool("audio", "actuator", "U1 Pro preset audio and motion playback. List actions first, then play a returned motion or vendor audio resource.", action_schema(actions, properties))
 
     def start(self):
         pass
@@ -164,49 +227,24 @@ class ServicePlugin:
         pass
 
     def dispatch(self, action, args):
-        service, params = ACTIONS[self.name][action]
-        if service is None:
-            return {"state": "running"}
-        payload = {key: args[key] for key in params if key in args}
-        if self.name == "speaker" and action == "play_action" and "action_id" in payload:
-            payload["action"] = payload.pop("action_id")
-        return self.nodes.call(service, payload)
-
-
-ACTIONS = {
-    "auth": {
-        "authorize": ("/robo/auth/call/authorize", ["appid", "api_key", "api_secret", "device_id", "license"]),
-        "auth_state": ("/robo/auth/call/auth_state", []),
-    },
-    "system": {name: (path, [] if name.startswith("get_") else ["enabled"]) for name, path in {
-        "get_ready_state": "/robo/system/call/get_ready_state",
-        "get_serial_number": "/robo/system/call/get_serial_number",
-        "get_system_version": "/robo/system/call/get_system_version",
-        "get_soft_version": "/robo/system/call/get_soft_version",
-    }.items()},
-    "wakeup": {
-        "set_followup": ("/robo/system/call/set_wakeup_followup", ["enabled"]),
-        "get_followup": ("/robo/system/call/get_wakeup_followup", []),
-        "set_enabled": ("/robo/system/call/set_wakeup_enabled", ["enabled"]),
-        "get_enabled": ("/robo/system/call/get_wakeup_enabled", []),
-    },
-    "vision": {
-        "set_vision_enabled": ("/robo/system/call/set_vision_enabled", ["enabled"]),
-        "get_vision_enabled": ("/robo/system/call/get_vision_enabled", []),
-        "set_face_recognition_enabled": ("/robo/system/call/set_face_recognition_enabled", ["enabled"]),
-        "get_face_recognition_enabled": ("/robo/system/call/get_face_recognition_enabled", []),
-    },
-    "speaker": {
-        "get_motion_info_list": ("/robo/audio/call/get_motion_info_list", []),
-        "play_action": ("/robo/audio/call/play_action", ["action_id", "uuid"]),
-        "play_text": ("/robo/audio/call/play_text", ["text", "motion", "uuid", "save"]),
-        "interrupt": ("/robo/audio/call/interrupt_action_audio", []),
-    },
-    "audio_stream": {name: (path, []) for name, path in {
-        "open": "/robo/audio/call/open_stream", "state": "/robo/audio/call/stream_state", "close": "/robo/audio/call/close_stream"}.items()},
-    "video_stream": {name: (path, []) for name, path in {
-        "open": "/robo/video/call/open_stream", "state": "/robo/video/call/stream_state", "close": "/robo/video/call/close_stream"}.items()},
-}
+        if action == "list_actions":
+            from uworld_action_msgs.srv import GetMotionInfoList
+            return jsonable(self.nodes.call("motion_list", GetMotionInfoList.Request()))
+        if action == "play_action":
+            from uworld_action_msgs.srv import PlayMotion
+            request = PlayMotion.Request()
+            request.motion_type = int(args["motion_type"])
+            request.motion_name = str(args["motion_name"])
+            return jsonable(self.nodes.call("play_motion", request))
+        if action == "play_resource":
+            from coze_msgs.srv import PlayResources
+            request = PlayResources.Request()
+            request.path = str(args["path"])
+            return jsonable(self.nodes.call("play_resource", request))
+        if action == "stop":
+            from coze_msgs.srv import InterruptActionAudio
+            return jsonable(self.nodes.call("interrupt", InterruptActionAudio.Request()))
+        raise ValueError(f"unknown audio action: {action}")
 
 
 class EventPlugin:
@@ -214,7 +252,7 @@ class EventPlugin:
         self.nodes, self.name, self.description = nodes, name, description
 
     def get_tool(self):
-        return tool(self.name, "sensor", self.description, topic_out=[{"topic": self.nodes._topics[self.name], "format": "data/json"}])
+        return tool(self.name, "sensor", self.description, _sensor_schema(), topic_out=[{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}])
 
     def start(self):
         pass
@@ -223,29 +261,18 @@ class EventPlugin:
         pass
 
     def dispatch(self, action, args):
-        return {"state": "idle" if action == "stop" else "running", "topic_out": [{"topic": self.nodes._topics[self.name], "format": "data/json"}]}
+        return {"state": "idle" if action == "stop" else "running", "topic_out": [{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}]}
 
 
 def build_plugins(config: dict, namespace: str, ros) -> list:
     nodes = U1Nodes(config, namespace, ros)
-    plugins = []
-    schemas = {
-        "auth": ({"appid": {"type": "string"}, "api_key": {"type": "string", "format": "password"}, "api_secret": {"type": "string", "format": "password"}, "device_id": {"type": "string"}, "license": {"type": "string", "format": "password"}}, "Authorize the U1 Pro SDK. Authorize before using protected system, audio, video, or event interfaces."),
-        "system": ({}, "Read whether the U1 Pro is ready, its serial number, and system/software versions."),
-        "wakeup": ({"enabled": {"type": "boolean"}}, "Enable or disable wake-word detection, or allow/block the interaction flow after wake-up."),
-        "vision": ({"enabled": {"type": "boolean"}}, "Enable or disable visual behaviors, or independently enable/disable face recognition."),
-        "speaker": ({"action_id": {"type": "string"}, "text": {"type": "string"}, "motion": {"type": "string"}, "uuid": {"type": "string"}, "save": {"type": "boolean"}}, "Make the U1 Pro speak, play one vendor motion action, or stop the current speech/action. Use playback_state to observe the real execution result."),
-        "audio_stream": ({}, "Advanced U1 Pro microphone shared-memory stream control. Opens or closes the vendor stream and returns its shared-memory configuration; this driver does not convert raw bytes to an ASR audio topic."),
-        "video_stream": ({}, "Advanced U1 Pro camera shared-memory stream control. Opens or closes the vendor stream and returns its shared-memory configuration; use video_metadata to interpret frames."),
-    }
-    for name, (properties, description) in schemas.items():
-        plugins.append(ServicePlugin(nodes, name, description, {key: ([], key) for key in ACTIONS[name]}, properties))
+    plugins = [MicPlugin(nodes), SpeakerPlugin(nodes), AudioPlugin(nodes)]
     descriptions = {
-        "ready_state": "Current U1 Pro device-ready state. Use this before protected operations.",
-        "playback_state": "Authoritative speech/action execution states. A speaker call only means the request was accepted; use this stream for the actual result.",
-        "main_wakeup_word": "Event emitted when the U1 Pro recognizes its main wake word.", "wakeup_event": "Event emitted for a recognized wake-up; it does not guarantee a follow-up conversation.",
-        "wakeup_state": "Current wake-up state event stream, separate from the post-wake interaction-flow switch.", "doa_event": "Direction-of-arrival event stream from the U1 Pro microphone array.",
-        "video_metadata": "Metadata for U1 Pro video shared-memory frames: frame ID, encoding, width, height, and row step.",
+        "main_wakeup_word": "Main wake-word event recognized by the U1 Pro.",
+        "wakeup_event": "U1 Pro wake-up recognition event; does not guarantee a follow-up conversation.",
+        "wakeup_state": "Current U1 Pro wake-up state.",
+        "doa_event": "Microphone-array sound direction with azimuth and confidence.",
+        "playback_state": "U1 Pro audio completion or interruption events for current audio UUIDs.",
     }
     plugins.extend(EventPlugin(nodes, name, description) for name, description in descriptions.items())
     return plugins

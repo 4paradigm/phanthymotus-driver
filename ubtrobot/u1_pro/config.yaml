@@ -1,7 +1,6 @@
 mcp_port: 15723
 ros_namespace: ""
 ros:
-  robot_domain_id: 20
+  robot_domain_id: 2
   core_domain_id: 42
-  robot_interface: "eth0"
-
+  robot_interface: "lo"

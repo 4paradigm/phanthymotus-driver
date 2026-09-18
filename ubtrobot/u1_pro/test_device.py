@@ -1,4 +1,4 @@
-"""Contract tests for the U1 Pro tool inventory without ROS installed."""
+"""Contract tests for the Agent-facing U1 Pro cards without ROS installed."""
 
 from __future__ import annotations
 
@@ -7,63 +7,62 @@ import types
 import unittest
 
 
-class FakeSrv:
-    class Request:
-        pass
-
-
 def _install_stubs():
-    rclpy = types.ModuleType("rclpy")
+    common = types.ModuleType("rclpy")
     node = types.ModuleType("rclpy.node")
-
-    class Node:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    node.Node = Node
+    node.Node = object
     qos = types.ModuleType("rclpy.qos")
-    qos.QoSProfile = lambda **kwargs: kwargs
-    qos.ReliabilityPolicy = types.SimpleNamespace(RELIABLE="reliable")
-    qos.DurabilityPolicy = types.SimpleNamespace(TRANSIENT_LOCAL="transient_local")
-    rclpy.node, rclpy.qos = node, qos
-    sys.modules.update({"rclpy": rclpy, "rclpy.node": node, "rclpy.qos": qos})
+    qos.QoSProfile = object
+    qos.ReliabilityPolicy = types.SimpleNamespace(RELIABLE=1, BEST_EFFORT=2)
+    common.node, common.qos = node, qos
+    sys.modules.update({"rclpy": common, "rclpy.node": node, "rclpy.qos": qos})
 
-    std_msgs = types.ModuleType("std_msgs")
-    std_msgs_msg = types.ModuleType("std_msgs.msg")
-    std_msgs_msg.String = type("String", (), {"__init__": lambda self: setattr(self, "data", "")})
-    std_msgs.msg = std_msgs_msg
-    sys.modules.update({"std_msgs": std_msgs, "std_msgs.msg": std_msgs_msg})
+    std = types.ModuleType("std_msgs")
+    std_msg = types.ModuleType("std_msgs.msg")
+    std_msg.String = type("String", (), {})
+    std_msg.Header = type("Header", (), {})
+    std.msg = std_msg
+    sys.modules.update({"std_msgs": std, "std_msgs.msg": std_msg})
 
-    robo = types.ModuleType("robo_sdk")
-    robo_srv = types.ModuleType("robo_sdk.srv")
-    robo_srv.StringCall = FakeSrv
-    robo.srv = robo_srv
-    std_srvs = types.ModuleType("std_srvs")
-    std_srvs_srv = types.ModuleType("std_srvs.srv")
-    std_srvs_srv.Trigger = FakeSrv
-    std_srvs.srv = std_srvs_srv
-    sys.modules.update({"robo_sdk": robo, "robo_sdk.srv": robo_srv, "std_srvs": std_srvs, "std_srvs.srv": std_srvs_srv})
+    def message(name):
+        return type(name, (), {"__init__": lambda self: None})
+
+    audio = types.ModuleType("audio_msgs")
+    audio_msg = types.ModuleType("audio_msgs.msg")
+    for name in ("AudioChunk", "AudioInData", "AudioOutData", "DoaEvent", "FinishList", "MainWakeupWord", "WakeupEvent", "WakeupState"):
+        setattr(audio_msg, name, message(name))
+    audio_srv = types.ModuleType("audio_msgs.srv")
+    for name in ("EnableAudioIn", "SetAudioVolume"):
+        setattr(audio_srv, name, type(name, (), {"Request": message("Request")}))
+    audio.msg, audio.srv = audio_msg, audio_srv
+    sys.modules.update({"audio_msgs": audio, "audio_msgs.msg": audio_msg, "audio_msgs.srv": audio_srv})
+
+    for package, names in {
+        "coze_msgs.srv": ("InterruptActionAudio", "PlayResources"),
+        "uworld_action_msgs.srv": ("GetMotionInfoList", "PlayMotion"),
+    }.items():
+        module = types.ModuleType(package)
+        for name in names:
+            setattr(module, name, type(name, (), {"Request": message("Request")}))
+        sys.modules[package] = module
 
 
 _install_stubs()
 
-from device import ACTIONS, EVENT_TOPICS, SERVICE_TYPES  # noqa: E402
+from device import MIC_TOPIC, SPEAKER_TOPIC  # noqa: E402
 
 
-class U1ContractTests(unittest.TestCase):
-    def test_documented_services_are_mapped(self):
-        self.assertIn("/robo/auth/call/authorize", SERVICE_TYPES)
-        self.assertIn("/robo/video/call/stream_state", SERVICE_TYPES)
-        self.assertEqual(SERVICE_TYPES["/robo/auth/call/auth_state"], "trigger")
+class U1CardContractTests(unittest.TestCase):
+    def test_stream_topics_match_robot_contract(self):
+        self.assertEqual(MIC_TOPIC, "/audio/sense/audio_data_to_asr")
+        self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
 
-    def test_documented_events_are_mapped(self):
-        self.assertEqual(EVENT_TOPICS["ready_state"], "/robo/system/subscribe/ready_state")
-        self.assertEqual(EVENT_TOPICS["video_metadata"], "/robo/video/subscribe/metadata")
+    def test_agent_facing_plugins_exist(self):
+        import device
 
-    def test_all_actions_have_vendor_services(self):
-        for actions in ACTIONS.values():
-            for service, _ in actions.values():
-                self.assertIn(service, SERVICE_TYPES)
+        self.assertTrue(hasattr(device, "MicPlugin"))
+        self.assertTrue(hasattr(device, "SpeakerPlugin"))
+        self.assertTrue(hasattr(device, "AudioPlugin"))
 
 
 if __name__ == "__main__":
