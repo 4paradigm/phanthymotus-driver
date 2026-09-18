@@ -168,7 +168,7 @@ class ServicePlugin:
         if service is None:
             return {"state": "running"}
         payload = {key: args[key] for key in params if key in args}
-        if self.name == "audio" and action == "play_action" and "action_id" in payload:
+        if self.name == "speaker" and action == "play_action" and "action_id" in payload:
             payload["action"] = payload.pop("action_id")
         return self.nodes.call(service, payload)
 
@@ -196,7 +196,7 @@ ACTIONS = {
         "set_face_recognition_enabled": ("/robo/system/call/set_face_recognition_enabled", ["enabled"]),
         "get_face_recognition_enabled": ("/robo/system/call/get_face_recognition_enabled", []),
     },
-    "audio": {
+    "speaker": {
         "get_motion_info_list": ("/robo/audio/call/get_motion_info_list", []),
         "play_action": ("/robo/audio/call/play_action", ["action_id", "uuid"]),
         "play_text": ("/robo/audio/call/play_text", ["text", "motion", "uuid", "save"]),
@@ -230,21 +230,22 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     nodes = U1Nodes(config, namespace, ros)
     plugins = []
     schemas = {
-        "auth": ({"appid": {"type": "string"}, "api_key": {"type": "string", "format": "password"}, "api_secret": {"type": "string", "format": "password"}, "device_id": {"type": "string"}, "license": {"type": "string", "format": "password"}}, "Authenticate and query U1 Pro SDK authorization state."),
-        "system": ({}, "Query U1 Pro ready state, serial number, and SDK versions."),
-        "wakeup": ({"enabled": {"type": "boolean"}}, "Control the documented wakeup event and follow-up switches."),
-        "vision": ({"enabled": {"type": "boolean"}}, "Control the documented vision and face-recognition switches."),
-        "audio": ({"action_id": {"type": "string"}, "text": {"type": "string"}, "motion": {"type": "string"}, "uuid": {"type": "string"}, "save": {"type": "boolean"}}, "Query motions, play a documented action or text, and interrupt playback."),
-        "audio_stream": ({}, "Open, query, or close the documented U1 Pro audio shared-memory stream."),
-        "video_stream": ({}, "Open, query, or close the documented U1 Pro video shared-memory stream."),
+        "auth": ({"appid": {"type": "string"}, "api_key": {"type": "string", "format": "password"}, "api_secret": {"type": "string", "format": "password"}, "device_id": {"type": "string"}, "license": {"type": "string", "format": "password"}}, "Authorize the U1 Pro SDK. Authorize before using protected system, audio, video, or event interfaces."),
+        "system": ({}, "Read whether the U1 Pro is ready, its serial number, and system/software versions."),
+        "wakeup": ({"enabled": {"type": "boolean"}}, "Enable or disable wake-word detection, or allow/block the interaction flow after wake-up."),
+        "vision": ({"enabled": {"type": "boolean"}}, "Enable or disable visual behaviors, or independently enable/disable face recognition."),
+        "speaker": ({"action_id": {"type": "string"}, "text": {"type": "string"}, "motion": {"type": "string"}, "uuid": {"type": "string"}, "save": {"type": "boolean"}}, "Make the U1 Pro speak, play one vendor motion action, or stop the current speech/action. Use playback_state to observe the real execution result."),
+        "audio_stream": ({}, "Advanced U1 Pro microphone shared-memory stream control. Opens or closes the vendor stream and returns its shared-memory configuration; this driver does not convert raw bytes to an ASR audio topic."),
+        "video_stream": ({}, "Advanced U1 Pro camera shared-memory stream control. Opens or closes the vendor stream and returns its shared-memory configuration; use video_metadata to interpret frames."),
     }
     for name, (properties, description) in schemas.items():
         plugins.append(ServicePlugin(nodes, name, description, {key: ([], key) for key in ACTIONS[name]}, properties))
     descriptions = {
-        "ready_state": "U1 Pro ready-state event stream.", "playback_state": "Media playback execution-state event stream.",
-        "main_wakeup_word": "Main wake-word event stream.", "wakeup_event": "Wakeup recognition event stream.",
-        "wakeup_state": "Wakeup state event stream.", "doa_event": "Direction-of-arrival event stream.",
-        "video_metadata": "Video shared-memory metadata event stream.",
+        "ready_state": "Current U1 Pro device-ready state. Use this before protected operations.",
+        "playback_state": "Authoritative speech/action execution states. A speaker call only means the request was accepted; use this stream for the actual result.",
+        "main_wakeup_word": "Event emitted when the U1 Pro recognizes its main wake word.", "wakeup_event": "Event emitted for a recognized wake-up; it does not guarantee a follow-up conversation.",
+        "wakeup_state": "Current wake-up state event stream, separate from the post-wake interaction-flow switch.", "doa_event": "Direction-of-arrival event stream from the U1 Pro microphone array.",
+        "video_metadata": "Metadata for U1 Pro video shared-memory frames: frame ID, encoding, width, height, and row step.",
     }
     plugins.extend(EventPlugin(nodes, name, description) for name, description in descriptions.items())
     return plugins

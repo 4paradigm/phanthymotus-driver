@@ -14,7 +14,7 @@ cards:
   - { name: system, type: actuator }
   - { name: wakeup, type: actuator }
   - { name: vision, type: actuator }
-  - { name: audio, type: actuator }
+  - { name: speaker, type: actuator }
   - { name: audio_stream, type: actuator }
   - { name: video_stream, type: actuator }
   - { name: ready_state, type: sensor }
