@@ -159,7 +159,9 @@ class RealManRM75ImageContractTests(unittest.TestCase):
             plugins = device.build_plugins({"ext_camera": {"enabled": True},
                                            "vision_capture": {"enabled": True}}, "rm75", ros2)
         self.assertEqual(plugins[-2:], [camera, capture])
-        capture_factory.assert_called_once_with({"enabled": True}, "rm75", ros2.executor_core, camera)
+        capture_factory.assert_called_once_with(
+            {"enabled": True}, "rm75", ros2.executor_core, external_camera=camera
+        )
 
     def test_capture_files_survive_container_replacement(self):
         service = (DRIVER / "deploy/service.yml").read_text()
@@ -183,6 +185,7 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
                 self.calls = []
                 self.connected = True
                 self.motion_enabled = True
+                self.motion_gate = threading.Lock()
 
             def command(self, method, *args):
                 self.calls.append((method, args))
@@ -280,6 +283,7 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
             def __init__(self):
                 self.connected = True
                 self.motion_enabled = True
+                self.motion_gate = threading.Lock()
 
             def command(self, method, *args):
                 released.wait(5.0)
@@ -311,6 +315,7 @@ class RealManRM75GripperPluginTests(unittest.TestCase):
             def __init__(self):
                 self.connected = True
                 self.motion_enabled = True
+                self.motion_gate = threading.Lock()
 
             def command(self, method, *args):
                 released.wait(5.0)
@@ -366,6 +371,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             self.calls = []
             self.connected = True
             self.motion_enabled = True
+            self.motion_gate = threading.Lock()
             self.pose_mm_deg = list(pose_mm_deg or [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
         def command(self, method, *args):
@@ -2554,7 +2560,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         plugin, robot = self._motion_plugin()
         plugin._skeleton_pub = mock.Mock()
         plugin._skeleton_message_type = mock.Mock
-        query = mock.Mock(side_effect=[RuntimeError("first"), RuntimeError("different"), {"position": [0]*7}, RuntimeError("new outage")])
+        query = mock.Mock(side_effect=[RuntimeError("first"), RuntimeError("different"), {"position": [0]*7, "raw_degree": [0]*7}, RuntimeError("new outage")])
         plugin.client.joint_states = query
         with mock.patch.object(self.device.time, "monotonic", return_value=10) as clock, mock.patch("builtins.print") as log:
             plugin._publish_skeleton()
@@ -2567,6 +2573,8 @@ class RealManRM75SDKClientTests(unittest.TestCase):
             clock.return_value = 14
             plugin._publish_skeleton()
             plugin._skeleton_pub.publish.assert_called_once()
+            payload = json.loads(plugin._skeleton_pub.publish.call_args.args[0].data)
+            self.assertEqual([0] * 7, [joint["degree"] for joint in payload["joints"]])
             clock.return_value = 14.1
             plugin._publish_skeleton()
             self.assertEqual(2, log.call_count)
