@@ -76,7 +76,13 @@ def _get_local_ip() -> str:
     except ImportError:
         pass
     try:
-        s = socket.socket(socket.AF_DGRAM)
+        # Was `socket.AF_DGRAM`, which does not exist — the AttributeError was
+        # swallowed by the `except Exception` below, so this whole fallback was
+        # dead and always returned "". An empty local_ip makes the multicast join
+        # fall back to INADDR_ANY, letting the routing table pick the interface;
+        # on a robot with both the internal 192.168.123.x link and an office LAN
+        # that is a coin toss, and it fails silently either way.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("192.168.123.1", 1))
         ip = s.getsockname()[0]
         s.close()
@@ -94,6 +100,21 @@ class _MicNode(Node):
         self._pub    = self.create_publisher(AudioChunk, topic, _LOW_LAT_QOS)
         self._sock:   socket.socket | None = None
         self._thread: threading.Thread | None = None
+        # The pump's own stop signal, separate from `_sock`.
+        #
+        # `_pump` used to loop on `while self._sock is not None` and re-read that
+        # attribute every iteration. A stop immediately followed by a start — the
+        # canvas does config→start→stop→config→start within seconds — could catch
+        # the old thread inside its publish loop; by the time it re-read
+        # `self._sock` it saw the *new* socket and carried on. Two pump threads
+        # then read the same socket, each assembling 1024-byte chunks from its own
+        # interleaved half of the packets, and every further stop/start could add
+        # another. The published audio is spliced from several misaligned streams,
+        # which is exactly what "ASR text repeats and drops syllables" looks like.
+        #
+        # An Event belongs to one capture session, so a thread signalled to stop
+        # stays stopped no matter what happens to `_sock` afterwards.
+        self._stop_evt = threading.Event()
         self.state   = "idle"
         self._packet_count = 0
         self._last_packet_ts = 0.0
@@ -115,26 +136,43 @@ class _MicNode(Node):
         sock.settimeout(0.5)
         self._sock   = sock
         self._packet_count = 0
-        self._thread = threading.Thread(target=self._pump, daemon=True)
+        stop_evt = threading.Event()
+        self._stop_evt = stop_evt
+        # The Event is passed in rather than read off `self`, so this thread can
+        # only ever be stopped by the session that created it.
+        self._thread = threading.Thread(
+            target=self._pump, args=(sock, stop_evt), daemon=True)
         self._thread.start()
         self.get_logger().info(f"Capture started — multicast {MIC_GROUP_IP}:{MIC_PORT}")
         return self._topic
 
     def stop_capture(self) -> None:
+        self._stop_evt.set()
         if self._sock:
             try:
                 self._sock.close()
             except Exception:
                 pass
             self._sock = None
+        # Wait for the pump to actually be gone before returning. Without this a
+        # start() arriving straight after could run alongside the previous pump,
+        # and two pumps splitting one packet stream is what garbles the audio.
+        # Bounded by the socket's 0.5s timeout; the join budget is well past it.
+        thread, self._thread = self._thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                self.get_logger().warning(
+                    "[mic] capture thread did not exit within 2s — "
+                    "it is signalled to stop and holds a closed socket")
         self.state = "idle"
         self.get_logger().info("Capture stopped")
 
-    def _pump(self) -> None:
+    def _pump(self, sock: socket.socket, stop_evt: threading.Event) -> None:
         buf = bytearray()
-        while self._sock is not None:
+        while not stop_evt.is_set():
             try:
-                data, _ = self._sock.recvfrom(65536)
+                data, _ = sock.recvfrom(65536)
             except socket.timeout:
                 continue
             except OSError:
@@ -142,7 +180,7 @@ class _MicNode(Node):
             self._packet_count += 1
             self._last_packet_ts = time.monotonic()
             buf.extend(data)
-            while len(buf) >= CHUNK_BYTES:
+            while len(buf) >= CHUNK_BYTES and not stop_evt.is_set():
                 chunk = bytes(buf[:CHUNK_BYTES])
                 buf   = buf[CHUNK_BYTES:]
                 try:
@@ -200,13 +238,47 @@ class MicPlugin:
             }
         return None
 
+    def _rival_publishers(self) -> int:
+        """How many *other* nodes are publishing our audio topic.
+
+        Two publishers on one audio topic is silently catastrophic and has no
+        other symptom. Each captures the same multicast independently and cuts it
+        into 1024-byte chunks on its own buffer boundary, so a subscriber
+        receives two interleaved, misaligned copies — which ASR renders as
+        repeated and dropped syllables, pointing the investigation at the speech
+        stack rather than at the wiring.
+
+        It is easy to end up here: a second driver container left running
+        alongside the one compose manages. `ros_namespace` defaults to the
+        hostname, and both containers share the host's network namespace, so both
+        resolve to the identical topic name.
+
+        Counted rather than prevented — this node cannot stop another process —
+        but an `error` state with a reason beats inferring it from garbled text.
+        """
+        try:
+            infos = self._node.get_publishers_info_by_topic(self._topic)
+        except Exception:
+            return 0            # older rclpy, or the graph is not up yet
+        mine = self._node.get_name()
+        return sum(1 for i in infos if getattr(i, 'node_name', '') != mine)
+
     def _self_check(self) -> tuple[str, str]:
         """Verify mic pipeline: multicast receiving + ROS2 topic subscribable.
 
+        Check 0: nobody else is publishing this topic.
         Check 1: multicast packets arriving (in-process).
         Check 2: ROS2 topic receivable from a subprocess (avoids same-process
                  FastDDS intra-participant matching issues).
         """
+        rivals = self._rival_publishers()
+        if rivals:
+            self._node.state = "error"
+            return "error", (
+                f"{self._topic} 上还有另外 {rivals} 个发布者 —— 音频会被两路交错"
+                f"切分破坏，ASR 表现为文字重复、漏字。通常是同一台机器上多跑了一份"
+                f"驱动容器（compose 只管 embodied-unitree-g1），请停掉多余的那个。")
+
         import time as _t
 
         # Check 1: multicast receiving
