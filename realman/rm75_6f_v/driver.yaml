@@ -18,6 +18,7 @@ cards:
   - { name: arm_all_state,    type: sensor }
   - { name: controller_state, type: sensor }
   - { name: joint_control,    type: actuator }
+  - { name: servo,            type: actuator }
   - { name: gripper,          type: actuator }
   - { name: ext_camera,       type: sensor }
-  - { name: vision_capture, type: actuator }
+  - { name: vision_capture,   type: actuator }
