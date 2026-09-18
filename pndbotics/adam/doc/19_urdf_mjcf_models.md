@@ -47,3 +47,27 @@ flip_visual_attachments = True
 | adam_sp_agx_ir | Adam SP + AGX + IR |
 | adam_standard | Adam Standard 标准版 |
 | adam_u | Adam U 版 |
+
+## Driver model selection
+
+The Adam driver returns an URDF through its `model` resource.  For the `pro`
+configuration it uses the official `adam_inspire` kinematic tree rather than
+the older `adam_standard` fallback, because the latter does not describe wrist
+roll or either hand. The robot's 12 hand feedback channels remain available
+from the separate `hand_state` sensor and are added to the `joints` skeleton
+stream. Since Adam uses `1000=opened` and `0=closed`, the driver inversely maps
+each channel into the public URDF finger limits so the visual opening direction
+matches the real hand. This is visualization only; it is not a vendor-provided
+actuator-space calibration. PNDbotics has not published an Adam Pro head/neck kinematic tree,
+so the driver adds a clearly marked visual-only neck/head mount using the
+published ±60-degree head limits. `head_control` uses the actual DDS joint
+names and limits; it does not rely on this visual approximation.
+
+On controller versions that do not publish `rt/handstate`, the `joints` card
+temporarily mirrors the accepted `rt/handcmd` target so hand gestures remain
+visible. The skeleton payload exposes `hand_skeleton_source` as either
+`rt/handstate` or `rt/handcmd_target`; fresh feedback always takes priority.
+
+The official mesh archives are intentionally not copied into the driver image.
+They are large, while the dashboard resource contract only requires the URDF
+for skeleton rendering.  The `model` response states this explicitly.

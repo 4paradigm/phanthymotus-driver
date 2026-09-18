@@ -4,13 +4,13 @@ ros_namespace: ""  # auto-detect from hostname
 # Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
 variant: "pro"
 
-# gRPC endpoint for locomotion control (PC1)
+# gRPC endpoint for RL locomotion control (fixed service port is 50051)
 grpc_host: "10.10.20.127"
 grpc_port: 50051
 
-# DDS domain ID (must match the robot controller).  The deployed Adam
-# controller publishes rt/lowstate on domain 0.
-dds_domain_id: 0
+# DDS domain ID (must match the robot controller).  Adam developer/RL mode
+# publishes rt/lowstate and accepts commands on domain 1.
+dds_domain_id: 1
 # Adam's rt/lowstate DDS traffic is on the robot-facing Ethernet LAN, not the
 # Jetson's Wi-Fi management network.
 dds_interface: "eno1"
@@ -27,6 +27,15 @@ plugins:
     http_timeout_sec: 2
   loco:
     enabled: true
+    grpc_api: "rl"
+  # Focused RL execution cards. Keep ``loco`` enabled for the backwards-
+  # compatible aggregate card; each focused card can be disabled separately.
+  motion:
+    enabled: true
+  tracking_motion:
+    # PNDbotics Adam currently has no supported recording or file-discovery
+    # API for this card; leave it hidden until one is available.
+    enabled: false
   camera:
     enabled: true
     # The ZED Mini is connected to this Jetson. Keep the local SDK path; the
@@ -69,7 +78,14 @@ plugins:
     max_video_seconds: 60
   arm:
     enabled: true
-    publish_rate_hz: 100
+    # Vendor arm-control example uses 50Hz complete rt/lowcmd packets.
+    control_rate_hz: 50
+  arm_gesture:
+    enabled: true
+  waist:
+    enabled: true
+  head:
+    enabled: true
   hand:
     enabled: true
     # Verified on Adam: all 12 hand channels move in the effective 0..1000
@@ -84,9 +100,13 @@ plugins:
     thumb_close_min_flex_position: 100
     open_positions: [1000, 1000, 1000, 1000, 1000, 0, 1000, 1000, 1000, 1000, 1000, 0]
     close_positions: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  hand_gesture:
+    enabled: true
   hand_state:
     enabled: true
     publish_rate_hz: 50
     state_timeout_sec: 1.0
   model:
     enabled: true
+    # Adam Pro uses PNDbotics' official Adam + Inspire-hand URDF.  The vendor
+    # does not publish a matching Pro head/neck kinematic model.
