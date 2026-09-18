@@ -46,3 +46,24 @@ def test_servo_holds_motion_gate_for_active_stream():
     client.motion_gate.release()
     assert second.dispatch("start", {"input_topic": "/control/b"})["state"] == "running"
     second.dispatch("stop", {})
+
+
+def test_servo_stop_releases_gate_when_node_teardown_fails():
+    client = FakeClient()
+    ros2 = mock.Mock()
+    plugin = RM75ServoPlugin(client, {}, ros2=ros2)
+    plugin._subscribe = mock.Mock()
+    assert plugin.dispatch("start", {"input_topic": "/control/a"})["state"] == "running"
+
+    node = mock.Mock()
+    node.destroy_node.side_effect = RuntimeError("teardown failed")
+    plugin._node = node
+    try:
+        plugin.dispatch("stop", {})
+    except RuntimeError as exc:
+        assert str(exc) == "teardown failed"
+    else:
+        raise AssertionError("expected teardown failure")
+
+    assert client.motion_gate.acquire(blocking=False) is True
+    client.motion_gate.release()
