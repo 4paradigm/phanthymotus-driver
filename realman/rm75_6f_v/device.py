@@ -164,14 +164,12 @@ class RM75Plugin:
         self.client = client
         self._ros2 = ros2
         self._skeleton_topic = f"/{namespace.strip('/') or 'rm75'}/state/joints"
-        self._angles_topic = f"/{namespace.strip('/') or 'rm75'}/state/joint_angles"
         ros_config = config.get("ros", {})
         self._skeleton_publish_hz = float(ros_config.get("skeleton_publish_hz", 10.0))
         if not math.isfinite(self._skeleton_publish_hz) or self._skeleton_publish_hz <= 0:
             raise ValueError("ros.skeleton_publish_hz must be a positive finite number")
         self._skeleton_node = None
         self._skeleton_pub = None
-        self._angles_pub = None
         self._skeleton_message_type = None
         self._last_skeleton_error = None
         self._skeleton_retry_at = 0.0
@@ -193,9 +191,6 @@ class RM75Plugin:
     def _skeleton_topic_out(self):
         return [{"topic": self._skeleton_topic, "format": "sensor/skeleton"}]
 
-    def _angles_topic_out(self):
-        return [{"topic": self._angles_topic, "format": "data/json"}]
-
     def get_tools(self):
         definitions = [
             tool("connection", "sensor", "RM75 SDK connection status; never initiates motion"),
@@ -205,10 +200,6 @@ class RM75Plugin:
                 f"Read and publish seven RM75 joint angles in radians at {self._skeleton_publish_hz:g} Hz",
                 topic_out=self._skeleton_topic_out(),
             ),
-            # Expose this read-only state as a sensor so Canvas renders a
-            # visible card while keeping the same MCP call contract.
-            tool("joint_angles", "sensor", "Read the current seven RM75 joint angles in degrees and radians",
-                 topic_out=self._angles_topic_out()),
             tool("model", "resource", "RM75-6F-V URDF for skeleton rendering"),
         ]
         definitions.extend(tool(name, "sensor", f"Read-only RealMan API2 call: {method}") for name, method in self.METHODS.items())
@@ -271,7 +262,6 @@ class RM75Plugin:
         node = Node("rm75_skeleton", context=self._ros2.ctx_core)
         self._skeleton_message_type = String
         self._skeleton_pub = node.create_publisher(String, self._skeleton_topic, qos)
-        self._angles_pub = node.create_publisher(String, self._angles_topic, qos)
         node.create_timer(1.0 / self._skeleton_publish_hz, self._publish_skeleton)
         self._ros2.executor_core.add_node(node)
         self._skeleton_node = node
@@ -279,7 +269,6 @@ class RM75Plugin:
     def _stop_skeleton_publisher(self):
         node, self._skeleton_node = self._skeleton_node, None
         self._skeleton_pub = None
-        self._angles_pub = None
         self._skeleton_message_type = None
         if node is None:
             return
@@ -309,9 +298,8 @@ class RM75Plugin:
 
     def _publish_skeleton(self):
         publisher = self._skeleton_pub
-        angles_publisher = self._angles_pub
         message_type = self._skeleton_message_type
-        if publisher is None or angles_publisher is None or message_type is None:
+        if publisher is None or message_type is None:
             return
         # A failed controller is sampled at most once every two seconds.
         # Visualization must not queue behind motion/stop SDK operations.
@@ -327,18 +315,6 @@ class RM75Plugin:
             skeleton = self._skeleton_payload()
             message.data = json.dumps(skeleton, ensure_ascii=False)
             publisher.publish(message)
-            angles = self.client.joint_states()
-            angle_message = message_type()
-            angle_message.data = json.dumps({
-                "timestamp_ms": skeleton["timestamp_ms"],
-                "format": "data/json",
-                "name": JOINT_NAMES,
-                "degree": angles["raw_degree"],
-                "radian": angles["position"],
-                "unit_degree": "deg",
-                "unit_radian": "rad",
-            }, ensure_ascii=False)
-            angles_publisher.publish(angle_message)
             self._last_skeleton_error = None
             self._skeleton_retry_at = 0.0
         except Exception as exc:
@@ -580,24 +556,12 @@ class RM75Plugin:
                 self._stop_motion()
             return {"state": "idle"}
         if action == "info":
-            topic_out = (
-                self._skeleton_topic_out() if name == "joint_states"
-                else self._angles_topic_out() if name == "joint_angles" else []
-            )
+            topic_out = self._skeleton_topic_out() if name == "joint_states" else []
             return {**self._motion_status(), "topic_out": topic_out}
         if name == "connection":
             return self.client.status()
         if name == "joint_states":
             return self.client.joint_states()
-        if name == "joint_angles":
-            state = self.client.joint_states()
-            return {
-                "name": JOINT_NAMES,
-                "degree": state["raw_degree"],
-                "radian": state["position"],
-                "unit_degree": "deg",
-                "unit_radian": "rad",
-            }
         if name == "model":
             path = Path(__file__).with_name("resource") / "rm75_6f_v.urdf"
             return {"urdf": path.read_text(encoding="utf-8")}
@@ -605,15 +569,6 @@ class RM75Plugin:
             if name == "controller_state":
                 return self.client.call_dict(self.METHODS[name])
             result = self.client.call(self.METHODS[name])
-            if name == "arm_all_state" and isinstance(result, dict):
-                angles = self.client.joint_states()
-                result["joint_angles"] = {
-                    "name": JOINT_NAMES,
-                    "degree": angles["raw_degree"],
-                    "radian": angles["position"],
-                    "unit_degree": "deg",
-                    "unit_radian": "rad",
-                }
             return result
         if name == "joint_control":
             if action == "set":
