@@ -173,6 +173,10 @@ is intended for general repositioning or large orientation changes;
 `motion_mode=linear` submits `rm_movel` and is intended for a verified straight
 approach or retreat. Planning failure, an unreachable pose, collision stop,
 timeout, or an operator stop ends the action and releases the motion lock.
+After a controller-event timeout or cancellation, `info` may report
+`controller_trajectory_state: draining`. The action is already terminal, but a
+new controller trajectory is rejected until the previous untagged SDK event is
+consumed; this prevents a late event from completing the next action.
 The controller's collision level, electronic fences, virtual walls, and
 physical safety system remain responsible for collision protection; the driver
 has no environment model and does not plan a detour around obstacles.

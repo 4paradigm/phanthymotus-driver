@@ -847,7 +847,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
             [call for call in self.client.calls[submit_index + 1:] if call[0].startswith("rm_get_")],
         )
         self.assertEqual(
-            [("rm_get_current_arm_state",)],
+            [("rm_get_arm_all_state",), ("rm_get_current_arm_state",)],
             [call for call in self.client.calls if call[0].startswith("rm_get_")],
         )
 
@@ -868,6 +868,26 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
         self.assertNotIn("rm_movel_offset", [entry[0] for entry in self.client.calls])
         self.assertFalse(plugin._motion_lock.locked())
+
+    def test_native_offset_preflight_failure_submits_nothing(self):
+        self.client.command_trajectory = mock.Mock()
+        self.client.wait_trajectory = mock.Mock()
+        self.arm._preflight = mock.Mock(side_effect=RuntimeError("joint 3 is disabled"))
+
+        with self.assertRaisesRegex(RuntimeError, "joint 3 is disabled"):
+            self.plugin.dispatch("move_offset", {
+                "dx_mm": 20,
+                "frame_type": "tool",
+                "speed_percent": 5,
+                "cartesian_enabled": True,
+                "confirm_motion": True,
+            })
+
+        self.arm._preflight.assert_called_once_with()
+        self.client.command_trajectory.assert_not_called()
+        self.assertNotIn("rm_movel_offset", [entry[0] for entry in self.client.calls])
+        self.assertEqual("ready", self.plugin._motion_status()["state"])
+        self.assertFalse(self.plugin._motion_lock.locked())
 
     def test_native_offset_rejects_pose_change_during_validation(self):
         self.client.command_trajectory = mock.Mock()
@@ -1841,19 +1861,45 @@ class RealManRM75SDKClientTests(unittest.TestCase):
         self.assertIs(True, client.wait_trajectory(0.1))
         robot.rm_movel_offset.assert_called_once_with([0.01] + [0.0] * 5, 5, 0, 0, 1, 0)
 
-    def test_controller_trajectory_wait_timeout_does_not_poison_next_command(self):
+    def test_late_event_is_drained_before_next_trajectory_is_registered(self):
         client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
         robot = mock.Mock()
         robot.rm_movel_offset.return_value = 0
         client._robot = robot
         client._handle = mock.Mock(id=8)
         args = ([0.01] + [0.0] * 5, 5, 0, 0, 1, 0)
+        first_completion = mock.Mock()
+        second_completion = mock.Mock()
 
-        client.command_trajectory("rm_movel_offset", *args)
+        client.command_trajectory(
+            "rm_movel_offset", *args, completion_callback=first_completion
+        )
         self.assertIsNone(client.wait_trajectory(0.0))
-        client.command_trajectory("rm_movel_offset", *args)
-        self.assertTrue(client.cancel_trajectory_wait())
-        self.assertIs(False, client.wait_trajectory(0.1))
+        self.assertEqual("draining", client.trajectory_wait_state())
+        with self.assertRaisesRegex(RuntimeError, "still draining"):
+            client.command_trajectory(
+                "rm_movel_offset", *args, completion_callback=second_completion
+            )
+
+        # The first command's late event only drains its retired slot.  It must
+        # not call either the cancelled callback or a future callback.
+        client._on_arm_event(mock.Mock(
+            event_type=1, device=0, handle_id=8, trajectory_state=True,
+        ))
+        self.assertEqual("idle", client.trajectory_wait_state())
+        first_completion.assert_not_called()
+        second_completion.assert_not_called()
+
+        client.command_trajectory(
+            "rm_movel_offset", *args, completion_callback=second_completion
+        )
+        self.assertEqual("waiting", client.trajectory_wait_state())
+        second_completion.assert_not_called()
+        client._on_arm_event(mock.Mock(
+            event_type=1, device=0, handle_id=8, trajectory_state=True,
+        ))
+        second_completion.assert_called_once_with(True)
+        self.assertIs(True, client.wait_trajectory(0.1))
 
     def test_trajectory_command_is_not_blocked_by_stalled_state_query_lock(self):
         client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
