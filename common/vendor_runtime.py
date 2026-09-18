@@ -204,6 +204,8 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
         def log_message(self, fmt, *args):
             msg = fmt % args
             if '"POST /mcp' not in msg or "200" not in msg:
+                # Host-networked MCP request lines are remote-controlled; escape
+                # and cap them before they can corrupt shared container logs.
                 address = self.address_string().encode("unicode_escape").decode("ascii")[:64]
                 safe = msg.encode("unicode_escape").decode("ascii")[:200]
                 print(f"[mcp] {address} {safe}")

@@ -44,8 +44,11 @@ class U1Nodes:
 
         self.robot = Node("u1_pro_driver", context=ros.ctx_robot)
         self.core = Node("u1_pro_bridge", namespace=namespace, context=ros.ctx_core)
-        ros.executor_robot.add_node(self.robot)
-        ros.executor_core.add_node(self.core)
+        self._executor_robot = ros.executor_robot
+        self._executor_core = ros.executor_core
+        self._executor_robot.add_node(self.robot)
+        self._executor_core.add_node(self.core)
+        self._closed = False
         self.namespace = namespace
         self.mic_topic = f"/{namespace}/mic/audio"
         self.AudioChunk = AudioChunk
@@ -53,12 +56,15 @@ class U1Nodes:
         self.String = String
         self._speaker_publisher = self.robot.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
         self._speaker_subscription = None
+        self._speaker_forwarding = False
         self._speaker_uuid = ""
 
         reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._mic_publisher = self.core.create_publisher(AudioChunk, self.mic_topic, best_effort)
         self._event_publishers = {}
+        self._event_forwarding = {}
+        self._mic_forwarding = False
         self._robot_subscriptions = []
         for name, msg_type, topic in (
             ("main_wakeup_word", MainWakeupWord, "/audio/sense/main_wakeup_word"),
@@ -83,12 +89,16 @@ class U1Nodes:
 
     def _event_callback(self, name: str):
         def callback(message):
+            if not self._event_forwarding.get(name, False):
+                return
             output = self.String()
             output.data = _event_json(message)
             self._event_publishers[name].publish(output)
         return callback
 
     def _mic_callback(self, message) -> None:
+        if not self._mic_forwarding:
+            return
         if message.sample_rate != 16000 or message.channels != 1:
             return
         chunk = self.AudioChunk()
@@ -111,10 +121,18 @@ class U1Nodes:
     def set_mic_enabled(self, enabled: bool) -> dict:
         from std_msgs.msg import Header
         from audio_msgs.srv import EnableAudioIn
+        if not enabled:
+            self._mic_forwarding = False
         request = EnableAudioIn.Request()
         request.header = Header()
         request.enable = enabled
-        return jsonable(self.call("mic_enable", request))
+        response = jsonable(self.call("mic_enable", request))
+        if enabled:
+            self._mic_forwarding = True
+        return response
+
+    def set_event_enabled(self, name: str, enabled: bool) -> None:
+        self._event_forwarding[name] = enabled
 
     def set_volume(self, volume: int) -> dict:
         from audio_msgs.srv import SetAudioVolume
@@ -123,6 +141,7 @@ class U1Nodes:
         return jsonable(self.call("volume", request))
 
     def close_speaker_subscription(self) -> None:
+        self._speaker_forwarding = False
         if self._speaker_subscription is not None:
             self.core.destroy_subscription(self._speaker_subscription)
             self._speaker_subscription = None
@@ -131,16 +150,26 @@ class U1Nodes:
         self.close_speaker_subscription()
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
         self._speaker_subscription = self.core.create_subscription(self.AudioChunk, input_topic, self._speaker_callback, 10)
+        self._speaker_forwarding = True
         return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
 
     def _speaker_callback(self, message) -> None:
+        if not self._speaker_forwarding:
+            return
         output = self.AudioOutData()
         output.uuid = self._speaker_uuid
         output.data.data = list(message.data)
         self._speaker_publisher.publish(output)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._mic_forwarding = False
+        self._event_forwarding.clear()
         self.close_speaker_subscription()
+        self._executor_robot.remove_node(self.robot)
+        self._executor_core.remove_node(self.core)
         self.robot.destroy_node()
         self.core.destroy_node()
 
@@ -149,23 +178,39 @@ class MicPlugin:
     def __init__(self, nodes: U1Nodes):
         self.nodes = nodes
         self.running = False
+        self._enable_requested = False
 
     def get_tool(self):
         return tool("mic", "sensor", "U1 Pro microphone array: live 16 kHz mono PCM audio for ASR.", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
 
     def start(self):
-        self.nodes.set_mic_enabled(True)
-        self.running = True
+        if self.running:
+            return
+        self._enable_requested = True
+        try:
+            self.nodes.set_mic_enabled(True)
+        except Exception:
+            self.running = False
+            raise
+        else:
+            self.running = True
 
     def stop(self):
-        self.nodes.set_mic_enabled(False)
-        self.running = False
+        if not self._enable_requested:
+            return
+        self._enable_requested = False
+        try:
+            self.nodes.set_mic_enabled(False)
+        finally:
+            self.running = False
 
     def dispatch(self, action, args):
         if action == "start":
             self.start()
         elif action == "stop":
             self.stop()
+        elif action != "info":
+            raise ValueError(f"unknown mic action: {action}")
         return {"state": "running" if self.running else "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
 
 
@@ -185,11 +230,16 @@ class SpeakerPlugin:
         return {"name": "speaker", "type": "actuator", "multiInstance": False, "description": "U1 Pro speaker. Connect an audio/pcm-16k stream such as TTS or mic audio, then start playback.", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "Connected audio/pcm-16k input topic"}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
 
     def start(self):
-        pass
+        # The input topic is supplied by Agent Core when the stream is connected;
+        # there is nothing to subscribe to during bundle startup.
+        self.nodes.close_speaker_subscription()
+        self.running = False
+        self.input_topic = ""
 
     def stop(self):
         self.nodes.close_speaker_subscription()
         self.running = False
+        self.input_topic = ""
 
     def dispatch(self, action, args):
         if action == "start":
@@ -205,12 +255,15 @@ class SpeakerPlugin:
         if action == "stop":
             self.stop()
             return {"state": "idle"}
-        return {"state": "running" if self.running else "idle", "input_topic": self.input_topic}
+        if action == "info":
+            return {"state": "running" if self.running else "idle", "input_topic": self.input_topic}
+        raise ValueError(f"unknown speaker action: {action}")
 
 
 class AudioPlugin:
     def __init__(self, nodes: U1Nodes):
         self.nodes = nodes
+        self.running = False
 
     def get_tool(self):
         actions = {
@@ -223,10 +276,18 @@ class AudioPlugin:
         return tool("audio", "actuator", "U1 Pro preset audio and motion playback. List actions first, then play a returned motion or vendor audio resource.", action_schema(actions, properties))
 
     def start(self):
-        pass
+        if self.running:
+            return
+        self.running = True
 
     def stop(self):
-        pass
+        if not self.running:
+            return
+        from coze_msgs.srv import InterruptActionAudio
+        try:
+            return jsonable(self.nodes.call("interrupt", InterruptActionAudio.Request()))
+        finally:
+            self.running = False
 
     def dispatch(self, action, args):
         if action == "list_actions":
@@ -244,31 +305,66 @@ class AudioPlugin:
             request.path = str(args["path"])
             return jsonable(self.nodes.call("play_resource", request))
         if action == "stop":
-            from coze_msgs.srv import InterruptActionAudio
-            return jsonable(self.nodes.call("interrupt", InterruptActionAudio.Request()))
+            return self.stop()
         raise ValueError(f"unknown audio action: {action}")
 
 
 class EventPlugin:
     def __init__(self, nodes: U1Nodes, name: str, description: str):
         self.nodes, self.name, self.description = nodes, name, description
+        self.running = False
 
     def get_tool(self):
         return tool(self.name, "sensor", self.description, _sensor_schema(), topic_out=[{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}])
 
     def start(self):
-        pass
+        if self.running:
+            return
+        self.nodes.set_event_enabled(self.name, True)
+        self.running = True
 
     def stop(self):
-        pass
+        if not self.running:
+            return
+        self.nodes.set_event_enabled(self.name, False)
+        self.running = False
 
     def dispatch(self, action, args):
-        return {"state": "idle" if action == "stop" else "running", "topic_out": [{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}]}
+        if action == "start":
+            self.start()
+        elif action == "stop":
+            self.stop()
+        elif action != "info":
+            raise ValueError(f"unknown event action: {action}")
+        return {"state": "running" if self.running else "idle", "topic_out": [{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}]}
+
+
+class _LifecyclePlugin:
+    """Close the shared ROS nodes after all functional cards have stopped."""
+
+    def __init__(self, nodes: U1Nodes):
+        self.nodes = nodes
+        self.closed = False
+
+    def get_tools(self):
+        return []
+
+    def start(self):
+        if self.closed:
+            raise RuntimeError("U1 Pro lifecycle is already closed")
+
+    def stop(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.nodes.close()
 
 
 def build_plugins(config: dict, namespace: str, ros) -> list:
     nodes = U1Nodes(config, namespace, ros)
-    plugins = [MicPlugin(nodes), SpeakerPlugin(nodes), AudioPlugin(nodes)]
+    # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
+    # card has disabled its vendor resources and stopped publishing.
+    plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), AudioPlugin(nodes)]
     descriptions = {
         "main_wakeup_word": "Main wake-word event recognized by the U1 Pro.",
         "wakeup_event": "U1 Pro wake-up recognition event; does not guarantee a follow-up conversation.",
