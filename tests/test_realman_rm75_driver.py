@@ -1690,7 +1690,36 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual("stopmotion", payload["reason"])
 
     def test_joint_stopmotion_cancels_active_cartesian_action(self):
-        started = self.plugin.dispatch("movel", self._movel_args())
+        callbacks = []
+
+        class EventClient(self.FakeClient):
+            def command_trajectory(self, method, *args, completion_callback=None):
+                self.calls.append((method, args))
+                callbacks.append(completion_callback)
+                return 0
+
+            def cancel_trajectory_wait(self):
+                self.calls.append(("cancel_trajectory_wait", ()))
+                return True
+
+        self.client = EventClient([0.0, 0.0, 200.0, 0.0, 0.0, 0.0])
+        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {
+                "safety": dict(self.FAST_SAFETY),
+                "cartesian": {"enabled": True, "stop_finalize_seconds": 0.01},
+            },
+            arm_plugin=self.arm,
+            namespace="rm75",
+        )
+        self.acp_events = []
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        started = self.plugin.dispatch("move", self._a_to_b_args())
+        self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
         stop = self.arm.dispatch("stopmotion", {"_tool_name": "joint_control"})
 
         self.assertEqual("stop_requested", stop["state"])
@@ -1701,6 +1730,19 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual(started["action_id"], action_id)
         self.assertEqual("cancelled", status)
         self.assertEqual("stopmotion", payload["reason"])
+        self.assertIn(("cancel_trajectory_wait", ()), self.client.calls)
+        self.assertEqual("ready", self.plugin.dispatch("info", {})["state"])
+        self.assertIsNone(self.arm._motion_state["active_action_id"])
+        self.assertFalse(self.plugin._motion_lock.locked())
+
+        # The shared lock and action state are released, so a second public
+        # move can be accepted immediately after the cross-card stop.
+        second = self.plugin.dispatch("move", self._a_to_b_args(b_x_mm=100))
+        self.assertNotEqual(started["action_id"], second["action_id"])
+        self.assertTrue(self._wait_for(lambda: len(callbacks) == 2))
+        callbacks[1](True)
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
+        self.assertEqual((second["action_id"], "completed"), self.acp_events[1][:2])
 
     def test_cartesian_stopmotion_stops_active_joint_action(self):
         action_id = "rm75_joint_active"
