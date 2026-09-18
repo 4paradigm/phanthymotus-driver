@@ -37,6 +37,11 @@ from rclpy.serialization import deserialize_message, serialize_message
 from rosidl_runtime_py.utilities import get_message
 
 
+# How often a bridged topic reports how many messages it has carried. Time-based
+# rather than count-based so a 16 kHz audio topic costs the same number of log
+# lines as a 10 Hz one; see the comment in TopicHandler.publish.
+PROGRESS_INTERVAL_S = 300.0
+
 # Default QoS profiles
 RELIABLE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.RELIABLE,
@@ -62,6 +67,9 @@ class TopicHandler:
         self.msg_class = get_message(msg_type_name)
         self.msg_count = 0
         self.context_invalid = False
+        # Starts at 0 so the very first message always prints; after that the
+        # interval governs.
+        self._last_progress_ts = 0.0
 
         # Create publisher on domain 42
         self.node = Node(
@@ -89,7 +97,23 @@ class TopicHandler:
             if ("camera" in self.topic or "imu" in self.topic) and self.msg_count <= 5:
                 print(f"[socket-bridge] {self.topic}: msg #{self.msg_count}, serialized={len(serialized_msg)} bytes, type={type(msg)}", flush=True)
 
-            if self.msg_count % 100 == 0:
+            # Progress on a clock, not on a message count.
+            #
+            # Every 100 messages sounds modest until you notice the rate: a
+            # 16 kHz audio topic and the joint stream each produced ~750 lines,
+            # and all the bridged topics together were 78% of this container's
+            # log (2200 of 2809). That crowds out the plugin errors, which are
+            # the only reason anyone opens it.
+            #
+            # What the line is for is "is data still flowing", and a 5-minute
+            # tick answers that just as well as a rate-proportional one — while
+            # costing the same few lines whether the topic carries 10 Hz of
+            # joint state or 16 kHz of audio. The first message is still logged
+            # immediately, because "did this bridge ever work" is a different
+            # question and it wants an instant answer.
+            now = time.monotonic()
+            if self.msg_count == 1 or now - self._last_progress_ts >= PROGRESS_INTERVAL_S:
+                self._last_progress_ts = now
                 print(
                     f"[socket-bridge] {self.topic}: published {self.msg_count} messages",
                     flush=True,
