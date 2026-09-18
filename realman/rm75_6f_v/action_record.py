@@ -22,6 +22,7 @@ class ActionRecord:
         self.index_path = self.root / "index.json"
         self.speed = max(1, min(100, int(config.get("speed_percent", 20))))
         self.timeout = max(30, int(config.get("replay_timeout_seconds", 600)))
+        self.start_timeout = max(1, min(self.timeout, int(config.get("replay_start_timeout_seconds", 10))))
         self._lock = threading.RLock()
         self._recording = False
         self._record_name = None
@@ -161,6 +162,7 @@ class ActionRecord:
     def _monitor(self, action_id, name):
         status, result = "error", {"reason": "replay_timeout"}
         started = time.monotonic()
+        start_deadline = started + self.start_timeout
         seen_running = False
         try:
             while time.monotonic() - started < self.timeout:
@@ -172,8 +174,16 @@ class ActionRecord:
                 state = self.client.call("rm_get_program_run_state")
                 run_state = int(state.get("run_state", 0)) if isinstance(state, dict) else 0
                 seen_running = seen_running or run_state in (1, 2)
-                if (seen_running and run_state == 0) or (not seen_running and time.monotonic() - started > 3):
+                now = time.monotonic()
+                if seen_running and run_state == 0:
                     status, result = "completed", {"reason": "trajectory_finished", "name": name}
+                    break
+                if not seen_running and now >= start_deadline:
+                    status, result = "error", {
+                        "reason": "replay_start_timeout",
+                        "name": name,
+                        "timeout_seconds": self.start_timeout,
+                    }
                     break
                 time.sleep(1)
         except Exception as exc:
