@@ -7,7 +7,9 @@ tcp_port: 8080
 ext_camera:
   enabled: true
 vision_capture:
-  enabled: true
+  # Video recording is outside this PR; keep the joint-state sensor path
+  # lightweight and do not require ffmpeg/ffprobe in the image.
+  enabled: false
   camera: external
   external_instance_id: ""
   output_dir: /opt/phanthy-motus/data/vision_capture/realman
