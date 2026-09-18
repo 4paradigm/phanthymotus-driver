@@ -109,32 +109,6 @@ For a supervised hardware check, create separate RGB, depth and infrared card
 instances, start them, then confirm that `frames_published` increases and the
 three topics render independently. USB disconnect becomes an explicit error until the same camera reconnects.
 
-### RGB photo and video capture
-
-`vision_capture` ports the Go2 card's JPEG photo and silent H.264 MP4 recording
-contract. It subscribes to an existing `ext_camera` RGB ROS topic and never
-opens another RealSense pipeline. RGB/depth/infrared live cards keep running.
-
-1. Start an `ext_camera` instance with `channel=rgb`.
-2. Add `vision_capture`. With exactly one running RGB instance, it is selected
-   automatically. Otherwise configure `external_instance_id` using the RGB
-   card's instance ID; `list_cameras` lists available sources. Depth and infrared
-   instances are excluded, including infrared JPEG streams.
-3. Run `capture_photo` for a new JPEG frame, or `record_video` with `duration_s`
-   (integer 1–30, default 5). Photos return `file_path`; recording immediately
-   returns `action_id` and its destination `file_path`, then sends ACP completion
-   after FFmpeg/ffprobe confirm the MP4's duration and frame count. The terminal
-   outcome remains in `info.last_recording`; the destination is not proof of a
-   completed file until that outcome is `completed`.
-4. `cancel` cancels the recording and removes incomplete output. It does not stop
-   the source camera. A stale/missing stream fails instead of saving old frames.
-
-The image installs FFmpeg/ffprobe. The service persists only the capture directory
-at `/opt/phanthy-motus/data/vision_capture/realman` on the host, with `photos/`
-and `videos/` subdirectories. Results are file paths, not public download URLs.
-Recordings are silent; no microphone or speaker is required. Files are retained
-until explicitly removed; monitor free space for repeated recording workloads.
-
 The deployment enables its motion capability, and every `set` call must still
 include `confirm_motion=true`. `joint1_deg` through `joint7_deg` are absolute
 targets in degrees. An omitted joint defaults to its measured position at the

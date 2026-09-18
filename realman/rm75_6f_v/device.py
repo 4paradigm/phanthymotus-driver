@@ -14,7 +14,9 @@ from pathlib import Path
 from common.vendor_runtime import action_schema, jsonable, tool
 
 
-JOINT_NAMES = [f"joint{i}" for i in range(1, 8)]
+# Keep the names identical to the official RM75 URDF.  Canvas uses the
+# joint name to associate each q value with the corresponding URDF joint.
+JOINT_NAMES = [f"joint_{i}" for i in range(1, 8)]
 SDK_LIBRARY_PATH = Path("/work/Robotic_Arm/libs/linux_arm/libapi_c.so")
 JOINT_LIMITS_DEG = [(-178.0, 178.0), (-130.0, 130.0), (-178.0, 178.0),
                     (-135.0, 135.0), (-178.0, 178.0), (-128.0, 128.0),
@@ -42,6 +44,7 @@ class RM75SDKClient:
         self.enabled = os.environ.get("RM_DRIVER_ENABLED", "0") == "1"
         self.motion_enabled = os.environ.get("RM_MOTION_ENABLED", "0") == "1"
         self._lock = threading.RLock()
+        self.motion_gate = threading.Lock()
         self._robot = None
         self._handle = None
         self._last_connection_error = None
@@ -130,13 +133,38 @@ class RM75SDKClient:
             "motion_enabled": self.motion_enabled,
         }
 
-    def call(self, method):
+    def call(self, method, *args):
         if not self.connected or self._robot is None:
             self.ensure_connected()
         with self._lock:
             if not self.connected or self._robot is None:
                 raise ConnectionError("RM75 SDK is not connected")
-            return _sdk_result(method, getattr(self._robot, method)())
+            return _sdk_result(method, getattr(self._robot, method)(*args))
+
+    def upload_recording(self, path, speed, slot, run=False):
+        from Robotic_Arm.rm_robot_interface import rm_send_project_t
+
+        project = rm_send_project_t(
+            project_path=str(path), plan_speed=speed, only_save=0 if run else 1,
+            save_id=slot, step_flag=0, auto_start=0, project_type=0,
+        )
+        # rm_send_project returns (status, error_line).  Keep the second
+        # value when status is non-zero; the generic call() helper raises
+        # first and otherwise hides the controller's useful line number.
+        with self._lock:
+            if not self.connected or self._robot is None:
+                raise ConnectionError("RM75 SDK is not connected")
+            result = self._robot.rm_send_project(project)
+        if not isinstance(result, tuple) or len(result) < 2:
+            raise RuntimeError(f"rm_send_project returned an invalid SDK result: {result!r}")
+        code, error_line = int(result[0]), int(result[1])
+        if code != 0:
+            raise RuntimeError(
+                f"rm_send_project failed with RealMan SDK code {code}; "
+                f"controller error line={error_line}"
+            )
+        if error_line != -1:
+            raise RuntimeError(f"trajectory project rejected at line {error_line}")
 
     def call_dict(self, method):
         if not self.connected or self._robot is None:
@@ -361,7 +389,7 @@ class RM75Plugin:
         self.stall_timeout_seconds = float(safety.get("stall_timeout_seconds", 10.0))
         self.progress_threshold_deg = float(safety.get("progress_threshold_deg", 0.05))
         self.max_motion_seconds = float(safety.get("max_motion_seconds", 300.0))
-        self._motion_lock = threading.Lock()
+        self._motion_lock = client.motion_gate
         self._motion_state = {"active_action_id": None}
         # 提交/慢停串行化锁：与 CartesianPlugin 共享，保证任一卡片的 stopmotion
         # 都排在另一卡片正在进行的 SDK 运动下发之后。
@@ -385,7 +413,7 @@ class RM75Plugin:
                 f"Read and publish seven RM75 joint angles in radians at {self._skeleton_publish_hz:g} Hz",
                 topic_out=self._skeleton_topic_out(),
             ),
-            tool("model", "resource", "RM75-6F-V simplified URDF for skeleton rendering"),
+            tool("model", "resource", "RM75-6F-V URDF for skeleton rendering"),
         ]
         definitions.extend(tool(name, "sensor", f"Read-only RealMan API2 call: {method}") for name, method in self.METHODS.items())
         joint_properties = {
@@ -474,9 +502,15 @@ class RM75Plugin:
             "timestamp_ms": int(time.time() * 1000),
             "format": "sensor/skeleton",
             "position_unit": "rad",
+            "angle_unit": "deg",
             "joint_count": len(JOINT_NAMES),
             "joints": [
-                {"idx": index, "name": name, "q": float(position)}
+                {
+                    "idx": index,
+                    "name": name,
+                    "q": float(position),
+                    "degree": float(state["raw_degree"][index]),
+                }
                 for index, (name, position) in enumerate(zip(JOINT_NAMES, state["position"]))
             ],
         }
@@ -497,7 +531,8 @@ class RM75Plugin:
             return
         try:
             message = message_type()
-            message.data = json.dumps(self._skeleton_payload(), ensure_ascii=False)
+            skeleton = self._skeleton_payload()
+            message.data = json.dumps(skeleton, ensure_ascii=False)
             publisher.publish(message)
             self._last_skeleton_error = None
             self._skeleton_retry_at = 0.0
@@ -737,7 +772,8 @@ class RM75Plugin:
         if name in self.METHODS:
             if name == "controller_state":
                 return self.client.call_dict(self.METHODS[name])
-            return self.client.call(self.METHODS[name])
+            result = self.client.call(self.METHODS[name])
+            return result
         if name == "joint_control":
             if action == "set":
                 return self._start_motion(args)
@@ -855,6 +891,9 @@ class GripperPlugin:
         position = _gripper_position(args.get("position"))
         if not self._gripper_lock.acquire(blocking=False):
             raise RuntimeError(f"another gripper motion is active: {self._active_action_id}")
+        if not self.client.motion_gate.acquire(blocking=False):
+            self._gripper_lock.release()
+            raise RuntimeError("another arm operation is active")
         action_id = f"rm75_gripper_{uuid4().hex[:10]}"
         with self._action_lock:
             self._active_action_id = action_id
@@ -886,6 +925,7 @@ class GripperPlugin:
                     self._active_action_id = None
                 self._interrupted.discard(action_id)
             self._gripper_lock.release()
+            self.client.motion_gate.release()
             self._acp_callback(action_id, status, result)
 
     def _acp_callback(self, action_id, status, result):
@@ -2210,30 +2250,37 @@ class CartesianPlugin:
 
 
 def build_plugins(config, namespace, ros2):
+    client = RM75SDKClient(config)
     from servo import RM75ServoPlugin
 
-    client = RM75SDKClient(config)
     arm = RM75Plugin(client, config, namespace=namespace, ros2=ros2)
     plugins = [
         arm,
         GripperPlugin(client, config, namespace=namespace, ros2=ros2),
-        # Stream-shaped joint control (motus.control/1). Present but inert: it
-        # subscribes to nothing until someone wires it on the canvas and
-        # confirms, and refuses to start at all while the driver is read-only.
         RM75ServoPlugin(client, config, namespace=namespace, ros2=ros2),
         CartesianPlugin(client, config, arm_plugin=arm, namespace=namespace, ros2=ros2),
     ]
-    external_camera = None
     camera_config = config.get("ext_camera", {})
+    ext_camera_plugin = None
     if camera_config.get("enabled", False):
         from camera import ExtCameraPlugin
 
-        external_camera = ExtCameraPlugin(camera_config, namespace, ros2.executor_core)
-        plugins.append(external_camera)
-    capture_config = config.get("vision_capture", {})
-    if capture_config.get("enabled", False):
+        ext_camera_plugin = ExtCameraPlugin(
+            camera_config, namespace, ros2.executor_core
+        )
+        plugins.append(ext_camera_plugin)
+    vision_config = config.get("vision_capture", {})
+    # Vision capture is an explicit capability; an enabled RGB camera alone
+    # must not implicitly add an undeclared recording card.
+    if vision_config.get("enabled", False):
         from vision_capture import VisionCapturePlugin
 
-        plugins.append(VisionCapturePlugin(
-            capture_config, namespace, ros2.executor_core, external_camera))
+        plugins.append(
+            VisionCapturePlugin(
+                vision_config,
+                namespace,
+                ros2.executor_core,
+                external_camera=ext_camera_plugin,
+            )
+        )
     return plugins

@@ -19,7 +19,29 @@ for.
   7. force-torque    per-axis absolute threshold                 → ABORTED
   8. continuity      *caller's job* — see below
   9. watchdog        no valid command within watchdog_ms         → hold
- 10. escalation      N consecutive watchdog periods              → abort
+ 10. escalation      N consecutive watchdog periods              → stand down
+
+**The two ways this stops are not the same stop, and conflating them cost a
+robot an afternoon.** A force-torque abort means the arm hit something: the next
+command is precisely the one that must not run, so it latches and only `reset()`
+clears it. A watchdog escalation means nobody has spoken for a while — its job,
+per step 10's own reasoning below, is to escalate the *response* so the arm does
+not hang in the air while an agent believes the action is still running. It is
+not a fault report, and it must not need a human.
+
+Making both latch produced a rule that contradicted itself: silence for four
+watchdog periods resumed on its own, silence for five needed an operator to tear
+the card down and rebuild it. Nothing about the robot differs across that 200 ms.
+Worse, the thing that routinely produces it is ordinary — restarting the card
+upstream takes longer than five periods, so reconfiguring a policy bricked the
+driver until somebody noticed.
+
+A stood-down sink therefore resumes on the next command that passes every check
+above. That is safe for the same reason the ordinary watchdog hold is safe:
+freshness (step 2) means a resuming command was computed from a recent
+observation, and the step clamp (step 4) still holds against `_last_values`,
+which survives. Whatever wires this class to a topic should announce the
+resumption, exactly as it should for a hold.
 
 Two of those are honest gaps rather than implementations:
 
@@ -146,7 +168,11 @@ class ControlSink:
 
         self._active = False           # has anything ever been applied
         self._holding = False          # watchdog has fired and not yet cleared
-        self._aborted = False
+        # The two stops. `_latched` is force-torque: nothing runs until reset().
+        # `_stood_down` is watchdog escalation: the next command that passes
+        # every check resumes. See the header for why they differ.
+        self._latched = False
+        self._stood_down = False
         self._watchdog_strikes = 0
         self._last_watchdog_ms: int | None = None
 
@@ -156,7 +182,7 @@ class ControlSink:
 
     def submit(self, message: dict) -> Outcome:
         """Run one command through the chain. Calls `apply` only if it passes."""
-        if self._aborted:
+        if self._latched:
             return self._count(Outcome(Verdict.ABORTED, "sink is aborted; call reset()"))
 
         now = self._clock()
@@ -193,6 +219,11 @@ class ControlSink:
         self._last_apply_ms = now
         self._active = True
         self._holding = False
+        # A command that passed every check is the evidence the silence is over,
+        # so it is also what ends a stand-down. Cleared here rather than at the
+        # top of submit(): a command that then gets dropped or rejected is not
+        # evidence of anything.
+        self._stood_down = False
         self._watchdog_strikes = 0
         self._last_watchdog_ms = None
 
@@ -207,7 +238,10 @@ class ControlSink:
         condition: nothing has been promised yet, and firing here would mean
         every card reports a fault before it is used.
         """
-        if self._aborted or not self._active:
+        # A stood-down sink stops ticking until something resumes it: otherwise
+        # every further period would fire `on_abort` again, and a driver whose
+        # abort handler returns to a safe pose would keep re-issuing that.
+        if self._latched or self._stood_down or not self._active:
             return None
 
         now = self._clock()
@@ -227,7 +261,7 @@ class ControlSink:
         self._watchdog_strikes += 1
 
         if self._watchdog_strikes >= self._escalate_after:
-            return self._count(self._abort(
+            return self._count(self._stand_down(
                 f"no valid command for {self._watchdog_strikes} watchdog periods "
                 f"({since} ms)"
             ))
@@ -249,7 +283,9 @@ class ControlSink:
         absence of a call.
         """
         thresholds = self.descriptor.force_torque
-        if thresholds is None or self._aborted:
+        # Checked even while stood down: a stood-down sink is one nobody is
+        # talking to, not one whose arm has stopped being able to hit something.
+        if thresholds is None or self._latched:
             return None
         for i, value in enumerate(readings):
             if i >= len(thresholds):
@@ -275,13 +311,19 @@ class ControlSink:
         self._seq_by_source.clear()
         self._active = False
         self._holding = False
-        self._aborted = False
+        self._latched = False
+        self._stood_down = False
         self._watchdog_strikes = 0
         self._last_watchdog_ms = None
 
     @property
     def aborted(self) -> bool:
-        return self._aborted
+        """Refusing everything until `reset()` — i.e. force-torque only.
+
+        A stood-down sink is not aborted in this sense: it is holding and will
+        resume on its own. `stats()["stood_down"]` is where to look for that.
+        """
+        return self._latched
 
     @property
     def holding(self) -> bool:
@@ -291,7 +333,12 @@ class ControlSink:
         return {
             "active": self._active,
             "holding": self._holding,
-            "aborted": self._aborted,
+            # Two fields, because they call for different actions: `aborted`
+            # needs a person, `stood_down` needs only the upstream to start
+            # talking again. One field meaning both is what made a routine
+            # restart look like a fault.
+            "aborted": self._latched,
+            "stood_down": self._stood_down,
             "holder": self._holder,
             "watchdog_strikes": self._watchdog_strikes,
             "counters": dict(self.counters),
@@ -476,7 +523,21 @@ class ControlSink:
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _abort(self, reason: str) -> Outcome:
-        self._aborted = True
+        """Force-torque. Latches: only `reset()` gets out of this."""
+        self._latched = True
+        self._holding = True
+        if self._on_abort is not None:
+            self._on_abort()
+        return Outcome(Verdict.ABORTED, reason)
+
+    def _stand_down(self, reason: str) -> Outcome:
+        """Watchdog escalation. Same response, but it does not latch.
+
+        Reported as ABORTED because that is what it is to the operator watching
+        — the card has stopped driving and said why — while the sink itself
+        stays willing to resume on a command that passes every check.
+        """
+        self._stood_down = True
         self._holding = True
         if self._on_abort is not None:
             self._on_abort()
