@@ -413,8 +413,6 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
 
     def _a_to_b_args(self, **overrides):
         args = {
-            "a_x_mm": 100, "a_y_mm": 0, "a_z_mm": 200,
-            "a_rx_deg": 0, "a_ry_deg": 0, "a_rz_deg": 0,
             "b_x_mm": 150, "b_y_mm": 0, "b_z_mm": 200,
             "b_rx_deg": 0, "b_ry_deg": 0, "b_rz_deg": 0,
             "speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True,
@@ -437,7 +435,8 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertEqual(False, schema["properties"]["cartesian_enabled"]["default"])
         self.assertIn("cartesian_enabled", schema["x-action-params"]["move_offset"]["params"])
         self.assertIn("move_a_to_b", schema["x-action-params"])
-        self.assertIn("a_x_mm", schema["x-action-params"]["move_a_to_b"]["params"])
+        self.assertNotIn("a_x_mm", schema["properties"])
+        self.assertNotIn("a_x_mm", schema["x-action-params"]["move_a_to_b"]["params"])
         self.assertIn("b_rz_deg", schema["x-action-params"]["move_a_to_b"]["params"])
         self.assertEqual(10, schema["properties"]["speed_percent"]["maximum"])
         self.assertNotIn("movel", schema["x-action-params"])
@@ -454,7 +453,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         )
         self.assertIn("工具系偏移", tools[0]["description"])
 
-    def test_move_a_to_b_reaches_a_before_submitting_b(self):
+    def test_move_a_to_b_reads_current_pose_as_a_and_submits_only_b(self):
         callbacks = []
 
         class EventClient(self.FakeClient):
@@ -470,7 +469,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
                 self.calls.append((method, args))
                 return 0
 
-        self.client = EventClient([0.0, 0.0, 200.0, 0.0, 0.0, 0.0])
+        self.client = EventClient([25.0, -10.0, 200.0, 1.0, 2.0, 3.0])
         self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
         self.plugin = self.device.CartesianPlugin(
             self.client,
@@ -487,26 +486,73 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
         movel_calls = [call for call in self.client.calls if call[0] == "rm_movel"]
         self.assertEqual(1, len(movel_calls))
-        self.assertEqual([0.1, 0.0, 0.2, 0.0, 0.0, 0.0], movel_calls[0][1][0])
+        self.assertEqual([0.15, 0.0, 0.2, 0.0, 0.0, 0.0], movel_calls[0][1][0])
         self.assertEqual([], self.acp_events)
+        self.assertEqual("to_b", self.plugin._motion_status()["active_stage"])
 
         callbacks[0](True)
-        self.assertTrue(self._wait_for(lambda: len(callbacks) == 2))
-        movel_calls = [call for call in self.client.calls if call[0] == "rm_movel"]
-        self.assertEqual(2, len(movel_calls))
-        self.assertEqual([0.15, 0.0, 0.2, 0.0, 0.0, 0.0], movel_calls[1][1][0])
-        self.assertEqual([], self.acp_events)
-
-        callbacks[1](True)
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         action_id, status, result = self.acp_events[0]
         self.assertEqual(started["action_id"], action_id)
         self.assertEqual("completed", status)
-        self.assertEqual(["to_a", "to_b"], result["completed_segments"])
-        self.assertFalse(result["point_a_already_reached"])
+        for actual, expected in zip(
+                result["point_a_pose_mm_deg"], [25.0, -10.0, 200.0, 1.0, 2.0, 3.0]):
+            self.assertAlmostEqual(expected, actual, places=9)
+        self.assertEqual([150.0, 0.0, 200.0, 0.0, 0.0, 0.0], result["target_pose_mm_deg"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
+        self.assertIsNone(self.plugin._motion_status()["active_stage"])
 
-    def test_move_a_to_b_does_not_submit_b_when_a_fails(self):
+    def test_move_a_to_b_omitted_axes_keep_current_a_values(self):
+        callbacks = []
+
+        class EventClient(self.FakeClient):
+            def command_trajectory(self, method, *args, completion_callback=None):
+                self.calls.append((method, args))
+                callbacks.append(completion_callback)
+                return 0
+
+            def cancel_trajectory_wait(self):
+                return True
+
+        self.client = EventClient([25.0, -10.0, 200.0, 10.0, 20.0, 30.0])
+        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
+        self.plugin = self.device.CartesianPlugin(
+            self.client,
+            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
+            arm_plugin=self.arm,
+            namespace="rm75",
+        )
+        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
+            (action_id, status, result)
+        )
+
+        self.plugin.dispatch("move_a_to_b", {
+            "b_x_mm": 150,
+            "b_y_mm": 0,
+            "b_z_mm": 250,
+            "speed_percent": 5,
+            "cartesian_enabled": True,
+            "confirm_motion": True,
+        })
+        self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
+        movel = next(call for call in self.client.calls if call[0] == "rm_movel")
+        expected = [0.15, 0.0, 0.25, math.radians(10), math.radians(20), math.radians(30)]
+        for actual, target in zip(movel[1][0], expected):
+            self.assertAlmostEqual(target, actual, places=9)
+        callbacks[0](True)
+        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
+
+    def test_move_a_to_b_requires_at_least_one_b_field(self):
+        with self.assertRaisesRegex(ValueError, "at least one B pose field"):
+            self.plugin.dispatch("move_a_to_b", {
+                "speed_percent": 5,
+                "cartesian_enabled": True,
+                "confirm_motion": True,
+            })
+        self.assertFalse(self.plugin._motion_lock.locked())
+        self.assertFalse(any(call[0] == "rm_get_current_arm_state" for call in self.client.calls))
+
+    def test_move_a_to_b_releases_action_when_controller_rejects_b(self):
         callbacks = []
 
         class EventClient(self.FakeClient):
@@ -538,46 +584,9 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         _, status, result = self.acp_events[0]
         self.assertEqual("error", status)
-        self.assertEqual("to_a", result["failed_segment"])
+        self.assertEqual("to_b", result["failed_segment"])
         self.assertIn("collision failure", result["reason"])
         self.assertEqual(1, len([call for call in self.client.calls if call[0] == "rm_movel"]))
-        self.assertEqual("ready", self.plugin._motion_status()["state"])
-
-    def test_move_a_to_b_releases_action_when_b_fails(self):
-        callbacks = []
-
-        class EventClient(self.FakeClient):
-            def command_trajectory(self, method, *args, completion_callback=None):
-                self.calls.append((method, args))
-                callbacks.append(completion_callback)
-                return 0
-
-            def cancel_trajectory_wait(self):
-                return True
-
-        self.client = EventClient([0.0, 0.0, 200.0, 0.0, 0.0, 0.0])
-        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
-        self.plugin = self.device.CartesianPlugin(
-            self.client,
-            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
-            arm_plugin=self.arm,
-            namespace="rm75",
-        )
-        self.acp_events = []
-        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
-            (action_id, status, result)
-        )
-
-        self.plugin.dispatch("move_a_to_b", self._a_to_b_args())
-        self.assertTrue(self._wait_for(lambda: len(callbacks) == 1))
-        callbacks[0](True)
-        self.assertTrue(self._wait_for(lambda: len(callbacks) == 2))
-        callbacks[1](False)
-
-        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
-        _, status, result = self.acp_events[0]
-        self.assertEqual("error", status)
-        self.assertEqual("to_b", result["failed_segment"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
         self.assertFalse(self.plugin._motion_lock.locked())
 
@@ -614,7 +623,7 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         first = self.plugin.dispatch("move_a_to_b", self._a_to_b_args())
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
         self.assertEqual((first["action_id"], "error"), self.acp_events[0][:2])
-        self.assertEqual("to_a", self.acp_events[0][2]["failed_segment"])
+        self.assertEqual("to_b", self.acp_events[0][2]["failed_segment"])
         self.assertEqual("ready", self.plugin._motion_status()["state"])
 
         second = self.plugin.dispatch("move_a_to_b", self._a_to_b_args())
@@ -622,53 +631,8 @@ class RealManRM75CartesianPluginTests(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 2))
         self.assertEqual((second["action_id"], "error"), self.acp_events[1][:2])
 
-    def test_move_a_to_b_skips_a_when_already_at_a(self):
-        class EventClient(self.FakeClient):
-            def command_trajectory(self, method, *args, completion_callback=None):
-                self.calls.append((method, args))
-                if completion_callback is not None:
-                    completion_callback(True)
-                return 0
-
-            def wait_trajectory(self, timeout_seconds):
-                return True
-
-            def cancel_trajectory_wait(self):
-                return True
-
-            def command_interrupt(self, method, *args):
-                self.calls.append((method, args))
-                return 0
-
-        self.client = EventClient([100.0, 0.0, 200.0, 0.0, 0.0, 0.0])
-        self.arm = self.device.RM75Plugin(self.client, {}, namespace="rm75")
-        self.plugin = self.device.CartesianPlugin(
-            self.client,
-            {"safety": dict(self.FAST_SAFETY), "cartesian": {"enabled": True}},
-            arm_plugin=self.arm,
-            namespace="rm75",
-        )
-        self.acp_events = []
-        self.plugin._acp_callback = lambda action_id, status, result: self.acp_events.append(
-            (action_id, status, result)
-        )
-
-        started = self.plugin.dispatch("move_a_to_b", self._a_to_b_args())
-
-        self.assertTrue(self._wait_for(lambda: len(self.acp_events) == 1))
-        action_id, status, result = self.acp_events[0]
-        self.assertEqual(started["action_id"], action_id)
-        self.assertEqual("completed", status)
-        self.assertEqual([100.0, 0.0, 200.0, 0.0, 0.0, 0.0], result["point_a_pose_mm_deg"])
-        self.assertEqual([150.0, 0.0, 200.0, 0.0, 0.0, 0.0], result["target_pose_mm_deg"])
-        self.assertTrue(result["point_a_already_reached"])
-        self.assertEqual(["to_b"], result["completed_segments"])
-        movel_calls = [call for call in self.client.calls if call[0] == "rm_movel"]
-        self.assertEqual(1, len(movel_calls))
-        self.assertEqual([0.15, 0.0, 0.2, 0.0, 0.0, 0.0], movel_calls[0][1][0])
-        self.assertEqual("ready", self.plugin._motion_status()["state"])
-
     def test_move_a_to_b_validates_b_before_motion(self):
+        self.client.command_trajectory = mock.Mock()
         with self.assertRaisesRegex(ValueError, "exceeds"):
             self.plugin.dispatch(
                 "move_a_to_b",
