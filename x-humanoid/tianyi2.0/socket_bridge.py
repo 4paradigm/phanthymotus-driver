@@ -110,6 +110,87 @@ class TopicHandler:
             traceback.print_exc()
 
 
+def qos_from(spec: dict) -> QoSProfile:
+    """Rebuild the caller's QoS on this side of the socket.
+
+    Outbound deliberately forces BEST_EFFORT (see TopicHandler) because every
+    reader in agent-core is BEST_EFFORT. Inbound has no such luxury: the profile
+    has to match whatever is *publishing* on domain 42, and a mismatch there is
+    silent — the subscription exists, the publisher exists, and no data moves.
+    """
+    spec = spec or {}
+    reliability = (ReliabilityPolicy.RELIABLE
+                   if str(spec.get("reliability", "best_effort")).lower() == "reliable"
+                   else ReliabilityPolicy.BEST_EFFORT)
+    return QoSProfile(
+        reliability=reliability,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=int(spec.get("depth", 1)),
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+
+class SubscriptionHandler:
+    """One inbound topic: subscribes on domain 42, writes frames back to the client.
+
+    The mirror image of TopicHandler, and it exists because the bridge used to
+    have no inbound direction at all. The main process cannot subscribe on domain
+    42 itself — its participant runs under the vendor DDS profile so that the
+    body link on 192.168.41.x stays up, and that participant is invisible to
+    agent-core. Publishers had a way across; subscriptions did not, so a card
+    that needed to *receive* started cleanly, reported running, and never heard
+    anything. `servo` was the first such card.
+
+    One handler per connection rather than per topic: each carries the socket it
+    forwards to, and two cards subscribing to one topic are two readers.
+    """
+
+    def __init__(self, topic: str, msg_type_name: str, qos: QoSProfile,
+                 ctx: Context, executor, conn: socket.socket):
+        self.topic = topic
+        self.msg_class = get_message(msg_type_name)
+        self.conn = conn
+        self.msg_count = 0
+        self.failed = False
+        self._send_lock = threading.Lock()
+
+        name = f"bridge_in_{topic.strip('/').replace('/', '_')}_{id(conn) & 0xffff:x}"
+        self.node = Node(name, context=ctx)
+        self.sub = self.node.create_subscription(
+            self.msg_class, topic, self._forward, qos)
+        executor.add_node(self.node)
+        print(f"[socket-bridge] inbound handler created: {topic} ({msg_type_name})",
+              flush=True)
+
+    def _forward(self, msg):
+        """Same framing as the outbound direction, in the other direction."""
+        if self.failed:
+            return
+        try:
+            data = serialize_message(msg)
+            with self._send_lock:
+                self.conn.sendall(struct.pack("<I", len(data)))
+                self.conn.sendall(data)
+            self.msg_count += 1
+            if self.msg_count % 500 == 0:
+                print(f"[socket-bridge] {self.topic}: forwarded {self.msg_count} "
+                      f"messages inbound", flush=True)
+        except Exception as e:      # noqa: BLE001 — the client went away
+            # Marked rather than raised: this runs on the executor thread, and a
+            # raise here would take down every other topic sharing it.
+            self.failed = True
+            print(f"[socket-bridge] inbound {self.topic}: client gone ({e})",
+                  flush=True)
+
+    def close(self, executor):
+        try:
+            executor.remove_node(self.node)
+        finally:
+            # destroy_node, not only remove_node: otherwise the subscription and
+            # the ROS node name leak, and the next start collides with itself.
+            self.node.destroy_node()
+
+
 class SocketBridgeServer:
     """Manages Unix socket server and topic handlers."""
 
@@ -188,8 +269,16 @@ class SocketBridgeServer:
 
             topic = metadata["topic"]
             msg_type = metadata["msg_type"]
+            # Absent means "out": every client written before the inbound
+            # direction existed sends no direction field, and must keep working.
+            direction = metadata.get("direction", "out")
 
-            print(f"[socket-bridge] new client: {topic} ({msg_type})", flush=True)
+            print(f"[socket-bridge] new client: {topic} ({msg_type}) [{direction}]",
+                  flush=True)
+
+            if direction == "in":
+                self.handle_inbound(conn, topic, msg_type, metadata.get("qos"))
+                return
 
             # Create handler if not exists or if previous handler has invalid context
             if topic not in self.handlers or getattr(self.handlers.get(topic), 'context_invalid', False):
@@ -234,6 +323,36 @@ class SocketBridgeServer:
             print(f"[socket-bridge] client handler error: {e}", flush=True)
         finally:
             conn.close()
+
+    def handle_inbound(self, conn: socket.socket, topic: str, msg_type: str,
+                       qos_spec):
+        """Subscribe on domain 42 for this client until it disconnects.
+
+        Nothing is read from the socket afterwards — the client never sends
+        again — so `recv` here is purely how a disconnect is noticed. It returns
+        b"" on a clean close and raises on a reset; either ends the handler and
+        tears the subscription down, which is what keeps a start/stop cycle from
+        leaving a live reader behind.
+        """
+        handler = None
+        try:
+            handler = SubscriptionHandler(topic, msg_type, qos_from(qos_spec),
+                                          self.ctx, self.executor, conn)
+            while not self._stop_flag.is_set():
+                conn.settimeout(1.0)
+                try:
+                    if not conn.recv(1):
+                        break                      # client closed
+                except socket.timeout:
+                    if handler.failed:
+                        break                      # forwarding side gave up
+                    continue
+        except Exception as e:      # noqa: BLE001
+            print(f"[socket-bridge] inbound {topic} error: {e}", flush=True)
+        finally:
+            if handler is not None:
+                handler.close(self.executor)
+            print(f"[socket-bridge] inbound handler closed: {topic}", flush=True)
 
     def start(self):
         """Start bridge server with single dynamic socket."""
