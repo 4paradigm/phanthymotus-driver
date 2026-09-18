@@ -768,8 +768,11 @@ class GripperPlugin:
 
 def build_plugins(config, namespace, ros2):
     client = RM75SDKClient(config)
+    from servo import RM75ServoPlugin
+
     plugins = [
         RM75Plugin(client, config, namespace=namespace, ros2=ros2),
+        RM75ServoPlugin(client, config, namespace=namespace, ros2=ros2),
         GripperPlugin(client, config, namespace=namespace, ros2=ros2),
     ]
     camera_config = config.get("ext_camera", {})
