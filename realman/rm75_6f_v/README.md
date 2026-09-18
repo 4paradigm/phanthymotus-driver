@@ -27,7 +27,7 @@ Available tools are:
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
-- `abs_move`: `move_a_to_b` reads the current TCP as A and moves to
+- `abs_move`: `move` reads the current TCP as A and moves to
   the requested base-frame B using
   joint-space planning by default, with an explicit TCP-linear mode available.
   Relative `move_offset`, absolute `movel`, and waypoint `movep` are not exposed.
@@ -156,10 +156,11 @@ The first supervised hardware test should change exactly one joint by no more
 than 1 degree at 1 percent speed. A reachable physical E-stop and a clear work
 area are required. Software interlocks do not replace the robot safety system.
 
-Cartesian motion is enabled in the default deployment and can be disabled with
-`RM75_CARTESIAN_ENABLED=0`. Verify the active TCP and configured workspace
-envelope before use. Every `abs_move.move_a_to_b` request must set both
-`cartesian_enabled=true` and `confirm_motion=true`. `move_a_to_b` reads the
+Physical motion and `abs_move` are enabled in the default deployment;
+`abs_move` can be disabled with `RM75_CARTESIAN_ENABLED=0`. Verify the active
+TCP, arrival device, and workspace envelope before use. Every
+`abs_move.move` request must also set both
+`cartesian_enabled=true` and `confirm_motion=true`. `move` reads the
 measured TCP as A and accepts B pose fields (`x/y/z` in millimetres and `rx/ry/rz` in
 degrees). Any omitted B axis keeps the measured A value, so callers
 can provide only `x/y/z` to preserve the current orientation. At least one B
