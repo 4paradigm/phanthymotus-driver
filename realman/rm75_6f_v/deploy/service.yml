@@ -21,6 +21,8 @@ realman-rm75-6f-v:
     - /dev:/dev:ro
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - ${RM_API2_LIB_DIR:-/opt/realman/rm_api2/libs/linux_arm}:/work/Robotic_Arm/libs/linux_arm:ro
+    # Agent Core CA：ACP 完成回调保持 TLS 证书校验，不回退到关闭校验
+    - ${RM75_CA_DIR:-/opt/phanthy-motus/data}:/opt/phanthy-motus/data:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -29,10 +31,13 @@ realman-rm75-6f-v:
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
     - AGENT_CORE_URL=${RM75_AGENT_CORE_URL:-https://phanthy-motus:15678}
-    # This deployment intentionally starts connected and motion-capable.
+    - AGENT_CORE_CA_CERT=${RM75_AGENT_CORE_CA_CERT:-/opt/phanthy-motus/data/certs/cert.pem}
+    # This deployment starts connected and motion-capable.
     # Physical E-stop, clear workspace and confirm_motion=true remain mandatory.
     - RM_DRIVER_ENABLED=1
     - RM_MOTION_ENABLED=1
+    # 绝对位姿运动默认启用；需要停用时由部署方显式设为 0。
+    - RM_CARTESIAN_ENABLED=${RM75_CARTESIAN_ENABLED:-1}
     - RM_ARM_IP=${RM75_ARM_IP:-192.168.1.18}
     - RM_TCP_PORT=8080
   logging:
@@ -40,4 +45,10 @@ realman-rm75-6f-v:
     options:
       max-size: "10m"
       max-file: "3"
-  restart: unless-stopped
+  # always, not unless-stopped: after a host reboot the robot must come back
+  # on its own. G1 came up from one with every container still exited, and
+  # somebody had to SSH in to start them — until then the robot was simply
+  # gone, indistinguishable from a broken deployment. The cost is that a
+  # container stopped by hand also returns after a reboot; here that is the
+  # lesser surprise.
+  restart: always
