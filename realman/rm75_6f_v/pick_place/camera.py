@@ -66,6 +66,9 @@ def _report(messages, result):
 
 
 def _capture(serial, requests, results, statuses, stopped):
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
     pipeline = None
     started = False
     try:
