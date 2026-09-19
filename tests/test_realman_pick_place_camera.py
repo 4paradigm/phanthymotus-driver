@@ -1,7 +1,9 @@
 """Pick-place-owned camera tests; other cards are not imported."""
 import queue
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -16,6 +18,9 @@ from pick_place import camera as rs
 
 class SnapshotTests(unittest.TestCase):
     def setUp(self):
+        patch = mock.patch("common.logsafe.install")
+        self.install_logsafe = patch.start()
+        self.addCleanup(patch.stop)
         self.raw = np.array([[0, 1000], [2000, 3000]], dtype=np.uint16)
         self.rgb = np.zeros((2, 2, 3), dtype=np.uint8)
         intrinsics = types.SimpleNamespace(width=2, height=2, fx=100, fy=101,
@@ -94,6 +99,7 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(rs, "CameraLease") as lease:
             rs._capture("D435", requests, results, statuses, stopped)
         self.assertEqual(frame_count, 4)
+        self.install_logsafe.assert_called_once_with(check_fd=False)
         self.assertEqual(results.qsize(), 1)
         self.assertEqual(results.get_nowait()["request_id"], "one-request")
         self.cv.imencode.assert_called_once()
@@ -140,3 +146,58 @@ class SnapshotTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"pyrealsense2": sdk}):
             with self.assertRaisesRegex(RuntimeError, "exactly one"):
                 rs.SnapshotCameras().select()
+
+
+class CaptureLogsafeTests(unittest.TestCase):
+    def test_spawned_capture_protects_both_streams_before_sdk_startup(self):
+        script = '''
+import multiprocessing as mp
+from pathlib import Path
+import queue
+import sys
+import types
+from unittest import mock
+
+root = Path(sys.argv[1])
+sys.path[:0] = [str(root), str(root / "realman/rm75_6f_v")]
+
+def child():
+    from common import logsafe
+    from pick_place.camera import _capture
+    assert not logsafe._installed
+
+    def context():
+        assert isinstance(sys.stdout, logsafe.LineAtomicStream)
+        assert isinstance(sys.stderr, logsafe.LineAtomicStream)
+        print("capture-stdout\\x00-safe", flush=True)
+        print("capture-stderr\\x00-safe", file=sys.stderr, flush=True)
+        raise RuntimeError("SDK startup checked")
+
+    statuses = queue.Queue()
+    with mock.patch.dict(sys.modules, {
+        "cv2": types.SimpleNamespace(),
+        "pyrealsense2": types.SimpleNamespace(context=context),
+    }), mock.patch("pick_place.camera.CameraLease"):
+        _capture("test", queue.Queue(), queue.Queue(), statuses, mp.Event())
+    assert statuses.get_nowait() == {"error": "SDK startup checked"}
+
+if __name__ == "__main__":
+    worker = mp.get_context("spawn").Process(target=child)
+    worker.start()
+    worker.join(10)
+    if worker.is_alive():
+        worker.terminate()
+        worker.join(2)
+        raise AssertionError("capture child timed out")
+    assert worker.exitcode == 0, worker.exitcode
+'''
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            probe = Path(directory, "capture_probe.py")
+            probe.write_text(script)
+            result = subprocess.run([sys.executable, "-I", str(probe), str(root)],
+                                    capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(b"capture-stdout-safe", result.stdout)
+        self.assertIn(b"capture-stderr-safe", result.stderr)
+        self.assertNotIn(b"\x00", result.stdout + result.stderr)

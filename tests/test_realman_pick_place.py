@@ -52,6 +52,10 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertIn("Y 正方向向照片下方（正值），负方向向上方（负值）", schema["properties"]["dy_mm"]["description"])
         self.assertEqual(schema["required"], ["action"])
         self.assertNotIn("x-completion", schema)
+        self.assertTrue(schema["x-is-dangerous"])
+        self.assertEqual(schema["x-resource"], "arm")
+        self.assertEqual(schema["x-hooks"]["on_interrupt_motion"], {"action": "cancel"})
+        self.assertEqual(schema["x-hooks"]["on_interrupt_all"], {"action": "cancel"})
 
     def test_each_mcp_action_exposes_observation_lifecycle(self):
         card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "pick_place")
@@ -231,9 +235,17 @@ class ObserveTests(unittest.TestCase):
         from http.server import ThreadingHTTPServer
         import json
         import threading
+        import time
         import urllib.request
         from common.vendor_runtime import make_handler
 
+        def delayed_snapshot(after, cancel, check):
+            # A synchronous call longer than the ACP guide's three-second
+            # threshold still returns the terminal result in this HTTP response.
+            time.sleep(3.1)
+            return self.snapshot(after, cancel, check)
+
+        self.camera.snapshot.side_effect = delayed_snapshot
         bundle = DriverBundle([self.plugin])
         server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(lambda: bundle, "test", "test"))
         worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -244,10 +256,13 @@ class ObserveTests(unittest.TestCase):
             request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/mcp",
                                              data=json.dumps(body).encode(),
                                              headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(request, timeout=5) as response:
+            started = time.monotonic()
+            with urllib.request.urlopen(request, timeout=10) as response:
                 rpc = json.load(response)
+            self.assertGreaterEqual(time.monotonic() - started, 3)
             result = json.loads(rpc["result"]["content"][0]["text"])
             self.assertEqual(result["state"], "completed", result)
+            self.assertNotIn("action_id", result)
             self.assertTrue(Path(result["result"]["file_path"]).exists())
             self.assertIsNone(self.plugin._active)
             self.camera.stop.assert_called_once()
