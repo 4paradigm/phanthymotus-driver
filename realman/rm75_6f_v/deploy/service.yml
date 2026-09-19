@@ -16,6 +16,7 @@ realman-rm75-6f-v:
   extra_hosts:
     - "${RM75_AGENT_CORE_HOSTNAME:-phanthy-motus}:${RM75_AGENT_CORE_ADDRESS:-127.0.0.1}"
   volumes:
+    - /opt/phanthy-motus/data/pick_place/realman:/opt/phanthy-motus/data/pick_place/realman
     - /opt/phanthy-motus/data/vision_capture/realman:/opt/phanthy-motus/data/vision_capture/realman
     - /dev:/dev:ro
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
