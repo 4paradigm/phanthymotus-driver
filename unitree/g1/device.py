@@ -86,7 +86,16 @@ def _get_local_ip() -> str:
         s.connect(("192.168.123.1", 1))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        # Only accept an address actually on the robot's own link. The routing
+        # table will happily answer with the office-LAN address when there is no
+        # 192.168.123.x route, and binding the multicast join to that interface
+        # means never receiving the mic stream at all — a confident wrong answer.
+        #
+        # Returning "" falls back to INADDR_ANY and lets the kernel choose, which
+        # is what this function did for its entire life while the typo made this
+        # branch unreachable. Keeping that behaviour for the non-robot case means
+        # fixing the typo cannot make anything worse than it already was.
+        return ip if ip.startswith("192.168.123.") else ""
     except Exception:
         return ""
 
@@ -255,13 +264,25 @@ class MicPlugin:
 
         Counted rather than prevented — this node cannot stop another process —
         but an `error` state with a reason beats inferring it from garbled text.
+
+        **Counted by number, not by name.** The first version of this excluded
+        our own publisher with `node_name != self._node.get_name()`, which is
+        wrong in precisely the case it was written for: the rival is a second
+        copy of this same driver, so its node is *also* called `g1_mic` and the
+        filter removed it too — the guard could never fire. Node names are not
+        unique in ROS 2; only GIDs are. We publish exactly one endpoint on this
+        topic, so anything beyond the first is somebody else, whatever it calls
+        itself.
+
+        `max(0, ...)` because our own publisher may not have reached the graph
+        yet. Under-counting there is the safe direction: a missed warning costs
+        an investigation, a false one costs a robot that refuses to start.
         """
         try:
             infos = self._node.get_publishers_info_by_topic(self._topic)
         except Exception:
             return 0            # older rclpy, or the graph is not up yet
-        mine = self._node.get_name()
-        return sum(1 for i in infos if getattr(i, 'node_name', '') != mine)
+        return max(0, len(infos) - 1)
 
     def _self_check(self) -> tuple[str, str]:
         """Verify mic pipeline: multicast receiving + ROS2 topic subscribable.
@@ -271,15 +292,24 @@ class MicPlugin:
         Check 2: ROS2 topic receivable from a subprocess (avoids same-process
                  FastDDS intra-participant matching issues).
         """
+        import time as _t
+
         rivals = self._rival_publishers()
+        if rivals:
+            # Confirm before refusing. The DDS graph does not drop an endpoint
+            # the instant its process dies, so right after someone stops the
+            # duplicate container the discovery data still lists it — and
+            # refusing then would turn the *fix* into what looks like a new
+            # fault. A second look a moment later costs one second on a path
+            # that already waits up to three for multicast.
+            _t.sleep(1.0)
+            rivals = self._rival_publishers()
         if rivals:
             self._node.state = "error"
             return "error", (
                 f"{self._topic} 上还有另外 {rivals} 个发布者 —— 音频会被两路交错"
                 f"切分破坏，ASR 表现为文字重复、漏字。通常是同一台机器上多跑了一份"
                 f"驱动容器（compose 只管 embodied-unitree-g1），请停掉多余的那个。")
-
-        import time as _t
 
         # Check 1: multicast receiving
         if self._node._packet_count == 0:

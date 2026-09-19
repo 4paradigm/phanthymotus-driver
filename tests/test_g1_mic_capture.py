@@ -32,6 +32,20 @@ ROOT = Path(__file__).resolve().parents[1]
 G1_DEVICE = ROOT / "unitree" / "g1" / "device.py"
 
 
+def _code(name: str, cls: str = "") -> str:
+    """A function's executable body, docstring stripped.
+
+    Asserting against `ast.unparse` alone matches the docstring too, and these
+    docstrings explain the bug being fixed — so a test looking for the old,
+    wrong code kept finding it in the paragraph describing why it was wrong.
+    """
+    fn = _func(name, cls)
+    body = fn.body[1:] if (fn.body and isinstance(fn.body[0], ast.Expr)
+                           and isinstance(fn.body[0].value, ast.Constant)
+                           and isinstance(fn.body[0].value.value, str)) else fn.body
+    return "\n".join(ast.unparse(n) for n in body)
+
+
 def _func(name: str, cls: str = "") -> ast.FunctionDef:
     """Pull one function out of device.py without importing it.
 
@@ -173,6 +187,29 @@ class RivalPublisherTests(unittest.TestCase):
         self.assertIn("embodied-unitree-g1", check)
         self.assertIn("重复", check)
 
+    def test_it_counts_by_number_not_by_node_name(self):
+        """对手是本驱动的第二份拷贝，节点名**也叫** g1_mic。
+
+        第一版用 `node_name != self._node.get_name()` 排除自己，恰好在它要防的那个场景里
+        把对手也排除掉 —— 护栏永远不会触发。ROS 2 的节点名不唯一，只有 GID 唯一；
+        而我们在这个 topic 上只有一个发布端点，所以「第一个之外的都是别人」。
+        """
+        body = _code("_rival_publishers", "MicPlugin")
+        self.assertNotIn("get_name()", body, "按名字排除自己会漏掉同名的对手")
+        self.assertIn("len(infos) - 1", body)
+        self.assertIn("max(0", body, "自己的发布者还没进图时不能算出负数")
+
+    def test_a_stale_graph_entry_does_not_refuse_outright(self):
+        """DDS 的图不会在进程死的瞬间就把端点摘掉。
+
+        刚停掉重复容器之后立刻启动，图里可能还留着它 —— 这时拒绝，会把**修复动作**
+        变成看起来像新故障。复核一次再决定。
+        """
+        check = _code("_self_check", "MicPlugin")
+        self.assertEqual(check.count("_rival_publishers()"), 2,
+                         "必须复核一次，不能一次就判死")
+        self.assertIn("_t.sleep", check)
+
     def test_counting_never_raises(self):
         """诊断不该成为压垮启动的那件事 —— 图还没起来时 rclpy 会抛。"""
         body = _func("_rival_publishers", "MicPlugin")
@@ -185,9 +222,20 @@ class LocalIpFallbackTests(unittest.TestCase):
         返回 "" 之后组播加入退化成 INADDR_ANY，由路由表决定走哪个网卡。"""
         # Assert on the AST, not the raw text: the comment explaining the bug
         # names the broken constant, and matching that would defeat the check.
-        body = ast.unparse(_func("_get_local_ip"))
+        body = _code("_get_local_ip")
         self.assertNotIn("socket.AF_DGRAM", body)
         self.assertIn("socket.AF_INET, socket.SOCK_DGRAM", body)
+
+    def test_the_fallback_only_accepts_the_robot_link(self):
+        """修好笔误之后，这条路径第一次真的会返回东西 —— 得保证返回对的东西。
+
+        没有 192.168.123.x 路由时，路由表会爽快地给出办公室网段的地址，拿它去 join
+        组播等于永远收不到麦克风流。返回 "" 退回 INADDR_ANY，正是这个笔误存在期间
+        一直在用的行为，所以修笔误不会让任何情况变得更糟。
+        """
+        body = _code("_get_local_ip")
+        self.assertIn("192.168.123.", body)
+        self.assertIn("startswith", body)
 
     def test_the_fallback_actually_returns_an_address(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
