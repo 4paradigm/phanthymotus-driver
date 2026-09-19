@@ -40,7 +40,7 @@ class PickPlaceConfigTests(unittest.TestCase):
         expected = {
             "speed_percent": 50, "observation_joints_deg": "-90,0,0,90,0,90,0",
             "x_compensation_mm": 30, "y_compensation_mm": -75,
-            "pick_descent_mm": 91, "pick_grip_force": 10, "place_descent_mm": 87,
+            "pick_descent_mm": 91, "pick_grip_force": 15, "place_descent_mm": 60,
         }
         self.assertEqual({key: prop["default"] for key, prop in card["configSchema"]["properties"].items()}, expected)
         self.assertEqual(self.configure(), {"ok": True, **expected})
@@ -92,7 +92,7 @@ class PickPlaceConfigTests(unittest.TestCase):
     def test_partial_updates_and_invalid_updates_are_atomic(self):
         configured = self.configure(speed_percent=25, x_compensation_mm=-1.5)
         self.assertTrue(configured["ok"])
-        self.assertEqual(configured["pick_grip_force"], 10)
+        self.assertEqual(configured["pick_grip_force"], 15)
         for invalid in (
             {"speed_percent": 0}, {"speed_percent": 101}, {"speed_percent": 1.5},
             {"speed_percent": True}, {"pick_grip_force": -1}, {"pick_grip_force": 101},
