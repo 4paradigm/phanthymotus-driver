@@ -4,13 +4,18 @@ The same file is *run* by the `sim_scenario` card on a rig and *replayed* by
 pytest under a fake clock. One definition, two runners, one `assertions.py` —
 otherwise the CI green and the rig green stop meaning the same thing.
 
-## The map is rectangles in YAML, not a generated blob
+## 地图有两种来源，场景两种都能引用
 
-`map.walls` is a list of `[x0, y0, x1, y1]` rectangles rasterised at load time.
-A binary occupancy grid committed to the repo would be undiffable, unreviewable
-and impossible to tweak without a tool; a list of walls can be read, changed in a
-PR, and argued about. `OccupancyGrid.from_dict` still exists for maps captured
-off a real robot.
+    map: {bounds: [...], walls: [[...]]}   # 合成的：几个矩形，能读、能在 PR 里改
+    map: bj-2f                              # 抓来的：从 maps/ 目录解析成资产
+
+合成地图写成矩形是对的 —— 一串矩形能读、能改、能争论，committed 的二进制栅格不能。
+但抓来的地图不成立：北京 2F 是 1543×2198 的真实栅格，没有任何一组矩形描述得了。
+所以两种都支持，各用在该用的地方。
+
+**点位跟着地图走，不跟着场景走。** 真机上 POI 就是按地图存的（`poi` 表以
+`(name, map_name)` 为键）。场景不写 `pois` 时用地图自带的那套；写了则以场景为准，
+这样同一张地图可以有「完整导览」「只看南区」好几个场景而不必复制点位。
 """
 
 from __future__ import annotations
@@ -103,7 +108,22 @@ class Scenario:
 
     # ---- derived -------------------------------------------------------
 
+    def bind_map(self, asset) -> None:
+        """由场景卡在 load 时注入 —— 只有它知道去哪些目录找地图。"""
+        self._map_asset = asset
+
+    @property
+    def map_name(self) -> str:
+        return self.map_spec if isinstance(self.map_spec, str) else ""
+
     def grid(self) -> OccupancyGrid:
+        asset = getattr(self, "_map_asset", None)
+        if asset is not None:
+            return asset.grid()
+        if isinstance(self.map_spec, str):
+            # 引用了一张地图但没绑上 —— 与其悄悄退回一张空图让导览莫名其妙地
+            # 走得通，不如直接说清楚。
+            raise ValueError(f"场景引用了地图 {self.map_spec!r}，但没有加载到")
         spec = self.map_spec or {}
         resolution = float(spec.get("resolution", 0.05))
         x0, y0, x1, y1 = [float(v) for v in spec.get("bounds", [-5.0, -5.0, 5.0, 5.0])]
@@ -129,39 +149,48 @@ class Scenario:
         }
 
     def waypoints(self) -> list[dict]:
-        return [dict(poi) for poi in self.pois]
+        if self.pois:
+            return [dict(poi) for poi in self.pois]
+        asset = getattr(self, "_map_asset", None)
+        return [dict(poi) for poi in (asset.pois if asset else [])]
 
     def waypoint(self, name: str) -> dict | None:
-        return next((dict(poi) for poi in self.pois if poi.get("name") == name), None)
+        return next((poi for poi in self.waypoints() if poi.get("name") == name), None)
 
     def validate(self) -> list[str]:
         """Warnings, not errors — chiefly: which waypoint pairs are unreachable.
 
-        `LocalBackend` drives straight at the target; there is **no path
-        planner**, while the real Slamtec chassis has one. So a map with an
-        obstacle between two waypoints produces a leg that fails against
-        geometry, and the tour looks broken for a reason that has nothing to do
-        with the orchestration being tested.
-
-        Rather than hide that, `do_load` reports it. A scenario that needs a
-        route around something is a scenario this backend cannot run yet — which
-        is one of the things a Stage 1 collision/planning backend would fix.
+        判据是「**规划得出来吗**」，不是「直线通不通」。早先没有规划器时用的是
+        后者，而真地图一上来就否掉了它：北京 2F 的 P3→P15 十二段里有五段直线穿墙，
+        展厅里本来就有展墙。现在有了 A*，该报的是真正到不了的点 —— 比如被墙围死、
+        或落在未探索区之外的点位。
         """
+        from simulator.generic.backend.planner import GridPlanner
+
         warnings: list[str] = []
         grid = self.grid()
         radius = float((self.motion or {}).get("radius", 0.25))
+        planner = GridPlanner(grid, radius)
         spawn = self.spawn or {}
         points = [("起点", float(spawn.get("x", 0.0)), float(spawn.get("y", 0.0)))]
-        points += [(poi.get("name", "?"), float(poi["x"]), float(poi["y"])) for poi in self.pois]
+        points += [(poi.get("name", "?"), float(poi["x"]), float(poi["y"]))
+                   for poi in self.waypoints()]
 
         for name, x, y in points[1:]:
             if grid.is_occupied(x, y):
                 warnings.append(f"航点 {name} 落在障碍物里")
-        for i, (name_a, ax, ay) in enumerate(points):
-            for name_b, bx, by in points[i + 1:]:
-                if grid.segment_blocked(ax, ay, bx, by, radius):
-                    warnings.append(
-                        f"{name_a} → {name_b} 直线不通；本后端不做路径规划，若导览用到这一段会撞墙")
+        # 只查导览真的会走的那些段。全连通检查在一张 14 个点的真实地图上要 91 次
+        # 规划，而其中绝大多数段这趟导览根本不走。
+        order = list((self.expect or {}).get("waypoint_order") or [])
+        legs = list(zip(order, order[1:])) if order else []
+        if order:
+            legs.insert(0, (points[0][0], order[0]))
+        by_name = {n: (x, y) for n, x, y in points}
+        for a, b in legs:
+            if a not in by_name or b not in by_name:
+                continue
+            if planner.plan(by_name[a], by_name[b]) is None:
+                warnings.append(f"{a} → {b} 规划不出路径；这一段导览走不通")
         return warnings
 
     def summary(self) -> dict:

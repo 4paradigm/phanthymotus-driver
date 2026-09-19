@@ -31,11 +31,13 @@ from pathlib import Path
 
 from simulator.generic import acp, assertions
 from simulator.generic.card_base import Card
+from simulator.generic.maps import discover as discover_maps
 from simulator.generic.scenario import Scenario, discover
 from simulator.generic.suite import SuiteRunner
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_SCENARIO_DIRS = (BUNDLE_DIR / "scenarios", BUNDLE_DIR / "scenarios" / "user")
+DEFAULT_MAP_DIRS = (BUNDLE_DIR / "maps", BUNDLE_DIR / "maps" / "user")
 
 
 class SimScenarioCard(Card):
@@ -57,6 +59,7 @@ class SimScenarioCard(Card):
         "abort": ([], "停止计时，保留事件记录"),
         "reset": ([], "回到场景初始状态并清空记录"),
         "note": (["text"], "往事件记录里写一条备注；打断钩子绑在这里"),
+        "list_maps": ([], "列出可用地图（扫描目录，新增地图无需重建镜像）"),
         "run_suite": (["scenarios", "repeats", "seed"],
                       "按顺序跑一批场景并逐个评分；立即返回，进度用 sim_report 轮询"),
         "abort_suite": ([], "中止正在跑的批次，保留已完成的结果"),
@@ -73,9 +76,10 @@ class SimScenarioCard(Card):
     }
     CONFIG_SCHEMA = {}
 
-    def __init__(self, world, config, namespace, ros2=None, scenario_dirs=None):
+    def __init__(self, world, config, namespace, ros2=None, scenario_dirs=None, map_dirs=None):
         super().__init__(world, config, namespace, ros2)
         self._dirs = [Path(d) for d in (scenario_dirs or DEFAULT_SCENARIO_DIRS)]
+        self._map_dirs = [Path(d) for d in (map_dirs or DEFAULT_MAP_DIRS)]
         self._scenarios: dict[str, Scenario] = {}
         self._active: Scenario | None = None
         self._t0: float | None = None
@@ -94,6 +98,10 @@ class SimScenarioCard(Card):
     def refresh(self) -> dict[str, Scenario]:
         self._scenarios = discover(*self._dirs)
         return self._scenarios
+
+    def maps(self) -> dict:
+        """每次调用重扫 —— 丢一份地图进 bind-mount 的目录，刷新画布就能选到。"""
+        return discover_maps(*self._map_dirs)
 
     def config_schema(self) -> dict:
         """Built at call time from the scenario directory, so dropping a YAML
@@ -155,6 +163,13 @@ class SimScenarioCard(Card):
         chosen = scenarios.get(scenario) or (self._active if not scenario else None)
         if chosen is None:
             return {"error": f"unknown scenario: {scenario}", "available": sorted(scenarios)}
+        # 场景引用地图名时，在这里解析并绑上 —— 只有这张卡知道去哪些目录找。
+        if chosen.map_name:
+            asset = self.maps().get(chosen.map_name)
+            if asset is None:
+                return {"error": f"场景 {chosen.slug} 引用的地图 {chosen.map_name} 找不到",
+                        "available_maps": sorted(self.maps())}
+            chosen.bind_map(asset)
         self._active = chosen
         self._t0 = None
         self._fired = set()
@@ -216,6 +231,10 @@ class SimScenarioCard(Card):
 
     def do_abort_suite(self, **_):
         return {"state": "idle", "suite": self.suite.abort()}
+
+    def do_list_maps(self, **_):
+        return {"state": "running" if self._running else "idle",
+                "maps": [m.summary() for m in sorted(self.maps().values(), key=lambda a: a.name)]}
 
     def do_read(self, **_):
         return self.payload()

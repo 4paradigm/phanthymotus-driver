@@ -172,6 +172,21 @@ class OccupancyGrid:
                     return True
         return False
 
+    def swept_blocked(self, x0: float, y0: float, x1: float, y1: float,
+                      radius: float, lead: float | None = None) -> bool:
+        """机器人从 (x0,y0) 扫到 (x1,y1) 会不会碰到东西。
+
+        **规划和积分必须问同一个问题。** 先前规划只按车宽判，积分器却还向前多伸
+        一个车身半径；于是规划认为拉直后能走的路径，跑起来中途撞墙 —— 十三站里
+        七站如此。两套定义就是这个 bug 本身，所以现在只有这一个。
+        """
+        lead = self.resolution if lead is None else lead
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length > 1e-9 and lead:
+            x1 = x1 + (x1 - x0) / length * lead
+            y1 = y1 + (y1 - y0) / length * lead
+        return self.segment_blocked(x0, y0, x1, y1, radius)
+
     def raycast(self, x: float, y: float, theta: float, max_range: float) -> float:
         """Distance to the first occupied cell, or ``max_range`` if none."""
         step = self.resolution * 0.5
