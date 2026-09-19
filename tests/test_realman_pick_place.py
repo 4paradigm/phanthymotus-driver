@@ -9,6 +9,22 @@ from common.vendor_runtime import DriverBundle
 sys.path.insert(0, str(DRIVER))
 
 
+def wait_for_completion(plugin, response):
+    """Wait only in offline tests; production completion is delivered through ACP."""
+    import threading
+    import time
+    if response["state"] != "running":
+        return response
+    deadline = time.perf_counter() + 6
+    while time.perf_counter() < deadline:
+        terminal = plugin.dispatch("info", {})["last_result"]
+        if (terminal and terminal["action_id"] == response["action_id"]
+                and terminal["callback"] != "pending"):
+            return terminal
+        threading.Event().wait(.005)
+    raise AssertionError(f"No completion for {response!r}")
+
+
 class PickPlaceConfigTests(unittest.TestCase):
     def setUp(self):
         device = load_device()
@@ -29,14 +45,14 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertEqual({key: prop["default"] for key, prop in card["configSchema"]["properties"].items()}, expected)
         self.assertEqual(self.configure(), {"ok": True, **expected})
 
-    def test_observe_has_no_parameters_or_asynchronous_completion_contract(self):
+    def test_motion_actions_declare_confirmation_and_acp_completion(self):
         card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "pick_place")
         schema = card["inputSchema"]
         self.assertEqual(set(schema["properties"]["action"]["enum"]), {"observe", "transfer_to", "transfer_by", "cancel"})
-        self.assertEqual(set(schema["properties"]), {"action", "x1", "y1", "x2", "y2", "dx_mm", "dy_mm"})
-        self.assertEqual(schema["x-action-params"]["observe"]["params"], [])
-        self.assertEqual(schema["x-action-params"]["transfer_to"]["params"], ["x1", "y1", "x2", "y2"])
-        self.assertEqual(schema["x-action-params"]["transfer_by"]["params"], ["x1", "y1", "dx_mm", "dy_mm"])
+        self.assertEqual(set(schema["properties"]), {"action", "x1", "y1", "x2", "y2", "dx_mm", "dy_mm", "confirm_motion"})
+        self.assertEqual(schema["x-action-params"]["observe"]["params"], ["confirm_motion"])
+        self.assertEqual(schema["x-action-params"]["transfer_to"]["params"], ["x1", "y1", "x2", "y2", "confirm_motion"])
+        self.assertEqual(schema["x-action-params"]["transfer_by"]["params"], ["x1", "y1", "dx_mm", "dy_mm", "confirm_motion"])
         for name in ("x1", "y1", "x2", "y2"):
             prop = schema["properties"][name]
             self.assertEqual((prop["type"], prop["minimum"], prop["maximum"]), ("number", -1, 1))
@@ -51,7 +67,13 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertIn("X 正方向向右（正值），负方向向左（负值）", schema["properties"]["dx_mm"]["description"])
         self.assertIn("Y 正方向向照片下方（正值），负方向向上方（负值）", schema["properties"]["dy_mm"]["description"])
         self.assertEqual(schema["required"], ["action"])
-        self.assertNotIn("x-completion", schema)
+        self.assertEqual(schema["x-completion"], {"actions": ["observe", "transfer_to", "transfer_by"], "timeout": 90})
+        self.assertEqual(schema["properties"]["confirm_motion"]["type"], "boolean")
+        self.assertIs(schema["properties"]["confirm_motion"]["const"], True)
+        self.assertEqual(schema["allOf"][0]["then"]["required"], ["confirm_motion"])
+        self.assertEqual(schema["allOf"][0]["if"]["properties"]["action"]["enum"],
+                         ["observe", "transfer_to", "transfer_by"])
+        self.assertEqual(schema["x-action-params"]["cancel"]["params"], [])
         self.assertTrue(schema["x-is-dangerous"])
         self.assertEqual(schema["x-resource"], "arm")
         self.assertEqual(schema["x-hooks"]["on_interrupt_motion"], {"action": "cancel"})
@@ -161,6 +183,8 @@ class ObserveTests(unittest.TestCase):
         self.plugin._ensure_publisher = mock.Mock()
         self.plugin._publish_photo = mock.Mock()
         self.copy = copy.deepcopy
+        self.completion_factory = self.enterContext(mock.patch("pick_place.Completion"))
+        self.completion_factory.return_value.send.return_value = ("accepted", None)
 
     def command(self, method, *args):
         self.commands.append((method, args))
@@ -191,7 +215,7 @@ class ObserveTests(unittest.TestCase):
                 "intrinsics": {"fx": 500}, "depth_scale_m": 0.001}
 
     def observe(self):
-        return self.plugin.dispatch("observe", {})
+        return wait_for_completion(self.plugin, self.plugin.dispatch("observe", {"confirm_motion": True}))
 
     def test_call_returns_after_one_move_and_one_photo(self):
         from pathlib import Path
@@ -201,7 +225,7 @@ class ObserveTests(unittest.TestCase):
         self.assertFalse(result["observation_required"])
         self.assertFalse(self.plugin.dispatch("info", {})["observation_required"])
         self.assertIsNone(self.plugin._active)
-        self.assertNotIn("action_id", result)
+        self.assertTrue(result["action_id"].startswith("pick_place_observe_"))
         self.assertNotIn("request_id", result)
         self.assertEqual(self.commands, [("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 50, 0, 0, 0))])
         self.camera.snapshot.assert_called_once()
@@ -230,47 +254,6 @@ class ObserveTests(unittest.TestCase):
         result = self.observe()
         self.assertEqual(result["state"], "completed", result)
         self.assertEqual(self.commands, [("rm_movej", ([-80., 1., 2., 85., 3., 80., 4.], 23, 0, 0, 0))])
-
-    def test_mcp_call_returns_completed_photo_without_extra_parameters(self):
-        from http.server import ThreadingHTTPServer
-        import json
-        import threading
-        import time
-        import urllib.request
-        from common.vendor_runtime import make_handler
-
-        def delayed_snapshot(after, cancel, check):
-            # A synchronous call longer than the ACP guide's three-second
-            # threshold still returns the terminal result in this HTTP response.
-            time.sleep(3.1)
-            return self.snapshot(after, cancel, check)
-
-        self.camera.snapshot.side_effect = delayed_snapshot
-        bundle = DriverBundle([self.plugin])
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(lambda: bundle, "test", "test"))
-        worker = threading.Thread(target=server.serve_forever, daemon=True)
-        worker.start()
-        try:
-            body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                    "params": {"name": "pick_place", "arguments": {"action": "observe"}}}
-            request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/mcp",
-                                             data=json.dumps(body).encode(),
-                                             headers={"Content-Type": "application/json"})
-            started = time.monotonic()
-            with urllib.request.urlopen(request, timeout=10) as response:
-                rpc = json.load(response)
-            self.assertGreaterEqual(time.monotonic() - started, 3)
-            result = json.loads(rpc["result"]["content"][0]["text"])
-            self.assertEqual(result["state"], "completed", result)
-            self.assertNotIn("action_id", result)
-            self.assertTrue(Path(result["result"]["file_path"]).exists())
-            self.assertIsNone(self.plugin._active)
-            self.camera.stop.assert_called_once()
-            self.plugin._publish_photo.assert_called_once()
-        finally:
-            server.shutdown()
-            worker.join(timeout=2)
-            server.server_close()
 
     def test_activation_and_info_do_not_capture_or_move(self):
         self.plugin.start()
@@ -316,7 +299,7 @@ class ObserveTests(unittest.TestCase):
         self.assertIsNone(self.plugin._observation)
         self.assertTrue(self.plugin.dispatch("info", {})["observation_required"])
 
-    def test_synchronous_timeout_stops_motion_and_returns_error(self):
+    def test_worker_timeout_stops_motion_and_reports_error(self):
         import time
         from unittest import mock
 

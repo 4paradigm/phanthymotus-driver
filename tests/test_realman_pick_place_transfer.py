@@ -95,10 +95,12 @@ class TransferTests(unittest.TestCase):
         self.after_command(method, args)
 
     def transfer(self, **updates):
-        return self.plugin.dispatch("transfer_to", {"x1": -.5, "y1": -1/3, "x2": .5, "y2": 1/3, **updates})
+        return fixtures.wait_for_completion(self.plugin, self.plugin.dispatch("transfer_to", {
+            "confirm_motion": True, "x1": -.5, "y1": -1/3, "x2": .5, "y2": 1/3, **updates}))
 
     def transfer_by(self, **updates):
-        return self.plugin.dispatch("transfer_by", {"x1": -.5, "y1": -1/3, "dx_mm": -30, "dy_mm": 0, **updates})
+        return fixtures.wait_for_completion(self.plugin, self.plugin.dispatch("transfer_by", {
+            "confirm_motion": True, "x1": -.5, "y1": -1/3, "dx_mm": -30, "dy_mm": 0, **updates}))
 
     def moves(self):
         return [args[0] for method, args in self.commands if method == "rm_movel"]
@@ -236,7 +238,7 @@ class TransferTests(unittest.TestCase):
                 self.assertEqual(self.transfer_by(**args)["state"], "error")
                 self.assertEqual(self.commands, [])
                 self.assertIsNotNone(self.plugin._observation)
-        self.assertEqual(self.plugin.dispatch("transfer_by", {"x1": 0, "y1": 0, "dx_mm": 30})["state"], "error")
+        self.assertEqual(self.plugin.dispatch("transfer_by", {"confirm_motion": True, "x1": 0, "y1": 0, "dx_mm": 30})["state"], "error")
         self.depth[1, 1] = 0
         self.make_photo()
         self.assertIn("no valid depth", self.transfer_by()["result"]["message"])
@@ -271,46 +273,12 @@ class TransferTests(unittest.TestCase):
         for transfer in (self.transfer, self.transfer_by):
             self.assertEqual(transfer()["code"], "OBSERVATION_REQUIRED")
 
-    def test_mcp_transfer_by_returns_completed_with_four_parameters(self):
-        from http.server import ThreadingHTTPServer
-        import threading
-        import urllib.request
-        from common.vendor_runtime import DriverBundle, make_handler
-
-        bundle = DriverBundle([self.plugin])
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(lambda: bundle, "test", "test"))
-        worker = threading.Thread(target=server.serve_forever, daemon=True)
-        worker.start()
-        try:
-            body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
-                "name": "pick_place", "arguments": {"action": "transfer_by", "x1": -.5, "y1": -1/3, "dx_mm": -30, "dy_mm": 0}}}
-            request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/mcp",
-                                             data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(request, timeout=5) as response:
-                rpc = json.load(response)
-            result = json.loads(rpc["result"]["content"][0]["text"])
-            self.assertEqual(result["state"], "completed", result)
-            self.assertEqual(result["result"]["pick_pixel"], [1, 1])
-            self.assertTrue(result["observation_required"])
-            self.assertIsNone(self.plugin._active)
-            self.assertEqual(len(self.moves()), 6)
-            self.plugin._publish_photo.assert_not_called()
-            with urllib.request.urlopen(request, timeout=5) as response:
-                repeated = json.loads(json.load(response)["result"]["content"][0]["text"])
-            self.assertEqual(repeated["code"], "OBSERVATION_REQUIRED")
-            self.assertTrue(repeated["observation_required"])
-            self.assertEqual(len(self.moves()), 6)
-        finally:
-            server.shutdown()
-            worker.join(timeout=2)
-            server.server_close()
-
     def test_observe_then_transfer_uses_one_photo_and_no_other_cards(self):
         def snapshot(after, cancel, check):
             check()
             return {**self.photo_data, "captured_at": after + .01}
         self.camera.snapshot.side_effect = snapshot
-        observed = self.plugin.dispatch("observe", {})
+        observed = fixtures.ObserveTests.observe(self)
         self.assertEqual(observed["state"], "completed", observed)
         result = self.transfer()
         self.assertEqual(result["state"], "completed", result)
@@ -329,7 +297,7 @@ class TransferTests(unittest.TestCase):
             check()
             return {**self.photo_data, "captured_at": after + .01}
         self.camera.snapshot.side_effect = snapshot
-        observed = self.plugin.dispatch("observe", {})
+        observed = fixtures.ObserveTests.observe(self)
         self.assertEqual(observed["state"], "completed", observed)
         self.assertFalse(observed["observation_required"])
         self.assertNotEqual(observed["result"]["observation_id"], previous_id)
@@ -414,7 +382,7 @@ class TransferTests(unittest.TestCase):
                 np.testing.assert_allclose(np.subtract(data["place_base_xy_mm"], data["pick_base_xy_mm"]), delta, atol=1e-10)
 
     def test_missing_arguments_and_missing_observation_do_not_move(self):
-        self.assertEqual(self.plugin.dispatch("transfer_to", {})["state"], "error")
+        self.assertEqual(self.plugin.dispatch("transfer_to", {"confirm_motion": True})["state"], "error")
         self.plugin._observation = None
         self.assertIn("Run observe", self.transfer()["message"])
         self.assertEqual(self.commands, [])
@@ -508,7 +476,7 @@ class TransferTests(unittest.TestCase):
             if method == "rm_movel" and not checked:
                 checked.append(True)
                 self.assertEqual(self.transfer()["state"], "error")
-                self.assertEqual(self.plugin.dispatch("observe", {})["state"], "error")
+                self.assertEqual(self.plugin.dispatch("observe", {"confirm_motion": True})["state"], "error")
                 self.assertEqual(self.plugin.dispatch("config", {"speed_percent": 1})["code"], "ACTION_IN_PROGRESS")
         self.after_command = check
         self.assertEqual(self.transfer()["state"], "completed")
