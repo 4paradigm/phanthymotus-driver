@@ -42,7 +42,7 @@ CONFIG_PROPERTIES = {
         "description": "基坐标 Y 补偿（mm），加到照片计算出的绝对水平目标，可为负数。",
     },
     "pick_grip_force": {
-        "type": "integer", "minimum": 0, "maximum": 100, "default": 10,
+        "type": "integer", "minimum": 0, "maximum": 100, "default": 15,
         "description": "抓取时的夹持力度，设备原始整数 0～100，非牛顿值。",
     },
     "pick_descent_mm": {
@@ -50,7 +50,7 @@ CONFIG_PROPERTIES = {
         "description": "抓取时从当前位置向下移动的距离（mm）。",
     },
     "place_descent_mm": {
-        "type": "number", "exclusiveMinimum": 0, "default": 87,
+        "type": "number", "exclusiveMinimum": 0, "default": 60,
         "description": "放置时从当前位置向下移动的距离（mm）。",
     },
 }

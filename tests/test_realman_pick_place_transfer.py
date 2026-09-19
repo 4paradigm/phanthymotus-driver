@@ -137,12 +137,12 @@ class TransferTests(unittest.TestCase):
         self.assertIn("Run observe", self.transfer()["message"])
         self.assertEqual(len(self.commands), count)
 
-    def test_default_descent_is_directly_91_and_87_mm(self):
+    def test_default_descent_is_directly_91_and_60_mm(self):
         result = self.transfer()
         self.assertEqual(result["state"], "completed", result)
-        np.testing.assert_allclose(np.array(self.moves())[:, 2], [.3, .209, .3, .3, .213, .3])
+        np.testing.assert_allclose(np.array(self.moves())[:, 2], [.3, .209, .3, .3, .24, .3])
         self.assertTrue(all(args[1] == 50 for name, args in self.commands if name == "rm_movel"))
-        self.assertIn(("rm_set_rm_plus_reg", (1220, 1, [10])), self.commands)
+        self.assertIn(("rm_set_rm_plus_reg", (1220, 1, [15])), self.commands)
 
     def test_one_photo_cannot_be_reused_by_either_transfer_action(self):
         for first in (self.transfer, self.transfer_by):
@@ -255,7 +255,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(result["state"], "completed", result)
         bases = np.array([work_rotation @ pose[:3] + self.frame["pose"][:3] for pose in self.moves()])
         np.testing.assert_allclose(bases[3] - bases[0], [.03, .02, 0], atol=1e-12)
-        np.testing.assert_allclose(bases[:, 2] - bases[0, 2], [0, -.091, 0, 0, -.087, 0], atol=1e-12)
+        np.testing.assert_allclose(bases[:, 2] - bases[0, 2], [0, -.091, 0, 0, -.060, 0], atol=1e-12)
 
     def test_transfer_by_uses_shared_cancellation_and_consumes_photo(self):
         def cancel(method, args):
@@ -320,7 +320,7 @@ class TransferTests(unittest.TestCase):
         result = self.transfer()
         self.assertEqual(result["state"], "completed", result)
         bases = np.array([work_rotation @ pose[:3] + self.frame["pose"][:3] for pose in self.moves()])
-        np.testing.assert_allclose(bases[:, 2], origin[2] + np.array([0, -.091, 0, 0, -.087, 0]))
+        np.testing.assert_allclose(bases[:, 2], origin[2] + np.array([0, -.091, 0, 0, -.060, 0]))
         np.testing.assert_allclose(bases[:3, :2], [origin[:2] + [.03, -.075]] * 3)
         np.testing.assert_allclose(bases[3:, :2], [origin[:2] + [-.07, -.05]] * 3)
 
