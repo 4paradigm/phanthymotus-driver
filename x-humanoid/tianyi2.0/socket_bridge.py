@@ -177,6 +177,9 @@ class SubscriptionHandler:
         self.msg_count = 0
         self.failed = False
         self._send_lock = threading.Lock()
+        # Starts at 0 so the first forwarded message always prints; after that
+        # PROGRESS_INTERVAL_S governs. Same contract as TopicHandler.
+        self._last_progress_ts = 0.0
 
         name = f"bridge_in_{topic.strip('/').replace('/', '_')}_{id(conn) & 0xffff:x}"
         self.node = Node(name, context=ctx)
@@ -196,7 +199,18 @@ class SubscriptionHandler:
                 self.conn.sendall(struct.pack("<I", len(data)))
                 self.conn.sendall(data)
             self.msg_count += 1
-            if self.msg_count % 500 == 0:
+            # On a clock, not a message count — the same reasoning as the
+            # outbound direction, which was changed first and left this one
+            # behind. A count-based trigger is loudest on the fastest topics,
+            # which are exactly the ones needing the least commentary, and
+            # nearly silent on slow ones where a stall would matter most.
+            #
+            # Inbound topics happen to be low-rate today, so this is not what is
+            # flooding the log. It is the same latent bug all the same: the day
+            # something high-rate is wired inbound, it floods.
+            now = time.monotonic()
+            if self.msg_count == 1 or now - self._last_progress_ts >= PROGRESS_INTERVAL_S:
+                self._last_progress_ts = now
                 print(f"[socket-bridge] {self.topic}: forwarded {self.msg_count} "
                       f"messages inbound", flush=True)
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
