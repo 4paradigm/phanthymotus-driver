@@ -92,10 +92,25 @@ class PickPlaceHTTPTests(unittest.TestCase):
         self.assertEqual(accepted["state"], "running", accepted)
         return observation.wait_for_completion(self.plugin, accepted)
 
+    def test_disabled_follow_up_reports_skipped_observation_in_one_acp_completion(self):
+        self.assertTrue(self.call("config", observe_after_transfer=False)["ok"])
+        self.fixture.make_photo()
+        result = self.completed(self.call("transfer_by", confirm_motion=True,
+                                         x1=-.5, y1=-1/3, dx_mm=30, dy_mm=0))
+        self.assertEqual(result["state"], "completed", result)
+        self.assertEqual(len(self.received), 1)
+        payload = self.received[0][1]
+        self.assertEqual(payload["action_id"], result["action_id"])
+        self.assertEqual(payload["result"]["observation"], {"skipped": True, "reason": "disabled"})
+        self.assertTrue(payload["result"]["observation_required"])
+        self.assertTrue(payload["result"]["release_completed"])
+        self.assertFalse(payload["result"]["holding_object_possible"])
+        self.fixture.camera.snapshot.assert_not_called()
+
     def test_tools_list_exposes_confirmation_completion_and_interrupt_contract(self):
         schema = self.rpc("tools/list")["result"]["tools"][0]["inputSchema"]
         self.assertEqual(schema["x-completion"], {
-            "actions": ["observe", "transfer_to", "transfer_by"], "timeout": 90})
+            "actions": ["observe", "transfer_to", "transfer_by"], "timeout": 210})
         for action in schema["x-completion"]["actions"]:
             self.assertIn("confirm_motion", schema["x-action-params"][action]["params"])
             self.assertIn("confirm_motion=true", schema["x-action-params"][action]["description"])
@@ -119,7 +134,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
                     self.assertNotIn("action_id", result)
         self.assertIs(self.plugin._observation, photo)
         self.assertEqual(self.fixture.commands, [])
-        self.fixture.pool.select.assert_not_called()
+        self.fixture.camera.snapshot.assert_not_called()
         self.fixture.completion_factory.assert_not_called()
         self.assertEqual(self.received, [])
         self.assertFalse(self.fixture.client.motion_lock.locked())
@@ -152,8 +167,8 @@ class PickPlaceHTTPTests(unittest.TestCase):
         self.assertTrue(completion["result"]["ok"])
         self.assertFalse(completion["result"]["observation_required"])
         self.assertTrue(Path(completion["result"]["file_path"]).exists())
-        self.fixture.camera.stop.assert_called_once()
-        self.fixture.plugin._publish_photo.assert_called_once()
+        self.fixture.camera.stop.assert_not_called()
+        self.assertIn("objects", completion["result"])
         self.assertFalse(self.fixture.client.motion_lock.locked())
         # A prior confirmation never authorizes a later call.
         self.assertEqual(self.call("observe")["code"], "CONFIRMATION_REQUIRED")
@@ -171,17 +186,61 @@ class PickPlaceHTTPTests(unittest.TestCase):
             self.assertEqual(payload["action_id"], accepted["action_id"])
             self.assertEqual(payload["status"], "completed")
             self.assertEqual(payload["result"]["pick_pixel"], [1, 1])
-            self.assertTrue(payload["result"]["observation_required"])
+            self.assertFalse(payload["result"]["observation_required"])
             self.assertFalse(payload["result"]["grasp_checked"])
-            count = len(self.fixture.commands)
-            self.assertEqual(self.call(action, confirm_motion=True, x1=-.5, y1=-1/3, **args)["code"],
-                             "OBSERVATION_REQUIRED")
-            self.assertEqual(len(self.fixture.commands), count)
+            self.assertTrue(payload["result"]["transfer_completed"])
+            fresh = payload["result"]["observation"]
+            self.assertTrue(fresh["ok"])
+            self.assertEqual(fresh, self.plugin._observation)
+            self.assertNotEqual(fresh["observation_id"], payload["result"]["observation_id"])
+            self.assertTrue(Path(fresh["file_path"]).exists())
+            self.assertEqual(fresh["objects"][0]["name"], "banana")
             ids.add(accepted["action_id"])
         self.assertEqual(len(ids), 2)
         self.assertEqual(len(self.received), 2)
         self.assertEqual(len(self.fixture.moves()), 12)
-        self.fixture.plugin._publish_photo.assert_not_called()
+        self.assertEqual(sum(name == "rm_movej" for name, _ in self.fixture.commands), 2)
+        self.assertIsNotNone(self.fixture.plugin._observation)
+
+    def test_transfer_waits_for_follow_up_observation_before_single_completion(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def snapshot(after, cancel, check):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release follow-up observation")
+            return self.fixture.snapshot(after, cancel, check)
+        self.fixture.camera.snapshot.side_effect = snapshot
+        accepted = self.call("transfer_by", confirm_motion=True, x1=-.5, y1=-1/3, dx_mm=30, dy_mm=0)
+        self.assertTrue(entered.wait(2))
+        self.assertEqual(len(self.fixture.moves()), 6)
+        self.assertEqual(self.received, [])
+        self.assertTrue(self.fixture.client.motion_lock.locked())
+        self.assertEqual(self.call("observe", confirm_motion=True)["state"], "error")
+        release.set()
+        terminal = self.completed(accepted)
+        self.assertEqual(terminal["state"], "completed", terminal)
+        self.assertEqual(len(self.received), 1)
+        payload = self.received[0][1]
+        self.assertEqual(payload["action_id"], accepted["action_id"])
+        self.assertTrue(payload["result"]["observation"]["ok"])
+        self.assertEqual(payload["result"]["observation"]["objects"][0]["name"], "banana")
+        self.assertFalse(payload["result"]["observation_required"])
+
+    def test_follow_up_failure_reports_completed_transfer_without_retrying(self):
+        self.fixture.camera.snapshot.side_effect = RuntimeError("VOP input lost")
+        accepted = self.call("transfer_to", confirm_motion=True, x1=-.5, y1=-1/3, x2=.5, y2=1/3)
+        terminal = self.completed(accepted)
+        self.assertEqual(terminal["state"], "error")
+        self.assertEqual(len(self.received), 1)
+        payload = self.received[0][1]
+        self.assertEqual(payload["action_id"], accepted["action_id"])
+        self.assertFalse(payload["result"]["ok"])
+        self.assertTrue(payload["result"]["transfer_completed"])
+        self.assertFalse(payload["result"]["observation"]["ok"])
+        self.assertTrue(payload["result"]["observation_required"])
+        self.assertEqual(len(self.fixture.moves()), 6)
+        self.assertEqual(sum(name == "rm_movej" for name, _ in self.fixture.commands), 1)
 
     def test_execution_error_is_delivered_with_matching_id_and_stop_result(self):
         self.fixture.camera.snapshot.side_effect = RuntimeError("camera disconnected")
@@ -213,7 +272,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
         self.assertEqual(len(self.received), 1)
         self.assertEqual(self.received[0][1]["status"], "cancelled")
         self.assertEqual(self.received[0][1]["action_id"], accepted["action_id"])
-        self.fixture.plugin._publish_photo.assert_not_called()
+        self.assertIsNone(self.fixture.plugin._observation)
         self.assertFalse(self.fixture.client.motion_lock.locked())
 
     def test_unregistered_completion_retries_identical_notification_only(self):
@@ -242,7 +301,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
                 self.assertEqual(result["state"], "error")
                 self.assertNotIn("action_id", result)
         self.assertEqual(self.fixture.commands, [])
-        self.fixture.pool.select.assert_not_called()
+        self.fixture.camera.snapshot.assert_not_called()
         self.assertEqual(self.received, [])
         self.assertFalse(self.fixture.client.motion_lock.locked())
 

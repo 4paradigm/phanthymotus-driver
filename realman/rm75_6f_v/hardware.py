@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 from pathlib import Path
-import tempfile
 import threading
 
 from common.vendor_runtime import jsonable
@@ -443,33 +441,3 @@ class ExclusiveSDKClient:
 
     def status(self):
         return self._client.status()
-
-
-class CameraLease:
-    """Exclude participating camera pipelines within this runtime.
-
-    Unrelated camera implementations need not use this lease; native SDK open
-    errors and frame freshness checks must still be enforced by the caller.
-    """
-
-    def __init__(self, serial):
-        self.serial = serial
-        self._file = None
-
-    def __enter__(self):
-        import fcntl
-
-        name = hashlib.sha256(self.serial.encode()).hexdigest()
-        handle = open(Path(tempfile.gettempdir()) / f"realman-camera-{name}.lock", "a")
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            handle.close()
-            raise RuntimeError("RealSense camera is in use by another action or card") from exc
-        self._file = handle
-        return self
-
-    def __exit__(self, *args):
-        if self._file is not None:
-            self._file.close()
-            self._file = None

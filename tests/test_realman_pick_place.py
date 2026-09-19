@@ -36,11 +36,12 @@ class PickPlaceConfigTests(unittest.TestCase):
     def test_registered_config_defaults(self):
         card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "pick_place")
         self.assertEqual(card["type"], "actuator")
-        self.assertNotIn("topic_in", card)
+        self.assertEqual([p["format"] for p in card["topic_in"]], ["image/jpeg", "image/depth-zlib", "data/json"])
+        self.assertNotIn("topic_out", card)
         expected = {
             "speed_percent": 50, "observation_joints_deg": "-90,0,0,90,0,90,0",
             "x_compensation_mm": 30, "y_compensation_mm": -75,
-            "pick_descent_mm": 91, "pick_grip_force": 15, "place_descent_mm": 60,
+            "pick_descent_mm": 91, "pick_grip_force": 15, "place_descent_mm": 60, "observe_after_transfer": False,
         }
         self.assertEqual({key: prop["default"] for key, prop in card["configSchema"]["properties"].items()}, expected)
         self.assertEqual(self.configure(), {"ok": True, **expected})
@@ -67,7 +68,7 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertIn("X 正方向向右（正值），负方向向左（负值）", schema["properties"]["dx_mm"]["description"])
         self.assertIn("Y 正方向向照片下方（正值），负方向向上方（负值）", schema["properties"]["dy_mm"]["description"])
         self.assertEqual(schema["required"], ["action"])
-        self.assertEqual(schema["x-completion"], {"actions": ["observe", "transfer_to", "transfer_by"], "timeout": 90})
+        self.assertEqual(schema["x-completion"], {"actions": ["observe", "transfer_to", "transfer_by"], "timeout": 210})
         self.assertEqual(schema["properties"]["confirm_motion"]["type"], "boolean")
         self.assertIs(schema["properties"]["confirm_motion"]["const"], True)
         self.assertEqual(schema["allOf"][0]["then"]["required"], ["confirm_motion"])
@@ -82,11 +83,12 @@ class PickPlaceConfigTests(unittest.TestCase):
     def test_each_mcp_action_exposes_observation_lifecycle(self):
         card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "pick_place")
         actions = card["inputSchema"]["x-action-params"]
-        self.assertIn(card["topic_out"][0]["topic"] + "/objects", actions["observe"]["description"])
+        self.assertIn("result.objects", actions["observe"]["description"])
         for name in ("transfer_to", "transfer_by"):
             description = actions[name]["description"]
             for requirement in ("observe", "captured_at", "position[0]", "position[1]",
-                                "每张照片仅供一次搬运", "observation_required=true", "不自动重试"):
+                                "每张照片仅供一次搬运", "observation_required=true", "不自动重试", "observe_after_transfer", "observation.skipped=true",
+                                "holding_object_possible", "release_completed", "recovery_required=true"):
                 self.assertIn(requirement, description)
 
     def test_partial_updates_and_invalid_updates_are_atomic(self):
@@ -99,6 +101,8 @@ class PickPlaceConfigTests(unittest.TestCase):
             {"pick_grip_force": 2.5}, {"pick_descent_mm": 0}, {"place_descent_mm": -1},
             {"x_compensation_mm": float("nan")}, {"y_compensation_mm": float("inf")},
             {"pick_descent_mm": "91"}, {"place_descent_mm": None},
+            {"observe_after_transfer": 1}, {"observe_after_transfer": 0},
+            {"observe_after_transfer": "true"}, {"observe_after_transfer": None},
             {"observation_joints_deg": [0] * 7}, {"observation_joints_deg": "0,0"},
             {"observation_joints_deg": "0,0,0,0,0,0,nan"},
             {"observation_joints_deg": "0,131,0,0,0,0,0"},
@@ -141,13 +145,13 @@ sys.exit(not result.wasSuccessful())
 
     def test_other_cards_configuration_does_not_configure_pick_place(self):
         from pick_place import PickPlacePlugin
-        from pick_place.camera import SnapshotCameras
+        from pick_place.inputs import ObservationInputs
         from hardware import RM75SDKClient
         config = {"ext_camera": {"enabled": False, "serial_number": "unrelated"},
                   "vision_capture": {"enabled": False, "output_dir": "/unrelated"},
                   "safety": {"max_speed_percent": 1}}
         card = PickPlacePlugin(RM75SDKClient({}).exclusive_client(), config)
-        self.assertIsInstance(card._cameras, SnapshotCameras)
+        self.assertIsInstance(card._inputs, ObservationInputs)
         self.assertEqual(card._output_dir, Path("/opt/phanthy-motus/data/pick_place/realman"))
         self.assertEqual(card.dispatch("config", {})["speed_percent"], 50)
 
@@ -176,12 +180,10 @@ class ObserveTests(unittest.TestCase):
         self.camera = mock.Mock()
         self.camera.info.return_value = {"state": "running", "fresh": True}
         self.camera.snapshot.side_effect = self.snapshot
-        self.pool = mock.Mock()
-        self.pool.select.return_value = self.camera
+        self.camera.identity.return_value = {"topics": ["/test/rgb", "/test/depth", "/test/rgb/objects"], "serial_number": "D435-test", "session_id": "session-test"}
+        self.camera.topics.return_value = [{"topic": t, "format": f} for t, f in zip(self.camera.identity()["topics"], ("image/jpeg", "image/depth-zlib", "data/json"))]
         self.plugin = PickPlacePlugin(self.client, {"pick_place": {"output_dir": self.temp.name}},
-                                      cameras=self.pool)
-        self.plugin._ensure_publisher = mock.Mock()
-        self.plugin._publish_photo = mock.Mock()
+                                      inputs=self.camera)
         self.copy = copy.deepcopy
         self.completion_factory = self.enterContext(mock.patch("pick_place.Completion"))
         self.completion_factory.return_value.send.return_value = ("accepted", None)
@@ -212,10 +214,45 @@ class ObserveTests(unittest.TestCase):
         return {"jpeg": b"\xff\xd8test\xff\xd9", "depth_zlib": b"test-depth",
                 "captured_at": max(time.time(), after + 0.001), "depth_captured_at": after + 0.001,
                 "serial_number": "D435-test", "width": 640, "height": 480,
-                "intrinsics": {"fx": 500}, "depth_scale_m": 0.001}
+                "intrinsics": {"fx": 500}, "depth_scale_m": 0.001,
+                "objects": [{"name": "banana", "position": [.1, .2], "confidence": .9}],
+                "objects_timestamp": after + .01, "input_identity": self.camera.identity()}
 
     def observe(self):
         return wait_for_completion(self.plugin, self.plugin.dispatch("observe", {"confirm_motion": True}))
+
+    def test_stop_does_not_wait_for_subscription_start_or_allow_late_restart(self):
+        import threading
+        entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+        results = []
+        def start(args, cancel):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test setup release timed out")
+            self.assertTrue(cancel.is_set())
+        self.camera.start.side_effect = start
+        worker = threading.Thread(target=lambda: results.append(self.plugin.start({"input_topics": []})))
+        stopper = threading.Thread(target=lambda: (self.plugin.stop(), stopped.set()))
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(self.plugin.start()["state"], "error")
+            self.assertEqual(self.plugin.dispatch("observe", {"confirm_motion": True})["state"], "error")
+            stopper.start()
+            self.assertTrue(stopped.wait(1), "stop must not wait for ROS setup")
+            self.camera.stop.assert_called_once()
+            self.assertEqual(self.plugin.start()["state"], "error")
+        finally:
+            release.set()
+            worker.join(2)
+            if stopper.ident is not None:
+                stopper.join(2)
+        self.assertEqual(results, [{"state": "idle"}])
+        self.assertIsNone(self.plugin._starting)
+        self.assertFalse(self.plugin._stopping)
+        self.camera.start.side_effect = None
+        self.assertEqual(self.plugin.start()["state"], "ready")
+        self.assertEqual(self.commands, [])
 
     def test_call_returns_after_one_move_and_one_photo(self):
         from pathlib import Path
@@ -229,7 +266,7 @@ class ObserveTests(unittest.TestCase):
         self.assertNotIn("request_id", result)
         self.assertEqual(self.commands, [("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 50, 0, 0, 0))])
         self.camera.snapshot.assert_called_once()
-        self.plugin._publish_photo.assert_called_once()
+        self.assertEqual(result["result"]["objects"], [{"name": "banana", "position": [.1, .2], "confidence": .9}])
         path = Path(result["result"]["file_path"])
         self.assertTrue(path.exists())
         metadata = json.loads(path.with_name("metadata.json").read_text())
@@ -237,7 +274,17 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(metadata["arm_endpoint"], "test-arm:8080")
         self.assertEqual(metadata["joint_degree"], [-90., 0., 0., 90., 0., 90., 0.])
         self.assertFalse(self.client.motion_lock.locked())
-        self.camera.stop.assert_called_once_with()
+        self.camera.stop.assert_not_called()
+
+    def test_camera_session_change_invalidates_saved_observation_without_motion(self):
+        self.assertEqual(self.observe()["state"], "completed")
+        count = len(self.commands)
+        self.camera.identity.return_value = {**self.camera.identity(), "session_id": "new-session"}
+        self.assertTrue(self.plugin.dispatch("info", {})["observation_required"])
+        result = self.plugin.dispatch("transfer_by", {
+            "confirm_motion": True, "x1": 0, "y1": 0, "dx_mm": 10, "dy_mm": 0})
+        self.assertEqual(result["code"], "OBSERVATION_REQUIRED")
+        self.assertEqual(len(self.commands), count)
 
     def test_each_call_takes_a_new_photo(self):
         first, second = self.observe(), self.observe()
@@ -246,7 +293,7 @@ class ObserveTests(unittest.TestCase):
         self.assertNotEqual(first["result"]["observation_id"], second["result"]["observation_id"])
         self.assertEqual(sum(name == "rm_movej" for name, _ in self.commands), 2)
         self.assertEqual(self.camera.snapshot.call_count, 2)
-        self.assertEqual(self.plugin._publish_photo.call_count, 2)
+        self.assertEqual(first["result"]["objects"], second["result"]["objects"])
 
     def test_observe_uses_configured_speed_and_joints(self):
         self.assertTrue(self.plugin.dispatch("config", {
@@ -260,8 +307,8 @@ class ObserveTests(unittest.TestCase):
         self.plugin.dispatch("info", {})
         self.plugin.stop()
         self.assertEqual(self.commands, [])
-        self.pool.select.assert_not_called()
-        self.plugin._publish_photo.assert_not_called()
+        self.camera.snapshot.assert_not_called()
+        self.assertIsNone(self.plugin._observation)
 
     def test_disconnected_readonly_and_busy_errors_are_distinct(self):
         self.client.connected = False
@@ -276,26 +323,26 @@ class ObserveTests(unittest.TestCase):
         finally:
             self.client.motion_lock.release()
         self.assertFalse(self.commands)
-        self.pool.select.assert_not_called()
+        self.camera.snapshot.assert_not_called()
 
     def test_joint_fault_blocks_before_motion(self):
         self.state["joint_err_code"][6] = 0xF000
         result = self.observe()
         self.assertEqual(result["state"], "error")
         self.assertFalse(self.commands)
-        self.plugin._publish_photo.assert_not_called()
+        self.assertIsNone(self.plugin._observation)
 
     def test_camera_failure_blocks_before_motion(self):
         self.camera.info.return_value = {"state": "error", "fresh": False, "error": "disconnected"}
         self.assertEqual(self.observe()["state"], "error")
         self.assertFalse(self.commands)
-        self.plugin._publish_photo.assert_not_called()
+        self.assertIsNone(self.plugin._observation)
 
     def test_capture_failure_stops_without_photo_or_return_motion(self):
         self.camera.snapshot.side_effect = RuntimeError("camera timeout")
         self.assertEqual(self.observe()["state"], "error")
         self.assertEqual([name for name, _ in self.commands], ["rm_movej", "rm_set_arm_slow_stop"])
-        self.plugin._publish_photo.assert_not_called()
+        self.assertIsNone(self.plugin._observation)
         self.assertIsNone(self.plugin._observation)
         self.assertTrue(self.plugin.dispatch("info", {})["observation_required"])
 
@@ -319,7 +366,7 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual([name for name, _ in self.commands], ["rm_movej", "rm_set_arm_slow_stop"])
         self.assertFalse(self.client.motion_lock.locked())
         self.camera.snapshot.assert_not_called()
-        self.plugin._publish_photo.assert_not_called()
+        self.assertIsNone(self.plugin._observation)
 
     def test_cancel_and_config_during_motion(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -338,7 +385,7 @@ class ObserveTests(unittest.TestCase):
             self.assertEqual(self.plugin.dispatch("config", {"speed_percent": 10})["code"], "ACTION_IN_PROGRESS")
             self.plugin.dispatch("cancel", {})
             self.assertEqual(pending.result(timeout=3)["state"], "cancelled")
-        self.plugin._publish_photo.assert_not_called()
+        self.assertIsNone(self.plugin._observation)
         self.assertEqual(sum(name == "rm_movej" for name, _ in self.commands), 1)
         self.assertFalse(self.client.motion_lock.locked())
 
@@ -349,7 +396,7 @@ class ObserveTests(unittest.TestCase):
             return photo
         self.camera.snapshot.side_effect = changed
         self.assertEqual(self.observe()["state"], "error")
-        self.plugin._publish_photo.assert_not_called()
+        self.assertIsNone(self.plugin._observation)
 
     def test_stop_waits_for_the_current_call_to_cancel_and_release_resources(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -369,7 +416,7 @@ class ObserveTests(unittest.TestCase):
             self.assertEqual(pending.result(timeout=1)["state"], "cancelled")
         self.assertFalse(self.client.motion_lock.locked())
         self.camera.stop.assert_called_once()
-        self.plugin._publish_photo.assert_not_called()
+        self.assertIsNone(self.plugin._observation)
 
     def test_read_feedback_rejects_idle_disagreement(self):
         import threading
@@ -423,27 +470,9 @@ class ObserveTests(unittest.TestCase):
         self.client.command = command
         self.assertEqual(self.observe()["state"], "error")
         self.camera.snapshot.assert_not_called()
-        self.plugin._publish_photo.assert_not_called()
+        self.assertIsNone(self.plugin._observation)
         self.assertTrue(self.client.motion_lock.locked())
 
-    def test_output_is_one_jpeg_message_with_capture_identity(self):
-        import sys
-        import types
-        from unittest import mock
-        from pick_place import PickPlacePlugin
-        def message():
-            return types.SimpleNamespace(header=types.SimpleNamespace(stamp=types.SimpleNamespace(), frame_id=""))
-        self.plugin._publisher = mock.Mock()
-        photo = {"captured_at": 100.25, "jpeg": b"test-photo"}
-        with mock.patch.dict(sys.modules, {"sensor_msgs.msg": types.SimpleNamespace(CompressedImage=message)}):
-            PickPlacePlugin._publish_photo(self.plugin, photo, "photo-id")
-        self.plugin._publisher.publish.assert_called_once()
-        msg = self.plugin._publisher.publish.call_args.args[0]
-        self.assertEqual(msg.data, b"test-photo")
-        self.assertEqual(msg.format, "jpeg")
-        self.assertEqual(msg.header.frame_id, "photo-id")
-        self.assertEqual(msg.header.stamp.sec, 100)
-        self.assertEqual(msg.header.stamp.nanosec, 250000000)
 
 
 if __name__ == "__main__":
