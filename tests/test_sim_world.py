@@ -92,6 +92,20 @@ def test_reaches_target_and_settles_on_final_heading():
     assert done[0]["progress"]["fraction"] == 1.0
 
 
+def test_a_running_job_reports_running_not_completed():
+    """Orin6 上读到过 `job: 三号展区 completed fraction=0.483` —— `status` 只看
+    `result`，而运行中的 `result` 就是 RESULT_OK。两个字段互相矛盾时，读的人会信
+    `status`，而 `nav.read` 会把它端给 LLM。"""
+    world, clock, _ = make_world()
+    job = world.submit_job("navigate_to", Pose(12.0, 0.0, 0.0))
+    run_for(world, clock, 6.0)
+
+    assert job.state == STATE_RUNNING
+    assert job.status == "running"
+    assert 0.0 < job.fraction < 1.0
+    assert world.snapshot()["job"]["status"] == "running"
+
+
 def test_rotate_in_place_does_not_translate():
     world, clock, _ = make_world()
     job = world.submit_job("rotate_to", Pose(0.0, 0.0, math.pi / 2))

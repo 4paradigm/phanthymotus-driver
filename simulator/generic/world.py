@@ -80,6 +80,15 @@ class NavJob:
 
     @property
     def status(self) -> str:
+        """`running` 直到抵达终态。
+
+        原本只看 `result`，而 `result` 在任务**运行中**就是 RESULT_OK（0）—— 于是
+        一个刚走到一半的任务对外报 `completed`。Orin6 上看到的就是
+        `job: 三号展区 completed fraction=0.483`：两个字段互相矛盾，而读的人会信
+        `status`。ACP 回调只在终态发出，所以线上没有报错这个假状态，但 `nav.read`
+        会把它端给 LLM。"""
+        if self.state != STATE_DONE:
+            return "running"
         return _STATUS_BY_RESULT.get(self.result, "failed")
 
     def as_dict(self) -> dict:
