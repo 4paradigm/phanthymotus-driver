@@ -31,7 +31,7 @@ from simulator.generic.cards_sensors import (  # noqa: E402
     BatteryCard,
     ImuCard,
     LaserScanCard,
-    MapCard,
+    SpatialMapCard,
     ModelCard,
     OdomCard,
 )
@@ -39,7 +39,7 @@ from simulator.generic.clock import FakeClock  # noqa: E402
 from simulator.generic.geometry import OCCUPIED, OccupancyGrid, Pose  # noqa: E402
 from simulator.generic.world import VirtualWorld  # noqa: E402
 
-ALL_SENSOR_CARDS = (OdomCard, ImuCard, LaserScanCard, BatteryCard, MapCard, ModelCard)
+ALL_SENSOR_CARDS = (OdomCard, ImuCard, LaserScanCard, BatteryCard, SpatialMapCard, ModelCard)
 
 EMBODIMENT = {"kind": "arm", "dof": 3, "joint_names": ["shoulder_pan", "shoulder_lift", "elbow"]}
 
@@ -106,7 +106,7 @@ def test_mapping_header_round_trips():
     grid = OccupancyGrid.blank(0.05, (-2.0, -2.0), 120, 120)
     grid.border(OCCUPIED)
     world, _, config = build(grid, spawn=(0.5, -0.25, 1.0))
-    card = MapCard(world, config, "sim")
+    card = SpatialMapCard(world, config, "sim")
 
     decoded = decode_mapping(card.payload())
 
@@ -120,7 +120,7 @@ def test_mapping_flags_have_the_has_z_bit_set():
     """`mapping.js` sniffs the protocol by testing `flags & 0x02`. Clear it and
     the renderer silently takes the legacy branch: blank panel, empty log."""
     world, _, config = build()
-    decoded = decode_mapping(MapCard(world, config, "sim").payload())
+    decoded = decode_mapping(SpatialMapCard(world, config, "sim").payload())
 
     assert decoded["flags"] & 0x02, f"flags={decoded['flags']} — has_z is clear"
     assert decoded["flags"] == 7
@@ -130,7 +130,7 @@ def test_mapping_yaw_is_negated_for_the_renderer():
     """The renderer's world is y-flipped; an un-negated yaw points the robot cone
     the wrong way and nothing complains."""
     world, _, config = build(spawn=(0.0, 0.0, 1.2))
-    decoded = decode_mapping(MapCard(world, config, "sim").payload())
+    decoded = decode_mapping(SpatialMapCard(world, config, "sim").payload())
 
     assert decoded["robot"][2] == pytest.approx(-1.2, abs=1e-5)
 
@@ -139,16 +139,16 @@ def test_mapping_stays_within_the_renderer_point_budget():
     grid = OccupancyGrid.blank(0.02, (-10.0, -10.0), 1000, 1000)
     grid.fill_rect(-9.0, -9.0, 9.0, 9.0, OCCUPIED)          # ~810k occupied cells
     world, _, config = build(grid)
-    card = MapCard(world, config, "sim")
+    card = SpatialMapCard(world, config, "sim")
 
     decoded = decode_mapping(card.payload())
 
-    assert 0 < decoded["count"] <= MapCard.MAX_POINTS
+    assert 0 < decoded["count"] <= SpatialMapCard.MAX_POINTS
 
 
 def test_mapping_carries_grid_and_waypoint_metadata():
     world, _, config = build()
-    card = MapCard(world, config, "sim")
+    card = SpatialMapCard(world, config, "sim")
     card.set_waypoints_provider(lambda: [{"name": "一号展区", "x": 2.0, "y": 1.0}])
 
     decoded = decode_mapping(card.payload())
@@ -169,16 +169,16 @@ def test_mapping_draws_trail_and_waypoints_at_distinct_heights():
         clock.advance(0.05)
         world.step(0.05)
 
-    card = MapCard(world, config, "sim")
+    card = SpatialMapCard(world, config, "sim")
     card.set_waypoints_provider(lambda: [{"name": "P", "x": 2.0, "y": 0.0}])
     heights = {round(z, 3) for _, _, z in decode_mapping(card.payload())["points"]}
 
-    assert {MapCard.Z_GRID, MapCard.Z_TRAIL, MapCard.Z_WAYPOINT} <= heights
+    assert {SpatialMapCard.Z_GRID, SpatialMapCard.Z_TRAIL, SpatialMapCard.Z_WAYPOINT} <= heights
 
 
 def test_mapping_survives_an_empty_map():
     world, _, config = build(OccupancyGrid.blank(0.05, (0.0, 0.0), 20, 20))
-    decoded = decode_mapping(MapCard(world, config, "sim").payload())
+    decoded = decode_mapping(SpatialMapCard(world, config, "sim").payload())
 
     assert decoded["count"] == 0
     assert decoded["meta"]["size"] == [20, 20]
@@ -352,7 +352,7 @@ def test_cards_start_and_stop_without_ros():
 
 def test_topic_names_are_namespaced():
     world, _, config = build()
-    assert MapCard(world, config, "robot7").topic == "/robot7/map"
+    assert SpatialMapCard(world, config, "robot7").topic == "/robot7/spatial_map"
 
 
 def test_base_card_publishes_nothing_when_it_has_no_topic():

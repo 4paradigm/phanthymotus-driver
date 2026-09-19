@@ -31,9 +31,11 @@ RUN mkdir -p /work/simulator && \
 # cleanly and then dies on startup with ModuleNotFoundError.
 COPY __init__.py acp.py assertions.py card_base.py cards_audio.py cards_motion.py \
      cards_scenario.py cards_sensors.py clock.py geometry.py main.py plugins.py \
-     scenario.py sensors.py suite.py world.py config.yaml driver.yaml \
+     maps.py scenario.py sensors.py suite.py world.py config.yaml driver.yaml \
      /work/simulator/generic/
 COPY backend/ /work/simulator/generic/backend/
+COPY tools/ /work/simulator/generic/tools/
+COPY maps/ /work/simulator/generic/maps/
 COPY scenarios/ /work/simulator/generic/scenarios/
 COPY deploy/ /deploy/
 

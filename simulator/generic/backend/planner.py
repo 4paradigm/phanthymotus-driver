@@ -31,9 +31,16 @@ _NEIGHBOURS = ((-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
 class GridPlanner:
     """在占用栅格上规划,按车宽膨胀。"""
 
-    def __init__(self, grid: OccupancyGrid, radius: float = 0.25):
+    def __init__(self, grid: OccupancyGrid, radius: float = 0.25, margin: float | None = None):
         self._grid = grid
+        # 规划半径 **大于** 车体半径，真实导航栈也是这么做的。两者相等时规划会贴着
+        # 墙找出一条「刚好通过」的路，执行时一点余量都没有，采样精度上的一点擦碰
+        # 就判撞。在 bj-2f 上这表现为一个反直觉的现象：**车越小反而走不通**
+        # （0.25m 走通 12/13，0.18m 只有 9/13）—— 因为膨胀越小、A* 找到的路越贴墙。
         self._radius = float(radius)
+        self._margin = (grid.resolution * 2.0 + float(radius) * 0.25
+                        if margin is None else float(margin))
+        self._plan_radius = self._radius + self._margin
         self._inflated: bytearray | None = None
         self._inflated_for: tuple[int, int, float] | None = None
 
@@ -41,13 +48,13 @@ class GridPlanner:
 
     def _inflation(self) -> bytearray:
         grid = self._grid
-        key = (id(grid), grid.revision, self._radius)
+        key = (id(grid), grid.revision, self._plan_radius)
         if self._inflated is not None and self._inflated_for == key:
             return self._inflated
 
         cells = grid.cells
         w, h = grid.width, grid.height
-        pad = int(math.ceil(self._radius / grid.resolution))
+        pad = int(math.ceil(self._plan_radius / grid.resolution))
         inflated = bytearray(cells)
         if pad > 0:
             disc = [(dx, dy) for dy in range(-pad, pad + 1) for dx in range(-pad, pad + 1)
@@ -80,7 +87,7 @@ class GridPlanner:
         w, h = grid.width, grid.height
         # 起终点豁免:机器人已经在那儿,也必须能停到那儿。半径取膨胀半径,
         # 保证「离开起点」和「进入终点」这两小段不会被自身膨胀锁死。
-        pad = int(math.ceil(self._radius / grid.resolution))
+        pad = int(math.ceil(self._plan_radius / grid.resolution))
 
         def exempt(x: int, y: int) -> bool:
             return (abs(x - sx) <= pad and abs(y - sy) <= pad) or \
@@ -150,7 +157,7 @@ class GridPlanner:
         for probe in range(2, len(cells)):
             ax, ay = grid.cell_to_world(*cells[anchor])
             bx, by = grid.cell_to_world(*cells[probe])
-            if grid.swept_blocked(ax, ay, bx, by, self._radius, self._radius):
+            if grid.swept_blocked(ax, ay, bx, by, self._plan_radius):
                 out.append(cells[probe - 1])
                 anchor = probe - 1
         out.append(cells[-1])

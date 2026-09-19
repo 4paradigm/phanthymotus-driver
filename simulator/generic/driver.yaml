@@ -16,7 +16,7 @@ cards:
   - { name: imu,          type: sensor }
   - { name: laser_scan,   type: sensor }
   - { name: battery,      type: sensor }
-  - { name: map,          type: sensor }
+  - { name: spatial_map,  type: sensor }
   - { name: model,        type: resource }
   - { name: loco,         type: actuator }
   - { name: controlled_spatial, type: actuator }

@@ -105,8 +105,11 @@ class BatteryCard(Card):
         return {"state": "running" if self._running else "idle", **self.payload()}
 
 
-class MapCard(Card):
-    """`sensor/mapping` — occupancy grid, travelled path and waypoints as one point set.
+class SpatialMapCard(Card):
+    """`sensor/mapping` —— 占用栅格、已走轨迹、航点，打成同一份点集。
+
+    名字对齐 `x-humanoid/tianyi2.0/controlled_spatial_map.py` 的 `spatial_map`：
+    要在画布上真的看到位置和轨迹点云，就该是那张卡的克隆，而不是另起一个名字。
 
     The wire format is not negotiable and is not self-describing, so it is
     written out explicitly here:
@@ -126,10 +129,10 @@ class MapCard(Card):
       7 sets bits 0, 1 and 2, which is what the real card sends.
     """
 
-    NAME = "map"
+    NAME = "spatial_map"
     KIND = "sensor"
-    DESCRIPTION = "虚拟建图 — 占用栅格 + 已走轨迹 + 航点标记"
-    TOPIC = "map"
+    DESCRIPTION = "虚拟建图 — 占用栅格 + 已走轨迹 + 航点标记，对标天轶的 spatial_map"
+    TOPIC = "spatial_map"
     FORMAT = "sensor/mapping"
     HZ = 2.0
     BINARY = True

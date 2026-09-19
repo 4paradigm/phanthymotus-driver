@@ -282,10 +282,11 @@ class VirtualWorld:
             # Turn in place first; driving while badly misaligned makes the path
             # a spiral and the distance assertions meaningless.
             return {"lin": 0.0, "ang": _sign(err) * min(max_ang, abs(err) * 2.0)}
-        # 中途点不必停下来，只有最后一个点才需要刹到 0 —— 逐点急停会让整条
-        # 路径走成一顿一顿的，和真机完全不像。
+        # 中途点不必刹到 0 —— 逐点急停会把一条路走成一顿一顿的，和真机不像。
         remaining = dist if job.leg >= len(job.route) - 1 else dist + job.dist_total
         approach = math.sqrt(max(0.0, 2.0 * accel * max(0.0, remaining - POS_TOL * 0.5)))
+        return {"lin": min(max_lin, approach),
+                "ang": _sign(err) * min(max_ang, abs(err) * 2.0)}
         return {"lin": min(max_lin, approach), "ang": _sign(err) * min(max_ang, abs(err) * 2.0)}
 
     def _update_job_locked(self) -> dict | None:
