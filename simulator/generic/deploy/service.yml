@@ -36,4 +36,10 @@ simulator-generic:
     options:
       max-size: "10m"
       max-file: "3"
-  restart: unless-stopped
+  # `always`, not `unless-stopped`. A host reboot leaves containers in the very
+  # state `unless-stopped` refuses to start from, so after a restart nothing
+  # comes back until someone SSHes in — which looks identical to a broken
+  # deployment. See tests/test_deploy_restart_policy.py; this fragment was
+  # copied from a driver that still had the old value, which is exactly the
+  # propagation path that test exists to cut.
+  restart: always
