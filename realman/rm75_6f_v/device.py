@@ -5,121 +5,27 @@ from __future__ import annotations
 
 import json
 import math
-import os
+import sys
 import threading
 import time
 from uuid import uuid4
 from pathlib import Path
 
-from common.vendor_runtime import action_schema, jsonable, tool
+from common.vendor_runtime import action_schema, tool
 
+try:
+    import hardware
+except ModuleNotFoundError as exc:
+    if exc.name != "hardware":
+        raise
+    # File-based loaders expose the repository root, not the driver directory.
+    from realman.rm75_6f_v import hardware
+    # Reuse this module when sibling cards import the normal runtime name.
+    sys.modules["hardware"] = hardware
 
-JOINT_NAMES = [f"joint{i}" for i in range(1, 8)]
-SDK_LIBRARY_PATH = Path("/work/Robotic_Arm/libs/linux_arm/libapi_c.so")
-JOINT_LIMITS_DEG = [(-178.0, 178.0), (-130.0, 130.0), (-178.0, 178.0),
-                    (-135.0, 135.0), (-178.0, 178.0), (-128.0, 128.0),
-                    (-360.0, 360.0)]
-JOINT_MAX_SPEED_DEG_S = [180.0, 180.0, 225.0, 225.0, 225.0, 225.0, 225.0]
-
-
-def _sdk_result(name, result):
-    if not isinstance(result, tuple) or not result:
-        raise RuntimeError(f"{name} returned an invalid SDK result: {result!r}")
-    code = int(result[0])
-    if code != 0:
-        raise RuntimeError(f"{name} failed with RealMan SDK code {code}")
-    if len(result) == 2:
-        return jsonable(result[1])
-    return jsonable(result[1:])
-
-
-class RM75SDKClient:
-    """Own one SDK handle and serialize all access to the vendor library."""
-
-    def __init__(self, config):
-        self.ip = os.environ.get("RM_ARM_IP", str(config.get("arm_ip", "")).strip())
-        self.port = int(os.environ.get("RM_TCP_PORT", config.get("tcp_port", 8080)))
-        self.enabled = os.environ.get("RM_DRIVER_ENABLED", "0") == "1"
-        self.motion_enabled = os.environ.get("RM_MOTION_ENABLED", "0") == "1"
-        self._lock = threading.RLock()
-        self._robot = None
-        self._handle = None
-
-    @property
-    def connected(self):
-        return self._handle is not None and int(getattr(self._handle, "id", -1)) >= 0
-
-    def start(self):
-        if not self.enabled:
-            print("[rm75] SDK connection disabled; set RM_DRIVER_ENABLED=1 and RM_ARM_IP after safety checks", flush=True)
-            return
-        if not self.ip:
-            raise ValueError("RM_ARM_IP is required when RM_DRIVER_ENABLED=1")
-        if not SDK_LIBRARY_PATH.is_file():
-            raise FileNotFoundError(
-                "RealMan API2 ARM64 library is missing; mount RM_API2_LIB_DIR "
-                "to /work/Robotic_Arm/libs/linux_arm"
-            )
-        from Robotic_Arm.rm_robot_interface import RoboticArm, rm_thread_mode_e
-
-        with self._lock:
-            self._robot = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
-            self._handle = self._robot.rm_create_robot_arm(self.ip, self.port)
-            if not self.connected:
-                bad_id = getattr(self._handle, "id", None)
-                self._handle = None
-                self._robot = None
-                raise ConnectionError(f"RealMan SDK could not connect to {self.ip}:{self.port}; handle={bad_id}")
-            print(f"[rm75] SDK connected to {self.ip}:{self.port} handle={self._handle.id}", flush=True)
-
-    def stop(self):
-        with self._lock:
-            robot, self._robot = self._robot, None
-            self._handle = None
-            if robot is not None:
-                robot.rm_delete_robot_arm()
-
-    def status(self):
-        return {
-            "state": "connected" if self.connected else "disabled" if not self.enabled else "disconnected",
-            "endpoint": f"{self.ip}:{self.port}" if self.ip else None,
-            "read_only": not self.motion_enabled,
-            "motion_enabled": self.motion_enabled,
-        }
-
-    def call(self, method):
-        with self._lock:
-            if not self.connected or self._robot is None:
-                raise ConnectionError("RM75 SDK is not connected")
-            return _sdk_result(method, getattr(self._robot, method)())
-
-    def call_dict(self, method):
-        with self._lock:
-            if not self.connected or self._robot is None:
-                raise ConnectionError("RM75 SDK is not connected")
-            result = getattr(self._robot, method)()
-            if not isinstance(result, dict) or "return_code" not in result:
-                raise RuntimeError(f"{method} returned an invalid SDK result: {result!r}")
-            code = int(result["return_code"])
-            if code != 0:
-                raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
-            return jsonable(result)
-
-    def joint_states(self):
-        degrees = self.call("rm_get_joint_degree")
-        if not isinstance(degrees, list) or len(degrees) != 7:
-            raise RuntimeError(f"rm_get_joint_degree returned {len(degrees) if isinstance(degrees, list) else 'invalid'} joints")
-        radians = [math.radians(float(value)) for value in degrees]
-        return {"name": JOINT_NAMES, "position": radians, "position_unit": "rad", "raw_degree": degrees}
-
-    def command(self, method, *args):
-        with self._lock:
-            if not self.connected or self._robot is None:
-                raise ConnectionError("RM75 SDK is not connected")
-            code = int(getattr(self._robot, method)(*args))
-            if code != 0:
-                raise RuntimeError(f"{method} failed with RealMan SDK code {code}")
-            return code
+from hardware import (
+    JOINT_NAMES, JOINT_LIMITS_DEG, JOINT_MAX_SPEED_DEG_S, RM75SDKClient,
+)
 
 
 class RM75Plugin:
@@ -727,16 +633,20 @@ class GripperPlugin:
 
 
 def build_plugins(config, namespace, ros2):
+    from pick_place import PickPlacePlugin
     from servo import RM75ServoPlugin
 
     client = RM75SDKClient(config)
+    shared = client.shared_client()
     plugins = [
-        RM75Plugin(client, config, namespace=namespace, ros2=ros2),
-        GripperPlugin(client, config, namespace=namespace, ros2=ros2),
+        client,
+        RM75Plugin(shared, config, namespace=namespace, ros2=ros2),
+        GripperPlugin(shared, config, namespace=namespace, ros2=ros2),
         # Stream-shaped joint control (motus.control/1). Present but inert: it
         # subscribes to nothing until someone wires it on the canvas and
         # confirms, and refuses to start at all while the driver is read-only.
-        RM75ServoPlugin(client, config, namespace=namespace, ros2=ros2),
+        RM75ServoPlugin(shared, config, namespace=namespace, ros2=ros2),
+        PickPlacePlugin(client.exclusive_client(), config, namespace, ros2),
     ]
     external_camera = None
     camera_config = config.get("ext_camera", {})

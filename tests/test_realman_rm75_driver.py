@@ -56,7 +56,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("numpy==1.23.5", dockerfile)
         self.assertIn("opencv-python-headless==4.11.0.86", dockerfile)
         self.assertIn("--only-binary=:all:", dockerfile)
-        self.assertIn("COPY main.py device.py servo.py camera.py realsense.py", dockerfile)
+        self.assertIn("COPY main.py device.py hardware.py servo.py camera.py realsense.py", dockerfile)
         camera = (DRIVER / "camera.py").read_text()
         self.assertNotIn("v4l2-ctl", camera)
         self.assertNotIn("import subprocess", camera)
@@ -109,6 +109,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         # whole of sys.modules on exit, so a module first imported inside the
         # block is discarded, and the same class ends up as two objects.
         from servo import RM75ServoPlugin
+        from pick_place import PickPlacePlugin
 
         calls = []
 
@@ -123,17 +124,18 @@ class RealManRM75ImageContractTests(unittest.TestCase):
                 {"ext_camera": {"enabled": True}}, "rm75", ros2
             )
         self.assertEqual(
-            [device.RM75Plugin, device.GripperPlugin, RM75ServoPlugin, FakeCamera],
+            [device.RM75SDKClient, device.RM75Plugin, device.GripperPlugin, RM75ServoPlugin, PickPlacePlugin, FakeCamera],
             [type(plugin) for plugin in enabled],
         )
-        self.assertIs(enabled[0].client, enabled[1].client)
+        self.assertIs(enabled[0], enabled[1].client._client)
+        self.assertIs(enabled[1].client, enabled[2].client)
         # The servo card shares the one SDK handle too — a second connection to
         # the same arm is a second thing able to move it.
-        self.assertIs(enabled[0].client, enabled[2].client)
+        self.assertIs(enabled[1].client, enabled[3].client)
         self.assertEqual(({"enabled": True}, "rm75", ros2.executor_core), calls[0])
         disabled = device.build_plugins({}, "rm75", ros2)
         self.assertEqual(
-            [device.RM75Plugin, device.GripperPlugin, RM75ServoPlugin],
+            [device.RM75SDKClient, device.RM75Plugin, device.GripperPlugin, RM75ServoPlugin, PickPlacePlugin],
             [type(plugin) for plugin in disabled],
         )
 
@@ -161,6 +163,12 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         dockerfile = (DRIVER / "Dockerfile").read_text()
         self.assertIn("ros-humble-rmw-fastrtps-cpp ffmpeg", dockerfile)
         self.assertIn("realsense.py vision_capture.py config.yaml", dockerfile)
+
+    def test_pick_place_has_its_own_persistent_directory(self):
+        directory = "/opt/phanthy-motus/data/pick_place/realman"
+        service = (DRIVER / "deploy/service.yml").read_text()
+        self.assertIn(f"{directory}:{directory}", service)
+        self.assertIn(f"pick_place:\n  output_dir: {directory}", (DRIVER / "config.yaml").read_text())
 
 
 class RealManRM75GripperPluginTests(unittest.TestCase):
@@ -381,7 +389,7 @@ class RealManRM75SDKClientTests(unittest.TestCase):
     def test_enabled_driver_reports_missing_host_sdk_mount(self):
         with mock.patch.dict(os.environ, {"RM_DRIVER_ENABLED": "1", "RM_ARM_IP": "192.0.2.1"}, clear=True):
             client = self.device.RM75SDKClient({"arm_ip": "", "tcp_port": 8080})
-        with mock.patch.object(self.device, "SDK_LIBRARY_PATH", Path("/definitely/missing/libapi_c.so")):
+        with mock.patch("hardware.SDK_LIBRARY_PATH", Path("/definitely/missing/libapi_c.so")):
             with self.assertRaisesRegex(FileNotFoundError, "mount RM_API2_LIB_DIR"):
                 client.start()
 
@@ -450,7 +458,8 @@ class RealManRM75SDKClientTests(unittest.TestCase):
 
     def test_sdk_error_is_not_returned_as_sensor_data(self):
         with self.assertRaisesRegex(RuntimeError, "code 5"):
-            self.device._sdk_result("rm_get_robot_info", (5, {}))
+            from hardware import _sdk_result
+            _sdk_result("rm_get_robot_info", (5, {}))
 
     def test_all_advertised_read_only_methods_accept_their_sdk_return_shapes(self):
         class Handle:

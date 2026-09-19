@@ -21,3 +21,4 @@ cards:
   - { name: gripper,          type: actuator }
   - { name: ext_camera,       type: sensor }
   - { name: vision_capture, type: actuator }
+  - { name: pick_place,       type: actuator }
