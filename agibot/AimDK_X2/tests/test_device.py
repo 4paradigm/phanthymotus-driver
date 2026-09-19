@@ -9,6 +9,7 @@ verification" note in CLAUDE.md.
 from __future__ import annotations
 
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -44,15 +45,33 @@ class FakeSrv:
     Response = FakeMsg
 
 
+class FakeLogger:
+    def __init__(self):
+        self.warnings = []
+
+    def warning(self, message):
+        self.warnings.append(message)
+
+    def info(self, message):
+        pass
+
+
 class FakePublisher:
     def __init__(self, msg_type, topic, qos):
         self.msg_type = msg_type
         self.topic = topic
         self.qos = qos
         self.published = []
+        self._published_condition = threading.Condition()
 
     def publish(self, msg):
-        self.published.append(msg)
+        with self._published_condition:
+            self.published.append(msg)
+            self._published_condition.notify_all()
+
+    def wait_for_count(self, count, timeout=1.0):
+        with self._published_condition:
+            return self._published_condition.wait_for(lambda: len(self.published) >= count, timeout)
 
 
 class FakeFuture:
@@ -100,6 +119,7 @@ class FakeNode:
         self.publishers = {}
         self.subscriptions = []
         self.clients = {}
+        self.logger = FakeLogger()
 
     def create_publisher(self, msg_type, topic, qos):
         pub = FakePublisher(msg_type, topic, qos)
@@ -107,8 +127,15 @@ class FakeNode:
         return pub
 
     def create_subscription(self, msg_type, topic, callback, qos):
-        self.subscriptions.append((topic, callback))
-        return object()
+        subscription = (topic, callback)
+        self.subscriptions.append(subscription)
+        return subscription
+
+    def destroy_subscription(self, subscription):
+        self.subscriptions.remove(subscription)
+
+    def get_logger(self):
+        return self.logger
 
     def create_client(self, srv_type, name):
         client = FakeClient(srv_type, name)
@@ -184,6 +211,7 @@ def _install_ros_stubs():
     module("aimdk_msgs")
     module(
         "aimdk_msgs.msg",
+        AudioPlayback=FakeMsg,
         CommonRequest=FakeMsg,
         HandCommand=FakeMsg,
         HandCommandArray=FakeMsg,
@@ -199,6 +227,8 @@ def _install_ros_stubs():
         "SetMcPresetMotion", "SetMicSourceRequest", "SetPmuLed",
     ]
     module("aimdk_msgs.srv", **{name: FakeSrv for name in srv_names})
+    module("audio_msgs")
+    module("audio_msgs.msg", AudioChunk=FakeMsg)
 
 
 _install_ros_stubs()
@@ -263,7 +293,7 @@ class ToolInventoryTests(unittest.TestCase):
         definitions = tool_definitions(plugins)
         expected_actuators = {
             "mc_mode", "locomotion", "preset_motion", "joint_command", "hand_command",
-            "linkcraft", "pmu_led", "tts", "emoji", "mic_source",
+            "linkcraft", "pmu_led", "tts", "speaker", "emoji", "mic_source",
         }
         by_name = {d["name"]: d["type"] for d in definitions}
         for name in expected_actuators:
@@ -333,6 +363,158 @@ class DispatchSmokeTests(unittest.TestCase):
         self.assertTrue(locomotion._registered)
         self.assertEqual(len(locomotion.nodes.locomotion_pub.published), 1)
         self.assertEqual(locomotion.nodes.locomotion_pub.published[0].forward_velocity, 0.5)
+
+
+class SpeakerPluginTests(unittest.TestCase):
+    def setUp(self):
+        self.plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"speaker": {"enabled": True}}})
+        self.speaker = find_plugin(self.plugins, "speaker")
+        self.nodes = self.speaker.nodes
+
+    def tearDown(self):
+        self.speaker.stop()
+
+    def test_card_declares_pcm_input_and_mouth_resource(self):
+        definition = self.speaker.get_tool()
+        self.assertEqual(definition["topic_in"], [{"format": "audio/pcm-16k"}])
+        self.assertEqual(definition["inputSchema"]["x-resource"], "mouth")
+        self.assertNotIn("x-resource", definition)
+        self.assertEqual(definition["inputSchema"]["x-action-params"]["start"]["params"], ["input_topic"])
+
+    def test_tts_declares_the_same_mouth_resource(self):
+        tts = find_plugin(self.plugins, "tts")
+        self.assertEqual(tts.get_tool()["inputSchema"]["x-resource"], "mouth")
+
+    def test_framework_start_is_inert_then_canvas_start_and_stop_work(self):
+        self.speaker.start()
+        self.assertEqual(self.nodes.core.subscriptions, [])
+        self.assertEqual(self.nodes.audio_playback_pub.published, [])
+        self.assertIsNone(self.speaker._worker)
+        self.assertEqual(self.speaker.dispatch("info", {})["state"], "idle")
+
+        started = self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        worker = self.speaker._worker
+        self.assertEqual(started["state"], "ready")
+        self.assertEqual(self.nodes.core.subscriptions[-1][0], "/canvas/tts")
+        self.assertTrue(worker.is_alive())
+
+        stopped = self.speaker.dispatch("stop", {})
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(self.nodes.core.subscriptions, [])
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(self.speaker._worker)
+
+    def test_valid_pcm_chunk_is_mapped_to_vendor_playback(self):
+        result = self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(self.nodes.core.subscriptions[-1][0], "/canvas/tts")
+        self.assertEqual(self.nodes.audio_playback_pub.published, [])
+
+        chunk = FakeMsg()
+        chunk.format = "audio/pcm-16k"
+        chunk.data = [1, 0, 255, 255]
+        self.speaker._on_chunk(chunk)
+        self.assertTrue(self.nodes.audio_playback_pub.wait_for_count(1))
+
+        sent = self.nodes.audio_playback_pub.published[-1]
+        self.assertEqual(sent.stamps, "stamp")
+        self.assertEqual(sent.info.channels, 1)
+        self.assertEqual(sent.info.sample_rate, 16000)
+        self.assertEqual(sent.info.size, 4)
+        self.assertEqual(sent.info.sample_format, "S16_LE")
+        self.assertEqual(sent.info.coding_format, "pcm")
+        self.assertEqual(sent.data.data, [1, 0, 255, 255])
+        self.assertEqual(sent.pkg_name, "test_ns_speaker")
+        self.assertTrue(sent.token_id)
+
+    def test_valid_frames_are_published_in_input_order_by_worker(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        for payload in ([1, 0], [2, 0], [3, 0]):
+            chunk = FakeMsg()
+            chunk.format = "audio/pcm-16k"
+            chunk.data = payload
+            self.speaker._on_chunk(chunk)
+        self.assertTrue(self.nodes.audio_playback_pub.wait_for_count(3))
+        self.assertEqual(
+            [sent.data.data for sent in self.nodes.audio_playback_pub.published],
+            [[1, 0], [2, 0], [3, 0]],
+        )
+
+    def test_eof_invalid_frame_and_stop_do_not_publish_extra_audio(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        eof = FakeMsg()
+        eof.format = "audio/pcm-16k"
+        eof.data = list(device.SpeakerPlugin.AUDIO_EOF_MAGIC)
+        self.speaker._on_chunk(eof)
+
+        invalid = FakeMsg()
+        invalid.format = "audio/pcm-16k"
+        invalid.data = [1]
+        self.speaker._on_chunk(invalid)
+        self.assertEqual(self.nodes.audio_playback_pub.published, [])
+        self.assertEqual(self.speaker.dispatch("info", {})["utterances_finished"], 1)
+        self.assertEqual(self.speaker.dispatch("info", {})["dropped_chunks"], 1)
+
+        self.speaker.dispatch("stop", {})
+        self.assertEqual(self.nodes.core.subscriptions, [])
+        self.assertEqual(self.speaker.dispatch("info", {})["state"], "idle")
+
+    def test_invalid_audio_warning_is_throttled(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        invalid = FakeMsg()
+        invalid.format = "not-pcm"
+        invalid.data = [1, 0]
+        for _ in range(101):
+            self.speaker._on_chunk(invalid)
+        self.assertEqual(self.speaker.dispatch("info", {})["dropped_chunks"], 101)
+        self.assertEqual(len(self.nodes.core.logger.warnings), 2)
+
+    def test_unsafe_format_is_escaped_and_capped_in_warning(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/tts"})
+        invalid = FakeMsg()
+        invalid.format = "bad\n\x1b[31m" + "x" * 1000
+        invalid.data = [1, 0]
+        self.speaker._on_chunk(invalid)
+        warning = self.nodes.core.logger.warnings[-1]
+        self.assertIn("code=unsupported_format", warning)
+        self.assertIn(r"bad\n\x1b[31m", warning)
+        self.assertNotIn("\n", warning)
+        self.assertNotIn("\x1b", warning)
+        self.assertLessEqual(len(warning), 200)
+
+    def test_queue_overflow_drops_newest_frame_and_reports_it(self):
+        # No worker is started here, so filling the bounded handoff queue deterministically
+        # exercises the explicit overflow policy without a scheduling race.
+        for value in range(self.speaker.QUEUE_SIZE + 1):
+            chunk = FakeMsg()
+            chunk.format = "audio/pcm-16k"
+            chunk.data = [value % 256, 0]
+            self.speaker._on_chunk(chunk)
+        info = self.speaker.dispatch("info", {})
+        self.assertEqual(info["queued_chunks"], self.speaker.QUEUE_SIZE)
+        self.assertEqual(info["overflow_dropped_chunks"], 1)
+        self.assertEqual(info["dropped_chunks"], 1)
+
+    def test_stop_joins_worker_and_repeated_start_creates_one_worker(self):
+        self.speaker.dispatch("start", {"input_topic": "/canvas/first"})
+        first = self.speaker._worker
+        self.assertTrue(first.is_alive())
+        self.speaker.dispatch("stop", {})
+        self.assertFalse(first.is_alive())
+        self.assertIsNone(self.speaker._worker)
+
+        self.speaker.dispatch("start", {"input_topic": "/canvas/second"})
+        second = self.speaker._worker
+        self.assertIsNot(first, second)
+        self.assertTrue(second.is_alive())
+
+    def test_unknown_action_returns_none(self):
+        self.assertIsNone(self.speaker.dispatch("unknown_action", {}))
+
+    def test_speaker_respects_enabled_switch(self):
+        plugins = build_bundle_plugins({"end_effector": "hand", "plugins": {"speaker": {"enabled": False}}})
+        names = {definition["name"] for definition in tool_definitions(plugins)}
+        self.assertNotIn("speaker", names)
 
 
 class StartStopLifecycleTests(unittest.TestCase):
