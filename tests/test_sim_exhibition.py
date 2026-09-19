@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 from simulator.generic import acp, assertions  # noqa: E402
 from simulator.generic.backend import LocalBackend  # noqa: E402
 from simulator.generic.cards_audio import TtsCard  # noqa: E402
-from simulator.generic.cards_motion import NavCard  # noqa: E402
+from simulator.generic.cards_motion import ControlledSpatialCard  # noqa: E402
 from simulator.generic.cards_scenario import SimReportCard, SimScenarioCard  # noqa: E402
 from simulator.generic.cards_sensors import MapCard  # noqa: E402
 from simulator.generic.clock import FakeClock  # noqa: E402
@@ -90,7 +90,7 @@ class ScriptedGuide:
         # Abandon this leg, take the detour, and — if this guide is the competent
         # one — put the abandoned waypoint back at the front of the queue.
         self.interrupted_at = self.current
-        self.nav.dispatch("cancel", {})
+        self.nav.dispatch("stop_nav", {})
         head = ["洗手间"] + ([self.current] if self.resume else [])
         self.queue = head + self.queue
         self.state = "idle"
@@ -115,7 +115,7 @@ class ScriptedGuide:
             self.state = "done"
             return
         self.current = self.queue.pop(0)
-        result = self.nav.dispatch("navigate_to", {"name": self.current})
+        result = self.nav.dispatch("navigate_to_tag", {"name": self.current})
         if "error" in result:
             self.state = "done"
             return
@@ -133,10 +133,9 @@ def build(scenario_slug="exhibition_tour"):
     config = {"embodiment": {"kind": "wheeled", "dof": 2, "joint_names": ["a", "b"]}}
 
     scenario_card = SimScenarioCard(world, config, "sim", scenario_dirs=[SCENARIO_DIR])
-    nav = NavCard(world, config, "sim")
+    nav = ControlledSpatialCard(world, config, "sim")
     tts = TtsCard(world, config, "sim")
     report = SimReportCard(world, config, "sim", scenario_card=scenario_card)
-    nav.set_waypoints_provider(scenario_card.waypoints)
 
     scenario_card.dispatch("load", {"scenario": scenario_slug})
     return {"world": world, "clock": clock, "scenario": scenario_card, "nav": nav,
@@ -308,7 +307,7 @@ def test_a_tour_that_drives_through_geometry_fails_safety():
     try:
         # Straight at a waypoint placed behind the north partition.
         rig["scenario"].dispatch("run", {})
-        rig["nav"].dispatch("move_to", {"x": 7.0, "y": 7.0, "yaw": 0.0})
+        rig["nav"].dispatch("navigate_to_pose", {"x": 7.0, "y": 7.0, "yaw": 0.0})
         run(rig, 60.0)
 
         report = rig["report"].report()

@@ -22,13 +22,35 @@ agent + VLA 回路。
 ## 卡片
 
 **Sensor**：`odom` `imu` `laser_scan` `battery` `map`
-**Actuator**：`loco` `nav` `switch_mode` `arm` `led` `tts` `speaker` `sim_scenario`
+**Actuator**：`loco` `controlled_spatial` `switch_mode` `arm` `led` `tts` `sim_scenario`
 **Resource**：`model`（URDF）`sim_report`（事件、播报记录、断言判定与得分）
 
 所有传感器都从**同一份世界状态**派生（`sensors.py` 是纯函数），不是各自造随机数 ——
 激光雷达与里程计不会互相矛盾，这是仿真值得信的前提。
 
-几个刻意的选择：
+**导航卡对标 `controlled_spatial` 而不是 `nav`。** 真驱动
+`x-humanoid/tianyi2.0/controlled_spatial.py` 里自己写着「this tool superseded `nav`
+for actual navigation」—— `nav` 是留下的旧卡。跟着 `controlled_spatial` 过来的是导览
+真正需要的那套词汇：**tag（打点）就是航点**（场景里的 POI 载入时变成 tag，`tag_place`
+还能跑着的时候就地新增）、**虚拟墙是 artifact**（加一道墙 → 栅格改变 → `laser_scan`
+立刻反映，障碍物因此有诚实来源，不必另造一张凭空的障碍卡）、**`stop_nav` 是打断的落点**。
+受保护操作要密码，`configSchema` 与真卡一致，仿真照样强制校验 —— 一个不检查密码的仿真，
+会让人以为真机上也不用给。
+
+**没有 `speaker` 卡。** 它曾经存在，是两样东西缝在一起：顶着**流消费端**的名字、干着
+**播放器**的活，还没有 `topic_in`，于是画布上谁也接不进来。两种形状都真实存在且不是
+同一张卡 —— 全仓 6 个真 `speaker`（g1/go2/r1/t800/bumi/q5）都声明
+`topic_in: audio/pcm-16k`；tianyi 的 `voice_play` 是另一种：按调用播 file/url/text，
+没有 `topic_in` 因为它不消费流。`tts` 已覆盖导览所需的全部（ACP 完成、打断、播报时序
+断言），所以这里一张嘴一张卡。
+
+**`imu` 只报这个世界真有的量。** 之前它填了 roll/pitch=0、角速度 x/y=0 和一个常数重力
+z —— 那些不是测量值，是把断言打扮成传感器数据，正是这套东西在别处要抓的毛病。世界是
+平面的，没有 z 动力学，所以只报 `yaw` / `angular_velocity_z` / `linear_acceleration_x`，
+并带一个 `planar: true` 让消费者分得清「按设计没有」和「传感器掉线了」。天轶的 IMU 卡
+也是同样的取舍：只转发物理上真有的字段，不合成朝向。
+
+其余刻意的选择：
 
 - **locomotion 卡叫 `loco`，语音卡叫 `tts`**，动作分别是 `stop_move` / `interrupt`。
   `llm.py` 的打断兜底恰好找这两个名字。详见 `cards_motion.py` 顶部与

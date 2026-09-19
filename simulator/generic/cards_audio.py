@@ -1,8 +1,23 @@
-"""Speech cards: `tts` and `speaker`.
+"""Speech: the `tts` card.
 
-Both drive the same mouth — one `SpeechQueue` in the world — which is why both
-declare `x-resource: ["mouth"]`. Two cards that can talk at once while claiming
-separate resources is how a robot ends up saying two things over each other.
+There was a `speaker` card here too. It has been removed, because it was two
+different things stitched together: the **name** of a stream sink and the
+**behaviour** of a player, with no `topic_in` at all, so nothing could be wired
+into it on the canvas.
+
+Both shapes exist for real, and they are not the same card. Every real
+`speaker` in this repo — `unitree/g1`, `go2`, `r1`, `engineai/t800`,
+`noetix/bumi`, `robotera/q5_bundle` — declares
+`topic_in: [{"format": "audio/pcm-16k"}]` and plays whatever arrives on the
+stream. `x-humanoid/tianyi2.0`'s `voice_play` is the other shape: call-driven
+`play_file` / `play_url` / `play_text`, and no `topic_in` because it consumes no
+stream. Copying the second while naming it after the first produced a card that
+answered to nobody.
+
+`tts` covers everything the exhibition tour needs — ACP completion, interrupt,
+and the announcement-ordering assertions — so the bundle has one mouth and one
+card for it. A stream-consuming `speaker` is worth adding when something needs
+the `topic_in` half of the canvas contract, which nothing here does yet.
 
 Neither Orin has a real speaker, so a virtual `tts` card is the only way to
 verify announcement ordering on those rigs at all. That is the single assertion
@@ -21,13 +36,12 @@ from simulator.generic.card_base import Card
 
 
 class _SpeechCard(Card):
-    """Shared plumbing: own the utterances this card created, and post ACP for
-    exactly those.
+    """Own the utterances this card created, and post ACP for exactly those.
 
-    Ownership matters because the world emits every terminal to every listener.
-    Without the filter, `speaker` would report `tts`'s completions under its own
-    tool name, and agent-core's transcript would attribute speech to the wrong
-    card — silently, since ACP has no idea which card it should have come from.
+    The ownership filter stays even with a single speech card: the world emits
+    every terminal to every listener, so a second mouth added later would
+    otherwise report this one's completions under its own tool name — silently,
+    since ACP cannot tell which card a completion should have come from.
     """
 
     RESOURCES = ["mouth"]
@@ -82,51 +96,3 @@ class TtsCard(_SpeechCard):
         return {"state": "running" if self._running else "idle",
                 "speech": self.world.snapshot()["speech"],
                 "queued": self.world.snapshot()["speech_queued"]}
-
-
-class SpeakerCard(_SpeechCard):
-    """Audio playback. Distinct from `tts` because a real robot has both, and
-    they contend for the same mouth — which the shared `SpeechQueue` models."""
-
-    NAME = "speaker"
-    KIND = "actuator"
-    DESCRIPTION = "虚拟扬声器 — 播放文字或音频文件，与 tts 共用同一个「嘴」"
-    TOPIC = ""
-    COMPLETION = {"actions": ["play_text", "play_file"], "timeout": 60}
-    ACTIONS = {
-        "play_text": (["text"], "朗读一段文字"),
-        "play_file": (["path", "seconds"], "播放一个音频文件，seconds 为其时长"),
-        "stop": ([], "停止播放"),
-        "read": ([], "读取当前播放状态"),
-    }
-    PROPERTIES = {
-        "text": {"type": "string"},
-        "path": {"type": "string", "description": "音频文件路径"},
-        "seconds": {"type": "number", "description": "音频时长，秒"},
-    }
-
-    def do_play_text(self, text: str = "", **_):
-        if not str(text).strip():
-            return {"error": "play_text requires non-empty text"}
-        return self._say(str(text))
-
-    def do_play_file(self, path: str = "", seconds: float = 3.0, **_):
-        if not str(path).strip():
-            return {"error": "play_file requires a path"}
-        # The queue measures duration from text length, so a file is represented
-        # by a placeholder of the right length. Nothing downstream reads the
-        # characters; what matters is that it occupies the mouth for `seconds`.
-        chars = max(1, int(float(seconds) * self.world._chars_per_sec))  # noqa: SLF001
-        result = self._say("♪" * chars)
-        result["path"] = path
-        result["text"] = f"<file:{path}>"
-        return result
-
-    def do_stop(self, **_):
-        stopped = self.world.interrupt_speech("speaker.stop")
-        return {"state": "idle", "stopped": len(stopped)}
-
-    def do_read(self, **_):
-        snapshot = self.world.snapshot()
-        return {"state": "running" if self._running else "idle",
-                "speech": snapshot["speech"], "queued": snapshot["speech_queued"]}

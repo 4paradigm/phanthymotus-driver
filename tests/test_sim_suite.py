@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 from simulator.generic import acp  # noqa: E402
 from simulator.generic.backend import LocalBackend  # noqa: E402
 from simulator.generic.cards_audio import TtsCard  # noqa: E402
-from simulator.generic.cards_motion import NavCard  # noqa: E402
+from simulator.generic.cards_motion import ControlledSpatialCard  # noqa: E402
 from simulator.generic.cards_scenario import SimReportCard, SimScenarioCard  # noqa: E402
 from simulator.generic.clock import FakeClock  # noqa: E402
 from simulator.generic.scenario import Scenario  # noqa: E402
@@ -78,10 +78,9 @@ def build(guide=True, **guide_kwargs):
     config = {"embodiment": {"kind": "wheeled", "dof": 2, "joint_names": ["a", "b"]}}
 
     scenario = SimScenarioCard(world, config, "sim", scenario_dirs=[SCENARIO_DIR])
-    nav = NavCard(world, config, "sim")
+    nav = ControlledSpatialCard(world, config, "sim")
     tts = TtsCard(world, config, "sim")
     report = SimReportCard(world, config, "sim", scenario_card=scenario)
-    nav.set_waypoints_provider(scenario.waypoints)
     if guide:
         SuiteGuide(nav, tts, world, **guide_kwargs)
     return {"world": world, "clock": clock, "scenario": scenario, "report": report, "nav": nav}

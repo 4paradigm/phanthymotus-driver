@@ -137,6 +137,10 @@ class VirtualWorld:
         self._speech_queue: list[Utterance] = []
         self._events: list[dict] = []
         self._manual = (0.0, 0.0)
+        # Tags (Slamtec's word for a named place) live here rather than on the
+        # navigator: the map card draws them and the navigator drives to them,
+        # and a scenario `tag_place`s new ones at runtime. One owner, two readers.
+        self._tags: dict[str, dict] = {}
         self._trail: list[tuple[float, float]] = []
         self._trail_step = float(cfg.get("trail_step_m", 0.15))
         self._trail_max = int(cfg.get("trail_max_points", 4000))
@@ -443,6 +447,38 @@ class VirtualWorld:
         if len(self._trail) > self._trail_max:
             del self._trail[:len(self._trail) - self._trail_max]
 
+    # ---- tags ---------------------------------------------------------
+
+    def set_tags(self, tags: list[dict]) -> None:
+        with self._lock:
+            self._tags = {t["name"]: dict(t) for t in tags if t.get("name")}
+
+    def tag_place(self, name: str, description: str = "") -> dict:
+        """Name the robot's current pose, exactly as the real chassis does."""
+        with self._lock:
+            pose = self._backend.state()["pose"]
+            tag = {"name": name, "x": round(pose.x, 3), "y": round(pose.y, 3),
+                   "yaw": round(pose.yaw, 3), "description": description}
+            self._tags[name] = tag
+            self._log_locked("tag_place", **tag)
+            return dict(tag)
+
+    def untag_place(self, name: str) -> bool:
+        with self._lock:
+            removed = self._tags.pop(name, None) is not None
+            if removed:
+                self._log_locked("untag_place", name=name)
+            return removed
+
+    def tags(self) -> list[dict]:
+        with self._lock:
+            return [dict(t) for t in self._tags.values()]
+
+    def tag(self, name: str) -> dict | None:
+        with self._lock:
+            found = self._tags.get(name)
+            return dict(found) if found else None
+
     def trail(self) -> list[tuple[float, float]]:
         with self._lock:
             return list(self._trail)
@@ -482,6 +518,7 @@ class VirtualWorld:
             self._events = []
             self._manual = (0.0, 0.0)
             self._trail = []
+            self._tags = {}
 
 
 def _sign(value: float) -> float:

@@ -60,7 +60,7 @@ sys.path.insert(0, str(ROOT))
 
 from simulator.generic.backend import LocalBackend  # noqa: E402
 from simulator.generic.cards_audio import TtsCard  # noqa: E402
-from simulator.generic.cards_motion import LocoCard, NavCard  # noqa: E402
+from simulator.generic.cards_motion import ControlledSpatialCard, LocoCard  # noqa: E402
 from simulator.generic.clock import FakeClock  # noqa: E402
 from simulator.generic.geometry import OccupancyGrid, Pose  # noqa: E402
 from simulator.generic.world import VirtualWorld  # noqa: E402
@@ -224,8 +224,8 @@ def test_the_fallback_action_names_really_stop_the_simulated_robot():
 def test_a_barge_in_equivalent_also_stops_an_active_navigation():
     """The case Tianyi gets wrong: a leg in progress when the user speaks."""
     world, clock, config = build()
-    loco, nav = LocoCard(world, config, "sim"), NavCard(world, config, "sim")
-    job_id = nav.dispatch("move_to", {"x": 12.0, "y": 0.0, "yaw": 0.0})["action_id"]
+    loco, nav = LocoCard(world, config, "sim"), ControlledSpatialCard(world, config, "sim")
+    job_id = nav.dispatch("navigate_to_pose", {"x": 12.0, "y": 0.0, "yaw": 0.0})["action_id"]
     for _ in range(100):
         clock.advance(0.05)
         world.step(0.05)

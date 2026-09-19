@@ -160,6 +160,9 @@ class SimScenarioCard(Card):
         self._fired = set()
         self._acp_posts = []
         self.world.reset(chosen.scene())
+        # 场景里的 POI 载入成地图上的 tag —— 真机上导览前也是先把展区打好点，
+        # 之后每一段走的都是 navigate_to_tag。
+        self.world.set_tags(chosen.waypoints())
         warnings = chosen.validate()
         for warning in warnings:
             self.world.log("scenario_warning", text=warning)

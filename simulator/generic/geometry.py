@@ -61,6 +61,12 @@ class OccupancyGrid:
         self.origin = (float(origin[0]), float(origin[1]))
         self.width = int(width)
         self.height = int(height)
+        # Bumped on every mutation. Anything caching a derived view of this grid
+        # — the map card's occupancy scan, for one — must key on it: virtual
+        # walls mutate the grid in place, so identity alone never changes and a
+        # cache built on `id(grid)` would keep serving the map from before the
+        # wall was added, with nothing to show that it had gone stale.
+        self.revision = 0
         if cells is None:
             self.cells = bytearray([FREE]) * (self.width * self.height)
         else:
@@ -117,8 +123,9 @@ class OccupancyGrid:
         return self.cells[cy * self.width + cx]
 
     def set_cell(self, cx: int, cy: int, value: int) -> None:
-        if self.in_bounds(cx, cy):
+        if self.in_bounds(cx, cy) and self.cells[cy * self.width + cx] != value:
             self.cells[cy * self.width + cx] = value
+            self.revision += 1
 
     def is_occupied(self, x: float, y: float) -> bool:
         """UNKNOWN counts as free — an unmapped cell is not a wall."""

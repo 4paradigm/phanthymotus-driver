@@ -30,8 +30,8 @@ sys.path.insert(0, str(ROOT))
 
 from simulator.generic import acp  # noqa: E402
 from simulator.generic.backend import LocalBackend  # noqa: E402
-from simulator.generic.cards_audio import SpeakerCard, TtsCard  # noqa: E402
-from simulator.generic.cards_motion import NavCard, SwitchModeCard  # noqa: E402
+from simulator.generic.cards_audio import TtsCard  # noqa: E402
+from simulator.generic.cards_motion import ControlledSpatialCard, SwitchModeCard  # noqa: E402
 from simulator.generic.clock import FakeClock  # noqa: E402
 from simulator.generic.geometry import OccupancyGrid  # noqa: E402
 from simulator.generic.world import VirtualWorld  # noqa: E402
@@ -79,7 +79,7 @@ def test_result_is_a_dict_not_a_string(rig):
     """`start.py` forwards `result` straight into the steering payload; a string
     there reaches the LLM as escaped source text instead of fields."""
     world, clock, posts = rig
-    NavCard(world, CONFIG, "sim").dispatch("move_to", {"x": 1.0, "y": 0.0, "yaw": 0.0})
+    ControlledSpatialCard(world, CONFIG, "sim").dispatch("navigate_to_pose", {"x": 1.0, "y": 0.0, "yaw": 0.0})
     run(world, clock, 20.0)
 
     assert isinstance(posts[0]["result"], dict)
@@ -89,11 +89,11 @@ def test_result_is_a_dict_not_a_string(rig):
 
 def test_preempted_navigation_posts_cancelled_with_partial_progress(rig):
     world, clock, posts = rig
-    nav = NavCard(world, CONFIG, "sim")
-    nav.dispatch("move_to", {"x": 12.0, "y": 0.0, "yaw": 0.0})
+    nav = ControlledSpatialCard(world, CONFIG, "sim")
+    nav.dispatch("navigate_to_pose", {"x": 12.0, "y": 0.0, "yaw": 0.0})
     run(world, clock, 8.0)
 
-    nav.dispatch("cancel", {})
+    nav.dispatch("stop_nav", {})
 
     assert len(posts) == 1
     assert posts[0]["status"] == "cancelled"
@@ -113,7 +113,7 @@ def test_interrupted_speech_posts_cancelled(rig):
 
 def test_a_completed_action_posts_completed(rig):
     world, clock, posts = rig
-    NavCard(world, CONFIG, "sim").dispatch("move_to", {"x": 1.0, "y": 0.0, "yaw": 0.0})
+    ControlledSpatialCard(world, CONFIG, "sim").dispatch("navigate_to_pose", {"x": 1.0, "y": 0.0, "yaw": 0.0})
     run(world, clock, 20.0)
 
     assert [post["status"] for post in posts] == ["completed"]
@@ -123,13 +123,13 @@ def test_a_superseded_leg_is_reported_so_the_llm_can_resume_it(rig):
     """The abandoned waypoint has to be identifiable, or the tour resumes at the
     wrong one — the single most common long-horizon mistake."""
     world, clock, posts = rig
-    nav = NavCard(world, CONFIG, "sim")
-    nav.set_waypoints_provider(lambda: [{"name": "二号展区", "x": 12.0, "y": 0.0},
-                                        {"name": "洗手间", "x": 0.0, "y": 3.0}])
-    nav.dispatch("navigate_to", {"name": "二号展区"})
+    nav = ControlledSpatialCard(world, CONFIG, "sim")
+    world.set_tags([{"name": "二号展区", "x": 12.0, "y": 0.0},
+                    {"name": "洗手间", "x": 0.0, "y": 3.0}])
+    nav.dispatch("navigate_to_tag", {"name": "二号展区"})
     run(world, clock, 6.0)
 
-    nav.dispatch("navigate_to", {"name": "洗手间"})
+    nav.dispatch("navigate_to_tag", {"name": "洗手间"})
 
     assert posts[0]["status"] == "cancelled"
     assert posts[0]["result"]["label"] == "二号展区"
@@ -139,10 +139,10 @@ def test_a_superseded_leg_is_reported_so_the_llm_can_resume_it(rig):
 
 def test_one_post_per_action_id_when_cancel_races_arrival(rig):
     world, clock, posts = rig
-    nav = NavCard(world, CONFIG, "sim")
-    action_id = nav.dispatch("move_to", {"x": 0.5, "y": 0.0, "yaw": 0.0})["action_id"]
+    nav = ControlledSpatialCard(world, CONFIG, "sim")
+    action_id = nav.dispatch("navigate_to_pose", {"x": 0.5, "y": 0.0, "yaw": 0.0})["action_id"]
     run(world, clock, 2.0)
-    nav.dispatch("cancel", {})
+    nav.dispatch("stop_nav", {})
     run(world, clock, 3.0)
 
     assert [post["action_id"] for post in posts].count(action_id) == 1
@@ -158,29 +158,9 @@ def test_interrupting_an_already_finished_utterance_posts_nothing_extra(rig):
 
     assert len(posts) == 1 and posts[0]["status"] == "completed"
 
-
-# ── ownership ────────────────────────────────────────────────────────────────
-
-def test_speaker_does_not_report_the_tts_cards_utterance(rig):
-    """The world emits every terminal to every listener. Without an ownership
-    filter each card would post the other's completions under its own tool name,
-    and ACP has no way to notice."""
-    world, clock, posts = rig
-    tts, speaker = TtsCard(world, CONFIG, "sim"), SpeakerCard(world, CONFIG, "sim")
-    tts.dispatch("speak", {"text": "讲解"})
-    run(world, clock, 3.0)
-
-    assert [post["tool"] for post in posts] == ["tts"]
-
-    speaker.dispatch("play_text", {"text": "提示音"})
-    run(world, clock, 3.0)
-
-    assert [post["tool"] for post in posts] == ["tts", "speaker"]
-
-
 def test_switch_mode_is_not_reported_as_a_navigation(rig):
     world, clock, posts = rig
-    NavCard(world, CONFIG, "sim")
+    ControlledSpatialCard(world, CONFIG, "sim")
     switch = SwitchModeCard(world, CONFIG, "sim")
 
     switch.dispatch("stand", {})
@@ -200,25 +180,10 @@ def test_a_failing_callback_does_not_kill_the_tick(rig):
         raise ConnectionError("agent core is down")
 
     acp.set_transport(explode)
-    NavCard(world, CONFIG, "sim").dispatch("move_to", {"x": 1.0, "y": 0.0, "yaw": 0.0})
+    ControlledSpatialCard(world, CONFIG, "sim").dispatch("navigate_to_pose", {"x": 1.0, "y": 0.0, "yaw": 0.0})
     run(world, clock, 20.0)
 
     assert world.snapshot()["job"]["status"] == "completed"
-
-
-def test_speaker_play_file_occupies_the_mouth_for_its_duration(rig):
-    world, clock, posts = rig
-    speaker = SpeakerCard(world, CONFIG, "sim")
-
-    result = speaker.dispatch("play_file", {"path": "/x.wav", "seconds": 4.0})
-
-    assert result["estimated_seconds"] == pytest.approx(4.0, abs=0.3)
-    assert result["text"] == "<file:/x.wav>"
-    run(world, clock, 2.0)
-    assert not posts, "still playing"
-    run(world, clock, 3.0)
-    assert posts[0]["status"] == "completed"
-
 
 def test_empty_text_is_rejected_rather_than_posting_a_zero_length_action(rig):
     world, _, posts = rig
