@@ -23,8 +23,8 @@ from simulator.generic.card_base import BUS_RENDERABLE_FORMATS  # noqa: E402
 from simulator.generic.cards_motion import (  # noqa: E402
     ArmCard,
     LedCard,
+    ControlledSpatialCard,
     LocoCard,
-    NavCard,
     SwitchModeCard,
 )
 from simulator.generic.cards_sensors import (  # noqa: E402
@@ -40,7 +40,7 @@ from simulator.generic.geometry import OccupancyGrid, Pose  # noqa: E402
 from simulator.generic.world import VirtualWorld  # noqa: E402
 
 ALL_CARDS = (OdomCard, ImuCard, LaserScanCard, BatteryCard, MapCard, ModelCard,
-             LocoCard, NavCard, SwitchModeCard, LedCard, ArmCard)
+             LocoCard, ControlledSpatialCard, SwitchModeCard, LedCard, ArmCard)
 
 VALID_KINDS = {"sensor", "actuator", "processor", "resource"}
 CONFIG = {"embodiment": {"kind": "wheeled", "dof": 2, "joint_names": ["a", "b"]}}
@@ -176,49 +176,119 @@ def test_dispatch_strips_the_injected_tool_name():
 
 # ── nav / ACP handshake ──────────────────────────────────────────────────────
 
-def test_nav_returns_an_action_id_immediately():
+def test_navigate_returns_an_action_id_immediately():
     """Asynchronous by contract: the LLM keeps reasoning, and the barrier holds
     the next actuator call until the callback lands."""
-    instance, world, _ = card(NavCard)
+    instance, world, _ = card(ControlledSpatialCard)
 
-    result = instance.dispatch("move_to", {"x": 5.0, "y": 0.0, "yaw": 0.0})
+    result = instance.dispatch("navigate_to_pose", {"x": 5.0, "y": 0.0, "yaw": 0.0})
 
     assert result["state"] == "running"
     assert result["action_id"].startswith("sim-nav-")
     assert result["estimated_distance_m"] == pytest.approx(5.0, abs=0.01)
 
 
-def test_nav_rejects_an_unknown_waypoint_with_the_known_list():
-    instance, _, _ = card(NavCard)
-    instance.set_waypoints_provider(lambda: [{"name": "入口", "x": 1.0, "y": 0.0}])
+def test_navigate_to_tag_rejects_an_unknown_tag_with_the_known_list():
+    instance, world, _ = card(ControlledSpatialCard)
+    world.set_tags([{"name": "入口", "x": 1.0, "y": 0.0}])
 
-    result = instance.dispatch("navigate_to", {"name": "月球"})
+    result = instance.dispatch("navigate_to_tag", {"name": "月球"})
 
     assert "error" in result
-    assert result["known_waypoints"] == ["入口"]
+    assert result["known_tags"] == ["入口"]
 
 
-def test_nav_cancel_reports_progress_rather_than_a_bare_ok():
-    instance, world, clock = card(NavCard)
-    instance.dispatch("move_to", {"x": 12.0, "y": 0.0, "yaw": 0.0})
+def test_stop_nav_reports_progress_rather_than_a_bare_ok():
+    instance, world, clock = card(ControlledSpatialCard)
+    instance.dispatch("navigate_to_pose", {"x": 12.0, "y": 0.0, "yaw": 0.0})
     for _ in range(160):
         clock.advance(0.05)
         world.step(0.05)
 
-    result = instance.dispatch("cancel", {})
+    result = instance.dispatch("stop_nav", {})
 
-    assert result["cancelled"] is True
+    assert result["stopped"] is True
     assert result["status"] == "cancelled"
     assert 0.0 < result["progress"]["fraction"] < 1.0
 
 
-def test_nav_cancel_with_nothing_running_is_not_an_error():
-    instance, _, _ = card(NavCard)
+def test_stop_nav_with_nothing_running_is_not_an_error():
+    instance, _, _ = card(ControlledSpatialCard)
 
-    result = instance.dispatch("cancel", {})
+    result = instance.dispatch("stop_nav", {})
 
-    assert result["cancelled"] is False
+    assert result["stopped"] is False
     assert "error" not in result
+
+
+def test_tag_place_names_the_current_pose():
+    """真机上导览前也是先把展区打好点，之后每段走 navigate_to_tag。"""
+    instance, world, clock = card(ControlledSpatialCard)
+    instance.dispatch("navigate_to_pose", {"x": 2.0, "y": 0.0, "yaw": 0.0})
+    for _ in range(200):
+        clock.advance(0.05)
+        world.step(0.05)
+
+    tag = instance.dispatch("tag_place", {"name": "一号展区", "description": "早期产品"})["tag"]
+
+    assert tag["name"] == "一号展区"
+    assert tag["x"] == pytest.approx(2.0, abs=0.15)
+    assert [t["name"] for t in world.tags()] == ["一号展区"]
+
+
+def test_protected_actions_are_refused_without_the_password():
+    """真卡会拒，仿真也必须拒 —— 一个不检查密码的仿真，会让人以为真机上也不用给。"""
+    instance, _, _ = card(ControlledSpatialCard)
+
+    denied = instance.dispatch("add_wall", {"x1": 0, "y1": 1, "x2": 2, "y2": 1})
+    allowed = instance.dispatch("add_wall", {"x1": 0, "y1": 1, "x2": 2, "y2": 1,
+                                             "password": "123456"})
+
+    assert "error" in denied and "password" in denied["error"]
+    assert allowed["state"] == "running"
+
+
+def test_a_virtual_wall_changes_the_grid_and_the_laser_sees_it():
+    """障碍物因此有了诚实的来源：加一道墙 → 栅格改变 → 激光雷达立刻反映。"""
+    from simulator.generic.cards_sensors import LaserScanCard
+
+    instance, world, _ = card(ControlledSpatialCard)
+    scan = LaserScanCard(world, CONFIG, "sim")
+    before = min(scan.payload()["ranges"])
+
+    instance.dispatch("add_wall", {"x1": 1.0, "y1": -2.0, "x2": 1.0, "y2": 2.0,
+                                   "password": "123456"})
+    after = min(scan.payload()["ranges"])
+
+    assert after < before
+    assert after == pytest.approx(1.0, abs=0.2)
+
+
+def test_removing_a_wall_restores_the_grid():
+    instance, world, _ = card(ControlledSpatialCard)
+    grid = world._backend.state()["grid"]  # noqa: SLF001
+    wall = instance.dispatch("add_wall", {"x1": 1.0, "y1": -2.0, "x2": 1.0, "y2": 2.0,
+                                          "password": "123456"})["wall"]
+    occupied = grid.is_occupied(1.0, 0.0)
+
+    instance.dispatch("remove_wall", {"wall_id": wall["id"], "password": "123456"})
+
+    assert occupied is True
+    assert grid.is_occupied(1.0, 0.0) is False
+    assert instance.dispatch("list_walls", {})["walls"] == []
+
+
+def test_mutating_the_grid_bumps_its_revision():
+    """map 卡的占用扫描按 revision 缓存 —— 虚拟墙是原地改栅格，identity 不变，
+    只按 id 缓存会一直画出加墙之前的地图。"""
+    instance, world, _ = card(ControlledSpatialCard)
+    grid = world._backend.state()["grid"]  # noqa: SLF001
+    before = grid.revision
+
+    instance.dispatch("add_wall", {"x1": 1.0, "y1": -1.0, "x2": 1.0, "y2": 1.0,
+                                   "password": "123456"})
+
+    assert grid.revision > before
 
 
 def test_arm_rejects_a_joint_vector_of_the_wrong_length():
@@ -243,7 +313,7 @@ def test_cards_sharing_a_physical_resource_declare_it():
     by_name = {cls.NAME: cls(world, CONFIG, "sim").get_tool() for cls in ALL_CARDS}
 
     assert by_name["loco"]["inputSchema"]["x-resource"] == ["base"]
-    assert by_name["nav"]["inputSchema"]["x-resource"] == ["base"]
+    assert by_name["controlled_spatial"]["inputSchema"]["x-resource"] == ["base"]
     assert by_name["arm"]["inputSchema"]["x-resource"] == ["arm"]
 
 

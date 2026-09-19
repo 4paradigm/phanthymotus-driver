@@ -144,7 +144,7 @@ class MapCard(Card):
     def __init__(self, world, config, namespace, ros2=None):
         super().__init__(world, config, namespace, ros2)
         self._waypoints_provider = None
-        self._grid_cache: tuple[int, int, list] | None = None
+        self._grid_cache: tuple[int, int, int, list] | None = None
 
     def set_waypoints_provider(self, fn) -> None:
         """Wired by the scenario card; without one the map simply has no markers."""
@@ -155,9 +155,12 @@ class MapCard(Card):
         changes on a scenario reset. A 40x40 m map at 5 cm is 640k cells, which
         at the 2 Hz publish rate would burn a fifth of a core for a picture that
         never changes."""
-        key = (id(grid), budget)
-        if self._grid_cache is not None and self._grid_cache[:2] == key:
-            return self._grid_cache[2]
+        # Keyed on revision as well as identity: a virtual wall mutates the grid
+        # in place, so identity alone never changes and the map would keep being
+        # drawn from before the wall existed.
+        key = (id(grid), grid.revision, budget)
+        if self._grid_cache is not None and self._grid_cache[:3] == key:
+            return self._grid_cache[3]
         points = sensors.occupancy_points(grid, budget, self.Z_GRID)
         self._grid_cache = (*key, points)
         return points

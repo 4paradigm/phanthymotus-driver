@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from simulator.generic import acp
 from simulator.generic.card_base import Card
-from simulator.generic.geometry import Pose, normalize_angle
+from simulator.generic.geometry import FREE, OCCUPIED, Pose
 
 
 class LocoCard(Card):
@@ -63,106 +63,242 @@ class LocoCard(Card):
                 "pose": snapshot["pose"], "lin": snapshot["lin"], "ang": snapshot["ang"]}
 
 
-class NavCard(Card):
-    """Waypoint navigation. Asynchronous: returns an `action_id` immediately and
-    posts the terminal transition to `/api/acp/complete` when the leg ends."""
+class ControlledSpatialCard(Card):
+    """建图与导航 —— 对标 `x-humanoid/tianyi2.0/controlled_spatial.py`。
 
-    NAME = "nav"
+    仿的是 `controlled_spatial` 而不是 `nav`：真驱动里那份源码自己写着
+    「this tool superseded `nav` for actual navigation」，`nav` 是留下来的旧卡。
+    对着被取代的那张写，等于把仿真锚在一个没人再用的接口上。
+
+    跟着它一起过来的，是导览场景真正需要的那套词汇：
+
+    * **tag（打点）** 就是航点。场景里的 POI 在载入时变成 tag，`tag_place` 还能在
+      跑的过程中就地新增 —— 这正是现场标注展区的做法。
+    * **虚拟墙**是 artifact。加一道墙 → 栅格改变 → `laser_scan` 立刻反映，
+      障碍物因此有了一个诚实的来源，不必再造一张凭空的「障碍卡」。
+    * **`stop_nav`** 是打断的落点，`x-hooks` 绑的也是它。
+
+    受保护操作要密码，`configSchema` 与真卡一致（默认 123456，底盘的固定初始密码，
+    不是用户秘密）。仿真照样强制校验 —— 一个不检查密码的仿真，会让人以为真机上
+    也不用给。
+
+    没有实现的部分：`start_mapping`/`stop_mapping`（本后端的地图由场景给定，
+    没有「边走边建」这回事）、轨道/区域/artifact POI。调用它们会明确报「未实现」，
+    而不是假装成功 —— 假装成功的仿真比没有仿真更坏。
+    """
+
+    NAME = "controlled_spatial"
     KIND = "actuator"
-    DESCRIPTION = "虚拟导航 — 按名称或坐标前往目标点，可中途取消"
+    DESCRIPTION = (
+        "⚠ 受保护操作需要密码：untag_place、add_wall、remove_wall、clear_walls 执行前"
+        "必须先向操作者索取密码并通过 password 传入。\n\n"
+        "虚拟底盘的建图与导航 —— 打点、列点、按点导航、按坐标导航、停止导航、"
+        "虚拟墙增删查、读取位姿与定位质量。"
+    )
     TOPIC = ""
     RESOURCES = ["base"]
-    HOOKS = {"on_interrupt_motion": {"action": "cancel"}}
-    COMPLETION = {"actions": ["navigate_to", "move_to", "rotate", "rotate_to"], "timeout": 180}
+    HOOKS = {"on_interrupt_motion": {"action": "stop_nav"}}
+    COMPLETION = {"actions": ["navigate_to_tag", "navigate_to_pose"], "timeout": 180}
+    CONFIG_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "password": {
+                "type": "string",
+                "description": "受保护操作（打点删除、虚拟墙增删）所需的密码，初始密码为 123456",
+                "default": "123456",
+                "format": "password",
+                # 与真卡同样的判断：底盘的固定初始密码，不是用户秘密。
+                "x-sensitive": False,
+                "scope": "shared",
+            },
+        },
+    }
     ACTIONS = {
-        "navigate_to": (["name"], "前往一个已命名的航点（展区、入口等）"),
-        "move_to": (["x", "y", "yaw"], "前往地图坐标 (x, y)，到达后转到 yaw 朝向"),
-        "rotate": (["delta"], "原地相对转动 delta 弧度"),
-        "rotate_to": (["yaw"], "原地转到绝对朝向 yaw"),
-        "cancel": ([], "取消正在进行的导航；已走过的进度会随 cancelled 一并上报"),
-        "list_waypoints": ([], "列出当前地图上所有已命名的航点"),
-        "read": ([], "读取当前导航状态与进度"),
+        "navigate_to_tag": (["name"], "前往一个已打点的位置（展区、入口等）"),
+        "navigate_to_pose": (["x", "y", "yaw"], "前往地图坐标 (x, y)，到达后转到 yaw 朝向"),
+        "stop_nav": ([], "停止当前导航；已走过的进度会随 cancelled 一并上报"),
+        "tag_place": (["name", "description"], "把机器人当前位置打成一个点"),
+        "untag_place": (["name", "password"], "🔒 删除一个点"),
+        "list_tags": ([], "列出当前地图上所有已打的点"),
+        "list_maps": ([], "列出可用地图（本仿真中一张地图即一个场景）"),
+        "load_map": (["map_name"], "载入一张地图 —— 等价于载入同名场景"),
+        "list_walls": ([], "列出虚拟墙"),
+        "add_wall": (["x1", "y1", "x2", "y2", "password"], "🔒 加一道虚拟墙；栅格与激光雷达会立刻反映"),
+        "remove_wall": (["wall_id", "password"], "🔒 删除一道虚拟墙"),
+        "clear_walls": (["password"], "🔒 清空所有虚拟墙"),
+        "get_pose": ([], "读取当前位姿"),
+        "get_localization_quality": ([], "读取定位质量"),
+        "read": ([], "读取导航状态与进度"),
     }
     PROPERTIES = {
-        "name": {"type": "string", "description": "航点名称"},
+        "name": {"type": "string", "description": "点位名称"},
+        "description": {"type": "string"},
         "x": {"type": "number"}, "y": {"type": "number"},
         "yaw": {"type": "number", "description": "朝向，弧度"},
-        "delta": {"type": "number", "description": "相对转角，弧度"},
+        "x1": {"type": "number"}, "y1": {"type": "number"},
+        "x2": {"type": "number"}, "y2": {"type": "number"},
+        "wall_id": {"type": "string"},
+        "map_name": {"type": "string"},
+        "password": {"type": "string", "description": "受保护操作的密码"},
     }
+
+    PROTECTED = ("untag_place", "add_wall", "remove_wall", "clear_walls")
+    WALL_THICKNESS = 0.2
 
     def __init__(self, world, config, namespace, ros2=None):
         super().__init__(world, config, namespace, ros2)
-        self._waypoints_provider = None
-        # Only this card's own jobs. `switch_mode` submits jobs too, and the
-        # world emits every terminal to every listener — without the filter,
-        # a posture change would be reported to agent-core as a navigation.
         self._owned: set[str] = set()
+        self._walls: dict[str, dict] = {}
+        self._map_loader = None
+        self._maps_provider = None
         world.add_nav_listener(self._on_terminal)
 
-    def set_waypoints_provider(self, fn) -> None:
-        self._waypoints_provider = fn
+    # ---- wiring -------------------------------------------------------
 
-    def waypoints(self) -> list[dict]:
-        if self._waypoints_provider is None:
-            return []
-        try:
-            return list(self._waypoints_provider() or [])
-        except Exception:
-            return []
+    def set_map_hooks(self, loader, maps_provider) -> None:
+        """场景卡把「载入地图 = 载入场景」接过来。"""
+        self._map_loader = loader
+        self._maps_provider = maps_provider
 
     # ---- ACP ----------------------------------------------------------
 
     def _on_terminal(self, payload: dict) -> None:
-        """Called once per job by the world, with no lock held."""
         action_id = payload.get("action_id")
         if action_id not in self._owned:
             return
         self._owned.discard(action_id)
         acp.notify(action_id, payload["status"], payload, tool=self.NAME)
 
-    # ---- actions ------------------------------------------------------
+    # ---- 密码 ----------------------------------------------------------
+
+    def _password(self) -> str:
+        return str((self.config.get("controlled_spatial") or {}).get("password", "123456"))
+
+    def _denied(self, action: str, password: str) -> dict | None:
+        if action not in self.PROTECTED:
+            return None
+        if str(password) == self._password():
+            return None
+        # 真卡会拒，仿真也必须拒：一个不检查密码的仿真，会让人以为真机上也不用给。
+        return {"error": f"{action} 是受保护操作，需要正确的 password",
+                "hint": "向操作者索取密码后通过 password 参数传入"}
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        denied = self._denied(action, (args or {}).get("password", ""))
+        return denied if denied else super().dispatch(action, args)
+
+    # ---- 导航 ----------------------------------------------------------
 
     def _accept(self, job) -> dict:
         self._owned.add(job.id)
-        # Immediately-returned handle. agent-core registers it as pending and
-        # the barrier holds the next actuator call until the callback lands.
         return {"state": "running", "action_id": job.id, "target": job.target.as_dict(),
                 "label": job.label, "estimated_distance_m": round(job.dist_total, 2)}
 
-    def do_navigate_to(self, name: str = "", **_):
-        match = next((w for w in self.waypoints() if w.get("name") == name), None)
-        if match is None:
-            known = [w.get("name") for w in self.waypoints()]
-            return {"error": f"unknown waypoint: {name}", "known_waypoints": known}
-        target = Pose(float(match["x"]), float(match["y"]), float(match.get("yaw", 0.0)))
+    def do_navigate_to_tag(self, name: str = "", **_):
+        tag = self.world.tag(name)
+        if tag is None:
+            return {"error": f"unknown tag: {name}",
+                    "known_tags": [t["name"] for t in self.world.tags()]}
+        target = Pose(float(tag["x"]), float(tag["y"]), float(tag.get("yaw", 0.0)))
         return self._accept(self.world.submit_job("navigate_to", target, label=name))
 
-    def do_move_to(self, x: float = 0.0, y: float = 0.0, yaw: float = 0.0, **_):
-        return self._accept(self.world.submit_job("move_to", Pose(float(x), float(y), float(yaw))))
+    def do_navigate_to_pose(self, x: float = 0.0, y: float = 0.0, yaw: float = 0.0, **_):
+        return self._accept(self.world.submit_job(
+            "navigate_to", Pose(float(x), float(y), float(yaw))))
 
-    def do_rotate(self, delta: float = 0.0, **_):
-        current = self.world.snapshot()["pose"]["yaw"]
-        target = Pose(0.0, 0.0, normalize_angle(current + float(delta)))
-        return self._accept(self.world.submit_job("rotate", target))
-
-    def do_rotate_to(self, yaw: float = 0.0, **_):
-        return self._accept(self.world.submit_job("rotate_to", Pose(0.0, 0.0, normalize_angle(float(yaw)))))
-
-    def do_cancel(self, **_):
+    def do_stop_nav(self, **_):
         payload = self.world.cancel_job("interrupted by user instruction")
         if payload is None:
-            return {"state": "idle", "cancelled": False, "reason": "nothing in progress"}
-        return {"state": "idle", "cancelled": True, **payload}
+            return {"state": "idle", "stopped": False, "reason": "nothing in progress"}
+        return {"state": "idle", "stopped": True, **payload}
 
-    def do_list_waypoints(self, **_):
+    # ---- 打点 ----------------------------------------------------------
+
+    def do_tag_place(self, name: str = "", description: str = "", **_):
+        if not str(name).strip():
+            return {"error": "tag_place requires a name"}
+        return {"state": "running", "tag": self.world.tag_place(str(name), str(description))}
+
+    def do_untag_place(self, name: str = "", **_):
+        if not self.world.untag_place(str(name)):
+            return {"error": f"unknown tag: {name}"}
+        return {"state": "running", "removed": name}
+
+    def do_list_tags(self, **_):
+        return {"state": "running" if self._running else "idle", "tags": self.world.tags()}
+
+    # ---- 地图 ----------------------------------------------------------
+
+    def do_list_maps(self, **_):
+        maps = list(self._maps_provider() or []) if self._maps_provider else []
+        return {"state": "running" if self._running else "idle", "maps": maps}
+
+    def do_load_map(self, map_name: str = "", **_):
+        if self._map_loader is None:
+            return {"error": "no map loader wired"}
+        return self._map_loader(str(map_name))
+
+    # ---- 虚拟墙 --------------------------------------------------------
+
+    def _grid(self):
+        return self.world._backend.state()["grid"]  # noqa: SLF001
+
+    def do_add_wall(self, x1: float = 0.0, y1: float = 0.0, x2: float = 0.0, y2: float = 0.0, **_):
+        grid = self._grid()
+        half = self.WALL_THICKNESS / 2.0
+        wall_id = f"wall-{len(self._walls) + 1}"
+        grid.fill_rect(min(x1, x2) - half, min(y1, y2) - half,
+                       max(x1, x2) + half, max(y1, y2) + half, OCCUPIED)
+        self._walls[wall_id] = {"id": wall_id, "start": {"x": float(x1), "y": float(y1)},
+                                "end": {"x": float(x2), "y": float(y2)}}
+        self.world.log("add_wall", **self._walls[wall_id])
+        # The grid's revision bump is what makes the map card redraw and the
+        # laser scan see it — a wall nobody can perceive is not an obstacle.
+        return {"state": "running", "wall": self._walls[wall_id], "grid_revision": grid.revision}
+
+    def do_remove_wall(self, wall_id: str = "", **_):
+        wall = self._walls.pop(str(wall_id), None)
+        if wall is None:
+            return {"error": f"unknown wall: {wall_id}"}
+        self._erase(wall)
+        return {"state": "running", "removed": wall_id}
+
+    def do_clear_walls(self, **_):
+        for wall in list(self._walls.values()):
+            self._erase(wall)
+        count, self._walls = len(self._walls), {}
+        return {"state": "running", "cleared": count}
+
+    def _erase(self, wall: dict) -> None:
+        grid = self._grid()
+        half = self.WALL_THICKNESS / 2.0
+        a, b = wall["start"], wall["end"]
+        grid.fill_rect(min(a["x"], b["x"]) - half, min(a["y"], b["y"]) - half,
+                       max(a["x"], b["x"]) + half, max(a["y"], b["y"]) + half, FREE)
+        self.world.log("remove_wall", id=wall["id"])
+
+    def do_list_walls(self, **_):
         return {"state": "running" if self._running else "idle",
-                "waypoints": [{"name": w.get("name", ""), "x": w["x"], "y": w["y"]}
-                              for w in self.waypoints()]}
+                "walls": list(self._walls.values())}
+
+    # ---- 状态 ----------------------------------------------------------
+
+    def do_get_pose(self, **_):
+        return {"state": "running" if self._running else "idle",
+                "pose": self.world.snapshot()["pose"]}
+
+    def do_get_localization_quality(self, **_):
+        # 本后端的位姿是积分出来的，没有配准，所以定位质量恒为满分。诚实地说出
+        # 这件事，而不是随机抖一个数字假装有不确定性。
+        return {"state": "running" if self._running else "idle",
+                "quality": 100, "note": "仿真位姿由积分得到，不存在配准误差"}
 
     def do_read(self, **_):
         snapshot = self.world.snapshot()
         return {"state": "running" if self._running else "idle",
-                "pose": snapshot["pose"], "job": snapshot["job"]}
+                "pose": snapshot["pose"], "job": snapshot["job"],
+                "tags": [t["name"] for t in self.world.tags()],
+                "walls": len(self._walls)}
 
 
 class SwitchModeCard(Card):

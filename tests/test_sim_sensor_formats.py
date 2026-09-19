@@ -220,8 +220,21 @@ def test_imu_is_derived_not_randomised():
 
     first, second = card.payload(), card.payload()
 
-    assert first["angular_velocity"] == second["angular_velocity"]
-    assert first["orientation"]["yaw"] == pytest.approx(0.7, abs=1e-6)
+    assert first["angular_velocity_z"] == second["angular_velocity_z"]
+    assert first["yaw"] == pytest.approx(0.7, abs=1e-5)
+
+
+def test_imu_reports_only_quantities_this_world_actually_has():
+    """以前它填了 roll/pitch=0、角速度 x/y=0、一个常数重力 z —— 那些不是测量值，
+    是把断言打扮成传感器数据。世界是平面的，没有 z 动力学；`planar` 让消费者能
+    分清「按设计没有」和「传感器掉线了」。"""
+    world, _, config = build()
+    payload = ImuCard(world, config, "sim").payload()
+
+    assert payload["planar"] is True
+    assert set(payload) == {"planar", "yaw", "angular_velocity_z",
+                            "linear_acceleration_x", "stamp"}
+    assert "orientation" not in payload and "linear_acceleration" not in payload
 
 
 def test_imu_angular_velocity_tracks_an_actual_rotation():
@@ -232,7 +245,7 @@ def test_imu_angular_velocity_tracks_an_actual_rotation():
         clock.advance(0.05)
         world.step(0.05)
 
-    assert card.payload()["angular_velocity"]["z"] > 0.1
+    assert card.payload()["angular_velocity_z"] > 0.1
 
 
 def test_odom_reports_pose_and_accumulated_distance():

@@ -150,8 +150,9 @@ def test_build_plugins_works_without_ros(bundle):
     dispatch surface can be exercised on a laptop."""
     tools = bundle.get_all_tools()
 
-    assert len(tools) == 15
-    assert {"nav", "tts", "loco", "map", "sim_scenario", "sim_report"} <= {t["name"] for t in tools}
+    assert len(tools) == 14
+    assert {"controlled_spatial", "tts", "loco", "map",
+            "sim_scenario", "sim_report"} <= {t["name"] for t in tools}
 
 
 def test_the_default_scenario_is_loaded_at_boot(bundle):
@@ -161,10 +162,12 @@ def test_the_default_scenario_is_loaded_at_boot(bundle):
     assert state["waypoints"][0] == "入口"
 
 
-def test_waypoints_reach_both_the_navigator_and_the_map(bundle):
-    waypoints = bundle.dispatch("nav", {"action": "list_waypoints"})["waypoints"]
+def test_scenario_pois_become_map_tags(bundle):
+    """真机上导览前先把展区打好点，之后每段走 navigate_to_tag —— 场景载入时
+    POI 就变成地图上的 tag，导航卡和 map 卡读的是同一份世界状态。"""
+    tags = bundle.dispatch("controlled_spatial", {"action": "list_tags"})["tags"]
 
-    assert [w["name"] for w in waypoints] == ["入口", "一号展区", "洗手间", "二号展区", "三号展区"]
+    assert [t["name"] for t in tags] == ["入口", "一号展区", "洗手间", "二号展区", "三号展区"]
 
 
 def test_every_card_answers_info_or_declines_cleanly(bundle):

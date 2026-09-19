@@ -60,8 +60,6 @@ class LocalBackend(WorldBackend):
     use a physics engine.
     """
 
-    GRAVITY = 9.80665
-
     def __init__(self, scene: dict | None = None):
         self._grid = OccupancyGrid.blank()
         self._pose = Pose()
@@ -211,15 +209,24 @@ class LocalBackend(WorldBackend):
                 "angle_increment": increment, "range_max": max_range, "ranges": ranges}
 
     def _sense_imu(self) -> dict:
-        """Derived from the integrator, never randomised.
+        """Only the quantities this world actually has.
 
-        Sensors that disagree with the world are worse than no sensors — a test
-        that passes against noise proves nothing.
+        The earlier version filled in `roll`/`pitch` as 0.0, `angular_velocity`
+        x/y as 0.0 and a constant gravity on z. None of those are measurements —
+        the world is planar and has no z dynamics, so they were assertions
+        dressed as sensor data, which is the exact failure this bundle exists to
+        catch elsewhere. `x-humanoid/tianyi2.0`'s IMU card makes the same choice
+        deliberately: it forwards only fields physically supplied by the stream
+        and synthesises no orientation.
+
+        `planar: true` says the absent axes are absent **by design**, so a
+        consumer can tell that apart from a sensor that dropped out.
         """
         return {
-            "linear_acceleration": {"x": self._lin_cmd - self._lin, "y": 0.0, "z": self.GRAVITY},
-            "angular_velocity": {"x": 0.0, "y": 0.0, "z": self._ang},
-            "orientation": {"roll": 0.0, "pitch": 0.0, "yaw": self._pose.yaw},
+            "planar": True,
+            "yaw": round(self._pose.yaw, 5),
+            "angular_velocity_z": round(self._ang, 5),
+            "linear_acceleration_x": round(self._lin_cmd - self._lin, 5),
         }
 
 

@@ -16,8 +16,14 @@ import os
 from pathlib import Path
 
 from simulator.generic.backend import LocalBackend
-from simulator.generic.cards_audio import SpeakerCard, TtsCard
-from simulator.generic.cards_motion import ArmCard, LedCard, LocoCard, NavCard, SwitchModeCard
+from simulator.generic.cards_audio import TtsCard
+from simulator.generic.cards_motion import (
+    ArmCard,
+    ControlledSpatialCard,
+    LedCard,
+    LocoCard,
+    SwitchModeCard,
+)
 from simulator.generic.cards_scenario import SimReportCard, SimScenarioCard
 from simulator.generic.cards_sensors import (
     BatteryCard,
@@ -35,8 +41,9 @@ BUNDLE_DIR = Path(__file__).resolve().parent
 CARD_TYPES = {
     "odom": OdomCard, "imu": ImuCard, "laser_scan": LaserScanCard, "battery": BatteryCard,
     "map": MapCard, "model": ModelCard,
-    "loco": LocoCard, "nav": NavCard, "switch_mode": SwitchModeCard, "arm": ArmCard, "led": LedCard,
-    "tts": TtsCard, "speaker": SpeakerCard,
+    "loco": LocoCard, "controlled_spatial": ControlledSpatialCard,
+    "switch_mode": SwitchModeCard, "arm": ArmCard, "led": LedCard,
+    "tts": TtsCard,
     "sim_scenario": SimScenarioCard, "sim_report": SimReportCard,
 }
 
@@ -70,7 +77,7 @@ def build_plugins(config: dict, namespace: str, ros2=None) -> list:
 
     scenario_card = None
     report_card = None
-    nav_card = None
+    spatial_card = None
     map_card = None
 
     for name, card_cls in CARD_TYPES.items():
@@ -85,18 +92,21 @@ def build_plugins(config: dict, namespace: str, ros2=None) -> list:
             continue                                   # constructed last; needs the scenario card
         card = card_cls(world, config, namespace, ros2)
         cards.append(card)
-        if isinstance(card, NavCard):
-            nav_card = card
+        if isinstance(card, ControlledSpatialCard):
+            spatial_card = card
         elif isinstance(card, MapCard):
             map_card = card
 
     if scenario_card is not None:
-        # Waypoints come from whichever scenario is loaded, so both the navigator
-        # and the map read them live rather than holding a stale copy.
-        if nav_card is not None:
-            nav_card.set_waypoints_provider(scenario_card.waypoints)
+        # Tags live in the world, so the navigator and the map both read the
+        # live set rather than each holding a copy that can go stale.
         if map_card is not None:
-            map_card.set_waypoints_provider(scenario_card.waypoints)
+            map_card.set_waypoints_provider(world.tags)
+        if spatial_card is not None:
+            # 「载入地图」在这套东西里就是「载入场景」——一张地图一个场景。
+            spatial_card.set_map_hooks(
+                lambda name: scenario_card.do_load(scenario=name),
+                lambda: sorted(scenario_card.refresh()))
         scenario_card.set_injector(_ros_injector(config, ros2))
         if (enabled.get("sim_report") or {}).get("enabled", True):
             report_card = SimReportCard(world, config, namespace, ros2, scenario_card=scenario_card)

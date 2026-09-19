@@ -58,11 +58,10 @@ plugins:
   map:          {enabled: true}
   model:        {enabled: true}
   loco:         {enabled: true}
-  nav:          {enabled: true}
+  controlled_spatial: {enabled: true}
   switch_mode:  {enabled: true}
   arm:          {enabled: true}
   led:          {enabled: true}
   tts:          {enabled: true}
-  speaker:      {enabled: true}
   sim_scenario: {enabled: true}
   sim_report:   {enabled: true}
