@@ -27,7 +27,7 @@ from simulator.generic.backend import LocalBackend  # noqa: E402
 from simulator.generic.cards_audio import TtsCard  # noqa: E402
 from simulator.generic.cards_motion import ControlledSpatialCard  # noqa: E402
 from simulator.generic.cards_scenario import SimReportCard, SimScenarioCard  # noqa: E402
-from simulator.generic.cards_sensors import MapCard  # noqa: E402
+from simulator.generic.cards_sensors import SpatialMapCard  # noqa: E402
 from simulator.generic.clock import FakeClock  # noqa: E402
 from simulator.generic.scenario import Scenario  # noqa: E402
 from simulator.generic.world import VirtualWorld  # noqa: E402
@@ -180,6 +180,9 @@ def test_load_reports_warnings_rather_than_failing_silently():
         "pois": [{"name": "far", "x": 9.0, "y": 0.0}],
     }, slug="blocked")
 
+    # validate 只查导览真的会走的那些段 —— 一张 14 个点的真实地图全连通要 91 次
+    # 规划，而绝大多数段这趟导览根本不走。
+    scenario.expect = {"waypoint_order": ["far"]}
     warnings = scenario.validate()
 
     assert warnings and "far" in warnings[0]
@@ -305,9 +308,9 @@ def test_the_oracle_rejects_a_completed_status_on_an_abandoned_leg(rig):
 def test_a_tour_that_drives_through_geometry_fails_safety():
     rig = build()
     try:
-        # Straight at a waypoint placed behind the north partition.
+        # 目标放在场景边界之外 —— 规划器绕不出去，必须如实报失败。
         rig["scenario"].dispatch("run", {})
-        rig["nav"].dispatch("navigate_to_pose", {"x": 7.0, "y": 7.0, "yaw": 0.0})
+        rig["nav"].dispatch("navigate_to_pose", {"x": 40.0, "y": 40.0, "yaw": 0.0})
         run(rig, 60.0)
 
         report = rig["report"].report()
@@ -377,8 +380,13 @@ def test_sim_report_is_a_resource_so_progress_can_be_polled_mid_tour(rig):
 def test_sim_report_lists_available_scenarios(rig):
     listing = rig["report"].dispatch("sim_report", {"what": "list"})
 
-    assert [item["slug"] for item in listing["scenarios"]] == ["exhibition_tour"]
-    assert listing["scenarios"][0]["waypoints"][0] == "入口"
+    by_slug = {item["slug"]: item for item in listing["scenarios"]}
+
+    assert "exhibition_tour" in by_slug
+    assert by_slug["exhibition_tour"]["waypoints"][0] == "入口"
+    # 北京 2F 那张不在场景里写 pois —— 点位跟着地图走，所以列表里是空的，
+    # 载入时才从 maps/bj-2f.json 解析出那 14 个真实点位。
+    assert by_slug["beijing_2f_tour"]["waypoints"] == []
 
 
 def test_scenario_state_topic_carries_progress_for_the_kv_panel(rig):
@@ -393,7 +401,7 @@ def test_scenario_state_topic_carries_progress_for_the_kv_panel(rig):
 
 
 def test_the_map_card_shows_the_scenario_waypoints(rig):
-    card = MapCard(rig["world"], rig["config"], "sim")
+    card = SpatialMapCard(rig["world"], rig["config"], "sim")
     card.set_waypoints_provider(rig["scenario"].waypoints)
 
     assert [w["name"] for w in card._waypoints()] == [  # noqa: SLF001

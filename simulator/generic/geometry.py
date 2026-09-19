@@ -173,18 +173,19 @@ class OccupancyGrid:
         return False
 
     def swept_blocked(self, x0: float, y0: float, x1: float, y1: float,
-                      radius: float, lead: float | None = None) -> bool:
-        """机器人从 (x0,y0) 扫到 (x1,y1) 会不会碰到东西。
+                      radius: float) -> bool:
+        """半径为 radius 的圆盘从 (x0,y0) 扫到 (x1,y1) 会不会碰到东西。
 
-        **规划和积分必须问同一个问题。** 先前规划只按车宽判，积分器却还向前多伸
-        一个车身半径；于是规划认为拉直后能走的路径，跑起来中途撞墙 —— 十三站里
-        七站如此。两套定义就是这个 bug 本身，所以现在只有这一个。
+        **规划、拉直、积分三处必须问同一个问题。** 这个 bug 在真地图上发作了三次，
+        每次都是「两套模型」：
+
+        1. 规划只按车宽判，积分器却沿**当前朝向**额外前伸一个车身半径。转向时朝向
+           和路段有夹角，那一段前伸就戳进墙里 —— 机器人明明在折线上（偏差 5 毫米）、
+           中心不在墙里、该段判定为通，却报撞。
+        2. 前伸这件事本身就是重复计算：圆盘沿路径扫过去就是一个胶囊，
+           `segment_blocked` 已经把垂直于路径的车宽算进去了。
+        3. 规划器的膨胀建的也是圆盘。三者现在是同一个模型。
         """
-        lead = self.resolution if lead is None else lead
-        length = math.hypot(x1 - x0, y1 - y0)
-        if length > 1e-9 and lead:
-            x1 = x1 + (x1 - x0) / length * lead
-            y1 = y1 + (y1 - y0) / length * lead
         return self.segment_blocked(x0, y0, x1, y1, radius)
 
     def raycast(self, x: float, y: float, theta: float, max_range: float) -> float:

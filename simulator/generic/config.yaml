@@ -55,7 +55,7 @@ plugins:
   imu:          {enabled: true}
   laser_scan:   {enabled: true}
   battery:      {enabled: true}
-  map:          {enabled: true}
+  spatial_map:  {enabled: true}
   model:        {enabled: true}
   loco:         {enabled: true}
   controlled_spatial: {enabled: true}

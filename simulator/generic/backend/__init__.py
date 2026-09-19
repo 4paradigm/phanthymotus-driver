@@ -89,10 +89,14 @@ class LocalBackend(WorldBackend):
         # 没动就失败。真底盘在最后一米靠桩时同样会关避障。这与规划器豁免起终点
         # 膨胀是同一个理由、同样的两个地方。
         self._exempt: list[tuple[float, float]] = []
-        # 靠桩距离，和车宽**无关**。先前它等于车半径，于是半径越小泡泡越小，
-        # 而 P7 距墙只有 6cm —— 泡泡根本盖不住整个靠桩过程，机器人在最后几十厘米
-        # 上撞停。真底盘关避障的那一段也是按距离算的，不是按车宽。
-        self._dock_clearance = 0.6
+        # 靠桩距离，和车宽**无关**。先前它等于车半径，于是车越小泡泡越小，而真正
+        # 要紧的是「贴着展屏的那一段有多长」。真底盘关避障的那一段也是按距离算的。
+        #
+        # 默认 1.0m 是量出来的，不是拍的：bj-2f 上离开 P7（距墙 6cm）时，余量要到
+        # 约 0.8m 外才超过 25cm 车半径。取 0.6m 时机器人在 0.65m 处跳出豁免，那里
+        # 余量 0.24m，当场判撞。按场景 motion.dock_clearance 可调 —— 展厅越挤，
+        # 这一段越长。
+        self._dock_clearance = 1.0
         self._closed = False
         if scene:
             self.reset(scene)
@@ -178,10 +182,10 @@ class LocalBackend(WorldBackend):
             # once its *centre* entered the wall.
             if self._exempt_here(self._pose.x, self._pose.y):
                 # 贴着展屏起步/收尾：只要车体中心不在墙里就放行。
-                blocked = self._grid.swept_blocked(self._pose.x, self._pose.y, nx, ny, 0.0, 0.0)
+                blocked = self._grid.swept_blocked(self._pose.x, self._pose.y, nx, ny, 0.0)
             else:
                 blocked = self._grid.swept_blocked(self._pose.x, self._pose.y, nx, ny,
-                                                   self._radius, self._radius)
+                                                   self._radius)
             if blocked:
                 # Hard stop against geometry. The nav controller turns this into a
                 # failed job; nothing here knows what a job is.

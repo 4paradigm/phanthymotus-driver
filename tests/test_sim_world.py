@@ -133,20 +133,42 @@ def test_a_24_second_leg_runs_in_microseconds_of_wall_clock():
 
 # ── collision ────────────────────────────────────────────────────────────────
 
-def test_driving_into_an_occupied_cell_fails_the_job():
+def test_a_wall_across_the_path_is_routed_around_not_crashed_into():
+    """规划器加进来之后的新行为。真展厅里 P3→P15 有五段直线穿墙，只会直冲的
+    后端跑不完一趟真实导览 —— 而"跑不完"的原因和被测的编排毫无关系。"""
     grid = OccupancyGrid.blank(0.05, (-5.0, -5.0), 600, 400)
-    grid.fill_rect(2.0, -1.0, 2.2, 1.0, OCCUPIED)          # wall across the path
+    grid.fill_rect(2.0, -1.0, 2.2, 1.0, OCCUPIED)          # 半截墙，两端留缝
     world, clock, _ = make_world(grid)
     done = []
     world.add_nav_listener(done.append)
 
     job = world.submit_job("navigate_to", Pose(4.0, 0.0, 0.0))
-    run_until(world, clock, lambda: job.terminal_posted)
+    run_until(world, clock, lambda: job.terminal_posted, limit=200.0)
 
+    assert job.result == RESULT_OK
+    assert len(job.route) > 1, "绕行必然不止一个航点"
+    assert done[0]["status"] == "completed"
+    assert all(not grid.is_occupied(x, y) for x, y in world.trail())
+
+
+def test_a_target_walled_in_completely_still_fails_against_geometry():
+    """绕得过去要绕，绕不过去必须如实报失败 —— 不能因为有了规划器就永远成功。"""
+    grid = OccupancyGrid.blank(0.05, (-5.0, -5.0), 600, 400)
+    grid.fill_rect(3.0, -1.0, 5.0, -0.8, OCCUPIED)         # 把目标四面围死
+    grid.fill_rect(3.0, 0.8, 5.0, 1.0, OCCUPIED)
+    grid.fill_rect(3.0, -1.0, 3.2, 1.0, OCCUPIED)
+    grid.fill_rect(4.8, -1.0, 5.0, 1.0, OCCUPIED)
+    world, clock, _ = make_world(grid)
+    done = []
+    world.add_nav_listener(done.append)
+
+    job = world.submit_job("navigate_to", Pose(4.0, 0.0, 0.0))
+    run_until(world, clock, lambda: job.terminal_posted, limit=200.0)
+
+    assert job.route == [], "围死的目标不该规划出路径"
     assert job.result == RESULT_FAILED
-    assert "blocked" in job.reason
     assert done[0]["status"] == "failed"
-    assert world.snapshot()["pose"]["x"] < 2.0, "stopped short of the wall, not through it"
+    assert [e["event"] for e in world.events() if e["event"] == "route_unplanned"]
 
 
 def test_segment_check_catches_a_one_cell_wall():

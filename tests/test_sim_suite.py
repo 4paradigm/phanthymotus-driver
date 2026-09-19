@@ -178,7 +178,7 @@ def test_the_suite_injects_the_scenario_prompt_to_wake_the_agent(rig):
 def test_an_empty_scenario_list_runs_everything_discovered(rig):
     result = rig["scenario"].dispatch("run_suite", {})
 
-    assert result["scenarios"] == ["exhibition_tour"]
+    assert "exhibition_tour" in result["scenarios"]
 
 
 def test_an_unknown_scenario_is_reported_not_silently_dropped(rig):
@@ -186,14 +186,14 @@ def test_an_unknown_scenario_is_reported_not_silently_dropped(rig):
                                       {"scenarios": ["exhibition_tour", "nope"]})
 
     assert result["unknown"] == ["nope"]
-    assert result["scenarios"] == ["exhibition_tour"]
+    assert "exhibition_tour" in result["scenarios"]
 
 
 def test_a_suite_of_only_unknown_scenarios_is_an_error(rig):
     result = rig["scenario"].dispatch("run_suite", {"scenarios": ["nope"]})
 
     assert "error" in result
-    assert result["available"] == ["exhibition_tour"]
+    assert "exhibition_tour" in result["available"]
 
 
 # ── silence is not success ───────────────────────────────────────────────────

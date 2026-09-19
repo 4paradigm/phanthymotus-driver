@@ -29,7 +29,7 @@ from simulator.generic.cards_sensors import (
     BatteryCard,
     ImuCard,
     LaserScanCard,
-    MapCard,
+    SpatialMapCard,
     ModelCard,
     OdomCard,
 )
@@ -40,7 +40,7 @@ BUNDLE_DIR = Path(__file__).resolve().parent
 
 CARD_TYPES = {
     "odom": OdomCard, "imu": ImuCard, "laser_scan": LaserScanCard, "battery": BatteryCard,
-    "map": MapCard, "model": ModelCard,
+    "spatial_map": SpatialMapCard, "model": ModelCard,
     "loco": LocoCard, "controlled_spatial": ControlledSpatialCard,
     "switch_mode": SwitchModeCard, "arm": ArmCard, "led": LedCard,
     "tts": TtsCard,
@@ -94,7 +94,7 @@ def build_plugins(config: dict, namespace: str, ros2=None) -> list:
         cards.append(card)
         if isinstance(card, ControlledSpatialCard):
             spatial_card = card
-        elif isinstance(card, MapCard):
+        elif isinstance(card, SpatialMapCard):
             map_card = card
 
     if scenario_card is not None:

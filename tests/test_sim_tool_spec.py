@@ -31,7 +31,7 @@ from simulator.generic.cards_sensors import (  # noqa: E402
     BatteryCard,
     ImuCard,
     LaserScanCard,
-    MapCard,
+    SpatialMapCard,
     ModelCard,
     OdomCard,
 )
@@ -39,7 +39,7 @@ from simulator.generic.clock import FakeClock  # noqa: E402
 from simulator.generic.geometry import OccupancyGrid, Pose  # noqa: E402
 from simulator.generic.world import VirtualWorld  # noqa: E402
 
-ALL_CARDS = (OdomCard, ImuCard, LaserScanCard, BatteryCard, MapCard, ModelCard,
+ALL_CARDS = (OdomCard, ImuCard, LaserScanCard, BatteryCard, SpatialMapCard, ModelCard,
              LocoCard, ControlledSpatialCard, SwitchModeCard, LedCard, ArmCard)
 
 VALID_KINDS = {"sensor", "actuator", "processor", "resource"}
@@ -321,6 +321,6 @@ def test_read_only_cards_are_typed_so_the_barrier_exempts_them():
     """`_needs_barrier` exempts sensor and resource. Typing a status read as an
     actuator queues it behind a 90 second navigation."""
     world, _ = build()
-    for cls in (OdomCard, ImuCard, LaserScanCard, BatteryCard, MapCard):
+    for cls in (OdomCard, ImuCard, LaserScanCard, BatteryCard, SpatialMapCard):
         assert cls(world, CONFIG, "sim").get_tool()["type"] == "sensor"
     assert ModelCard(world, CONFIG, "sim").get_tool()["type"] == "resource"

@@ -21,7 +21,7 @@ agent + VLA 回路。
 
 ## 卡片
 
-**Sensor**：`odom` `imu` `laser_scan` `battery` `map`
+**Sensor**：`odom` `imu` `laser_scan` `battery` `spatial_map`
 **Actuator**：`loco` `controlled_spatial` `switch_mode` `arm` `led` `tts` `sim_scenario`
 **Resource**：`model`（URDF）`sim_report`（事件、播报记录、断言判定与得分）
 
@@ -65,7 +65,7 @@ z —— 那些不是测量值，是把断言打扮成传感器数据，正是�
 
 ## 跑一趟导览
 
-画布上：加载场景 → `run` → 看 `map`、`sim_scenario` 的状态面板、活动流与
+画布上：加载场景 → `run` → 看 `spatial_map`、`sim_scenario` 的状态面板、活动流与
 `performance.js` 的分步耗时；跑完 `sim_report` 给判定与得分。
 
 命令行：

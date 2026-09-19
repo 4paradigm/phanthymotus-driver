@@ -151,7 +151,7 @@ def test_build_plugins_works_without_ros(bundle):
     tools = bundle.get_all_tools()
 
     assert len(tools) == 14
-    assert {"controlled_spatial", "tts", "loco", "map",
+    assert {"controlled_spatial", "tts", "loco", "spatial_map",
             "sim_scenario", "sim_report"} <= {t["name"] for t in tools}
 
 
