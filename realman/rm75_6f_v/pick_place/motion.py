@@ -8,6 +8,10 @@ import numpy as np
 from hardware import JOINT_LIMITS_DEG
 
 
+class FeedbackPending(RuntimeError):
+    """A bounded feedback/settling condition; never a controller fault."""
+
+
 def vector(value, size, label):
     if not isinstance(value, (list, tuple)) or len(value) != size:
         raise RuntimeError(f"Invalid {label}")
@@ -38,6 +42,32 @@ class ObservationMotion:
         self.client = client
         self.cancel = cancel
         self.deadline = deadline
+        self.feedback_recoveries = 0
+
+    def retry_feedback(self, sample, timeout=2.0):
+        # Retry reads only. Once disturbed, require a consistent 0.3 s window
+        # before permitting the next command. Persistent errors still stop.
+        deadline = time.monotonic() + timeout
+        pending, stable_since = None, None
+        while True:
+            self.check_cancel()
+            try:
+                result = sample()
+            except FeedbackPending as exc:
+                pending, stable_since = exc, None
+            else:
+                self.check_cancel()
+                if pending is None:
+                    return result
+                now = time.monotonic()
+                if stable_since is None:
+                    stable_since = now
+                if now - stable_since >= 0.3 and now <= deadline:
+                    self.feedback_recoveries += 1
+                    return result
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Feedback did not recover: {pending}") from pending
+            self.cancel.wait(0.1)
 
     def check_cancel(self):
         if self.cancel.is_set():
@@ -46,6 +76,9 @@ class ObservationMotion:
             raise RuntimeError("Action timed out")
 
     def read(self):
+        return self.retry_feedback(self._read)
+
+    def _read(self):
         self.check_cancel()
         started = time.monotonic()
         state = self.client.call("rm_get_arm_all_state")
@@ -68,11 +101,11 @@ class ObservationMotion:
         if idle:
             planned = vector(trajectory.get("data"), 7, "idle joint feedback")
             if any(abs(a-b) > 0.2 for a, b in zip(joints, planned)):
-                raise RuntimeError("Idle controller and joint feedback disagree")
+                raise FeedbackPending("Idle controller and joint feedback disagree")
             if any(abs(a-b) > 0.2 for a, b in zip(joints, arm_joints)):
-                raise RuntimeError("Arm and joint feedback disagree")
+                raise FeedbackPending("Arm and joint feedback disagree")
         if time.monotonic() - started > 1.0:
-            raise RuntimeError("SDK feedback is stale")
+            raise FeedbackPending("SDK feedback is stale")
         self.check_cancel()
         return {"joints": joints, "pose": pose, "idle": idle}
 
@@ -96,12 +129,16 @@ class ObservationMotion:
         deadline = time.monotonic() + timeout
         window = []
         best_error, progress_at = math.inf, time.monotonic()
-        while time.monotonic() < deadline:
+        def sample():
             feedback = self.read()
             if guard is not None:
                 guard(feedback)
             if check is not None:
                 check()
+            return feedback
+
+        while time.monotonic() < deadline:
+            feedback = self.retry_feedback(sample)
             now = time.monotonic()
             error = max(abs(a-b) for a, b in zip(feedback["joints"], target)) if target else 0
             if target and best_error - error >= 0.05:

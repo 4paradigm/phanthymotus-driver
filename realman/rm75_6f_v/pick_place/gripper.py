@@ -3,19 +3,27 @@
 import math
 import time
 
+from .motion import FeedbackPending
+
 
 class Gripper:
     def __init__(self, client, motion, send, check):
         self.client, self.motion, self.send, self.check = client, motion, send, check
 
     def read(self, method, *args):
-        self.motion.check_cancel()
-        started = time.monotonic()
-        result = self.client.call(method, *args)
-        if time.monotonic() - started > 1:
-            raise RuntimeError("Gripper feedback is stale")
-        self.check()
-        return result
+        def sample():
+            self.motion.check_cancel()
+            started = time.monotonic()
+            result = self.client.call(method, *args)
+            # A slow response containing a real fault must not be discarded.
+            if method == "rm_get_rm_plus_state_info":
+                self.validate_state(result)
+            stale = time.monotonic() - started > 1
+            self.check()
+            if stale:
+                raise FeedbackPending("Gripper feedback is stale")
+            return result
+        return self.motion.retry_feedback(sample)
 
     def verify(self):
         info = self.read("rm_get_rm_plus_base_info")
@@ -24,7 +32,10 @@ class Gripper:
         self.state()
 
     def state(self):
-        state = self.read("rm_get_rm_plus_state_info")
+        return self.read("rm_get_rm_plus_state_info")
+
+    @staticmethod
+    def validate_state(state):
         errors = state.get("dof_err")
         if not isinstance(errors, list) or not errors or any(int(value) for value in errors) or int(state.get("sys_state", -1)):
             raise RuntimeError("Gripper feedback is missing or faulted")
@@ -32,7 +43,6 @@ class Gripper:
             values = state.get(name)
             if not isinstance(values, list) or not values or not math.isfinite(float(values[0])):
                 raise RuntimeError(f"Gripper {name} feedback is missing")
-        return state
 
     def force(self, value):
         self.verify()

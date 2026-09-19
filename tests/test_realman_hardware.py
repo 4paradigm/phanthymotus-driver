@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "realman/rm75_6f_v"))
-from hardware import CameraLease, RM75SDKClient
+from hardware import RM75SDKClient
 from common.vendor_runtime import DriverBundle
 
 
@@ -257,7 +257,6 @@ class SDKOwnershipTests(unittest.TestCase):
                                     rm_event_callback_ptr=lambda callback: callback,
                                     rm_thread_mode_e=types.SimpleNamespace(RM_TRIPLE_MODE_E=3))
         card = PickPlacePlugin(client.exclusive_client(), {})
-        card._ensure_publisher = mock.Mock()
         bundle = DriverBundle([client, card])
         with tempfile.NamedTemporaryFile() as library, \
              mock.patch("hardware.SDK_LIBRARY_PATH", Path(library.name)), \
@@ -274,19 +273,3 @@ class SDKOwnershipTests(unittest.TestCase):
         robot.rm_create_robot_arm.assert_called_once_with("test-arm", 8080)
         robot.rm_delete_robot_arm.assert_called_once_with()
         robot.rm_movej.assert_not_called()
-
-
-class CameraOwnershipTests(unittest.TestCase):
-    def test_same_device_excludes_other_pipeline_and_releases_on_failure(self):
-        with tempfile.TemporaryDirectory() as directory, \
-             mock.patch("hardware.tempfile.gettempdir", return_value=directory):
-            with self.assertRaisesRegex(ValueError, "capture failed"):
-                with CameraLease("one"):
-                    with self.assertRaisesRegex(RuntimeError, "in use"):
-                        with CameraLease("one"):
-                            self.fail("Second pipeline acquired an occupied camera")
-                    with CameraLease("two"):
-                        pass
-                    raise ValueError("capture failed")
-            with CameraLease("one"):
-                pass

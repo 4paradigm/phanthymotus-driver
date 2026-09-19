@@ -1,5 +1,6 @@
 """RealMan RealSense wire format and shared RGB-D-IR ownership tests."""
 import importlib.util
+import json
 from pathlib import Path
 import queue
 import sys
@@ -212,19 +213,33 @@ class FakeConfig:
 
 
 class FakeFrame:
-    def __init__(self, data):
+    def __init__(self, data, stamp):
         self.data = data
+        self.stamp = stamp
+        h, w = data.shape[:2]
+        intr = types.SimpleNamespace(width=w, height=h, fx=w, fy=h, ppx=w/2, ppy=h/2,
+                                     model="distortion.none", coeffs=[0] * 5)
+        self.profile = types.SimpleNamespace(as_video_stream_profile=lambda: types.SimpleNamespace(
+            get_intrinsics=lambda: intr,
+            get_extrinsics_to=lambda _: types.SimpleNamespace(
+                rotation=[1, 0, 0, 0, 1, 0, 0, 0, 1], translation=[0.02, 0, 0])))
+
+    def get_timestamp(self):
+        return self.stamp * 1000
+
+    def get_frame_timestamp_domain(self):
+        return "global_time"
 
     def get_data(self):
         return self.data
 
 
 class FakeFrameSet:
-    def __init__(self, kinds, data=None):
+    def __init__(self, kinds, data=None, stamp=100.0):
         self.kinds = set(kinds)
         data = data or {}
         self.frames = {
-            kind: FakeFrame(data.get(kind)) for kind in self.kinds
+            kind: FakeFrame(data.get(kind), stamp) for kind in self.kinds
         }
 
     def get_color_frame(self):
@@ -259,7 +274,7 @@ class FakeNode:
         self.publishers.pop(publisher.topic, None)
 
     def get_clock(self):
-        stamp = types.SimpleNamespace(to_msg=lambda: "stamp")
+        stamp = types.SimpleNamespace(to_msg=lambda: types.SimpleNamespace(sec=100, nanosec=100_000_000))
         return types.SimpleNamespace(now=lambda: stamp)
 
     def destroy_node(self):
@@ -277,7 +292,7 @@ class RGBDCaptureTests(unittest.TestCase):
     """Exercise pipeline selection and health timing without RealSense hardware."""
 
     def capture(
-        self, samples, usb_type="3.2", serial="serial-1234", routes=None, reconnect=False,
+        self, samples, usb_type="3.2", serial="serial-1234", routes=None, reconnect=False, sync_error=False,
     ):
         clock = [100.0]
         quit_event = threading.Event()
@@ -300,7 +315,7 @@ class RGBDCaptureTests(unittest.TestCase):
                 quit_event.set()
                 return FakeFrameSet(())
             clock[0] = 100.0 + elapsed
-            return FakeFrameSet(kinds, frame_data)
+            return FakeFrameSet(kinds, frame_data, clock[0] - 0.02)
 
         pipeline = types.SimpleNamespace(
             start=mock.Mock(), stop=mock.Mock(), wait_for_frames=wait_for_frames)
@@ -318,9 +333,16 @@ class RGBDCaptureTests(unittest.TestCase):
             def first_depth_sensor(self):
                 return depth_sensor
 
+            def query_sensors(self):
+                sensor = mock.Mock()
+                sensor.set_option.side_effect = RuntimeError("clock option unavailable") if sync_error else None
+                return [sensor]
+
         device = Device()
         context = types.SimpleNamespace(query_devices=lambda: [device])
         sdk = types.SimpleNamespace(
+            option=types.SimpleNamespace(global_time_enabled="global_time_enabled"),
+            timestamp_domain=types.SimpleNamespace(system_time="system_time", global_time="global_time"),
             context=lambda: context,
             config=lambda: config,
             pipeline=lambda selected_context: pipeline,
@@ -346,10 +368,11 @@ class RGBDCaptureTests(unittest.TestCase):
             "rclpy.qos": types.SimpleNamespace(qos_profile_sensor_data=None),
             "sensor_msgs.msg": types.SimpleNamespace(
                 CompressedImage=FakeCompressedImage),
+            "std_msgs.msg": types.SimpleNamespace(String=types.SimpleNamespace),
         }
         with mock.patch.dict(sys.modules, modules), mock.patch.object(
             rs.time, "monotonic", side_effect=lambda: clock[0]
-        ):
+        ), mock.patch.object(rs.time, "time", side_effect=lambda: clock[0]):
             worker = rs._capture if reconnect else rs._capture_once
             with mock.patch.object(quit_event, "wait", side_effect=lambda _: quit_event.is_set()):
                 worker("robot_a", serial, routes or {}, queue.Queue(), quit_event, statuses)
@@ -365,7 +388,7 @@ class RGBDCaptureTests(unittest.TestCase):
         self.assertEqual(pipeline.start.call_count, 2)
         self.assertEqual(pipeline.stop.call_count, 2)
         self.assertEqual(config.device, "serial-1234")
-        self.assertEqual(len(node.publishers), 3)
+        self.assertEqual(len(node.publishers), 4)
         for publisher in node.publishers.values():
             self.assertEqual(len(publisher.messages), 1)
 
@@ -442,12 +465,39 @@ class RGBDCaptureTests(unittest.TestCase):
                 "16UC1; compressedDepth zlib",
             "/robot_a/ext_camera/infrared_card/infrared": "jpeg",
         }
-        self.assertEqual(set(node.publishers), set(expected))
+        metadata_topic = "/robot_a/ext_camera/depth_card/depth/metadata"
+        self.assertEqual(set(node.publishers), set(expected) | {metadata_topic})
+        metadata = json.loads(node.publishers[metadata_topic].messages[0].data)
+        self.assertEqual(metadata["rgb_intrinsics"]["width"], 1280)
+        self.assertEqual(metadata["depth_intrinsics"]["width"], 640)
+        self.assertEqual(metadata["depth_scale_m"], 0.001)
+        self.assertEqual(metadata["rgb_topics"], ["/robot_a/ext_camera/rgb_card/rgb"])
+        self.assertEqual(metadata["rgb_stamp_ns"], 100_080_000_000)
         for topic, image_format in expected.items():
             messages = node.publishers[topic].messages
             self.assertEqual(len(messages), 1)
             self.assertEqual(messages[0].format, image_format)
             self.assertTrue(messages[0].data)
+            channel = topic.rsplit("/", 1)[1]
+            self.assertEqual(messages[0].header.frame_id, f"robot_a_{channel}_optical")
+            self.assertEqual(messages[0].header.stamp.sec, 100)
+            self.assertEqual(messages[0].header.stamp.nanosec, 100_000_000)
+            if channel in ("rgb", "depth"):
+                self.assertEqual(metadata[channel + "_header_stamp_ns"], 100_100_000_000)
+                self.assertEqual(metadata[channel + "_frame_id"], messages[0].header.frame_id)
+            if channel == "depth":
+                raw = np.frombuffer(zlib.decompress(messages[0].data), dtype="<u2")
+                np.testing.assert_array_equal(raw, np.ones(640 * 480, dtype="<u2"))
+            else:
+                self.assertEqual(messages[0].data, bytes([1, 2, 3]))
+
+    def test_optional_timestamp_setup_failure_preserves_existing_preview(self):
+        errors, _, _, _, node = self.capture(
+            [(0.1, rs.STREAMS)], routes={"rgb": "rgb", "depth": "depth", "ir": "infrared"},
+            sync_error=True)
+        self.assertEqual(errors, [])
+        for key, channel in (("rgb", "rgb"), ("depth", "depth"), ("ir", "infrared")):
+            self.assertEqual(len(node.publishers[f"/robot_a/ext_camera/{key}/{channel}"].messages), 1)
 
 
 if __name__ == "__main__":
