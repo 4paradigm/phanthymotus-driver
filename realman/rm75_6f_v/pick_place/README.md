@@ -6,32 +6,45 @@ RealMan Driver ACTUATOR 卡片，提供 `observe` 观察拍照、`transfer_to` �
 
 ## 执行契约
 
-三个动作均使用同步 MCP 调用，等待本次执行结束后返回 `completed`、`error` 或
-`cancelled`，不提前返回后台任务。调用方直接读取本次响应的终态和结果；因此不声明
-异步 `x-completion`，不创建待完成的 `action_id`，也不使用 ACP 回调或任务轮询。
-动作执行预算为 45 秒，超时进入停止与反馈确认流程；该预算不是对底层 SDK 阻塞时间的保证。
-同步调用方须配置足够的请求超时，并在收到终态后继续后续步骤。
+三个运动动作 `observe`、`transfer_to`、`transfer_by` 每次都必须显式传入
+`confirm_motion: true`。缺失、`false` 或非布尔值均返回 `CONFIRMATION_REQUIRED`，
+不会占用设备、启动相机或下发运动。该确认不跨请求复用；`RM_MOTION_ENABLED` 仅控制部署能力。
+`cancel`、`stop`、`info`、启动和配置不需要运动确认，两个中断钩子始终可调用。
 
-本卡片按框架规范声明 `type: actuator`、`x-is-dangerous: true`、`x-resource: arm`
-以及两个中断钩子，由调用方和 Agent Core 承担任务授权与安全确认。
-`RM_MOTION_ENABLED` 只控制部署是否具备动作能力，不代表逐次用户授权。
-在已授权的任务中，动作调用即执行，不再增加 `confirm_motion` 参数；
-Driver 仍检查连接、只读模式、设备互斥、故障、反馈和照片有效期，并支持取消。
+动作通过输入检查并取得设备互斥后，立即返回 `state: "running"` 和唯一 `action_id`，
+后台线程执行完整动作。输入 Schema 声明 `x-completion.actions` 为三个运动动作、
+`timeout: 90`，并保留 `type: actuator`、`x-is-dangerous: true`、`x-resource: arm`。
+框架通过 ACP 等待完成，不要求模型轮询或重复下发动作。
+动作执行预算为 45 秒，超时进入停止与反馈确认流程；90 秒 ACP 等待预算包含停止、
+相机清理及回调重试余量，不是对底层 SDK 阻塞时间的保证。
+
+后台执行结束后，卡片向 `${AGENT_CORE_URL}/api/acp/complete` 上报同一 `action_id`，
+`status` 为 `completed`、`error` 或 `cancelled`，`result` 包含动作结果及
+`observation_required`。只有 `status=completed` 且 `result.ok=true` 才表示动作完成；
+最初的 `running` 响应仅表示已接收。动作接收前的拒绝同步返回，不产生 ACP 待完成记录。
+
+回调使用 `AGENT_CORE_CA_CERT` 指定的 CA 并保留 TLS 证书与主机名校验，缺失或无效的 CA
+在接收动作前拒绝请求。服务部署已提供 Core 地址和 CA 挂载。
+回调要求 Core 返回 `ok: true` 及相同 `action_id`；未确认、连接失败或 Core 尚未登记
+pending 时，最多尝试 3 次，每次请求超时 5 秒，间隔 0.5 秒。只重发同一完成通知，
+不重发设备命令。`info.last_result.callback` 为 `pending`、`accepted` 或 `failed`，
+失败原因保存在 `callback_error`，不会改写已完成的物理动作结果。
+Driver 继续检查连接、只读模式、设备互斥、故障、反馈和照片有效期，并支持取消。
 
 ## 大模型调用
 
 MCP 总描述及各动作描述包含调用顺序、坐标约定、动作选择和照片有效期。
 用户可以用“把香蕉向右移动 3 厘米”这样的任务指令，由模型通过框架完成：
 
-1. 调用 `observe`，等待同步返回成功。
+1. 调用 `observe(confirm_motion=true)`，等待框架 ACP 通知本次观察成功。
 2. 通过已连接的视觉/目标检测工具读取本次照片的结构化检测结果。VOP 的结果主题为
    `/{namespace}/pick_place/photo/objects`，使用框架的传感器数据查询工具读取。
    有观察编号时匹配 `observation_id`，否则核对结果时间不早于本次 `captured_at`；
    尚未收到新结果时等待，目标不存在或无法确定时报告或询问用户，不猜测坐标。
 3. 选取香蕉检测中心的 `position[0]、position[1]`，调用 `transfer_by`，
-   填写 `dx_mm=30、dy_mm=0`。放到照片中的指定位置时使用 `transfer_to`；
+   填写 `dx_mm=30、dy_mm=0、confirm_motion=true`。放到照片中的指定位置时使用 `transfer_to`；
    放在另一物体旁边时选择旁边空位，参照物中心不代表空位。
-4. 等待搬运同步返回，以 `state=completed` 且 `result.ok=true` 判断动作完成，报告结果并结束。
+4. 等待框架 ACP 完成通知，以 `status=completed` 且 `result.ok=true` 判断动作完成，报告结果并结束。
    失败或取消时报告原因，不自动重试；`grasp_checked=false` 表示卡片没有自动核验是否抓到物体。
 
 一个任务需要搬运多个物体时，逐个执行“观察 → 获取新检测 → 搬运”，每次使用新照片的位置。
@@ -59,8 +72,8 @@ X/Y 补偿是独立的水平定位参数，作用于基坐标系中的目标位�
 
 ## observe
 
-调用 `pick_place` 时仅需 `{"action": "observe"}`，该动作没有额外参数。
-调用即执行观察动作，完成运动、拍照和输出后直接返回结果。
+调用 `pick_place` 时传入 `{"action": "observe", "confirm_motion": true}`。
+接收后返回 `running` 和 `action_id`，后台完成运动、拍照和输出，再通过 ACP 上报结果。
 Driver 必须已连接并以 `live` 模式部署；只读部署会明确提示当前模式不可执行动作。
 
 动作检查关节故障、使能状态、控制器限位及相机可用性，然后以配置速度下发一条
@@ -68,10 +81,10 @@ Driver 必须已连接并以 `live` 模式部署；只读部署会明确提示�
 获取一组新鲜 RGB-D 帧，再核验拍照期间的位姿与坐标系。全过程不操作夹爪。
 相机由卡片自行选择唯一连接的 RealSense；多台或无可用相机时拒绝执行。
 
-成功返回 `state: "completed"`，`result` 包含照片路径、观察编号、拍摄时间、尺寸和元数据路径。
-响应中的 `observation_required: false` 表示本次照片可用于一次搬运。
-失败或取消直接返回对应结果。每次调用都执行一次观察；并发调用在设备忙时被拒绝。
-`info.last_result` 和 `info.observation` 可查看最近结果，但执行动作不需要轮询或完成回调。
+成功时 ACP 上报 `status: "completed"`，`result` 包含照片路径、观察编号、拍摄时间、尺寸和元数据路径。
+ACP 结果中的 `observation_required: false` 表示本次照片可用于一次搬运。
+后台执行失败或取消时由 ACP 上报对应终态；并发调用在设备忙时被拒绝。
+`info.last_result` 和 `info.observation` 可查看最近结果；正常调用流程等待框架 ACP 通知，无需轮询。
 
 ## 位置坐标
 
@@ -96,11 +109,11 @@ Driver 必须已连接并以 `live` 模式部署；只读部署会明确提示�
 先执行 `observe`，再使用该照片上的四个归一化坐标调用：
 
 ```json
-{"action": "transfer_to", "x1": -0.3, "y1": 0.2, "x2": 0.3, "y2": 0.2}
+{"action": "transfer_to", "confirm_motion": true, "x1": -0.3, "y1": 0.2, "x2": 0.3, "y2": 0.2}
 ```
 
 `(x1, y1)` 为抓取物体的中心，`(x2, y2)` 为放置位置，均遵循上述位置坐标约定。
-调用仅需这四个参数，执行整次搬运后返回，不需要确认参数、请求编号或任务轮询。
+调用传入这四个位置参数及 `confirm_motion=true`，接收后返回 `action_id`，整次搬运由后台完成并通过 ACP 上报。
 
 两点均使用最近一次成功观察的原始对齐深度和内参计算，并分别叠加配置的 X/Y 补偿，
 得到绝对基坐标水平目标；B 点不相对 A 点累加位移。任一点越界或深度无效，均在运动前
@@ -114,7 +127,7 @@ Driver 必须已连接并以 `live` 模式部署；只读部署会明确提示�
 至少一个非零；无须填写 `x2、y2`。例如，将该物体向照片左侧移动 30 mm：
 
 ```json
-{"action": "transfer_by", "x1": 0.08, "y1": -0.079, "dx_mm": -30, "dy_mm": 0}
+{"action": "transfer_by", "confirm_motion": true, "x1": 0.08, "y1": -0.079, "dx_mm": -30, "dy_mm": 0}
 ```
 
 位移 `dx_mm、dy_mm` 的方向以本次 `observe` 的照片为准，单位为 mm；它们是实际位移量，不是归一化坐标。
@@ -135,7 +148,7 @@ Driver 必须已连接并以 `live` 模式部署；只读部署会明确提示�
 不换算为目标像素，不使用另一点的深度。工作坐标有旋转时，仍保持上述基坐标方向。
 
 MCP 调用选择：需要放到照片中某个位置时使用 `transfer_to`；需要将选中物体沿照片方向
-移动指定毫米距离时使用 `transfer_by`。两者都完成抓起、搬运、放下后同步返回。
+移动指定毫米距离时使用 `transfer_by`。两者都由后台完成抓起、搬运、放下，再通过 ACP 通知框架。
 
 ## 共用搬运流程
 
@@ -153,14 +166,14 @@ MCP 调用选择：需要放到照片中某个位置时使用 `transfer_to`；�
 夹持力度只写寄存器 1220，以交替长度的回读确认，不写驱动力寄存器或 Flash。
 
 全过程检查新鲜反馈、故障、坐标系、姿态、行程及夹爪状态，并确认每段到位和停稳。
-成功返回 `state: "completed"`，结果包含使用的观察编号、内部实际读取深度的抓取像素
+成功时 ACP 上报 `status: "completed"`，结果包含使用的观察编号、内部实际读取深度的抓取像素
 `pick_pixel` 和两处基坐标水平目标、最终位姿。`transfer_to` 还返回放置像素 `place_pixel`；
 这些结果字段仍是原图整数像素，与动作输入的归一化坐标区分。`transfer_by` 返回 `dx_mm、dy_mm` 和方向基准
 `direction_reference: "observation_image"`。`grasp_checked: false` 表示未判断是否实际
 抓到物体。两种搬运动作均不拍照或发布图像。
 
-观察和两种搬运动作的执行超时均为 45 秒，预留停止与资源释放时间，以适配 Core 的 60 秒同步调用
-限制；过低速度或较长行程可能超时，超时后停止，不继续剩余步骤。
+观察和两种搬运动作的执行超时均为 45 秒；过低速度或较长行程可能超时，
+超时后停止，不继续剩余步骤。后台终态通过 ACP 上报，不占用原 MCP 请求等待。
 
 ## 单张照片输出
 
@@ -184,7 +197,7 @@ MCP 调用选择：需要放到照片中某个位置时使用 `transfer_to`；�
 任一搬运动作首次下发设备命令后即使当前照片失效，下一次搬运需重新 `observe`；
 即使命令报错或动作取消，也不恢复照片的有效性。该检查由卡片执行，在同一设备互斥下
 消费照片，不能通过切换 `transfer_to` / `transfer_by` 复用，也不会从已保存文件恢复。
-动作返回及 `info` 中的 `observation_required` 表示下一次搬运是否需要重新观察。
+ACP 终态结果及 `info` 中的 `observation_required` 表示下一次搬运是否需要重新观察。
 无有效照片时，搬运直接返回 `state: "error"`、`code: "OBSERVATION_REQUIRED"`、
 `observation_required: true`，不会下发设备命令。
 参数错误且尚未下发设备命令时保留照片，可修正参数；外部移动物体后也应重新观察。

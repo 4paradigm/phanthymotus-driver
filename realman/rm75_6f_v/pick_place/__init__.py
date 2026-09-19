@@ -14,11 +14,14 @@ from .motion import ObservationMotion, pose_close
 from .camera import SnapshotCameras
 from .geometry import displacement, positions
 from .transfer import Transfer
+from .completion import Completion
 from hardware import JOINT_LIMITS_DEG
 
 
-# Core allows 60 seconds per synchronous actuator call; leave time to stop and clean up.
+# Motion budget; ACP additionally allows stopping, camera cleanup and callback delivery.
 ACTION_TIMEOUT_SECONDS = 45
+COMPLETION_TIMEOUT_SECONDS = 90
+MOTION_ACTIONS = ("observe", "transfer_to", "transfer_by")
 
 
 CONFIG_PROPERTIES = {
@@ -108,8 +111,9 @@ class PickPlacePlugin:
             "目标缺失或无法确定时报告或询问用户，不猜测坐标。"
             "每张照片仅供一次搬运：首次下发设备命令即失效，失败或取消也不能复用。"
             "下一次搬运必须重新 observe 并使用新检测坐标，多个物体也须逐次观察和搬运。"
-            "调用直接完成抓起、搬运、放下及回升，同步返回，无需轮询或重复下发。"
-            "state=completed 且 result.ok=true 表示动作完成；grasp_checked=false 表示未自动核验实际抓到物体。"
+            "每次调用须显式传 confirm_motion=true；返回 state=running 和 action_id 后由后台完成抓起、搬运、放下及回升。"
+            "等待框架 ACP 完成通知，无需轮询或重复下发。"
+            "ACP status=completed 且 result.ok=true 表示动作完成；grasp_checked=false 表示未自动核验实际抓到物体。"
             "observation_required=true 表示再次搬运前需要新照片，无有效照片会返回 OBSERVATION_REQUIRED；不要求任务完成后继续拍照。"
             "失败或取消时报告原因，不自动重试；完成用户要求后报告结果并结束任务。")
         properties = {name: {"type": "number", "minimum": -1, "maximum": 1, "description": description}
@@ -119,26 +123,29 @@ class PickPlacePlugin:
                           ("x2", "transfer_to 放置位置在 observe 照片中的归一化 X 坐标，范围 [-1,1]：左边缘 -1、中心 0、右边缘 +1，正方向向右，与 x1 相同。"),
                           ("y2", "transfer_to 放置位置在 observe 照片中的归一化 Y 坐标，范围 [-1,1]：上边缘 -1、中心 0、下边缘 +1，正方向向下，与 y1 相同。"))}
         properties.update({
+            "confirm_motion": {"type": "boolean", "const": True,
+                               "description": "每次 observe、transfer_to、transfer_by 请求必须显式为 true，确认执行本次机械臂动作；取消无需此参数。"},
             "dx_mm": {"type": "number", "description": "transfer_by 从抓取点沿桌面左右平移的有符号距离（mm），可为小数。以 observe 照片为准：X 正方向向右（正值），负方向向左（负值），0 不左右移动；当前安装对应基坐标 ΔX=-dx_mm。不是像素或绝对位置。"},
             "dy_mm": {"type": "number", "description": "transfer_by 从抓取点沿桌面上下平移的有符号距离（mm），可为小数。以 observe 照片为准：Y 正方向向照片下方（正值），负方向向上方（负值），0 不上下平移；当前安装对应基坐标 ΔY=dy_mm。不是机械臂 Z 升降、像素或绝对位置。"},
         })
         schema = action_schema({
-            "observe": ([], (
-                "观察桌面，或为一次搬运获取新照片。无参数；按卡片配置移动到观察位，停稳后拍摄并输出一张照片，"
-                "同步完成后返回 state=completed、result.ok=true，以及 observation_id、captured_at、width、height、topic_out。"
+            "observe": (["confirm_motion"], (
+                "观察桌面，或为一次搬运获取新照片。每次须显式传 confirm_motion=true；按卡片配置移动到观察位，停稳后拍摄并输出一张照片。"
+                "立即返回 state=running 和 action_id，等待框架 ACP 通知 status=completed、result.ok=true，"
+                "以及 observation_id、captured_at、width、height、topic_out；无需轮询或重复下发。"
                 "这是单次拍照，该动作本身不识别物体；通过已连接的视觉/目标检测工具读取本次照片的结构化检测结果。"
                 f"VOP 连线时检测主题为 {self._topic}/objects，可通过框架的传感器数据查询工具读取；"
                 "核对检测结果对应本次照片，尚未收到时等待新结果，不使用历史检测。"
                 "VOP position[0]、position[1] 可直接作为搬运的 x1、y1，无需读取本地照片文件或换算像素。"
                 "一张照片只能用于一次搬运；每次搬运后再次移动任何物体，都须重新 observe 并重新检测。"
                 "失败或取消时报告原因，不自动重试。")),
-            "transfer_to": (["x1", "y1", "x2", "y2"], (
+            "transfer_to": (["x1", "y1", "x2", "y2", "confirm_motion"], (
                 "指定目标点：用于把物体放到照片中的指定位置，或另一物体旁的空位。"
                 "(x1,y1) 是抓取物体中心，(x2,y2) 是放置点，四个值均为同次 observe 照片的归一化坐标 [-1,1]。"
                 "照片中心为 (0,0)，X 向右、Y 向下为正；VOP position[0] 对应 X、position[1] 对应 Y，"
                 "无需换算像素或读取照片文件。放在另一物体旁边时选择其旁的空位，不能把参照物中心直接当作空位；"
                 "指定毫米距离的相对移动使用 transfer_by。" + transfer_guidance)),
-            "transfer_by": (["x1", "y1", "dx_mm", "dy_mm"], (
+            "transfer_by": (["x1", "y1", "dx_mm", "dy_mm", "confirm_motion"], (
                 "指定距离（mm）：用于把一个物体向左、右、照片上方或下方移动指定距离。"
                 "(x1,y1) 为 observe 照片中物体中心的归一化坐标 [-1,1]，照片中心为 (0,0)，"
                 "直接使用 VOP position[0]、position[1]，无需换算像素或读取照片文件。"
@@ -149,6 +156,10 @@ class PickPlacePlugin:
                 "放到照片中指定位置使用 transfer_to。" + transfer_guidance)),
             "cancel": ([], "中止当前动作，停止后终止后续步骤，不自动回程或释放夹爪；再次搬运前重新 observe。"),
         }, properties)
+        # Require confirmation only for motion, leaving interrupt hooks callable.
+        schema["allOf"] = [{"if": {"properties": {"action": {"enum": list(MOTION_ACTIONS)}}},
+                            "then": {"required": ["confirm_motion"]}}]
+        schema["x-completion"] = {"actions": list(MOTION_ACTIONS), "timeout": COMPLETION_TIMEOUT_SECONDS}
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "cancel"},
                              "on_interrupt_all": {"action": "cancel"}}
         schema["x-is-dangerous"] = True
@@ -158,7 +169,8 @@ class PickPlacePlugin:
             "放到指定位置用 transfer_to，按方向移动指定毫米距离用 transfer_by。"
             "位置为照片中心归一化坐标 [-1,1]，X 向右、Y 向下为正，可直接使用 VOP position；"
             "毫米位移与位置坐标分别填写。每张照片仅供一次搬运，下一次搬运前必须重新观察并检测。"
-            "动作同步执行并返回结果，完成用户要求后报告并结束；失败不自动重试。"),
+            "每次运动须传 confirm_motion=true，调用返回 action_id 后等待框架 ACP 完成通知；"
+            "完成用户要求后报告并结束，失败不自动重试。"),
                           schema, topic_out=self._outputs())
         definition["configSchema"] = {
             "type": "object", "properties": copy.deepcopy(CONFIG_PROPERTIES), "additionalProperties": False,
@@ -240,6 +252,9 @@ class PickPlacePlugin:
             return {"state": "stopping"}
 
     def _execute(self, action, args):
+        if args.get("confirm_motion") is not True:
+            return {"state": "error", "code": "CONFIRMATION_REQUIRED",
+                    "message": "confirm_motion must be true for every movement request"}
         with self._config_lock:
             if not self.client.connected:
                 return {"state": "error", "message": "Mechanical arm is not connected"}
@@ -255,11 +270,10 @@ class PickPlacePlugin:
                 return {"state": "error", "message": "Another device action is active"}
             try:
                 active = {"config": dict(self._config), "cancel": threading.Event(),
-                          "done": threading.Event(), "motion_sent": False}
+                          "done": threading.Event(), "motion_sent": False,
+                          "action_id": f"pick_place_{action}_{uuid4().hex}", "action": action}
                 if action == "observe":
-                    self._ensure_publisher()
                     active["observation_id"] = "pick_place_observe_" + uuid4().hex
-                    self._observation = None
                 else:
                     if action == "transfer_by":
                         active["positions"] = positions(args, ("x1", "y1"))
@@ -267,12 +281,36 @@ class PickPlacePlugin:
                     else:
                         active["positions"] = positions(args)
                     active["observation"] = dict(self._observation)
+                active["completion"] = Completion(args.get("_tool_name", self.PREFIX))
                 self._active = active
+                threading.Thread(target=self._run_action, args=(active,),
+                                 name=active["action_id"], daemon=True).start()
+                if action == "observe":
+                    self._observation = None
             except Exception as exc:
                 self._active = None
                 self.client.motion_lock.release()
                 return {"state": "error", "message": str(exc)}
-        return self._run_observe(active) if action == "observe" else self._run_transfer(active)
+        return {"state": "running", "action_id": active["action_id"]}
+
+    def _run_action(self, active):
+        try:
+            terminal = (self._run_observe(active) if active["action"] == "observe"
+                        else self._run_transfer(active))
+        except Exception as exc:
+            # Include failures in worker setup in the same terminal contract.
+            status, result = self._failure(active, exc)
+            terminal = self._finish(active, status, result)
+        try:
+            callback, error = active["completion"].send(active["action_id"], terminal["state"],
+                {**terminal["result"], "observation_required": terminal["observation_required"]})
+        except Exception as exc:
+            callback, error = "failed", str(exc)
+        with self._config_lock:
+            # Update this record, not a newer action's completion.
+            terminal["callback"] = callback
+            if error:
+                terminal["callback_error"] = error
 
     def _failure(self, active, exc):
         if active["motion_sent"]:
@@ -290,7 +328,8 @@ class PickPlacePlugin:
 
     def _finish(self, active, status, result):
         with self._config_lock:
-            terminal = {"state": status, "result": result,
+            terminal = {"state": status, "result": result, "action_id": active["action_id"],
+                        "callback": "pending",
                         "observation_required": self._observation is None}
             self._last_result = terminal
             self._active = None
@@ -352,6 +391,9 @@ class PickPlacePlugin:
         camera = result = None
         status = "error"
         try:
+            with self._config_lock:
+                motion.check_cancel()
+                self._ensure_publisher()
             config = active["config"]
             target = [float(value) for value in config["observation_joints_deg"].split(",")]
             motion.validate_target(target)
@@ -450,6 +492,6 @@ class PickPlacePlugin:
                         "motion_blocked": self._motion_blocked,
                         "observation_required": self._observation is None,
                         "last_result": copy.deepcopy(self._last_result), "observation": copy.deepcopy(self._observation)}
-        if action in ("observe", "transfer_to", "transfer_by"):
+        if action in MOTION_ACTIONS:
             return self._execute(action, args)
-        return {"state": "error", "message": "Action is not implemented"}
+        return None
