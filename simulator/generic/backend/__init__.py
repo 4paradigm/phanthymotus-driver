@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 
+from simulator.generic.backend.planner import GridPlanner
 from simulator.generic.geometry import OccupancyGrid, Pose, normalize_angle
 
 
@@ -43,6 +44,10 @@ class WorldBackend:
         raise NotImplementedError
 
     def sense(self, kinds: list[str]) -> dict:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def plan(self, start, goal) -> list | None:  # pragma: no cover - interface
+        """世界坐标折线，无解返回 None。真地图上直线大多不通。"""
         raise NotImplementedError
 
     def health(self) -> bool:  # pragma: no cover - interface
@@ -78,6 +83,16 @@ class LocalBackend(WorldBackend):
         self._contact: str | None = None
         self._odometer = 0.0
         self._scan = {"n_beams": 60, "fov": math.radians(270.0), "max_range": 8.0}
+        self._planner = GridPlanner(self._grid, self._radius)
+        # 停靠位姿附近豁免车宽检查。真展厅里 P7 距墙 6cm、P3 18cm，都小于车半径
+        # 25cm —— 机器人本来就紧贴展屏停，所以它在自己的目的地就「算撞墙」，一步
+        # 没动就失败。真底盘在最后一米靠桩时同样会关避障。这与规划器豁免起终点
+        # 膨胀是同一个理由、同样的两个地方。
+        self._exempt: list[tuple[float, float]] = []
+        # 靠桩距离，和车宽**无关**。先前它等于车半径，于是半径越小泡泡越小，
+        # 而 P7 距墙只有 6cm —— 泡泡根本盖不住整个靠桩过程，机器人在最后几十厘米
+        # 上撞停。真底盘关避障的那一段也是按距离算的，不是按车宽。
+        self._dock_clearance = 0.6
         self._closed = False
         if scene:
             self.reset(scene)
@@ -109,9 +124,23 @@ class LocalBackend(WorldBackend):
         self._joint_speed = float(scene.get("joint_speed", self._joint_speed))
 
         self._scan.update(scene.get("scan") or {})
+        self._dock_clearance = float(motion.get("dock_clearance", self._dock_clearance))
+        self._planner = GridPlanner(self._grid, self._radius)
         self._lin = self._ang = self._lin_cmd = self._ang_cmd = 0.0
         self._contact = None
+        self._exempt = []
         self._odometer = 0.0
+
+    def plan(self, start, goal) -> list | None:
+        return self._planner.plan(start, goal)
+
+    def set_clearance_exempt(self, points) -> None:
+        """这些点周围一个车身半径内只查车体中心，不查整个车宽。"""
+        self._exempt = [(float(x), float(y)) for x, y in (points or [])]
+
+    def _exempt_here(self, x: float, y: float) -> bool:
+        reach = self._dock_clearance ** 2
+        return any((x - ex) ** 2 + (y - ey) ** 2 <= reach for ex, ey in self._exempt)
 
     def health(self) -> bool:
         return not self._closed
@@ -147,10 +176,13 @@ class LocalBackend(WorldBackend):
             # widening it: `radius` alone is perpendicular to travel, which models
             # the robot's width but gives it no length — so it would stop only
             # once its *centre* entered the wall.
-            lead = self._radius * _sign(self._lin)
-            ex = nx + math.cos(self._pose.yaw) * lead
-            ey = ny + math.sin(self._pose.yaw) * lead
-            if self._grid.segment_blocked(self._pose.x, self._pose.y, ex, ey, self._radius):
+            if self._exempt_here(self._pose.x, self._pose.y):
+                # 贴着展屏起步/收尾：只要车体中心不在墙里就放行。
+                blocked = self._grid.swept_blocked(self._pose.x, self._pose.y, nx, ny, 0.0, 0.0)
+            else:
+                blocked = self._grid.swept_blocked(self._pose.x, self._pose.y, nx, ny,
+                                                   self._radius, self._radius)
+            if blocked:
                 # Hard stop against geometry. The nav controller turns this into a
                 # failed job; nothing here knows what a job is.
                 self._contact = "base"

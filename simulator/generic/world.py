@@ -69,6 +69,13 @@ class NavJob:
     dist_total: float = 0.0
     dist_done: float = 0.0
     phase: str = "translate"        # translate | final_yaw
+    # 规划出来的折线（世界坐标，不含起点）。真地图上相邻展位之间多半不通直线，
+    # 所以「一段导航」实际上是沿一条折线走，而不是对着终点直冲。
+    route: list = field(default_factory=list)
+    leg: int = 0
+    # 任务开始时的位姿。第一段的起点是它，不是「当前位姿」—— 拿当前位姿当段起点，
+    # 已走距离会恒等于 0，进度永远不动。
+    start: Pose = field(default_factory=Pose)
     terminal_posted: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
@@ -98,7 +105,8 @@ class NavJob:
             "status": self.status, "reason": self.reason,
             "progress": {"dist_done": round(self.dist_done, 3),
                          "dist_total": round(self.dist_total, 3),
-                         "fraction": round(self.fraction, 3)},
+                         "fraction": round(self.fraction, 3),
+                         "leg": self.leg, "legs": len(self.route)},
         }
 
 
@@ -264,14 +272,20 @@ class VirtualWorld:
             err = normalize_angle(job.target.yaw - pose.yaw)
             return {"lin": 0.0, "ang": _sign(err) * min(max_ang, abs(err) * 2.0)}
 
-        dist = pose.distance_to(job.target)
-        err = normalize_angle(pose.bearing_to(job.target) - pose.yaw)
+        waypoint = job.target
+        if job.route and job.leg < len(job.route):
+            wx, wy = job.route[job.leg]
+            waypoint = Pose(wx, wy, job.target.yaw)
+        dist = pose.distance_to(waypoint)
+        err = normalize_angle(pose.bearing_to(waypoint) - pose.yaw)
         if abs(err) > STEER_TOL:
             # Turn in place first; driving while badly misaligned makes the path
             # a spiral and the distance assertions meaningless.
             return {"lin": 0.0, "ang": _sign(err) * min(max_ang, abs(err) * 2.0)}
-        # Trapezoid: never enter a state the remaining distance cannot brake from.
-        approach = math.sqrt(max(0.0, 2.0 * accel * max(0.0, dist - POS_TOL * 0.5)))
+        # 中途点不必停下来，只有最后一个点才需要刹到 0 —— 逐点急停会让整条
+        # 路径走成一顿一顿的，和真机完全不像。
+        remaining = dist if job.leg >= len(job.route) - 1 else dist + job.dist_total
+        approach = math.sqrt(max(0.0, 2.0 * accel * max(0.0, remaining - POS_TOL * 0.5)))
         return {"lin": min(max_lin, approach), "ang": _sign(err) * min(max_ang, abs(err) * 2.0)}
 
     def _update_job_locked(self) -> dict | None:
@@ -284,7 +298,16 @@ class VirtualWorld:
         if state.get("contact"):
             return self._finish_job_locked(job, RESULT_FAILED, f"blocked by geometry at {state['contact']}")
 
-        job.dist_done = max(job.dist_done, job.dist_total - pose.distance_to(job.target))
+        if job.route:
+            if job.leg < len(job.route):
+                wx, wy = job.route[job.leg]
+                # 中途点的到达判定放宽一些：卡着 POS_TOL 会让机器人在拐角来回修正。
+                tol = POS_TOL if job.leg == len(job.route) - 1 else POS_TOL * 2.5
+                if math.hypot(pose.x - wx, pose.y - wy) <= tol:
+                    job.leg += 1
+            job.dist_done = max(job.dist_done, _route_progress(job, pose))
+        else:
+            job.dist_done = max(job.dist_done, job.dist_total - pose.distance_to(job.target))
 
         if job.kind in ("rotate", "rotate_to"):
             if abs(normalize_angle(job.target.yaw - pose.yaw)) <= YAW_TOL:
@@ -292,7 +315,7 @@ class VirtualWorld:
             return None
 
         if job.phase == "translate":
-            if pose.distance_to(job.target) <= POS_TOL:
+            if job.leg >= len(job.route) and pose.distance_to(job.target) <= POS_TOL:
                 job.dist_done = job.dist_total
                 job.phase = "final_yaw"
             return None
@@ -329,12 +352,25 @@ class VirtualWorld:
             if previous is not None and not previous.terminal_posted:
                 superseded = self._finish_job_locked(previous, RESULT_CANCELLED, "superseded by a new command")
             pose: Pose = self._backend.state()["pose"]
+            route: list = []
+            if kind not in ("rotate", "rotate_to"):
+                # 先规划。规划不出来就退回直线 —— 并且在事件里记一笔，这样
+                # 「撞墙停住」至少有个可查的原因，而不是看起来莫名其妙。
+                planner = getattr(self._backend, "plan", None)
+                route = (planner((pose.x, pose.y), (target.x, target.y)) or []) if planner else []
+                if not route:
+                    self._log_locked("route_unplanned", label=label,
+                                     target=target.as_dict(), reason="no path found")
             job = NavJob(
                 id=f"sim-nav-{uuid.uuid4().hex[:12]}",
                 kind=kind, target=target.copy(), label=label,
-                started_at=self._clock.now(),
-                dist_total=0.0 if kind in ("rotate", "rotate_to") else pose.distance_to(target),
+                started_at=self._clock.now(), route=route, start=pose.copy(),
+                dist_total=(0.0 if kind in ("rotate", "rotate_to")
+                            else _route_length(pose, route, target)),
             )
+            exempt = getattr(self._backend, "set_clearance_exempt", None)
+            if exempt is not None:
+                exempt([(pose.x, pose.y), (target.x, target.y)])
             self._job = job                       # registered...
             job.state = STATE_RUNNING             # ...and only then running
             self._log_locked("nav_start", **job.as_dict())
@@ -519,6 +555,32 @@ class VirtualWorld:
             self._manual = (0.0, 0.0)
             self._trail = []
             self._tags = {}
+
+
+def _route_length(start: Pose, route: list, target: Pose) -> float:
+    if not route:
+        return start.distance_to(target)
+    total = math.hypot(route[0][0] - start.x, route[0][1] - start.y)
+    for (ax, ay), (bx, by) in zip(route, route[1:]):
+        total += math.hypot(bx - ax, by - ay)
+    return total
+
+
+def _route_progress(job: NavJob, pose: Pose) -> float:
+    """已走过的折线长度：走完的整段 + 当前段里已走的部分。"""
+    done = 0.0
+    previous = (job.start.x, job.start.y)
+    for index, (wx, wy) in enumerate(job.route):
+        if index >= job.leg:
+            break
+        done += math.hypot(wx - previous[0], wy - previous[1])
+        previous = (wx, wy)
+    if job.leg < len(job.route):
+        wx, wy = job.route[job.leg]
+        segment = math.hypot(wx - previous[0], wy - previous[1])
+        left = math.hypot(wx - pose.x, wy - pose.y)
+        done += max(0.0, segment - left)
+    return done
 
 
 def _sign(value: float) -> float:
