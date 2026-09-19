@@ -387,17 +387,20 @@ class ObserveTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "timeout"):
             ObservationMotion(self.client, threading.Event()).settled(self.joints, timeout=0.2)
 
-    def test_existing_cards_keep_local_locks_and_share_only_sdk_connection(self):
+    def test_all_motion_cards_share_driver_connection_and_upstream_motion_gate(self):
         device = load_device()
         plugins = device.build_plugins({}, "test", None)
         client = plugins[0]
-        self.assertIsNot(plugins[1]._motion_lock, client.motion_lock)
+        self.assertIs(plugins[1]._motion_lock, client.motion_lock)
+        self.assertIs(client.motion_gate, client.motion_lock)
         self.assertIsNot(plugins[2]._gripper_lock, client.motion_lock)
         self.assertFalse(hasattr(plugins[3], "_motion_lock"))
         self.assertIs(plugins[1].client._client, client)
         self.assertIs(plugins[2].client._client, client)
         self.assertIs(plugins[3].client._client, client)
         self.assertIs(plugins[4].client._client, client)
+        self.assertIs(plugins[4]._motion_lock, client.motion_gate)
+        self.assertIs(plugins[5].client._client, client)
 
 
     def test_stop_failure_keeps_device_ownership(self):

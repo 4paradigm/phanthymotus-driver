@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -137,6 +138,94 @@ class SDKOwnershipTests(unittest.TestCase):
         self.assertTrue(self.owner.acquire())
         self.owner.release()
 
+    def test_active_joint_action_blocks_pick_place_and_can_still_stop(self):
+        from test_realman_rm75_driver import load_device
+
+        device = load_device()
+        self.client.motion_enabled = True
+        self.robot.rm_get_arm_all_state.return_value = (0, {
+            "joint_err_code": [0] * 7, "joint_en_flag": [1] * 7,
+            "err": {"err_len": 0, "err": []},
+        })
+        self.robot.rm_get_joint_drive_min_pos.return_value = (0, [v[0] for v in device.JOINT_LIMITS_DEG])
+        self.robot.rm_get_joint_drive_max_pos.return_value = (0, [v[1] for v in device.JOINT_LIMITS_DEG])
+        arm = device.RM75Plugin(self.client.shared_client(), {
+            "safety": {"start_grace_seconds": 60, "poll_interval_seconds": 0.001},
+        })
+        completed = threading.Event()
+        arm._acp_callback = mock.Mock(side_effect=lambda *args: completed.set())
+        started = arm.dispatch("set", {
+            "_tool_name": "joint_control", "joint1_deg": 10, "confirm_motion": True,
+        })
+        try:
+            self.assertFalse(self.owner.acquire())
+            self.assertEqual("running", started["state"])
+        finally:
+            stopped = arm.dispatch("stopmotion", {"_tool_name": "joint_control"})
+        self.assertEqual(started["action_id"], stopped["action_id"])
+        self.assertTrue(completed.wait(2))
+        self.robot.rm_set_arm_slow_stop.assert_called_once_with()
+        arm._acp_callback.assert_called_once_with(
+            started["action_id"], "cancelled", {"reason": "stopmotion"})
+        self.assertTrue(self.owner.acquire())
+        self.owner.release()
+
+    def test_active_servo_stream_blocks_pick_place_until_stop(self):
+        from servo import RM75ServoPlugin
+
+        self.client.motion_enabled = True
+        servo = RM75ServoPlugin(self.client.shared_client(), {}, ros2=mock.Mock())
+        servo._subscribe = mock.Mock()
+        self.assertEqual("running", servo.dispatch("start", {"input_topic": "/control/test"})["state"])
+        try:
+            self.assertFalse(self.owner.acquire())
+        finally:
+            servo.dispatch("stop", {})
+        self.assertTrue(self.owner.acquire())
+        self.owner.release()
+
+    def test_pick_place_ownership_blocks_other_registered_motion_cards(self):
+        from test_realman_rm75_driver import load_device
+        from servo import RM75ServoPlugin
+
+        device = load_device()
+        self.client.motion_enabled = True
+        shared = self.client.shared_client()
+        arm = device.RM75Plugin(shared, {})
+        gripper = device.GripperPlugin(shared, {})
+        cartesian = device.CartesianPlugin(shared, {"cartesian": {"enabled": True}}, arm_plugin=arm)
+        servo = RM75ServoPlugin(shared, {}, ros2=mock.Mock())
+        self.assertTrue(self.owner.acquire())
+        try:
+            for card, action, args in (
+                (arm, "set", {"_tool_name": "joint_control", "joint1_deg": 10, "confirm_motion": True}),
+                (gripper, "set_position", {"position": 500, "confirm_motion": True}),
+                (cartesian, "movel", {"speed_percent": 5, "cartesian_enabled": True, "confirm_motion": True}),
+            ):
+                with self.subTest(card=type(card).__name__):
+                    with self.assertRaisesRegex(RuntimeError, "another .*active"):
+                        card.dispatch(action, args)
+            result = servo.dispatch("start", {"input_topic": "/control/test"})
+            self.assertEqual("error", result["state"])
+            self.assertIn("another arm operation", result["message"])
+            self.assertEqual([], self.robot.mock_calls)
+        finally:
+            self.owner.release()
+
+    def test_upstream_sdk_write_paths_respect_exclusive_ownership(self):
+        self.assertTrue(self.owner.acquire())
+        try:
+            with self.assertRaisesRegex(RuntimeError, "reserved"):
+                self.client.command_trajectory("rm_movel", [0] * 6, 5, 0, 0, 0)
+            with self.assertRaisesRegex(RuntimeError, "reserved"):
+                self.client.upload_recording("unused.txt", 5, 1, run=True)
+            with self.assertRaisesRegex(RuntimeError, "reserved"):
+                self.client.command_interrupt("rm_set_arm_slow_stop")
+            self.assertEqual("idle", self.client.trajectory_wait_state())
+            self.assertEqual([], self.robot.mock_calls)
+        finally:
+            self.owner.release()
+
     def test_shared_client_preserves_connection_across_card_lifecycle_calls(self):
         from test_realman_rm75_driver import load_device
 
@@ -165,6 +254,7 @@ class SDKOwnershipTests(unittest.TestCase):
         robot = mock.Mock()
         robot.rm_create_robot_arm.return_value = types.SimpleNamespace(id=1)
         sdk = types.SimpleNamespace(RoboticArm=mock.Mock(return_value=robot),
+                                    rm_event_callback_ptr=lambda callback: callback,
                                     rm_thread_mode_e=types.SimpleNamespace(RM_TRIPLE_MODE_E=3))
         card = PickPlacePlugin(client.exclusive_client(), {})
         card._ensure_publisher = mock.Mock()
