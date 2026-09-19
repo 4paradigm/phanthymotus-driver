@@ -6,7 +6,7 @@ hardware_model: "rm75-6f-v"
 image_name: realman-rm75-6f-v
 port: 15718
 mcp_url: "http://localhost:15718/mcp"
-description: "ARM64 RealMan RM75-6F-V state, joint motion, two-finger gripper, and upper-computer RealSense camera Driver"
+description: "ARM64 RealMan RM75-6F-V state, joint motion, Cartesian motion, two-finger gripper, upper-computer RealSense camera, and photo/video capture Driver using the official Python API2 SDK"
 build_context_extras:
   - ../../common
 cards:
@@ -18,6 +18,8 @@ cards:
   - { name: arm_all_state,    type: sensor }
   - { name: controller_state, type: sensor }
   - { name: joint_control,    type: actuator }
+  - { name: servo,            type: actuator }
   - { name: gripper,          type: actuator }
   - { name: ext_camera,       type: sensor }
-  - { name: vision_capture, type: actuator }
+  - { name: abs_move,         type: actuator }
+  - { name: vision_capture,   type: actuator }
