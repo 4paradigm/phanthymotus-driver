@@ -509,14 +509,33 @@ Upon receiving this, Agent Core executes `initialize` → `tools/list` and regis
 
 ## Port Allocation
 
-Driver ports are allocated in the **15700–15799** range:
+Driver ports are allocated in the **15700–15799** range. This table listed two
+entries for a long time while fourteen drivers were in use; the authoritative
+source is `*/*/driver.yaml`, and this is a snapshot of it:
 
-| Driver | Port |
-|--------|------|
-| Unitree G1 | 15701 |
-| Phanthy Remote Control | 15710 |
+| Driver | Port | | Driver | Port |
+|--------|------|-|--------|------|
+| Unitree G1 | 15701 | | Unitree Go1 | 15715 |
+| Unitree R1 | 15702 | | DeepRobotics Lynx M20 | 15716 |
+| Unitree Go2 | 15703 | | AgiBot X2 | 15717 |
+| Noetix Bumi | 15704 | | RealMan RM75-6F-V | 15718 |
+| Booster K1 | 15705 | | PNDbotics Adam | 15722 |
+| BrainCo Revo2 | 15706 | | Chasing Qianjiao P200 Pro | 15739 |
+| X-humanoid Tianyi 2.0 | 15707 | | RoboEra Q5 | 15793 |
+| EngineAI T800 | 15708 | | | |
+| Unitree AS2W | 15709 | | **Simulator (generic)** | **15711** |
+| Phanthy Remote Control | 15710 | | *reserved for simulators* | *15712–15714* |
+
+Ports outside this repo: Agent Core 15678, Perception MCP 15720, Perception WS
+15721, actucore 15730.
 
 New drivers should choose an unoccupied port. The WebSocket port is typically the MCP port + 1.
+
+Check before choosing, rather than trusting the table:
+
+```bash
+grep -h '^port:' */*/driver.yaml | sort -u
+```
 
 ---
 

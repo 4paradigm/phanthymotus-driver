@@ -1,0 +1,29 @@
+id: simulator-generic
+name: Generic Simulator (Virtual Cards)
+category: driver
+hardware_provider: simulator
+hardware_model: "generic"
+image_name: simulator-generic
+port: 15711
+mcp_url: "http://localhost:15711/mcp"
+description: "虚拟具身仿真 — 无硬件的传感器/执行器卡片，用于 Agent + VLA 回路测试、回归与演示"
+build_context_extras:
+  - ../../common
+# Kept in sync by hand with config.yaml's `plugins.*.enabled`, as the other
+# bundles do. 15711-15714 are reserved for simulator variants.
+cards:
+  - { name: odom,         type: sensor }
+  - { name: imu,          type: sensor }
+  - { name: laser_scan,   type: sensor }
+  - { name: battery,      type: sensor }
+  - { name: map,          type: sensor }
+  - { name: model,        type: resource }
+  - { name: loco,         type: actuator }
+  - { name: nav,          type: actuator }
+  - { name: switch_mode,  type: actuator }
+  - { name: arm,          type: actuator }
+  - { name: led,          type: actuator }
+  - { name: tts,          type: actuator }
+  - { name: speaker,      type: actuator }
+  - { name: sim_scenario, type: actuator }
+  - { name: sim_report,   type: resource }
