@@ -81,9 +81,31 @@ class SourceTests(unittest.TestCase):
     def setUp(self):
         self.src = BRIDGE.read_text(encoding="utf-8")
 
-    def test_the_count_based_trigger_is_gone(self):
-        self.assertNotIn("msg_count % 100", self.src,
-                         "按条数触发会让快 topic 淹掉整个日志")
+    def test_no_count_based_trigger_remains_in_either_direction(self):
+        """两个方向都要改。
+
+        出站那个先改了，入站这个被落下 —— 而它是同一个 bug：按条数触发在最快的
+        topic 上最吵，在真停了才要紧的慢 topic 上几乎不吭声。入站今天恰好都是低速
+        topic，所以它没在刷屏，但哪天有个高速 topic 接进来就会。
+        """
+        import re
+        leftovers = re.findall(r"msg_count % \d+", self.src)
+        self.assertEqual(leftovers, [], f"还有按条数的触发: {leftovers}")
+
+    def test_both_directions_report_on_the_clock(self):
+        outbound = ast.unparse(self._method("TopicHandler", "publish"))
+        inbound = ast.unparse(self._method("SubscriptionHandler", "_forward"))
+        for name, body in (("publish", outbound), ("_forward", inbound)):
+            self.assertIn("PROGRESS_INTERVAL_S", body, f"{name} 不是按时间计")
+            self.assertIn("msg_count == 1", body, f"{name} 丢了首条立即上报")
+
+    @staticmethod
+    def _method(cls_name, fn_name):
+        tree = ast.parse(BRIDGE.read_text(encoding="utf-8"))
+        cls = next(n for n in tree.body
+                   if isinstance(n, ast.ClassDef) and n.name == cls_name)
+        return next(n for n in cls.body
+                    if isinstance(n, ast.FunctionDef) and n.name == fn_name)
 
     def test_the_interval_is_a_named_constant(self):
         self.assertIn("PROGRESS_INTERVAL_S", self.src)
