@@ -23,7 +23,7 @@ agent + VLA 回路。
 
 **Sensor**：`odom` `imu` `laser_scan` `battery` `spatial_map`
 **Actuator**：`loco` `controlled_spatial` `switch_mode` `arm` `led` `tts` `sim_scenario`
-**Resource**：`model`（URDF）`sim_report`（事件、播报记录、断言判定与得分）
+**Resource**：`model`（URDF）`sim_report`（事件、播报记录、ACP 上报 —— 事实，不含判定）
 
 所有传感器都从**同一份世界状态**派生（`sensors.py` 是纯函数），不是各自造随机数 ——
 激光雷达与里程计不会互相矛盾，这是仿真值得信的前提。
@@ -84,8 +84,14 @@ curl -s localhost:15711/mcp -H 'Content-Type: application/json' \
 
 ## 场景
 
-`scenarios/*.yaml` 是**唯一真相**：`sim_scenario` 卡在真机上跑它，pytest 用假时钟
-重放它，两边过同一份 `assertions.py`。否则 CI 绿和真机绿就不再是同一件事。
+`scenarios/*.yaml` 描述的是**世界**：地图、出生点、航点、脚本化插话。它不是测试用例 ——
+用例是 agent-core 那边带 `test` 段的解决方案包体，跑动与判定都在那里
+（`benchmark_case.py` / `benchmark_runner.py`）。
+
+**判定不在这个仓里。** 原先 `assertions.py` 住在这儿，等于裁判住在被测系统内部：一条
+坏掉的 ACP 路径会把自己判成绿的。现在**驱动产出事实，agent-core 做裁判**。
+`tools/record_facts.py` 把一趟重放录成事实流，作为 agent-core 判定测试的夹具 —— 两个
+仓之间不抽共享包，照 `motus.vla/1` 的所有权模型办：规格是文档，两侧各跑各的契约测试。
 
 新增场景不用重建镜像 —— 丢进 `/opt/phanthy-motus/data/sim/scenarios`（已 bind-mount），
 刷新画布，卡片配置里的下拉框就有了（`configSchema` 在调用时扫描目录生成）。
@@ -119,7 +125,7 @@ sensors.py      从世界状态派生传感器读数的纯函数
 card_base.py    卡片基类：生命周期、发布器、权威 info；以及格式→渲染器对照表
 cards_*.py      各卡片
 scenario.py     场景定义与发现
-assertions.py   裁判：七项断言 + 五维评分
+tools/          STCM 地图导入、事实流录制
 acp.py          /api/acp/complete 回调
 plugins.py      build_plugins：构造一个世界，注入每张卡
 ```

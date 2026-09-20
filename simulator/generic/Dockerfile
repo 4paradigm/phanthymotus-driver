@@ -29,9 +29,9 @@ RUN mkdir -p /work/simulator && \
 # tests/test_dockerfile_copies.py's import check vacuous, and that check is the
 # only thing standing between a forgotten module and a container that builds
 # cleanly and then dies on startup with ModuleNotFoundError.
-COPY __init__.py acp.py assertions.py card_base.py cards_audio.py cards_motion.py \
+COPY __init__.py acp.py card_base.py cards_audio.py cards_motion.py \
      cards_scenario.py cards_sensors.py clock.py geometry.py main.py plugins.py \
-     maps.py scenario.py sensors.py suite.py world.py config.yaml driver.yaml \
+     maps.py scenario.py sensors.py world.py config.yaml driver.yaml \
      /work/simulator/generic/
 COPY backend/ /work/simulator/generic/backend/
 COPY tools/ /work/simulator/generic/tools/
