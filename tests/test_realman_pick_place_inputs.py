@@ -51,6 +51,9 @@ class InputTests(unittest.TestCase):
     def setUp(self):
         self.inputs = ObservationInputs()
         self.inputs._topics = TOPICS[:]
+        self.inputs._source_key = (("/", "robot_realsense_rgbd_camera", (1,)),) * 3
+        self.inputs._calibration = calibration()
+        self.inputs._session_id = "session-a"
         self.now = 1000.0
         self.enterContext(mock.patch("pick_place.inputs.time.time", side_effect=lambda: self.now))
         self.enterContext(mock.patch("pick_place.inputs.time.monotonic", side_effect=lambda: self.now))
@@ -67,10 +70,8 @@ class InputTests(unittest.TestCase):
         self.feed()
         self.on_wait()
 
-    def feed(self, value=120, objects=None, metadata=None, metadata_first=False):
+    def feed(self, value=120, objects=None, metadata=None):
         m = calibration(self.now) if metadata is None else metadata
-        if metadata_first:
-            self.inputs.receive("metadata", types.SimpleNamespace(data=json.dumps(m)))
         jpeg = cv2.imencode(".jpg", np.full((60, 80, 3), value, np.uint8))[1].tobytes()
         for name, data, fmt in (
             ("rgb", jpeg, "jpeg"),
@@ -89,9 +90,7 @@ class InputTests(unittest.TestCase):
                     frame_id="robot_" + name + "_optical",
                 ),
             )
-            self.inputs.receive(name, msg)
-        if not metadata_first:
-            self.inputs.receive("metadata", types.SimpleNamespace(data=json.dumps(m)))
+            self.inputs.receive(name, msg, message_info={"source_timestamp": m[name + "_stamp_ns"]})
         if objects is None:
             objects = [dict(name="banana", position=[0.2, -0.1], confidence=0.8)]
         payload = dict(timestamp=self.now, count=len(objects), objects=objects, latency_ms=10)
@@ -113,7 +112,7 @@ class InputTests(unittest.TestCase):
             with self.subTest(topics=topics), self.assertRaises(ValueError):
                 resolve_topics({"input_topics": topics})
 
-    def test_ros_binding_is_idempotent_and_stop_removes_only_own_subscriptions(self):
+    def test_ros_binding_is_idempotent_and_only_uses_three_private_subscriptions(self):
         import sys
         node = mock.Mock()
         ros = types.SimpleNamespace(ctx_core=object(), executor_core=mock.Mock())
@@ -122,25 +121,27 @@ class InputTests(unittest.TestCase):
                    "rclpy.qos": types.SimpleNamespace(qos_profile_sensor_data=object()),
                    "sensor_msgs.msg": types.SimpleNamespace(CompressedImage=object),
                    "std_msgs.msg": types.SimpleNamespace(String=object)}
-        with mock.patch.dict(sys.modules, modules):
+        finished = threading.Event()
+        def reader(node, subscriptions, generation, stopped):
+            stopped.wait(2)
+            node.destroy_node()
+            finished.set()
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(inputs, "_read", side_effect=reader):
             inputs.start({"input_topics": TOPICS[::-1]})
             inputs.start({"input_topics": TOPICS})
-        calls = node.create_subscription.call_args_list
-        self.assertEqual([c.args[1] for c in calls], [*TOPICS, TOPICS[1] + "/metadata"])
-        node.create_publisher.assert_not_called()
-        ros.executor_core.add_node.assert_called_once_with(node)
-        callbacks = [c.args[2] for c in calls]
-        inputs.stop()
-        ros.executor_core.remove_node.assert_called_once_with(node)
+            calls = node.create_subscription.call_args_list
+            self.assertEqual([c.args[1] for c in calls], TOPICS)
+            node.create_publisher.assert_not_called()
+            ros.executor_core.add_node.assert_not_called()
+            inputs.stop()
+            self.assertTrue(finished.wait(1))
         node.destroy_node.assert_called_once()
-        for callback in callbacks:
-            callback(types.SimpleNamespace())
-        self.assertTrue(all(not b for b in inputs._buffers.values()))
+        ros.executor_core.remove_node.assert_not_called()
         self.assertEqual(inputs._errors, {})
 
     def test_stop_cancels_blocked_ros_setup_without_resurrecting_node(self):
         import sys
-        for stage in ("construct", "subscribe", "register"):
+        for stage in ("construct", "subscribe"):
             with self.subTest(stage=stage):
                 entered, release = threading.Event(), threading.Event()
                 node, executor = mock.Mock(), mock.Mock()
@@ -152,8 +153,7 @@ class InputTests(unittest.TestCase):
                         raise RuntimeError("test setup release timed out")
                     return node
                 constructor = mock.Mock(return_value=node)
-                {"construct": constructor, "subscribe": node.create_subscription,
-                 "register": executor.add_node}[stage].side_effect = block
+                {"construct": constructor, "subscribe": node.create_subscription}[stage].side_effect = block
                 modules = {"rclpy.node": types.SimpleNamespace(Node=constructor),
                            "rclpy.qos": types.SimpleNamespace(qos_profile_sensor_data=object()),
                            "sensor_msgs.msg": types.SimpleNamespace(CompressedImage=object),
@@ -176,29 +176,36 @@ class InputTests(unittest.TestCase):
                     self.assertIsNone(inputs._node)
                     self.assertEqual(inputs.identity()["topics"], [])
                     node.destroy_node.assert_called_once()
-                    if stage == "register":
-                        executor.remove_node.assert_called_once_with(node)
-                    else:
-                        executor.remove_node.assert_not_called()
-                    constructor.side_effect = node.create_subscription.side_effect = None
-                    executor.add_node.side_effect = None
-                    inputs.start({"input_topics": TOPICS})
-                    self.assertIs(inputs._node, node)
-                    inputs.stop()
+                    executor.add_node.assert_not_called()
+                    executor.remove_node.assert_not_called()
 
-    def test_metadata_can_arrive_before_images_without_changing_capture_time(self):
-        def reordered_feed():
-            self.now += .05
-            self.feed(metadata_first=True)
-        self.cancel.wait = lambda _: reordered_feed()
+    def test_dds_source_timestamp_is_used_instead_of_image_header(self):
         result = self.snapshot()
         metadata = result["source_calibration"]
         self.assertEqual(result["captured_at"], metadata["rgb_stamp_ns"] / 1e9)
         self.assertNotEqual(result["captured_at"], metadata["rgb_header_stamp_ns"] / 1e9)
+        self.assertEqual(result["synchronization"]["timestamp_source"], "dds_source_timestamp")
+        self.assertTrue(result["synchronization"]["capture_time_approximate"])
 
-    def test_recent_publication_cannot_make_pre_settle_capture_usable(self):
+    def test_recent_dds_publication_is_an_explicit_capture_time_approximation(self):
+        # Header/capture age cannot prove when a republished image was acquired.
+        # The accepted contract uses DDS publication time, not delivery time.
+        def old_header():
+            metadata = calibration(self.now)
+            metadata.update(rgb_header_stamp_ns=1, depth_header_stamp_ns=2)
+            self.inputs._buffers["rgb"].clear()
+            self.inputs._buffers["depth"].clear()
+            self.feed(metadata=metadata)
+        self.on_wait = old_header
+        result = self.snapshot()
+        self.assertGreater(result["captured_at"], 1000.58)
+        self.assertEqual(result["source_calibration"]["rgb_header_stamp_ns"], 1)
+        self.assertTrue(result["synchronization"]["capture_time_approximate"])
+
+    def test_pre_settle_dds_samples_are_not_usable(self):
         def delayed():
-            self.inputs._buffers["metadata"].clear()
+            self.inputs._buffers["rgb"].clear()
+            self.inputs._buffers["depth"].clear()
             metadata = calibration(self.now)
             metadata.update(rgb_stamp_ns=999_990_000_000, depth_stamp_ns=999_991_000_000)
             self.feed(metadata=metadata)
@@ -207,10 +214,12 @@ class InputTests(unittest.TestCase):
             self.snapshot(timeout=.9)
         self.align.assert_not_called()
 
-    def test_images_must_match_metadata_headers_exactly(self):
-        def mismatch():
-            self.inputs._buffers["rgb"][-1]["stamp_ns"] += 1
-        self.on_wait = mismatch
+    def test_rgb_depth_pairing_requires_bounded_source_time_skew(self):
+        def skewed():
+            self.inputs._buffers["depth"].clear()
+            self.inputs._buffers["depth"].append(dict(self.inputs._buffers["rgb"][-1],
+                                                    stamp_ns=round((self.now - .8) * 1e9)))
+        self.on_wait = skewed
         with self.assertRaisesRegex(RuntimeError, "timed out"):
             self.snapshot(timeout=1)
         self.align.assert_not_called()
@@ -307,33 +316,138 @@ class InputTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "timed out"):
             self.snapshot(timeout=1)
 
-    def test_mismatched_camera_skew_and_calibration_are_rejected(self):
-        for edit in (
-            lambda m: m.update(rgb_topics=["/other/rgb"]),
-            lambda m: m.update(depth_stamp_ns=m["depth_stamp_ns"] - 300_000_000),
-            lambda m: m.update(depth_scale_m=0.0001),
-            lambda m: m["rgb_intrinsics"].update(fx=0),
-        ):
-            with self.subTest(edit=edit):
-                metadata = calibration(self.now)
-                edit(metadata)
-                self.inputs.receive("metadata", types.SimpleNamespace(data=json.dumps(metadata)))
+    def test_consumer_rejects_old_future_or_missing_dds_timestamp(self):
+        for stamp in (998_000_000_000, 1001_000_000_000, None, 0, True):
+            with self.subTest(stamp=stamp):
+                self.inputs.receive("rgb", types.SimpleNamespace(), message_info={"source_timestamp": stamp})
                 self.assertEqual(self.inputs.info()["state"], "error")
+                self.assertIn("timestamp", self.inputs.info()["error"])
+                self.now += .001
                 self.feed()
 
-    def test_consumer_rejects_old_or_future_acquisition_with_fresh_publication(self):
-        for name in ("rgb_stamp_ns", "depth_stamp_ns"):
-            for seconds in (998, 1001):
-                with self.subTest(name=name, seconds=seconds):
-                    metadata = calibration(self.now)
-                    metadata[name] = seconds * 1_000_000_000
-                    self.inputs.receive("metadata", types.SimpleNamespace(data=json.dumps(metadata)))
-                    self.assertEqual(self.inputs.info()["state"], "error")
-                    self.assertIn("timestamp", self.inputs.info()["error"])
-                    self.feed()
+    def test_input_gap_invalidates_saved_observation_identity(self):
+        before = self.inputs.identity()
+        self.now += 1.1
+        self.assertFalse(self.inputs.info()["fresh"])
+        self.assertNotEqual(before, self.inputs.identity())
+        self.feed()
+        self.assertTrue(self.inputs.info()["fresh"])
+        self.assertNotEqual(before, self.inputs.identity())
 
-    def test_calibration_cannot_be_applied_to_another_session(self):
-        self.on_wait = lambda: self.feed(metadata={**calibration(self.now), "session_id": "other-session"})
+    def test_calibration_is_queried_once_per_source_not_per_observation(self):
+        self.inputs._calibration = None
+        with mock.patch("pick_place.inputs.read_calibration", return_value=calibration()) as read:
+            self.inputs._initialize_calibration(self.inputs._generation)
+            self.snapshot()
+            self.inputs._initialize_calibration(self.inputs._generation)
+            self.snapshot()
+        read.assert_called_once()
+
+    def test_stop_during_calibration_discards_late_result(self):
+        entered, release = threading.Event(), threading.Event()
+        self.inputs._calibration = None
+        def blocked(*args):
+            entered.set()
+            release.wait(2)
+            return calibration()
+        with mock.patch("pick_place.inputs.read_calibration", side_effect=blocked):
+            worker = threading.Thread(target=self.inputs._initialize_calibration, args=(self.inputs._generation,))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.inputs.stop()
+                self.assertIsNone(self.inputs._calibration)
+            finally:
+                release.set()
+                worker.join(1)
+        self.assertIsNone(self.inputs._calibration)
+        self.assertEqual(self.inputs.identity()["topics"], [])
+
+    def test_publisher_replacement_invalidates_calibration_and_observation(self):
+        node = mock.Mock()
+        def endpoint(name="camera", gid=1):
+            return types.SimpleNamespace(node_namespace="/", node_name=name, endpoint_gid=[gid])
+        node.get_publishers_info_by_topic.side_effect = lambda t: [endpoint()]
+        self.inputs._refresh_source(node, self.inputs._generation)
+        self.inputs._calibration = calibration()
+        self.feed()
+        before = self.inputs.identity()
+        node.get_publishers_info_by_topic.side_effect = lambda t: [endpoint(gid=2)]
+        self.inputs._refresh_source(node, self.inputs._generation)
+        self.assertNotEqual(before, self.inputs.identity())
+        self.assertIsNone(self.inputs._calibration)
+        self.assertTrue(all(not b for b in self.inputs._buffers.values()))
+        for publishers in ([endpoint(), endpoint()], [endpoint("other")] ):
+            node.get_publishers_info_by_topic.side_effect = lambda t: publishers if t == TOPICS[1] else [endpoint()]
+            self.inputs._refresh_source(node, self.inputs._generation)
+            self.assertEqual(self.inputs.info()["state"], "error")
+
+    def test_calibration_failure_is_not_queried_every_frame(self):
+        self.inputs._calibration = None
+        with mock.patch("pick_place.inputs.read_calibration", side_effect=RuntimeError("camera unavailable")) as read:
+            self.inputs._initialize_calibration(self.inputs._generation)
+            self.feed()
+            self.inputs._initialize_calibration(self.inputs._generation)
+        read.assert_called_once()
+        self.assertIn("calibration unavailable", self.inputs.info()["error"])
+
+    def test_resolution_change_invalidates_saved_observation(self):
+        before = self.inputs.identity()
+        jpeg = cv2.imencode(".jpg", np.zeros((48, 64, 3), np.uint8))[1].tobytes()
+        msg = types.SimpleNamespace(data=jpeg, format="jpeg", header=types.SimpleNamespace(
+            frame_id="robot_rgb_optical", stamp=types.SimpleNamespace(sec=1000, nanosec=0)))
+        self.inputs.receive("rgb", msg, message_info=types.SimpleNamespace(source_timestamp=1_000_000_000_000))
+        self.assertNotEqual(before, self.inputs.identity())
+        self.assertEqual(self.inputs.info()["state"], "error")
+        self.assertIn("dimensions", self.inputs.info()["error"])
+
+    def test_reader_preserves_dds_info_and_owns_node_destruction(self):
+        node, sub = mock.Mock(), mock.MagicMock()
+        stop = threading.Event()
+        info = {"source_timestamp": 1_000_000_000_000}
+        msg = object()
+        sub.handle.take_message.side_effect = [(msg, info), None]
+        def received(*args):
+            stop.set()
+        with mock.patch.object(self.inputs, "_refresh_source"), mock.patch.object(
+                self.inputs, "_initialize_calibration"), mock.patch.object(
+                self.inputs, "receive", side_effect=received) as receive:
+            self.inputs._read(node, [("rgb", object, sub)], self.inputs._generation, stop)
+        receive.assert_called_once_with("rgb", msg, self.inputs._generation, info)
+        node.destroy_node.assert_called_once()
+
+    def test_stop_during_take_does_not_destroy_a_live_subscription(self):
+        node, sub = mock.Mock(), mock.MagicMock()
+        entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+        self.inputs._reader_stop = stopped
+        self.inputs._node = node
+        generation = self.inputs._generation
+        def take(*args):
+            entered.set()
+            release.wait(2)
+            return types.SimpleNamespace(), {"source_timestamp": 1_000_000_000_000}
+        sub.handle.take_message.side_effect = take
+        with mock.patch.object(self.inputs, "_refresh_source"), mock.patch.object(self.inputs, "_initialize_calibration"):
+            worker = threading.Thread(target=self.inputs._read,
+                                      args=(node, [("rgb", object, sub)], generation, stopped))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.inputs.stop()
+                node.destroy_node.assert_not_called()
+            finally:
+                release.set()
+                worker.join(1)
+        self.assertFalse(worker.is_alive())
+        node.destroy_node.assert_called_once()
+        self.assertEqual(self.inputs._errors, {})
+        self.assertIsNone(self.inputs._node)
+
+    def test_source_change_during_snapshot_is_rejected(self):
+        def changed():
+            with self.inputs._condition:
+                self.inputs._reset_frames()
+        self.on_wait = changed
         with self.assertRaisesRegex(RuntimeError, "source changed"):
             self.snapshot()
 

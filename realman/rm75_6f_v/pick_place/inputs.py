@@ -11,7 +11,8 @@ import zlib
 
 import numpy as np
 
-from .alignment import align_depth, validate_calibration
+from .alignment import align_depth, decode_depth
+from .calibration import read_calibration
 
 
 INPUT_FORMATS = ("image/depth-zlib", "image/jpeg", "data/json")
@@ -47,8 +48,12 @@ class ObservationInputs:
         self._topics = []
         self._node = None
         self._generation = 0
-        self._buffers = {name: deque(maxlen=90) for name in ("rgb", "depth", "metadata", "objects")}
+        self._buffers = {name: deque(maxlen=90) for name in ("rgb", "depth", "objects")}
         self._errors = {}
+        self._calibration = None
+        self._source_key = None
+        self._session_id = uuid4().hex
+        self._reader_stop = None
 
     def topics(self):
         with self._condition:
@@ -77,7 +82,7 @@ class ObservationInputs:
             return generation != self._generation or (cancel is not None and cancel.is_set())
 
         node = None
-        added = committed = False
+        committed = False
         try:
             from rclpy.node import Node
             from rclpy.qos import qos_profile_sensor_data
@@ -85,72 +90,144 @@ class ObservationInputs:
             from std_msgs.msg import String
 
             node = Node("vision_pick_and_drop_inputs_" + uuid4().hex[:8], context=self._ros2.ctx_core)
+            subscriptions = []
             for name, topic, kind in (
                 ("rgb", topics[0], CompressedImage),
                 ("depth", topics[1], CompressedImage),
                 ("objects", topics[2], String),
-                ("metadata", topics[1] + "/metadata", String),
             ):
                 with self._condition:
                     if cancelled():
                         return self.info()
-                node.create_subscription(
-                    kind,
-                    topic,
-                    lambda msg, name=name: self.receive(name, msg, generation),
-                    qos_profile_sensor_data,
-                )
-            with self._condition:
-                if cancelled():
-                    return self.info()
-            self._ros2.executor_core.add_node(node)
-            added = True
+                sub = node.create_subscription(kind, topic, lambda msg: None, qos_profile_sensor_data)
+                subscriptions.append((name, kind, sub))
             with self._condition:
                 if not cancelled():
-                    self._node = node
+                    stopped = threading.Event()
+                    worker = threading.Thread(target=self._read, args=(node, subscriptions, generation, stopped),
+                                              name="pick-place-inputs", daemon=True)
+                    worker.start()
+                    self._node, self._reader_stop = node, stopped
                     committed = True
             return self.info()
         finally:
             if not committed:
                 with self._condition:
                     if generation == self._generation:
-                        self._generation += 1
-                        self._topics = []
-                        self._errors.clear()
-                        for buffer in self._buffers.values():
-                            buffer.clear()
-                        self._condition.notify_all()
+                        self.stop()
                 if node is not None:
-                    try:
-                        if added:
-                            self._ros2.executor_core.remove_node(node)
-                    finally:
-                        node.destroy_node()
+                    node.destroy_node()
+
+    def _reset_frames(self):
+        self._session_id = uuid4().hex
+        for buffer in self._buffers.values():
+            buffer.clear()
+        self._condition.notify_all()
 
     def stop(self):
         with self._condition:
-            node, self._node = self._node, None
+            if self._reader_stop is not None:
+                self._reader_stop.set()
+            self._node = self._reader_stop = None
             self._generation += 1
             self._topics = []
+            self._source_key = self._calibration = None
             self._errors.clear()
-            for buffer in self._buffers.values():
-                buffer.clear()
-            self._condition.notify_all()
-        if node is not None:
-            try:
-                self._ros2.executor_core.remove_node(node)
-            finally:
-                node.destroy_node()
+            self._reset_frames()
+        # The reader owns destruction: never destroy a handle during take_message
+        # or wait for a blocked SDK query while holding the lifecycle/action lock.
 
-    def receive(self, name, msg, generation=None):
+    def _refresh_source(self, node, generation):
+        with self._condition:
+            if generation != self._generation:
+                return
+            topics = list(self._topics)
+        endpoints = [node.get_publishers_info_by_topic(t) for t in topics]
+        key = None
+        error = None
+        if any(len(entries) > 1 for entries in endpoints):
+            error = "Each observation input must have exactly one publisher"
+        elif all(len(entries) == 1 for entries in endpoints):
+            key = tuple((e[0].node_namespace, e[0].node_name, tuple(e[0].endpoint_gid)) for e in endpoints)
+            if key[0][:2] != key[1][:2]:
+                error = "RGB and depth inputs must come from the same physical camera publisher"
+                key = None
+        with self._condition:
+            if generation != self._generation:
+                return
+            if key != self._source_key:
+                self._source_key, self._calibration = key, None
+                self._errors.clear()
+                self._reset_frames()
+            if error:
+                self._errors["source"] = error
+            else:
+                self._errors.pop("source", None)
+
+    def _initialize_calibration(self, generation):
+        with self._condition:
+            if (generation != self._generation or self._calibration is not None
+                    or not self._source_key or "calibration" in self._errors
+                    or not self._buffers["rgb"] or not self._buffers["depth"]):
+                return
+            source, session = self._source_key, self._session_id
+            rgb, depth = self._buffers["rgb"][-1], self._buffers["depth"][-1]
+        calibration, error = None, None
+        try:
+            _, shape = self._thumbnail(rgb["data"])
+            calibration = read_calibration(source[0][1], shape, depth["data"], session)
+        except Exception as exc:
+            error = f"Camera calibration unavailable; restart the card after correcting inputs: {exc}"
+        with self._condition:
+            if generation == self._generation and source == self._source_key and session == self._session_id:
+                self._calibration = calibration
+                if error:
+                    self._errors["calibration"] = error
+                self._condition.notify_all()
+
+    def _read(self, node, subscriptions, generation, stopped):
+        # The installed executor discards MessageInfo. Take only our own three
+        # subscriptions here, preserving DDS source timestamps without changing
+        # the shared executor or registering this node with it.
+        next_graph_check = 0
+        try:
+            while not stopped.is_set():
+                if time.monotonic() >= next_graph_check:
+                    self._refresh_source(node, generation)
+                    next_graph_check = time.monotonic() + 0.2
+                for name, kind, sub in subscriptions:
+                    for _ in range(8):
+                        if stopped.is_set():
+                            return
+                        with sub.handle:
+                            pair = sub.handle.take_message(kind, False)
+                        if pair is None:
+                            break
+                        msg, info = pair
+                        self.receive(name, msg, generation, info)
+                self._initialize_calibration(generation)
+                stopped.wait(0.02)
+        except Exception as exc:
+            with self._condition:
+                if generation == self._generation:
+                    self._errors["receiver"] = str(exc)
+                    self._reset_frames()
+        finally:
+            node.destroy_node()
+
+    def receive(self, name, msg, generation=None, message_info=None):
         with self._condition:
             if generation is not None and generation != self._generation:
                 return
+            if not self._source_key:
+                return
             now = time.time()
+            self._expire_frames(now)
             try:
                 if name in ("rgb", "depth"):
-                    stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-                    if stamp <= 0 or not -0.1 <= now - stamp / 1e9 <= MAX_FRAME_AGE:
+                    stamp = (message_info.get("source_timestamp") if isinstance(message_info, dict)
+                             else getattr(message_info, "source_timestamp", None))
+                    if type(stamp) is not int or stamp <= 0 or not -0.1 <= now - stamp / 1e9 <= MAX_FRAME_AGE:
                         raise ValueError(f"{name} frame timestamp is stale or invalid")
                     payload = bytes(msg.data)
                     if not payload or len(payload) > 16 * 1024 * 1024:
@@ -163,8 +240,28 @@ class ObservationInputs:
                         raise ValueError("RGB input must be JPEG")
                     if name == "depth" and msg.format != "16UC1; compressedDepth zlib":
                         raise ValueError("Depth input must be zlib-compressed uint16 millimetres")
+                    prefix = self._source_key[0][1].rsplit("_realsense_rgbd_", 1)[0]
+                    if msg.header.frame_id != f"{prefix}_{name}_optical":
+                        raise ValueError("Image frame does not match the camera publisher")
+                    if self._calibration is not None:
+                        intr = self._calibration[name + "_intrinsics"]
+                        try:
+                            if name == "rgb":
+                                _, shape = self._thumbnail(payload)
+                                if shape != (intr["height"], intr["width"]):
+                                    raise ValueError("RGB dimensions changed")
+                            else:
+                                decode_depth(payload, intr["width"], intr["height"])
+                        except ValueError:
+                            self._reset_frames()
+                            self._errors["calibration"] = "Image dimensions changed or invalid depth; restart the card"
+                            raise
+                    previous = self._buffers[name]
+                    if previous and stamp <= previous[-1]["stamp_ns"]:
+                        return
                     value = {
                         "stamp_ns": stamp,
+                        "header_stamp_ns": msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec,
                         "received_at": now,
                         "data": payload,
                         "frame_id": msg.header.frame_id,
@@ -173,62 +270,53 @@ class ObservationInputs:
                     value = json.loads(msg.data)
                     if not isinstance(value, dict):
                         raise ValueError(f"Invalid {name} payload")
-                    if name == "metadata":
-                        validate_calibration(value)
-                        for key in ("rgb_stamp_ns", "depth_stamp_ns",
-                                    "rgb_header_stamp_ns", "depth_header_stamp_ns"):
-                            if (
-                                type(value.get(key)) is not int
-                                or not -0.1 <= now - value[key] / 1e9 <= MAX_FRAME_AGE
-                            ):
-                                raise ValueError("RGB-D calibration timestamp is stale or invalid")
-                        for key in ("rgb_frame_id", "depth_frame_id"):
-                            if not isinstance(value.get(key), str) or not value[key]:
-                                raise ValueError("RGB-D metadata lacks image frame identity")
-                        if abs(value["rgb_stamp_ns"] - value["depth_stamp_ns"]) / 1e9 > MAX_RGBD_SKEW:
-                            raise ValueError("RGB and depth acquisition times are too far apart")
-                        if not self._topics or self._topics[0] not in value.get("rgb_topics", []):
-                            raise ValueError("RGB and depth inputs must come from the same physical camera")
-                    else:
-                        stamp = value.get("timestamp")
-                        latency = value.get("latency_ms")
-                        objects = value.get("objects")
-                        if not _finite(stamp) or not -0.1 <= now - stamp <= 5:
-                            raise ValueError("VOP result timestamp is stale or invalid")
-                        if not _finite(latency) or not 0 <= latency <= 5000:
-                            raise ValueError("VOP result lacks a valid inference duration")
+                    stamp = value.get("timestamp")
+                    latency = value.get("latency_ms")
+                    objects = value.get("objects")
+                    if not _finite(stamp) or not -0.1 <= now - stamp <= 5:
+                        raise ValueError("VOP result timestamp is stale or invalid")
+                    if not _finite(latency) or not 0 <= latency <= 5000:
+                        raise ValueError("VOP result lacks a valid inference duration")
+                    if (
+                        not isinstance(objects, list)
+                        or len(objects) > 1000
+                        or value.get("count") != len(objects)
+                    ):
+                        raise ValueError("Invalid VOP object list")
+                    for obj in objects:
+                        position = obj.get("position") if isinstance(obj, dict) else None
                         if (
-                            not isinstance(objects, list)
-                            or len(objects) > 1000
-                            or value.get("count") != len(objects)
+                            not isinstance(position, list)
+                            or len(position) != 2
+                            or any(not _finite(v) or not -1 <= v <= 1 for v in position)
+                            or not isinstance(obj.get("name"), str)
+                            or not _finite(obj.get("confidence"))
+                            or not 0 <= obj["confidence"] <= 1
                         ):
-                            raise ValueError("Invalid VOP object list")
-                        for obj in objects:
-                            position = obj.get("position") if isinstance(obj, dict) else None
-                            if (
-                                not isinstance(position, list)
-                                or len(position) != 2
-                                or any(not _finite(v) or not -1 <= v <= 1 for v in position)
-                                or not isinstance(obj.get("name"), str)
-                                or not _finite(obj.get("confidence"))
-                                or not 0 <= obj["confidence"] <= 1
-                            ):
-                                raise ValueError("Invalid VOP object coordinates or confidence")
+                            raise ValueError("Invalid VOP object coordinates or confidence")
                     value["received_at"] = now
                 self._buffers[name].append(value)
                 self._errors.pop(name, None)
-            except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            except (ValueError, TypeError, KeyError, AttributeError, OverflowError, zlib.error) as exc:
                 self._errors[name] = str(exc)
             self._condition.notify_all()
+
+    def _expire_frames(self, now):
+        if any(values and now - values[-1]["stamp_ns"] / 1e9 > MAX_FRAME_AGE
+               for name, values in self._buffers.items() if name in ("rgb", "depth")):
+            self._reset_frames()
 
     def info(self):
         with self._condition:
             now = time.time()
+            self._expire_frames(now)
             missing = [
                 name
                 for name, values in self._buffers.items()
                 if not values or now - values[-1]["received_at"] > (5 if name == "objects" else MAX_FRAME_AGE)
             ]
+            if self._calibration is None:
+                missing.append("calibration")
             error = next(iter(self._errors.values()), None)
             if not self._topics:
                 error = "Connect RGB, depth and VOP inputs and start the card"
@@ -242,11 +330,11 @@ class ObservationInputs:
 
     def identity(self):
         with self._condition:
-            metadata = self._buffers["metadata"][-1] if self._buffers["metadata"] else {}
+            self._expire_frames(time.time())
             return {
                 "topics": list(self._topics),
-                "serial_number": metadata.get("serial_number"),
-                "session_id": metadata.get("session_id"),
+                "serial_number": (self._calibration or {}).get("serial_number"),
+                "session_id": self._session_id,
             }
 
     @staticmethod
@@ -277,17 +365,18 @@ class ObservationInputs:
                 cancel.wait(0.05)
                 continue
             with self._condition:
+                for name, values in self._buffers.items():
+                    while values and (values[0]["timestamp"] if name == "objects"
+                                      else values[0]["stamp_ns"] / 1e9) <= after:
+                        values.popleft()
                 buffers = {key: list(values) for key, values in self._buffers.items()}
                 identity = self.identity()
+                calibration = copy.deepcopy(self._calibration)
             if identity != source:
                 raise RuntimeError("Observation input source changed")
             # Observe the entire post-settle window, not just its endpoints.
-            acquisition = {m["rgb_header_stamp_ns"]: m["rgb_stamp_ns"]
-                           for m in buffers["metadata"] if m["session_id"] == source["session_id"]}
             for frame in buffers["rgb"]:
-                if frame["stamp_ns"] not in acquisition:
-                    continue
-                stamp = acquisition[frame["stamp_ns"]] / 1e9
+                stamp = frame["stamp_ns"] / 1e9
                 if stamp <= after or stamp <= checked_stamp:
                     continue
                 thumb, shape = self._thumbnail(frame["data"])
@@ -306,27 +395,23 @@ class ObservationInputs:
                 started = objects["timestamp"] - objects["latency_ms"] / 1000
                 if first_detection is None or started <= first_detection or started < after + STEADY_SECONDS:
                     continue
-                candidates = [
-                    m
-                    for m in buffers["metadata"]
-                    if m["session_id"] == identity["session_id"]
-                    and min(m["rgb_stamp_ns"], m["depth_stamp_ns"]) / 1e9 > after
-                    and abs(m["rgb_stamp_ns"] / 1e9 - started) <= MAX_RGBD_SKEW
-                ]
-                for metadata in sorted(candidates, key=lambda m: abs(m["rgb_stamp_ns"] / 1e9 - started)):
-                    rgb = next((v for v in buffers["rgb"] if v["stamp_ns"] == metadata["rgb_header_stamp_ns"]), None)
-                    depth = next(
-                        (v for v in buffers["depth"] if v["stamp_ns"] == metadata["depth_header_stamp_ns"]), None
-                    )
-                    if rgb is None or depth is None:
+                if calibration is None:
+                    continue
+                candidates = [rgb for rgb in buffers["rgb"] if rgb["stamp_ns"] / 1e9 > after
+                              and abs(rgb["stamp_ns"] / 1e9 - started) <= MAX_RGBD_SKEW]
+                for rgb in sorted(candidates, key=lambda r: abs(r["stamp_ns"] / 1e9 - started)):
+                    depths = [d for d in buffers["depth"] if d["stamp_ns"] / 1e9 > after
+                              and abs(d["stamp_ns"] - rgb["stamp_ns"]) / 1e9 <= MAX_RGBD_SKEW]
+                    if not depths:
                         continue
-                    if (
-                        rgb["frame_id"] != metadata["rgb_frame_id"]
-                        or depth["frame_id"] != metadata["depth_frame_id"]
-                    ):
-                        raise ValueError("RGB-D frame identity does not match calibration")
-                    if time.time() - objects["timestamp"] > 1 or time.time() - metadata["rgb_stamp_ns"] / 1e9 > 2:
+                    depth = min(depths, key=lambda d: abs(d["stamp_ns"] - rgb["stamp_ns"]))
+                    if time.time() - objects["timestamp"] > 1 or time.time() - rgb["stamp_ns"] / 1e9 > MAX_FRAME_AGE:
                         continue
+                    metadata = dict(calibration, session_id=identity["session_id"], rgb_topics=[source["topics"][0]],
+                                    rgb_stamp_ns=rgb["stamp_ns"], depth_stamp_ns=depth["stamp_ns"],
+                                    rgb_header_stamp_ns=rgb["header_stamp_ns"],
+                                    depth_header_stamp_ns=depth["header_stamp_ns"],
+                                    rgb_frame_id=rgb["frame_id"], depth_frame_id=depth["frame_id"])
                     intr = metadata["rgb_intrinsics"]
                     _, shape = self._thumbnail(rgb["data"])
                     if shape != (intr["height"], intr["width"]):
@@ -356,6 +441,8 @@ class ObservationInputs:
                         "objects_timestamp": objects["timestamp"],
                         "synchronization": {
                             "mode": "stationary_window",
+                            "timestamp_source": "dds_source_timestamp",
+                            "capture_time_approximate": True,
                             "settled_after": after,
                             "window_restarts": restarts,
                             "rgb_depth_skew_ms": abs(metadata["rgb_stamp_ns"] - metadata["depth_stamp_ns"]) / 1e6,
