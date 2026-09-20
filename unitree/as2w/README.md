@@ -37,10 +37,11 @@ The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint
 limits but omits the vendor STL visual/collision meshes. The driver only needs
 the kinematic chain for the `joints` skeleton card, avoiding large binary
-assets in the repository. As2W publishes 12 active leg joints in `rt/lowstate`;
-its fixed-size motor array also contains four reserved zero slots. The driver
-publishes only the 12 active joints so the skeleton does not interpret reserved
-slots as foot pose data. The model retains the four continuous wheel-foot joints
+assets in the repository. As2W publishes 12 active leg joints in `rt/lowstate`.
+The skeleton names use the canonical `*_joint` suffix and match the URDF joint
+names exactly. Its fixed-size motor array also contains four reserved zero
+slots. The driver publishes only the 12 active joints so the skeleton does not
+interpret reserved slots as foot pose data. The model retains the four continuous wheel-foot joints
 and the fixed JT128 sensor mount.
 
 `controlled_spatial` is a thin adapter for Unitree's documented `slam_operate`
@@ -62,9 +63,16 @@ and publishes JPEG `sensor_msgs/CompressedImage` frames to
 service or ROS2 depth topic, so `camera_depth` is intentionally not registered
 until a real depth source is identified.
 
-`special_action` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
+`special_motion` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
 continuous `loco` control card.
+
+The RPC proxy runs sport, voice, and video clients in separate workers. State
+subscriptions use a depth-one callback queue so joints and locomotion state
+publish the newest sample instead of draining stale samples. The microphone
+first listens to `rt/audiosender`; when that firmware stream is silent, the
+optional ALSA fallback tries the board capture devices and publishes compliant
+16 kHz mono PCM frames.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.

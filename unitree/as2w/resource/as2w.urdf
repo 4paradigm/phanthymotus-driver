@@ -13,7 +13,7 @@
       <inertia ixx="0.00049181" ixy="3.528E-05" ixz="-1.8E-07" iyy="0.0006194" iyz="9E-07" izz="0.00059384"/>
     </inertial>
     <visual><geometry><cylinder radius="0.055" length="0.10"/></geometry></visual></link>
-  <joint name="FL_hip" type="revolute">
+  <joint name="FL_hip_joint" type="revolute">
     <origin xyz="0.2119 0.06 0" rpy="0 0 0"/>
     <parent link="base_link"/>
     <child link="FL_hip"/>
@@ -27,7 +27,7 @@
       <inertia ixx="0.00681859" ixy="0.00023526" ixz="-0.00071654" iyy="0.00613083" iyz="0.00120069" izz="0.00178083"/>
     </inertial>
     <visual><geometry><box size="0.10 0.20 0.25"/></geometry></visual></link>
-  <joint name="FL_thigh" type="revolute">
+  <joint name="FL_thigh_joint" type="revolute">
     <origin xyz="0 0.1054 0" rpy="0 0 0"/>
     <parent link="FL_hip"/>
     <child link="FL_thigh"/>
@@ -41,7 +41,7 @@
       <inertia ixx="0.0067061" ixy="3.87E-06" ixz="-3.5E-07" iyy="0.0067667" iyz="9.146E-05" izz="0.00061164"/>
     </inertial>
     <visual><geometry><box size="0.09 0.09 0.24"/></geometry></visual></link>
-  <joint name="FL_calf" type="revolute">
+  <joint name="FL_calf_joint" type="revolute">
     <origin xyz="0 0 -0.212" rpy="0 0 0"/>
     <parent link="FL_thigh"/>
     <child link="FL_calf"/>
@@ -55,7 +55,7 @@
       <inertia ixx="0.0014579" ixy="0" ixz="0" iyy="0.0025769" iyz="0" izz="0.0014579"/>
     </inertial>
     <visual><geometry><cylinder radius="0.055" length="0.12"/></geometry></visual></link>
-  <joint name="FL_foot" type="continuous">
+  <joint name="FL_foot_joint" type="continuous">
     <origin xyz="0 0 -0.212" rpy="0 0 0"/>
     <parent link="FL_calf"/>
     <child link="FL_foot"/>
@@ -69,7 +69,7 @@
       <inertia ixx="0.00049181" ixy="-3.527E-05" ixz="-1.8E-07" iyy="0.0006194" iyz="-9E-07" izz="0.00059384"/>
     </inertial>
     <visual><geometry><cylinder radius="0.055" length="0.10"/></geometry></visual></link>
-  <joint name="FR_hip" type="revolute">
+  <joint name="FR_hip_joint" type="revolute">
     <origin xyz="0.2119 -0.06 0" rpy="0 0 0"/>
     <parent link="base_link"/>
     <child link="FR_hip"/>
@@ -83,7 +83,7 @@
       <inertia ixx="0.00681875" ixy="-0.00023526" ixz="-0.00071655" iyy="0.00613099" iyz="-0.00120071" izz="0.00178083"/>
     </inertial>
     <visual><geometry><box size="0.10 0.20 0.25"/></geometry></visual></link>
-  <joint name="FR_thigh" type="revolute">
+  <joint name="FR_thigh_joint" type="revolute">
     <origin xyz="0 -0.1054 0" rpy="0 0 0"/>
     <parent link="FR_hip"/>
     <child link="FR_thigh"/>
@@ -97,7 +97,7 @@
       <inertia ixx="0.0067059" ixy="-3.88E-06" ixz="-3.3E-07" iyy="0.0067665" iyz="-9.144E-05" izz="0.00061165"/>
     </inertial>
     <visual><geometry><box size="0.09 0.09 0.24"/></geometry></visual></link>
-  <joint name="FR_calf" type="revolute">
+  <joint name="FR_calf_joint" type="revolute">
     <origin xyz="0 0 -0.212" rpy="0 0 0"/>
     <parent link="FR_thigh"/>
     <child link="FR_calf"/>
@@ -111,7 +111,7 @@
       <inertia ixx="0.0014579" ixy="0" ixz="0" iyy="0.0025769" iyz="0" izz="0.0014579"/>
     </inertial>
     <visual><geometry><cylinder radius="0.055" length="0.12"/></geometry></visual></link>
-  <joint name="FR_foot" type="continuous">
+  <joint name="FR_foot_joint" type="continuous">
     <origin xyz="0 0 -0.212" rpy="0 0 0"/>
     <parent link="FR_calf"/>
     <child link="FR_foot"/>
@@ -125,7 +125,7 @@
       <inertia ixx="0.0004918" ixy="-3.549E-05" ixz="-2E-07" iyy="0.00061933" iyz="-7.9E-07" izz="0.00059378"/>
     </inertial>
     <visual><geometry><cylinder radius="0.055" length="0.10"/></geometry></visual></link>
-  <joint name="RL_hip" type="revolute">
+  <joint name="RL_hip_joint" type="revolute">
     <origin xyz="-0.2119 0.06 0" rpy="0 0 0"/>
     <parent link="base_link"/>
     <child link="RL_hip"/>
@@ -139,7 +139,7 @@
       <inertia ixx="0.0069198" ixy="0.00019339" ixz="-0.00070171" iyy="0.0062719" iyz="0.001158" izz="0.0017134"/>
     </inertial>
     <visual><geometry><box size="0.10 0.20 0.25"/></geometry></visual></link>
-  <joint name="RL_thigh" type="revolute">
+  <joint name="RL_thigh_joint" type="revolute">
     <origin xyz="0 0.1054 0" rpy="0 0 0"/>
     <parent link="RL_hip"/>
     <child link="RL_thigh"/>
@@ -153,7 +153,7 @@
       <inertia ixx="0.0049046" ixy="2.76E-06" ixz="-1.873E-05" iyy="0.0050599" iyz="6.496E-05" izz="0.00054577"/>
     </inertial>
     <visual><geometry><box size="0.09 0.09 0.24"/></geometry></visual></link>
-  <joint name="RL_calf" type="revolute">
+  <joint name="RL_calf_joint" type="revolute">
     <origin xyz="0 0 -0.212" rpy="0 0 0"/>
     <parent link="RL_thigh"/>
     <child link="RL_calf"/>
@@ -167,7 +167,7 @@
       <inertia ixx="0.0014579" ixy="0" ixz="0" iyy="0.0025769" iyz="0" izz="0.0014579"/>
     </inertial>
     <visual><geometry><cylinder radius="0.055" length="0.12"/></geometry></visual></link>
-  <joint name="RL_foot" type="continuous">
+  <joint name="RL_foot_joint" type="continuous">
     <origin xyz="0 0 -0.212" rpy="0 0 0"/>
     <parent link="RL_calf"/>
     <child link="RL_foot"/>
@@ -181,7 +181,7 @@
       <inertia ixx="0.00049181" ixy="3.549E-05" ixz="-2E-07" iyy="0.00061933" iyz="7.9E-07" izz="0.00059378"/>
     </inertial>
     <visual><geometry><cylinder radius="0.055" length="0.10"/></geometry></visual></link>
-  <joint name="RR_hip" type="revolute">
+  <joint name="RR_hip_joint" type="revolute">
     <origin xyz="-0.2119 -0.06 0" rpy="0 0 0"/>
     <parent link="base_link"/>
     <child link="RR_hip"/>
@@ -195,7 +195,7 @@
       <inertia ixx="0.00691991" ixy="-0.00019339" ixz="-0.00070172" iyy="0.00627201" iyz="-0.001158" izz="0.00171336"/>
     </inertial>
     <visual><geometry><box size="0.10 0.20 0.25"/></geometry></visual></link>
-  <joint name="RR_thigh" type="revolute">
+  <joint name="RR_thigh_joint" type="revolute">
     <origin xyz="0 -0.1054 0" rpy="0 0 0"/>
     <parent link="RR_hip"/>
     <child link="RR_thigh"/>
@@ -209,7 +209,7 @@
       <inertia ixx="0.0049045" ixy="-2.77E-06" ixz="-1.872E-05" iyy="0.0050598" iyz="-6.496E-05" izz="0.00054577"/>
     </inertial>
     <visual><geometry><box size="0.09 0.09 0.24"/></geometry></visual></link>
-  <joint name="RR_calf" type="revolute">
+  <joint name="RR_calf_joint" type="revolute">
     <origin xyz="0 0 -0.212" rpy="0 0 0"/>
     <parent link="RR_thigh"/>
     <child link="RR_calf"/>
@@ -223,7 +223,7 @@
       <inertia ixx="0.0014579" ixy="0" ixz="0" iyy="0.0025769" iyz="0" izz="0.0014579"/>
     </inertial>
     <visual><geometry><cylinder radius="0.055" length="0.12"/></geometry></visual></link>
-  <joint name="RR_foot" type="continuous">
+  <joint name="RR_foot_joint" type="continuous">
     <origin xyz="0 0 -0.212" rpy="0 0 0"/>
     <parent link="RR_calf"/>
     <child link="RR_foot"/>

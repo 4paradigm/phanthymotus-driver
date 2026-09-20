@@ -38,7 +38,8 @@ class Bundle:
         if dds_ready and p.get("camera_rgb", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera_rgb", {}), namespace, executor, proxy))
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
-        if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy))
+        special_cfg = p.get("special_motion", p.get("special_action", {}))
+        if special_cfg.get("enabled", True): self.plugins.append(SpecialActionPlugin(special_cfg, namespace, executor, proxy))
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
     def start_all(self):

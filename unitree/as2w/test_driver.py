@@ -142,7 +142,7 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn('<robot name="As2W">', urdf)
         self.assertNotIn("meshes/", urdf)
         for name in ("FL_foot", "FR_foot", "RL_foot", "RR_foot"):
-            self.assertIn(f'<joint name="{name}" type="continuous">', urdf)
+            self.assertIn(f'<joint name="{name}_joint" type="continuous">', urdf)
 
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
@@ -163,8 +163,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(3, len(published))
         joint_state = __import__("json").loads(published[1])
         self.assertEqual(12, len([key for key in joint_state if key.endswith("_q")]))
-        self.assertIn("FR_hip_q", joint_state)
-        self.assertNotIn("FR_foot_q", joint_state)
+        self.assertIn("FR_hip_joint_q", joint_state)
+        self.assertNotIn("FR_foot_joint_q", joint_state)
 
     def test_joints_payload_keeps_skeleton_contract(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
@@ -180,10 +180,17 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual([1, 0, 0, 0], payload["imu_quat"])
         self.assertEqual({"idx", "name", "q", "dq", "tau", "temperature"},
                          set(payload["joints"][0]))
+        self.assertEqual("FR_hip_joint", payload["joints"][0]["name"])
+
+    def test_joint_names_match_urdf_joint_names(self):
+        import re
+        urdf = (ROOT / "resource" / "as2w.urdf").read_text()
+        names = re.findall(r'<joint name="([^"]+)"', urdf)
+        self.assertTrue(set(self.device._AS2_JOINT_NAMES).issubset(names))
 
     def test_audio_data_is_converted_to_audio_chunk(self):
         message = self.device._audio_chunk([0, 255, 3])
-        self.assertEqual("pcm_16k_16bit_mono", message.format)
+        self.assertEqual("audio/pcm-16k", message.format)
         self.assertEqual([0, 255, 3], message.data)
 
     def test_speaker_streams_blocks_and_stops(self):
@@ -204,7 +211,8 @@ class TestDriverContracts(unittest.TestCase):
         plugin = self.device.LedPlugin({}, "test", None, proxy)
         result = plugin.dispatch("set_color", {"red": 300, "green": -2, "blue": 18})
         self.assertEqual([255, 0, 18], result["color"])
-        self.assertEqual([(255, 0, 18)], calls)
+        self.assertIn((255, 0, 18), calls)
+        plugin.stop()
 
     def test_camera_rgb_schema_and_topic(self):
         plugin = self.device.CameraPlugin.__new__(self.device.CameraPlugin)
@@ -213,6 +221,43 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("camera_rgb", tool["name"])
         self.assertEqual("image/jpeg", tool["topic_out"][0]["format"])
         self.assertEqual("/test/camera/rgb", tool["topic_out"][0]["topic"])
+        self.assertNotIn("action", tool["inputSchema"]["properties"])
+
+    def test_rpc_channel_ignores_late_result_from_timed_out_call(self):
+        rpc = _load("as2w_rpc_under_test", ROOT / "rpc_proxy.py")
+        channel = rpc._RpcChannel.__new__(rpc._RpcChannel)
+        channel._startup_error = None
+        channel._lock = __import__("threading").Lock()
+        channel._timeout = 0.05
+        channel._next_request_id = 1
+        channel._last_error = {}
+        import queue
+        channel._commands = queue.Queue()
+        channel._results = queue.Queue()
+        channel._results.put({"request_id": 1, "result": "late"})
+        channel._results.put({"request_id": 2, "result": "current"})
+        self.assertEqual("current", channel.call("Ping"))
+
+    def test_speaker_drops_old_blocks_when_live_queue_is_full(self):
+        node = self.device._SpeakerNode.__new__(self.device._SpeakerNode)
+        import queue
+        node._queue = queue.Queue(maxsize=2)
+        node.state = "ready"
+        node._on_chunk(types.SimpleNamespace(data=b"one"))
+        node._on_chunk(types.SimpleNamespace(data=b"two"))
+        node._on_chunk(types.SimpleNamespace(data=b"new"))
+        self.assertEqual([b"two", b"new"], [node._queue.get_nowait(), node._queue.get_nowait()])
+
+    def test_speaker_volume_and_led_action_parameters_are_explicit(self):
+        speaker = self.device.SpeakerPlugin.__new__(self.device.SpeakerPlugin)
+        speaker._node = types.SimpleNamespace(_client=types.SimpleNamespace(), state="idle", topic=None, blocks_sent=0)
+        speaker_schema = speaker.get_tool()["x-action-params"]
+        self.assertEqual([], speaker_schema["get_volume"]["params"])
+        self.assertEqual(["volume"], speaker_schema["set_volume"]["params"])
+        led = self.device.LedPlugin.__new__(self.device.LedPlugin)
+        led_schema = led.get_tool()["inputSchema"]["x-action-params"]
+        self.assertEqual([], led_schema["off"]["params"])
+        self.assertTrue(led.get_tool()["description"])
 
     def test_battery_current_is_explicitly_exposed_in_ma_and_a(self):
         node = self.device._StateNode.__new__(self.device._StateNode)

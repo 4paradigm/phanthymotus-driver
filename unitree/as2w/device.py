@@ -21,7 +21,7 @@ try:
     _LOW_LAT_QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
         history=HistoryPolicy.KEEP_LAST,
-        depth=200,
+        depth=1,
         durability=DurabilityPolicy.VOLATILE,
     )
     _CAMERA_QOS = QoSProfile(
@@ -65,18 +65,20 @@ class _StateNode:
     def __init__(self, namespace, executor):
         from rclpy.node import Node
         self.node = Node("as2w_state")
-        self.imu = self.node.create_publisher(String, f"/{namespace}/state/imu", 10)
-        self.joints = self.node.create_publisher(String, f"/{namespace}/state/joints", 10)
-        self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", 10)
-        self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", 10)
-        self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", 10)
+        self.imu = self.node.create_publisher(String, f"/{namespace}/state/imu", _LOW_LAT_QOS or 1)
+        self.joints = self.node.create_publisher(String, f"/{namespace}/state/joints", _LOW_LAT_QOS or 1)
+        self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", _LOW_LAT_QOS or 1)
+        self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", _LOW_LAT_QOS or 1)
+        self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", _LOW_LAT_QOS or 1)
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
         # AS2/As2W's official sport-state example uses the lf namespace.
         self._sport = ChannelSubscriber("rt/lf/sportmodestate", SportModeState_)
-        self._low.Init(self._on_low, 10)
-        self._bms.Init(self._on_bms, 10)
-        self._sport.Init(self._on_sport, 10)
+        # Keep only the newest state sample. A backlog of LowState frames is
+        # visible as stale joint poses in the frontend.
+        self._low.Init(self._on_low, 1)
+        self._bms.Init(self._on_bms, 1)
+        self._sport.Init(self._on_sport, 1)
         executor.add_node(self.node)
 
     def close(self):
@@ -242,10 +244,10 @@ class LocoPlugin:
         matches = 0
         while time.monotonic() < deadline:
             code, state = self.proxy.GetState()
-            name = str(state.get("fsm_name", "")) if code == 0 else ""
-            if name and name != "ai_damping":
+            name = str(state.get("fsm_name", "")).upper() if code == 0 else ""
+            if name and name != "DAMPING":
                 left_old_state = True
-            if left_old_state and name == expected_name:
+            if left_old_state and name == expected_name.upper():
                 matches += 1
             else:
                 matches = 0
@@ -271,15 +273,18 @@ class LocoPlugin:
             if duration < 0: return {"ret": -1, "message": "duration must be -1, 0, or positive"}
             self._stop_continuous(); ret = self.proxy.Move(vx, vy, yaw); time.sleep(duration); self.proxy.StopMove(); return {"ret": ret, "duration": duration}
         if action == "stop_move": self._stop_continuous(); return {"ret": self.proxy.StopMove()}
-        methods = {"stand_up": ("StandUp", "ai_stand_up"), "stand_down": ("StandDown", "ai_stand_down"), "balance_stand": ("BalanceStand", "ai_balance_stand"), "recovery_stand": ("RecoveryStand", "ai_recovery_stand")}
+        methods = {"stand_up": ("StandUp", "STAND_UP"), "stand_down": ("StandDown", "STAND_DOWN"), "balance_stand": ("BalanceStand", "BALANCE_STAND"), "recovery_stand": ("RecoveryStand", "RECOVERY_STAND")}
         if action in methods:
             method, expected_name = methods[action]
             ret = getattr(self.proxy, method)()
-            if ret != 0: return {"ret": ret, "accepted": False, "action": action}
+            if ret != 0: return {"ret": ret, "accepted": False, "action": action, "error": "SportClient rejected the action"}
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
             threading.Thread(target=self._await_posture, args=(action_id, action, expected_name), daemon=True).start()
             return {"ret": 0, "accepted": True, "status": "running", "action": action, "action_id": action_id}
-        if action == "damp": return {"ret": self.proxy.Damp(), "accepted": True, "action": action}
+        if action == "damp":
+            ret = self.proxy.Damp()
+            return {"ret": ret, "accepted": ret == 0, "action": action,
+                    **({} if ret == 0 else {"error": "SportClient rejected the action"})}
         if action == "euler": return {"ret": self.proxy.Euler(float(args.get("roll", 0)), float(args.get("pitch", 0)), float(args.get("yaw", 0)))}
         if action == "speed_level":
             preset = args.get("speed_preset", "normal")
@@ -299,14 +304,14 @@ class LocoPlugin:
 
 class SpecialActionPlugin:
     """As2W-specific discrete motions provided by the official SportClient."""
-    PREFIX = "special_action"
+    PREFIX = "special_motion"
 
     def __init__(self, config, namespace, executor, proxy):
         self.proxy = proxy
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
-        return {"name": "special_action", "type": "actuator", "multiInstance": False,
+        return {"name": "special_motion", "type": "actuator", "multiInstance": False,
                 "description": "As2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions},
@@ -328,24 +333,31 @@ class SpecialActionPlugin:
         if action == "stop": return {"state": "idle"}
         if action in ("front_flip", "back_flip", "handstand", "biped_stand") and not args.get("confirm", False):
             return {"error": "special action requires confirm=true"}
-        if action == "front_flip": return {"ret": self.proxy.FrontFlip()}
-        if action == "back_flip": return {"ret": self.proxy.BackFlip()}
-        if action == "handstand": return {"ret": self.proxy.HandStand(1 if args.get("enter", True) else 0)}
-        if action == "biped_stand": return {"ret": self.proxy.BipedStand(1 if args.get("enter", True) else 0)}
+        methods = {
+            "front_flip": lambda: self.proxy.FrontFlip(),
+            "back_flip": lambda: self.proxy.BackFlip(),
+            "handstand": lambda: self.proxy.HandStand(1 if args.get("enter", True) else 0),
+            "biped_stand": lambda: self.proxy.BipedStand(1 if args.get("enter", True) else 0),
+        }
+        if action in methods:
+            ret = methods[action]()
+            return {"ret": ret, "accepted": ret == 0, "action": action,
+                    **({} if ret == 0 else {"error": "SportClient rejected the special action"})}
         return None
 
 
 _AS2_JOINT_NAMES = [
-    "FR_hip", "FR_thigh", "FR_calf",
-    "FL_hip", "FL_thigh", "FL_calf",
-    "RR_hip", "RR_thigh", "RR_calf",
-    "RL_hip", "RL_thigh", "RL_calf",
+    "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+    "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+    "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+    "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
 ]
 
 
-MIC_AUDIO_FORMAT = "pcm_16k_16bit_mono"
+MIC_AUDIO_FORMAT = "audio/pcm-16k"
 SPEAKER_APP_NAME = "as2w_speaker"
-SPEAKER_BLOCK_BYTES = 9600  # 300 ms at 16 kHz, 16-bit, mono.
+SPEAKER_BLOCK_BYTES = 3200  # 100 ms at 16 kHz, 16-bit, mono.
+SPEAKER_QUEUE_BLOCKS = 8  # Keep the live stream below 800 ms of queued audio.
 
 
 def _audio_chunk(payload):
@@ -359,7 +371,7 @@ def _audio_chunk(payload):
 class _MicNode:
     """Republish AS2's robot microphone DDS stream as AudioChunk messages."""
 
-    def __init__(self, topic):
+    def __init__(self, topic, config=None):
         from rclpy.node import Node
         self.node = Node("as2w_mic")
         self.topic = topic
@@ -368,6 +380,10 @@ class _MicNode:
         self.state = "idle"
         self.packet_count = 0
         self.last_packet_ts = 0.0
+        self._config = config or {}
+        self._alsa_thread = None
+        self._alsa_stop = threading.Event()
+        self.backend = "dds"
 
     def start(self):
         if self.subscriber is not None:
@@ -375,6 +391,11 @@ class _MicNode:
         self.subscriber = ChannelSubscriber("rt/audiosender", AudioData_)
         self.subscriber.Init(self._on_audio, 10)
         self.state = "running"
+        if self._config.get("backend", "auto") in ("auto", "alsa"):
+            self._alsa_thread = threading.Thread(target=self._alsa_fallback,
+                                                 daemon=True, name="as2w-mic-alsa")
+            self._alsa_stop.clear()
+            self._alsa_thread.start()
         return self.topic
 
     def stop(self):
@@ -384,6 +405,10 @@ class _MicNode:
             except Exception:
                 pass
             self.subscriber = None
+        self._alsa_stop.set()
+        if self._alsa_thread is not None:
+            self._alsa_thread.join(timeout=1)
+            self._alsa_thread = None
         self.state = "idle"
 
     def _on_audio(self, msg):
@@ -393,6 +418,58 @@ class _MicNode:
         self.publisher.publish(_audio_chunk(payload))
         self.packet_count += 1
         self.last_packet_ts = time.monotonic()
+        self.backend = "dds"
+        self._alsa_stop.set()
+
+    def _alsa_fallback(self):
+        # AS2 firmware may advertise rt/audiosender without publishing it
+        # until its voice capture service is enabled. Use the board capture
+        # device in that case so the mic card remains useful on this hardware.
+        try:
+            import alsaaudio
+            configured = self._config.get("alsa_device", "default")
+            devices = [configured] if configured != "auto" else ["default", "hw:1,0", "hw:1,1"]
+            pcm = None
+            for device in devices:
+                try:
+                    pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NONBLOCK,
+                                        device=device)
+                    break
+                except Exception:
+                    continue
+            if pcm is None:
+                return
+            pcm.setchannels(1)
+            pcm.setrate(16000)
+            pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+            pcm.setperiodsize(512)
+        except Exception:
+            return
+        deadline = time.monotonic() + float(self._config.get("dds_grace_s", 2.0))
+        try:
+            while not self._alsa_stop.is_set():
+                try:
+                    length, data = pcm.read()
+                except Exception:
+                    # Non-blocking ALSA reports an empty period as EAGAIN on
+                    # some board images; keep polling without killing mic.
+                    self._alsa_stop.wait(0.01)
+                    continue
+                if length <= 0 or not data:
+                    self._alsa_stop.wait(0.01)
+                    continue
+                if time.monotonic() < deadline:
+                    continue
+                message = _audio_chunk(data)
+                self.publisher.publish(message)
+                self.packet_count += 1
+                self.last_packet_ts = time.monotonic()
+                self.backend = "alsa"
+        finally:
+            try:
+                pcm.close()
+            except Exception:
+                pass
 
 
 class MicPlugin:
@@ -400,7 +477,7 @@ class MicPlugin:
 
     def __init__(self, config, namespace, executor):
         self._topic = f"/{namespace}/mic/audio"
-        self._node = _MicNode(self._topic)
+        self._node = _MicNode(self._topic, config)
         executor.add_node(self._node.node)
 
     def get_tool(self):
@@ -437,7 +514,7 @@ class _SpeakerNode:
         import queue
         self.node = Node("as2w_speaker")
         self._client = audio_client
-        self._queue = queue.Queue()
+        self._queue = queue.Queue(maxsize=SPEAKER_QUEUE_BLOCKS)
         self._subscription = None
         self._stop_event = threading.Event()
         self._thread = None
@@ -445,8 +522,13 @@ class _SpeakerNode:
         self.state = "idle"
         self.blocks_sent = 0
         self._next_play_time = 0.0
+        self._last_play_error = 0.0
 
     def start(self, topic):
+        if self._thread is not None and self._thread.is_alive():
+            if self.topic == topic:
+                return topic
+            self.stop()
         if self._subscription is not None:
             if self.topic == topic:
                 return topic
@@ -461,6 +543,7 @@ class _SpeakerNode:
         return topic
 
     def stop(self):
+        import queue
         if self._subscription is not None:
             try:
                 self.node.destroy_subscription(self._subscription)
@@ -468,10 +551,16 @@ class _SpeakerNode:
                 pass
             self._subscription = None
         self._stop_event.set()
-        self._queue.put(None)
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-            self._thread = None
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            self._clear_queue()
+            self._queue.put_nowait(None)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5)
+            if not thread.is_alive():
+                self._thread = None
         self._clear_queue()
         self._next_play_time = 0.0
         try:
@@ -489,9 +578,22 @@ class _SpeakerNode:
                 return
 
     def _on_chunk(self, msg):
+        import queue
         payload = bytes(getattr(msg, "data", []))
         if payload:
-            self._queue.put(payload)
+            try:
+                self._queue.put_nowait(payload)
+            except queue.Full:
+                # The source is live audio; preserving old audio would make
+                # latency grow without bound. Drop the oldest block instead.
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._queue.put_nowait(payload)
+                except queue.Full:
+                    return
             self.state = "playing"
 
     def _drain(self):
@@ -522,7 +624,10 @@ class _SpeakerNode:
             result = self._client.Audio_PlayStream(SPEAKER_APP_NAME, "0", payload)
             self.blocks_sent += 1
         except Exception as exc:
-            print(f"[speaker] PlayStream failed: {exc}", flush=True)
+            now = time.monotonic()
+            if now - self._last_play_error >= 10.0:
+                print(f"[speaker] PlayStream failed: {str(exc)[:160]}", flush=True)
+                self._last_play_error = now
             return None
         # Keep at most 240 ms of audio ahead of the robot decoder.  Without a
         # cumulative deadline, fast RPC responses can overrun the firmware's
@@ -550,7 +655,12 @@ class SpeakerPlugin:
                     "input_topic": {"type": "string", "description": "ROS2 AudioChunk topic"},
                     "volume": {"type": "integer", "minimum": 0, "maximum": 100}},
                     "required": ["action"]},
-                "topic_in": [{"format": "audio/pcm-16k"}]}
+                "topic_in": [{"format": "audio/pcm-16k"}],
+                "x-action-params": {
+                    "start": {"params": ["input_topic"], "description": "Subscribe to an AudioChunk topic."},
+                    "stop": {"params": [], "description": "Stop playback and clear buffered audio."},
+                    "get_volume": {"params": [], "description": "Read the current volume."},
+                    "set_volume": {"params": ["volume"], "description": "Set volume from 0 to 100."}}}
 
     def start(self):
         pass
@@ -606,9 +716,11 @@ class _CameraRgbNode:
 
     def stop(self):
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3)
-            self._thread = None
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=6)
+            if not thread.is_alive():
+                self._thread = None
         self.state = "idle"
 
     def _loop(self):
@@ -619,6 +731,8 @@ class _CameraRgbNode:
                 self.last_error = str(exc)
                 self._stop_event.wait(self.period)
                 continue
+            if self._stop_event.is_set():
+                break
             code, payload = result if isinstance(result, tuple) and len(result) == 2 else (3104, None)
             if code == 0 and payload:
                 message = CompressedImage()
@@ -645,8 +759,7 @@ class CameraPlugin:
     def get_tool(self):
         return {"name": "camera_rgb", "type": "sensor", "multiInstance": False,
                 "description": f"AS2 videohub RGB JPEG stream at up to 5 FPS: {self._topic}",
-                "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": ["snapshot", "info"]}}},
+                "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
 
     def start(self):
@@ -662,9 +775,6 @@ class CameraPlugin:
         if action == "stop":
             self._node.stop()
             return {"state": "idle"}
-        if action == "snapshot":
-            return {"state": self._node.state, "frames": self._node.frames,
-                    "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
         if action == "info":
             return {"state": self._node.state, "frames": self._node.frames,
                     "last_error": self._node.last_error,
@@ -678,27 +788,54 @@ class LedPlugin:
     def __init__(self, config, namespace, executor, proxy):
         self._proxy = proxy
         self._color = [0, 0, 0]
+        self._keepalive_stop = threading.Event()
+        self._keepalive_thread = None
 
     def get_tool(self):
         return {"name": "led", "type": "actuator", "multiInstance": False,
-                "description": "AS2 RGB LED control through the voice service",
+                "description": "AS2 RGB LED. The selected color is refreshed periodically because AS2 firmware may time out LED state.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["set_color", "off", "info"]},
-                    "red": {"type": "integer", "minimum": 0, "maximum": 255},
-                    "green": {"type": "integer", "minimum": 0, "maximum": 255},
-                    "blue": {"type": "integer", "minimum": 0, "maximum": 255}},
-                    "required": ["action"]}}
+                    "red": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Red channel 0-255."},
+                    "green": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Green channel 0-255."},
+                    "blue": {"type": "integer", "minimum": 0, "maximum": 255, "description": "Blue channel 0-255."}},
+                    "required": ["action"],
+                    "x-action-params": {
+                        "set_color": {"params": ["red", "green", "blue"], "description": "Set RGB color."},
+                        "off": {"params": [], "description": "Turn the LED off."},
+                        "info": {"params": [], "description": "Read the selected color."}}}}
 
     def start(self):
-        pass
+        self._keepalive_stop.clear()
+        if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
+            self._keepalive_thread = threading.Thread(target=self._keepalive,
+                                                       daemon=True, name="as2w-led")
+            self._keepalive_thread.start()
 
     def stop(self):
-        pass
+        self._keepalive_stop.set()
+        if self._keepalive_thread is not None:
+            self._keepalive_thread.join(timeout=1)
+            self._keepalive_thread = None
+
+    def _keepalive(self):
+        while not self._keepalive_stop.is_set():
+            color = tuple(self._color)
+            try:
+                self._proxy.Audio_LedControl(*color)
+            except Exception as exc:
+                now = time.monotonic()
+                previous = getattr(self, "_last_error", 0.0)
+                if now - previous >= 10.0:
+                    print(f"[led] refresh failed: {str(exc)[:160]}", flush=True)
+                    self._last_error = now
+            self._keepalive_stop.wait(0.7)
 
     def dispatch(self, action, args):
         if action in ("start", "info"):
             return {"state": "ready", "color": list(self._color)}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action == "off":
             color = (0, 0, 0)
@@ -707,6 +844,7 @@ class LedPlugin:
                           for key in ("red", "green", "blue"))
         else:
             return None
-        result = self._proxy.Audio_LedControl(*color)
         self._color = list(color)
+        result = self._proxy.Audio_LedControl(*color)
+        self.start()
         return {"ret": result, "color": list(color)}
