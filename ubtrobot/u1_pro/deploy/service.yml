@@ -5,6 +5,8 @@ ubtrobot-u1-pro:
   ipc: host
   pid: host
   privileged: true
+  volumes:
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

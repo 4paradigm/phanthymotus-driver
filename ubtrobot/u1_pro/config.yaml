@@ -5,3 +5,8 @@ ros:
   core_domain_id: 42
   robot_interface: "lo"
   cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/></Interfaces></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+vision_capture:
+  output_dir: "/opt/phanthy-motus/data/vision_capture/u1_pro"
+  video_fps: 15
+  default_video_seconds: 5
+  max_video_seconds: 60

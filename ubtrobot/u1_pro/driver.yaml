@@ -15,4 +15,5 @@ cards:
   - { name: audio, type: actuator }
   - { name: expression, type: actuator }
   - { name: camera_rgb, type: sensor }
+  - { name: vision_capture, type: actuator }
   - { name: doa_event, type: sensor }

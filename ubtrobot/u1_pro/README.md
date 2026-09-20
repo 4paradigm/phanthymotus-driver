@@ -7,6 +7,7 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 - `audio`: documented `play_action`, `play_text`, motion listing, interruption, and asynchronous completion.
 - `expression`: a separate face/light motion card backed by the vendor command-motion list. The agent must call `list_actions` and use an exact returned `motion_id`; no firmware-dependent smile/blink aliases are invented.
 - `camera_rgb`: the documented U1 video stream. It opens the vendor stream, reads the section 4.5 shared-memory ring, and publishes `/namespace/camera/rgb` as `image/jpeg`.
+- `vision_capture`: photo/video capture built on the `camera_rgb` JPEG cache. It supports `capture_image`, timed `record_video`, continuous `start_recording`/`stop_recording`, `list`, `delete`, and `info`.
 - `doa_event`: an opt-in JSON sound-direction event stream.
 
 At startup the driver authorizes the vendor SDK from protected configuration or
@@ -27,7 +28,15 @@ BGRA/mono raw formats and rejects unknown encodings rather than publishing
 corrupt images. The video shared-memory path must be visible inside the driver
 container, as required by the vendor SDK deployment.
 
-The image installs `python3-pil` for the documented raw-video-to-JPEG conversion,
+Captured media is stored under `/opt/phanthy-motus/data/vision_capture/u1_pro`,
+which is mounted from the host by the deployment. `capture_image` returns a JPG
+path immediately after a fresh frame arrives. `record_video` returns an action ID
+and completes through Agent Core ACP after ffmpeg finishes the MP4; `duration`
+defaults to 5 seconds and is capped at 60 seconds. The card never records a
+stale frame as the first frame of a request.
+
+The image installs `python3-pil` for the documented raw-video-to-JPEG conversion
+and `ffmpeg` for MP4 capture,
 and `python3-colcon-common-extensions`, `cmake`, and `build-essential`
 only to build the local ROS interface packages during the image build. It installs the
 CycloneDDS RMW used by the dual-domain runtime and `PyYAML` used by the shared driver

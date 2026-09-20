@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -273,6 +274,41 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIn("play", expression_tool["inputSchema"]["properties"]["action"]["enum"])
         with self.assertRaises(ValueError):
             expression.dispatch("play", {})
+
+    def test_vision_capture_saves_a_fresh_jpeg(self):
+        import device
+
+        class FakeCamera:
+            running = True
+
+            def frame_sequence(self):
+                return 0
+
+            def wait_for_jpeg(self, after_sequence, timeout_s):
+                self.request = (after_sequence, timeout_s)
+                return b"\xff\xd8\xfffake-jpeg\xff\xd9", 1
+
+            def _state(self):
+                return {"state": "running"}
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            plugin = device.VisionCapturePlugin(FakeCamera(), {"output_dir": output_dir})
+            result = plugin.dispatch("capture_image", {"image_name": "test"})
+            self.assertEqual(result["state"], "captured")
+            self.assertEqual(result["filename"], "test.jpg")
+            with open(result["path"], "rb") as handle:
+                self.assertEqual(handle.read(), b"\xff\xd8\xfffake-jpeg\xff\xd9")
+            self.assertEqual(plugin.dispatch("list", {})["files"][0]["filename"], "test.jpg")
+
+    def test_vision_capture_schema_matches_tianyi_actions(self):
+        import device
+
+        class FakeCamera:
+            running = False
+
+        plugin = device.VisionCapturePlugin(FakeCamera(), {})
+        actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        self.assertEqual(actions, ["capture_image", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "start", "stop"])
 
     def test_video_frame_conversion_strips_step_padding(self):
         import device

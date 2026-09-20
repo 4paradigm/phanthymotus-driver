@@ -10,8 +10,11 @@ from __future__ import annotations
 import json
 import mmap
 import os
+import re
+import shutil
 import ssl
 import struct
+import subprocess
 import threading
 import time
 import urllib.request
@@ -728,7 +731,9 @@ class CameraRgbPlugin:
         self._publisher = None
         self._reader = None
         self._metadata = {}
-        self._lock = threading.Lock()
+        self._frame_condition = threading.Condition()
+        self._latest_jpeg = None
+        self._frame_sequence = 0
         self._frames = 0
         self._last_error = ""
 
@@ -791,9 +796,28 @@ class CameraRgbPlugin:
             message.format = "jpeg"
             message.data = list(jpeg)
             self._publisher.publish(message)
-            self._frames += 1
+            with self._frame_condition:
+                self._latest_jpeg = jpeg
+                self._frame_sequence += 1
+                self._frames += 1
+                self._frame_condition.notify_all()
         except Exception as exc:
             self._last_error = str(exc)[:256]
+
+    def wait_for_jpeg(self, after_sequence=None, timeout_s=5.0):
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._frame_condition:
+            baseline = self._frame_sequence if after_sequence is None else after_sequence
+            while self._latest_jpeg is None or self._frame_sequence <= baseline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, self._frame_sequence
+                self._frame_condition.wait(timeout=remaining)
+            return self._latest_jpeg, self._frame_sequence
+
+    def frame_sequence(self):
+        with self._frame_condition:
+            return self._frame_sequence
 
     def _state(self):
         result = {
@@ -814,6 +838,247 @@ class CameraRgbPlugin:
             return self.stop()
         if action == "info":
             return self._state()
+        return None
+
+
+class VisionCapturePlugin:
+    """Save fresh U1 JPEG frames and encode them as MP4 for Agent Core."""
+
+    def __init__(self, camera: CameraRgbPlugin, config: dict):
+        self.camera = camera
+        self.config = dict(config or {})
+        self.output_dir = os.path.abspath(str(self.config.get(
+            "output_dir", "/opt/phanthy-motus/data/vision_capture/u1_pro")))
+        self.channel_dir = str(self.config.get("channel_output_dir") or self.output_dir)
+        self.fps = max(1.0, min(30.0, float(self.config.get("video_fps", 15))))
+        self.default_seconds = max(1.0, min(60.0, float(self.config.get("default_video_seconds", 5))))
+        self.max_seconds = max(self.default_seconds, min(60.0, float(self.config.get("max_video_seconds", 60))))
+        self._lock = threading.Lock()
+        self._active = None
+        self._last_recording = None
+
+    def get_tool(self):
+        actions = {
+            "capture_image": (["image_name"], "Capture a fresh U1 Pro RGB image as a JPEG."),
+            "record_video": (["video_name", "duration"], "Record a fresh U1 Pro RGB video as an MP4; duration defaults to 5 seconds and is capped at 60 seconds."),
+            "start_recording": (["video_name"], "Start continuous U1 Pro RGB recording until stop_recording is called."),
+            "stop_recording": ([], "Stop the active continuous recording and finalize its MP4."),
+            "list": ([], "List saved U1 Pro photos and videos."),
+            "delete": (["name"], "Delete one saved .jpg or .mp4 file by its complete filename."),
+            "info": ([], "Show camera readiness, output paths, and recording state."),
+            "start": ([], "Prepare the U1 Pro capture card."),
+            "stop": ([], "Stop an active recording and release capture state."),
+        }
+        schema = action_schema(actions, {
+            "image_name": {"type": "string", "description": "Optional filename stem without .jpg."},
+            "video_name": {"type": "string", "description": "Optional filename stem without .mp4."},
+            "duration": {"type": "number", "minimum": 1, "maximum": 60, "default": self.default_seconds, "description": "Video duration in seconds."},
+            "name": {"type": "string", "description": "Complete saved filename, ending in .jpg or .mp4."},
+        })
+        schema["x-completion"] = {"actions": ["record_video"], "timeout": int(self.max_seconds + 15)}
+        return tool(
+            "vision_capture", "actuator",
+            "U1 Pro RGB photo and video capture. Reuses camera_rgb, saves media under the configured shared data directory, and returns a channel-visible path.",
+            schema,
+        )
+
+    @staticmethod
+    def _safe_stem(value, field):
+        if value in (None, ""):
+            return None
+        value = str(value).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", value):
+            raise ValueError(f"{field} must contain only letters, numbers, '.', '_' or '-' and be at most 100 characters")
+        return value
+
+    def _path(self, stem, suffix, prefix):
+        stem = self._safe_stem(stem, "name") or f"{prefix}_{time.time_ns()}"
+        path = os.path.join(self.output_dir, stem + suffix)
+        if os.path.exists(path):
+            raise ValueError(f"file already exists: {os.path.basename(path)}")
+        return path
+
+    def _result_path(self, path, mime, state):
+        return {"state": state, "filename": os.path.basename(path), "path": path,
+                "channel_reply_path": os.path.join(self.channel_dir, os.path.basename(path)),
+                "mime": mime, "size": os.path.getsize(path)}
+
+    def _ensure_camera(self):
+        if not self.camera.running:
+            state = self.camera.start()
+            if state.get("state") == "error":
+                raise RuntimeError(state.get("message", "U1 Pro camera is unavailable"))
+
+    def start(self):
+        return {"state": "ready"}
+
+    def stop(self):
+        result = self._stop_recording()
+        return result or {"state": "idle"}
+
+    def _info(self):
+        with self._lock:
+            active = dict(self._active) if self._active else None
+        return {"state": "recording" if active else "ready", "camera": self.camera._state(),
+                "output_dir": self.output_dir, "channel_output_dir": self.channel_dir,
+                "photos_dir": self.output_dir, "videos_dir": self.output_dir,
+                "fps": self.fps, "active_recording": active,
+                "last_recording": self._last_recording}
+
+    def _list(self):
+        if not os.path.isdir(self.output_dir):
+            return {"state": "listed", "files": []}
+        files = []
+        for name in sorted(os.listdir(self.output_dir)):
+            path = os.path.join(self.output_dir, name)
+            if os.path.isfile(path) and os.path.splitext(name)[1].lower() in (".jpg", ".mp4"):
+                files.append({"filename": name, "path": path, "size": os.path.getsize(path),
+                              "mime": "image/jpeg" if name.lower().endswith(".jpg") else "video/mp4"})
+        return {"state": "listed", "files": files}
+
+    def _delete(self, name):
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|mp4)", name, re.IGNORECASE):
+            return {"state": "error", "message": "name must be a complete .jpg or .mp4 filename"}
+        path = os.path.join(self.output_dir, name)
+        if not os.path.isfile(path):
+            return {"state": "error", "message": f"file not found: {name}"}
+        os.remove(path)
+        return {"state": "deleted", "filename": name}
+
+    def _capture_image(self, args):
+        try:
+            self._ensure_camera()
+            sequence = self.camera.frame_sequence()
+            frame, _ = self.camera.wait_for_jpeg(sequence, 5.0)
+            if frame is None:
+                return {"state": "error", "message": "no fresh U1 Pro camera frame received"}
+            os.makedirs(self.output_dir, exist_ok=True)
+            path = self._path(args.get("image_name"), ".jpg", "IMG")
+            with open(path, "wb") as handle:
+                handle.write(frame)
+            return self._result_path(path, "image/jpeg", "captured")
+        except Exception as exc:
+            return {"state": "error", "message": str(exc)}
+
+    def _start_recording(self, args, duration, action_id=None):
+        try:
+            self._ensure_camera()
+            if shutil.which("ffmpeg") is None:
+                return {"state": "error", "message": "ffmpeg is required for MP4 recording"}
+            with self._lock:
+                if self._active:
+                    return {"state": "error", "message": "a U1 Pro recording is already active"}
+                os.makedirs(self.output_dir, exist_ok=True)
+                path = self._path(args.get("video_name"), ".mp4", "VID")
+                active = {"state": "recording", "path": path, "duration": duration,
+                          "action_id": action_id, "cancel": threading.Event(),
+                          "started_at": time.time()}
+                self._active = active
+                thread = threading.Thread(target=self._record_worker, args=(active,), daemon=True, name="u1-vision-recording")
+                active["thread"] = thread
+                thread.start()
+            result = {"state": "recording", "filename": os.path.basename(path), "path": path,
+                      "channel_reply_path": os.path.join(self.channel_dir, os.path.basename(path)), "mime": "video/mp4"}
+            if action_id:
+                result["action_id"] = action_id
+            return result
+        except Exception as exc:
+            return {"state": "error", "message": str(exc)}
+
+    def _record_worker(self, active):
+        process = None
+        result = None
+        try:
+            baseline = self.camera.frame_sequence()
+            frame, sequence = self.camera.wait_for_jpeg(baseline, 5.0)
+            if frame is None:
+                raise RuntimeError("no fresh U1 Pro camera frame received")
+            duration = active["duration"]
+            total_frames = int(round(duration * self.fps)) if duration else None
+            command = ["ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-framerate", str(self.fps),
+                       "-i", "pipe:0", "-an", "-vf", "scale=ceil(iw/2)*2:ceil(ih/2)*2",
+                       "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+            if total_frames:
+                command.extend(["-frames:v", str(total_frames)])
+            command.extend(["-movflags", "+faststart", active["path"]])
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            active["process"] = process
+            index = 0
+            next_tick = time.monotonic()
+            while not active["cancel"].is_set() and (total_frames is None or index < total_frames):
+                process.stdin.write(frame)
+                process.stdin.flush()
+                index += 1
+                next_tick += 1.0 / self.fps
+                remaining = max(0.0, next_tick - time.monotonic())
+                if remaining:
+                    new_frame, new_sequence = self.camera.wait_for_jpeg(sequence, remaining)
+                    if new_frame is not None:
+                        frame, sequence = new_frame, new_sequence
+                    else:
+                        time.sleep(remaining)
+            process.stdin.close()
+            return_code = process.wait(timeout=15)
+            if active["cancel"].is_set():
+                raise RuntimeError("recording cancelled")
+            if return_code != 0 or not os.path.isfile(active["path"]):
+                error = process.stderr.read().decode("utf-8", "replace")[-512:]
+                raise RuntimeError(error or "ffmpeg failed to create MP4")
+            result = self._result_path(active["path"], "video/mp4", "recorded")
+        except Exception as exc:
+            result = {"state": "cancelled" if active["cancel"].is_set() else "error", "message": str(exc)}
+            try:
+                if active.get("path") and os.path.exists(active["path"]):
+                    os.remove(active["path"])
+            except OSError:
+                pass
+        finally:
+            if process and process.poll() is None:
+                process.kill()
+                process.wait()
+            with self._lock:
+                self._last_recording = result
+                self._active = None
+            if active.get("action_id"):
+                _acp_notify(active["action_id"], "completed" if result and result.get("state") == "recorded" else "error", result or {"state": "error"}, "vision_capture")
+
+    def _stop_recording(self):
+        with self._lock:
+            active = self._active
+        if not active:
+            return None
+        active["cancel"].set()
+        process = active.get("process")
+        if process and process.poll() is None:
+            process.kill()
+        active["thread"].join(timeout=15)
+        with self._lock:
+            return self._last_recording or {"state": "cancelled"}
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
+        if action == "info":
+            return self._info()
+        if action == "list":
+            return self._list()
+        if action == "delete":
+            return self._delete(args.get("name"))
+        if action == "capture_image":
+            return self._capture_image(args)
+        if action == "start_recording":
+            return self._start_recording(args, None)
+        if action == "stop_recording":
+            return self._stop_recording() or {"state": "idle", "message": "no active recording"}
+        if action == "record_video":
+            try:
+                duration = max(1.0, min(self.max_seconds, float(args.get("duration", self.default_seconds))))
+            except (TypeError, ValueError):
+                return {"state": "error", "message": "duration must be a number between 1 and 60"}
+            action_id = str(args.get("action_id") or f"u1-vision-{uuid.uuid4().hex}")[:128]
+            return self._start_recording(args, duration, action_id)
         return None
 
 
@@ -894,8 +1159,10 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
     # card has disabled its vendor resources and stopped publishing.
     audio = AudioPlugin(nodes)
+    camera = CameraRgbPlugin(nodes, config)
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
-               ExpressionPlugin(audio), CameraRgbPlugin(nodes, config)]
+               ExpressionPlugin(audio), camera,
+               VisionCapturePlugin(camera, config.get("vision_capture", {}))]
     descriptions = {
         "doa_event": "Microphone-array sound direction with azimuth and confidence.",
     }
