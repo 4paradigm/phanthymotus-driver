@@ -396,6 +396,39 @@ def test_reset_to_an_unknown_map_says_which_ones_exist(rig):
     assert "error" in result and result["available_maps"]
 
 
+def test_the_nav_card_lists_maps_not_scenarios(rig):
+    """Orin6 上抓到的：技能第 0 步照着 `list_maps` 去 load，而它答的是场景名 ——
+    agent 于是去加载一个不存在的「地图」。地图是地图，场景是场景。"""
+    rig["nav"].set_map_hooks(rig["scenario"].switch_map,
+                             lambda: sorted(rig["scenario"].maps()))
+
+    names = rig["nav"].dispatch("list_maps", {})["maps"]
+
+    assert "bj-2f" in names
+    assert "beijing_2f_tour" not in names
+
+
+def test_loading_the_map_that_is_already_active_succeeds(rig):
+    """技能第 0 步是「没有 active map 就 load map」。跑基准测试时世界被 owner 持有，
+    一律拒绝会让这一步失败 —— agent 读到「地图加载不了」，很合理地告诉访客展厅在
+    维护然后 finish()。Orin6 上就这么白跑了一轮，机器人一步没动。"""
+    rig["scenario"].dispatch("reset", {"map": "bj-2f", "owner": "benchmark"})
+
+    result = rig["scenario"].switch_map("bj-2f")
+
+    assert result.get("already_active") is True
+    assert "error" not in result
+
+
+def test_switching_to_a_different_map_mid_run_is_still_refused(rig):
+    """换**别的**图才是改动正在被测量的世界。"""
+    rig["scenario"].dispatch("reset", {"map": "bj-2f", "owner": "benchmark"})
+
+    result = rig["scenario"].switch_map("其他地图")
+
+    assert "error" in result
+
+
 def test_note_records_a_barge_in_even_when_nothing_else_reacts(rig):
     """Bound to on_interrupt_all. On a robot whose navigation does not stop, this
     note is the only evidence the interrupt was ever delivered."""

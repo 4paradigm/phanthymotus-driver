@@ -103,10 +103,15 @@ def build_plugins(config: dict, namespace: str, ros2=None) -> list:
         if map_card is not None:
             map_card.set_waypoints_provider(world.tags)
         if spatial_card is not None:
-            # 「载入地图」在这套东西里就是「载入场景」——一张地图一个场景。
+            # 「地图」就是地图资产，不是场景 slug。
+            #
+            # 原先这里把两者划了等号（「一张地图一个场景」），在地图还只存在于场景
+            # yaml 里的时候成立。`maps/` 成为独立资产之后就不成立了：用例说的是一张
+            # **地图**（`world.map: bj-2f`），而 `list_maps` 答的是场景名
+            # （`beijing_2f_tour`）。Orin6 上 agent 照着那份清单去 load，自然找不到。
             spatial_card.set_map_hooks(
-                lambda name: scenario_card.do_load(scenario=name),
-                lambda: sorted(scenario_card.refresh()))
+                scenario_card.switch_map,
+                lambda: sorted(scenario_card.maps()))
         scenario_card.set_injector(_ros_injector(config, ros2))
         if (enabled.get("sim_report") or {}).get("enabled", True):
             report_card = SimReportCard(world, config, namespace, ros2, scenario_card=scenario_card)
