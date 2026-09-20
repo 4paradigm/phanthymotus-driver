@@ -415,9 +415,9 @@ class ArmBulkActionTests(RunningArmMixin, unittest.TestCase):
 
     def test_tool_schema_only_advertises_body_part_actions(self):
         schema = self.arm_plugin().get_tool()["inputSchema"]
-        self.assertEqual(["set_shoulder", "set_elbow", "set_wrist"],
+        self.assertEqual(["set_shoulder", "set_elbow", "set_wrist", "reset"],
                          schema["properties"]["action"]["enum"])
-        self.assertEqual(set(ArmControlPlugin._GROUP_JOINTS),
+        self.assertEqual({*ArmControlPlugin._GROUP_JOINTS, "reset"},
                          set(schema["x-action-params"]))
         self.assertNotIn("joints", schema["properties"])
         self.assertNotIn("pose", schema["properties"])
@@ -900,16 +900,17 @@ class WaistHeadControlTests(RunningArmMixin, unittest.TestCase):
         self.assertIn("state", waist.dispatch("info", {}))
 
 
-class RemovedAxisGestureTests(unittest.TestCase):
-    def test_config_and_marketplace_no_longer_list_axis_gesture_cards(self):
+class RemovedGestureTests(unittest.TestCase):
+    def test_config_and_marketplace_no_longer_list_removed_gesture_cards(self):
         base = __file__.rsplit("/", 1)[0]
         for filename in ("config.yaml", "driver.yaml"):
             with open(f"{base}/{filename}", encoding="utf-8") as stream:
                 content = stream.read()
+            self.assertNotIn("arm_gesture", content, filename)
             self.assertNotIn("waist_gesture", content, filename)
             self.assertNotIn("head_gesture", content, filename)
 
-    def test_bundle_does_not_register_axis_gesture_cards(self):
+    def test_bundle_does_not_register_removed_gesture_cards(self):
         disabled = {name: {"enabled": False} for name in (
             "state", "estop", "loco", "motion", "tracking_motion",
             "camera", "vision_capture", "hand", "hand_gesture",
@@ -920,7 +921,7 @@ class RemovedAxisGestureTests(unittest.TestCase):
             "plugins": {
                 **disabled,
                 "arm": {"enabled": True},
-                "arm_gesture": {"enabled": False},
+                "arm_gesture": {"enabled": True},
                 "waist": {"enabled": True},
                 "head": {"enabled": True},
             },
@@ -928,11 +929,9 @@ class RemovedAxisGestureTests(unittest.TestCase):
         bundle = AdamDeviceBundle(
             config, "", None, None, dds_lowcmd_pub=_FakePublisher(),
             ros2_enabled=False)
-        self.assertEqual(
-            {"arm_control", "waist_control", "head_control"},
-            set(bundle._tool_map))
-        self.assertNotIn("waist_gesture", bundle._tool_map)
-        self.assertNotIn("head_gesture", bundle._tool_map)
+        self.assertIn("arm_control", bundle._tool_map)
+        self.assertNotIn("arm_gesture", bundle._tool_map)
+        self.assertIn("waist_control", bundle._tool_map)
 
 
 if __name__ == "__main__":

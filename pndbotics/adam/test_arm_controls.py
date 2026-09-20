@@ -77,6 +77,39 @@ class ArmControlTests(unittest.TestCase):
         self.assertEqual("right_wrist_roll", ARM_ACTIONS["set_right_wrist_roll"])
         self.assertEqual(len(ARM_JOINT_CONTROLS), len(ARM_ACTIONS))
 
+    def test_reset_is_advertised_and_restores_the_startup_arm_pose(self):
+        plugin = _prime_arm_plugin(_FakePublisher())
+        tool = plugin.get_tool()
+        self.assertIn("reset", tool["inputSchema"]["properties"]["action"]["enum"])
+        self.assertEqual(
+            ["duration_s"],
+            tool["inputSchema"]["x-action-params"]["reset"]["params"],
+        )
+
+        original_factory = getattr(device, "pnd_adam_msg_dds__LowCmd_", None)
+        device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
+        try:
+            plugin.start()
+            plugin._target_q = {
+                ADAM_PRO_JOINTS.index("shoulderPitch_Left"): math.radians(-90),
+            }
+            result = plugin.dispatch("reset", {"duration_s": 3.0})
+        finally:
+            plugin._stop_event.set()
+            if plugin._thread is not None:
+                plugin._thread.join(1.0)
+            if original_factory is None:
+                del device.pnd_adam_msg_dds__LowCmd_
+            else:
+                device.pnd_adam_msg_dds__LowCmd_ = original_factory
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(len(ARM_JOINT_CONTROLS), result["joints_set"])
+        self.assertEqual(3.0, result["duration_s"])
+        for _, joint, _, _ in ARM_JOINT_CONTROLS.values():
+            index = ADAM_PRO_JOINTS.index(joint)
+            self.assertAlmostEqual(plugin._hold_q[index], plugin._target_q[index])
+
     def test_degrees_convert_to_the_ros_joint_target(self):
         name, target = _arm_target_radians("left_shoulder_pitch", -90)
         self.assertEqual("shoulderPitch_Left", name)

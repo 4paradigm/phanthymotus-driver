@@ -80,8 +80,6 @@ plugins:
     enabled: true
     # Vendor arm-control example uses 50Hz complete rt/lowcmd packets.
     control_rate_hz: 50
-  arm_gesture:
-    enabled: true
   waist:
     enabled: true
   head:
