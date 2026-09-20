@@ -256,10 +256,23 @@ class SimScenarioCard(Card):
             asset = self.maps().get(map)
             if asset is None:
                 return {"error": f"找不到地图 {map}", "available_maps": sorted(self.maps())}
-            target = self._active or Scenario.from_dict({"name": map}, slug=map)
+            # 指定了地图就**从这张地图新建一个场景**，不是把新地图绑到旧场景上。
+            #
+            # Orin6 上抓到的：绑到旧场景上，栅格换成了 bj-2f，航点却还是上一个场景
+            # 的（`Scenario.waypoints()` 自己的 `pois` 优先于地图的）。于是机器人
+            # 在北京 2F 的图上找「一号展区」—— 用例说的 P3/P4/P5 一个都不存在，
+            # 而日志里看着一切正常：导航发出去了，barrier 也过了。
+            target = Scenario.from_dict({"name": asset.name}, slug=map)
             target.bind_map(asset)
             if spawn:
                 target.spawn = dict(spawn)
+            elif asset.pois:
+                # 没给出生点就停在第一个点位上，而不是原点 —— 真实地图的原点通常
+                # 在墙里，机器人一上来就判撞。
+                first = asset.pois[0]
+                target.spawn = {"x": float(first.get("x", 0.0)),
+                                "y": float(first.get("y", 0.0)),
+                                "yaw": float(first.get("yaw", 0.0))}
             self._active = target
             return self._load_active(seed=seed)
 

@@ -363,6 +363,39 @@ def test_reset_returns_the_world_to_the_start_of_the_scenario(rig):
     assert [e["event"] for e in rig["world"].events()] == ["scenario_load"]
 
 
+def test_reset_to_a_named_map_takes_that_maps_waypoints(rig):
+    """Orin6 上抓到的：用例说 `world.map: bj-2f`，栅格换过去了，航点却还是上一个
+    场景的 —— 机器人在北京 2F 的图上找「一号展区」，用例要的 P3/P4/P5 一个都不存在。
+
+    日志里看着一切正常：导航发出去了，barrier 也过了，分数却对不上任何东西。所以
+    指定地图要**新建一个场景**，而不是把新地图绑到旧场景上（`Scenario.waypoints()`
+    里自己的 `pois` 优先于地图的）。"""
+    before = [w["name"] for w in rig["scenario"].waypoints()]
+
+    result = rig["scenario"].dispatch("reset", {"map": "bj-2f"})
+
+    after = [w["name"] for w in rig["scenario"].waypoints()]
+    assert "error" not in result, result
+    assert "一号展区" in before and "一号展区" not in after
+    # bj-2f 的 14 个点位来自真实展厅的 controlled_spatial.db
+    assert {"P3", "P4", "P5"} <= set(after)
+
+
+def test_reset_to_a_named_map_spawns_on_a_real_point(rig):
+    """真实地图的原点通常在墙里 —— 停在那儿，机器人一上来就判撞。"""
+    rig["scenario"].dispatch("reset", {"map": "bj-2f"})
+
+    pose = rig["world"].snapshot()["pose"]
+
+    assert (pose["x"], pose["y"]) != (0.0, 0.0)
+
+
+def test_reset_to_an_unknown_map_says_which_ones_exist(rig):
+    result = rig["scenario"].dispatch("reset", {"map": "没有这张图"})
+
+    assert "error" in result and result["available_maps"]
+
+
 def test_note_records_a_barge_in_even_when_nothing_else_reacts(rig):
     """Bound to on_interrupt_all. On a robot whose navigation does not stop, this
     note is the only evidence the interrupt was ever delivered."""
