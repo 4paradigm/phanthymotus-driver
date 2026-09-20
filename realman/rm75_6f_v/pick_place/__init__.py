@@ -15,10 +15,6 @@ from .completion import Completion
 from hardware import JOINT_LIMITS_DEG
 
 
-# Transfer includes six moves and gripper operations, with time for settling.
-# Observation has no deadline. Core's ACP wait limit remains independent.
-TRANSFER_TIMEOUT_SECONDS = 120
-COMPLETION_TIMEOUT_SECONDS = 210
 MOTION_ACTIONS = ("observe", "grab_to", "grab_by")
 
 
@@ -125,13 +121,14 @@ class PickPlacePlugin:
             "observation_required=true；开启时在返回观察位并停稳后更新内存中的 RGB-D 快照，返回 observation.ok=true、"
             "observation_id、captured_at、objects、count，observation_required=false。"
             "新观察同时成为下一次搬运的依据，可用于评估效果；无需为取得物品列表另外调用 VOP。"
-            "卡片的返回观察与拍照等待不设总时限；框架 ACP 等待上限仍为 210 秒，框架超时不代表卡片停止，不要重复下发。"
+            "卡片执行不设超时，到位、夹爪确认、反馈恢复和拍照均等待条件满足；需要结束等待时调用 cancel。"
+            "ACP 等待由 Core 管理；框架超时不代表卡片停止，不要重复下发。"
             "result.observation_id 是本次抓放使用的照片编号，result.observation.observation_id 是动作后的新编号。"
             "ACP status=completed 且 result.ok=true 表示配置要求的动作链完成；transfer_completed=true 表示抓放与回升完成，return_completed=true 表示已返回观察位。"
             "grasp_checked=false 表示卡片没有自动判断物体是否实际搬运成功，不能仅据动作成功宣称抓取成功。"
             "抓放完成但后续观察失败时仍保留 transfer_completed=true，不能因此认定物体没有移动或直接重做搬运。"
-            "短暂反馈波动和轻微偏移会在有时限的等待中重新核验，恢复后继续当前步骤，不重复设备指令。"
-            "持续偏移、真实故障、超时或取消会停止；失败后不自动重试，结果包含 stage、last_completed_stage、"
+            "反馈波动和容差附近的轻微偏移会持续等待并重新核验，恢复后继续当前步骤，不重复设备指令。"
+            "偏移超出允许范围、真实故障或取消会停止；失败后不自动重试，结果包含 stage、last_completed_stage、"
             "holding_object_possible、release_completed。recovery_required=true 时需人工确认并安全处理持物或停止状态，"
             "不要直接 observe 或从头重试。其余情况下 observation_required=true 时先重新 observe，使用新坐标。")
         properties = {name: {"type": "number", "minimum": -1, "maximum": 1, "description": description}
@@ -158,8 +155,8 @@ class PickPlacePlugin:
                 "直接使用返回的物品列表，无需换算像素或另调 VOP；count=0 表示没有检测到物体，此时不猜测抓取点。"
                 "前提是三路输入已连接并启动：同一 ext_camera 的 RGB、depth，以及该 RGB 经 VOP 得到的物品列表。"
                 "卡片完成内参匹配、深度对齐和静止窗口同步；短暂画面变化会重新等待稳定及新的检测结果。"
-                "卡片的观察等待不设总时限，直到获得有效结果、取消或检查失败；设备故障与运动停滞仍会中止。"
-                "框架 ACP 等待上限仍为 210 秒，框架超时不代表卡片停止，不要重复下发；需要结束等待时调用 cancel。"
+                "卡片执行不设超时，直到获得有效结果、取消或检查失败；设备故障及偏移超出允许范围仍会中止。"
+                "ACP 等待由 Core 管理；框架超时不代表卡片停止，不要重复下发；需要结束等待时调用 cancel。"
                 "照片仅供一次搬运。搬运后是否自动生成新观察由配置 observe_after_transfer 决定，以完成结果 observation_required 为准。"
                 "此前动作若返回 recovery_required=true，先人工处理持物或停止状态，不以重新观察代替恢复。")),
             "grab_to": (["start_point_x", "start_point_y", "target_point_x", "target_point_y", "rotation_deg", "confirm_motion"], (
@@ -182,7 +179,7 @@ class PickPlacePlugin:
         # Require confirmation only for motion, leaving interrupt hooks callable.
         schema["allOf"] = [{"if": {"properties": {"action": {"enum": list(MOTION_ACTIONS)}}},
                             "then": {"required": ["confirm_motion"]}}]
-        schema["x-completion"] = {"actions": list(MOTION_ACTIONS), "timeout": COMPLETION_TIMEOUT_SECONDS}
+        schema["x-completion"] = {"actions": list(MOTION_ACTIONS)}
         schema["x-hooks"] = {"on_interrupt_motion": {"action": "cancel"},
                              "on_interrupt_all": {"action": "cancel"}}
         schema["x-is-dangerous"] = True
@@ -236,7 +233,7 @@ class PickPlacePlugin:
             with self._config_lock:
                 active = self._active
             if active is not None:
-                active["done"].wait(timeout=8)
+                active["done"].wait()
             with self._config_lock:
                 if self._active is not None:
                     return {"state": "stopping"}
@@ -361,8 +358,7 @@ class PickPlacePlugin:
         return terminal
 
     def _run_transfer(self, active):
-        motion = ObservationMotion(self.client, active["cancel"],
-                                   deadline=time.monotonic() + TRANSFER_TIMEOUT_SECONDS)
+        motion = ObservationMotion(self.client, active["cancel"])
         def send(method, *args):
             with self._config_lock:
                 motion.check_cancel()
@@ -449,7 +445,7 @@ class PickPlacePlugin:
         config = active["config"]
         target = [float(value) for value in config["observation_joints_deg"].split(",")]
         motion.validate_target(target)
-        motion.settled(timeout=None)
+        motion.settled()
         # A completed transfer returns even when image inputs are unavailable.
         if active["action"] == "observe":
             while True:
@@ -460,7 +456,7 @@ class PickPlacePlugin:
                 if readiness["fresh"]:
                     break
                 active["cancel"].wait(0.1)
-        motion.settled(timeout=None)
+        motion.settled()
         frames = motion.frames()
         with self._config_lock:
             motion.check_cancel()
@@ -472,7 +468,7 @@ class PickPlacePlugin:
                 raise RuntimeError(state.get("error") or "Observation input feedback stopped")
             return state["state"] == "running" and state["fresh"]
 
-        feedback = motion.settled(target, timeout=None)
+        feedback = motion.settled(target)
         if motion.frames() != frames:
             raise RuntimeError("Coordinate frames changed during observation")
 
@@ -495,14 +491,14 @@ class PickPlacePlugin:
                 raise RuntimeError("Arm moved during photograph capture")
             if (not current["idle"] or not pose_close(current["pose"], feedback["pose"], distance=0.0003)
                     or any(abs(a-b) > 0.2 for a, b in zip(current["joints"], target))):
-                feedback = motion.settled(target, timeout=None)
+                feedback = motion.settled(target)
                 # Tell snapshot to drop RGB-D/VOP from before settling.
                 return False
             return camera_ready()
 
         while True:
             photo = self._inputs.snapshot(time.time() + 0.15, active["cancel"], still_at_observation)
-            after = motion.settled(target, timeout=None, check=camera_ready)
+            after = motion.settled(target, check=camera_ready)
             if motion.frames() != frames or not pose_close(after["pose"], feedback["pose"], distance=0.002, angle=1):
                 raise RuntimeError("Observation pose or coordinate frames changed during capture")
             if pose_close(after["pose"], feedback["pose"], distance=0.0003):

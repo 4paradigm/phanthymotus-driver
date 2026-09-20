@@ -134,7 +134,7 @@ class Transfer:
 
         self.path_guard = path
         self._send("rm_movel", target, self.config["speed_percent"], 0, 0, 0)
-        self.motion.settled(timeout=45, guard=self.guard,
+        self.motion.settled(guard=self.guard,
                             check=self.gripper.state, reached=reached)
         self.hold(target)
         self.check()
@@ -177,7 +177,7 @@ class Transfer:
         self.rotation_path = (start_rotation, self.rotation_deg)
         self.path_guard = fixed_position
         self._send("rm_movel", target, self.config["speed_percent"], 0, 0, 0)
-        self.motion.settled(timeout=45, guard=self.guard, check=self.gripper.state,
+        self.motion.settled(guard=self.guard, check=self.gripper.state,
                             reached=lambda f: pose_close(f["pose"], target, distance=0.001, angle=1))
         self.grip_orientation = target[3:]
         self.rotation_path = None

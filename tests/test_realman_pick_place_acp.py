@@ -110,7 +110,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
     def test_tools_list_exposes_confirmation_completion_and_interrupt_contract(self):
         schema = self.rpc("tools/list")["result"]["tools"][0]["inputSchema"]
         self.assertEqual(schema["x-completion"], {
-            "actions": ["observe", "grab_to", "grab_by"], "timeout": 210})
+            "actions": ["observe", "grab_to", "grab_by"]})
         for action in schema["x-completion"]["actions"]:
             self.assertIn("confirm_motion", schema["x-action-params"][action]["params"])
             self.assertIn("confirm_motion=true", schema["x-action-params"][action]["description"])
@@ -285,6 +285,16 @@ class PickPlaceHTTPTests(unittest.TestCase):
         self.assertEqual(len(self.received), 2)
         self.assertEqual(self.received[0], self.received[1])
         self.assertEqual(len(self.fixture.moves()), 6)
+
+    def test_completion_waits_for_delayed_core_acknowledgement_without_request_timeout(self):
+        def acknowledge(payload):
+            threading.Event().wait(5.2)
+            return {"ok": True, "action_id": payload["action_id"]}
+        self.acknowledge = acknowledge
+        result = Completion("vision_pick_and_drop").send("delayed-action", "completed", {"ok": True})
+        self.assertEqual(result, ("accepted", None))
+        self.assertEqual(len(self.received), 1)
+        self.assertEqual(self.fixture.commands, [])
 
     def test_unacknowledged_callback_is_visible_without_changing_motion_outcome(self):
         self.acknowledge = lambda payload: {"ok": True, "action_id": "another-action"}

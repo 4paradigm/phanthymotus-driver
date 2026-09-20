@@ -33,11 +33,11 @@ class TransferTests(unittest.TestCase):
         self.after_command = lambda method, args: None
         self.now = 1000.0
         self.on_wait = lambda: None
-        # Advance the real settling/deadline logic without sleeping or bypassing checks.
+        # Advance settling and feedback checks without sleeping or bypassing them.
         self.enterContext(mock.patch("pick_place.time.monotonic", side_effect=lambda: self.now))
         original = ObservationMotion.__init__
-        def initialize(motion, client, cancel, deadline=None):
-            original(motion, client, cancel, deadline)
+        def initialize(motion, client, cancel):
+            original(motion, client, cancel)
             cancel.wait = self.wait
         self.enterContext(mock.patch.object(ObservationMotion, "__init__", initialize))
         self.depth = np.full((3, 4), 400, dtype="<u2")
@@ -532,6 +532,7 @@ class TransferTests(unittest.TestCase):
         self.camera.info.return_value = {"state": "running", "fresh": False}
         def cancel():
             if self.now >= 1300:
+                self.on_wait = lambda: None
                 self.plugin.dispatch("cancel", {})
         self.on_wait = cancel
         result = fixtures.ObserveTests.observe(self)
@@ -562,14 +563,19 @@ class TransferTests(unittest.TestCase):
         self.assertGreaterEqual(self.now - started[0], 310)
         self.assertEqual([name for name, _ in self.commands], ["rm_movej"])
 
-    def test_observation_stall_still_stops_motion(self):
+    def test_observation_without_progress_waits_until_cancelled(self):
         def stalled(method, args):
             if method == "rm_movej":
                 self.joints = [0.] * 7
         self.after_command = stalled
+        def cancel():
+            if self.now >= 1300:
+                self.on_wait = lambda: None
+                self.plugin.dispatch("cancel", {})
+        self.on_wait = cancel
         result = fixtures.ObserveTests.observe(self)
-        self.assertEqual(result["state"], "error", result)
-        self.assertIn("stalled", result["result"]["message"])
+        self.assertEqual(result["state"], "cancelled", result)
+        self.assertGreaterEqual(self.now, 1300)
         self.assertEqual([name for name, _ in self.commands], ["rm_movej", "rm_set_arm_slow_stop"])
         self.camera.snapshot.assert_not_called()
 
@@ -694,7 +700,7 @@ class TransferTests(unittest.TestCase):
     def test_horizontal_height_drift_stops_before_opening(self):
         def drift(method, args):
             if method == "rm_movel":
-                self.pose[2] += .002
+                self.pose[2] += .003
         self.after_command = drift
         result = self.transfer()
         self.assertEqual(result["state"], "error")
@@ -718,9 +724,14 @@ class TransferTests(unittest.TestCase):
         def call(method, *args):
             return [99] * args[1] if method == "rm_get_rm_plus_reg" else original(method, *args)
         self.client.call = call
+        def cancel():
+            if self.now >= 1300:
+                self.on_wait = lambda: None
+                self.plugin.dispatch("cancel", {})
+        self.on_wait = cancel
         result = self.transfer()
-        self.assertEqual(result["state"], "error")
-        self.assertIn("force setting was not confirmed", result["result"]["message"])
+        self.assertEqual(result["state"], "cancelled", result)
+        self.assertGreaterEqual(self.now, 1300)
         self.assertEqual([name for name, _ in self.commands], ["rm_movel", "rm_set_rm_plus_reg", "rm_set_arm_slow_stop"])
 
     def test_opening_must_arrive_before_descent(self):
@@ -728,11 +739,42 @@ class TransferTests(unittest.TestCase):
             if method == "rm_set_hand_follow_pos":
                 self.grip_position = 950
         self.after_command = stuck
+        def cancel():
+            if self.now >= 1300:
+                self.on_wait = lambda: None
+                self.plugin.dispatch("cancel", {})
+        self.on_wait = cancel
         result = self.transfer()
-        self.assertEqual(result["state"], "error")
-        self.assertIn("opening did not reach", result["result"]["message"])
+        self.assertEqual(result["state"], "cancelled", result)
+        self.assertGreaterEqual(self.now, 1300)
         self.assertEqual(len(self.moves()), 1)
         self.assertEqual(self.commands[-1][0], "rm_set_arm_slow_stop")
+
+    def test_gripper_force_and_opening_wait_for_delayed_confirmation(self):
+        pending, delayed = [], set()
+        def delay(method, args):
+            field = ("grip_force" if method == "rm_set_rm_plus_reg" else
+                     "grip_position" if method == "rm_set_hand_follow_pos" and args[0][0] == 1000 else None)
+            if field is not None and field not in delayed:
+                delayed.add(field)
+                pending.append((field, getattr(self, field), self.now + 30, len(self.commands)))
+                setattr(self, field, 99 if field == "grip_force" else 950)
+        def confirm():
+            if pending:
+                field, target, ready, count = pending[0]
+                self.assertEqual(len(self.commands), count)
+                if self.now >= ready:
+                    setattr(self, field, target)
+                    pending.clear()
+        self.after_command, self.on_wait = delay, confirm
+        result = self.grab_by()
+        self.assertEqual(result["state"], "completed", result)
+        self.assertEqual(delayed, {"grip_force", "grip_position"})
+        self.assertGreater(self.now - 1000, 60)
+        self.assertEqual(len(self.moves()), 6)
+        self.assertEqual(sum(name == "rm_set_rm_plus_reg" for name, _ in self.commands), 3)
+        self.assertEqual([args[0][0] for method, args in self.commands if method == "rm_set_hand_follow_pos"],
+                         [1000, 0, 1000, 0])
 
     def test_cancel_after_close_prevents_lifting_and_placing(self):
         def cancel(method, args):
@@ -769,15 +811,30 @@ class TransferTests(unittest.TestCase):
         self.assertTrue(self.client.motion_lock.locked())
         self.assertTrue(self.plugin.dispatch("info", {})["motion_blocked"])
 
-    def test_action_timeout_stops_before_further_commands(self):
-        def timeout(method, args):
+    def test_long_moves_and_rotation_finish_without_action_or_segment_deadlines(self):
+        pending = []
+        original = self.command
+        def command(method, *args):
+            before = self.pose[:]
+            original(method, *args)
             if method == "rm_movel":
-                self.now += 121
-        self.after_command = timeout
-        result = self.transfer()
-        self.assertEqual(result["state"], "error", result)
-        self.assertIn("timed out", result["result"]["message"])
-        self.assertEqual([name for name, _ in self.commands], ["rm_movel", "rm_set_arm_slow_stop"])
+                pending.append((self.now + 60, self.pose[:], len(self.commands)))
+                self.pose = before
+        def arrive():
+            if pending:
+                ready, target, count = pending[0]
+                self.assertEqual(len(self.commands), count)
+                if self.now >= ready:
+                    self.pose = target
+                    pending.clear()
+        self.client.command, self.on_wait = command, arrive
+        result = self.transfer(rotation_deg=45)
+        self.assertEqual(result["state"], "completed", result)
+        self.assertGreater(self.now - 1000, 7 * 60)
+        self.assertEqual(len(self.moves()), 7)
+        self.assertTrue(result["result"]["rotation_completed"])
+        self.assertTrue(result["result"]["release_completed"])
+        self.assertFalse(any(name == "rm_set_arm_slow_stop" for name, _ in self.commands))
         self.assertFalse(self.client.motion_lock.locked())
 
     def test_gripper_fault_during_closing_aborts_without_lift(self):
@@ -910,7 +967,7 @@ class TransferTests(unittest.TestCase):
                 self.assertNotIn("final_pose", result["result"])
                 self.camera.snapshot.assert_not_called()
 
-    def test_minor_disturbance_while_holding_recovers_and_finishes_placing(self):
+    def test_prolonged_minor_disturbance_while_holding_recovers_and_finishes_placing(self):
         for disturbed_stage in ("pick_close", "pick_lift", "move_to_place", "place_open"):
             with self.subTest(stage=disturbed_stage):
                 self.make_photo()
@@ -918,7 +975,7 @@ class TransferTests(unittest.TestCase):
                 disturbed, restored = [], []
                 def disturb(method, args):
                     if self.plugin._active["stage"] == disturbed_stage and not disturbed:
-                        disturbed.append((self.pose[:], self.now + .4, len(self.commands)))
+                        disturbed.append((self.pose[:], self.now + 30, len(self.commands)))
                         self.pose[2 if disturbed_stage in ("pick_lift", "move_to_place") else 0] += .0015
                 def recover():
                     if disturbed and not restored:
@@ -979,15 +1036,21 @@ class TransferTests(unittest.TestCase):
                 self.assertTrue(result["result"]["release_completed"])
                 self.assertGreater(result["result"]["feedback_recoveries"], 0)
 
-    def test_persistent_disturbance_after_grasp_reports_holding_and_stops(self):
+    def test_persistent_disturbance_after_grasp_waits_until_cancelled_and_reports_holding(self):
         def disturb(method, args):
             if method == "rm_set_hand_follow_pos" and args[0][0] == 0:
                 self.pose[0] += .0015
         self.after_command = disturb
+        def cancel():
+            if self.now >= 1300:
+                self.on_wait = lambda: None
+                self.plugin.dispatch("cancel", {})
+        self.on_wait = cancel
         result = self.transfer()
-        self.assertEqual(result["state"], "error", result)
+        self.assertEqual(result["state"], "cancelled", result)
+        self.assertGreaterEqual(self.now, 1300)
         data = result["result"]
-        self.assertIn("Feedback did not recover", data["message"])
+        self.assertIn("cancelled", data["message"])
         self.assertTrue(data["holding_object_possible"])
         self.assertTrue(data["recovery_required"])
         self.assertFalse(data["release_completed"])

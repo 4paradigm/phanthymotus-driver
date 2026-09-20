@@ -96,7 +96,7 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertIn("X 正方向向右（正值），负方向向左（负值）", schema["properties"]["delta_x"]["description"])
         self.assertIn("Y 正方向向照片下方（正值），负方向向上方（负值）", schema["properties"]["delta_y"]["description"])
         self.assertEqual(schema["required"], ["action"])
-        self.assertEqual(schema["x-completion"], {"actions": ["observe", "grab_to", "grab_by"], "timeout": 210})
+        self.assertEqual(schema["x-completion"], {"actions": ["observe", "grab_to", "grab_by"]})
         self.assertEqual(schema["properties"]["confirm_motion"]["type"], "boolean")
         self.assertIs(schema["properties"]["confirm_motion"]["const"], True)
         self.assertEqual(schema["allOf"][0]["then"]["required"], ["confirm_motion"])
@@ -503,19 +503,23 @@ class ObserveTests(unittest.TestCase):
         self.camera.stop.assert_called_once()
         self.assertIsNone(self.plugin._observation)
 
-    def test_read_feedback_rejects_idle_disagreement(self):
+    def test_read_feedback_waits_on_idle_disagreement_until_cancelled(self):
         import threading
         from pick_place.motion import ObservationMotion
         self.client.call_dict = lambda method: {"trajectory_type": 0, "data": [1]*7}
-        with self.assertRaisesRegex(RuntimeError, "disagree"):
-            ObservationMotion(self.client, threading.Event()).read()
+        cancel = threading.Event()
+        cancel.wait = lambda seconds: cancel.set()
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            ObservationMotion(self.client, cancel).read()
 
     def test_settle_requires_idle_and_fresh_samples(self):
         import threading
         from pick_place.motion import ObservationMotion
         self.client.call_dict = lambda method: {"trajectory_type": 1, "data": self.joints[:]}
-        with self.assertRaisesRegex(RuntimeError, "timeout"):
-            ObservationMotion(self.client, threading.Event()).settled(self.joints, timeout=0.2)
+        cancel = threading.Event()
+        cancel.wait = lambda seconds: cancel.set()
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            ObservationMotion(self.client, cancel).settled(self.joints)
 
     def test_all_motion_cards_share_driver_connection_and_upstream_motion_gate(self):
         device = load_device()

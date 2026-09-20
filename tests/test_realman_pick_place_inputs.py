@@ -96,8 +96,17 @@ class InputTests(unittest.TestCase):
         payload = dict(timestamp=self.now, count=len(objects), objects=objects, latency_ms=10)
         self.inputs.receive("objects", types.SimpleNamespace(data=json.dumps(payload)))
 
-    def snapshot(self, **kwargs):
-        return self.inputs.snapshot(1000.0, self.cancel, lambda: None, **kwargs)
+    def snapshot(self, cancel_after=None):
+        on_wait = self.on_wait
+        def wait():
+            on_wait()
+            if cancel_after is not None and self.now >= 1000 + cancel_after:
+                self.cancel.set()
+        self.on_wait = wait
+        try:
+            return self.inputs.snapshot(1000.0, self.cancel, lambda: None)
+        finally:
+            self.on_wait = on_wait
 
     def test_oversized_vop_payload_is_rejected_before_json_decoding(self):
         for payload in ("x" * (256 * 1024 + 1), "物" * (128 * 1024)):
@@ -260,8 +269,8 @@ class InputTests(unittest.TestCase):
             metadata.update(rgb_stamp_ns=999_990_000_000, depth_stamp_ns=999_991_000_000)
             self.feed(metadata=metadata)
         self.on_wait = delayed
-        with self.assertRaisesRegex(RuntimeError, "timed out"):
-            self.snapshot(timeout=.9)
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            self.snapshot(cancel_after=.9)
         self.align.assert_not_called()
 
     def test_rgb_depth_pairing_requires_bounded_source_time_skew(self):
@@ -270,8 +279,8 @@ class InputTests(unittest.TestCase):
             self.inputs._buffers["depth"].append(dict(self.inputs._buffers["rgb"][-1],
                                                     stamp_ns=round((self.now - .8) * 1e9)))
         self.on_wait = skewed
-        with self.assertRaisesRegex(RuntimeError, "timed out"):
-            self.snapshot(timeout=1)
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            self.snapshot(cancel_after=1)
         self.align.assert_not_called()
 
     def test_snapshot_waits_for_post_settle_window_and_new_vop_results(self):
@@ -303,13 +312,13 @@ class InputTests(unittest.TestCase):
         self.assertGreater(result["captured_at"], 1000.8)
         self.align.assert_called_once()
 
-    def test_continuous_scene_change_times_out_without_returning_stale_detection(self):
+    def test_continuous_scene_change_waits_until_cancelled_without_returning_stale_detection(self):
         def change():
             self.inputs._buffers["rgb"].pop()
             self.feed(value=220 if int(self.now * 20) % 2 else 120)
         self.on_wait = change
-        with self.assertRaisesRegex(RuntimeError, "timed out"):
-            self.snapshot(timeout=2)
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            self.snapshot(cancel_after=2)
         self.align.assert_not_called()
 
     def test_snapshot_waits_without_deadline_until_scene_is_stable(self):
@@ -370,8 +379,8 @@ class InputTests(unittest.TestCase):
             )
 
         self.on_wait = stale
-        with self.assertRaisesRegex(RuntimeError, "timed out"):
-            self.snapshot(timeout=1)
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            self.snapshot(cancel_after=1)
         self.align.assert_not_called()
 
     def test_inference_started_before_settling_is_not_selected(self):
@@ -385,8 +394,8 @@ class InputTests(unittest.TestCase):
             )
 
         self.on_wait = old_inference
-        with self.assertRaisesRegex(RuntimeError, "timed out"):
-            self.snapshot(timeout=1)
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            self.snapshot(cancel_after=1)
 
     def test_consumer_rejects_old_future_or_missing_dds_timestamp(self):
         for stamp in (998_000_000_000, 1001_000_000_000, None, 0, True):
