@@ -101,7 +101,7 @@ class PickPlacePlugin:
         self._ros2 = ros2
         self._inputs = inputs if inputs is not None else ObservationInputs(ros2)
         self._output_dir = Path(config.get("vision_pick_and_drop", {}).get(
-            "output_dir", "/opt/phanthy-motus/data/pick_place/realman"))
+            "output_dir", "/tmp/phanthy-motus/pick_place/realman"))
         self._config = {name: prop["default"] for name, prop in CONFIG_PROPERTIES.items()}
         self._config_lock = threading.RLock()
         self._active = None

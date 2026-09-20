@@ -300,9 +300,11 @@ RGB-D 配对及结果中的 `captured_at/depth_captured_at`。不使用本卡片
 
 每次成功观察只保存一张接收到的 JPEG、一份对齐深度及一个物品列表快照。
 照片、深度、彩色内参、源相机标定和时间、拍照位姿、工作/工具坐标系及配置一起保存在
-持久目录的 `<观察编号>/` 中。后台输入流不会覆盖有效照片，也不会连续向大模型发送图像或物品列表。
-持久目录由 `config.yaml` 的 `vision_pick_and_drop.output_dir` 设置，默认路径为
-`/opt/phanthy-motus/data/pick_place/realman`，使用独立数据卷。
+保存目录的 `<观察编号>/` 中。后台输入流不会覆盖有效照片，也不会连续向大模型发送图像或物品列表。
+保存目录由 `config.yaml` 的 `vision_pick_and_drop.output_dir` 设置，默认路径为
+`/tmp/phanthy-motus/pick_place/realman`，位于容器自身的可写文件系统，不需要宿主机挂载。
+照片和深度供当前观察及后续抓放使用，返回的 `file_path/metadata_path` 是容器内路径。
+容器删除、重建后不保留这些文件，重新启动后必须重新观察。
 
 ## 生命周期与设备协调
 

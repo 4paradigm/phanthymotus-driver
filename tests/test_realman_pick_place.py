@@ -170,7 +170,7 @@ sys.exit(not result.wasSuccessful())
                   "safety": {"max_speed_percent": 1}}
         card = PickPlacePlugin(RM75SDKClient({}).exclusive_client(), config)
         self.assertIsInstance(card._inputs, ObservationInputs)
-        self.assertEqual(card._output_dir, Path("/opt/phanthy-motus/data/pick_place/realman"))
+        self.assertEqual(card._output_dir, Path("/tmp/phanthy-motus/pick_place/realman"))
         self.assertEqual(card.dispatch("config", {})["speed_percent"], 50)
 
 

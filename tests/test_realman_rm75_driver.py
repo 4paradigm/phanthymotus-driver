@@ -175,10 +175,11 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         self.assertIn("ros-humble-rmw-fastrtps-cpp ffmpeg", dockerfile)
         self.assertIn("realsense.py vision_capture.py config.yaml", dockerfile)
 
-    def test_pick_place_has_its_own_persistent_directory(self):
-        directory = "/opt/phanthy-motus/data/pick_place/realman"
+    def test_pick_place_uses_container_storage_without_a_host_mount(self):
+        directory = "/tmp/phanthy-motus/pick_place/realman"
         service = (DRIVER / "deploy/service.yml").read_text()
-        self.assertIn(f"{directory}:{directory}", service)
+        self.assertNotIn(directory, service)
+        self.assertNotIn("/data/pick_place/", service)
         self.assertIn(f"vision_pick_and_drop:\n  output_dir: {directory}", (DRIVER / "config.yaml").read_text())
 
 
