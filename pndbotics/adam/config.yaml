@@ -70,6 +70,13 @@ plugins:
   arm:
     enabled: true
     publish_rate_hz: 100
+  upper_body_control:
+    # Match the vendor low-level example's 2.5 ms command period.
+    control_rate_hz: 400
+  waist:
+    enabled: true
+  head:
+    enabled: true
   hand:
     enabled: true
     # Verified on Adam: all 12 hand channels move in the effective 0..1000
