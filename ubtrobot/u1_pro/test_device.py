@@ -114,9 +114,19 @@ class FakeNodes:
 
 class U1CardContractTests(unittest.TestCase):
     def test_stream_topics_match_robot_contract(self):
+        import device
+
         self.assertEqual(MIC_TOPIC, "/audio/sense/audio_data_to_asr")
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
+        self.assertEqual(device.EVENT_TOPICS["wakeup_event"], "/robo/audio/subscribe/wakeup_event")
+
+    def test_event_bridge_keeps_sdk_string_payloads(self):
+        import device
+
+        message = types.SimpleNamespace(data='{"code":"EVENT","data":{"azimuth":12.5}}')
+        self.assertEqual(device._event_json(message), message.data)
+        self.assertEqual(device._event_data(message.data), {"azimuth": 12.5})
 
     def test_agent_facing_plugins_exist(self):
         import device
@@ -164,6 +174,8 @@ class U1CardContractTests(unittest.TestCase):
                 return types.SimpleNamespace(publish=lambda message: None)
 
             def create_subscription(self, *args, **kwargs):
+                self.subscriptions = getattr(self, "subscriptions", [])
+                self.subscriptions.append(args)
                 return types.SimpleNamespace()
 
             def create_client(self, srv_type, name):
@@ -184,6 +196,8 @@ class U1CardContractTests(unittest.TestCase):
             nodes = device.U1Nodes({}, "test", ros)
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
+            self.assertEqual(len(nodes.robot.subscriptions), 6)
+            self.assertTrue(all(subscription[0] is sys.modules["std_msgs.msg"].String for subscription in nodes.robot.subscriptions[:5]))
             self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name, "/robo/audio/call/play_action")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
             nodes.close()
@@ -317,7 +331,7 @@ class U1CardContractTests(unittest.TestCase):
             notify.assert_not_called()
             plugin._on_playback_state({"uuid": vendor_uuid, "phase": "feedback", "success": True, "state_name": "COMPLETED"})
             notify.assert_not_called()
-            plugin._on_playback_state({"uuid": vendor_uuid, "phase": "result", "success": True, "state_name": "COMPLETED", "message": "x" * 1000, "unexpected": "drop"})
+            plugin._on_playback_state({"code": "EVENT", "data": {"uuid": vendor_uuid, "phase": "result", "success": True, "state": "COMPLETED", "message": "x" * 1000, "unexpected": "drop"}})
             notify.assert_called_once()
             self.assertEqual(notify.call_args.args[1], "completed")
             playback = notify.call_args.args[2]["playback"]

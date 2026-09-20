@@ -24,6 +24,18 @@ MIC_TOPIC = "/audio/sense/audio_data_to_asr"
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
 
+# The U1 Pro SDK document declares all five event topics as
+# std_msgs/msg/String.  Their String.data value is a JSON envelope.  Keep
+# these wire types separate from the local audio bridge messages below; using
+# a custom audio_msgs event type would prevent DDS matching on the robot.
+EVENT_TOPICS = {
+    "main_wakeup_word": "/robo/audio/subscribe/main_wakeup_word",
+    "wakeup_event": "/robo/audio/subscribe/wakeup_event",
+    "wakeup_state": "/robo/audio/subscribe/wakeup_state",
+    "doa_event": "/robo/audio/subscribe/doa_event",
+    "playback_state": PLAYBACK_TOPIC,
+}
+
 
 def _sensor_schema() -> dict:
     return {
@@ -37,6 +49,28 @@ def _event_json(message: Any) -> str:
     if hasattr(message, "data") and isinstance(message.data, str):
         return message.data
     return json.dumps(jsonable(message), ensure_ascii=False)
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return jsonable(value)
+
+
+def _event_data(event: Any) -> dict:
+    """Unwrap the SDK's JSON event envelope for internal consumers."""
+    current = _json_value(event)
+    for _ in range(4):
+        if not isinstance(current, dict) or "data" not in current:
+            break
+        nested = _json_value(current["data"])
+        if not isinstance(nested, dict):
+            break
+        current = nested
+    return current if isinstance(current, dict) else {}
 
 
 def _bounded_playback(data: dict) -> dict:
@@ -121,13 +155,7 @@ class U1Nodes:
         self._mic_forwarding = False
         self._playback_listeners = []
         self._robot_subscriptions = []
-        for name, topic in (
-            ("main_wakeup_word", "/robo/audio/subscribe/main_wakeup_word"),
-            ("wakeup_event", "/robo/audio/subscribe/wakeup_event"),
-            ("wakeup_state", "/robo/audio/subscribe/wakeup_state"),
-            ("doa_event", "/robo/audio/subscribe/doa_event"),
-            ("playback_state", PLAYBACK_TOPIC),
-        ):
+        for name, topic in EVENT_TOPICS.items():
             output_topic = f"/{namespace}/u1_pro/{name}"
             self._event_publishers[name] = self.core.create_publisher(String, output_topic, reliable)
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
@@ -149,10 +177,7 @@ class U1Nodes:
             output = self.String()
             output.data = _event_json(message)
             if name == "playback_state":
-                try:
-                    event = json.loads(output.data)
-                except (TypeError, json.JSONDecodeError):
-                    event = {}
+                event = _json_value(output.data)
                 for listener in tuple(self._playback_listeners):
                     listener(event)
             if not self._event_forwarding.get(name, False):
@@ -417,8 +442,8 @@ class AudioPlugin:
         return {"state": "queued", "action_id": action_id, "request": result}
 
     def _on_playback_state(self, event: dict) -> None:
-        data = event.get("data") if isinstance(event.get("data"), dict) else event
-        if not isinstance(data, dict) or data.get("phase") != "result":
+        data = _event_data(event)
+        if data.get("phase") != "result":
             return
         event_uuid = data.get("uuid")
         with self._lock:
@@ -426,7 +451,7 @@ class AudioPlugin:
             if not active or not event_uuid or event_uuid != active["vendor_uuid"]:
                 return
             self._active = None
-        state_name = str(data.get("state_name", "")).upper()
+        state_name = str(data.get("state_name") or data.get("state") or "").upper()
         failed = state_name == "FAILED" or data.get("success") is False
         success = not failed and (data.get("success") is True or state_name == "COMPLETED")
         status = "completed" if success else "error"

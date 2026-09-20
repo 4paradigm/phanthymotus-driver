@@ -10,11 +10,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AudioData.msg"
   "msg/AudioInData.msg"
   "msg/AudioOutData.msg"
-  "msg/DoaEvent.msg"
-  "msg/MainWakeupWord.msg"
-  "msg/WakeupEvent.msg"
-  "msg/WakeupState.msg"
-  "msg/FinishList.msg"
   "srv/EnableAudioIn.srv"
   "srv/SetAudioVolume.srv"
   DEPENDENCIES std_msgs
