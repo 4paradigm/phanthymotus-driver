@@ -2,12 +2,11 @@
 
 import ast
 import ctypes
-import json
 import math
-from pathlib import Path
 import unittest
 from unittest import mock
 import zlib
+from uuid import uuid4
 
 import numpy as np
 
@@ -62,17 +61,14 @@ class TransferTests(unittest.TestCase):
                                 "model": "distortion.none", "coeffs": [0]*5}}
         self.photo_data = photo
         self.photo_pose = self.pose[:]
-        self.photo = self.plugin._save_photo(photo, {
-            "observation_id": "photo-" + str(len(list(Path(self.temp.name).iterdir()))),
+        self.plugin._observation = self.plugin._make_observation(photo, {
+            "observation_id": "photo-" + uuid4().hex,
             "config": dict(self.plugin._config)}, {"joints": self.joints, "pose": self.pose},
             {"work": self.copy(self.frame), "tool": self.copy(self.frame)})
-        self.plugin._observation = dict(self.photo)
+        self.photo = self.copy(self.plugin._observation["result"])
 
     def edit_metadata(self, edit):
-        path = Path(self.photo["metadata_path"])
-        data = json.loads(path.read_text())
-        edit(data)
-        path.write_text(json.dumps(data))
+        edit(self.plugin._observation["metadata"])
 
     def call(self, method, *args):
         if method == "rm_get_rm_plus_base_info":
@@ -110,6 +106,19 @@ class TransferTests(unittest.TestCase):
 
     def moves(self):
         return [args[0] for method, args in self.commands if method == "rm_movel"]
+
+    def test_grab_uses_memory_snapshot_without_reading_or_writing_files(self):
+        from pathlib import Path
+        for action in (self.transfer, self.grab_by):
+            with self.subTest(action=action.__name__):
+                self.make_photo()
+                with mock.patch("builtins.open", side_effect=AssertionError("Unexpected file access")), \
+                        mock.patch.object(Path, "open", side_effect=AssertionError("Unexpected file access")), \
+                        mock.patch.object(Path, "mkdir", side_effect=AssertionError("Unexpected output directory")):
+                    result = action()
+                self.assertEqual(result["state"], "completed", result)
+                self.assertTrue(result["result"]["observation"]["ok"])
+                self.assertEqual(self.plugin._observation["result"], result["result"]["observation"])
 
     def test_optional_rotation_preserves_pick_place_positions_and_returns_to_observation(self):
         for action in (self.transfer, self.grab_by):
@@ -246,7 +255,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(result["result"]["place_pixel"], [3, 2])
         self.assertIsNone(self.plugin._active)
         observation = result["result"]["observation"]
-        self.assertEqual(self.plugin._observation, observation)
+        self.assertEqual(self.plugin._observation["result"], observation)
         self.assertEqual(result["result"]["final_pose"], self.photo_pose)
         self.assertFalse(result["observation_required"])
         self.assertTrue(result["result"]["transfer_completed"])
@@ -254,8 +263,8 @@ class TransferTests(unittest.TestCase):
         self.camera.snapshot.assert_called_once()
         self.assertEqual(self.commands[-1], ("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 37, 0, 0, 0)))
         self.assertNotEqual(observation["observation_id"], self.photo["observation_id"])
-        self.assertTrue(Path(observation["file_path"]).exists())
-        metadata = json.loads(Path(observation["metadata_path"]).read_text())
+        self.assertEqual(self.plugin._observation["jpeg"], b"photo")
+        metadata = self.plugin._observation["metadata"]
         self.assertEqual(metadata["config"], self.plugin._config)
         self.assertEqual(metadata["pose"], self.photo_pose)
 
@@ -283,7 +292,6 @@ class TransferTests(unittest.TestCase):
                 self.assertNotEqual(info["observation"]["observation_id"], photo["observation_id"])
                 self.assertEqual(result["result"]["observation_id"], photo["observation_id"])
                 self.assertEqual(info["last_result"], result)
-                self.assertTrue(Path(photo["file_path"]).exists())
                 self.assertFalse(self.client.motion_lock.locked())
 
     def test_failed_first_command_consumes_photo_before_sdk_returns(self):
@@ -328,7 +336,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(result["result"]["direction_reference"], "observation_image")
         self.assertEqual(result["result"]["pick_pixel"], [3, 2])
         self.assertNotIn("place_pixel", result["result"])
-        self.assertEqual(self.plugin._observation, result["result"]["observation"])
+        self.assertEqual(self.plugin._observation["result"], result["result"]["observation"])
         self.assertFalse(self.client.motion_lock.locked())
         self.camera.snapshot.assert_called_once()
         self.assertEqual(self.commands[-1][0], "rm_movej")
@@ -470,7 +478,6 @@ class TransferTests(unittest.TestCase):
         self.assertTrue(result["result"]["transfer_completed"])
         self.assertTrue(result["observation_required"])
         self.assertIsNone(self.plugin._observation)
-        self.assertEqual(len(list(Path(self.temp.name).iterdir())), 1)
         self.assertEqual(sum(name == "rm_set_arm_slow_stop" for name, _ in self.commands), 1)
 
     def test_follow_up_observation_has_its_own_bounded_time_budget(self):

@@ -170,20 +170,17 @@ sys.exit(not result.wasSuccessful())
                   "safety": {"max_speed_percent": 1}}
         card = PickPlacePlugin(RM75SDKClient({}).exclusive_client(), config)
         self.assertIsInstance(card._inputs, ObservationInputs)
-        self.assertEqual(card._output_dir, Path("/tmp/phanthy-motus/pick_place/realman"))
+        self.assertIsNone(card._observation)
         self.assertEqual(card.dispatch("config", {})["speed_percent"], 50)
 
 
 class ObserveTests(unittest.TestCase):
     def setUp(self):
         import copy
-        import tempfile
         import threading
         import types
         from unittest import mock
         from pick_place import PickPlacePlugin
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
         self.client = types.SimpleNamespace(connected=True, motion_enabled=True,
                                            motion_lock=threading.Lock())
         self.joints = [0.0] * 7
@@ -200,8 +197,7 @@ class ObserveTests(unittest.TestCase):
         self.camera.snapshot.side_effect = self.snapshot
         self.camera.identity.return_value = {"topics": ["/test/rgb", "/test/depth", "/test/rgb/objects"], "serial_number": "D435-test", "session_id": "session-test"}
         self.camera.topics.return_value = [{"topic": t, "format": f} for t, f in zip(self.camera.identity()["topics"], ("image/jpeg", "image/depth-zlib", "data/json"))]
-        self.plugin = PickPlacePlugin(self.client, {"vision_pick_and_drop": {"output_dir": self.temp.name}},
-                                      inputs=self.camera)
+        self.plugin = PickPlacePlugin(self.client, {}, inputs=self.camera)
         self.copy = copy.deepcopy
         self.completion_factory = self.enterContext(mock.patch("pick_place.Completion"))
         self.completion_factory.return_value.send.return_value = ("accepted", None)
@@ -273,9 +269,12 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_call_returns_after_one_move_and_one_photo(self):
-        from pathlib import Path
         import json
-        result = self.observe()
+        from unittest import mock
+        with mock.patch("builtins.open", side_effect=AssertionError("Observation must stay in memory")), \
+                mock.patch.object(Path, "open", side_effect=AssertionError("Observation must stay in memory")), \
+                mock.patch.object(Path, "mkdir", side_effect=AssertionError("Observation needs no output directory")):
+            result = self.observe()
         self.assertEqual(result["state"], "completed", result)
         self.assertFalse(result["observation_required"])
         self.assertFalse(self.plugin.dispatch("info", {})["observation_required"])
@@ -285,14 +284,50 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(self.commands, [("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 50, 0, 0, 0))])
         self.camera.snapshot.assert_called_once()
         self.assertEqual(result["result"]["objects"], [{"name": "banana", "position": [.1, .2], "confidence": .9}])
-        path = Path(result["result"]["file_path"])
-        self.assertTrue(path.exists())
-        metadata = json.loads(path.with_name("metadata.json").read_text())
+        snapshot = self.plugin._observation
+        self.assertEqual(snapshot["jpeg"], b"\xff\xd8test\xff\xd9")
+        self.assertEqual(snapshot["depth_zlib"], b"test-depth")
+        metadata = snapshot["metadata"]
+        public = self.plugin.dispatch("info", {})
+        self.assertEqual(public["observation"], result["result"])
+        for field in ("file_path", "metadata_path", "jpeg", "depth_zlib", "metadata"):
+            self.assertNotIn(field, public["observation"])
+            self.assertNotIn(field, public["last_result"]["result"])
+        json.dumps(public)
+        json.dumps(self.completion_factory.return_value.send.call_args.args[-1])
         self.assertEqual(metadata["depth_aligned_to"], "color")
         self.assertEqual(metadata["arm_endpoint"], "test-arm:8080")
         self.assertEqual(metadata["joint_degree"], [-90., 0., 0., 90., 0., 90., 0.])
         self.assertFalse(self.client.motion_lock.locked())
         self.camera.stop.assert_not_called()
+
+    def test_snapshot_owns_input_context_and_public_results_cannot_mutate_it(self):
+        photo = self.snapshot(1234, None, lambda: None)
+        self.camera.snapshot.side_effect = lambda *args: photo
+        terminal = self.observe()
+        self.assertEqual(terminal["state"], "completed", terminal)
+        photo["intrinsics"]["fx"] = 1
+        photo["objects"][0]["position"][0] = -.9
+        public = self.plugin.dispatch("info", {})
+        public["observation"]["pose"][0] = 99
+        public["observation"]["objects"][0]["position"][0] = -.8
+        terminal["result"]["objects"][0]["position"][0] = -.7
+        self.assertEqual(self.plugin._observation["metadata"]["intrinsics"]["fx"], 500)
+        self.assertEqual(self.plugin._observation["metadata"]["pose"][0], .1)
+        self.assertEqual(self.plugin._observation["result"]["objects"][0]["position"], [.1, .2])
+
+    def test_cancellation_before_snapshot_commit_leaves_no_usable_observation(self):
+        from unittest import mock
+        prepare = self.plugin._make_observation
+        def cancelled(*args):
+            observation = prepare(*args)
+            self.plugin.dispatch("cancel", {})
+            return observation
+        with mock.patch.object(self.plugin, "_make_observation", side_effect=cancelled):
+            result = self.observe()
+        self.assertEqual(result["state"], "cancelled", result)
+        self.assertTrue(result["observation_required"])
+        self.assertIsNone(self.plugin._observation)
 
     def test_camera_session_change_invalidates_saved_observation_without_motion(self):
         self.assertEqual(self.observe()["state"], "completed")
@@ -311,6 +346,7 @@ class ObserveTests(unittest.TestCase):
         self.assertNotEqual(first["result"]["observation_id"], second["result"]["observation_id"])
         self.assertEqual(sum(name == "rm_movej" for name, _ in self.commands), 2)
         self.assertEqual(self.camera.snapshot.call_count, 2)
+        self.assertEqual(self.plugin.dispatch("info", {})["observation"], second["result"])
         self.assertEqual(first["result"]["objects"], second["result"]["objects"])
 
     def test_observe_uses_configured_speed_and_joints(self):
