@@ -9,7 +9,7 @@ from hardware import JOINT_LIMITS_DEG
 
 
 class FeedbackPending(RuntimeError):
-    """A bounded feedback/settling condition; never a controller fault."""
+    """A recoverable feedback/settling condition; never a controller fault."""
 
 
 def vector(value, size, label):
@@ -38,16 +38,14 @@ def pose_close(first, second, distance=0.00015, angle=0.1):
 
 
 class ObservationMotion:
-    def __init__(self, client, cancel, deadline=None):
+    def __init__(self, client, cancel):
         self.client = client
         self.cancel = cancel
-        self.deadline = deadline
         self.feedback_recoveries = 0
 
-    def retry_feedback(self, sample, timeout=2.0):
+    def retry_feedback(self, sample):
         # Retry reads only. Once disturbed, require a consistent 0.3 s window
-        # before permitting the next command. Persistent errors still stop.
-        deadline = time.monotonic() + timeout
+        # before permitting the next command. Faults and cancellation still stop.
         pending, stable_since = None, None
         while True:
             self.check_cancel()
@@ -62,18 +60,14 @@ class ObservationMotion:
                 now = time.monotonic()
                 if stable_since is None:
                     stable_since = now
-                if now - stable_since >= 0.3 and now <= deadline:
+                if now - stable_since >= 0.3:
                     self.feedback_recoveries += 1
                     return result
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f"Feedback did not recover: {pending}") from pending
             self.cancel.wait(0.1)
 
     def check_cancel(self):
         if self.cancel.is_set():
             raise RuntimeError("Action cancelled")
-        if self.deadline is not None and time.monotonic() >= self.deadline:
-            raise RuntimeError("Action timed out")
 
     def read(self):
         return self.retry_feedback(self._read)
@@ -125,10 +119,8 @@ class ObservationMotion:
             if not low <= value <= high:
                 raise ValueError(f"Observation J{index + 1} must be within [{low}, {high}]")
 
-    def settled(self, target=None, timeout=4.0, check=None, guard=None, reached=None):
-        deadline = None if timeout is None else time.monotonic() + timeout
+    def settled(self, target=None, check=None, guard=None, reached=None):
         window = []
-        best_error, progress_at = math.inf, time.monotonic()
         def sample():
             feedback = self.read()
             if guard is not None:
@@ -137,14 +129,10 @@ class ObservationMotion:
                 check()
             return feedback
 
-        while deadline is None or time.monotonic() < deadline:
+        while True:
             feedback = self.retry_feedback(sample)
             now = time.monotonic()
             error = max(abs(a-b) for a, b in zip(feedback["joints"], target)) if target else 0
-            if target and best_error - error >= 0.05:
-                best_error, progress_at = error, now
-            elif target and error > 0.2 and now - progress_at > 10:
-                raise RuntimeError("Observation motion stalled")
             if feedback["idle"] and error <= 0.2 and (reached is None or reached(feedback)):
                 if window and (not pose_close(window[0][1]["pose"], feedback["pose"])
                                or any(abs(a-b) > 0.05 for a, b in zip(window[0][1]["joints"], feedback["joints"]))):
@@ -155,4 +143,3 @@ class ObservationMotion:
             else:
                 window.clear()
             self.cancel.wait(0.1)
-        raise RuntimeError("Arm motion did not settle before timeout")

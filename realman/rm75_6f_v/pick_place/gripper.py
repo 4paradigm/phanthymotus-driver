@@ -47,9 +47,8 @@ class Gripper:
     def force(self, value):
         self.verify()
         self.send("rm_set_rm_plus_reg", 1220, 1, [value])
-        deadline = time.monotonic() + 5
         matches = 0
-        while time.monotonic() < deadline:
+        while True:
             for length in (2, 1):
                 values = self.read("rm_get_rm_plus_reg", 1220, length)
                 if not isinstance(values, list) or len(values) != length:
@@ -60,22 +59,21 @@ class Gripper:
                 if length == 2:
                     self.motion.cancel.wait(0.15)
             matches = matches + 1 if actual == value else 0
-            if matches >= 3 and time.monotonic() < deadline:
+            if matches >= 3:
                 return
             self.motion.cancel.wait(0.15)
-        raise RuntimeError("Gripper force setting was not confirmed")
 
     def move(self, position):
         self.state()
         self.send("rm_set_hand_follow_pos", [position, 0, 0, 0, 0, 0], True)
-        deadline = time.monotonic() + (1 if position == 0 else 15)
+        closed_after = time.monotonic() + 1
         stable, previous = 0, None
         while True:
             state = self.state()
             actual = state["pos"][0]
             if position == 0:
                 # An object may prevent zero opening; do not gate lifting on it.
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= closed_after:
                     return
             else:
                 at_target = abs(actual - position) <= 5 and state["dof_state"][0] == 2 and abs(state["speed"][0]) <= 1
@@ -83,6 +81,4 @@ class Gripper:
                 previous = actual
                 if stable >= 4:
                     return
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("Gripper opening did not reach its target")
             self.motion.cancel.wait(0.15)

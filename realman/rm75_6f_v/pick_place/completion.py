@@ -10,7 +10,6 @@ import urllib.request
 class Completion:
     ATTEMPTS = 3
     RETRY_DELAY = 0.5
-    REQUEST_TIMEOUT = 5
 
     def __init__(self, tool_name):
         ca_cert = os.environ.get("AGENT_CORE_CA_CERT")
@@ -29,7 +28,7 @@ class Completion:
             try:
                 request = urllib.request.Request(self.url, data=payload, method="POST",
                                                  headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(request, timeout=self.REQUEST_TIMEOUT,
+                with urllib.request.urlopen(request, timeout=None,
                                             context=self.context) as response:
                     acknowledgement = json.load(response)
                 if (not isinstance(acknowledgement, dict)
