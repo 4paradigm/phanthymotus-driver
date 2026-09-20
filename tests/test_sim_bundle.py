@@ -237,3 +237,81 @@ def test_resetting_a_map_built_world_does_not_look_up_a_scenario(config):
 
     assert "error" not in again, again
     assert again.get("loaded") == "bj-2f"
+
+
+# ── 热加一张地图 ─────────────────────────────────────────────────────────────
+
+def _tiny_map(path, name):
+    """一张最小的可用地图。格式照 `simulator/generic/maps/bj-2f.json`。"""
+    import base64
+    import json
+    import zlib
+    grid = bytes(20 * 20)                      # 全 0 = 全部可通行
+    path.write_text(json.dumps({
+        "name": name, "resolution": 0.1, "origin": [0.0, 0.0],
+        "width": 20, "height": 20,
+        "data": base64.b64encode(zlib.compress(grid)).decode(),
+        "pois": [{"name": "门口", "x": 0.5, "y": 0.5, "yaw": 0.0}],
+    }), encoding="utf-8")
+
+
+def test_a_map_dropped_into_the_mount_is_reachable_through_the_agents_own_path(
+        tmp_path, monkeypatch, config):
+    """**加一张地图不该要重建镜像。**
+
+    `SimScenarioCard.maps()` 的文档一直写着「丢一份进 bind-mount 的目录，刷新画布就能
+    选到」，但两个默认目录都在镜像里，而 `build_plugins` 也没传 `map_dirs` —— 场景能
+    热加，地图不能，两者在 UI 上却长得一样。
+
+    这条走的是 **agent 自己那条路**：导航卡的 `list_maps` / `load_map`，和真机上技能的
+    第 0 步同名。只测 `maps()` 能扫到是不够的 —— 中间还隔着 `set_map_hooks` 那一层接线，
+    而那正是「扫得到却载不进」会发生的地方。
+    """
+    from simulator.generic.cards_motion import ControlledSpatialCard
+    from simulator.generic.cards_scenario import SimScenarioCard
+
+    external = tmp_path / "maps"
+    external.mkdir()
+    _tiny_map(external / "site-b.json", "site-b")
+
+    # **走 `build_plugins`，不手工塞 `map_dirs`。** 直接给卡片传目录的话，旧代码也能
+    # 过 —— 而旧代码缺的正是 `build_plugins` 里那一句没传。绕过被测的那一环去测它，
+    # 等于没测。
+    monkeypatch.setenv("SIM_MAP_DIR", str(external))
+    cards = build_plugins(config, "sim", None)
+    try:
+        nav = next(c for c in cards if isinstance(c, ControlledSpatialCard))
+        scenario = next(c for c in cards if isinstance(c, SimScenarioCard))
+
+        assert "site-b" in nav.do_list_maps()["maps"]
+
+        loaded = nav.do_load_map(map_name="site-b")
+
+        assert "error" not in loaded, loaded
+        assert scenario.active_map == "site-b"
+    finally:
+        for card in cards:
+            try:
+                card.stop()
+            except Exception:
+                pass
+
+
+def test_map_dirs_puts_the_mounted_one_last_so_it_wins(monkeypatch):
+    """和场景那条同一个规矩：镜像里那份在前，挂进来的在后 —— 同名时挂进来的赢。"""
+    from simulator.generic.plugins import map_dirs
+
+    monkeypatch.setenv("SIM_MAP_DIR", "/mnt/somewhere/maps")
+
+    dirs = [str(d) for d in map_dirs({})]
+
+    assert dirs[-1] == "/mnt/somewhere/maps"
+    assert any(d.endswith("generic/maps") for d in dirs)
+
+
+def test_config_can_replace_the_map_dirs_outright():
+    from simulator.generic.plugins import map_dirs
+
+    dirs = map_dirs({"scenario": {"map_dirs": ["/only/here"]}})
+
+    assert [str(d) for d in dirs] == ["/only/here"]

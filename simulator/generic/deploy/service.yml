@@ -10,7 +10,9 @@ simulator-generic:
     # *directory* of that name, FastDDS falls back to every interface, and
     # nothing is logged.
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
-    # Drop a scenario YAML in here and refresh the canvas — no rebuild.
+    # Drop a scenario YAML — or a map JSON — in here and refresh the canvas;
+    # no rebuild. Both SIM_SCENARIO_DIR and SIM_MAP_DIR live under this one
+    # mount, which is why there is a single volume rather than two.
     - /opt/phanthy-motus/data/sim:/opt/phanthy-motus/data/sim
   environment:
     - ROS_DOMAIN_ID=42
@@ -22,6 +24,11 @@ simulator-generic:
     - RCUTILS_COLORIZED_OUTPUT=0
     - AGENT_CORE_URL=${SIM_AGENT_CORE_URL:-https://localhost:15678}
     - SIM_SCENARIO_DIR=/opt/phanthy-motus/data/sim/scenarios
+    # Maps were the asymmetry: scenarios could be hot-added, maps needed an
+    # image rebuild, and the two look identical in the UI. The agent reaches a
+    # map through the navigation card's `list_maps` / `load_map` — the same
+    # names a skill uses on a real robot — and that path rescans on every call.
+    - SIM_MAP_DIR=/opt/phanthy-motus/data/sim/maps
     # Recorded in every run report. A score with no configuration attached is
     # noise: the axis that matters is whether the number moved when the model,
     # the prompt or the image changed.
