@@ -56,6 +56,17 @@ class ArmControlTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only Adam Pro"):
             ArmControlPlugin({}, "", None, variant="sp")
 
+    def test_adam_pro_layout_matches_the_vendor_motor_order(self):
+        expected = {
+            "waistYaw": 12, "waistRoll": 13, "waistPitch": 14,
+            "wristRoll_Left": 19, "wristPitch_Left": 20,
+            "wristYaw_Left": 21, "wristRoll_Right": 26,
+            "wristPitch_Right": 27, "wristYaw_Right": 28,
+            "neckYaw": 29, "neckPitch": 30,
+        }
+        for joint, index in expected.items():
+            self.assertEqual(index, ADAM_PRO_JOINTS.index(joint), joint)
+
     def test_each_joint_has_a_distinct_action_and_angle_field(self):
         self.assertEqual("left_elbow", ARM_ACTIONS["set_left_elbow"])
         self.assertEqual("right_wrist_roll", ARM_ACTIONS["set_right_wrist_roll"])
@@ -139,7 +150,9 @@ class ArmControlTests(unittest.TestCase):
         plugin._active = True
         plugin._streaming = True
         waist = ADAM_PRO_JOINTS.index("waistYaw")
+        neck = ADAM_PRO_JOINTS.index("neckYaw")
         plugin._target_q[waist] = 0.2
+        plugin._target_q[neck] = 0.1
         original_factory = getattr(device, "pnd_adam_msg_dds__LowCmd_", None)
         device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
         try:
@@ -151,6 +164,7 @@ class ArmControlTests(unittest.TestCase):
             else:
                 device.pnd_adam_msg_dds__LowCmd_ = original_factory
         self.assertEqual(0.0, publisher.commands[-1].motor_cmd[waist].kp)
+        self.assertEqual(0.0, publisher.commands[-1].motor_cmd[neck].kp)
 
     def test_segment_starts_from_current_output_and_ends_at_target(self):
         publisher = _FakePublisher()
