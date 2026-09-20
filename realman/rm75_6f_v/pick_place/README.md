@@ -1,7 +1,7 @@
 # vision_pick_and_drop
 
-RealMan Driver ACTUATOR 卡片，提供 `observe` 观察拍照、`transfer_to` 指定目标点搬运和
-`transfer_by` 指定距离搬运。
+RealMan Driver ACTUATOR 卡片，提供 `observe` 观察拍照、`grab_to` 指定目标点搬运和
+`grab_by` 指定距离搬运。
 接收三个数据输入，运动与夹爪由本卡片独立执行。启动、配置和页面刷新不会触发运动。
 
 ## 画布数据流
@@ -21,7 +21,7 @@ VOP 订阅同一 RGB 通道，检测结果连入 `vision_pick_and_drop`，由 `o
 
 ## 执行契约
 
-三个运动动作 `observe`、`transfer_to`、`transfer_by` 每次都必须显式传入
+三个运动动作 `observe`、`grab_to`、`grab_by` 每次都必须显式传入
 `confirm_motion: true`。缺失、`false` 或非布尔值均返回 `CONFIRMATION_REQUIRED`，
 不会占用机械臂或下发运动。该确认不跨请求复用；`RM_MOTION_ENABLED` 仅控制部署能力。
 `cancel`、`stop`、`info`、启动和配置不需要运动确认，两个中断钩子始终可调用。
@@ -55,8 +55,8 @@ MCP 总描述及各动作描述包含调用顺序、坐标约定、动作选择�
 1. 调用 `observe(confirm_motion=true)`，等待框架 ACP 通知本次观察成功。
 2. 从本次 ACP 完成结果 `result.objects` 读取物品名称、`position` 和 `confidence`。
    `count=0` 是有效的空检测结果。目标不存在或无法确定时报告或询问用户，不猜测坐标。
-3. 选取香蕉检测中心的 `position[0]、position[1]`，调用 `transfer_by`，
-   填写 `delta_x=30、delta_y=0、confirm_motion=true`。放到照片中的指定位置时使用 `transfer_to`；
+3. 选取香蕉检测中心的 `position[0]、position[1]`，调用 `grab_by`，
+   填写 `delta_x=30、delta_y=0、confirm_motion=true`。放到照片中的指定位置时使用 `grab_to`；
    放在另一物体旁边时选择旁边空位，参照物中心不代表空位。
 4. 等待框架 ACP 完成通知。`status=completed` 且 `result.ok=true` 表示配置要求的动作链完成。
    开启 `observe_after_transfer` 时，读取 `result.observation` 中的新照片和检测结果评估效果；
@@ -124,12 +124,12 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 输入超出 `[-1,1]` 或不是有限数值时拒绝执行，不自动猜测输入是否为像素坐标。
 此坐标约定也可供符合该数据契约的检测模型或人工填写使用。
 
-## transfer_to：指定目标点
+## grab_to：指定目标点
 
 使用最近一次成功观察（独立 `observe` 或搬运返回的 `observation`）中的四个归一化坐标调用：
 
 ```json
-{"action": "transfer_to", "start_point_x": -0.3, "start_point_y": 0.2, "target_point_x": 0.3, "target_point_y": 0.2, "confirm_motion": true}
+{"action": "grab_to", "start_point_x": -0.3, "start_point_y": 0.2, "target_point_x": 0.3, "target_point_y": 0.2, "confirm_motion": true}
 ```
 
 参数顺序为 `start_point_x、start_point_y、target_point_x、target_point_y、rotation_deg、confirm_motion`。
@@ -142,7 +142,7 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 拒绝执行，不用邻点或新拍深度替代。沿用当前安装方向：相机右对应基坐标 −X、图像下
 对应 +Y；这是固定安装约定，不能代替手眼标定，改变相机安装方向后需重新适配。
 
-## transfer_by：指定距离（mm）
+## grab_by：指定距离（mm）
 
 参数顺序为 `start_point_x、start_point_y、delta_x、delta_y、rotation_deg、confirm_motion`；`delta_x/delta_y` 单位均为毫米。
 
@@ -151,7 +151,7 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 若两个位移都为 0，须设置非零 `rotation_deg`，表示原地抓起旋转再放下；无须填写 `target_point_x、target_point_y`。例如，将该物体向照片左侧移动 30 mm：
 
 ```json
-{"action": "transfer_by", "start_point_x": 0.08, "start_point_y": -0.079, "delta_x": -30, "delta_y": 0, "confirm_motion": true}
+{"action": "grab_by", "start_point_x": 0.08, "start_point_y": -0.079, "delta_x": -30, "delta_y": 0, "confirm_motion": true}
 ```
 
 位移 `delta_x、delta_y` 的方向以本次 `observe` 的照片为准，单位为 mm；它们是实际位移量，不是归一化坐标。
@@ -171,13 +171,13 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 抓取点 A 使用原始深度和配置的 X/Y 补偿定位，B 不重复添加补偿；位移按毫米计算，
 不换算为目标像素，不使用另一点的深度。工作坐标有旋转时，仍保持上述基坐标方向。
 
-MCP 调用选择：需要放到照片中某个位置时使用 `transfer_to`；需要将选中物体沿照片方向
-移动指定毫米距离时使用 `transfer_by`。两者都由后台完成抓起、搬运、放下及回升；
+MCP 调用选择：需要放到照片中某个位置时使用 `grab_to`；需要将选中物体沿照片方向
+移动指定毫米距离时使用 `grab_by`。两者都由后台完成抓起、搬运、放下及回升；
 随后始终返回观察位；`observe_after_transfer` 只决定是否采集新观察，整次动作只通过一次 ACP 通知框架。
 
 ## 可选夹爪 Rz 旋转
 
-`transfer_to` 和 `transfer_by` 均接受可选 `rotation_deg`，单位为度，范围 `[-180,180]`，省略时为 0。
+`grab_to` 和 `grab_by` 均接受可选 `rotation_deg`，单位为度，范围 `[-180,180]`，省略时为 0。
 **常规搬运省略这个参数；只有用户明确要求旋转时才设置。** 正值表示俯视顺时针，负值表示逆时针。
 旋转围绕夹爪自身向下的 Z 轴，保持抓起回升后的 TCP 位置与高度，再保持旋转后的朝向搬运和放下。
 工作坐标有旋转时合成完整姿态，不直接把角度加到工作坐标的欧拉 Rz，也不改变图像 XY 的方向约定。
@@ -185,7 +185,7 @@ MCP 调用选择：需要放到照片中某个位置时使用 `transfer_to`；�
 例如，向照片右侧搬运 30 mm，并将物体顺时针旋转 45°：
 
 ```json
-{"action": "transfer_by", "start_point_x": 0.08, "start_point_y": -0.079, "delta_x": 30, "delta_y": 0, "rotation_deg": 45, "confirm_motion": true}
+{"action": "grab_by", "start_point_x": 0.08, "start_point_y": -0.079, "delta_x": 30, "delta_y": 0, "rotation_deg": 45, "confirm_motion": true}
 ```
 
 旋转只在抓起并回升之后执行，到位并停稳后才移动到放置点。0 不下发旋转命令；旋转使用配置速度，
@@ -212,8 +212,8 @@ MCP 调用选择：需要放到照片中某个位置时使用 `transfer_to`；�
 
 全过程检查新鲜反馈、故障、坐标系、姿态、行程及夹爪状态，并确认每段到位和停稳。
 成功时 ACP 上报 `status: "completed"`，结果包含使用的观察编号、内部实际读取深度的抓取像素
-`pick_pixel` 和两处基坐标水平目标、最终位姿。`transfer_to` 还返回放置像素 `place_pixel`；
-这些结果字段仍是原图整数像素，与动作输入的归一化坐标区分。`transfer_by` 返回 `delta_x、delta_y` 和方向基准
+`pick_pixel` 和两处基坐标水平目标、最终位姿。`grab_to` 还返回放置像素 `place_pixel`；
+这些结果字段仍是原图整数像素，与动作输入的归一化坐标区分。`grab_by` 返回 `delta_x、delta_y` 和方向基准
 `direction_reference: "observation_image"`。`grasp_checked: false` 表示未判断是否实际
 抓到物体。`final_pose` 是整次动作经核验的最终位姿：两种开关状态下都在观察位。
 
@@ -312,7 +312,7 @@ SDK 设备单位为 0.001 m 时无需单位量化转换，其他设备单位遵�
 任一搬运动作首次下发设备命令即使当前照片失效，命令报错或取消也不恢复旧照片。
 开启搬运后观察且新观察成功时，以新观察替换当前有效照片；关闭或新观察未完成时，下一次搬运须先 `observe`。
 若失败结果同时返回 `recovery_required=true`，先人工确认并安全处理，再重新观察。
-旧照片在同一设备互斥下被消费，不能通过切换 `transfer_to` / `transfer_by` 复用，
+旧照片在同一设备互斥下被消费，不能通过切换 `grab_to` / `grab_by` 复用，
 也不会从已保存文件恢复。历史文件保留，当前有效照片仅指向最新成功观察。
 ACP 终态结果及 `info` 中的 `observation_required` 表示下一次搬运是否需要重新观察。
 无有效照片时，搬运直接返回 `state: "error"`、`code: "OBSERVATION_REQUIRED"`、

@@ -95,7 +95,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
     def test_disabled_follow_up_reports_skipped_observation_in_one_acp_completion(self):
         self.assertTrue(self.call("config", observe_after_transfer=False)["ok"])
         self.fixture.make_photo()
-        result = self.completed(self.call("transfer_by", confirm_motion=True,
+        result = self.completed(self.call("grab_by", confirm_motion=True,
                                          start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0))
         self.assertEqual(result["state"], "completed", result)
         self.assertEqual(len(self.received), 1)
@@ -110,7 +110,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
     def test_tools_list_exposes_confirmation_completion_and_interrupt_contract(self):
         schema = self.rpc("tools/list")["result"]["tools"][0]["inputSchema"]
         self.assertEqual(schema["x-completion"], {
-            "actions": ["observe", "transfer_to", "transfer_by"], "timeout": 210})
+            "actions": ["observe", "grab_to", "grab_by"], "timeout": 210})
         for action in schema["x-completion"]["actions"]:
             self.assertIn("confirm_motion", schema["x-action-params"][action]["params"])
             self.assertIn("confirm_motion=true", schema["x-action-params"][action]["description"])
@@ -125,7 +125,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
 
     def test_every_motion_requires_literal_true_before_any_side_effect(self):
         photo = self.plugin._observation
-        for action in ("observe", "transfer_to", "transfer_by"):
+        for action in ("observe", "grab_to", "grab_by"):
             for confirmation in ({}, {"confirm_motion": False}, {"confirm_motion": None},
                                  {"confirm_motion": 1}, {"confirm_motion": "true"}):
                 with self.subTest(action=action, confirmation=confirmation):
@@ -176,8 +176,8 @@ class PickPlaceHTTPTests(unittest.TestCase):
 
     def test_both_transfer_actions_deliver_correlated_completion_and_consume_photo(self):
         ids = set()
-        for action, args in (("transfer_to", {"target_point_x": .5, "target_point_y": 1/3}),
-                             ("transfer_by", {"delta_x": -30, "delta_y": 0})):
+        for action, args in (("grab_to", {"target_point_x": .5, "target_point_y": 1/3}),
+                             ("grab_by", {"delta_x": -30, "delta_y": 0})):
             self.fixture.make_photo()
             accepted = self.call(action, confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, **args)
             terminal = self.completed(accepted)
@@ -211,7 +211,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
                 raise RuntimeError("test did not release follow-up observation")
             return self.fixture.snapshot(after, cancel, check)
         self.fixture.camera.snapshot.side_effect = snapshot
-        accepted = self.call("transfer_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0)
+        accepted = self.call("grab_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0)
         self.assertTrue(entered.wait(2))
         self.assertEqual(len(self.fixture.moves()), 6)
         self.assertEqual(self.received, [])
@@ -229,7 +229,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
 
     def test_follow_up_failure_reports_completed_transfer_without_retrying(self):
         self.fixture.camera.snapshot.side_effect = RuntimeError("VOP input lost")
-        accepted = self.call("transfer_to", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, target_point_x=.5, target_point_y=1/3)
+        accepted = self.call("grab_to", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, target_point_x=.5, target_point_y=1/3)
         terminal = self.completed(accepted)
         self.assertEqual(terminal["state"], "error")
         self.assertEqual(len(self.received), 1)
@@ -277,7 +277,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
 
     def test_unregistered_completion_retries_identical_notification_only(self):
         self.acknowledge = lambda payload: {"ok": len(self.received) > 1, "action_id": payload["action_id"]}
-        terminal = self.completed(self.call("transfer_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0))
+        terminal = self.completed(self.call("grab_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0))
         self.assertEqual(terminal["callback"], "accepted")
         self.assertEqual(len(self.received), 2)
         self.assertEqual(self.received[0], self.received[1])
@@ -285,7 +285,7 @@ class PickPlaceHTTPTests(unittest.TestCase):
 
     def test_unacknowledged_callback_is_visible_without_changing_motion_outcome(self):
         self.acknowledge = lambda payload: {"ok": True, "action_id": "another-action"}
-        terminal = self.completed(self.call("transfer_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0))
+        terminal = self.completed(self.call("grab_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0))
         self.assertEqual(terminal["state"], "completed")
         self.assertTrue(terminal["result"]["ok"])
         self.assertEqual(terminal["callback"], "failed")
@@ -327,10 +327,10 @@ class PickPlaceHTTPTests(unittest.TestCase):
                 return response
             return original(completion, action_id, status, result)
         with mock.patch.object(Completion, "send", send):
-            first = self.call("transfer_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0)
+            first = self.call("grab_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0)
             self.assertTrue(entered.wait(2))
             self.fixture.make_photo()
-            second = self.call("transfer_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0)
+            second = self.call("grab_by", confirm_motion=True, start_point_x=-.5, start_point_y=-1/3, delta_x=30, delta_y=0)
             terminal = self.completed(second)
             release.set()
             self.assertTrue(finished.wait(2))
