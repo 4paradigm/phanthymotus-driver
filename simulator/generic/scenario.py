@@ -198,9 +198,13 @@ class Scenario:
         return warnings
 
     def summary(self) -> dict:
+        # `waypoints()`，不是 `self.pois` —— 后者只有场景自己声明的那些，而从地图资产
+        # 建出来的场景一个都没有（航点在资产里）。两者在同一个类里对「航点」给出不同
+        # 答案，而送出去的是错的那个：Orin6 上热加一张图、载入成功，返回里却写着
+        # `waypoints: []`，读的人会以为这张图没有点位 —— 其实世界已经拿到了。
         return {
             "slug": self.slug, "name": self.name,
-            "waypoints": [poi.get("name") for poi in self.pois],
+            "waypoints": [poi.get("name") for poi in self.waypoints()],
             "injections": [item.as_dict() for item in self.injections],
             "expect": dict(self.expect),
             "weights": dict(self.weights),
