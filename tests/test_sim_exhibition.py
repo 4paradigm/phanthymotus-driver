@@ -1,13 +1,19 @@
 """The exhibition tour, replayed under a fake clock.
 
 On a rig an LLM drives these cards. Here a deliberately small scripted agent
-stands in for it, so that CI can run the same scenario file, against the same
-`assertions.py`, without an API key or four minutes of wall clock.
+stands in for it, so CI can run the same scenario file without an API key or four
+minutes of wall clock.
 
-**The agent is not the oracle.** It only calls cards; every verdict comes from
-`assertions.evaluate` reading the event log and the ACP posts. Keeping those
-disjoint is the whole reason a broken ACP path cannot mark itself green — so this
-file also runs deliberately *wrong* agents and checks that the oracle fails them.
+**This file asserts facts, not verdicts.** The judge moved to agent-core
+(`benchmark_case.py`) — it has to be outside the system under test, and the
+simulator driver is part of that system. So what is checked here is what the
+driver is actually responsible for: that the tour produces a truthful event log,
+a truthful transcript, and truthful ACP bodies. Whether that adds up to a pass is
+someone else's call.
+
+`tools/record_facts.py` dumps this same replay as the fixture agent-core's judge
+tests run against — one recorded run, judged on the other side, with no shared
+package between the two repos.
 
 Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_sim_exhibition.py -q
 """
@@ -22,7 +28,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from simulator.generic import acp, assertions  # noqa: E402
+from simulator.generic import acp  # noqa: E402
 from simulator.generic.backend import LocalBackend  # noqa: E402
 from simulator.generic.cards_audio import TtsCard  # noqa: E402
 from simulator.generic.cards_motion import ControlledSpatialCard  # noqa: E402
@@ -199,14 +205,14 @@ def test_scenario_discovery_feeds_the_canvas_dropdown(rig):
 
 # ── the happy path ───────────────────────────────────────────────────────────
 
-def test_a_competent_guide_passes_every_assertion(rig):
+def test_a_competent_guide_produces_a_clean_fact_stream(rig):
+    """能被判成满分的那份事实长什么样 —— 判定在 agent-core，这里只对事实负责。"""
     drive(rig)
-
     report = rig["report"].report()
-    failures = [check for check in report["assertions"] if not check["ok"]]
 
-    assert not failures, [(f["name"], f["detail"]) for f in failures]
-    assert report["score"]["total"] == 100.0
+    assert [e for e in report["events"] if e["event"] == "nav_failed"] == []
+    assert report["trail_occupied"] == 0
+    assert report["waypoints"] == ["入口", "一号展区", "洗手间", "二号展区", "三号展区"]
 
 
 def test_the_tour_visits_the_waypoints_in_the_expected_order(rig):
@@ -228,13 +234,13 @@ def test_every_waypoint_is_announced_after_arriving_and_before_leaving(rig):
 
 
 def test_the_interrupted_leg_is_reported_cancelled_with_partial_progress(rig):
+    """ACP 绝不能撒的那个谎：一段被放弃的路报 completed，等于说机器人到过一个
+    它没去过的展点。进度也必须如实 —— 0 和 1 都是在说别的事。"""
     drive(rig)
     report = rig["report"].report()
 
-    leg = next(check for check in report["assertions"] if check["name"] == "interrupted_leg")
     cancelled = [p for p in report["acp_posts"] if p.get("status") == "cancelled"]
 
-    assert leg["ok"], leg["detail"]
     assert [p["result"]["label"] for p in cancelled] == ["二号展区"]
     assert 0.0 < cancelled[0]["result"]["progress"]["fraction"] < 1.0
 
@@ -262,104 +268,42 @@ def test_each_action_reports_its_terminal_exactly_once(rig):
 
 # ── the oracle has to be able to fail ────────────────────────────────────────
 
-def test_a_guide_that_forgets_to_resume_fails_long_horizon(rig):
-    """The mistake an LLM makes most often: after the detour it carries on to the
-    *next* waypoint instead of the one it abandoned. Invisible to any single-step
-    check."""
+def test_a_guide_that_forgets_to_resume_leaves_it_visible_in_the_facts(rig):
+    """LLM 最常犯的错：绕行之后接着去**下一个**展点，而不是被放弃的那个。任何单步
+    检查都看不见它 —— 但事实流里看得见，被取消的那一站再也没出现过。"""
     drive(rig, resume=False)
 
     report = rig["report"].report()
-    resume = next(c for c in report["assertions"] if c["name"] == "resume_correctness")
-    order = next(c for c in report["assertions"] if c["name"] == "waypoint_order")
+    cancelled = [p["result"]["label"] for p in report["acp_posts"]
+                 if p.get("status") == "cancelled"]
 
-    assert resume["ok"] is False
-    assert "never returned" in resume["detail"]
-    assert order["ok"] is False
-    assert report["score"]["by_dimension"]["long_horizon"] == 0.0
-    assert report["score"]["total"] < 100.0
+    assert cancelled == ["二号展区"]
+    assert "二号展区" not in report["waypoints"]
 
 
-def test_a_silent_guide_fails_the_announcement_check(rig):
+def test_a_silent_guide_leaves_an_empty_transcript(rig):
+    """两台 Orin 都没有真喇叭 —— 这份播报记录是在它们上面检查播报顺序的唯一办法。"""
     drive(rig, announce=False)
+    report = rig["report"].report()
 
-    check = next(c for c in rig["report"].report()["assertions"]
-                 if c["name"] == "announce_after_arrive")
-
-    assert check["ok"] is False
-    assert "never announced" in check["detail"]
+    assert report["transcript"] == []
+    assert report["waypoints"]
 
 
-def test_the_oracle_rejects_a_completed_status_on_an_abandoned_leg(rig):
-    """The specific lie ACP must never tell: reporting `completed` for a leg the
-    robot walked away from says it reached a waypoint it never saw."""
-    drive(rig)
-    scenario = rig["scenario"].active
-    posts = [dict(p) for p in rig["scenario"].acp_posts]
-    for post in posts:
-        if (post.get("result") or {}).get("label") == "二号展区" and post["status"] == "cancelled":
-            post["status"] = "completed"
-
-    check = assertions.check_interrupted_leg(scenario, rig["world"].events(), acp_posts=posts)
-
-    assert check["ok"] is False
-    assert "expected 'cancelled'" in check["detail"]
-
-
-def test_a_tour_that_drives_through_geometry_fails_safety():
+def test_an_unreachable_target_is_reported_as_a_failed_leg():
+    """目标放在场景边界之外 —— 规划器绕不出去，必须如实报失败，而不是假装走到了。"""
     rig = build()
     try:
-        # 目标放在场景边界之外 —— 规划器绕不出去，必须如实报失败。
         rig["scenario"].dispatch("run", {})
         rig["nav"].dispatch("navigate_to_pose", {"x": 40.0, "y": 40.0, "yaw": 0.0})
         run(rig, 60.0)
 
         report = rig["report"].report()
-        safety = next(c for c in report["assertions"] if c["name"] == "never_occupied")
 
-        assert safety["ok"] is False
-        assert "against geometry" in safety["detail"]
-        assert report["score"]["by_dimension"]["safety"] == 0.0
+        assert [e["event"] for e in report["events"] if e["event"] == "nav_failed"]
+        assert report["waypoints"] == []
     finally:
         acp.set_transport(None)
-
-
-# ── scoring ──────────────────────────────────────────────────────────────────
-
-def test_weights_come_from_the_scenario_not_from_code(rig):
-    drive(rig, resume=False)
-    scenario = rig["scenario"].active
-    results = rig["report"].report()["assertions"]
-
-    default = assertions.score(scenario, results)["total"]
-    scenario.weights = {**scenario.weights, "long_horizon": 1}
-    reweighted = assertions.score(scenario, results)["total"]
-
-    assert reweighted > default, "changing a weight must change the score without a code change"
-
-
-def test_an_unmeasured_dimension_scores_none_rather_than_zero():
-    """`not measured` and `measured and failed` are different facts; averaging
-    them together is how a benchmark starts lying."""
-    scenario = Scenario.from_dict({"name": "bare", "expect": {}}, slug="bare")
-
-    result = assertions.score(scenario, assertions.evaluate(scenario, [], acp_posts=[]))
-
-    assert result["by_dimension"]["long_horizon"] is None
-    assert result["by_dimension"]["latency"] is None
-
-
-def test_report_records_what_the_run_was_measured_against(rig, monkeypatch):
-    """A score with no configuration attached is noise — the axis anyone cares
-    about is whether the number moved when the model or the prompt changed."""
-    monkeypatch.setenv("SIM_LLM_MODEL", "claude-opus-5")
-    monkeypatch.setenv("IMAGE_TAG", "release.260918.abc1234")
-    drive(rig, seconds=5.0)
-
-    environment = rig["report"].report()["environment"]
-
-    assert environment["llm_model"] == "claude-opus-5"
-    assert environment["image_tag"] == "release.260918.abc1234"
-    assert environment["tier"] == "fidelity"
 
 
 # ── the cards around it ──────────────────────────────────────────────────────

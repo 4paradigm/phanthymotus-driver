@@ -1,8 +1,12 @@
 """Scenario definitions: the YAML is the single source of truth.
 
 The same file is *run* by the `sim_scenario` card on a rig and *replayed* by
-pytest under a fake clock. One definition, two runners, one `assertions.py` —
-otherwise the CI green and the rig green stop meaning the same thing.
+pytest under a fake clock. One definition, two runners — otherwise the CI green
+and the rig green stop meaning the same thing.
+
+It describes a **world**, not a test case. A case is a solution package with a
+`test` section, and agent-core runs and judges it; the driver's job stops at
+producing facts.
 
 ## 地图有两种来源，场景两种都能引用
 

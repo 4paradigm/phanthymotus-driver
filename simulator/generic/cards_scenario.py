@@ -1,8 +1,22 @@
-"""`sim_scenario` and `sim_report` — the run control and the oracle.
+"""`sim_scenario` and `sim_report` — world control, and the facts it produced.
 
 This is what makes the bundle usable "the same way as the current canvas": you
 drag `sim_scenario` onto the canvas next to `nav` and `tts`, wire it to
 `decision_core`, and it is a card like any other.
+
+## These cards do not own a test case
+
+They used to: `run_suite` drove batches, `assertions.py` judged them, and the
+score came back out of `sim_report`. Both are gone. A test case is
+**solution + execution plan + evaluation plan**, it spans agent-core and the
+driver, and a card cannot hold it — a card lives in one driver, so when the
+driver is missing the card does not exist either, and there is nowhere to say
+"you are missing this driver". The case is a `test` section in a solution
+package; agent-core runs it and judges it (`benchmark_case.py`,
+`benchmark_runner.py`).
+
+What is left here is the world: load it, reset it, inject into it, and report
+what happened. **The driver produces facts; agent-core judges them.**
 
 ## Why `sim_scenario` is an actuator and `sim_report` is a resource
 
@@ -13,14 +27,15 @@ testing.
 `sim_report` must be `resource`: `_needs_barrier` (llm.py:601) exempts `sensor`
 and `resource`, which is what lets progress be read *while* a 90 second
 navigation is pending. As an actuator every status read would queue behind the
-tour, and a suite run could not be polled at all.
+tour, and a run in progress could not be polled at all.
 
 ## Why the report also goes out on a topic
 
 A `resource` card has **no renderer on the canvas** — grepping `'resource'`
 across `agent-core/web/js/` returns nothing. So `sim_report` alone is invisible;
-the verdict has to be published as `data/json` as well, where `kv-latest.js`
-picks it up. `sim_report` stays because CI and scripts need the structured reply.
+progress has to be published as `data/json` as well, where `kv-latest.js` picks
+it up. `sim_report` stays because agent-core, CI and scripts read the structured
+reply.
 """
 
 from __future__ import annotations
@@ -29,11 +44,11 @@ import json
 import os
 from pathlib import Path
 
-from simulator.generic import acp, assertions
+from simulator.generic import acp
 from simulator.generic.card_base import Card
+from simulator.generic.geometry import OCCUPIED
 from simulator.generic.maps import discover as discover_maps
 from simulator.generic.scenario import Scenario, discover
-from simulator.generic.suite import SuiteRunner
 
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_SCENARIO_DIRS = (BUNDLE_DIR / "scenarios", BUNDLE_DIR / "scenarios" / "user")
@@ -57,22 +72,21 @@ class SimScenarioCard(Card):
         "run": ([], "开始计时并启动脚本化注入"),
         "inject": (["text", "kind"], "立刻注入一个事件（如用户插话）"),
         "abort": ([], "停止计时，保留事件记录"),
-        "reset": ([], "回到场景初始状态并清空记录"),
+        "reset": (["scenario", "map", "spawn", "seed"],
+                  "回到初始状态并清空记录；可指定地图与出生位姿"),
         "note": (["text"], "往事件记录里写一条备注；打断钩子绑在这里"),
         "list_maps": ([], "列出可用地图（扫描目录，新增地图无需重建镜像）"),
-        "run_suite": (["scenarios", "repeats", "seed"],
-                      "按顺序跑一批场景并逐个评分；立即返回，进度用 sim_report 轮询"),
-        "abort_suite": ([], "中止正在跑的批次，保留已完成的结果"),
         "read": ([], "读取当前场景与进度"),
     }
     PROPERTIES = {
         "scenario": {"type": "string", "description": "场景 slug"},
         "text": {"type": "string"},
         "kind": {"type": "string", "description": "事件类型，默认 user_message"},
-        "scenarios": {"type": "array", "items": {"type": "string"},
-                      "description": "要跑的场景 slug 列表；留空表示全部"},
-        "repeats": {"type": "integer", "description": "每个场景重复次数；LLM 是随机的，n=1 的分数没有意义"},
+        "map": {"type": "string", "description": "reset 时指定地图；留空沿用当前场景"},
+        "spawn": {"type": "object", "description": "reset 时指定出生位姿 {x, y, yaw}"},
         "seed": {"type": "integer"},
+        "owner": {"type": "string",
+                  "description": "基准测试跑动的持有者；被持有时别人改不动世界"},
     }
     CONFIG_SCHEMA = {}
 
@@ -86,9 +100,9 @@ class SimScenarioCard(Card):
         self._fired: set[int] = set()
         self._acp_posts: list[dict] = []
         self._injector = None
+        self._owner = ""
         self.refresh()
         world.add_step_listener(self._on_step)
-        self.suite = SuiteRunner(self, world)
         # What actually went to /api/acp/complete, not the world's internal job
         # payload — see `acp.add_observer`.
         acp.add_observer(self.record_acp)
@@ -156,9 +170,27 @@ class SimScenarioCard(Card):
                 print(f"[sim-scenario] injection transport failed: {exc}", flush=True)
         return event
 
+    # ---- ownership ----------------------------------------------------
+
+    def _held_by_someone_else(self, owner: str) -> dict | None:
+        """基准测试跑着的时候，别人改不动世界。
+
+        这张卡是 LLM 可调用的工具，`load` 和 `reset` 就在它的 action 枚举里 ——
+        也就是**被测的 agent 能重置正在测它的那次测量**，而且重置之后什么痕迹都不
+        剩，那次跑动只会记一个说不清的低分。跑动的持有者带 `owner` 过来，其他调用
+        方在此期间被拒。
+        """
+        if self._owner and owner != self._owner:
+            return {"error": f"世界正被 {self._owner} 的基准测试跑动持有",
+                    "owner": self._owner}
+        return None
+
     # ---- actions ------------------------------------------------------
 
-    def do_load(self, scenario: str = "", **_):
+    def do_load(self, scenario: str = "", owner: str = "", **_):
+        held = self._held_by_someone_else(owner)
+        if held:
+            return held
         scenarios = self.refresh()
         chosen = scenarios.get(scenario) or (self._active if not scenario else None)
         if chosen is None:
@@ -171,6 +203,10 @@ class SimScenarioCard(Card):
                         "available_maps": sorted(self.maps())}
             chosen.bind_map(asset)
         self._active = chosen
+        return self._load_active()
+
+    def _load_active(self, seed: int = 0):
+        chosen = self._active
         self._t0 = None
         self._fired = set()
         self._acp_posts = []
@@ -193,16 +229,43 @@ class SimScenarioCard(Card):
         return {"state": "running", "scenario": self._active.slug,
                 "waypoints": [poi.get("name") for poi in self._active.pois]}
 
-    def do_abort(self, **_):
+    def do_abort(self, owner: str = "", **_):
+        held = self._held_by_someone_else(owner)
+        if held:
+            return held
         self._t0 = None
+        self._owner = ""            # 跑动结束，世界还给画布
         if self._active is not None:
             self.world.log("scenario_stop", scenario=self._active.slug)
         return {"state": "idle"}
 
-    def do_reset(self, **_):
+    def do_reset(self, scenario: str = "", map: str = "", spawn=None,  # noqa: A002
+                 seed: int = 0, owner: str = "", **_):
+        """回到起点。
+
+        地图与出生点可以由调用方给 —— 基准测试用例自带世界（`test.run.world`），
+        驱动里的 yaml 是另一份来源。两份各存一次，迟早会对不上，所以用例给了就以
+        用例为准。
+        """
+        held = self._held_by_someone_else(owner)
+        if held:
+            return held
+        self._owner = owner or self._owner
+
+        if map:
+            asset = self.maps().get(map)
+            if asset is None:
+                return {"error": f"找不到地图 {map}", "available_maps": sorted(self.maps())}
+            target = self._active or Scenario.from_dict({"name": map}, slug=map)
+            target.bind_map(asset)
+            if spawn:
+                target.spawn = dict(spawn)
+            self._active = target
+            return self._load_active(seed=seed)
+
         if self._active is None:
             return {"state": "idle", "reset": False}
-        return self.do_load(scenario=self._active.slug)
+        return self.do_load(scenario=self._active.slug, owner=owner)
 
     def do_inject(self, text: str = "", kind: str = "user_message", **_):
         if not str(text).strip():
@@ -216,21 +279,6 @@ class SimScenarioCard(Card):
         # interrupt was ever delivered.
         self.world.log("note", text=str(text) or "interrupt")
         return {"state": "running", "noted": text}
-
-    def do_run_suite(self, scenarios=None, repeats: int = 1, seed: int = 0, **_):
-        available = sorted(self.refresh())
-        chosen = [slug for slug in (scenarios or available) if slug in available]
-        unknown = [slug for slug in (scenarios or []) if slug not in available]
-        if not chosen:
-            return {"error": "no runnable scenario", "available": available, "unknown": unknown}
-        # `suite` is nested, not spread: the card has a `state` and so does the
-        # batch, and spreading let the batch's overwrite the card's — the third
-        # time in this bundle that two different meanings collided under one key.
-        return {"state": "running", "scenarios": chosen, "repeats": max(1, int(repeats)),
-                "unknown": unknown, "suite": self.suite.start(chosen, repeats=repeats, seed=seed)}
-
-    def do_abort_suite(self, **_):
-        return {"state": "idle", "suite": self.suite.abort()}
 
     def do_list_maps(self, **_):
         return {"state": "running" if self._running else "idle",
@@ -281,17 +329,28 @@ class SimScenarioCard(Card):
             "speech": snapshot["speech"],
             "injections_fired": len(self._fired),
             "acp_posts": len(self._acp_posts),
-            "suite": self.suite.status(),
+            "owner": self._owner,
         }
 
 
 class SimReportCard(Card):
-    """Facts and verdicts. Never talks to agent-core — the judge and the system
-    under test stay disjoint, or a broken ACP path marks itself green."""
+    """Facts, and only facts.
+
+    The verdict used to be computed here, which put the judge inside the system
+    under test — a broken ACP path marks itself green. It now lives in
+    agent-core's `benchmark_case.py`, and this card produces what the judge reads:
+    the event log, the transcript, the ACP bodies as posted, and the few
+    measurements that need the world's own geometry to compute.
+
+    `trail_occupied` is the one that has to stay on this side. Judging "never
+    drove through a wall" from the integrator's own `nav_failed` events asks the
+    integrator to report its own bug; measuring the trail against the grid does
+    not. So the count is a fact produced here and judged there.
+    """
 
     NAME = "sim_report"
     KIND = "resource"
-    DESCRIPTION = "仿真运行结果 — 事件记录、播报记录、断言判定与得分"
+    DESCRIPTION = "仿真运行结果 — 事件记录、播报记录、ACP 上报"
     TOPIC = ""
 
     def __init__(self, world, config, namespace, ros2=None, scenario_card=None):
@@ -305,22 +364,12 @@ class SimReportCard(Card):
         which = args.get("what", "report")
         if which == "list":
             return self.do_list()
-        if which == "suite":
-            return self.do_suite()
         return self.report()
 
     def do_list(self) -> dict:
         scenarios = self._scenario_card.refresh() if self._scenario_card else {}
         return {"scenarios": [scenario.summary() for scenario in sorted(
             scenarios.values(), key=lambda s: s.slug)]}
-
-    def do_suite(self) -> dict:
-        """Batch progress and scores. Readable *while* the suite runs, because
-        this card is a `resource` and `_needs_barrier` exempts those."""
-        card = self._scenario_card
-        if card is None:
-            return {"error": "no scenario card"}
-        return card.suite.summary()
 
     def transcript(self) -> list[dict]:
         """Requested text, start, end, outcome. This is the assertion surface for
@@ -346,9 +395,6 @@ class SimReportCard(Card):
             return {"state": "idle", "error": "no scenario loaded",
                     "events": len(events), "transcript": self.transcript()}
 
-        grid = self.world._backend.state()["grid"]  # noqa: SLF001
-        results = assertions.evaluate(scenario, events, acp_posts=card.acp_posts,
-                                      trail=self.world.trail(), grid=grid)
         return {
             "state": "running" if card.elapsed() is not None else "idle",
             "scenario": scenario.slug,
@@ -358,10 +404,21 @@ class SimReportCard(Card):
             "transcript": self.transcript(),
             "waypoints": [e["label"] for e in events if e["event"] == "arrive" and e.get("label")],
             "acp_posts": card.acp_posts,
-            "assertions": results,
-            "score": assertions.score(scenario, results),
+            "trail_occupied": self.trail_occupied(),
             "environment": _environment(),
         }
+
+    def trail_occupied(self) -> int:
+        """走过的轨迹里落在占用格上的点数。
+
+        必须在这一侧算 —— 它要的是世界自己的栅格。而它值得算：只看积分器自己报的
+        `nav_failed`，等于让积分器报告自己的 bug。
+        """
+        grid = self.world._backend.state()["grid"]  # noqa: SLF001
+        if grid is None:
+            return 0
+        return sum(1 for x, y in self.world.trail()
+                   if grid.at(*grid.world_to_cell(x, y)) == OCCUPIED)
 
 
 def _environment() -> dict:
