@@ -278,6 +278,16 @@ class SimScenarioCard(Card):
 
         if self._active is None:
             return {"state": "idle", "reset": False}
+
+        # **从地图资产建出来的场景，它的 slug 是地图名，不是场景名。** 上面那个分支
+        # 用 `Scenario.from_dict({...}, slug=map)` 造它，所以拿这个 slug 去
+        # `do_load` 找场景文件必然找不到 —— 报出来是 `unknown scenario: bj-2f`，
+        # 一个看着像「用例写错了地图」的错误，而其实是重置自己走错了路。
+        #
+        # Orin6 上一个**不声明地图**的用例就撞上了：跑在当前世界上是新的默认，
+        # 而「当前世界」恰恰就是这种从资产建出来的场景。这种直接重建，不查表。
+        if self._active.slug not in self.refresh():
+            return self._load_active(seed=seed)
         return self.do_load(scenario=self._active.slug, owner=owner)
 
     # ---- 给导航卡的「地图」接口 ---------------------------------------
