@@ -249,8 +249,9 @@ def _acp_notify(action_id: str | None, status: str, result: dict, tool_name: str
     context = ssl._create_unverified_context() if base.startswith("https://") else None
     try:
         urllib.request.urlopen(request, timeout=5, context=context).read()
-    except Exception as exc:
-        print(f"[U1 ACP] completion failed for {action_id}: {exc}", flush=True)
+    except Exception:
+        safe_id = str(action_id).encode("unicode_escape").decode("ascii")[:128]
+        print(f"[U1 ACP] completion request failed for action_id={safe_id}", flush=True)
 
 
 def _decode_vendor_result(response: Any) -> Any:
@@ -345,16 +346,16 @@ class U1Nodes:
             print(f"[U1 init] authorization skipped; missing fields: {', '.join(missing)}", flush=True)
         else:
             try:
-                result = self.string_call("authorize", values)
-                print(f"[U1 init] authorization result: {result}", flush=True)
-            except Exception as exc:
-                print(f"[U1 init] authorization failed: {exc}", flush=True)
+                self.string_call("authorize", values)
+                print("[U1 init] authorization request completed", flush=True)
+            except Exception:
+                print("[U1 init] authorization request failed", flush=True)
 
         try:
-            result = self.string_call("wakeup_enabled", {"enabled": False})
-            print(f"[U1 init] built-in wake word disabled: {result}", flush=True)
-        except Exception as exc:
-            print(f"[U1 init] failed to disable built-in wake word: {exc}", flush=True)
+            self.string_call("wakeup_enabled", {"enabled": False})
+            print("[U1 init] built-in wake word disable request completed", flush=True)
+        except Exception:
+            print("[U1 init] built-in wake word disable request failed", flush=True)
 
     def _event_callback(self, name: str):
         def callback(message):
@@ -861,8 +862,8 @@ class VisionCapturePlugin:
         actions = {
             "capture_image": (["image_name"], "Capture a fresh U1 Pro RGB image as a JPEG."),
             "record_video": (["video_name", "duration"], "Record a fresh U1 Pro RGB video as an MP4; duration defaults to 5 seconds and is capped at 60 seconds."),
-            "start_recording": (["video_name"], "Start continuous U1 Pro RGB recording until stop_recording is called."),
-            "stop_recording": ([], "Stop the active continuous recording and finalize its MP4."),
+            "start_recording": (["video_name"], "Start manual continuous recording; use stop_recording to finalize it. The final result is returned by stop_recording and info, not ACP."),
+            "stop_recording": (["recording_id"], "Stop the selected manual recording and finalize its MP4."),
             "list": ([], "List saved U1 Pro photos and videos."),
             "delete": (["name"], "Delete one saved .jpg or .mp4 file by its complete filename."),
             "info": ([], "Show camera readiness, output paths, and recording state."),
@@ -874,6 +875,7 @@ class VisionCapturePlugin:
             "video_name": {"type": "string", "description": "Optional filename stem without .mp4."},
             "duration": {"type": "number", "minimum": 1, "maximum": 60, "default": self.default_seconds, "description": "Video duration in seconds."},
             "name": {"type": "string", "description": "Complete saved filename, ending in .jpg or .mp4."},
+            "recording_id": {"type": "string", "description": "Recording ID returned by start_recording."},
         })
         schema["x-completion"] = {"actions": ["record_video"], "timeout": int(self.max_seconds + 15)}
         return tool(
@@ -918,7 +920,10 @@ class VisionCapturePlugin:
 
     def _info(self):
         with self._lock:
-            active = dict(self._active) if self._active else None
+            active = None
+            if self._active:
+                active = {key: self._active[key] for key in (
+                    "recording_id", "state", "path", "duration", "started_at")}
         return {"state": "recording" if active else "ready", "camera": self.camera._state(),
                 "output_dir": self.output_dir, "channel_output_dir": self.channel_dir,
                 "photos_dir": self.output_dir, "videos_dir": self.output_dir,
@@ -971,8 +976,11 @@ class VisionCapturePlugin:
                 os.makedirs(self.output_dir, exist_ok=True)
                 path = self._path(args.get("video_name"), ".mp4", "VID")
                 active = {"state": "recording", "path": path, "duration": duration,
+                          "recording_id": f"u1-recording-{uuid.uuid4().hex}",
                           "action_id": action_id, "cancel": threading.Event(),
+                          "continuous": duration is None,
                           "started_at": time.time()}
+                self._last_recording = None
                 self._active = active
                 thread = threading.Thread(target=self._record_worker, args=(active,), daemon=True, name="u1-vision-recording")
                 active["thread"] = thread
@@ -981,6 +989,8 @@ class VisionCapturePlugin:
                       "channel_reply_path": os.path.join(self.channel_dir, os.path.basename(path)), "mime": "video/mp4"}
             if action_id:
                 result["action_id"] = action_id
+            else:
+                result["recording_id"] = active["recording_id"]
             return result
         except Exception as exc:
             return {"state": "error", "message": str(exc)}
@@ -1019,12 +1029,13 @@ class VisionCapturePlugin:
                         time.sleep(remaining)
             process.stdin.close()
             return_code = process.wait(timeout=15)
-            if active["cancel"].is_set():
+            if active["cancel"].is_set() and not active["continuous"]:
                 raise RuntimeError("recording cancelled")
             if return_code != 0 or not os.path.isfile(active["path"]):
                 error = process.stderr.read().decode("utf-8", "replace")[-512:]
                 raise RuntimeError(error or "ffmpeg failed to create MP4")
             result = self._result_path(active["path"], "video/mp4", "recorded")
+            result["recording_id"] = active["recording_id"]
         except Exception as exc:
             result = {"state": "cancelled" if active["cancel"].is_set() else "error", "message": str(exc)}
             try:
@@ -1040,18 +1051,23 @@ class VisionCapturePlugin:
                 self._last_recording = result
                 self._active = None
             if active.get("action_id"):
-                _acp_notify(active["action_id"], "completed" if result and result.get("state") == "recorded" else "error", result or {"state": "error"}, "vision_capture")
+                status = "completed" if result and result.get("state") == "recorded" else (
+                    "cancelled" if result and result.get("state") == "cancelled" else "error")
+                _acp_notify(active["action_id"], status, result or {"state": "error"}, "vision_capture")
 
-    def _stop_recording(self):
+    def _stop_recording(self, recording_id=None):
         with self._lock:
             active = self._active
         if not active:
             return None
+        if recording_id and recording_id != active["recording_id"]:
+            return {"state": "error", "message": "recording_id does not match the active recording"}
         active["cancel"].set()
         process = active.get("process")
-        if process and process.poll() is None:
-            process.kill()
         active["thread"].join(timeout=15)
+        if active["thread"].is_alive() and process and process.poll() is None:
+            process.kill()
+            active["thread"].join(timeout=2)
         with self._lock:
             return self._last_recording or {"state": "cancelled"}
 
@@ -1071,7 +1087,7 @@ class VisionCapturePlugin:
         if action == "start_recording":
             return self._start_recording(args, None)
         if action == "stop_recording":
-            return self._stop_recording() or {"state": "idle", "message": "no active recording"}
+            return self._stop_recording(args.get("recording_id")) or {"state": "idle", "message": "no active recording"}
         if action == "record_video":
             try:
                 duration = max(1.0, min(self.max_seconds, float(args.get("duration", self.default_seconds))))

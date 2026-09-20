@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import sys
+import io
 import tempfile
 import types
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 
@@ -309,6 +311,33 @@ class U1CardContractTests(unittest.TestCase):
         plugin = device.VisionCapturePlugin(FakeCamera(), {})
         actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(actions, ["capture_image", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "start", "stop"])
+        self.assertEqual(plugin.get_tool()["inputSchema"]["x-completion"]["actions"], ["record_video"])
+
+    def test_authorization_logs_do_not_include_vendor_response(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            config={"auth": {key: "secret-value" for key in ("appid", "api_key", "api_secret", "device_id", "license")}},
+            string_call=mock.Mock(return_value={"token": "do-not-log", "license": "private"}),
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            device.U1Nodes.initialize_robot(nodes)
+        text = output.getvalue()
+        self.assertNotIn("secret-value", text)
+        self.assertNotIn("do-not-log", text)
+        self.assertIn("authorization request completed", text)
+        self.assertIn("wake word disable request completed", text)
+
+    def test_acp_error_log_escapes_action_id(self):
+        import device
+
+        with mock.patch.object(device.urllib.request, "urlopen", side_effect=RuntimeError("transport details")):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                device._acp_notify("request\nforged", "error", {})
+        self.assertIn(r"action_id=request\nforged", output.getvalue())
+        self.assertNotIn("transport details", output.getvalue())
 
     def test_video_frame_conversion_strips_step_padding(self):
         import device

@@ -33,7 +33,10 @@ which is mounted from the host by the deployment. `capture_image` returns a JPG
 path immediately after a fresh frame arrives. `record_video` returns an action ID
 and completes through Agent Core ACP after ffmpeg finishes the MP4; `duration`
 defaults to 5 seconds and is capped at 60 seconds. The card never records a
-stale frame as the first frame of a request.
+stale frame as the first frame of a request. `start_recording` is an explicitly
+manual lifecycle action: it returns a `recording_id` immediately and keeps
+recording until `stop_recording`; the final result is returned by
+`stop_recording` and `info`, rather than being treated as a finite ACP task.
 
 The image installs `python3-pil` for the documented raw-video-to-JPEG conversion
 and `ffmpeg` for MP4 capture,
