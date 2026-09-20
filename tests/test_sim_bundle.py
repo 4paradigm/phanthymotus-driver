@@ -205,3 +205,35 @@ def test_the_shipped_scenario_loads_with_no_warnings(bundle):
     result = bundle.dispatch("sim_scenario", {"action": "load", "scenario": "exhibition_tour"})
 
     assert result["warnings"] == [], result["warnings"]
+
+
+# ── 不声明地图的重置 ─────────────────────────────────────────────────────────
+
+def test_resetting_a_map_built_world_does_not_look_up_a_scenario(config):
+    """**从地图资产建出来的场景，它的 slug 是地图名，不是场景名。**
+
+    `do_reset(map=...)` 用 `Scenario.from_dict({...}, slug=map)` 造它。所以随后一次
+    不带地图的 `reset` 要是拿这个 slug 去查场景表，必然查不到 —— 报出来是
+    `unknown scenario: bj-2f`，一个看着像「用例写错了地图」的错误，而其实是重置自己
+    走错了路。
+
+    Orin6 上一个**不声明地图**的基准测试用例就撞上了：跑在当前世界上是新的默认，
+    而「当前世界」恰恰就是这种从资产建出来的场景。
+    """
+    from simulator.generic.cards_scenario import SimScenarioCard
+    from simulator.generic.clock import FakeClock
+    from simulator.generic.backend import LocalBackend
+    from simulator.generic.world import VirtualWorld
+
+    world = VirtualWorld(LocalBackend(), FakeClock(), {})
+    card = SimScenarioCard(world, config, "sim",
+                           scenario_dirs=[BUNDLE / "simulator" / "generic" / "scenarios"]
+                           if (BUNDLE / "simulator").exists() else None)
+
+    built = card.do_reset(map="bj-2f", owner="t")
+    assert "error" not in built, built
+
+    again = card.do_reset(owner="t")
+
+    assert "error" not in again, again
+    assert again.get("loaded") == "bj-2f"
