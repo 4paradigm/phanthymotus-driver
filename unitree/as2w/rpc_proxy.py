@@ -146,7 +146,10 @@ class RpcProxy:
         return self._audio.call("PlayStop", app_name)
 
     def Audio_GetVolume(self):
-        return self._audio.call("GetVolume")
+        result = self._audio.call("GetVolume")
+        if isinstance(result, tuple) and len(result) == 2:
+            return result
+        return result, None
 
     def Audio_SetVolume(self, volume):
         return self._audio.call("SetVolume", volume)

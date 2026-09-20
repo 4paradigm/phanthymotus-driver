@@ -66,6 +66,8 @@ class _Proxy:
     def __init__(self):
         self.moves = []
         self.stops = 0
+        self.state = "BALANCE_STAND"
+        self.balance_stands = 0
 
     def Move(self, *args):
         self.moves.append(args)
@@ -73,6 +75,17 @@ class _Proxy:
 
     def StopMove(self):
         self.stops += 1
+        return 0
+
+    def GetState(self):
+        return 0, {"fsm_name": self.state}
+
+    def BalanceStand(self):
+        self.balance_stands += 1
+        self.state = "BALANCE_STAND"
+        return 0
+
+    def Damp(self):
         return 0
 
 
@@ -193,6 +206,20 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("audio/pcm-16k", message.format)
         self.assertEqual([0, 255, 3], message.data)
 
+    def test_mic_aggregates_small_audio_packets_to_asr_frame_size(self):
+        node = self.device._MicNode.__new__(self.device._MicNode)
+        published = []
+        node.publisher = types.SimpleNamespace(
+            publish=lambda message: published.append(message))
+        node._publish_lock = __import__("threading").Lock()
+        node._publish_buffer = bytearray()
+        node.packet_count = 0
+        node._publish_pcm(b"a" * 400)
+        node._publish_pcm(b"b" * 700)
+        self.assertEqual(1, len(published))
+        self.assertEqual(1024, len(published[0].data))
+        self.assertEqual("audio/pcm-16k", published[0].format)
+
     def test_speaker_streams_blocks_and_stops(self):
         client = types.SimpleNamespace(Audio_PlayStream=lambda *args: (0, ""),
                                        Audio_PlayStop=lambda *args: 0)
@@ -204,6 +231,16 @@ class TestDriverContracts(unittest.TestCase):
         node._play_block(b"x" * self.device.SPEAKER_BLOCK_BYTES)
         self.assertEqual(1, node.blocks_sent)
         self.assertEqual(0, node._client.Audio_PlayStream("as2w_speaker", "0", b"x" * self.device.SPEAKER_BLOCK_BYTES)[0])
+
+    def test_speaker_does_not_count_failed_play_stream(self):
+        node = self.device._SpeakerNode.__new__(self.device._SpeakerNode)
+        node._client = types.SimpleNamespace(Audio_PlayStream=lambda *args: 3104)
+        node._stop_event = __import__("threading").Event()
+        node.blocks_sent = 0
+        node._next_play_time = 0.0
+        node._play_block(b"x" * self.device.SPEAKER_BLOCK_BYTES)
+        self.assertEqual(0, node.blocks_sent)
+        self.assertEqual(3104, node.last_play_error["code"])
 
     def test_led_clamps_color_and_uses_audio_service(self):
         calls = []
@@ -251,13 +288,82 @@ class TestDriverContracts(unittest.TestCase):
     def test_speaker_volume_and_led_action_parameters_are_explicit(self):
         speaker = self.device.SpeakerPlugin.__new__(self.device.SpeakerPlugin)
         speaker._node = types.SimpleNamespace(_client=types.SimpleNamespace(), state="idle", topic=None, blocks_sent=0)
-        speaker_schema = speaker.get_tool()["x-action-params"]
+        speaker_schema = speaker.get_tool()["inputSchema"]["x-action-params"]
         self.assertEqual([], speaker_schema["get_volume"]["params"])
         self.assertEqual(["volume"], speaker_schema["set_volume"]["params"])
         led = self.device.LedPlugin.__new__(self.device.LedPlugin)
         led_schema = led.get_tool()["inputSchema"]["x-action-params"]
         self.assertEqual([], led_schema["off"]["params"])
         self.assertTrue(led.get_tool()["description"])
+
+    def test_speaker_get_volume_handles_rpc_fallback(self):
+        speaker = self.device.SpeakerPlugin.__new__(self.device.SpeakerPlugin)
+        speaker._node = types.SimpleNamespace(
+            _client=types.SimpleNamespace(Audio_GetVolume=lambda: 3104),
+            state="idle", topic=None, blocks_sent=0)
+        self.assertEqual({"ret": 3104, "volume": None},
+                         speaker.dispatch("get_volume", {}))
+
+    def test_speaker_action_params_live_inside_input_schema(self):
+        speaker = self.device.SpeakerPlugin.__new__(self.device.SpeakerPlugin)
+        speaker._node = types.SimpleNamespace()
+        schema = speaker.get_tool()["inputSchema"]
+        self.assertEqual([], schema["x-action-params"]["get_volume"]["params"])
+        self.assertNotIn("x-action-params", speaker.get_tool())
+
+    def test_loco_moves_directly_from_balance_stand(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+        self.assertEqual(0, result["ret"])
+        self.assertEqual("BALANCE_STAND", result["current_state"])
+        self.assertEqual([(0.2, 0, 0)], proxy.moves)
+
+    def test_loco_automatically_balances_before_move_from_stand_up(self):
+        proxy = _Proxy()
+        proxy.state = "STAND_UP"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify"):
+            result = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+            self.assertTrue(result["accepted"])
+            self.assertEqual("balance_stand", result["transition"])
+            for _ in range(50):
+                if proxy.moves:
+                    break
+                __import__("time").sleep(0.01)
+        self.assertEqual(1, proxy.balance_stands)
+        self.assertEqual([(0.2, 0, 0)], proxy.moves)
+        self.assertIsNone(plugin._transition_stop)
+        plugin.stop()
+
+    def test_loco_explains_move_rejection_from_down_state(self):
+        proxy = _Proxy()
+        proxy.state = "STAND_DOWN"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+        self.assertEqual(-1, result["ret"])
+        self.assertEqual("STAND_DOWN", result["current_state"])
+        self.assertIn("stand_up", result["suggested_actions"])
+        self.assertIn("not standing", result["reason"])
+
+    def test_loco_refuses_damp_while_moving_with_recovery_steps(self):
+        proxy = _Proxy()
+        proxy.state = "WALKING"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("damp", {})
+        self.assertEqual(-1, result["ret"])
+        self.assertEqual("WALKING", result["current_state"])
+        self.assertEqual(["stop_move", "damp"], result["suggested_actions"])
+
+    def test_special_motion_explains_non_standing_state(self):
+        proxy = _Proxy()
+        proxy.state = "STAND_DOWN"
+        plugin = self.device.SpecialActionPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("front_flip", {"confirm": True})
+        self.assertEqual(-1, result["ret"])
+        self.assertEqual("STAND_DOWN", result["current_state"])
+        self.assertIn("standing", result["reason"])
+        self.assertIn("stand_up", result["suggested_actions"])
 
     def test_battery_current_is_explicitly_exposed_in_ma_and_a(self):
         node = self.device._StateNode.__new__(self.device._StateNode)

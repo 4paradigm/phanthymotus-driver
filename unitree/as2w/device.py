@@ -204,6 +204,141 @@ class LocoPlugin:
         self.proxy = proxy
         self._lock = threading.Lock()
         self._stop = None
+        self._transition_stop = None
+
+    _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND"}
+    _MOVING = {"WALK", "WALKING", "RUN", "RUNNING", "MOVE", "MOVING",
+               "REGULAR_WALK", "REGULAR_RUN"}
+    _DOWN = {"STAND_DOWN", "DAMPING", "LYING", "FALL", "FALLEN",
+             "SQUAT"}
+
+    @classmethod
+    def _is_moving(cls, state):
+        return state in cls._MOVING or "WALK" in state or "RUN" in state or "MOVE" in state
+
+    def _read_state(self):
+        result = self.proxy.GetState()
+        if not isinstance(result, tuple) or len(result) != 2:
+            return None, None, {"ret": result if isinstance(result, int) else 3104,
+                                 "current_state": "UNKNOWN",
+                                 "error": "Unable to read robot locomotion state",
+                                 "reason": "SportClient.GetState did not return a state",
+                                 "suggested_actions": ["get_state"]}
+        code, state = result
+        if code != 0 or not isinstance(state, dict):
+            return None, state if isinstance(state, dict) else {}, {
+                "ret": code, "current_state": "UNKNOWN",
+                "error": "Unable to read robot locomotion state",
+                "reason": "SportClient.GetState failed; refusing an unsafe transition",
+                "suggested_actions": ["get_state"]}
+        name = str(state.get("fsm_name", "")).strip().upper()
+        if not name:
+            return None, state, {
+                "ret": -1, "current_state": "UNKNOWN",
+                "error": "Robot returned no locomotion state",
+                "reason": "The current FSM state is unknown; refusing the action",
+                "suggested_actions": ["get_state"]}
+        return name, state, None
+
+    @staticmethod
+    def _not_allowed(action, state, reason, suggested):
+        return {"ret": -1, "accepted": False, "action": action,
+                "current_state": state or "UNKNOWN", "error": "Action cannot be executed",
+                "reason": reason, "suggested_actions": suggested}
+
+    def _cancel_transition(self):
+        with self._lock:
+            event = self._transition_stop
+            self._transition_stop = None
+        if event is not None:
+            event.set()
+
+    def _finish_transition(self, stop_event):
+        with self._lock:
+            if self._transition_stop is stop_event:
+                self._transition_stop = None
+
+    def _transition_to_balance_and_move(self, action_id, vx, vy, yaw, duration, stop_event):
+        deadline = time.monotonic() + 12.0
+        while time.monotonic() < deadline:
+            if stop_event.is_set():
+                self._finish_transition(stop_event)
+                _acp_notify(action_id, "cancelled", {
+                    "action": "move", "reason": "move transition was cancelled"})
+                return
+            name, state, error = self._read_state()
+            if name == "BALANCE_STAND":
+                return self._run_move_after_transition(action_id, vx, vy, yaw, duration, stop_event)
+            if error:
+                self._finish_transition(stop_event)
+                _acp_notify(action_id, "error", error)
+                return
+            time.sleep(0.15)
+        _acp_notify(action_id, "error", self._not_allowed(
+            "move", name or "UNKNOWN",
+            "The automatic balance-stand transition did not complete",
+            ["stop_move", "balance_stand", "get_state"]))
+        self._finish_transition(stop_event)
+
+    def _run_move_after_transition(self, action_id, vx, vy, yaw, duration, stop_event):
+        if stop_event.is_set():
+            self._finish_transition(stop_event)
+            _acp_notify(action_id, "cancelled", {
+                "action": "move", "reason": "move transition was cancelled"})
+            return
+        ret = self.proxy.Move(vx, vy, yaw)
+        if ret != 0:
+            self._finish_transition(stop_event)
+            _acp_notify(action_id, "error", {"ret": ret, "accepted": False,
+                "action": "move", "current_state": "BALANCE_STAND",
+                "error": "Move was rejected after balance stand",
+                "reason": "The sport controller refused the velocity command",
+                "suggested_actions": ["get_state", "stop_move"]})
+            return
+        if duration is None:
+            self._finish_transition(stop_event)
+            _acp_notify(action_id, "completed", {
+                "action": "move", "ret": 0, "current_state": "BALANCE_STAND"})
+            return
+        if duration == -1:
+            with self._lock:
+                self._stop = stop_event
+            while not stop_event.is_set():
+                if self.proxy.Move(vx, vy, yaw) != 0:
+                    break
+                stop_event.wait(0.1)
+            self.proxy.StopMove()
+            with self._lock:
+                if self._stop is stop_event:
+                    self._stop = None
+            self._finish_transition(stop_event)
+            return
+        deadline = time.monotonic() + duration
+        try:
+            while time.monotonic() < deadline:
+                time.sleep(min(0.1, deadline - time.monotonic()))
+                if time.monotonic() < deadline:
+                    ret = self.proxy.Move(vx, vy, yaw)
+                    if ret != 0:
+                        break
+        finally:
+            self.proxy.StopMove()
+        _acp_notify(action_id, "completed" if ret == 0 else "error",
+                    {"action": "move", "ret": ret, "duration": duration})
+        self._finish_transition(stop_event)
+
+    def _move_error_for_state(self, state):
+        if state in self._DOWN:
+            return self._not_allowed("move", state,
+                "The robot is not standing, so the controller rejects Move",
+                ["stand_up", "recovery_stand"])
+        if self._is_moving(state):
+            return self._not_allowed("move", state,
+                "The robot is already in a dynamic locomotion state",
+                ["stop_move", "get_state"])
+        return self._not_allowed("move", state,
+            "The robot is in a transition, special motion, or fault state",
+            ["stop_move", "recovery_stand", "get_state"])
     def get_tool(self):
         actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
@@ -225,6 +360,7 @@ class LocoPlugin:
                     "get_state": {"params": [], "description": "Read sport state."}}}}
     def start(self): pass
     def stop(self):
+        self._cancel_transition()
         self._stop_continuous()
         self.proxy.StopMove()
     def _stop_continuous(self):
@@ -243,8 +379,26 @@ class LocoPlugin:
         left_old_state = False
         matches = 0
         while time.monotonic() < deadline:
-            code, state = self.proxy.GetState()
-            name = str(state.get("fsm_name", "")).upper() if code == 0 else ""
+            result = self.proxy.GetState()
+            if not isinstance(result, tuple) or len(result) != 2:
+                _acp_notify(action_id, "error", {
+                    "ret": result if isinstance(result, int) else 3104,
+                    "action": action,
+                    "error": "Unable to read robot locomotion state",
+                    "reason": "The controller did not return an FSM state while waiting for the transition",
+                    "suggested_actions": ["get_state", "retry"]})
+                return
+            code, state = result
+            if code != 0 or not isinstance(state, dict):
+                _acp_notify(action_id, "error", {
+                    "ret": code,
+                    "current_state": "UNKNOWN",
+                    "action": action,
+                    "error": "Unable to read robot locomotion state",
+                    "reason": "The controller returned an invalid FSM state while waiting for the transition",
+                    "suggested_actions": ["get_state", "retry"]})
+                return
+            name = str(state.get("fsm_name", "")).upper()
             if name and name != "DAMPING":
                 left_old_state = True
             if left_old_state and name == expected_name.upper():
@@ -255,36 +409,123 @@ class LocoPlugin:
                 _acp_notify(action_id, "completed", {"action": action, "state": state})
                 return
             time.sleep(.25)
-        _acp_notify(action_id, "error", {"action": action, "error": "controller state did not reach the expected posture within 20 seconds"})
+        _acp_notify(action_id, "error", {"action": action,
+                    "current_state": name or "UNKNOWN",
+                    "error": "controller state did not reach the expected posture within 20 seconds",
+                    "reason": f"The controller did not enter {expected_name}",
+                    "suggested_actions": ["get_state", "stop_move", "recovery_stand"]})
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
+            self._cancel_transition()
             self._stop_continuous()
             return {"state": "idle", "ret": self.proxy.StopMove()}
         if action == "move":
             vx, vy, yaw = max(-1.5, min(1.5, float(args.get("vx", 0)))), max(-1, min(1, float(args.get("vy", 0)))), max(-2, min(2, float(args.get("vyaw", 0))))
             duration = args.get("duration")
-            if duration is None: return {"ret": self.proxy.Move(vx, vy, yaw), "vx": vx, "vy": vy, "vyaw": yaw}
+            if duration is not None:
+                duration = float(duration)
+                if not math.isfinite(duration) or duration > 30:
+                    return {"ret": -1, "error": "duration must be at most 30 seconds"}
+                if duration < 0 and duration != -1:
+                    return {"ret": -1, "error": "duration must be -1, 0, or positive"}
+            state_name, state, state_error = self._read_state()
+            if state_error:
+                return {**state_error, "action": "move"}
+            if state_name == "STAND_UP":
+                self._cancel_transition()
+                ret = self.proxy.BalanceStand()
+                if ret != 0:
+                    return {**self._not_allowed("move", state_name,
+                        "BalanceStand is required before Move from STAND_UP, but it was rejected",
+                        ["get_state", "balance_stand"]), "ret": ret}
+                action_id = f"as2w_loco_{uuid4().hex[:8]}"
+                transition_stop = threading.Event()
+                with self._lock:
+                    self._transition_stop = transition_stop
+                threading.Thread(target=self._transition_to_balance_and_move,
+                    args=(action_id, vx, vy, yaw, duration, transition_stop), daemon=True,
+                    name="as2w-loco-balance-move").start()
+                return {"ret": 0, "accepted": True, "status": "running",
+                        "action": "move", "transition": "balance_stand",
+                        "action_id": action_id, "current_state": state_name}
+            if state_name not in self._STANDING:
+                return self._move_error_for_state(state_name)
+            self._cancel_transition()
+            if duration is None:
+                self._stop_continuous()
+                ret = self.proxy.Move(vx, vy, yaw)
+                return {"ret": ret, "accepted": ret == 0, "action": "move",
+                        "current_state": state_name, "vx": vx, "vy": vy, "vyaw": yaw,
+                        **({} if ret == 0 else {"error": "Sport controller rejected Move",
+                          "reason": "The robot is standing but the velocity command was refused",
+                          "suggested_actions": ["get_state", "stop_move"]})}
             duration = float(duration)
-            if not math.isfinite(duration) or duration > 30:
-                return {"ret": -1, "message": "duration must be at most 30 seconds"}
             if duration == -1:
                 self._continuous(vx, vy, yaw); return {"ret": 0, "status": "running", "duration": -1}
             if duration < 0: return {"ret": -1, "message": "duration must be -1, 0, or positive"}
             self._stop_continuous(); ret = self.proxy.Move(vx, vy, yaw); time.sleep(duration); self.proxy.StopMove(); return {"ret": ret, "duration": duration}
-        if action == "stop_move": self._stop_continuous(); return {"ret": self.proxy.StopMove()}
+        if action == "stop_move":
+            self._cancel_transition()
+            self._stop_continuous()
+            ret = self.proxy.StopMove()
+            return {"ret": ret, "accepted": ret == 0, "action": action,
+                    **({} if ret == 0 else {"error": "StopMove was rejected",
+                      "reason": "The controller is not accepting stop commands",
+                      "suggested_actions": ["get_state", "recovery_stand"]})}
         methods = {"stand_up": ("StandUp", "STAND_UP"), "stand_down": ("StandDown", "STAND_DOWN"), "balance_stand": ("BalanceStand", "BALANCE_STAND"), "recovery_stand": ("RecoveryStand", "RECOVERY_STAND")}
         if action in methods:
+            self._cancel_transition()
+            state_name, state, state_error = self._read_state()
+            if state_error:
+                return {**state_error, "action": action}
+            if action == "stand_up" and state_name not in {"STAND_DOWN", "DAMPING", "FALL", "FALLEN"}:
+                return self._not_allowed(action, state_name,
+                    "StandUp is only valid from a down, damping, or fallen posture",
+                    ["stand_down", "damp", "recovery_stand"])
+            if action == "stand_down" and self._is_moving(state_name):
+                return self._not_allowed(action, state_name,
+                    "StandDown cannot be issued while the robot is walking",
+                    ["stop_move", "stand_down"])
+            if action == "stand_down" and state_name in self._DOWN:
+                return self._not_allowed(action, state_name,
+                    "The robot is already down or damping",
+                    ["stand_up", "recovery_stand"])
+            if action == "balance_stand" and state_name not in {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND"}:
+                return self._not_allowed(action, state_name,
+                    "BalanceStand requires the robot to be standing first",
+                    ["stand_up", "recovery_stand"])
+            if action == "recovery_stand" and state_name not in {"FALL", "FALLEN", "STAND_DOWN", "DAMPING"}:
+                return self._not_allowed(action, state_name,
+                    "RecoveryStand is only valid from a fallen or down posture",
+                    ["stand_down", "damp", "recovery_stand"])
+            if action in {"balance_stand", "recovery_stand"} and self._is_moving(state_name):
+                return self._not_allowed(action, state_name,
+                    "Posture transition cannot be issued while the robot is moving",
+                    ["stop_move", action])
             method, expected_name = methods[action]
             ret = getattr(self.proxy, method)()
-            if ret != 0: return {"ret": ret, "accepted": False, "action": action, "error": "SportClient rejected the action"}
+            if ret != 0:
+                return {**self._not_allowed(action, state_name,
+                    "SportClient rejected the posture transition",
+                    ["get_state", "stop_move", "recovery_stand"]), "ret": ret}
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
             threading.Thread(target=self._await_posture, args=(action_id, action, expected_name), daemon=True).start()
             return {"ret": 0, "accepted": True, "status": "running", "action": action, "action_id": action_id}
         if action == "damp":
+            self._cancel_transition()
+            state_name, state, state_error = self._read_state()
+            if state_error:
+                return {**state_error, "action": action}
+            if self._is_moving(state_name):
+                return self._not_allowed(action, state_name,
+                    "Damp is refused while the robot is walking or running",
+                    ["stop_move", "damp"])
             ret = self.proxy.Damp()
             return {"ret": ret, "accepted": ret == 0, "action": action,
-                    **({} if ret == 0 else {"error": "SportClient rejected the action"})}
+                    **({} if ret == 0 else {"error": "SportClient rejected the action",
+                      "reason": "The controller refused damping from the current posture",
+                      "suggested_actions": ["get_state", "stop_move"]})}
         if action == "euler": return {"ret": self.proxy.Euler(float(args.get("roll", 0)), float(args.get("pitch", 0)), float(args.get("yaw", 0)))}
         if action == "speed_level":
             preset = args.get("speed_preset", "normal")
@@ -297,8 +538,14 @@ class LocoPlugin:
         if action == "left_side_gait": return {"ret": self.proxy.LeftSideGait(1 if args.get("flag", True) else 0)}
         if action == "right_side_gait": return {"ret": self.proxy.RightSideGait(1 if args.get("flag", True) else 0)}
         if action == "get_state":
-            code, state = self.proxy.GetState()
-            return {"ret": code, "state": state}
+            result = self.proxy.GetState()
+            if isinstance(result, tuple) and len(result) == 2:
+                code, state = result
+                return {"ret": code, "state": state}
+            return {"ret": result if isinstance(result, int) else 3104,
+                    "state": {}, "error": "Unable to read robot locomotion state",
+                    "reason": "SportClient.GetState did not return a state",
+                    "suggested_actions": ["retry", "recovery_stand"]}
         return None
 
 
@@ -340,9 +587,33 @@ class SpecialActionPlugin:
             "biped_stand": lambda: self.proxy.BipedStand(1 if args.get("enter", True) else 0),
         }
         if action in methods:
+            state_result = self.proxy.GetState()
+            if not isinstance(state_result, tuple) or len(state_result) != 2:
+                return {"ret": state_result if isinstance(state_result, int) else 3104,
+                        "accepted": False, "action": action, "current_state": "UNKNOWN",
+                        "error": "Unable to read robot locomotion state",
+                        "reason": "The current FSM state is unknown; refusing a dangerous motion",
+                        "suggested_actions": ["get_state", "stand_up"]}
+            code, state = state_result
+            state_name = str(state.get("fsm_name", "")).strip().upper() if isinstance(state, dict) else ""
+            if code != 0 or not state_name:
+                return {"ret": code, "accepted": False, "action": action,
+                        "current_state": state_name or "UNKNOWN",
+                        "error": "Unable to read robot locomotion state",
+                        "reason": "The current FSM state is unknown; refusing a dangerous motion",
+                        "suggested_actions": ["get_state", "stand_up"]}
+            if state_name not in {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND"}:
+                return {"ret": -1, "accepted": False, "action": action,
+                        "current_state": state_name,
+                        "error": "Special motion cannot be executed from the current state",
+                        "reason": "The robot must be standing and balanced before a special motion",
+                        "suggested_actions": ["stand_up", "balance_stand", "recovery_stand"]}
             ret = methods[action]()
             return {"ret": ret, "accepted": ret == 0, "action": action,
-                    **({} if ret == 0 else {"error": "SportClient rejected the special action"})}
+                    "current_state": state_name,
+                    **({} if ret == 0 else {"error": "SportClient rejected the special action",
+                      "reason": "The controller refused the special motion from the current posture",
+                      "suggested_actions": ["get_state", "recovery_stand"]})}
         return None
 
 
@@ -377,19 +648,33 @@ class _MicNode:
         self.topic = topic
         self.publisher = self.node.create_publisher(AudioChunk, topic, _LOW_LAT_QOS)
         self.subscriber = None
+        self._subscribers = []
         self.state = "idle"
         self.packet_count = 0
         self.last_packet_ts = 0.0
+        self._last_dds_packet_ts = 0.0
         self._config = config or {}
         self._alsa_thread = None
         self._alsa_stop = threading.Event()
+        self._publish_lock = threading.Lock()
+        self._publish_buffer = bytearray()
         self.backend = "dds"
 
     def start(self):
-        if self.subscriber is not None:
+        if self.state == "running":
             return self.topic
-        self.subscriber = ChannelSubscriber("rt/audiosender", AudioData_)
-        self.subscriber.Init(self._on_audio, 10)
+        topics = self._config.get("dds_topics", ["rt/audiosender"])
+        if isinstance(topics, str):
+            topics = [topics]
+        self._subscribers = []
+        for topic in topics:
+            try:
+                subscriber = ChannelSubscriber(topic, AudioData_)
+                subscriber.Init(lambda msg, source=topic: self._on_audio(msg, source), 1)
+                self._subscribers.append(subscriber)
+            except Exception:
+                continue
+        self.subscriber = self._subscribers[0] if self._subscribers else None
         self.state = "running"
         if self._config.get("backend", "auto") in ("auto", "alsa"):
             self._alsa_thread = threading.Thread(target=self._alsa_fallback,
@@ -399,27 +684,48 @@ class _MicNode:
         return self.topic
 
     def stop(self):
-        if self.subscriber is not None:
+        for subscriber in self._subscribers:
             try:
-                self.subscriber.Close()
+                subscriber.Close()
             except Exception:
                 pass
-            self.subscriber = None
+        self._subscribers = []
+        self.subscriber = None
         self._alsa_stop.set()
         if self._alsa_thread is not None:
             self._alsa_thread.join(timeout=1)
             self._alsa_thread = None
         self.state = "idle"
 
-    def _on_audio(self, msg):
+    def _publish_pcm(self, payload):
+        with self._publish_lock:
+            self._publish_buffer.extend(payload)
+            while len(self._publish_buffer) >= 1024:
+                chunk = bytes(self._publish_buffer[:1024])
+                del self._publish_buffer[:1024]
+                self.publisher.publish(_audio_chunk(chunk))
+                self.packet_count += 1
+
+    def _on_audio(self, msg, source=None):
         payload = bytes(getattr(msg, "data", []))
         if not payload:
             return
-        self.publisher.publish(_audio_chunk(payload))
-        self.packet_count += 1
-        self.last_packet_ts = time.monotonic()
+        # Subscribe to the firmware names used by different AS2 images, but
+        # publish from only one active source at a time if both are bridged.
+        now = time.monotonic()
+        active = getattr(self, "_active_dds_topic", None)
+        if active is not None and source != active and now - self.last_packet_ts < 1.0:
+            return
+        self._active_dds_topic = source
+        if self.backend == "alsa":
+            # Drop a partial fallback frame before resuming the firmware
+            # stream; never mix samples from two capture backends.
+            with self._publish_lock:
+                self._publish_buffer.clear()
+        self._publish_pcm(payload)
+        self.last_packet_ts = now
+        self._last_dds_packet_ts = now
         self.backend = "dds"
-        self._alsa_stop.set()
 
     def _alsa_fallback(self):
         # AS2 firmware may advertise rt/audiosender without publishing it
@@ -427,25 +733,47 @@ class _MicNode:
         # device in that case so the mic card remains useful on this hardware.
         try:
             import alsaaudio
-            configured = self._config.get("alsa_device", "default")
-            devices = [configured] if configured != "auto" else ["default", "hw:1,0", "hw:1,1"]
-            pcm = None
-            for device in devices:
+            configured = self._config.get("alsa_device", "auto")
+            if configured != "auto":
+                devices = [configured]
+            else:
                 try:
-                    pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NONBLOCK,
-                                        device=device)
-                    break
+                    devices = list(alsaaudio.pcms(alsaaudio.PCM_CAPTURE))
                 except Exception:
-                    continue
+                    devices = []
+                devices += ["default", "plughw:1,0", "plughw:1,1", "hw:1,0", "hw:1,1"]
+            devices = list(dict.fromkeys(devices))
+            pcm = None
+            sample_rate = 16000
+            channels = 1
+            for device in devices:
+                for rate, channel_count in ((16000, 1), (48000, 1), (48000, 2), (44100, 1)):
+                    candidate = None
+                    try:
+                        candidate = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NONBLOCK,
+                                                  device=device)
+                        candidate.setchannels(channel_count)
+                        candidate.setrate(rate)
+                        candidate.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+                        candidate.setperiodsize(512 if rate == 16000 else 1024)
+                        pcm = candidate
+                        sample_rate, channels = rate, channel_count
+                        break
+                    except Exception:
+                        if candidate is not None:
+                            try:
+                                candidate.close()
+                            except Exception:
+                                pass
+                if pcm is not None:
+                    break
             if pcm is None:
                 return
-            pcm.setchannels(1)
-            pcm.setrate(16000)
-            pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-            pcm.setperiodsize(512)
         except Exception:
             return
         deadline = time.monotonic() + float(self._config.get("dds_grace_s", 2.0))
+        import audioop
+        audio_state = None
         try:
             while not self._alsa_stop.is_set():
                 try:
@@ -460,9 +788,22 @@ class _MicNode:
                     continue
                 if time.monotonic() < deadline:
                     continue
-                message = _audio_chunk(data)
-                self.publisher.publish(message)
-                self.packet_count += 1
+                if time.monotonic() - self._last_dds_packet_ts < 1.0:
+                    # Prefer the firmware stream whenever it is alive. Keep
+                    # the ALSA device open so fallback resumes if DDS stops.
+                    continue
+                if self.backend == "dds":
+                    # DDS has gone quiet. Discard its incomplete frame once
+                    # before switching to ALSA so the PCM streams do not mix.
+                    with self._publish_lock:
+                        self._publish_buffer.clear()
+                    self.backend = "alsa"
+                if channels == 2:
+                    # Downmix little-endian signed stereo to mono.
+                    data = audioop.tomono(data, 2, 0.5, 0.5)
+                if sample_rate != 16000:
+                    data, audio_state = audioop.ratecv(data, 2, 1, sample_rate, 16000, audio_state)
+                self._publish_pcm(data)
                 self.last_packet_ts = time.monotonic()
                 self.backend = "alsa"
         finally:
@@ -523,16 +864,27 @@ class _SpeakerNode:
         self.blocks_sent = 0
         self._next_play_time = 0.0
         self._last_play_error = 0.0
+        self.last_play_error = None
 
     def start(self, topic):
         if self._thread is not None and self._thread.is_alive():
             if self.topic == topic:
                 return topic
             self.stop()
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError("speaker worker is still stopping; retry start after it exits")
         if self._subscription is not None:
             if self.topic == topic:
                 return topic
             self.stop()
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError("speaker worker is still stopping; retry start after it exits")
+        try:
+            # AudioClient keeps a stream session on the robot. Clear a stale
+            # session left by a previous container before accepting new audio.
+            self._client.Audio_PlayStop(SPEAKER_APP_NAME)
+        except Exception:
+            pass
         self.topic = topic
         self._subscription = self.node.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS)
@@ -622,12 +974,17 @@ class _SpeakerNode:
         started = time.monotonic()
         try:
             result = self._client.Audio_PlayStream(SPEAKER_APP_NAME, "0", payload)
+            if isinstance(result, tuple) and len(result) == 2:
+                code, detail = result
+            else:
+                code, detail = result, None
+            if code != 0:
+                self._record_play_error(code, detail)
+                return result
+            self.last_play_error = None
             self.blocks_sent += 1
         except Exception as exc:
-            now = time.monotonic()
-            if now - self._last_play_error >= 10.0:
-                print(f"[speaker] PlayStream failed: {str(exc)[:160]}", flush=True)
-                self._last_play_error = now
+            self._record_play_error("exception", str(exc))
             return None
         # Keep at most 240 ms of audio ahead of the robot decoder.  Without a
         # cumulative deadline, fast RPC responses can overrun the firmware's
@@ -638,6 +995,14 @@ class _SpeakerNode:
         if wait_for > 0:
             self._stop_event.wait(wait_for)
         return result
+
+    def _record_play_error(self, code, detail):
+        self.last_play_error = {"code": code, "detail": str(detail)[:160]}
+        now = time.monotonic()
+        previous = getattr(self, "_last_play_error", 0.0)
+        if now - previous >= 10.0:
+            print(f"[speaker] PlayStream failed: code={code} detail={str(detail)[:160]}", flush=True)
+            self._last_play_error = now
 
 
 class SpeakerPlugin:
@@ -654,13 +1019,13 @@ class SpeakerPlugin:
                     "action": {"type": "string", "enum": ["start", "stop", "info", "get_volume", "set_volume"]},
                     "input_topic": {"type": "string", "description": "ROS2 AudioChunk topic"},
                     "volume": {"type": "integer", "minimum": 0, "maximum": 100}},
-                    "required": ["action"]},
-                "topic_in": [{"format": "audio/pcm-16k"}],
-                "x-action-params": {
+                    "required": ["action"],
+                    "x-action-params": {
                     "start": {"params": ["input_topic"], "description": "Subscribe to an AudioChunk topic."},
                     "stop": {"params": [], "description": "Stop playback and clear buffered audio."},
                     "get_volume": {"params": [], "description": "Read the current volume."},
-                    "set_volume": {"params": ["volume"], "description": "Set volume from 0 to 100."}}}
+                    "set_volume": {"params": ["volume"], "description": "Set volume from 0 to 100."}}},
+                "topic_in": [{"format": "audio/pcm-16k"}]}
 
     def start(self):
         pass
@@ -673,15 +1038,27 @@ class SpeakerPlugin:
             topic = args.get("input_topic") or args.get("topic_in")
             if not topic:
                 return {"error": "Missing input_topic"}
-            return {"state": "ready", "topic": self._node.start(topic)}
+            try:
+                started_topic = self._node.start(topic)
+            except RuntimeError as exc:
+                return {"state": self._node.state, "accepted": False,
+                        "error": str(exc),
+                        "reason": "The previous playback RPC is still in flight",
+                        "suggested_actions": ["stop", "retry"]}
+            return {"state": "ready", "topic": started_topic}
         if action == "stop":
             self._node.stop()
             return {"state": "idle"}
         if action == "info":
             return {"state": self._node.state, "topic": self._node.topic,
-                    "blocks_sent": self._node.blocks_sent}
+                    "blocks_sent": self._node.blocks_sent,
+                    "last_error": self._node.last_play_error}
         if action == "get_volume":
-            code, volume = self._node._client.Audio_GetVolume()
+            result = self._node._client.Audio_GetVolume()
+            if isinstance(result, tuple) and len(result) == 2:
+                code, volume = result
+            else:
+                code, volume = result, None
             return {"ret": code, "volume": volume}
         if action == "set_volume":
             volume = max(0, min(100, int(args.get("volume", 50))))
