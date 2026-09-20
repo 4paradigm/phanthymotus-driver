@@ -27,6 +27,7 @@ from common.vendor_runtime import action_schema, jsonable, tool
 SERVICE_TIMEOUT = 3.0
 MIC_TOPIC = "/audio/sense/audio_data_to_asr"
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
+AUDIO_FORMAT = "audio/pcm-16k"
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
 VIDEO_METADATA_TOPIC = "/robo/video/subscribe/metadata"
 VIDEO_OPEN = "/robo/video/call/open_stream"
@@ -471,7 +472,10 @@ class U1Nodes:
     def _speaker_callback(self, message) -> None:
         if not self._speaker_forwarding:
             return
+        if getattr(message, "format", "") != AUDIO_FORMAT:
+            return
         output = self.AudioOutData()
+        output.header = message.header
         output.uuid = self._speaker_uuid
         output.data.data = list(message.data)
         self._speaker_publisher.publish(output)

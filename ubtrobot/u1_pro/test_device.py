@@ -75,12 +75,14 @@ class FakePublisher:
 
 class FakeAudioChunk:
     def __init__(self):
+        self.header = types.SimpleNamespace(frame_id="input", stamp=types.SimpleNamespace(sec=12, nanosec=34))
         self.format = ""
         self.data = []
 
 
 class FakeAudioOutData:
     def __init__(self):
+        self.header = None
         self.uuid = ""
         self.data = types.SimpleNamespace(data=[])
 
@@ -508,11 +510,35 @@ class U1CardContractTests(unittest.TestCase):
             _speaker_uuid="u1-test",
             _speaker_publisher=publisher,
         )
-        message = types.SimpleNamespace(data=[1, 2, 3])
+        message = types.SimpleNamespace(
+            header=types.SimpleNamespace(frame_id="input", stamp=types.SimpleNamespace(sec=12, nanosec=34)),
+            format=device.AUDIO_FORMAT,
+            data=[1, 2, 3],
+        )
         device.U1Nodes._speaker_callback(nodes, message)
         nodes._speaker_forwarding = False
         device.U1Nodes._speaker_callback(nodes, message)
         self.assertEqual(len(publisher.messages), 1)
+        self.assertIs(publisher.messages[0].header, message.header)
+        self.assertEqual(publisher.messages[0].data.data, [1, 2, 3])
+
+    def test_speaker_callback_rejects_non_pcm_input(self):
+        import device
+
+        publisher = FakePublisher()
+        nodes = types.SimpleNamespace(
+            _speaker_forwarding=True,
+            AudioOutData=FakeAudioOutData,
+            _speaker_uuid="u1-test",
+            _speaker_publisher=publisher,
+        )
+        message = types.SimpleNamespace(
+            header=types.SimpleNamespace(),
+            format="audio/opus",
+            data=[1, 2, 3],
+        )
+        device.U1Nodes._speaker_callback(nodes, message)
+        self.assertEqual(publisher.messages, [])
 
 
 if __name__ == "__main__":
