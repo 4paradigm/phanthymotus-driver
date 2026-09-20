@@ -14,7 +14,7 @@ vision_capture:
   fps: 15
   max_duration_s: 30
 vision_pick_and_drop:
-  output_dir: /opt/phanthy-motus/data/pick_place/realman
+  output_dir: /tmp/phanthy-motus/pick_place/realman
 safety:
   max_speed_percent: 10
   default_speed_percent: 5
