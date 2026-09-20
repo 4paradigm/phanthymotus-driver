@@ -339,3 +339,69 @@ def test_a_map_built_scenario_reports_the_maps_own_waypoints(tmp_path):
     loaded = card.switch_map("site-c")
 
     assert loaded.get("waypoints") == ["门口"]
+
+
+# ── 世界锁不能活过它的持有者 ─────────────────────────────────────────────────
+
+def _scenario_card(tmp_path):
+    from simulator.generic.backend import LocalBackend
+    from simulator.generic.cards_scenario import SimScenarioCard
+    from simulator.generic.clock import FakeClock
+    from simulator.generic.world import VirtualWorld
+
+    external = tmp_path / "maps"
+    external.mkdir()
+    _tiny_map(external / "site-a.json", "site-a")
+    _tiny_map(external / "site-b.json", "site-b")
+    world = VirtualWorld(LocalBackend(), FakeClock(), {})
+    return SimScenarioCard(world, {}, "sim", map_dirs=[external])
+
+
+def test_a_running_benchmark_still_keeps_others_out(tmp_path):
+    """这把锁存在的理由没变：被测的 agent 能调到 `reset`，也就是能重置正在测它的
+    那次测量，而且重置之后什么痕迹都不剩。"""
+    card = _scenario_card(tmp_path)
+    card.do_reset(map="site-a", owner="benchmark")
+
+    refused = card.switch_map("site-b")
+
+    assert "error" in refused and refused["owner"] == "benchmark"
+
+
+def test_an_abandoned_lock_expires_instead_of_bricking_the_world(tmp_path, monkeypatch):
+    """**锁不能活过它的持有者。**
+
+    原先唯一的释放路径是带着对的 owner 显式 abort —— agent-core 重启、跑动被杀、
+    容器被重建，任何一种都让世界永久锁死。而症状不是一条报错：agent 读到「地图加载
+    不了」，很合理地告诉访客展厅在维护，然后 finish()。Orin6 上真发生过，每条日志
+    都正常。
+    """
+    import simulator.generic.cards_scenario as mod
+
+    card = _scenario_card(tmp_path)
+    card.do_reset(map="site-a", owner="benchmark")
+    # 持有者走了：没有人再续租。
+    monkeypatch.setattr(mod.time, "time", lambda: card._owner_seen + mod.OWNER_TTL + 1)
+
+    loaded = card.switch_map("site-b")
+
+    assert "error" not in loaded, loaded
+    assert card.active_map == "site-b"
+
+
+def test_polling_the_report_renews_the_lock(tmp_path, monkeypatch):
+    """跑动每两秒问一次事实，那一下就是心跳 —— 否则一次超过 TTL 的长跑会被自己的锁
+    过期，而它明明还在跑。"""
+    import simulator.generic.cards_scenario as mod
+    from simulator.generic.cards_scenario import SimReportCard
+
+    card = _scenario_card(tmp_path)
+    card.do_reset(map="site-a", owner="benchmark")
+    report = SimReportCard(card.world, {}, "sim", scenario_card=card)
+
+    later = card._owner_seen + mod.OWNER_TTL - 1
+    monkeypatch.setattr(mod.time, "time", lambda: later)
+    report.report()                                   # 续租
+    monkeypatch.setattr(mod.time, "time", lambda: later + mod.OWNER_TTL - 1)
+
+    assert "error" in card.switch_map("site-b")       # 还在跑，仍然拒绝
