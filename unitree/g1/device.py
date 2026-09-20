@@ -1356,10 +1356,7 @@ class LocoStatePlugin:
         return self._node
 
     def start(self) -> None:
-        with self._lifecycle_lock:
-            if self._node is None:
-                self._node = _LidarNode(self._cloud_topic)
-                self._executor.add_node(self._node)
+        pass  # State subscriptions are always active, created in __init__.
 
     def stop(self) -> None:
         pass
@@ -2673,7 +2670,10 @@ class LidarPlugin:
         }
 
     def start(self) -> None:
-        pass  # DDS subscription starts in __init__
+        with self._lifecycle_lock:
+            if self._node is None:
+                self._node = _LidarNode(self._cloud_topic)
+                self._executor.add_node(self._node)
 
     def stop(self) -> None:
         with self._lifecycle_lock:

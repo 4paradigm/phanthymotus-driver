@@ -47,3 +47,17 @@ service 检查和差异检查。真实 ROS/设备行为留待获授权后的现�
 - 验证等级：本地 unit/contract，包含真实 spawn 进程门控及真实发布函数的模拟
   ROS/设备端点测试；没有运行实际 ROS 网络、RealSense、MID360 或 ARM64 镜像。
   上述为实现阶段验证记录，不代表已部署或真机验收，消费端改动由其他同事负责。
+
+## 部署后启动回归修复（2026-09-20）
+
+- 北京 G1 切换到 `23c71af` 后，只读验活发现 `LocoStatePlugin.start()`
+  误用了 LiDAR 节点重建逻辑，访问未定义的 `_lifecycle_lock` 导致启动报错。
+- 将重建逻辑恢复到 `LidarPlugin.start()`，同时修复 LiDAR 全局停止后无法
+  重建节点的问题；`loco_state` 恢复构造时订阅、start/stop 不关闭常驻状态流的
+  原有契约。不改 topic、schema、运动授权或消费者。
+- 两项新增回归测试先复现 AttributeError 和节点未重建，再验证修复；全量
+  G1 unittest 270 项通过，service 检查 1 checked / 0 failed，差异检查通过。
+- README 中的独立输出启停及旧接口兼容说明仍适用，无需修改接口或操作文档。
+- 本次修复完成本地代码与模拟端点验证后，用户授权提交推送及北京 G1 部署准备；
+  构建新镜像后，非 Shadow Driver 由用户执行容器切换，再只读验活。
+  此前 `23c71af` 镜像切换不能视为本次修复验收。

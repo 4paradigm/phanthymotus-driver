@@ -305,7 +305,43 @@ class CameraLifecycleTests(unittest.TestCase):
         self.assertIsNone(plugin._gates["capture"].token())
 
 
+class LocoStateLifecycleTests(unittest.TestCase):
+    def test_constructor_then_repeated_start_keeps_state_subscription(self):
+        node_factory = mock.Mock()
+        executor = mock.Mock()
+        cls = device_class("LocoStatePlugin", _LocoStateNode=node_factory)
+        plugin = cls({}, "ubuntu", executor)
+        plugin.start()
+        plugin.start()
+        plugin.stop()
+        plugin.start()
+        node_factory.assert_called_once_with(
+            "/ubuntu/loco/state", "/ubuntu/loco/motion_state")
+        executor.add_node.assert_called_once_with(node_factory.return_value)
+        self.assertIs(plugin.node, node_factory.return_value)
+        self.assertEqual(plugin.dispatch("info", {})["state"], "running")
+
+
 class LidarLifecycleTests(unittest.TestCase):
+    def test_global_stop_then_start_recreates_node_once(self):
+        node_factory = mock.Mock(side_effect=lambda topic: mock.Mock())
+        executor = mock.Mock()
+        cls = device_class("LidarPlugin", _LidarNode=node_factory)
+        plugin = cls({}, "ubuntu", executor)
+        original = plugin._node
+        plugin.start()
+        self.assertEqual(node_factory.call_count, 1)
+        plugin.stop()
+        plugin.stop()
+        original.close.assert_called_once_with()
+        original.destroy_node.assert_called_once_with()
+        executor.remove_node.assert_called_once_with(original)
+        plugin.start()
+        plugin.start()
+        self.assertEqual(node_factory.call_count, 2)
+        self.assertIsNot(plugin._node, original)
+        self.assertEqual(executor.add_node.call_count, 2)
+
     def test_real_imu_worker_keeps_publishing_with_cloud_disabled(self):
         from test_navigation_sensor_card import NavigationSensorCardContractTest
         module = NavigationSensorCardContractTest.load_bridge_module()
