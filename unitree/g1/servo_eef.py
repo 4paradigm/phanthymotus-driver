@@ -8,7 +8,7 @@
 ## 动作空间：19 维
 
       0..6    左末端  [x, y, z, qx, qy, qz, qw]   米 + 单位四元数（xyzw）
-      7       左夹爪  0 = 张开 .. 1 = 闭合
+      7       左夹爪  Dex1 的关节值，**不是 0..1 的归一化闭合度**（见下）
       8..14   右末端  同上
       15      右夹爪
      16..18   腰      [roll, pitch, yaw] 弧度
@@ -17,6 +17,23 @@
 checkpoint 原生吐 23 维 `EE_R6_G1`，由 `phanthymotus-cloud` 的
 `runtimes/common/normalize.py` 抹平 —— 那边的模块文档里记着真实的 23 维排法，
 以及它和上游枚举注释不一致的地方（两个夹爪都在尾部，而且**右在前**）。
+
+## 夹爪的单位是 0..4.5，不是 0..1 —— 而 `servo` 那张卡说的是 0..1
+
+这一条是拿 checkpoint 自带的 `dataset_statistics.json` 核出来的，不是推的：
+`g1_stack_block` 的 23 维统计量里，第 18、19 维的范围是 **[0.019, 4.5]**，而其余
+21 维全部落在 ±1 以内。那两维就是夹爪（布局见云端 `normalize.py`），4.5 是 Dex1
+的行程，不是归一化闭合度。
+
+**所以限位不能写 0..1。** 写了的话 sink 会把每一条指令都拒掉 —— 响亮，但整条管线
+跑不起来，而报错说的是「夹爪超限」，指向模型而不是这份声明。
+
+**一个没有解决的矛盾，留在这里而不是挑一个答案：** 同一对物理夹爪，`servo.py`
+（接 UnifoLM-WMA-0）声明的是 0..1 归一化，这张卡（接 UnifoLM-VLA-0）按统计量是
+0..4.5。两个 checkpoint 对同一个执行器的单位约定不同，而两张卡都把收到的数直接
+写进 `Dex1MotorCmd.q`。**只有一个能是对的**，而哪个对要真机上看一次夹爪的实际
+开合才知道。云端的规范化层对夹爪是原样透传的，也应当如此：把它归一化到 0..1 需要
+知道这只夹爪的完整行程，而那是机器人的知识，不是模型的。
 
 ## 腰：声明满 3 维，不可动的轴用限位卡死
 
@@ -111,7 +128,9 @@ WORKSPACE = ((-0.6, 0.9), (-0.9, 0.9), (-0.6, 1.0))
 # 见 common/control/sink.py 的 `_clamp_step`）。
 MAX_LINEAR_VELOCITY = 0.5        # m/s
 MAX_ANGULAR_VELOCITY = 2.0       # rad/s
-GRIPPER_MAX_VELOCITY = 2.0
+# Dex1 的行程，取自 checkpoint 统计量里第 18/19 维的 max（见模块文档）。
+GRIPPER_RANGE = (0.0, 4.5)
+GRIPPER_MAX_VELOCITY = 6.0       # 单位同上，不是 0..1/s
 WAIST_MAX_VELOCITY = 1.0
 
 # 残差阈值。比收敛判据松一档：收敛判据是求解器停下来的条件，这是「停下来的地方
@@ -165,11 +184,14 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ,
                        "mode": "eef_pose"})
         offset += 7
         if grippers:
-            lower.append(0.0)
-            upper.append(1.0)
+            lower.append(GRIPPER_RANGE[0])
+            upper.append(GRIPPER_RANGE[1])
             max_velocity.append(GRIPPER_MAX_VELOCITY)
             groups.append({"name": f"gripper_{side}", "offset": offset, "count": 1,
-                           "unit": "normalized", "resource": f"gripper_{side}",
+                           # `dex1` 而不是 `normalized`：这个数不是 0..1，写
+                           # normalized 会让读描述符的人（和下一张照抄的卡片）
+                           # 以为它是。见模块文档。
+                           "unit": "dex1", "resource": f"gripper_{side}",
                            "mode": "joint_position"})
             offset += 1
 
@@ -189,7 +211,8 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ,
         "dof": len(joint_names),
         "joint_names": joint_names,
         "units": ({"length": "m", "rotation": "quat_xyzw", "angle": "rad",
-                   "normalized": "0-1", "time": "s"} if grippers else
+                   "dex1": f"{GRIPPER_RANGE[0]:g}-{GRIPPER_RANGE[1]:g}",
+                   "time": "s"} if grippers else
                   {"length": "m", "rotation": "quat_xyzw", "angle": "rad",
                    "time": "s"}),
         "limits": {
@@ -656,6 +679,11 @@ class G1ServoEefPlugin:
             # 两者是两回事：前者的宽度和含义由机器人决定，后者由协议定义。
             "values": list(measured["left"]) + list(measured["right"]) + list(waist),
             # 和这张卡片声明的布局同构：不带夹爪时那两格也不在。
+            #
+            # 夹爪那两格是 0.0 占位：这个驱动不订 Dex1 的状态话题，所以报不出
+            # 实测开合度。它只服务于增量模型的位姿基准，而没有哪个增量模型的
+            # delta 是叠在夹爪上的（夹爪那一维本来就是绝对的）。真要报实测值，
+            # 得先订上 Dex1 的 state —— 那是另一件事。
             "eef": ([*poses["left"]]
                     + ([0.0] if self._grippers_enabled else [])
                     + [*poses["right"]]

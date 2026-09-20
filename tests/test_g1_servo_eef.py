@@ -108,6 +108,28 @@ def test_disabling_grippers_shifts_every_index_and_the_card_follows():
     assert card._layout["left_gripper"] is None
 
 
+def test_the_gripper_range_matches_the_checkpoint_and_is_not_0_to_1():
+    """UnifoLM-VLA 的 G1 checkpoint 输出的夹爪值是 **0..4.5**，不是归一化闭合度。
+
+    来源是 checkpoint 自带的 `dataset_statistics.json`：`g1_stack_block` 那 23 维
+    统计量里第 18/19 维的范围是 [0.019, 4.5]，而其余 21 维全部落在 ±1 以内。
+    kai 上的真模型跑一次也印证了（那两维 2.67..4.47，其余都很小）。
+
+    声明成 0..1 的后果不是静默的，但整条管线跑不起来：sink 会把每一条指令都拒掉，
+    而报错说的是「夹爪超限」，指向模型而不是这份声明。
+
+    `servo.py`（接 WMA checkpoint）对**同一对物理夹爪**声明的是 0..1，两者只有一个
+    能是对的 —— 那要真机上看一次开合才知道，见模块文档。这条测试钉的是这张卡与它
+    自己那个 checkpoint 一致。
+    """
+    parsed = parse_descriptor(servo_eef.build_descriptor())
+    for gripper in (7, 15):
+        assert (parsed.lower[gripper], parsed.upper[gripper]) == (0.0, 4.5)
+    # 单位名也不能写 normalized —— 下一个照抄这张卡的人会以为它是 0..1。
+    assert "normalized" not in parsed.units
+    assert parsed.units["dex1"] == "0-4.5"
+
+
 def test_an_out_of_range_rate_is_refused():
     with pytest.raises(ValueError, match="expected_hz"):
         servo_eef.G1ServoEefPlugin({"expected_hz": 500}, "g1", executor=None)
