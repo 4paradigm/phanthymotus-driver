@@ -101,18 +101,18 @@ class TransferTests(unittest.TestCase):
         self.after_command(method, args)
 
     def transfer(self, **updates):
-        return fixtures.wait_for_completion(self.plugin, self.plugin.dispatch("transfer_to", {
+        return fixtures.wait_for_completion(self.plugin, self.plugin.dispatch("grab_to", {
             "confirm_motion": True, "start_point_x": -.5, "start_point_y": -1/3, "target_point_x": .5, "target_point_y": 1/3, **updates}))
 
-    def transfer_by(self, **updates):
-        return fixtures.wait_for_completion(self.plugin, self.plugin.dispatch("transfer_by", {
+    def grab_by(self, **updates):
+        return fixtures.wait_for_completion(self.plugin, self.plugin.dispatch("grab_by", {
             "confirm_motion": True, "start_point_x": -.5, "start_point_y": -1/3, "delta_x": -30, "delta_y": 0, **updates}))
 
     def moves(self):
         return [args[0] for method, args in self.commands if method == "rm_movel"]
 
     def test_optional_rotation_preserves_pick_place_positions_and_returns_to_observation(self):
-        for action in (self.transfer, self.transfer_by):
+        for action in (self.transfer, self.grab_by):
             for angle in (-180, -90, -30.5, 30.5, 90, 180):
                 with self.subTest(action=action.__name__, angle=angle):
                     self.commands.clear()
@@ -145,7 +145,7 @@ class TransferTests(unittest.TestCase):
                 self.pose[3:] = [math.atan2(matrix[2, 1], matrix[2, 2]),
                                  math.asin(-matrix[2, 0]), math.atan2(matrix[1, 0], matrix[0, 0])]
                 self.make_photo()
-                result = self.transfer_by(rotation_deg=angle)
+                result = self.grab_by(rotation_deg=angle)
                 self.assertEqual(result["state"], "completed", result)
                 moves = self.moves()
                 expected = rotation([0, 0, 0, math.pi, 0, 0]) @ rotation([0, 0, 0, 0, 0, math.radians(angle)])
@@ -153,17 +153,17 @@ class TransferTests(unittest.TestCase):
                 np.testing.assert_allclose(moves[3][:3], moves[2][:3])
 
     def test_in_place_rotation_and_default_no_rotation(self):
-        result = self.transfer_by(delta_x=0, delta_y=0, rotation_deg=45)
+        result = self.grab_by(delta_x=0, delta_y=0, rotation_deg=45)
         self.assertEqual(result["state"], "completed", result)
         np.testing.assert_allclose(result["result"]["pick_base_xy_mm"], result["result"]["place_base_xy_mm"])
         self.commands.clear()
-        result = self.transfer_by(rotation_deg=0)
+        result = self.grab_by(rotation_deg=0)
         self.assertEqual(result["state"], "completed", result)
         self.assertEqual(len(self.moves()), 6)
         self.assertFalse(result["result"]["rotation_completed"])
 
     def test_rotation_validation_rejects_bad_angles_before_consuming_photo(self):
-        for action in (self.transfer, self.transfer_by):
+        for action in (self.transfer, self.grab_by):
             for angle in (None, True, "45", float("nan"), float("inf"), -180.01, 180.01):
                 with self.subTest(action=action.__name__, angle=angle):
                     result = action(rotation_deg=angle)
@@ -267,7 +267,7 @@ class TransferTests(unittest.TestCase):
         self.assertIn(("rm_set_rm_plus_reg", (1220, 1, [15])), self.commands)
 
     def test_both_transfers_consume_old_photo_and_replace_it_after_observing(self):
-        for transfer in (self.transfer, self.transfer_by):
+        for transfer in (self.transfer, self.grab_by):
             with self.subTest(action=transfer.__name__):
                 self.make_photo()
                 photo = self.copy(self.photo)
@@ -287,7 +287,7 @@ class TransferTests(unittest.TestCase):
                 self.assertFalse(self.client.motion_lock.locked())
 
     def test_failed_first_command_consumes_photo_before_sdk_returns(self):
-        for transfer in (self.transfer, self.transfer_by):
+        for transfer in (self.transfer, self.grab_by):
             with self.subTest(action=transfer.__name__):
                 self.make_photo()
                 def fail(method, args):
@@ -303,17 +303,17 @@ class TransferTests(unittest.TestCase):
                 self.camera.snapshot.assert_not_called()
                 self.assertFalse(any(name == "rm_movej" for name, _ in self.commands))
                 count = len(self.commands)
-                for repeated in (self.transfer, self.transfer_by):
+                for repeated in (self.transfer, self.grab_by):
                     self.assertEqual(repeated()["code"], "OBSERVATION_REQUIRED")
                 self.assertEqual(len(self.commands), count)
                 self.assertFalse(self.client.motion_lock.locked())
 
-    def test_transfer_by_uses_pick_point_and_configured_millimetres(self):
+    def test_grab_by_uses_pick_point_and_configured_millimetres(self):
         self.assertTrue(self.plugin.dispatch("config", {"speed_percent": 37,
             "x_compensation_mm": 40, "y_compensation_mm": -60,
             "pick_grip_force": 35, "pick_descent_mm": 80, "place_descent_mm": 70})["ok"])
         self.make_photo()
-        result = self.transfer_by(start_point_x=.5, start_point_y=1/3, delta_x=-30.5, delta_y=20.25)
+        result = self.grab_by(start_point_x=.5, start_point_y=1/3, delta_x=-30.5, delta_y=20.25)
         self.assertEqual(result["state"], "completed", result)
         expected = [[.04, .165, .3], [.04, .165, .22], [.04, .165, .3],
                     [.0705, .18525, .3], [.0705, .18525, .23], [.0705, .18525, .3]]
@@ -333,67 +333,67 @@ class TransferTests(unittest.TestCase):
         self.camera.snapshot.assert_called_once()
         self.assertEqual(self.commands[-1][0], "rm_movej")
 
-    def test_transfer_by_signed_image_directions(self):
+    def test_grab_by_signed_image_directions(self):
         for dx, dy, base_delta in ((30, 0, [-30, 0]), (-30, 0, [30, 0]),
                                    (0, 25, [0, 25]), (0, -25, [0, -25]),
                                    (30, -25, [-30, -25])):
             with self.subTest(dx=dx, dy=dy):
                 self.make_photo()
-                result = self.transfer_by(delta_x=dx, delta_y=dy)
+                result = self.grab_by(delta_x=dx, delta_y=dy)
                 self.assertEqual(result["state"], "completed", result)
                 data = result["result"]
                 np.testing.assert_allclose(np.subtract(data["place_base_xy_mm"], data["pick_base_xy_mm"]), base_delta)
 
-    def test_transfer_by_needs_only_pick_depth_not_destination_pixels(self):
+    def test_grab_by_needs_only_pick_depth_not_destination_pixels(self):
         self.depth[:] = 0
         self.depth[1, 1] = 400
         self.make_photo()
-        result = self.transfer_by()
+        result = self.grab_by()
         self.assertEqual(result["state"], "completed", result)
         np.testing.assert_allclose(result["result"]["place_base_xy_mm"], [160, 125])
 
-    def test_transfer_by_rejects_invalid_displacement_and_pick_before_commands(self):
+    def test_grab_by_rejects_invalid_displacement_and_pick_before_commands(self):
         for args in ({"delta_x": None}, {"delta_y": None}, {"delta_x": True}, {"delta_y": "30"},
                      {"delta_x": float("nan")}, {"delta_y": float("inf")},
                      {"delta_x": 0, "delta_y": 0}, {"start_point_x": 1.0001}, {"start_point_y": -1.0001},
                      {"start_point_x": 691}, {"start_point_y": "0"}, {"start_point_x": True}, {"start_point_y": float("nan")}):
             with self.subTest(args=args):
-                self.assertEqual(self.transfer_by(**args)["state"], "error")
+                self.assertEqual(self.grab_by(**args)["state"], "error")
                 self.assertEqual(self.commands, [])
                 self.assertIsNotNone(self.plugin._observation)
-        self.assertEqual(self.plugin.dispatch("transfer_by", {"confirm_motion": True, "start_point_x": 0, "start_point_y": 0, "delta_x": 30})["state"], "error")
+        self.assertEqual(self.plugin.dispatch("grab_by", {"confirm_motion": True, "start_point_x": 0, "start_point_y": 0, "delta_x": 30})["state"], "error")
         self.depth[1, 1] = 0
         self.make_photo()
-        self.assertIn("no valid depth", self.transfer_by()["result"]["message"])
+        self.assertIn("no valid depth", self.grab_by()["result"]["message"])
         self.assertEqual(self.commands, [])
 
-    def test_transfer_by_keeps_base_direction_with_rotated_work_frame(self):
+    def test_grab_by_keeps_base_direction_with_rotated_work_frame(self):
         self.frame["pose"] = [.2, -.1, .05, .2, -.1, .3]
         work_rotation = rotation(self.frame["pose"])
         orientation = work_rotation.T @ rotation([0, 0, 0, math.pi, 0, 0])
         self.pose[3:] = [math.atan2(orientation[2, 1], orientation[2, 2]),
                          math.asin(-orientation[2, 0]), math.atan2(orientation[1, 0], orientation[0, 0])]
         self.make_photo()
-        result = self.transfer_by(delta_x=-30, delta_y=20)
+        result = self.grab_by(delta_x=-30, delta_y=20)
         self.assertEqual(result["state"], "completed", result)
         bases = np.array([work_rotation @ pose[:3] + self.frame["pose"][:3] for pose in self.moves()])
         np.testing.assert_allclose(bases[3] - bases[0], [.03, .02, 0], atol=1e-12)
         np.testing.assert_allclose(bases[:, 2] - bases[0, 2], [0, -.091, 0, 0, -.060, 0], atol=1e-12)
 
-    def test_transfer_by_uses_shared_cancellation_and_consumes_photo(self):
+    def test_grab_by_uses_shared_cancellation_and_consumes_photo(self):
         def cancel(method, args):
             if method == "rm_movel":
                 self.assertEqual(self.plugin.dispatch("config", {"speed_percent": 1})["code"], "ACTION_IN_PROGRESS")
                 self.assertEqual(self.transfer()["state"], "error")
                 self.plugin.dispatch("cancel", {})
         self.after_command = cancel
-        result = self.transfer_by()
+        result = self.grab_by()
         self.assertEqual(result["state"], "cancelled", result)
         self.assertEqual([name for name, _ in self.commands], ["rm_movel", "rm_set_arm_slow_stop"])
         self.assertFalse(self.client.motion_lock.locked())
         self.assertIsNone(self.plugin._observation)
         self.assertTrue(result["observation_required"])
-        for transfer in (self.transfer, self.transfer_by):
+        for transfer in (self.transfer, self.grab_by):
             self.assertEqual(transfer()["code"], "OBSERVATION_REQUIRED")
 
     def test_observe_then_transfer_refreshes_photo_without_other_card_implementations(self):
@@ -417,7 +417,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(first["state"], "completed", first)
         latest = first["result"]["observation"]
         x, y = latest["objects"][0]["position"]
-        second = self.transfer_by(start_point_x=x, start_point_y=y, delta_x=10, delta_y=0)
+        second = self.grab_by(start_point_x=x, start_point_y=y, delta_x=10, delta_y=0)
         self.assertEqual(second["state"], "completed", second)
         self.assertEqual(second["result"]["observation_id"], latest["observation_id"])
         self.assertNotEqual(second["result"]["observation"]["observation_id"], latest["observation_id"])
@@ -441,7 +441,7 @@ class TransferTests(unittest.TestCase):
         self.assertIsNone(self.plugin._observation)
         self.assertEqual([name for name, _ in self.commands][-2:], ["rm_movej", "rm_set_arm_slow_stop"])
         self.assertEqual(len(self.moves()), 6)
-        self.assertEqual(self.transfer_by()["code"], "OBSERVATION_REQUIRED")
+        self.assertEqual(self.grab_by()["code"], "OBSERVATION_REQUIRED")
 
     def test_return_uses_configured_observation_joints_and_cancel_does_not_capture(self):
         target = [-80., 1., 2., 85., 3., 80., 4.]
@@ -452,7 +452,7 @@ class TransferTests(unittest.TestCase):
                 self.assertEqual(args, (target, 23, 0, 0, 0))
                 self.plugin.dispatch("cancel", {})
         self.after_command = cancel_on_return
-        result = self.transfer_by()
+        result = self.grab_by()
         self.assertEqual(result["state"], "cancelled", result)
         self.assertTrue(result["result"]["transfer_completed"])
         self.assertTrue(result["observation_required"])
@@ -486,7 +486,7 @@ class TransferTests(unittest.TestCase):
             if method == "rm_movej":
                 self.now += 46
         self.after_command = expire_return
-        failed = self.transfer_by()
+        failed = self.grab_by()
         self.assertEqual(failed["state"], "error", failed)
         self.assertTrue(failed["result"]["transfer_completed"])
         self.assertTrue(failed["observation_required"])
@@ -495,7 +495,7 @@ class TransferTests(unittest.TestCase):
     def test_busy_and_config_changes_are_rejected_until_follow_up_observation_finishes(self):
         def snapshot(after, cancel, check):
             self.assertTrue(self.client.motion_lock.locked())
-            self.assertEqual(self.transfer_by()["state"], "error")
+            self.assertEqual(self.grab_by()["state"], "error")
             self.assertEqual(self.plugin.dispatch("config", {"speed_percent": 1})["code"], "ACTION_IN_PROGRESS")
             return self.snapshot(after, cancel, check)
         self.camera.snapshot.side_effect = snapshot
@@ -546,7 +546,7 @@ class TransferTests(unittest.TestCase):
                 self.make_photo()
                 self.edit_metadata(lambda data: data["intrinsics"].update(
                     fx=width, fy=height, ppx=width/2, ppy=height/2))
-                result = self.transfer_by(start_point_x=.08, start_point_y=-.079, delta_x=30, delta_y=0)
+                result = self.grab_by(start_point_x=.08, start_point_y=-.079, delta_x=30, delta_y=0)
                 self.assertEqual(result["state"], "completed", result)
                 data = result["result"]
                 self.assertEqual(data["pick_pixel"], pixel)
@@ -577,7 +577,7 @@ class TransferTests(unittest.TestCase):
                 np.testing.assert_allclose(np.subtract(data["place_base_xy_mm"], data["pick_base_xy_mm"]), delta, atol=1e-10)
 
     def test_missing_arguments_and_missing_observation_do_not_move(self):
-        self.assertEqual(self.plugin.dispatch("transfer_to", {"confirm_motion": True})["state"], "error")
+        self.assertEqual(self.plugin.dispatch("grab_to", {"confirm_motion": True})["state"], "error")
         self.plugin._observation = None
         self.assertIn("Run observe", self.transfer()["message"])
         self.assertEqual(self.commands, [])
@@ -772,7 +772,7 @@ class TransferTests(unittest.TestCase):
 
     def test_disabled_follow_up_returns_to_observation_without_camera(self):
         self.plugin.dispatch("config", {"observe_after_transfer": False})
-        for transfer in (self.transfer, self.transfer_by):
+        for transfer in (self.transfer, self.grab_by):
             with self.subTest(action=transfer.__name__):
                 self.make_photo()
                 self.commands.clear()
@@ -821,7 +821,7 @@ class TransferTests(unittest.TestCase):
                         else:
                             raise RuntimeError("return failed")
                 self.after_command = fail
-                result = self.transfer_by()
+                result = self.grab_by()
                 self.assertEqual(result["state"], "cancelled" if cancel else "error", result)
                 self.assertTrue(result["result"]["transfer_completed"])
                 self.assertFalse(result["result"]["return_completed"])
@@ -870,7 +870,7 @@ class TransferTests(unittest.TestCase):
                 remaining[0] -= 1
             return {"trajectory_type": 0, "data": planned}
         self.after_command, self.client.call_dict = disturb, trajectory
-        result = self.transfer_by()
+        result = self.grab_by()
         self.assertEqual(result["state"], "completed", result)
         self.assertEqual(len(self.moves()), 6)
         self.assertEqual([a[0][0] for m, a in self.commands if m == "rm_set_hand_follow_pos"], [1000, 0, 1000, 0])

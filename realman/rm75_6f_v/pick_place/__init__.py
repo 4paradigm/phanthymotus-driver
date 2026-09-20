@@ -23,7 +23,7 @@ from hardware import JOINT_LIMITS_DEG
 ACTION_TIMEOUT_SECONDS = 45
 TRANSFER_TIMEOUT_SECONDS = 120
 COMPLETION_TIMEOUT_SECONDS = 210
-MOTION_ACTIONS = ("observe", "transfer_to", "transfer_by")
+MOTION_ACTIONS = ("observe", "grab_to", "grab_by")
 
 
 CONFIG_PROPERTIES = {
@@ -137,15 +137,15 @@ class PickPlacePlugin:
                       for name, description in (
                           ("start_point_x", "抓取中心在最新观察照片中的归一化 X 坐标，范围 [-1,1]：左边缘 -1、中心 0、右边缘 +1，正方向向右。可直接使用该照片的 VOP position[0]，无需换算像素。"),
                           ("start_point_y", "抓取中心在最新观察照片中的归一化 Y 坐标，范围 [-1,1]：上边缘 -1、中心 0、下边缘 +1，正方向向下。可直接使用该照片的 VOP position[1]，无需换算像素。"),
-                          ("target_point_x", "transfer_to 放置位置在最新观察照片中的归一化 X 坐标，范围 [-1,1]：左边缘 -1、中心 0、右边缘 +1，正方向向右，与 start_point_x 相同。"),
-                          ("target_point_y", "transfer_to 放置位置在最新观察照片中的归一化 Y 坐标，范围 [-1,1]：上边缘 -1、中心 0、下边缘 +1，正方向向下，与 start_point_y 相同。"))}
+                          ("target_point_x", "grab_to 放置位置在最新观察照片中的归一化 X 坐标，范围 [-1,1]：左边缘 -1、中心 0、右边缘 +1，正方向向右，与 start_point_x 相同。"),
+                          ("target_point_y", "grab_to 放置位置在最新观察照片中的归一化 Y 坐标，范围 [-1,1]：上边缘 -1、中心 0、下边缘 +1，正方向向下，与 start_point_y 相同。"))}
         properties.update({
-            "delta_x": {"type": "number", "description": "transfer_by 从抓取点沿桌面左右平移的有符号距离（mm），可为小数。以最新观察照片为准：X 正方向向右（正值），负方向向左（负值），0 不左右移动；当前安装对应基坐标 ΔX=-delta_x。不是像素或绝对位置。"},
-            "delta_y": {"type": "number", "description": "transfer_by 从抓取点沿桌面上下平移的有符号距离（mm），可为小数。以最新观察照片为准：Y 正方向向照片下方（正值），负方向向上方（负值），0 不上下平移；当前安装对应基坐标 ΔY=delta_y。不是机械臂 Z 升降、像素或绝对位置。"},
+            "delta_x": {"type": "number", "description": "grab_by 从抓取点沿桌面左右平移的有符号距离（mm），可为小数。以最新观察照片为准：X 正方向向右（正值），负方向向左（负值），0 不左右移动；当前安装对应基坐标 ΔX=-delta_x。不是像素或绝对位置。"},
+            "delta_y": {"type": "number", "description": "grab_by 从抓取点沿桌面上下平移的有符号距离（mm），可为小数。以最新观察照片为准：Y 正方向向照片下方（正值），负方向向上方（负值），0 不上下平移；当前安装对应基坐标 ΔY=delta_y。不是机械臂 Z 升降、像素或绝对位置。"},
             "rotation_deg": {"type": "number", "minimum": -180, "maximum": 180, "default": 0,
                              "description": "可选夹爪自身 Rz 旋转角（°），范围 [-180,180]：俯视正值顺时针、负值逆时针。抓起并回升后旋转再搬运放下；常规搬运省略，仅在用户明确要求旋转时填写。0 不旋转。"},
             "confirm_motion": {"type": "boolean", "const": True,
-                               "description": "每次 observe、transfer_to、transfer_by 请求必须显式为 true，确认执行本次机械臂动作；取消无需此参数。"},
+                               "description": "每次 observe、grab_to、grab_by 请求必须显式为 true，确认执行本次机械臂动作；取消无需此参数。"},
         })
         schema = action_schema({
             "observe": (["confirm_motion"], (
@@ -159,13 +159,13 @@ class PickPlacePlugin:
                 "卡片完成内参匹配、深度对齐和静止窗口同步；短暂画面变化会重新等待稳定及新的检测结果。"
                 "照片仅供一次搬运。搬运后是否自动生成新观察由配置 observe_after_transfer 决定，以完成结果 observation_required 为准。"
                 "此前动作若返回 recovery_required=true，先人工处理持物或停止状态，不以重新观察代替恢复。")),
-            "transfer_to": (["start_point_x", "start_point_y", "target_point_x", "target_point_y", "rotation_deg", "confirm_motion"], (
+            "grab_to": (["start_point_x", "start_point_y", "target_point_x", "target_point_y", "rotation_deg", "confirm_motion"], (
                 "指定目标点：用于把物体放到照片中的指定位置，或另一物体旁的空位。"
                 "(start_point_x,start_point_y) 是抓取物体中心，(target_point_x,target_point_y) 是放置点，四个值均为同一张最新观察照片的归一化坐标 [-1,1]。"
                 "照片中心为 (0,0)，X 向右、Y 向下为正；VOP position[0] 对应 X、position[1] 对应 Y，"
                 "无需换算像素或读取照片文件。放在另一物体旁边时选择其旁的空位，不能把参照物中心直接当作空位；"
-                "指定毫米距离的相对移动使用 transfer_by。" + transfer_guidance)),
-            "transfer_by": (["start_point_x", "start_point_y", "delta_x", "delta_y", "rotation_deg", "confirm_motion"], (
+                "指定毫米距离的相对移动使用 grab_by。" + transfer_guidance)),
+            "grab_by": (["start_point_x", "start_point_y", "delta_x", "delta_y", "rotation_deg", "confirm_motion"], (
                 "指定距离（mm）：用于把一个物体向左、右、照片上方或下方移动指定距离。"
                 "(start_point_x,start_point_y) 为最新观察照片中物体中心的归一化坐标 [-1,1]，照片中心为 (0,0)，"
                 "直接使用 VOP position[0]、position[1]，无需换算像素或读取照片文件。"
@@ -173,7 +173,7 @@ class PickPlacePlugin:
                 "方向以照片为准：X 正方向向右、Y 正方向向下，负值反向；上/下也是桌面平移，不是 Z 升降。"
                 "向右 30 mm：delta_x=30、delta_y=0；向左 30 mm：delta_x=-30、delta_y=0；"
                 "向照片上方 20 mm：delta_x=0、delta_y=-20；向下 20 mm：delta_x=0、delta_y=20。"
-                "放到照片中指定位置使用 transfer_to。" + transfer_guidance)),
+                "放到照片中指定位置使用 grab_to。" + transfer_guidance)),
             "cancel": ([], "中止当前动作，无需 confirm_motion。停止后不继续抓放、回程或观察，不自动松爪；若已抓取，物体可能仍在夹爪中。等待 ACP 终态并检查 holding_object_possible、release_completed、recovery_required，先安全处理再开始新任务。"),
         }, properties)
         # Require confirmation only for motion, leaving interrupt hooks callable.
@@ -185,8 +185,8 @@ class PickPlacePlugin:
         schema["x-is-dangerous"] = True
         schema["x-resource"] = "arm"
         definition = tool("vision_pick_and_drop", "actuator", (
-            "观察和搬运桌面物体。先 observe 获取一张照片对应的物品列表；按照片中的目标位置放置用 transfer_to，"
-            "按方向移动指定毫米距离用 transfer_by。位置采用中心归一化坐标 [-1,1]，可直接使用本卡片返回的 VOP position："
+            "观察和搬运桌面物体。先 observe 获取一张照片对应的物品列表；按照片中的目标位置放置用 grab_to，"
+            "按方向移动指定毫米距离用 grab_by。位置采用中心归一化坐标 [-1,1]，可直接使用本卡片返回的 VOP position："
             "X 向右、Y 向下为正；位移参数单独使用 mm，上下也指桌面方向。"
             "常规搬运不设置 rotation_deg；仅用户明确要求时，抓起回升后绕夹爪 Rz 旋转，正值俯视顺时针、负值逆时针。"
             "每次运动传 confirm_motion=true，收到 action_id 后等待框架 ACP 终态，无需补发消息或重复调用。"
@@ -294,7 +294,7 @@ class PickPlacePlugin:
                           "action_id": f"vision_pick_and_drop_{action}_{uuid4().hex}", "action": action}
                 if action != "observe":
                     active["rotation_deg"] = rotation_degrees(args)
-                    if action == "transfer_by":
+                    if action == "grab_by":
                         active["positions"] = positions(args, ("start_point_x", "start_point_y"))
                         active["displacement_mm"] = displacement(args, active["rotation_deg"])
                     else:

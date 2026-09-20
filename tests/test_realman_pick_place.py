@@ -49,12 +49,12 @@ class PickPlaceConfigTests(unittest.TestCase):
     def test_motion_actions_declare_confirmation_and_acp_completion(self):
         card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "vision_pick_and_drop")
         schema = card["inputSchema"]
-        self.assertEqual(set(schema["properties"]["action"]["enum"]), {"observe", "transfer_to", "transfer_by", "cancel"})
+        self.assertEqual(set(schema["properties"]["action"]["enum"]), {"observe", "grab_to", "grab_by", "cancel"})
         self.assertEqual(set(schema["properties"]), {"action", "start_point_x", "start_point_y", "target_point_x", "target_point_y", "delta_x", "delta_y", "rotation_deg", "confirm_motion"})
         self.assertEqual(schema["x-action-params"]["observe"]["params"], ["confirm_motion"])
-        self.assertEqual(schema["x-action-params"]["transfer_to"]["params"], ["start_point_x", "start_point_y", "target_point_x", "target_point_y", "rotation_deg", "confirm_motion"])
-        self.assertEqual(schema["x-action-params"]["transfer_by"]["params"], ["start_point_x", "start_point_y", "delta_x", "delta_y", "rotation_deg", "confirm_motion"])
-        for action in ("transfer_to", "transfer_by"):
+        self.assertEqual(schema["x-action-params"]["grab_to"]["params"], ["start_point_x", "start_point_y", "target_point_x", "target_point_y", "rotation_deg", "confirm_motion"])
+        self.assertEqual(schema["x-action-params"]["grab_by"]["params"], ["start_point_x", "start_point_y", "delta_x", "delta_y", "rotation_deg", "confirm_motion"])
+        for action in ("grab_to", "grab_by"):
             params = schema["x-action-params"][action]["params"]
             self.assertEqual([name for name in schema["properties"] if name in params], params)
             self.assertEqual(params[-2:], ["rotation_deg", "confirm_motion"])
@@ -72,12 +72,12 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertIn("X 正方向向右（正值），负方向向左（负值）", schema["properties"]["delta_x"]["description"])
         self.assertIn("Y 正方向向照片下方（正值），负方向向上方（负值）", schema["properties"]["delta_y"]["description"])
         self.assertEqual(schema["required"], ["action"])
-        self.assertEqual(schema["x-completion"], {"actions": ["observe", "transfer_to", "transfer_by"], "timeout": 210})
+        self.assertEqual(schema["x-completion"], {"actions": ["observe", "grab_to", "grab_by"], "timeout": 210})
         self.assertEqual(schema["properties"]["confirm_motion"]["type"], "boolean")
         self.assertIs(schema["properties"]["confirm_motion"]["const"], True)
         self.assertEqual(schema["allOf"][0]["then"]["required"], ["confirm_motion"])
         self.assertEqual(schema["allOf"][0]["if"]["properties"]["action"]["enum"],
-                         ["observe", "transfer_to", "transfer_by"])
+                         ["observe", "grab_to", "grab_by"])
         self.assertEqual(schema["x-action-params"]["cancel"]["params"], [])
         self.assertTrue(schema["x-is-dangerous"])
         self.assertEqual(schema["x-resource"], "arm")
@@ -91,7 +91,7 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["rotation_deg"]["minimum"], -180)
         self.assertEqual(schema["properties"]["rotation_deg"]["maximum"], 180)
         self.assertNotIn("rotation_deg", schema["required"])
-        for name in ("transfer_to", "transfer_by"):
+        for name in ("grab_to", "grab_by"):
             desc = schema["x-action-params"][name]["description"]
             for text in ("常规搬运省略", "用户明确要求", "俯视顺时针", "逆时针", "rotation_deg"):
                 self.assertIn(text, desc)
@@ -102,7 +102,7 @@ class PickPlaceConfigTests(unittest.TestCase):
         card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "vision_pick_and_drop")
         actions = card["inputSchema"]["x-action-params"]
         self.assertIn("result.objects", actions["observe"]["description"])
-        for name in ("transfer_to", "transfer_by"):
+        for name in ("grab_to", "grab_by"):
             description = actions[name]["description"]
             for requirement in ("observe", "captured_at", "position[0]", "position[1]",
                                 "每张照片仅供一次搬运", "observation_required=true", "不自动重试", "observe_after_transfer", "observation.skipped=true",
@@ -137,7 +137,7 @@ class PickPlaceConfigTests(unittest.TestCase):
                                       observation_joints_deg="178,130,178,135,178,128,360")["ok"])
         self.assertTrue(self.configure(speed_percent=1, pick_grip_force=100,
                                       observation_joints_deg="-178,-130,-178,-135,-178,-128,-360")["ok"])
-        for action in ("observe", "transfer_to", "transfer_by"):
+        for action in ("observe", "grab_to", "grab_by"):
             self.assertEqual(self.bundle.dispatch("vision_pick_and_drop", {"action": action})["state"], "error")
 
 
@@ -153,7 +153,7 @@ result = unittest.TextTestRunner().run(unittest.TestSuite([
     ObserveTests("test_call_returns_after_one_move_and_one_photo"),
     ObserveTests("test_activation_and_info_do_not_capture_or_move"),
     __import__("test_realman_pick_place_transfer").TransferTests("test_complete_transfer_uses_configured_absolute_targets"),
-    __import__("test_realman_pick_place_transfer").TransferTests("test_transfer_by_uses_pick_point_and_configured_millimetres"),
+    __import__("test_realman_pick_place_transfer").TransferTests("test_grab_by_uses_pick_point_and_configured_millimetres"),
 ]))
 sys.exit(not result.wasSuccessful())
 '''
@@ -299,7 +299,7 @@ class ObserveTests(unittest.TestCase):
         count = len(self.commands)
         self.camera.identity.return_value = {**self.camera.identity(), "session_id": "new-session"}
         self.assertTrue(self.plugin.dispatch("info", {})["observation_required"])
-        result = self.plugin.dispatch("transfer_by", {
+        result = self.plugin.dispatch("grab_by", {
             "confirm_motion": True, "start_point_x": 0, "start_point_y": 0, "delta_x": 10, "delta_y": 0})
         self.assertEqual(result["code"], "OBSERVATION_REQUIRED")
         self.assertEqual(len(self.commands), count)
