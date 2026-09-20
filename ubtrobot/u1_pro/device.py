@@ -8,8 +8,10 @@ management call. The robot's public ROS graph provides useful contracts:
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import ssl
+import struct
 import threading
 import time
 import urllib.request
@@ -23,6 +25,10 @@ SERVICE_TIMEOUT = 3.0
 MIC_TOPIC = "/audio/sense/audio_data_to_asr"
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
+VIDEO_METADATA_TOPIC = "/robo/video/subscribe/metadata"
+VIDEO_OPEN = "/robo/video/call/open_stream"
+VIDEO_STATE = "/robo/video/call/stream_state"
+VIDEO_CLOSE = "/robo/video/call/close_stream"
 
 # The U1 Pro SDK document declares all five event topics as
 # std_msgs/msg/String.  Their String.data value is a JSON envelope.  Keep
@@ -81,6 +87,145 @@ def _bounded_playback(data: dict) -> dict:
     return result
 
 
+def _unwrap_result(value: Any) -> dict:
+    """Return the JSON object carried by a Trigger/StringCall response."""
+    if isinstance(value, dict):
+        result = value
+    else:
+        result = _decode_vendor_result(value)
+    for _ in range(4):
+        if not isinstance(result, dict):
+            return {}
+        nested = result.get("data", result.get("result"))
+        if isinstance(nested, str):
+            try:
+                nested = json.loads(nested)
+            except json.JSONDecodeError:
+                return result
+        if not isinstance(nested, dict):
+            return result
+        result = nested
+    return result
+
+
+def _stream_config(*values: Any) -> dict:
+    """Find the documented shared-memory fields in nested service results."""
+    keys = {"stream", "state", "path", "frame_payload_size", "max_frames"}
+    merged = {}
+    def visit(value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return
+        if isinstance(value, dict):
+            merged.update({key: value[key] for key in keys if key in value})
+            for child in value.values():
+                visit(child)
+    for value in values:
+        visit(value)
+    return merged
+
+
+def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
+    """Convert one SDK raw frame to JPEG using only documented metadata."""
+    if payload.startswith(b"\xff\xd8\xff"):
+        return payload
+    from PIL import Image
+
+    width = int(metadata.get("width", 0))
+    height = int(metadata.get("height", 0))
+    step = int(metadata.get("step", 0))
+    encoding = str(metadata.get("encoding", "")).lower().replace("-", "_")
+    if width <= 0 or height <= 0:
+        raise ValueError("video metadata must contain positive width and height")
+    if encoding in {"rgb8", "8uc3"}:
+        mode, rawmode, channels = "RGB", "RGB", 3
+    elif encoding == "bgr8":
+        mode, rawmode, channels = "RGB", "BGR", 3
+    elif encoding == "rgba8":
+        mode, rawmode, channels = "RGBA", "RGBA", 4
+    elif encoding == "bgra8":
+        mode, rawmode, channels = "RGBA", "BGRA", 4
+    elif encoding in {"mono8", "8uc1"}:
+        mode, rawmode, channels = "L", "L", 1
+    else:
+        raise ValueError(f"unsupported U1 Pro video encoding: {encoding!r}")
+    row_bytes = width * channels
+    step = step or row_bytes
+    if step < row_bytes or len(payload) < step * height:
+        raise ValueError("U1 Pro video frame payload is smaller than metadata dimensions")
+    # Strip row padding before handing the data to Pillow. The SDK payload is
+    # a bounded raw frame, not a ROS Image message, so step is significant.
+    packed = b"".join(payload[row * step:row * step + row_bytes] for row in range(height))
+    image = Image.frombytes(mode, (width, height), packed, "raw", rawmode)
+    if mode == "RGBA":
+        image = image.convert("RGB")
+    import io
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=85, optimize=False)
+    return output.getvalue()
+
+
+class VideoSharedMemoryReader:
+    """Read the U1 SDK's fixed-slot video ring described in PDF section 4.5."""
+
+    _HEADER = struct.Struct("<QQQ")  # sequence, timestamp_ns, payload_size
+
+    def __init__(self, config: dict, metadata_getter, frame_callback):
+        self.config = dict(config)
+        self.metadata_getter = metadata_getter
+        self.frame_callback = frame_callback
+        self._stop = threading.Event()
+        self._thread = None
+        self._last_sequence = -1
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="u1-video-reader", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._thread = None
+
+    def _run(self):
+        path = str(self.config.get("path", ""))
+        payload_size = int(self.config.get("frame_payload_size", 0))
+        max_frames = int(self.config.get("max_frames", 0))
+        if not path or payload_size <= 0 or max_frames <= 0:
+            print("[U1 camera] invalid shared-memory video configuration", flush=True)
+            return
+        slot_size = self._HEADER.size + payload_size
+        try:
+            with open(path, "rb") as handle:
+                with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as shared:
+                    if len(shared) < slot_size * max_frames:
+                        raise ValueError("video shared-memory file is smaller than configured ring")
+                    while not self._stop.is_set():
+                        newest = None
+                        for index in range(max_frames):
+                            offset = index * slot_size
+                            sequence, timestamp_ns, size = self._HEADER.unpack_from(shared, offset)
+                            if sequence <= self._last_sequence or size <= 0 or size > payload_size:
+                                continue
+                            if newest is None or sequence > newest[0]:
+                                newest = (sequence, timestamp_ns, bytes(shared[offset + self._HEADER.size:offset + self._HEADER.size + size]))
+                        if newest is not None:
+                            self._last_sequence = newest[0]
+                            self.frame_callback(newest[2], self.metadata_getter(), newest[1])
+                        else:
+                            self._stop.wait(0.005)
+        except FileNotFoundError:
+            print(f"[U1 camera] shared-memory path does not exist: {path}", flush=True)
+        except Exception as exc:
+            print(f"[U1 camera] shared-memory reader stopped: {exc}", flush=True)
+
+
 def _acp_notify(action_id: str | None, status: str, result: dict, tool_name: str = "audio") -> None:
     if not action_id:
         return
@@ -125,6 +270,7 @@ class U1Nodes:
         from audio_msgs.srv import EnableAudioIn, SetAudioVolume
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
+        from sensor_msgs.msg import CompressedImage
 
         self.robot = Node("u1_pro_driver", context=ros.ctx_robot)
         self.core = Node("u1_pro_bridge", namespace=namespace, context=ros.ctx_core)
@@ -139,6 +285,7 @@ class U1Nodes:
         self.AudioChunk = AudioChunk
         self.AudioOutData = AudioOutData
         self.String = String
+        self.CompressedImage = CompressedImage
         self._speaker_publisher = self.robot.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
         self._speaker_subscription = None
         self._speaker_forwarding = False
@@ -151,11 +298,14 @@ class U1Nodes:
         self._event_forwarding = {}
         self._mic_forwarding = False
         self._playback_listeners = []
+        self._video_metadata = {}
+        self._video_metadata_lock = threading.Lock()
         self._robot_subscriptions = []
         for name, topic in EVENT_TOPICS.items():
             output_topic = f"/{namespace}/u1_pro/{name}"
             self._event_publishers[name] = self.core.create_publisher(String, output_topic, reliable)
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
+        self._robot_subscriptions.append(self.robot.create_subscription(String, VIDEO_METADATA_TOPIC, self._metadata_callback, reliable))
         self._robot_subscriptions.append(self.robot.create_subscription(AudioInData, MIC_TOPIC, self._mic_callback, best_effort))
 
         self._clients = {
@@ -168,6 +318,9 @@ class U1Nodes:
             "authorize": self.robot.create_client(StringCall, "/robo/auth/call/authorize"),
             "auth_state": self.robot.create_client(Trigger, "/robo/auth/call/auth_state"),
             "wakeup_enabled": self.robot.create_client(StringCall, "/robo/system/call/set_wakeup_enabled"),
+            "video_open": self.robot.create_client(Trigger, VIDEO_OPEN),
+            "video_state": self.robot.create_client(Trigger, VIDEO_STATE),
+            "video_close": self.robot.create_client(Trigger, VIDEO_CLOSE),
         }
 
     def initialize_robot(self) -> None:
@@ -212,6 +365,16 @@ class U1Nodes:
                 return
             self._event_publishers[name].publish(output)
         return callback
+
+    def _metadata_callback(self, message) -> None:
+        value = _json_value(_event_json(message))
+        data = _event_data(value)
+        with self._video_metadata_lock:
+            self._video_metadata = dict(data)
+
+    def video_metadata(self) -> dict:
+        with self._video_metadata_lock:
+            return dict(self._video_metadata)
 
     def _mic_callback(self, message) -> None:
         if not self._mic_forwarding:
@@ -261,7 +424,8 @@ class U1Nodes:
         return _decode_vendor_result(self.call(name, request))
 
     def trigger_call(self, name: str) -> dict:
-        response = self.call(name, None)
+        from std_srvs.srv import Trigger
+        response = self.call(name, Trigger.Request())
         message = getattr(response, "message", "")
         if isinstance(message, str) and message:
             try:
@@ -271,6 +435,15 @@ class U1Nodes:
         if isinstance(response, dict):
             return response
         return {"success": bool(getattr(response, "success", False)), "message": message}
+
+    def open_video(self) -> dict:
+        opened = self.trigger_call("video_open")
+        state = self.trigger_call("video_state")
+        return {"open": opened, "state": state,
+                "stream": _stream_config(opened, state)}
+
+    def close_video(self) -> dict:
+        return self.trigger_call("video_close")
 
     def set_volume(self, volume: int) -> dict:
         from audio_msgs.srv import SetAudioVolume
@@ -451,7 +624,7 @@ class AudioPlugin:
         self.running = False
         return result
 
-    def _queue(self, kind: str, payload: dict, action_id: str) -> dict:
+    def _queue(self, kind: str, payload: dict, action_id: str, tool_name: str = "audio") -> dict:
         with self._lock:
             if self._active:
                 return {"state": "error", "message": "another U1 Pro audio action is active", "action_id": self._active["action_id"]}
@@ -465,7 +638,7 @@ class AudioPlugin:
             with self._lock:
                 if self._active and self._active["action_id"] == action_id:
                     self._active = None
-            _acp_notify(action_id, "error", {"state": "error", "message": str(exc)})
+            _acp_notify(action_id, "error", {"state": "error", "message": str(exc)}, tool_name)
             raise
         return {"state": "queued", "action_id": action_id, "request": result}
 
@@ -544,6 +717,156 @@ class EventPlugin:
         return {"state": "running" if self.running else "idle", "topic_out": [{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}]}
 
 
+class CameraRgbPlugin:
+    """Expose the SDK video shared-memory stream as Agent Core JPEG frames."""
+
+    def __init__(self, nodes: U1Nodes, config: dict):
+        self.nodes = nodes
+        self.config = config
+        self.topic = f"/{nodes.namespace}/camera/rgb"
+        self.running = False
+        self._publisher = None
+        self._reader = None
+        self._metadata = {}
+        self._lock = threading.Lock()
+        self._frames = 0
+        self._last_error = ""
+
+    def get_tool(self):
+        return tool(
+            "camera_rgb", "sensor",
+            "U1 Pro RGB camera stream. Starts the documented vendor video stream, reads its shared-memory raw frames, and publishes JPEG images on the Agent Core camera topic.",
+            _sensor_schema(),
+            topic_out=[{"topic": self.topic, "format": "image/jpeg"}],
+        )
+
+    def start(self):
+        if self.running:
+            return self._state()
+        try:
+            if self._publisher is None:
+                self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
+            response = self.nodes.open_video()
+            stream = dict(response.get("stream") or {})
+            if str(stream.get("state", "OPEN")).upper() == "CLOSED":
+                raise RuntimeError("U1 Pro video stream remained closed after open_stream")
+            self._metadata = self.nodes.video_metadata()
+            reader_config = {**stream, **dict(self.config.get("video", {}))}
+            reader_config.setdefault("path", stream.get("path"))
+            reader_config.setdefault("frame_payload_size", stream.get("frame_payload_size"))
+            reader_config.setdefault("max_frames", stream.get("max_frames"))
+            missing = [key for key in ("path", "frame_payload_size", "max_frames") if not reader_config.get(key)]
+            if missing:
+                raise RuntimeError("U1 Pro video stream response is missing: " + ", ".join(missing))
+            self._reader = VideoSharedMemoryReader(reader_config, self.nodes.video_metadata, self._publish_frame)
+            self._reader.start()
+            self.running = True
+            self._last_error = ""
+        except Exception as exc:
+            self._last_error = str(exc)[:256]
+            try:
+                self.nodes.close_video()
+            except Exception:
+                pass
+        return self._state()
+
+    def stop(self):
+        if self._reader:
+            self._reader.stop()
+            self._reader = None
+        if self.running:
+            try:
+                self.nodes.close_video()
+            except Exception as exc:
+                self._last_error = str(exc)[:256]
+        self.running = False
+        return self._state()
+
+    def _publish_frame(self, payload: bytes, metadata: dict, timestamp_ns: int):
+        try:
+            jpeg = _jpeg_from_frame(payload, metadata)
+            message = self.nodes.CompressedImage()
+            message.header.stamp.sec = int(timestamp_ns // 1_000_000_000)
+            message.header.stamp.nanosec = int(timestamp_ns % 1_000_000_000)
+            message.format = "jpeg"
+            message.data = list(jpeg)
+            self._publisher.publish(message)
+            self._frames += 1
+        except Exception as exc:
+            self._last_error = str(exc)[:256]
+
+    def _state(self):
+        result = {
+            "state": "running" if self.running else ("error" if self._last_error else "idle"),
+            "topic_out": [{"topic": self.topic, "format": "image/jpeg"}],
+            "frames_published": self._frames,
+            "metadata": dict(self._metadata),
+        }
+        if self._last_error:
+            result["message"] = self._last_error
+        return result
+
+    def dispatch(self, action, args):
+        del args
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
+        if action == "info":
+            return self._state()
+        return None
+
+
+class ExpressionPlugin:
+    """Semantic Agent card for vendor-provided face and local motions."""
+
+    def __init__(self, audio: AudioPlugin):
+        self.audio = audio
+        self.running = False
+
+    def get_tool(self):
+        actions = {
+            "start": ([], "Prepare the U1 Pro expression action card."),
+            "list_actions": ([], "List vendor-provided command motions that can be used for expressions or light head/face movements."),
+            "play": (["motion_id"], "Play one motion_id returned by list_actions. Do not invent motion IDs."),
+            "stop": ([], "Interrupt the current U1 Pro expression or audio motion."),
+            "info": ([], "Read the expression card and active playback state."),
+        }
+        schema = action_schema(actions, {
+            "motion_id": {"type": "string", "minLength": 1, "description": "Exact vendor motion_id from list_actions, such as A029."},
+            "action_id": {"type": "string", "description": "Optional caller correlation ID."},
+        })
+        schema["x-completion"] = {"actions": ["play"], "timeout": 120}
+        return tool("expression", "actuator", "U1 Pro face and light motion control through vendor preset actions. Discover available motion IDs first; the card does not guess aliases because the vendor list is firmware-dependent.", schema)
+
+    def start(self):
+        self.running = True
+        return {"state": "ready"}
+
+    def stop(self):
+        self.running = False
+        return self.audio.stop()
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "list_actions":
+            return self.audio.nodes.string_call("motion_list", {})
+        if action == "play":
+            motion_id = str(args.get("motion_id", "")).strip()
+            if not motion_id:
+                raise ValueError("expression.play requires motion_id from expression.list_actions")
+            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
+            return self.audio._queue("play_action", {"action": motion_id}, action_id, "expression")
+        if action == "stop":
+            return self.stop()
+        if action == "info":
+            with self.audio._lock:
+                active = dict(self.audio._active) if self.audio._active else None
+            return {"state": "ready" if self.running else "idle", "active": active}
+        return None
+
+
 class _LifecyclePlugin:
     """Close the shared ROS nodes after all functional cards have stopped."""
 
@@ -570,7 +893,9 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     nodes = U1Nodes(config, namespace, ros)
     # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
     # card has disabled its vendor resources and stopped publishing.
-    plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), AudioPlugin(nodes)]
+    audio = AudioPlugin(nodes)
+    plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
+               ExpressionPlugin(audio), CameraRgbPlugin(nodes, config)]
     descriptions = {
         "doa_event": "Microphone-array sound direction with azimuth and confidence.",
     }

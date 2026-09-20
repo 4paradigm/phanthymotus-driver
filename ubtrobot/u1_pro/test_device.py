@@ -25,6 +25,14 @@ def _install_stubs():
     std.msg = std_msg
     sys.modules.update({"std_msgs": std, "std_msgs.msg": std_msg})
 
+    sensor = types.ModuleType("sensor_msgs")
+    sensor_msg = types.ModuleType("sensor_msgs.msg")
+    sensor_msg.CompressedImage = type("CompressedImage", (), {
+        "__init__": lambda self: setattr(self, "header", types.SimpleNamespace(
+            stamp=types.SimpleNamespace(sec=0, nanosec=0)))})
+    sensor.msg = sensor_msg
+    sys.modules.update({"sensor_msgs": sensor, "sensor_msgs.msg": sensor_msg})
+
     def message(name):
         return type(name, (), {"__init__": lambda self: None})
 
@@ -188,8 +196,8 @@ class U1CardContractTests(unittest.TestCase):
             nodes = device.U1Nodes({}, "test", ros)
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
-            self.assertEqual(len(nodes.robot.subscriptions), 3)
-            self.assertTrue(all(subscription[0] is sys.modules["std_msgs.msg"].String for subscription in nodes.robot.subscriptions[:2]))
+            self.assertEqual(len(nodes.robot.subscriptions), 4)
+            self.assertTrue(all(subscription[0] is sys.modules["std_msgs.msg"].String for subscription in nodes.robot.subscriptions[:3]))
             self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name, "/robo/audio/call/play_action")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
             nodes.close()
@@ -249,6 +257,31 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIsNone(device.SpeakerPlugin(nodes).dispatch("unknown", {}))
         self.assertIsNone(device.AudioPlugin(nodes).dispatch("unknown", {}))
         self.assertEqual(device.SpeakerPlugin(nodes).dispatch("start", {}), {"state": "ready"})
+
+    def test_camera_contract_and_expression_contract(self):
+        import device
+
+        nodes = FakeNodes()
+        audio = device.AudioPlugin(nodes)
+        camera = device.CameraRgbPlugin(nodes, {})
+        camera_tool = camera.get_tool()
+        self.assertEqual(camera_tool["name"], "camera_rgb")
+        self.assertEqual(camera_tool["topic_out"], [{"topic": "/test/camera/rgb", "format": "image/jpeg"}])
+        expression = device.ExpressionPlugin(audio)
+        expression_tool = expression.get_tool()
+        self.assertEqual(expression_tool["name"], "expression")
+        self.assertIn("play", expression_tool["inputSchema"]["properties"]["action"]["enum"])
+        with self.assertRaises(ValueError):
+            expression.dispatch("play", {})
+
+    def test_video_frame_conversion_strips_step_padding(self):
+        import device
+
+        metadata = {"width": 2, "height": 2, "step": 8, "encoding": "rgb8"}
+        payload = bytes((255, 0, 0, 0, 255, 0, 99, 99,
+                         0, 0, 255, 255, 255, 255, 88, 88))
+        jpeg = device._jpeg_from_frame(payload, metadata)
+        self.assertTrue(jpeg.startswith(b"\xff\xd8\xff"))
 
     def test_mic_callback_drops_audio_after_stop(self):
         import device

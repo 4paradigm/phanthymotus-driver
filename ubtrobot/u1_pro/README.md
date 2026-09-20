@@ -5,6 +5,8 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 - `mic`: the vendor 16 kHz mono input stream as `audio/pcm-16k`.
 - `speaker`: an Agent Core `audio/pcm-16k` input stream forwarded to the vendor output topic.
 - `audio`: documented `play_action`, `play_text`, motion listing, interruption, and asynchronous completion.
+- `expression`: a separate face/light motion card backed by the vendor command-motion list. The agent must call `list_actions` and use an exact returned `motion_id`; no firmware-dependent smile/blink aliases are invented.
+- `camera_rgb`: the documented U1 video stream. It opens the vendor stream, reads the section 4.5 shared-memory ring, and publishes `/namespace/camera/rgb` as `image/jpeg`.
 - `doa_event`: an opt-in JSON sound-direction event stream.
 
 At startup the driver authorizes the vendor SDK from protected configuration or
@@ -18,7 +20,15 @@ field contains the vendor JSON envelope. The local `audio_msgs` package therefor
 contains the bridge audio messages and audio service definitions; it does not redefine the
 vendor event topics, because a different DDS message type would not match the robot.
 
-The image installs `python3-colcon-common-extensions`, `cmake`, and `build-essential`
+The camera card relies on the SDK video service response fields `path`,
+`frame_payload_size`, and `max_frames`, and on video metadata fields `width`,
+`height`, `step`, and `encoding`. It supports the documented packed RGB/BGR/RGBA/
+BGRA/mono raw formats and rejects unknown encodings rather than publishing
+corrupt images. The video shared-memory path must be visible inside the driver
+container, as required by the vendor SDK deployment.
+
+The image installs `python3-pil` for the documented raw-video-to-JPEG conversion,
+and `python3-colcon-common-extensions`, `cmake`, and `build-essential`
 only to build the local ROS interface packages during the image build. It installs the
 CycloneDDS RMW used by the dual-domain runtime and `PyYAML` used by the shared driver
 configuration loader. The deployment uses host networking and loopback-bound

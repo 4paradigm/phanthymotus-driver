@@ -6,11 +6,13 @@ hardware_model: "u1_pro"
 image_name: ubtrobot-u1-pro
 port: 15740
 mcp_url: "http://localhost:15740/mcp"
-description: "UBTECH U1 Pro microphone, live speaker PCM, preset audio/motion playback, wakeup events, and sound direction"
+description: "UBTECH U1 Pro microphone, live speaker PCM, audio playback, preset face motions, RGB camera, and sound direction"
 build_context_extras:
   - ../../common
 cards:
   - { name: mic, type: sensor }
   - { name: speaker, type: actuator }
   - { name: audio, type: actuator }
+  - { name: expression, type: actuator }
+  - { name: camera_rgb, type: sensor }
   - { name: doa_event, type: sensor }
