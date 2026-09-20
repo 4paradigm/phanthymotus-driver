@@ -594,3 +594,51 @@ def test_counters_separate_dropped_from_rejected():
     assert counters["applied"] == 1
     assert counters["dropped"] == 1
     assert counters["rejected"] == 1
+
+
+# ── 按段声明动作空间：一个向量里可以有两种空间 ───────────────────────────────
+
+
+def test_groups_inherit_the_descriptor_mode_when_they_do_not_declare_one():
+    """每一个已有的驱动都是单一空间，所以不写就是「和整体一样」，不是「未知」。
+
+    这条钉的是向后兼容：仓库里现存的每一份 descriptor 都没有按段的 mode，它们
+    必须继续解析出和从前一样的东西。
+    """
+    parsed = parse_descriptor(descriptor_dict())
+    assert parsed.groups
+    assert all(group.mode == parsed.mode for group in parsed.groups)
+
+
+def test_a_vector_can_carry_two_action_spaces_at_once():
+    """UnifoLM-VLA 的 G1 输出就是混的，这是这个字段存在的唯一理由。
+
+    23 维 = 2 × [末端 xyz(3) + R6 旋转(6) + 夹爪(1)] + 腰 rpy(3)：前面是笛卡尔
+    位姿，腰那三个是关节角。整个 descriptor 只有一个 mode 的话，这种向量声明
+    不出来 —— 只能谎报一个，而谎报的后果是位姿被当成关节角发给机械臂。
+    """
+    # 共享的 descriptor_dict() 只有 2 维，撑不下「位姿 + 腰」这个形状，所以这条
+    # 用例自己搭一个 —— 被测的是混合声明，不是那份 fixture。
+    raw = descriptor_dict()
+    raw["dof"] = 4
+    raw["joint_names"] = ["x", "y", "z", "waist"]
+    raw["limits"] = {"lower": [-1.0] * 4, "upper": [1.0] * 4}
+    raw["groups"] = [
+        {"name": "eef", "offset": 0, "count": 3,
+         "unit": "m", "resource": "arm", "mode": "eef_pose"},
+        {"name": "waist", "offset": 3, "count": 1,
+         "unit": "rad", "resource": "waist"},          # 不写 → 继承 joint_position
+    ]
+    parsed = parse_descriptor(raw)
+    assert [g.mode for g in parsed.groups] == ["eef_pose", parsed.mode]
+
+
+def test_a_group_mode_outside_the_vocabulary_is_refused():
+    """词汇表小是有意的：每个 mode 都是一份关于 `values` 含义的契约，
+    而一个没人实现的 mode 就是一个没人测过的 mode。"""
+    raw = descriptor_dict()
+    raw["groups"] = [{"name": "all", "offset": 0, "count": raw["dof"],
+                      "mode": "eef_r6_g1"}]
+    with pytest.raises(Exception) as caught:
+        parse_descriptor(raw)
+    assert "eef_r6_g1" in str(caught.value)

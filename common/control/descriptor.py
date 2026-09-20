@@ -53,6 +53,14 @@ class Group:
     count: int
     unit: str = ""
     resource: str = ""
+    # 这一段的动作空间。留空表示继承 `descriptor.mode` —— 每一个已有的驱动都是
+    # 单一空间，所以不写就是「和整体一样」，不是「未知」。
+    #
+    # **为什么要按段声明。** 一个末端位姿模型的输出是混的：UnifoLM-VLA 的 G1
+    # checkpoint 是 2 × [末端 xyz(3) + R6 旋转(6) + 夹爪(1)] + 腰 rpy(3) = 23 维 ——
+    # 前面那些是笛卡尔位姿，腰那三个是关节角。整个 descriptor 只有一个 mode 的话，
+    # 这种向量根本声明不出来，于是只能谎报一个，而谎报的后果是位姿被当成关节角。
+    mode: str = ""
 
     @property
     def slice(self) -> slice:
@@ -230,7 +238,7 @@ def parse_descriptor(raw: dict) -> Descriptor:
     if end_effector is not None and not isinstance(end_effector, dict):
         raise DescriptorError("descriptor.end_effector must be an object or absent")
 
-    groups = _parse_groups(raw.get("groups"), dof=dof)
+    groups = _parse_groups(raw.get("groups"), dof=dof, default_mode=mode)
 
     return Descriptor(
         mode=mode,
@@ -253,16 +261,19 @@ def parse_descriptor(raw: dict) -> Descriptor:
     )
 
 
-def _parse_groups(raw, *, dof: int) -> tuple:
+def _parse_groups(raw, *, dof: int, default_mode: str = "") -> tuple:
     """Validate `groups`, or default to one group covering the whole vector.
 
     Groups must tile `[0, dof)` exactly, in order and without gaps. A gap would
     leave dimensions with no declared unit and no owning channel — and since
     the whole point of a group is to say what a slice *means*, a dimension in
     no group is a dimension nobody has described.
+
+    每一段可以带自己的 `mode`；不带就继承 `default_mode`（即 `descriptor.mode`）。
+    见 `Group.mode` —— 混合空间的向量是这个字段存在的唯一理由。
     """
     if raw is None:
-        return (Group(name="all", offset=0, count=dof),)
+        return (Group(name="all", offset=0, count=dof, mode=default_mode),)
     if not isinstance(raw, (list, tuple)) or not raw:
         raise DescriptorError("descriptor.groups must be a non-empty list or absent")
 
@@ -286,9 +297,16 @@ def _parse_groups(raw, *, dof: int) -> tuple:
                 f"{expected} — groups must tile the vector in order with no gaps"
             )
         expected = offset + count
+        mode = str(entry.get("mode") or "") or default_mode
+        if mode not in MODES:
+            raise DescriptorError(
+                f"descriptor.groups[{i}] ({name}) 的 mode {mode!r} 不在 "
+                f"{', '.join(MODES)} 里"
+            )
         groups.append(Group(name=name, offset=offset, count=count,
                             unit=str(entry.get("unit") or ""),
-                            resource=str(entry.get("resource") or "")))
+                            resource=str(entry.get("resource") or ""),
+                            mode=mode))
 
     if expected != dof:
         raise DescriptorError(
