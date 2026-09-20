@@ -10,7 +10,7 @@ through all of it: dropped is the network being a network, rejected is somebody
 having wired something up wrong, and only the second is worth waking a person
 for.
 
-  1. contract        schema / mode / dof against the descriptor  → REJECTED
+  1. contract        schema / mode / dof / unit quaternions      → REJECTED
   2. freshness       ttl expiry, stale observation, seq regress  → DROPPED
   3. arbitration     priority, then latest seq                   → DROPPED
   4. step clamp      max_delta_per_step                          → CLAMPED
@@ -82,6 +82,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 
+from . import rotation
 from .descriptor import SCHEMA, Descriptor, parse_descriptor
 
 
@@ -149,6 +150,15 @@ class ControlSink:
         )
         if escalate_after < 1:
             raise ValueError("escalate_after must be at least 1")
+
+        # Where the orientations live. Derived once: the descriptor is frozen
+        # precisely so cached values like this cannot go stale under a running
+        # sink. `_quat_component_indices` is the same information as a set, so
+        # the per-value loops can skip those slots with one lookup.
+        self._eef_quat_offsets = self.descriptor.eef_quat_offsets
+        self._quat_component_indices = frozenset(
+            offset + i for offset in self._eef_quat_offsets for i in range(4)
+        )
 
         self._apply = apply
         self._on_watchdog = on_watchdog
@@ -387,6 +397,23 @@ class ControlSink:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return Outcome(Verdict.REJECTED, f"values[{i}] is not a number: {value!r}")
 
+        # Every `eef_pose` segment's quaternion must be unit length. This is
+        # the one check in the whole chain that can catch a *different rotation
+        # representation* arriving in the right number of slots: an rpy triple
+        # or the first four of an R6 block has no reason to land on the unit
+        # sphere. See descriptor.EEF_POSE_STRIDE for why the layout is a
+        # quaternion at all — this check is the entire reason.
+        for offset in self._eef_quat_offsets:
+            quaternion = values[offset:offset + 4]
+            if not rotation.is_unit(quaternion):
+                return Outcome(
+                    Verdict.REJECTED,
+                    f"values[{offset}:{offset + 4}] is not a unit quaternion "
+                    f"(|q| = {rotation.norm(quaternion):.4f}) — an eef_pose is "
+                    "[x, y, z, qx, qy, qz, qw] with the rotation as a unit "
+                    "quaternion in xyzw order",
+                )
+
         if not isinstance(message.get("source"), str) or not message["source"]:
             return Outcome(Verdict.REJECTED, "source is required and must be a string")
         return None
@@ -476,6 +503,8 @@ class ControlSink:
         out = list(values)
         clamped = []
         for i, (want, previous, limit) in enumerate(zip(values, self._last_values, limits)):
+            if i in self._quat_component_indices:
+                continue             # handled as one rotation below
             delta = want - previous
             if delta > limit:
                 out[i] = previous + limit
@@ -483,6 +512,22 @@ class ControlSink:
             elif delta < -limit:
                 out[i] = previous - limit
                 clamped.append(self.descriptor.joint_names[i])
+
+        # An orientation is clamped as an angle, not component by component.
+        # Clamping x, y, z and w independently yields a vector that is no
+        # longer unit length, which `_check_contract` then rejects on the
+        # *next* message — so the naive version shows up as "everything is
+        # rejected once the policy speeds up", with nothing pointing here.
+        # `max_delta_per_step` at the `qx` slot is read as radians per step;
+        # the other three slots of that quaternion are unused.
+        for offset in self._eef_quat_offsets:
+            span = slice(offset, offset + 4)
+            limited_quaternion, was_limited = rotation.slerp_limit(
+                self._last_values[span], values[span], limits[offset]
+            )
+            if was_limited:
+                out[span] = list(limited_quaternion)
+                clamped.append(self.descriptor.joint_names[offset])
         return tuple(out), clamped
 
     def _check_hard_limits(self, values: tuple[float, ...], now: int) -> Outcome | None:
@@ -496,6 +541,14 @@ class ControlSink:
         which holds — a state the policy can at least observe.
         """
         for i, value in enumerate(values):
+            if i in self._quat_component_indices:
+                # A quaternion component's bound carries no physical meaning —
+                # every unit quaternion has all four in [-1, 1], and the same
+                # orientation can be written with any of them negated. The
+                # orientation's actual bound is the arm's joint limits, which
+                # the IK solver enforces. Checking here would reject valid
+                # poses for arithmetic reasons.
+                continue
             lo, hi = self.descriptor.lower[i], self.descriptor.upper[i]
             if value < lo or value > hi:
                 return Outcome(
@@ -511,12 +564,25 @@ class ControlSink:
         if dt <= 0:
             return None
         for i, (value, previous) in enumerate(zip(values, self._last_values)):
+            if i in self._quat_component_indices:
+                continue             # angular speed, below
             speed = abs(value - previous) / dt
             if speed > max_velocity[i]:
                 return Outcome(
                     Verdict.REJECTED,
                     f"{self.descriptor.joint_names[i]} would move at {speed:.3f} "
                     f"(limit {max_velocity[i]})",
+                )
+        # Angular speed per orientation, in rad/s, against the limit declared
+        # at the `qx` slot — the same convention as the step clamp above.
+        for offset in self._eef_quat_offsets:
+            span = slice(offset, offset + 4)
+            speed = rotation.angle_between(self._last_values[span], values[span]) / dt
+            if speed > max_velocity[offset]:
+                return Outcome(
+                    Verdict.REJECTED,
+                    f"{self.descriptor.joint_names[offset]} would rotate at "
+                    f"{speed:.3f} rad/s (limit {max_velocity[offset]})",
                 )
         return None
 

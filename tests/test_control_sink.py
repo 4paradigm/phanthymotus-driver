@@ -618,19 +618,23 @@ def test_a_vector_can_carry_two_action_spaces_at_once():
     不出来 —— 只能谎报一个，而谎报的后果是位姿被当成关节角发给机械臂。
     """
     # 共享的 descriptor_dict() 只有 2 维，撑不下「位姿 + 腰」这个形状，所以这条
-    # 用例自己搭一个 —— 被测的是混合声明，不是那份 fixture。
+    # 用例自己搭一个 —— 被测的是混合声明，不是那份 fixture。位姿那段是 7 维
+    # （xyz + 单位四元数 xyzw），规范化之后的标准布局，不是模型原生的 R6。
     raw = descriptor_dict()
-    raw["dof"] = 4
-    raw["joint_names"] = ["x", "y", "z", "waist"]
-    raw["limits"] = {"lower": [-1.0] * 4, "upper": [1.0] * 4}
+    raw["dof"] = 8
+    raw["joint_names"] = ["x", "y", "z", "qx", "qy", "qz", "qw", "waist"]
+    raw["limits"] = {"lower": [-1.0] * 8, "upper": [1.0] * 8}
     raw["groups"] = [
-        {"name": "eef", "offset": 0, "count": 3,
+        {"name": "eef", "offset": 0, "count": 7,
          "unit": "m", "resource": "arm", "mode": "eef_pose"},
-        {"name": "waist", "offset": 3, "count": 1,
+        {"name": "waist", "offset": 7, "count": 1,
          "unit": "rad", "resource": "waist"},          # 不写 → 继承 joint_position
     ]
     parsed = parse_descriptor(raw)
     assert [g.mode for g in parsed.groups] == ["eef_pose", parsed.mode]
+    # 混合向量里只有位姿那段带四元数，腰不带 —— sink 的三处逐值检查就是靠这个
+    # 索引集合避开四元数的。
+    assert parsed.eef_quat_offsets == (3,)
 
 
 def test_a_group_mode_outside_the_vocabulary_is_refused():
@@ -642,3 +646,160 @@ def test_a_group_mode_outside_the_vocabulary_is_refused():
     with pytest.raises(Exception) as caught:
         parse_descriptor(raw)
     assert "eef_r6_g1" in str(caught.value)
+
+
+# ── eef_pose：位姿段的四元数 ─────────────────────────────────────────────────
+#
+# 这一组测的是「为什么标准布局用四元数而不是 rpy 或 R6」。三种都是一串浮点数，
+# 接反了都不报错；四元数是其中唯一自带校验的那一个，而下面第一条就是那份校验。
+
+
+def eef_descriptor_dict(**overrides):
+    """一个末端位姿 + 一个腰关节：混合向量的最小形状。
+
+    `max_delta_per_step` 与 `max_velocity` 在 `qx` 那一格上是**弧度**，整段姿态
+    共用它 —— 另外三格不读。见 sink._clamp_step。
+    """
+    base = descriptor_dict()
+    base.update({
+        "dof": 8,
+        "joint_names": ["x", "y", "z", "qx", "qy", "qz", "qw", "waist"],
+        "limits": {
+            "lower": [-2.0] * 8,
+            "upper": [2.0] * 8,
+            "max_delta_per_step": [0.05, 0.05, 0.05, 0.2, 0.2, 0.2, 0.2, 0.1],
+            "max_velocity": [1.0, 1.0, 1.0, 6.0, 6.0, 6.0, 6.0, 1.0],
+        },
+        "groups": [
+            {"name": "eef", "offset": 0, "count": 7, "mode": "eef_pose"},
+            {"name": "waist", "offset": 7, "count": 1, "mode": "joint_position"},
+        ],
+    })
+    base.update(overrides)
+    return base
+
+
+def eef_message(clock, values, **overrides):
+    return message(clock, values, dof=8, **overrides)
+
+
+def identity_pose(waist=0.0):
+    return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, waist]
+
+
+def test_a_rotation_that_is_not_a_unit_quaternion_is_rejected():
+    """把 rpy 或者 R6 的前四个数填进四元数那四格，范数不会是 1。
+
+    **这是选四元数的全部理由。** 维度对得上、消息校验通过、延迟正常，而机械臂
+    会走到错误的地方 —— 除非有一条检查抓得住「这四个数根本不是一个旋转」。
+    """
+    clock, recorder = FakeClock(), Recorder()
+    sink = make_sink(clock, recorder, eef_descriptor_dict())
+
+    # rpy (0.1, 0.2, 0.3) 被当成 quat 的前三个数，第四格是 R6 漏进来的下一个值。
+    outcome = sink.submit(eef_message(clock, [0.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.4, 0.0]))
+    assert outcome.verdict is Verdict.REJECTED
+    assert "unit quaternion" in outcome.reason
+    assert recorder.calls == []
+
+
+def test_a_unit_quaternion_passes_and_a_slightly_off_one_still_does():
+    """容差要能容下 JSON 往返和 float32 的动作头，不能容下另一种表示。"""
+    clock, recorder = FakeClock(), Recorder()
+    sink = make_sink(clock, recorder, eef_descriptor_dict())
+
+    assert sink.submit(eef_message(clock, identity_pose())).applied
+    clock.advance(40)
+    nearly = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0 - 5e-4, 0.0]
+    assert sink.submit(eef_message(clock, nearly, seq=2)).applied
+
+
+def test_the_orientation_step_clamp_keeps_the_quaternion_unit_length():
+    """逐分量钳位会破坏单位范数，然后下一条消息在契约检查处被拒。
+
+    症状是「策略一动快就全被拒」，而那条报错一个字都不提钳位。所以姿态走
+    slerp 角度钳位，这条用例断言的正是「钳过之后它仍然是个合法四元数」。
+    """
+    import math
+
+    clock, recorder = FakeClock(), Recorder()
+    sink = make_sink(clock, recorder, eef_descriptor_dict())
+    assert sink.submit(eef_message(clock, identity_pose())).applied
+
+    # 绕 z 转 1.2 rad，远超每步 0.2 rad 的上限。
+    half = 1.2 / 2
+    clock.advance(40)
+    outcome = sink.submit(eef_message(
+        clock,
+        [0.0, 0.0, 0.0, 0.0, 0.0, math.sin(half), math.cos(half), 0.0],
+        seq=2,
+    ))
+
+    assert outcome.verdict is Verdict.CLAMPED
+    applied = recorder.calls[-1][0]
+    quaternion = applied[3:7]
+    assert abs(math.sqrt(sum(v * v for v in quaternion)) - 1.0) < 1e-9
+    # 走了 0.2 rad，不是 1.2。
+    travelled = 2 * math.acos(min(1.0, abs(quaternion[3])))
+    assert abs(travelled - 0.2) < 1e-6
+
+
+def test_the_opposite_sign_quaternion_is_the_same_orientation_not_a_half_turn():
+    """`q` 和 `-q` 是同一个朝向。策略输出翻个号不要钱，而按分量算就是 180°。
+
+    不处理的话，一个静止不动的末端会被判成每步都在极速翻转，然后被限速拒掉。
+    """
+    clock, recorder = FakeClock(), Recorder()
+    sink = make_sink(clock, recorder, eef_descriptor_dict())
+    assert sink.submit(eef_message(clock, identity_pose())).applied
+
+    clock.advance(40)
+    flipped = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0]
+    outcome = sink.submit(eef_message(clock, flipped, seq=2))
+    assert outcome.verdict is Verdict.APPLIED      # 没被钳，也没被限速拒
+
+
+def test_a_quaternion_component_is_not_checked_against_position_bounds():
+    """四元数分量的上下界没有物理意义 —— 任何单位四元数四个分量都在 [-1, 1]，
+    而同一个朝向可以把它们全取反。真正的边界是手臂的关节限位，那是 IK 的事。"""
+    clock, recorder = FakeClock(), Recorder()
+    raw = eef_descriptor_dict()
+    # 位置那三维收紧到 ±0.01，姿态四维给一个**荒谬的**窄区间：它应当被忽略。
+    raw["limits"]["lower"] = [-0.01, -0.01, -0.01, 0.9, 0.9, 0.9, 0.9, -2.0]
+    raw["limits"]["upper"] = [0.01, 0.01, 0.01, 0.95, 0.95, 0.95, 0.95, 2.0]
+    sink = make_sink(clock, recorder, raw)
+
+    assert sink.submit(eef_message(clock, identity_pose())).applied
+
+    # 而位置的限位照旧生效 —— 步长钳位先把 0.5 削到 0.05，仍然在界外。
+    clock.advance(40)
+    outcome = sink.submit(eef_message(
+        clock, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], seq=2))
+    assert outcome.verdict is Verdict.REJECTED
+    assert outcome.reason.startswith("x at ") and "outside" in outcome.reason
+
+
+def test_an_eef_pose_group_whose_width_is_not_a_multiple_of_seven_is_refused():
+    """6 是 rpy 配 xyz，9 是 R6 配 xyz，8 是把夹爪塞了进来 —— 三种都会被逐位
+    读成四元数，不报错。宽度是能在解析期就抓住它们的地方。"""
+    for count in (3, 6, 8, 9):
+        raw = descriptor_dict()
+        raw["dof"] = count
+        raw["joint_names"] = [f"j{i}" for i in range(count)]
+        raw["limits"] = {"lower": [-1.0] * count, "upper": [1.0] * count}
+        raw["groups"] = [{"name": "eef", "offset": 0, "count": count,
+                          "mode": "eef_pose"}]
+        with pytest.raises(DescriptorError) as caught:
+            parse_descriptor(raw)
+        assert "eef_pose" in str(caught.value)
+
+
+def test_two_end_effectors_in_one_group_are_two_quaternions():
+    """双臂可以是一段 14 维，也可以是两段各 7 维。两种都要找得出两个朝向。"""
+    raw = descriptor_dict()
+    raw["dof"] = 14
+    raw["joint_names"] = [f"j{i}" for i in range(14)]
+    raw["limits"] = {"lower": [-1.0] * 14, "upper": [1.0] * 14}
+    raw["groups"] = [{"name": "arms", "offset": 0, "count": 14,
+                      "mode": "eef_pose"}]
+    assert parse_descriptor(raw).eef_quat_offsets == (3, 10)

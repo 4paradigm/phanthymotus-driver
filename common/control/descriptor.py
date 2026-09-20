@@ -24,9 +24,28 @@ MODES = (
     "joint_position",    # absolute joint positions, descriptor.units["angle"]
     "joint_velocity",    # joint velocities
     "joint_torque",      # joint torques
-    "eef_pose",          # end-effector pose in descriptor.frame
+    "eef_pose",          # absolute end-effector pose(s), see EEF_POSE_STRIDE
     "twist",             # body twist (vx, vy, vz, wx, wy, wz)
 )
+
+# ── `eef_pose` 的布局 ───────────────────────────────────────────────────────
+#
+# 每个末端占 **7 维**：`[x, y, z, qx, qy, qz, qw]` —— 米，加一个**单位四元数**，
+# `descriptor.frame` 下的**绝对**位姿（不是增量）。一段 `eef_pose` 的 count 必须
+# 是 7 的整数倍，双臂就是 14 或者两段各 7。
+#
+# **夹爪不在这里面。** 它是自己的一段 `joint_position`，unit `normalized`。把它
+# 塞进位姿段会让这段的宽度变成 8，而 8 % 7 != 0 正是下面那条检查要抓的东西。
+#
+# **为什么是四元数，而不是 rpy 或者 R6。** 三种都是一串浮点数，接反了、轴序弄错
+# 了、旋转矩阵前两列不正交了，都不报错 —— 机械臂走到错误的地方，而日志是干净的。
+# 四元数是其中唯一**自带校验**的：单位范数。一个 rpy 三元组或者 R6 的前四个数，
+# 没有理由恰好落在单位球面上，于是 `sink._check_contract` 能把它响亮地拒掉。
+# 这条检查是选它的全部理由，见 `rotation.UNIT_TOLERANCE`。
+#
+# 顺序是 **xyzw**，和 `geometry_msgs/Quaternion`、scipy、`motus.vla/1` 一致。
+EEF_POSE_STRIDE = 7
+EEF_POSE_QUAT = slice(3, 7)   # 一段 7 维里的四元数部分
 
 
 class DescriptorError(ValueError):
@@ -100,6 +119,25 @@ class Descriptor:
     @property
     def has_force_torque(self) -> bool:
         return self.force_torque is not None
+
+    @property
+    def eef_quat_offsets(self) -> tuple[int, ...]:
+        """Index of `qx` for every end-effector pose in the vector.
+
+        Derived from `groups` rather than from `mode`, because a mixed vector
+        is the case this exists for: G1's normalised action space is two poses,
+        two grippers and three waist joints, and only the pose segments carry
+        a quaternion. Callers should compute this once — the sink does, at
+        construction — since a descriptor cannot change under a running sink.
+        """
+        out = []
+        for group in self.groups:
+            if group.mode != "eef_pose":
+                continue
+            for start in range(group.offset, group.offset + group.count,
+                               EEF_POSE_STRIDE):
+                out.append(start + EEF_POSE_QUAT.start)
+        return tuple(out)
 
     @property
     def resources(self) -> tuple[str, ...]:
@@ -302,6 +340,15 @@ def _parse_groups(raw, *, dof: int, default_mode: str = "") -> tuple:
             raise DescriptorError(
                 f"descriptor.groups[{i}] ({name}) 的 mode {mode!r} 不在 "
                 f"{', '.join(MODES)} 里"
+            )
+        # 一段位姿只能是整数个 7。宽度不对的时候，最可能的解释是旋转用了别的表示
+        # —— 6 是 rpy 配 xyz，9 是 R6 配 xyz，8 是把夹爪塞了进来 —— 而这三种都会
+        # 在运行时被逐位读成四元数，不报错。
+        if mode == "eef_pose" and count % EEF_POSE_STRIDE:
+            raise DescriptorError(
+                f"descriptor.groups[{i}] ({name}) 声明 eef_pose 但 count 是 "
+                f"{count}，不是 {EEF_POSE_STRIDE} 的整数倍 —— 一个末端位姿是 "
+                "[x, y, z, qx, qy, qz, qw]。夹爪要单独成一段 joint_position"
             )
         groups.append(Group(name=name, offset=offset, count=count,
                             unit=str(entry.get("unit") or ""),
