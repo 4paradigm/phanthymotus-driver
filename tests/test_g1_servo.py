@@ -31,11 +31,22 @@ sys.path.insert(0, str(ROOT))
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location(
-        "g1_servo", ROOT / "unitree" / "g1" / "servo.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    """`servo.py` 现在 `from arm_sdk import ...`，那是同目录的兄弟模块。
+
+    容器里这么写是对的（`PYTHONPATH=/work`，bundle 的文件都摊在 /work 下），但
+    在测试里就得把 bundle 目录也放进 sys.path。名字加前缀存进 `sys.modules`，
+    是因为这个仓库里不止一个 bundle 有同名文件，泄漏一个裸 `arm_sdk` 会让另一个
+    测试文件在毫不相干的地方失败。
+    """
+    bundle = ROOT / "unitree" / "g1"
+    sys.path.insert(0, str(bundle))
+    try:
+        spec = importlib.util.spec_from_file_location("g1_servo", bundle / "servo.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path.remove(str(bundle))
 
 
 servo = _load()
@@ -111,65 +122,22 @@ class _FakeMessage:
 
 
 def _card(monkeypatch, **config):
+    """一张卡片，外加一条被桩掉发布器的 arm_sdk 通道。
+
+    渐变、增益、权重现在住在 `arm_sdk.ArmSdkChannel` 里（`servo_eef` 要用同一条，
+    而一条抄了两遍的安全链就是一条会分叉的安全链），所以这里把 fake 装到通道上。
+    通道自身的行为在 tests/test_g1_arm_sdk.py。
+    """
     monkeypatch.setattr(servo.time, "sleep", lambda _s: None)
     card = servo.G1ServoPlugin(config, "g1", executor=None)
-    card._arm_pub = _FakePublisher()
-    card._msg = _FakeMessage()
-    card._crc = None
+    channel = card._channel
+    monkeypatch.setattr(channel.__class__, "_write",
+                        lambda self, message: publisher.Write(message))
+    publisher = _FakePublisher()
+    channel._arm_pub = publisher
+    channel._message = _FakeMessage()
+    channel._crc = None
     return card
-
-
-def test_handback_reaches_exactly_zero_and_never_jumps(monkeypatch):
-    """权重从 1 直接归零 = 手臂瞬间脱力自由落体。
-
-    这条同时钉两件事：**终点必须正好是 0**（停在 0.03 意味着没完全交还），
-    以及**中间不能有大台阶**（一步跨过去等于没有渐变）。
-    """
-    card = _card(monkeypatch)
-    card._weight = 1.0
-    card._ramp(1.0, 0.0, servo.HANDBACK_S)
-
-    written = card._arm_pub.writes
-    assert written, "渐变期间必须持续发布，否则权重根本传不出去"
-    assert written[-1] == 0.0
-    assert card._weight == 0.0
-    biggest_step = max(abs(b - a) for a, b in zip(written, written[1:]))
-    assert biggest_step < 0.05, f"权重出现了 {biggest_step:.3f} 的台阶"
-
-
-def test_handback_takes_the_vendor_two_seconds(monkeypatch):
-    """两秒是官方例程的值，不是手感参数。步数少了就等于把渐变压缩掉了。"""
-    card = _card(monkeypatch)
-    card._weight = 1.0
-    card._ramp(1.0, 0.0, servo.HANDBACK_S)
-    assert len(card._arm_pub.writes) == int(servo.HANDBACK_S * servo.RAMP_HZ)
-
-
-def test_takeover_is_slower_at_the_start_than_linear(monkeypatch):
-    """接管走 `weight*weight`，和官方例程一致 —— 前段更慢。
-
-    线性接管会在交接的前几十毫秒里就把大部分权重给出去，而那正是内置控制器
-    还握着这些电机的时候。
-    """
-    card = _card(monkeypatch)
-    card._ramp(0.0, 1.0, servo.TAKEOVER_S)
-    written = card._arm_pub.writes
-    half = written[len(written) // 2]
-    assert half < 0.5, f"接管到一半时权重已经是 {half:.3f}，比线性还快"
-    assert written[-1] == pytest.approx(1.0)
-
-
-def test_the_ramp_keeps_sending_the_last_accepted_target(monkeypatch):
-    """渐变期间发的是最后一个被接受的目标，不是零位。
-
-    发零位等于在交还的两秒里把手臂拉回零位再松开 —— 一个没人要求过的动作。
-    """
-    card = _card(monkeypatch)
-    card._last_target = [0.3] * 14 + [0.0, 0.0]
-    card._weight = 1.0
-    card._ramp(1.0, 0.0, 0.1)
-    for motor_id in servo.ARM_MOTOR_IDS:
-        assert card._msg.motor_cmd[motor_id].q == pytest.approx(0.3)
 
 
 # ── hold：看门狗不松手 ───────────────────────────────────────────────────────
@@ -181,19 +149,20 @@ def test_the_watchdog_holds_rather_than_releasing(monkeypatch):
     `_hold` 必须**不动权重** —— 降权重会让手臂在流中断的瞬间松开手上的东西。
     """
     card = _card(monkeypatch)
-    card._weight = 1.0
-    card._last_target = [0.1] * 16
+    card._channel._weight = 1.0
+    card._channel._last_target = [0.1] * 16
     card._hold()
-    assert card._weight == 1.0, "看门狗不该改权重"
-    assert card._arm_pub.writes == [], "看门狗不该发布任何东西；不发就是保持"
+    assert card._channel.weight == 1.0, "看门狗不该改权重"
+    assert card._channel._arm_pub.writes == [], \
+        "看门狗不该发布任何东西；不发就是保持"
 
 
 def test_pause_does_not_release_either(monkeypatch):
     card = _card(monkeypatch)
     card._running = True
-    card._weight = 1.0
+    card._channel._weight = 1.0
     assert card._halt(True)["state"] == "paused"
-    assert card._weight == 1.0
+    assert card._channel.weight == 1.0
 
 
 # ── 配置与拒绝 ───────────────────────────────────────────────────────────────
