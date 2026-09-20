@@ -432,7 +432,7 @@ class ObserveTests(unittest.TestCase):
         self.assertIsNone(self.plugin._observation)
         self.assertTrue(self.plugin.dispatch("info", {})["observation_required"])
 
-    def test_worker_timeout_stops_motion_and_reports_error(self):
+    def test_observe_has_no_total_time_limit(self):
         import time
         from unittest import mock
 
@@ -442,17 +442,16 @@ class ObserveTests(unittest.TestCase):
         def command(method, *args):
             original(method, *args)
             if method == "rm_movej":
-                elapsed[0] = 46
+                elapsed[0] = 300
 
         self.client.command = command
         with mock.patch("pick_place.time.monotonic", side_effect=lambda: clock() + elapsed[0]):
             result = self.observe()
-        self.assertEqual(result["state"], "error")
-        self.assertIn("timed out", result["result"]["message"])
-        self.assertEqual([name for name, _ in self.commands], ["rm_movej", "rm_set_arm_slow_stop"])
+        self.assertEqual(result["state"], "completed", result)
+        self.assertEqual([name for name, _ in self.commands], ["rm_movej"])
         self.assertFalse(self.client.motion_lock.locked())
-        self.camera.snapshot.assert_not_called()
-        self.assertIsNone(self.plugin._observation)
+        self.camera.snapshot.assert_called_once()
+        self.assertIsNotNone(self.plugin._observation)
 
     def test_cancel_and_config_during_motion(self):
         from concurrent.futures import ThreadPoolExecutor

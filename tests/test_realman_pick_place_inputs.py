@@ -312,6 +312,28 @@ class InputTests(unittest.TestCase):
             self.snapshot(timeout=2)
         self.align.assert_not_called()
 
+    def test_snapshot_waits_without_deadline_until_scene_is_stable(self):
+        def change():
+            if self.now < 1015:
+                self.inputs._buffers["rgb"].pop()
+                self.feed(value=220 if int(self.now * 20) % 2 else 120)
+        self.on_wait = change
+        result = self.snapshot()
+        self.assertGreater(result["captured_at"], 1015)
+        self.assertGreater(result["synchronization"]["window_restarts"], 1)
+        self.align.assert_called_once()
+
+    def test_snapshot_wait_without_deadline_can_be_cancelled(self):
+        def missing_detection():
+            self.inputs._buffers["objects"].clear()
+            if self.now >= 1015:
+                self.cancel.set()
+        self.on_wait = missing_detection
+        with self.assertRaisesRegex(RuntimeError, "Observation cancelled"):
+            self.snapshot()
+        self.assertGreaterEqual(self.now, 1015)
+        self.align.assert_not_called()
+
     def test_pose_recovery_discards_entire_observation_window(self):
         checks = []
         def check():
