@@ -1,0 +1,93 @@
+# 展厅导览 — the scenario this whole bundle was built around.
+#
+# It is not a demo. Every field below feeds an assertion in `assertions.py`, and
+# the interesting one is `interrupted_leg` + `resume_target`: the robot is asked
+# to abandon a leg partway and then has to come back to *that* waypoint rather
+# than the one after it. That is the long-horizon mistake an LLM makes most
+# often, and no single-step check can see it.
+#
+# The map is rectangles rather than a committed occupancy blob so it can be read,
+# changed in a PR, and argued about.
+
+name: 展厅导览 · 基础巡游
+description: >
+  从入口出发依次讲解三个展区，途中被访客打断并临时加插一个目的地，
+  之后回到被放弃的那个展区继续。断言运动顺序、播报时机、打断上报与续接。
+
+# The opening instruction a suite run injects on /remote_control/message. The
+# LLM on the machine is what then decides to navigate and announce — the suite
+# measures the agent, so it must not be the agent.
+prompt: 现在有访客到了，请按顺序带他参观各个展区，每到一处做简短讲解。
+
+embodiment:
+  kind: wheeled
+  dof: 2
+  joint_names: [head_yaw, head_pitch]
+
+map:
+  resolution: 0.05
+  bounds: [-4.0, -8.0, 18.0, 8.0]
+  border: true
+  # 障碍全部落在导览动线之外 —— 本后端直线驱向目标、不做路径规划，
+  # 挡在两个航点之间的墙会让那一段撞停。`Scenario.validate()` 会在 load 时
+  # 把「直线不通」的航点对报出来，别靠跑一遍才发现。
+  walls:
+    # 北侧展墙，在 y=3 主动线之上
+    - [4.0, 5.0, 10.0, 5.6]
+    # 西北角储藏间
+    - [-3.0, 4.0, -1.5, 6.5]
+    # 东北角设备间
+    - [15.5, 4.5, 17.5, 7.0]
+
+spawn: {x: 0.0, y: 0.0, yaw: 0.0}
+
+motion:
+  max_lin: 0.5
+  max_ang: 0.6
+  accel: 0.4
+  radius: 0.25
+
+speech:
+  chars_per_sec: 5.0
+
+scan:
+  n_beams: 60
+  fov: 4.712        # 270°
+  max_range: 8.0
+
+pois:
+  - {name: 入口,     x: 1.5,  y: 0.0,  yaw: 0.0,   description: 展厅入口与迎宾区}
+  - {name: 一号展区, x: 6.0,  y: 3.0,  yaw: 1.57,  description: 早期产品与发展历程}
+  - {name: 洗手间,   x: 8.0,  y: -3.0, yaw: -1.57, description: 无障碍洗手间}
+  - {name: 二号展区, x: 12.0, y: 3.0,  yaw: 1.57,  description: 核心技术与专利墙}
+  - {name: 三号展区, x: 15.0, y: -4.0, yaw: 3.14,  description: 应用场景与合作伙伴}
+
+# Keyed off an event rather than an absolute time. A fixed `at:` that lands
+# mid-leg under a fake clock can land two waypoints later on a rig, where the
+# LLM round trip runs 3-48 s — and the interruption assertion then fails for a
+# reason that has nothing to do with the robot.
+injections:
+  - after_arrival: 一号展区
+    delay: 8.0
+    kind: user_message
+    text: 先别走了，带我去一下洗手间
+
+expect:
+  waypoint_order: [入口, 一号展区, 洗手间, 二号展区, 三号展区]
+  announce_after_arrive: true
+  never_occupied: true
+  interrupted_leg:
+    target: 二号展区
+    acp_status: cancelled
+    min_progress: 0.02
+  resume_target: 二号展区
+  max_wall_seconds: 600
+
+# Weights live here, not in code: they are the thing people argue about and
+# adjust, and changing one must not be a code change.
+weights:
+  orchestration: 30
+  interruption: 25
+  long_horizon: 25
+  safety: 15
+  latency: 5

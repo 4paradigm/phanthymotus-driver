@@ -1,0 +1,67 @@
+mcp_port: 15711
+name: 虚拟具身仿真 (Generic Simulator)
+
+# NOT the hostname. `vendor_runtime.resolve_namespace` falls back to
+# socket.gethostname(), which on a rig already running a real driver would put
+# the simulator's topics on top of the robot's.
+ros_namespace: sim
+
+ros:
+  # The simulator has no vendor bus, so both contexts sit on domain 42 with the
+  # fleet loopback profile. `lo` keeps CYCLONEDDS_URI honest even though it is
+  # inert under rmw_fastrtps_cpp.
+  robot_domain_id: 42
+  core_domain_id: 42
+  robot_interface: lo
+
+# What this bundle is pretending to be. Every card reads it, so one bundle
+# impersonates a wheeled base, a quadruped, a humanoid or a bare arm.
+embodiment:
+  kind: wheeled            # wheeled | quadruped | humanoid | arm
+  dof: 2
+  # Must match the URDF the `model` card serves character for character, or the
+  # skeleton renderer draws nothing and reports nothing about why. The fallback
+  # URDF is generated from this list precisely so the two cannot drift.
+  joint_names: [head_yaw, head_pitch]
+  joint_speed: 1.5
+
+world:
+  tick_hz: 20
+  chars_per_sec: 5.0       # speech duration = characters / this
+  trail_step_m: 0.15
+  # Same channel names the real drivers use (`base`, `mouth`, `arm`), so the
+  # barrier behaves identically. Set a prefix only when running the simulator
+  # alongside a real robot on one machine for comparison.
+  resource_prefix: ""
+  motion:
+    max_lin: 0.5
+    max_ang: 0.6
+    accel: 0.4
+    radius: 0.25
+
+battery:
+  start_percent: 100.0
+  drain_per_second: 0.005
+  drain_per_metre: 0.05
+  low_threshold: 20.0
+
+scenario:
+  default: exhibition_tour
+  # Injected tasks travel the same topic a real remote control uses.
+  inject_topic: /remote_control/message
+
+plugins:
+  odom:         {enabled: true}
+  imu:          {enabled: true}
+  laser_scan:   {enabled: true}
+  battery:      {enabled: true}
+  spatial_map:  {enabled: true}
+  model:        {enabled: true}
+  loco:         {enabled: true}
+  controlled_spatial: {enabled: true}
+  switch_mode:  {enabled: true}
+  arm:          {enabled: true}
+  led:          {enabled: true}
+  tts:          {enabled: true}
+  sim_scenario: {enabled: true}
+  sim_report:   {enabled: true}
