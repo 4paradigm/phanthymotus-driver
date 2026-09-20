@@ -138,12 +138,12 @@ ADAM_PRO_JOINTS = [
     "kneePitch_Left", "anklePitch_Left", "ankleRoll_Left",
     "hipPitch_Right", "hipRoll_Right", "hipYaw_Right",
     "kneePitch_Right", "anklePitch_Right", "ankleRoll_Right",
-    "waistYaw", "waistRoll", "waistPitch",
-    "shoulderPitch_Left", "shoulderRoll_Left", "shoulderYaw_Left", "elbow_Left",
-    "wristRoll_Left", "wristPitch_Left", "wristYaw_Left",
-    "shoulderPitch_Right", "shoulderRoll_Right", "shoulderYaw_Right", "elbow_Right",
-    "wristRoll_Right", "wristPitch_Right", "wristYaw_Right",
+    "waistRoll", "waistPitch", "waistYaw",
     "neckYaw", "neckPitch",
+    "shoulderPitch_Left", "shoulderRoll_Left", "shoulderYaw_Left", "elbow_Left",
+    "wristYaw_Left", "wristPitch_Left", "wristRoll_Left",
+    "shoulderPitch_Right", "shoulderRoll_Right", "shoulderYaw_Right", "elbow_Right",
+    "wristYaw_Right", "wristPitch_Right", "wristRoll_Right",
 ]
 
 VARIANT_JOINTS = {

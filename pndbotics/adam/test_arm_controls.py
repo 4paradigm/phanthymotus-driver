@@ -56,13 +56,18 @@ class ArmControlTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only Adam Pro"):
             ArmControlPlugin({}, "", None, variant="sp")
 
-    def test_adam_pro_layout_matches_the_vendor_motor_order(self):
+    def test_adam_pro_layout_matches_the_verified_motor_order(self):
         expected = {
-            "waistYaw": 12, "waistRoll": 13, "waistPitch": 14,
-            "wristRoll_Left": 19, "wristPitch_Left": 20,
-            "wristYaw_Left": 21, "wristRoll_Right": 26,
-            "wristPitch_Right": 27, "wristYaw_Right": 28,
-            "neckYaw": 29, "neckPitch": 30,
+            "waistRoll": 12, "waistPitch": 13, "waistYaw": 14,
+            "neckYaw": 15, "neckPitch": 16,
+            "shoulderPitch_Left": 17, "shoulderRoll_Left": 18,
+            "shoulderYaw_Left": 19, "elbow_Left": 20,
+            "wristYaw_Left": 21, "wristPitch_Left": 22,
+            "wristRoll_Left": 23,
+            "shoulderPitch_Right": 24, "shoulderRoll_Right": 25,
+            "shoulderYaw_Right": 26, "elbow_Right": 27,
+            "wristYaw_Right": 28, "wristPitch_Right": 29,
+            "wristRoll_Right": 30,
         }
         for joint, index in expected.items():
             self.assertEqual(index, ADAM_PRO_JOINTS.index(joint), joint)
@@ -88,6 +93,42 @@ class ArmControlTests(unittest.TestCase):
             _arm_target_radians("dof_pos/shoulderPitch_Left", 0)
         with self.assertRaisesRegex(ValueError, "finite"):
             _arm_target_radians("left_elbow", float("nan"))
+
+    def test_shoulder_command_writes_arm_slots_without_targeting_neck(self):
+        publisher = _FakePublisher()
+        plugin = _prime_arm_plugin(publisher)
+        plugin._hold_q = [0.0] * 31
+        plugin._current_q = [0.0] * 31
+        plugin._seg_current = [0.0] * 31
+        original_factory = getattr(device, "pnd_adam_msg_dds__LowCmd_", None)
+        device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
+        try:
+            plugin.start()
+            result = plugin.dispatch("set_shoulder", {
+                "side": "left", "pitch_deg": -30, "roll_deg": 20,
+                "yaw_deg": 10,
+            })
+            self.assertTrue(result["success"], result)
+            plugin._stop_event.set()
+            plugin._thread.join(1.0)
+            plugin._thread = None
+            plugin._seg_started_at = time.monotonic() - plugin._seg_span
+            plugin._write_command(0.02)
+        finally:
+            plugin._stop_event.set()
+            if plugin._thread is not None:
+                plugin._thread.join(1.0)
+            if original_factory is None:
+                del device.pnd_adam_msg_dds__LowCmd_
+            else:
+                device.pnd_adam_msg_dds__LowCmd_ = original_factory
+
+        command = publisher.commands[-1]
+        self.assertEqual(0.0, command.motor_cmd[15].q)
+        self.assertEqual(0.0, command.motor_cmd[16].q)
+        self.assertAlmostEqual(math.radians(-30), command.motor_cmd[17].q)
+        self.assertAlmostEqual(math.radians(20), command.motor_cmd[18].q)
+        self.assertAlmostEqual(math.radians(10), command.motor_cmd[19].q)
 
     def test_lowcmd_holds_non_arm_joints_and_uses_official_arm_pd(self):
         publisher = _FakePublisher()
