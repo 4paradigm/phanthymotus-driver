@@ -15,6 +15,18 @@ plugins:
     enabled: true
   arm:
     enabled: true
+  # 双臂 + 双夹爪的连续控制（motus.control/1，16 维）。给执行模型用。
+  #
+  # **默认关闭。** 它走 rt/arm_sdk 直接写关节指令，与内置控制器通过混合权重共存
+  # （无需调试模式），但它仍然是这个驱动里唯一直接驱动电机的东西。开之前读一遍
+  # servo.py 的模块文档，尤其是交还渐出那一段。
+  servo:
+    enabled: false
+    # 指令流频率上限 50；descriptor 的 max_delta_per_step 按它算。
+    expected_hz: 30
+    # 没装 Dex1 夹爪就设 false —— 那会让这张卡**声明成 14 维**，于是 16 维的模型
+    # 协商失败，而不是被执行一半。
+    grippers: true
   state:
     enabled: true
   camera:
