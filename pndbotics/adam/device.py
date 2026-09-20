@@ -498,6 +498,8 @@ class _StatePublisherNode(Node):
 
     _BATTERY_INTERVAL_S = 1.0
 
+    _BATTERY_INTERVAL_S = 1.0
+
     def __init__(self, namespace: str, variant: str, publish_rate_hz: float):
         super().__init__("adam_state_publisher")
         self._namespace = namespace
@@ -768,9 +770,13 @@ class StatePlugin:
 # ===========================================================================
 
 class LocoPlugin:
-    """High-level locomotion via the Adam RL gRPC service."""
+    """Adam locomotion state-machine card backed by the RL gRPC service."""
 
     PREFIX = "loco"
+    # JSON Schema enums render as a selector in the Dashboard.  The server
+    # remains authoritative: it rejects a state that is not currently listed
+    # by GetRobotState.switchable_states.
+    MODE_OPTIONS = ["STOP", "ZERO", "STAND_WALK", "MULTI_AGENT", "MOTION_TRACK"]
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  grpc_client, **kwargs):
@@ -781,120 +787,65 @@ class LocoPlugin:
         return {
             "name": "loco",
             "type": "actuator",
-            "description": "Adam locomotion — walk, turn, stop, gestures, mode switching",
+            "description": (
+                "Adam RL locomotion state machine — inspect supported states and "
+                "switch only to a state returned by get_state"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": [
-                            "set_mode", "move", "stop", "stand_motion",
-                            "stand_action", "stand_dynamic", "get_state",
-                            "list_actions", "clear_error", "carry_box",
-                        ],
+                        "enum": ["set_mode", "get_state", "list_actions", "info"],
                     },
                     "mode": {
                         "type": "string",
+                        "enum": self.MODE_OPTIONS,
                         "minLength": 1,
-                        "description": "Target state name returned by get_state.switchable_states",
+                        "description": (
+                            "Choose a state returned by get_state.switchable_states; "
+                            "unavailable transitions are rejected by the robot"
+                        ),
                     },
-                    "vx": {"type": "number", "description": "Forward velocity (m/s)"},
-                    "vy": {"type": "number", "description": "Lateral velocity (m/s)"},
-                    "vyaw": {"type": "number", "description": "Yaw angular velocity (rad/s)"},
-                    "motion_id": {"type": "integer", "description": "Predefined motion ID"},
-                    "action_id": {"type": "integer", "description": "Predefined action/gesture ID"},
-                    "pitch": {"type": "number", "description": "Body pitch (rad)"},
-                    "roll": {"type": "number", "description": "Body roll (rad)"},
-                    "yaw": {"type": "number", "description": "Body yaw (rad)"},
-                    "height": {"type": "number", "description": "Body height (m)"},
-                    "enable": {"type": "boolean", "description": "Enable/disable flag"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "set_mode": {
                         "params": ["mode"],
-                        "description": "Switch robot mode (e.g., stand, walk)",
-                    },
-                    "move": {
-                        "params": ["vx", "vy", "vyaw"],
-                        "description": "Walk with specified velocities",
-                    },
-                    "stop": {
-                        "params": [],
-                        "description": "Stop all movement",
-                    },
-                    "stand_motion": {
-                        "params": ["motion_id"],
-                        "description": "Execute predefined standing pose",
-                    },
-                    "stand_action": {
-                        "params": ["action_id"],
-                        "description": "Execute predefined gesture/action",
-                    },
-                    "stand_dynamic": {
-                        "params": ["pitch", "roll", "yaw", "height"],
-                        "description": "Adjust body orientation and height while standing",
+                        "description": "Switch to an RL state advertised by get_state",
                     },
                     "get_state": {
                         "params": [],
-                        "description": "Query current robot state (mode, gait, battery)",
+                        "description": "Query RL FSM state and supported transitions",
                     },
                     "list_actions": {
                         "params": [],
-                        "description": "List available motions and actions",
+                        "description": "List switchable RL states and available actions",
                     },
-                    "clear_error": {
-                        "params": [],
-                        "description": "Clear error state",
-                    },
-                    "carry_box": {
-                        "params": ["enable"],
-                        "description": "Enable/disable carry box mode",
-                    },
+                    "info": {"params": [], "description": "Describe the RL control contract"},
                 },
             },
         }
 
     def start(self):
-        pass
+        return None
 
     def stop(self):
-        pass
+        return None
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
         if action == "set_mode":
             return self._grpc.set_mode(args.get("mode", ""))
-        if action == "move":
-            return self._grpc.set_speed(
-                args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0)
-            )
-        if action == "stop_move" or action == "stop":
-            return self._grpc.set_speed(0.0, 0.0, 0.0)
-        if action == "stand_motion":
-            return self._grpc.set_stand_motion(args.get("motion_id", 0))
-        if action == "stand_action":
-            return self._grpc.set_stand_action(args.get("action_id", 0))
-        if action == "stand_dynamic":
-            return self._grpc.set_stand_dynamic(
-                pitch=args.get("pitch", 0.0),
-                roll=args.get("roll", 0.0),
-                yaw=args.get("yaw", 0.0),
-                height=args.get("height", 0.0),
-            )
         if action == "get_state":
             return self._grpc.get_robot_state()
         if action == "list_actions":
             return self._grpc.get_stand_list()
-        if action == "clear_error":
-            return self._grpc.set_error_clear()
-        if action == "carry_box":
-            return self._grpc.set_carry_box(args.get("enable", False))
         if action == "info":
-            return {"state": "ready"}
+            return {
+                "state": "ready",
+                "protocol": "pnd.robot RobotControl (RL)",
+                "velocity_control": "unavailable: RL SetVelocity is reserved",
+                "set_mode": "requires a name returned by get_state.switchable_states",
+            }
         return None
 
 
