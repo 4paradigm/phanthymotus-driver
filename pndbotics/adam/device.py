@@ -1097,8 +1097,11 @@ class AxisControlPlugin:
     def get_tool(self):
         properties = {
             "action": {
-                "type": "string", "enum": ["reset"],
-                "oneOf": [{"const": "reset", "title": "回到起始角度"}],
+                "type": "string", "enum": ["set_angles", "reset"],
+                "oneOf": [
+                    {"const": "set_angles", "title": "执行角度控制"},
+                    {"const": "reset", "title": "回到起始角度"},
+                ],
             },
             "duration_s": {
                 "type": "number", "title": "动作时长（秒）",
@@ -1153,6 +1156,10 @@ class AxisControlPlugin:
             return {"success": False, "code": "INVALID_ARGUMENT",
                     "message": duration_error}
         if action == "reset":
+            error = self._control.reset(
+                [values[1] for values in self.CONTROLS.values()], duration)
+            return error or {"success": True, "state": "active", "action": "reset"}
+        if action == "set_angles":
             targets = {}
             for axis, (_, joint_name, minimum, maximum) in self.CONTROLS.items():
                 field = f"{axis}_deg"
@@ -1167,14 +1174,13 @@ class AxisControlPlugin:
                     return {"success": False, "code": "INVALID_ARGUMENT",
                             "message": f"{field} must be a number in [{minimum:g}, {maximum:g}]"}
                 targets[joint_name] = math.radians(degrees)
-            if targets:
-                error = self._control.set_targets(targets, duration)
-                return error or {"success": True, "state": "active",
-                                 "action": "set_angles", "duration_s": duration,
-                                 "protocol": "rt/lowcmd"}
-            error = self._control.reset(
-                [values[1] for values in self.CONTROLS.values()], duration)
-            return error or {"success": True, "state": "active", "action": "reset"}
+            if not targets:
+                return {"success": False, "code": "INVALID_ARGUMENT",
+                        "message": "set_angles requires at least one angle"}
+            error = self._control.set_targets(targets, duration)
+            return error or {"success": True, "state": "active",
+                             "action": "set_angles", "duration_s": duration,
+                             "protocol": "rt/lowcmd"}
         if not action.startswith("set_"):
             return None
         axis = action[4:]
@@ -1200,16 +1206,16 @@ class WaistControlPlugin(AxisControlPlugin):
     PREFIX = "waist_control"
     TOOL_NAME = "waist_control"
     CONTROLS = WAIST_JOINT_CONTROLS
-    DESCRIPTION = ("Adam Pro 腰部基础角度控制。侧倾、俯仰和旋转角度全部直接显示，"
-                   "reset 可回到启动时角度；每个字段均标明真实限位。")
+    DESCRIPTION = ("Adam Pro 腰部基础角度控制。侧倾、俯仰和旋转角度全部直接显示；"
+                   "set_angles 执行填写的角度，reset 回到启动时角度。")
 
 
 class HeadControlPlugin(AxisControlPlugin):
     PREFIX = "head_control"
     TOOL_NAME = "head_control"
     CONTROLS = HEAD_JOINT_CONTROLS
-    DESCRIPTION = ("Adam Pro 头部基础角度控制。偏航与俯仰角度全部直接显示，"
-                   "reset 可回到启动时角度，范围均为 [-60, 60] 度。")
+    DESCRIPTION = ("Adam Pro 头部基础角度控制。偏航与俯仰角度全部直接显示；"
+                   "set_angles 执行填写的角度，reset 回到启动时角度。")
 
 
 # ===========================================================================

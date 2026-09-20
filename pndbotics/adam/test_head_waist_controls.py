@@ -47,7 +47,8 @@ class HeadWaistSchemaTests(unittest.TestCase):
     def test_head_angles_are_all_visible_with_real_ranges(self):
         tool = HeadControlPlugin(_FakeControl()).get_tool()
         schema = tool["inputSchema"]
-        self.assertEqual(schema["properties"]["action"]["enum"], ["reset"])
+        self.assertEqual(
+            schema["properties"]["action"]["enum"], ["set_angles", "reset"])
         self.assertNotIn("x-action-params", schema)
         for field in ("yaw_deg", "pitch_deg"):
             self.assertIn(field, schema["properties"])
@@ -57,7 +58,8 @@ class HeadWaistSchemaTests(unittest.TestCase):
     def test_waist_angles_are_all_visible_with_real_ranges(self):
         tool = WaistControlPlugin(_FakeControl()).get_tool()
         schema = tool["inputSchema"]
-        self.assertEqual(schema["properties"]["action"]["enum"], ["reset"])
+        self.assertEqual(
+            schema["properties"]["action"]["enum"], ["set_angles", "reset"])
         self.assertNotIn("x-action-params", schema)
         expected = {
             "roll_deg": (-16.0, 16.0),
@@ -68,18 +70,22 @@ class HeadWaistSchemaTests(unittest.TestCase):
             self.assertEqual(schema["properties"][field]["minimum"], limits[0])
             self.assertEqual(schema["properties"][field]["maximum"], limits[1])
 
-    def test_reset_applies_visible_angles_or_returns_to_start(self):
+    def test_set_angles_applies_visible_angles_and_reset_returns_to_start(self):
         control = _FakeControl()
         plugin = HeadControlPlugin(control)
         result = plugin.dispatch(
-            "reset", {"yaw_deg": 30, "pitch_deg": -10, "duration_s": 2})
+            "set_angles", {"yaw_deg": 30, "pitch_deg": -10, "duration_s": 2})
         self.assertTrue(result["success"])
         targets, duration = control.calls[-1]
         self.assertAlmostEqual(targets["neckYaw"], math.radians(30))
         self.assertAlmostEqual(targets["neckPitch"], math.radians(-10))
         self.assertEqual(duration, 2.0)
 
-        result = plugin.dispatch("reset", {"pitch_deg": 61})
+        result = plugin.dispatch("set_angles", {"pitch_deg": 61})
+        self.assertFalse(result["success"])
+        self.assertEqual(result["code"], "INVALID_ARGUMENT")
+
+        result = plugin.dispatch("set_angles", {})
         self.assertFalse(result["success"])
         self.assertEqual(result["code"], "INVALID_ARGUMENT")
 
