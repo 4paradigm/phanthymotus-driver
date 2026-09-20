@@ -31,12 +31,12 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.bundle = DriverBundle(device.build_plugins({}, "rm75", None))
 
     def configure(self, **values):
-        return self.bundle.dispatch("pick_place", {"action": "config", **values})
+        return self.bundle.dispatch("vision_pick_and_drop", {"action": "config", **values})
 
     def test_registered_config_defaults(self):
-        card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "pick_place")
+        card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "vision_pick_and_drop")
         self.assertEqual(card["type"], "actuator")
-        self.assertEqual([p["format"] for p in card["topic_in"]], ["image/jpeg", "image/depth-zlib", "data/json"])
+        self.assertEqual([p["format"] for p in card["topic_in"]], ["image/depth-zlib", "image/jpeg", "data/json"])
         self.assertNotIn("topic_out", card)
         expected = {
             "speed_percent": 50, "observation_joints_deg": "-90,0,0,90,0,90,0",
@@ -47,26 +47,30 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertEqual(self.configure(), {"ok": True, **expected})
 
     def test_motion_actions_declare_confirmation_and_acp_completion(self):
-        card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "pick_place")
+        card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "vision_pick_and_drop")
         schema = card["inputSchema"]
         self.assertEqual(set(schema["properties"]["action"]["enum"]), {"observe", "transfer_to", "transfer_by", "cancel"})
-        self.assertEqual(set(schema["properties"]), {"action", "x1", "y1", "x2", "y2", "dx_mm", "dy_mm", "confirm_motion"})
+        self.assertEqual(set(schema["properties"]), {"action", "start_point_x", "start_point_y", "target_point_x", "target_point_y", "delta_x", "delta_y", "rotation_deg", "confirm_motion"})
         self.assertEqual(schema["x-action-params"]["observe"]["params"], ["confirm_motion"])
-        self.assertEqual(schema["x-action-params"]["transfer_to"]["params"], ["x1", "y1", "x2", "y2", "confirm_motion"])
-        self.assertEqual(schema["x-action-params"]["transfer_by"]["params"], ["x1", "y1", "dx_mm", "dy_mm", "confirm_motion"])
-        for name in ("x1", "y1", "x2", "y2"):
+        self.assertEqual(schema["x-action-params"]["transfer_to"]["params"], ["start_point_x", "start_point_y", "target_point_x", "target_point_y", "rotation_deg", "confirm_motion"])
+        self.assertEqual(schema["x-action-params"]["transfer_by"]["params"], ["start_point_x", "start_point_y", "delta_x", "delta_y", "rotation_deg", "confirm_motion"])
+        for action in ("transfer_to", "transfer_by"):
+            params = schema["x-action-params"][action]["params"]
+            self.assertEqual([name for name in schema["properties"] if name in params], params)
+            self.assertEqual(params[-2:], ["rotation_deg", "confirm_motion"])
+        for name in ("start_point_x", "start_point_y", "target_point_x", "target_point_y"):
             prop = schema["properties"][name]
             self.assertEqual((prop["type"], prop["minimum"], prop["maximum"]), ("number", -1, 1))
             self.assertIn("归一化", prop["description"])
-            self.assertIn("正方向向右" if name.startswith("x") else "正方向向下", prop["description"])
-        self.assertIn("position[0]", schema["properties"]["x1"]["description"])
-        self.assertIn("position[1]", schema["properties"]["y1"]["description"])
-        for name in ("dx_mm", "dy_mm"):
+            self.assertIn("正方向向右" if name.endswith("_x") else "正方向向下", prop["description"])
+        self.assertIn("position[0]", schema["properties"]["start_point_x"]["description"])
+        self.assertIn("position[1]", schema["properties"]["start_point_y"]["description"])
+        for name in ("delta_x", "delta_y"):
             self.assertEqual(schema["properties"][name]["type"], "number")
             self.assertNotIn("minimum", schema["properties"][name])
             self.assertIn("mm", schema["properties"][name]["description"])
-        self.assertIn("X 正方向向右（正值），负方向向左（负值）", schema["properties"]["dx_mm"]["description"])
-        self.assertIn("Y 正方向向照片下方（正值），负方向向上方（负值）", schema["properties"]["dy_mm"]["description"])
+        self.assertIn("X 正方向向右（正值），负方向向左（负值）", schema["properties"]["delta_x"]["description"])
+        self.assertIn("Y 正方向向照片下方（正值），负方向向上方（负值）", schema["properties"]["delta_y"]["description"])
         self.assertEqual(schema["required"], ["action"])
         self.assertEqual(schema["x-completion"], {"actions": ["observe", "transfer_to", "transfer_by"], "timeout": 210})
         self.assertEqual(schema["properties"]["confirm_motion"]["type"], "boolean")
@@ -80,8 +84,22 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertEqual(schema["x-hooks"]["on_interrupt_motion"], {"action": "cancel"})
         self.assertEqual(schema["x-hooks"]["on_interrupt_all"], {"action": "cancel"})
 
+    def test_rotation_is_optional_and_explicitly_requested_in_mcp_guidance(self):
+        card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "vision_pick_and_drop")
+        schema = card["inputSchema"]
+        self.assertEqual(schema["properties"]["rotation_deg"]["default"], 0)
+        self.assertEqual(schema["properties"]["rotation_deg"]["minimum"], -180)
+        self.assertEqual(schema["properties"]["rotation_deg"]["maximum"], 180)
+        self.assertNotIn("rotation_deg", schema["required"])
+        for name in ("transfer_to", "transfer_by"):
+            desc = schema["x-action-params"][name]["description"]
+            for text in ("常规搬运省略", "用户明确要求", "俯视顺时针", "逆时针", "rotation_deg"):
+                self.assertIn(text, desc)
+        self.assertEqual([p["desc"] for p in card["topic_in"]], ["深度图像", "RGB 图像", "VOP 物品列表"])
+        self.assertNotIn("pick_place", [t["name"] for t in self.bundle.get_all_tools()])
+
     def test_each_mcp_action_exposes_observation_lifecycle(self):
-        card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "pick_place")
+        card = next(tool for tool in self.bundle.get_all_tools() if tool["name"] == "vision_pick_and_drop")
         actions = card["inputSchema"]["x-action-params"]
         self.assertIn("result.objects", actions["observe"]["description"])
         for name in ("transfer_to", "transfer_by"):
@@ -120,7 +138,7 @@ class PickPlaceConfigTests(unittest.TestCase):
         self.assertTrue(self.configure(speed_percent=1, pick_grip_force=100,
                                       observation_joints_deg="-178,-130,-178,-135,-178,-128,-360")["ok"])
         for action in ("observe", "transfer_to", "transfer_by"):
-            self.assertEqual(self.bundle.dispatch("pick_place", {"action": action})["state"], "error")
+            self.assertEqual(self.bundle.dispatch("vision_pick_and_drop", {"action": action})["state"], "error")
 
 
 class IndependenceTests(unittest.TestCase):
@@ -182,7 +200,7 @@ class ObserveTests(unittest.TestCase):
         self.camera.snapshot.side_effect = self.snapshot
         self.camera.identity.return_value = {"topics": ["/test/rgb", "/test/depth", "/test/rgb/objects"], "serial_number": "D435-test", "session_id": "session-test"}
         self.camera.topics.return_value = [{"topic": t, "format": f} for t, f in zip(self.camera.identity()["topics"], ("image/jpeg", "image/depth-zlib", "data/json"))]
-        self.plugin = PickPlacePlugin(self.client, {"pick_place": {"output_dir": self.temp.name}},
+        self.plugin = PickPlacePlugin(self.client, {"vision_pick_and_drop": {"output_dir": self.temp.name}},
                                       inputs=self.camera)
         self.copy = copy.deepcopy
         self.completion_factory = self.enterContext(mock.patch("pick_place.Completion"))
@@ -262,7 +280,7 @@ class ObserveTests(unittest.TestCase):
         self.assertFalse(result["observation_required"])
         self.assertFalse(self.plugin.dispatch("info", {})["observation_required"])
         self.assertIsNone(self.plugin._active)
-        self.assertTrue(result["action_id"].startswith("pick_place_observe_"))
+        self.assertTrue(result["action_id"].startswith("vision_pick_and_drop_observe_"))
         self.assertNotIn("request_id", result)
         self.assertEqual(self.commands, [("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 50, 0, 0, 0))])
         self.camera.snapshot.assert_called_once()
@@ -282,7 +300,7 @@ class ObserveTests(unittest.TestCase):
         self.camera.identity.return_value = {**self.camera.identity(), "session_id": "new-session"}
         self.assertTrue(self.plugin.dispatch("info", {})["observation_required"])
         result = self.plugin.dispatch("transfer_by", {
-            "confirm_motion": True, "x1": 0, "y1": 0, "dx_mm": 10, "dy_mm": 0})
+            "confirm_motion": True, "start_point_x": 0, "start_point_y": 0, "delta_x": 10, "delta_y": 0})
         self.assertEqual(result["code"], "OBSERVATION_REQUIRED")
         self.assertEqual(len(self.commands), count)
 

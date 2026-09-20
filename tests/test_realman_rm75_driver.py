@@ -179,7 +179,7 @@ class RealManRM75ImageContractTests(unittest.TestCase):
         directory = "/opt/phanthy-motus/data/pick_place/realman"
         service = (DRIVER / "deploy/service.yml").read_text()
         self.assertIn(f"{directory}:{directory}", service)
-        self.assertIn(f"pick_place:\n  output_dir: {directory}", (DRIVER / "config.yaml").read_text())
+        self.assertIn(f"vision_pick_and_drop:\n  output_dir: {directory}", (DRIVER / "config.yaml").read_text())
 
 
 class RealManRM75GripperPluginTests(unittest.TestCase):

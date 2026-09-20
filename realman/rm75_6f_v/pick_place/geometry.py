@@ -10,7 +10,7 @@ import numpy as np
 from .motion import rotation, vector
 
 
-def positions(args, names=("x1", "y1", "x2", "y2")):
+def positions(args, names=("start_point_x", "start_point_y", "target_point_x", "target_point_y")):
     result = []
     for name in names:
         value = args.get(name)
@@ -21,15 +21,23 @@ def positions(args, names=("x1", "y1", "x2", "y2")):
     return [result[index:index + 2] for index in range(0, len(result), 2)]
 
 
-def displacement(args):
+def rotation_degrees(args):
+    value = args.get("rotation_deg", 0)
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not -180 <= value <= 180):
+        raise ValueError("rotation_deg must be a finite angle in [-180, 180] degrees")
+    return float(value)
+
+
+def displacement(args, rotation_deg=0):
     result = []
-    for name in ("dx_mm", "dy_mm"):
+    for name in ("delta_x", "delta_y"):
         value = args.get(name)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError(f"{name} must be a finite displacement in millimetres")
         result.append(float(value))
-    if not any(result):
-        raise ValueError("At least one of dx_mm and dy_mm must be nonzero")
+    if not any(result) and not rotation_deg:
+        raise ValueError("At least one of delta_x, delta_y and rotation_deg must be nonzero")
     return result
 
 

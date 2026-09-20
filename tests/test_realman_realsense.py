@@ -13,6 +13,7 @@ import zlib
 import numpy as np
 
 SOURCE = Path(__file__).resolve().parents[1] / "realman/rm75_6f_v/realsense.py"
+sys.path.insert(0, str(SOURCE.parent))
 spec = importlib.util.spec_from_file_location("realman_realsense", SOURCE)
 rs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rs)
@@ -220,6 +221,8 @@ class FakeFrame:
         intr = types.SimpleNamespace(width=w, height=h, fx=w, fy=h, ppx=w/2, ppy=h/2,
                                      model="distortion.none", coeffs=[0] * 5)
         self.profile = types.SimpleNamespace(as_video_stream_profile=lambda: types.SimpleNamespace(
+            unique_id=lambda: w * 10000 + h * 10 + data.ndim,
+            width=lambda: w, height=lambda: h, fps=lambda: 15, format=lambda: str(data.dtype),
             get_intrinsics=lambda: intr,
             get_extrinsics_to=lambda _: types.SimpleNamespace(
                 rotation=[1, 0, 0, 0, 1, 0, 0, 0, 1], translation=[0.02, 0, 0])))
@@ -259,6 +262,9 @@ class FakePublisher:
 
     def publish(self, message):
         self.messages.append(message)
+
+    def get_subscription_count(self):
+        return 1
 
 
 class FakeNode:

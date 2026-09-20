@@ -263,7 +263,7 @@ class SDKOwnershipTests(unittest.TestCase):
              mock.patch.dict(sys.modules, {"Robotic_Arm.rm_robot_interface": sdk}):
             bundle.start_all()
             self.assertTrue(client.connected)
-            self.assertEqual([tool["name"] for tool in bundle.get_all_tools()], ["pick_place"])
+            self.assertEqual([tool["name"] for tool in bundle.get_all_tools()], ["vision_pick_and_drop"])
             # Stopping the card does not disconnect the Driver's device resource.
             card.stop()
             self.assertTrue(client.connected)

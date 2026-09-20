@@ -1,4 +1,4 @@
-# pick_place
+# vision_pick_and_drop
 
 RealMan Driver ACTUATOR 卡片，提供 `observe` 观察拍照、`transfer_to` 指定目标点搬运和
 `transfer_by` 指定距离搬运。
@@ -7,15 +7,15 @@ RealMan Driver ACTUATOR 卡片，提供 `observe` 观察拍照、`transfer_to` �
 ## 画布数据流
 
 ```text
-ext_camera (rgb) ─┬─────────────→ pick_place 输入 1：RGB 图像
-                 └→ VOP ───────→ pick_place 输入 3：物品列表
-ext_camera (depth) ─────────────→ pick_place 输入 2：深度图像
-大模型 ── MCP / ACP ────────────↔ pick_place
+ext_camera (depth) ─────────────→ vision_pick_and_drop 输入 1：深度图像
+ext_camera (rgb) ─┬─────────────→ vision_pick_and_drop 输入 2：RGB 图像
+                 └→ VOP ───────→ vision_pick_and_drop 输入 3：物品列表
+大模型 ── MCP / ACP ────────────↔ vision_pick_and_drop
 ```
 
 两个 `ext_camera` 实例须选择同一台 RealSense，分别配置 `rgb`、`depth` channel。
-VOP 订阅同一 RGB 通道，检测结果连入 `pick_place`，由 `observe` 完成结果交给大模型。
-`pick_place` 没有图像输出端口。框架启动时传入三条 `input_topics`，
+VOP 订阅同一 RGB 通道，检测结果连入 `vision_pick_and_drop`，由 `observe` 完成结果交给大模型。
+`vision_pick_and_drop` 没有图像输出端口。框架启动时传入三条 `input_topics`，
 卡片按 `/rgb`、`/depth`、`/rgb/objects` 识别来源，不依赖连线创建顺序。
 `info.topic_in` 返回三个实际绑定主题及格式；`info.inputs` 返回数据就绪和错误状态。
 
@@ -56,7 +56,7 @@ MCP 总描述及各动作描述包含调用顺序、坐标约定、动作选择�
 2. 从本次 ACP 完成结果 `result.objects` 读取物品名称、`position` 和 `confidence`。
    `count=0` 是有效的空检测结果。目标不存在或无法确定时报告或询问用户，不猜测坐标。
 3. 选取香蕉检测中心的 `position[0]、position[1]`，调用 `transfer_by`，
-   填写 `dx_mm=30、dy_mm=0、confirm_motion=true`。放到照片中的指定位置时使用 `transfer_to`；
+   填写 `delta_x=30、delta_y=0、confirm_motion=true`。放到照片中的指定位置时使用 `transfer_to`；
    放在另一物体旁边时选择旁边空位，参照物中心不代表空位。
 4. 等待框架 ACP 完成通知。`status=completed` 且 `result.ok=true` 表示配置要求的动作链完成。
    开启 `observe_after_transfer` 时，读取 `result.observation` 中的新照片和检测结果评估效果；
@@ -91,7 +91,7 @@ X/Y 补偿是独立的水平定位参数，作用于基坐标系中的目标位�
 
 ## observe
 
-调用 `pick_place` 时传入 `{"action": "observe", "confirm_motion": true}`。
+调用 `vision_pick_and_drop` 时传入 `{"action": "observe", "confirm_motion": true}`。
 接收后返回 `running` 和 `action_id`，后台完成运动、同步观察和结果保存，再通过 ACP 上报结果。
 Driver 必须已连接并以 `live` 模式部署；只读部署会明确提示当前模式不可执行动作。
 
@@ -108,7 +108,7 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 
 ## 位置坐标
 
-两个搬运动作的位置参数 `x1、y1、x2、y2` 都使用最近一次成功观察照片的
+两个搬运动作的位置参数 `start_point_x、start_point_y、target_point_x、target_point_y` 都使用最近一次成功观察照片的
 **中心归一化坐标**，数值范围 `[-1, 1]`，支持小数，照片中心为 `(0, 0)`。
 
 | 轴 | −1 | 0 | +1 | 正方向 |
@@ -116,8 +116,8 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 | X | 照片左边缘 | 水平中心 | 照片右边缘 | 向右 |
 | Y | 照片上边缘 | 垂直中心 | 照片下边缘 | 向下 |
 
-与 VOP 的 `position` 定义一致：将同次观察的检测结果 `position[0]` 传给 `x1`，
-`position[1]` 传给 `y1` 即可，不需要大模型读取照片文件或换算像素。
+与 VOP 的 `position` 定义一致：将同次观察的检测结果 `position[0]` 传给 `start_point_x`，
+`position[1]` 传给 `start_point_y` 即可，不需要大模型读取照片文件或换算像素。
 卡片按保存照片的实际宽高在内部换算：`pixel_x = round((x+1)*width/2)`、
 `pixel_y = round((y+1)*height/2)`；右/下边缘取整到尺寸边界时使用最后一个像素。
 例如 `1280×720` 照片中的 `(0.08, -0.079)` 对应像素 `(691, 332)`。
@@ -129,10 +129,12 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 使用最近一次成功观察（独立 `observe` 或搬运返回的 `observation`）中的四个归一化坐标调用：
 
 ```json
-{"action": "transfer_to", "confirm_motion": true, "x1": -0.3, "y1": 0.2, "x2": 0.3, "y2": 0.2}
+{"action": "transfer_to", "start_point_x": -0.3, "start_point_y": 0.2, "target_point_x": 0.3, "target_point_y": 0.2, "confirm_motion": true}
 ```
 
-`(x1, y1)` 为抓取物体的中心，`(x2, y2)` 为放置位置，均遵循上述位置坐标约定。
+参数顺序为 `start_point_x、start_point_y、target_point_x、target_point_y、rotation_deg、confirm_motion`。
+
+`(start_point_x, start_point_y)` 为抓取物体的中心，`(target_point_x, target_point_y)` 为放置位置，均遵循上述位置坐标约定。
 调用传入这四个位置参数及 `confirm_motion=true`，接收后返回 `action_id`，整次搬运由后台完成并通过 ACP 上报。
 
 两点均使用最近一次成功观察的原始对齐深度和内参计算，并分别叠加配置的 X/Y 补偿，
@@ -142,18 +144,20 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 
 ## transfer_by：指定距离（mm）
 
-使用最新观察照片中物体中心的归一化坐标 `(x1, y1)` 指定抓取对象，
-再给出从该抓取点出发的桌面位移 `dx_mm、dy_mm`。两个位移都要填写，支持小数，
-至少一个非零；无须填写 `x2、y2`。例如，将该物体向照片左侧移动 30 mm：
+参数顺序为 `start_point_x、start_point_y、delta_x、delta_y、rotation_deg、confirm_motion`；`delta_x/delta_y` 单位均为毫米。
+
+使用最新观察照片中物体中心的归一化坐标 `(start_point_x, start_point_y)` 指定抓取对象，
+再给出从该抓取点出发的桌面位移 `delta_x、delta_y`。两个位移都要填写，支持小数，
+若两个位移都为 0，须设置非零 `rotation_deg`，表示原地抓起旋转再放下；无须填写 `target_point_x、target_point_y`。例如，将该物体向照片左侧移动 30 mm：
 
 ```json
-{"action": "transfer_by", "confirm_motion": true, "x1": 0.08, "y1": -0.079, "dx_mm": -30, "dy_mm": 0}
+{"action": "transfer_by", "start_point_x": 0.08, "start_point_y": -0.079, "delta_x": -30, "delta_y": 0, "confirm_motion": true}
 ```
 
-位移 `dx_mm、dy_mm` 的方向以本次 `observe` 的照片为准，单位为 mm；它们是实际位移量，不是归一化坐标。
+位移 `delta_x、delta_y` 的方向以本次 `observe` 的照片为准，单位为 mm；它们是实际位移量，不是归一化坐标。
 **X 正方向向右，Y 正方向向下；正值沿正方向，负值反向，0 表示该方向不移动。**
 
-| 需求 | `dx_mm` | `dy_mm` |
+| 需求 | `delta_x` | `delta_y` |
 | --- | --- | --- |
 | 向右移动 30 mm | 30 | 0 |
 | 向左移动 30 mm | -30 | 0 |
@@ -163,13 +167,31 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 
 这里的“上/下”是桌面平面内的方向，**不是机械臂 Z 轴升降**。位移相对于物体的抓取点，
 不是当前机械臂位置、绝对基坐标或像素增量。当前安装映射为基坐标
-`ΔX = -dx_mm`、`ΔY = dy_mm`，放置点直接由 `B = A + (ΔX, ΔY)` 计算。
+`ΔX = -delta_x`、`ΔY = delta_y`，放置点直接由 `B = A + (ΔX, ΔY)` 计算。
 抓取点 A 使用原始深度和配置的 X/Y 补偿定位，B 不重复添加补偿；位移按毫米计算，
 不换算为目标像素，不使用另一点的深度。工作坐标有旋转时，仍保持上述基坐标方向。
 
 MCP 调用选择：需要放到照片中某个位置时使用 `transfer_to`；需要将选中物体沿照片方向
 移动指定毫米距离时使用 `transfer_by`。两者都由后台完成抓起、搬运、放下及回升；
 随后始终返回观察位；`observe_after_transfer` 只决定是否采集新观察，整次动作只通过一次 ACP 通知框架。
+
+## 可选夹爪 Rz 旋转
+
+`transfer_to` 和 `transfer_by` 均接受可选 `rotation_deg`，单位为度，范围 `[-180,180]`，省略时为 0。
+**常规搬运省略这个参数；只有用户明确要求旋转时才设置。** 正值表示俯视顺时针，负值表示逆时针。
+旋转围绕夹爪自身向下的 Z 轴，保持抓起回升后的 TCP 位置与高度，再保持旋转后的朝向搬运和放下。
+工作坐标有旋转时合成完整姿态，不直接把角度加到工作坐标的欧拉 Rz，也不改变图像 XY 的方向约定。
+
+例如，向照片右侧搬运 30 mm，并将物体顺时针旋转 45°：
+
+```json
+{"action": "transfer_by", "start_point_x": 0.08, "start_point_y": -0.079, "delta_x": 30, "delta_y": 0, "rotation_deg": 45, "confirm_motion": true}
+```
+
+旋转只在抓起并回升之后执行，到位并停稳后才移动到放置点。0 不下发旋转命令；旋转使用配置速度，
+保留姿态、固定位置、夹爪、故障和取消检查。失败时返回 `stage=rotate_gripper` 及可能持物状态，不自动放下或重试。
+结果包含请求角度 `rotation_deg` 和旋转到位标志 `rotation_completed`，省略/0 时后者为 false。
+该标志表示机械臂姿态到位，不表示已验证物体实际旋转角度。
 
 ## 共用搬运流程
 
@@ -178,12 +200,12 @@ MCP 调用选择：需要放到照片中某个位置时使用 `transfer_to`；�
 1. 保持观察高度和姿态，水平移动至 A。
 2. 以力度 100 张爪到位，再设置配置的抓取力度。
 3. 按配置的抓取下降距离下降，闭合后等待 1 秒，回到下降前保存的高度。
-4. 保持高度、姿态和夹持状态，水平移动至 B。
+4. 仅在 `rotation_deg` 非零时绕夹爪 Rz 旋转并确认停稳，再保持高度、当前姿态和夹持状态水平移动至 B。
 5. 按配置的放置下降距离下降，以力度 100 张爪到位，回到保存的高度，再闭合空爪。
 6. 始终按配置的观察关节角和速度返回观察位并确认停稳。
 7. 仅在 `observe_after_transfer=true` 时，保存一张新照片、深度及物品列表，刷新当前有效观察；关闭时不拍照。
 
-抓放使用六段直线运动，每段仅下发一条 `rm_movel`；随后以一条 `rm_movej` 返回观察位，全部使用 `speed_percent`；
+抓放使用六段直线运动；请求旋转时增加一段固定 TCP 位置的姿态运动，每段仅下发一条 `rm_movel`；随后以一条 `rm_movej` 返回观察位，全部使用 `speed_percent`；
 垂直距离直接使用 `pick_descent_mm` 和 `place_descent_mm`，工作坐标有旋转时仍按
 基坐标水平/竖直方向计算。闭合不要求实际开度为 0，也不以检测到物体作为回升条件。
 夹持力度只写寄存器 1220，以交替长度的回读确认，不写驱动力寄存器或 Flash。
@@ -191,7 +213,7 @@ MCP 调用选择：需要放到照片中某个位置时使用 `transfer_to`；�
 全过程检查新鲜反馈、故障、坐标系、姿态、行程及夹爪状态，并确认每段到位和停稳。
 成功时 ACP 上报 `status: "completed"`，结果包含使用的观察编号、内部实际读取深度的抓取像素
 `pick_pixel` 和两处基坐标水平目标、最终位姿。`transfer_to` 还返回放置像素 `place_pixel`；
-这些结果字段仍是原图整数像素，与动作输入的归一化坐标区分。`transfer_by` 返回 `dx_mm、dy_mm` 和方向基准
+这些结果字段仍是原图整数像素，与动作输入的归一化坐标区分。`transfer_by` 返回 `delta_x、delta_y` 和方向基准
 `direction_reference: "observation_image"`。`grasp_checked: false` 表示未判断是否实际
 抓到物体。`final_pose` 是整次动作经核验的最终位姿：两种开关状态下都在观察位。
 
@@ -252,7 +274,15 @@ RGB、深度和红外图像保持发布时钟 `header.stamp` 和 `{namespace}_{s
 相机会话及标定仅随旁路消息提供，不增加画布端口，不改变现有图像主题、编码、尺寸或头字段语义。
 标定、时间或来源不匹配时拒绝观察；相机预览仍可独立使用。
 
-`pick_place` 根据上述标定，用官方 RealSense SDK 的 `software_device` 接收数据，
+采集端通过独立的 `realsense_metadata.py` 发布通用元数据，不依赖任何抓取卡片。
+元数据在图像发布后处理；发布器创建、销毁、标定读取、序列化或发送失败仅记录
+`rgbd_error`，不触发相机重连或停止图像。旁路发布器创建/销毁失败每秒重试一次，
+其他正常旁路继续发布。没有旁路订阅者或没有同时发布 RGB/depth 时，不读取标定或序列化元数据。
+标定按采集会话与 SDK 流配置缓存；重连或配置变化后重新读取，采集时间与图像头仍逐帧提供。
+时间同步在每个采集会话中尽力设置一次；采集端只检查时间域和数值，照片新鲜度由本卡片判断。
+原有图像主题、编码、分辨率、帧率、QoS 和图像头语义保持不变。
+
+`vision_pick_and_drop` 根据上述标定，用官方 RealSense SDK 的 `software_device` 接收数据，
 再执行 `align(color)`，得到与 RGB 同尺寸、同坐标的深度。该操作不打开物理相机。
 保留原始有效/无效测量，不填洞、不取邻点替代。已有深度编码以毫米量化；
 SDK 设备单位为 0.001 m 时无需单位量化转换，其他设备单位遵循毫米编码精度。
@@ -270,7 +300,7 @@ SDK 设备单位为 0.001 m 时无需单位量化转换，其他设备单位遵�
 每次成功观察只保存一张接收到的 JPEG、一份对齐深度及一个物品列表快照。
 照片、深度、彩色内参、源相机标定和时间、拍照位姿、工作/工具坐标系及配置一起保存在
 持久目录的 `<观察编号>/` 中。后台输入流不会覆盖有效照片，也不会连续向大模型发送图像或物品列表。
-持久目录由 `config.yaml` 的 `pick_place.output_dir` 设置，默认路径为
+持久目录由 `config.yaml` 的 `vision_pick_and_drop.output_dir` 设置，默认路径为
 `/opt/phanthy-motus/data/pick_place/realman`，使用独立数据卷。
 
 ## 生命周期与设备协调
@@ -292,8 +322,8 @@ ACP 终态结果及 `info` 中的 `observation_required` 表示下一次搬运�
 卡片无法仅凭四个数值判断调用者是否沿用了历史检测结果。
 
 本卡片不导入或调用关节控制、夹爪、servo、ext_camera、vision_capture 或 VOP 的功能实现。
-相机采集由 `ext_camera` 管理；`pick_place` 仅依赖三路消息及深度附带标定的公开数据契约，
-自行完成同步、深度对齐、坐标转换和运动。停用 `pick_place` 只停止自己的订阅，
+相机采集由 `ext_camera` 管理；`vision_pick_and_drop` 仅依赖三路消息及深度附带标定的公开数据契约，
+自行完成同步、深度对齐、坐标转换和运动。停用 `vision_pick_and_drop` 只停止自己的订阅，
 不会停用相机或影响其他消费者。相机或 VOP 未提供可用输入时，观察在运动前拒绝；
 搬运使用已保存的 RGB-D，不因外部输入短暂延迟中止抓放；开启的后续观察会等待新输入，
 持续缺失则独立报告观察失败并保留已完成的抓放结果。

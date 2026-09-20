@@ -102,14 +102,124 @@ class TransferTests(unittest.TestCase):
 
     def transfer(self, **updates):
         return fixtures.wait_for_completion(self.plugin, self.plugin.dispatch("transfer_to", {
-            "confirm_motion": True, "x1": -.5, "y1": -1/3, "x2": .5, "y2": 1/3, **updates}))
+            "confirm_motion": True, "start_point_x": -.5, "start_point_y": -1/3, "target_point_x": .5, "target_point_y": 1/3, **updates}))
 
     def transfer_by(self, **updates):
         return fixtures.wait_for_completion(self.plugin, self.plugin.dispatch("transfer_by", {
-            "confirm_motion": True, "x1": -.5, "y1": -1/3, "dx_mm": -30, "dy_mm": 0, **updates}))
+            "confirm_motion": True, "start_point_x": -.5, "start_point_y": -1/3, "delta_x": -30, "delta_y": 0, **updates}))
 
     def moves(self):
         return [args[0] for method, args in self.commands if method == "rm_movel"]
+
+    def test_optional_rotation_preserves_pick_place_positions_and_returns_to_observation(self):
+        for action in (self.transfer, self.transfer_by):
+            for angle in (-180, -90, -30.5, 30.5, 90, 180):
+                with self.subTest(action=action.__name__, angle=angle):
+                    self.commands.clear()
+                    self.make_photo()
+                    result = action(rotation_deg=angle)
+                    self.assertEqual(result["state"], "completed", result)
+                    moves = self.moves()
+                    self.assertEqual(len(moves), 7)
+                    np.testing.assert_allclose(moves[3][:3], moves[2][:3])
+                    expected = rotation(moves[2]) @ rotation([0, 0, 0, 0, 0, math.radians(angle)])
+                    for pose in moves[3:]:
+                        np.testing.assert_allclose(rotation(pose), expected, atol=1e-12)
+                    # Positive Rz around a downward gripper sends its +X toward base -Y.
+                    np.testing.assert_allclose(rotation(moves[3])[:, 0],
+                        [math.cos(math.radians(angle)), -math.sin(math.radians(angle)), 0], atol=1e-12)
+                    self.assertEqual(result["result"]["rotation_deg"], angle)
+                    self.assertTrue(result["result"]["rotation_completed"])
+                    self.assertTrue(result["result"]["release_completed"])
+                    self.assertTrue(result["result"]["return_completed"])
+                    self.assertEqual(self.pose, self.photo_pose)
+                    self.assertTrue(all(args[1] == 50 for name, args in self.commands if name == "rm_movel"))
+
+    def test_rotation_is_relative_to_gripper_with_rotated_work_frame(self):
+        for work_angles, angle in (([.2, -.1, .3], 35), ([0, math.pi / 2, 0], 180)):
+            with self.subTest(work_angles=work_angles):
+                self.commands.clear()
+                self.frame["pose"] = [.2, -.1, .05, *work_angles]
+                work_rotation = rotation(self.frame["pose"])
+                matrix = work_rotation.T @ rotation([0, 0, 0, math.pi, 0, 0])
+                self.pose[3:] = [math.atan2(matrix[2, 1], matrix[2, 2]),
+                                 math.asin(-matrix[2, 0]), math.atan2(matrix[1, 0], matrix[0, 0])]
+                self.make_photo()
+                result = self.transfer_by(rotation_deg=angle)
+                self.assertEqual(result["state"], "completed", result)
+                moves = self.moves()
+                expected = rotation([0, 0, 0, math.pi, 0, 0]) @ rotation([0, 0, 0, 0, 0, math.radians(angle)])
+                np.testing.assert_allclose(work_rotation @ rotation(moves[3]), expected, atol=1e-12)
+                np.testing.assert_allclose(moves[3][:3], moves[2][:3])
+
+    def test_in_place_rotation_and_default_no_rotation(self):
+        result = self.transfer_by(delta_x=0, delta_y=0, rotation_deg=45)
+        self.assertEqual(result["state"], "completed", result)
+        np.testing.assert_allclose(result["result"]["pick_base_xy_mm"], result["result"]["place_base_xy_mm"])
+        self.commands.clear()
+        result = self.transfer_by(rotation_deg=0)
+        self.assertEqual(result["state"], "completed", result)
+        self.assertEqual(len(self.moves()), 6)
+        self.assertFalse(result["result"]["rotation_completed"])
+
+    def test_rotation_validation_rejects_bad_angles_before_consuming_photo(self):
+        for action in (self.transfer, self.transfer_by):
+            for angle in (None, True, "45", float("nan"), float("inf"), -180.01, 180.01):
+                with self.subTest(action=action.__name__, angle=angle):
+                    result = action(rotation_deg=angle)
+                    self.assertEqual(result["state"], "error", result)
+                    self.assertIn("rotation_deg", result["message"])
+                    self.assertEqual(self.commands, [])
+                    self.assertIsNotNone(self.plugin._observation)
+
+    def test_rotation_waits_for_orientation_before_moving_to_place(self):
+        pending = []
+        def moving(method, args):
+            if method == "rm_movel" and len(self.moves()) == 4:
+                pending.append(list(args[0]))
+                self.pose[5] = -math.pi / 4
+        def finish():
+            if pending:
+                self.pose = pending.pop()
+        self.after_command, self.on_wait = moving, finish
+        result = self.transfer(rotation_deg=90)
+        self.assertEqual(result["state"], "completed", result)
+        self.assertEqual(len(self.moves()), 7)
+        self.assertTrue(result["result"]["rotation_completed"])
+
+    def test_rotation_fault_direction_and_cancel_stop_with_held_object_status(self):
+        for failure in ("wrong_direction", "position", "fault", "cancel"):
+            with self.subTest(failure=failure):
+                self.commands.clear()
+                self.pose = self.photo_pose[:]
+                self.state["joint_err_code"] = [0] * 7
+                self.make_photo()
+                def fail(method, args):
+                    if method != "rm_movel" or len(self.moves()) != 4:
+                        return
+                    if failure == "wrong_direction":
+                        self.pose[5] = math.pi / 4
+                    elif failure == "position":
+                        self.pose[0] += .003
+                    elif failure == "fault":
+                        self.state["joint_err_code"][6] = 61440
+                    else:
+                        self.plugin.dispatch("cancel", {})
+                self.after_command = fail
+                result = self.transfer(rotation_deg=90)
+                self.assertIn(result["state"], ("error", "cancelled"), result)
+                self.assertEqual(len(self.moves()), 4)
+                self.assertEqual(result["result"]["stage"], "rotate_gripper")
+                self.assertFalse(result["result"]["rotation_completed"])
+                self.assertFalse(result["result"]["release_completed"])
+                self.assertTrue(result["result"]["holding_object_possible"])
+                self.assertTrue(result["result"]["recovery_required"])
+                self.assertTrue(result["observation_required"])
+                self.assertFalse(any(name == "rm_movej" for name, _ in self.commands))
+                # Reset the offline fault fixture between independent executions.
+                self.plugin._motion_blocked = False
+                if self.client.motion_lock.locked():
+                    self.client.motion_lock.release()
 
     def test_complete_transfer_uses_configured_absolute_targets(self):
         self.assertTrue(self.plugin.dispatch("config", {"speed_percent": 37,
@@ -203,7 +313,7 @@ class TransferTests(unittest.TestCase):
             "x_compensation_mm": 40, "y_compensation_mm": -60,
             "pick_grip_force": 35, "pick_descent_mm": 80, "place_descent_mm": 70})["ok"])
         self.make_photo()
-        result = self.transfer_by(x1=.5, y1=1/3, dx_mm=-30.5, dy_mm=20.25)
+        result = self.transfer_by(start_point_x=.5, start_point_y=1/3, delta_x=-30.5, delta_y=20.25)
         self.assertEqual(result["state"], "completed", result)
         expected = [[.04, .165, .3], [.04, .165, .22], [.04, .165, .3],
                     [.0705, .18525, .3], [.0705, .18525, .23], [.0705, .18525, .3]]
@@ -213,8 +323,8 @@ class TransferTests(unittest.TestCase):
                          [(1220, 1, [100]), (1220, 1, [35]), (1220, 1, [100])])
         self.assertEqual([args[0][0] for name, args in self.commands if name == "rm_set_hand_follow_pos"],
                          [1000, 0, 1000, 0])
-        self.assertEqual(result["result"]["dx_mm"], -30.5)
-        self.assertEqual(result["result"]["dy_mm"], 20.25)
+        self.assertEqual(result["result"]["delta_x"], -30.5)
+        self.assertEqual(result["result"]["delta_y"], 20.25)
         self.assertEqual(result["result"]["direction_reference"], "observation_image")
         self.assertEqual(result["result"]["pick_pixel"], [3, 2])
         self.assertNotIn("place_pixel", result["result"])
@@ -229,7 +339,7 @@ class TransferTests(unittest.TestCase):
                                    (30, -25, [-30, -25])):
             with self.subTest(dx=dx, dy=dy):
                 self.make_photo()
-                result = self.transfer_by(dx_mm=dx, dy_mm=dy)
+                result = self.transfer_by(delta_x=dx, delta_y=dy)
                 self.assertEqual(result["state"], "completed", result)
                 data = result["result"]
                 np.testing.assert_allclose(np.subtract(data["place_base_xy_mm"], data["pick_base_xy_mm"]), base_delta)
@@ -243,15 +353,15 @@ class TransferTests(unittest.TestCase):
         np.testing.assert_allclose(result["result"]["place_base_xy_mm"], [160, 125])
 
     def test_transfer_by_rejects_invalid_displacement_and_pick_before_commands(self):
-        for args in ({"dx_mm": None}, {"dy_mm": None}, {"dx_mm": True}, {"dy_mm": "30"},
-                     {"dx_mm": float("nan")}, {"dy_mm": float("inf")},
-                     {"dx_mm": 0, "dy_mm": 0}, {"x1": 1.0001}, {"y1": -1.0001},
-                     {"x1": 691}, {"y1": "0"}, {"x1": True}, {"y1": float("nan")}):
+        for args in ({"delta_x": None}, {"delta_y": None}, {"delta_x": True}, {"delta_y": "30"},
+                     {"delta_x": float("nan")}, {"delta_y": float("inf")},
+                     {"delta_x": 0, "delta_y": 0}, {"start_point_x": 1.0001}, {"start_point_y": -1.0001},
+                     {"start_point_x": 691}, {"start_point_y": "0"}, {"start_point_x": True}, {"start_point_y": float("nan")}):
             with self.subTest(args=args):
                 self.assertEqual(self.transfer_by(**args)["state"], "error")
                 self.assertEqual(self.commands, [])
                 self.assertIsNotNone(self.plugin._observation)
-        self.assertEqual(self.plugin.dispatch("transfer_by", {"confirm_motion": True, "x1": 0, "y1": 0, "dx_mm": 30})["state"], "error")
+        self.assertEqual(self.plugin.dispatch("transfer_by", {"confirm_motion": True, "start_point_x": 0, "start_point_y": 0, "delta_x": 30})["state"], "error")
         self.depth[1, 1] = 0
         self.make_photo()
         self.assertIn("no valid depth", self.transfer_by()["result"]["message"])
@@ -264,7 +374,7 @@ class TransferTests(unittest.TestCase):
         self.pose[3:] = [math.atan2(orientation[2, 1], orientation[2, 2]),
                          math.asin(-orientation[2, 0]), math.atan2(orientation[1, 0], orientation[0, 0])]
         self.make_photo()
-        result = self.transfer_by(dx_mm=-30, dy_mm=20)
+        result = self.transfer_by(delta_x=-30, delta_y=20)
         self.assertEqual(result["state"], "completed", result)
         bases = np.array([work_rotation @ pose[:3] + self.frame["pose"][:3] for pose in self.moves()])
         np.testing.assert_allclose(bases[3] - bases[0], [.03, .02, 0], atol=1e-12)
@@ -307,7 +417,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(first["state"], "completed", first)
         latest = first["result"]["observation"]
         x, y = latest["objects"][0]["position"]
-        second = self.transfer_by(x1=x, y1=y, dx_mm=10, dy_mm=0)
+        second = self.transfer_by(start_point_x=x, start_point_y=y, delta_x=10, delta_y=0)
         self.assertEqual(second["state"], "completed", second)
         self.assertEqual(second["result"]["observation_id"], latest["observation_id"])
         self.assertNotEqual(second["result"]["observation"]["observation_id"], latest["observation_id"])
@@ -410,9 +520,9 @@ class TransferTests(unittest.TestCase):
         np.testing.assert_allclose(bases[3:, :2], [origin[:2] + [-.07, -.05]] * 3)
 
     def test_both_positions_are_validated_before_any_command(self):
-        for args in ({"x1": None}, {"x2": None}, {"y1": -1.0001}, {"x1": True},
-                     {"y2": 1.0001}, {"x1": float("inf")}, {"x2": float("nan")},
-                     {"x2": 700}, {"y2": 350}, {"y1": "0"}):
+        for args in ({"start_point_x": None}, {"target_point_x": None}, {"start_point_y": -1.0001}, {"start_point_x": True},
+                     {"target_point_y": 1.0001}, {"start_point_x": float("inf")}, {"target_point_x": float("nan")},
+                     {"target_point_x": 700}, {"target_point_y": 350}, {"start_point_y": "0"}):
             with self.subTest(args=args):
                 self.assertEqual(self.transfer(**args)["state"], "error")
                 self.assertEqual(self.commands, [])
@@ -436,7 +546,7 @@ class TransferTests(unittest.TestCase):
                 self.make_photo()
                 self.edit_metadata(lambda data: data["intrinsics"].update(
                     fx=width, fy=height, ppx=width/2, ppy=height/2))
-                result = self.transfer_by(x1=.08, y1=-.079, dx_mm=30, dy_mm=0)
+                result = self.transfer_by(start_point_x=.08, start_point_y=-.079, delta_x=30, delta_y=0)
                 self.assertEqual(result["state"], "completed", result)
                 data = result["result"]
                 self.assertEqual(data["pick_pixel"], pixel)
@@ -447,19 +557,19 @@ class TransferTests(unittest.TestCase):
                                 ((1, -1), [3, 0]), ((-1, 1), [0, 2]), ((.999, .999), [3, 2])):
             with self.subTest(position=position):
                 self.make_photo()
-                result = self.transfer(x1=position[0], y1=position[1], x2=position[0], y2=position[1])
+                result = self.transfer(start_point_x=position[0], start_point_y=position[1], target_point_x=position[0], target_point_y=position[1])
                 self.assertEqual(result["state"], "completed", result)
                 self.assertEqual(result["result"]["pick_pixel"], pixel)
                 self.assertEqual(result["result"]["place_pixel"], pixel)
 
     def test_normalized_xy_signs_preserve_installed_base_directions(self):
-        for x2, y2, pixel, delta in ((.5, -1/3, [3, 1], [-80, 0]),
+        for target_point_x, target_point_y, pixel, delta in ((.5, -1/3, [3, 1], [-80, 0]),
                                     (-1, -1/3, [0, 1], [40, 0]),
                                     (-.5, 1/3, [1, 2], [0, 20]),
                                     (-.5, -1, [1, 0], [0, -20])):
-            with self.subTest(x2=x2, y2=y2):
+            with self.subTest(target_point_x=target_point_x, target_point_y=target_point_y):
                 self.make_photo()
-                result = self.transfer(x2=x2, y2=y2)
+                result = self.transfer(target_point_x=target_point_x, target_point_y=target_point_y)
                 self.assertEqual(result["state"], "completed", result)
                 data = result["result"]
                 self.assertEqual(data["pick_pixel"], [1, 1])
