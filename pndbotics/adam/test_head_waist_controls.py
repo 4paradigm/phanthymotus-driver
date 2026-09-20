@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import math
 import sys
+import threading
 import types
 import unittest
+from unittest.mock import patch
 
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
@@ -150,6 +152,30 @@ class _SequenceSubscriber:
         return None
 
 
+class _RecordingPublisher:
+    def __init__(self, result=True):
+        self.result = result
+        self.calls = []
+
+    def Write(self, command, timeout=None):
+        self.calls.append((command, timeout))
+        return self.result
+
+
+class _MotorCommand:
+    pass
+
+
+class _LowCommand:
+    def __init__(self, dof):
+        self.mode_pr = 0
+        self.motor_cmd = [_MotorCommand() for _ in range(dof)]
+
+
+def _fake_lowcmd(dof):
+    return _LowCommand(dof)
+
+
 class UpperBodyControllerTests(unittest.TestCase):
     def test_pro_joint_indices_match_vendor_low_level_layout(self):
         self.assertEqual(ADAM_PRO_JOINTS.index("waistYaw"), 12)
@@ -208,6 +234,66 @@ class UpperBodyControllerTests(unittest.TestCase):
                 "neckPitch": control._hold_q[control._joint_index("neckPitch")],
             },
         )
+
+    def test_write_command_counts_only_successful_dds_writes(self):
+        publisher = _RecordingPublisher()
+        control = UpperBodyLowcmdController({}, dds_lowcmd_pub=publisher)
+        control._hold_q = [0.0] * control._DOF
+        control._segment_q = list(control._hold_q)
+        control._active = True
+        with patch(
+                "device.pnd_adam_msg_dds__LowCmd_", _fake_lowcmd,
+                create=True):
+            control._write_command()
+        self.assertEqual(control._writes, 1)
+        self.assertIsNone(control._last_error)
+        self.assertEqual(publisher.calls[0][1], 0.2)
+
+    def test_write_command_records_false_dds_result_as_failure(self):
+        publisher = _RecordingPublisher(result=False)
+        control = UpperBodyLowcmdController({}, dds_lowcmd_pub=publisher)
+        control._hold_q = [0.0] * control._DOF
+        control._segment_q = list(control._hold_q)
+        control._active = True
+        with patch(
+                "device.pnd_adam_msg_dds__LowCmd_", _fake_lowcmd,
+                create=True):
+            control._write_command()
+        self.assertEqual(control._writes, 0)
+        self.assertIn("not matched", control._last_error)
+
+    def test_set_targets_waits_for_successful_dds_write(self):
+        publisher = _RecordingPublisher()
+        control = UpperBodyLowcmdController({}, dds_lowcmd_pub=publisher)
+        control._hold_q = [0.0] * control._DOF
+        control._segment_q = list(control._hold_q)
+        control._state_ready.set()
+        timer = threading.Timer(0.01, control._write_command)
+        with patch(
+                "device.pnd_adam_msg_dds__LowCmd_", _fake_lowcmd,
+                create=True):
+            timer.start()
+            result = control.set_targets({"neckYaw": 0.1})
+            timer.join()
+        self.assertIsNone(result)
+        self.assertEqual(control._writes, 1)
+
+    def test_set_targets_reports_failed_dds_write(self):
+        publisher = _RecordingPublisher(result=False)
+        control = UpperBodyLowcmdController({}, dds_lowcmd_pub=publisher)
+        control._hold_q = [0.0] * control._DOF
+        control._segment_q = list(control._hold_q)
+        control._state_ready.set()
+        timer = threading.Timer(0.01, control._write_command)
+        with patch(
+                "device.pnd_adam_msg_dds__LowCmd_", _fake_lowcmd,
+                create=True):
+            timer.start()
+            result = control.set_targets({"neckYaw": 0.1})
+            timer.join()
+        self.assertEqual(result["code"], "DDS_WRITE_FAILED")
+        self.assertIn("not matched", result["message"])
+        self.assertEqual(control._writes, 0)
 
 
 class BundleRegistrationTests(unittest.TestCase):

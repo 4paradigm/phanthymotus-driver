@@ -71,7 +71,8 @@ plugins:
     enabled: true
     publish_rate_hz: 100
   upper_body_control:
-    control_rate_hz: 50
+    # Match the vendor low-level example's 2.5 ms command period.
+    control_rate_hz: 400
   waist:
     enabled: true
   head:

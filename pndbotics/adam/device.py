@@ -917,7 +917,7 @@ class UpperBodyLowcmdController:
     """Own the single complete-body lowcmd stream used by head and waist."""
 
     _DOF = 31
-    _RATE_HZ = 50.0
+    _RATE_HZ = 400.0
     _MAX_VELOCITY_RAD_S = 0.5
     _EASE_PEAK_RATE = 1.875
     _DEFAULT_TRANSITION_SECONDS = 0.8
@@ -933,7 +933,7 @@ class UpperBodyLowcmdController:
                  dds_lowstate_sub=None):
         self._publisher = dds_lowcmd_pub
         self._lowstate_sub = dds_lowstate_sub
-        self._rate_hz = max(10.0, min(100.0, float(
+        self._rate_hz = max(10.0, min(400.0, float(
             plugin_config.get("control_rate_hz", self._RATE_HZ))))
         self._state_wait_timeout_s = max(0.0, min(10.0, float(
             plugin_config.get("state_wait_timeout_s", 3.0))))
@@ -1028,7 +1028,9 @@ class UpperBodyLowcmdController:
                 motor.tau = 0.0
                 motor.kp, motor.kd = self._GAINS.get(joint_name, (0.0, 0.0))
                 motor.ki = 0.0
-            self._publisher.Write(command)
+            write_result = self._publisher.Write(command, timeout=0.2)
+            if write_result is False:
+                raise RuntimeError("DDS writer is not matched or rejected the command")
             with self._lock:
                 self._segment_q = current_q
                 self._writes += 1
@@ -1088,7 +1090,26 @@ class UpperBodyLowcmdController:
                 minimum_span,
             )
             self._active = True
-        return None
+            self._last_error = None
+            writes_before = self._writes
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._writes > writes_before:
+                    return None
+                error = self._last_error
+            if error:
+                return {
+                    "success": False,
+                    "code": "DDS_WRITE_FAILED",
+                    "message": error,
+                }
+            time.sleep(0.005)
+        return {
+            "success": False,
+            "code": "DDS_WRITE_FAILED",
+            "message": "rt/lowcmd was not written within 0.5 seconds",
+        }
 
     def set_target(self, joint_name, radians, duration_s=None):
         return self.set_targets({joint_name: radians}, duration_s)
