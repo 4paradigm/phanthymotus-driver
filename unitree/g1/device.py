@@ -19,6 +19,8 @@ drivers/unitree/g1/device.py — Unitree G1 设备插件（重构版）。
   VisionCapturePlugin (actuator) — 复用 camera_rgb 保存照片/视频
 """
 
+from __future__ import annotations
+
 from datetime import datetime
 import json
 import math
@@ -45,6 +47,12 @@ from audio_msgs.msg import AudioChunk
 
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from pointcloud_utils import gravity_align_inplace
+from velocity_proposal import (
+    DEFAULT_VELOCITY_PROPOSAL_TOPIC,
+    resolve_input_topic,
+    resolve_optional_expected_nav_id,
+    velocity_proposal_port,
+)
 import sport_mode_state as _SMS
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
@@ -1450,7 +1458,7 @@ class LocoStatePlugin:
         return self._node
 
     def start(self) -> None:
-        pass  # DDS subscription starts in __init__
+        pass  # State subscriptions are always active, created in __init__.
 
     def stop(self) -> None:
         pass
@@ -1503,6 +1511,9 @@ def _loco_acp_notify(action_id: str, status: str, result: dict, tool: str = "loc
 
 class LocoPlugin:
     PREFIX = "loco"
+    # Stop locomotion before tearing down any other plugin during bundle
+    # shutdown.  This is an explicit lifecycle contract consumed by main.py.
+    STOP_PRIORITY = 0
 
     def __init__(self, plugin_config: dict, namespace: str, executor, loco_client, slam_client=None,
                  smart_motion=None, state_node=None, posture_node=None):
@@ -1510,7 +1521,9 @@ class LocoPlugin:
         self._slam_client = slam_client
         self._smart_motion = smart_motion
         self._namespace = namespace
+        self._control_lock = threading.RLock()
         self._move_timer: threading.Timer | None = None
+        self._velocity_proposal_topic = DEFAULT_VELOCITY_PROPOSAL_TOPIC
         # _LocoStateNode — authoritative fsm_id/fsm_mode from rt/sportmodestate.
         self._state_node = state_node
         # _LowStateNode — joint-derived posture, needed to tell lying from squatting
@@ -1575,8 +1588,13 @@ class LocoPlugin:
                     "shake_hand":       {"params": [],                                 "description": "Perform a handshake gesture"},
                 },
             },
+            "topic_in": [self._velocity_proposal_port()],
         }
 
+    def _velocity_proposal_port(self) -> dict:
+        return velocity_proposal_port(self._velocity_proposal_topic)
+
+    # ── FSM state groups for safety checks ──────────────────────────────────────
     # ── FSM state groups ────────────────────────────────────────────────────────
     # Official ID table: 专家接口 § 模式ID说明 at
     # https://support.unitree.com/home/zh/G1_developer/sport_services_interface
@@ -1628,7 +1646,6 @@ class LocoPlugin:
         if self._posture_node is None:
             return {}
         return self._posture_node.get_posture()
-
 
     def _switch_mode_tool(self) -> dict:
         return {
@@ -1694,18 +1711,100 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
+        # Driver startup remains disarmed. Canvas action=start subscribes to
+        # the only proposal topic; the first fresh legal motion binds nav_id.
         pass
 
     def stop(self) -> None:
-        if self._move_timer:
-            self._move_timer.cancel()
-            self._move_timer = None
-        self._client.StopMove()
+        with self._control_lock:
+            if self._move_timer:
+                self._move_timer.cancel()
+                self._move_timer = None
+            self._disconnect_velocity_proposal("driver_stop")
+
+    def _connect_velocity_proposal(self, args: dict) -> dict:
+        try:
+            topic = resolve_input_topic(args, self._velocity_proposal_topic)
+            expected_nav_id = resolve_optional_expected_nav_id(args)
+        except ValueError as exc:
+            self._client.StopMove()
+            if self._smart_motion:
+                self._smart_motion.unbind_velocity_proposal("proposal_bind_rejected")
+            return {
+                "state": "error",
+                "connected": False,
+                "error": str(exc),
+                "topic_in": [self._velocity_proposal_port()],
+            }
+        if not self._smart_motion:
+            self._client.StopMove()
+            return {
+                "state": "error",
+                "connected": False,
+                "error": "SmartMotion safety harness is required for velocity_proposal",
+                "topic_in": [self._velocity_proposal_port()],
+            }
+        result = self._smart_motion.bind_velocity_proposal(topic, expected_nav_id)
+        connected_ready = bool(
+            result.get("connected")
+            and (result.get("armed") or result.get("awaiting_nav_id"))
+        )
+        if result.get("error") or not connected_ready:
+            result = dict(result)
+            fallback_stop_ret = None
+            fallback_stop_error = None
+            try:
+                fallback_stop_ret = self._client.StopMove()
+            except Exception as exc:
+                fallback_stop_error = str(exc)
+            result["fallback_stop_ret"] = fallback_stop_ret
+            result["fallback_stop_error"] = fallback_stop_error
+        return {
+            **result,
+            "state": "ready" if connected_ready else "error",
+            "topic_in": [self._velocity_proposal_port()],
+        }
+
+    def _disconnect_velocity_proposal(self, reason: str) -> dict:
+        # Main-process RPC is an independent first stop path.  It guarantees
+        # StopMove precedes subscriber teardown even if SmartMotion IPC hangs
+        # and the child has to be terminated fail-closed.
+        fallback_stop_ret = self._client.StopMove()
+        if self._smart_motion:
+            try:
+                result = self._smart_motion.unbind_velocity_proposal(reason)
+            except Exception as exc:
+                return {
+                    "state": "error",
+                    "connected": False,
+                    "stop_confirmed": False,
+                    "error": f"SmartMotion unbind failed: {exc}",
+                    "fallback_stop_ret": fallback_stop_ret,
+                    "topic_in": [self._velocity_proposal_port()],
+                }
+            stop_failed = (
+                result.get("error")
+                or result.get("stop_confirmed") is not True
+            )
+            if stop_failed:
+                result.setdefault("state", "error")
+                result.setdefault("error", "StopMove was not confirmed")
+                result["fallback_stop_ret"] = fallback_stop_ret
+            return {"topic_in": [self._velocity_proposal_port()], **result}
+        return {
+            "state": "idle" if fallback_stop_ret == 0 else "error",
+            "connected": False,
+            "stop_confirmed": fallback_stop_ret == 0,
+            "reason": reason,
+            "topic_in": [self._velocity_proposal_port()],
+            **({"error": f"StopMove failed: code={fallback_stop_ret}"} if fallback_stop_ret != 0 else {}),
+        }
 
     def _auto_stop(self):
         """Timer 回调：自动停止运动"""
-        self._move_timer = None
-        self._client.StopMove()
+        with self._control_lock:
+            self._move_timer = None
+            self._client.StopMove()
 
     def _auto_stop_acp(self, action_id: str):
         """Timer 回调：自动停止运动 + fire ACP callback."""
@@ -1719,16 +1818,50 @@ class LocoPlugin:
         _loco_acp_notify(action_id, "completed", {"reason": "duration_expired"}, tool="loco")
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        with self._control_lock:
+            try:
+                return self._dispatch_serialized(action, args)
+            except Exception as exc:
+                self._client.StopMove()
+                return {
+                    "state": "error",
+                    "connected": False,
+                    "error": f"loco safety fallback: {exc}",
+                    "topic_in": [self._velocity_proposal_port()],
+                }
+
+    def _dispatch_serialized(self, action: str, args: dict) -> dict | None:
+        tool_name = args.get("_tool_name", "loco")
         if action == "start":
-            return {"state": "ready"}
+            if tool_name == "loco":
+                return self._connect_velocity_proposal(args)
+            return {"state": "running" if tool_name == "motion_events" else "ready"}
         if action == "stop":
+            if tool_name == "loco":
+                return self._disconnect_velocity_proposal("canvas_stop")
             return {"state": "idle"}
         if action == "info":
-            tool_name = args.get("_tool_name", "motion_events")
             if tool_name == "motion_events" and self._smart_motion:
                 topic = f"/{self._namespace}/safety/motion_events"
                 return {"state": "running", "topic_out": [{"topic": topic, "format": "data/json"}]}
-            return None
+            if tool_name != "loco":
+                return {"state": "ready"}
+            if self._smart_motion:
+                result = self._smart_motion.get_velocity_proposal_status()
+                if result.get("error"):
+                    self._client.StopMove()
+            else:
+                result = {
+                    "enabled": False,
+                    "connected": False,
+                    "armed": False,
+                    "last_reason": "SmartMotion safety harness unavailable",
+                }
+            return {
+                "state": "running" if result.get("connected") else "ready",
+                "topic_in": [self._velocity_proposal_port()],
+                **result,
+            }
         if action == "move":
             vx   = float(args.get("vx",   0))
             vy   = float(args.get("vy",   0))
@@ -1738,7 +1871,9 @@ class LocoPlugin:
             # Route through SmartMotion safety harness
             if self._smart_motion:
                 result = self._smart_motion.move(vx, vy, vyaw, duration)
-                if duration > 0:
+                if result.get("error"):
+                    self._client.StopMove()
+                elif duration > 0:
                     from uuid import uuid4
                     action_id = f"g1_move_{uuid4().hex[:8]}"
                     result["action_id"] = action_id
@@ -1775,7 +1910,10 @@ class LocoPlugin:
         elif action == "stop_move":
             # Route through SmartMotion safety harness
             if self._smart_motion:
-                return self._smart_motion.stop()
+                result = self._smart_motion.stop()
+                if result.get("error"):
+                    self._client.StopMove()
+                return result
 
             # Fallback: direct control
             if self._move_timer:
@@ -1793,6 +1931,13 @@ class LocoPlugin:
             # x-action-params split: action is the mode directly
             # Legacy: action == "switch_mode" with mode in args
             mode = action if action != "switch_mode" else args.get("mode", "")
+            if mode != "get_current_mode":
+                stopped = self._disconnect_velocity_proposal("mode_switch")
+                if mode != "emergency_stop" and (
+                    stopped.get("error")
+                    or stopped.get("stop_confirmed") is not True
+                ):
+                    return stopped
 
             # 阻尼 is the guaranteed fallback mode — the vendor doc states it can
             # always be entered, so emergency_stop must not be gated on anything.
@@ -1904,6 +2049,9 @@ class LocoPlugin:
                                  f"standup2squat, squat2standup, emergency_stop, "
                                  f"get_current_mode"}
         elif action == "switch_mode_expert":
+            stopped = self._disconnect_velocity_proposal("expert_mode_switch")
+            if stopped.get("error") or stopped.get("stop_confirmed") is not True:
+                return stopped
             fid = int(args.get("fsm_id", 0))
             ret = self._client.SetFsmId(fid)
             return {"ret": ret, "fsm_id": fid}
@@ -2459,6 +2607,11 @@ class _LidarNode(Node):
         super().__init__("g1_lidar")
         from std_msgs.msg import UInt8MultiArray
         self._cloud_pub = self.create_publisher(UInt8MultiArray, cloud_topic, _LOW_LAT_QOS)
+        from sensor_output import OutputGate
+        self.output_gate = OutputGate()
+        self._safety_pub = self.create_publisher(
+            UInt8MultiArray, cloud_topic + "_internal", _LOW_LAT_QOS)
+        self._closing = threading.Event()
         self._last_cloud_time: float = 0.0
         self._imu_roll:  float = 0.0
         self._imu_pitch: float = 0.0
@@ -2500,6 +2653,9 @@ class _LidarNode(Node):
         """DDS callback — throttle and enqueue for worker thread.
         Runs directly in CycloneDDS receive thread (queueLen=0).
         """
+        if self._closing.is_set():
+            return
+        token = self.output_gate.token()
         self._cb_count += 1
         now = time.monotonic()
         if now - self._last_cloud_time < LIDAR_CLOUD_INTERVAL:
@@ -2517,7 +2673,7 @@ class _LidarNode(Node):
         # Non-blocking put; drop frame if worker is busy
         try:
             self._cloud_queue.put_nowait((point_step, total_points, data,
-                                         self._imu_roll, self._imu_pitch))
+                                         self._imu_roll, self._imu_pitch, token))
         except queue.Full:
             self._cb_dropped += 1
 
@@ -2536,11 +2692,14 @@ class _LidarNode(Node):
         """Worker thread: gravity alignment + publish (off the DDS receive thread)."""
         import array as _array
         from std_msgs.msg import UInt8MultiArray
-        while True:
-            item = self._cloud_queue.get()
+        while not self._closing.is_set():
+            try:
+                item = self._cloud_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
             if item is None:
                 break
-            point_step, total_points, data, roll, pitch = item
+            point_step, total_points, data, roll, pitch, token = item
             t0 = time.monotonic()
 
             # Apply gravity alignment (returns bytearray, avoids extra copy)
@@ -2553,11 +2712,22 @@ class _LidarNode(Node):
             buf[8:] = data
             ros_msg = UInt8MultiArray()
             ros_msg.data = _array.array('B', buf)
-            self._cloud_pub.publish(ros_msg)
+            self._safety_pub.publish(ros_msg)
+            self.output_gate.publish(token, self._cloud_pub, ros_msg)
 
             elapsed_ms = (time.monotonic() - t0) * 1000
             self._worker_count += 1
             self._worker_total_ms += elapsed_ms
+
+    def close(self):
+        self._closing.set()
+        for name in ("_cloud_sub", "_livox_imu_sub"):
+            subscriber = getattr(self, name, None)
+            if subscriber is not None:
+                subscriber.Close()
+        self._worker.join(timeout=2.0)
+        if self._worker.is_alive():
+            raise TimeoutError("lidar_worker_shutdown_timeout")
 
     def _on_livox_imu(self, msg) -> None:
         """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar, inverted mount)."""
@@ -2575,8 +2745,11 @@ class _LidarNode(Node):
 class LidarPlugin:
     PREFIX = "lidar"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, navigation=None):
         self._cloud_topic = f"/{namespace}/lidar/cloud"
+        self._navigation = navigation
+        self._executor = executor
+        self._lifecycle_lock = threading.RLock()
         self._node = _LidarNode(self._cloud_topic)
         executor.add_node(self._node)
 
@@ -2590,7 +2763,8 @@ class LidarPlugin:
             "multiInstance": False,
             "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
+            "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]
+                         + ([self._navigation.cloud_descriptor()] if self._navigation else []),
             "configSchema": {
                 "type": "object",
                 "properties": {},
@@ -2598,18 +2772,43 @@ class LidarPlugin:
         }
 
     def start(self) -> None:
-        pass  # DDS subscription starts in __init__
+        with self._lifecycle_lock:
+            if self._node is None:
+                self._node = _LidarNode(self._cloud_topic)
+                self._executor.add_node(self._node)
 
     def stop(self) -> None:
-        pass
+        with self._lifecycle_lock:
+            if self._node is None:
+                return
+            self._node.close()
+            self._executor.remove_node(self._node)
+            self._node.destroy_node()
+            self._node = None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]}
+        if action in {"start", "stop", "info"}:
+            with self._lifecycle_lock:
+                try:
+                    if action == "start":
+                        self.start()
+                    if self._node is None:
+                        return {"state": "idle", "ready": False,
+                                "topic_out": self._cloud_tool()["topic_out"]}
+                    if action != "info":
+                        self._node.output_gate.set_enabled(action == "start")
+                        if self._navigation:
+                            self._navigation.set_output("cloud", action == "start")
+                    outputs = {"legacy": self._node.output_gate.status(500)}
+                    if self._navigation:
+                        outputs["navigation"] = self._navigation.output_status("cloud")
+                    idle = all(o["state"] == "idle" for o in outputs.values())
+                    ready = all(o["ready"] for o in outputs.values())
+                    return {"state": "idle" if idle else ("ready" if ready else "not_ready"),
+                            "ready": ready, "outputs": outputs,
+                            "topic_out": self._cloud_tool()["topic_out"]}
+                except (TimeoutError, OSError) as exc:
+                    return {"state": "error", "ready": False, "error": str(exc)}
         return None
 
 
@@ -3982,7 +4181,7 @@ RS_DIST_INTERVAL = 0.1  # 10 Hz for distance JSON
 
 
 class _CameraFrameNode(Node):
-    """Cache the existing camera_rgb JPEG stream for persistent capture."""
+    """Cache the internal JPEG stream independently of public camera outputs."""
 
     def __init__(self, color_topic: str):
         from sensor_msgs.msg import CompressedImage
@@ -4014,6 +4213,10 @@ class _CameraFrameNode(Node):
             }
             self._condition.notify_all()
 
+    def clear(self):
+        with self._condition:
+            self._latest = None
+
     def wait_for_frame(self, after_sequence=None, timeout_s=5.0):
         deadline = time.monotonic() + max(0.0, timeout_s)
         with self._condition:
@@ -4032,20 +4235,36 @@ class RealSensePlugin:
     PREFIX = "camera"
 
     def __init__(self, plugin_config: dict, namespace: str, executor):
+        self._config = dict(plugin_config or {})
         self._namespace   = namespace
         self._color_topic = f"/{namespace}/camera/rgb"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._dist_topic  = f"/{namespace}/camera/distance"
-        self._executor = executor
+        self._rgb_frame_topic = self._config.get(
+            "rgb_frame_topic", f"/{namespace}/camera/rgb_frame"
+        )
+        self._depth_frame_topic = self._config.get(
+            "depth_frame_topic", f"/{namespace}/camera/depth_frame"
+        )
         self._proc = None
+        self._status_q = None
+        self._status = {"state": "idle"}
+        self._executor = executor
         self._frame_node = None
+        from sensor_output import OutputGate
+        self._gates = {name: OutputGate() for name in (
+            "camera_rgb", "camera_depth", "camera_distance")}
+        self._gates["capture"] = OutputGate(False)
+        self._requested_outputs = {name: name != "capture" for name in self._gates}
+        self._lifecycle_lock = threading.RLock()
+        self._capture_waiters = 0
         self._ensure_frame_node()
 
     def _ensure_frame_node(self) -> None:
         """Create the cache subscription once for this plugin lifecycle."""
         if self._frame_node is not None:
             return
-        node = _CameraFrameNode(self._color_topic)
+        node = _CameraFrameNode(self._color_topic + "_internal")
         self._executor.add_node(node)
         self._frame_node = node
 
@@ -4059,7 +4278,8 @@ class RealSensePlugin:
             "multiInstance": False,
             "description": f"RealSense color camera — {RS_COLOR_W}x{RS_COLOR_H} JPEG @ {RS_COLOR_FPS}fps. Publishes CompressedImage to {self._color_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}],
+            "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]
+                         + self._frame_outputs("rgb"),
         }
 
     def _depth_tool(self) -> dict:
@@ -4069,7 +4289,8 @@ class RealSensePlugin:
             "multiInstance": False,
             "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 (z16, mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
+            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]
+                         + self._frame_outputs("depth"),
         }
 
     def _dist_tool(self) -> dict:
@@ -4082,22 +4303,64 @@ class RealSensePlugin:
             "topic_out": [{"topic": self._dist_topic, "format": "data/json"}],
         }
 
+    def _frame_outputs(self, stream) -> list:
+        from camera_frame import DEPTH_SCHEMA, ENVELOPE_FORMAT, RGB_SCHEMA
+        if not self._config.get("frame_enabled", True):
+            return []
+        return [{
+            "port": f"{stream}_frame",
+            "topic": self._rgb_frame_topic if stream == "rgb" else self._depth_frame_topic,
+            "format": ENVELOPE_FORMAT,
+            "ros_type": "std_msgs/msg/UInt8MultiArray",
+            "schema": RGB_SCHEMA if stream == "rgb" else DEPTH_SCHEMA,
+        }]
+
+    def _drain_status(self) -> dict:
+        if self._status_q is not None:
+            while True:
+                try:
+                    value = self._status_q.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(value, dict):
+                    self._status = value
+        result = dict(self._status)
+        if self._proc is not None and not self._proc.is_alive():
+            result["state"] = "error"
+            result.setdefault("error", "RealSense subprocess exited")
+        return result
+
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._start_capture_process()
+
+    def _start_capture_process(self) -> None:
         import multiprocessing as mp
         # A stopped plugin may be started again in the same driver process.
         # Recreate the cache node that stop() explicitly destroyed.
         self._ensure_frame_node()
         if self._proc is not None and self._proc.is_alive():
             return
+        from sensor_output import OutputGate
+        self._gates = {name: OutputGate(on) for name, on in self._requested_outputs.items()}
+        if self._status_q is not None:
+            self._status_q.close()
         ctx = mp.get_context("spawn")
+        self._status_q = ctx.Queue(maxsize=1)
+        self._status = {"state": "starting"}
         self._proc = ctx.Process(
-            target=run_realsense_process, args=(self._namespace,),
+            target=run_realsense_process,
+            args=(self._namespace, self._config, self._status_q, self._gates),
             name="realsense", daemon=True,
         )
         self._proc.start()
         print(f"[bundle] RealSense capture forked → pid={self._proc.pid}")
 
     def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._stop_capture_process()
+
+    def _stop_capture_process(self) -> None:
         if self._proc is not None and self._proc.is_alive():
             self._proc.terminate()
             self._proc.join(timeout=3.0)
@@ -4105,6 +4368,10 @@ class RealSensePlugin:
                 self._proc.kill()
                 self._proc.join(timeout=2.0)
         self._proc = None
+        if self._status_q is not None:
+            self._status_q.close()
+            self._status_q = None
+        self._status = {"state": "idle"}
         node = self._frame_node
         self._frame_node = None
         if node is not None:
@@ -4124,27 +4391,59 @@ class RealSensePlugin:
         return self._proc is not None and self._proc.is_alive()
 
     def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
-        node = self._frame_node
-        if node is None:
-            return None, 0
-        return node.wait_for_frame(after_sequence, timeout_s)
+        with self._lifecycle_lock:
+            if timeout_s <= 0:
+                return (self._frame_node.wait_for_frame(after_sequence, 0)
+                        if self._frame_node is not None else (None, 0))
+            self._start_capture_process()
+            node = self._frame_node
+            if self._capture_waiters == 0:
+                node.clear()
+                self._gates["capture"].set_enabled(True)
+                self._requested_outputs["capture"] = True
+            self._capture_waiters += 1
+        try:
+            return node.wait_for_frame(after_sequence, timeout_s)
+        finally:
+            with self._lifecycle_lock:
+                self._capture_waiters -= 1
+                if self._capture_waiters == 0:
+                    self._gates["capture"].set_enabled(False)
+                    self._requested_outputs["capture"] = False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            tool_name = args.get('_tool_name', '')
-            if tool_name == 'camera_depth':
-                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
-            if tool_name == 'camera_distance':
-                return {"state": "running", "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
-            return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
+        if action in {"start", "stop", "info"}:
+            with self._lifecycle_lock:
+                name = args.get("_tool_name", "camera_rgb")
+                tools = {tool["name"]: tool for tool in self.get_tools()}
+                if name not in tools:
+                    return {"state": "error", "error": "unknown_camera_tool"}
+                try:
+                    if action != "info":
+                        if not self.is_running():
+                            from sensor_output import OutputGate
+                            self._gates = {key: OutputGate(on) for key, on in self._requested_outputs.items()}
+                        self._gates[name].set_enabled(action == "start")
+                        self._requested_outputs[name] = action == "start"
+                    if action == "start":
+                        self._start_capture_process()
+                    status = self._drain_status()
+                    output = self._gates[name].status()
+                    ready = output["ready"] and self.is_running() and status.get("state") == "running"
+                    return {**status, **output, "ready": ready,
+                            "state": "idle" if not output["enabled"] else ("ready" if ready else "not_ready"),
+                            "topic_out": tools[name]["topic_out"]}
+                except (TimeoutError, OSError) as exc:
+                    return {"state": "error", "ready": False, "error": str(exc)}
         return None
 
 
-def run_realsense_process(namespace: str) -> None:
+def run_realsense_process(
+    namespace: str,
+    plugin_config: dict | None = None,
+    status_q=None,
+    gates=None,
+) -> None:
     """RealSense subprocess entry — independent GIL for full 1080p@15fps throughput.
 
     All heavy imports (cv2, numpy, pyrealsense2, sensor_msgs) happen here
@@ -4155,7 +4454,13 @@ def run_realsense_process(namespace: str) -> None:
     # ROS/native initialization, or any child-process output.
     from common import logsafe
     logsafe.install(check_fd=False)
+    from sensor_output import OutputGate
+    if gates is None:
+        gates = {name: OutputGate() for name in (
+            "camera_rgb", "camera_depth", "camera_distance")}
+        gates["capture"] = OutputGate(False)
 
+    from array import array
     import os
     import cv2
     import numpy as np
@@ -4164,8 +4469,30 @@ def run_realsense_process(namespace: str) -> None:
     from rclpy.node import Node as _Node
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from std_msgs.msg import String as _String
+    from std_msgs.msg import String as _String, UInt8MultiArray
     from sensor_msgs.msg import Image, CompressedImage
+    from camera_frame import (
+        DEPTH_SCHEMA,
+        RGB_SCHEMA,
+        RealSenseClockNormalizer,
+        build_calibrations,
+        build_depth_image_metadata,
+        build_frame_metadata,
+        build_intrinsics,
+        compress_depth_payload,
+        encode_envelope,
+        load_lidar_camera_calibration,
+        realsense_extrinsics_transform,
+    )
+
+    config_values = dict(plugin_config or {})
+    frame_enabled = bool(config_values.get("frame_enabled", True))
+    rgb_frame_topic = config_values.get(
+        "rgb_frame_topic", f"/{namespace}/camera/rgb_frame"
+    )
+    depth_frame_topic = config_values.get(
+        "depth_frame_topic", f"/{namespace}/camera/depth_frame"
+    )
 
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -4178,12 +4505,45 @@ def run_realsense_process(namespace: str) -> None:
         def __init__(self, color_topic, depth_topic, dist_topic):
             super().__init__("g1_realsense")
             self._color_pub = self.create_publisher(CompressedImage, color_topic, _QOS)
+            self._capture_pub = self.create_publisher(CompressedImage, color_topic + "_internal", _QOS)
             self._depth_pub = self.create_publisher(Image, depth_topic, _QOS)
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
+            self._rgb_frame_pub = (
+                self.create_publisher(UInt8MultiArray, rgb_frame_topic, _QOS)
+                if frame_enabled else None
+            )
+            self._depth_frame_pub = (
+                self.create_publisher(UInt8MultiArray, depth_frame_topic, _QOS)
+                if frame_enabled else None
+            )
 
             self._pipeline = None
+            self._shutting_down = False
+            self._last_frame_monotonic = 0.0
             self._last_ts        = 0.0
             self._last_dist_time = 0.0
+            self._last_status_time = 0.0
+            self._serial = None
+            self._rgb_calibration = None
+            self._depth_calibration = None
+            self._sequence = {"rgb": 0, "depth": 0}
+            self._diagnostics = {
+                "reconnect_count": 0,
+                "framesets": 0,
+                "rgb_frame_published": 0,
+                "depth_frame_published": 0,
+                "invalid_source_stamps": 0,
+                "out_of_order_source_stamps": 0,
+                "color_coalesced": 0,
+                "depth_coalesced": 0,
+                "legacy_publish_errors": 0,
+                "frame_publish_errors": 0,
+                "jpeg_encode_errors": 0,
+                "frameset_errors": 0,
+            }
+            # Do not shadow rclpy.node.Node._clock: get_clock() relies on the
+            # ROS Clock object's handle when stamping the legacy messages.
+            self._camera_clock_normalizer = self._new_clock_normalizer()
 
             self._depth_q = queue.Queue(maxsize=1)
             self._depth_worker = None
@@ -4192,38 +4552,209 @@ def run_realsense_process(namespace: str) -> None:
             self._color_worker = None
 
             self._worker_stop = threading.Event()
+            self._reconnect_interval = max(
+                0.2, float(config_values.get("reconnect_interval_sec", 1.0))
+            )
+            self._stale_frame_timeout = max(
+                self._reconnect_interval,
+                float(config_values.get("stale_frame_timeout_sec", 2.5)),
+            )
+            self._capture_timer = self.create_timer(
+                self._reconnect_interval, self._ensure_capture
+            )
 
             self.get_logger().info(
-                f"RealSenseNode ready — color:{color_topic} depth:{depth_topic} dist:{dist_topic}"
+                f"RealSenseNode ready — color:{color_topic} depth:{depth_topic} "
+                f"dist:{dist_topic} rgb_frame:{rgb_frame_topic if frame_enabled else 'disabled'} "
+                f"depth_frame:{depth_frame_topic if frame_enabled else 'disabled'}"
             )
+            self._publish_status("starting")
+
+        def _new_clock_normalizer(self):
+            return RealSenseClockNormalizer(
+                warmup_samples=int(config_values.get("clock_warmup_samples", 8)),
+                window_samples=int(config_values.get("clock_window_samples", 300)),
+                reset_threshold_ns=int(
+                    float(config_values.get("clock_reset_threshold_ms", 1000)) * 1_000_000
+                ),
+                reset_confirm_samples=int(
+                    config_values.get("clock_reset_confirm_samples", 5)
+                ),
+            )
+
+        def _record_error(self, counter, message):
+            count = self._diagnostics[counter] + 1
+            self._diagnostics[counter] = count
+            if count == 1 or count % 100 == 0:
+                self.get_logger().error(f"{message} (count={count})")
+
+        def _publish_status(self, state, error=None, force=False):
+            now = time.monotonic()
+            if not force and now - self._last_status_time < 1.0:
+                return
+            self._last_status_time = now
+            value = {
+                "state": state,
+                "device_serial": self._serial,
+                "frame_enabled": frame_enabled,
+                "diagnostics": dict(self._diagnostics),
+            }
+            if self._rgb_calibration:
+                value["calibration_id"] = self._rgb_calibration["calibration_id"]
+                value["lidar_camera_status"] = self._rgb_calibration[
+                    "lidar_to_camera"
+                ].get("status")
+                value["base_camera_status"] = self._rgb_calibration[
+                    "base_to_camera"
+                ].get("status")
+            if error:
+                value["error"] = str(error)
+            if status_q is None:
+                return
+            try:
+                while True:
+                    status_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                status_q.put_nowait(value)
+            except queue.Full:
+                pass
+
+        def _frame_domain(self, frame):
+            try:
+                return str(frame.get_frame_timestamp_domain())
+            except Exception:
+                return "unknown"
+
+        def _timing(self, frame, stream, receive_unix_ns):
+            try:
+                source_ms = frame.get_timestamp()
+            except Exception:
+                source_ms = None
+            timing = self._camera_clock_normalizer.normalize(
+                source_timestamp_ms=source_ms,
+                source_domain=self._frame_domain(frame),
+                driver_receive_stamp_ns=receive_unix_ns,
+                stream=stream,
+            )
+            if not timing.available:
+                self._diagnostics["invalid_source_stamps"] += 1
+            if timing.out_of_order:
+                self._diagnostics["out_of_order_source_stamps"] += 1
+            return timing
+
+        @staticmethod
+        def _intrinsics(profile):
+            intrinsics = profile.get_intrinsics()
+            return build_intrinsics(
+                width=intrinsics.width,
+                height=intrinsics.height,
+                fx=intrinsics.fx,
+                fy=intrinsics.fy,
+                cx=intrinsics.ppx,
+                cy=intrinsics.ppy,
+                coefficients=list(intrinsics.coeffs),
+                realsense_model=str(intrinsics.model),
+            )
+
+        def _configure_profile(self, profile):
+            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            depth_profile = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+            depth_sensor = profile.get_device().first_depth_sensor()
+            depth_scale_m = float(depth_sensor.get_depth_scale())
+            depth_to_color_rs = depth_profile.get_extrinsics_to(color_profile)
+            depth_to_rgb = realsense_extrinsics_transform(
+                source_frame="camera_depth_optical_frame",
+                target_frame="camera_color_optical_frame",
+                rotation_column_major=list(depth_to_color_rs.rotation),
+                translation_m=list(depth_to_color_rs.translation),
+            )
+            (
+                lidar_to_rgb,
+                base_to_camera,
+                calibration_error,
+            ) = load_lidar_camera_calibration(
+                config_values.get(
+                    "lidar_camera_calibration",
+                    "/work/calibration/g1_factory_nominal_lidar_camera.yaml",
+                )
+            )
+            self._rgb_calibration, self._depth_calibration = build_calibrations(
+                serial=self._serial,
+                rgb_intrinsics=self._intrinsics(color_profile),
+                depth_intrinsics=self._intrinsics(depth_profile),
+                depth_to_rgb=depth_to_rgb,
+                lidar_to_rgb=lidar_to_rgb,
+                base_to_camera=base_to_camera,
+                depth_scale_m=depth_scale_m,
+            )
+            if calibration_error:
+                self.get_logger().warn(
+                    f"Camera extrinsic calibration incomplete: {calibration_error}"
+                )
 
         def start_capture(self):
             if self._pipeline is not None:
                 return
-            ctx = rs.context()
-            devs = ctx.query_devices()
-            if len(devs) == 0:
-                self.get_logger().warn("RealSenseNode: no device connected")
+            pipeline = None
+            try:
+                ctx = rs.context()
+                devs = ctx.query_devices()
+                if len(devs) == 0:
+                    self._publish_status("not_ready", "no RealSense device connected")
+                    return
+                self._serial = devs[0].get_info(rs.camera_info.serial_number)
+
+                pipeline = rs.pipeline()
+                config = rs.config()
+                config.enable_device(self._serial)
+                config.enable_stream(rs.stream.depth, RS_DEPTH_W, RS_DEPTH_H, rs.format.z16, RS_DEPTH_FPS)
+                config.enable_stream(rs.stream.color, RS_COLOR_W, RS_COLOR_H, rs.format.bgr8, RS_COLOR_FPS)
+                profile = pipeline.start(config, self._on_frame)
+                self._configure_profile(profile)
+                self._camera_clock_normalizer = self._new_clock_normalizer()
+                self._sequence = {"rgb": 0, "depth": 0}
+                self._last_frame_monotonic = time.monotonic()
+                self._worker_stop.clear()
+                self._depth_worker = threading.Thread(target=self._depth_loop, name="rs_depth", daemon=True)
+                self._depth_worker.start()
+                self._color_worker = threading.Thread(target=self._color_loop, name="rs_color", daemon=True)
+                self._color_worker.start()
+                self._pipeline = pipeline
+                self._diagnostics["reconnect_count"] += 1
+                self._publish_status("running", force=True)
+                self.get_logger().info(
+                    f"RealSense capture started — device {self._serial}"
+                )
+            except Exception as exc:
+                if pipeline is not None:
+                    try:
+                        pipeline.stop()
+                    except Exception:
+                        pass
+                self._pipeline = None
+                self._publish_status("not_ready", exc, force=True)
+                self.get_logger().warn(f"RealSense start failed; will retry: {exc}")
+
+        def _ensure_capture(self):
+            if self._shutting_down:
                 return
-            serial = devs[0].get_info(rs.camera_info.serial_number)
+            # token() intentionally drops samples on a busy publication lock;
+            # that must not be mistaken for absence of an acquisition demand.
+            if not any(g.acquisition_requested() for g in gates.values()):
+                if self._pipeline is not None:
+                    self.stop_capture(reconnecting=True)
+                return
+            if self._pipeline is None:
+                self.start_capture()
+                return
+            if time.monotonic() - self._last_frame_monotonic > self._stale_frame_timeout:
+                self.get_logger().warn("RealSense frame stream stale; reconnecting")
+                self.stop_capture(reconnecting=True)
+                self.start_capture()
 
-            pipeline = rs.pipeline()
-            config = rs.config()
-            config.enable_device(serial)
-            config.enable_stream(rs.stream.depth, RS_DEPTH_W, RS_DEPTH_H, rs.format.z16, RS_DEPTH_FPS)
-            config.enable_stream(rs.stream.color, RS_COLOR_W, RS_COLOR_H, rs.format.bgr8, RS_COLOR_FPS)
-
-            self._worker_stop.clear()
-            self._depth_worker = threading.Thread(target=self._depth_loop, name="rs_depth", daemon=True)
-            self._depth_worker.start()
-            self._color_worker = threading.Thread(target=self._color_loop, name="rs_color", daemon=True)
-            self._color_worker.start()
-
-            pipeline.start(config, self._on_frame)
-            self._pipeline = pipeline
-            self.get_logger().info(f"RealSense capture started — device {serial}")
-
-        def stop_capture(self):
+        def stop_capture(self, reconnecting=False):
             if self._pipeline is not None:
                 try:
                     self._pipeline.stop()
@@ -4237,13 +4768,27 @@ def run_realsense_process(namespace: str) -> None:
             if self._color_worker is not None:
                 self._color_worker.join(timeout=2.0)
                 self._color_worker = None
+            self._drain_frame_queue(self._color_q)
+            self._drain_frame_queue(self._depth_q)
+            if not reconnecting:
+                self._publish_status("idle", force=True)
             self.get_logger().info("RealSense capture stopped")
+
+        @staticmethod
+        def _drain_frame_queue(frame_queue):
+            try:
+                while True:
+                    frame_queue.get_nowait()
+            except queue.Empty:
+                pass
 
         def _depth_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    depth_np, stamp = self._depth_q.get(timeout=0.5)
+                    depth_np, stamp, timing, receive_mono_ns, calibration, sequence, token = self._depth_q.get(timeout=0.5)
                 except queue.Empty:
+                    continue
+                if token != gates["camera_depth"].token():
                     continue
                 try:
                     msg = Image()
@@ -4255,44 +4800,138 @@ def run_realsense_process(namespace: str) -> None:
                     msg.is_bigendian = 0
                     msg.step = depth_np.shape[1] * 2
                     msg.data = depth_np.tobytes()
-                    self._depth_pub.publish(msg)
+                    if not gates["camera_depth"].publish(
+                            token, self._depth_pub, msg, record=self._depth_frame_pub is None):
+                        continue
                 except Exception as e:
-                    self.get_logger().error(f"[realsense] depth publish error: {e}")
+                    self._record_error(
+                        "legacy_publish_errors",
+                        f"[realsense] depth legacy publish error: {e}",
+                    )
+                    continue
+                if self._depth_frame_pub is None or calibration is None:
+                    continue
+                try:
+                    raw_payload = depth_np.astype("<u2", copy=False).tobytes()
+                    payload = compress_depth_payload(raw_payload)
+                    metadata = build_frame_metadata(
+                        schema=DEPTH_SCHEMA,
+                        frame_id="camera_depth_optical_frame",
+                        timing=timing,
+                        driver_receive_monotonic_ns=receive_mono_ns,
+                        sequence=sequence,
+                        image=build_depth_image_metadata(
+                            width=depth_np.shape[1],
+                            height=depth_np.shape[0],
+                            uncompressed_size=len(raw_payload),
+                            payload_size=len(payload),
+                            depth_scale_m=calibration["depth_scale_m"],
+                        ),
+                        calibration=calibration,
+                    )
+                    envelope = encode_envelope(metadata, payload)
+                    frame_msg = UInt8MultiArray()
+                    frame_msg.data = array("B", envelope)
+                    if gates["camera_depth"].publish(token, self._depth_frame_pub, frame_msg):
+                        self._diagnostics["depth_frame_published"] += 1
+                except Exception as e:
+                    self._record_error(
+                        "frame_publish_errors",
+                        f"[realsense] depth frame publish error: {e}",
+                    )
 
         def _color_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    color_np, stamp = self._color_q.get(timeout=0.5)
+                    color_np, stamp, timing, receive_mono_ns, calibration, sequence, token, capture_token = self._color_q.get(timeout=0.5)
                 except queue.Empty:
+                    continue
+                if (token != gates["camera_rgb"].token()
+                        and capture_token != gates["capture"].token()):
                     continue
                 try:
                     ok, jpg = cv2.imencode(".jpg", color_np, [cv2.IMWRITE_JPEG_QUALITY, RS_JPEG_QUALITY])
-                    if ok:
-                        cmsg = CompressedImage()
-                        cmsg.header.stamp = stamp
-                        cmsg.header.frame_id = "camera_color_optical_frame"
-                        cmsg.format = "jpeg"
-                        cmsg.data = jpg.tobytes()
-                        self._color_pub.publish(cmsg)
+                    if not ok:
+                        self._record_error(
+                            "jpeg_encode_errors",
+                            "[realsense] JPEG encode failed",
+                        )
+                        continue
+                    payload = jpg.tobytes()
+                    cmsg = CompressedImage()
+                    cmsg.header.stamp = stamp
+                    cmsg.header.frame_id = "camera_color_optical_frame"
+                    cmsg.format = "jpeg"
+                    cmsg.data = payload
+                    if not gates["capture"].publish(capture_token, self._capture_pub, cmsg):
+                        # Keep the existing passive cache warm while RGB is on;
+                        # an explicit capture request also works with RGB off.
+                        gates["camera_rgb"].publish(token, self._capture_pub, cmsg, record=False)
+                    if not gates["camera_rgb"].publish(
+                            token, self._color_pub, cmsg, record=self._rgb_frame_pub is None):
+                        continue
                 except Exception as e:
-                    self.get_logger().error(f"[realsense] color publish error: {e}")
+                    self._record_error(
+                        "legacy_publish_errors",
+                        f"[realsense] color legacy publish error: {e}",
+                    )
+                    continue
+                if self._rgb_frame_pub is None or calibration is None:
+                    continue
+                try:
+                    metadata = build_frame_metadata(
+                        schema=RGB_SCHEMA,
+                        frame_id="camera_color_optical_frame",
+                        timing=timing,
+                        driver_receive_monotonic_ns=receive_mono_ns,
+                        sequence=sequence,
+                        image={
+                            "encoding": "jpeg",
+                            "width": int(color_np.shape[1]),
+                            "height": int(color_np.shape[0]),
+                            "payload_size": len(payload),
+                        },
+                        calibration=calibration,
+                    )
+                    envelope = encode_envelope(metadata, payload)
+                    frame_msg = UInt8MultiArray()
+                    frame_msg.data = array("B", envelope)
+                    if gates["camera_rgb"].publish(token, self._rgb_frame_pub, frame_msg):
+                        self._diagnostics["rgb_frame_published"] += 1
+                except Exception as e:
+                    self._record_error(
+                        "frame_publish_errors",
+                        f"[realsense] color frame publish error: {e}",
+                    )
 
         def _on_frame(self, frame):
             try:
+                tokens = {name: gate.token() for name, gate in gates.items()}
                 if not frame.is_frameset():
                     return
                 fs = frame.as_frameset()
                 color_frame = fs.get_color_frame()
                 depth_frame = fs.get_depth_frame()
+                receive_unix_ns = time.time_ns()
+                receive_mono_ns = time.monotonic_ns()
                 stamp = self.get_clock().now().to_msg()
+                self._last_frame_monotonic = time.monotonic()
+                self._diagnostics["framesets"] += 1
 
-                if color_frame:
+                if color_frame and (tokens["camera_rgb"] is not None or tokens["capture"] is not None):
                     color_np = np.asanyarray(color_frame.get_data())
+                    color_timing = self._timing(color_frame, "rgb", receive_unix_ns)
+                    self._sequence["rgb"] += 1
                     try:
                         self._color_q.get_nowait()
+                        self._diagnostics["color_coalesced"] += 1
                     except queue.Empty:
                         pass
-                    self._color_q.put((color_np, stamp))
+                    self._color_q.put_nowait((
+                        color_np, stamp, color_timing, receive_mono_ns,
+                        self._rgb_calibration, self._sequence["rgb"],
+                        tokens["camera_rgb"], tokens["capture"],
+                    ))
 
                 dist = 0.0
                 if depth_frame:
@@ -4300,12 +4939,20 @@ def run_realsense_process(namespace: str) -> None:
                         depth_frame.get_width() // 2,
                         depth_frame.get_height() // 2,
                     )
+                if depth_frame and tokens["camera_depth"] is not None:
                     depth_np = np.array(depth_frame.get_data())
+                    depth_timing = self._timing(depth_frame, "depth", receive_unix_ns)
+                    self._sequence["depth"] += 1
                     try:
                         self._depth_q.get_nowait()
+                        self._diagnostics["depth_coalesced"] += 1
                     except queue.Empty:
                         pass
-                    self._depth_q.put((depth_np, stamp))
+                    self._depth_q.put_nowait((
+                        depth_np, stamp, depth_timing, receive_mono_ns,
+                        self._depth_calibration, self._sequence["depth"],
+                        tokens["camera_depth"],
+                    ))
 
                 now = time.monotonic()
                 if now - self._last_dist_time >= RS_DIST_INTERVAL:
@@ -4314,11 +4961,15 @@ def run_realsense_process(namespace: str) -> None:
                     self._last_ts = now
                     out = _String()
                     out.data = json.dumps({"distance_m": round(dist, 3), "fps": round(fps, 1)})
-                    self._dist_pub.publish(out)
+                    gates["camera_distance"].publish(tokens["camera_distance"], self._dist_pub, out)
                 else:
                     self._last_ts = now
+                self._publish_status("running")
             except Exception as e:
-                self.get_logger().error(f"[realsense] frame error: {e}")
+                self._record_error(
+                    "frameset_errors",
+                    f"[realsense] frame error: {e}",
+                )
 
     color_topic = f"/{namespace}/camera/rgb"
     depth_topic = f"/{namespace}/camera/depth"
@@ -4340,6 +4991,7 @@ def run_realsense_process(namespace: str) -> None:
         if rclpy.ok():
             print(f"[realsense-proc] executor stopped: {e}", flush=True)
     finally:
+        node._shutting_down = True
         node.stop_capture()
         try:
             node.destroy_node()

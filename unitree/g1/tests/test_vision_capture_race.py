@@ -99,18 +99,54 @@ class VisionCaptureRaceTests(unittest.TestCase):
             "remove_node": lambda self, node: removed.append(node),
         })()
         plugin._color_topic = "/g1/camera/rgb"
+        plugin._lifecycle_lock = threading.RLock()
         plugin._proc = None
+        closed = []
+        plugin._status_q = type("StatusQueue", (), {
+            "close": lambda self: closed.append(True),
+        })()
         old_node = _CameraFrameNode(plugin._color_topic)
         plugin._frame_node = old_node
 
         plugin.stop()
 
+        self.assertEqual([True], closed)
+        self.assertIsNone(plugin._status_q)
+        self.assertEqual({"state": "idle"}, plugin._status)
         self.assertEqual([old_node], removed)
         self.assertTrue(old_node.destroyed)
         self.assertIsNone(plugin._frame_node)
         plugin._ensure_frame_node()
         self.assertEqual(1, len(added))
         self.assertIs(plugin._frame_node, added[0])
+
+    def test_bundle_stops_motion_then_capture_then_camera_despite_failure(self):
+        tree = ast.parse((ROOT / "main.py").read_text())
+        bundle = next(n for n in tree.body
+                      if isinstance(n, ast.ClassDef) and n.name == "G1DeviceBundle")
+        method = next(n for n in bundle.body
+                      if isinstance(n, ast.FunctionDef) and n.name == "stop_all")
+        namespace = {}
+        exec(compile(ast.Module(body=[method], type_ignores=[]),
+                     str(ROOT / "main.py"), "exec"), namespace)
+        events = []
+
+        class Plugin:
+            def __init__(self, prefix, priority=100):
+                self.PREFIX = prefix
+                if prefix == "loco":
+                    self.STOP_PRIORITY = priority
+
+            def stop(self):
+                events.append(self.PREFIX)
+                if self.PREFIX == "vision_capture":
+                    raise RuntimeError("capture cleanup failed")
+
+        instance = type("Bundle", (), {})()
+        instance._plugins = [Plugin("camera"), Plugin("vision_capture"),
+                             Plugin("loco", 0)]
+        namespace["stop_all"](instance)
+        self.assertEqual(["loco", "vision_capture", "camera"], events)
 
     def test_missing_camera_returns_structured_precondition(self):
         plugin_class = _load_class("VisionCapturePlugin")
