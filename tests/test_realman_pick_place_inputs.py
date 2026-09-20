@@ -102,7 +102,7 @@ class InputTests(unittest.TestCase):
 
     def test_connects_by_stream_semantics_not_connection_order(self):
         self.assertEqual(resolve_topics({"input_topics": TOPICS[::-1], "input_topic": TOPICS[2]}), TOPICS)
-        self.assertEqual([x["topic"] for x in self.inputs.topics()], TOPICS)
+        self.assertEqual([x["topic"] for x in self.inputs.topics()], [TOPICS[1], TOPICS[0], TOPICS[2]])
         self.assertTrue(self.inputs.info()["fresh"])
         for topics in (
             TOPICS[:2],
@@ -320,6 +320,17 @@ class InputTests(unittest.TestCase):
                 self.inputs.receive("metadata", types.SimpleNamespace(data=json.dumps(metadata)))
                 self.assertEqual(self.inputs.info()["state"], "error")
                 self.feed()
+
+    def test_consumer_rejects_old_or_future_acquisition_with_fresh_publication(self):
+        for name in ("rgb_stamp_ns", "depth_stamp_ns"):
+            for seconds in (998, 1001):
+                with self.subTest(name=name, seconds=seconds):
+                    metadata = calibration(self.now)
+                    metadata[name] = seconds * 1_000_000_000
+                    self.inputs.receive("metadata", types.SimpleNamespace(data=json.dumps(metadata)))
+                    self.assertEqual(self.inputs.info()["state"], "error")
+                    self.assertIn("timestamp", self.inputs.info()["error"])
+                    self.feed()
 
     def test_calibration_cannot_be_applied_to_another_session(self):
         self.on_wait = lambda: self.feed(metadata={**calibration(self.now), "session_id": "other-session"})

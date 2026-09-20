@@ -12,7 +12,7 @@ from uuid import uuid4
 from common.vendor_runtime import action_schema, tool
 from .motion import ObservationMotion, pose_close
 from .inputs import ObservationInputs
-from .geometry import displacement, positions
+from .geometry import displacement, positions, rotation_degrees
 from .transfer import Transfer
 from .completion import Completion
 from hardware import JOINT_LIMITS_DEG
@@ -29,7 +29,7 @@ MOTION_ACTIONS = ("observe", "transfer_to", "transfer_by")
 CONFIG_PROPERTIES = {
     "speed_percent": {
         "type": "integer", "minimum": 1, "maximum": 100, "default": 50,
-        "description": "全局运行速度（%），用于观察位、水平移动及抓放升降。",
+        "description": "全局运行速度（%），用于观察位、水平移动、抓放升降及夹爪 Rz 旋转。",
     },
     "observation_joints_deg": {
         "type": "string", "default": "-90,0,0,90,0,90,0",
@@ -94,13 +94,13 @@ def validate_config(config):
 
 
 class PickPlacePlugin:
-    PREFIX = "pick_place"
+    PREFIX = "vision_pick_and_drop"
 
     def __init__(self, client, config, namespace="rm75", ros2=None, inputs=None):
         self.client = client
         self._ros2 = ros2
         self._inputs = inputs if inputs is not None else ObservationInputs(ros2)
-        self._output_dir = Path(config.get("pick_place", {}).get(
+        self._output_dir = Path(config.get("vision_pick_and_drop", {}).get(
             "output_dir", "/opt/phanthy-motus/data/pick_place/realman"))
         self._config = {name: prop["default"] for name, prop in CONFIG_PROPERTIES.items()}
         self._config_lock = threading.RLock()
@@ -119,6 +119,8 @@ class PickPlacePlugin:
             "目标缺失或位置不明时不猜测。每张照片仅供一次搬运，首次下发设备命令即消费，旧检测坐标不能复用。"
             "每次调用须显式传 confirm_motion=true；返回 state=running 和 action_id 后等待框架 ACP 终态，"
             "无需轮询、补发消息或重复下发动作。卡片按配置完成抓起、水平搬运、放下和回升。"
+            "rotation_deg 是可选的夹爪自身 Rz 旋转角（°），正值为俯视顺时针，负值为逆时针；"
+            "常规搬运省略此参数，只有用户明确要求旋转时才设置。抓起并回升后旋转，保持该朝向搬运并放下。"
             "配置 observe_after_transfer 控制后续观察：抓放完成后始终按配置返回观察位；关闭时不拍照，observation.skipped=true、"
             "observation_required=true；开启时在返回观察位并停稳后保存一张新照片，返回 observation.ok=true、"
             "observation_id、captured_at、file_path、objects、count，observation_required=false。"
@@ -133,15 +135,17 @@ class PickPlacePlugin:
             "不要直接 observe 或从头重试。其余情况下 observation_required=true 时先重新 observe，使用新坐标。")
         properties = {name: {"type": "number", "minimum": -1, "maximum": 1, "description": description}
                       for name, description in (
-                          ("x1", "抓取中心在最新观察照片中的归一化 X 坐标，范围 [-1,1]：左边缘 -1、中心 0、右边缘 +1，正方向向右。可直接使用该照片的 VOP position[0]，无需换算像素。"),
-                          ("y1", "抓取中心在最新观察照片中的归一化 Y 坐标，范围 [-1,1]：上边缘 -1、中心 0、下边缘 +1，正方向向下。可直接使用该照片的 VOP position[1]，无需换算像素。"),
-                          ("x2", "transfer_to 放置位置在最新观察照片中的归一化 X 坐标，范围 [-1,1]：左边缘 -1、中心 0、右边缘 +1，正方向向右，与 x1 相同。"),
-                          ("y2", "transfer_to 放置位置在最新观察照片中的归一化 Y 坐标，范围 [-1,1]：上边缘 -1、中心 0、下边缘 +1，正方向向下，与 y1 相同。"))}
+                          ("start_point_x", "抓取中心在最新观察照片中的归一化 X 坐标，范围 [-1,1]：左边缘 -1、中心 0、右边缘 +1，正方向向右。可直接使用该照片的 VOP position[0]，无需换算像素。"),
+                          ("start_point_y", "抓取中心在最新观察照片中的归一化 Y 坐标，范围 [-1,1]：上边缘 -1、中心 0、下边缘 +1，正方向向下。可直接使用该照片的 VOP position[1]，无需换算像素。"),
+                          ("target_point_x", "transfer_to 放置位置在最新观察照片中的归一化 X 坐标，范围 [-1,1]：左边缘 -1、中心 0、右边缘 +1，正方向向右，与 start_point_x 相同。"),
+                          ("target_point_y", "transfer_to 放置位置在最新观察照片中的归一化 Y 坐标，范围 [-1,1]：上边缘 -1、中心 0、下边缘 +1，正方向向下，与 start_point_y 相同。"))}
         properties.update({
+            "delta_x": {"type": "number", "description": "transfer_by 从抓取点沿桌面左右平移的有符号距离（mm），可为小数。以最新观察照片为准：X 正方向向右（正值），负方向向左（负值），0 不左右移动；当前安装对应基坐标 ΔX=-delta_x。不是像素或绝对位置。"},
+            "delta_y": {"type": "number", "description": "transfer_by 从抓取点沿桌面上下平移的有符号距离（mm），可为小数。以最新观察照片为准：Y 正方向向照片下方（正值），负方向向上方（负值），0 不上下平移；当前安装对应基坐标 ΔY=delta_y。不是机械臂 Z 升降、像素或绝对位置。"},
+            "rotation_deg": {"type": "number", "minimum": -180, "maximum": 180, "default": 0,
+                             "description": "可选夹爪自身 Rz 旋转角（°），范围 [-180,180]：俯视正值顺时针、负值逆时针。抓起并回升后旋转再搬运放下；常规搬运省略，仅在用户明确要求旋转时填写。0 不旋转。"},
             "confirm_motion": {"type": "boolean", "const": True,
                                "description": "每次 observe、transfer_to、transfer_by 请求必须显式为 true，确认执行本次机械臂动作；取消无需此参数。"},
-            "dx_mm": {"type": "number", "description": "transfer_by 从抓取点沿桌面左右平移的有符号距离（mm），可为小数。以最新观察照片为准：X 正方向向右（正值），负方向向左（负值），0 不左右移动；当前安装对应基坐标 ΔX=-dx_mm。不是像素或绝对位置。"},
-            "dy_mm": {"type": "number", "description": "transfer_by 从抓取点沿桌面上下平移的有符号距离（mm），可为小数。以最新观察照片为准：Y 正方向向照片下方（正值），负方向向上方（负值），0 不上下平移；当前安装对应基坐标 ΔY=dy_mm。不是机械臂 Z 升降、像素或绝对位置。"},
         })
         schema = action_schema({
             "observe": (["confirm_motion"], (
@@ -149,26 +153,26 @@ class PickPlacePlugin:
                 "停稳后保存一张照片，返回物品列表，不持续推送照片。动作不操作夹爪。"
                 "返回 state=running 和 action_id 后等待框架 ACP 通知 status=completed、result.ok=true；"
                 "结果包含 observation_id、captured_at、file_path、width、height、objects、count 和 observation_required=false。"
-                "从 result.objects 选择目标，使用其 name、position、confidence；position[0]/position[1] 可直接填搬运 x1/y1。"
+                "从 result.objects 选择目标，使用其 name、position、confidence；position[0]/position[1] 可直接填搬运 start_point_x/start_point_y。"
                 "无需读取照片文件、换算像素或另调 VOP；count=0 表示没有检测到物体，此时不猜测抓取点。"
                 "前提是三路输入已连接并启动：同一 ext_camera 的 RGB、depth，以及该 RGB 经 VOP 得到的物品列表。"
                 "卡片完成内参匹配、深度对齐和静止窗口同步；短暂画面变化会重新等待稳定及新的检测结果。"
                 "照片仅供一次搬运。搬运后是否自动生成新观察由配置 observe_after_transfer 决定，以完成结果 observation_required 为准。"
                 "此前动作若返回 recovery_required=true，先人工处理持物或停止状态，不以重新观察代替恢复。")),
-            "transfer_to": (["x1", "y1", "x2", "y2", "confirm_motion"], (
+            "transfer_to": (["start_point_x", "start_point_y", "target_point_x", "target_point_y", "rotation_deg", "confirm_motion"], (
                 "指定目标点：用于把物体放到照片中的指定位置，或另一物体旁的空位。"
-                "(x1,y1) 是抓取物体中心，(x2,y2) 是放置点，四个值均为同一张最新观察照片的归一化坐标 [-1,1]。"
+                "(start_point_x,start_point_y) 是抓取物体中心，(target_point_x,target_point_y) 是放置点，四个值均为同一张最新观察照片的归一化坐标 [-1,1]。"
                 "照片中心为 (0,0)，X 向右、Y 向下为正；VOP position[0] 对应 X、position[1] 对应 Y，"
                 "无需换算像素或读取照片文件。放在另一物体旁边时选择其旁的空位，不能把参照物中心直接当作空位；"
                 "指定毫米距离的相对移动使用 transfer_by。" + transfer_guidance)),
-            "transfer_by": (["x1", "y1", "dx_mm", "dy_mm", "confirm_motion"], (
+            "transfer_by": (["start_point_x", "start_point_y", "delta_x", "delta_y", "rotation_deg", "confirm_motion"], (
                 "指定距离（mm）：用于把一个物体向左、右、照片上方或下方移动指定距离。"
-                "(x1,y1) 为最新观察照片中物体中心的归一化坐标 [-1,1]，照片中心为 (0,0)，"
+                "(start_point_x,start_point_y) 为最新观察照片中物体中心的归一化坐标 [-1,1]，照片中心为 (0,0)，"
                 "直接使用 VOP position[0]、position[1]，无需换算像素或读取照片文件。"
-                "dx_mm、dy_mm 是从物体抓取点出发的桌面毫米位移，两项都要填写，至少一项非零；1 cm=10 mm。"
+                "delta_x、delta_y 是从物体抓取点出发的桌面毫米位移，两项都要填写；若两项均为 0，须指定非零 rotation_deg，表示原地抓起旋转再放下；1 cm=10 mm。"
                 "方向以照片为准：X 正方向向右、Y 正方向向下，负值反向；上/下也是桌面平移，不是 Z 升降。"
-                "向右 30 mm：dx_mm=30、dy_mm=0；向左 30 mm：dx_mm=-30、dy_mm=0；"
-                "向照片上方 20 mm：dx_mm=0、dy_mm=-20；向下 20 mm：dx_mm=0、dy_mm=20。"
+                "向右 30 mm：delta_x=30、delta_y=0；向左 30 mm：delta_x=-30、delta_y=0；"
+                "向照片上方 20 mm：delta_x=0、delta_y=-20；向下 20 mm：delta_x=0、delta_y=20。"
                 "放到照片中指定位置使用 transfer_to。" + transfer_guidance)),
             "cancel": ([], "中止当前动作，无需 confirm_motion。停止后不继续抓放、回程或观察，不自动松爪；若已抓取，物体可能仍在夹爪中。等待 ACP 终态并检查 holding_object_possible、release_completed、recovery_required，先安全处理再开始新任务。"),
         }, properties)
@@ -180,10 +184,11 @@ class PickPlacePlugin:
                              "on_interrupt_all": {"action": "cancel"}}
         schema["x-is-dangerous"] = True
         schema["x-resource"] = "arm"
-        definition = tool("pick_place", "actuator", (
+        definition = tool("vision_pick_and_drop", "actuator", (
             "观察和搬运桌面物体。先 observe 获取一张照片对应的物品列表；按照片中的目标位置放置用 transfer_to，"
             "按方向移动指定毫米距离用 transfer_by。位置采用中心归一化坐标 [-1,1]，可直接使用本卡片返回的 VOP position："
             "X 向右、Y 向下为正；位移参数单独使用 mm，上下也指桌面方向。"
+            "常规搬运不设置 rotation_deg；仅用户明确要求时，抓起回升后绕夹爪 Rz 旋转，正值俯视顺时针、负值逆时针。"
             "每次运动传 confirm_motion=true，收到 action_id 后等待框架 ACP 终态，无需补发消息或重复调用。"
             "搬运完成后始终返回观察位。observe_after_transfer 开启时，再拍照并在 result.observation 返回新照片和物品列表；"
             "关闭时返回观察位后结束，不拍照。以 observation_required 判断是否需要重新 observe，每张照片仅供一次搬运。"
@@ -286,11 +291,12 @@ class PickPlacePlugin:
             try:
                 active = {"config": dict(self._config), "cancel": threading.Event(),
                           "done": threading.Event(), "motion_sent": False,
-                          "action_id": f"pick_place_{action}_{uuid4().hex}", "action": action}
+                          "action_id": f"vision_pick_and_drop_{action}_{uuid4().hex}", "action": action}
                 if action != "observe":
+                    active["rotation_deg"] = rotation_degrees(args)
                     if action == "transfer_by":
-                        active["positions"] = positions(args, ("x1", "y1"))
-                        active["displacement_mm"] = displacement(args)
+                        active["positions"] = positions(args, ("start_point_x", "start_point_y"))
+                        active["displacement_mm"] = displacement(args, active["rotation_deg"])
                     else:
                         active["positions"] = positions(args)
                     active["observation"] = dict(self._observation)
@@ -369,7 +375,8 @@ class PickPlacePlugin:
         observe_after = active["config"]["observe_after_transfer"]
         try:
             transfer = Transfer(self.client, motion, active["observation"], active["config"],
-                                active["positions"], send, stage, active.get("displacement_mm"))
+                                active["positions"], send, stage, active.get("displacement_mm"),
+                                rotation_deg=active["rotation_deg"])
             transfer_result = transfer.run()
             result = {**transfer_result, "transfer_completed": True,
                       "observe_after_transfer": observe_after, "recovery_required": False,
@@ -440,7 +447,7 @@ class PickPlacePlugin:
         # Shared by observe and a completed transfer, under the same device lock,
         # cancellation token and action_id. Only the outer action sends completion.
         if capture:
-            active["observation_id"] = "pick_place_observe_" + uuid4().hex
+            active["observation_id"] = "vision_pick_and_drop_observe_" + uuid4().hex
         motion = ObservationMotion(self.client, active["cancel"],
                                    deadline=time.monotonic() + ACTION_TIMEOUT_SECONDS)
         result = None
@@ -532,7 +539,7 @@ class PickPlacePlugin:
         if action == "config":
             updates = {key: value for key, value in args.items() if key not in ("_tool_name", "instance_id")}
             if updates.keys() - CONFIG_PROPERTIES.keys():
-                return {"ok": False, "code": "INVALID_CONFIG", "message": "Unknown pick_place configuration field"}
+                return {"ok": False, "code": "INVALID_CONFIG", "message": "Unknown vision_pick_and_drop configuration field"}
             with self._config_lock:
                 if self._active is not None:
                     return {"ok": False, "code": "ACTION_IN_PROGRESS", "message": "Wait for the current action to finish before configuring"}

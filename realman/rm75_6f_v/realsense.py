@@ -3,13 +3,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import json
 import multiprocessing as mp
 import queue
 import threading
 import time
 import zlib
-from uuid import uuid4
 
 import numpy as np
 
@@ -62,32 +60,6 @@ def encode_depth(raw: np.ndarray, scale: float) -> bytes:
     return zlib.compress(mm.astype("<u2").tobytes(), 1)
 
 
-def frame_time_ns(frame, rs):
-    if frame.get_frame_timestamp_domain() not in (
-            rs.timestamp_domain.system_time, rs.timestamp_domain.global_time):
-        raise ValueError("RGB-D requires host-synchronized camera timestamps")
-    seconds = frame.get_timestamp() / 1000.0
-    if not np.isfinite(seconds) or not -0.1 <= time.time() - seconds <= 1.0:
-        raise ValueError("RGB-D camera timestamp is stale or invalid")
-    return round(seconds * 1_000_000_000)
-
-
-def rgbd_metadata(frames, stamps, serial, session, rgb_topics):
-    """Calibration accompanies the existing, unmodified JPEG/Z16-mm streams."""
-    profiles = {name: frames[name].profile.as_video_stream_profile() for name in ("rgb", "depth")}
-    def intrinsics(profile):
-        intr = profile.get_intrinsics()
-        return {key: getattr(intr, key) for key in ("width", "height", "fx", "fy", "ppx", "ppy")} | {
-            "model": str(intr.model), "coeffs": list(intr.coeffs)}
-    extr = profiles["depth"].get_extrinsics_to(profiles["rgb"])
-    return {"version": 2, "serial_number": serial, "session_id": session,
-            "rgb_topics": rgb_topics, "rgb_stamp_ns": stamps["rgb"], "depth_stamp_ns": stamps["depth"],
-            "rgb_intrinsics": intrinsics(profiles["rgb"]), "depth_intrinsics": intrinsics(profiles["depth"]),
-            "depth_to_color": {"rotation": list(extr.rotation), "translation": list(extr.translation)},
-            # encode_depth publishes millimetres, regardless of device depth units.
-            "depth_scale_m": 0.001, "depth_aligned_to": "depth"}
-
-
 def _report(status_queue, status):
     status = copy.deepcopy(status)
     try:
@@ -132,7 +104,7 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
         import rclpy
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage
-        from std_msgs.msg import String
+        from realsense_metadata import RGBDMetadata
 
         context = rs.context()
         device = find_device_by_serial(rs, context, serial_number)
@@ -146,13 +118,8 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
         scale = device.first_depth_sensor().get_depth_scale()
         if not np.isfinite(scale) or scale <= 0:
             raise RuntimeError("RealSense reported an invalid depth scale")
-        for sensor in device.query_sensors():
-            try:
-                if sensor.supports(rs.option.global_time_enabled):
-                    sensor.set_option(rs.option.global_time_enabled, 1)
-            except RuntimeError:
-                # Optional synchronization must not prevent existing previews.
-                pass
+        metadata = RGBDMetadata(namespace, serial_number, rs)
+        metadata.configure_clock(device)
 
         status.update({
             "device_name": _device_info(
@@ -180,8 +147,6 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
         suffix = hashlib.sha256(serial_number.encode()).hexdigest()[:12]
         node = rclpy.create_node(f"{namespace}_realsense_rgbd_{suffix}")
         publishers = {}
-        metadata_publishers = {}
-        session = uuid4().hex
         pipeline = rs.pipeline(context)
         pipeline.start(config)
         streaming = True
@@ -201,8 +166,6 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
             for key in list(publishers):
                 if key not in routes or publishers[key][0] != routes[key]:
                     node.destroy_publisher(publishers.pop(key)[1])
-                    if key in metadata_publishers:
-                        node.destroy_publisher(metadata_publishers.pop(key))
             for key, channel in routes.items():
                 if key not in publishers:
                     topic = (
@@ -214,9 +177,6 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
                         node.create_publisher(
                             CompressedImage, topic, qos_profile_sensor_data),
                     )
-                    if channel == "depth":
-                        metadata_publishers[key] = node.create_publisher(
-                            String, topic + "/metadata", qos_profile_sensor_data)
 
             try:
                 frameset = pipeline.wait_for_frames(200)
@@ -245,20 +205,7 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
                 raise RuntimeError(
                     "RealSense RGB/depth/infrared frames stopped arriving")
 
-            metadata = None
             headers = {}
-            if metadata_publishers and frames.get("rgb") and frames.get("depth"):
-                try:
-                    stamps = {name: frame_time_ns(frames[name], rs) for name in ("rgb", "depth")}
-                    rgb_topics = [f"/{namespace}/ext_camera/{key.replace('-', '_')}/rgb"
-                                  for key, channel in routes.items() if channel == "rgb"]
-                    metadata = rgbd_metadata(frames, stamps, serial_number, session, rgb_topics)
-                except (ValueError, RuntimeError) as exc:
-                    # Preview remains available, but consumers cannot use uncalibrated frames for motion.
-                    status["rgbd_error"] = str(exc)
-                else:
-                    status.pop("rgbd_error", None)
-
             for stream, frame in frames.items():
                 if not frame or stream not in routes.values():
                     continue
@@ -266,10 +213,7 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
                 msg = CompressedImage()
                 msg.header.stamp = node.get_clock().now().to_msg()
                 msg.header.frame_id = f"{namespace}_{stream}_optical"
-                if stream in ("rgb", "depth"):
-                    headers[stream + "_header_stamp_ns"] = (
-                        msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec)
-                    headers[stream + "_frame_id"] = msg.header.frame_id
+                headers[stream] = msg.header
                 if stream == "depth":
                     msg.format = "16UC1; compressedDepth zlib"
                     msg.data = encode_depth(raw, scale)
@@ -298,12 +242,7 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
                         status["last_frame"][key] = now
                         status["channels"][key] = channel
 
-            if metadata is not None and len(headers) == 4:
-                metadata.update(headers)
-                msg = String()
-                msg.data = json.dumps(metadata)
-                for publisher in metadata_publishers.values():
-                    publisher.publish(msg)
+            metadata.publish(node, routes, frames, headers, status)
 
             if now - last_report >= 0.2:
                 _report(status_queue, status)

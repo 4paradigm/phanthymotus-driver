@@ -23,4 +23,4 @@ cards:
   - { name: ext_camera,       type: sensor }
   - { name: abs_move,         type: actuator }
   - { name: vision_capture, type: actuator }
-  - { name: pick_place,       type: actuator }
+  - { name: vision_pick_and_drop,       type: actuator }

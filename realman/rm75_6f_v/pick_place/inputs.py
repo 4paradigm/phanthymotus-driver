@@ -14,8 +14,8 @@ import numpy as np
 from .alignment import align_depth, validate_calibration
 
 
-INPUT_FORMATS = ("image/jpeg", "image/depth-zlib", "data/json")
-INPUT_NAMES = ("RGB 图像", "深度图像", "VOP 物品列表")
+INPUT_FORMATS = ("image/depth-zlib", "image/jpeg", "data/json")
+INPUT_NAMES = ("深度图像", "RGB 图像", "VOP 物品列表")
 MAX_FRAME_AGE = 1.0
 MAX_RGBD_SKEW = 0.2
 STEADY_SECONDS = 0.6
@@ -32,7 +32,7 @@ def resolve_topics(args):
             raise ValueError("Expected one RGB, one depth and one objects input")
         result.append(candidates[0])
     if result[2] != result[0] + "/objects":
-        raise ValueError("VOP must consume the same RGB topic connected to pick_place")
+        raise ValueError("VOP must consume the same RGB topic connected to vision_pick_and_drop")
     return result
 
 
@@ -53,7 +53,7 @@ class ObservationInputs:
     def topics(self):
         with self._condition:
             return [
-                {"format": fmt, "desc": desc, **({"topic": self._topics[i]} if self._topics else {})}
+                {"format": fmt, "desc": desc, **({"topic": self._topics[(1, 0, 2)[i]]} if self._topics else {})}
                 for i, (fmt, desc) in enumerate(zip(INPUT_FORMATS, INPUT_NAMES))
             ]
 
@@ -84,7 +84,7 @@ class ObservationInputs:
             from sensor_msgs.msg import CompressedImage
             from std_msgs.msg import String
 
-            node = Node("pick_place_inputs_" + uuid4().hex[:8], context=self._ros2.ctx_core)
+            node = Node("vision_pick_and_drop_inputs_" + uuid4().hex[:8], context=self._ros2.ctx_core)
             for name, topic, kind in (
                 ("rgb", topics[0], CompressedImage),
                 ("depth", topics[1], CompressedImage),

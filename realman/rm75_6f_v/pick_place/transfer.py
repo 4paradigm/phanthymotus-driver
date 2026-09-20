@@ -10,13 +10,18 @@ from .motion import FeedbackPending, pose_close, rotation, vector
 
 
 class Transfer:
-    def __init__(self, client, motion, observation, config, selected, send, stage, displacement_mm=None):
+    def __init__(self, client, motion, observation, config, selected, send, stage, displacement_mm=None,
+                 rotation_deg=0):
         self.client, self.motion, self.config = client, motion, config
         self.send, self.stage = send, stage
         self.displacement_mm = displacement_mm
         self.metadata, self.pixels, self.targets = load_targets(
             observation, config, client.status()["endpoint"], selected, displacement_mm)
         self.reference = vector(self.metadata["pose"], 6, "observation pose")
+        self.grip_orientation = self.reference[3:]
+        self.rotation_deg = rotation_deg
+        self.rotation_path = None
+        self.rotation_completed = False
         self.frames = self.metadata["frames"]
         work = vector(self.frames["work"]["pose"], 6, "work frame")
         self.work_rotation, self.work_translation = rotation(work), np.asarray(work[:3])
@@ -38,6 +43,7 @@ class Transfer:
         return {"stage": self.current_stage, "last_completed_stage": self.last_completed_stage,
                 "holding_object_possible": self.holding_object_possible,
                 "release_completed": self.release_completed,
+                "rotation_deg": self.rotation_deg, "rotation_completed": self.rotation_completed,
                 "feedback_recoveries": self.motion.feedback_recoveries}
 
     @staticmethod
@@ -54,14 +60,25 @@ class Transfer:
 
     def pose(self, base_position):
         position = self.work_rotation.T @ (np.asarray(base_position) - self.work_translation)
-        return [*position.tolist(), *self.reference[3:]]
+        return [*position.tolist(), *self.grip_orientation]
 
     def orientation_guard(self, pose):
-        if not pose_close(pose, self.reference, distance=math.inf, angle=1):
-            raise RuntimeError("Transfer orientation changed")
         direction = (self.work_rotation @ rotation(pose))[2, 2]
         if -direction < math.cos(math.radians(1)):
             raise RuntimeError("Transfer requires the installed gripper to point vertically down")
+        if self.rotation_path is None:
+            expected = [*pose[:3], *self.grip_orientation]
+            if not pose_close(pose, expected, distance=math.inf, angle=1):
+                raise RuntimeError("Transfer orientation changed")
+        else:
+            start_rotation, requested = self.rotation_path
+            relative = start_rotation.T @ rotation(pose)
+            angle = math.degrees(math.atan2(relative[1, 0], relative[0, 0]))
+            # The two representations of the half-turn describe the same endpoint.
+            if abs(requested) == 180 and abs(angle + requested) <= 1:
+                angle += math.copysign(360, requested)
+            if not min(0, requested) - 1 <= angle <= max(0, requested) + 1:
+                raise RuntimeError("Gripper rotation left the requested Rz interval")
 
     def plane_guard(self, feedback):
         self.position_guard(abs(self.base(feedback["pose"])[2] - self.reference_z), 0.001,
@@ -130,8 +147,47 @@ class Transfer:
         base[2] = self.reference_z
         return self.move(self.pose(base), vertical=False)
 
+    def rotate(self, current):
+        if not self.rotation_deg:
+            return current
+        self.check()
+        self.set_stage("rotate_gripper")
+        start_rotation = rotation([*current[:3], *self.grip_orientation])
+        # Right multiplication rotates around the gripper's own Z, which points
+        # down: a positive angle is clockwise when viewed from above.
+        rz = rotation([0, 0, 0, 0, 0, math.radians(self.rotation_deg)])
+        orientation = start_rotation @ rz
+        cy = math.hypot(orientation[0, 0], orientation[1, 0])
+        ry = math.atan2(-orientation[2, 0], cy)
+        if cy > 1e-9:
+            rx = math.atan2(orientation[2, 1], orientation[2, 2])
+            yaw = math.atan2(orientation[1, 0], orientation[0, 0])
+        else:
+            rx, yaw = 0.0, math.atan2(-orientation[0, 1], orientation[1, 1])
+        target = [*current[:3], rx, ry, yaw]
+        anchor = self.base(current)
+
+        def fixed_position(feedback):
+            actual = self.base(feedback["pose"])
+            self.position_guard(np.linalg.norm(actual[:2] - anchor[:2]), 0.001,
+                                "Gripper rotation changed XY position")
+            self.position_guard(abs(actual[2] - anchor[2]), 0.001,
+                                "Gripper rotation changed height")
+
+        self.rotation_path = (start_rotation, self.rotation_deg)
+        self.path_guard = fixed_position
+        self._send("rm_movel", target, self.config["speed_percent"], 0, 0, 0)
+        self.motion.settled(timeout=45, guard=self.guard, check=self.gripper.state,
+                            reached=lambda f: pose_close(f["pose"], target, distance=0.001, angle=1))
+        self.grip_orientation = target[3:]
+        self.rotation_path = None
+        self.hold(target)
+        self.check()
+        self.rotation_completed = True
+        return target
+
     def cycle(self, kind, current):
-        top = [*current[:3], *self.reference[3:]]
+        top = [*current[:3], *self.grip_orientation]
         bottom_base = self.base(top)
         bottom_base[2] -= self.config[f"{kind}_descent_mm"] / 1000
         bottom = self.pose(bottom_base)
@@ -169,6 +225,7 @@ class Transfer:
         self.set_stage("move_to_pick")
         current = self.horizontal(self.targets[0])
         current = self.cycle("pick", current)
+        current = self.rotate(current)
         self.set_stage("move_to_place")
         current = self.horizontal(self.targets[1])
         current = self.cycle("place", current)
@@ -182,6 +239,6 @@ class Transfer:
         if self.displacement_mm is None:
             result["place_pixel"] = self.pixels[1]
         else:
-            result.update(dx_mm=self.displacement_mm[0], dy_mm=self.displacement_mm[1],
+            result.update(delta_x=self.displacement_mm[0], delta_y=self.displacement_mm[1],
                           direction_reference="observation_image")
         return result
