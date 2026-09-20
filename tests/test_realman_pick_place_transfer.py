@@ -497,24 +497,81 @@ class TransferTests(unittest.TestCase):
         self.assertIsNone(self.plugin._observation)
         self.assertEqual(sum(name == "rm_set_arm_slow_stop" for name, _ in self.commands), 1)
 
-    def test_follow_up_observation_has_its_own_bounded_time_budget(self):
+    def test_follow_up_observation_has_no_time_limit(self):
         def delay_return(method, args):
             if method == "rm_movej":
-                self.now += 38
+                self.now += 300
         self.after_command = delay_return
+        def delayed_snapshot(after, cancel, check):
+            self.now += 300
+            return self.snapshot(after, cancel, check)
+        self.camera.snapshot.side_effect = delayed_snapshot
         result = self.transfer()
         self.assertEqual(result["state"], "completed", result)
-        self.assertGreater(self.now - 1000, 45)
-        self.make_photo()
-        def expire_return(method, args):
+        self.assertGreater(self.now - 1000, 600)
+        self.assertTrue(result["result"]["transfer_completed"])
+        self.assertTrue(result["result"]["return_completed"])
+        self.assertTrue(result["result"]["observation"]["ok"])
+        self.assertFalse(result["observation_required"])
+        self.assertEqual(sum(name == "rm_movej" for name, _ in self.commands), 1)
+        self.assertEqual(len(self.moves()), 6)
+
+    def test_observe_waits_for_delayed_inputs_before_moving(self):
+        def readiness():
+            fresh = self.now >= 1300
+            if not fresh:
+                self.assertEqual(self.commands, [])
+            return {"state": "running", "fresh": fresh}
+        self.camera.info.side_effect = readiness
+        result = fixtures.ObserveTests.observe(self)
+        self.assertEqual(result["state"], "completed", result)
+        self.assertGreaterEqual(self.now, 1300)
+        self.assertEqual([name for name, _ in self.commands], ["rm_movej"])
+
+    def test_cancel_ends_unlimited_input_wait_without_moving(self):
+        self.camera.info.return_value = {"state": "running", "fresh": False}
+        def cancel():
+            if self.now >= 1300:
+                self.plugin.dispatch("cancel", {})
+        self.on_wait = cancel
+        result = fixtures.ObserveTests.observe(self)
+        self.assertEqual(result["state"], "cancelled", result)
+        self.assertGreaterEqual(self.now, 1300)
+        self.assertEqual(self.commands, [])
+        self.camera.snapshot.assert_not_called()
+        self.assertFalse(self.client.motion_lock.locked())
+
+    def test_observe_waits_for_slow_progress_and_settling_without_deadline(self):
+        target = [-90., 0., 0., 90., 0., 90., 0.]
+        started = []
+        def moving(method, args):
             if method == "rm_movej":
-                self.now += 46
-        self.after_command = expire_return
-        failed = self.grab_by()
-        self.assertEqual(failed["state"], "error", failed)
-        self.assertTrue(failed["result"]["transfer_completed"])
-        self.assertTrue(failed["observation_required"])
-        self.assertIn("timed out", failed["result"]["message"])
+                self.joints = [0.] * 7
+                started.append(self.now)
+        def progress():
+            if started:
+                fraction = min((self.now - started[0]) / 300, 1)
+                self.joints = [joint * fraction for joint in target]
+        self.after_command = moving
+        self.on_wait = progress
+        self.client.call_dict = lambda method: {
+            "trajectory_type": int(bool(started) and self.now - started[0] < 310),
+            "data": self.joints[:]}
+        result = fixtures.ObserveTests.observe(self)
+        self.assertEqual(result["state"], "completed", result)
+        self.assertGreaterEqual(self.now - started[0], 310)
+        self.assertEqual([name for name, _ in self.commands], ["rm_movej"])
+
+    def test_observation_stall_still_stops_motion(self):
+        def stalled(method, args):
+            if method == "rm_movej":
+                self.joints = [0.] * 7
+        self.after_command = stalled
+        result = fixtures.ObserveTests.observe(self)
+        self.assertEqual(result["state"], "error", result)
+        self.assertIn("stalled", result["result"]["message"])
+        self.assertEqual([name for name, _ in self.commands], ["rm_movej", "rm_set_arm_slow_stop"])
+        self.camera.snapshot.assert_not_called()
 
     def test_busy_and_config_changes_are_rejected_until_follow_up_observation_finishes(self):
         def snapshot(after, cancel, check):

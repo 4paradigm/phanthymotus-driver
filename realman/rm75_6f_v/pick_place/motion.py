@@ -126,7 +126,7 @@ class ObservationMotion:
                 raise ValueError(f"Observation J{index + 1} must be within [{low}, {high}]")
 
     def settled(self, target=None, timeout=4.0, check=None, guard=None, reached=None):
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         window = []
         best_error, progress_at = math.inf, time.monotonic()
         def sample():
@@ -137,7 +137,7 @@ class ObservationMotion:
                 check()
             return feedback
 
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             feedback = self.retry_feedback(sample)
             now = time.monotonic()
             error = max(abs(a-b) for a, b in zip(feedback["joints"], target)) if target else 0

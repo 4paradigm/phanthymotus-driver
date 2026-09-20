@@ -357,14 +357,14 @@ class ObservationInputs:
             raise ValueError("RGB JPEG cannot be decoded")
         return cv2.resize(rgb, (160, 90), interpolation=cv2.INTER_AREA).astype(np.int16), rgb.shape
 
-    def snapshot(self, after, cancel, check, timeout=12.0):
-        deadline = time.monotonic() + timeout
+    def snapshot(self, after, cancel, check, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
         source = self.identity()
         first_detection = None
         baseline = None
         checked_stamp = 0
         restarts = 0
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             if cancel.is_set():
                 raise RuntimeError("Observation cancelled")
             if check() is False:
