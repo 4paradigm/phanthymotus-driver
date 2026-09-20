@@ -1037,7 +1037,11 @@ class VisionCapturePlugin:
             result = self._result_path(active["path"], "video/mp4", "recorded")
             result["recording_id"] = active["recording_id"]
         except Exception as exc:
-            result = {"state": "cancelled" if active["cancel"].is_set() else "error", "message": str(exc)}
+            result = {
+                "state": "cancelled" if active["cancel"].is_set() else "error",
+                "recording_id": active["recording_id"],
+                "message": str(exc),
+            }
             try:
                 if active.get("path") and os.path.exists(active["path"]):
                     os.remove(active["path"])
@@ -1068,8 +1072,14 @@ class VisionCapturePlugin:
         if active["thread"].is_alive() and process and process.poll() is None:
             process.kill()
             active["thread"].join(timeout=2)
+        if active["thread"].is_alive():
+            return {
+                "state": "stopping",
+                "recording_id": active["recording_id"],
+                "message": "recording stop is still in progress",
+            }
         with self._lock:
-            return self._last_recording or {"state": "cancelled"}
+            return self._last_recording or {"state": "cancelled", "recording_id": active["recording_id"]}
 
     def dispatch(self, action, args):
         if action == "start":

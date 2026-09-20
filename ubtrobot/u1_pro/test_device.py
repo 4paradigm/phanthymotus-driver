@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import io
+import threading
 import tempfile
 import types
 import unittest
@@ -312,6 +313,40 @@ class U1CardContractTests(unittest.TestCase):
         actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(actions, ["capture_image", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "start", "stop"])
         self.assertEqual(plugin.get_tool()["inputSchema"]["x-completion"]["actions"], ["record_video"])
+
+    def test_manual_recording_has_explicit_id_without_acp_completion(self):
+        import device
+
+        plugin = device.VisionCapturePlugin(types.SimpleNamespace(), {})
+        with mock.patch.object(plugin, "_start_recording", return_value={"state": "recording", "recording_id": "u1-recording-test"}) as start:
+            result = plugin.dispatch("start_recording", {"video_name": "demo"})
+        self.assertEqual(result["recording_id"], "u1-recording-test")
+        start.assert_called_once_with({"video_name": "demo"}, None)
+        self.assertNotIn("action_id", result)
+
+    def test_recording_failure_keeps_recording_id(self):
+        import device
+
+        class Camera:
+            def frame_sequence(self):
+                return 0
+
+            def wait_for_jpeg(self, after_sequence, timeout_s):
+                return None, after_sequence
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            plugin = device.VisionCapturePlugin(Camera(), {"output_dir": output_dir})
+            active = {
+                "recording_id": "u1-recording-failed",
+                "duration": None,
+                "continuous": True,
+                "path": output_dir + "/failed.mp4",
+                "action_id": None,
+                "cancel": threading.Event(),
+            }
+            plugin._record_worker(active)
+        self.assertEqual(plugin._last_recording["state"], "error")
+        self.assertEqual(plugin._last_recording["recording_id"], "u1-recording-failed")
 
     def test_authorization_logs_do_not_include_vendor_response(self):
         import device
