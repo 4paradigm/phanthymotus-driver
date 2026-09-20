@@ -2558,7 +2558,8 @@ class ArmGesturePlugin:
         if shape is None or self._hand is None or side == "both":
             return None
         result = self._hand.dispatch(shape, {"side": side})
-        if isinstance(result, dict) and result.get("state") == "error":
+        if isinstance(result, dict) and (result.get("state") == "error"
+                                         or result.get("success") is False):
             return result
         return None
 
@@ -2584,18 +2585,19 @@ class ArmGesturePlugin:
                           "reason": "superseded or stopped"}
                 return
             for pose, hold_seconds in steps:
-                if self._sequence_cancelled(action_id):
-                    status = "cancelled"
-                    result = {"gesture": "wave", "side": side,
-                              "reason": "superseded or stopped"}
-                    return
-                error = self._control._set_targets(
-                    self._targets_for(pose, side), preferred_span=hold_seconds)
+                with self._sequence_lock:
+                    if self._sequence_id != action_id:
+                        status = "cancelled"
+                        result = {"gesture": "wave", "side": side,
+                                  "reason": "superseded or stopped"}
+                        return
+                    error = self._control._set_targets(
+                        self._targets_for(pose, side), preferred_span=hold_seconds)
+                    actual_span = self._control._active_segment_span()
                 if error:
                     status = "failed"
                     result = {"gesture": "wave", "side": side, "error": error}
                     return
-                actual_span = self._control._active_segment_span()
                 if not self._hold_sequence(action_id, actual_span):
                     status = "cancelled"
                     result = {"gesture": "wave", "side": side,
@@ -2618,23 +2620,24 @@ class ArmGesturePlugin:
                           "reason": "superseded or stopped"}
                 return
             for degrees in self._HANDSHAKE_ELBOW_SEQUENCE:
-                if self._sequence_cancelled(action_id):
-                    status = "cancelled"
-                    result = {"gesture": "handshake", "side": side,
-                              "reason": "superseded or stopped"}
-                    return
                 joint, target = _arm_target_radians(elbow_control, degrees)
-                error = self._control._set_targets(
-                    {joint: target},
-                    preferred_span=self._HANDSHAKE_SEGMENT_SECONDS,
-                    velocity_limit=self._GESTURE_VELOCITY_RAD_S)
+                with self._sequence_lock:
+                    if self._sequence_id != action_id:
+                        status = "cancelled"
+                        result = {"gesture": "handshake", "side": side,
+                                  "reason": "superseded or stopped"}
+                        return
+                    error = self._control._set_targets(
+                        {joint: target},
+                        preferred_span=self._HANDSHAKE_SEGMENT_SECONDS,
+                        velocity_limit=self._GESTURE_VELOCITY_RAD_S)
+                    actual_span = self._control._active_segment_span()
                 if error:
                     status = "failed"
                     result = {"gesture": "handshake", "side": side,
                               "error": error}
                     return
-                if not self._hold_sequence(
-                        action_id, self._control._active_segment_span()):
+                if not self._hold_sequence(action_id, actual_span):
                     status = "cancelled"
                     result = {"gesture": "handshake", "side": side,
                               "reason": "superseded or stopped"}
@@ -2679,20 +2682,28 @@ class ArmGesturePlugin:
         # A newly accepted gesture owns the shared controller.  Cancel any old
         # sequence before setting its first target so a stale worker cannot
         # overwrite the new command on its next segment.
-        self._cancel_sequence()
-        error = self._control._set_targets(
-            targets, preferred_span=span,
-            velocity_limit=self._GESTURE_VELOCITY_RAD_S)
-        if error:
-            return error
-        hand_error = self._apply_gesture_hand(action, side)
+        sequence_action = action in ("wave", "handshake")
+        action_id = (f"adam_arm_{action}_{uuid.uuid4().hex[:8]}"
+                     if sequence_action else None)
+        with self._sequence_lock:
+            self._sequence_id = None
+            error = self._control._set_targets(
+                targets, preferred_span=span,
+                velocity_limit=self._GESTURE_VELOCITY_RAD_S)
+            if error:
+                return error
+            ready_span = self._control._active_segment_span()
+            hand_error = self._apply_gesture_hand(action, side)
+            if not hand_error:
+                self._sequence_id = action_id
         if hand_error:
             return {
                 "success": False,
-                "code": hand_error.get("error", "HAND_FAILED"),
+                "code": hand_error.get("code", hand_error.get("error", "HAND_FAILED")),
                 "message": (
                     f"arm target accepted but the hand shape failed: "
-                    f"{hand_error.get('message', hand_error['error'])}"),
+                    f"{hand_error.get('message', hand_error.get('error', 'hand rejected'))}"),
+                "arm_accepted": True,
             }
 
         if action not in ("wave", "handshake"):
@@ -2705,10 +2716,6 @@ class ArmGesturePlugin:
 
         # The ready target is accepted synchronously, while the worker waits for
         # its actual velocity-limited span before starting the repeated motion.
-        ready_span = self._control._active_segment_span()
-        action_id = f"adam_arm_{action}_{uuid.uuid4().hex[:8]}"
-        with self._sequence_lock:
-            self._sequence_id = action_id
         worker = self._play_wave if action == "wave" else self._play_handshake
         threading.Thread(target=worker, args=(side, action_id, ready_span),
                          daemon=True, name=f"adam_arm_{action}_{side}").start()

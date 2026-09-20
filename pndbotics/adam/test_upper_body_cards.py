@@ -11,6 +11,7 @@ asynchronous wave.
 from __future__ import annotations
 
 import math
+import threading
 import sys
 import time
 import types
@@ -540,17 +541,28 @@ class ArmGestureHandBindingTests(RunningArmMixin, unittest.TestCase):
         self.assertNotIn("hand_gesture", result)
 
     def test_a_hand_failure_is_reported_after_the_arm_accepts(self):
+        for failure in (
+            {"state": "error", "error": "DDS_UNAVAILABLE",
+             "message": "rt/handcmd down"},
+            {"success": False, "code": "DDS_UNAVAILABLE",
+             "message": "rt/handcmd down"},
+        ):
+            _, hand, gestures = self._pair()
+            hand._control._activate = lambda _positions, _action: failure.copy()
+            result = gestures.dispatch("salute", {"side": "right"})
+            self.assertFalse(result["success"], result)
+            self.assertEqual("DDS_UNAVAILABLE", result["code"])
+            self.assertTrue(result["arm_accepted"])
+            self.assertIn("hand shape failed", result["message"])
+
+    def test_failed_hand_does_not_start_a_wave_sequence(self):
         _, hand, gestures = self._pair()
-
-        def _fail(_positions, _action):
-            return {"state": "error", "error": "DDS_UNAVAILABLE",
-                    "message": "rt/handcmd down"}
-
-        hand._control._activate = _fail
-        result = gestures.dispatch("salute", {"side": "right"})
+        hand._control._activate = lambda _positions, _action: {
+            "success": False, "code": "DDS_UNAVAILABLE"}
+        result = gestures.dispatch("wave", {"side": "right"})
         self.assertFalse(result["success"], result)
-        self.assertEqual("DDS_UNAVAILABLE", result["code"])
-        self.assertIn("hand shape failed", result["message"])
+        self.assertTrue(result["arm_accepted"])
+        self.assertIsNone(gestures._sequence_id)
 
     def test_every_bound_shape_is_a_real_hand_gesture(self):
         for gesture, shape in ArmGesturePlugin._GESTURE_HAND_SHAPES.items():
@@ -658,6 +670,43 @@ class ArmWaveTests(RunningArmMixin, unittest.TestCase):
         self.assertEqual("handshake", self.calls[0][2]["gesture"])
         elbow = ADAM_PRO_JOINTS.index("elbow_Left")
         self.assertAlmostEqual(math.radians(-80), control._target_q[elbow])
+
+    def test_superseded_wave_cannot_write_after_new_pose(self):
+        control = self.arm_plugin()
+        control._active_segment_span = lambda: 0.01
+        gestures = ArmGesturePlugin(control)
+        gestures._WAVE_SEQUENCE = (("wave_out", 0.01),)
+        entered = threading.Event()
+        release = threading.Event()
+        original_targets = gestures._targets_for
+
+        def delayed_targets(pose, side):
+            if pose == "wave_out":
+                entered.set()
+                self.assertTrue(release.wait(2.0))
+            return original_targets(pose, side)
+
+        gestures._targets_for = delayed_targets
+        wave = gestures.dispatch("wave", {})
+        self.assertTrue(entered.wait(2.0))
+        pose_result = []
+        pose_thread = threading.Thread(
+            target=lambda: pose_result.append(
+                gestures.dispatch("salute", {"side": "right"})))
+        pose_thread.start()
+        release.set()
+        pose_thread.join(2.0)
+        self.assertFalse(pose_thread.is_alive())
+        self.assertTrue(pose_result[0]["success"], pose_result)
+        deadline = time.monotonic() + 2.0
+        while not self.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        statuses = {call[0]: call[1] for call in self.calls}
+        self.assertEqual("cancelled", statuses.get(wave["action_id"]))
+        elbow = ADAM_PRO_JOINTS.index("elbow_Right")
+        self.assertAlmostEqual(
+            math.radians(ARM_POSES["salute"][1]["right_elbow"]),
+            control._target_q[elbow])
 
     def test_a_pose_cancels_a_running_wave_before_setting_its_target(self):
         control = self.arm_plugin()
