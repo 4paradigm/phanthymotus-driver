@@ -37,8 +37,11 @@ The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint
 limits but omits the vendor STL visual/collision meshes. The driver only needs
 the kinematic chain for the `joints` skeleton card, avoiding large binary
-assets in the repository. As2W has 16 movable joints (12 leg joints plus 4
-continuous wheel-foot joints) and the fixed JT128 sensor mount.
+assets in the repository. As2W publishes 12 active leg joints in `rt/lowstate`;
+its fixed-size motor array also contains four reserved zero slots. The driver
+publishes only the 12 active joints so the skeleton does not interpret reserved
+slots as foot pose data. The model retains the four continuous wheel-foot joints
+and the fixed JT128 sensor mount.
 
 `controlled_spatial` is a thin adapter for Unitree's documented `slam_operate`
 service: mapping, relocalization, and point-goal navigation. The latest AS2
@@ -46,6 +49,18 @@ SDK does not package a model-specific SLAM client, so the driver implements the
 documented common RPC contract directly in an isolated CycloneDDS process. It
 requires the vendor `unitree_slam` service to be installed and already running
 on the robot or extension host; the driver does not start that service.
+
+The `mic` card republishes Unitree's `rt/audiosender` DDS `AudioData_` stream to
+`/<namespace>/mic/audio` as `audio_msgs/AudioChunk` (`audio/pcm-16k`). The
+`speaker` card subscribes to an `AudioChunk` topic supplied as `input_topic` and
+streams PCM blocks through the AS2 `voice` service; it also exposes volume get/set
+actions. Audio service availability depends on the AS2 firmware configuration.
+
+The `camera_rgb` card polls the verified AS2 `videohub.GetImageSample()` service
+and publishes JPEG `sensor_msgs/CompressedImage` frames to
+`/<namespace>/camera/rgb`. The current AS2 SDK and machine expose no depth-camera
+service or ROS2 depth topic, so `camera_depth` is intentionally not registered
+until a real depth source is identified.
 
 `special_action` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the

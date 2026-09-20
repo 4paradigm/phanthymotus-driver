@@ -3,7 +3,7 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 WORKDIR /work
 ARG PYPI_MIRROR
-RUN apt-get update && apt-get install -y --no-install-recommends python3-pip cmake build-essential curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip python3-colcon-common-extensions cmake build-essential curl libasound2-dev && rm -rf /var/lib/apt/lists/*
 ARG CYCLONEDDS_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/cyclonedds-0.10.5.tar.gz
 RUN curl -fsSL ${CYCLONEDDS_URL} | tar xz -C /tmp && \
     cmake -S /tmp/cyclonedds-0.10.5 -B /tmp/cyclonedds-0.10.5/build -DCMAKE_INSTALL_PREFIX=/opt/cyclonedds && \
@@ -27,4 +27,4 @@ ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 \
     RCUTILS_COLORIZED_OUTPUT=0 \
     CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 EXPOSE 15709
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-}"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-}"]

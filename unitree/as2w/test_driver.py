@@ -27,6 +27,14 @@ def _install_device_stubs():
     std_msgs.UInt8MultiArray = type("UInt8MultiArray", (), {})
     sys.modules["std_msgs"] = types.ModuleType("std_msgs")
     sys.modules["std_msgs.msg"] = std_msgs
+    audio_msgs = types.ModuleType("audio_msgs.msg")
+    audio_msgs.AudioChunk = type("AudioChunk", (), {})
+    sys.modules["audio_msgs"] = types.ModuleType("audio_msgs")
+    sys.modules["audio_msgs.msg"] = audio_msgs
+    sensor_msgs = types.ModuleType("sensor_msgs.msg")
+    sensor_msgs.CompressedImage = type("CompressedImage", (), {})
+    sys.modules["sensor_msgs"] = types.ModuleType("sensor_msgs")
+    sys.modules["sensor_msgs.msg"] = sensor_msgs
     qos = types.ModuleType("rclpy.qos")
     qos.DurabilityPolicy = types.SimpleNamespace(VOLATILE=1)
     qos.HistoryPolicy = types.SimpleNamespace(KEEP_LAST=1)
@@ -42,6 +50,7 @@ def _install_device_stubs():
     channel.ChannelSubscriber = type("ChannelSubscriber", (), {})
     sys.modules["unitree_sdk2py.core.channel"] = channel
     dds = types.ModuleType("unitree_sdk2py.idl.unitree_go.msg.dds_")
+    dds.AudioData_ = type("AudioData_", (), {})
     dds.SportModeState_ = type("SportModeState_", (), {})
     sys.modules["unitree_sdk2py.idl.unitree_go.msg.dds_"] = dds
     sensor_dds = types.ModuleType("unitree_sdk2py.idl.sensor_msgs.msg.dds_")
@@ -153,23 +162,57 @@ class TestDriverContracts(unittest.TestCase):
         node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors, bms_state=None))
         self.assertEqual(3, len(published))
         joint_state = __import__("json").loads(published[1])
-        self.assertEqual(16, len([key for key in joint_state if key.endswith("_q")]))
+        self.assertEqual(12, len([key for key in joint_state if key.endswith("_q")]))
         self.assertIn("FR_hip_q", joint_state)
+        self.assertNotIn("FR_foot_q", joint_state)
 
     def test_joints_payload_keeps_skeleton_contract(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []
         node.imu = node.joint_state = node.battery = types.SimpleNamespace(publish=lambda message: None)
         node.joints = types.SimpleNamespace(publish=lambda message: published.append(message.data))
-        motors = [types.SimpleNamespace(q=float(i), dq=0, tau_est=0, temperature=[0, 0]) for i in range(16)]
+        motors = [types.SimpleNamespace(q=float(i), dq=0, tau_est=0, temperature=[0, 0]) for i in range(35)]
         imu = types.SimpleNamespace(quaternion=[1, 0, 0, 0], gyroscope=[], accelerometer=[], rpy=[])
         node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors))
         payload = __import__("json").loads(published[0])
         self.assertEqual({"joints", "imu_quat"}, set(payload))
-        self.assertEqual(16, len(payload["joints"]))
+        self.assertEqual(12, len(payload["joints"]))
         self.assertEqual([1, 0, 0, 0], payload["imu_quat"])
         self.assertEqual({"idx", "name", "q", "dq", "tau", "temperature"},
                          set(payload["joints"][0]))
+
+    def test_audio_data_is_converted_to_audio_chunk(self):
+        message = self.device._audio_chunk([0, 255, 3])
+        self.assertEqual("pcm_16k_16bit_mono", message.format)
+        self.assertEqual([0, 255, 3], message.data)
+
+    def test_speaker_streams_blocks_and_stops(self):
+        client = types.SimpleNamespace(Audio_PlayStream=lambda *args: (0, ""),
+                                       Audio_PlayStop=lambda *args: 0)
+        node = self.device._SpeakerNode.__new__(self.device._SpeakerNode)
+        node._client = client
+        node._stop_event = __import__("threading").Event()
+        node.blocks_sent = 0
+        node.state = "ready"
+        node._play_block(b"x" * self.device.SPEAKER_BLOCK_BYTES)
+        self.assertEqual(1, node.blocks_sent)
+        self.assertEqual(0, node._client.Audio_PlayStream("as2w_speaker", "0", b"x" * self.device.SPEAKER_BLOCK_BYTES)[0])
+
+    def test_led_clamps_color_and_uses_audio_service(self):
+        calls = []
+        proxy = types.SimpleNamespace(Audio_LedControl=lambda *args: calls.append(args) or 0)
+        plugin = self.device.LedPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("set_color", {"red": 300, "green": -2, "blue": 18})
+        self.assertEqual([255, 0, 18], result["color"])
+        self.assertEqual([(255, 0, 18)], calls)
+
+    def test_camera_rgb_schema_and_topic(self):
+        plugin = self.device.CameraPlugin.__new__(self.device.CameraPlugin)
+        plugin._topic = "/test/camera/rgb"
+        tool = plugin.get_tool()
+        self.assertEqual("camera_rgb", tool["name"])
+        self.assertEqual("image/jpeg", tool["topic_out"][0]["format"])
+        self.assertEqual("/test/camera/rgb", tool["topic_out"][0]["topic"])
 
     def test_battery_current_is_explicitly_exposed_in_ma_and_a(self):
         node = self.device._StateNode.__new__(self.device._StateNode)

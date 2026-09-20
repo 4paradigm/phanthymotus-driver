@@ -26,11 +26,16 @@ def load_config():
 
 class Bundle:
     def __init__(self, cfg, namespace, executor, proxy, interface, dds_ready=True):
-        from device import StatePlugin, LocoPlugin, SpecialActionPlugin
+        from device import (StatePlugin, LocoPlugin, SpecialActionPlugin,
+                            MicPlugin, SpeakerPlugin, LedPlugin, CameraPlugin)
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
+        if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor))
+        if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, proxy))
+        if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
+        if dds_ready and p.get("camera_rgb", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera_rgb", {}), namespace, executor, proxy))
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
         if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy))

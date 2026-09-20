@@ -2,6 +2,10 @@ mcp_port: 15709
 robot_interface: eth0
 ros_namespace: ""
 plugins:
+  mic: {enabled: true}
+  speaker: {enabled: true}
+  led: {enabled: true}
+  camera_rgb: {enabled: true, fps: 5}
   loco: {enabled: true}
   special_action: {enabled: true}
   state: {enabled: true}
