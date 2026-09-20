@@ -28,7 +28,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=:all: \
 WORKDIR /work
 COPY common/ /work/common/
 COPY vendor/Robotic_Arm/ /work/Robotic_Arm/
-COPY main.py device.py hardware.py servo.py camera.py realsense.py vision_capture.py config.yaml driver.yaml realsense_metadata.py /work/realman/rm75_6f_v/
+COPY main.py device.py hardware.py servo.py camera.py realsense.py vision_capture.py config.yaml driver.yaml /work/realman/rm75_6f_v/
 COPY resource/ /work/realman/rm75_6f_v/resource/
 COPY pick_place/ /work/realman/rm75_6f_v/pick_place/
 COPY deploy/ /deploy/

@@ -104,7 +104,6 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
         import rclpy
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage
-        from realsense_metadata import RGBDMetadata
 
         context = rs.context()
         device = find_device_by_serial(rs, context, serial_number)
@@ -118,8 +117,6 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
         scale = device.first_depth_sensor().get_depth_scale()
         if not np.isfinite(scale) or scale <= 0:
             raise RuntimeError("RealSense reported an invalid depth scale")
-        metadata = RGBDMetadata(namespace, serial_number, rs)
-        metadata.configure_clock(device)
 
         status.update({
             "device_name": _device_info(
@@ -205,7 +202,6 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
                 raise RuntimeError(
                     "RealSense RGB/depth/infrared frames stopped arriving")
 
-            headers = {}
             for stream, frame in frames.items():
                 if not frame or stream not in routes.values():
                     continue
@@ -213,7 +209,6 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
                 msg = CompressedImage()
                 msg.header.stamp = node.get_clock().now().to_msg()
                 msg.header.frame_id = f"{namespace}_{stream}_optical"
-                headers[stream] = msg.header
                 if stream == "depth":
                     msg.format = "16UC1; compressedDepth zlib"
                     msg.data = encode_depth(raw, scale)
@@ -241,8 +236,6 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
                         status["frames"][key] = status["frames"].get(key, 0) + 1
                         status["last_frame"][key] = now
                         status["channels"][key] = channel
-
-            metadata.publish(node, routes, frames, headers, status)
 
             if now - last_report >= 0.2:
                 _report(status_queue, status)
@@ -403,9 +396,6 @@ class RealSenseSession:
                 "source_stream": channel,
                 "stream_index": STREAM_INDEX[channel],
                 "unit": UNITS[channel],
-                "metadata_topic": (f"/{self.namespace}/ext_camera/{instance_id.replace('-', '_')}/depth/metadata"
-                                   if channel == "depth" else None),
-                "rgbd_error": self._status.get("rgbd_error"),
                 "depth_scale_m": (
                     self._status.get("depth_scale_m")
                     if channel == "depth" else None
