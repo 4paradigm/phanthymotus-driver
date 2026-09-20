@@ -280,6 +280,30 @@ class SimScenarioCard(Card):
             return {"state": "idle", "reset": False}
         return self.do_load(scenario=self._active.slug, owner=owner)
 
+    # ---- 给导航卡的「地图」接口 ---------------------------------------
+
+    @property
+    def active_map(self) -> str:
+        """当前世界用的是哪张地图资产（没绑资产则为空）。"""
+        asset = getattr(self._active, "_map_asset", None) if self._active else None
+        return getattr(asset, "name", "") or ""
+
+    def switch_map(self, name: str) -> dict:
+        """导航卡的 `load_map` 落到这里。
+
+        **已经是这张图就直接成功。** 技能的第 0 步普遍是「没有 active map 就 load
+        map」，跑基准测试时世界被 `owner` 持有，一律拒绝会让这一步失败 —— agent 读
+        到的是「地图加载不了」，于是它会很合理地告诉访客展厅在维护，然后 finish()。
+        Orin6 上就是这么白跑了一轮：机器人一步没动，而每条日志都正常。
+
+        换**别的**图仍然拒绝：那才是改动正在被测量的世界。
+        """
+        name = str(name or "")
+        if name and name == self.active_map:
+            return {"state": "running" if self._running else "idle",
+                    "loaded": name, "already_active": True}
+        return self.do_reset(map=name)
+
     def do_inject(self, text: str = "", kind: str = "user_message", **_):
         if not str(text).strip():
             return {"error": "inject requires text"}
