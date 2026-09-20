@@ -107,6 +107,23 @@ class TransferTests(unittest.TestCase):
     def moves(self):
         return [args[0] for method, args in self.commands if method == "rm_movel"]
 
+    def test_both_grabs_rotation_and_return_obey_lower_driver_speed_limit(self):
+        from pick_place import PickPlacePlugin
+        self.plugin = PickPlacePlugin(self.client, {"safety": {"max_speed_percent": 3}}, inputs=self.camera)
+        self.assertTrue(self.plugin.dispatch("config", {"observe_after_transfer": True})["ok"])
+        self.assertEqual(self.plugin.dispatch("config", {"speed_percent": 4})["code"], "INVALID_CONFIG")
+        for action in (self.transfer, self.grab_by):
+            with self.subTest(action=action.__name__):
+                self.commands.clear()
+                self.make_photo()
+                result = action(rotation_deg=30)
+                self.assertEqual(result["state"], "completed", result)
+                self.assertTrue(result["result"]["rotation_completed"])
+                self.assertTrue(result["result"]["observation"]["ok"])
+                moves = [(name, args) for name, args in self.commands if name in ("rm_movej", "rm_movel")]
+                self.assertEqual([name for name, _ in moves], ["rm_movel"] * 7 + ["rm_movej"])
+                self.assertTrue(all(args[1] == 3 for _, args in moves))
+
     def test_grab_uses_memory_snapshot_without_reading_or_writing_files(self):
         from pathlib import Path
         for action in (self.transfer, self.grab_by):
@@ -142,7 +159,7 @@ class TransferTests(unittest.TestCase):
                     self.assertTrue(result["result"]["release_completed"])
                     self.assertTrue(result["result"]["return_completed"])
                     self.assertEqual(self.pose, self.photo_pose)
-                    self.assertTrue(all(args[1] == 50 for name, args in self.commands if name == "rm_movel"))
+                    self.assertTrue(all(args[1] == 5 for name, args in self.commands if name == "rm_movel"))
 
     def test_rotation_is_relative_to_gripper_with_rotated_work_frame(self):
         for work_angles, angle in (([.2, -.1, .3], 35), ([0, math.pi / 2, 0], 180)):
@@ -231,7 +248,7 @@ class TransferTests(unittest.TestCase):
                     self.client.motion_lock.release()
 
     def test_complete_transfer_uses_configured_absolute_targets(self):
-        self.assertTrue(self.plugin.dispatch("config", {"speed_percent": 37,
+        self.assertTrue(self.plugin.dispatch("config", {"speed_percent": 7,
             "x_compensation_mm": 40, "y_compensation_mm": -60,
             "pick_grip_force": 35, "pick_descent_mm": 80, "place_descent_mm": 70})["ok"])
         self.make_photo()
@@ -244,7 +261,7 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(pose[3:], [math.pi, 0, 0])
         for method, args in self.commands:
             if method == "rm_movel":
-                self.assertEqual(args[1:], (37, 0, 0, 0))
+                self.assertEqual(args[1:], (7, 0, 0, 0))
         self.assertEqual([args for method, args in self.commands if method == "rm_set_rm_plus_reg"],
                          [(1220, 1, [100]), (1220, 1, [35]), (1220, 1, [100])])
         self.assertEqual(self.register_reads, [(1220, 2), (1220, 1)] * 9)
@@ -261,7 +278,7 @@ class TransferTests(unittest.TestCase):
         self.assertTrue(result["result"]["transfer_completed"])
         self.assertFalse(self.client.motion_lock.locked())
         self.camera.snapshot.assert_called_once()
-        self.assertEqual(self.commands[-1], ("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 37, 0, 0, 0)))
+        self.assertEqual(self.commands[-1], ("rm_movej", ([-90., 0., 0., 90., 0., 90., 0.], 7, 0, 0, 0)))
         self.assertNotEqual(observation["observation_id"], self.photo["observation_id"])
         self.assertEqual(self.plugin._observation["jpeg"], b"photo")
         metadata = self.plugin._observation["metadata"]
@@ -272,7 +289,7 @@ class TransferTests(unittest.TestCase):
         result = self.transfer()
         self.assertEqual(result["state"], "completed", result)
         np.testing.assert_allclose(np.array(self.moves())[:, 2], [.3, .209, .3, .3, .24, .3])
-        self.assertTrue(all(args[1] == 50 for name, args in self.commands if name == "rm_movel"))
+        self.assertTrue(all(args[1] == 5 for name, args in self.commands if name == "rm_movel"))
         self.assertIn(("rm_set_rm_plus_reg", (1220, 1, [15])), self.commands)
 
     def test_both_transfers_consume_old_photo_and_replace_it_after_observing(self):
@@ -317,7 +334,7 @@ class TransferTests(unittest.TestCase):
                 self.assertFalse(self.client.motion_lock.locked())
 
     def test_grab_by_uses_pick_point_and_configured_millimetres(self):
-        self.assertTrue(self.plugin.dispatch("config", {"speed_percent": 37,
+        self.assertTrue(self.plugin.dispatch("config", {"speed_percent": 7,
             "x_compensation_mm": 40, "y_compensation_mm": -60,
             "pick_grip_force": 35, "pick_descent_mm": 80, "place_descent_mm": 70})["ok"])
         self.make_photo()
@@ -326,7 +343,7 @@ class TransferTests(unittest.TestCase):
         expected = [[.04, .165, .3], [.04, .165, .22], [.04, .165, .3],
                     [.0705, .18525, .3], [.0705, .18525, .23], [.0705, .18525, .3]]
         np.testing.assert_allclose(np.array(self.moves())[:, :3], expected)
-        self.assertTrue(all(args[1] == 37 for name, args in self.commands if name == "rm_movel"))
+        self.assertTrue(all(args[1] == 7 for name, args in self.commands if name == "rm_movel"))
         self.assertEqual([args for name, args in self.commands if name == "rm_set_rm_plus_reg"],
                          [(1220, 1, [100]), (1220, 1, [35]), (1220, 1, [100])])
         self.assertEqual([args[0][0] for name, args in self.commands if name == "rm_set_hand_follow_pos"],
@@ -453,11 +470,11 @@ class TransferTests(unittest.TestCase):
 
     def test_return_uses_configured_observation_joints_and_cancel_does_not_capture(self):
         target = [-80., 1., 2., 85., 3., 80., 4.]
-        self.plugin.dispatch("config", {"observation_joints_deg": "-80,1,2,85,3,80,4", "speed_percent": 23})
+        self.plugin.dispatch("config", {"observation_joints_deg": "-80,1,2,85,3,80,4", "speed_percent": 7})
         self.make_photo()
         def cancel_on_return(method, args):
             if method == "rm_movej":
-                self.assertEqual(args, (target, 23, 0, 0, 0))
+                self.assertEqual(args, (target, 7, 0, 0, 0))
                 self.plugin.dispatch("cancel", {})
         self.after_command = cancel_on_return
         result = self.grab_by()
@@ -590,7 +607,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_configuration_change_requires_new_observation(self):
-        self.plugin.dispatch("config", {"speed_percent": 40})
+        self.plugin.dispatch("config", {"speed_percent": 7})
         self.assertIn("Run observe", self.transfer()["message"])
         self.assertEqual(self.commands, [])
 

@@ -19,6 +19,11 @@ VOP 订阅同一 RGB 通道，检测结果连入 `vision_pick_and_drop`，由 `o
 卡片按 `/rgb`、`/depth`、`/rgb/objects` 识别来源，不依赖连线创建顺序。
 `info.topic_in` 返回三个实际绑定主题及格式；`info.inputs` 返回数据就绪和错误状态。
 
+VOP JSON 输入最多 256 KiB（UTF-8 字节），在解析前检查；物品最多 1000 个，
+每个 `name` 最多 256 个 UTF-8 字节。超限或无效消息被拒绝，后续有效消息可恢复输入。
+仅保留检测契约的 `timestamp/count/latency_ms/objects`；每个物品保留
+`name/position/confidence`，不缓存或转发额外字段。
+
 ## 执行契约
 
 三个运动动作 `observe`、`grab_to`、`grab_by` 每次都必须显式传入
@@ -77,7 +82,7 @@ MCP 总描述及各动作描述包含调用顺序、坐标约定、动作选择�
 
 | 配置 | 默认值 | 范围与含义 |
 | --- | --- | --- |
-| `speed_percent` | 50 | 整数 1～100，全局运动速度百分比 |
+| `speed_percent` | 5 | 整数 1～Driver 速度上限（最高 10），用于全部关节与笛卡尔运动 |
 | `observation_joints_deg` | `-90,0,0,90,0,90,0` | 英文逗号分隔的 J1～J7 关节角，单位 °，按设备各关节限位校验 |
 | `x_compensation_mm` | 30 | 有限数值，基坐标 X 绝对目标补偿，单位 mm |
 | `y_compensation_mm` | -75 | 有限数值，基坐标 Y 绝对目标补偿，单位 mm |
@@ -85,6 +90,11 @@ MCP 总描述及各动作描述包含调用顺序、坐标约定、动作选择�
 | `pick_descent_mm` | 91 | 有限正数，抓取下降距离，单位 mm |
 | `place_descent_mm` | 60 | 有限正数，放置下降距离，单位 mm |
 | `observe_after_transfer` | false | 搬运后拍照的布尔开关；搬运后始终返回观察位，开启时再保存新照片并返回物品列表 |
+
+速度上限为 `min(safety.max_speed_percent, 10)`，默认速度取
+`min(safety.default_speed_percent, 速度上限)`，由 Driver 配置在卡片初始化时确定。
+MCP 配置 Schema 展示实际默认值和上限；超限配置返回 `INVALID_CONFIG`，不截断请求值，
+也不修改当前配置。卡片直接读取 Driver 配置，不依赖其他卡片的实现或运行状态。
 
 下降距离是从本次下降起点向下移动的距离。
 X/Y 补偿是独立的水平定位参数，作用于基坐标系中的目标位置。

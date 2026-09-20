@@ -20,6 +20,8 @@ INPUT_NAMES = ("深度图像", "RGB 图像", "VOP 物品列表")
 MAX_FRAME_AGE = 1.0
 MAX_RGBD_SKEW = 0.2
 STEADY_SECONDS = 0.6
+MAX_OBJECTS_PAYLOAD_BYTES = 256 * 1024
+MAX_OBJECT_NAME_BYTES = 256
 
 
 def resolve_topics(args):
@@ -267,7 +269,12 @@ class ObservationInputs:
                         "frame_id": msg.header.frame_id,
                     }
                 else:
-                    value = json.loads(msg.data)
+                    payload = msg.data
+                    # Bound character count before allocating its UTF-8 encoding.
+                    if (not isinstance(payload, str) or len(payload) > MAX_OBJECTS_PAYLOAD_BYTES
+                            or len(payload.encode("utf-8")) > MAX_OBJECTS_PAYLOAD_BYTES):
+                        raise ValueError("Invalid VOP payload size; maximum is 262144 UTF-8 bytes")
+                    value = json.loads(payload)
                     if not isinstance(value, dict):
                         raise ValueError(f"Invalid {name} payload")
                     stamp = value.get("timestamp")
@@ -290,14 +297,18 @@ class ObservationInputs:
                             or len(position) != 2
                             or any(not _finite(v) or not -1 <= v <= 1 for v in position)
                             or not isinstance(obj.get("name"), str)
+                            or len(obj["name"]) > MAX_OBJECT_NAME_BYTES
+                            or len(obj["name"].encode("utf-8")) > MAX_OBJECT_NAME_BYTES
                             or not _finite(obj.get("confidence"))
                             or not 0 <= obj["confidence"] <= 1
                         ):
-                            raise ValueError("Invalid VOP object coordinates or confidence")
-                    value["received_at"] = now
+                            raise ValueError("Invalid VOP object name (maximum 256 UTF-8 bytes), coordinates or confidence")
+                    value = {"timestamp": stamp, "latency_ms": latency, "count": len(objects),
+                             "objects": [{key: obj[key] for key in ("name", "position", "confidence")}
+                                         for obj in objects], "received_at": now}
                 self._buffers[name].append(value)
                 self._errors.pop(name, None)
-            except (ValueError, TypeError, KeyError, AttributeError, OverflowError, zlib.error) as exc:
+            except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError, zlib.error) as exc:
                 self._errors[name] = str(exc)
             self._condition.notify_all()
 

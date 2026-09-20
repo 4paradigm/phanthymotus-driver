@@ -22,7 +22,7 @@ class VendorRuntimeLoggingTests(unittest.TestCase):
         self.handler_type = make_handler(lambda: DriverBundle([]), "test", "test")
         self.handler = object.__new__(self.handler_type)
         self.handler.client_address = ("127.0.0.1", 12345)
-        self.printed = self.enterContext(mock.patch("builtins.print"))
+        self.printed = self.enterContext(mock.patch("common.vendor_runtime.print", create=True))
 
     def test_control_characters_and_unicode_are_escaped_after_formatting(self):
         self.handler.log_message('"%s" %s %s', 'GET /\x1b[31m\r\nforged\t中文 HTTP/1.1', 404, "-")

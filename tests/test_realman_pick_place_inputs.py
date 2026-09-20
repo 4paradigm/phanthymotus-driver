@@ -99,6 +99,56 @@ class InputTests(unittest.TestCase):
     def snapshot(self, **kwargs):
         return self.inputs.snapshot(1000.0, self.cancel, lambda: None, **kwargs)
 
+    def test_oversized_vop_payload_is_rejected_before_json_decoding(self):
+        for payload in ("x" * (256 * 1024 + 1), "物" * (128 * 1024)):
+            with self.subTest(characters=len(payload)):
+                before = list(self.inputs._buffers["objects"])
+                with mock.patch("pick_place.inputs.json.loads") as decode:
+                    self.inputs.receive("objects", types.SimpleNamespace(data=payload))
+                self.assertEqual(decode.call_count, 0)
+                self.assertEqual(list(self.inputs._buffers["objects"]), before)
+                self.assertIn("payload size", self.inputs._errors["objects"])
+                self.feed()
+                self.assertTrue(self.inputs.info()["fresh"])
+
+    def test_vop_payload_byte_boundary_accepts_valid_utf8_json(self):
+        obj = dict(name="香蕉", position=[.2, -.1], confidence=.8)
+        payload = json.dumps(dict(timestamp=self.now, count=1, objects=[obj], latency_ms=10), ensure_ascii=False)
+        payload += " " * (256 * 1024 - len(payload.encode("utf-8")))
+        self.inputs.receive("objects", types.SimpleNamespace(data=payload))
+        self.assertNotIn("objects", self.inputs._errors)
+        self.assertEqual(self.inputs._buffers["objects"][-1]["objects"], [obj])
+        with mock.patch("pick_place.inputs.json.loads") as decode:
+            self.inputs.receive("objects", types.SimpleNamespace(data=payload + " "))
+        self.assertEqual(decode.call_count, 0)
+        self.assertIn("payload size", self.inputs._errors["objects"])
+
+    def test_vop_name_limit_is_in_utf8_bytes(self):
+        for name in ("x" * 257, "物" * 86):
+            with self.subTest(name_length=len(name)):
+                before = list(self.inputs._buffers["objects"])
+                self.feed(objects=[dict(name=name, position=[.2, -.1], confidence=.8)])
+                self.assertIn("objects", self.inputs._errors)
+                self.assertEqual(list(self.inputs._buffers["objects"]), before)
+        name = "物" * 85 + "x"
+        self.feed(objects=[dict(name=name, position=[.2, -.1], confidence=.8)])
+        self.assertNotIn("objects", self.inputs._errors)
+        self.assertEqual(self.inputs._buffers["objects"][-1]["objects"][0]["name"], name)
+
+    def test_vop_retains_only_documented_detection_fields(self):
+        obj = dict(name="banana", position=[.2, -.1], confidence=.8)
+        payload = dict(timestamp=self.now, count=1, latency_ms=10,
+                       objects=[dict(obj, extra={"text": "x" * 1000})], extra="x" * 1000)
+        self.inputs.receive("objects", types.SimpleNamespace(data=json.dumps(payload)))
+        self.assertEqual(self.inputs._buffers["objects"][-1], dict(
+            timestamp=self.now, count=1, latency_ms=10, received_at=self.now, objects=[obj]))
+
+    def test_deeply_nested_vop_json_does_not_stop_the_receiver(self):
+        self.inputs.receive("objects", types.SimpleNamespace(data="[" * 20000 + "0" + "]" * 20000))
+        self.assertIn("objects", self.inputs._errors)
+        self.feed()
+        self.assertTrue(self.inputs.info()["fresh"])
+
     def test_connects_by_stream_semantics_not_connection_order(self):
         self.assertEqual(resolve_topics({"input_topics": TOPICS[::-1], "input_topic": TOPICS[2]}), TOPICS)
         self.assertEqual([x["topic"] for x in self.inputs.topics()], [TOPICS[1], TOPICS[0], TOPICS[2]])
