@@ -25,7 +25,7 @@ G1_DIR = Path(__file__).resolve().parents[1]
 
 def proposal(**changes):
     value = {
-        "schema": "phanthy.navigation.velocity_proposal.v1",
+        "schema": "phanthy.navigation.motion_sequence.v1",
         "nav_id": "nav-001",
         "sequence": 1,
         "issued_at_unix_ms": 1_800_000_000_000,
@@ -48,12 +48,12 @@ class TopicResolutionTest(unittest.TestCase):
         self.assertEqual(
             velocity_proposal_port(EXPECTED_TOPIC),
             {
-                "port": "velocity_proposal",
+                "port": "motion_sequence",
                 "topic": EXPECTED_TOPIC,
                 "format": "data/json",
                 "ros_type": "std_msgs/msg/String",
                 "qos": "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
-                "schema": "phanthy.navigation.velocity_proposal.v1",
+                "schema": "phanthy.navigation.motion_sequence.v1",
             },
         )
 
@@ -123,6 +123,14 @@ class ProposalValidationTest(unittest.TestCase):
         self.assertEqual(result.nav_id, "nav-001")
         self.assertEqual(result.ttl_ms, 200)
         self.assertFalse(result.is_zero)
+
+    def test_old_schema_is_rejected_even_with_unchanged_fields(self):
+        with self.assertRaises(VelocityProposalValidationError) as caught:
+            validate_velocity_proposal(
+                proposal(schema="phanthy.navigation.velocity_proposal.v1"),
+                self.limits,
+            )
+        self.assertEqual(caught.exception.code, "schema_mismatch")
 
     def test_default_config_matches_loco_contract_velocity_limits(self):
         config = yaml.safe_load((G1_DIR / "config.yaml").read_text())

@@ -187,7 +187,8 @@ class LocoTopicLifecycleTest(unittest.TestCase):
         tool = self.plugin.get_tools()[0]
         port = tool["topic_in"]
         self.assertEqual(len(port), 1)
-        self.assertEqual(port[0]["port"], "velocity_proposal")
+        self.assertEqual(port[0]["port"], "motion_sequence")
+        self.assertEqual(port[0]["schema"], "phanthy.navigation.motion_sequence.v1")
         self.assertEqual(port[0]["topic"], self.topic)
         self.assertEqual(
             tool["inputSchema"]["properties"]["action"]["enum"],

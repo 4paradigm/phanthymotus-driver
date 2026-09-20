@@ -72,13 +72,15 @@ python main.py
 
 ### G1 受控导航速度执行
 
-唯一提案 topic 为 `/ubuntu/navigation/motion_sequence`，端口名仍为
-`velocity_proposal`。发布端与 Canvas 连线需从
+唯一提案 topic 为 `/ubuntu/navigation/motion_sequence`，端口名为
+`motion_sequence`。发布端与 Canvas 连线需从
 `/ubuntu/navigation/nav2/velocity_proposal` 迁移，Driver 不再订阅旧 topic。
-本次仅修改 topic 名称，消息 schema 和执行语义不变。
+schema 改为 `phanthy.navigation.motion_sequence.v1`，拒绝旧
+`phanthy.navigation.velocity_proposal.v1`；消息字段和执行语义不变。
+切换前停止智能控制，同步更新两端契约及 Canvas 连线后再启动。
 
 G1 `loco` actuator 接收由导航 lease 约束的
-`phanthy.navigation.velocity_proposal.v1` 输入。订阅端使用可靠的
+`phanthy.navigation.motion_sequence.v1` 输入。订阅端使用可靠的
 `KEEP_LAST(depth=1)`，执行端使用容量为 1 的 latest-only 队列：未读取
 或已等待的旧速度都会被新速度替换，不会积压。proposal TTL 失效会立即
 触发 `StopMove`；只有在返回后用新的 odometry 样本确认零速，同一导航

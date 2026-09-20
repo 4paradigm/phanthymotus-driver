@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 
-VELOCITY_PROPOSAL_SCHEMA = "phanthy.navigation.velocity_proposal.v1"
+VELOCITY_PROPOSAL_SCHEMA = "phanthy.navigation.motion_sequence.v1"
 DEFAULT_VELOCITY_PROPOSAL_TOPIC = "/ubuntu/navigation/motion_sequence"
 TERMINAL_STATUSES = {
     "paused",
@@ -40,7 +40,7 @@ _UNSUPPORTED_STATUS_ALIASES = {"status", "navigation_status", "navigation_state"
 def velocity_proposal_port(topic: str) -> dict:
     """Return the authoritative N5 canvas port declaration."""
     return {
-        "port": "velocity_proposal",
+        "port": "motion_sequence",
         "topic": topic,
         "format": "data/json",
         "ros_type": "std_msgs/msg/String",
