@@ -315,3 +315,27 @@ def test_config_can_replace_the_map_dirs_outright():
     dirs = map_dirs({"scenario": {"map_dirs": ["/only/here"]}})
 
     assert [str(d) for d in dirs] == ["/only/here"]
+
+
+def test_a_map_built_scenario_reports_the_maps_own_waypoints(tmp_path):
+    """`summary()` 读的必须是 `waypoints()`，不是 `self.pois`。
+
+    从地图资产建出来的场景自己一个 POI 都没声明 —— 航点在资产里，`waypoints()` 会
+    回落过去。读 `self.pois` 的话，载入成功的返回里写着 `waypoints: []`，而世界其实
+    已经拿到了点位。同一个类对「航点」给出两个答案，送出去的是错的那个。
+    """
+    from simulator.generic.backend import LocalBackend
+    from simulator.generic.cards_scenario import SimScenarioCard
+    from simulator.generic.clock import FakeClock
+    from simulator.generic.world import VirtualWorld
+
+    external = tmp_path / "maps"
+    external.mkdir()
+    _tiny_map(external / "site-c.json", "site-c")
+
+    world = VirtualWorld(LocalBackend(), FakeClock(), {})
+    card = SimScenarioCard(world, {}, "sim", map_dirs=[external])
+
+    loaded = card.switch_map("site-c")
+
+    assert loaded.get("waypoints") == ["门口"]
