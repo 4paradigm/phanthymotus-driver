@@ -119,7 +119,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(MIC_TOPIC, "/audio/sense/audio_data_to_asr")
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
-        self.assertEqual(device.EVENT_TOPICS["wakeup_event"], "/robo/audio/subscribe/wakeup_event")
+        self.assertEqual(device.EVENT_TOPICS["doa_event"], "/robo/audio/subscribe/doa_event")
 
     def test_event_bridge_keeps_sdk_string_payloads(self):
         import device
@@ -134,15 +134,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertTrue(hasattr(device, "MicPlugin"))
         self.assertTrue(hasattr(device, "SpeakerPlugin"))
         self.assertTrue(hasattr(device, "AudioPlugin"))
-        self.assertTrue(hasattr(device, "AuthPlugin"))
-
-    def test_auth_card_has_explicit_credential_and_lifecycle_actions(self):
-        import device
-
-        schema = device.AuthPlugin(FakeNodes()).get_tool()["inputSchema"]
-        self.assertEqual(schema["properties"]["action"]["enum"], ["start", "authorize", "auth_state", "stop", "info"])
-        self.assertNotIn("appid", schema["properties"])
-        self.assertIsNone(device.AuthPlugin(FakeNodes()).dispatch("unknown", {}))
+        self.assertNotIn("AuthPlugin", vars(device))
 
     def test_nodes_are_registered_with_the_matching_domain_executors(self):
         import device
@@ -196,8 +188,8 @@ class U1CardContractTests(unittest.TestCase):
             nodes = device.U1Nodes({}, "test", ros)
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
-            self.assertEqual(len(nodes.robot.subscriptions), 6)
-            self.assertTrue(all(subscription[0] is sys.modules["std_msgs.msg"].String for subscription in nodes.robot.subscriptions[:5]))
+            self.assertEqual(len(nodes.robot.subscriptions), 3)
+            self.assertTrue(all(subscription[0] is sys.modules["std_msgs.msg"].String for subscription in nodes.robot.subscriptions[:2]))
             self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name, "/robo/audio/call/play_action")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
             nodes.close()
@@ -210,10 +202,10 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = FakeNodes()
-        plugin = device.EventPlugin(nodes, "wakeup_event", "test event")
+        plugin = device.EventPlugin(nodes, "doa_event", "test event")
         plugin.start()
         plugin.stop()
-        self.assertEqual(nodes.event_enabled, [("wakeup_event", True), ("wakeup_event", False)])
+        self.assertEqual(nodes.event_enabled, [("doa_event", True), ("doa_event", False)])
         self.assertFalse(plugin.running)
 
     def test_disabled_event_callback_does_not_publish(self):
@@ -276,6 +268,14 @@ class U1CardContractTests(unittest.TestCase):
         nodes._mic_forwarding = False
         device.U1Nodes._mic_callback(nodes, message)
         self.assertEqual(len(publisher.messages), 1)
+
+    def test_lifecycle_initializes_robot_defaults(self):
+        import device
+
+        nodes = mock.Mock()
+        lifecycle = device._LifecyclePlugin(nodes)
+        lifecycle.start()
+        nodes.initialize_robot.assert_called_once_with()
 
     def test_audio_stop_interrupts_vendor_playback(self):
         import device

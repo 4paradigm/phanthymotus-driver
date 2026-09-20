@@ -5,10 +5,15 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 - `mic`: the vendor 16 kHz mono input stream as `audio/pcm-16k`.
 - `speaker`: an Agent Core `audio/pcm-16k` input stream forwarded to the vendor output topic.
 - `audio`: documented `play_action`, `play_text`, motion listing, interruption, and asynchronous completion.
-- `auth`: authorization and authorization-state queries using protected configuration or environment variables.
-- `main_wakeup_word`, `wakeup_event`, `wakeup_state`, `doa_event`, and `playback_state`: opt-in JSON event streams.
+- `doa_event`: an opt-in JSON sound-direction event stream.
 
-The SDK document defines all five event topics as `std_msgs/msg/String`. The `String.data`
+At startup the driver authorizes the vendor SDK from protected configuration or
+environment variables, then disables the vendor's built-in wake word. Authentication
+is a driver deployment concern rather than an Agent Core action. The playback event
+topic remains an internal subscription used to complete `audio` actions; it is not
+exposed as a separate Agent Core card.
+
+The SDK document defines the event topics as `std_msgs/msg/String`. The `String.data`
 field contains the vendor JSON envelope. The local `audio_msgs` package therefore only
 contains the bridge audio messages and audio service definitions; it does not redefine the
 vendor event topics, because a different DDS message type would not match the robot.

@@ -29,9 +29,6 @@ PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
 # these wire types separate from the local audio bridge messages below; using
 # a custom audio_msgs event type would prevent DDS matching on the robot.
 EVENT_TOPICS = {
-    "main_wakeup_word": "/robo/audio/subscribe/main_wakeup_word",
-    "wakeup_event": "/robo/audio/subscribe/wakeup_event",
-    "wakeup_state": "/robo/audio/subscribe/wakeup_state",
     "doa_event": "/robo/audio/subscribe/doa_event",
     "playback_state": PLAYBACK_TOPIC,
 }
@@ -170,7 +167,38 @@ class U1Nodes:
             "interrupt": self.robot.create_client(Trigger, "/robo/audio/call/interrupt_action_audio"),
             "authorize": self.robot.create_client(StringCall, "/robo/auth/call/authorize"),
             "auth_state": self.robot.create_client(Trigger, "/robo/auth/call/auth_state"),
+            "wakeup_enabled": self.robot.create_client(StringCall, "/robo/system/call/set_wakeup_enabled"),
         }
+
+    def initialize_robot(self) -> None:
+        """Authorize the SDK and disable its built-in wake word on startup."""
+        env_names = {
+            "appid": "U1_PRO_APPID",
+            "api_key": "U1_PRO_API_KEY",
+            "api_secret": "U1_PRO_API_SECRET",
+            "device_id": "U1_PRO_DEVICE_ID",
+            "license": "U1_PRO_LICENSE",
+        }
+        auth_config = self.config.get("auth", {})
+        values = {
+            key: str(auth_config.get(key) or os.environ.get(env_names[key], ""))
+            for key in env_names
+        }
+        missing = [key for key, value in values.items() if not value]
+        if missing:
+            print(f"[U1 init] authorization skipped; missing fields: {', '.join(missing)}", flush=True)
+        else:
+            try:
+                result = self.string_call("authorize", values)
+                print(f"[U1 init] authorization result: {result}", flush=True)
+            except Exception as exc:
+                print(f"[U1 init] authorization failed: {exc}", flush=True)
+
+        try:
+            result = self.string_call("wakeup_enabled", {"enabled": False})
+            print(f"[U1 init] built-in wake word disabled: {result}", flush=True)
+        except Exception as exc:
+            print(f"[U1 init] failed to disable built-in wake word: {exc}", flush=True)
 
     def _event_callback(self, name: str):
         def callback(message):
@@ -486,58 +514,6 @@ class AudioPlugin:
         return None
 
 
-class AuthPlugin:
-    def __init__(self, nodes: U1Nodes):
-        self.nodes = nodes
-        self.running = True
-
-    def get_tool(self):
-        actions = {
-            "start": ([], "Prepare the U1 Pro authentication card."),
-            "authorize": ([], "Authorize with credentials injected through protected U1_PRO_* environment variables or config."),
-            "auth_state": ([], "Query whether the U1 Pro SDK is currently authorized."),
-            "stop": ([], "Stop the authentication card without changing the vendor authorization state."),
-            "info": ([], "Read the authentication card state."),
-        }
-        return tool("auth", "actuator", "U1 Pro SDK authentication. Credentials must be injected through protected U1_PRO_* environment variables or config; they are never accepted as MCP arguments or stored by this driver.", action_schema(actions, {}))
-
-    def start(self):
-        return {"state": "ready"}
-
-    def stop(self):
-        self.running = False
-        return {"state": "idle"}
-
-    def dispatch(self, action, args):
-        if action == "start":
-            self.running = True
-            return {"state": "ready"}
-        if action == "stop":
-            return self.stop()
-        if action == "info":
-            return {"state": "ready" if self.running else "idle"}
-        if action == "authorize":
-            env_names = {
-                "appid": "U1_PRO_APPID",
-                "api_key": "U1_PRO_API_KEY",
-                "api_secret": "U1_PRO_API_SECRET",
-                "device_id": "U1_PRO_DEVICE_ID",
-                "license": "U1_PRO_LICENSE",
-            }
-            auth_config = self.nodes.config.get("auth", {})
-            values = {
-                key: str(auth_config.get(key) or os.environ.get(env_names[key], ""))
-                for key in env_names
-            }
-            missing = [key for key, value in values.items() if not value]
-            if missing:
-                raise ValueError("missing U1 Pro auth fields: " + ", ".join(missing))
-            return self.nodes.string_call("authorize", values)
-        if action == "auth_state":
-            return self.nodes.trigger_call("auth_state")
-        return None
-
-
 class EventPlugin:
     def __init__(self, nodes: U1Nodes, name: str, description: str):
         self.nodes, self.name, self.description = nodes, name, description
@@ -581,6 +557,7 @@ class _LifecyclePlugin:
     def start(self):
         if self.closed:
             raise RuntimeError("U1 Pro lifecycle is already closed")
+        self.nodes.initialize_robot()
 
     def stop(self):
         if self.closed:
@@ -593,13 +570,9 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     nodes = U1Nodes(config, namespace, ros)
     # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
     # card has disabled its vendor resources and stopped publishing.
-    plugins = [_LifecyclePlugin(nodes), AuthPlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), AudioPlugin(nodes)]
+    plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), AudioPlugin(nodes)]
     descriptions = {
-        "main_wakeup_word": "Main wake-word event recognized by the U1 Pro.",
-        "wakeup_event": "U1 Pro wake-up recognition event; does not guarantee a follow-up conversation.",
-        "wakeup_state": "Current U1 Pro wake-up state.",
         "doa_event": "Microphone-array sound direction with azimuth and confidence.",
-        "playback_state": "U1 Pro audio completion or interruption events for current audio UUIDs.",
     }
     plugins.extend(EventPlugin(nodes, name, description) for name, description in descriptions.items())
     return plugins
