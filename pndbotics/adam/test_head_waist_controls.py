@@ -10,6 +10,7 @@ import unittest
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
 from device import (
+    ADAM_PRO_JOINTS,
     AdamDeviceBundle,
     HeadControlPlugin,
     UpperBodyLowcmdController,
@@ -49,7 +50,15 @@ class HeadWaistSchemaTests(unittest.TestCase):
         schema = tool["inputSchema"]
         self.assertEqual(
             schema["properties"]["action"]["enum"], ["set_angles", "reset"])
-        self.assertNotIn("x-action-params", schema)
+        self.assertEqual(
+            schema["x-action-params"],
+            {
+                "set_angles": {
+                    "params": ["duration_s", "yaw_deg", "pitch_deg"],
+                },
+                "reset": {"params": []},
+            },
+        )
         for field in ("yaw_deg", "pitch_deg"):
             self.assertIn(field, schema["properties"])
             self.assertEqual(schema["properties"][field]["minimum"], -60.0)
@@ -60,7 +69,17 @@ class HeadWaistSchemaTests(unittest.TestCase):
         schema = tool["inputSchema"]
         self.assertEqual(
             schema["properties"]["action"]["enum"], ["set_angles", "reset"])
-        self.assertNotIn("x-action-params", schema)
+        self.assertEqual(
+            schema["x-action-params"],
+            {
+                "set_angles": {
+                    "params": [
+                        "duration_s", "roll_deg", "pitch_deg", "yaw_deg",
+                    ],
+                },
+                "reset": {"params": []},
+            },
+        )
         expected = {
             "roll_deg": (-16.0, 16.0),
             "pitch_deg": (-48.0, 78.0),
@@ -107,7 +126,71 @@ class _RecordingUpperBodyController(UpperBodyLowcmdController):
         return None
 
 
+class _MotorState:
+    def __init__(self, q):
+        self.q = q
+
+
+class _LowState:
+    def __init__(self, positions):
+        self.motor_state = [_MotorState(q) for q in positions]
+
+
+class _SequenceSubscriber:
+    def __init__(self, messages):
+        self.messages = list(messages)
+
+    def Read(self, timeout=None):
+        if self.messages:
+            return self.messages.pop(0)
+        return None
+
+
 class UpperBodyControllerTests(unittest.TestCase):
+    def test_pro_joint_indices_match_vendor_low_level_layout(self):
+        self.assertEqual(ADAM_PRO_JOINTS.index("waistYaw"), 12)
+        self.assertEqual(ADAM_PRO_JOINTS.index("waistRoll"), 13)
+        self.assertEqual(ADAM_PRO_JOINTS.index("waistPitch"), 14)
+        self.assertEqual(ADAM_PRO_JOINTS.index("neckYaw"), 29)
+        self.assertEqual(ADAM_PRO_JOINTS.index("neckPitch"), 30)
+
+    def test_initial_state_accepts_complete_frame_after_timeout(self):
+        positions = [float(index) for index in range(31)]
+        control = UpperBodyLowcmdController(
+            {}, dds_lowcmd_pub=object(),
+            dds_lowstate_sub=_SequenceSubscriber([None, _LowState(positions)]),
+        )
+        control._read_initial_state()
+        self.assertTrue(control._state_ready.is_set())
+        self.assertEqual(control._hold_q, positions)
+        self.assertIsNone(control._last_error)
+
+    def test_short_initial_state_reports_actual_motor_count(self):
+        control = UpperBodyLowcmdController(
+            {"state_wait_timeout_s": 0}, dds_lowcmd_pub=object(),
+            dds_lowstate_sub=object(),
+        )
+        self.assertFalse(control._load_initial_state(_LowState([0.0] * 30)))
+        result = control.set_targets({"neckYaw": 0.0})
+        self.assertEqual(result["code"], "LOWSTATE_UNAVAILABLE")
+        self.assertEqual(
+            result["message"],
+            "rt/lowstate has 30 motors; expected at least 31",
+        )
+
+    def test_non_finite_initial_state_is_rejected(self):
+        positions = [0.0] * 31
+        positions[29] = math.nan
+        control = UpperBodyLowcmdController(
+            {"state_wait_timeout_s": 0}, dds_lowcmd_pub=object(),
+            dds_lowstate_sub=object(),
+        )
+        self.assertFalse(control._load_initial_state(_LowState(positions)))
+        self.assertEqual(
+            control._last_error,
+            "rt/lowstate contains a non-finite motor position",
+        )
+
     def test_reset_submits_all_axes_as_one_target_batch(self):
         control = _RecordingUpperBodyController()
         control.reset(["neckYaw", "neckPitch"], 1.5)

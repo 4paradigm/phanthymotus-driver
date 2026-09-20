@@ -136,12 +136,12 @@ ADAM_PRO_JOINTS = [
     "kneePitch_Left", "anklePitch_Left", "ankleRoll_Left",
     "hipPitch_Right", "hipRoll_Right", "hipYaw_Right",
     "kneePitch_Right", "anklePitch_Right", "ankleRoll_Right",
-    "waistRoll", "waistPitch", "waistYaw",
-    "neckYaw", "neckPitch",
+    "waistYaw", "waistRoll", "waistPitch",
     "shoulderPitch_Left", "shoulderRoll_Left", "shoulderYaw_Left", "elbow_Left",
-    "wristYaw_Left", "wristPitch_Left", "wristRoll_Left",
+    "wristRoll_Left", "wristPitch_Left", "wristYaw_Left",
     "shoulderPitch_Right", "shoulderRoll_Right", "shoulderYaw_Right", "elbow_Right",
-    "wristYaw_Right", "wristPitch_Right", "wristRoll_Right",
+    "wristRoll_Right", "wristPitch_Right", "wristYaw_Right",
+    "neckYaw", "neckPitch",
 ]
 
 VARIANT_JOINTS = {
@@ -935,6 +935,8 @@ class UpperBodyLowcmdController:
         self._lowstate_sub = dds_lowstate_sub
         self._rate_hz = max(10.0, min(100.0, float(
             plugin_config.get("control_rate_hz", self._RATE_HZ))))
+        self._state_wait_timeout_s = max(0.0, min(10.0, float(
+            plugin_config.get("state_wait_timeout_s", 3.0))))
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._state_ready = threading.Event()
@@ -958,25 +960,49 @@ class UpperBodyLowcmdController:
     def _joint_index(joint_name):
         return ADAM_PRO_JOINTS.index(joint_name)
 
+    def _load_initial_state(self, state):
+        if state is None:
+            self._last_error = "waiting for rt/lowstate data"
+            return False
+        motors = getattr(state, "motor_state", None)
+        if motors is None:
+            self._last_error = "rt/lowstate has no motor_state"
+            return False
+        if len(motors) < self._DOF:
+            self._last_error = (
+                f"rt/lowstate has {len(motors)} motors; expected at least {self._DOF}"
+            )
+            return False
+        positions = [float(motors[index].q) for index in range(self._DOF)]
+        if not all(math.isfinite(value) for value in positions):
+            self._last_error = "rt/lowstate contains a non-finite motor position"
+            return False
+        with self._lock:
+            self._hold_q = positions
+            self._segment_q = list(positions)
+            self._last_error = None
+        self._state_ready.set()
+        return True
+
     def _read_initial_state(self):
         if self._lowstate_sub is None:
+            self._last_error = "rt/lowstate reader is unavailable"
             return
         while not self._stop_event.is_set() and not self._state_ready.is_set():
             try:
-                state = self._lowstate_sub.Read(timeout=0.2)
-                motors = getattr(state, "motor_state", None) if state else None
-                if motors is None or len(motors) < self._DOF:
-                    continue
-                positions = [float(motors[index].q) for index in range(self._DOF)]
-                if not all(math.isfinite(value) for value in positions):
-                    continue
-                with self._lock:
-                    self._hold_q = positions
-                    self._segment_q = list(positions)
-                self._state_ready.set()
+                self._load_initial_state(self._lowstate_sub.Read(timeout=0.2))
             except Exception as exc:
                 self._last_error = f"rt/lowstate read failed: {exc}"
                 self._stop_event.wait(0.1)
+
+    def _wait_for_state(self):
+        if self._state_ready.wait(self._state_wait_timeout_s):
+            return None
+        return {
+            "success": False,
+            "code": "LOWSTATE_UNAVAILABLE",
+            "message": self._last_error or "waiting for a complete rt/lowstate message",
+        }
 
     def _write_command(self):
         with self._lock:
@@ -1042,9 +1068,9 @@ class UpperBodyLowcmdController:
         if self._publisher is None:
             return {"success": False, "code": "DDS_UNAVAILABLE",
                     "message": "rt/lowcmd publisher is unavailable"}
-        if not self._state_ready.is_set():
-            return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
-                    "message": "waiting for a complete rt/lowstate message"}
+        state_error = self._wait_for_state()
+        if state_error is not None:
+            return state_error
         updates = {
             self._joint_index(joint_name): radians
             for joint_name, radians in targets_by_name.items()
@@ -1068,9 +1094,9 @@ class UpperBodyLowcmdController:
         return self.set_targets({joint_name: radians}, duration_s)
 
     def reset(self, joints, duration_s=None):
-        if not self._state_ready.is_set():
-            return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
-                    "message": "waiting for a complete rt/lowstate message"}
+        state_error = self._wait_for_state()
+        if state_error is not None:
+            return state_error
         with self._lock:
             targets = {
                 joint_name: self._hold_q[self._joint_index(joint_name)]
@@ -1116,6 +1142,7 @@ class AxisControlPlugin:
                 "minimum": minimum, "maximum": maximum, "multipleOf": 1.0,
                 "description": f"绝对目标角度，范围 [{minimum:g}, {maximum:g}] 度。",
             }
+        angle_fields = [f"{axis}_deg" for axis in self.CONTROLS]
         return {
             "name": self.TOOL_NAME, "type": "actuator",
             "description": self.DESCRIPTION,
@@ -1123,6 +1150,10 @@ class AxisControlPlugin:
                 "type": "object", "properties": properties,
                 "required": ["action"], "additionalProperties": False,
                 "x-resource": ["adam_upper_body"],
+                "x-action-params": {
+                    "set_angles": {"params": ["duration_s", *angle_fields]},
+                    "reset": {"params": []},
+                },
             },
         }
 
