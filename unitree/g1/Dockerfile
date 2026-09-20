@@ -57,6 +57,7 @@ COPY scan_context.py /work/scan_context.py
 COPY controlled_spatial.py /work/controlled_spatial.py
 COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
+COPY servo.py /work/servo.py
 COPY test_slam_rpc.py /work/test_slam_rpc.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
