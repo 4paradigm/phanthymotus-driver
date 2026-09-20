@@ -86,20 +86,30 @@ def _copied_names(dockerfile: Path) -> set:
 
 
 def _sibling_imports(driver_dir: Path) -> dict:
-    """`{module: [files that import it]}` for bare-name imports of siblings.
+    """`{module: [files that import it]}` for imports of sibling modules.
 
     A driver's entry point runs with its own directory on sys.path, so it
     imports its neighbours by bare name — `from servo import ...`. That reads
     identically to a third-party import, which is what makes the failure mode
     here so quiet.
+
+    Dotted package imports count too. A bundle laid out as a package writes
+    `from simulator.generic.suite import SuiteRunner`, whose first component is
+    the package rather than the module — so matching only the first component
+    silently sees `simulator`, finds no sibling by that name, and passes. That
+    is exactly how `suite.py` shipped absent from a COPY list and took the
+    container down on startup, with this test green.
     """
     modules = {p.stem for p in driver_dir.glob('*.py')}
-    pattern = re.compile(r'^\s*(?:from|import)\s+([a-z_][a-z0-9_]*)', re.M)
+    pattern = re.compile(r'^\s*(?:from|import)\s+([a-z_][a-z0-9_.]*)', re.M)
     found: dict = {}
     for source in driver_dir.glob('*.py'):
-        for name in pattern.findall(source.read_text(errors='ignore')):
-            if name in modules and name != source.stem:
-                found.setdefault(name, []).append(source.name)
+        for dotted in pattern.findall(source.read_text(errors='ignore')):
+            # Bare name, or the last component of a dotted path — either can name
+            # a sibling module in this directory.
+            for name in {dotted.split('.')[0], dotted.rsplit('.', 1)[-1]}:
+                if name in modules and name != source.stem:
+                    found.setdefault(name, []).append(source.name)
     return found
 
 

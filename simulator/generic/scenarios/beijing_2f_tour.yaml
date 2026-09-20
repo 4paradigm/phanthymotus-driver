@@ -1,0 +1,80 @@
+# 北京 2F 展厅导览 —— 对着真实的东西写的，不是编的。
+#
+# 三样都来自现场：
+#
+#   地图   maps/bj-2f.json，由天轶上的 controlled_bj-2f.stcm 导出
+#          （见 tools/import_stcm.py；23.1m × 33.0m，降采样到 0.06m）
+#   点位   同一次导出带出来的 14 个 POI，来自驱动的 controlled_spatial.db
+#   站序   Resource Center 上的 `exhibition-guide-beijing`（范式北京展厅导览）skill
+#
+# 那个 skill 的规矩直接决定了下面的 expect：
+#   * 第 0 步先 list tags，没有 active map 就 load map bj-2f —— 正是 controlled_spatial
+#   * 连续导览严格按 P3…P15，不得在中间站询问是否继续、不得跳过
+#   * 每站固定两步：导航 → 到达后讲解（语音）
+#   * 禁止 task_create / task_update；导览中不得 finish()
+#
+# P1 是起始点、P2 是欢迎点，都不是内容展位，不计入连续导览顺序。
+
+name: 北京2F展厅 · 完整导览
+description: >
+  范式北京 2F 展厅的完整导览：从欢迎点出发，按 P3 到 P15 十三个展位依次讲解。
+  地图、点位与站序均取自真实展厅与线上 skill。
+
+# 触发这趟导览的真实说法。
+prompt: 带我转一下展区并给我介绍下
+
+embodiment:
+  kind: wheeled
+  dof: 2
+  joint_names: [head_yaw, head_pitch]
+
+# 引用 maps/ 目录里的资产。换展厅只换这一行 + 一个地图文件，场景逻辑不动。
+map: bj-2f
+
+# P2 欢迎点，导览从这里起步。
+spawn: {x: 5.980, y: 8.767, yaw: 0.554}
+
+motion:
+  max_lin: 0.6
+  max_ang: 0.8
+  accel: 0.5
+  radius: 0.25
+
+speech:
+  chars_per_sec: 5.0
+
+scan:
+  n_beams: 60
+  fov: 4.712        # 270°
+  max_range: 8.0
+
+# 不写 pois —— 点位跟着地图走，用 maps/bj-2f.json 里那 14 个真实 POI。
+# 需要只跑一部分时，在这里覆盖即可。
+
+# 访客中途插话，把机器人从「去 P6」的路上拽走。按事件触发而不是绝对时间：
+# 真机上 LLM 往返 3-48 秒，绝对偏移会落到完全不同的一段上。
+injections:
+  - after_arrival: P5
+    delay: 6.0
+    kind: user_message
+    text: 先等一下，我想先看看那边那个算力工厂
+
+expect:
+  # skill 规定的连续导览顺序，一站不少、一站不换。
+  waypoint_order: [P3, P4, P5, P6, P7, P8, P9, P10, P11, P12, P13, P14, P15]
+  announce_after_arrive: true
+  never_occupied: true
+  interrupted_leg:
+    target: P6
+    acp_status: cancelled
+    min_progress: 0.02
+  resume_target: P6
+  # 十三站、真实距离约 60 米，加上每站讲解 —— 给足余量。
+  max_wall_seconds: 1200
+
+weights:
+  orchestration: 30
+  interruption: 25
+  long_horizon: 25
+  safety: 15
+  latency: 5
