@@ -11,11 +11,9 @@ from __future__ import annotations
 from array import array
 import json
 import math
-import os
+import multiprocessing
 from pathlib import Path
 import queue
-import subprocess
-import sys
 import threading
 import time
 
@@ -36,6 +34,7 @@ from navigation_pointcloud import (
     validated_rotation_matrix,
 )
 from navigation_time import ClockOffsetEstimator, split_ns, stamp_to_ns
+from sensor_output import OutputGate, run_navigation_worker
 from unitree_sdk2py.core.channel import ChannelSubscriber
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import Imu_, PointCloud2_
 
@@ -94,8 +93,11 @@ def _quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> tuple:
 
 
 class _NavigationSensorNode(Node):
-    def __init__(self, config: dict, namespace: str):
+    def __init__(self, config: dict, namespace: str, gates=None):
         super().__init__("g1_navigation_sensor_bridge")
+        self._gates = gates if gates is not None else {
+            stream: OutputGate() for stream in ("cloud", "imu")
+        }
 
         prefix = f"/{namespace}/navigation"
         self.cloud_topic = _absolute_topic(config.get("cloud_topic"), f"{prefix}/lidar")
@@ -231,10 +233,11 @@ class _NavigationSensorNode(Node):
         header.frame_id = frame_id
 
     def _on_cloud(self, msg) -> None:
+        token = self._gates["cloud"].token()
         self._counters["cloud_received"] += 1
         self._last_receive_monotonic["cloud"] = time.monotonic()
         corrected_ns = self._correct_stamp(msg.header.stamp, "cloud")
-        if corrected_ns is None:
+        if corrected_ns is None or token is None:
             self._counters["cloud_dropped"] += 1
             self._maybe_publish_status()
             return
@@ -244,6 +247,7 @@ class _NavigationSensorNode(Node):
             for field in msg.fields
         ]
         item = (
+            token,
             corrected_ns,
             int(msg.height),
             int(msg.width),
@@ -275,6 +279,7 @@ class _NavigationSensorNode(Node):
                 break
 
             (
+                token,
                 corrected_ns,
                 height,
                 width,
@@ -285,6 +290,8 @@ class _NavigationSensorNode(Node):
                 data,
                 is_dense,
             ) = item
+            if token != self._gates["cloud"].token():
+                continue
             try:
                 converted = unitree_mid360_to_navigation_cloud(
                     data=data,
@@ -317,8 +324,8 @@ class _NavigationSensorNode(Node):
                 # at a time in debug mode. array('B') uses its constant-time path.
                 out.data = array("B", converted)
                 out.is_dense = is_dense
-                self._cloud_pub.publish(out)
-                self._counters["cloud_published"] += 1
+                if self._gates["cloud"].publish(token, self._cloud_pub, out):
+                    self._counters["cloud_published"] += 1
             except (TypeError, ValueError) as exc:
                 self._counters["cloud_dropped"] += 1
                 if self._counters["cloud_dropped"] <= 3:
@@ -327,16 +334,17 @@ class _NavigationSensorNode(Node):
                     )
 
     def _on_imu(self, msg) -> None:
+        token = self._gates["imu"].token()
         self._counters["imu_received"] += 1
         self._last_receive_monotonic["imu"] = time.monotonic()
         corrected_ns = self._correct_stamp(msg.header.stamp, "imu")
-        if corrected_ns is None:
+        if corrected_ns is None or token is None:
             self._counters["imu_dropped"] += 1
             self._maybe_publish_status()
             return
 
         try:
-            self._imu_queue.put_nowait((corrected_ns, msg))
+            self._imu_queue.put_nowait((token, corrected_ns, msg))
         except queue.Full:
             # Prefer fresh inertial data over completing a stale backlog.
             try:
@@ -344,7 +352,7 @@ class _NavigationSensorNode(Node):
             except queue.Empty:
                 pass
             self._counters["imu_dropped"] += 1
-            self._imu_queue.put_nowait((corrected_ns, msg))
+            self._imu_queue.put_nowait((token, corrected_ns, msg))
         self._maybe_publish_status()
 
     def _imu_loop(self) -> None:
@@ -355,7 +363,9 @@ class _NavigationSensorNode(Node):
                 continue
             if item is None:
                 break
-            corrected_ns, msg = item
+            token, corrected_ns, msg = item
+            if token != self._gates["imu"].token():
+                continue
 
             out = Imu()
             self._set_stamp(out.header, corrected_ns, self._imu_frame)
@@ -413,8 +423,8 @@ class _NavigationSensorNode(Node):
             out.linear_acceleration_covariance = rotate_covariance9(
                 msg.linear_acceleration_covariance, self._sensor_rotation
             )
-            self._imu_pub.publish(out)
-            self._counters["imu_published"] += 1
+            if self._gates["imu"].publish(token, self._imu_pub, out):
+                self._counters["imu_published"] += 1
 
     def _maybe_publish_status(self) -> None:
         now = time.monotonic()
@@ -572,24 +582,20 @@ class NavigationSensorPlugin:
         self._executor = executor
         self._namespace = namespace
         self._network_iface = network_iface
+        self._config = dict(plugin_config)
+        self._lifecycle_lock = threading.RLock()
+        self._requested_outputs = {stream: True for stream in ("cloud", "imu")}
+        self._gates = {stream: OutputGate() for stream in self._requested_outputs}
         self._status_node = _NavigationSensorMonitorNode(plugin_config, namespace)
         executor.add_node(self._status_node)
+        self._monitor_attached = True
         self._worker_path = Path(__file__).with_name("navigation_sensor_bridge_main.py")
         self._proc = None
 
     def get_tools(self) -> list[dict]:
         return [
             self._tool(
-                "navigation_lidar",
-                "Normalized MID360 PointCloud2 for navigation consumers",
-                self._status_node.cloud_topic,
-                "sensor/pointcloud",
-                "sensor_msgs/msg/PointCloud2",
-                "RELIABLE + KEEP_LAST(depth=2) + VOLATILE",
-                self._status_node.lidar_frame,
-            ),
-            self._tool(
-                "navigation_imu",
+                "lidar_imu",
                 "Normalized MID360 IMU in the same clock domain as LiDAR",
                 self._status_node.imu_topic,
                 "sensor/imu",
@@ -598,6 +604,15 @@ class NavigationSensorPlugin:
                 self._status_node.imu_frame,
             ),
         ]
+
+    def cloud_descriptor(self) -> dict:
+        return self._tool(
+            "lidar_cloud", "Normalized MID360 PointCloud2",
+            self._status_node.cloud_topic, "sensor/pointcloud",
+            "sensor_msgs/msg/PointCloud2",
+            "RELIABLE + KEEP_LAST(depth=2) + VOLATILE",
+            self._status_node.lidar_frame,
+        )["topic_out"][0] | {"port": "navigation_lidar"}
 
     @staticmethod
     def _tool(
@@ -628,64 +643,97 @@ class NavigationSensorPlugin:
         }
 
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._start_worker()
+
+    def _start_worker(self) -> None:
         if self._worker_running():
+            return
+        if not any(self._requested_outputs.values()):
             return
         if not self._worker_path.is_file():
             raise FileNotFoundError(f"navigation sensor worker missing: {self._worker_path}")
-        env = os.environ.copy()
-        env["ROS_NAMESPACE"] = self._namespace
+        if not self._monitor_attached:
+            self._status_node = _NavigationSensorMonitorNode(self._config, self._namespace)
+            self._executor.add_node(self._status_node)
+            self._monitor_attached = True
+        # A killed process can leave a semaphore locked. Never reuse its gates
+        # or readiness counters in a new producer generation.
+        self._gates = {s: OutputGate(on) for s, on in self._requested_outputs.items()}
         self._status_node.reset()
-        self._proc = subprocess.Popen(
-            [sys.executable, str(self._worker_path), self._network_iface],
-            cwd=str(self._worker_path.parent),
-            env=env,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
+        self._proc = multiprocessing.get_context("spawn").Process(
+            target=run_navigation_worker,
+            args=(self._config, self._namespace, self._network_iface, self._gates),
+            name="navigation_sensors", daemon=True,
         )
+        self._proc.start()
         print(
             f"[navigation-sensors] isolated worker started pid={self._proc.pid}",
             flush=True,
         )
 
     def _worker_running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+        return self._proc is not None and self._proc.is_alive()
 
     def _stop_worker(self) -> None:
         proc = self._proc
         if proc is None:
             return
-        if proc.poll() is None:
+        if proc.is_alive():
             proc.terminate()
-            try:
-                proc.wait(timeout=5.0)
-            except subprocess.TimeoutExpired:
+            proc.join(timeout=5.0)
+            if proc.is_alive():
                 proc.kill()
-                proc.wait(timeout=2.0)
+                proc.join(timeout=2.0)
         self._proc = None
 
     def stop(self) -> None:
-        self._stop_worker()
+        with self._lifecycle_lock:
+            self._stop_worker()
+            self._status_node.reset()
+            if self._monitor_attached:
+                self._executor.remove_node(self._status_node)
+                self._status_node.destroy_node()
+                self._monitor_attached = False
+
+    def set_output(self, stream, enabled):
+        with self._lifecycle_lock:
+            if not self._worker_running():
+                self._gates = {s: OutputGate(on) for s, on in self._requested_outputs.items()}
+            self._gates[stream].set_enabled(enabled)
+            self._requested_outputs[stream] = bool(enabled)
+            if enabled:
+                self._start_worker()
+            elif not any(self._requested_outputs.values()):
+                self._stop_worker()
+
+    def output_status(self, stream):
+        with self._lifecycle_lock:
+            running = self._worker_running()
+            status = self._status_node.status(running)
+            output = self._gates[stream].status(500 if stream == "cloud" else 100)
+            # Sibling stream's stale/disabled status must not poison this output.
+            blockers = [b for b in status.get("blockers", [])
+                        if not b.startswith(("cloud_", "imu_"))]
+            if output["enabled"] and not output["ready"]:
+                blockers.append(f"{stream}_not_fresh")
+            if not output["enabled"]:
+                blockers = []
+            ready = output["ready"] and not blockers
+            return {**status, **output, "ready": ready, "blockers": blockers,
+                    "worker_running": running,
+                    "state": "idle" if not output["enabled"] else
+                    ("ready" if ready else "not_ready"),
+                    "worker_pid": self._proc.pid if running else None}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action in {"start", "info"}:
-            if action == "start" and not self._worker_running():
-                self.start()
-            tool_name = args.get("_tool_name", "")
-            tools = {tool["name"]: tool for tool in self.get_tools()}
-            selected = tools.get(tool_name, tools["navigation_lidar"])
-            worker_running = self._worker_running()
-            status = self._status_node.status(worker_running)
-            if action == "start":
-                state = "running" if worker_running else "error"
-            else:
-                state = "ready" if status["ready"] else "not_ready"
-            return {
-                "state": state,
-                "topic_out": selected["topic_out"],
-                "worker_pid": self._proc.pid if worker_running else None,
-                **status,
-            }
-        if action == "stop":
-            self._stop_worker()
-            return {"state": "idle", "worker_running": False, "worker_pid": None}
+        if action in {"start", "stop", "info"}:
+            with self._lifecycle_lock:
+                try:
+                    if action != "info":
+                        self.set_output("imu", action == "start")
+                    return {**self.output_status("imu"),
+                            "topic_out": self.get_tools()[0]["topic_out"]}
+                except (TimeoutError, OSError) as exc:
+                    return {"state": "error", "ready": False, "error": str(exc)}
         return None

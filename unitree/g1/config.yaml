@@ -47,7 +47,8 @@ plugins:
   camera:
     enabled: true
     # Self-describing binary frames are published beside the untouched legacy
-    # CompressedImage/Image topics. Camera failures remain isolated from loco.
+    # CompressedImage/Image topics, on the existing camera_rgb/camera_depth
+    # cards. Camera failures remain isolated from loco.
     frame_enabled: true
     rgb_frame_topic: /ubuntu/camera/rgb_frame
     depth_frame_topic: /ubuntu/camera/depth_frame
@@ -67,7 +68,8 @@ plugins:
   lidar:
     enabled: true
   # MID360 raw DDS -> native ROS 2 topics for navigation consumers. This
-  # read-only bridge coexists with the legacy lidar card used by Canvas/safety.
+  # read-only bridge supplies lidar_cloud's second output and lidar_imu.
+  # Safety uses an internal copy of the legacy cloud, independent of card stop.
   navigation_sensors:
     enabled: true
     raw_cloud_topic: rt/utlidar/cloud_livox_mid360

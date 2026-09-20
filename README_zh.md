@@ -124,11 +124,13 @@ velocity proposal 合同与 `loco.move` 输入边界保持一致：前后和横�
 点云转换只接受小端且满足 `row_step == width * point_step` 的紧凑行布局；
 大端、带行 padding 或行长不足的有组织点云会被丢弃，避免错误解码。
 
-`navigation_lidar` 与 `navigation_imu` 两张卡共享同一个 worker。停止任意一张
-卡都会停止两路数据并释放 MID360 worker；再次启动任意一张卡会创建新的共享
-worker。
+`lidar_cloud` 保留旧点云输出作为第一项，并增加 `navigation_lidar` 端口输出标准
+PointCloud2；新增 `lidar_imu` 输出 MID360 IMU，原机身 `imu` 不变。
+两路标准输出共享 worker，但分别启停：停止一张卡不影响另一张，全部停止才释放
+worker。重新启动不会发送上一启停周期的排队帧。安全检查改用内部
+`/ubuntu/lidar/cloud_internal`，复用同一份点云转换，不依赖公开点云卡是否启用。
 
-`navigation_imu` 声明 `format=sensor/imu`，原生 ROS 消息为
+`lidar_imu` 声明 `format=sensor/imu`，原生 ROS 消息为
 `sensor_msgs/msg/Imu`：姿态使用四元数，角速度单位为 rad/s，线加速度
 单位为 m/s²，并保留三组标准 3×3 协方差。PhanthyMotus PR #141
 会按原生类型订阅，再转成版本化的 `phanthy.sensor.imu.v1` 面板载荷，
@@ -141,12 +143,29 @@ RealSense 插件保留现有 `/ubuntu/camera/rgb` 压缩图、
 BEST_EFFORT + KEEP_LAST(1) 自描述帧数据流。它们是通用传感器/数采输出，
 不与导航算法绑定：
 
-- `camera_rgb_frame` → `/ubuntu/camera/rgb_frame`：
+- `camera_rgb` 的 `rgb_frame` 端口 → `/ubuntu/camera/rgb_frame`：
   `phanthy.sensor.camera_rgb_frame.v1`；
-- `camera_depth_frame` → `/ubuntu/camera/depth_frame`：
+- `camera_depth` 的 `depth_frame` 端口 → `/ubuntu/camera/depth_frame`：
   `phanthy.sensor.camera_depth_frame.v1`。
 
-两者以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE1` 二进制 envelope：固定
+停止相机卡只停止该卡的 legacy 和 PSE1 两路输出，不影响另一相机卡、距离输出或
+拍照/录像。拍照使用按需启用的内部 JPEG 通道。全部输出及拍照需求停止后，共享
+进程暂停相机采集。停止门控超时返回错误，不伪报 idle。
+
+旧 Canvas 迁移（消费端同事负责）：
+
+| 原卡片 | 新卡片 / 端口 |
+|---|---|
+| navigation_lidar | lidar_cloud / navigation_lidar |
+| navigation_imu | lidar_imu / 原输出 |
+| camera_rgb_frame | camera_rgb / rgb_frame |
+| camera_depth_frame | camera_depth / depth_frame |
+
+移除的名字不保留隐藏别名。原输出维持列表首位和原描述，topic、ROS 类型、载荷、
+QoS、schema、标定及时间语义不变；直接订阅 topic 无需修改协议。此轮整合尚未
+部署或真机验收，本地测试不能代替 ROS/设备验收。
+
+两路自描述帧以 `std_msgs/msg/UInt8MultiArray` 承载 `PSE1` 二进制 envelope：固定
 小端头（magic、JSON 元数据长度、二进制载荷长度）之后依次是规范 JSON
 元数据和 JPEG 或 zlib level 1 无损压缩的 Z16 小端载荷。Depth 元数据通过
 `image.compression` 描述压缩方式，并同时记录压缩前后的字节数；消费者先用

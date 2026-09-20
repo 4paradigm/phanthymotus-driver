@@ -2207,8 +2207,8 @@ def _run_smart_motion_process(namespace: str, config: dict, proposal_config: dic
 
     try:
         lidar_node.create_subscription(
-            UInt8MultiArray, f"/{namespace}/lidar/cloud", on_cloud, _QOS)
-        print(f"[SmartMotion:pid={os.getpid()}] LiDAR subscribed (ROS2 /{namespace}/lidar/cloud)")
+            UInt8MultiArray, f"/{namespace}/lidar/cloud_internal", on_cloud, _QOS)
+        print(f"[SmartMotion:pid={os.getpid()}] LiDAR subscribed (ROS2 /{namespace}/lidar/cloud_internal)")
     except Exception as e:
         print(f"[SmartMotion:pid={os.getpid()}] WARNING: LiDAR subscribe failed: {e}")
 

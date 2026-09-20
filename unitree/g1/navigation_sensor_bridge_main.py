@@ -55,7 +55,10 @@ def main() -> int:
     if not plugin_config.get("enabled", False):
         raise RuntimeError("plugins.navigation_sensors.enabled must be true")
 
-    namespace = _resolve_namespace(config)
+    return run(plugin_config, _resolve_namespace(config), network_interface)
+
+
+def run(plugin_config, namespace, network_interface, gates=None) -> int:
     ChannelFactoryInitialize(0, network_interface)
     print(
         f"[navigation-sensors-worker] DDS initialized on {network_interface}; "
@@ -65,7 +68,7 @@ def main() -> int:
 
     rclpy.init()
     executor = MultiThreadedExecutor(num_threads=3)
-    node = _NavigationSensorNode(plugin_config, namespace)
+    node = _NavigationSensorNode(plugin_config, namespace, gates)
     executor.add_node(node)
     stop = threading.Event()
 

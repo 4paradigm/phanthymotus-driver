@@ -285,8 +285,10 @@ class DriverCameraContractTest(unittest.TestCase):
         source = (G1_DIR / "device.py").read_text(encoding="utf-8")
         self.assertIn('self._color_topic = f"/{namespace}/camera/rgb"', source)
         self.assertIn('self._depth_topic = f"/{namespace}/camera/depth"', source)
-        self.assertIn('"name": "camera_rgb_frame"', source)
-        self.assertIn('"name": "camera_depth_frame"', source)
+        self.assertNotIn('"name": "camera_rgb_frame"', source)
+        self.assertNotIn('"name": "camera_depth_frame"', source)
+        self.assertIn('self._frame_outputs("rgb")', source)
+        self.assertIn('self._frame_outputs("depth")', source)
         self.assertNotIn('"name": "camera_rgb_v2"', source)
         self.assertNotIn('"name": "camera_depth_v2"', source)
         self.assertIn('"ros_type": "std_msgs/msg/UInt8MultiArray"', source)
@@ -333,12 +335,14 @@ class DriverCameraContractTest(unittest.TestCase):
         card_names = {card["name"] for card in manifest["cards"]}
         self.assertTrue(
             {
-                "camera_rgb_frame",
-                "camera_depth_frame",
-                "navigation_lidar",
-                "navigation_imu",
+                "camera_rgb",
+                "camera_depth",
+                "lidar_cloud",
+                "lidar_imu",
             }.issubset(card_names)
         )
+        self.assertFalse({"camera_rgb_frame", "camera_depth_frame",
+                          "navigation_lidar", "navigation_imu"} & card_names)
 
 
 if __name__ == "__main__":

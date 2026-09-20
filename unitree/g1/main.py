@@ -166,22 +166,25 @@ class G1DeviceBundle:
                 plugins_cfg["vision_capture"], namespace, executor, camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
-        if plugins_cfg.get("lidar", {}).get("enabled", False):
-            from device import LidarPlugin
-            self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))
-            print("[bundle] LidarPlugin loaded")
-
+        navigation_sensors = None
         if plugins_cfg.get("navigation_sensors", {}).get("enabled", False):
             from navigation_sensor_bridge import NavigationSensorPlugin
-            self._plugins.append(
-                NavigationSensorPlugin(
-                    plugins_cfg["navigation_sensors"],
-                    namespace,
-                    executor,
-                    network_iface,
-                )
+            navigation_sensors = NavigationSensorPlugin(
+                plugins_cfg["navigation_sensors"],
+                namespace,
+                executor,
+                network_iface,
             )
+            if not plugins_cfg.get("lidar", {}).get("enabled", False):
+                navigation_sensors.set_output("cloud", False)
+            self._plugins.append(navigation_sensors)
             print("[bundle] NavigationSensorPlugin loaded")
+
+        if plugins_cfg.get("lidar", {}).get("enabled", False):
+            from device import LidarPlugin
+            self._plugins.append(LidarPlugin(
+                plugins_cfg["lidar"], namespace, executor, navigation_sensors))
+            print("[bundle] LidarPlugin loaded")
 
         if plugins_cfg.get("slam", {}).get("enabled", False):
             from device import SpatialPlugin

@@ -99,6 +99,7 @@ class VisionCaptureRaceTests(unittest.TestCase):
             "remove_node": lambda self, node: removed.append(node),
         })()
         plugin._color_topic = "/g1/camera/rgb"
+        plugin._lifecycle_lock = threading.RLock()
         plugin._proc = None
         closed = []
         plugin._status_q = type("StatusQueue", (), {

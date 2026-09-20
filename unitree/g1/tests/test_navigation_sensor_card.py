@@ -7,6 +7,7 @@ import time
 import types
 import unittest
 from unittest import mock
+from sensor_output import OutputGate
 
 
 G1_DIR = Path(__file__).resolve().parents[1]
@@ -122,18 +123,17 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         source = (G1_DIR / "navigation_sensor_bridge.py").read_text()
         for expected in (
             '"navigation_lidar"',
-            '"navigation_imu"',
+            '"lidar_imu"',
             '"sensor/pointcloud"',
             '"sensor_msgs/msg/PointCloud2"',
             '"sensor_msgs/msg/Imu"',
             '"RELIABLE + KEEP_LAST(depth=2) + VOLATILE"',
             '"RELIABLE + KEEP_LAST(depth=200) + VOLATILE"',
-            'state = "running" if worker_running else "error"',
             'blockers.append("clock_not_ready")',
             'blockers.append("cloud_stale")',
             'blockers.append("imu_stale")',
             'blockers.append("worker_not_running")',
-            'subprocess.Popen(',
+            'target=run_navigation_worker',
         ):
             self.assertIn(expected, source)
         self.assertNotIn('"sensor/pointcloud2"', source)
@@ -142,6 +142,8 @@ class NavigationSensorCardContractTest(unittest.TestCase):
     def test_runtime_exposes_only_generic_navigation_sensor_tools(self):
         module = self.load_bridge_module()
         plugin = module.NavigationSensorPlugin.__new__(module.NavigationSensorPlugin)
+        plugin._lifecycle_lock = threading.RLock()
+        plugin._gates = {s: OutputGate() for s in ("cloud", "imu")}
         plugin._status_node = types.SimpleNamespace(
             cloud_topic="/ubuntu/navigation/lidar",
             imu_topic="/ubuntu/navigation/imu",
@@ -155,12 +157,12 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 "counters": {},
             },
         )
-        plugin._proc = types.SimpleNamespace(poll=lambda: None, pid=1234)
+        plugin._proc = types.SimpleNamespace(is_alive=lambda: True, pid=1234)
 
         tools = {tool["name"]: tool for tool in plugin.get_tools()}
-        self.assertEqual(set(tools), {"navigation_lidar", "navigation_imu"})
-        lidar = tools["navigation_lidar"]["topic_out"][0]
-        imu = tools["navigation_imu"]["topic_out"][0]
+        self.assertEqual(set(tools), {"lidar_imu"})
+        lidar = plugin.cloud_descriptor()
+        imu = tools["lidar_imu"]["topic_out"][0]
         self.assertEqual(lidar["format"], "sensor/pointcloud")
         self.assertEqual(lidar["ros_type"], "sensor_msgs/msg/PointCloud2")
         self.assertEqual(lidar["qos"], "RELIABLE + KEEP_LAST(depth=2) + VOLATILE")
@@ -170,9 +172,10 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertEqual(imu["qos"], "RELIABLE + KEEP_LAST(depth=200) + VOLATILE")
         self.assertEqual(imu["frame_id"], "custom_imu_frame")
 
-        info = plugin.dispatch("info", {"_tool_name": "navigation_lidar"})
+        info = plugin.dispatch("info", {"_tool_name": "lidar_imu"})
         self.assertEqual(info["state"], "not_ready")
-        self.assertEqual(info["blockers"], ["clock_not_ready"])
+        self.assertIn("clock_not_ready", info["blockers"])
+        self.assertIn("imu_not_fresh", info["blockers"])
 
     def test_monitor_preserves_configured_sensor_frames(self):
         module = self.load_bridge_module()
@@ -266,7 +269,7 @@ class NavigationSensorCardContractTest(unittest.TestCase):
 
     def test_worker_entry_owns_the_heavy_sensor_node(self):
         source = (G1_DIR / "navigation_sensor_bridge_main.py").read_text()
-        self.assertIn("_NavigationSensorNode(plugin_config, namespace)", source)
+        self.assertIn("_NavigationSensorNode(plugin_config, namespace, gates)", source)
         self.assertIn("ChannelFactoryInitialize(0, network_interface)", source)
         self.assertLess(
             source.index("logsafe.install(check_fd=False)"),
@@ -282,32 +285,34 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         plugin._network_iface = "eth0"
         plugin._worker_path = G1_DIR / "navigation_sensor_bridge_main.py"
         plugin._proc = None
+        plugin._lifecycle_lock = threading.RLock()
+        plugin._config = {}
+        plugin._requested_outputs = {s: True for s in ("cloud", "imu")}
+        plugin._monitor_attached = True
+        plugin._gates = {s: OutputGate() for s in ("cloud", "imu")}
         plugin._executor = mock.Mock()
         plugin._status_node = mock.Mock()
         proc = mock.Mock(pid=4321)
-        proc.poll.return_value = None
+        proc.is_alive.side_effect = [True, True, False]
 
-        with mock.patch.object(module.subprocess, "Popen", return_value=proc) as popen:
+        with mock.patch.object(module.multiprocessing.get_context("spawn"), "Process", return_value=proc) as process:
             plugin.start()
             plugin.start()
 
-        popen.assert_called_once()
-        self.assertEqual(
-            popen.call_args.args[0],
-            [sys.executable, str(plugin._worker_path), "eth0"],
-        )
+        process.assert_called_once()
+        proc.start.assert_called_once()
         plugin.stop()
         proc.terminate.assert_called_once_with()
-        proc.wait.assert_called_once_with(timeout=5.0)
+        proc.join.assert_called_once_with(timeout=5.0)
         self.assertIsNone(plugin._proc)
-        plugin._executor.remove_node.assert_not_called()
-        plugin._status_node.destroy_node.assert_not_called()
-        plugin._status_node.reset.assert_called_once_with()
+        plugin._executor.remove_node.assert_called_once_with(plugin._status_node)
+        plugin._status_node.destroy_node.assert_called_once_with()
+        self.assertEqual(plugin._status_node.reset.call_count, 2)
 
-    def test_either_card_stop_terminates_shared_worker_and_allows_restart(self):
+    def test_card_stop_is_isolated_and_last_stop_releases_worker(self):
         module = self.load_bridge_module()
 
-        for tool_name in ("navigation_lidar", "navigation_imu"):
+        for tool_name in ("cloud", "imu"):
             with self.subTest(tool_name=tool_name):
                 plugin = module.NavigationSensorPlugin.__new__(
                     module.NavigationSensorPlugin
@@ -316,6 +321,11 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 plugin._network_iface = "eth0"
                 plugin._worker_path = G1_DIR / "navigation_sensor_bridge_main.py"
                 plugin._proc = None
+                plugin._config = {}
+                plugin._requested_outputs = {s: True for s in ("cloud", "imu")}
+                plugin._monitor_attached = True
+                plugin._lifecycle_lock = threading.RLock()
+                plugin._gates = {s: OutputGate() for s in ("cloud", "imu")}
                 plugin._status_node = types.SimpleNamespace(
                     cloud_topic="/ubuntu/navigation/lidar",
                     imu_topic="/ubuntu/navigation/imu",
@@ -329,35 +339,57 @@ class NavigationSensorCardContractTest(unittest.TestCase):
                 )
                 first = mock.Mock(pid=1001)
                 second = mock.Mock(pid=1002)
-                first.poll.return_value = None
-                second.poll.return_value = None
+                first.is_alive.return_value = True
+                first.terminate.side_effect = lambda: setattr(first.is_alive, "return_value", False)
+                second.is_alive.return_value = True
 
                 with mock.patch.object(
-                    module.subprocess,
-                    "Popen",
-                    side_effect=(first, second),
-                ) as popen:
+                    module.multiprocessing.get_context("spawn"), "Process", side_effect=(first, second),
+                ) as process:
                     plugin.start()
-                    stopped = plugin.dispatch("stop", {"_tool_name": tool_name})
-                    stopped_again = plugin.dispatch(
-                        "stop", {"_tool_name": tool_name}
-                    )
-                    restarted = plugin.dispatch(
-                        "start", {"_tool_name": tool_name}
-                    )
+                    plugin.set_output(tool_name, False)
+                    stopped = plugin.output_status(tool_name)
+                    plugin.set_output(tool_name, False)
+                    first.terminate.assert_not_called()
+                    sibling = "imu" if tool_name == "cloud" else "cloud"
+                    self.assertIsNotNone(plugin._gates[sibling].token())
+                    plugin.set_output(sibling, False)
+                    plugin.set_output(tool_name, True)
+                    restarted = plugin.output_status(tool_name)
 
-                self.assertEqual(
-                    stopped,
-                    {"state": "idle", "worker_running": False, "worker_pid": None},
-                )
-                self.assertEqual(stopped_again, stopped)
+                self.assertEqual(stopped["state"], "idle")
+                self.assertTrue(stopped["worker_running"])
                 first.terminate.assert_called_once_with()
-                first.wait.assert_called_once_with(timeout=5.0)
-                self.assertEqual(popen.call_count, 2)
-                self.assertEqual(restarted["state"], "running")
+                first.join.assert_called_once_with(timeout=5.0)
+                self.assertEqual(process.call_count, 2)
+                self.assertEqual(restarted["state"], "not_ready")
                 self.assertFalse(restarted["ready"])
-                self.assertEqual(restarted["blockers"], ["clock_not_ready"])
+                self.assertIn("clock_not_ready", restarted["blockers"])
                 self.assertEqual(restarted["worker_pid"], 1002)
+
+    def test_global_stop_recreates_monitor_on_restart(self):
+        module = self.load_bridge_module()
+        executor = mock.Mock()
+        monitors = [mock.Mock(), mock.Mock()]
+        processes = [mock.Mock(pid=1), mock.Mock(pid=2)]
+        for proc in processes:
+            proc.is_alive.return_value = True
+            proc.terminate.side_effect = lambda proc=proc: setattr(proc.is_alive, "return_value", False)
+        with mock.patch.object(module, "_NavigationSensorMonitorNode", side_effect=monitors), \
+             mock.patch.object(module.multiprocessing.get_context("spawn"), "Process", side_effect=processes):
+            plugin = module.NavigationSensorPlugin({}, "ubuntu", executor)
+            plugin.start()
+            old_gate = plugin._gates["imu"]
+            old_gate.publish(old_gate.token(), mock.Mock(), object())
+            plugin.stop()
+            plugin.stop()
+            monitors[0].destroy_node.assert_called_once()
+            plugin.start()
+            self.assertIs(plugin._status_node, monitors[1])
+            self.assertEqual(executor.add_node.call_count, 2)
+            self.assertFalse(plugin._gates["imu"].status()["ready"])
+            plugin.stop()
+            monitors[1].destroy_node.assert_called_once()
 
     def test_status_monitor_fails_closed_for_dead_or_stale_worker(self):
         module = self.load_bridge_module()

@@ -150,22 +150,25 @@ The MID360 converter accepts only little-endian, tightly packed PointCloud2 rows
 (`row_step == width * point_step`). Big-endian clouds, organized clouds with row
 padding, and undersized rows are dropped instead of being decoded incorrectly.
 
-The `navigation_imu` tool declares `format=sensor/imu`. Its native ROS message
+The `lidar_imu` tool declares `format=sensor/imu`. Its native ROS message
 uses quaternion orientation, angular velocity in rad/s, linear acceleration in
 m/s², and the three standard 3×3 covariance arrays. PhanthyMotus PR #141
 subscribes to this native type and converts it to the versioned
 `phanthy.sensor.imu.v1` dashboard payload without changing the ROS topic.
 
-Both cards share this single worker. Stopping either `navigation_lidar` or
-`navigation_imu` stops both streams and releases the MID360 worker; starting
-either card starts a fresh shared worker again.
+`lidar_cloud` exposes the unchanged legacy cloud first, plus the standard
+PointCloud2 on port `navigation_lidar`. `lidar_imu` exposes the MID360 IMU;
+the existing body `imu` card is unchanged. Each card stops only its own outputs.
+The isolated worker remains alive while either standard output is enabled and
+is released when both stop. Restart discards queued frames from the old epoch.
 
 LiDAR and IMU retain their shared MID360 source clock and are normalized into
 one ROS system-time domain. Samples are dropped while clock offset estimation
 is not ready or after an invalid/reset observation; the Driver never invents a
 source timestamp. The fixed upside-down mounting rotation is applied equally
 to cloud and IMU. The existing `/ubuntu/lidar/cloud` legacy card remains
-enabled for Canvas and safety consumers.
+available for Canvas. Safety uses `/ubuntu/lidar/cloud_internal`, produced from
+the same conversion independently of the public card's publishing gate.
 
 Navigation consumers such as LiDAR-inertial mapping and path planning can bind
 to these topics without the Driver naming or selecting a specific algorithm.
@@ -181,12 +184,26 @@ The RealSense plugin keeps the legacy `/ubuntu/camera/rgb` compressed image,
 exposes two latest-only, BEST_EFFORT self-describing frame streams. They are
 general sensor/data-collection outputs and are not coupled to navigation:
 
-- `camera_rgb_frame` → `/ubuntu/camera/rgb_frame` —
+- `camera_rgb`, port `rgb_frame` → `/ubuntu/camera/rgb_frame` —
   `phanthy.sensor.camera_rgb_frame.v1`;
-- `camera_depth_frame` → `/ubuntu/camera/depth_frame` —
+- `camera_depth`, port `depth_frame` → `/ubuntu/camera/depth_frame` —
   `phanthy.sensor.camera_depth_frame.v1`.
 
-Both use `std_msgs/msg/UInt8MultiArray` as a transport for the `PSE1` binary
+Stopping a camera card gates both its legacy and envelope outputs, not its
+sibling, distance, or photo/video capture. Capture uses an on-demand internal
+JPEG channel. With no active outputs or capture requests, the shared process
+pauses hardware capture. A stop timeout is an error, never an idle success.
+
+Migration: replace saved Canvas `navigation_lidar` with `lidar_cloud`'s
+`navigation_lidar` port; `navigation_imu` with `lidar_imu`; `camera_rgb_frame`
+with `camera_rgb`'s `rgb_frame`; `camera_depth_frame` with `camera_depth`'s
+`depth_frame`. The old card names are not aliases. Topic subscribers need no
+wire migration. Existing outputs retain their position and metadata; all topic
+names, types, QoS, schemas and calibration/time semantics remain unchanged.
+Consumer/Canvas migration is a separate task. Hardware/ROS acceptance for this
+consolidation is pending; local tests are not a deployment claim.
+
+Both frame streams use `std_msgs/msg/UInt8MultiArray` as a transport for the `PSE1` binary
 envelope: a fixed little-endian header (`magic`, JSON metadata length, binary
 payload length), canonical JSON metadata, then JPEG or zlib level-1 losslessly
 compressed little-endian Z16 bytes. Depth metadata declares the codec in

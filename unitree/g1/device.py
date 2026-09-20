@@ -1356,7 +1356,10 @@ class LocoStatePlugin:
         return self._node
 
     def start(self) -> None:
-        pass  # DDS subscription starts in __init__
+        with self._lifecycle_lock:
+            if self._node is None:
+                self._node = _LidarNode(self._cloud_topic)
+                self._executor.add_node(self._node)
 
     def stop(self) -> None:
         pass
@@ -2505,6 +2508,11 @@ class _LidarNode(Node):
         super().__init__("g1_lidar")
         from std_msgs.msg import UInt8MultiArray
         self._cloud_pub = self.create_publisher(UInt8MultiArray, cloud_topic, _LOW_LAT_QOS)
+        from sensor_output import OutputGate
+        self.output_gate = OutputGate()
+        self._safety_pub = self.create_publisher(
+            UInt8MultiArray, cloud_topic + "_internal", _LOW_LAT_QOS)
+        self._closing = threading.Event()
         self._last_cloud_time: float = 0.0
         self._imu_roll:  float = 0.0
         self._imu_pitch: float = 0.0
@@ -2546,6 +2554,9 @@ class _LidarNode(Node):
         """DDS callback — throttle and enqueue for worker thread.
         Runs directly in CycloneDDS receive thread (queueLen=0).
         """
+        if self._closing.is_set():
+            return
+        token = self.output_gate.token()
         self._cb_count += 1
         now = time.monotonic()
         if now - self._last_cloud_time < LIDAR_CLOUD_INTERVAL:
@@ -2563,7 +2574,7 @@ class _LidarNode(Node):
         # Non-blocking put; drop frame if worker is busy
         try:
             self._cloud_queue.put_nowait((point_step, total_points, data,
-                                         self._imu_roll, self._imu_pitch))
+                                         self._imu_roll, self._imu_pitch, token))
         except queue.Full:
             self._cb_dropped += 1
 
@@ -2582,11 +2593,14 @@ class _LidarNode(Node):
         """Worker thread: gravity alignment + publish (off the DDS receive thread)."""
         import array as _array
         from std_msgs.msg import UInt8MultiArray
-        while True:
-            item = self._cloud_queue.get()
+        while not self._closing.is_set():
+            try:
+                item = self._cloud_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
             if item is None:
                 break
-            point_step, total_points, data, roll, pitch = item
+            point_step, total_points, data, roll, pitch, token = item
             t0 = time.monotonic()
 
             # Apply gravity alignment (returns bytearray, avoids extra copy)
@@ -2599,11 +2613,22 @@ class _LidarNode(Node):
             buf[8:] = data
             ros_msg = UInt8MultiArray()
             ros_msg.data = _array.array('B', buf)
-            self._cloud_pub.publish(ros_msg)
+            self._safety_pub.publish(ros_msg)
+            self.output_gate.publish(token, self._cloud_pub, ros_msg)
 
             elapsed_ms = (time.monotonic() - t0) * 1000
             self._worker_count += 1
             self._worker_total_ms += elapsed_ms
+
+    def close(self):
+        self._closing.set()
+        for name in ("_cloud_sub", "_livox_imu_sub"):
+            subscriber = getattr(self, name, None)
+            if subscriber is not None:
+                subscriber.Close()
+        self._worker.join(timeout=2.0)
+        if self._worker.is_alive():
+            raise TimeoutError("lidar_worker_shutdown_timeout")
 
     def _on_livox_imu(self, msg) -> None:
         """Compute roll/pitch from Livox IMU accelerometer (co-located with lidar, inverted mount)."""
@@ -2621,8 +2646,11 @@ class _LidarNode(Node):
 class LidarPlugin:
     PREFIX = "lidar"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor, navigation=None):
         self._cloud_topic = f"/{namespace}/lidar/cloud"
+        self._navigation = navigation
+        self._executor = executor
+        self._lifecycle_lock = threading.RLock()
         self._node = _LidarNode(self._cloud_topic)
         executor.add_node(self._node)
 
@@ -2636,7 +2664,8 @@ class LidarPlugin:
             "multiInstance": False,
             "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
+            "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]
+                         + ([self._navigation.cloud_descriptor()] if self._navigation else []),
             "configSchema": {
                 "type": "object",
                 "properties": {},
@@ -2647,15 +2676,37 @@ class LidarPlugin:
         pass  # DDS subscription starts in __init__
 
     def stop(self) -> None:
-        pass
+        with self._lifecycle_lock:
+            if self._node is None:
+                return
+            self._node.close()
+            self._executor.remove_node(self._node)
+            self._node.destroy_node()
+            self._node = None
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]}
+        if action in {"start", "stop", "info"}:
+            with self._lifecycle_lock:
+                try:
+                    if action == "start":
+                        self.start()
+                    if self._node is None:
+                        return {"state": "idle", "ready": False,
+                                "topic_out": self._cloud_tool()["topic_out"]}
+                    if action != "info":
+                        self._node.output_gate.set_enabled(action == "start")
+                        if self._navigation:
+                            self._navigation.set_output("cloud", action == "start")
+                    outputs = {"legacy": self._node.output_gate.status(500)}
+                    if self._navigation:
+                        outputs["navigation"] = self._navigation.output_status("cloud")
+                    idle = all(o["state"] == "idle" for o in outputs.values())
+                    ready = all(o["ready"] for o in outputs.values())
+                    return {"state": "idle" if idle else ("ready" if ready else "not_ready"),
+                            "ready": ready, "outputs": outputs,
+                            "topic_out": self._cloud_tool()["topic_out"]}
+                except (TimeoutError, OSError) as exc:
+                    return {"state": "error", "ready": False, "error": str(exc)}
         return None
 
 
@@ -4028,7 +4079,7 @@ RS_DIST_INTERVAL = 0.1  # 10 Hz for distance JSON
 
 
 class _CameraFrameNode(Node):
-    """Cache the existing camera_rgb JPEG stream for persistent capture."""
+    """Cache the internal JPEG stream independently of public camera outputs."""
 
     def __init__(self, color_topic: str):
         from sensor_msgs.msg import CompressedImage
@@ -4059,6 +4110,10 @@ class _CameraFrameNode(Node):
                 "frame_sequence": self._sequence,
             }
             self._condition.notify_all()
+
+    def clear(self):
+        with self._condition:
+            self._latest = None
 
     def wait_for_frame(self, after_sequence=None, timeout_s=5.0):
         deadline = time.monotonic() + max(0.0, timeout_s)
@@ -4094,21 +4149,25 @@ class RealSensePlugin:
         self._status = {"state": "idle"}
         self._executor = executor
         self._frame_node = None
+        from sensor_output import OutputGate
+        self._gates = {name: OutputGate() for name in (
+            "camera_rgb", "camera_depth", "camera_distance")}
+        self._gates["capture"] = OutputGate(False)
+        self._requested_outputs = {name: name != "capture" for name in self._gates}
+        self._lifecycle_lock = threading.RLock()
+        self._capture_waiters = 0
         self._ensure_frame_node()
 
     def _ensure_frame_node(self) -> None:
         """Create the cache subscription once for this plugin lifecycle."""
         if self._frame_node is not None:
             return
-        node = _CameraFrameNode(self._color_topic)
+        node = _CameraFrameNode(self._color_topic + "_internal")
         self._executor.add_node(node)
         self._frame_node = node
 
     def get_tools(self) -> list:
-        tools = [self._color_tool(), self._depth_tool(), self._dist_tool()]
-        if self._config.get("frame_enabled", True):
-            tools.extend([self._rgb_frame_tool(), self._depth_frame_tool()])
-        return tools
+        return [self._color_tool(), self._depth_tool(), self._dist_tool()]
 
     def _color_tool(self) -> dict:
         return {
@@ -4117,7 +4176,8 @@ class RealSensePlugin:
             "multiInstance": False,
             "description": f"RealSense color camera — {RS_COLOR_W}x{RS_COLOR_H} JPEG @ {RS_COLOR_FPS}fps. Publishes CompressedImage to {self._color_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}],
+            "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]
+                         + self._frame_outputs("rgb"),
         }
 
     def _depth_tool(self) -> dict:
@@ -4127,7 +4187,8 @@ class RealSensePlugin:
             "multiInstance": False,
             "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 (z16, mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}],
+            "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]
+                         + self._frame_outputs("depth"),
         }
 
     def _dist_tool(self) -> dict:
@@ -4140,41 +4201,17 @@ class RealSensePlugin:
             "topic_out": [{"topic": self._dist_topic, "format": "data/json"}],
         }
 
-    def _rgb_frame_tool(self) -> dict:
-        from camera_frame import ENVELOPE_FORMAT, RGB_SCHEMA
-
-        return {
-            "name": "camera_rgb_frame",
-            "type": "sensor",
-            "multiInstance": False,
-            "description": "Self-describing RealSense RGB frames with source/receive timing, "
-                           "intrinsics, and LiDAR/base-to-camera calibration metadata.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{
-                "topic": self._rgb_frame_topic,
-                "format": ENVELOPE_FORMAT,
-                "ros_type": "std_msgs/msg/UInt8MultiArray",
-                "schema": RGB_SCHEMA,
-            }],
-        }
-
-    def _depth_frame_tool(self) -> dict:
-        from camera_frame import DEPTH_SCHEMA, ENVELOPE_FORMAT
-
-        return {
-            "name": "camera_depth_frame",
-            "type": "sensor",
-            "multiInstance": False,
-            "description": "Self-describing RealSense depth frames with source/receive timing, "
-                           "depth scale, intrinsics, and RGB/LiDAR/base extrinsics.",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{
-                "topic": self._depth_frame_topic,
-                "format": ENVELOPE_FORMAT,
-                "ros_type": "std_msgs/msg/UInt8MultiArray",
-                "schema": DEPTH_SCHEMA,
-            }],
-        }
+    def _frame_outputs(self, stream) -> list:
+        from camera_frame import DEPTH_SCHEMA, ENVELOPE_FORMAT, RGB_SCHEMA
+        if not self._config.get("frame_enabled", True):
+            return []
+        return [{
+            "port": f"{stream}_frame",
+            "topic": self._rgb_frame_topic if stream == "rgb" else self._depth_frame_topic,
+            "format": ENVELOPE_FORMAT,
+            "ros_type": "std_msgs/msg/UInt8MultiArray",
+            "schema": RGB_SCHEMA if stream == "rgb" else DEPTH_SCHEMA,
+        }]
 
     def _drain_status(self) -> dict:
         if self._status_q is not None:
@@ -4192,24 +4229,36 @@ class RealSensePlugin:
         return result
 
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._start_capture_process()
+
+    def _start_capture_process(self) -> None:
         import multiprocessing as mp
         # A stopped plugin may be started again in the same driver process.
         # Recreate the cache node that stop() explicitly destroyed.
         self._ensure_frame_node()
         if self._proc is not None and self._proc.is_alive():
             return
+        from sensor_output import OutputGate
+        self._gates = {name: OutputGate(on) for name, on in self._requested_outputs.items()}
+        if self._status_q is not None:
+            self._status_q.close()
         ctx = mp.get_context("spawn")
         self._status_q = ctx.Queue(maxsize=1)
         self._status = {"state": "starting"}
         self._proc = ctx.Process(
             target=run_realsense_process,
-            args=(self._namespace, self._config, self._status_q),
+            args=(self._namespace, self._config, self._status_q, self._gates),
             name="realsense", daemon=True,
         )
         self._proc.start()
         print(f"[bundle] RealSense capture forked → pid={self._proc.pid}")
 
     def stop(self) -> None:
+        with self._lifecycle_lock:
+            self._stop_capture_process()
+
+    def _stop_capture_process(self) -> None:
         if self._proc is not None and self._proc.is_alive():
             self._proc.terminate()
             self._proc.join(timeout=3.0)
@@ -4240,28 +4289,50 @@ class RealSensePlugin:
         return self._proc is not None and self._proc.is_alive()
 
     def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
-        node = self._frame_node
-        if node is None:
-            return None, 0
-        return node.wait_for_frame(after_sequence, timeout_s)
+        with self._lifecycle_lock:
+            if timeout_s <= 0:
+                return (self._frame_node.wait_for_frame(after_sequence, 0)
+                        if self._frame_node is not None else (None, 0))
+            self._start_capture_process()
+            node = self._frame_node
+            if self._capture_waiters == 0:
+                node.clear()
+                self._gates["capture"].set_enabled(True)
+                self._requested_outputs["capture"] = True
+            self._capture_waiters += 1
+        try:
+            return node.wait_for_frame(after_sequence, timeout_s)
+        finally:
+            with self._lifecycle_lock:
+                self._capture_waiters -= 1
+                if self._capture_waiters == 0:
+                    self._gates["capture"].set_enabled(False)
+                    self._requested_outputs["capture"] = False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            tool_name = args.get('_tool_name', '')
-            status = self._drain_status()
-            if tool_name == 'camera_depth':
-                return {**status, "topic_out": [{"topic": self._depth_topic, "format": "image/depth-z16"}]}
-            if tool_name == 'camera_distance':
-                return {**status, "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
-            if tool_name == 'camera_rgb_frame':
-                return {**status, "topic_out": self._rgb_frame_tool()["topic_out"]}
-            if tool_name == 'camera_depth_frame':
-                return {**status, "topic_out": self._depth_frame_tool()["topic_out"]}
-            return {**status, "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
+        if action in {"start", "stop", "info"}:
+            with self._lifecycle_lock:
+                name = args.get("_tool_name", "camera_rgb")
+                tools = {tool["name"]: tool for tool in self.get_tools()}
+                if name not in tools:
+                    return {"state": "error", "error": "unknown_camera_tool"}
+                try:
+                    if action != "info":
+                        if not self.is_running():
+                            from sensor_output import OutputGate
+                            self._gates = {key: OutputGate(on) for key, on in self._requested_outputs.items()}
+                        self._gates[name].set_enabled(action == "start")
+                        self._requested_outputs[name] = action == "start"
+                    if action == "start":
+                        self._start_capture_process()
+                    status = self._drain_status()
+                    output = self._gates[name].status()
+                    ready = output["ready"] and self.is_running() and status.get("state") == "running"
+                    return {**status, **output, "ready": ready,
+                            "state": "idle" if not output["enabled"] else ("ready" if ready else "not_ready"),
+                            "topic_out": tools[name]["topic_out"]}
+                except (TimeoutError, OSError) as exc:
+                    return {"state": "error", "ready": False, "error": str(exc)}
         return None
 
 
@@ -4269,6 +4340,7 @@ def run_realsense_process(
     namespace: str,
     plugin_config: dict | None = None,
     status_q=None,
+    gates=None,
 ) -> None:
     """RealSense subprocess entry — independent GIL for full 1080p@15fps throughput.
 
@@ -4280,6 +4352,11 @@ def run_realsense_process(
     # ROS/native initialization, or any child-process output.
     from common import logsafe
     logsafe.install(check_fd=False)
+    from sensor_output import OutputGate
+    if gates is None:
+        gates = {name: OutputGate() for name in (
+            "camera_rgb", "camera_depth", "camera_distance")}
+        gates["capture"] = OutputGate(False)
 
     from array import array
     import os
@@ -4326,6 +4403,7 @@ def run_realsense_process(
         def __init__(self, color_topic, depth_topic, dist_topic):
             super().__init__("g1_realsense")
             self._color_pub = self.create_publisher(CompressedImage, color_topic, _QOS)
+            self._capture_pub = self.create_publisher(CompressedImage, color_topic + "_internal", _QOS)
             self._depth_pub = self.create_publisher(Image, depth_topic, _QOS)
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
             self._rgb_frame_pub = (
@@ -4560,6 +4638,12 @@ def run_realsense_process(
         def _ensure_capture(self):
             if self._shutting_down:
                 return
+            # token() intentionally drops samples on a busy publication lock;
+            # that must not be mistaken for absence of an acquisition demand.
+            if not any(g.acquisition_requested() for g in gates.values()):
+                if self._pipeline is not None:
+                    self.stop_capture(reconnecting=True)
+                return
             if self._pipeline is None:
                 self.start_capture()
                 return
@@ -4599,8 +4683,10 @@ def run_realsense_process(
         def _depth_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    depth_np, stamp, timing, receive_mono_ns, calibration, sequence = self._depth_q.get(timeout=0.5)
+                    depth_np, stamp, timing, receive_mono_ns, calibration, sequence, token = self._depth_q.get(timeout=0.5)
                 except queue.Empty:
+                    continue
+                if token != gates["camera_depth"].token():
                     continue
                 try:
                     msg = Image()
@@ -4612,7 +4698,9 @@ def run_realsense_process(
                     msg.is_bigendian = 0
                     msg.step = depth_np.shape[1] * 2
                     msg.data = depth_np.tobytes()
-                    self._depth_pub.publish(msg)
+                    if not gates["camera_depth"].publish(
+                            token, self._depth_pub, msg, record=self._depth_frame_pub is None):
+                        continue
                 except Exception as e:
                     self._record_error(
                         "legacy_publish_errors",
@@ -4642,8 +4730,8 @@ def run_realsense_process(
                     envelope = encode_envelope(metadata, payload)
                     frame_msg = UInt8MultiArray()
                     frame_msg.data = array("B", envelope)
-                    self._depth_frame_pub.publish(frame_msg)
-                    self._diagnostics["depth_frame_published"] += 1
+                    if gates["camera_depth"].publish(token, self._depth_frame_pub, frame_msg):
+                        self._diagnostics["depth_frame_published"] += 1
                 except Exception as e:
                     self._record_error(
                         "frame_publish_errors",
@@ -4653,8 +4741,11 @@ def run_realsense_process(
         def _color_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    color_np, stamp, timing, receive_mono_ns, calibration, sequence = self._color_q.get(timeout=0.5)
+                    color_np, stamp, timing, receive_mono_ns, calibration, sequence, token, capture_token = self._color_q.get(timeout=0.5)
                 except queue.Empty:
+                    continue
+                if (token != gates["camera_rgb"].token()
+                        and capture_token != gates["capture"].token()):
                     continue
                 try:
                     ok, jpg = cv2.imencode(".jpg", color_np, [cv2.IMWRITE_JPEG_QUALITY, RS_JPEG_QUALITY])
@@ -4670,7 +4761,13 @@ def run_realsense_process(
                     cmsg.header.frame_id = "camera_color_optical_frame"
                     cmsg.format = "jpeg"
                     cmsg.data = payload
-                    self._color_pub.publish(cmsg)
+                    if not gates["capture"].publish(capture_token, self._capture_pub, cmsg):
+                        # Keep the existing passive cache warm while RGB is on;
+                        # an explicit capture request also works with RGB off.
+                        gates["camera_rgb"].publish(token, self._capture_pub, cmsg, record=False)
+                    if not gates["camera_rgb"].publish(
+                            token, self._color_pub, cmsg, record=self._rgb_frame_pub is None):
+                        continue
                 except Exception as e:
                     self._record_error(
                         "legacy_publish_errors",
@@ -4697,8 +4794,8 @@ def run_realsense_process(
                     envelope = encode_envelope(metadata, payload)
                     frame_msg = UInt8MultiArray()
                     frame_msg.data = array("B", envelope)
-                    self._rgb_frame_pub.publish(frame_msg)
-                    self._diagnostics["rgb_frame_published"] += 1
+                    if gates["camera_rgb"].publish(token, self._rgb_frame_pub, frame_msg):
+                        self._diagnostics["rgb_frame_published"] += 1
                 except Exception as e:
                     self._record_error(
                         "frame_publish_errors",
@@ -4707,6 +4804,7 @@ def run_realsense_process(
 
         def _on_frame(self, frame):
             try:
+                tokens = {name: gate.token() for name, gate in gates.items()}
                 if not frame.is_frameset():
                     return
                 fs = frame.as_frameset()
@@ -4718,7 +4816,7 @@ def run_realsense_process(
                 self._last_frame_monotonic = time.monotonic()
                 self._diagnostics["framesets"] += 1
 
-                if color_frame:
+                if color_frame and (tokens["camera_rgb"] is not None or tokens["capture"] is not None):
                     color_np = np.asanyarray(color_frame.get_data())
                     color_timing = self._timing(color_frame, "rgb", receive_unix_ns)
                     self._sequence["rgb"] += 1
@@ -4730,6 +4828,7 @@ def run_realsense_process(
                     self._color_q.put_nowait((
                         color_np, stamp, color_timing, receive_mono_ns,
                         self._rgb_calibration, self._sequence["rgb"],
+                        tokens["camera_rgb"], tokens["capture"],
                     ))
 
                 dist = 0.0
@@ -4738,6 +4837,7 @@ def run_realsense_process(
                         depth_frame.get_width() // 2,
                         depth_frame.get_height() // 2,
                     )
+                if depth_frame and tokens["camera_depth"] is not None:
                     depth_np = np.array(depth_frame.get_data())
                     depth_timing = self._timing(depth_frame, "depth", receive_unix_ns)
                     self._sequence["depth"] += 1
@@ -4749,6 +4849,7 @@ def run_realsense_process(
                     self._depth_q.put_nowait((
                         depth_np, stamp, depth_timing, receive_mono_ns,
                         self._depth_calibration, self._sequence["depth"],
+                        tokens["camera_depth"],
                     ))
 
                 now = time.monotonic()
@@ -4758,7 +4859,7 @@ def run_realsense_process(
                     self._last_ts = now
                     out = _String()
                     out.data = json.dumps({"distance_m": round(dist, 3), "fps": round(fps, 1)})
-                    self._dist_pub.publish(out)
+                    gates["camera_distance"].publish(tokens["camera_distance"], self._dist_pub, out)
                 else:
                     self._last_ts = now
                 self._publish_status("running")

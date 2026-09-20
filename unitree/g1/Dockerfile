@@ -71,6 +71,7 @@ COPY navigation_sensor_bridge_main.py /work/navigation_sensor_bridge_main.py
 COPY navigation_pointcloud.py /work/navigation_pointcloud.py
 COPY navigation_time.py /work/navigation_time.py
 COPY camera_frame.py /work/camera_frame.py
+COPY sensor_output.py /work/sensor_output.py
 COPY calibration/ /work/calibration/
 COPY test_slam_rpc.py /work/test_slam_rpc.py
 COPY config.yaml /work/config.yaml
