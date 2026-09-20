@@ -19,7 +19,7 @@ from velocity_proposal import (
 )
 
 
-EXPECTED_TOPIC = "/ubuntu/navigation/nav2/velocity_proposal"
+EXPECTED_TOPIC = "/ubuntu/navigation/motion_sequence"
 G1_DIR = Path(__file__).resolve().parents[1]
 
 

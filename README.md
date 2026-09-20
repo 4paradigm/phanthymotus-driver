@@ -80,6 +80,11 @@ python main.py
 
 ### G1 Controlled Navigation Velocity
 
+The sole proposal topic is `/ubuntu/navigation/motion_sequence`; the port name
+remains `velocity_proposal`. Publishers and Canvas connections must migrate from
+`/ubuntu/navigation/nav2/velocity_proposal`; the old topic is not subscribed.
+Only the topic name changes, not the message schema or execution semantics.
+
 The G1 `loco` actuator accepts a lease-bound
 `phanthy.navigation.velocity_proposal.v1` input. Valid proposals are executed
 through a reliable `KEEP_LAST(depth=1)` subscription and a capacity-one

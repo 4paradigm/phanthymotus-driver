@@ -13,7 +13,7 @@ from typing import Any, Mapping, Optional
 
 
 VELOCITY_PROPOSAL_SCHEMA = "phanthy.navigation.velocity_proposal.v1"
-DEFAULT_VELOCITY_PROPOSAL_TOPIC = "/ubuntu/navigation/nav2/velocity_proposal"
+DEFAULT_VELOCITY_PROPOSAL_TOPIC = "/ubuntu/navigation/motion_sequence"
 TERMINAL_STATUSES = {
     "paused",
     "arrived",

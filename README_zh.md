@@ -72,6 +72,11 @@ python main.py
 
 ### G1 受控导航速度执行
 
+唯一提案 topic 为 `/ubuntu/navigation/motion_sequence`，端口名仍为
+`velocity_proposal`。发布端与 Canvas 连线需从
+`/ubuntu/navigation/nav2/velocity_proposal` 迁移，Driver 不再订阅旧 topic。
+本次仅修改 topic 名称，消息 schema 和执行语义不变。
+
 G1 `loco` actuator 接收由导航 lease 约束的
 `phanthy.navigation.velocity_proposal.v1` 输入。订阅端使用可靠的
 `KEEP_LAST(depth=1)`，执行端使用容量为 1 的 latest-only 队列：未读取

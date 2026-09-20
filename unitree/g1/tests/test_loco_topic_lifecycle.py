@@ -179,7 +179,7 @@ class LocoTopicLifecycleTest(unittest.TestCase):
             {}, "ubuntu", executor=None, loco_client=self.client,
             smart_motion=self.smart_motion,
         )
-        self.topic = "/ubuntu/navigation/nav2/velocity_proposal"
+        self.topic = "/ubuntu/navigation/motion_sequence"
         self.nav_id = "nav-001"
 
     def test_tool_exposes_velocity_proposal_input(self):

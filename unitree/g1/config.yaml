@@ -13,7 +13,7 @@ plugins:
     enabled: true
   loco:
     enabled: true
-    # Canvas start subscribes to the sole N5 proposal topic. While idle, the
+    # Canvas start subscribes to /ubuntu/navigation/motion_sequence. While idle, the
     # first fresh legal nonzero proposal atomically binds its nav_id.
     velocity_proposal_enabled: true
     velocity_proposal_driver_authorized: true
