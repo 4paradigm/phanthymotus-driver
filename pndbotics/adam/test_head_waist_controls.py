@@ -112,6 +112,10 @@ class HeadWaistSchemaTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(control.calls[-1], (("neckYaw", "neckPitch"), None))
 
+    def test_lifecycle_stop_reports_idle(self):
+        plugin = HeadControlPlugin(_FakeControl())
+        self.assertEqual(plugin.stop(), {"state": "idle"})
+
 
 class _RecordingUpperBodyController(UpperBodyLowcmdController):
     def __init__(self):
@@ -243,6 +247,32 @@ class BundleRegistrationTests(unittest.TestCase):
         )
         self.assertNotIn("head_gesture", names)
         self.assertNotIn("waist_gesture", names)
+
+    def test_bundle_disables_pro_only_controls_for_other_variants(self):
+        config = {
+            "variant": "sp",
+            "plugins": {
+                "state": {"enabled": False},
+                "estop": {"enabled": False},
+                "loco": {"enabled": False},
+                "camera": {"enabled": False},
+                "vision_capture": {"enabled": False},
+                "arm": {"enabled": False},
+                "hand": {"enabled": False},
+                "hand_state": {"enabled": False},
+                "model": {"enabled": False},
+                "head": {"enabled": True},
+                "waist": {"enabled": True},
+            },
+        }
+        bundle = AdamDeviceBundle(
+            config, "", None, None, ros2_enabled=False,
+            dds_lowcmd_pub=object(), dds_upper_body_lowstate_sub=object(),
+        )
+        names = [tool["name"] for tool in bundle.get_all_tools()]
+        self.assertNotIn("head_control", names)
+        self.assertNotIn("waist_control", names)
+        self.assertIsNone(bundle._upper_body_control)
 
 
 if __name__ == "__main__":

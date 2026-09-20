@@ -1161,7 +1161,7 @@ class AxisControlPlugin:
         return {"state": "ready"}
 
     def stop(self):
-        return {"state": "ready"}
+        return {"state": "idle"}
 
     @staticmethod
     def _duration(args):
@@ -3343,6 +3343,13 @@ class AdamDeviceBundle:
 
         head_enabled = plugins_cfg.get("head", {}).get("enabled", False)
         waist_enabled = plugins_cfg.get("waist", {}).get("enabled", False)
+        if (head_enabled or waist_enabled) and variant != "pro":
+            print(
+                "[adam] WARNING: head/waist controls require variant=pro; "
+                f"disabled for variant={variant}"
+            )
+            head_enabled = False
+            waist_enabled = False
         if head_enabled or waist_enabled:
             self._upper_body_control = UpperBodyLowcmdController(
                 plugins_cfg.get("upper_body_control", {}),
