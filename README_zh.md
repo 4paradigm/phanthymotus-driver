@@ -128,6 +128,9 @@ velocity proposal 合同与 `loco.move` 输入边界保持一致：前后和横�
 `/ubuntu/navigation/imu`（`Imu`）。两路数据保留 MID360 共享源时钟并统一
 归一化到 ROS system time；时钟未就绪、重置或样本无效时直接丢弃，不伪造
 源时间戳。
+各导航流归一化后的时间戳重复或倒序时丢弃，不用上一帧加一伪造新样本。
+诊断分别记录 `cloud_non_increasing_timestamps` 和
+`imu_non_increasing_timestamps`；后续严格递增的样本可正常恢复。
 点云转换只接受小端且满足 `row_step == width * point_step` 的紧凑行布局；
 大端、带行 padding 或行长不足的有组织点云会被丢弃，避免错误解码。
 

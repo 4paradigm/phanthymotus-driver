@@ -7,6 +7,8 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
+# Replace the unavailable inherited Ubuntu Ports mirror; dependency set is unchanged.
+# The added runtime source/calibration COPY entries below are the intended image growth.
 RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
         -exec sed -i \
             -e "s|http://mirrors.tencentyun.com/ubuntu-ports|${UBUNTU_PORTS_MIRROR}|g" \

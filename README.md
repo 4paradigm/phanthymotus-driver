@@ -158,6 +158,11 @@ The MID360 converter accepts only little-endian, tightly packed PointCloud2 rows
 (`row_step == width * point_step`). Big-endian clouds, organized clouds with row
 padding, and undersized rows are dropped instead of being decoded incorrectly.
 
+For each navigation stream, duplicate or decreasing normalized timestamps are
+dropped, never clamped to manufacture a newer measurement. Diagnostics count
+these as `cloud_non_increasing_timestamps` / `imu_non_increasing_timestamps`;
+subsequent strictly increasing samples can resume normally.
+
 The `lidar_imu` tool declares `format=sensor/imu`. Its native ROS message
 uses quaternion orientation, angular velocity in rad/s, linear acceleration in
 m/s², and the three standard 3×3 covariance arrays. PhanthyMotus PR #141

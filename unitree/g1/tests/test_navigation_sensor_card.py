@@ -431,27 +431,33 @@ class NavigationSensorCardContractTest(unittest.TestCase):
         self.assertIn("invalid imu timestamp count=200", messages[2])
         self.assertIn("invalid cloud timestamp count=1", messages[3])
 
-    def test_duplicate_imu_timestamps_are_strictly_increasing(self):
+    def test_duplicate_and_decreasing_corrected_stamps_are_dropped(self):
         module = self.load_bridge_module()
         node = module._NavigationSensorNode.__new__(module._NavigationSensorNode)
         node._clock_offset = mock.Mock()
-        node._clock_offset.correct_observation.return_value = 123456789
         node._last_stamp_ns = {"cloud": 0, "imu": 0}
         node._stamp_lock = threading.Lock()
         node._counters = {
-            "imu_invalid_timestamps": 0,
-            "stamp_clamped": 0,
+            "cloud_non_increasing_timestamps": 0,
+            "imu_non_increasing_timestamps": 0,
         }
         node.get_clock = lambda: types.SimpleNamespace(
             now=lambda: types.SimpleNamespace(nanoseconds=987654321)
         )
         stamp = types.SimpleNamespace(sec=1, nanosec=2)
 
-        first = node._correct_stamp(stamp, "imu")
-        second = node._correct_stamp(stamp, "imu")
-
-        self.assertEqual(second, first + 1)
-        self.assertEqual(node._counters["stamp_clamped"], 1)
+        for stream in ("cloud", "imu"):
+            with self.subTest(stream=stream):
+                node._clock_offset.correct_observation.side_effect = [
+                    100, 100, 99, 101,
+                ]
+                self.assertEqual(node._correct_stamp(stamp, stream), 100)
+                self.assertIsNone(node._correct_stamp(stamp, stream))
+                self.assertIsNone(node._correct_stamp(stamp, stream))
+                self.assertEqual(node._last_stamp_ns[stream], 100)
+                self.assertEqual(node._counters[
+                    f"{stream}_non_increasing_timestamps"], 2)
+                self.assertEqual(node._correct_stamp(stamp, stream), 101)
 
 
 if __name__ == "__main__":

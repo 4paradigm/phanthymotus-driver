@@ -164,7 +164,8 @@ class _NavigationSensorNode(Node):
             "imu_dropped": 0,
             "cloud_invalid_timestamps": 0,
             "imu_invalid_timestamps": 0,
-            "stamp_clamped": 0,
+            "cloud_non_increasing_timestamps": 0,
+            "imu_non_increasing_timestamps": 0,
         }
         self._last_receive_monotonic = {"cloud": 0.0, "imu": 0.0}
 
@@ -220,8 +221,9 @@ class _NavigationSensorNode(Node):
             return None
         with self._stamp_lock:
             if corrected_ns <= self._last_stamp_ns[stream]:
-                corrected_ns = self._last_stamp_ns[stream] + 1
-                self._counters["stamp_clamped"] += 1
+                # Never relabel a delayed/duplicate measurement as fresh data.
+                self._counters[f"{stream}_non_increasing_timestamps"] += 1
+                return None
             self._last_stamp_ns[stream] = corrected_ns
         return corrected_ns
 
