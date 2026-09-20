@@ -58,6 +58,24 @@ def scenario_dirs(config: dict) -> list[Path]:
     return [BUNDLE_DIR / "scenarios", Path(external)]
 
 
+def map_dirs(config: dict) -> list[Path]:
+    """地图目录。和 `scenario_dirs` 对称：镜像里那份在前，bind-mount 的在后，后者覆盖。
+
+    没有这一条的时候，两个默认目录都在镜像里（`maps/` 与 `maps/user/`），而
+    `build_plugins` 建卡时也不传 `map_dirs` —— 于是加一张地图必须重建镜像，尽管
+    `SimScenarioCard.maps()` 的文档写着「丢一份进 bind-mount 的目录，刷新画布就能选到」。
+    场景可以热加，地图不行，而两者在 UI 上长得一样。
+
+    热加是要紧的，因为 agent 换地图走的是导航卡的 `list_maps` / `load_map`（和真机
+    上技能的第 0 步同名）—— 那条路每次调用都重扫目录，所以新地图丢进来就能被它看到。
+    """
+    configured = (config.get("scenario") or {}).get("map_dirs")
+    if configured:
+        return [Path(entry) for entry in configured]
+    external = os.environ.get("SIM_MAP_DIR", "/opt/phanthy-motus/data/sim/maps")
+    return [BUNDLE_DIR / "maps", BUNDLE_DIR / "maps" / "user", Path(external)]
+
+
 def build_world(config: dict, clock=None) -> VirtualWorld:
     world = VirtualWorld(LocalBackend(), clock or RealClock(), config.get("world") or {})
     world.reset({
@@ -85,7 +103,8 @@ def build_plugins(config: dict, namespace: str, ros2=None) -> list:
             continue
         if card_cls is SimScenarioCard:
             scenario_card = SimScenarioCard(world, config, namespace, ros2,
-                                            scenario_dirs=scenario_dirs(config))
+                                            scenario_dirs=scenario_dirs(config),
+                                            map_dirs=map_dirs(config))
             cards.append(scenario_card)
             continue
         if card_cls is SimReportCard:
