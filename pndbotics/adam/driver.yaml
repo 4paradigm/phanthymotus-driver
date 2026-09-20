@@ -26,7 +26,6 @@ cards:
   - { name: loco,               type: actuator }
   - { name: motion,             type: actuator }
   - { name: arm_control,        type: actuator }
-  - { name: arm_gesture,        type: actuator }
   - { name: waist_control,       type: actuator }
   - { name: head_control,        type: actuator }
   - { name: hand,               type: actuator }

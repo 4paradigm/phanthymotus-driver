@@ -1680,11 +1680,12 @@ class ArmControlPlugin:
     }
 
     def get_tool(self) -> dict:
-        actions = list(self._GROUP_JOINTS)
+        actions = [*self._GROUP_JOINTS, "reset"]
         action_options = [
             {"const": action, "title": title}
             for action, title in self._GROUP_TITLES.items()
         ]
+        action_options.append({"const": "reset", "title": "回到起始手臂角度"})
         side_ranges = {
             side: {
                 "pitch_deg": (-207.0, 117.0, "前后摆"),
@@ -1758,6 +1759,10 @@ class ArmControlPlugin:
                 "description": self._GROUP_TITLES[action],
             }
             for action, params in group_params.items()
+        }
+        action_params["reset"] = {
+            "params": ["duration_s"],
+            "description": "回到开始控制时的手臂角度。",
         }
         return {
             "name": "arm_control",
@@ -2020,6 +2025,26 @@ class ArmControlPlugin:
             return {"state": "ready"}
         if action == "stop":
             return self._stop_and_wait()
+        if action == "reset":
+            error = self._ready_error()
+            if error:
+                return error
+            if self._hold_q is None:
+                return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
+                        "message": "No startup arm pose captured yet"}
+            targets = {
+                joint: self._hold_q[self._joint_index(joint)]
+                for _, joint, _, _ in ARM_JOINT_CONTROLS.values()
+            }
+            span, span_error = self._preferred_span(args)
+            if span_error:
+                return span_error
+            error = self._set_targets(targets, preferred_span=span)
+            if error:
+                return error
+            return {"success": True, "state": "active", "action": "reset",
+                    "joints_set": len(targets), "duration_s": span,
+                    "protocol": "rt/lowcmd"}
         if action == "get_state":
             return self._joint_state()
         # Compound shoulder/elbow/wrist verbs land in the same segment as a
@@ -4988,17 +5013,13 @@ class AdamDeviceBundle:
                 plugins_cfg.get("vision_capture", {}), camera_plugin))
 
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
-        # Build it first: arm_gesture binds its shapes through the hand_gesture
-        # card, so the gesture needs an instance to point at.
-        hand_gesture_plugin = None
         if hand_enabled:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
             self._plugins.append(p)
             if plugins_cfg.get("hand_gesture", {}).get("enabled", True):
-                hand_gesture_plugin = HandGesturePlugin(p)
-                self._plugins.append(hand_gesture_plugin)
+                self._plugins.append(HandGesturePlugin(p))
 
         # Direct upper-body control is DDS-only and intentionally remains
         # available when ROS2 is absent or isolated on the Jetson.
@@ -5011,9 +5032,6 @@ class AdamDeviceBundle:
                 variant=variant,
             )
             self._plugins.append(p)
-            if plugins_cfg.get("arm_gesture", {}).get("enabled", True):
-                self._plugins.append(
-                    ArmGesturePlugin(p, hand=hand_gesture_plugin))
             if plugins_cfg.get("waist", {}).get("enabled", True):
                 self._plugins.append(WaistControlPlugin(p))
             if plugins_cfg.get("head", {}).get("enabled", True):
