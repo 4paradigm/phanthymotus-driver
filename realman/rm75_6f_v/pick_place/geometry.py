@@ -1,8 +1,6 @@
 """Fixed-photo normalized positions and millimetre targets for the installed camera."""
 
-import json
 import math
-from pathlib import Path
 import zlib
 
 import numpy as np
@@ -72,9 +70,8 @@ def camera_point(depth, metadata, pixel):
 
 
 def load_targets(observation, config, endpoint, selected, displacement_mm=None):
-    path = Path(observation["metadata_path"])
-    metadata = json.loads(path.read_text())
-    if (metadata["observation_id"] != observation["observation_id"]
+    metadata = observation["metadata"]
+    if (metadata["observation_id"] != observation["result"]["observation_id"]
             or metadata["arm_endpoint"] != endpoint or metadata["config"] != config):
         raise ValueError("Photograph context changed; run observe again")
     if metadata.get("depth_aligned_to") != "color" or metadata.get("depth_encoding") != "zlib/uint16-le":
@@ -85,7 +82,7 @@ def load_targets(observation, config, endpoint, selected, displacement_mm=None):
     # Image center is (0, 0), +X right and +Y down. Include the outer edges at +1.
     pixels = [[min(round((x + 1) * width / 2), width - 1),
                min(round((y + 1) * height / 2), height - 1)] for x, y in selected]
-    depth = np.frombuffer(zlib.decompress(path.with_name("depth.zlib").read_bytes()), dtype="<u2").reshape(height, width)
+    depth = np.frombuffer(zlib.decompress(observation["depth_zlib"]), dtype="<u2").reshape(height, width)
     pose = vector(metadata["pose"], 6, "photograph pose")
     work = vector(metadata["frames"]["work"]["pose"], 6, "photograph work frame")
     anchor = rotation(work) @ np.asarray(pose[:3]) + work[:3]

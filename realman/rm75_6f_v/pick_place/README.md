@@ -59,7 +59,7 @@ MCP 总描述及各动作描述包含调用顺序、坐标约定、动作选择�
    填写 `delta_x=30、delta_y=0、confirm_motion=true`。放到照片中的指定位置时使用 `grab_to`；
    放在另一物体旁边时选择旁边空位，参照物中心不代表空位。
 4. 等待框架 ACP 完成通知。`status=completed` 且 `result.ok=true` 表示配置要求的动作链完成。
-   开启 `observe_after_transfer` 时，读取 `result.observation` 中的新照片和检测结果评估效果；
+   开启 `observe_after_transfer` 时，读取 `result.observation` 中的新观察编号和检测结果评估效果；
    关闭时结果明确跳过观察，如需验证效果或再次搬运则单独调用 `observe`。
    `grasp_checked=false` 表示卡片没有自动核验是否抓到物体，卡片不自行判断任务成功或自动重试。
 
@@ -67,7 +67,7 @@ MCP 总描述及各动作描述包含调用顺序、坐标约定、动作选择�
 动作结果中的 `observation_required=true` 表示没有有效新照片，**再次搬运前**需要重新观察。
 持物或停稳状态需要处理时（`recovery_required=true`），先人工处理，不直接从头重试或重新观察。
 其他情况下由调用方根据最新结果决定后续任务，不能把后续观察失败解释为物体没有移动。
-模型可直接使用结构化检测结果，无需读取本地照片文件、计算像素或查询异步任务。
+模型直接使用结构化检测结果，无需换算像素或查询异步任务。
 
 ## 配置
 
@@ -100,8 +100,9 @@ Driver 必须已连接并以 `live` 模式部署；只读部署会明确提示�
 从外部数据流保存一组 RGB-D 和物品列表，再核验采集期间的位姿与坐标系。
 全过程不操作夹爪，也不打开物理相机。
 
-成功时 ACP 上报 `status: "completed"`，`result` 包含照片路径、观察编号、拍摄时间、尺寸、
-元数据路径、`objects`、`count`、`objects_timestamp` 和 `synchronization`。
+成功时 ACP 上报 `status: "completed"`，`result` 包含观察编号、拍摄时间、尺寸、位姿、
+`objects`、`count`、`objects_timestamp` 和 `synchronization`。RGB、深度及标定只保存在
+本卡片内存中，供后续抓放使用；ACP 和 `info` 返回观察摘要，不包含图像字节或文件路径。
 ACP 结果中的 `observation_required: false` 表示本次照片可用于一次搬运。
 后台执行失败或取消时由 ACP 上报对应终态；并发调用在设备忙时被拒绝。
 `info.last_result` 和 `info.observation` 可查看最近结果；正常调用流程等待框架 ACP 通知，无需轮询。
@@ -117,7 +118,7 @@ ACP 结果中的 `observation_required: false` 表示本次照片可用于一次
 | Y | 照片上边缘 | 垂直中心 | 照片下边缘 | 向下 |
 
 与 VOP 的 `position` 定义一致：将同次观察的检测结果 `position[0]` 传给 `start_point_x`，
-`position[1]` 传给 `start_point_y` 即可，不需要大模型读取照片文件或换算像素。
+`position[1]` 传给 `start_point_y` 即可，不需要大模型换算像素。
 卡片按保存照片的实际宽高在内部换算：`pixel_x = round((x+1)*width/2)`、
 `pixel_y = round((y+1)*height/2)`；右/下边缘取整到尺寸边界时使用最后一个像素。
 例如 `1280×720` 照片中的 `(0.08, -0.079)` 对应像素 `(691, 332)`。
@@ -224,7 +225,7 @@ MCP 调用选择：需要放到照片中某个位置时使用 `grab_to`；需要
 - `observe_after_transfer`：本次实际使用的配置；关闭时返回 `observation={"skipped":true,"reason":"disabled"}`、
   `observation_required=true`，不是拍照失败。下一次搬运前须先 `observe`。
 - `observation.ok=true`：已返回观察位并刷新观察，包含 `observation_id`、`captured_at`、
-  `file_path`、`metadata_path`、`pose`、`objects/count` 和同步信息；结构与独立 `observe` 的结果一致。
+  `width/height`、`pose`、`objects/count` 和同步信息；结构与独立 `observe` 的结果一致。
 - 顶层 `observation_id` 标识本次搬运使用的旧照片；`observation.observation_id` 标识动作后的新照片。
   新照片同时成为 `info.observation`，`observation_required=false`，可供下一次搬运。
 - 抓放已完成而返回观察位或采集失败时，终态为 `error/cancelled`、`ok=false`、
@@ -298,25 +299,24 @@ RGB-D 配对及结果中的 `captured_at/depth_captured_at`。不使用本卡片
 结果用 `synchronization.mode=stationary_window` 明确表示静止窗口关联，不声称 VOP 与 RGB
 严格同帧。若要支持运动场景中的严格逐帧关联，检测输出还需携带原始图像时间戳/帧号。
 
-每次成功观察只保存一张接收到的 JPEG、一份对齐深度及一个物品列表快照。
-照片、深度、彩色内参、源相机标定和时间、拍照位姿、工作/工具坐标系及配置一起保存在
-保存目录的 `<观察编号>/` 中。后台输入流不会覆盖有效照片，也不会连续向大模型发送图像或物品列表。
-保存目录由 `config.yaml` 的 `vision_pick_and_drop.output_dir` 设置，默认路径为
-`/tmp/phanthy-motus/pick_place/realman`，位于容器自身的可写文件系统，不需要宿主机挂载。
-照片和深度供当前观察及后续抓放使用，返回的 `file_path/metadata_path` 是容器内路径。
-容器删除、重建后不保留这些文件，重新启动后必须重新观察。
+每次成功观察只在内存中保留一份 RGB-D 快照：一张接收到的 JPEG、一份对齐深度、
+物品列表、内参、源相机标定与时间、拍照位姿、工作/工具坐标系及配置。
+抓放直接读取这份快照，不创建照片文件、目录或存储挂载，也不需要输出目录配置。
+后台输入流不会覆盖有效快照，不连续向大模型发送照片或检测结果。
+新观察替换当前快照；消费、失效或停止后，卡片解除对快照的持有，正在执行的动作结束后释放其剩余引用。
+进程重启后必须重新观察。公开的结果摘要与私有快照隔离，读取或修改结果不会改变抓放依据。
 
 ## 生命周期与设备协调
 
 `cancel` 请求中止，`stop` 中止并释放本卡片的资源；不自动回程、释放夹爪或重试动作。
 失败或取消不产生可搬运的观察结果。若无法确认机械臂已停稳，会保留设备互斥并报告
 `motion_blocked`；检查设备后重启 Driver 才能解除该阻塞。
-重新观察、配置变化、输入重新绑定、输入来源变化或图像中断、停止或进程重启会使当前观察结果失效；已保存文件仍保留。
+重新观察、配置变化、输入重新绑定、输入来源变化或图像中断、停止或进程重启会使当前观察结果失效。
 任一搬运动作首次下发设备命令即使当前照片失效，命令报错或取消也不恢复旧照片。
 开启搬运后观察且新观察成功时，以新观察替换当前有效照片；关闭或新观察未完成时，下一次搬运须先 `observe`。
 若失败结果同时返回 `recovery_required=true`，先人工确认并安全处理，再重新观察。
 旧照片在同一设备互斥下被消费，不能通过切换 `grab_to` / `grab_by` 复用，
-也不会从已保存文件恢复。历史文件保留，当前有效照片仅指向最新成功观察。
+当前有效快照仅对应最新成功观察。
 ACP 终态结果及 `info` 中的 `observation_required` 表示下一次搬运是否需要重新观察。
 无有效照片时，搬运直接返回 `state: "error"`、`code: "OBSERVATION_REQUIRED"`、
 `observation_required: true`，不会下发设备命令。
