@@ -148,6 +148,33 @@ class U1CardContractTests(unittest.TestCase):
         self.assertTrue(hasattr(device, "AudioPlugin"))
         self.assertNotIn("AuthPlugin", vars(device))
 
+    def test_build_plugins_follow_plugin_contract(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            namespace="test",
+            mic_topic="/test/mic/audio",
+            add_playback_listener=lambda listener: None,
+        )
+        with mock.patch.object(device, "U1Nodes", return_value=nodes):
+            plugins = device.build_plugins({}, "test", object())
+
+        prefixes = [plugin.PREFIX for plugin in plugins]
+        self.assertEqual(prefixes, [
+            "lifecycle", "mic", "speaker", "audio", "expression",
+            "camera_rgb", "vision_capture", "doa_event",
+        ])
+        self.assertEqual(len(prefixes), len(set(prefixes)))
+        for plugin in plugins:
+            self.assertTrue(plugin.PREFIX)
+            self.assertTrue(callable(plugin.start))
+            self.assertTrue(callable(plugin.stop))
+            self.assertTrue(callable(plugin.dispatch))
+            result = plugin.dispatch("unknown", {})
+            self.assertTrue(result is None or isinstance(result, dict))
+            if hasattr(plugin, "get_tool"):
+                self.assertEqual(plugin.get_tool()["name"], plugin.PREFIX)
+
     def test_nodes_are_registered_with_the_matching_domain_executors(self):
         import device
 

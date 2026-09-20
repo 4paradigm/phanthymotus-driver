@@ -490,13 +490,15 @@ class U1Nodes:
 
 
 class MicPlugin:
+    PREFIX = "mic"
+
     def __init__(self, nodes: U1Nodes):
         self.nodes = nodes
         self.running = False
         self._enable_requested = False
 
     def get_tool(self):
-        return tool("mic", "sensor", "U1 Pro microphone array: live 16 kHz mono PCM audio for ASR.", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
+        return tool(self.PREFIX, "sensor", "U1 Pro microphone array: live 16 kHz mono PCM audio for ASR.", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
 
     def start(self):
         if self.running:
@@ -535,6 +537,8 @@ class MicPlugin:
 
 
 class SpeakerPlugin:
+    PREFIX = "speaker"
+
     def __init__(self, nodes: U1Nodes):
         self.nodes = nodes
         self.running = False
@@ -547,7 +551,7 @@ class SpeakerPlugin:
             "stop": ([], "Stop consuming the connected audio stream."),
             "info": ([], "Read speaker connection state."),
         }
-        return {"name": "speaker", "type": "actuator", "multiInstance": False, "description": "U1 Pro speaker. Connect an audio/pcm-16k stream such as TTS or mic audio, then start playback.", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "Connected audio/pcm-16k input topic"}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
+        return {"name": self.PREFIX, "type": "actuator", "multiInstance": False, "description": "U1 Pro speaker. Connect an audio/pcm-16k stream such as TTS or mic audio, then start playback.", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "Connected audio/pcm-16k input topic"}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
 
     def start(self):
         # The input topic is supplied by Agent Core when the stream is connected;
@@ -582,6 +586,8 @@ class SpeakerPlugin:
 
 
 class AudioPlugin:
+    PREFIX = "audio"
+
     def __init__(self, nodes: U1Nodes):
         self.nodes = nodes
         self.running = False
@@ -607,7 +613,7 @@ class AudioPlugin:
         }
         schema = action_schema(actions, properties)
         schema["x-completion"] = {"actions": ["play_action", "play_text"], "timeout": 120}
-        return tool("audio", "actuator", "U1 Pro preset motion and text playback. Use list_actions to discover motion IDs; play calls return queued and complete asynchronously from playback_state.", schema)
+        return tool(self.PREFIX, "actuator", "U1 Pro preset motion and text playback. Use list_actions to discover motion IDs; play calls return queued and complete asynchronously from playback_state.", schema)
 
     def start(self):
         self.running = True
@@ -692,8 +698,11 @@ class AudioPlugin:
 
 
 class EventPlugin:
+    PREFIX = "event"
+
     def __init__(self, nodes: U1Nodes, name: str, description: str):
         self.nodes, self.name, self.description = nodes, name, description
+        self.PREFIX = name
         self.running = False
 
     def get_tool(self):
@@ -724,6 +733,8 @@ class EventPlugin:
 class CameraRgbPlugin:
     """Expose the SDK video shared-memory stream as Agent Core JPEG frames."""
 
+    PREFIX = "camera_rgb"
+
     def __init__(self, nodes: U1Nodes, config: dict):
         self.nodes = nodes
         self.config = config
@@ -740,7 +751,7 @@ class CameraRgbPlugin:
 
     def get_tool(self):
         return tool(
-            "camera_rgb", "sensor",
+            self.PREFIX, "sensor",
             "U1 Pro RGB camera stream. Starts the documented vendor video stream, reads its shared-memory raw frames, and publishes JPEG images on the Agent Core camera topic.",
             _sensor_schema(),
             topic_out=[{"topic": self.topic, "format": "image/jpeg"}],
@@ -845,6 +856,8 @@ class CameraRgbPlugin:
 class VisionCapturePlugin:
     """Save fresh U1 JPEG frames and encode them as MP4 for Agent Core."""
 
+    PREFIX = "vision_capture"
+
     def __init__(self, camera: CameraRgbPlugin, config: dict):
         self.camera = camera
         self.config = dict(config or {})
@@ -879,7 +892,7 @@ class VisionCapturePlugin:
         })
         schema["x-completion"] = {"actions": ["record_video"], "timeout": int(self.max_seconds + 15)}
         return tool(
-            "vision_capture", "actuator",
+            self.PREFIX, "actuator",
             "U1 Pro RGB photo and video capture. Reuses camera_rgb, saves media under the configured shared data directory, and returns a channel-visible path.",
             schema,
         )
@@ -1111,6 +1124,8 @@ class VisionCapturePlugin:
 class ExpressionPlugin:
     """Semantic Agent card for vendor-provided face and local motions."""
 
+    PREFIX = "expression"
+
     def __init__(self, audio: AudioPlugin):
         self.audio = audio
         self.running = False
@@ -1128,7 +1143,7 @@ class ExpressionPlugin:
             "action_id": {"type": "string", "description": "Optional caller correlation ID."},
         })
         schema["x-completion"] = {"actions": ["play"], "timeout": 120}
-        return tool("expression", "actuator", "U1 Pro face and light motion control through vendor preset actions. Discover available motion IDs first; the card does not guess aliases because the vendor list is firmware-dependent.", schema)
+        return tool(self.PREFIX, "actuator", "U1 Pro face and light motion control through vendor preset actions. Discover available motion IDs first; the card does not guess aliases because the vendor list is firmware-dependent.", schema)
 
     def start(self):
         self.running = True
@@ -1161,6 +1176,8 @@ class ExpressionPlugin:
 class _LifecyclePlugin:
     """Close the shared ROS nodes after all functional cards have stopped."""
 
+    PREFIX = "lifecycle"
+
     def __init__(self, nodes: U1Nodes):
         self.nodes = nodes
         self.closed = False
@@ -1178,6 +1195,10 @@ class _LifecyclePlugin:
             return
         self.closed = True
         self.nodes.close()
+
+    def dispatch(self, action, args):
+        del action, args
+        return None
 
 
 def build_plugins(config: dict, namespace: str, ros) -> list:
