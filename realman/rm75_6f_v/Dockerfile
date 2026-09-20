@@ -21,15 +21,16 @@ RUN sed -i "s|http://mirrors.tencentyun.com/ubuntu-ports|${APT_MIRROR}|g" /etc/a
 # from Ubuntu's signed runtime package above; no target-architecture maintainer
 # script or libc trigger is bypassed. The target wheel uses the Linux V4L2
 # backend, but only the kernel ABI is needed: v4l-utils and a compiler remain
-# unnecessary. OpenCV only encodes JPEG frames; it needs no GUI backend.
+# unnecessary. OpenCV needs no GUI backend.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --only-binary=:all: \
     numpy==1.23.5 opencv-python-headless==4.11.0.86 pyrealsense2==2.56.5.9235
 
 WORKDIR /work
 COPY common/ /work/common/
 COPY vendor/Robotic_Arm/ /work/Robotic_Arm/
-COPY main.py device.py servo.py camera.py realsense.py vision_capture.py config.yaml driver.yaml /work/realman/rm75_6f_v/
+COPY main.py device.py hardware.py servo.py camera.py realsense.py vision_capture.py config.yaml driver.yaml /work/realman/rm75_6f_v/
 COPY resource/ /work/realman/rm75_6f_v/resource/
+COPY pick_place/ /work/realman/rm75_6f_v/pick_place/
 COPY deploy/ /deploy/
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
