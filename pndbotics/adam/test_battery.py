@@ -28,6 +28,9 @@ class BatteryPayloadTests(unittest.TestCase):
             "current": -3.5,
             "power": -161.7,
             "wh_accumulated": 87.25,
+            "percentage": None,
+            "percentage_available": False,
+            "percentage_message": "The Adam DDS BMS message does not provide state of charge",
             "status": "discharging",
             "source_topic": "rt/lowstate",
         })
@@ -39,6 +42,8 @@ class BatteryPayloadTests(unittest.TestCase):
         self.assertEqual(data["source_topic"], "rt/lowstate")
         self.assertIsNone(data["voltage"])
         self.assertIsNone(data["current"])
+        self.assertIsNone(data["percentage"])
+        self.assertFalse(data["percentage_available"])
 
 
 if __name__ == "__main__":
