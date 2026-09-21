@@ -75,9 +75,8 @@ import time
 from common.control import ControlSink, Verdict, parse_descriptor
 from common.control.kinematics import ArmChain, KinematicsError
 
-from arm_sdk import HANDBACK_S, TAKEOVER_S, ArmSdkChannel
+from arm_sdk import HANDBACK_S, LOW_STATE_TOPIC, TAKEOVER_S, ArmSdkChannel
 
-LOW_STATE_TOPIC = "rt/lowstate"
 URDF_PATH = "/work/resource/g1_model.urdf"
 
 # 末端取手掌根，不是腕。腕之后还有一段固定变换，拿腕当末端会让整条轨迹系统性地

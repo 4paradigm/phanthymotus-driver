@@ -26,6 +26,17 @@
     msg.motor_cmd[arm_joint].q/dq/kp/kd/tau     # 只写手臂那 14 个
 
 代价是接管和交还都要**渐变**，不能瞬间切 —— 见 `ramp`。
+
+── 接管之前必须先知道手臂在哪 ──────────────────────────────────────────────
+
+`LowCmd_` 这个消息里每个 `motor_cmd[i].q` 的默认值是 **0.0**，而 0 不是「不控制」，
+是「去零位」。所以 `open()` 如果只填 kp/kd 就开始渐入权重，发出去的是一条「双臂去
+全零位」的指令 —— 零位是手臂伸直贴体侧，而卡片启动时手臂通常不在那儿。表现是
+**一 start 两条胳膊就以 kp=300 在一秒内甩直**，而日志里什么都没有。
+
+所以 `open()` 先订一帧 `rt/lowstate`，拿实测关节角给 `q` 打底，并把它设成
+`_last_target`。**读不到就拒绝启动**：不知道手臂在哪就接管，正是最危险的那一种，
+而「拒绝」是唯一能让它变成一次可观察失败的处置。
 """
 
 from __future__ import annotations
@@ -35,6 +46,8 @@ import time
 
 ARM_SDK_TOPIC = "rt/arm_sdk"
 DEX1_CMD_TOPICS = {"left": "rt/dex1/left/cmd", "right": "rt/dex1/right/cmd"}
+# 实测关节角。接管前必须读到一帧，见 `_read_measured_arms`。
+LOW_STATE_TOPIC = "rt/lowstate"
 
 # G1_29_JointArmIndex：左臂 15..21，右臂 22..28。
 ARM_MOTOR_IDS = list(range(15, 29))
@@ -68,6 +81,11 @@ class ArmSdkChannel:
     直接收到的是同一种东西，这正是它能被两张卡片共用的原因。
     """
 
+    # 等一帧 `rt/lowstate` 的上限。它以 500 Hz 发，正常情况下第一帧在几毫秒内就到；
+    # 给到 2 秒是为了容忍 DDS 发现（joining 一个已有的 domain 要握手）。超时不重试
+    # —— 超时本身就说明这条链路不通，而在不通的链路上接管手臂是最坏的选择。
+    LOW_STATE_TIMEOUT_S = 2.0
+
     def __init__(self, *, send_crc: bool = True, grippers: bool = True,
                  waist: bool = False):
         self._send_crc = bool(send_crc)
@@ -80,14 +98,17 @@ class ArmSdkChannel:
         self._crc = None
         self._weight = 0.0
         self._last_target = None
+        self._measured_waist: dict = {}
+        self._low_state_sub = None
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 
     def open(self):
-        """建发布器。Dex1 的 idl 缺席时**拒绝启动**，不降级。
+        """建发布器，并用**实测关节角**给指令打底。
 
-        让一张声明了 16 维的卡片只驱动 14 维，是协商通过之后再静默少动两个自由度
-        —— 正是这套协议存在的理由。
+        两处都会拒绝启动而不是降级：Dex1 的 idl 缺席（让一张声明 16 维的卡片只驱动
+        14 维，是协商通过之后再静默少动两个自由度），以及读不到 `rt/lowstate`
+        （不知道手臂在哪就接管 —— 见模块文档）。
         """
         from unitree_sdk2py.core.channel import ChannelPublisher
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
@@ -112,6 +133,10 @@ class ArmSdkChannel:
                 publisher.Init()
                 gripper_pubs[side] = publisher
 
+        # **先读实测，再建消息。** 顺序是有意的：读失败就在建立任何发布器之后、
+        # 发出任何一条指令之前抛出，而 `_start` 会把卡片回滚成 idle。
+        measured = self._read_measured_arms()
+
         message = unitree_hg_msg_dds__LowCmd_()
         motor_ids = list(ARM_MOTOR_IDS)
         if self._waist:
@@ -128,6 +153,13 @@ class ArmSdkChannel:
                 message.motor_cmd[motor_id].kd = KD_ARM
             message.motor_cmd[motor_id].tau = 0.0
             message.motor_cmd[motor_id].dq = 0.0
+        # q 必须逐个填成实测值。漏掉它，默认的 0.0 就是「去零位」。
+        for motor_id, value in zip(ARM_MOTOR_IDS, measured):
+            message.motor_cmd[motor_id].q = float(value)
+        if self._waist:
+            # 腰同理。这里读到的是实测腰角，第一条真正的指令会覆盖它。
+            for name, motor_id in WAIST_MOTOR_IDS.items():
+                message.motor_cmd[motor_id].q = float(self._measured_waist.get(name, 0.0))
 
         crc = None
         if self._send_crc:
@@ -139,12 +171,57 @@ class ArmSdkChannel:
             self._gripper_pubs = gripper_pubs
             self._message = message
             self._crc = crc
+            # 渐入期间 `ramp` 重发的就是它 —— 也就是手臂此刻所在的位置。
+            self._last_target = list(measured)
 
     def close(self):
         with self._lock:
             self._arm_pub = None
             self._gripper_pubs = {}
             self._last_target = None
+            self._low_state_sub = None
+
+    def _read_measured_arms(self):
+        """等一帧 `rt/lowstate`，返回 14 个臂关节的实测角（左 7 + 右 7）。
+
+        **纯读，不发布任何东西。** 它唯一的作用是回答「接管的那一刻，手臂在哪」，
+        而这个问题没有安全的默认答案：`LowCmd_` 里 `q` 的默认值 0.0 是「去零位」，
+        不是「不动」。
+
+        读不到就抛 —— 调用方（`_start`）会把卡片回滚成 idle 并把原因报出去。这比
+        「用零位兜底」好，理由和这个仓库里每一条「拒绝而不是猜」一样：猜错的代价
+        不是一条报错，是手臂以 kp=300 甩到一个没人要求过的位置。
+        """
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+
+        received: dict = {}
+
+        def _on_state(message):
+            if "m" not in received:
+                received["m"] = message
+
+        subscriber = ChannelSubscriber(LOW_STATE_TOPIC, LowState_)
+        subscriber.Init(_on_state, 10)
+        self._low_state_sub = subscriber
+
+        deadline = time.monotonic() + self.LOW_STATE_TIMEOUT_S
+        while "m" not in received and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if "m" not in received:
+            raise RuntimeError(
+                f"{self.LOW_STATE_TIMEOUT_S:g} 秒内没有收到 {LOW_STATE_TOPIC} —— "
+                "拿不到实测关节角就不能接管手臂（指令里 q 的默认值 0.0 是「去零位」，"
+                "不是「不动」）。检查 NETWORK_INTERFACE 和机器人是否上电"
+            )
+
+        motors = received["m"].motor_state
+        measured = [float(motors[i].q) for i in ARM_MOTOR_IDS]
+        self._measured_waist = {
+            name: float(motors[motor_id].q)
+            for name, motor_id in WAIST_MOTOR_IDS.items()
+        }
+        return measured
 
     # ── 状态 ─────────────────────────────────────────────────────────────────
 
@@ -212,8 +289,10 @@ class ArmSdkChannel:
           而不是线性 —— 它前段更慢。
         - **交还**（1→0）渐出，是因为权重归零的那一刻手臂脱力。两秒是官方例程的值。
 
-        渐变期间发的是**最后一个被接受的目标**，没有目标就只发权重（关节字段保持
-        上一次的值，电机因此停在原地）。
+        渐变期间发的是**最后一个被接受的目标**。接管时那就是 `open()` 从
+        `rt/lowstate` 读回来的实测角 —— 也就是手臂此刻所在的位置，所以渐入期间它
+        停在原地。看门狗清掉目标之后（`forget_target`）则只发权重，关节字段保持
+        消息里上一次的值，同样是停在原地。
         """
         publisher, message = self._arm_pub, self._message
         if publisher is None or message is None:
