@@ -180,8 +180,9 @@ def test_the_wrists_get_the_weaker_gains(monkeypatch):
 
 
 class _FakeMotorState:
-    def __init__(self, q):
+    def __init__(self, q, mode=1):
         self.q = q
+        self.mode = mode
 
 
 class _FakeLowState:
@@ -326,3 +327,75 @@ def test_the_subscriber_is_closed_even_when_no_frame_arrives(monkeypatch):
     with pytest.raises(RuntimeError):
         channel_obj._read_measured_arms()
     assert closed == [True]
+
+
+def test_the_machine_type_is_echoed_back_or_the_robot_ignores_us(monkeypatch):
+    """`mode_machine` 是**硬件型号握手**，不回传机器人就静默忽略整条指令。
+
+    真机上证实过：G1 报 `mode_machine=4`，我们发默认的 0，于是权重渐入正常、
+    IK 残差 0.26 mm、`rt/arm_sdk` 照发，而手臂一动不动 —— 链路每一环都「成功」。
+    """
+    import types
+
+    class _Frame(_FakeLowState):
+        mode_machine = 4
+        mode_pr = 0
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            callback(_Frame())
+
+        def Close(self):  # noqa: N802
+            pass
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    c = arm_sdk.ArmSdkChannel(grippers=False)
+    c._read_measured_arms()
+    assert c._mode_machine == 4
+
+
+def test_a_joint_the_robot_does_not_have_refuses_the_start(monkeypatch):
+    """`mode == 0` 表示这个关节不存在或未使能。
+
+    实测的那台 G1 是 23dof/arm5：两条手臂的 wrist_pitch/wrist_yaw 都是 mode=0。
+    往它们写目标不报错，只会让手臂到不了 IK 解出来的位姿，而残差（在**模型**里
+    算的）一切正常 —— 残差校验的是求解器，不是机器人。
+    """
+    import types
+
+    class _Arm5Frame(_FakeLowState):
+        mode_machine = 10
+
+        def __init__(self):
+            super().__init__()
+            for i in (20, 21, 27, 28):        # 两侧 wrist_pitch / wrist_yaw
+                self.motor_state[i].mode = 0
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            callback(_Arm5Frame())
+
+        def Close(self):  # noqa: N802
+            pass
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    with pytest.raises(RuntimeError, match="mode=0"):
+        arm_sdk.ArmSdkChannel(grippers=False)._read_measured_arms()
