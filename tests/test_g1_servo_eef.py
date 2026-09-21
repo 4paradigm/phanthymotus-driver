@@ -566,3 +566,6 @@ def test_the_canvas_port_formats_match_the_cards_this_one_connects_to():
     spec = _card("23dof").get_tool()
     assert spec["topic_in"][0]["format"] == "control/eef"
     assert spec["topic_out"][0]["format"] == "state/joint"
+    # **话题名也要报出来，而且不能等 start。** 画布连线时上游卡片必须已经说得出
+    # 自己往哪儿发；没有的话报的是「连线缺少 topic」，读起来像上游坏了。
+    assert spec["topic_out"][0]["topic"] == "/g1/servo_eef/state"

@@ -393,6 +393,14 @@ class G1ServoEefPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  arm_client=None):
         self._ns = namespace
+        # **一个来源，两处使用。** 画布要上游卡片报出**话题名**才能连线，而这个
+        # 名字在 `_bind_inputs` 里是临时拼出来的、没有声明出去 —— 于是连线时报
+        # 「连线缺少 topic: servo_eef → vla，请检查上游卡片是否能报出输出话题」，
+        # 读起来像上游坏了，实际上是这张卡片从没说过自己往哪儿发。
+        #
+        # 它不需要等 start 才知道：名字只由命名空间决定。actucore 的 vla 卡片在
+        # 同一处也有一段注释说明这件事（"There is nothing to discover anyway"）。
+        self._state_topic = f"/{(namespace or '').strip('/') or 'g1'}/servo_eef/state"
         self._executor = executor
         config = plugin_config or {}
 
@@ -491,7 +499,8 @@ class G1ServoEefPlugin:
             # 报 `data/json` 在语义上不算错——载荷确实是 JSON——但它让这条反馈
             # 回路在画布上**根本连不上**，而且是静默的：拖放没反应，没提示也没
             # 日志。天轶的 servo.py 一直报的是 `state/joint`，本卡片此前和它不一致。
-            "topic_out": [{"format": "state/joint",
+            "topic_out": [{"topic": self._state_topic,
+                           "format": "state/joint",
                            "desc": "关节角与**当前末端位姿**（标准布局）"}],
         }
 
@@ -727,8 +736,7 @@ class G1ServoEefPlugin:
         node = Node("g1_servo_eef", context=None)
         node.create_subscription(String, topic, self._on_message, qos)
         node.create_timer(WATCHDOG_MS / 2000.0, self._tick)
-        state_pub = node.create_publisher(
-            String, f"/{self._ns.strip('/') or 'g1'}/servo_eef/state", 1)
+        state_pub = node.create_publisher(String, self._state_topic, 1)
         self._executor.add_node(node)
 
         self._subscribe_low_state()
