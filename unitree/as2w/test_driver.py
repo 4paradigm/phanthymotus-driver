@@ -50,7 +50,6 @@ def _install_device_stubs():
     channel.ChannelSubscriber = type("ChannelSubscriber", (), {})
     sys.modules["unitree_sdk2py.core.channel"] = channel
     dds = types.ModuleType("unitree_sdk2py.idl.unitree_go.msg.dds_")
-    dds.AudioData_ = type("AudioData_", (), {})
     dds.SportModeState_ = type("SportModeState_", (), {})
     sys.modules["unitree_sdk2py.idl.unitree_go.msg.dds_"] = dds
     sensor_dds = types.ModuleType("unitree_sdk2py.idl.sensor_msgs.msg.dds_")
@@ -205,6 +204,13 @@ class TestDriverContracts(unittest.TestCase):
         message = self.device._audio_chunk([0, 255, 3])
         self.assertEqual("audio/pcm-16k", message.format)
         self.assertEqual([0, 255, 3], message.data)
+
+    def test_mic_declares_robot_multicast_source(self):
+        mic = self.device.MicPlugin.__new__(self.device.MicPlugin)
+        mic._topic = "/test/mic/audio"
+        tool = mic.get_tool()
+        self.assertIn("robot-body microphone multicast", tool["description"])
+        self.assertEqual("audio/pcm-16k", tool["topic_out"][0]["format"])
 
     def test_mic_aggregates_small_audio_packets_to_asr_frame_size(self):
         node = self.device._MicNode.__new__(self.device._MicNode)

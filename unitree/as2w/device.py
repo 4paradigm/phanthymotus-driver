@@ -1,6 +1,8 @@
 """Unitree As2W driver plugins (official AS2 SDK SportClient)."""
 import json
 import math
+import socket
+import struct
 import threading
 import time
 from uuid import uuid4
@@ -10,7 +12,6 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from unitree_sdk2py.core.channel import ChannelSubscriber
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_, LowState_
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import AudioData_
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 
 
@@ -36,6 +37,9 @@ except ImportError:
 
 
 _STATE_PUBLISH_HZ = 60.0
+_MIC_GROUP = "239.168.123.161"
+_MIC_PORT = 5555
+_MIC_CHUNK_BYTES = 1024
 
 
 def _number(value, default=0.0):
@@ -752,198 +756,95 @@ def _audio_chunk(payload):
 
 
 class _MicNode:
-    """Republish AS2's robot microphone DDS stream as AudioChunk messages."""
+    """Republish AS2's robot-body audio multicast as AudioChunk messages."""
 
     def __init__(self, topic, config=None):
         from rclpy.node import Node
         self.node = Node("as2w_mic")
         self.topic = topic
         self.publisher = self.node.create_publisher(AudioChunk, topic, _LOW_LAT_QOS)
-        self.subscriber = None
-        self._subscribers = []
         self.state = "idle"
         self.packet_count = 0
         self.last_packet_ts = 0.0
         self.last_error = None
-        self._last_dds_packet_ts = 0.0
         self._config = config or {}
-        self._alsa_thread = None
-        self._alsa_stop = threading.Event()
+        self._socket = None
+        self._capture_thread = None
         self._publish_lock = threading.Lock()
         self._publish_buffer = bytearray()
-        self.backend = "dds"
+        self.backend = "robot_multicast"
 
     def start(self):
         if self.state == "running":
             return self.topic
-        topics = self._config.get(
-            "dds_topics", ["rt/audiosender", "rt/lf/audiosender", "rt/audio"])
-        if isinstance(topics, str):
-            topics = [topics]
-        self._subscribers = []
-        for topic in topics:
-            try:
-                subscriber = ChannelSubscriber(topic, AudioData_)
-                subscriber.Init(lambda msg, source=topic: self._on_audio(msg, source), 1)
-                self._subscribers.append(subscriber)
-            except Exception:
-                continue
-        self.subscriber = self._subscribers[0] if self._subscribers else None
         with self._publish_lock:
             self._publish_buffer.clear()
-        self._active_dds_topic = None
+        group = self._config.get("multicast_group", _MIC_GROUP)
+        port = int(self._config.get("multicast_port", _MIC_PORT))
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", port))
+            interface = self._config.get("multicast_interface", "")
+            if interface:
+                membership = struct.pack(
+                    "=4s4si", socket.inet_aton(group),
+                    socket.inet_aton("0.0.0.0"), socket.if_nametoindex(interface))
+            else:
+                membership = struct.pack("4s4s", socket.inet_aton(group),
+                                         socket.inet_aton("0.0.0.0"))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        except (OSError, ValueError) as exc:
+            if sock is not None:
+                sock.close()
+            self.state = "error"
+            self.last_error = f"robot microphone multicast unavailable: {str(exc)[:160]}"
+            return self.topic
+        sock.settimeout(0.5)
+        self._socket = sock
         self.state = "running"
-        if self._config.get("backend", "auto") in ("auto", "alsa"):
-            self._alsa_thread = threading.Thread(target=self._alsa_fallback,
-                                                 daemon=True, name="as2w-mic-alsa")
-            self._alsa_stop.clear()
-            self._alsa_thread.start()
+        self._capture_thread = threading.Thread(target=self._capture_loop,
+                                                 daemon=True, name="as2w-mic-udp")
+        self._capture_thread.start()
         return self.topic
 
     def stop(self):
-        for subscriber in self._subscribers:
+        sock = self._socket
+        self._socket = None
+        if sock is not None:
             try:
-                subscriber.Close()
+                sock.close()
             except Exception:
                 pass
-        self._subscribers = []
-        self.subscriber = None
-        self._alsa_stop.set()
-        if self._alsa_thread is not None:
-            self._alsa_thread.join(timeout=1)
-            self._alsa_thread = None
+        if self._capture_thread is not None:
+            self._capture_thread.join(timeout=1)
+            self._capture_thread = None
         self.state = "idle"
+
+    def _capture_loop(self):
+        while self._socket is not None:
+            try:
+                payload, _ = self._socket.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not payload:
+                continue
+            self._publish_pcm(payload)
+            self.last_packet_ts = time.monotonic()
+            self.backend = "robot_multicast"
+            self.last_error = None
 
     def _publish_pcm(self, payload):
         with self._publish_lock:
             self._publish_buffer.extend(payload)
-            while len(self._publish_buffer) >= 1024:
-                chunk = bytes(self._publish_buffer[:1024])
-                del self._publish_buffer[:1024]
+            while len(self._publish_buffer) >= _MIC_CHUNK_BYTES:
+                chunk = bytes(self._publish_buffer[:_MIC_CHUNK_BYTES])
+                del self._publish_buffer[:_MIC_CHUNK_BYTES]
                 self.publisher.publish(_audio_chunk(chunk))
                 self.packet_count += 1
-
-    def _on_audio(self, msg, source=None):
-        try:
-            payload = bytes(getattr(msg, "data", []))
-        except (TypeError, ValueError) as exc:
-            self.last_error = f"invalid audio packet from {source}: {str(exc)[:120]}"
-            return
-        if not payload:
-            return
-        # Subscribe to the firmware names used by different AS2 images, but
-        # publish from only one active source at a time if both are bridged.
-        now = time.monotonic()
-        active = getattr(self, "_active_dds_topic", None)
-        if active is not None and source != active and now - self.last_packet_ts < 1.0:
-            return
-        self._active_dds_topic = source
-        if self.backend == "alsa":
-            # Drop a partial fallback frame before resuming the firmware
-            # stream; never mix samples from two capture backends.
-            with self._publish_lock:
-                self._publish_buffer.clear()
-        self._publish_pcm(payload)
-        self.last_packet_ts = now
-        self._last_dds_packet_ts = now
-        self.backend = "dds"
-        self.last_error = None
-
-    def _alsa_fallback(self):
-        # AS2 firmware may advertise rt/audiosender without publishing it
-        # until its voice capture service is enabled. Use the board capture
-        # device in that case so the mic card remains useful on this hardware.
-        try:
-            import alsaaudio
-            # On the Jetson carrier, ALSA's first enumerated entry is often
-            # the synthetic `null` PCM. It returns meaningless silence and
-            # must never be selected as a microphone.
-            configured = self._config.get(
-                "alsa_device", "hw:CARD=tegrasndt210ref,DEV=0")
-            if configured != "auto":
-                devices = [configured]
-            else:
-                try:
-                    devices = list(alsaaudio.pcms(alsaaudio.PCM_CAPTURE))
-                except Exception:
-                    devices = []
-                devices += ["hw:CARD=tegrasndt210ref,DEV=0",
-                            "plughw:CARD=tegrasndt210ref,DEV=0",
-                            "hw:1,0", "plughw:1,0"]
-            devices = [device for device in devices if str(device).lower() != "null"]
-            devices = list(dict.fromkeys(devices))
-            pcm = None
-            sample_rate = 16000
-            channels = 1
-            for device in devices:
-                for rate, channel_count in ((16000, 1), (48000, 1), (48000, 2), (44100, 1)):
-                    candidate = None
-                    try:
-                        candidate = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NONBLOCK,
-                                                  device=device)
-                        candidate.setchannels(channel_count)
-                        candidate.setrate(rate)
-                        candidate.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-                        candidate.setperiodsize(512 if rate == 16000 else 1024)
-                        pcm = candidate
-                        sample_rate, channels = rate, channel_count
-                        break
-                    except Exception:
-                        if candidate is not None:
-                            try:
-                                candidate.close()
-                            except Exception:
-                                pass
-                if pcm is not None:
-                    break
-            if pcm is None:
-                self.last_error = "no usable ALSA capture device"
-                return
-        except Exception as exc:
-            self.last_error = f"ALSA fallback unavailable: {str(exc)[:120]}"
-            return
-        deadline = time.monotonic() + float(self._config.get("dds_grace_s", 2.0))
-        import audioop
-        audio_state = None
-        try:
-            while not self._alsa_stop.is_set():
-                try:
-                    length, data = pcm.read()
-                except Exception:
-                    # Non-blocking ALSA reports an empty period as EAGAIN on
-                    # some board images; keep polling without killing mic.
-                    self._alsa_stop.wait(0.01)
-                    continue
-                if length <= 0 or not data:
-                    self._alsa_stop.wait(0.01)
-                    continue
-                if time.monotonic() < deadline:
-                    continue
-                if time.monotonic() - self._last_dds_packet_ts < 1.0:
-                    # Prefer the firmware stream whenever it is alive. Keep
-                    # the ALSA device open so fallback resumes if DDS stops.
-                    continue
-                if self.backend == "dds":
-                    # DDS has gone quiet. Discard its incomplete frame once
-                    # before switching to ALSA so the PCM streams do not mix.
-                    with self._publish_lock:
-                        self._publish_buffer.clear()
-                    self.backend = "alsa"
-                if channels == 2:
-                    # Downmix little-endian signed stereo to mono.
-                    data = audioop.tomono(data, 2, 0.5, 0.5)
-                if sample_rate != 16000:
-                    data, audio_state = audioop.ratecv(data, 2, 1, sample_rate, 16000, audio_state)
-                self._publish_pcm(data)
-                self.last_packet_ts = time.monotonic()
-                self.backend = "alsa"
-                self.last_error = None
-        finally:
-            try:
-                pcm.close()
-            except Exception:
-                pass
-
 
 class MicPlugin:
     PREFIX = "mic"
@@ -955,7 +856,7 @@ class MicPlugin:
 
     def get_tool(self):
         return {"name": "mic", "type": "sensor", "multiInstance": False,
-                "description": f"As2W microphone DDS stream as PCM 16kHz/16bit/mono: {self._topic}",
+                "description": f"As2W robot-body microphone multicast as PCM 16kHz/16bit/mono: {self._topic}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
 
@@ -968,7 +869,10 @@ class MicPlugin:
     def dispatch(self, action, args):
         if action in ("start", "mic"):
             self._node.start()
-            return {"state": "running", "topic": self._topic}
+            result = {"state": self._node.state, "topic": self._topic}
+            if self._node.last_error:
+                result["error"] = self._node.last_error
+            return result
         if action == "stop":
             self._node.stop()
             return {"state": "idle"}
@@ -980,9 +884,10 @@ class MicPlugin:
                     "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
                     "packets": self._node.packet_count,
                     "backend": self._node.backend,
+                    "multicast": {"group": self._node._config.get("multicast_group", _MIC_GROUP),
+                                   "port": int(self._node._config.get("multicast_port", _MIC_PORT)),
+                                   "interface": self._node._config.get("multicast_interface", "auto")},
                     "packet_age_s": age,
-                    "dds_topics": list(self._node._config.get(
-                        "dds_topics", ["rt/audiosender", "rt/lf/audiosender", "rt/audio"])),
                     "error": getattr(self._node, "last_error", None)}
         return None
 
