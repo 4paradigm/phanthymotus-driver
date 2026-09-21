@@ -58,6 +58,8 @@ COPY controlled_spatial.py /work/controlled_spatial.py
 COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
 COPY servo.py /work/servo.py
+COPY arm_sdk.py /work/arm_sdk.py
+COPY servo_eef.py /work/servo_eef.py
 COPY test_slam_rpc.py /work/test_slam_rpc.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
@@ -74,3 +76,13 @@ ENV CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><O
 EXPOSE 15701
 
 CMD ["/bin/bash", "-c", "if command -v nvpmodel >/dev/null 2>&1; then nvpmodel -m 0 2>/dev/null; jetson_clocks 2>/dev/null; echo '[init] Jetson MAXN + clocks locked'; fi && source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-eth0}"]
+
+# ── IK：pinocchio ───────────────────────────────────────────────────────────
+#
+# `servo_eef` 解逆运动学要它。**加在文件末尾**是有意的：在开头插一个 ARG 或一条
+# RUN 会让它后面的每一层都失效，整个镜像重建一遍。
+#
+# 约 200 MB。只有 servo_eef 用得到，而那张卡默认关闭 —— 但装它而不是让 import 在
+# 运行时失败：一张声明了 eef_pose 却解不了 IK 的卡片，会收下位姿然后什么都不做，
+# 而画布上它看起来是在跑的。缺了它 `ArmChain` 会拒绝启动并写出包名。
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} pin

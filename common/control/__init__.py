@@ -29,14 +29,25 @@ Design notes and the reasoning behind each check:
 `phanthymotus/docs/vla-integration.md` § "通用控制接口".
 """
 
-from .descriptor import SCHEMA, Descriptor, Group, parse_descriptor
+from . import rotation
+from .descriptor import (
+    EEF_POSE_QUAT,
+    EEF_POSE_STRIDE,
+    SCHEMA,
+    Descriptor,
+    Group,
+    parse_descriptor,
+)
 from .sink import ControlSink, Outcome, Verdict
 
 __all__ = [
     "SCHEMA",
+    "EEF_POSE_STRIDE",
+    "EEF_POSE_QUAT",
     "Descriptor",
     "Group",
     "parse_descriptor",
+    "rotation",
     "ControlSink",
     "Outcome",
     "Verdict",
