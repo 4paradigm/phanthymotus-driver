@@ -122,6 +122,39 @@ HANDBACK_S = 2.0
 RAMP_HZ = 100.0
 
 
+def read_low_state_once(timeout_s: float = 2.0):
+    """等一帧 `rt/lowstate` 并**立刻关掉订阅**。纯读，不发布任何东西。
+
+    抽成模块函数，是因为有两个调用方：通道要用它拿接管前的实测角，卡片要用它判
+    机器人型号（arm5 还是 arm7）。各建一条用完即关的订阅，比让一方去问另一方要
+    缓存清楚 —— 缓存会过期，而这两处都要的是「此刻」。
+
+    读完就关：留着意味着一条 500 Hz 的订阅活到进程结束，而这个仓库里「孤儿订阅」
+    的历史是回调还在跑、ROS 图看着健康，直到某次 teardown 顺序出错把整层带走。
+    """
+    from unitree_sdk2py.core.channel import ChannelSubscriber
+    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+
+    received: dict = {}
+    subscriber = ChannelSubscriber(LOW_STATE_TOPIC, LowState_)
+    subscriber.Init(lambda message: received.setdefault("m", message), 10)
+    try:
+        deadline = time.monotonic() + timeout_s
+        while "m" not in received and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        try:
+            subscriber.Close()
+        except Exception:  # noqa: BLE001
+            pass
+    if "m" not in received:
+        raise RuntimeError(
+            f"{timeout_s:g} 秒内没有收到 {LOW_STATE_TOPIC}。"
+            "检查 NETWORK_INTERFACE 和机器人是否上电"
+        )
+    return received["m"]
+
+
 class ArmSdkChannel:
     """一条 arm_sdk 发布链路，外加两只 Dex1。
 
@@ -136,10 +169,13 @@ class ArmSdkChannel:
     LOW_STATE_TIMEOUT_S = 2.0
 
     def __init__(self, *, send_crc: bool = True, grippers: bool = True,
-                 waist: bool = False):
+                 waist: bool = False, driven_arm_ids=None):
         self._send_crc = bool(send_crc)
         self._grippers = bool(grippers)
         self._waist = bool(waist)
+        # 这台机器人真正要驱动的臂关节。23dof/arm5 的机器上 20/21/27/28 不存在，
+        # 把它们算进来会让下面的 mode 核对误判成「机器人坏了」。
+        self._driven_arm_ids = list(driven_arm_ids or ARM_MOTOR_IDS)
         self._lock = threading.RLock()
         self._arm_pub = None
         self._gripper_pubs: dict = {}
@@ -194,6 +230,8 @@ class ArmSdkChannel:
         motor_ids = list(ARM_MOTOR_IDS)
         if self._waist:
             motor_ids += sorted(WAIST_MOTOR_IDS.values())
+        motor_ids = [i for i in motor_ids
+                     if i in self._driven_arm_ids or i in WAIST_MOTOR_IDS.values()]
         for motor_id in motor_ids:
             if motor_id in WRIST_MOTOR_IDS:
                 message.motor_cmd[motor_id].kp = KP_WRIST
@@ -207,7 +245,7 @@ class ArmSdkChannel:
             message.motor_cmd[motor_id].tau = 0.0
             message.motor_cmd[motor_id].dq = 0.0
         # q 必须逐个填成实测值。漏掉它，默认的 0.0 就是「去零位」。
-        for motor_id, value in zip(ARM_MOTOR_IDS, measured):
+        for motor_id, value in zip(self._driven_arm_ids, measured):
             message.motor_cmd[motor_id].q = float(value)
         if self._waist:
             # 腰同理。这里读到的是实测腰角，第一条真正的指令会覆盖它。
@@ -288,22 +326,19 @@ class ArmSdkChannel:
         # **这台机器人真有这些关节吗。** `mode == 0` 表示不存在或未使能，而往一个
         # mode=0 的关节写目标不会报错，只会什么都不发生 —— 然后整条手臂到不了 IK
         # 解出来的那个位姿，而残差（在模型里算的）一切正常。
-        absent = [motor_id for motor_id in ARM_MOTOR_IDS
+        absent = [motor_id for motor_id in self._driven_arm_ids
                   if int(getattr(motors[motor_id], "mode", 1)) == 0]
         if self._waist:
             absent += [motor_id for motor_id in sorted(WAIST_MOTOR_IDS.values())
                        if int(getattr(motors[motor_id], "mode", 1)) == 0]
         if absent:
             raise RuntimeError(
-                f"这些关节报 mode=0（不存在或未使能）：{absent}。"
-                f"本机 mode_machine={self._mode_machine} —— 官方的 23dof/arm5 是 5 自由度"
-                "手臂 + 1 自由度腰，而这张卡和 resource/g1_model.urdf 是 29dof"
-                "（arm7 + 3 自由度腰）。往不存在的关节写目标不报错，只会让手臂到不了 "
-                "IK 解出来的位姿，而残差一切正常。要在这台机器人上跑，需要一份 "
-                "23dof 的 URDF 和相应的关节表"
+                f"要驱动的关节里有 mode=0（不存在或未使能）：{absent}。"
+                f"本机 mode_machine={self._mode_machine}。往不存在的关节写目标不报错，"
+                "只会让手臂到不了 IK 解出来的位姿，而残差一切正常 —— 所以这里拒绝"
             )
 
-        measured = [float(motors[i].q) for i in ARM_MOTOR_IDS]
+        measured = [float(motors[i].q) for i in self._driven_arm_ids]
         self._measured_waist = {
             name: float(motors[motor_id].q)
             for name, motor_id in WAIST_MOTOR_IDS.items()
@@ -341,7 +376,7 @@ class ArmSdkChannel:
             self._last_target = list(radians)
         if publisher is None or message is None:
             return
-        for motor_id, value in zip(ARM_MOTOR_IDS, radians):
+        for motor_id, value in zip(self._driven_arm_ids, radians):
             # 已经是弧度：descriptor 用的就是线上的单位，这里没有换算可以弄反。
             message.motor_cmd[motor_id].q = float(value)
         if waist is not None and self._waist:
@@ -394,7 +429,7 @@ class ArmSdkChannel:
             self._weight = max(0.0, min(1.0, blended))
             target = self._last_target
             if target is not None:
-                for motor_id, value in zip(ARM_MOTOR_IDS, target[:14]):
+                for motor_id, value in zip(self._driven_arm_ids, target):
                     message.motor_cmd[motor_id].q = float(value)
             self._write(message)
             time.sleep(period)

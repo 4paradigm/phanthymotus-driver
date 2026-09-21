@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT))
 from common.control import Verdict, parse_descriptor  # noqa: E402
 
 URDF = ROOT / "unitree" / "g1" / "resource" / "g1_model.urdf"
+URDF_23 = ROOT / "unitree" / "g1" / "resource" / "g1_23dof.urdf"
 
 pinocchio = pytest.importorskip(
     "pinocchio",
@@ -235,12 +236,17 @@ class _FakeChannel:
         self.forgotten += 1
 
 
-def _card(**config):
-    # 默认路径是容器里的 /work/resource/…，在这儿不成立。
-    config.setdefault("urdf", str(URDF))
+def _card(variant="29dof", **config):
+    """真机上型号由 `detect_variant` 从实测电机 mode 得出；测试里直接指定。
+
+    `urdf` 覆盖是给测试用的：默认路径是容器里的 `/work/resource/…`。
+    """
+    config.setdefault("urdf", str(URDF if variant == "29dof" else URDF_23))
     card = servo_eef.G1ServoEefPlugin(config, "g1", executor=None)
     card._channel = _FakeChannel()
-    card._chains = card._build_chains()
+    card._variant = variant
+    card._arm_motor_ids = servo_eef.VARIANTS[variant]["motors"]
+    card._chains = card._build_chains(variant)
     return card
 
 
@@ -249,8 +255,9 @@ def _pose_command(card, *, left=None, right=None, waist=(0.0, 0.0, 0.0)):
 
     手写坐标会让这些用例变成「我猜的那个点够不够得着」的测试。
     """
-    seed = (0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0)
-    extra = dict(zip(servo_eef.WAIST_JOINTS, waist))
+    # 种子长度跟着链走：29dof 七个，23dof 五个。
+    seed = (0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0)[:len(card._chains["left"].lower)]
+    extra = card._waist_extra(waist)
     poses = {side: list(card._chains[side].forward(seed, extra))
              for side in ("left", "right")}
     if left is not None:
@@ -366,3 +373,70 @@ def test_the_state_payload_carries_both_the_joints_and_the_end_effector_pose():
                             abs_tol=1e-9)
     # 时间戳取实测那一帧，不是现在 —— 报现在等于宣称通道刚刚更新过。
     assert payload["stamp_ms"] == 1_700_000_000_000
+
+
+# ── arm5：办公室那台 G1 是 23dof，而仓库原本只有 29dof 的 URDF ──────────────
+
+
+class _M:
+    def __init__(self, mode):
+        self.mode = mode
+
+
+def _modes(arm5: bool):
+    """35 个电机槽，arm5 时把两侧腕 pitch/yaw 标成 mode=0。"""
+    state = [_M(1) for _ in range(35)]
+    if arm5:
+        for i in (20, 21, 27, 28):
+            state[i].mode = 0
+    return state
+
+
+def test_the_variant_comes_from_the_robot_not_from_config():
+    """配置会写错，实测不会。两侧腕 pitch/yaw 缺席就是 arm5。"""
+    assert servo_eef.detect_variant(_modes(arm5=True)) == "23dof"
+    assert servo_eef.detect_variant(_modes(arm5=False)) == "29dof"
+
+
+def test_the_arm5_chain_has_five_joints_and_a_different_tip():
+    """23dof 的末端 link 在 URDF 里叫 `wrist_roll_rubber_hand`，不是
+    `hand_palm_link` —— 名字选错会在建链时就报错，这是好的。"""
+    card = _card("23dof")
+    chain = card._chains["left"]
+    assert len(chain.lower) == 5
+    assert servo_eef.VARIANTS["23dof"]["tips"]["left"] == "left_wrist_roll_rubber_hand"
+
+
+def test_the_descriptor_stays_19_dim_on_both_variants():
+    """**末端位姿是笛卡尔的 7 维，和手臂有几个自由度无关。**
+
+    所以动作空间两种机器人一样宽 —— 云端那个 19 维的标准布局在 arm5 上照样能接，
+    协商不会因为硬件少两个关节而失败。变的只是 IK 链。
+    """
+    for variant in ("29dof", "23dof"):
+        card = _card(variant)
+        assert card._descriptor.dof == 19
+        assert card._descriptor.eef_quat_offsets == (3, 11)
+
+
+def test_the_waist_triple_maps_onto_whatever_the_robot_has():
+    """标准向量的腰永远是 `[roll, pitch, yaw]`；23dof 只有 yaw。
+
+    丢掉另外两维不是在忽略指令 —— 它们已经被描述符的限位卡死在 ±0.02 rad，
+    所以那是一组已经被证明接近零的数。
+    """
+    waist = (0.01, -0.01, 0.42)
+    assert _card("23dof")._waist_extra(waist) == {"waist_yaw_joint": 0.42}
+    assert _card("29dof")._waist_extra(waist) == {
+        "waist_roll_joint": 0.01, "waist_pitch_joint": -0.01, "waist_yaw_joint": 0.42}
+
+
+def test_an_arm5_robot_solves_and_publishes_five_joints_per_arm():
+    """5 自由度解 6 自由度目标解不满，但残差在卡片阈值内 —— 真机离线验过 1.1–1.8 mm。"""
+    card = _card("23dof")
+    card._apply(_pose_command(card), None)
+
+    assert len(card._channel.arms) == 1
+    radians, waist = card._channel.arms[0]
+    assert len(radians) == 10, "arm5 每臂 5 个关节，两臂 10 个"
+    assert waist == [0.0, 0.0, 0.0]
