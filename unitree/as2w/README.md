@@ -6,7 +6,7 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `unitree_sdk2py.as2.sport.SportClient`: `Move`, `StopMove`, `StandUp`, `StandDown`,
 `BalanceStand`, `RecoveryStand`, `Damp`, `Euler`, `BodyHeight`, `BodyPosition`,
 `SwitchGait`, `SpeedLevel`, `SwitchJoystick`, `SetAutoRecovery`, `GetState`,
-`FrontFlip`, and `BackFlip`.
+`FrontFlip`, `BackFlip`, `HandStand`, and `BipedStand`.
 
 Run `python3 main.py <robot-interface>` on the robot network (normally `eth0`,
 the interface with a `192.168.123.x` address). The deployment explicitly sets
@@ -30,7 +30,7 @@ runtime dependencies and are required on both amd64 and aarch64.
 
 `duration=-1` starts a 10 Hz velocity command loop; `stop_move`, shutdown, and
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
-attitude inputs are clamped before reaching the robot. Special actions should only
+attitude inputs are clamped before reaching the robot. Special motions should only
 be invoked with a clear area and appropriate operator approval.
 
 The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
@@ -47,9 +47,16 @@ documented common RPC contract directly in an isolated CycloneDDS process. It
 requires the vendor `unitree_slam` service to be installed and already running
 on the robot or extension host; the driver does not start that service.
 
-`special_action` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
+`special_motion` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
 continuous `loco` control card.
+
+The multimedia cards use transports verified on As2W hardware. `speaker`
+streams PCM-16k through the A2 `voice` service, while `camera` publishes JPEG
+frames returned by the Go2-compatible `videohub` service. `mic` listens for the
+official A2 multicast stream at `239.168.123.161:5555`; when the robot's voice
+assistant / wake-up conversation mode is disabled, the card remains in a
+diagnostic `waiting` state and automatically recovers when packets appear.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.

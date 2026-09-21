@@ -271,16 +271,17 @@ class LocoPlugin:
         return None
 
 
-class SpecialActionPlugin:
+class SpecialMotionPlugin:
     """As2W-specific discrete motions provided by the official SportClient."""
-    PREFIX = "special_action"
+    PREFIX = "special_motion"
 
     def __init__(self, config, namespace, executor, proxy):
         self.proxy = proxy
+        self._active_posture = None
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
-        return {"name": "special_action", "type": "actuator", "multiInstance": False,
+        return {"name": "special_motion", "type": "actuator", "multiInstance": False,
                 "description": "As2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions},
@@ -295,18 +296,38 @@ class SpecialActionPlugin:
                         "biped_stand": {"params": ["enter", "confirm"], "description": "DANGEROUS biped stand; requires confirm=true."}}}}
 
     def start(self): pass
-    def stop(self): pass
+    def stop(self):
+        if self._active_posture == "handstand":
+            self.proxy.HandStand(0)
+        elif self._active_posture == "biped_stand":
+            self.proxy.BipedStand(0)
+        self._active_posture = None
 
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
-        if action == "stop": return {"state": "idle"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
         if action in ("front_flip", "back_flip", "handstand", "biped_stand") and not args.get("confirm", False):
-            return {"error": "special action requires confirm=true"}
+            return {"error": "special motion requires confirm=true"}
         if action == "front_flip": return {"ret": self.proxy.FrontFlip()}
         if action == "back_flip": return {"ret": self.proxy.BackFlip()}
-        if action == "handstand": return {"ret": self.proxy.HandStand(1 if args.get("enter", True) else 0)}
-        if action == "biped_stand": return {"ret": self.proxy.BipedStand(1 if args.get("enter", True) else 0)}
+        if action == "handstand":
+            enter = bool(args.get("enter", True))
+            ret = self.proxy.HandStand(1 if enter else 0)
+            if ret == 0: self._active_posture = "handstand" if enter else None
+            return {"ret": ret, "enter": enter}
+        if action == "biped_stand":
+            enter = bool(args.get("enter", True))
+            ret = self.proxy.BipedStand(1 if enter else 0)
+            if ret == 0: self._active_posture = "biped_stand" if enter else None
+            return {"ret": ret, "enter": enter}
         return None
+
+
+# Import compatibility for deployments that imported the old Python class.
+# Only the ``special_motion`` tool is advertised by the bundle.
+SpecialActionPlugin = SpecialMotionPlugin
 
 
 _AS2_JOINT_NAMES = [

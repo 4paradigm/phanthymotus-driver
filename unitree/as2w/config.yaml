@@ -3,7 +3,22 @@ robot_interface: eth0
 ros_namespace: ""
 plugins:
   loco: {enabled: true}
-  special_action: {enabled: true}
+  special_motion: {enabled: true}
+  mic:
+    enabled: true
+    group: "239.168.123.161"
+    port: 5555
+    startup_grace_s: 3
+    chunk_bytes: 1024
+  speaker:
+    enabled: true
+    buffer_ms: 300
+  camera:
+    enabled: true
+    backend: videohub
+    fps: 10
+    rpc_timeout: 1.0
+    retry_interval: 2.0
   state: {enabled: true}
   lidar:
     enabled: true
