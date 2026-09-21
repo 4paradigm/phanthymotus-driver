@@ -71,7 +71,7 @@ until a real depth source is identified.
 continuous `loco` control card.
 
 The RPC proxy runs sport, speaker-audio, LED-audio, and video clients in separate
-workers. State DDS callbacks only replace a latest-value cache; a 30 Hz publisher
+workers. State DDS callbacks only replace a latest-value cache; a 60 Hz publisher
 worker serializes and publishes the newest joint and locomotion samples instead
 of draining stale samples. The microphone first listens to the firmware audio
 topic aliases; when those streams are silent, the optional ALSA fallback tries
@@ -79,3 +79,22 @@ the board capture devices and publishes compliant 16 kHz mono PCM frames.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.
+
+Loco examples:
+
+```json
+{"action":"move","vx":0.3,"vy":0,"vyaw":0,"duration":2}
+{"action":"move","vx":0.2,"vy":0,"vyaw":0,"duration":-1}
+{"action":"stop_move"}
+{"action":"speed_level","speed_preset":"slow"}
+{"action":"auto_recovery","flag":true}
+{"action":"switch_joystick","flag":false}
+{"action":"left_side_gait","flag":true}
+```
+
+`flag` is not a generic parameter: it enables or disables automatic fall
+recovery, gives or removes joystick control, or enters/exits a side gait.
+`special_motion` requires `confirm: true`; flips are one-shot actions, while
+`handstand` and `biped_stand` use `enter: true` to enter and `enter: false` to
+exit. These motions are posture- and firmware-dependent and require a clear
+safety area.

@@ -338,6 +338,16 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(2, node._low_generation)
         publish.assert_not_called()
 
+    def test_loco_and_special_motion_describe_boolean_parameters(self):
+        loco = self.device.LocoPlugin.__new__(self.device.LocoPlugin)
+        loco_schema = loco.get_tool()["inputSchema"]
+        self.assertIn("Automatic fall recovery", loco_schema["x-action-params"]["auto_recovery"]["description"])
+        self.assertIn("joystick", loco_schema["x-action-params"]["switch_joystick"]["description"])
+        special = self.device.SpecialActionPlugin.__new__(self.device.SpecialActionPlugin)
+        special_schema = special.get_tool()["inputSchema"]
+        self.assertIn("enter", special_schema["x-action-params"]["handstand"]["params"])
+        self.assertIn("One-shot", special_schema["x-action-params"]["front_flip"]["description"])
+
     def test_loco_auto_balances_from_passive(self):
         proxy = _Proxy()
         proxy.state = "PASSIVE"

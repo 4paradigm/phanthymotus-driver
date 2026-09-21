@@ -35,7 +35,7 @@ except ImportError:
     pass
 
 
-_STATE_PUBLISH_HZ = 30.0
+_STATE_PUBLISH_HZ = 60.0
 
 
 def _number(value, default=0.0):
@@ -95,9 +95,12 @@ class _StateNode:
         self._stop_event = threading.Event()
         self._publisher_thread = threading.Thread(
             target=self._publish_loop, daemon=True, name="as2w-state-publish")
-        self._low.Init(self._on_low, 1)
-        self._bms.Init(self._on_bms, 1)
-        self._sport.Init(self._on_sport, 1)
+        # queueLen=1 in the bundled SDK rejects new samples when full; it is
+        # not a latest-value queue. LowState is high-rate, so consume it
+        # directly and let the callback replace the cached pointer.
+        self._low.Init(self._on_low, 0)
+        self._bms.Init(self._on_bms, 0)
+        self._sport.Init(self._on_sport, 0)
         executor.add_node(self.node)
         self._publisher_thread.start()
 
@@ -445,10 +448,10 @@ class LocoPlugin:
     def get_tool(self):
         actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
-                "description": "As2W locomotion. Velocity is clamped to vx [-1.5, 1.5] m/s, vy [-1, 1] m/s, yaw [-2, 2] rad/s. Stand actions are accepted first and report completion through ACP.", "inputSchema": {"type": "object", "properties": {
+                "description": "As2W locomotion. move uses vx forward/back m/s, vy lateral m/s, vyaw rotation rad/s, and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; balance_stand enables active balance; damp releases motor torque; recovery_stand is for fallen/down posture; speed_level accepts slow/normal/fast; body_height/body_position/euler are direct controller offsets. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity rad/s [-2, 2]"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
-                    "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Enable or disable the selected feature"}}, "required": ["action"],
+                    "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
                 "x-completion": {"actions": ["stand_up", "stand_down", "balance_stand", "recovery_stand"], "timeout": 20},
                 "x-action-params": {
                     "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with optional duration (-1 for continuous)."},
@@ -458,8 +461,8 @@ class LocoPlugin:
                     "damp": {"params": [], "description": "Damp motors."}, "euler": {"params": ["roll", "pitch", "yaw"], "description": "Set body attitude."},
                     "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set body height offset."},
                     "body_position": {"params": ["x", "y", "z", "yaw"], "description": "Set body position offset."},
-                    "switch_joystick": {"params": ["flag"], "description": "Enable or disable joystick."}, "left_side_gait": {"params": ["flag"], "description": "Enable left-side gait."},
-                    "right_side_gait": {"params": ["flag"], "description": "Enable right-side gait."}, "auto_recovery": {"params": ["flag"], "description": "Enable or disable auto recovery."},
+                    "switch_joystick": {"params": ["flag"], "description": "true hands control to the wireless joystick; false disables it."}, "left_side_gait": {"params": ["flag"], "description": "Enter or exit left-side gait; true enters, false exits."},
+                    "right_side_gait": {"params": ["flag"], "description": "Enter or exit right-side gait; true enters, false exits."}, "auto_recovery": {"params": ["flag"], "description": "Automatic fall recovery; true enables, false disables."},
                     "get_state": {"params": [], "description": "Read sport state."}}}}
     def start(self): pass
     def stop(self):
@@ -668,18 +671,18 @@ class SpecialActionPlugin:
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
         return {"name": "special_motion", "type": "actuator", "multiInstance": False,
-                "description": "As2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
+                "description": "AS2 special motions. Use only with a clear safety area and the firmware-required posture: front_flip/back_flip are one-shot flips; handstand/biped_stand enter or exit a sustained posture. confirm=true is mandatory.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions},
-                    "enter": {"type": "boolean", "description": "Enter or exit a sustained posture."},
-                    "confirm": {"type": "boolean", "description": "Required true for hazardous motions."}},
+                    "enter": {"type": "boolean", "description": "Only for handstand/biped_stand: true enters, false exits; omit for flips."},
+                    "confirm": {"type": "boolean", "description": "Safety acknowledgement; must be true."}},
                     "required": ["action"],
                     "x-is-dangerous": True,
                     "x-action-params": {
-                        "front_flip": {"params": ["confirm"], "description": "DANGEROUS forward flip; requires confirm=true."},
-                        "back_flip": {"params": ["confirm"], "description": "DANGEROUS backward flip; requires confirm=true."},
-                        "handstand": {"params": ["enter", "confirm"], "description": "DANGEROUS handstand; requires confirm=true."},
-                        "biped_stand": {"params": ["enter", "confirm"], "description": "DANGEROUS biped stand; requires confirm=true."}}}}
+                        "front_flip": {"params": ["confirm"], "description": "One-shot forward flip; normally requires BALANCE_STAND and confirm=true."},
+                        "back_flip": {"params": ["confirm"], "description": "One-shot backward flip; normally requires BALANCE_STAND and confirm=true."},
+                        "handstand": {"params": ["enter", "confirm"], "description": "Enter/exit handstand with enter=true/false and confirm=true."},
+                        "biped_stand": {"params": ["enter", "confirm"], "description": "Enter/exit biped stand with enter=true/false and confirm=true."}}}}
 
     def start(self): pass
     def stop(self): pass
@@ -852,7 +855,11 @@ class _MicNode:
         # device in that case so the mic card remains useful on this hardware.
         try:
             import alsaaudio
-            configured = self._config.get("alsa_device", "auto")
+            # On the Jetson carrier, ALSA's first enumerated entry is often
+            # the synthetic `null` PCM. It returns meaningless silence and
+            # must never be selected as a microphone.
+            configured = self._config.get(
+                "alsa_device", "hw:CARD=tegrasndt210ref,DEV=0")
             if configured != "auto":
                 devices = [configured]
             else:
@@ -860,7 +867,10 @@ class _MicNode:
                     devices = list(alsaaudio.pcms(alsaaudio.PCM_CAPTURE))
                 except Exception:
                     devices = []
-                devices += ["default", "plughw:1,0", "plughw:1,1", "hw:1,0", "hw:1,1"]
+                devices += ["hw:CARD=tegrasndt210ref,DEV=0",
+                            "plughw:CARD=tegrasndt210ref,DEV=0",
+                            "hw:1,0", "plughw:1,0"]
+            devices = [device for device in devices if str(device).lower() != "null"]
             devices = list(dict.fromkeys(devices))
             pcm = None
             sample_rate = 16000
@@ -1225,6 +1235,8 @@ class _CameraRgbNode:
         self.state = "idle"
         self.frames = 0
         self.last_frame_ts = 0.0
+        self.last_frame_interval_s = None
+        self.last_rpc_s = None
         self.last_error = None
 
     def start(self):
@@ -1247,7 +1259,9 @@ class _CameraRgbNode:
     def _loop(self):
         while not self._stop_event.is_set():
             try:
+                rpc_started = time.monotonic()
                 result = self.proxy.Video_GetImageSample()
+                self.last_rpc_s = time.monotonic() - rpc_started
             except Exception as exc:
                 self.last_error = str(exc)
                 self._stop_event.wait(self.period)
@@ -1262,6 +1276,8 @@ class _CameraRgbNode:
                 message.data = list(payload)
                 self.publisher.publish(message)
                 self.frames += 1
+                if self.last_frame_ts:
+                    self.last_frame_interval_s = time.monotonic() - self.last_frame_ts
                 self.last_frame_ts = time.monotonic()
                 self.last_error = None
             elif code != 0:
@@ -1298,6 +1314,8 @@ class CameraPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": self._node.state, "frames": self._node.frames,
+                    "last_frame_interval_s": self._node.last_frame_interval_s,
+                    "last_rpc_s": self._node.last_rpc_s,
                     "last_error": self._node.last_error,
                     "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
         return None

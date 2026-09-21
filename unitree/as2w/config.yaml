@@ -2,10 +2,12 @@ mcp_port: 15709
 robot_interface: eth0
 ros_namespace: ""
 plugins:
-  mic: {enabled: true, backend: auto, alsa_device: auto, dds_grace_s: 0.5}
+  # AS2 firmware currently publishes no audiosender DDS packets on the
+  # observed unit. Use the physical Jetson capture endpoint, never ALSA null.
+  mic: {enabled: true, backend: auto, alsa_device: "hw:CARD=tegrasndt210ref,DEV=0", dds_grace_s: 0.5}
   speaker: {enabled: true}
   led: {enabled: true}
-  camera_rgb: {enabled: true, fps: 5}
+  camera_rgb: {enabled: true, fps: 10}
   loco: {enabled: true}
   special_motion: {enabled: true}
   state: {enabled: true}

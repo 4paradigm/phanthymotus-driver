@@ -131,7 +131,10 @@ class RpcProxy:
         # workers prevent a slow LED call from stopping live playback (and
         # vice versa).
         self._audio_led = _RpcChannel(network_interface, "audio_led", 4.0)
-        self._video = _RpcChannel(network_interface, "video", 5.0)
+        # A snapshot is polled as a live stream. A five-second RPC timeout
+        # turns one unavailable frame into a multi-second camera freeze;
+        # keep the failure bounded so the next snapshot can be attempted.
+        self._video = _RpcChannel(network_interface, "video", 1.0)
 
     def call(self, method, *args):
         return self._sport.call(method, *args)
