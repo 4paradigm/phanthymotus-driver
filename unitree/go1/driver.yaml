@@ -11,11 +11,14 @@ build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
 # Kept in sync by hand with config.yaml's `plugins.*.enabled`. camera_depth and
-# camera_pointcloud are disabled (Nano needs DEPTH_ENABLE=1 / PCL_ENABLE=1) and
-# excluded. `system_health` is intentionally excluded too: config.yaml has a
-# YAML indentation bug (line ~18) that nests `system_health:` as a dead key
-# inside `face_light`'s mapping instead of a sibling plugin key, so
-# `pc.get("system_health", {})` in main.py never finds it and the card never
+# camera_pointcloud are enabled: their Nano-side streamers (depth_stream /
+# pointcloud_stream systemd services) are deployed by nano_bootstrap.sh with
+# DEPTH_ENABLE=1 / PCL_ENABLE=1 and are on-demand (camera opens only while a
+# Pi-side card is streaming, so they don't fight the RGB card for the device
+# outside of active streams). `system_health` is intentionally excluded:
+# config.yaml has a YAML indentation bug (line ~18) that nests `system_health:`
+# as a dead key inside `face_light`'s mapping instead of a sibling plugin key,
+# so `pc.get("system_health", {})` in main.py never finds it and the card never
 # loads — confirmed by parsing config.yaml with PyYAML. Fix that indentation
 # bug first if system_health should ship. activity_monitor is listed as
 # `actuator` because that's what its own get_tool() declares in sensors.py,
@@ -25,6 +28,8 @@ cards:
   - { name: battery,            type: sensor }
   - { name: face_light,         type: actuator }
   - { name: camera_rgb,         type: sensor }
+  - { name: camera_depth,       type: sensor }
+  - { name: camera_pointcloud,  type: sensor }
   - { name: imu,                type: sensor }
   - { name: feet,               type: sensor }
   - { name: fall_alarm,         type: sensor }
