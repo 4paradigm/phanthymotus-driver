@@ -29,7 +29,9 @@ def _install_device_stubs():
     sys.modules["std_msgs.msg"] = std_msgs
     rclpy = types.ModuleType("rclpy")
     rclpy_node = types.ModuleType("rclpy.node")
-    rclpy_node.Node = type("Node", (), {})
+    class Node:
+        def __init__(self, *_args, **_kwargs): pass
+    rclpy_node.Node = Node
     rclpy.node = rclpy_node
     sys.modules["rclpy"] = rclpy
     sys.modules["rclpy.node"] = rclpy_node
@@ -131,6 +133,63 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("audio/pcm-16k", speaker.get_tool()["topic_in"][0]["format"])
         self.assertEqual("camera", camera.get_tool()["name"])
         self.assertEqual("image/jpeg", camera.get_tool()["topic_out"][0]["format"])
+
+    def test_speaker_info_returns_authoritative_input_topic(self):
+        plugin = self.multimedia.SpeakerPlugin.__new__(self.multimedia.SpeakerPlugin)
+        plugin._node = types.SimpleNamespace(
+            state="ready",
+            topic="/current/audio",
+            _backend=types.SimpleNamespace(is_available=lambda: True),
+        )
+        inferred = plugin.dispatch("info", {"input_topic": "/wired/audio"})
+        self.assertEqual(
+            [{"topic": "/wired/audio", "format": "audio/pcm-16k"}],
+            inferred["topic_in"],
+        )
+        current = plugin.dispatch("info", {})
+        self.assertEqual("/current/audio", current["topic_in"][0]["topic"])
+
+        plugin._node.topic = ""
+        unwired = plugin.dispatch("info", {})
+        self.assertEqual([{"format": "audio/pcm-16k"}], unwired["topic_in"])
+
+    def test_speaker_lifecycle_recreates_backend_after_stop(self):
+        created = []
+
+        class FakeBackend:
+            def __init__(self, interface, merge_bytes):
+                self.interface = interface
+                self.merge_bytes = merge_bytes
+                self.error = ""
+                self.alive = True
+                created.append(self)
+            def is_available(self): return self.alive
+            def close(self): self.alive = False
+            def call(self, *_args, **_kwargs): return {"ok": True}
+            def put(self, _pcm): pass
+
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        with patch.object(self.multimedia, "_SpeakerBackend", FakeBackend):
+            plugin = self.multimedia.SpeakerPlugin(
+                {"buffer_ms": 300}, "test", executor, "eth0")
+            self.assertIsNone(plugin._node._backend)
+            self.assertTrue(plugin.start()["ok"])
+            first = plugin._node._backend
+            self.assertEqual("ready", plugin._node.state)
+            plugin.stop()
+            self.assertIsNone(plugin._node._backend)
+            self.assertEqual("idle", plugin._node.state)
+            self.assertTrue(plugin.start()["ok"])
+            second = plugin._node._backend
+            self.assertIsNot(first, second)
+            self.assertFalse(first.alive)
+            self.assertTrue(second.alive)
+            self.assertEqual(2, len(created))
+
+    def test_docker_image_validates_audio_msgs_at_build_time(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("test -f /ros_ws/install/setup.bash", dockerfile)
+        self.assertIn("from audio_msgs.msg import AudioChunk", dockerfile)
 
     def test_camera_worker_is_pinned_to_verified_videohub_client(self):
         source = (ROOT / "multimedia.py").read_text()

@@ -57,6 +57,9 @@ frames returned by the Go2-compatible `videohub` service. `mic` listens for the
 official A2 multicast stream at `239.168.123.161:5555`; when the robot's voice
 assistant / wake-up conversation mode is disabled, the card remains in a
 diagnostic `waiting` state and automatically recovers when packets appear.
+The shared ROS base workspace must provide `audio_msgs`; the Docker build
+sources `/ros_ws/install/setup.bash` and imports `AudioChunk` as a mandatory
+build-time validation, so a base-image mismatch fails before deployment.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.

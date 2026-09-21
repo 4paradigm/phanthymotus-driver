@@ -356,6 +356,9 @@ class _SpeakerBackend:
             ready = {"ok": False, "error": "speaker worker startup timed out"}
         self.error = "" if ready.get("ok") else ready.get("error", "speaker unavailable")
 
+    def is_available(self):
+        return not self.error and self._process.is_alive()
+
     def put(self, pcm):
         if self.error:
             return
@@ -371,6 +374,8 @@ class _SpeakerBackend:
     def call(self, operation, value=None, timeout=6.0):
         if self.error:
             return {"ok": False, "error": self.error}
+        if not self._process.is_alive():
+            return {"ok": False, "error": "speaker worker is not running"}
         with self._lock:
             request_id = uuid4().hex
             self._control.put((request_id, operation, value))
@@ -385,7 +390,8 @@ class _SpeakerBackend:
             return {"ok": False, "error": "speaker operation timed out"}
 
     def close(self):
-        self.call("close", timeout=3.0)
+        if self._process.is_alive():
+            self.call("close", timeout=3.0)
         self._process.join(timeout=3.0)
         if self._process.is_alive():
             self._process.terminate()
@@ -394,14 +400,42 @@ class _SpeakerBackend:
 class _SpeakerNode(Node):
     def __init__(self, interface, merge_bytes):
         super().__init__("as2w_speaker")
-        self._backend = _SpeakerBackend(interface, merge_bytes)
+        self._interface = interface
+        self._merge_bytes = merge_bytes
+        self._backend = None
         self._subscription = None
         self.topic = ""
-        self.state = "error" if self._backend.error else "idle"
+        self.state = "idle"
+
+    def start_backend(self):
+        if self._backend is not None and self._backend.is_available():
+            if self.state in ("idle", "error"):
+                self.state = "ready"
+            return {"ok": True}
+        if self._backend is not None:
+            self._backend.close()
+        self._backend = _SpeakerBackend(self._interface, self._merge_bytes)
+        if self._backend.error:
+            self.state = "error"
+            return {"ok": False, "error": self._backend.error}
+        self.state = "ready"
+        return {"ok": True}
+
+    def call_backend(self, operation, value=None):
+        if self._backend is None or not self._backend.is_available():
+            return {
+                "ok": False,
+                "code": "PRECONDITION_FAILED",
+                "error": "speaker backend is not running; start the card first",
+            }
+        return self._backend.call(operation, value)
 
     def start_play(self, topic):
         if not topic:
             return {"ok": False, "error": "input_topic is required"}
+        ready = self.start_backend()
+        if not ready.get("ok"):
+            return ready
         if self._subscription is not None and self.topic != topic:
             self.destroy_subscription(self._subscription)
             self._subscription = None
@@ -409,11 +443,14 @@ class _SpeakerNode(Node):
             self._subscription = self.create_subscription(
                 AudioChunk, topic, self._on_audio, _LOW_LAT_QOS)
         self.topic = topic
-        result = self._backend.call("reset")
+        result = self.call_backend("reset")
         self.state = "ready" if result.get("ok") else "error"
         return result
 
     def _on_audio(self, message):
+        if self._backend is None or not self._backend.is_available():
+            self.state = "error"
+            return
         self._backend.put(bytes(message.data))
         if self.state == "ready":
             self.state = "playing"
@@ -422,7 +459,7 @@ class _SpeakerNode(Node):
         if self._subscription is not None:
             self.destroy_subscription(self._subscription)
             self._subscription = None
-        result = self._backend.call("stop")
+        result = self.call_backend("stop")
         self.topic = ""
         self.state = "idle" if result.get("ok") else "error"
         return result
@@ -431,7 +468,10 @@ class _SpeakerNode(Node):
         if self._subscription is not None:
             self.destroy_subscription(self._subscription)
             self._subscription = None
-        self._backend.close()
+        if self._backend is not None:
+            self._backend.close()
+            self._backend = None
+        self.topic = ""
         self.state = "idle"
 
 
@@ -473,31 +513,42 @@ class SpeakerPlugin:
         }
 
     def start(self):
-        pass
+        return self._node.start_backend()
 
     def stop(self):
         self._node.close()
 
     def dispatch(self, action, args):
+        reported_topic = self._node.topic
         if action in ("start", "play"):
             result = self._node.start_play(args.get("input_topic", ""))
         elif action == "stop":
-            result = self._node.stop_play()
+            self.stop()
+            result = {"ok": True}
         elif action in ("interrupt", "pause", "resume"):
-            result = self._node._backend.call(action)
+            result = self._node.call_backend(action)
             if result.get("ok"):
                 self._node.state = {"interrupt": "ready", "pause": "paused", "resume": "playing"}[action]
         elif action == "get_volume":
-            result = self._node._backend.call("get_volume")
+            result = self._node.call_backend("get_volume")
         elif action == "set_volume":
             volume = max(0, min(100, int(args.get("volume", 50))))
-            result = self._node._backend.call("set_volume", volume)
+            result = self._node.call_backend("set_volume", volume)
             result["volume"] = volume
         elif action == "info":
-            result = {"ok": not bool(self._node._backend.error)}
+            backend = self._node._backend
+            result = {"ok": backend is not None and backend.is_available()}
+            input_topic = args.get("input_topic") or self._node.topic
+            reported_topic = input_topic
+            descriptor = {"format": "audio/pcm-16k"}
+            if input_topic:
+                descriptor["topic"] = input_topic
+            result["topic_in"] = [descriptor]
         else:
             return None
-        result.update({"state": self._node.state, "topic": self._node.topic})
+        if action != "info":
+            reported_topic = self._node.topic
+        result.update({"state": self._node.state, "topic": reported_topic})
         return result
 
 
