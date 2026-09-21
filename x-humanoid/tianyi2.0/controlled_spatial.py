@@ -699,7 +699,36 @@ class ControlledSpatialPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
-            return {"state": "idle"}
+            # **必须真的取消在飞的导航，不能只返回一个常量。**
+            #
+            # 这张卡没有生命周期状态（真实动作是 start_mapping / navigate_to_* 那
+            # 些），所以 start/stop/info 一直是三个写死的返回值。对 start 和 info
+            # 那是无害的；对 stop 不是 —— agent-core 的「停止智能控制」正是给每张
+            # 卡片下发 `action: stop`，而这里收下之后什么都不做。
+            #
+            # 后果：**导航在飞的时候按停止，机器人继续走到目标点**，而界面显示已经
+            # 停了。天轶实测 2026-09-22 发现（当时恰好没有在飞的动作，没出事）。
+            #
+            # 取消走和 `stop_nav` 同一条路，并且清掉同一组状态 —— 两处不一致的话，
+            # 停止之后 `_nav_active` 还是 True，下一次导航的到达判断会读到上一次的
+            # 残留。
+            #
+            # `cancel_current_action()` 只终止**运动**，不碰建图：建图中途按停止而
+            # 把地图丢掉，比让它继续建完更糟。
+            result = None
+            if self._nav_active:
+                try:
+                    result = self._slamtec.cancel_current_action()
+                except Exception as exc:      # noqa: BLE001
+                    # 取消失败要说出来。吞掉的话就退回成原来那个"永远成功"的
+                    # 返回值，而机器人还在走。
+                    return {"state": "error",
+                            "message": f"取消导航失败，机器人可能仍在移动：{exc}"}
+            self._nav_arrived.clear()
+            self._nav_active = False
+            self._nav_action_id = None
+            return {"state": "idle"} if result is None else {
+                "state": "idle", "cancelled_nav": True, "api_result": result}
         if action == "info":
             return {"state": "running"}
 
