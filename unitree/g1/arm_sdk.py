@@ -27,6 +27,29 @@
 
 代价是接管和交还都要**渐变**，不能瞬间切 —— 见 `ramp`。
 
+── `mode_machine` 必须原样回传，否则整条指令被静默忽略 ────────────────────
+
+`LowCmd_` 里有 `mode_machine` 和 `mode_pr` 两个字段，默认都是 0。`mode_machine` 是
+**硬件型号握手**：控制端要把 `rt/lowstate` 里读到的值原样填回去，对不上机器人就
+不理这条指令 —— 不报错，不回消息，手臂纹丝不动。
+
+实测过：G1 报 `mode_machine=4`，我们发 0，于是 arm_sdk 权重渐入正常、IK 残差 0.26 mm、
+`rt/arm_sdk` 照发，而手臂一动不动。整条链路每一环都"成功"。
+
+── 这台机器人有几个关节，要问它，不要问 URDF ──────────────────────────────
+
+`rt/lowstate` 里每个电机有一个 `mode` 字段，0 表示这个关节**不存在或未使能**。
+实测的这台 G1：两条手臂的 `wrist_pitch`/`wrist_yaw` 都是 `mode=0`、q 恒为 0，腰只有
+yaw 是 1 —— 也就是 **5 自由度手臂 + 1 自由度腰**（官方叫 23dof / arm5），而仓库里的
+`g1_model.urdf` 是 29dof（arm7 + 3 自由度腰）。
+
+差别不会报错。IK 在 7 自由度模型里解，把 +0.0845 rad 放进一个物理上不存在的
+`wrist_pitch`，残差报 0.26 mm（在**模型**里确实解出来了），然后机器人做不到那个位姿。
+**残差校验的是求解器，不是机器人。**
+
+所以 `open()` 会核对每一个要驱动的关节的 `mode`，有 0 就拒绝启动并点名 —— 把一次
+静默的「姿态对不上」变成一次启动期的响亮失败。
+
 ── 接管之前必须先知道手臂在哪 ──────────────────────────────────────────────
 
 `LowCmd_` 这个消息里每个 `motor_cmd[i].q` 的默认值是 **0.0**，而 0 不是「不控制」，
@@ -99,6 +122,8 @@ class ArmSdkChannel:
         self._weight = 0.0
         self._last_target = None
         self._measured_waist: dict = {}
+        self._mode_machine = 0
+        self._mode_pr = 0
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 
@@ -137,6 +162,9 @@ class ArmSdkChannel:
         measured = self._read_measured_arms()
 
         message = unitree_hg_msg_dds__LowCmd_()
+        # **硬件型号握手。** 不回传这两个字段，机器人静默忽略整条指令 —— 见模块文档。
+        message.mode_machine = self._mode_machine
+        message.mode_pr = self._mode_pr
         motor_ids = list(ARM_MOTOR_IDS)
         if self._waist:
             motor_ids += sorted(WAIST_MOTOR_IDS.values())
@@ -225,7 +253,30 @@ class ArmSdkChannel:
                 "不是「不动」）。检查 NETWORK_INTERFACE 和机器人是否上电"
             )
 
-        motors = received["m"].motor_state
+        frame = received["m"]
+        # 型号握手用的两个字段，和实测角来自同一帧。
+        self._mode_machine = int(getattr(frame, "mode_machine", 0))
+        self._mode_pr = int(getattr(frame, "mode_pr", 0))
+
+        motors = frame.motor_state
+        # **这台机器人真有这些关节吗。** `mode == 0` 表示不存在或未使能，而往一个
+        # mode=0 的关节写目标不会报错，只会什么都不发生 —— 然后整条手臂到不了 IK
+        # 解出来的那个位姿，而残差（在模型里算的）一切正常。
+        absent = [motor_id for motor_id in ARM_MOTOR_IDS
+                  if int(getattr(motors[motor_id], "mode", 1)) == 0]
+        if self._waist:
+            absent += [motor_id for motor_id in sorted(WAIST_MOTOR_IDS.values())
+                       if int(getattr(motors[motor_id], "mode", 1)) == 0]
+        if absent:
+            raise RuntimeError(
+                f"这些关节报 mode=0（不存在或未使能）：{absent}。"
+                f"本机 mode_machine={self._mode_machine} —— 官方的 23dof/arm5 是 5 自由度"
+                "手臂 + 1 自由度腰，而这张卡和 resource/g1_model.urdf 是 29dof"
+                "（arm7 + 3 自由度腰）。往不存在的关节写目标不报错，只会让手臂到不了 "
+                "IK 解出来的位姿，而残差一切正常。要在这台机器人上跑，需要一份 "
+                "23dof 的 URDF 和相应的关节表"
+            )
+
         measured = [float(motors[i].q) for i in ARM_MOTOR_IDS]
         self._measured_waist = {
             name: float(motors[motor_id].q)
