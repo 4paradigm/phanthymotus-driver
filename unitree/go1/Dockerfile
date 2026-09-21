@@ -16,8 +16,7 @@ WORKDIR /work
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) -exec sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" {} + ; \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client \
-        python3-pil && \
+        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /work/requirements.txt

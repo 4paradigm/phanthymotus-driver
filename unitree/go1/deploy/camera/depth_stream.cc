@@ -108,6 +108,8 @@ static void serve_client(int cli, int device_id) {
             usleep(2000);
             continue;
         }
+        // Go1 相机物理装反:旋转 180° 翻正(镜像 rgb_stream / SDK example_getRectFrame 的做法)。
+        cv::flip(depth, depth, -1);
         std::vector<uchar> buf;
         cv::imencode(".jpg", depth, buf, jpgparams);
         uint32_t n = htonl((uint32_t)buf.size());

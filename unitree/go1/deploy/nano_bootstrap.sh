@@ -210,7 +210,7 @@ After=network.target
 Type=simple
 User=unitree
 WorkingDirectory=$SDK
-ExecStart=$SDK/bins/pointcloud_stream $PORT $DEVID 4
+ExecStart=$SDK/bins/pointcloud_stream $PORT $DEVID 2
 Restart=always
 RestartSec=3
 [Install]
