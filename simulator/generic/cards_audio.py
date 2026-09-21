@@ -97,6 +97,10 @@ class SpeakerCard(Card):
     ACTIONS = {
         "read": ([], "读取当前是否在播，以及累计播了几段"),
     }
+    # `start` / `stop` 不列在这里：`Card.dispatch` 会把它们当生命周期动词拦下来，
+    # 自己调无参的 `self.start()`，`do_start` 永远不会被调到。`cards_scenario.py`
+    # 的注释记着这条，而这张卡第一版就是写成 `do_start` 的 —— 结果是启动成功、
+    # `state: running`、`input_topic` 却始终为空：一张**聋着的**卡，看不出任何异常。
     PROPERTIES = {
         "input_topic": {"type": "string",
                         "description": "要订阅的 PCM 音频 topic；由画布连线提供"},
@@ -120,18 +124,39 @@ class SpeakerCard(Card):
 
     # ---- lifecycle -----------------------------------------------------
 
-    def do_start(self, input_topic: str = "", **_):
-        """画布把上游 `tts` 的 `topic_out` 当作 `input_topic` 传进来。"""
-        self._input_topic = str(input_topic or self._input_topic)
+    def dispatch(self, action: str, args: dict) -> dict:
+        """在生命周期动词被基类吞掉之前，把 `input_topic` 截下来。
+
+        画布把上游 `tts` 的 `topic_out` 当作 `start` 的 `input_topic` 传进来，而
+        `Card.dispatch` 调的是无参的 `self.start()` —— 不在这儿接，参数就丢了。
+        """
+        if action == "start":
+            picked = str((args or {}).get("input_topic") or "")
+            if picked:
+                self._input_topic = picked
+        return super().dispatch(action, args)
+
+    def start(self) -> None:
         super().start()
         self._open_subscription()
-        return {"state": "running", "input_topic": self._input_topic}
 
-    def do_stop(self, **_):
+    def stop(self) -> None:
         self._close_subscription()
         self._end_utterance()
         super().stop()
-        return {"state": "idle"}
+
+    def info(self) -> dict:
+        """**把真正绑上的那条 topic 报出来。**
+
+        agent-core 用 `info().topic_in[].topic` 判断一张卡到底接上了什么
+        （`api/config.py::_bound_inputs`）。不报的话，一张聋着的卡和一张正常工作的卡
+        在它眼里一模一样 —— 而这正是第一版的下场。
+        """
+        base = super().info()
+        base["topic_in"] = ([{"topic": self._input_topic, "format": "audio/pcm-16k"}]
+                            if self._input_topic else list(self.TOPIC_IN))
+        base["speaking"] = self._speaking
+        return base
 
     def do_read(self, **_):
         return {"state": "running" if self._running else "idle",
