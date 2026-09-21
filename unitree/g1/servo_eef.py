@@ -485,7 +485,13 @@ class G1ServoEefPlugin:
             "topic_in": [{"format": "control/eef",
                           "desc": f"motus.control/1，{self._descriptor.dof} 维"
                                   "（末端 xyz + 四元数 xyzw、夹爪、腰）"}],
-            "topic_out": [{"format": "data/json",
+            # **`state/joint`，不是 `data/json`。** 画布按严格字符串相等匹配端口，
+            # 而 `vla` 卡片的观测输入口声明的就是 `state/joint`（actucore 的
+            # `plugins/vla/plugin.py`，注释写着「接驱动命令卡片的状态输出」）。
+            # 报 `data/json` 在语义上不算错——载荷确实是 JSON——但它让这条反馈
+            # 回路在画布上**根本连不上**，而且是静默的：拖放没反应，没提示也没
+            # 日志。天轶的 servo.py 一直报的是 `state/joint`，本卡片此前和它不一致。
+            "topic_out": [{"format": "state/joint",
                            "desc": "关节角与**当前末端位姿**（标准布局）"}],
         }
 
