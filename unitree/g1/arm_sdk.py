@@ -99,7 +99,6 @@ class ArmSdkChannel:
         self._weight = 0.0
         self._last_target = None
         self._measured_waist: dict = {}
-        self._low_state_sub = None
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 
@@ -179,7 +178,6 @@ class ArmSdkChannel:
             self._arm_pub = None
             self._gripper_pubs = {}
             self._last_target = None
-            self._low_state_sub = None
 
     def _read_measured_arms(self):
         """等一帧 `rt/lowstate`，返回 14 个臂关节的实测角（左 7 + 右 7）。
@@ -201,13 +199,25 @@ class ArmSdkChannel:
             if "m" not in received:
                 received["m"] = message
 
+        # **只要一帧，拿到就关。** 留着它意味着一条 500 Hz 的订阅活到进程结束，
+        # 而这个仓库里「孤儿订阅」的历史是：卡片 stop 之后回调还在跑，图看着健康，
+        # 全栈订阅却在某一次 teardown 顺序错误时一起停摆。
         subscriber = ChannelSubscriber(LOW_STATE_TOPIC, LowState_)
         subscriber.Init(_on_state, 10)
-        self._low_state_sub = subscriber
+        try:
+            deadline = time.monotonic() + self.LOW_STATE_TIMEOUT_S
+            while "m" not in received and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            # SDK 的 `Close()` 是 `del self.__reader` 然后置 None，而 DDS 的回调
+            # 可能正在飞 —— 那会在日志里留一条 `'NoneType' object has no attribute
+            # 'take'`。**这是 SDK 自己的 teardown 竞态，不是我们的错**，而且确定性地
+            # 关掉比让它被 GC 回收要好：窗口从「不确定」缩到几微秒，且只有一次。
+            try:
+                subscriber.Close()
+            except Exception:  # noqa: BLE001 —— 关不掉也不能挡住启动
+                pass
 
-        deadline = time.monotonic() + self.LOW_STATE_TIMEOUT_S
-        while "m" not in received and time.monotonic() < deadline:
-            time.sleep(0.01)
         if "m" not in received:
             raise RuntimeError(
                 f"{self.LOW_STATE_TIMEOUT_S:g} 秒内没有收到 {LOW_STATE_TOPIC} —— "

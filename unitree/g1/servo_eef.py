@@ -279,6 +279,7 @@ class G1ServoEefPlugin:
         self._seed = {"left": None, "right": None}
         self._measured: dict = {}
         self._measured_ms = 0
+        self._low_state_sub = None
         self._last_outcome = None
         self._rejects: list = []
         self._last_residual: dict = {}
@@ -439,6 +440,15 @@ class G1ServoEefPlugin:
             except Exception:  # noqa: BLE001
                 pass
         self._channel.close()
+        # **必须关。** 不关的话每一次 start 都留下一条 500 Hz 的 rt/lowstate 订阅，
+        # 而画布做 start/stop 是家常便饭 —— 这正是这个仓库里「孤儿订阅」那一类故障
+        # 的形状：图看着健康，回调还在跑，直到某次 teardown 顺序出错把整层带走。
+        subscriber, self._low_state_sub = self._low_state_sub, None
+        if subscriber is not None:
+            try:
+                subscriber.Close()
+            except Exception:  # noqa: BLE001 —— 清理失败不能挡住 stop 返回
+                pass
         with self._lock:
             self._state_pub = None
             self._chains = {}
