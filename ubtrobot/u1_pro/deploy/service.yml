@@ -10,7 +10,6 @@ ubtrobot-u1-pro:
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-    - ROS_LOCALHOST_ONLY=1
     - RCUTILS_COLORIZED_OUTPUT=0
     - PYTHONUNBUFFERED=1
   logging:

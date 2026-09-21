@@ -136,9 +136,11 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
         self.assertEqual(device.EVENT_TOPICS["doa_event"], "/robo/audio/subscribe/doa_event")
 
-    def test_u1_cyclonedds_config_does_not_select_loopback_twice(self):
+    def test_u1_cyclonedds_config_uses_robot_multicast_interface(self):
         config = Path(__file__).with_name("config.yaml").read_text(encoding="utf-8")
-        self.assertIn("AllowMulticast", config)
+        self.assertIn('robot_interface: "rgmii0"', config)
+        self.assertIn("NetworkInterface name='rgmii0'", config)
+        self.assertIn("AllowMulticast>true", config)
         self.assertNotIn("NetworkInterface name='lo'", config)
 
     def test_event_bridge_keeps_sdk_string_payloads(self):

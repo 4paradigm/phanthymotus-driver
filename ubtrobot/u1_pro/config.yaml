@@ -3,10 +3,10 @@ ros_namespace: ""
 ros:
   robot_domain_id: 2
   core_domain_id: 42
-  robot_interface: "lo"
-  # Let CycloneDDS select loopback once. Selecting `lo` explicitly here can
-  # collide with the interface selected by the host/container environment.
-  cyclonedds_uri: "<CycloneDDS><Domain><General><AllowMulticast>true</AllowMulticast></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+  # rgmii0 is the U1 robot-side Ethernet interface on the target platform.
+  # It supports multicast discovery; loopback does not.
+  robot_interface: "rgmii0"
+  cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='rgmii0'/></Interfaces><AllowMulticast>true</AllowMulticast></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
 vision_capture:
   output_dir: "/opt/phanthy-motus/data/vision_capture/u1_pro"
   video_fps: 15

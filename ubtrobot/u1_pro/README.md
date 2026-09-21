@@ -43,8 +43,10 @@ and `ffmpeg` for MP4 capture,
 and `python3-colcon-common-extensions`, `cmake`, and `build-essential`
 only to build the local ROS interface packages during the image build. It installs the
 CycloneDDS RMW used by the dual-domain runtime and `PyYAML` used by the shared driver
-configuration loader. The deployment uses host networking and loopback-bound
-`CYCLONEDDS_URI`; the repository DDS checker reports this as a known FastDDS-checker gap.
+configuration loader. The deployment uses host networking and binds CycloneDDS to
+the U1 target's multicast-capable `rgmii0` interface. `ROS_LOCALHOST_ONLY` must
+remain unset so the vendor domain can discover the robot services; the repository
+DDS checker reports the CycloneDDS isolation limitation as a known gap.
 
 Local contract checks:
 
