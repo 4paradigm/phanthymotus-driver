@@ -456,3 +456,103 @@ def test_only_the_waist_joints_the_robot_has_get_written(monkeypatch):
     assert motors[arm_sdk.WAIST_MOTOR_IDS["yaw"]].q == pytest.approx(0.42)
     assert motors[arm_sdk.WAIST_MOTOR_IDS["roll"]].q == 0.0      # 没写
     assert motors[arm_sdk.WAIST_MOTOR_IDS["pitch"]].q == 0.0
+
+
+# ── 夹爪装没装，也要问机器人 ────────────────────────────────────────────────
+#
+# 这一组的由来：办公室那台 G1 的 config.yaml 写着 `grippers: true`，而机器上两条
+# 接法一条都没有。卡片照样声明 19 维、照样往 `rt/dex1/left/cmd` 发 —— 一个没有任何
+# 订阅者的话题。协商过、消息校验过、两个自由度去了虚空。
+#
+# 型号（arm5/arm7）和关节使能早就是问机器人得来的，夹爪是最后一处还在信配置的。
+
+
+def _stub_dex1(monkeypatch, *, internal, external, seen=None):
+    """按话题分派的假订阅：lowstate 一定给，dex1 state 看 `external`。
+
+    `internal` 决定 motor 31/33 的 mode —— 两条接法在 DDS 上长得完全不一样，
+    所以假件也必须把它们分开，否则测的是一个现实中不存在的机器人。
+    """
+    import types
+
+    class _Frame(_FakeLowState):
+        mode_machine = 4
+
+        def __init__(self):
+            super().__init__()
+            for i in arm_sdk.DEX1_INTERNAL_MOTOR_IDS.values():
+                self.motor_state[i].mode = 1 if internal else 0
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            self.topic = topic
+            if seen is not None:
+                seen.append(topic)
+
+        def Init(self, callback, depth):  # noqa: N802
+            if self.topic == arm_sdk.LOW_STATE_TOPIC:
+                callback(_Frame())
+            elif external:
+                callback(types.SimpleNamespace(states=[types.SimpleNamespace(q=0.0)]))
+
+        def Close(self):  # noqa: N802
+            pass
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    hg = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    hg.LowState_ = object
+    go = types.ModuleType("unitree_sdk2py.idl.unitree_go.msg.dds_")
+    go.MotorStates_ = object
+    go.MotorCmds_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", hg)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_go.msg.dds_", go)
+    monkeypatch.setattr(arm_sdk, "DEX1_STATE_TIMEOUT_S", 0.05)
+
+
+def test_a_gripper_the_robot_does_not_have_refuses_the_start(monkeypatch):
+    """两条接法都探不到 → 拒绝，并说清楚去改哪个开关。
+
+    降级成「悄悄少两维」是**不行的**：卡片已经把 19 报给了协商，改宽度等于让
+    `dof` 这个字段撒谎，而它存在的全部理由就是抓这件事。
+    """
+    _stub_dex1(monkeypatch, internal=False, external=False)
+    with pytest.raises(RuntimeError, match="grippers"):
+        arm_sdk.ArmSdkChannel(grippers=True)._read_measured_arms()
+
+
+def test_an_internally_wired_gripper_is_refused_rather_than_published_at(monkeypatch):
+    """探到了，但驱动不了 —— 这也是拒绝，不是「试试看」。
+
+    内部走线的 Dex1 不听 `rt/dex1/*/cmd`，它要写 LowCmd_ 的 31/33 号电机。往前者
+    发不会报错也不会动，和「没装」的症状一模一样。
+    """
+    _stub_dex1(monkeypatch, internal=True, external=False)
+    with pytest.raises(RuntimeError, match="内部走线"):
+        arm_sdk.ArmSdkChannel(grippers=True)._read_measured_arms()
+
+
+def test_an_externally_wired_gripper_is_accepted(monkeypatch):
+    """这条是我们真的实现了的那一条。"""
+    _stub_dex1(monkeypatch, internal=False, external=True)
+    channel = arm_sdk.ArmSdkChannel(grippers=True)
+    assert len(channel._read_measured_arms()) == 14
+    assert channel._dex1 == "external"
+
+
+def test_the_internal_check_costs_nothing_when_it_answers(monkeypatch):
+    """内部走线探到了就不去等外接话题 —— 否则每次启动白等一秒。"""
+    topics: list[str] = []
+    _stub_dex1(monkeypatch, internal=True, external=False, seen=topics)
+    with pytest.raises(RuntimeError):
+        arm_sdk.ArmSdkChannel(grippers=True)._read_measured_arms()
+    assert not [t for t in topics if t.startswith("rt/dex1/")]
+
+
+def test_without_grippers_nothing_is_probed_at_all(monkeypatch):
+    """`grippers=False` 是一张 14/17 维的卡片，它跟 Dex1 没有任何关系。"""
+    topics: list[str] = []
+    _stub_dex1(monkeypatch, internal=False, external=False, seen=topics)
+    assert len(arm_sdk.ArmSdkChannel(grippers=False)._read_measured_arms()) == 14
+    assert topics == [arm_sdk.LOW_STATE_TOPIC]
