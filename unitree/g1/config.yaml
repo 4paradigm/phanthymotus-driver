@@ -27,6 +27,23 @@ plugins:
     # 没装 Dex1 夹爪就设 false —— 那会让这张卡**声明成 14 维**，于是 16 维的模型
     # 协商失败，而不是被执行一半。
     grippers: true
+  # 双臂**末端位姿**的连续控制（motus.control/1，19 维），在本机解 IK。
+  #
+  # 和 servo 是两个动作空间，不是一张卡片的两种模式：servo 收关节角，这张收绝对
+  # 末端位姿。云端把模型的私有布局规范化成这个标准空间，机器人这边解 IK。
+  #
+  # **默认关闭，而且它一次真机都没跑过。** 除了 servo 的那些理由，还多两条：腰的
+  # roll/pitch 能不能经 arm_sdk 写没有依据（限位已经卡死在 ±0.02 rad），以及
+  # CLIK 的姿态跟踪没有在真机上量过。真机验证按官方文档：**先把 G1 悬挂起来，
+  # 进锁定站立**。
+  servo_eef:
+    enabled: false
+    expected_hz: 30
+    grippers: true
+    # 解出来的位姿离目标多远就拒绝并保持。这是唯一让「解不出来」变成响亮失败的
+    # 地方 —— 迭代法不收敛时返回的是某个关节角，不是异常。
+    max_position_residual: 0.01     # m
+    max_rotation_residual: 0.05     # rad
   state:
     enabled: true
   camera:
