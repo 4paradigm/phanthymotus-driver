@@ -26,7 +26,13 @@ plugins:
     expected_hz: 30
     # 没装 Dex1 夹爪就设 false —— 那会让这张卡**声明成 14 维**，于是 16 维的模型
     # 协商失败，而不是被执行一半。
-    grippers: true
+    #
+    # **默认 false，因为这个默认此前是错的。** 办公室那台 G1（10.100.129.168）写
+    # 着 true 而机器上两条接法一条都没有（内部走线的 motor 31/33 都是 mode=0，外接
+    # 的 rt/dex1/*/state 也没有任何消息）。现在 arm_sdk.detect_dex1 会在启动时问
+    # 机器人并拒绝这种不一致，所以填错至少会响；默认站在「没装」这边，是因为不带
+    # 夹爪的 G1 更常见，而多声明两维是那两种错误里更糟的一种。
+    grippers: false
   # 双臂**末端位姿**的连续控制（motus.control/1，19 维），在本机解 IK。
   #
   # 和 servo 是两个动作空间，不是一张卡片的两种模式：servo 收关节角，这张收绝对
@@ -39,7 +45,8 @@ plugins:
   servo_eef:
     enabled: false
     expected_hz: 30
-    grippers: true
+    # 同 servo，见上面那段 —— 默认改成 false 是因为原来的 true 在真机上是错的。
+    grippers: false
     # 腰「收下但不执行」。**默认 true，因为默认 false 在 1 自由度腰的 G1 上等于
     # 这张卡完全不能用**：模型输出的腰 roll 恒在 0.087–0.148 rad（实测
     # unifolm-vla-g1，换四组完全不同的输入再问没有一次接近零），而 roll/pitch 的

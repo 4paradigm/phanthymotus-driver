@@ -95,6 +95,20 @@ import time
 
 ARM_SDK_TOPIC = "rt/arm_sdk"
 DEX1_CMD_TOPICS = {"left": "rt/dex1/left/cmd", "right": "rt/dex1/right/cmd"}
+# Dex1 有**两种接法**，而只探一种等于没探。
+#
+# - 外接：夹爪走 USB-485 小板，`dex1_1_service` 把串口桥成 DDS，于是
+#   `rt/dex1/<side>/{cmd,state}` 存在。这是 `DEX1_CMD_TOPICS` 假定的那条路。
+# - 内部走线：夹爪直接挂在机器人内部总线上，**没有那两个话题**，而是占用
+#   `LowState_.motor_state` 的 31（左）/ 33（右）—— 宇树 `xr_teleoperate` 的
+#   `--ee dex1_internal` 走的就是这条。
+#
+# 判存在必须两条都问：内部走线的机器人在外接话题上永远是静默的，反之亦然。
+DEX1_INTERNAL_MOTOR_IDS = {"left": 31, "right": 33}
+DEX1_STATE_TOPICS = {"left": "rt/dex1/left/state", "right": "rt/dex1/right/state"}
+# 外接那条路要等一帧。夹爪以 1 kHz 报状态，一秒足够；这一步只在内部走线已经判否
+# 之后才跑，所以装了内部夹爪的机器人不为它付任何时间。
+DEX1_STATE_TIMEOUT_S = 1.0
 # 实测关节角。接管前必须读到一帧，见 `_read_measured_arms`。
 LOW_STATE_TOPIC = "rt/lowstate"
 
@@ -155,6 +169,48 @@ def read_low_state_once(timeout_s: float = 2.0):
     return received["m"]
 
 
+def detect_dex1(motor_state, timeout_s: float = DEX1_STATE_TIMEOUT_S) -> str:
+    """机器人上到底有没有 Dex1。返回 `""`（没有）或接法名。
+
+    **问机器人，不问配置** —— 和 `servo_eef.detect_variant` 同一条规矩，理由也
+    一样：配置是人填的，而这里填错不报错。办公室那台 G1 的 `config.yaml` 写着
+    `grippers: true`，机器人上两条接法一条都没有，于是卡片多声明两维、往虚空发
+    两条夹爪指令，协商照过。
+
+    先看内部走线（`motor_state` 已经在手上，零成本），没有再去等外接话题。
+    """
+    present = [side for side, motor_id in DEX1_INTERNAL_MOTOR_IDS.items()
+               if motor_id < len(motor_state)
+               and int(getattr(motor_state[motor_id], "mode", 0)) != 0]
+    if present:
+        return "internal"
+
+    try:
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
+    except ImportError:
+        # idl 缺席在 `open()` 里是一条独立的、更具体的拒绝。这里只负责「探不到」。
+        return ""
+
+    seen: dict = {}
+    subscribers = []
+    try:
+        for side, topic in DEX1_STATE_TOPICS.items():
+            subscriber = ChannelSubscriber(topic, MotorStates_)
+            subscriber.Init(lambda m, side=side: seen.setdefault(side, m), 10)
+            subscribers.append(subscriber)
+        deadline = time.monotonic() + timeout_s
+        while not seen and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        for subscriber in subscribers:
+            try:
+                subscriber.Close()
+            except Exception:  # noqa: BLE001 —— 关不掉也不能挡住启动
+                pass
+    return "external" if seen else ""
+
+
 class ArmSdkChannel:
     """一条 arm_sdk 发布链路，外加两只 Dex1。
 
@@ -193,6 +249,8 @@ class ArmSdkChannel:
         self._measured_waist: dict = {}
         self._mode_machine = 0
         self._mode_pr = 0
+        # `open()` 探到的 Dex1 接法（"internal" / "external"），供状态回报用。
+        self._dex1 = ""
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 
@@ -345,6 +403,34 @@ class ArmSdkChannel:
                 f"本机 mode_machine={self._mode_machine}。往不存在的关节写目标不报错，"
                 "只会让手臂到不了 IK 解出来的位姿，而残差一切正常 —— 所以这里拒绝"
             )
+
+        # **夹爪同理，而且它此前是唯一一处还在信配置的。** 型号（arm5/arm7）和
+        # 关节使能都是问机器人得来的，夹爪装没装却只看 `config.yaml` —— 同一类坑
+        # 修了一个漏了一个。少这一维不会报错：卡片照样声明 19 维、照样往
+        # `rt/dex1/*/cmd` 发，而那个话题在没装夹爪的机器上没有任何订阅者。
+        if self._grippers:
+            self._dex1 = detect_dex1(motors)
+            if not self._dex1:
+                raise RuntimeError(
+                    f"配置里 grippers=true，但这台机器人两条接法都探不到 Dex1："
+                    f"内部走线的 motor[{DEX1_INTERNAL_MOTOR_IDS['left']}]/"
+                    f"[{DEX1_INTERNAL_MOTOR_IDS['right']}] 都是 mode=0，外接的 "
+                    f"{DEX1_STATE_TIMEOUT_S:g} 秒内也没有 rt/dex1/*/state。"
+                    "把 config.yaml 的 grippers 设成 false —— 那会让这张卡少声明"
+                    "两维，于是带夹爪的模型**协商失败**，而不是被执行一半"
+                )
+            if self._dex1 == "internal":
+                # 探到了，但我们驱动不了它：发布器指向 `rt/dex1/*/cmd`，而内部走线
+                # 的夹爪不听那个话题，它要写进 LowCmd_ 的 31/33 号电机。没实现的
+                # 路径要响亮地说没实现，而不是往一个没人订阅的话题上发。
+                raise RuntimeError(
+                    f"这台机器人的 Dex1 是**内部走线**（motor "
+                    f"{DEX1_INTERNAL_MOTOR_IDS['left']}/"
+                    f"{DEX1_INTERNAL_MOTOR_IDS['right']} 在报状态），而这里只实现了"
+                    f"外接那条路（发 {DEX1_CMD_TOPICS['left']}）。内部走线的夹爪不听"
+                    "那个话题，发下去不会报错也不会动。先把 grippers 设成 false，"
+                    "或者把这条链路补成写 LowCmd_ 的 31/33 号电机"
+                )
 
         measured = [float(motors[i].q) for i in self._driven_arm_ids]
         # **三个轴都读，不只是要驱动的那些。** 一个腰不被驱动的调用方
