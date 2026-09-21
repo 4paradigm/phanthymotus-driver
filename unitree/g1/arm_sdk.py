@@ -433,9 +433,13 @@ class ArmSdkChannel:
                 )
 
         measured = [float(motors[i].q) for i in self._driven_arm_ids]
+        # **三个轴都读，不只是要驱动的那些。** 一个腰不被驱动的调用方
+        # （`servo_eef` 的 advisory 腰）恰恰最需要知道腰**实际在哪** —— 它要把这
+        # 个值挂进 IK 链。只读 `_driven_waist` 的话那里会拿到空字典、退化成零，
+        # 而零是「躯干笔直」，不是「躯干此刻的样子」。
         self._measured_waist = {
-            name: float(motors[WAIST_MOTOR_IDS[name]].q)
-            for name in self._driven_waist
+            name: float(motors[motor_id].q)
+            for name, motor_id in WAIST_MOTOR_IDS.items()
         }
         return measured
 
@@ -444,6 +448,15 @@ class ArmSdkChannel:
     @property
     def weight(self) -> float:
         return self._weight
+
+    @property
+    def measured_waist(self) -> dict:
+        """接管那一刻读到的腰角，`{"roll"|"pitch"|"yaw": rad}`。三个轴都有。
+
+        给 advisory 腰的 IK 用：躯干不会被驱动，所以它停在这里，而链上必须挂它
+        实际所在的角度，不是指令要求的角度。
+        """
+        return dict(self._measured_waist)
 
     @property
     def last_target(self):

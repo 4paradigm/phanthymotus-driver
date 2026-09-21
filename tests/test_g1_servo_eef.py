@@ -21,6 +21,7 @@ import importlib.util
 import json
 import math
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from common.control import Verdict, parse_descriptor  # noqa: E402
+from common.control import ControlSink, Verdict, parse_descriptor  # noqa: E402
 
 URDF = ROOT / "unitree" / "g1" / "resource" / "g1_model.urdf"
 URDF_23 = ROOT / "unitree" / "g1" / "resource" / "g1_23dof.urdf"
@@ -225,6 +226,7 @@ class _FakeChannel:
         self.grippers = []
         self.forgotten = 0
         self.weight = 0.0
+        self.measured = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
 
     def publish_arms(self, radians, waist=None):
         self.arms.append((list(radians), None if waist is None else list(waist)))
@@ -234,6 +236,10 @@ class _FakeChannel:
 
     def forget_target(self):
         self.forgotten += 1
+
+    @property
+    def measured_waist(self):
+        return dict(self.measured)
 
 
 def _card(variant="29dof", **config):
@@ -440,3 +446,126 @@ def test_an_arm5_robot_solves_and_publishes_five_joints_per_arm():
     radians, waist = card._channel.arms[0]
     assert len(radians) == 10, "arm5 每臂 5 个关节，两臂 10 个"
     assert waist == [0.0, 0.0, 0.0]
+
+
+# ── 腰 advisory：收下但不执行 ───────────────────────────────────────────────
+#
+# 由来是一次真 GPU 实测：`unifolm-vla-g1` 输出的腰 roll 恒在 0.087–0.148 rad
+# （换随机噪点／全黑／全白／空指令四组输入再问，没有一次接近零），而这台机器的腰
+# roll/pitch 电机 mode=0、限位卡死在 ±0.02。25 步的动作块**一步都没通过**，全停在
+# `waist_roll outside [-0.02, 0.02]` —— 连同两条本来完全可以执行的手臂。
+#
+# 这里用的 0.138 就是那次实测 25 步里的第一步。
+
+MEASURED_WAIST_ROLL = 0.1379613343456097
+
+
+def test_an_advisory_waist_relaxes_its_limits_and_says_so():
+    """限位要跟着改。
+
+    留着 ±0.02 而段已经 advisory，会让读描述符的人（和下一张照抄的卡片）以为那个
+    约束还在生效，而 sink 早已跳过它。
+    """
+    parsed = parse_descriptor(servo_eef.build_descriptor(waist_advisory=True))
+    waist = [g for g in parsed.groups if g.name == "waist"][0]
+    assert waist.advisory is True
+    assert parsed.advisory_indices == frozenset({16, 17, 18})
+    for axis in (16, 17):
+        assert parsed.lower[axis] < -2.0 and parsed.upper[axis] > 2.0
+
+
+def test_the_default_still_drives_the_waist():
+    """默认必须是「会执行」—— 三个轴都在的 29dof 上腰是真能动的。"""
+    parsed = parse_descriptor(servo_eef.build_descriptor())
+    assert parsed.advisory_indices == frozenset()
+    assert (parsed.lower[16], parsed.upper[16]) == (-0.02, 0.02)
+
+
+def test_the_measured_waist_roll_is_refused_when_driven_and_accepted_when_advisory():
+    """同一条真实指令，两种声明，两种结局。这是整件事的全部。"""
+    for advisory, expected in ((False, Verdict.REJECTED), (True, Verdict.APPLIED)):
+        card = _card("23dof", waist_advisory=advisory)
+        command = _pose_command(card, waist=(MEASURED_WAIST_ROLL, 0.0, 0.0))
+        sink = ControlSink(parse_descriptor(
+            servo_eef.build_descriptor(waist_advisory=advisory)), card._apply)
+        outcome = sink.submit({
+            "schema": "motus.control/1", "seq": 1, "mode": "eef_pose",
+            "dof": len(command), "values": list(command),
+            "stamp_ms": int(time.time() * 1000), "ttl_ms": 500,
+            "source": "test", "priority": 50,
+        })
+        assert outcome.verdict is expected, (advisory, outcome.reason)
+
+
+def test_an_advisory_waist_goes_to_the_solver_as_measured_not_as_commanded():
+    """**这一条是 advisory 和「放宽限位」的全部区别。**
+
+    放宽限位会把指令腰角挂进 IK 链，而躯干根本不会去那儿 —— 于是每一拍的手臂解都
+    算在一个机器人到不了的姿态上，差同样一点，看起来像标定问题。advisory 挂实测
+    值：躯干不动，所以这一拍它就在那儿。
+    """
+    card = _card("23dof", waist_advisory=True)
+    card._channel.measured = {"roll": 0.0, "pitch": 0.0, "yaw": 0.25}
+    extra = card._waist_extra([MEASURED_WAIST_ROLL, 0.1, 0.9])
+    assert extra == {"waist_yaw_joint": 0.25}          # 实测的 0.25，不是指令的 0.9
+
+
+def test_an_advisory_waist_is_never_written_to_the_channel():
+    """「不执行」要落到线上，不是只落在描述符里。"""
+    card = _card("23dof", waist_advisory=True)
+    card._apply(_pose_command(card, waist=(MEASURED_WAIST_ROLL, 0.0, 0.0)), None)
+    assert card._channel.arms, "指令应当被执行"
+    assert all(waist is None for _, waist in card._channel.arms)
+
+
+def test_a_driven_waist_is_written_to_the_channel():
+    """反面：默认声明下腰照旧发下去。"""
+    card = _card("29dof", waist_advisory=False)
+    card._apply(_pose_command(card, waist=(0.0, 0.0, 0.3)), None)
+    assert card._channel.arms[-1][1] == pytest.approx([0.0, 0.0, 0.3])
+
+
+def test_a_one_dof_waist_robot_refuses_to_start_with_the_driven_declaration():
+    """声明在 `__init__` 定死（协商要读它），机器人是唯一能证伪它的地方。
+
+    不拦的话这张卡会起来并且看起来在跑，然后每一条指令都在硬限位处被整条拒掉 ——
+    画布上是一张绿色的卡片配一个一动不动的机器人。
+    """
+    card = _card("23dof", waist_advisory=False)
+    card._executor = object()
+    card._detect_variant_from_robot = lambda: "23dof"
+    result = card._start({"input_topic": "/x"})
+    assert result["state"] == "error"
+    assert "waist_advisory" in result["message"]
+
+
+def test_the_same_robot_starts_once_the_waist_is_declared_advisory(monkeypatch):
+    """对照面：声明改对了就不该再拦在这一步。
+
+    这里只断言**没有停在腰那道检查上** —— 再往后是真的订阅 ROS，测不到。
+    """
+    card = _card("23dof", waist_advisory=True)
+    card._executor = object()
+    card._detect_variant_from_robot = lambda: "23dof"
+    result = card._start({"input_topic": "/x"})
+    assert "waist_advisory" not in (result.get("message") or "")
+
+
+def test_the_canvas_port_formats_match_the_cards_this_one_connects_to():
+    """**画布按严格字符串相等匹配端口，不等就静默拒绝拖放。**
+
+    没提示、没日志，看起来就像画布坏了。真机上这条链路的两个端口都撞过：
+
+      输入  本卡片收 `control/eef`，而 actucore 的 vla 卡片曾发 `control/waypoint`
+      输出  本卡片曾报 `data/json`，而 vla 的观测输入口要的是 `state/joint`
+
+    两边分属不同仓库，没有任何一处检查它们是否对得上 —— 所以这条用例把本侧的两个
+    串钉死，并写明对面是谁。`data/json` 语义上不算错（载荷确实是 JSON），它只是
+    让这条反馈回路连不起来。
+    """
+    spec = _card("23dof").get_tool()
+    assert spec["topic_in"][0]["format"] == "control/eef"
+    assert spec["topic_out"][0]["format"] == "state/joint"
+    # **话题名也要报出来，而且不能等 start。** 画布连线时上游卡片必须已经说得出
+    # 自己往哪儿发；没有的话报的是「连线缺少 topic」，读起来像上游坏了。
+    assert spec["topic_out"][0]["topic"] == "/g1/servo_eef/state"

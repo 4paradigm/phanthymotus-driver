@@ -65,6 +65,36 @@ IK 把**指令**腰角当作链上的固定值（不是实测值）：指令是�
 需要云端把腰声明成可选**，而不是放宽这里的限位 —— 放宽等于让 IK 按一个机器人永远
 到不了的躯干姿态去解手臂，那是个静默的系统性偏移。
 
+### 真机验证（2026-09-21，办公室 G1 `10.100.129.168`，23dof，悬挂，FSM 500）
+
+advisory 这条路在真机上跑过了，三件事分别有独立证据：
+
+**1. 守卫拦在启动处。** `waist_advisory: false` → 卡片拒绝启动并点名开关，零动作。
+注意这和旧代码的表现不同：旧代码会起来、看着在跑，然后每条指令在硬限位处被拒。
+旧症状现在复现不了，因为它被前移了。
+
+**2. 腰真的没被写。** 嗅探 `rt/arm_sdk` 共 274 帧（含一次 18° 的双臂运动），腰
+roll/pitch/yaw 的 `motor_cmd.q` **全程 0.0、`kp` 全程 0.0**，而指令里一直带着
+`roll=0.1380`。kp 为 0 是第二层保险：就算哪天 q 被写进去也不会施力。
+
+**3. IK 挂的是实测腰角，不是指令腰角。** 这条要专门设计才能测出来，而它正是
+advisory 和「干脆放宽限位」的分界。做法：末端目标取**实测关节角的正解**（即「回到
+此刻所在的位置」），而指令腰 yaw 填 **0.9 rad**，实测只有 0.0012。
+
+    IK 若挂指令腰角 → 以为躯干转了 51°，手臂必须改几十度才能够到同一个 pelvis
+                      系位姿 → 手会动
+    IK 若挂实测腰角 → 解回原处 → 手不动
+
+实测臂关节指令首末最大变化 **0.0086 / 0.0155 rad（≈0.5°）**，而那 0.5° 是从实测
+种子出发的数值收敛加编码器抖动。**这条用例里「不动」是阳性结果。**
+
+另外量到的：`verdict: applied`、残差 0.32/0.26 mm；双臂前伸 8 cm 时残差 2.8/2.5 mm
+（arm5 的 x 向包络约 11 cm，所以接近边缘），跟踪误差 0.011 rad。流停后 1332 ms
+看门狗 → `aborted` → 保持。
+
+**没验到的**：29dof 上腰被真正驱动的那一支（手上没有 arm7 机器），以及端到端接
+`unifolm-vla-g1`（那台机器还差两道独立的门，见下一节）。
+
 ## 末端 frame 是「装了什么手」的事，不是「几个关节」的事
 
 `VARIANTS` 按 arm5/arm7 选 URDF 和 tip link，而这两件事只有后者是型号决定的：
@@ -86,6 +116,20 @@ mode=0，外接的 `rt/dex1/*/state` 也没有消息，`arm_sdk.detect_dex1` 现
 梯度下降（不依赖求解器）求工作空间到目标的最近距离，是 7–47 mm，目标在包络外面；
 同一段轨迹 arm7 解到 0.01–0.25 mm、2–4 次迭代。这不是求解器或任务优先级的问题：
 把姿态完全放弃、只解位置，也还差 39.6 mm。
+
+### 那台 G1 跑不了这个 checkpoint，有**三个互相独立**的原因
+
+腰只是其中一个，而且是唯一修掉的那个。按开火顺序：
+
+1. **维度。** 那台机器没有夹爪（内部走线的 motor 31/33 与外接的 `rt/dex1/*/state`
+   都空），于是 `grippers=false`、卡片是 **17 维**，而模型是 19 维。协商在维度这一
+   条就拒了，**advisory/optional 那道门根本轮不到开火**。这是对的行为。
+2. **腰。** 本节修的。
+3. **够不着。** 上面那段，要 arm7。
+
+把真 capabilities 和真 descriptor 送进真协商函数跑过：17 维时报的是「分成 5 段 /
+3 段」加「19 维 / 17 维」；把 `grippers` 强行设成 true 凑到 19 维时，报的才是
+「下游把 'waist' 声明成 advisory，而模型没有把 'waist' 声明成 optional」。
 
 ## 解不出来必须是响亮的
 
@@ -224,12 +268,22 @@ STATE_MAX_HZ = 30.0
 
 
 def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ,
-                     grippers: bool = True) -> dict:
+                     grippers: bool = True,
+                     waist_advisory: bool = False) -> dict:
     """19 维（不带夹爪时 17 维）。
 
     `grippers=False` 真的是一张 17 维的卡片，不是一张 19 维却悄悄忽略两个值的卡
     片 —— 和 `servo` 同样的理由：留着宽度会让一个 19 维模型协商通过，然后两个自由
     度静默不动。
+
+    `waist_advisory=True` 则相反：**宽度留着，并且把腰那一段标成 advisory**，也就
+    是「收下但不执行」。这不是同一件事的两种写法，区别在于**谁给的许可**——
+    advisory 在协商时会被拿去和生产者的 `optional` 对质，生产者没声明就拒绝启动。
+    详见 `common/control/descriptor.py` 的 `Group.advisory`。
+
+    为什么腰不走 `grippers` 那条「少声明几维」的路：模型输出的 19 维里腰是**中
+    间**的三维（16..18），少声明它就少了三维宽度，19 维的模型直接协商失败——而
+    那正是我们要解决的问题本身，不是解法。
     """
     joint_names = (
         ["eef_l_x", "eef_l_y", "eef_l_z", "eef_l_qx", "eef_l_qy", "eef_l_qz", "eef_l_qw"]
@@ -273,13 +327,30 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ,
                            "mode": "joint_position"})
             offset += 1
 
-    # 腰：roll 与 pitch 卡死，yaw 是真实行程。见模块文档。
-    for low, high in (WAIST_LOCKED_LIMIT, WAIST_LOCKED_LIMIT, WAIST_YAW_LIMIT):
+    # 腰。两种声明，取决于这台机器人驱不驱得动它整段：
+    #
+    # - **驱得动**（29dof，三个轴都在）：roll/pitch 卡死在 ±0.02、yaw 真实行程。
+    #   那对 roll/pitch 卡死的限位此时仍然有意义——三个轴都会被真的写下去，而
+    #   roll/pitch 能不能经 arm_sdk 写没有依据，所以先按不能算。
+    # - **驱不动**（23dof，roll/pitch 电机 mode=0）：整段标 advisory，限位不再被
+    #   检查（sink 跳过 advisory 段），所以这里填的是物理行程而不是 ±0.02——
+    #   留着 ±0.02 会让读描述符的人以为那个约束还在生效。
+    #
+    # **advisory 是整段的，所以 23dof 上连 yaw 也不再驱动。** 这是有意的取舍：
+    # 模型给的是一个协调的躯干位姿，只执行其中三分之一会得到一个模型从未要求过的
+    # 姿势；而末端目标是绝对的，IK 会自己补偿。相对现状也没有损失——现状是整条
+    # 指令在 roll 的硬限位处被拒，yaw 同样一动不动。
+    waist_limits = ((WAIST_YAW_LIMIT,) * 3 if waist_advisory
+                    else (WAIST_LOCKED_LIMIT, WAIST_LOCKED_LIMIT, WAIST_YAW_LIMIT))
+    for low, high in waist_limits:
         lower.append(low)
         upper.append(high)
         max_velocity.append(WAIST_MAX_VELOCITY)
-    groups.append({"name": "waist", "offset": offset, "count": 3,
-                   "unit": "rad", "resource": "waist", "mode": "joint_position"})
+    waist_group = {"name": "waist", "offset": offset, "count": 3,
+                   "unit": "rad", "resource": "waist", "mode": "joint_position"}
+    if waist_advisory:
+        waist_group["advisory"] = True
+    groups.append(waist_group)
 
     return {
         "control_interface": "motus.control/1",
@@ -322,6 +393,14 @@ class G1ServoEefPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor,
                  arm_client=None):
         self._ns = namespace
+        # **一个来源，两处使用。** 画布要上游卡片报出**话题名**才能连线，而这个
+        # 名字在 `_bind_inputs` 里是临时拼出来的、没有声明出去 —— 于是连线时报
+        # 「连线缺少 topic: servo_eef → vla，请检查上游卡片是否能报出输出话题」，
+        # 读起来像上游坏了，实际上是这张卡片从没说过自己往哪儿发。
+        #
+        # 它不需要等 start 才知道：名字只由命名空间决定。actucore 的 vla 卡片在
+        # 同一处也有一段注释说明这件事（"There is nothing to discover anyway"）。
+        self._state_topic = f"/{(namespace or '').strip('/') or 'g1'}/servo_eef/state"
         self._executor = executor
         config = plugin_config or {}
 
@@ -339,8 +418,17 @@ class G1ServoEefPlugin:
         self._max_rotation_residual = float(
             config.get("max_rotation_residual", MAX_ROTATION_RESIDUAL))
 
+        # **必须在这里定，不能等 `_start` 探完型号。** 协商读的是 agent-core 在
+        # 卡片绑定时拿到的那份 descriptor，而那份来自静态的工具 schema。等到
+        # `_start` 才把腰标成 advisory，意味着一个没声明 `optional` 的模型可以先
+        # 协商通过、再在运行时被悄悄丢掉三维——正好是 advisory 要防的那件事。
+        #
+        # 所以它是配置项，而**机器人负责证伪**：`_start` 探到型号之后对质，不一致
+        # 就拒绝启动。和 `grippers` 同一条规矩——声明在配置里，真相在机器人那儿。
+        self._waist_advisory = bool(config.get("waist_advisory", False))
         self._descriptor_raw = build_descriptor(self._expected_hz,
-                                                self._grippers_enabled)
+                                                self._grippers_enabled,
+                                                self._waist_advisory)
         self._descriptor = parse_descriptor(self._descriptor_raw)
         self._layout = _layout(self._grippers_enabled)
 
@@ -405,7 +493,14 @@ class G1ServoEefPlugin:
             "topic_in": [{"format": "control/eef",
                           "desc": f"motus.control/1，{self._descriptor.dof} 维"
                                   "（末端 xyz + 四元数 xyzw、夹爪、腰）"}],
-            "topic_out": [{"format": "data/json",
+            # **`state/joint`，不是 `data/json`。** 画布按严格字符串相等匹配端口，
+            # 而 `vla` 卡片的观测输入口声明的就是 `state/joint`（actucore 的
+            # `plugins/vla/plugin.py`，注释写着「接驱动命令卡片的状态输出」）。
+            # 报 `data/json` 在语义上不算错——载荷确实是 JSON——但它让这条反馈
+            # 回路在画布上**根本连不上**，而且是静默的：拖放没反应，没提示也没
+            # 日志。天轶的 servo.py 一直报的是 `state/joint`，本卡片此前和它不一致。
+            "topic_out": [{"topic": self._state_topic,
+                           "format": "state/joint",
                            "desc": "关节角与**当前末端位姿**（标准布局）"}],
         }
 
@@ -456,6 +551,24 @@ class G1ServoEefPlugin:
             # 然后什么都不做 —— 而画布上它看起来是在跑的。
             return {"state": "error", "message": f"IK 建链失败: {exc}"}
 
+        # **配置说的腰，和机器人真有的腰，必须一致。** 声明在 `__init__` 定死了
+        # （协商要读它），这里是唯一能证伪它的地方。
+        drives_whole_waist = variant == "29dof"
+        if not drives_whole_waist and not self._waist_advisory:
+            return {"state": "error", "message": (
+                f"这台机器人是 {variant}，腰 roll/pitch 的电机 mode=0，驱动不了 —— "
+                "而 descriptor 把腰那一段声明成会执行（waist_advisory=false），"
+                "于是任何一条带非零 roll/pitch 的指令都会在硬限位 ±0.02 处被**整条**"
+                "拒掉。实测 unifolm-vla-g1 的腰 roll 恒在 0.087–0.148 rad，25 步全拒。"
+                "在 config.yaml 里设 servo_eef.waist_advisory: true —— 那会把腰声明成"
+                "「收下但不执行」，而模型必须在 capabilities 里声明 waist 是 optional，"
+                "否则协商拒绝。这两道一起才让「丢掉三维」是双方都同意过的")}
+        if drives_whole_waist and self._waist_advisory:
+            # 反过来不拦：你可能就是想让这台 29dof 别动腰。但要说出来。
+            print("[servo_eef] 注意：这台 29dof 的腰三个轴都在，"
+                  "但 waist_advisory=true —— 腰不会被驱动", flush=True)
+
+
         sink = ControlSink(
             self._descriptor,
             self._apply,
@@ -471,12 +584,13 @@ class G1ServoEefPlugin:
             self._arm_motor_ids = VARIANTS[variant]["motors"]
             self._channel = ArmSdkChannel(
                 send_crc=self._send_crc, grippers=self._grippers_enabled,
-                waist=True,
+                # advisory 的腰是真的不碰：通道连腰的发布槽位都不建，
+                # 所以「不执行」不是靠调用方记得不传值来保证的。
+                waist=not self._waist_advisory,
                 driven_arm_ids=(VARIANTS[variant]["motors"]["left"]
                                 + VARIANTS[variant]["motors"]["right"]),
-                # 23dof 只有 yaw；roll/pitch 已被描述符限位卡死在 ±0.02。
-                driven_waist_names=(("roll", "pitch", "yaw")
-                                    if variant == "29dof" else ("yaw",)))
+                driven_waist_names=(() if self._waist_advisory else
+                                    ("roll", "pitch", "yaw")))
             self._sink = sink
             self._input_topic = topic
             self._running = True
@@ -496,6 +610,7 @@ class G1ServoEefPlugin:
         print(f"[servo_eef] streaming from {topic}", flush=True)
         print(f"[servo_eef] variant={variant} chains={len(chains)}", flush=True)
         return {"state": "running", "input": topic, "variant": variant,
+                "waist": "advisory" if self._waist_advisory else "driven",
                 "control_interface": self._descriptor_raw}
 
     def _halt(self, halted: bool):
@@ -562,6 +677,9 @@ class G1ServoEefPlugin:
                 "input": self._input_topic,
                 "weight": round(self._channel.weight, 3),
                 "grippers": self._grippers_enabled,
+                # 「收下但不驱动」必须在状态里看得见。一个被丢掉的自由度如果只有
+                # descriptor 里一个布尔知道，那它在运维眼里就是「腰怎么不动」。
+                "waist": "advisory" if self._waist_advisory else "driven",
             "variant": self._variant,
                 "control_interface": self._descriptor_raw,
                 "residual": dict(self._last_residual),
@@ -618,8 +736,7 @@ class G1ServoEefPlugin:
         node = Node("g1_servo_eef", context=None)
         node.create_subscription(String, topic, self._on_message, qos)
         node.create_timer(WATCHDOG_MS / 2000.0, self._tick)
-        state_pub = node.create_publisher(
-            String, f"/{self._ns.strip('/') or 'g1'}/servo_eef/state", 1)
+        state_pub = node.create_publisher(String, self._state_topic, 1)
         self._executor.add_node(node)
 
         self._subscribe_low_state()
@@ -745,19 +862,32 @@ class G1ServoEefPlugin:
             self._last_residual = residuals
 
         self._channel.publish_arms(
-            list(solutions["left"]) + list(solutions["right"]), waist=waist)
+            list(solutions["left"]) + list(solutions["right"]),
+            waist=None if self._waist_advisory else waist)
         if self._grippers_enabled:
             for side in ("left", "right"):
                 self._channel.publish_gripper(
                     side, values[self._layout[f"{side}_gripper"]])
 
     def _waist_extra(self, waist) -> dict:
-        """把标准向量里的腰三元组 `[roll, pitch, yaw]` 映射到这个型号真有的关节。
+        """把腰映射到这个型号真有的关节，给 IK 当链上的固定值。
 
-        23dof 只有 yaw —— 另外两维已经被描述符的限位卡死在 ±0.02 rad，所以丢掉它们
-        不是在忽略指令，而是在忽略一组已经被证明接近零的数。29dof 三个都挂上。
+        **关键是挂哪一组数**，而这取决于腰会不会被执行：
+
+        - 会执行（`waist_advisory=False`）：挂**指令**腰角。指令是这一拍要去的
+          地方，而末端目标和它是同一拍算出来的；挂实测值等于把手臂的目标算在一个
+          已经过时的躯干姿态上。
+        - 不执行（advisory）：挂**实测**腰角。躯干不会动，所以这一拍它就在那儿。
+          挂指令值才是真正危险的那个选择——IK 会按一个机器人永远到不了的躯干姿态
+          去解手臂，每一拍都差同样一点，看起来像标定问题。这正是「放宽限位」和
+          「声明 advisory」的全部区别：前者两件事都做错了，后者只是不做。
         """
         names = WAIST_JOINTS_BY_VARIANT.get(self._variant or "29dof")
+        if self._waist_advisory:
+            measured = self._channel.measured_waist
+            # `waist_yaw_joint` → `yaw`，即 `WAIST_MOTOR_IDS` 的键。
+            return {name: float(measured.get(name[len("waist_"):-len("_joint")], 0.0))
+                    for name in names}
         if len(names) == 1:                       # 23dof：只有 yaw，取第三个
             return {names[0]: float(waist[2])}
         return dict(zip(names, (float(v) for v in waist)))

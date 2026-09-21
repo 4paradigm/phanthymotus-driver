@@ -186,6 +186,11 @@ class ControlSink:
         self._quat_component_indices = frozenset(
             offset + i for offset in self._eef_quat_offsets for i in range(4)
         )
+        # 声明为 advisory 的那些维：驱动收下但不执行（见 `descriptor.Group`）。
+        # 检查一个不会被执行的数没有意义 —— 而更糟的是，一个为「这台机器人动不
+        # 了这个轴」而卡死的限位会把**整条**指令拒掉，连同那些本可以执行的维。
+        # G1 的 1 自由度腰上就是这样：25 步全数在 waist_roll 的 ±0.02 处被拒。
+        self._advisory_indices = self.descriptor.advisory_indices
 
         self._apply = apply
         self._on_watchdog = on_watchdog
@@ -534,8 +539,10 @@ class ControlSink:
         out = list(values)
         clamped = []
         for i, (want, previous, limit) in enumerate(zip(values, self._last_values, limits)):
-            if i in self._quat_component_indices:
-                continue             # handled as one rotation below
+            if i in self._advisory_indices or i in self._quat_component_indices:
+                # 不执行的维不必钳 —— 钳了只会让状态回报里那个数看起来被平滑过，
+                # 而它根本没有去过任何地方。姿态在下面按角度整体钳。
+                continue
             delta = want - previous
             if delta > limit:
                 out[i] = previous + limit
@@ -572,6 +579,8 @@ class ControlSink:
         which holds — a state the policy can at least observe.
         """
         for i, value in enumerate(values):
+            if i in self._advisory_indices:
+                continue             # 不执行的维，限位无从谈起
             if i in self._quat_component_indices:
                 # A quaternion component's bound carries no physical meaning —
                 # every unit quaternion has all four in [-1, 1], and the same
@@ -595,8 +604,8 @@ class ControlSink:
         if dt <= 0:
             return None
         for i, (value, previous) in enumerate(zip(values, self._last_values)):
-            if i in self._quat_component_indices:
-                continue             # angular speed, below
+            if i in self._advisory_indices or i in self._quat_component_indices:
+                continue             # 不执行的维；四元数的角速度在下面单独算
             speed = abs(value - previous) / dt
             if speed > max_velocity[i]:
                 return Outcome(

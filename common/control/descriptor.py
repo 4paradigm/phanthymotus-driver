@@ -80,6 +80,25 @@ class Group:
     # 前面那些是笛卡尔位姿，腰那三个是关节角。整个 descriptor 只有一个 mode 的话，
     # 这种向量根本声明不出来，于是只能谎报一个，而谎报的后果是位姿被当成关节角。
     mode: str = ""
+    # **这一段收下了但不执行。** 默认 false —— 也就是「会执行」，今天每一个驱动的
+    # 每一段都是这样。
+    #
+    # 它是一个**声明**，不是行为开关：`ControlSink` 看见它就跳过这一段的限位、步长
+    # 与速度检查（检查一个不会被执行的数没有意义，而卡死的限位会把整条指令拒掉），
+    # 驱动自己负责真的不去驱动它。
+    #
+    # 具体是为 G1 的 1 自由度腰加的：模型输出腰的三个关节角，而那台机器的腰
+    # roll/pitch 电机 mode=0。此前卡片把这两维的限位卡死在 ±0.02，于是
+    # `unifolm-vla-g1` 的每一条指令都在硬限位处被整条拒掉 —— 25 步全拒，连 IK 都
+    # 到不了。
+    #
+    # **为什么这不是「静默丢两维」**，也就是这个仓库一直拒绝的那件事：丢维要
+    # **生产者先给许可**。生产者在 `motus.vla/1` 的
+    # `capabilities.control_groups[].optional` 里声明「这一段任务不要求执行」，
+    # 两者在 `actucore/plugins/vla/negotiate.py` 相遇，规则只有一句：**驱动标了
+    # advisory 而生产者没标 optional → 拒绝协商**。两个名字故意不同，语义不对称，
+    # 同名会让一次复制粘贴把「可以不执行」变成「已经没执行」。
+    advisory: bool = False
 
     @property
     def slice(self) -> slice:
@@ -138,6 +157,20 @@ class Descriptor:
                                EEF_POSE_STRIDE):
                 out.append(start + EEF_POSE_QUAT.start)
         return tuple(out)
+
+    @property
+    def advisory_indices(self) -> frozenset:
+        """Every index the driver has declared it accepts but will not execute.
+
+        Derived once by the sink at construction, the same way
+        `eef_quat_offsets` is — a descriptor cannot change under a running
+        sink, so recomputing per command would be pure cost.
+        """
+        out: set = set()
+        for group in self.groups:
+            if group.advisory:
+                out.update(range(group.offset, group.offset + group.count))
+        return frozenset(out)
 
     @property
     def resources(self) -> tuple[str, ...]:
@@ -350,10 +383,17 @@ def _parse_groups(raw, *, dof: int, default_mode: str = "") -> tuple:
                 f"{count}，不是 {EEF_POSE_STRIDE} 的整数倍 —— 一个末端位姿是 "
                 "[x, y, z, qx, qy, qz, qw]。夹爪要单独成一段 joint_position"
             )
+        advisory = entry.get("advisory", False)
+        if not isinstance(advisory, bool):
+            # 字符串 "false" 是真值，而这个字段的方向是**放行**：填错的代价是一段
+            # 本该被限位守住的动作变成不检查。所以只收 bool。
+            raise DescriptorError(
+                f"descriptor.groups[{i}] ({name}).advisory must be true or "
+                f"false, got {advisory!r}")
         groups.append(Group(name=name, offset=offset, count=count,
                             unit=str(entry.get("unit") or ""),
                             resource=str(entry.get("resource") or ""),
-                            mode=mode))
+                            mode=mode, advisory=advisory))
 
     if expected != dof:
         raise DescriptorError(
