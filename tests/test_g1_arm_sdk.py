@@ -399,3 +399,60 @@ def test_a_joint_the_robot_does_not_have_refuses_the_start(monkeypatch):
 
     with pytest.raises(RuntimeError, match="mode=0"):
         arm_sdk.ArmSdkChannel(grippers=False)._read_measured_arms()
+
+
+def test_the_waist_check_follows_the_variant_too(monkeypatch):
+    """23dof 的机器上腰只有 yaw —— roll/pitch 报 mode=0。
+
+    真机上就是在这里挂的一次：臂关节按型号放行了，腰还在按三个要，于是卡片拒绝
+    启动并点名 `[13, 14]`。守卫没错，是通道的腰处理没跟着型号走。
+    """
+    import types
+
+    class _Arm5Frame(_FakeLowState):
+        mode_machine = 4
+
+        def __init__(self):
+            super().__init__()
+            for i in (20, 21, 27, 28, 13, 14):     # 腕 pitch/yaw + 腰 roll/pitch
+                self.motor_state[i].mode = 0
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            callback(_Arm5Frame())
+
+        def Close(self):  # noqa: N802
+            pass
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    arm5_ids = list(range(15, 20)) + list(range(22, 27))
+
+    # 腰按 29dof 要三个 → 应当拒绝，并点名 13/14
+    with pytest.raises(RuntimeError, match="13"):
+        arm_sdk.ArmSdkChannel(grippers=False, waist=True,
+                              driven_arm_ids=arm5_ids)._read_measured_arms()
+
+    # 腰按 23dof 只要 yaw → 应当通过
+    c = arm_sdk.ArmSdkChannel(grippers=False, waist=True,
+                              driven_arm_ids=arm5_ids,
+                              driven_waist_names=("yaw",))
+    assert len(c._read_measured_arms()) == 10
+
+
+def test_only_the_waist_joints_the_robot_has_get_written(monkeypatch):
+    """入参永远是标准布局的 [roll, pitch, yaw]，写的只是这台真有的那些。"""
+    c = _channel(monkeypatch, waist=True, driven_waist_names=("yaw",))
+    c.publish_arms([0.0] * 14, waist=(0.9, -0.9, 0.42))
+    motors = c._message.motor_cmd
+    assert motors[arm_sdk.WAIST_MOTOR_IDS["yaw"]].q == pytest.approx(0.42)
+    assert motors[arm_sdk.WAIST_MOTOR_IDS["roll"]].q == 0.0      # 没写
+    assert motors[arm_sdk.WAIST_MOTOR_IDS["pitch"]].q == 0.0
