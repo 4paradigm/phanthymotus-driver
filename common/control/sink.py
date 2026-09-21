@@ -111,7 +111,29 @@ class Outcome:
 
 
 def _monotonic_ms() -> int:
+    """内部计时用：看门狗、速度、仲裁新鲜度。单调，不受 NTP 跳变影响。"""
     return int(time.monotonic() * 1000)
+
+
+def _wall_ms() -> int:
+    """**只**用来和消息里的 `stamp_ms` / `obs_stamp_ms` 比。
+
+    那两个字段由**另一个进程**打上，`motus.control/1` 把它们定义成 Unix 毫秒
+    （`actucore/plugins/vla/plugin.py` 发的就是 `int(time.time() * 1000)`）。拿单调
+    时钟去减一个 Unix 时间戳，得到的是「本机开机至今」减「1970 至今」——一个约
+    -1.79e12 的数。
+
+    后果不是报错，是**整条新鲜度检查静音**：`age` 永远是个巨大的负数，永远小于任何
+    `ttl`，于是过期指令和陈旧观测**全部放行**。实测：一条一小时前生成、基于一小时前
+    观测的指令，verdict 是 `applied`。
+
+    而这正是这个类的文档特意警告过的那件事 ——「set it generously and the protection
+    is gone while still appearing to be there」。它比那还糟：不是设得宽，是根本没在比。
+
+    内部计时仍然用单调时钟。跨进程比较需要共同的纪元，而时长测量不需要、且不该被
+    NTP 跳变影响 —— 两件事两个时钟，不是一个疏忽。
+    """
+    return int(time.time() * 1000)
 
 
 class ControlSink:
@@ -132,7 +154,11 @@ class ControlSink:
             holding an arm in the air indefinitely while the agent believes the
             action is still running.
         escalate_after: consecutive watchdog periods before escalating.
-        clock: `() -> int` milliseconds, monotonic. Injected for tests.
+        clock: `() -> int` milliseconds, monotonic — 内部计时（看门狗、速度）。
+            Injected for tests.
+        wall_clock: `() -> int` Unix 毫秒 —— **只**用来和消息里的 `stamp_ms` /
+            `obs_stamp_ms` 比，因为那两个字段是另一个进程按 Unix 纪元打的。
+            默认 `_wall_ms`；测试注入。两个时钟不是疏忽，见 `_wall_ms`。
     """
 
     def __init__(
@@ -144,6 +170,7 @@ class ControlSink:
         on_abort=None,
         escalate_after: int = 5,
         clock=None,
+        wall_clock=None,
     ):
         self.descriptor: Descriptor = (
             descriptor if isinstance(descriptor, Descriptor) else parse_descriptor(descriptor)
@@ -165,6 +192,10 @@ class ControlSink:
         self._on_abort = on_abort if on_abort is not None else on_watchdog
         self._escalate_after = escalate_after
         self._clock = clock or _monotonic_ms
+        # **故意不回退到 `clock`。** 「只注入 clock 就让两个时钟合一」正是让这个
+        # bug 活下来的那个条件：测试于是永远在「stamp 和 now 同一个纪元」的前提下
+        # 跑，而那恰恰是真实链路上不成立的。要同一个纪元的测试必须显式说出来。
+        self._wall_clock = wall_clock or _wall_ms
 
         # Last command actually applied — the baseline for step clamping and
         # for the velocity check.
@@ -201,7 +232,7 @@ class ControlSink:
         if outcome is not None:
             return self._count(outcome)
 
-        outcome = self._check_freshness(message, now)
+        outcome = self._check_freshness(message, self._wall_clock())
         if outcome is not None:
             return self._count(outcome)
 
