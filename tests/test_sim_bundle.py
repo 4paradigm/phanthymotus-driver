@@ -485,16 +485,46 @@ def test_one_sentence_is_not_logged_as_several():
     assert len(starts) == 1
 
 
-def test_a_speaker_with_no_ros_simply_does_not_subscribe():
-    """pytest 和离线重放都没有 ROS。安静地不订阅，而不是把整张卡带崩。"""
+def _speaker():
     from simulator.generic.cards_audio import SpeakerCard
     from simulator.generic.backend import LocalBackend
     from simulator.generic.clock import FakeClock
     from simulator.generic.world import VirtualWorld
 
-    card = SpeakerCard(VirtualWorld(LocalBackend(), FakeClock(), {}), {}, "sim")
+    return SpeakerCard(VirtualWorld(LocalBackend(), FakeClock(), {}), {}, "sim")
 
-    started = card.do_start(input_topic="/perception/tts_audio")
 
-    assert started["state"] == "running"
-    assert started["input_topic"] == "/perception/tts_audio"
+def test_start_carries_the_topic_the_canvas_resolved():
+    """**`Card.dispatch` 把 `start` 当生命周期动词拦下来，自己调无参的 `self.start()`。**
+
+    第一版把它写成了 `do_start(input_topic=...)` —— 永远不会被调到。结果是卡片启动
+    成功、`state: running`、`input_topic` 始终为空：一张**聋着的**卡，从外面看不出
+    任何异常，而「世界真的做了什么」那一列就一直是空的。Orin6 上就是这么现形的。
+    """
+    card = _speaker()
+
+    card.dispatch("start", {"input_topic": "/perception/tts"})
+
+    assert card.do_read()["input_topic"] == "/perception/tts"
+
+
+def test_info_reports_the_topic_it_actually_bound():
+    """agent-core 用 `info().topic_in[].topic` 判断一张卡接上了什么
+    （`api/config.py::_bound_inputs`）。不报的话，聋着的卡和正常的卡在它眼里一样。"""
+    card = _speaker()
+
+    deaf = card.info()
+    card.dispatch("start", {"input_topic": "/perception/tts"})
+    bound = card.info()
+
+    assert [t.get("topic") for t in deaf["topic_in"] if t.get("topic")] == []
+    assert [t["topic"] for t in bound["topic_in"]] == ["/perception/tts"]
+
+
+def test_a_speaker_with_no_ros_simply_does_not_subscribe():
+    """pytest 和离线重放都没有 ROS。安静地不订阅，而不是把整张卡带崩。"""
+    card = _speaker()
+
+    card.dispatch("start", {"input_topic": "/perception/tts_audio"})
+
+    assert card.do_read()["state"] == "running"
