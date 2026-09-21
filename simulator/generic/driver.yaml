@@ -24,5 +24,9 @@ cards:
   - { name: arm,          type: actuator }
   - { name: led,          type: actuator }
   - { name: tts,          type: actuator }
+  # 订阅 audio/pcm-16k。接真实 tts 的输出，好让仿真世界听得见画布上绑的
+  # 是 perception 合成器时说了什么 —— 否则基准测试的「世界真的做了什么」
+  # 那一列在 agent 明明在说话时是空的。
+  - { name: speaker,      type: actuator }
   - { name: sim_scenario, type: actuator }
   - { name: sim_report,   type: resource }

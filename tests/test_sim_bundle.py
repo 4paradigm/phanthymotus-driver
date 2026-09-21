@@ -150,7 +150,7 @@ def test_build_plugins_works_without_ros(bundle):
     dispatch surface can be exercised on a laptop."""
     tools = bundle.get_all_tools()
 
-    assert len(tools) == 14
+    assert len(tools) == 15
     assert {"controlled_spatial", "tts", "loco", "spatial_map",
             "sim_scenario", "sim_report"} <= {t["name"] for t in tools}
 
@@ -405,3 +405,82 @@ def test_polling_the_report_renews_the_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(mod.time, "time", lambda: later + mod.OWNER_TTL - 1)
 
     assert "error" in card.switch_map("site-b")       # 还在跑，仍然拒绝
+
+
+# ── 世界要听得见真实 tts ─────────────────────────────────────────────────────
+
+def test_the_speaker_declares_the_stream_half_of_the_canvas_contract():
+    """**`topic_in` 是这张卡存在的理由。**
+
+    这里原先有一张 `speaker`，被删掉了，因为它照着 `voice_play` 那种调用式的卡抄，
+    却用了 speaker 的名字 —— 没有 `topic_in`，画布上什么都连不进去。真机上的每一张
+    speaker 都是订阅 `audio/pcm-16k` 的。
+    """
+    from simulator.generic.cards_audio import SpeakerCard
+    from simulator.generic.backend import LocalBackend
+    from simulator.generic.clock import FakeClock
+    from simulator.generic.world import VirtualWorld
+
+    card = SpeakerCard(VirtualWorld(LocalBackend(), FakeClock(), {}), {}, "sim")
+    definition = card.get_tool()
+
+    assert definition["topic_in"] == [{"format": "audio/pcm-16k"}]
+    # 嘴由**合成**的那张卡占（tts）。这里再占一次，barrier 会让它和自己的上游串行 ——
+    # 而它正在播，恰恰是因为 tts 正在说。
+    assert "x-resource" not in definition["inputSchema"]
+
+
+def test_audio_on_the_stream_becomes_speak_events_in_the_world():
+    """左栏能看到 agent 调了 tts，右栏却一句话都没有 —— 差的就是这一步。"""
+    from simulator.generic.cards_audio import SpeakerCard
+    from simulator.generic.backend import LocalBackend
+    from simulator.generic.clock import FakeClock
+    from simulator.generic.world import VirtualWorld
+
+    world = VirtualWorld(LocalBackend(), FakeClock(), {})
+    card = SpeakerCard(world, {}, "sim")
+    card._input_topic = "/perception/tts_audio"
+
+    card._on_step(10.0, 0.1)          # 世界的时钟走到 10 秒
+    card._on_audio(None)              # 第一块音频
+    card._on_step(10.2, 0.1)
+    card._on_audio(None)              # 还在播
+    card._on_step(12.0, 0.1)          # 静了 1.8 秒 > QUIET_SECONDS
+
+    kinds = [e["event"] for e in world.events() if e["event"].startswith("speak")]
+    assert kinds == ["speak_start", "speak_end"]
+
+
+def test_one_sentence_is_not_logged_as_several():
+    """PCM 流里没有「说完了」这个标记，只能按静默判断 —— 门槛太短，一句话会被拆成
+    好几段，而「到了再讲」那条判定会看到一串莫名其妙的短播报。"""
+    from simulator.generic.cards_audio import SpeakerCard
+    from simulator.generic.backend import LocalBackend
+    from simulator.generic.clock import FakeClock
+    from simulator.generic.world import VirtualWorld
+
+    world = VirtualWorld(LocalBackend(), FakeClock(), {})
+    card = SpeakerCard(world, {}, "sim")
+
+    for tick in range(10):            # 每 0.2 秒一块，中间的间隔都小于门槛
+        card._on_step(tick * 0.2, 0.2)
+        card._on_audio(None)
+    card._on_step(5.0, 0.2)
+
+    starts = [e for e in world.events() if e["event"] == "speak_start"]
+    assert len(starts) == 1
+
+
+def test_a_speaker_with_no_ros_simply_does_not_subscribe():
+    """pytest 和离线重放都没有 ROS。安静地不订阅，而不是把整张卡带崩。"""
+    from simulator.generic.cards_audio import SpeakerCard
+    from simulator.generic.backend import LocalBackend
+    from simulator.generic.clock import FakeClock
+    from simulator.generic.world import VirtualWorld
+
+    card = SpeakerCard(VirtualWorld(LocalBackend(), FakeClock(), {}), {}, "sim")
+
+    started = card.do_start(input_topic="/perception/tts_audio")
+
+    assert started["state"] == "running"
+    assert started["input_topic"] == "/perception/tts_audio"

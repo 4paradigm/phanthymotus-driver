@@ -1,23 +1,33 @@
-"""Speech: the `tts` card.
+"""Speech: the `tts` and `speaker` cards.
 
-There was a `speaker` card here too. It has been removed, because it was two
-different things stitched together: the **name** of a stream sink and the
-**behaviour** of a player, with no `topic_in` at all, so nothing could be wired
-into it on the canvas.
+Two different shapes, and they are not interchangeable. Every real `speaker` in
+this repo — `unitree/g1`, `go2`, `r1`, `engineai/t800`, `noetix/bumi`,
+`robotera/q5_bundle` — declares `topic_in: [{"format": "audio/pcm-16k"}]` and
+plays whatever arrives on the stream. `x-humanoid/tianyi2.0`'s `voice_play` is
+the other shape: call-driven `play_file` / `play_url` / `play_text`, no
+`topic_in` because it consumes no stream. A `speaker` card once lived here that
+copied the second while wearing the first's name, with no `topic_in` at all, so
+nothing could be wired into it — it was removed, and this docstring said a
+stream-consuming one was worth adding "when something needs the `topic_in` half
+of the canvas contract".
 
-Both shapes exist for real, and they are not the same card. Every real
-`speaker` in this repo — `unitree/g1`, `go2`, `r1`, `engineai/t800`,
-`noetix/bumi`, `robotera/q5_bundle` — declares
-`topic_in: [{"format": "audio/pcm-16k"}]` and plays whatever arrives on the
-stream. `x-humanoid/tianyi2.0`'s `voice_play` is the other shape: call-driven
-`play_file` / `play_url` / `play_text`, and no `topic_in` because it consumes no
-stream. Copying the second while naming it after the first produced a card that
-answered to nobody.
+**That is now the case.** A solution whose canvas binds perception's `tts`
+synthesises real audio and publishes it — and the simulated world never hears a
+word of it. On the benchmark's run log, the「世界真的做了什么」column stays empty
+while the agent is plainly speaking, and every judgement about announcement
+timing has nothing to read. The gap is not the agent's; it is that the world had
+no ears.
 
-`tts` covers everything the exhibition tour needs — ACP completion, interrupt,
-and the announcement-ordering assertions — so the bundle has one mouth and one
-card for it. A stream-consuming `speaker` is worth adding when something needs
-the `topic_in` half of the canvas contract, which nothing here does yet.
+So `speaker` is back, in the shape every real one has: it subscribes to the
+stream the canvas wires into it and logs what a speaker can actually know —
+**that audio played, and for how long**. Not what was said: PCM carries no text,
+and a real speaker does not know it either. The run log's left column already
+shows the text from the agent's own call; what the right column was missing is a
+`speak_start` / `speak_end` pair at the right moments.
+
+`tts` remains the call-driven mouth for solutions that want the simulator to own
+synthesis too — it is the only way to check announcement ordering on an Orin,
+neither of which has a real speaker.
 
 Neither Orin has a real speaker, so a virtual `tts` card is the only way to
 verify announcement ordering on those rigs at all. That is the single assertion
@@ -63,6 +73,127 @@ class _SpeechCard(Card):
         self._owned.add(utterance.id)
         return {"state": "running", "action_id": utterance.id,
                 "text": utterance.text, "estimated_seconds": round(utterance.duration, 2)}
+
+
+class SpeakerCard(Card):
+    """A mouth that only listens to a stream.
+
+    **Declares no `x-resource`.** The real ones do not either: the mouth is
+    claimed by whatever *synthesises* (`tts`), and claiming it here too would
+    make the barrier serialise a card against its own upstream — the speaker is
+    playing precisely because tts is speaking.
+
+    Silence is judged by a gap, not by an end-of-stream marker, because there is
+    no such marker in a PCM stream. `QUIET_SECONDS` therefore sets how long a
+    pause has to be before it counts as the end of an utterance; too short and a
+    single sentence is logged as several.
+    """
+
+    NAME = "speaker"
+    KIND = "actuator"
+    DESCRIPTION = "虚拟扬声器 — 订阅 PCM 音频流并记录播报起止；接真实 tts 的输出"
+    TOPIC = ""
+    TOPIC_IN = [{"format": "audio/pcm-16k"}]
+    ACTIONS = {
+        "read": ([], "读取当前是否在播，以及累计播了几段"),
+    }
+    PROPERTIES = {
+        "input_topic": {"type": "string",
+                        "description": "要订阅的 PCM 音频 topic；由画布连线提供"},
+    }
+
+    # 音频流里没有「说完了」这个标记，只能按静默判断。
+    QUIET_SECONDS = 0.6
+
+    def __init__(self, world, config, namespace, ros2=None):
+        super().__init__(world, config, namespace, ros2)
+        self._sub = None
+        self._sub_node = None
+        self._input_topic = ""
+        self._speaking = False
+        self._now = 0.0
+        self._last_chunk = 0.0
+        self._started_at = 0.0
+        self._turns = 0
+        self._action_id = ""
+        world.add_step_listener(self._on_step)
+
+    # ---- lifecycle -----------------------------------------------------
+
+    def do_start(self, input_topic: str = "", **_):
+        """画布把上游 `tts` 的 `topic_out` 当作 `input_topic` 传进来。"""
+        self._input_topic = str(input_topic or self._input_topic)
+        super().start()
+        self._open_subscription()
+        return {"state": "running", "input_topic": self._input_topic}
+
+    def do_stop(self, **_):
+        self._close_subscription()
+        self._end_utterance()
+        super().stop()
+        return {"state": "idle"}
+
+    def do_read(self, **_):
+        return {"state": "running" if self._running else "idle",
+                "input_topic": self._input_topic,
+                "speaking": self._speaking, "turns": self._turns}
+
+    # ---- the stream ----------------------------------------------------
+
+    def _open_subscription(self) -> None:
+        """没有 ROS 时安静地不订阅 —— pytest 与离线重放都走这条路。"""
+        if self._ros2 is None or not self._input_topic or self._sub is not None:
+            return
+        try:
+            from rclpy.node import Node
+            from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+            from std_msgs.msg import UInt8MultiArray
+
+            self._sub_node = Node(f"{self.namespace}_speaker", context=self._ros2.ctx_core)
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=10)
+            self._sub = self._sub_node.create_subscription(
+                UInt8MultiArray, self._input_topic, self._on_audio, qos)
+            self._ros2.executor_core.add_node(self._sub_node)
+        except Exception as exc:                      # noqa: BLE001
+            print(f"[sim-speaker] 订阅 {self._input_topic} 失败：{exc}", flush=True)
+
+    def _close_subscription(self) -> None:
+        node, self._sub_node, self._sub = self._sub_node, None, None
+        if node is None:
+            return
+        try:
+            self._ros2.executor_core.remove_node(node)
+            # `destroy_node`，不只是 `remove_node` —— 否则发布者和 ROS 节点名都会泄漏，
+            # 下一次订阅会撞上「name already registered」。
+            node.destroy_node()
+        except Exception:
+            pass
+
+    def _on_audio(self, _msg) -> None:
+        # 时刻取自世界的事件记录，而不是墙钟：加速倍率下两者不是一回事，而这条事件
+        # 要和同一条事实流里的 `arrive` 相减。
+        self._last_chunk = self._now
+        if not self._speaking:
+            self._speaking = True
+            self._started_at = self._now
+            self._turns += 1
+            self._action_id = f"spk-{self._turns}"
+            self.world.log("speak_start", action_id=self._action_id,
+                           source=self._input_topic or "stream")
+
+    def _on_step(self, t: float, _dt: float) -> None:
+        self._now = t
+        if self._speaking and t - self._last_chunk > self.QUIET_SECONDS:
+            self._end_utterance(t)
+
+    def _end_utterance(self, now: float | None = None) -> None:
+        if not self._speaking:
+            return
+        self._speaking = False
+        ended = self._now if now is None else now
+        self.world.log("speak_end", action_id=self._action_id, status="completed",
+                       duration=round(max(0.0, ended - self._started_at), 2))
 
 
 class TtsCard(_SpeechCard):
