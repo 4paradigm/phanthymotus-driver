@@ -101,6 +101,17 @@ def message(clock: FakeClock, values, *, seq=1, source="vla", priority=50,
 
 
 def make_sink(clock, apply, descriptor=None, **kwargs):
+    """**两个时钟都用同一个假时钟**，而这是一个显式的选择。
+
+    sink 内部用单调时钟计时，用墙钟和消息里的 `stamp_ms` 比 —— 因为那个字段是另一
+    个进程按 Unix 纪元打的。这里的用例自己构造消息、stamp 取自同一个 FakeClock，
+    所以两边合一才说得通。
+
+    但它必须**写出来**：默认不合一。「只注入 clock 就自动合一」曾经是这个文件的
+    行为，而那正是让「sink 拿单调时钟去减 Unix 时间戳」活到真机测试前一刻的原因
+    —— 每条用例都在一个真实链路上不成立的前提下跑。
+    """
+    kwargs.setdefault("wall_clock", clock)
     return ControlSink(
         descriptor or descriptor_dict(), apply, clock=clock, **kwargs
     )
@@ -803,3 +814,66 @@ def test_two_end_effectors_in_one_group_are_two_quaternions():
     raw["groups"] = [{"name": "arms", "offset": 0, "count": 14,
                       "mode": "eef_pose"}]
     assert parse_descriptor(raw).eef_quat_offsets == (3, 10)
+
+
+# ── 新鲜度比的是两个进程之间的时间，所以必须同一个纪元 ──────────────────────
+
+
+def test_a_wall_clock_stamp_is_actually_compared_against_wall_clock():
+    """**这条是整个文件里最重要的一条，因为它此前不存在。**
+
+    消息里的 `stamp_ms` / `obs_stamp_ms` 由**另一个进程**打上，`motus.control/1`
+    把它们定义成 Unix 毫秒（`actucore` 发的就是 `int(time.time() * 1000)`）。而
+    sink 原本拿 `time.monotonic()` 去减它们 —— 「本机开机至今」减「1970 至今」，
+    约 -1.79e12。
+
+    后果不是报错，是整条新鲜度检查静音：`age` 永远是巨大的负数，永远小于任何
+    `ttl`。实测过：一条一小时前生成、基于一小时前观测的指令，verdict 是 `applied`。
+
+    这个 bug 能活到真机测试的前一刻，是因为**这个文件里每一条用例都注入 FakeClock**
+    —— 注入之后 stamp 和 now 自然同一个纪元，而那正是真实链路上不成立的前提。所以
+    这条用例故意**不注入** wall_clock，用真实的墙钟。
+    """
+    import time as real_time
+
+    clock, recorder = FakeClock(), Recorder()
+    # 只注入内部计时的那个时钟；wall_clock 留默认，也就是真的 time.time()。
+    sink = ControlSink(descriptor_dict(), recorder, clock=clock)
+
+    wall_now = int(real_time.time() * 1000)
+    stale = message(clock, [0.1, 0.1], ttl_ms=100)
+    stale["stamp_ms"] = wall_now - 3_600_000        # 一小时前生成
+    stale["obs_stamp_ms"] = wall_now - 3_600_000    # 基于一小时前的观测
+
+    outcome = sink.submit(stale)
+
+    assert outcome.verdict is Verdict.DROPPED, "过期指令必须被丢弃"
+    assert "expired" in outcome.reason
+    assert recorder.calls == [], "陈旧指令绝不能到达 apply"
+
+
+def test_a_fresh_wall_clock_command_still_passes():
+    """修复不能把正常的指令也挡掉 —— 否则整条流都停了。"""
+    import time as real_time
+
+    clock, recorder = FakeClock(), Recorder()
+    sink = ControlSink(descriptor_dict(), recorder, clock=clock)
+
+    wall_now = int(real_time.time() * 1000)
+    fresh = message(clock, [0.1, 0.1], ttl_ms=500)
+    fresh["stamp_ms"] = wall_now
+    fresh["obs_stamp_ms"] = wall_now
+
+    assert sink.submit(fresh).applied
+    assert recorder.last == (0.1, 0.1)
+
+
+def test_the_two_clocks_are_separate_on_purpose():
+    """内部计时仍然用单调时钟：时长测量不该被 NTP 跳变影响。
+
+    跨进程比较需要共同的纪元，时长测量不需要 —— 两件事两个时钟。
+    """
+    clock, recorder = FakeClock(), Recorder()
+    sink = ControlSink(descriptor_dict(), recorder, clock=clock)
+    assert sink._clock is clock
+    assert sink._wall_clock is not clock

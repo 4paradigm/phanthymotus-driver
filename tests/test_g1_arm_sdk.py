@@ -174,3 +174,285 @@ def test_the_wrists_get_the_weaker_gains(monkeypatch):
     assert arm_sdk.KD_WRIST < arm_sdk.KD_ARM
     assert arm_sdk.WRIST_MOTOR_IDS == {19, 20, 21, 26, 27, 28}
     assert arm_sdk.WRIST_MOTOR_IDS < set(arm_sdk.ARM_MOTOR_IDS)
+
+
+# ── 接管之前必须先知道手臂在哪 ──────────────────────────────────────────────
+
+
+class _FakeMotorState:
+    def __init__(self, q, mode=1):
+        self.q = q
+        self.mode = mode
+
+
+class _FakeLowState:
+    """29 个关节，每个给一个能认出来的值。"""
+
+    def __init__(self):
+        self.motor_state = [_FakeMotorState(i / 100.0) for i in range(35)]
+
+
+def _stub_low_state(monkeypatch, deliver=True):
+    """替掉 `ChannelSubscriber`，模拟 rt/lowstate 到达或者不到达。"""
+    import types
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            self.topic = topic
+
+        def Init(self, callback, depth):  # noqa: N802 —— SDK 的大小写
+            if deliver:
+                callback(_FakeLowState())
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    channel.ChannelPublisher = lambda *a, **k: types.SimpleNamespace(
+        Init=lambda: None, Write=lambda m: None)
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    dds.LowCmd_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+
+def test_the_measured_arm_angles_are_read_before_anything_is_published(monkeypatch):
+    """**这条测的是那个会让手臂甩起来的默认值。**
+
+    `LowCmd_` 里每个 `motor_cmd[i].q` 默认是 0.0，而 0 不是「不控制」是「去零位」。
+    只填 kp/kd 就渐入权重，发出去的是「双臂去全零位」—— 手臂以 kp=300 在一秒内甩
+    直，而日志里什么都没有。所以 `open()` 必须先拿实测角把 q 填上。
+    """
+    _stub_low_state(monkeypatch)
+    channel = arm_sdk.ArmSdkChannel(grippers=False)
+    measured = channel._read_measured_arms()
+
+    assert len(measured) == 14
+    # ARM_MOTOR_IDS 是 15..28，桩里第 i 个关节的 q 是 i/100。
+    assert measured[0] == pytest.approx(0.15)
+    assert measured[-1] == pytest.approx(0.28)
+
+
+def test_without_a_low_state_frame_it_refuses_to_open(monkeypatch):
+    """不知道手臂在哪就接管，是这条链路上最危险的一种。
+
+    用零位兜底会让它「看起来能启动」，然后甩臂。拒绝是唯一能把它变成一次可观察
+    失败的处置 —— `_start` 会把卡片回滚成 idle 并报出原因。
+    """
+    _stub_low_state(monkeypatch, deliver=False)
+    channel = arm_sdk.ArmSdkChannel(grippers=False)
+    monkeypatch.setattr(channel.__class__, "LOW_STATE_TIMEOUT_S", 0.05)
+
+    with pytest.raises(RuntimeError, match="rt/lowstate"):
+        channel._read_measured_arms()
+
+
+def test_the_ramp_holds_the_arms_where_they_were_found(monkeypatch):
+    """接管渐入期间重发的，必须是手臂此刻所在的位置。
+
+    这是模块文档一直声称、而代码此前并没有做到的那件事。
+    """
+    monkeypatch.setattr(arm_sdk.time, "sleep", lambda _s: None)
+    _stub_low_state(monkeypatch)
+    channel = arm_sdk.ArmSdkChannel(grippers=False)
+    measured = channel._read_measured_arms()
+    channel._last_target = list(measured)
+    channel._arm_pub = _FakePublisher()
+    channel._message = _FakeMessage()
+    channel._crc = None
+
+    channel.ramp(0.0, 1.0, arm_sdk.TAKEOVER_S)
+
+    for motor_id, expected in zip(arm_sdk.ARM_MOTOR_IDS, measured):
+        assert channel._message.motor_cmd[motor_id].q == pytest.approx(expected)
+        assert channel._message.motor_cmd[motor_id].q != 0.0
+
+
+def test_the_low_state_subscriber_is_closed_after_the_one_frame(monkeypatch):
+    """只要一帧，拿到就关。
+
+    留着它意味着一条 500 Hz 的订阅活到进程结束。这个仓库里「孤儿订阅」的历史是：
+    卡片 stop 之后回调还在跑，ROS 图看着健康，直到某次 teardown 顺序出错把整层
+    订阅一起带走 —— 而那时候症状指向的是别的地方。
+    """
+    import types
+
+    closed = []
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            callback(_FakeLowState())
+
+        def Close(self):  # noqa: N802
+            closed.append(True)
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    arm_sdk.ArmSdkChannel(grippers=False)._read_measured_arms()
+    assert closed == [True]
+
+
+def test_the_subscriber_is_closed_even_when_no_frame_arrives(monkeypatch):
+    """超时路径同样要关 —— 那条路上我们已经建了订阅，只是没等到数据。"""
+    import types
+
+    closed = []
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            pass                       # 什么都不送
+
+        def Close(self):  # noqa: N802
+            closed.append(True)
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    channel_obj = arm_sdk.ArmSdkChannel(grippers=False)
+    monkeypatch.setattr(channel_obj.__class__, "LOW_STATE_TIMEOUT_S", 0.05)
+    with pytest.raises(RuntimeError):
+        channel_obj._read_measured_arms()
+    assert closed == [True]
+
+
+def test_the_machine_type_is_echoed_back_or_the_robot_ignores_us(monkeypatch):
+    """`mode_machine` 是**硬件型号握手**，不回传机器人就静默忽略整条指令。
+
+    真机上证实过：G1 报 `mode_machine=4`，我们发默认的 0，于是权重渐入正常、
+    IK 残差 0.26 mm、`rt/arm_sdk` 照发，而手臂一动不动 —— 链路每一环都「成功」。
+    """
+    import types
+
+    class _Frame(_FakeLowState):
+        mode_machine = 4
+        mode_pr = 0
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            callback(_Frame())
+
+        def Close(self):  # noqa: N802
+            pass
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    c = arm_sdk.ArmSdkChannel(grippers=False)
+    c._read_measured_arms()
+    assert c._mode_machine == 4
+
+
+def test_a_joint_the_robot_does_not_have_refuses_the_start(monkeypatch):
+    """`mode == 0` 表示这个关节不存在或未使能。
+
+    实测的那台 G1 是 23dof/arm5：两条手臂的 wrist_pitch/wrist_yaw 都是 mode=0。
+    往它们写目标不报错，只会让手臂到不了 IK 解出来的位姿，而残差（在**模型**里
+    算的）一切正常 —— 残差校验的是求解器，不是机器人。
+    """
+    import types
+
+    class _Arm5Frame(_FakeLowState):
+        mode_machine = 10
+
+        def __init__(self):
+            super().__init__()
+            for i in (20, 21, 27, 28):        # 两侧 wrist_pitch / wrist_yaw
+                self.motor_state[i].mode = 0
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            callback(_Arm5Frame())
+
+        def Close(self):  # noqa: N802
+            pass
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    with pytest.raises(RuntimeError, match="mode=0"):
+        arm_sdk.ArmSdkChannel(grippers=False)._read_measured_arms()
+
+
+def test_the_waist_check_follows_the_variant_too(monkeypatch):
+    """23dof 的机器上腰只有 yaw —— roll/pitch 报 mode=0。
+
+    真机上就是在这里挂的一次：臂关节按型号放行了，腰还在按三个要，于是卡片拒绝
+    启动并点名 `[13, 14]`。守卫没错，是通道的腰处理没跟着型号走。
+    """
+    import types
+
+    class _Arm5Frame(_FakeLowState):
+        mode_machine = 4
+
+        def __init__(self):
+            super().__init__()
+            for i in (20, 21, 27, 28, 13, 14):     # 腕 pitch/yaw + 腰 roll/pitch
+                self.motor_state[i].mode = 0
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            callback(_Arm5Frame())
+
+        def Close(self):  # noqa: N802
+            pass
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    arm5_ids = list(range(15, 20)) + list(range(22, 27))
+
+    # 腰按 29dof 要三个 → 应当拒绝，并点名 13/14
+    with pytest.raises(RuntimeError, match="13"):
+        arm_sdk.ArmSdkChannel(grippers=False, waist=True,
+                              driven_arm_ids=arm5_ids)._read_measured_arms()
+
+    # 腰按 23dof 只要 yaw → 应当通过
+    c = arm_sdk.ArmSdkChannel(grippers=False, waist=True,
+                              driven_arm_ids=arm5_ids,
+                              driven_waist_names=("yaw",))
+    assert len(c._read_measured_arms()) == 10
+
+
+def test_only_the_waist_joints_the_robot_has_get_written(monkeypatch):
+    """入参永远是标准布局的 [roll, pitch, yaw]，写的只是这台真有的那些。"""
+    c = _channel(monkeypatch, waist=True, driven_waist_names=("yaw",))
+    c.publish_arms([0.0] * 14, waist=(0.9, -0.9, 0.42))
+    motors = c._message.motor_cmd
+    assert motors[arm_sdk.WAIST_MOTOR_IDS["yaw"]].q == pytest.approx(0.42)
+    assert motors[arm_sdk.WAIST_MOTOR_IDS["roll"]].q == 0.0      # 没写
+    assert motors[arm_sdk.WAIST_MOTOR_IDS["pitch"]].q == 0.0

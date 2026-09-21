@@ -59,6 +59,7 @@ from arm_sdk import (  # noqa: F401 —— 重新导出，测试与配置按 ser
     ARM_SDK_TOPIC,
     DEX1_CMD_TOPICS,
     HANDBACK_S,
+    LOW_STATE_TOPIC,
     KD_ARM,
     KD_WRIST,
     KP_ARM,
@@ -71,8 +72,6 @@ from arm_sdk import (  # noqa: F401 —— 重新导出，测试与配置按 ser
 )
 
 # ── 关节与限位，全部来自官方文档与仓库里的 URDF ─────────────────────────────
-
-LOW_STATE_TOPIC = "rt/lowstate"
 
 JOINT_NAMES = [
     "left_shoulder_pitch", "left_shoulder_roll", "left_shoulder_yaw",
