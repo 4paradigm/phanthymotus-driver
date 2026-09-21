@@ -26,6 +26,66 @@
     msg.motor_cmd[arm_joint].q/dq/kp/kd/tau     # 只写手臂那 14 个
 
 代价是接管和交还都要**渐变**，不能瞬间切 —— 见 `ramp`。
+
+── `rt/arm_sdk` 要求**运控服务正在运行**，这是它唯一的前置 ──────────────
+
+这条是真机上花了最久才定位的，而且中途走错过一次，错法值得留下来。
+
+`rt/arm_sdk` **不是**一条直接写电机的通道，它是高层运控服务提供的接口，由那个服务
+做混合：`实际执行 = 运控指令 × (1 − weight) + arm_sdk 指令 × weight`。运控服务没在
+跑，就没有人订阅 `rt/arm_sdk` —— 权重、增益、CRC、IK 全都正确，消息发进虚空，手臂
+纹丝不动，**没有任何一处报错**。
+
+判据是问 loco 服务要一次状态，不是看日志：
+
+    GetFsmId() -> (3102, None)
+    [Writer] no subscriber matched rt/api/sport/request — is the peer service running?
+
+FSM 500（Regular Mode，1 自由度腰）下同一条指令立刻生效，实测左肘 −0.0437 rad
+（指令 −0.05）。
+
+**和 `rt/lowcmd` 的前置正好相反**：那条要求进调试模式、把运控停掉。选错通道加选错
+模式，两次都不会报错。
+
+**注意 FSM 801（AI Run）不要用。** 宇树 issue #182 记录了在 locomotion 模式下使用
+`rt/arm_sdk` 触发单向不可恢复的 FSM 转换，之后机器人走不了路。
+
+── `mode_machine` 回传：按文档做，但**实测它对 arm_sdk 没有影响** ──────────
+
+`LowCmd_` 有 `mode_machine`/`mode_pr` 两个字段，默认 0，官方文档说控制端要把
+`rt/lowstate` 读到的值原样填回去，否则机器人忽略低层指令。
+
+我们照做了，但要说清楚：**这条在 arm_sdk 上被实测证伪。** FSM 500 下做过 A/B ——
+回传 4 和回传 0，左肘位移分别是 −0.0437 和 −0.0436 rad，没有差别。
+
+保留回传是因为它零成本且符合文档（那条要求很可能是针对 `rt/lowcmd` 的），但**不要
+把它当成"指令不生效"的排查方向** —— 曾经有人（我）在这上面找错了方向，真正的原因
+是上面那条。
+
+── 这台机器人有几个关节，要问它，不要问 URDF ──────────────────────────────
+
+`rt/lowstate` 里每个电机有一个 `mode` 字段，0 表示这个关节**不存在或未使能**。
+实测的这台 G1：两条手臂的 `wrist_pitch`/`wrist_yaw` 都是 `mode=0`、q 恒为 0，腰只有
+yaw 是 1 —— 也就是 **5 自由度手臂 + 1 自由度腰**（官方叫 23dof / arm5），而仓库里的
+`g1_model.urdf` 是 29dof（arm7 + 3 自由度腰）。
+
+差别不会报错。IK 在 7 自由度模型里解，把 +0.0845 rad 放进一个物理上不存在的
+`wrist_pitch`，残差报 0.26 mm（在**模型**里确实解出来了），然后机器人做不到那个位姿。
+**残差校验的是求解器，不是机器人。**
+
+所以 `open()` 会核对每一个要驱动的关节的 `mode`，有 0 就拒绝启动并点名 —— 把一次
+静默的「姿态对不上」变成一次启动期的响亮失败。
+
+── 接管之前必须先知道手臂在哪 ──────────────────────────────────────────────
+
+`LowCmd_` 这个消息里每个 `motor_cmd[i].q` 的默认值是 **0.0**，而 0 不是「不控制」，
+是「去零位」。所以 `open()` 如果只填 kp/kd 就开始渐入权重，发出去的是一条「双臂去
+全零位」的指令 —— 零位是手臂伸直贴体侧，而卡片启动时手臂通常不在那儿。表现是
+**一 start 两条胳膊就以 kp=300 在一秒内甩直**，而日志里什么都没有。
+
+所以 `open()` 先订一帧 `rt/lowstate`，拿实测关节角给 `q` 打底，并把它设成
+`_last_target`。**读不到就拒绝启动**：不知道手臂在哪就接管，正是最危险的那一种，
+而「拒绝」是唯一能让它变成一次可观察失败的处置。
 """
 
 from __future__ import annotations
@@ -35,6 +95,8 @@ import time
 
 ARM_SDK_TOPIC = "rt/arm_sdk"
 DEX1_CMD_TOPICS = {"left": "rt/dex1/left/cmd", "right": "rt/dex1/right/cmd"}
+# 实测关节角。接管前必须读到一帧，见 `_read_measured_arms`。
+LOW_STATE_TOPIC = "rt/lowstate"
 
 # G1_29_JointArmIndex：左臂 15..21，右臂 22..28。
 ARM_MOTOR_IDS = list(range(15, 29))
@@ -60,6 +122,39 @@ HANDBACK_S = 2.0
 RAMP_HZ = 100.0
 
 
+def read_low_state_once(timeout_s: float = 2.0):
+    """等一帧 `rt/lowstate` 并**立刻关掉订阅**。纯读，不发布任何东西。
+
+    抽成模块函数，是因为有两个调用方：通道要用它拿接管前的实测角，卡片要用它判
+    机器人型号（arm5 还是 arm7）。各建一条用完即关的订阅，比让一方去问另一方要
+    缓存清楚 —— 缓存会过期，而这两处都要的是「此刻」。
+
+    读完就关：留着意味着一条 500 Hz 的订阅活到进程结束，而这个仓库里「孤儿订阅」
+    的历史是回调还在跑、ROS 图看着健康，直到某次 teardown 顺序出错把整层带走。
+    """
+    from unitree_sdk2py.core.channel import ChannelSubscriber
+    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+
+    received: dict = {}
+    subscriber = ChannelSubscriber(LOW_STATE_TOPIC, LowState_)
+    subscriber.Init(lambda message: received.setdefault("m", message), 10)
+    try:
+        deadline = time.monotonic() + timeout_s
+        while "m" not in received and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        try:
+            subscriber.Close()
+        except Exception:  # noqa: BLE001
+            pass
+    if "m" not in received:
+        raise RuntimeError(
+            f"{timeout_s:g} 秒内没有收到 {LOW_STATE_TOPIC}。"
+            "检查 NETWORK_INTERFACE 和机器人是否上电"
+        )
+    return received["m"]
+
+
 class ArmSdkChannel:
     """一条 arm_sdk 发布链路，外加两只 Dex1。
 
@@ -68,11 +163,26 @@ class ArmSdkChannel:
     直接收到的是同一种东西，这正是它能被两张卡片共用的原因。
     """
 
+    # 等一帧 `rt/lowstate` 的上限。它以 500 Hz 发，正常情况下第一帧在几毫秒内就到；
+    # 给到 2 秒是为了容忍 DDS 发现（joining 一个已有的 domain 要握手）。超时不重试
+    # —— 超时本身就说明这条链路不通，而在不通的链路上接管手臂是最坏的选择。
+    LOW_STATE_TIMEOUT_S = 2.0
+
     def __init__(self, *, send_crc: bool = True, grippers: bool = True,
-                 waist: bool = False):
+                 waist: bool = False, driven_arm_ids=None,
+                 driven_waist_names=None):
         self._send_crc = bool(send_crc)
         self._grippers = bool(grippers)
         self._waist = bool(waist)
+        # 这台机器人真正要驱动的臂关节。23dof/arm5 的机器上 20/21/27/28 不存在，
+        # 把它们算进来会让下面的 mode 核对误判成「机器人坏了」。
+        self._driven_arm_ids = list(driven_arm_ids or ARM_MOTOR_IDS)
+        # 腰同理：23dof 的机器上只有 yaw 存在（roll/pitch 报 mode=0）。写成名字
+        # 而不是下标，是因为调用方按 roll/pitch/yaw 思考，而下标是 13/14/12 ——
+        # 那个顺序每次都要回去查表，而查错不报错。
+        self._driven_waist = tuple(driven_waist_names
+                                   if driven_waist_names is not None
+                                   else WAIST_MOTOR_IDS)
         self._lock = threading.RLock()
         self._arm_pub = None
         self._gripper_pubs: dict = {}
@@ -80,14 +190,18 @@ class ArmSdkChannel:
         self._crc = None
         self._weight = 0.0
         self._last_target = None
+        self._measured_waist: dict = {}
+        self._mode_machine = 0
+        self._mode_pr = 0
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 
     def open(self):
-        """建发布器。Dex1 的 idl 缺席时**拒绝启动**，不降级。
+        """建发布器，并用**实测关节角**给指令打底。
 
-        让一张声明了 16 维的卡片只驱动 14 维，是协商通过之后再静默少动两个自由度
-        —— 正是这套协议存在的理由。
+        两处都会拒绝启动而不是降级：Dex1 的 idl 缺席（让一张声明 16 维的卡片只驱动
+        14 维，是协商通过之后再静默少动两个自由度），以及读不到 `rt/lowstate`
+        （不知道手臂在哪就接管 —— 见模块文档）。
         """
         from unitree_sdk2py.core.channel import ChannelPublisher
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
@@ -112,10 +226,19 @@ class ArmSdkChannel:
                 publisher.Init()
                 gripper_pubs[side] = publisher
 
+        # **先读实测，再建消息。** 顺序是有意的：读失败就在建立任何发布器之后、
+        # 发出任何一条指令之前抛出，而 `_start` 会把卡片回滚成 idle。
+        measured = self._read_measured_arms()
+
         message = unitree_hg_msg_dds__LowCmd_()
+        # **硬件型号握手。** 不回传这两个字段，机器人静默忽略整条指令 —— 见模块文档。
+        message.mode_machine = self._mode_machine
+        message.mode_pr = self._mode_pr
         motor_ids = list(ARM_MOTOR_IDS)
         if self._waist:
-            motor_ids += sorted(WAIST_MOTOR_IDS.values())
+            motor_ids += [WAIST_MOTOR_IDS[name] for name in self._driven_waist]
+        motor_ids = [i for i in motor_ids
+                     if i in self._driven_arm_ids or i in WAIST_MOTOR_IDS.values()]
         for motor_id in motor_ids:
             if motor_id in WRIST_MOTOR_IDS:
                 message.motor_cmd[motor_id].kp = KP_WRIST
@@ -128,6 +251,14 @@ class ArmSdkChannel:
                 message.motor_cmd[motor_id].kd = KD_ARM
             message.motor_cmd[motor_id].tau = 0.0
             message.motor_cmd[motor_id].dq = 0.0
+        # q 必须逐个填成实测值。漏掉它，默认的 0.0 就是「去零位」。
+        for motor_id, value in zip(self._driven_arm_ids, measured):
+            message.motor_cmd[motor_id].q = float(value)
+        if self._waist:
+            # 腰同理。这里读到的是实测腰角，第一条真正的指令会覆盖它。
+            for name in self._driven_waist:
+                message.motor_cmd[WAIST_MOTOR_IDS[name]].q = float(
+                    self._measured_waist.get(name, 0.0))
 
         crc = None
         if self._send_crc:
@@ -139,12 +270,88 @@ class ArmSdkChannel:
             self._gripper_pubs = gripper_pubs
             self._message = message
             self._crc = crc
+            # 渐入期间 `ramp` 重发的就是它 —— 也就是手臂此刻所在的位置。
+            self._last_target = list(measured)
 
     def close(self):
         with self._lock:
             self._arm_pub = None
             self._gripper_pubs = {}
             self._last_target = None
+
+    def _read_measured_arms(self):
+        """等一帧 `rt/lowstate`，返回 14 个臂关节的实测角（左 7 + 右 7）。
+
+        **纯读，不发布任何东西。** 它唯一的作用是回答「接管的那一刻，手臂在哪」，
+        而这个问题没有安全的默认答案：`LowCmd_` 里 `q` 的默认值 0.0 是「去零位」，
+        不是「不动」。
+
+        读不到就抛 —— 调用方（`_start`）会把卡片回滚成 idle 并把原因报出去。这比
+        「用零位兜底」好，理由和这个仓库里每一条「拒绝而不是猜」一样：猜错的代价
+        不是一条报错，是手臂以 kp=300 甩到一个没人要求过的位置。
+        """
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+
+        received: dict = {}
+
+        def _on_state(message):
+            if "m" not in received:
+                received["m"] = message
+
+        # **只要一帧，拿到就关。** 留着它意味着一条 500 Hz 的订阅活到进程结束，
+        # 而这个仓库里「孤儿订阅」的历史是：卡片 stop 之后回调还在跑，图看着健康，
+        # 全栈订阅却在某一次 teardown 顺序错误时一起停摆。
+        subscriber = ChannelSubscriber(LOW_STATE_TOPIC, LowState_)
+        subscriber.Init(_on_state, 10)
+        try:
+            deadline = time.monotonic() + self.LOW_STATE_TIMEOUT_S
+            while "m" not in received and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            # SDK 的 `Close()` 是 `del self.__reader` 然后置 None，而 DDS 的回调
+            # 可能正在飞 —— 那会在日志里留一条 `'NoneType' object has no attribute
+            # 'take'`。**这是 SDK 自己的 teardown 竞态，不是我们的错**，而且确定性地
+            # 关掉比让它被 GC 回收要好：窗口从「不确定」缩到几微秒，且只有一次。
+            try:
+                subscriber.Close()
+            except Exception:  # noqa: BLE001 —— 关不掉也不能挡住启动
+                pass
+
+        if "m" not in received:
+            raise RuntimeError(
+                f"{self.LOW_STATE_TIMEOUT_S:g} 秒内没有收到 {LOW_STATE_TOPIC} —— "
+                "拿不到实测关节角就不能接管手臂（指令里 q 的默认值 0.0 是「去零位」，"
+                "不是「不动」）。检查 NETWORK_INTERFACE 和机器人是否上电"
+            )
+
+        frame = received["m"]
+        # 型号握手用的两个字段，和实测角来自同一帧。
+        self._mode_machine = int(getattr(frame, "mode_machine", 0))
+        self._mode_pr = int(getattr(frame, "mode_pr", 0))
+
+        motors = frame.motor_state
+        # **这台机器人真有这些关节吗。** `mode == 0` 表示不存在或未使能，而往一个
+        # mode=0 的关节写目标不会报错，只会什么都不发生 —— 然后整条手臂到不了 IK
+        # 解出来的那个位姿，而残差（在模型里算的）一切正常。
+        absent = [motor_id for motor_id in self._driven_arm_ids
+                  if int(getattr(motors[motor_id], "mode", 1)) == 0]
+        if self._waist:
+            absent += [WAIST_MOTOR_IDS[name] for name in self._driven_waist
+                       if int(getattr(motors[WAIST_MOTOR_IDS[name]], "mode", 1)) == 0]
+        if absent:
+            raise RuntimeError(
+                f"要驱动的关节里有 mode=0（不存在或未使能）：{absent}。"
+                f"本机 mode_machine={self._mode_machine}。往不存在的关节写目标不报错，"
+                "只会让手臂到不了 IK 解出来的位姿，而残差一切正常 —— 所以这里拒绝"
+            )
+
+        measured = [float(motors[i].q) for i in self._driven_arm_ids]
+        self._measured_waist = {
+            name: float(motors[WAIST_MOTOR_IDS[name]].q)
+            for name in self._driven_waist
+        }
+        return measured
 
     # ── 状态 ─────────────────────────────────────────────────────────────────
 
@@ -177,14 +384,14 @@ class ArmSdkChannel:
             self._last_target = list(radians)
         if publisher is None or message is None:
             return
-        for motor_id, value in zip(ARM_MOTOR_IDS, radians):
+        for motor_id, value in zip(self._driven_arm_ids, radians):
             # 已经是弧度：descriptor 用的就是线上的单位，这里没有换算可以弄反。
             message.motor_cmd[motor_id].q = float(value)
         if waist is not None and self._waist:
-            roll, pitch, yaw = (float(v) for v in waist)
-            message.motor_cmd[WAIST_MOTOR_IDS["roll"]].q = roll
-            message.motor_cmd[WAIST_MOTOR_IDS["pitch"]].q = pitch
-            message.motor_cmd[WAIST_MOTOR_IDS["yaw"]].q = yaw
+            # 入参永远是标准布局的 [roll, pitch, yaw]，只写这台机器人真有的那些。
+            values = dict(zip(("roll", "pitch", "yaw"), (float(v) for v in waist)))
+            for name in self._driven_waist:
+                message.motor_cmd[WAIST_MOTOR_IDS[name]].q = values[name]
         self._write(message)
 
     def publish_gripper(self, side: str, closure):
@@ -212,8 +419,10 @@ class ArmSdkChannel:
           而不是线性 —— 它前段更慢。
         - **交还**（1→0）渐出，是因为权重归零的那一刻手臂脱力。两秒是官方例程的值。
 
-        渐变期间发的是**最后一个被接受的目标**，没有目标就只发权重（关节字段保持
-        上一次的值，电机因此停在原地）。
+        渐变期间发的是**最后一个被接受的目标**。接管时那就是 `open()` 从
+        `rt/lowstate` 读回来的实测角 —— 也就是手臂此刻所在的位置，所以渐入期间它
+        停在原地。看门狗清掉目标之后（`forget_target`）则只发权重，关节字段保持
+        消息里上一次的值，同样是停在原地。
         """
         publisher, message = self._arm_pub, self._message
         if publisher is None or message is None:
@@ -228,7 +437,7 @@ class ArmSdkChannel:
             self._weight = max(0.0, min(1.0, blended))
             target = self._last_target
             if target is not None:
-                for motor_id, value in zip(ARM_MOTOR_IDS, target[:14]):
+                for motor_id, value in zip(self._driven_arm_ids, target):
                     message.motor_cmd[motor_id].q = float(value)
             self._write(message)
             time.sleep(period)

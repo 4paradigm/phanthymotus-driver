@@ -201,8 +201,10 @@ def test_a_command_outside_the_vendor_limits_never_reaches_the_sdk():
 
     plugin, client = make_plugin()
     clock = [1_000_000]
+    # 两个时钟都用这个假时钟：下面的消息 stamp 也取自它。必须显式写 —— sink 默认
+    # 用墙钟和 `stamp_ms` 比，因为真实链路上那个字段是另一个进程按 Unix 纪元打的。
     sink = ControlSink(servo.build_descriptor(), plugin._apply,
-                       clock=lambda: clock[0])
+                       clock=lambda: clock[0], wall_clock=lambda: clock[0])
 
     beyond = math.radians(device.JOINT_LIMITS_DEG[1][1] + 10.0)   # joint2 over max
     outcome = sink.submit({
@@ -221,8 +223,10 @@ def test_a_valid_command_reaches_the_sdk_in_degrees():
 
     plugin, client = make_plugin()
     clock = [1_000_000]
+    # 两个时钟都用这个假时钟：下面的消息 stamp 也取自它。必须显式写 —— sink 默认
+    # 用墙钟和 `stamp_ms` 比，因为真实链路上那个字段是另一个进程按 Unix 纪元打的。
     sink = ControlSink(servo.build_descriptor(), plugin._apply,
-                       clock=lambda: clock[0])
+                       clock=lambda: clock[0], wall_clock=lambda: clock[0])
 
     outcome = sink.submit({
         "schema": "motus.control/1", "seq": 1, "stamp_ms": clock[0],

@@ -75,24 +75,70 @@ import time
 from common.control import ControlSink, Verdict, parse_descriptor
 from common.control.kinematics import ArmChain, KinematicsError
 
-from arm_sdk import HANDBACK_S, TAKEOVER_S, ArmSdkChannel
+from arm_sdk import HANDBACK_S, LOW_STATE_TOPIC, TAKEOVER_S, ArmSdkChannel
 
-LOW_STATE_TOPIC = "rt/lowstate"
-URDF_PATH = "/work/resource/g1_model.urdf"
+# ── 两种 G1，启动时按实测决定用哪一套 ──────────────────────────────────────
+#
+# 办公室那台是 **arm5 + 1 自由度腰**（23dof）：`rt/lowstate` 里 wrist_pitch /
+# wrist_yaw 与腰 roll/pitch 的 `mode` 全是 0，也就是这些关节不存在或未使能。而
+# 仓库原本只有 29dof 的 URDF（arm7 + 3 自由度腰）。
+#
+# **这个差别不报错。** 在 7 自由度模型里解一个 5 自由度手臂够不着的位姿，求解器会
+# 把解分配给不存在的 wrist_pitch（实测 +0.0845 rad），然后报残差 0.26 mm —— 在
+# **模型**里它确实解出来了。残差校验的是求解器，不是机器人。
+#
+# 所以型号由 `motor_state[].mode` 决定，不由配置决定：配置会写错，而实测不会。
+URDF_29DOF = "/work/resource/g1_model.urdf"
+URDF_23DOF = "/work/resource/g1_23dof.urdf"
 
 # 末端取手掌根，不是腕。腕之后还有一段固定变换，拿腕当末端会让整条轨迹系统性地
 # 差掉那一段 —— 一个恒定偏移，看起来像标定问题。
-TIP_LINKS = {"left": "left_hand_palm_link", "right": "right_hand_palm_link"}
-ARM_JOINTS = {
-    side: [f"{side}_{name}_joint" for name in (
-        "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
-        "wrist_roll", "wrist_pitch", "wrist_yaw")]
-    for side in ("left", "right")
+_ARM7 = ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
+         "wrist_roll", "wrist_pitch", "wrist_yaw")
+_ARM5 = _ARM7[:5]                       # 没有 wrist_pitch / wrist_yaw
+
+# 末端取手掌根而不是腕：腕之后还有一段固定变换，拿腕当末端会让整条轨迹系统性地差
+# 掉那一段 —— 一个恒定偏移，看起来像标定问题。两份 URDF 里那个 link 叫法不同。
+VARIANTS = {
+    "29dof": {
+        "urdf": URDF_29DOF,
+        "arm": _ARM7,
+        "tips": {"left": "left_hand_palm_link", "right": "right_hand_palm_link"},
+        "motors": {"left": list(range(15, 22)), "right": list(range(22, 29))},
+    },
+    "23dof": {
+        "urdf": URDF_23DOF,
+        "arm": _ARM5,
+        "tips": {"left": "left_wrist_roll_rubber_hand",
+                 "right": "right_wrist_roll_rubber_hand"},
+        "motors": {"left": list(range(15, 20)), "right": list(range(22, 27))},
+    },
 }
-WAIST_JOINTS = ("waist_roll_joint", "waist_pitch_joint", "waist_yaw_joint")
+# 29dof 的腰是三个关节，23dof 只有 yaw。描述符两种情况下**都声明 3 维**（模型输出
+# 就是 3 维），差别只在 IK 链里挂几个 —— 不可动的那两个本来就已经用限位卡死。
+WAIST_JOINTS_BY_VARIANT = {
+    "29dof": ("waist_roll_joint", "waist_pitch_joint", "waist_yaw_joint"),
+    "23dof": ("waist_yaw_joint",),
+}
+
+# 向后兼容的别名：外部（测试、其它模块）按老名字引用。
+TIP_LINKS = VARIANTS["29dof"]["tips"]
+ARM_JOINTS = {side: [f"{side}_{n}_joint" for n in _ARM7]
+              for side in ("left", "right")}
+WAIST_JOINTS = WAIST_JOINTS_BY_VARIANT["29dof"]
+
+
+def detect_variant(motor_state) -> str:
+    """看 `rt/lowstate` 的电机 `mode` 判型号。`mode == 0` = 不存在或未使能。
+
+    问机器人，不问配置：配置会写错，而实测不会。两侧腕 pitch/yaw 缺席就是 arm5。
+    """
+    absent = [i for i in (20, 21, 27, 28)
+              if int(getattr(motor_state[i], "mode", 1)) == 0]
+    return "23dof" if len(absent) == 4 else "29dof"
 
 # G1_29 的关节下标，从 rt/lowstate 里读实测角用。
-ARM_MOTOR_IDS = {"left": list(range(15, 22)), "right": list(range(22, 29))}
+ARM_MOTOR_IDS = VARIANTS["29dof"]["motors"]
 WAIST_MOTOR_IDS = (13, 14, 12)          # roll, pitch, yaw —— 和标准向量同序
 
 # 布局。**不是常量** —— 不带夹爪时整条向量往前挪两格，而一组写死的下标在那种
@@ -252,7 +298,10 @@ class G1ServoEefPlugin:
             raise ValueError(f"servo_eef.expected_hz must be in (0, {MAX_HZ}]")
         self._send_crc = bool(config.get("send_crc", True))
         self._grippers_enabled = bool(config.get("grippers", True))
-        self._urdf_path = str(config.get("urdf", URDF_PATH))
+        # 只在测试里用：真机上型号由 `detect_variant` 从实测电机 mode 得出，
+        # 不由配置决定 —— 配置会写错，而实测不会。
+        self._urdf_override = str(config.get("urdf", "")) or None
+        self._variant = ""
         self._max_position_residual = float(
             config.get("max_position_residual", MAX_POSITION_RESIDUAL))
         self._max_rotation_residual = float(
@@ -267,10 +316,12 @@ class G1ServoEefPlugin:
         self._sink = None
         self._sub_node = None
         self._state_pub = None
+        # 通道在 `_start` 里定完型号才建 —— 它要知道这台机器人真有哪些臂关节。
         self._channel = ArmSdkChannel(send_crc=self._send_crc,
                                       grippers=self._grippers_enabled,
                                       waist=True)
         self._chains: dict = {}
+        self._arm_motor_ids = VARIANTS["29dof"]["motors"]
         self._input_topic = ""
         self._running = False
         self._paused = False
@@ -280,6 +331,7 @@ class G1ServoEefPlugin:
         self._seed = {"left": None, "right": None}
         self._measured: dict = {}
         self._measured_ms = 0
+        self._low_state_sub = None
         self._last_outcome = None
         self._rejects: list = []
         self._last_residual: dict = {}
@@ -363,7 +415,10 @@ class G1ServoEefPlugin:
             return {"state": "error", "message": "没有 ROS 上下文，无法订阅"}
 
         try:
-            chains = self._build_chains()
+            # **先问机器人是什么型号，再建链。** 顺序是有意的：拿 29dof 的链去解
+            # 一台 arm5 的手臂不会报错，只会把解分配给不存在的关节。
+            variant = self._detect_variant_from_robot()
+            chains = self._build_chains(variant)
         except KinematicsError as exc:
             # 拒绝启动，不降级。一张声明了 eef_pose 的卡片解不了 IK，就是收下位姿
             # 然后什么都不做 —— 而画布上它看起来是在跑的。
@@ -380,6 +435,16 @@ class G1ServoEefPlugin:
                 return {"state": "error",
                         "message": f"已经在运行（{self._input_topic}）"}
             self._chains = chains
+            self._variant = variant
+            self._arm_motor_ids = VARIANTS[variant]["motors"]
+            self._channel = ArmSdkChannel(
+                send_crc=self._send_crc, grippers=self._grippers_enabled,
+                waist=True,
+                driven_arm_ids=(VARIANTS[variant]["motors"]["left"]
+                                + VARIANTS[variant]["motors"]["right"]),
+                # 23dof 只有 yaw；roll/pitch 已被描述符限位卡死在 ±0.02。
+                driven_waist_names=(("roll", "pitch", "yaw")
+                                    if variant == "29dof" else ("yaw",)))
             self._sink = sink
             self._input_topic = topic
             self._running = True
@@ -397,7 +462,8 @@ class G1ServoEefPlugin:
         # 内置控制器给它的位置上，不会先跳到一个目标再开始受控。
         self._channel.ramp(0.0, 1.0, TAKEOVER_S)
         print(f"[servo_eef] streaming from {topic}", flush=True)
-        return {"state": "running", "input": topic,
+        print(f"[servo_eef] variant={variant} chains={len(chains)}", flush=True)
+        return {"state": "running", "input": topic, "variant": variant,
                 "control_interface": self._descriptor_raw}
 
     def _halt(self, halted: bool):
@@ -440,6 +506,15 @@ class G1ServoEefPlugin:
             except Exception:  # noqa: BLE001
                 pass
         self._channel.close()
+        # **必须关。** 不关的话每一次 start 都留下一条 500 Hz 的 rt/lowstate 订阅，
+        # 而画布做 start/stop 是家常便饭 —— 这正是这个仓库里「孤儿订阅」那一类故障
+        # 的形状：图看着健康，回调还在跑，直到某次 teardown 顺序出错把整层带走。
+        subscriber, self._low_state_sub = self._low_state_sub, None
+        if subscriber is not None:
+            try:
+                subscriber.Close()
+            except Exception:  # noqa: BLE001 —— 清理失败不能挡住 stop 返回
+                pass
         with self._lock:
             self._state_pub = None
             self._chains = {}
@@ -455,6 +530,7 @@ class G1ServoEefPlugin:
                 "input": self._input_topic,
                 "weight": round(self._channel.weight, 3),
                 "grippers": self._grippers_enabled,
+            "variant": self._variant,
                 "control_interface": self._descriptor_raw,
                 "residual": dict(self._last_residual),
                 "last": self._last_outcome,
@@ -463,17 +539,37 @@ class G1ServoEefPlugin:
 
     # ── wiring ───────────────────────────────────────────────────────────────
 
-    def _build_chains(self) -> dict:
-        """两条链，各建各的模型。
+    def _build_chains(self, variant: str) -> dict:
+        """按型号建两条链，各建各的模型。
 
         共享一份 `pinocchio.Data` 的两条手臂会在求解过程里互相踩 —— 表现是偶发的、
         和负载相关的错误解，而不是异常。两份模型多占几 MB，换的是这个。
         """
+        spec = VARIANTS[variant]
+        urdf = self._urdf_override or spec["urdf"]
         return {
-            side: ArmChain(self._urdf_path, tip_link=TIP_LINKS[side],
-                           joint_names=ARM_JOINTS[side])
+            side: ArmChain(urdf, tip_link=spec["tips"][side],
+                           joint_names=[f"{side}_{n}_joint" for n in spec["arm"]])
             for side in ("left", "right")
         }
+
+    def _detect_variant_from_robot(self) -> str:
+        """读一帧 `rt/lowstate`，按电机 `mode` 判型号。
+
+        放在这里而不是 `ArmSdkChannel` 里：通道只管发，型号决定的是**运动学**，
+        而那是这张卡的事。两边各读一帧，代价是几毫秒，换的是职责不混。
+        """
+        from arm_sdk import read_low_state_once
+
+        try:
+            frame = read_low_state_once()
+        except Exception as exc:  # noqa: BLE001
+            raise KinematicsError(
+                f"读不到 rt/lowstate，无法判断机器人型号（{exc}）。"
+                "不判型号就建链，等于赌它是 29dof —— 赌错了不报错，"
+                "只会把 IK 的解分配给不存在的关节"
+            ) from exc
+        return detect_variant(frame.motor_state)
 
     def _open(self, topic: str):
         from rclpy.node import Node
@@ -518,7 +614,7 @@ class G1ServoEefPlugin:
         try:
             motors = message.motor_state
             measured = {
-                side: [float(motors[i].q) for i in ARM_MOTOR_IDS[side]]
+                side: [float(motors[i].q) for i in self._arm_motor_ids[side]]
                 for side in ("left", "right")
             }
             measured["waist"] = [float(motors[i].q) for i in WAIST_MOTOR_IDS]
@@ -583,7 +679,7 @@ class G1ServoEefPlugin:
             if chain is None:
                 return
             seed = self._seed_for(side)
-            extra = dict(zip(WAIST_JOINTS, waist))
+            extra = self._waist_extra(waist)
             try:
                 joints, position_residual, rotation_residual, _ = chain.solve(
                     values[span], seed, extra)
@@ -623,6 +719,17 @@ class G1ServoEefPlugin:
                 self._channel.publish_gripper(
                     side, values[self._layout[f"{side}_gripper"]])
 
+    def _waist_extra(self, waist) -> dict:
+        """把标准向量里的腰三元组 `[roll, pitch, yaw]` 映射到这个型号真有的关节。
+
+        23dof 只有 yaw —— 另外两维已经被描述符的限位卡死在 ±0.02 rad，所以丢掉它们
+        不是在忽略指令，而是在忽略一组已经被证明接近零的数。29dof 三个都挂上。
+        """
+        names = WAIST_JOINTS_BY_VARIANT.get(self._variant or "29dof")
+        if len(names) == 1:                       # 23dof：只有 yaw，取第三个
+            return {names[0]: float(waist[2])}
+        return dict(zip(names, (float(v) for v in waist)))
+
     def _seed_for(self, side: str):
         """上一拍的解；还没有就用实测值；再没有就用零位。
 
@@ -636,7 +743,7 @@ class G1ServoEefPlugin:
             return seed
         if measured is not None:
             return measured
-        return [0.0] * len(ARM_JOINTS[side])
+        return [0.0] * len(self._arm_motor_ids[side])
 
     def _publish_state(self):
         """关节角 + **当前末端位姿**，一路话题、一份载荷。
@@ -660,7 +767,7 @@ class G1ServoEefPlugin:
             return
 
         waist = measured.get("waist") or [0.0, 0.0, 0.0]
-        extra = dict(zip(WAIST_JOINTS, waist))
+        extra = self._waist_extra(waist)
         try:
             poses = {side: chains[side].forward(measured[side], extra)
                      for side in ("left", "right")}
