@@ -25,16 +25,16 @@ def _values(value):
         return [value]
 
 
-def _acp_notify(action_id, status, result):
+def _acp_notify(action_id, status, result, tool="loco"):
     import os, ssl, urllib.request
     payload = json.dumps({"action_id": action_id, "status": status,
-                          "result": result, "tool": "loco", "ts": time.time()}).encode()
+                          "result": result, "tool": tool, "ts": time.time()}).encode()
     try:
         request = urllib.request.Request(f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete",
             data=payload, headers={"Content-Type": "application/json"}, method="POST")
         urllib.request.urlopen(request, timeout=5, context=ssl._create_unverified_context())
     except Exception as exc:
-        print(f"[loco] ACP callback failed for {action_id}: {exc}", flush=True)
+        print(f"[{tool}] ACP callback failed for {action_id}: {exc}", flush=True)
 
 
 class _StateNode:
@@ -278,6 +278,8 @@ class SpecialMotionPlugin:
     def __init__(self, config, namespace, executor, proxy):
         self.proxy = proxy
         self._active_posture = None
+        self._state_lock = threading.Lock()
+        self._motion_lock = threading.Lock()
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
@@ -289,6 +291,7 @@ class SpecialMotionPlugin:
                     "confirm": {"type": "boolean", "description": "Required true for hazardous motions."}},
                     "required": ["action"],
                     "x-is-dangerous": True,
+                    "x-completion": {"actions": actions, "timeout": 30},
                     "x-action-params": {
                         "front_flip": {"params": ["confirm"], "description": "DANGEROUS forward flip; requires confirm=true."},
                         "back_flip": {"params": ["confirm"], "description": "DANGEROUS backward flip; requires confirm=true."},
@@ -297,31 +300,66 @@ class SpecialMotionPlugin:
 
     def start(self): pass
     def stop(self):
-        if self._active_posture == "handstand":
-            self.proxy.HandStand(0)
-        elif self._active_posture == "biped_stand":
-            self.proxy.BipedStand(0)
-        self._active_posture = None
+        with self._state_lock:
+            posture = self._active_posture
+        ret = 0
+        if posture == "handstand":
+            ret = self.proxy.HandStand(0)
+        elif posture == "biped_stand":
+            ret = self.proxy.BipedStand(0)
+        if ret == 0:
+            with self._state_lock:
+                if self._active_posture == posture:
+                    self._active_posture = None
+        return ret
+
+    def _run_motion(self, action_id, action, enter):
+        result = {"action": action}
+        if action in ("handstand", "biped_stand"):
+            result["enter"] = enter
+        try:
+            if action == "front_flip":
+                ret = self.proxy.FrontFlip()
+            elif action == "back_flip":
+                ret = self.proxy.BackFlip()
+            elif action == "handstand":
+                ret = self.proxy.HandStand(1 if enter else 0)
+            else:
+                ret = self.proxy.BipedStand(1 if enter else 0)
+            result["ret"] = ret
+            if ret == 0 and action in ("handstand", "biped_stand"):
+                with self._state_lock:
+                    self._active_posture = action if enter else None
+            status = "completed" if ret == 0 else "error"
+        except Exception as exc:
+            status = "error"
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._motion_lock.release()
+        _acp_notify(action_id, status, result, tool="special_motion")
+
+    def _start_motion(self, action, args):
+        if not self._motion_lock.acquire(blocking=False):
+            return {"error": "another special motion is still running"}
+        action_id = f"as2w_special_motion_{uuid4().hex[:8]}"
+        enter = bool(args.get("enter", True))
+        try:
+            threading.Thread(target=self._run_motion,
+                             args=(action_id, action, enter), daemon=True).start()
+        except Exception:
+            self._motion_lock.release()
+            raise
+        return {"accepted": True, "status": "running", "action": action,
+                "action_id": action_id}
 
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
-            self.stop()
-            return {"state": "idle"}
+            return {"state": "idle", "ret": self.stop()}
         if action in ("front_flip", "back_flip", "handstand", "biped_stand") and not args.get("confirm", False):
             return {"error": "special motion requires confirm=true"}
-        if action == "front_flip": return {"ret": self.proxy.FrontFlip()}
-        if action == "back_flip": return {"ret": self.proxy.BackFlip()}
-        if action == "handstand":
-            enter = bool(args.get("enter", True))
-            ret = self.proxy.HandStand(1 if enter else 0)
-            if ret == 0: self._active_posture = "handstand" if enter else None
-            return {"ret": ret, "enter": enter}
-        if action == "biped_stand":
-            enter = bool(args.get("enter", True))
-            ret = self.proxy.BipedStand(1 if enter else 0)
-            if ret == 0: self._active_posture = "biped_stand" if enter else None
-            return {"ret": ret, "enter": enter}
+        if action in ("front_flip", "back_flip", "handstand", "biped_stand"):
+            return self._start_motion(action, args)
         return None
 
 

@@ -107,6 +107,11 @@ class TestDriverContracts(unittest.TestCase):
         schema = plugin.get_tool()["inputSchema"]
         self.assertEqual("special_motion", plugin.get_tool()["name"])
         self.assertTrue(schema["x-is-dangerous"])
+        self.assertEqual(
+            {"front_flip", "back_flip", "handstand", "biped_stand"},
+            set(schema["x-completion"]["actions"]),
+        )
+        self.assertEqual(30, schema["x-completion"]["timeout"])
         self.assertIn("confirm", schema["x-action-params"]["front_flip"]["params"])
         self.assertIn("error", plugin.dispatch("front_flip", {}))
 
@@ -117,10 +122,75 @@ class TestDriverContracts(unittest.TestCase):
             BipedStand=lambda flag: calls.append(("biped_stand", flag)) or 0,
         )
         plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
-        self.assertEqual(0, plugin.dispatch("handstand", {"confirm": True, "enter": True})["ret"])
+        completed = __import__("threading").Event()
+        with patch.object(self.device, "_acp_notify", side_effect=lambda *_args, **_kwargs: completed.set()):
+            result = plugin.dispatch("handstand", {"confirm": True, "enter": True})
+            self.assertTrue(result["action_id"].startswith("as2w_special_motion_"))
+            self.assertTrue(completed.wait(1))
         self.assertEqual("handstand", plugin._active_posture)
         self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
         self.assertEqual([("handstand", 1), ("handstand", 0)], calls)
+
+    def test_special_motion_returns_immediately_and_reports_acp_completion(self):
+        entered = __import__("threading").Event()
+        release = __import__("threading").Event()
+        notified = []
+
+        def front_flip():
+            entered.set()
+            release.wait(1)
+            return 0
+
+        proxy = types.SimpleNamespace(FrontFlip=front_flip)
+        plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
+        with patch.object(
+                self.device, "_acp_notify",
+                side_effect=lambda *args, **kwargs: notified.append((args, kwargs))):
+            result = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertTrue(result["accepted"])
+            self.assertEqual("running", result["status"])
+            self.assertTrue(result["action_id"].startswith("as2w_special_motion_"))
+            self.assertTrue(entered.wait(1))
+            self.assertEqual([], notified)
+            self.assertIn("error", plugin.dispatch("back_flip", {"confirm": True}))
+            release.set()
+            for _ in range(100):
+                if notified:
+                    break
+                __import__("time").sleep(.01)
+
+        self.assertEqual(1, len(notified))
+        args, kwargs = notified[0]
+        self.assertEqual(result["action_id"], args[0])
+        self.assertEqual("completed", args[1])
+        self.assertEqual(0, args[2]["ret"])
+        self.assertEqual("special_motion", kwargs["tool"])
+
+    def test_special_motion_exception_reports_error_and_releases_slot(self):
+        notified = []
+        completed = __import__("threading").Event()
+
+        def fail():
+            raise RuntimeError("motion failed")
+
+        proxy = types.SimpleNamespace(FrontFlip=fail)
+        plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
+        with patch.object(
+                self.device, "_acp_notify",
+                side_effect=lambda *args, **kwargs: (notified.append((args, kwargs)), completed.set())):
+            first = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertTrue(completed.wait(1))
+            self.assertEqual(first["action_id"], notified[0][0][0])
+            self.assertEqual("error", notified[0][0][1])
+            self.assertIn("RuntimeError", notified[0][0][2]["error"])
+
+            proxy.FrontFlip = lambda: 0
+            completed.clear()
+            second = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertTrue(second["accepted"])
+            self.assertNotEqual(first["action_id"], second["action_id"])
+            self.assertTrue(completed.wait(1))
+            self.assertEqual("completed", notified[1][0][1])
 
     def test_multimedia_card_contracts_match_verified_hardware(self):
         mic = self.multimedia.MicPlugin.__new__(self.multimedia.MicPlugin)
