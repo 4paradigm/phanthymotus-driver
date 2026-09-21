@@ -139,9 +139,19 @@ class U1CardContractTests(unittest.TestCase):
     def test_u1_cyclonedds_config_uses_robot_multicast_interface(self):
         config = Path(__file__).with_name("config.yaml").read_text(encoding="utf-8")
         self.assertIn('robot_interface: "rgmii0"', config)
+        self.assertIn("NetworkInterface name='lo'", config)
         self.assertIn("NetworkInterface name='rgmii0'", config)
         self.assertIn("AllowMulticast>true", config)
-        self.assertNotIn("NetworkInterface name='lo'", config)
+
+    def test_mic_service_error_does_not_enable_forwarding(self):
+        import device
+
+        nodes = object.__new__(device.U1Nodes)
+        nodes._mic_forwarding = False
+        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=7))
+        with self.assertRaisesRegex(RuntimeError, "microphone enable failed"):
+            nodes.set_mic_enabled(True)
+        self.assertFalse(nodes._mic_forwarding)
 
     def test_event_bridge_keeps_sdk_string_payloads(self):
         import device

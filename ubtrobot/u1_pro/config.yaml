@@ -3,10 +3,10 @@ ros_namespace: ""
 ros:
   robot_domain_id: 2
   core_domain_id: 42
-  # rgmii0 is the U1 robot-side Ethernet interface on the target platform.
-  # It supports multicast discovery; loopback does not.
+  # The vendor domain needs rgmii0, while Agent Core uses host loopback.
+  # CycloneDDS is process-wide, so both interfaces must be allowed here.
   robot_interface: "rgmii0"
-  cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='rgmii0'/></Interfaces><AllowMulticast>true</AllowMulticast></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
+  cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/><NetworkInterface name='rgmii0'/></Interfaces><AllowMulticast>true</AllowMulticast></General><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
 vision_capture:
   output_dir: "/opt/phanthy-motus/data/vision_capture/u1_pro"
   video_fps: 15

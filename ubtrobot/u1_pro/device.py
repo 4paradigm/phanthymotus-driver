@@ -412,6 +412,9 @@ class U1Nodes:
         request.header = Header()
         request.enable = enabled
         response = jsonable(self.call("mic_enable", request))
+        if enabled and response.get("code", 0) not in (0, "0", None):
+            self._mic_forwarding = False
+            raise RuntimeError(f"vendor microphone enable failed (code={response.get('code')})")
         if enabled:
             self._mic_forwarding = True
         return response
