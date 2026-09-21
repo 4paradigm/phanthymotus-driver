@@ -83,6 +83,21 @@ compliant 16 kHz mono PCM frames.
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.
 
+Change scope and validation notes:
+
+- The audio, video, LED, locomotion, and state changes are intentional parts of
+  the AS2W hardware card bundle. The Dockerfile does not add an APT or pip
+  package for these cards. It sources `/ros_ws/install/setup.bash` because the
+  runtime imports the shared `audio_msgs` message package; the image and
+  runtime dependency are otherwise unchanged.
+- The `driver.yaml` changes only advertise the cards that are registered by
+  this bundle; metadata does not add image contents.
+- Run `python3 -m unittest unitree/as2w/test_driver.py` for the no-hardware
+  contract suite, `python3 -m compileall -q unitree/as2w` for syntax checks,
+  and `git diff --check` before submitting. Hardware-dependent audio multicast,
+  AS2 voice, videohub, and sport behavior still require validation against the
+  target robot firmware.
+
 Loco examples:
 
 ```json

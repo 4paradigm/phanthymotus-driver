@@ -417,15 +417,47 @@ class LocoPlugin:
         if duration == -1:
             with self._lock:
                 self._stop = stop_event
-            while not stop_event.is_set():
-                if self.proxy.Move(vx, vy, yaw) != 0:
-                    break
-                stop_event.wait(0.1)
-            self.proxy.StopMove()
-            with self._lock:
-                if self._stop is stop_event:
-                    self._stop = None
-            self._finish_transition(stop_event)
+            move_ret = 0
+            move_error = None
+            try:
+                while not stop_event.is_set():
+                    try:
+                        move_ret = self.proxy.Move(vx, vy, yaw)
+                    except Exception as exc:
+                        move_ret = 3104
+                        move_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                    if move_ret != 0:
+                        break
+                    stop_event.wait(0.1)
+            finally:
+                try:
+                    self.proxy.StopMove()
+                except Exception:
+                    pass
+                with self._lock:
+                    if self._stop is stop_event:
+                        self._stop = None
+                self._finish_transition(stop_event)
+            if move_ret != 0 and not stop_event.is_set():
+                result = {
+                    "action": "move",
+                    "ret": move_ret,
+                    "rpc_ret": move_ret,
+                    "current_state": "BALANCE_STAND",
+                    "error": "Continuous Move failed",
+                    "reason": "The sport controller stopped accepting the velocity command",
+                    "suggested_actions": ["get_state", "stop_move"],
+                }
+                if move_error:
+                    result["rpc_error"] = move_error
+                _acp_notify(action_id, "error", result)
+            else:
+                _acp_notify(action_id, "cancelled", {
+                    "action": "move",
+                    "ret": 0,
+                    "duration": -1,
+                    "reason": "Continuous move stopped by stop_move or card shutdown",
+                })
             return
         deadline = time.monotonic() + duration
         try:
@@ -456,7 +488,7 @@ class LocoPlugin:
                     "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity rad/s [-2, 2]"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
                     "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
-                "x-completion": {"actions": ["stand_up", "stand_down", "balance_stand", "recovery_stand"], "timeout": 20},
+                "x-completion": {"actions": ["move", "stand_up", "stand_down", "balance_stand", "recovery_stand"], "timeout": 45},
                 "x-action-params": {
                     "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with optional duration (-1 for continuous)."},
                     "stop_move": {"params": [], "description": "Stop movement."},
@@ -1134,7 +1166,8 @@ class _CameraRgbNode:
         self.topic = topic
         self.proxy = proxy
         self.publisher = self.node.create_publisher(CompressedImage, topic, _CAMERA_QOS)
-        self.period = 1.0 / max(0.5, min(15.0, float(fps)))
+        self.fps = max(0.5, min(15.0, float(fps)))
+        self.period = 1.0 / self.fps
         self._stop_event = threading.Event()
         self._thread = None
         self.state = "idle"
@@ -1196,11 +1229,12 @@ class CameraPlugin:
     def __init__(self, config, namespace, executor, proxy):
         self._topic = f"/{namespace}/camera/rgb"
         self._node = _CameraRgbNode(self._topic, proxy, config.get("fps", 5))
+        self._fps = self._node.fps
         executor.add_node(self._node.node)
 
     def get_tool(self):
         return {"name": "camera_rgb", "type": "sensor", "multiInstance": False,
-                "description": f"AS2 videohub RGB JPEG stream at up to 5 FPS: {self._topic}",
+                "description": f"AS2 videohub RGB JPEG stream at up to {getattr(self, '_fps', 5.0):g} FPS (implementation cap 15 FPS): {self._topic}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
 

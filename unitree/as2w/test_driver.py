@@ -260,10 +260,12 @@ class TestDriverContracts(unittest.TestCase):
     def test_camera_rgb_schema_and_topic(self):
         plugin = self.device.CameraPlugin.__new__(self.device.CameraPlugin)
         plugin._topic = "/test/camera/rgb"
+        plugin._fps = 10.0
         tool = plugin.get_tool()
         self.assertEqual("camera_rgb", tool["name"])
         self.assertEqual("image/jpeg", tool["topic_out"][0]["format"])
         self.assertEqual("/test/camera/rgb", tool["topic_out"][0]["topic"])
+        self.assertIn("up to 10 FPS", tool["description"])
         self.assertNotIn("action", tool["inputSchema"]["properties"])
 
     def test_rpc_channel_ignores_late_result_from_timed_out_call(self):
@@ -415,6 +417,56 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIsNone(plugin._transition_stop)
         plugin.stop()
 
+    def test_loco_continuous_transition_reports_cancelled_on_stop_move(self):
+        proxy = _Proxy()
+        proxy.state = "STAND_UP"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify") as notify:
+            result = plugin.dispatch("move", {
+                "vx": 0.2, "vy": 0, "vyaw": 0, "duration": -1})
+            action_id = result["action_id"]
+            for _ in range(50):
+                if proxy.moves:
+                    break
+                __import__("time").sleep(0.01)
+            plugin.dispatch("stop_move", {})
+            for _ in range(50):
+                if any(call.args[0] == action_id for call in notify.call_args_list):
+                    break
+                __import__("time").sleep(0.01)
+        matching = [call for call in notify.call_args_list if call.args[0] == action_id]
+        self.assertTrue(matching)
+        self.assertEqual("cancelled", matching[-1].args[1])
+        self.assertEqual(-1, matching[-1].args[2]["duration"])
+        self.assertIsNone(plugin._transition_stop)
+        self.assertIsNone(plugin._stop)
+        plugin.stop()
+
+    def test_loco_continuous_transition_reports_move_rpc_failure(self):
+        class _FailingMoveProxy(_Proxy):
+            def Move(self, *args):
+                self.moves.append(args)
+                return 0 if len(self.moves) == 1 else -7
+
+        proxy = _FailingMoveProxy()
+        proxy.state = "STAND_UP"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify") as notify:
+            result = plugin.dispatch("move", {
+                "vx": 0.2, "vy": 0, "vyaw": 0, "duration": -1})
+            action_id = result["action_id"]
+            for _ in range(100):
+                if any(call.args[0] == action_id for call in notify.call_args_list):
+                    break
+                __import__("time").sleep(0.01)
+        matching = [call for call in notify.call_args_list if call.args[0] == action_id]
+        self.assertTrue(matching)
+        self.assertEqual("error", matching[-1].args[1])
+        self.assertEqual(-7, matching[-1].args[2]["rpc_ret"])
+        self.assertIsNone(plugin._transition_stop)
+        self.assertIsNone(plugin._stop)
+        plugin.stop()
+
     def test_loco_explains_move_rejection_from_down_state(self):
         proxy = _Proxy()
         proxy.state = "STAND_DOWN"
@@ -466,6 +518,8 @@ class TestDriverContracts(unittest.TestCase):
         plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
         schema = plugin.get_tool()["inputSchema"]
         self.assertEqual(["slow", "normal", "fast"], schema["properties"]["speed_preset"]["enum"])
+        self.assertIn("move", schema["x-completion"]["actions"])
+        self.assertEqual(45, schema["x-completion"]["timeout"])
         self.assertIn("stand_up", schema["x-completion"]["actions"])
         self.assertNotIn("switch_gait", schema["properties"]["action"]["enum"])
 
