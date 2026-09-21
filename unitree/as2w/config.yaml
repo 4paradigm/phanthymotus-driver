@@ -2,7 +2,7 @@ mcp_port: 15709
 robot_interface: eth0
 ros_namespace: ""
 plugins:
-  mic: {enabled: true, backend: auto, alsa_device: auto, dds_grace_s: 2}
+  mic: {enabled: true, backend: auto, alsa_device: auto, dds_grace_s: 0.5}
   speaker: {enabled: true}
   led: {enabled: true}
   camera_rgb: {enabled: true, fps: 5}

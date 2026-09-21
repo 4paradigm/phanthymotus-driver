@@ -22,7 +22,7 @@ def _serve(commands, results, interface, kind):
             client = SportClient()
             client.SetTimeout(5.0)
             client.Init()
-        elif kind == "audio":
+        elif kind in ("audio", "audio_led"):
             from unitree_sdk2py.a2.audio.audio_client import AudioClient
             client = AudioClient()
             client.SetTimeout(2.0)
@@ -126,6 +126,11 @@ class RpcProxy:
     def __init__(self, network_interface=""):
         self._sport = _RpcChannel(network_interface, "sport", 7.0)
         self._audio = _RpcChannel(network_interface, "audio", 4.0)
+        # Keep periodic LED refreshes from queueing behind speaker PCM
+        # blocks.  Both clients use the same firmware service, but separate
+        # workers prevent a slow LED call from stopping live playback (and
+        # vice versa).
+        self._audio_led = _RpcChannel(network_interface, "audio_led", 4.0)
         self._video = _RpcChannel(network_interface, "video", 5.0)
 
     def call(self, method, *args):
@@ -136,6 +141,7 @@ class RpcProxy:
 
     def stop(self):
         self._video.stop()
+        self._audio_led.stop()
         self._audio.stop()
         self._sport.stop()
 
@@ -155,7 +161,7 @@ class RpcProxy:
         return self._audio.call("SetVolume", volume)
 
     def Audio_LedControl(self, red, green, blue):
-        return self._audio.call("LedControl", red, green, blue)
+        return self._audio_led.call("LedControl", red, green, blue)
 
     def Video_GetImageSample(self):
         return self._video.call("GetImageSample")

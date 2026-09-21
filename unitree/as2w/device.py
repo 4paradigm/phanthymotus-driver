@@ -35,6 +35,9 @@ except ImportError:
     pass
 
 
+_STATE_PUBLISH_HZ = 30.0
+
+
 def _number(value, default=0.0):
     try:
         return float(value)
@@ -74,12 +77,29 @@ class _StateNode:
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
         # AS2/As2W's official sport-state example uses the lf namespace.
         self._sport = ChannelSubscriber("rt/lf/sportmodestate", SportModeState_)
-        # Keep only the newest state sample. A backlog of LowState frames is
-        # visible as stale joint poses in the frontend.
+        # DDS callbacks must do almost no work.  In particular, JSON encoding
+        # and ROS publication from the callback can make the callback queue
+        # fall behind the robot's LowState stream.  Keep only the newest
+        # object and let a small publisher worker consume it.  This gives the
+        # frontend the newest pose instead of an old queue of poses.
+        self._latest_lock = threading.Lock()
+        self._latest_low = None
+        self._latest_bms = None
+        self._latest_sport = None
+        self._low_generation = 0
+        self._bms_generation = 0
+        self._sport_generation = 0
+        self._published_low_generation = -1
+        self._published_bms_generation = -1
+        self._published_sport_generation = -1
+        self._stop_event = threading.Event()
+        self._publisher_thread = threading.Thread(
+            target=self._publish_loop, daemon=True, name="as2w-state-publish")
         self._low.Init(self._on_low, 1)
         self._bms.Init(self._on_bms, 1)
         self._sport.Init(self._on_sport, 1)
         executor.add_node(self.node)
+        self._publisher_thread.start()
 
     def close(self):
         for subscriber in (self._low, self._bms, self._sport):
@@ -87,6 +107,10 @@ class _StateNode:
                 subscriber.Close()
             except Exception:
                 pass
+        self._stop_event.set()
+        publisher_thread = getattr(self, "_publisher_thread", None)
+        if publisher_thread is not None:
+            publisher_thread.join(timeout=1.0)
         self.node.destroy_node()
 
     def _publish(self, publisher, value):
@@ -98,7 +122,41 @@ class _StateNode:
     def _flat(prefix, values):
         return {f"{prefix}_{i}": float(value) for i, value in enumerate(values)}
 
+    def _publish_loop(self):
+        wait_for = 1.0 / _STATE_PUBLISH_HZ
+        while not self._stop_event.is_set():
+            with self._latest_lock:
+                low = self._latest_low
+                bms = self._latest_bms
+                sport = self._latest_sport
+                low_generation = self._low_generation
+                bms_generation = self._bms_generation
+                sport_generation = self._sport_generation
+            if low is not None and low_generation != self._published_low_generation:
+                self._publish_low(low)
+                self._published_low_generation = low_generation
+            if bms is not None and bms_generation != self._published_bms_generation:
+                self._publish_bms(bms)
+                self._published_bms_generation = bms_generation
+            if sport is not None and sport_generation != self._published_sport_generation:
+                self._publish_sport(sport)
+                self._published_sport_generation = sport_generation
+            self._stop_event.wait(wait_for)
+
     def _on_low(self, msg):
+        latest_lock = getattr(self, "_latest_lock", None)
+        if latest_lock is None:
+            self._publish_low(msg)
+            return
+        with latest_lock:
+            self._latest_low = msg
+            self._low_generation += 1
+        # The test harness constructs this object without __init__.  Keep the
+        # helper useful there while the real node always uses the worker.
+        if getattr(self, "_publisher_thread", None) is None:
+            self._publish_low(msg)
+
+    def _publish_low(self, msg):
         imu = getattr(msg, "imu_state", getattr(msg, "imu", None))
         if imu is not None:
             imu_data = {}
@@ -130,7 +188,19 @@ class _StateNode:
         # expects these two top-level fields and does not consume joint_count.
         self._publish(self.joints, {"joints": skeleton,
                                     "imu_quat": list(getattr(imu, "quaternion", [])) if imu else []})
+
     def _on_bms(self, bms):
+        latest_lock = getattr(self, "_latest_lock", None)
+        if latest_lock is None:
+            self._publish_bms(bms)
+            return
+        with latest_lock:
+            self._latest_bms = bms
+            self._bms_generation += 1
+        if getattr(self, "_publisher_thread", None) is None:
+            self._publish_bms(bms)
+
+    def _publish_bms(self, bms):
         # Unitree BmsState_.current is milliamps (mA).
         current_ma = _number(getattr(bms, "current", 0))
         battery = {"soc": int(getattr(bms, "soc", 0)),
@@ -140,6 +210,17 @@ class _StateNode:
         self._publish(self.battery, battery)
 
     def _on_sport(self, msg):
+        latest_lock = getattr(self, "_latest_lock", None)
+        if latest_lock is None:
+            self._publish_sport(msg)
+            return
+        with latest_lock:
+            self._latest_sport = msg
+            self._sport_generation += 1
+        if getattr(self, "_publisher_thread", None) is None:
+            self._publish_sport(msg)
+
+    def _publish_sport(self, msg):
         loco = {"mode": int(getattr(msg, "mode", 0)),
                 "body_height": _number(getattr(msg, "body_height", 0))}
         loco.update(self._flat("velocity", getattr(msg, "velocity", [])))
@@ -206,7 +287,13 @@ class LocoPlugin:
         self._stop = None
         self._transition_stop = None
 
-    _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND"}
+    _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING"}
+    # AS2 reports fsm_id=0/fsm_name=PASSIVE while the body is not yet in the
+    # balance controller.  It is ambiguous from the name alone whether the
+    # operator has just stood the robot up, so a move request starts the
+    # balance transition in the background and lets the firmware reject it if
+    # the posture is actually unsafe.
+    _BALANCE_REQUIRED = {"STAND_UP", "PASSIVE", "STAND", "STANDING"}
     _MOVING = {"WALK", "WALKING", "RUN", "RUNNING", "MOVE", "MOVING",
                "REGULAR_WALK", "REGULAR_RUN"}
     _DOWN = {"STAND_DOWN", "DAMPING", "LYING", "FALL", "FALLEN",
@@ -246,6 +333,13 @@ class LocoPlugin:
                 "current_state": state or "UNKNOWN", "error": "Action cannot be executed",
                 "reason": reason, "suggested_actions": suggested}
 
+    @classmethod
+    def _rpc_rejected(cls, action, state, ret, reason, suggested):
+        result = cls._not_allowed(action, state, reason, suggested)
+        result["ret"] = ret
+        result["rpc_ret"] = ret
+        return result
+
     def _cancel_transition(self):
         with self._lock:
             event = self._transition_stop
@@ -260,6 +354,8 @@ class LocoPlugin:
 
     def _transition_to_balance_and_move(self, action_id, vx, vy, yaw, duration, stop_event):
         deadline = time.monotonic() + 12.0
+        last_state = "UNKNOWN"
+        last_move_ret = None
         while time.monotonic() < deadline:
             if stop_event.is_set():
                 self._finish_transition(stop_event)
@@ -267,26 +363,37 @@ class LocoPlugin:
                     "action": "move", "reason": "move transition was cancelled"})
                 return
             name, state, error = self._read_state()
+            last_state = name or last_state
             if name == "BALANCE_STAND":
                 return self._run_move_after_transition(action_id, vx, vy, yaw, duration, stop_event)
             if error:
                 self._finish_transition(stop_event)
                 _acp_notify(action_id, "error", error)
                 return
+            # Some AS2 firmware keeps GetState at PASSIVE for a short time
+            # after BalanceStand.  Do not wait forever for a state label that
+            # is lagging behind the command path: probe Move in the worker and
+            # continue as soon as the sport service accepts it.
+            last_move_ret = self.proxy.Move(vx, vy, yaw)
+            if last_move_ret == 0:
+                return self._run_move_after_transition(
+                    action_id, vx, vy, yaw, duration, stop_event,
+                    move_already_sent=True)
             time.sleep(0.15)
-        _acp_notify(action_id, "error", self._not_allowed(
-            "move", name or "UNKNOWN",
-            "The automatic balance-stand transition did not complete",
-            ["stop_move", "balance_stand", "get_state"]))
+        _acp_notify(action_id, "error", self._rpc_rejected(
+            "move", last_state, last_move_ret if last_move_ret is not None else -1,
+            "The automatic balance-stand transition did not reach a state that accepts Move",
+            ["get_state", "balance_stand", "stand_up", "stop_move"]))
         self._finish_transition(stop_event)
 
-    def _run_move_after_transition(self, action_id, vx, vy, yaw, duration, stop_event):
+    def _run_move_after_transition(self, action_id, vx, vy, yaw, duration,
+                                   stop_event, move_already_sent=False):
         if stop_event.is_set():
             self._finish_transition(stop_event)
             _acp_notify(action_id, "cancelled", {
                 "action": "move", "reason": "move transition was cancelled"})
             return
-        ret = self.proxy.Move(vx, vy, yaw)
+        ret = 0 if move_already_sent else self.proxy.Move(vx, vy, yaw)
         if ret != 0:
             self._finish_transition(stop_event)
             _acp_notify(action_id, "error", {"ret": ret, "accepted": False,
@@ -332,10 +439,6 @@ class LocoPlugin:
             return self._not_allowed("move", state,
                 "The robot is not standing, so the controller rejects Move",
                 ["stand_up", "recovery_stand"])
-        if self._is_moving(state):
-            return self._not_allowed("move", state,
-                "The robot is already in a dynamic locomotion state",
-                ["stop_move", "get_state"])
         return self._not_allowed("move", state,
             "The robot is in a transition, special motion, or fault state",
             ["stop_move", "recovery_stand", "get_state"])
@@ -432,13 +535,13 @@ class LocoPlugin:
             state_name, state, state_error = self._read_state()
             if state_error:
                 return {**state_error, "action": "move"}
-            if state_name == "STAND_UP":
+            if state_name in self._BALANCE_REQUIRED:
                 self._cancel_transition()
                 ret = self.proxy.BalanceStand()
                 if ret != 0:
-                    return {**self._not_allowed("move", state_name,
-                        "BalanceStand is required before Move from STAND_UP, but it was rejected",
-                        ["get_state", "balance_stand"]), "ret": ret}
+                    return self._rpc_rejected("move", state_name, ret,
+                        "The robot is not currently accepting the automatic balance-stand transition",
+                        ["get_state", "stand_up", "balance_stand", "recovery_stand"])
                 action_id = f"as2w_loco_{uuid4().hex[:8]}"
                 transition_stop = threading.Event()
                 with self._lock:
@@ -449,7 +552,7 @@ class LocoPlugin:
                 return {"ret": 0, "accepted": True, "status": "running",
                         "action": "move", "transition": "balance_stand",
                         "action_id": action_id, "current_state": state_name}
-            if state_name not in self._STANDING:
+            if state_name not in self._STANDING and not self._is_moving(state_name):
                 return self._move_error_for_state(state_name)
             self._cancel_transition()
             if duration is None:
@@ -479,10 +582,14 @@ class LocoPlugin:
             state_name, state, state_error = self._read_state()
             if state_error:
                 return {**state_error, "action": action}
-            if action == "stand_up" and state_name not in {"STAND_DOWN", "DAMPING", "FALL", "FALLEN"}:
+            if action == "stand_up" and self._is_moving(state_name):
                 return self._not_allowed(action, state_name,
-                    "StandUp is only valid from a down, damping, or fallen posture",
-                    ["stand_down", "damp", "recovery_stand"])
+                    "StandUp cannot be issued while the robot is walking",
+                    ["stop_move", "stand_up"])
+            if action == "stand_up" and state_name in self._STANDING:
+                return self._not_allowed(action, state_name,
+                    "The robot is already standing; use balance_stand or move",
+                    ["balance_stand", "move", "stand_down"])
             if action == "stand_down" and self._is_moving(state_name):
                 return self._not_allowed(action, state_name,
                     "StandDown cannot be issued while the robot is walking",
@@ -491,9 +598,9 @@ class LocoPlugin:
                 return self._not_allowed(action, state_name,
                     "The robot is already down or damping",
                     ["stand_up", "recovery_stand"])
-            if action == "balance_stand" and state_name not in {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND"}:
+            if action == "balance_stand" and state_name in self._DOWN:
                 return self._not_allowed(action, state_name,
-                    "BalanceStand requires the robot to be standing first",
+                    "BalanceStand requires the robot to be standing or in passive mode first",
                     ["stand_up", "recovery_stand"])
             if action == "recovery_stand" and state_name not in {"FALL", "FALLEN", "STAND_DOWN", "DAMPING"}:
                 return self._not_allowed(action, state_name,
@@ -506,9 +613,9 @@ class LocoPlugin:
             method, expected_name = methods[action]
             ret = getattr(self.proxy, method)()
             if ret != 0:
-                return {**self._not_allowed(action, state_name,
+                return self._rpc_rejected(action, state_name, ret,
                     "SportClient rejected the posture transition",
-                    ["get_state", "stop_move", "recovery_stand"]), "ret": ret}
+                    ["get_state", "stop_move", "stand_up", "recovery_stand"])
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
             threading.Thread(target=self._await_posture, args=(action_id, action, expected_name), daemon=True).start()
             return {"ret": 0, "accepted": True, "status": "running", "action": action, "action_id": action_id}
@@ -523,9 +630,11 @@ class LocoPlugin:
                     ["stop_move", "damp"])
             ret = self.proxy.Damp()
             return {"ret": ret, "accepted": ret == 0, "action": action,
+                    "current_state": state_name,
                     **({} if ret == 0 else {"error": "SportClient rejected the action",
                       "reason": "The controller refused damping from the current posture",
-                      "suggested_actions": ["get_state", "stop_move"]})}
+                      "suggested_actions": ["get_state", "stop_move", "recovery_stand"],
+                      "rpc_ret": ret})}
         if action == "euler": return {"ret": self.proxy.Euler(float(args.get("roll", 0)), float(args.get("pitch", 0)), float(args.get("yaw", 0)))}
         if action == "speed_level":
             preset = args.get("speed_preset", "normal")
@@ -652,6 +761,7 @@ class _MicNode:
         self.state = "idle"
         self.packet_count = 0
         self.last_packet_ts = 0.0
+        self.last_error = None
         self._last_dds_packet_ts = 0.0
         self._config = config or {}
         self._alsa_thread = None
@@ -663,7 +773,8 @@ class _MicNode:
     def start(self):
         if self.state == "running":
             return self.topic
-        topics = self._config.get("dds_topics", ["rt/audiosender"])
+        topics = self._config.get(
+            "dds_topics", ["rt/audiosender", "rt/lf/audiosender", "rt/audio"])
         if isinstance(topics, str):
             topics = [topics]
         self._subscribers = []
@@ -675,6 +786,9 @@ class _MicNode:
             except Exception:
                 continue
         self.subscriber = self._subscribers[0] if self._subscribers else None
+        with self._publish_lock:
+            self._publish_buffer.clear()
+        self._active_dds_topic = None
         self.state = "running"
         if self._config.get("backend", "auto") in ("auto", "alsa"):
             self._alsa_thread = threading.Thread(target=self._alsa_fallback,
@@ -707,7 +821,11 @@ class _MicNode:
                 self.packet_count += 1
 
     def _on_audio(self, msg, source=None):
-        payload = bytes(getattr(msg, "data", []))
+        try:
+            payload = bytes(getattr(msg, "data", []))
+        except (TypeError, ValueError) as exc:
+            self.last_error = f"invalid audio packet from {source}: {str(exc)[:120]}"
+            return
         if not payload:
             return
         # Subscribe to the firmware names used by different AS2 images, but
@@ -726,6 +844,7 @@ class _MicNode:
         self.last_packet_ts = now
         self._last_dds_packet_ts = now
         self.backend = "dds"
+        self.last_error = None
 
     def _alsa_fallback(self):
         # AS2 firmware may advertise rt/audiosender without publishing it
@@ -768,8 +887,10 @@ class _MicNode:
                 if pcm is not None:
                     break
             if pcm is None:
+                self.last_error = "no usable ALSA capture device"
                 return
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"ALSA fallback unavailable: {str(exc)[:120]}"
             return
         deadline = time.monotonic() + float(self._config.get("dds_grace_s", 2.0))
         import audioop
@@ -806,6 +927,7 @@ class _MicNode:
                 self._publish_pcm(data)
                 self.last_packet_ts = time.monotonic()
                 self.backend = "alsa"
+                self.last_error = None
         finally:
             try:
                 pcm.close()
@@ -834,16 +956,24 @@ class MicPlugin:
         self._node.stop()
 
     def dispatch(self, action, args):
-        if action == "start":
+        if action in ("start", "mic"):
             self._node.start()
             return {"state": "running", "topic": self._topic}
         if action == "stop":
             self._node.stop()
             return {"state": "idle"}
         if action == "info":
+            age = None
+            if self._node.last_packet_ts:
+                age = max(0.0, time.monotonic() - self._node.last_packet_ts)
             return {"state": self._node.state,
                     "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
-                    "packets": self._node.packet_count}
+                    "packets": self._node.packet_count,
+                    "backend": self._node.backend,
+                    "packet_age_s": age,
+                    "dds_topics": list(self._node._config.get(
+                        "dds_topics", ["rt/audiosender", "rt/lf/audiosender", "rt/audio"])),
+                    "error": getattr(self._node, "last_error", None)}
         return None
 
 
@@ -1010,22 +1140,31 @@ class SpeakerPlugin:
 
     def __init__(self, config, namespace, executor, audio_client):
         self._node = _SpeakerNode(audio_client)
+        configured_topic = (config or {}).get("input_topic")
+        if configured_topic:
+            self._input_topic = str(configured_topic).replace("{namespace}", namespace)
+        else:
+            # A speaker card must be startable without a hand-written MCP
+            # argument.  External producers can publish AudioChunk messages
+            # here; an explicit input_topic still overrides this default.
+            self._input_topic = f"/{namespace}/speaker/audio"
         executor.add_node(self._node.node)
 
     def get_tool(self):
+        input_topic = getattr(self, "_input_topic", "/speaker/audio")
         return {"name": "speaker", "type": "actuator", "multiInstance": False,
-                "description": "As2W speaker: subscribes to PCM 16kHz/16bit/mono AudioChunk stream",
+                "description": f"As2W speaker: subscribes to PCM 16kHz/16bit/mono AudioChunk stream. Default input topic: {input_topic}",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "info", "get_volume", "set_volume"]},
-                    "input_topic": {"type": "string", "description": "ROS2 AudioChunk topic"},
+                    "input_topic": {"type": "string", "description": f"Optional ROS2 AudioChunk topic; defaults to {input_topic}"},
                     "volume": {"type": "integer", "minimum": 0, "maximum": 100}},
                     "required": ["action"],
                     "x-action-params": {
-                    "start": {"params": ["input_topic"], "description": "Subscribe to an AudioChunk topic."},
+                    "start": {"params": [], "description": "Start playback on the configured AudioChunk topic; input_topic may override it."},
                     "stop": {"params": [], "description": "Stop playback and clear buffered audio."},
                     "get_volume": {"params": [], "description": "Read the current volume."},
                     "set_volume": {"params": ["volume"], "description": "Set volume from 0 to 100."}}},
-                "topic_in": [{"format": "audio/pcm-16k"}]}
+                "topic_in": [{"topic": input_topic, "format": "audio/pcm-16k"}]}
 
     def start(self):
         pass
@@ -1034,10 +1173,14 @@ class SpeakerPlugin:
         self._node.stop()
 
     def dispatch(self, action, args):
-        if action in ("start", "play"):
-            topic = args.get("input_topic") or args.get("topic_in")
+        if action in ("start", "play", "speaker"):
+            topic = args.get("input_topic") or args.get("topic_in") or getattr(self, "_input_topic", "/speaker/audio")
+            if isinstance(topic, dict):
+                topic = topic.get("topic")
+            elif isinstance(topic, (list, tuple)):
+                topic = topic[0] if topic else None
             if not topic:
-                return {"error": "Missing input_topic"}
+                topic = getattr(self, "_input_topic", "/speaker/audio")
             try:
                 started_topic = self._node.start(topic)
             except RuntimeError as exc:
@@ -1045,7 +1188,8 @@ class SpeakerPlugin:
                         "error": str(exc),
                         "reason": "The previous playback RPC is still in flight",
                         "suggested_actions": ["stop", "retry"]}
-            return {"state": "ready", "topic": started_topic}
+            return {"state": "ready", "topic": started_topic,
+                    "input_topic": started_topic}
         if action == "stop":
             self._node.stop()
             return {"state": "idle"}
@@ -1183,6 +1327,11 @@ class LedPlugin:
                         "info": {"params": [], "description": "Read the selected color."}}}}
 
     def start(self):
+        # Do not send a black LED command every 0.7 seconds during bundle
+        # startup.  Apart from being unnecessary, that used to occupy the
+        # shared voice RPC worker and made live speaker audio appear silent.
+        if not any(self._color):
+            return
         self._keepalive_stop.clear()
         if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
             self._keepalive_thread = threading.Thread(target=self._keepalive,
@@ -1222,6 +1371,9 @@ class LedPlugin:
         else:
             return None
         self._color = list(color)
+        if action == "off":
+            self.stop()
         result = self._proxy.Audio_LedControl(*color)
-        self.start()
+        if action != "off" and result == 0:
+            self.start()
         return {"ret": result, "color": list(color)}

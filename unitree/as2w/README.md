@@ -52,10 +52,13 @@ requires the vendor `unitree_slam` service to be installed and already running
 on the robot or extension host; the driver does not start that service.
 
 The `mic` card republishes Unitree's `rt/audiosender` DDS `AudioData_` stream to
-`/<namespace>/mic/audio` as `audio_msgs/AudioChunk` (`audio/pcm-16k`). The
-`speaker` card subscribes to an `AudioChunk` topic supplied as `input_topic` and
-streams PCM blocks through the AS2 `voice` service; it also exposes volume get/set
-actions. Audio service availability depends on the AS2 firmware configuration.
+`/<namespace>/mic/audio` as `audio_msgs/AudioChunk` (`audio/pcm-16k`). It also
+tries the firmware topic aliases `rt/lf/audiosender` and `rt/audio`, then uses
+the configured ALSA capture device if the DDS stream is silent. The `speaker`
+card subscribes to `/<namespace>/speaker/audio` by default; callers may provide
+an optional `input_topic` to use another `AudioChunk` stream. It streams bounded
+PCM blocks through the AS2 `voice` service and exposes volume get/set actions.
+Audio service availability depends on the AS2 firmware configuration.
 
 The `camera_rgb` card polls the verified AS2 `videohub.GetImageSample()` service
 and publishes JPEG `sensor_msgs/CompressedImage` frames to
@@ -67,12 +70,12 @@ until a real depth source is identified.
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
 continuous `loco` control card.
 
-The RPC proxy runs sport, voice, and video clients in separate workers. State
-subscriptions use a depth-one callback queue so joints and locomotion state
-publish the newest sample instead of draining stale samples. The microphone
-first listens to `rt/audiosender`; when that firmware stream is silent, the
-optional ALSA fallback tries the board capture devices and publishes compliant
-16 kHz mono PCM frames.
+The RPC proxy runs sport, speaker-audio, LED-audio, and video clients in separate
+workers. State DDS callbacks only replace a latest-value cache; a 30 Hz publisher
+worker serializes and publishes the newest joint and locomotion samples instead
+of draining stale samples. The microphone first listens to the firmware audio
+topic aliases; when those streams are silent, the optional ALSA fallback tries
+the board capture devices and publishes compliant 16 kHz mono PCM frames.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.

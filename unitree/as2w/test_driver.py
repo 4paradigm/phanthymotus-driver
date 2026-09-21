@@ -307,9 +307,72 @@ class TestDriverContracts(unittest.TestCase):
     def test_speaker_action_params_live_inside_input_schema(self):
         speaker = self.device.SpeakerPlugin.__new__(self.device.SpeakerPlugin)
         speaker._node = types.SimpleNamespace()
+        speaker._input_topic = "/test/speaker/audio"
         schema = speaker.get_tool()["inputSchema"]
         self.assertEqual([], schema["x-action-params"]["get_volume"]["params"])
+        self.assertEqual([], schema["x-action-params"]["start"]["params"])
+        self.assertEqual("/test/speaker/audio", speaker.get_tool()["topic_in"][0]["topic"])
         self.assertNotIn("x-action-params", speaker.get_tool())
+
+    def test_speaker_start_uses_default_topic_when_input_is_omitted(self):
+        speaker = self.device.SpeakerPlugin.__new__(self.device.SpeakerPlugin)
+        speaker._input_topic = "/test/speaker/audio"
+        speaker._node = types.SimpleNamespace(
+            start=lambda topic: topic, state="idle")
+        result = speaker.dispatch("start", {})
+        self.assertEqual("/test/speaker/audio", result["topic"])
+        self.assertEqual("/test/speaker/audio", result["input_topic"])
+
+    def test_state_callbacks_keep_only_the_newest_sample(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        node._latest_lock = __import__("threading").Lock()
+        node._latest_low = None
+        node._low_generation = 0
+        node._publisher_thread = object()
+        first = types.SimpleNamespace(marker="first")
+        second = types.SimpleNamespace(marker="second")
+        with patch.object(node, "_publish_low") as publish:
+            node._on_low(first)
+            node._on_low(second)
+        self.assertIs(second, node._latest_low)
+        self.assertEqual(2, node._low_generation)
+        publish.assert_not_called()
+
+    def test_loco_auto_balances_from_passive(self):
+        proxy = _Proxy()
+        proxy.state = "PASSIVE"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify"):
+            result = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+            self.assertTrue(result["accepted"])
+            self.assertEqual("PASSIVE", result["current_state"])
+            for _ in range(50):
+                if proxy.moves:
+                    break
+                __import__("time").sleep(0.01)
+        self.assertEqual(1, proxy.balance_stands)
+        self.assertEqual([(0.2, 0, 0)], proxy.moves)
+        plugin.stop()
+
+    def test_loco_updates_velocity_while_already_walking(self):
+        proxy = _Proxy()
+        proxy.state = "WALKING"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("move", {"vx": 0.3, "vy": 0, "vyaw": 0})
+        self.assertEqual(0, result["ret"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual([(0.3, 0, 0)], proxy.moves)
+
+    def test_loco_rpc_failure_exposes_code_and_state(self):
+        proxy = _Proxy()
+        proxy.state = "PASSIVE"
+        proxy.BalanceStand = lambda: -7
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+        self.assertEqual(-7, result["ret"])
+        self.assertEqual(-7, result["rpc_ret"])
+        self.assertEqual("PASSIVE", result["current_state"])
+        self.assertIn("balance", result["reason"])
 
     def test_loco_moves_directly_from_balance_stand(self):
         proxy = _Proxy()
