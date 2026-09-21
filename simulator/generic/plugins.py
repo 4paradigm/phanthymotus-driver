@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 
 from simulator.generic.backend import LocalBackend
-from simulator.generic.cards_audio import SpeakerCard, TtsCard
+from simulator.generic.cards_audio import TtsCard
 from simulator.generic.cards_motion import (
     ArmCard,
     ControlledSpatialCard,
@@ -43,7 +43,7 @@ CARD_TYPES = {
     "spatial_map": SpatialMapCard, "model": ModelCard,
     "loco": LocoCard, "controlled_spatial": ControlledSpatialCard,
     "switch_mode": SwitchModeCard, "arm": ArmCard, "led": LedCard,
-    "tts": TtsCard, "speaker": SpeakerCard,
+    "tts": TtsCard,
     "sim_scenario": SimScenarioCard, "sim_report": SimReportCard,
 }
 

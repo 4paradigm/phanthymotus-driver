@@ -150,7 +150,7 @@ def test_build_plugins_works_without_ros(bundle):
     dispatch surface can be exercised on a laptop."""
     tools = bundle.get_all_tools()
 
-    assert len(tools) == 15
+    assert len(tools) == 14
     assert {"controlled_spatial", "tts", "loco", "spatial_map",
             "sim_scenario", "sim_report"} <= {t["name"] for t in tools}
 
@@ -421,110 +421,23 @@ def test_polling_the_report_renews_the_lock(tmp_path, monkeypatch):
     assert "error" in card.switch_map("site-b")       # 还在跑，仍然拒绝
 
 
-# ── 世界要听得见真实 tts ─────────────────────────────────────────────────────
+# ── 世界里的播报事实从哪来 ───────────────────────────────────────────────────
 
-def test_the_speaker_declares_the_stream_half_of_the_canvas_contract():
-    """**`topic_in` 是这张卡存在的理由。**
+def test_the_bundle_ships_no_speaker_card():
+    """**播报事实由 agent-core 记，不靠仿真器长耳朵。**
 
-    这里原先有一张 `speaker`，被删掉了，因为它照着 `voice_play` 那种调用式的卡抄，
-    却用了 speaker 的名字 —— 没有 `topic_in`，画布上什么都连不进去。真机上的每一张
-    speaker 都是订阅 `audio/pcm-16k` 的。
+    这里曾经有一张订阅 PCM 的 `speaker`，为的是让基准测试的「世界真的做了什么」那一列
+    在画布绑的是 perception 合成器时也有内容。它被删掉了，因为 agent-core 自己就把派发
+    出去的异步动作记成了同样形状的事实（`benchmark_facts.py`，按申报的 `x-resource`
+    通道分类），那条路**真机上也能跑**，而这张卡不能 —— 真机画布上没有仿真器。
+
+    代价还不只是白做：它要求镜像里有 `audio_msgs`，而 ROS 的订阅按类型匹配，类型写错
+    就根本不配对且什么都不报。第一版订成 `std_msgs/UInt8MultiArray`，于是节点在、topic
+    列得出来、回调永不触发，那一列照样空着。
+
+    这条测试钉住「别再加回来」，而不是钉住某个实现。
     """
-    from simulator.generic.cards_audio import SpeakerCard
-    from simulator.generic.backend import LocalBackend
-    from simulator.generic.clock import FakeClock
-    from simulator.generic.world import VirtualWorld
+    from simulator.generic import cards_audio, plugins
 
-    card = SpeakerCard(VirtualWorld(LocalBackend(), FakeClock(), {}), {}, "sim")
-    definition = card.get_tool()
-
-    assert definition["topic_in"] == [{"format": "audio/pcm-16k"}]
-    # 嘴由**合成**的那张卡占（tts）。这里再占一次，barrier 会让它和自己的上游串行 ——
-    # 而它正在播，恰恰是因为 tts 正在说。
-    assert "x-resource" not in definition["inputSchema"]
-
-
-def test_audio_on_the_stream_becomes_speak_events_in_the_world():
-    """左栏能看到 agent 调了 tts，右栏却一句话都没有 —— 差的就是这一步。"""
-    from simulator.generic.cards_audio import SpeakerCard
-    from simulator.generic.backend import LocalBackend
-    from simulator.generic.clock import FakeClock
-    from simulator.generic.world import VirtualWorld
-
-    world = VirtualWorld(LocalBackend(), FakeClock(), {})
-    card = SpeakerCard(world, {}, "sim")
-    card._input_topic = "/perception/tts_audio"
-
-    card._on_step(10.0, 0.1)          # 世界的时钟走到 10 秒
-    card._on_audio(None)              # 第一块音频
-    card._on_step(10.2, 0.1)
-    card._on_audio(None)              # 还在播
-    card._on_step(12.0, 0.1)          # 静了 1.8 秒 > QUIET_SECONDS
-
-    kinds = [e["event"] for e in world.events() if e["event"].startswith("speak")]
-    assert kinds == ["speak_start", "speak_end"]
-
-
-def test_one_sentence_is_not_logged_as_several():
-    """PCM 流里没有「说完了」这个标记，只能按静默判断 —— 门槛太短，一句话会被拆成
-    好几段，而「到了再讲」那条判定会看到一串莫名其妙的短播报。"""
-    from simulator.generic.cards_audio import SpeakerCard
-    from simulator.generic.backend import LocalBackend
-    from simulator.generic.clock import FakeClock
-    from simulator.generic.world import VirtualWorld
-
-    world = VirtualWorld(LocalBackend(), FakeClock(), {})
-    card = SpeakerCard(world, {}, "sim")
-
-    for tick in range(10):            # 每 0.2 秒一块，中间的间隔都小于门槛
-        card._on_step(tick * 0.2, 0.2)
-        card._on_audio(None)
-    card._on_step(5.0, 0.2)
-
-    starts = [e for e in world.events() if e["event"] == "speak_start"]
-    assert len(starts) == 1
-
-
-def _speaker():
-    from simulator.generic.cards_audio import SpeakerCard
-    from simulator.generic.backend import LocalBackend
-    from simulator.generic.clock import FakeClock
-    from simulator.generic.world import VirtualWorld
-
-    return SpeakerCard(VirtualWorld(LocalBackend(), FakeClock(), {}), {}, "sim")
-
-
-def test_start_carries_the_topic_the_canvas_resolved():
-    """**`Card.dispatch` 把 `start` 当生命周期动词拦下来，自己调无参的 `self.start()`。**
-
-    第一版把它写成了 `do_start(input_topic=...)` —— 永远不会被调到。结果是卡片启动
-    成功、`state: running`、`input_topic` 始终为空：一张**聋着的**卡，从外面看不出
-    任何异常，而「世界真的做了什么」那一列就一直是空的。Orin6 上就是这么现形的。
-    """
-    card = _speaker()
-
-    card.dispatch("start", {"input_topic": "/perception/tts"})
-
-    assert card.do_read()["input_topic"] == "/perception/tts"
-
-
-def test_info_reports_the_topic_it_actually_bound():
-    """agent-core 用 `info().topic_in[].topic` 判断一张卡接上了什么
-    （`api/config.py::_bound_inputs`）。不报的话，聋着的卡和正常的卡在它眼里一样。"""
-    card = _speaker()
-
-    deaf = card.info()
-    card.dispatch("start", {"input_topic": "/perception/tts"})
-    bound = card.info()
-
-    assert [t.get("topic") for t in deaf["topic_in"] if t.get("topic")] == []
-    assert [t["topic"] for t in bound["topic_in"]] == ["/perception/tts"]
-
-
-def test_a_speaker_with_no_ros_simply_does_not_subscribe():
-    """pytest 和离线重放都没有 ROS。安静地不订阅，而不是把整张卡带崩。"""
-    card = _speaker()
-
-    card.dispatch("start", {"input_topic": "/perception/tts_audio"})
-
-    assert card.do_read()["state"] == "running"
+    assert not hasattr(cards_audio, "SpeakerCard")
+    assert "speaker" not in plugins.CARD_TYPES
