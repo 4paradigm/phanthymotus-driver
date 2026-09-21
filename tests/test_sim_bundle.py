@@ -155,19 +155,30 @@ def test_build_plugins_works_without_ros(bundle):
             "sim_scenario", "sim_report"} <= {t["name"] for t in tools}
 
 
-def test_the_default_scenario_is_loaded_at_boot(bundle):
+def test_the_default_scenario_is_the_real_beijing_hall(bundle):
+    """默认载**真图**，不是合成世界。
+
+    默认原先是 `exhibition_tour` —— 用矩形拼出来的世界，航点叫「一号展区」那些。
+    容器一重建就回到它，而人看着 agent 往「一号展区」导航，会以为是真图上的展位名
+    不对、或者地图打包错了。Orin6 上就是这么被问到的。
+    """
     state = bundle.dispatch("sim_scenario", {"action": "read"})
 
-    assert state["scenario"] == "exhibition_tour"
-    assert state["waypoints"][0] == "入口"
+    assert state["scenario"] == "beijing_2f_tour"
+    # 真图的点位是从驱动的 controlled_spatial.db 导出来的 P 系列，不是手写的名字。
+    assert all(name.startswith("P") for name in state["waypoints"]), state["waypoints"]
 
 
 def test_scenario_pois_become_map_tags(bundle):
     """真机上导览前先把展区打好点，之后每段走 navigate_to_tag —— 场景载入时
     POI 就变成地图上的 tag，导航卡和 map 卡读的是同一份世界状态。"""
     tags = bundle.dispatch("controlled_spatial", {"action": "list_tags"})["tags"]
+    loaded = bundle.dispatch("sim_scenario", {"action": "read"})
 
-    assert [t["name"] for t in tags] == ["入口", "一号展区", "洗手间", "二号展区", "三号展区"]
+    # 比的是**两边一致**，不是某一串具体的名字 —— 钉死名字的话，换一次默认场景
+    # 这条就红了，而它要守的东西一点没变。
+    assert [t["name"] for t in tags] == loaded["waypoints"]
+    assert tags, "载入的场景没有产出任何 tag"
 
 
 def test_every_card_answers_info_or_declines_cleanly(bundle):
@@ -198,11 +209,14 @@ def test_resource_cards_return_their_resource(bundle):
         # The skeleton renderer matches by name; one mismatch draws nothing and
         # reports nothing about why.
         assert f'<joint name="{name}"' in model["urdf"]
-    assert report["scenario"] == "exhibition_tour"
+    assert report["scenario"] == "beijing_2f_tour"
 
 
-def test_the_shipped_scenario_loads_with_no_warnings(bundle):
-    result = bundle.dispatch("sim_scenario", {"action": "load", "scenario": "exhibition_tour"})
+@pytest.mark.parametrize("slug", ["beijing_2f_tour", "exhibition_tour"])
+def test_every_shipped_scenario_loads_with_no_warnings(bundle, slug):
+    """两个都要能干净载入。合成的那个没有被删 —— 打断/恢复那几条断言是照它写的，
+    它只是不再是默认。"""
+    result = bundle.dispatch("sim_scenario", {"action": "load", "scenario": slug})
 
     assert result["warnings"] == [], result["warnings"]
 
