@@ -56,6 +56,9 @@ class Card:
     KIND = "sensor"                 # sensor | actuator | processor | resource
     DESCRIPTION = ""
     TOPIC = ""                      # suffix under the ROS namespace; "" = no topic
+    # 这张卡**消费**一条流。agent-core 解析上游卡片的 `topic_out`，把它当作
+    # `input_topic` 传给 `start` —— 画布上那根连线就是绑定，卡片自己不去猜 topic 名。
+    TOPIC_IN: list[dict] = []
     FORMAT = "data/json"
     HZ = 2.0
     BINARY = False                  # True -> UInt8MultiArray, False -> String(json)
@@ -108,7 +111,8 @@ class Card:
         if self.HOOKS:
             schema["x-hooks"] = dict(self.HOOKS)
         definition = tool(self.NAME, self.KIND, self.DESCRIPTION, schema,
-                          topic_out=self.topic_out() or None)
+                          topic_out=self.topic_out() or None,
+                          topic_in=list(self.TOPIC_IN) or None)
         if self.CONFIG_SCHEMA:
             definition["configSchema"] = self.config_schema()
         return definition

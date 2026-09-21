@@ -46,7 +46,14 @@ battery:
   low_threshold: 20.0
 
 scenario:
-  default: exhibition_tour
+  # 默认载真实的北京 2F 展厅：地图由天轶上的 controlled_bj-2f.stcm 导出，14 个 POI
+  # 来自驱动的 controlled_spatial.db，站序来自线上的 `exhibition-guide-beijing` skill。
+  #
+  # 原先默认是 `exhibition_tour` —— 一个用矩形拼出来的合成世界，航点叫「一号展区」
+  # 那些。它仍然留着（`assertions` 那套打断/恢复的断言是照它写的），但它不该是默认：
+  # 容器一重建就回到合成世界，而人看着 agent 往「一号展区」导航，会以为是真图上的
+  # 展位名不对，或者以为地图打包错了。
+  default: beijing_2f_tour
   # Injected tasks travel the same topic a real remote control uses.
   inject_topic: /remote_control/message
 
