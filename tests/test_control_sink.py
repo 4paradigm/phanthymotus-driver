@@ -877,3 +877,92 @@ def test_the_two_clocks_are_separate_on_purpose():
     sink = ControlSink(descriptor_dict(), recorder, clock=clock)
     assert sink._clock is clock
     assert sink._wall_clock is not clock
+
+
+# ── advisory：收下但不执行 ───────────────────────────────────────────────────
+#
+# 这一组的由来是一次实测：G1 的 1 自由度腰上，`unifolm-vla-g1` 的 25 步动作块
+# **一步都没通过**，全数停在 `waist_roll at 0.1380 outside [-0.02, 0.02]`。那个
+# 限位没错（腰确实动不了），但它把**整条**指令拒掉了，连同两条手臂——而手臂的
+# 目标是绝对末端位姿，本来完全可以执行。
+#
+# advisory 说的是「这一段我收下但不执行」，于是它的限位、步长和速度都不再被检查：
+# 检查一个不会被执行的数没有意义。丢维的**许可**来自生产者（`motus.vla/1` 的
+# `optional`），在 actucore 的协商里对质，不在这里。
+
+
+def advisory_descriptor(**overrides):
+    """两维，第二维声明成 advisory。"""
+    raw = descriptor_dict(**overrides)
+    raw["groups"] = [
+        {"name": "driven", "offset": 0, "count": 1},
+        {"name": "ignored", "offset": 1, "count": 1, "advisory": True},
+    ]
+    return raw
+
+
+def test_a_value_outside_an_advisory_limit_does_not_reject_the_command():
+    """整组用例的核心：真机上就是这一条把整条管线挡在门外的。"""
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, parse_descriptor(advisory_descriptor()))
+    outcome = sink.submit(message(clock, [0.0, 99.0]))
+    assert outcome.verdict is Verdict.APPLIED
+    assert apply.last[0] == 0.0
+
+
+def test_the_driven_dimensions_are_still_checked(monkeypatch):
+    """advisory 是**按段**放行的，不是整条向量的开关。
+
+    如果它顺手放过了相邻的维，那就不是「丢掉一段」而是「关掉限位」，
+    而后者的症状是手臂走到限位外，没有任何一处报错。
+    """
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, parse_descriptor(advisory_descriptor()))
+    outcome = sink.submit(message(clock, [99.0, 0.0]))
+    assert outcome.verdict is Verdict.REJECTED
+    assert "shoulder" in outcome.reason
+
+
+def test_an_advisory_value_is_not_step_clamped():
+    """钳它只会让状态回报里那个数看起来被平滑过，而它根本没去过任何地方。"""
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, parse_descriptor(advisory_descriptor()))
+    sink.submit(message(clock, [0.0, 0.0]))
+    clock.advance(33)
+    sink.submit(message(clock, [0.0, 5.0], seq=2))
+    assert apply.last[1] == 5.0            # 逐位原样，limit 是 0.1
+
+
+def test_an_advisory_dimension_has_no_speed_limit_either():
+    """限位和速度是同一件事的两种说法，只放行一种等于没放行。"""
+    clock, apply = FakeClock(), Recorder()
+    raw = advisory_descriptor()
+    raw["limits"]["max_velocity"] = [1.0, 1.0]
+    raw["limits"]["max_delta_per_step"] = [100.0, 100.0]
+    sink = make_sink(clock, apply, parse_descriptor(raw))
+    sink.submit(message(clock, [0.0, 0.0]))
+    clock.advance(10)                       # 0.9 rad / 0.01 s = 90 rad/s
+    outcome = sink.submit(message(clock, [0.0, 0.9], seq=2))
+    assert outcome.verdict is Verdict.APPLIED
+
+
+def test_a_descriptor_without_advisory_executes_everything():
+    """缺省必须是「会执行」。
+
+    反过来——缺省可丢——会让今天每一个驱动的每一段悄悄变成可丢，而这个字段
+    存在的理由正好是不让丢维悄悄发生。
+    """
+    parsed = parse_descriptor(descriptor_dict())
+    assert parsed.advisory_indices == frozenset()
+    assert all(not group.advisory for group in parsed.groups)
+
+
+def test_a_non_boolean_advisory_is_refused():
+    """字符串 "false" 是真值，而这个字段的方向是**放行**。
+
+    填错的代价是一段本该被限位守住的动作变成不检查——一个静默放宽的约束。
+    """
+    raw = advisory_descriptor()
+    raw["groups"][1]["advisory"] = "false"
+    with pytest.raises(DescriptorError, match="advisory"):
+        parse_descriptor(raw)
