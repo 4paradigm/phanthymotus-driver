@@ -169,13 +169,20 @@ class ArmSdkChannel:
     LOW_STATE_TIMEOUT_S = 2.0
 
     def __init__(self, *, send_crc: bool = True, grippers: bool = True,
-                 waist: bool = False, driven_arm_ids=None):
+                 waist: bool = False, driven_arm_ids=None,
+                 driven_waist_names=None):
         self._send_crc = bool(send_crc)
         self._grippers = bool(grippers)
         self._waist = bool(waist)
         # 这台机器人真正要驱动的臂关节。23dof/arm5 的机器上 20/21/27/28 不存在，
         # 把它们算进来会让下面的 mode 核对误判成「机器人坏了」。
         self._driven_arm_ids = list(driven_arm_ids or ARM_MOTOR_IDS)
+        # 腰同理：23dof 的机器上只有 yaw 存在（roll/pitch 报 mode=0）。写成名字
+        # 而不是下标，是因为调用方按 roll/pitch/yaw 思考，而下标是 13/14/12 ——
+        # 那个顺序每次都要回去查表，而查错不报错。
+        self._driven_waist = tuple(driven_waist_names
+                                   if driven_waist_names is not None
+                                   else WAIST_MOTOR_IDS)
         self._lock = threading.RLock()
         self._arm_pub = None
         self._gripper_pubs: dict = {}
@@ -229,7 +236,7 @@ class ArmSdkChannel:
         message.mode_pr = self._mode_pr
         motor_ids = list(ARM_MOTOR_IDS)
         if self._waist:
-            motor_ids += sorted(WAIST_MOTOR_IDS.values())
+            motor_ids += [WAIST_MOTOR_IDS[name] for name in self._driven_waist]
         motor_ids = [i for i in motor_ids
                      if i in self._driven_arm_ids or i in WAIST_MOTOR_IDS.values()]
         for motor_id in motor_ids:
@@ -249,8 +256,9 @@ class ArmSdkChannel:
             message.motor_cmd[motor_id].q = float(value)
         if self._waist:
             # 腰同理。这里读到的是实测腰角，第一条真正的指令会覆盖它。
-            for name, motor_id in WAIST_MOTOR_IDS.items():
-                message.motor_cmd[motor_id].q = float(self._measured_waist.get(name, 0.0))
+            for name in self._driven_waist:
+                message.motor_cmd[WAIST_MOTOR_IDS[name]].q = float(
+                    self._measured_waist.get(name, 0.0))
 
         crc = None
         if self._send_crc:
@@ -329,8 +337,8 @@ class ArmSdkChannel:
         absent = [motor_id for motor_id in self._driven_arm_ids
                   if int(getattr(motors[motor_id], "mode", 1)) == 0]
         if self._waist:
-            absent += [motor_id for motor_id in sorted(WAIST_MOTOR_IDS.values())
-                       if int(getattr(motors[motor_id], "mode", 1)) == 0]
+            absent += [WAIST_MOTOR_IDS[name] for name in self._driven_waist
+                       if int(getattr(motors[WAIST_MOTOR_IDS[name]], "mode", 1)) == 0]
         if absent:
             raise RuntimeError(
                 f"要驱动的关节里有 mode=0（不存在或未使能）：{absent}。"
@@ -340,8 +348,8 @@ class ArmSdkChannel:
 
         measured = [float(motors[i].q) for i in self._driven_arm_ids]
         self._measured_waist = {
-            name: float(motors[motor_id].q)
-            for name, motor_id in WAIST_MOTOR_IDS.items()
+            name: float(motors[WAIST_MOTOR_IDS[name]].q)
+            for name in self._driven_waist
         }
         return measured
 
@@ -380,10 +388,10 @@ class ArmSdkChannel:
             # 已经是弧度：descriptor 用的就是线上的单位，这里没有换算可以弄反。
             message.motor_cmd[motor_id].q = float(value)
         if waist is not None and self._waist:
-            roll, pitch, yaw = (float(v) for v in waist)
-            message.motor_cmd[WAIST_MOTOR_IDS["roll"]].q = roll
-            message.motor_cmd[WAIST_MOTOR_IDS["pitch"]].q = pitch
-            message.motor_cmd[WAIST_MOTOR_IDS["yaw"]].q = yaw
+            # 入参永远是标准布局的 [roll, pitch, yaw]，只写这台机器人真有的那些。
+            values = dict(zip(("roll", "pitch", "yaw"), (float(v) for v in waist)))
+            for name in self._driven_waist:
+                message.motor_cmd[WAIST_MOTOR_IDS[name]].q = values[name]
         self._write(message)
 
     def publish_gripper(self, side: str, closure):

@@ -441,7 +441,10 @@ class G1ServoEefPlugin:
                 send_crc=self._send_crc, grippers=self._grippers_enabled,
                 waist=True,
                 driven_arm_ids=(VARIANTS[variant]["motors"]["left"]
-                                + VARIANTS[variant]["motors"]["right"]))
+                                + VARIANTS[variant]["motors"]["right"]),
+                # 23dof 只有 yaw；roll/pitch 已被描述符限位卡死在 ±0.02。
+                driven_waist_names=(("roll", "pitch", "yaw")
+                                    if variant == "29dof" else ("yaw",)))
             self._sink = sink
             self._input_topic = topic
             self._running = True
