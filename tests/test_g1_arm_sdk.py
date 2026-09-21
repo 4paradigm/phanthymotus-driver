@@ -264,3 +264,65 @@ def test_the_ramp_holds_the_arms_where_they_were_found(monkeypatch):
     for motor_id, expected in zip(arm_sdk.ARM_MOTOR_IDS, measured):
         assert channel._message.motor_cmd[motor_id].q == pytest.approx(expected)
         assert channel._message.motor_cmd[motor_id].q != 0.0
+
+
+def test_the_low_state_subscriber_is_closed_after_the_one_frame(monkeypatch):
+    """只要一帧，拿到就关。
+
+    留着它意味着一条 500 Hz 的订阅活到进程结束。这个仓库里「孤儿订阅」的历史是：
+    卡片 stop 之后回调还在跑，ROS 图看着健康，直到某次 teardown 顺序出错把整层
+    订阅一起带走 —— 而那时候症状指向的是别的地方。
+    """
+    import types
+
+    closed = []
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            callback(_FakeLowState())
+
+        def Close(self):  # noqa: N802
+            closed.append(True)
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    arm_sdk.ArmSdkChannel(grippers=False)._read_measured_arms()
+    assert closed == [True]
+
+
+def test_the_subscriber_is_closed_even_when_no_frame_arrives(monkeypatch):
+    """超时路径同样要关 —— 那条路上我们已经建了订阅，只是没等到数据。"""
+    import types
+
+    closed = []
+
+    class _Subscriber:
+        def __init__(self, topic, kind):
+            pass
+
+        def Init(self, callback, depth):  # noqa: N802
+            pass                       # 什么都不送
+
+        def Close(self):  # noqa: N802
+            closed.append(True)
+
+    channel = types.ModuleType("unitree_sdk2py.core.channel")
+    channel.ChannelSubscriber = _Subscriber
+    dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
+    dds.LowState_ = object
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.core.channel", channel)
+    monkeypatch.setitem(sys.modules, "unitree_sdk2py.idl.unitree_hg.msg.dds_", dds)
+
+    channel_obj = arm_sdk.ArmSdkChannel(grippers=False)
+    monkeypatch.setattr(channel_obj.__class__, "LOW_STATE_TIMEOUT_S", 0.05)
+    with pytest.raises(RuntimeError):
+        channel_obj._read_measured_arms()
+    assert closed == [True]
