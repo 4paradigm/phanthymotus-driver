@@ -55,7 +55,7 @@ The `mic` card receives the robot-body microphone's Unitree audio multicast
 stream (`239.168.123.161:5555`) and republishes it to
 `/<namespace>/mic/audio` as `audio_msgs/AudioChunk` (`audio/pcm-16k`). It does
 not read an extension-board ALSA device. This is the same raw PCM path used by
-the vendored Unitree SDK example `example/a2/audio/a2_audio_client_example.cpp`;
+the upstream Unitree SDK example `example/a2/audio/a2_audio_client_example.cpp`;
 that example also subscribes to `rt/audio_msg` for ASR text. The AS2
 `AudioClient` exposes playback, TTS, volume, and LED APIs, but not a raw capture
 RPC, so the multicast receiver is the appropriate robot-body input path. The `speaker`
