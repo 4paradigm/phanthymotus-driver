@@ -549,3 +549,20 @@ def test_the_same_robot_starts_once_the_waist_is_declared_advisory(monkeypatch):
     card._detect_variant_from_robot = lambda: "23dof"
     result = card._start({"input_topic": "/x"})
     assert "waist_advisory" not in (result.get("message") or "")
+
+
+def test_the_canvas_port_formats_match_the_cards_this_one_connects_to():
+    """**画布按严格字符串相等匹配端口，不等就静默拒绝拖放。**
+
+    没提示、没日志，看起来就像画布坏了。真机上这条链路的两个端口都撞过：
+
+      输入  本卡片收 `control/eef`，而 actucore 的 vla 卡片曾发 `control/waypoint`
+      输出  本卡片曾报 `data/json`，而 vla 的观测输入口要的是 `state/joint`
+
+    两边分属不同仓库，没有任何一处检查它们是否对得上 —— 所以这条用例把本侧的两个
+    串钉死，并写明对面是谁。`data/json` 语义上不算错（载荷确实是 JSON），它只是
+    让这条反馈回路连不起来。
+    """
+    spec = _card("23dof").get_tool()
+    assert spec["topic_in"][0]["format"] == "control/eef"
+    assert spec["topic_out"][0]["format"] == "state/joint"
