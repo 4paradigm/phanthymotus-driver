@@ -8,7 +8,7 @@ main.py 按 config.yaml 的三个 key 分别调用对应 make_* 工厂函数；�
 三张卡的功能共享同一文件的实现：
   camera_rgb        — RGB 去畸变翻正 JPEG      (TCP :9201~9205)
   camera_depth      — 彩色深度 JPEG            (TCP :9101~9105)
-  camera_pointcloud — PointCloud2 + JPEG 俯视投影 (TCP :9401~9405)
+  camera_pointcloud — 3D 点云(UInt8MultiArray, agent-core Three.js 渲染) (TCP :9401~9405)
 
 架构（与之前各自独立的三文件完全一致）：
   ┌─ Nano 板卡 (.13/.14/.15) ────────────────────┐     ┌─ Pi 驱动容器 (.161) ────────┐
@@ -34,7 +34,8 @@ from typing import Any
 try:
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from sensor_msgs.msg import PointCloud2, PointField, CompressedImage
+    from std_msgs.msg import UInt8MultiArray
+    from sensor_msgs.msg import CompressedImage
     _HAS_ROS2 = True
     _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -67,18 +68,19 @@ _TYPE_TOPIC_SUFFIX = {"rgb": "mono", "depth": "depth", "pointcloud": "pointcloud
 _TYPE_DESC = {
     "rgb": "Go1 五机位 RGB 相机：去畸变矫正推流，可热切机位，与深度/点云互斥",
     "depth": "Go1 五机位深度流（~10Hz，彩色 JPEG：近红/远青）— multiInstance，position 下拉框选机位",
-    "pointcloud": "Go1 五机位点云（XYZ, 米, 相机系）— multiInstance, position 下拉框选机位",
+    "pointcloud": "Go1 五机位点云（3D 渲染, 相机前方视图）— multiInstance, position 下拉框选机位",
 }
 _TYPE_FMT = {
-    # Agent Core 的网页相机渲染器按 MIME 类型选择 renderer；虽然 ROS2
+    # Agent Core 的网页渲染器按 MIME 类型选择 renderer；虽然 ROS2
     # 载体是 CompressedImage，payload 本身是 JPEG，必须向画布声明为
     # image/jpeg，避免二进制帧被当作普通传感器文本而显示为空白。
     "rgb": "image/jpeg",
     "depth": "image/jpeg",
-    "pointcloud": "image/jpeg",
+    # 点云走 agent-core 的 Three.js 3D 渲染器（sensor/pointcloud →
+    # UInt8MultiArray 载体，payload=[12 LE][N LE][N×xyz f32 LE]）。
+    "pointcloud": "sensor/pointcloud",
 }
 _TYPE_FRAME_ID_SUFFIX = {"rgb": "_rgb", "depth": "_depth", "pointcloud": ""}
-_TYPE_HAS_PREVIEW = {"rgb": False, "depth": False, "pointcloud": True}
 _VALID_TYPES = list(_TYPE_PORT_KEY.keys())
 _TYPE_TITLE = {"rgb": "RGB 彩色", "depth": "深度", "pointcloud": "点云"}
 
@@ -111,60 +113,6 @@ def _resolve_positions_raw(plugin_config: dict | None) -> dict:
         if pos in positions and isinstance(ov, dict):
             positions[pos].update(ov)
     return positions
-
-# ── 点云 JPEG 俯视投影 ──────────────────────────
-
-_HAS_PIL = False
-try:
-    from PIL import Image as _PILImage
-    _HAS_PIL = True
-except ImportError:
-    pass
-
-_PCL_W, _PCL_H = 480, 480
-_PCL_R = 2
-_PCL_XR, _PCL_YR = 4.0, 3.0
-_PCL_ZMIN, _PCL_ZMAX = 0.3, 5.0
-
-def _pcl_jet_t(t):
-    t = max(0.0, min(1.0, float(t)))
-    r = max(0.0, min(1.0, 1.5 - abs(4 * t - 3)))
-    g = max(0.0, min(1.0, 1.5 - abs(4 * t - 2)))
-    b = max(0.0, min(1.0, 1.5 - abs(4 * t - 1)))
-    return r, g, b
-
-def _pcl_to_jpeg(xyz_blob: bytes, num_points: int) -> bytes | None:
-    if not _HAS_PIL or num_points == 0:
-        return None
-    try:
-        import numpy as np
-    except ImportError:
-        return None
-    pts = np.frombuffer(xyz_blob, dtype="<f4").reshape(num_points, 3)
-    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
-    mask = (np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-            & (z > _PCL_ZMIN) & (z < _PCL_ZMAX)
-            & (np.abs(x) < _PCL_XR / 2) & (np.abs(y) < _PCL_YR / 2))
-    x, y, z = x[mask], y[mask], z[mask]
-    img = np.zeros((_PCL_H, _PCL_W, 3), dtype=np.uint8)
-    if x.size > 0:
-        px = np.clip(((x + _PCL_XR / 2) / _PCL_XR * (_PCL_W - 1)).astype(np.int32), 0, _PCL_W - 1)
-        py = np.clip(((y + _PCL_YR / 2) / _PCL_YR * (_PCL_H - 1)).astype(np.int32), 0, _PCL_H - 1)
-        t_arr = np.clip((z - _PCL_ZMIN) / (_PCL_ZMAX - _PCL_ZMIN), 0, 1)
-        colors = np.zeros((len(px), 3), dtype=np.uint8)
-        for i in range(len(px)):
-            colors[i] = tuple(int(v * 255) for v in _pcl_jet_t(t_arr[i]))
-        for i in range(len(px)):
-            x0, y0 = int(px[i]), int(py[i])
-            for dy in range(-_PCL_R, _PCL_R + 1):
-                for dx in range(-_PCL_R, _PCL_R + 1):
-                    if dx * dx + dy * dy <= _PCL_R * _PCL_R:
-                        xi, yi = x0 + dx, y0 + dy
-                        if 0 <= xi < _PCL_W and 0 <= yi < _PCL_H:
-                            img[yi, xi] = colors[i]
-    buf = __import__('io').BytesIO()
-    _PILImage.fromarray(img).save(buf, format="JPEG", quality=75)
-    return buf.getvalue()
 
 # ── TCP 流接收器 ─────────────────────────────────
 
@@ -312,53 +260,87 @@ class _RgbStream:
                     pass
 
 class _DepthStream(_BaseStream):
-    """深度流：[4B 长度大端][JPEG payload] → CompressedImage。"""
+    """深度流：[4B 长度大端][JPEG payload] → CompressedImage。
+
+    与 _RgbStream 同款的非阻塞批量读取：每轮 drain 接收队列、丢弃过期完整帧、
+    只发布最新一帧 —— 深度计算(Nano 端 CPU 立体匹配)速率波动大，若逐帧阻塞收发，
+    旧帧会在内核接收队列堆积，画面越看越滞后。
+    """
+
+    # 单次最多从内核接收队列取 2 MiB；循环会立即继续 drain，避免持续来帧时长期霸占线程。
+    _MAX_DRAIN_BYTES = 2_097_152
 
     def __init__(self, node: Node, topic: str):
         super().__init__(node, topic)
         self._pub = node.create_publisher(CompressedImage, topic, _QOS) if _HAS_ROS2 else None
 
     def _loop(self, gen, position, host, port):
-        t_connect, t_first, t_steady = 8.0, 15.0, 8.0
         while self._run and gen == self._gen:
             try:
-                s = socket.create_connection((host, port), timeout=t_connect)
-                s.settimeout(t_first)
+                s = socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT)
+                s.setblocking(False)
                 self.connected = True
                 if self._node:
-                    self._node.get_logger().info(f"[{position}] 已连 depth_stream {host}:{port}")
+                    self._node.get_logger().info(f"[{position}] 已连 depth_stream {host}:{port}(等第一帧,暖机中)")
             except Exception:
                 self.connected = False
                 time.sleep(2)
                 continue
             try:
                 got_first = False
+                rx = bytearray()
                 while self._run and gen == self._gen:
-                    hdr = _recvall(s, 4)
-                    if hdr is None:
+                    timeout = _STEADY_TIMEOUT if got_first else _FIRST_FRAME_TIMEOUT
+                    readable, _, _ = select.select([s], [], [], timeout)
+                    if not readable:
+                        raise TimeoutError("timed out")
+
+                    received = 0
+                    peer_closed = False
+                    while received < self._MAX_DRAIN_BYTES:
+                        try:
+                            chunk = s.recv(min(65_536, self._MAX_DRAIN_BYTES - received))
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            peer_closed = True
+                            break
+                        rx.extend(chunk)
+                        received += len(chunk)
+                    if peer_closed:
                         break
-                    n = struct.unpack(">I", hdr)[0]
-                    if n <= 0 or n > 5_000_000:
-                        break
-                    data = _recvall(s, n)
-                    if data is None:
-                        break
+
+                    # 丢弃本批次中已过期的完整帧，仅留最后一帧待发布；不完整尾帧保留到下一次 recv。
+                    latest = None
+                    complete_frames = 0
+                    while len(rx) >= 4:
+                        n = struct.unpack(">I", rx[:4])[0]
+                        if n <= 0 or n > 5_000_000:
+                            raise ValueError(f"invalid depth frame length: {n}")
+                        end = 4 + n
+                        if len(rx) < end:
+                            break
+                        latest = bytes(rx[4:end])
+                        del rx[:end]
+                        complete_frames += 1
+                    self.frames += complete_frames
+                    if latest is None:
+                        continue
+
                     if not got_first:
                         got_first = True
-                        s.settimeout(t_steady)
-                        if self._node:
-                            self._node.get_logger().info(f"[{position}] 首帧到达")
+                        self._node.get_logger().info(f"[{position}] 首帧到达,进入稳态推流")
+
                     if self._pub is not None:
                         msg = CompressedImage()
                         msg.header.stamp = self._node.get_clock().now().to_msg()
                         msg.header.frame_id = f"go1_{position}_depth"
                         msg.format = "jpeg"
-                        msg.data = data
+                        msg.data = latest
                         try:
                             self._pub.publish(msg)
                         except Exception:
                             break
-                    self.frames += 1
             except Exception as e:  # noqa: BLE001
                 if self._node:
                     self._node.get_logger().warn(f"[{position}] depth stream 中断: {e}")
@@ -373,83 +355,92 @@ class _DepthStream(_BaseStream):
 class _PclStream(_BaseStream):
     """点云流：[4B total][total payload] → [4B numPoints][N×3×float32]。
 
-    同时发布：PointCloud2 + JPEG 俯视投影。
+    单路输出：UInt8MultiArray，payload = [12 LE][N LE][N×xyz f32 LE]，
+    直接对接 agent-core 的 Three.js 点云渲染器（sensor/pointcloud）。
     """
 
-    def __init__(self, node: Node, topic_pcl: str, topic_preview: str):
-        super().__init__(node, topic_preview)
-        self._pub_pcl = node.create_publisher(PointCloud2, topic_pcl, _QOS) if _HAS_ROS2 else None
-        self._pub_jpeg = node.create_publisher(CompressedImage, topic_preview, _QOS) if (_HAS_ROS2 and _HAS_PIL) else None
+    # 渲染器 MAX_POINTS 上限
+    _MAX_POINTS = 40000
+    # 单帧点云最大 40000×12+8 ≈ 480KB；单次 drain 上限取 4 MiB(约 8 帧余量)。
+    _MAX_DRAIN_BYTES = 4_194_304
+
+    def __init__(self, node: Node, topic: str):
+        super().__init__(node, topic)
+        self._pub = node.create_publisher(UInt8MultiArray, topic, _QOS) if _HAS_ROS2 else None
         self.last_points = 0
 
-    def _make_pcl_msg(self, num_points: int, xyz_blob: bytes):
-        msg = PointCloud2()
-        msg.header.stamp = self._node.get_clock().now().to_msg()
-        msg.header.frame_id = f"go1_{self.position}"
-        msg.height = 1
-        msg.width = num_points
-        msg.fields = [
-            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-        ]
-        msg.is_bigendian = False
-        msg.point_step = 12
-        msg.row_step = 12 * num_points
-        msg.data = xyz_blob
-        msg.is_dense = True
-        return msg
-
     def _loop(self, gen, position, host, port):
-        t_connect, t_first, t_steady = 8.0, 15.0, 8.0
         while self._run and gen == self._gen:
             try:
-                s = socket.create_connection((host, port), timeout=t_connect)
-                s.settimeout(t_first)
+                s = socket.create_connection((host, port), timeout=_CONNECT_TIMEOUT)
+                s.setblocking(False)
                 self.connected = True
                 if self._node:
-                    self._node.get_logger().info(f"[{position}] 已连 pointcloud_stream {host}:{port}")
+                    self._node.get_logger().info(f"[{position}] 已连 pointcloud_stream {host}:{port}(等第一帧,暖机中)")
             except Exception:
                 self.connected = False
                 time.sleep(2)
                 continue
             try:
                 got_first = False
+                rx = bytearray()
                 while self._run and gen == self._gen:
-                    hdr = _recvall(s, 4)
-                    if hdr is None:
+                    timeout = _STEADY_TIMEOUT if got_first else _FIRST_FRAME_TIMEOUT
+                    readable, _, _ = select.select([s], [], [], timeout)
+                    if not readable:
+                        raise TimeoutError("timed out")
+
+                    received = 0
+                    peer_closed = False
+                    while received < self._MAX_DRAIN_BYTES:
+                        try:
+                            chunk = s.recv(min(65_536, self._MAX_DRAIN_BYTES - received))
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            peer_closed = True
+                            break
+                        rx.extend(chunk)
+                        received += len(chunk)
+                    if peer_closed:
                         break
-                    total = struct.unpack(">I", hdr)[0]
-                    if total < 4 or total > 50_000_000:
-                        break
-                    payload = _recvall(s, total)
-                    if payload is None:
-                        break
-                    num_points = struct.unpack(">I", payload[:4])[0]
-                    xyz_blob = payload[4:]
+
+                    # 丢弃本批次中已过期的完整帧，仅留最后一帧；不完整尾帧保留到下一次 recv。
+                    # 帧结构: [4B 大端 total][4B 大端 numPoints][numPoints×3×f32]。
+                    latest = None
+                    complete_frames = 0
+                    while len(rx) >= 8:
+                        total = struct.unpack(">I", rx[:4])[0]
+                        if total < 4 or total > 50_000_000:
+                            raise ValueError(f"invalid pcl frame length: {total}")
+                        end = 4 + total
+                        if len(rx) < end:
+                            break
+                        latest = bytes(rx[4:end])
+                        del rx[:end]
+                        complete_frames += 1
+                    self.frames += complete_frames
+                    if latest is None:
+                        continue
+
+                    num_points = struct.unpack(">I", latest[:4])[0]
+                    xyz_blob = latest[4:]
                     if len(xyz_blob) != num_points * 12:
                         continue
-                    if self._pub_pcl is not None:
-                        self._pub_pcl.publish(self._make_pcl_msg(num_points, xyz_blob))
-                    if self._pub_jpeg is not None:
-                        jpeg = _pcl_to_jpeg(xyz_blob, num_points)
-                        if jpeg:
-                            pmsg = CompressedImage()
-                            pmsg.header.stamp = self._node.get_clock().now().to_msg()
-                            pmsg.header.frame_id = f"go1_{position}_pcl_preview"
-                            pmsg.format = "jpeg"
-                            pmsg.data = jpeg
-                            try:
-                                self._pub_jpeg.publish(pmsg)
-                            except Exception:
-                                pass
-                    self.frames += 1
-                    self.last_points = num_points
+
                     if not got_first:
                         got_first = True
-                        s.settimeout(t_steady)
-                        if self._node:
-                            self._node.get_logger().info(f"[{position}] 首帧到达")
+                        self._node.get_logger().info(f"[{position}] 首帧到达,进入稳态推流")
+
+                    frame = self._encode_frame(xyz_blob, num_points)
+                    if frame is not None and self._pub is not None:
+                        msg = UInt8MultiArray()
+                        msg.data = frame
+                        try:
+                            self._pub.publish(msg)
+                        except Exception:
+                            break
+                    self.last_points = num_points
             except Exception as e:  # noqa: BLE001
                 if self._node:
                     self._node.get_logger().warn(f"[{position}] pointcloud stream 中断: {e}")
@@ -459,6 +450,27 @@ class _PclStream(_BaseStream):
                     s.close()
                 except Exception:
                     pass
+
+    def _encode_frame(self, xyz_blob: bytes, num_points: int) -> bytes | None:
+        """相机系 XYZ → agent-core 渲染系打包。
+
+        Nano 送来的是相机光学系（x 右, y 下, z 前）。Go1 相机物理 180° 翻转安装，
+        机身系（右/上/前）= (-x_cam, +y_cam, +z_cam)。渲染器把 packet (x,y,z)
+        显示为 (y, -z, -x)（q5 已验证此约定），要得到 显示 X=右、Y=上、Z=前，
+        需打包 packet = (-前, -右, -上) = (-z_cam, +x_cam, -y_cam)。
+        """
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+        pts = np.frombuffer(xyz_blob, dtype="<f4").reshape(num_points, 3)
+        if num_points > self._MAX_POINTS:
+            pts = pts[:: (num_points + self._MAX_POINTS - 1) // self._MAX_POINTS]
+        out = np.empty((len(pts), 3), dtype="<f4")
+        out[:, 0] = -pts[:, 2]   # -z_cam
+        out[:, 1] = pts[:, 0]    # +x_cam
+        out[:, 2] = -pts[:, 1]   # -y_cam
+        return struct.pack("<II", 12, len(out)) + out.tobytes()
 
 # ── Plugin 类 ──────────────────────────────────────
 
@@ -478,7 +490,6 @@ class Plugin:
         self._topic_root = _TYPE_TOPIC_ROOT[self._type]
         self._topic_suffix = _TYPE_TOPIC_SUFFIX[self._type]
         self._frame_id_suffix = _TYPE_FRAME_ID_SUFFIX[self._type]
-        self._has_preview = _TYPE_HAS_PREVIEW[self._type]
         self._desc = _TYPE_DESC[self._type]
         self._fmt = _TYPE_FMT[self._type]
 
@@ -511,10 +522,6 @@ class Plugin:
         safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in iid)
         return f"/{self._ns}/{self._topic_root}/{safe}/{self._topic_suffix}"
 
-    def _topic_preview(self, iid: str) -> str:
-        safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in iid)
-        return f"/{self._ns}/{self._topic_root}/{safe}/{self._topic_suffix}_preview"
-
     # ── 机位解析 ──
 
     def _resolve_pos(self, iid: str, args: dict) -> str:
@@ -530,10 +537,7 @@ class Plugin:
 
     def _stream_for(self, iid: str) -> _BaseStream:
         if iid not in self._streams:
-            if self._has_preview:
-                self._streams[iid] = _PclStream(self._node, self._topic(iid), self._topic_preview(iid))
-            else:
-                self._streams[iid] = self._stream_cls(self._node, self._topic(iid))
+            self._streams[iid] = self._stream_cls(self._node, self._topic(iid))
         return self._streams[iid]
 
     # ── 生命周期 ──
@@ -558,8 +562,6 @@ class Plugin:
         topic_out = []
         if self._node:
             topic_out.append({"topic": self._topic("default"), "format": self._fmt})
-            if self._has_preview and _HAS_PIL:
-                topic_out.append({"topic": self._topic_preview("default"), "format": "image/jpeg"})
         return [{
             "name": self._card, "type": TYPE, "multiInstance": True,
             "description": self._desc + (" — ROS2" if self._node else " — no rclpy, poll via MCP"),
@@ -624,8 +626,6 @@ class Plugin:
         topic_out = []
         if self._node:
             topic_out.append({"topic": self._topic(iid), "format": self._fmt})
-            if self._has_preview and _HAS_PIL:
-                topic_out.append({"topic": self._topic_preview(iid), "format": "image/jpeg"})
         base = {
             "state": state, "position": pos,
             "positions_available": _VALID_POSITIONS,
@@ -636,7 +636,7 @@ class Plugin:
             "frames_published": st.frames if st else 0,
             "topic_out": topic_out,
         }
-        if self._has_preview:
+        if self._type == "pointcloud":
             base["last_frame_points"] = st.last_points if st else 0
         base["note"] = "streaming; stop to release camera" if state == "running" else "start to connect; stop releases it"
         return base
@@ -651,15 +651,10 @@ class Plugin:
         if iid in self._streams:
             self._streams.pop(iid, None).stop()
         # 创建新实例
-        if self._has_preview:
-            st = _PclStream(self._node, self._topic(iid), self._topic_preview(iid))
-        else:
-            st = self._stream_cls(self._node, self._topic(iid))
+        st = self._stream_cls(self._node, self._topic(iid))
         self._streams[iid] = st
         st.start(position, p["board_ip"], int(p.get(self._port_key, self._default_port)))
         topic_out = [{"topic": self._topic(iid), "format": self._fmt}]
-        if self._has_preview and _HAS_PIL:
-            topic_out.append({"topic": self._topic_preview(iid), "format": "image/jpeg"})
         return {"ok": True, "card": self._card, "action": "start", "timestamp_ms": _now_ms(),
                 "state": "running", "position": position, "type": self._type,
                 "topic_out": topic_out}
