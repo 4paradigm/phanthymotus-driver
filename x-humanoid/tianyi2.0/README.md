@@ -4,25 +4,24 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
-## ActuCore teleoperation execution
+## 三段遥操与旧执行接口
 
-The optional, disabled-by-default `teleop_executor` executes robot-space targets
-from the `teleop` card inside the normal ActuCore bundle. PICO pairing, controller
-mapping, IK, operator controls and the return-arm trajectory belong to ActuCore;
-the Driver owns actuator arbitration, bounded position output, feedback and
-confirmed stop. There is no separate PICO service in this Driver.
+新遥操在同一 Canvas 连接 `teleop → motion_control → arm`：普通 ActuCore
+内的 `teleop` 负责 PICO 配对、双握把和相对末端映射；本 Driver 的
+`motion_control` 负责天轶模型、IK、碰撞检查、可视化及显式结束收臂；
+现有 `arm` 增加连续关节入口，复用位置发布与共享执行权。
+不会启动第二个 ActuCore，也没有 Driver 内的 PICO 服务。
 
-Continuous targets use local domain-42 DDS; loopback MCP handles only preparation,
-control ownership and pause/resume/release. Arms-only operation explicitly disables
-hand output. Existing arm, gesture, hand, body, navigation and servo paths share
-the teleop execution gate, so acquiring control never silently preempts them.
+新入口显式启用 `motion_control.enabled`，默认关闭。Canvas 开启智能控制
+只准备链路；PICO 开始遥操后才准备操作会话，握把使能才获取执行权。
+Preview 只求解和显示，独立凭据不能进入 arm 硬件入口；结束或项目关闭
+请求 Driver 收臂并等待实测停止/释放，断开头显不会取消已经受理的收臂。
 
-The Canvas `teleop` card and PICO operator controls are the user entry points;
-`teleop_executor` is the internal execution interface. See the
-[execution contract](TELEOP.md) and [build/deployment runbook](deploy/TELEOP_RUNBOOK.md)
-for configuration, recovery, diagnostics and acceptance limits. A site trial has
-reported usable dual-arm following and confirmed return-arm completion; this does
-not certify hand operation or process-crash behavior for every installation.
+旧 `teleop_executor` / `motus.motion-target.v1` 继续兼容旧 ActuCore 的关节输出，
+原动作、servo 和新流共用同一个 MotionGate，不能并行写同一执行器。
+参见[三段接口与使用说明](MOTION_CONTROL.md)、[旧执行协议](TELEOP.md)和
+[构建部署说明](deploy/TELEOP_RUNBOOK.md)。旧版现场跟随证据不代替本次迁移后的
+部署及真机验收；本轮实现和测试均离线完成。
 
 ## Head camera snapshot card
 

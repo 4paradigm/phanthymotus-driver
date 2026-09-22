@@ -6,14 +6,8 @@ from teleop_executor import TeleopExecutor
 
 
 def executor():
-    result=TeleopExecutor.__new__(TeleopExecutor)
-    result._lifecycle_lock=threading.RLock()
-    result._closed=threading.Event()
-    result._thread=None;result._bus_socket=None;result._bus_process=None
-    result._feedback_executor=None;result._feedback_thread=None
-    result._feedback_closed=threading.Event();result._feedback_error=None
-    result.node=None;result._subscribed=False
-    result.ns='test'
+    result=TeleopExecutor({},'test',None,None,None,[])
+    result._subscribed=False
     result.gate=SimpleNamespace(session_id=None,hold=lambda *a,**k:None)
     result.info=lambda:{'ownership_held':bool(result.gate.session_id)}
     return result

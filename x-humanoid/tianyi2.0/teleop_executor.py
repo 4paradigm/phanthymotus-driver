@@ -128,6 +128,8 @@ class TeleopExecutor:
             acceptance_check=self._execution_accepted)
         self.node = None
         self._bus_socket=None;self._bus_process=None
+        self.motion_control = None
+        self._bus_send_lock = threading.Lock()
 
     def _execution_accepted(self):
         if not self.profile:
@@ -245,7 +247,8 @@ class TeleopExecutor:
              'FASTRTPS_DEFAULT_PROFILES_FILE':'/opt/phanthy-motus/dds-local.xml'}
         self._bus_socket=parent
         try:
-            self._bus_process=subprocess.Popen([sys.executable,__file__,'--bus',str(child.fileno()),self.ns],
+            self._bus_process=subprocess.Popen([sys.executable,__file__,'--bus',str(child.fileno()),self.ns]
+                + (['--control-v2'] if self.motion_control is not None else []),
                 pass_fds=(child.fileno(),),env=env)
         finally:
             child.close()
@@ -261,7 +264,9 @@ class TeleopExecutor:
             received = time.monotonic_ns()
             self.tick()
             executed = time.monotonic_ns()
-            try:self._bus_socket.send(json.dumps(self.info(),allow_nan=False).encode())
+            try:
+                with self._bus_send_lock:
+                    self._bus_socket.send(json.dumps(self.info(),allow_nan=False).encode())
             except (OSError,ValueError):self.gate.hold("feedback_publish_failed")
             finished = time.monotonic_ns()
             self._watchdog_timing = {"started_ns": started,
@@ -277,16 +282,25 @@ class TeleopExecutor:
     def _receive_latest_command(self):
         # DDS depth=1 does not bound the downstream datagram socket queue.
         # Never let an expired intermediate packet pre-empt a fresh latest one.
-        latest = None
+        latest = {}
         received = 0
         for _ in range(128):
             try:
-                latest = self._bus_socket.recv(8193)
+                raw = self._bus_socket.recv(16385)
+                try:
+                    value = json.loads(raw, object_pairs_hook=self._unique)
+                    route = value.get('_motion_route', 'legacy') if isinstance(value, dict) else 'legacy'
+                    if route not in ('eef', 'arm'):
+                        route = 'legacy'
+                except (ValueError, TypeError, RecursionError):
+                    route = 'legacy'
+                latest[route] = raw
                 received += 1
             except BlockingIOError:
-                if latest is not None:
-                    self._trace('receive_batch', received=received, superseded=received-1)
-                    self._command(SimpleNamespace(data=latest))
+                if latest:
+                    self._trace('receive_batch', received=received, superseded=received-len(latest))
+                    for raw in latest.values():
+                        self._command(SimpleNamespace(data=raw))
                 return
             except OSError:
                 self.gate.hold('local_dds_receive_failed')
@@ -416,11 +430,29 @@ class TeleopExecutor:
         received_ns = time.monotonic_ns()
         packet = None
         try:
-            if len(msg.data) > 8192:raise ValueError('command_too_large')
+            if len(msg.data) > 16384:raise ValueError('command_too_large')
             packet = json.loads(msg.data, object_pairs_hook=self._unique)
         except (ValueError, TypeError, RecursionError):
             self.gate.hold('invalid_command')
             self._trace('command_decision',received_ns=received_ns,accepted=False,reason='invalid_command')
+            return
+        if isinstance(packet, dict) and '_motion_route' in packet:
+            try:
+                if set(packet) != {'_motion_route', 'packet'} or self.motion_control is None:
+                    raise ValueError('control_interface_unavailable')
+                if packet['_motion_route'] == 'eef':
+                    accepted = self.motion_control.receive_eef(packet['packet'])
+                elif packet['_motion_route'] == 'arm':
+                    accepted = self.arm.accept_control(packet['packet'])
+                else:
+                    raise ValueError('invalid_control_route')
+                reason = None if accepted else 'hold_confirmation_or_time_fence'
+            except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                accepted, reason = False, str(exc)
+                if self.motion_control is not None:
+                    self.motion_control.rejected(packet.get('_motion_route'), packet.get('packet'), reason)
+            self._trace('control_v2_decision', received_ns=received_ns,
+                        route=packet.get('_motion_route'), accepted=accepted, reason=reason)
             return
         fields = {}
         if isinstance(packet,dict):
@@ -472,6 +504,17 @@ class TeleopExecutor:
                 if self.hand._send_angles(side, angles).get("error"):
                     raise ValueError("hand_publish_failed")
 
+    def publish_joint_command(self, packet):
+        """Numerical worker -> local DDS arm input, never directly to hardware."""
+        raw = json.dumps({'_motion_route': 'joint_output', 'packet': packet}, allow_nan=False).encode()
+        if self._bus_socket is None:
+            raise ValueError('local_dds_unavailable')
+        try:
+            with self._bus_send_lock:
+                self._bus_socket.send(raw)
+        except OSError as exc:
+            raise ValueError('joint_publish_failed') from exc
+
     def foreign_publishers(self):
         owned={(n.get_namespace(),n.get_name()) for p in self.plugins
                for n in [getattr(p,'_pub_node',None)] if n is not None}
@@ -503,7 +546,8 @@ class TeleopExecutor:
                 "calibration_sha256": self.profile_sha256, "foreign_publishers": self._foreign_publishers,
                 "publisher_present": self._output_ready,
                 "x-teleop-target": tool["x-teleop-target"],
-                "topic_in": tool["topic_in"], "topic_out": tool["topic_out"]}
+                "topic_in": tool["topic_in"], "topic_out": tool["topic_out"],
+                **(self.motion_control.feedback_fields() if self.motion_control is not None else {})}
 
     def dispatch(self, action, args):
         if action == 'info':
@@ -686,6 +730,8 @@ class TeleopExecutor:
             return {"state": "error", "code": str(exc), "error": str(exc)}
 
     def stop(self):
+        if self.motion_control is not None:
+            self.motion_control.stop()
         with self._lifecycle_lock:
             self._operator_prepared=False
             self.gate.hold("driver_shutdown", release=True)
@@ -728,7 +774,7 @@ class TeleopExecutor:
         self._subscribed = False
 
 
-def run_local_bus(fd,namespace):
+def run_local_bus(fd,namespace,control_v2=False):
     """Only process allowed to receive teleop DDS commands; no robot-side context."""
     try:
         from common import logsafe
@@ -760,13 +806,31 @@ def run_local_bus(fd,namespace):
     topic=f'/{namespace}/motion/teleop'
     node.create_subscription(String,topic+'/command',command,qos)
     pub=node.create_publisher(String,topic+'/feedback',qos)
+    joint_pub = None
+    if control_v2:
+        def routed(route, msg):
+            if len(msg.data) > 8192:return
+            try:
+                packet = json.loads(msg.data, object_pairs_hook=TeleopExecutor._unique)
+                wire.send(json.dumps({'_motion_route': route, 'packet': packet}, allow_nan=False).encode())
+            except (ValueError, TypeError, BlockingIOError):pass
+        node.create_subscription(String,f'/{namespace}/motion/control/command',lambda msg:routed('eef',msg),qos)
+        node.create_subscription(String,f'/{namespace}/motion/arm/command',lambda msg:routed('arm',msg),qos)
+        joint_pub = node.create_publisher(String,f'/{namespace}/motion/arm/command',qos)
     try:
         while rclpy.ok():
             rclpy.spin_once(node,timeout_sec=.01)
-            latest=None
+            latest=None;latest_joint=None
             for _ in range(128):
-                try:latest=wire.recv(65536)
+                try:
+                    raw=wire.recv(65536)
+                    value=json.loads(raw)
+                    if isinstance(value,dict) and value.get('_motion_route')=='joint_output':
+                        latest_joint=value['packet']
+                    else:latest=raw
                 except BlockingIOError:break
+            if latest_joint is not None and joint_pub is not None:
+                msg=String();msg.data=json.dumps(latest_joint,allow_nan=False);joint_pub.publish(msg)
             if latest:
                 msg=String();msg.data=latest.decode();pub.publish(msg)
     except (ExternalShutdownException, KeyboardInterrupt):
@@ -778,5 +842,6 @@ def run_local_bus(fd,namespace):
 
 
 if __name__=='__main__':
-    if len(sys.argv)!=4 or sys.argv[1]!='--bus':raise SystemExit('internal local DDS bus only')
-    run_local_bus(int(sys.argv[2]),sys.argv[3])
+    if len(sys.argv) not in (4,5) or sys.argv[1]!='--bus' or (len(sys.argv)==5 and sys.argv[4]!='--control-v2'):
+        raise SystemExit('internal local DDS bus only')
+    run_local_bus(int(sys.argv[2]),sys.argv[3],len(sys.argv)==5)

@@ -1,6 +1,6 @@
-# 天轶连续遥操执行契约
+# 天轶连续遥操执行契约（兼容 v1）
 
-`teleop_executor` 接收普通 ActuCore 内 `teleop` 卡片产生的机器人目标。PICO 配对、控制器映射、IK、可达性和碰撞检查、显示、开始/结束操作及收臂轨迹均由 ActuCore 负责。Driver 负责执行权、最新目标、限位限速、反馈和停止确认，不解析 PICO 协议或自动回零。
+本文描述保留的 `teleop_executor` / `motus.motion-target.v1` 兼容入口；旧 ActuCore 在上游进行 IK，再发送关节目标。新三段路径 `teleop → motion_control → arm` 的天轶 IK、碰撞、模型、可视化和显式收臂已迁入同一 Driver，详见 [MOTION_CONTROL.md](MOTION_CONTROL.md)。两条路径复用同一个 MotionGate，不可同时获取执行权。Driver 均不解析 PICO 协议；断线和暂停不会自动收臂。
 
 ## 启用与用户入口
 

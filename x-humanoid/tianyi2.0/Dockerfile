@@ -25,6 +25,10 @@ RUN if [ -n "$UBUNTU_PORTS_MIRROR" ]; then \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml numpy opencv-python-headless phonemizer pyalsaaudio sounddevice
 
+COPY tianyi_motion/requirements.lock /tmp/tianyi-motion-requirements.lock
+RUN pip3 install --no-cache-dir --require-hashes --only-binary=:all: \
+    -i ${PYPI_MIRROR} -r /tmp/tianyi-motion-requirements.lock
+
 # audio_msgs is inherited from ros-base's /ros_ws overlay, not rebuilt here.
 COPY msgs/ /tianyi_ws/src/
 RUN cd /tianyi_ws && \
@@ -43,10 +47,11 @@ ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py device.py servo.py joints_bridge.py light.py nav_client.py ext_devices.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py /work/
-COPY motion_stream.py teleop_executor.py dds-local.xml /work/
+COPY motion_stream.py teleop_executor.py motion_control.py dds-local.xml /work/
+COPY tianyi_motion/ /work/tianyi_motion/
 COPY dds-local.xml /opt/phanthy-motus/
 COPY deploy/     /deploy/
-RUN bash -c 'source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /tianyi_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk; from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus, CmdSetMotorPosition; from teleop_executor import TeleopExecutor; from main import TianyiDeviceBundle"'
+RUN bash -c 'source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /tianyi_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk; from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus, CmdSetMotorPosition; from teleop_executor import TeleopExecutor; from motion_control import MotionControl; import pinocchio, scipy; from main import TianyiDeviceBundle"'
 RUN mkdir -p /opt/phanthy-motus/data/maps
 
 EXPOSE 15707

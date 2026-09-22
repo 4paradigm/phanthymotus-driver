@@ -603,15 +603,26 @@ class TianyiDeviceBundle:
             print("[bundle] LightPlugin loaded")
 
         self._teleop = None
-        if cfg.get("teleop", {}).get("enabled", False):
+        if cfg.get("teleop", {}).get("enabled", False) or cfg.get('motion_control', {}).get('enabled', False):
             from teleop_executor import TeleopExecutor
             from device import ArmPlugin, HandPlugin
             arm = next((p for p in self._plugins if isinstance(p, ArmPlugin)), None)
             hand = next((p for p in self._plugins if isinstance(p, HandPlugin)), None)
-            if cfg['teleop'].get('live_enabled') is True and (arm is None or hand is None):
+            teleop_cfg = dict(cfg.get('teleop', {}))
+            if cfg.get('motion_control', {}).get('calibration_path'):
+                teleop_cfg['calibration_path'] = cfg['motion_control']['calibration_path']
+            if teleop_cfg.get('live_enabled') is True and (arm is None or hand is None):
                 raise ValueError("live teleop requires arm and hand plugins")
-            self._teleop = TeleopExecutor(cfg["teleop"], namespace, ros2, arm, hand, self._plugins)
+            self._teleop = TeleopExecutor(teleop_cfg, namespace, ros2, arm, hand, self._plugins)
             self._plugins.append(self._teleop)
+            if cfg.get('motion_control', {}).get('enabled', False):
+                from motion_control import MotionControl
+                if arm is None:
+                    raise ValueError('motion_control requires arm plugin')
+                controller = MotionControl(cfg['motion_control'], self._teleop)
+                self._teleop.motion_control = controller
+                arm._motion_control = controller
+                self._plugins.append(controller)
 
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
     _ALWAYS_START = {
@@ -661,7 +672,7 @@ class TianyiDeviceBundle:
         teleop = getattr(self, "_teleop", None)
         if teleop is not None:
             from teleop_executor import MOTION_TOOLS
-            if tool_name in MOTION_TOOLS:
+            if tool_name in MOTION_TOOLS and args.get('action') != 'info':
                 try:
                     with teleop.gate.legacy():
                         return self._dispatch(tool_name, dict(args))
@@ -857,7 +868,7 @@ def make_handler():
                     ok({"tools": _bundle.get_all_tools()})
                 elif method == "tools/call":
                     name   = params.get("name", "")
-                    if name == "teleop_executor":
+                    if name in ("teleop_executor", "motion_control"):
                         import ipaddress
                         if self.headers.get("Origin") or not ipaddress.ip_address(self.client_address[0]).is_loopback:
                             err(-32600, "teleop executor requires loopback")

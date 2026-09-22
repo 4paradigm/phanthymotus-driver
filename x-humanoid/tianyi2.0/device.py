@@ -3061,7 +3061,7 @@ class ArmPlugin:
         self._sequence = _ActionSequence("ArmPlugin")
 
     def get_tool(self) -> dict:
-        return {
+        tool = {
             "name": "arm",
             "type": "actuator",
             "description": (
@@ -3176,6 +3176,23 @@ class ArmPlugin:
                 },
             },
         }
+        controller = getattr(self, '_motion_control', None)
+        if controller is not None:
+            tool.update(controller.arm_metadata())
+            tool['inputSchema']['properties']['action']['enum'].extend(['info', 'start', 'stop'])
+            tool['inputSchema']['properties'].update({
+                'input_topic': {'type': 'string'}, 'instance_id': {'type': 'string'},
+                'control_interface': {'type': 'object'}})
+            tool['inputSchema']['x-action-params'].update({
+                'info': {'params': []}, 'start': {'params': ['input_topic', 'instance_id', 'control_interface']},
+                'stop': {'params': []}})
+        return tool
+
+    def accept_control(self, packet):
+        controller = getattr(self, '_motion_control', None)
+        if controller is None:
+            raise ValueError('control_interface_unavailable')
+        return controller.receive_joint(packet)
 
     def start(self):
         try:
@@ -3193,6 +3210,25 @@ class ArmPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action == 'info' and getattr(self, '_motion_control', None) is not None:
+            return {**self._motion_control.arm_metadata(),
+                    'control_interface': self._motion_control.control_interface('joint_position')}
+        if action == 'start' and getattr(self, '_motion_control', None) is not None:
+            if args.get('input_topic') not in (None, self._motion_control.arm_topic):
+                return {'state': 'error', 'code': 'arm_input_topic_mismatch', 'error': 'arm_input_topic_mismatch'}
+            interface = args.get('control_interface')
+            expected = self._motion_control.control_interface('joint_position')
+            if interface is not None and (not isinstance(interface, dict) or any(
+                    interface.get(k) != expected[k] for k in ('control_interface', 'mode', 'dof', 'joint_names', 'units', 'groups'))):
+                return {'state': 'error', 'code': 'arm_control_interface_mismatch', 'error': 'arm_control_interface_mismatch'}
+            if self._pos_publisher is None:self.start()
+            return {'state': 'ready', **self._motion_control.arm_metadata()}
+        if action == 'stop' and getattr(self, '_motion_control', None) is not None:
+            # The owning motion_control must first confirm release; arm cannot
+            # implicitly discard its lease or start an independent stop path.
+            if self._motion_control.gate.session_id:
+                return {'state': 'error', 'error': 'motion_owned_by_teleop', 'code': 'motion_owned_by_teleop'}
+            return {'state': 'idle'}
         if action == "move_pos":
             poses = self._requested_poses(args)
             speed = args.get("speed", 0.5)
