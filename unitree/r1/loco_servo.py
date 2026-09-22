@@ -106,6 +106,27 @@ def _step_limit(accel: float, floor: float) -> float:
     """
     return max(accel, floor)
 
+# ── the space this robot occupies ────────────────────────────────────────────
+#
+# Declared for the same reason `min_magnitude` is: it is a fact about the robot,
+# and a policy that hard-codes it is a policy that is wrong on the next chassis.
+# A navigation card testing a fixed angular slice of its camera is testing a
+# *different width at every distance* — at R1's numbers the slice is narrower
+# than the robot below about 1.1 m, which is to say precisely where it matters —
+# so the consumer needs the metric envelope to build a corridor out of.
+#
+# From Unitree's own spec sheet: 1230 x 357 x 190 mm (H x W x D).
+#
+# **This is the static envelope with the arms at rest.** A walking gait swings a
+# leg past the torso box and a raised arm leaves it entirely, so a consumer is
+# expected to add its own margin rather than treat these as clearances. That is
+# also why `source` is declared: an estimate and a measurement should not be
+# treated with equal confidence.
+FOOTPRINT_HALF_WIDTH = 0.179     # m, half of 357 mm
+FOOTPRINT_FRONT = 0.095          # m, half of 190 mm — torso only
+FOOTPRINT_REAR = 0.095
+FOOTPRINT_HEIGHT = 1.23
+
 DEFAULT_EXPECTED_HZ = 10.0
 MAX_HZ = 20.0
 # Generous next to an arm's 200 ms because a chassis at 0.4 m/s travels 12 cm in
@@ -160,6 +181,19 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ) -> dict:
         # The chassis reports no force-torque. Declared null rather than omitted
         # so the absent protection is visible; parse_descriptor requires it.
         "force_torque": None,
+        # What this robot will hit things with. See FOOTPRINT_HALF_WIDTH.
+        "footprint": {
+            "shape": "box",
+            "half_width": FOOTPRINT_HALF_WIDTH,
+            "front": FOOTPRINT_FRONT,
+            "rear": FOOTPRINT_REAR,
+            "height": FOOTPRINT_HEIGHT,
+            # "vendor-spec" | "measured" | "estimate". Provenance matters here:
+            # this box is off a datasheet, not off this robot with a tape
+            # measure, and it says nothing about where the arms are.
+            "source": "vendor-spec",
+            "arms": "at-rest",
+        },
     }
 
 

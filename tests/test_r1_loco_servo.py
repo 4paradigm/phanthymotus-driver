@@ -423,3 +423,39 @@ def test_a_ramp_from_rest_reaches_an_executable_speed_on_its_first_step():
     assert abs(applied[0]) >= floor, (
         f"first step was {applied[0]:.2f} rad/s, under the {floor} floor — "
         "the robot would stand still for it")
+
+
+# ── the footprint ────────────────────────────────────────────────────────────
+
+def test_the_footprint_is_declared_in_metres_and_names_its_provenance():
+    """A navigation card cannot build a corridor out of an angular camera slice:
+    a fixed slice covers a different width at every distance, and at R1's
+    numbers it is narrower than the robot below ~1.1 m — which is exactly where
+    stopping matters. So the chassis declares its own envelope, same reasoning
+    as `min_magnitude`.
+
+    `source` is part of the contract, not decoration. A datasheet box and a
+    measured one deserve different margins, and a consumer that cannot tell
+    them apart will pick one number for both.
+    """
+    footprint = loco_servo.build_descriptor()["footprint"]
+    assert footprint["shape"] == "box"
+    assert footprint["source"] in ("vendor-spec", "measured", "estimate")
+    for field in ("half_width", "front", "rear", "height"):
+        assert footprint[field] > 0, field
+    # 357 mm across, per Unitree's spec sheet.
+    assert footprint["half_width"] == pytest.approx(0.1785, abs=0.002)
+
+
+def test_the_footprint_does_not_pretend_to_cover_the_arms():
+    """The problem that prompted this is a shoulder clipping a doorframe, and a
+    raised arm leaves the torso box entirely. Declaring the box as if it were a
+    clearance would hand the consumer a number that is wrong in the one
+    direction that hurts."""
+    assert loco_servo.build_descriptor()["footprint"]["arms"] == "at-rest"
+
+
+def test_the_descriptor_still_parses_with_the_footprint_on_it():
+    """It is an addition to `motus.control/1`, so every existing consumer has to
+    keep working without knowing about it."""
+    parse_descriptor(loco_servo.build_descriptor())
