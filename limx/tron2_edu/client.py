@@ -3,7 +3,7 @@
 There is one reader and no automatic reconnection or command replay. A response
 must match the configured robot, request GUID and response title.
 """
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 import copy
 import json
 import threading
@@ -159,7 +159,7 @@ class TronClient:
                 raise RuntimeError("robot rejected request or returned an invalid result")
             result["round_trip_ms"] = (result["received_monotonic_ns"] - requested) / 1e6
             return result
-        except TimeoutError:
+        except FutureTimeoutError:
             raise TimeoutError("robot response timed out; outcome unknown, no retry") from None
         finally:
             with self._lock:
