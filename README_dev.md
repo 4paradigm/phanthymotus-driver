@@ -559,7 +559,15 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
 | `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
+| `state/odom` | Text / KV panel | `motus.odom/1` — see "Robot Odometry" |
+| `control/velocity` | Text / KV panel | `motus.control/1` `twist` — see "Continuous Control" |
+| `control/joint` | Text / KV panel | `motus.control/1` joint modes |
 | (no hint) | Activity stream | Fallback when no format specified |
+
+The last three carry a declared schema rather than free-form JSON, and the port
+format is what a *consumer* matches on when wiring a canvas — the renderer is
+incidental. `control/*` is an **input** port on a driver command card;
+`state/odom` is an output.
 
 ### Depth Rendering — `image/depth-z16` vs `image/depth-zlib`
 
@@ -1168,6 +1176,36 @@ always mis-typed: if it only reads state, give it `type: sensor` or `resource`, 
 exempts it from the barrier entirely. (Note that changing `type` also changes who may
 call it: a `viewer`-role peer may call sensor tools. Do not retype a tool casually.)
 
+### `x-resource` is a label, not a lock — two cards on one resource must arbitrate
+
+ACP uses `x-resource` to decide what waits behind what *within its own
+scheduling*. It does not stop two cards from reaching the same hardware by
+different routes, and the moment a physical resource has both a **call-shaped**
+card and a **stream-shaped** card, it has exactly that.
+
+R1's chassis is the case to learn from. `loco` is call-shaped (`move`,
+`stop_move`, LLM-callable); `loco_servo` is stream-shaped (a `control/velocity`
+topic at 10 Hz). Both hold the same `RpcProxy` and both call `Move`. Matching
+`x-resource: ["base"]` on the two makes them *look* coordinated while
+`loco.move(duration=-1)` and a streaming policy fight each other at 10 Hz, with
+nothing logging the conflict — each card is behaving exactly as designed.
+
+If you add a stream-shaped card beside an existing call-shaped one:
+
+- give the stream card a reference to the call-shaped plugin, and **refuse to
+  start** while a continuous motion is in flight there;
+- make the call-shaped actions **pause the stream first**. An explicit
+  instruction from a person or the LLM outranks a running policy, and that
+  direction must not be reversed;
+- wire both into the interrupt card (`SmartMotionPlugin` and friends), or
+  `interrupt` stops one and the other keeps driving;
+- watch registration order in `main.py` — a plugin that looks its neighbour up
+  by `PREFIX` finds nothing if it is constructed first.
+
+The same applies to `arm` versus `servo` on G1; there the handover is mediated
+by arm_sdk's weight ramp rather than by a reference, but the requirement — one
+owner of the hardware at a time, explicitly — is the same.
+
 ### It is a vocabulary, not a fixed list — including for non-humanoids
 
 Agent Core contains **no channel names at all**; it only intersects the strings
@@ -1418,6 +1456,40 @@ to that is to refuse — not to apply the first `dof` values and hope.
 Payload is JSON in a `std_msgs/String`, like the perception cards: 30 Hz x 14 DOF
 is about 30 KB/s, and the dashboard can render it directly.
 
+### `twist` — the limit fields mean something different here
+
+Every other mode carries **positions**; `twist` carries **velocities**. The
+check chain was designed around the first, so two of the limit fields change
+meaning under the second. Neither is flagged anywhere at runtime, and both look
+correct until a robot accelerates like it was kicked.
+
+| field | position modes | `twist` |
+|---|---|---|
+| `limits.lower` / `upper` | joint range | the **velocity envelope** — still right |
+| `limits.max_delta_per_step` | velocity cap | the **acceleration** cap — also right, and the one you want |
+| `limits.max_velocity` | velocity cap | jerk. Meaningless. **Do not declare it.** |
+
+`max_velocity` is optional in `parse_descriptor`, so omitting it is the correct
+action, not a workaround.
+
+**Give an unactuatable axis `lower == upper == 0`, do not omit it.** A ground
+base has no `vz`, `wx` or `wy`, and the vector is six wide regardless. Pinning
+them to zero makes the sink **reject** a policy that puts anything there;
+leaving them wide makes it silently ignore a model that believes it is
+commanding vertical motion.
+
+```python
+"limits": {
+    "lower": [-1.0, -1.0, 0.0,  0.0, 0.0, -2.0],
+    "upper": [ 1.0,  1.0, 0.0,  0.0, 0.0,  2.0],
+    "max_delta_per_step": [0.15, 0.15, 1e-6, 1e-6, 1e-6, 0.3],   # acceleration
+    # no max_velocity — see above
+},
+```
+
+First implementation: `unitree/r1/loco_servo.py`. Measured motion comes back on
+`motus.odom/1`, whose axes are these axes — see that section.
+
 ### Use `common/control.ControlSink` — do not write the checks yourself
 
 There are fourteen bundles here. A safety chain copied fourteen times diverges
@@ -1527,3 +1599,157 @@ python3 -m pytest tests/test_control_sink.py -q
 ```
 
 Adding a driver-specific check? Add it there, not in your bundle.
+
+---
+
+## Robot Odometry (`motus.odom/1`)
+
+The counterpart to `motus.control/1`: that one carries commands **to** a robot,
+this one carries what the robot reports about **its own motion** back.
+
+**It is the measurement dual of `twist`.** Same six axes, same order, same body
+frame, same SI units. A consumer that commands
+`values = [vx, vy, vz, wx, wy, wz]` and reads back
+`twist = [vx, vy, vz, wx, wy, wz]` compares them with a subtraction and no
+lookup table. That is the whole design, and the reason this is not a sixth
+dialect of something that already exists five times.
+
+Implementation: `common/odom.py`. Tests: `tests/test_odom_format.py`.
+
+### Why not adopt a shape that already exists
+
+The same physical quantity has five shapes in this repository, disagreeing on
+the container type, on where the units live, and on whether an unmeasured axis
+is reported at all:
+
+| driver | linear | angular |
+|---|---|---|
+| Unitree R1/G1/Go2 | `velocity: [x,y,z]` | `yaw_speed`, a scalar |
+| Unitree Go1 | `velocity_body_mps: {forward, lateral}` + `velocity_index_2_raw` | `yaw_speed_rad_s` |
+| Booster K1 | `linear_velocity: [...]` | `angular_velocity: [...]` |
+| EngineAI T800 | `linear_velocity: {x,y,z}` + `speed_m_s` + `valid` | `yaw_rate_rad_s` |
+| EngineAI T800, same file | `linear_velocity: [...]` | — |
+
+Two are worth pointing at. Go1's third component is called
+`velocity_index_2_raw` — the name is an admission that nobody knows what it
+means. And T800 grew a `valid` flag by itself, which means somebody already hit
+the failure in rule 1 below and fixed it for one driver.
+
+### The four rules
+
+**1. An axis that was not measured is `null`, never `0.0`.** The one that
+matters. A robot that does not report speed, reporting zero, is
+indistinguishable from a robot standing still — which is exactly the failure
+mode of everything that consumes this. A stuck-detector ("commanded 0.3 m/s,
+measured nothing, so we have hit something") then fires on every robot that
+simply has no odometry. Same reasoning as `descriptor.force_torque` being
+required even as `null`: a missing protection must be visible, not assumed.
+
+Per **axis**, not one `valid` flag for the sample: Go1-shaped partial knowledge
+— two axes trustworthy, the third meaningless — is the normal case.
+
+**2. Units live in `units`, not in field names.** `yaw_speed_rad_s` /
+`speed_m_s` / `position_m` is not self-consistent within one vendor and cannot
+survive a driver reporting degrees.
+
+**3. `frame` is required.** Body versus world is the most dangerous ambiguity
+here and not one of the five existing shapes states which it is. Guessing wrong
+gives plausible numbers with the lateral sign flipped whenever the robot is not
+facing along world x.
+
+**4. Vendor fields go in `vendor`, untouched.** R1's `mode` / `gait_type` /
+`body_height`, a wheeled base's battery and wheel RPM, a drone's barometric
+altitude. Adopting this format costs a driver nothing it already reports, and a
+consumer written against the core cannot be broken by a driver adding to
+`vendor`. **Extensions grow into `vendor`; the core stays frozen.**
+
+### Two halves, as in `motus.control/1`
+
+| Half | Where | What |
+|------|-------|------|
+| **Interface** | your state card's `info()` | what this robot reports — read once, negotiated against |
+| **Sample** | the `state/odom` topic | one reading, with `null` for anything not measured |
+
+The `null`s in a sample say "not in this frame". A consumer also has to know *at
+start* that a robot never reports speed at all, so it can degrade or refuse then
+rather than discovering it at 10 Hz. Hence the declaration. agent-core's
+existing `info()` path carries it with no changes.
+
+```python
+# info()
+{"odom_interface": {"schema": "motus.odom/1", "frame": "body",
+                    "provides": ["vx", "vy", "wz"],
+                    "rate_hz": 10, "pose_drift": "unbounded"}}
+```
+
+```python
+# one message on the topic
+{
+    "schema": "motus.odom/1",
+    "stamp_ms": 1758537600123,
+    "frame": "body",
+    "units": {"linear": "m/s", "angular": "rad/s", "length": "m"},
+    "twist": [0.31, 0.02, null, null, null, -0.42],   # AXES order; null = unmeasured
+    "pose": null,
+    "contact": {"grounded": true},
+    "vendor": {"mode": 811, "gait_type": 1, "body_height": 0.78}
+}
+```
+
+`pose` is separate and defaults to `null` because legged dead reckoning drifts
+without bound. If you report one, state which: `pose_drift` is `none` |
+`unbounded` (legged) | `bounded` (wheel odometry with a correction source, or
+SLAM). That field is what decides whether a consumer may accumulate it.
+
+Payload is JSON in a `std_msgs/String` on a `state/odom` port, like every other
+state card.
+
+### Implementing it in a new driver
+
+1. Build the declaration once, at construction, and return it from `info()`:
+
+   ```python
+   from common.odom import build_interface, build_sample
+
+   self._odom_interface = build_interface(
+       provides=["vx", "vy", "wz"],      # ONLY the axes you actually measure
+       rate_hz=10, pose_drift="unbounded",
+   )
+   ```
+
+   `build_interface` validates what it builds, so a malformed declaration fails
+   in your unit test rather than on a robot.
+
+2. In your vendor callback, map into `AXES` order and **use `None` for every
+   axis you do not measure**:
+
+   ```python
+   out = build_sample(
+       stamp_ms=int(time.time() * 1000),
+       twist=[vel[0], vel[1], None, None, None, msg.yaw_speed],
+       vendor={"mode": msg.mode, "gait_type": msg.gait_type},
+   )
+   ```
+
+3. Declare the port: `"topic_out": [{"topic": …, "format": "state/odom"}]`.
+
+4. Read axes with `common.odom.axis(sample, "vx")`, never by indexing
+   `sample["twist"]`. That helper is the one place keeping "not moving" and
+   "does not know" apart, and indexing the list directly is one `or 0.0` away
+   from losing it.
+
+**Do not convert an existing state topic in place.** Publish `state/odom`
+alongside whatever the driver already sends. The old shape has consumers you
+cannot see from inside the bundle, and a 10 Hz duplicate is far cheaper than a
+migration across fourteen of them.
+
+### Checklist for a new driver
+
+- [ ] `provides` lists only axes genuinely measured — not the ones the SDK has a
+      field for
+- [ ] every unmeasured axis is `None` in `twist`, and no `or 0.0` anywhere near it
+- [ ] `frame` is right; if it is `world`, say so rather than relabelling it body
+- [ ] `stamp_ms` is when the reading was *taken*, not when it was published
+- [ ] vendor-specific fields are under `vendor`, not at the top level
+- [ ] `pose_drift` is honest; `unbounded` unless there is a correction source
+- [ ] a unit test calls `parse_interface()` on your declaration

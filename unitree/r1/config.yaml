@@ -12,6 +12,25 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个底盘
+  # 的两条路径：loco 是调用形态，一次 tools/call 一个动作；这张是数据面，订阅
+  # 一路 control/velocity 指令流。两者显式仲裁 —— loco 的 move/stop_move 会先
+  # 把这张卡片暂停，人和 LLM 的显式指令优先于正在跑的策略。
+  loco_servo:
+    enabled: true
+    # **默认只打日志，不驱动底盘。** 新接一张会让机器人走起来的卡片，第一次
+    # 一定是连上去看它想发什么，而不是让它直接发。真机验过符号和量级之后再关。
+    dry_run: true
+    expected_hz: 10
+    # 启动前要求 FSM=811（loco_mode）。只有在没接底盘的台架上才需要关 ——
+    # 躺着开始收速度流是最糟的一种启动。
+    require_standing: true
+    # Turn in place only: vx/vy are zeroed before they reach the SDK, so the
+    # robot cannot travel. Useful for a first real run — it can only spin where
+    # it stands. Clamps rather than rejects, because pinning the axes in the
+    # descriptor would make the sink refuse the whole command and the robot
+    # would not turn either. info() reports it and counts what it suppressed.
+    rotate_only: true
   state:
     enabled: true
   asr:

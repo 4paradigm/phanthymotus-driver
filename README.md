@@ -134,6 +134,8 @@ The Agent Core Web Dashboard renders live data streams based on the `format` fie
 | `sensor/lidar*` | Lidar scan | 2D/3D lidar point visualization |
 | `sensor/pointcloud` | Point cloud | 3D point cloud renderer |
 | `sensor/mapping` | 2D Map | Occupancy grid / SLAM map |
+| `state/odom` | Text / KV panel | `motus.odom/1` — what the robot reports about its own motion |
+| `control/velocity` | Text / KV panel | `motus.control/1` `twist` — a command stream **into** a driver |
 
 ### Skeleton Rendering (`sensor/skeleton`)
 
