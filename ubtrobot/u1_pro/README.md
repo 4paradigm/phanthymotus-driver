@@ -48,7 +48,8 @@ the U1 target's multicast-capable `rgmii0` interface and host loopback for Agent
 Core. `ROS_LOCALHOST_ONLY` must remain unset so the vendor domain can discover
 the robot services. CycloneDDS configuration is process-wide, so both contexts
 share these interfaces and the repository DDS checker reports per-participant
-isolation as a known gap.
+isolation as a known gap. `MaxAutoParticipantIndex` is increased to 200 because
+the U1 host already runs many ROS participants on the vendor domain.
 
 Local contract checks:
 

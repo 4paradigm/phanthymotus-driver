@@ -142,6 +142,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIn("NetworkInterface name='lo'", config)
         self.assertIn("NetworkInterface name='rgmii0'", config)
         self.assertIn("AllowMulticast>true", config)
+        self.assertIn("MaxAutoParticipantIndex>200", config)
 
     def test_mic_service_error_does_not_enable_forwarding(self):
         import device
