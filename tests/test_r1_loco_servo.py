@@ -346,3 +346,49 @@ def test_the_interrupt_hooks_are_bound():
     hooks = _card(FakeClient()).get_tool()["inputSchema"]["x-hooks"]
     assert hooks["on_interrupt_motion"]["action"] == "pause"
     assert hooks["on_interrupt_all"]["action"] == "pause"
+
+
+# ── rotate_only ──────────────────────────────────────────────────────────────
+
+def test_rotate_only_zeroes_translation_but_keeps_the_turn():
+    """The whole point of the switch. Pinning vx/vy in the descriptor instead
+    would make the sink reject the entire command — yaw included — so the robot
+    would not even turn, which is the opposite of what was asked for."""
+    client = FakeClient()
+    card = _card(client, rotate_only=True)
+    _sink(card).submit(_command([0.3, 0.1, 0.0, 0.0, 0.0, -0.4]))
+    assert client.moves == [(0.0, 0.0, -0.4)]
+
+
+def test_rotate_only_counts_what_it_suppressed():
+    """A card quietly dropping two thirds of every command is the failure this
+    driver keeps warning about; it has to be visible from info()."""
+    card = _card(FakeClient(), rotate_only=True)
+    sink = _sink(card)
+    sink.submit(_command([0.3, 0.0, 0.0, 0.0, 0.0, 0.0], seq=1))
+    sink.submit(_command([0.3, 0.0, 0.0, 0.0, 0.0, 0.0], seq=2))
+    info = card.dispatch("info", {})
+    assert info["rotate_only"] is True
+    assert info["suppressed_translations"] == 2
+
+
+def test_rotate_only_does_not_count_commands_that_were_already_pure_yaw():
+    card = _card(FakeClient(), rotate_only=True)
+    _sink(card).submit(_command([0.0, 0.0, 0.0, 0.0, 0.0, -0.4]))
+    assert card.dispatch("info", {})["suppressed_translations"] == 0
+
+
+def test_rotate_only_is_off_by_default():
+    assert _card(FakeClient()).dispatch("info", {})["rotate_only"] is False
+
+
+def test_the_descriptor_declares_the_robots_deadband():
+    """Measured on r1_sz one axis at a time: below these the robot does nothing,
+    the SDK still returns 0, and every layer reports success. A policy that
+    does not know about it emits a smooth ramp and never actuates."""
+    limits = loco_servo.build_descriptor()["limits"]
+    assert limits["min_magnitude"] == [0.4, 0.4, 0.0, 0.0, 0.0, 1.0]
+
+
+def test_the_deadband_does_not_break_descriptor_parsing():
+    parse_descriptor(loco_servo.build_descriptor())

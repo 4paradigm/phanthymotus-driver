@@ -25,6 +25,12 @@ plugins:
     # 启动前要求 FSM=811（loco_mode）。只有在没接底盘的台架上才需要关 ——
     # 躺着开始收速度流是最糟的一种启动。
     require_standing: true
+    # Turn in place only: vx/vy are zeroed before they reach the SDK, so the
+    # robot cannot travel. Useful for a first real run — it can only spin where
+    # it stands. Clamps rather than rejects, because pinning the axes in the
+    # descriptor would make the sink refuse the whole command and the robot
+    # would not turn either. info() reports it and counts what it suppressed.
+    rotate_only: true
   state:
     enabled: true
   asr:
