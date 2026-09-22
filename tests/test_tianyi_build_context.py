@@ -101,6 +101,8 @@ def test_build_stages_message_packages_used_by_dockerfile(build_tree, entrypoint
 
     assert "common/logsafe.py" in record["files"]
     assert not any("audio_msgs/" in name for name in record["files"])
+    assert "ENV PYTHONUNBUFFERED=1" in record["dockerfile"].splitlines()
+    assert "ENV RCUTILS_COLORIZED_OUTPUT=0" in record["dockerfile"].splitlines()
 
     # Inspect the actual Dockerfile COPY operands rather than assuming that a
     # package somewhere in the context will be available to colcon.

@@ -20,6 +20,8 @@ bash src/driver/x-humanoid/tianyi2.0/deploy/build_teleop.sh \
 
 Docker 构建的 RUN 不执行基础镜像 ENTRYPOINT。编译和导入检查因此显式加载 `/opt/ros/humble` → `/ros_ws/install`，完成编译后再加载 `/tianyi_ws/install`；运行 CMD 也使用相同顺序。替换 ROS_BASE_IMAGE 时必须保留兼容的 audio_msgs overlay，缺失时构建或启动明确失败，不忽略错误。`AudioChunk` 与实际 Tianyi 主入口导入检查保留。
 
+镜像显式设置 `PYTHONUNBUFFERED=1` 和 `RCUTILS_COLORIZED_OUTPUT=0`，分别保持 Python 日志及时输出并关闭 ROS 控制台颜色；不依赖基础镜像的默认值。这两项环境配置不增加安装包或文件层。
+
 消息编译失败时，构建会输出 `TIANYI_CMAKE_DIAGNOSTIC`：rcutils 库存在性、符号链接和 ELF 架构，CMake 版本/前缀、rcutils 导出的查找参数，以及两个消息包中白名单内的 CMakeCache/编译器架构字段。它不打印完整环境、缓存或认证配置，不重新配置或修复库；诊断本身失败也保留原 colcon 退出码。成功编译不执行诊断。ARM64 原生构建与非 ARM64 主机经 QEMU 构建应分别记录，不能用前者通过直接解释后者的库查找失败。
 
 QEMU 构建曾出现库文件存在、ELF 与编译器均为 AArch64、查找路径正确，但只有部分消息包返回 `NOTFOUND` 的情况。[上游原始调查](https://github.com/ros2/rcutils/issues/525#issuecomment-4049423490)指出 CMake/KWSys 的目录遍历只在整个循环前清除 errno，循环内成功的内存分配仍可能遗留 errno，导致正确目录被当作读取失败。本镜像在消息编译时临时编译 `cmake_readdir_errno.c`，只对 colcon **及该构建进程树**设置 LD_PRELOAD，在每次真实 readdir/readdir64 调用前清零 errno；真实调用返回的错误保留。正常退出或失败均清理临时源码和共享库，最终 ENV/CMD 不含 LD_PRELOAD，不影响 Driver 运行。未修改 ROS 导出文件、atomic 链接、依赖版本或缺库检查。
@@ -76,6 +78,8 @@ Linux/glibc 环境另运行 `tests/test_tianyi_cmake_errno.py`，使用真实 cc
 
 `tests/test_teleop_logsafe.py`（相对 Tianyi 目录）真实启动 `teleop_executor.py --bus` 子进程，以 ROS stub 和匿名本地 socketpair 验证：源码/镜像布局均在导入 ROS 前安装 common.logsafe，stdout、stderr 的 Python 输出及启动异常移除控制字符并按行写入。它不创建 DDS 参与者；logsafe 不包装 C/C++ 库直接写文件描述符的原生日志，不能据此声称所有原生输出已受保护。
 
+`tests/test_teleop_bus_faults.py` 同样运行真实 bus 子进程，分别检查 legacy DDS 命令和父端返回反馈/关节结果这两个 IPC 方向。坏反馈不终止进程或覆盖同批有效结果，后续有效帧继续发布；坏 v1 命令仍进入父执行器 HOLD，测试通过合成反馈确认释放并重新 claim 后才发送新的有效签名目标。测试使用匿名 socket 和 ROS stub，不创建真实 DDS 参与者，也不把软件可恢复性当成物理停止证明。
+
 将源码中的 `tests/image_shadow_smoke.py` 只读挂载到候选容器；生产镜像默认不打包测试脚本。需在 network none、只读根、仅 /tmp 可写、无设备/真实配置/凭据的隔离环境中执行，并加载镜像 ROS 环境。它验证实际 bundle 双轮启停和 Shadow 拒绝 claim，硬件发布器必须为零。合成 ROS/MCP 测试不能替代真机。
 
 ## 发布前后检查
@@ -93,7 +97,7 @@ Linux/glibc 环境另运行 `tests/test_tianyi_cmake_errno.py`，使用真实 cc
 
 开始后先松开两侧握把；同时握住才跟随，松开任意握把保持，重新握住按实测姿态重建相对基准。正常结束在 PICO 或卡片选择 **结束并收臂**，也可在 Canvas **关闭智能控制**：ActuCore 撤销输入，Driver 的 motion_control 生成并检查回自然姿态的轨迹，确认到位及停止后释放控制权。关闭智能控制会同时撤销 `armed`，PICO 断连也可完成；收臂或释放失败会保留故障状态与反馈通路，处理原因后显式重试，不能将按钮受理当作完成。立即停止、断网或故障只请求保持，不自动收臂或张手。
 
-日常使用上述 Canvas / PICO 流程，不依赖后端脚本。历史独立启动、回放和准备脚本仅供离线或已授权的专项诊断，不作为绕过智能控制生命周期的日常入口。新连线和项目启停生命周期目前只有离线验证，需单独完成现场验收；此前现场跟随、恢复及收臂证据不自动覆盖它。
+日常使用上述 Canvas / PICO 流程，不依赖后端脚本。历史独立启动、回放和准备脚本仅供离线或已授权的专项诊断，不作为绕过智能控制生命周期的日常入口。`388fe78` 已完成 Shadow 部署和真实 ROS 零输出预览链验证；新的物理跟随、恢复及收臂仍需现场验收，此前旧架构的物理证据不自动覆盖它。当前 bus 异常帧与日志修复尚未部署。
 
 首次试验与持续操作的开关及证据要求见执行契约。反馈中的 applied_sequence 与 last_vendor_command 不等于到位；验收必须比较实测 q/dq，记录方向、幅度、延迟、恢复和结束收臂。跟随误差如实报告，不额外设置精度门槛。碰撞、不可达、丢失反馈和停止故障保留首因，不能把 UI “运行中”当作硬件正在执行。
 

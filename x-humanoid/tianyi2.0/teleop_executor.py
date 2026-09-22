@@ -827,15 +827,25 @@ def run_local_bus(fd,namespace,control_v2=False):
             for _ in range(128):
                 try:
                     raw=wire.recv(65536)
-                    value=json.loads(raw)
-                    if isinstance(value,dict) and value.get('_motion_route')=='joint_output':
-                        latest_joint=value['packet']
-                    else:latest=raw
                 except BlockingIOError:break
+                try:
+                    # This direction carries parent feedback / solved joints,
+                    # not DDS commands. A malformed datagram must not kill the
+                    # shared bus or replace the previous valid latest result.
+                    value=json.loads(raw,object_pairs_hook=TeleopExecutor._unique)
+                    if type(value) is not dict:continue
+                    if '_motion_route' in value:
+                        if (set(value)!={'_motion_route','packet'}
+                                or value['_motion_route']!='joint_output'
+                                or type(value['packet']) is not dict):continue
+                        latest_joint=json.dumps(value['packet'],allow_nan=False)
+                    else:
+                        latest=json.dumps(value,allow_nan=False)
+                except (ValueError,TypeError,RecursionError):continue
             if latest_joint is not None and joint_pub is not None:
-                msg=String();msg.data=json.dumps(latest_joint,allow_nan=False);joint_pub.publish(msg)
+                msg=String();msg.data=latest_joint;joint_pub.publish(msg)
             if latest:
-                msg=String();msg.data=latest.decode();pub.publish(msg)
+                msg=String();msg.data=latest;pub.publish(msg)
     except (ExternalShutdownException, KeyboardInterrupt):
         pass  # SIGTERM can already have shut down the ROS context.
     finally:

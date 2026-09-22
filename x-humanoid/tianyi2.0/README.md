@@ -20,8 +20,10 @@ Preview 只求解和显示，独立凭据不能进入 arm 硬件入口；结束�
 旧 `teleop_executor` / `motus.motion-target.v1` 继续兼容旧 ActuCore 的关节输出，
 原动作、servo 和新流共用同一个 MotionGate，不能并行写同一执行器。
 参见[三段接口与使用说明](MOTION_CONTROL.md)、[旧执行协议](TELEOP.md)和
-[构建部署说明](deploy/TELEOP_RUNBOOK.md)。旧版现场跟随证据不代替本次迁移后的
-部署及真机验收；本轮实现和测试均离线完成。
+[构建部署说明](deploy/TELEOP_RUNBOOK.md)。`388fe78` 已部署为 Shadow（Live 关闭），
+真实 ROS 预览链收到 45 帧末端输入、44 个关联决策及 190 帧反馈，ActuCore 收到 IK
+显示数据；关节输出及厂商 `cmd_pos` / `cmd_ctrl` 命令均为零，Preview 释放成功。
+这不是物理跟随验收；后续 bus 异常帧与日志修复仅完成离线验证，尚未部署。
 
 ## Head camera snapshot card
 

@@ -47,6 +47,7 @@ RUN cd /tianyi_ws && \
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV PYTHONUNBUFFERED=1
+ENV RCUTILS_COLORIZED_OUTPUT=0
 
 # Ensure tianyi msg packages are on PYTHONPATH (base image entrypoint won't source them)
 ENV PYTHONPATH=/tianyi_ws/install/lyre_msgs/local/lib/python3.10/dist-packages:/tianyi_ws/install/bodyctrl_msgs/local/lib/python3.10/dist-packages:${PYTHONPATH}
