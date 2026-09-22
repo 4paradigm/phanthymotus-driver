@@ -100,6 +100,15 @@ def _get_local_ip() -> str:
         return ""
 
 
+def _pcm_has_variation(pcm: bytes) -> bool:
+    """Return whether a PCM-16LE chunk contains more than one sample value."""
+    sample_count = len(pcm) // 2
+    if sample_count < 2:
+        return False
+    samples = struct.unpack_from(f"<{sample_count}h", pcm)
+    return min(samples) != max(samples)
+
+
 # ── MicPlugin (sensor) ───────────────────────────────────────────────────────
 
 class _MicNode(Node):
@@ -126,6 +135,7 @@ class _MicNode(Node):
         self._stop_evt = threading.Event()
         self.state   = "idle"
         self._packet_count = 0
+        self._varying_chunk_count = 0
         self._last_packet_ts = 0.0
         self.get_logger().info(f"MicNode ready — topic: {topic}")
 
@@ -145,6 +155,7 @@ class _MicNode(Node):
         sock.settimeout(0.5)
         self._sock   = sock
         self._packet_count = 0
+        self._varying_chunk_count = 0
         stop_evt = threading.Event()
         self._stop_evt = stop_evt
         # The Event is passed in rather than read off `self`, so this thread can
@@ -192,6 +203,8 @@ class _MicNode(Node):
             while len(buf) >= CHUNK_BYTES and not stop_evt.is_set():
                 chunk = bytes(buf[:CHUNK_BYTES])
                 buf   = buf[CHUNK_BYTES:]
+                if _pcm_has_variation(chunk):
+                    self._varying_chunk_count += 1
                 try:
                     msg = AudioChunk()
                     msg.header = Header()
@@ -289,6 +302,7 @@ class MicPlugin:
 
         Check 0: nobody else is publishing this topic.
         Check 1: multicast packets arriving (in-process).
+        Check 1b: PCM actually varies (voice wake-up mode off → flat PCM).
         Check 2: ROS2 topic receivable from a subprocess (avoids same-process
                  FastDDS intra-participant matching issues).
         """
@@ -319,6 +333,25 @@ class MicPlugin:
         if self._node._packet_count == 0:
             self._node.state = "error"
             return "error", "no multicast packets received in 3s"
+
+        # Check 1b: PCM variation. The robot can keep sending flat PCM while
+        # voice wake-up mode is off — packets arrive, but the samples never
+        # move, and downstream ASR would just hear silence forever. Require a
+        # new chunk with actual sample variation before start succeeds.
+        varying_before = self._node._varying_chunk_count
+        deadline = _t.monotonic() + 3.0
+        while (
+            _t.monotonic() < deadline
+            and self._node._varying_chunk_count == varying_before
+        ):
+            _t.sleep(0.1)
+
+        if self._node._varying_chunk_count == varying_before:
+            self._node.state = "error"
+            return "error", (
+                "麦克风启动失败：收到音频数据，但没有检测到声音波动。"
+                "请使用机器人遥控器同时按下 L1+L2，将语音状态切换为唤醒模式，"
+                "然后重新启动。")
 
         # Check 2: ROS2 topic receivable — use subprocess to avoid same-process DDS issues
         check_script = (
