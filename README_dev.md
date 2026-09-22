@@ -1525,6 +1525,55 @@ reads `min_magnitude` at negotiation and raises its own ceilings off it
 (`plugins/navi/policy.py::adopt_limits`) — that is the pattern to copy, not a
 number to hard-code.
 
+### `footprint` — declare the space your robot occupies
+
+Optional, and additive to `motus.control/1`: an existing consumer that has never
+heard of it keeps working. Declare it on any chassis a navigation policy will
+drive.
+
+```python
+"footprint": {
+    "shape": "box",
+    "half_width": 0.179,        # m, half the widest lateral span
+    "front": 0.095,             # m, ahead of the rotation centre
+    "rear": 0.095,
+    "height": 1.23,
+    "source": "vendor-spec",    # "measured" | "estimate" | "vendor-spec"
+    "arms": "at-rest",
+},
+```
+
+Same reasoning as `min_magnitude`: it is a fact about the robot, and a policy
+that hard-codes it is wrong on the next chassis. The consumer is a navigation
+card, and what it is otherwise reduced to is testing a fixed angular slice of
+its camera — which covers **a different width of the world at every distance**.
+With a 63° lens the centre third spans `0.204 × distance` either side of the
+axis, so at 0.8 m it is ±0.16 m: narrower than R1's shoulders, at precisely the
+distance where stopping is decided. A doorframe 0.25 m off the axis is filed
+under "left", the left third has never stopped forward motion, and the shoulder
+goes into it while the depth map reports the way ahead as clear.
+
+Three things about the fields:
+
+* **`source` is part of the contract.** A datasheet box and one taken off this
+  robot with a tape measure deserve different margins, and a consumer that
+  cannot tell them apart will pick one number for both.
+* **Declare the static envelope, not a clearance.** A swinging arm and a leg
+  mid-stride both leave the torso box. The consumer adds its own margin —
+  `navi` does, via `clearance_margin_m` — and a driver that pre-inflates its
+  declaration makes that margin unknowable.
+* **A missing declaration must be safe by default.** `navi` falls back to a
+  half-width wider than any humanoid here and says so in `info().degraded`,
+  because every failure mode of this number is one-sided: too wide costs some
+  unnecessary slowing, too narrow puts a shoulder into a doorframe.
+
+Not yet declared: where the **camera** is. A depth consumer also needs
+`{fx, fy, cx, cy}` and the sensor's pose in the body frame to know which pixels
+are floor and which are shoulder-height, and nothing in this project publishes
+either — consumers currently work from a configured half-FOV, which is a guess
+with no provenance at all. That is the same declaration in the perception layer,
+and it is the next one to add.
+
 ### Use `common/control.ControlSink` — do not write the checks yourself
 
 There are fourteen bundles here. A safety chain copied fourteen times diverges
