@@ -377,8 +377,9 @@ class LocoServoPlugin:
                 "applied": self._applied,
                 "holds": self._holds,
                 "refused": self._refused,
-                # SDK 侧的拒绝。和 refused（我们自己拒绝）是两回事：那个说
-                # 「我们没发」，这个说「发了，机器人不要」。
+                # Rejections from the SDK. A different fact from `refused`,
+                # which is us declining to send: this one is "sent, and the
+                # robot would not take it".
                 "sdk_errors": self._sdk_errors,
                 "last_ret": self._last_ret,
                 # Empty when the posture is fine. A card that is subscribed and
@@ -527,16 +528,19 @@ class LocoServoPlugin:
                   f"vyaw={wz:+.3f})", flush=True)
             return
 
-        # **接住返回码。** 丢掉它，一个逐条拒绝我们的 SDK 和一个正常工作的 SDK
-        # 从外面看完全一样：applied 照涨、没有报错、机器人不动。真机上就是这样
-        # 花了时间才想到要看这里 —— `loco` 的 move 一直是把 ret 报出来的，这张
-        # 卡片抄的时候漏了。
+        # **Keep the return code.** Discard it and an SDK rejecting every
+        # command looks identical from outside to one working perfectly:
+        # `applied` climbs, nothing is logged, the robot stands still. That is
+        # what it took a while to think of looking at on the robot — `loco`'s
+        # own `move` has always reported `ret`, and this card missed it when it
+        # copied the pattern.
         ret = self._client.Move(vx, vy, wz, True)
         if ret != 0:
             self._sdk_errors += 1
             self._last_ret = ret
-            # 只在状态翻转和每 100 条时打印：10 Hz 下每条一行会把其余日志埋掉，
-            # 而第一条已经说明了一切。
+            # Logged on the transition and every hundredth after: at 10 Hz a
+            # line per command buries every other log the robot produces, and
+            # the first one already says everything the rest would.
             if self._sdk_errors == 1 or self._sdk_errors % 100 == 0:
                 print(f"[loco_servo] SDK 拒绝了指令（第 {self._sdk_errors} 条）："
                       f"Move(vx={vx:+.3f}, vy={vy:+.3f}, vyaw={wz:+.3f}) "
