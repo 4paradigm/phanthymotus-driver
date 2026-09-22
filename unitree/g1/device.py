@@ -351,7 +351,7 @@ class MicPlugin:
             return "error", (
                 "麦克风启动失败：收到音频数据，但没有检测到声音波动。"
                 "请使用机器人遥控器同时按下 L1+L2，将语音状态切换为唤醒模式，"
-                "然后重新启动。")
+                "然后重新开启智能控制。")
 
         # Check 2: ROS2 topic receivable — use subprocess to avoid same-process DDS issues
         check_script = (
