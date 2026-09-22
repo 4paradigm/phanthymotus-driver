@@ -165,6 +165,34 @@ def test_lease_expiration_and_stop_cannot_replay_old_target():
     assert robot.commands[-1][1]["x"] == 0
 
 
+def test_stop_during_preflight_cannot_be_overtaken(monkeypatch):
+    p, robot = plugin()
+    entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+    original = device.number
+    def number(value, name, low, high):
+        if name == "lease":
+            entered.set()
+            assert release.wait(2)
+        return original(value, name, low, high)
+    monkeypatch.setattr(device, "number", number)
+    mover = threading.Thread(target=lambda: p.set_velocity({"x": .1}))
+    def stop():
+        p.dispatch("stop", {"_tool_name": "tron2_velocity"})
+        stopped.set()
+    stopper = threading.Thread(target=stop)
+    mover.start()
+    assert entered.wait(1)
+    stopper.start()
+    try:
+        assert not stopped.wait(.05)
+    finally:
+        release.set()
+        mover.join(timeout=2)
+        stopper.join(timeout=2)
+    assert stopped.is_set() and p._target is None
+    assert robot.commands[-1][1] == {"x": 0, "y": 0, "z": 0}
+
+
 @pytest.mark.parametrize("cause", ["stale", "rejected", "disconnected"])
 def test_stream_fault_clears_target_and_latches(cause):
     p, robot = plugin()

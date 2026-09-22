@@ -172,6 +172,12 @@ class TronPlugin:
         raise ValueError("unsupported action")
 
     def set_velocity(self, args):
+        # Include preflight in the stop/send critical section: a stop received
+        # while validating an older request must not be overtaken by its send.
+        with self._lock:
+            return self._set_velocity(args)
+
+    def _set_velocity(self, args):
         if self.arms or not self._motion_enabled:
             raise RuntimeError("velocity motion is disabled")
         lease = number(args.get("lease", .25), "lease", .05, .5)
