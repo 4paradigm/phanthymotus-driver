@@ -43,13 +43,19 @@ def configure_cyclonedds(config: dict) -> str:
         raise ValueError(f"invalid robot network interface: {interface}")
     configured_uri = ros.get("cyclonedds_uri")
     if configured_uri:
-        os.environ.setdefault("CYCLONEDDS_URI", str(configured_uri))
+        # The driver config is the deployment contract. An inherited URI can
+        # silently bind the second DDS context to the wrong interface or emit
+        # tracing output, so it must not override the component configuration.
+        os.environ["CYCLONEDDS_URI"] = str(configured_uri)
         return interface
-    os.environ.setdefault(
+    os.environ[
         "CYCLONEDDS_URI",
+    ] = (
         "<CycloneDDS><Domain><General><Interfaces>"
         f"<NetworkInterface name='{interface}'/>"
-        "</Interfaces></General></Domain></CycloneDDS>",
+        "</Interfaces></General><AllowMulticast>false</AllowMulticast>"
+        "<Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile>"
+        "</Tracing></Domain></CycloneDDS>"
     )
     return interface
 

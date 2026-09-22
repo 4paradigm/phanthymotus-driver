@@ -130,6 +130,16 @@ class FakeNodes:
 
 
 class U1CardContractTests(unittest.TestCase):
+    def test_cyclonedds_config_overrides_inherited_uri(self):
+        import common.vendor_runtime as runtime
+
+        with mock.patch.dict(os.environ, {"CYCLONEDDS_URI": "<invalid/>"}, clear=False):
+            runtime.configure_cyclonedds({"ros": {
+                "robot_interface": "lo",
+                "cyclonedds_uri": "<CycloneDDS><Domain><Tracing><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>",
+            }})
+            self.assertIn("/dev/null", os.environ["CYCLONEDDS_URI"])
+
     def test_deployment_shares_vendor_runtime_ipc(self):
         service = Path(__file__).with_name("deploy") / "service.yml"
         text = service.read_text()
