@@ -72,6 +72,7 @@ class MotionGate:
         self.latest = None
         self.last_emit = None
         self.last_q = None
+        self.command_state = None
         self.last_hands = None
         self.stop_sent_ns = None
         self.stop_target = None
@@ -172,6 +173,10 @@ class MotionGate:
         self.seq, self.latest = -1, None
         self.applied_seq = -1
         self.last_q, self.last_emit = q, self.clock()
+        self.command_state = {'schema': 'motus.command-state.v1', 'kind': 'stationary_seed',
+            'sample_ns': self.last_emit, 'q': list(q), 'dq': [0.]*14, 'ddq': [0.]*14,
+            'dt_s': None, 'target_sequence': -1, 'limited': False,
+            'derivatives': 'stationary_reference', 'published': False}
         self.stop_target = self.stop_sent_ns = None
         self.release_requested = False
         self.output_active = False
@@ -325,6 +330,7 @@ class MotionGate:
                 if self.state in ("hold", "fault"):
                     if self.stop_sent_ns is None:
                         self.emit(measured, None)  # Never open the hands on stop.
+                        self._record_command(measured, self.clock(), holding=True)
                         self.last_q, self.last_emit = list(measured), now
                         self.stop_target, self.stop_sent_ns = measured, now
                         self._stop_started_ns = now
@@ -354,6 +360,7 @@ class MotionGate:
                             self._stop_settle = (stamp, list(measured))
                         elif stamp - self._stop_settle[0] >= 100_000_000:
                             self.emit(measured, None)
+                            self._record_command(measured, self.clock(), holding=True)
                             self.last_q, self.last_emit = list(measured), now
                             self.stop_target, self.stop_sent_ns = list(measured), now
                             self._stop_reheld = True
@@ -371,6 +378,7 @@ class MotionGate:
                 target = [max(lo, m-lead, min(hi, m+lead, previous + max(-limit, min(limit, t-previous))))
                           for m, previous, t, (lo, hi) in zip(measured, self.last_q, self.latest["q"], self.limits)]
                 self.emit(target, self.latest["hands"])
+                self._record_command(target, self.clock())
                 self.last_q, self.last_hands, self.last_emit = target, self.latest["hands"], now
                 self.applied_seq = self.latest["seq"]
                 if self.diagnostics["last_command"]["applied_ns"] is None:
@@ -395,6 +403,30 @@ class MotionGate:
                 else:
                     self._fault(code)
 
+    def _record_command(self, q, now, *, holding=False):
+        """Publish-side evidence, committed only after emit returns successfully.
+
+        Derivatives are finite differences of issued positions, NOT motor
+        measurements or a claim of continuous polynomial execution. A hold has
+        no inferred derivatives; only fresh feedback can confirm physical stop.
+        """
+        previous = self.command_state
+        dt = (now-previous['sample_ns'])/1e9 if previous else None
+        dq = ddq = None
+        if not holding and previous and dt is not None and 0 < dt <= .1:
+            dq = [(b-a)/dt for a,b in zip(previous['q'], q)]
+            if previous['dq'] is not None:
+                interval = (dt+previous['dt_s'])/2 if previous['dt_s'] else dt
+                ddq = [(b-a)/interval for a,b in zip(previous['dq'], dq)]
+        requested = self.latest['q'] if self.latest and not holding else q
+        delta = [b-a for a,b in zip(requested, q)]
+        self.command_state = {'schema': 'motus.command-state.v1',
+            'kind': 'hold' if holding else 'motion', 'sample_ns': now,
+            'q': list(q), 'dq': dq, 'ddq': ddq, 'dt_s': dt,
+            'target_sequence': self.latest['seq'] if self.latest and not holding else None,
+            'limited': any(abs(x) > 1e-10 for x in delta), 'limit_delta_rad': delta,
+            'derivatives': 'finite_difference', 'published': True}
+
     def status(self):
         with self.lock:
             feedback = self.snapshot()
@@ -414,9 +446,11 @@ class MotionGate:
                     "continuation_allowed": self._can_continue(),
                     "continuation_ready": self._can_continue() and self._stop_confirmed,
                     "timing_policy": {"target_max_ms": 100, "feedback_hold_ms": 100,
+                                      "command_state_version": 1,
                                       "management_retry_ms": 300, "recoverable_hold": True,
                                       "ready_timeout_ms": self.continuation_timeout_ns//1_000_000,
                                       "continuation_timeout_ms": self.continuation_timeout_ns//1_000_000,
                                       "feedback_fault_timeout_ms": self.feedback_fault_timeout_ns//1_000_000},
                     "diagnostics": copy.deepcopy(self.diagnostics),
-                    "feedback": feedback, "commanded_q": self.last_q, "monotonic_ns": self.clock()}
+                    "feedback": feedback, "commanded_q": self.last_q,
+                    "command_state": copy.deepcopy(self.command_state), "monotonic_ns": self.clock()}
