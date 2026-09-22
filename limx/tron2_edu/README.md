@@ -11,7 +11,8 @@
 
 只在所选构型中发布对应 MCP 工具。模块更换后必须停止 Driver，按机器人信息页
 更新 ACCID 和 profile 后重新启动。不能把双臂、掌足、轮足作为可同时调用的能力。
-移动双臂的升降台/底盘、相机、夹爪、回充不在本版功能内。
+移动双臂的升降台/底盘及逐际二指夹爪提供可选状态采集；它们的运动控制、相机
+和回充不在本版功能内。
 
 ## 配置与运行
 
@@ -38,6 +39,53 @@ PYTHONPATH=. python3 limx/tron2_edu/main.py
 掌足 x/y/z 是无量纲比例；轮足 x 是 m/s，y 必须为 0。
 厂商文档把轮足旋转 z 标作 m/s，单位表述存在歧义，本版不将它宣称为 rad/s；
 现场需与厂商确认后配置速度上限（默认绝对值 0.2）。
+
+## 定频采集与录制
+
+`tron2_telemetry` 提供 start、stop、get、info，声明 data/json 输出话题
+`/<namespace>/tron2/state`，ROS 类型为 std_msgs/msg/String。连接成功后自动启动
+采集，也可单独 start；后者不会连接机器人或使能本体功能。stop 只停止采集，不
+停止本体运动，断开 connection 则同时结束采集和本 Driver 持有的速度流。
+
+telemetry_hz 默认 5 Hz（可设 1–10），它是每频道轮询及发布的频率上限。单独工作
+线程串行查询，不持有运动锁，慢响应不会累积请求队列；实际采样率以接收时间为准。
+
+| 频道 | 构型/启用条件 |
+| --- | --- |
+| robot_info | 全构型，从厂商通知读取模式、诊断、电量/软件版本 |
+| imu | 全构型，仅采集上游已开启的 IMU 通知；不自动使能或关闭全局 IMU |
+| joint_states / eef_pose | 双臂构型，原生关节状态与左右末端位姿 |
+| gripper | 双臂构型，gripper_state_enabled=true，需已安装逐际二指夹爪 |
+| lifter / chassis | mobile_arms 且 mobile_state_enabled=true，需对应模块 |
+
+每频道分别返回 fresh、age_ms、error、sample。sample 保留厂商数据，包含原始
+WebSocket source_timestamp_ms、本机 received_at_ns / received_monotonic_ns、
+本地接收 sequence、连接 session_id；查询还提供 round_trip_ms。
+外层 timestamp_ms 是发布时刻，不能当作硬件采样时刻。厂商数据若自带 timestamp
+也保留在 data 内；未提供的时间不会用本机时间冒充。
+
+fresh 只按本机接收年龄计算（robot_info 2.5 秒，其余 1.5 秒），不证明源端实时性。
+过期、异常、断线或来自上一连接的数据返回 sample=null。相同样本重复发布时
+原始时间和序号不变；sequence 不是硬件丢帧计数。各频道独立采样，未做时钟同步。
+关节数据验证等长、有限数值和关节名；末端保留厂商 WXYZ 顺序并检查单位四元数。
+可选模块保留厂商原始字段和单位，不将未提供的反馈填成零。ACCID 不写入数据话题。
+
+last_velocity_command 记录速度发送目标、GUID、提交/发送时间和发送状态。
+它也覆盖 watchdog/stop 发出的零速度；sent 不代表物理动作已执行，
+physical_execution_confirmed 始终为 false。此频道不能替代本体实测速度。
+
+在装有 rosbag2 的同一主机使用以下命令录制。示例假设 `ROS_NAMESPACE=robot`，
+实际话题名从 tron2_telemetry.info.topic_out 获取：
+
+```bash
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+ros2 bag record /robot/tron2/state
+```
+
+本版提供标准 ROS 2 数据入口；相机同步、天轶专用遥操录制格式和 VLA 数据集导出
+仍属平台适配范围，没有在 Driver 中重建一套录制系统。
 
 ## 双臂运动的明确缺口
 

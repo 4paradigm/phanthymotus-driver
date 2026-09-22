@@ -22,7 +22,8 @@ def load(name, path):
 
 
 client = load("tron_client_test", ROOT / "limx/tron2_edu/client.py")
-with patch.dict(sys.modules, {"client": client}):
+telemetry = load("tron_telemetry_test", ROOT / "limx/tron2_edu/telemetry.py")
+with patch.dict(sys.modules, {"client": client, "telemetry": telemetry}):
     device = load("tron_device_test", ROOT / "limx/tron2_edu/device.py")
 
 
@@ -104,6 +105,8 @@ def test_wrong_robot_disconnects_and_invalidates_state(connected):
 class Robot:
     connected = True
     accid = "SF_TRON2A_TEST"
+    timeout = .2
+    session_id = 1
 
     def __init__(self):
         self.commands = []
@@ -274,3 +277,171 @@ def test_mcp_http_reports_only_selected_capabilities():
         server.shutdown()
         server.server_close()
         worker.join(timeout=1)
+
+
+def test_protocol_sample_preserves_envelope_time_without_retimestamping(connected):
+    transport, sock = connected
+    transport._receive({"accid": transport.accid, "title": "notify_robot_info", "timestamp": 1234,
+                        "data": {"accid": transport.accid, "status": "WALK"}})
+    first = transport.notification_sample("notify_robot_info")
+    assert first["source_timestamp_ms"] == 1234
+    assert first["session_id"] == 1
+    assert transport.notification_sample("notify_robot_info") == first
+    assert transport.notification("notify_robot_info")["status"] == "WALK"
+
+
+class SamplingRobot(Robot):
+    def __init__(self):
+        super().__init__()
+        self.requested = []
+        self.invalid = False
+    def command_sample(self):
+        return None
+    def sample(self, data):
+        return {"data": data, "source_timestamp_ms": 1234,
+                "received_at_ns": time.time_ns(), "received_monotonic_ns": time.monotonic_ns(),
+                "session_id": self.session_id, "sequence": 1}
+    def notification_sample(self, title):
+        if title == "notify_imu":
+            raise RuntimeError("IMU not enabled upstream")
+        return self.sample({"accid": self.accid, "status": "WALK"})
+    def request_sample(self, title):
+        self.requested.append(title)
+        if title == "request_get_joint_state":
+            return self.sample({"names": ["j1"], "q": [float("nan") if self.invalid else .1],
+                                "dq": [0.], "tau": [1.]})
+        if title == "request_get_move_pose":
+            return self.sample({"left_position": [0.] * 3, "right_position": [0.] * 3,
+                                "left_quat": [1., 0., 0., 0.], "right_quat": [1., 0., 0., 0.]})
+        return self.sample({"result": "success", "vendor_field": 1})
+
+
+def test_poll_channels_follow_installed_configuration():
+    robot = SamplingRobot()
+    fixed = telemetry.TronTelemetry(robot, {}, "fixed_arms")
+    fixed.poll_once()
+    assert robot.requested == ["request_get_joint_state", "request_get_move_pose"]
+    robot.requested.clear()
+    mobile = telemetry.TronTelemetry(robot, {"gripper_state_enabled": True, "mobile_state_enabled": True}, "mobile_arms")
+    mobile.poll_once()
+    assert robot.requested == ["request_get_joint_state", "request_get_move_pose", "request_get_limx_2fclaw_state",
+                               "request_lifter_state", "request_chassis_state"]
+    leg = telemetry.TronTelemetry(robot, {"gripper_state_enabled": True, "mobile_state_enabled": True}, "biped")
+    assert not leg.queries
+
+
+def test_poll_invalid_stale_and_previous_connection_samples_are_unavailable():
+    robot = SamplingRobot()
+    stream = telemetry.TronTelemetry(robot, {}, "fixed_arms")
+    stream.poll_once()
+    data = stream.snapshot()
+    assert data["channels"]["joint_states"]["fresh"]
+    assert "accid" not in data["channels"]["robot_info"]["sample"]["data"]
+    assert data["channels"]["imu"]["sample"] is None
+    old = stream._samples["joint_states"]["received_monotonic_ns"]
+    stream._samples["joint_states"]["received_monotonic_ns"] = old - 2_000_000_000
+    assert stream.snapshot()["channels"]["joint_states"]["sample"] is None
+    stream.poll_once()
+    robot.session_id += 1
+    assert stream.snapshot()["channels"]["joint_states"]["sample"] is None
+    robot.invalid = True
+    stream.poll_once()
+    data = stream.snapshot()["channels"]["joint_states"]
+    assert not data["fresh"] and data["error"]
+
+
+def test_telemetry_stop_waits_for_one_query_and_sends_no_motion():
+    robot = SamplingRobot()
+    stream = telemetry.TronTelemetry(robot, {}, "fixed_arms")
+    entered, release = threading.Event(), threading.Event()
+    original = robot.request_sample
+    def request(title):
+        entered.set()
+        assert release.wait(2)
+        return original(title)
+    robot.request_sample = request
+    stream.start()
+    assert entered.wait(1)
+    stream._stop.set()
+    release.set()
+    stream.stop()
+    assert robot.requested == ["request_get_joint_state"]
+    assert not robot.commands and not stream.info()["polling"]
+
+
+def test_telemetry_ros_publishes_freshness_envelope_and_stops():
+    robot = SamplingRobot()
+    nodes = []
+    class Node:
+        def __init__(self, *args, **kwargs):
+            self.messages, self.destroyed = [], False
+            nodes.append(self)
+        def create_publisher(self, kind, topic, qos):
+            return SimpleNamespace(publish=lambda message: self.messages.append(json.loads(message.data)))
+        def create_timer(self, period, callback):
+            self.tick = callback
+        def destroy_node(self):
+            self.destroyed = True
+    executor = SimpleNamespace(add_node=lambda n: None, remove_node=lambda n: None)
+    ros = SimpleNamespace(ctx_core=None, executor_core=executor)
+    modules = {"rclpy.node": SimpleNamespace(Node=Node),
+               "rclpy.qos": SimpleNamespace(qos_profile_sensor_data=None),
+               "std_msgs.msg": SimpleNamespace(String=SimpleNamespace)}
+    stream = telemetry.TronTelemetry(robot, {}, "biped", ros2=ros)
+    with patch.dict(sys.modules, modules):
+        stream.start()
+        nodes[0].tick()
+        assert nodes[0].messages[0]["channels"]["robot_info"]["sample"]["source_timestamp_ms"] == 1234
+        assert not nodes[0].messages[0]["channels"]["imu"]["fresh"]
+        stream.stop()
+        nodes[0].tick()
+        assert nodes[0].destroyed and len(nodes[0].messages) == 1
+    assert not robot.commands
+
+
+def test_command_capture_separates_send_from_physical_execution(connected):
+    transport, sock = connected
+    guid = transport.send("request_twist", {"x": .1, "y": 0., "z": 0.})
+    sample = transport.command_sample()
+    assert sample["guid"] == guid and sample["state"] == "sent"
+    assert sample["values"]["x"] == .1 and sample["physical_execution_confirmed"] is False
+    assert sample["sent_at_ns"] >= sample["submitted_at_ns"]
+    transport.send("request_twist", {"x": 0., "y": 0., "z": 0.})
+    assert transport.command_sample()["values"]["x"] == 0.
+
+
+def test_query_sample_uses_response_timestamp_and_round_trip(connected):
+    transport, sock = connected
+    outcome = []
+    worker = threading.Thread(target=lambda: outcome.append(transport.request_sample("request_get_joint_state")))
+    worker.start()
+    request = sock.outgoing.get(timeout=1)
+    transport._receive({**request, "timestamp": 4321, "title": "response_get_joint_state",
+                        "data": {"result": "success", "q": [1.]}})
+    worker.join(timeout=1)
+    assert outcome[0]["source_timestamp_ms"] == 4321
+    assert outcome[0]["round_trip_ms"] >= 0
+    assert outcome[0]["data"]["q"] == [1.]
+
+
+def test_failed_velocity_submission_is_recorded_as_unknown(connected):
+    transport, sock = connected
+    def fail(raw):
+        raise ConnectionError("write failed")
+    sock.send = fail
+    with pytest.raises(ConnectionError, match="outcome unknown"):
+        transport.send("request_twist", {"x": .1, "y": 0., "z": 0.})
+    assert transport.command_sample()["state"] == "submission_unknown"
+    assert not transport.command_sample()["physical_execution_confirmed"]
+
+
+def test_telemetry_card_dispatch_and_descriptor():
+    from common.vendor_runtime import DriverBundle
+    robot = SamplingRobot()
+    p = device.TronPlugin({"profile": "fixed_arms"}, robot)
+    p.telemetry.poll_once()
+    bundle = DriverBundle([p])
+    definition = next(t for t in bundle.get_all_tools() if t["name"] == "tron2_telemetry")
+    assert definition["topic_out"][0]["format"] == "data/json"
+    snapshot = bundle.dispatch("tron2_telemetry", {"action": "get"})
+    assert snapshot["channels"]["joint_states"]["sample"]["data"]["q"] == [.1]

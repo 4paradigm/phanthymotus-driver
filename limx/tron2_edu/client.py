@@ -23,6 +23,9 @@ class TronClient:
         self._socket = None
         self._reader = None
         self._error = None
+        self.session_id = 0
+        self._sequence = 0
+        self._last_twist = None
 
     @property
     def connected(self):
@@ -46,7 +49,9 @@ class TronClient:
                 factory = self._factory
             self._socket = factory(self.endpoint, timeout=self.timeout,
                                    http_no_proxy=[uri.hostname], enable_multithread=True)
+            self.session_id += 1
             self._notifications.clear()
+            self._last_twist = None
             self._error = None
             sock = self._socket
             self._reader = threading.Thread(target=self._read, args=(sock,), daemon=True)
@@ -60,7 +65,10 @@ class TronClient:
                     raise ConnectionError("robot connection closed")
                 if len(raw) > 1024 * 1024:
                     raise ValueError("oversized robot message")
-                self._receive(json.loads(raw))
+                with self._lock:
+                    if self._socket is not sock:
+                        return
+                    self._receive(json.loads(raw))
         except Exception:
             # Do not log vendor payloads/endpoints/identifiers.
             self._disconnect(sock, "robot transport lost; reconnect explicitly")
@@ -74,21 +82,31 @@ class TronClient:
         if not isinstance(title, str) or not isinstance(data, dict):
             raise ValueError("invalid robot envelope")
         with self._lock:
+            self._sequence += 1
+            timestamp = message.get("timestamp")
+            sample = {"data": copy.deepcopy(data), "sequence": self._sequence,
+                      "session_id": self.session_id,
+                      "source_timestamp_ms": timestamp if type(timestamp) is int and timestamp >= 0 else None,
+                      "received_at_ns": time.time_ns(), "received_monotonic_ns": time.monotonic_ns()}
             if title.startswith("response_"):
                 pending = self._pending.get(message.get("guid"))
                 if pending and title == pending[0]:
                     future = pending[1]
                     if not future.done():
-                        future.set_result(copy.deepcopy(data))
+                        future.set_result(sample)
             elif title in ("notify_robot_info", "notify_imu", "notify_twist"):
-                self._notifications[title] = (copy.deepcopy(data), time.monotonic())
+                self._notifications[title] = sample
 
     def notification(self, title, max_age=2.5):
+        return self.notification_sample(title, max_age)["data"]
+
+    def notification_sample(self, title, max_age=2.5):
         with self._lock:
             value = self._notifications.get(title)
-            if not self._socket or value is None or time.monotonic() - value[1] > max_age:
+            if (not self._socket or value is None
+                    or (time.monotonic_ns() - value["received_monotonic_ns"]) / 1e9 > max_age):
                 raise RuntimeError("fresh robot feedback unavailable")
-            return copy.deepcopy(value[0])
+            return copy.deepcopy(value)
 
     def _send(self, title, data, guid):
         message = {"accid": self.accid, "title": title, "guid": guid,
@@ -98,11 +116,28 @@ class TronClient:
                 sock = self._socket
             if sock is None:
                 raise ConnectionError("robot is disconnected")
+            command = None
+            if title == "request_twist":
+                command = {"guid": guid, "values": copy.deepcopy(data), "session_id": self.session_id,
+                           "submitted_at_ns": time.time_ns(), "state": "submission_pending",
+                           "physical_execution_confirmed": False}
+                with self._lock:
+                    self._last_twist = command
             try:
                 sock.send(json.dumps(message, allow_nan=False))
             except Exception:
+                if command is not None:
+                    with self._lock:
+                        command["state"] = "submission_unknown"
                 self._disconnect(sock, "robot send failed; outcome unknown")
                 raise ConnectionError("robot send failed; outcome unknown") from None
+            if command is not None:
+                with self._lock:
+                    command.update(state="sent", sent_at_ns=time.time_ns())
+
+    def command_sample(self):
+        with self._lock:
+            return copy.deepcopy(self._last_twist)
 
     def send(self, title, data):
         guid = uuid4().hex
@@ -110,14 +145,19 @@ class TronClient:
         return guid
 
     def request(self, title, data=None):
+        return self.request_sample(title, data)["data"]
+
+    def request_sample(self, title, data=None):
         guid, future = uuid4().hex, Future()
+        requested = time.monotonic_ns()
         with self._lock:
             self._pending[guid] = (title.replace("request_", "response_", 1), future)
         try:
             self._send(title, data or {}, guid)
             result = future.result(timeout=self.timeout)
-            if result.get("result") != "success":
+            if result["data"].get("result") != "success":
                 raise RuntimeError("robot rejected request or returned an invalid result")
+            result["round_trip_ms"] = (result["received_monotonic_ns"] - requested) / 1e6
             return result
         except TimeoutError:
             raise TimeoutError("robot response timed out; outcome unknown, no retry") from None

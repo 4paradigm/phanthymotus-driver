@@ -13,3 +13,8 @@ tron2:
   motion_enabled: false
   # Biped: normalized ratios; wheeled biped: native x/z command units.
   speed_limit: 0.2
+  # Read-only sampling; a single worker prevents query backlogs.
+  telemetry_hz: 5
+  gripper_state_enabled: false
+  # Only applies to mobile_arms with the corresponding modules installed.
+  mobile_state_enabled: false

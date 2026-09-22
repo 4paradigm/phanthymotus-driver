@@ -9,6 +9,7 @@ import time
 
 from common.vendor_runtime import action_schema, tool
 from client import TronClient
+from telemetry import TronTelemetry
 
 
 PROFILES = {"fixed_arms", "mobile_arms", "biped", "wheeled_biped"}
@@ -28,7 +29,7 @@ def number(value, name, low, high):
 
 
 class TronPlugin:
-    def __init__(self, config, client=None):
+    def __init__(self, config, client=None, *, ros2=None, namespace="tron2"):
         self.cfg = config
         self.profile = config.get("profile", "fixed_arms")
         if self.profile not in PROFILES:
@@ -42,6 +43,7 @@ class TronPlugin:
         self._fault = None
         self._motion_enabled = config.get("motion_enabled", False) is True
         self._limit = number(config.get("speed_limit", .2), "speed_limit", .01, 1.0)
+        self.telemetry = TronTelemetry(self.client, config, self.profile, ros2=ros2, namespace=namespace)
 
     @property
     def arms(self):
@@ -50,6 +52,7 @@ class TronPlugin:
     def start(self):
         if self.cfg.get("enabled", False) is True:
             self.client.connect()
+            self.telemetry.start()
 
     def stop(self):
         error = None
@@ -65,6 +68,7 @@ class TronPlugin:
         if self._thread:
             self._thread.join(timeout=3)
         self.client.close()
+        self.telemetry.stop()
         if error:
             raise RuntimeError("disconnected; zero velocity delivery unconfirmed") from error
 
@@ -74,6 +78,12 @@ class TronPlugin:
                    "info": ([], "Connection and capability status"),
                    "get": ([], "Read fresh robot information")}
         definitions = [tool("tron2_connection", "sensor", "TRON 2 EDU connection", action_schema(actions, {}))]
+        definitions.append(tool("tron2_telemetry", "sensor", "Timed state stream for monitoring and recording",
+                                action_schema({"start": ([], "Start bounded state polling and publication"),
+                                               "stop": ([], "Stop telemetry without changing motion"),
+                                               "get": ([], "Latest samples with freshness and source timestamps"),
+                                               "info": ([], "Polling and publication status")}, {}),
+                                topic_out=self.telemetry.topic_out()))
         info_actions = dict(actions)
         info_actions["stop"] = ([], "Stop reading")
         definitions.append(tool("tron2_robot_info", "sensor", "Robot mode, diagnostics and battery",
@@ -122,6 +132,18 @@ class TronPlugin:
         name = args.get("_tool_name", "tron2_connection")
         if name not in {definition["name"] for definition in self.get_tools()}:
             raise ValueError("tool unavailable for this configuration")
+        if name == "tron2_telemetry":
+            if action == "get":
+                return self.telemetry.snapshot()
+            if action == "start":
+                self.telemetry.start()
+                return self.telemetry.info()
+            if action == "stop":
+                self.telemetry.stop()
+                return self.telemetry.info()
+            if action == "info":
+                return self.telemetry.info()
+            raise ValueError("unsupported telemetry action")
         if action == "info":
             return self.info()
         if name == "tron2_connection":
@@ -132,6 +154,7 @@ class TronPlugin:
                     self._shutdown.clear()
                     self.client.connect()
                     self._fault = None
+                    self.telemetry.start()
                 return self.info()
             if action == "stop":
                 self.stop()
@@ -239,4 +262,4 @@ class TronPlugin:
 
 
 def build_plugins(config, namespace, ros2):
-    return [TronPlugin(config["tron2"])]
+    return [TronPlugin(config["tron2"], ros2=ros2, namespace=namespace)]
