@@ -25,8 +25,9 @@ RUN if [ -n "$UBUNTU_PORTS_MIRROR" ]; then \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml numpy opencv-python-headless phonemizer pyalsaaudio sounddevice
 
-# Build tianyi ROS2 message packages (bodyctrl_msgs + lyre_msgs)
+# Both build entry points stage the shared audio_msgs package at context root.
 COPY msgs/ /tianyi_ws/src/
+COPY audio_msgs/ /tianyi_ws/src/audio_msgs/
 RUN cd /tianyi_ws && \
     . /opt/ros/humble/setup.sh && \
     colcon build --packages-select bodyctrl_msgs lyre_msgs audio_msgs
@@ -45,7 +46,7 @@ COPY main.py device.py servo.py joints_bridge.py light.py nav_client.py ext_devi
 COPY motion_stream.py teleop_executor.py dds-local.xml /work/
 COPY dds-local.xml /opt/phanthy-motus/
 COPY deploy/     /deploy/
-RUN bash -c 'source /opt/ros/humble/setup.bash && source /tianyi_ws/install/setup.bash && python3 -c "from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus, CmdSetMotorPosition; from teleop_executor import TeleopExecutor; from main import TianyiDeviceBundle"'
+RUN bash -c 'source /opt/ros/humble/setup.bash && source /tianyi_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk; from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus, CmdSetMotorPosition; from teleop_executor import TeleopExecutor; from main import TianyiDeviceBundle"'
 RUN mkdir -p /opt/phanthy-motus/data/maps
 
 EXPOSE 15707

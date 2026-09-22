@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -54,6 +55,11 @@ def _copied_sources(dockerfile: Path):
 @pytest.mark.parametrize('dockerfile', DOCKERFILES, ids=lambda p: str(p.relative_to(ROOT)))
 def test_every_copied_path_exists(dockerfile):
     context = dockerfile.parent
+    metadata = context / 'driver.yaml'
+    extras = (yaml.safe_load(metadata.read_text()) or {}).get(
+        'build_context_extras', []) if metadata.is_file() else []
+    # build.sh stages each extra at context root under its basename.
+    staged = {Path(extra).name: context / extra for extra in extras}
     missing = []
     for line, src in _copied_sources(dockerfile):
         # Globs and build-ARG interpolation (`${REV}`) both resolve at build
@@ -61,9 +67,12 @@ def test_every_copied_path_exists(dockerfile):
         if any(ch in src for ch in '*?[') or '${' in src or '$' in src:
             continue
         # A COPY source is relative to the build context. These images are built
-        # from the driver directory, with common/ staged in beforehand.
+        # from the driver directory, with driver.yaml's extras staged beforehand.
         candidate = context / src
         if candidate.exists() or (ROOT / src).exists():
+            continue
+        parts = Path(src).parts
+        if parts and parts[0] in staged and staged[parts[0]].joinpath(*parts[1:]).exists():
             continue
         missing.append((src, line[:90]))
     assert not missing, (

@@ -16,6 +16,8 @@ bash src/driver/x-humanoid/tianyi2.0/deploy/build_teleop.sh \
 
 脚本只构建，不推送、不启动服务。临时上下文复用仓内 common 和 audio_msgs；厂商消息编译或实际主入口导入失败立即报错。基础镜像按 digest 固定，apt 保留签名验证；镜像 ID 与源码哈希应写入本次私有部署记录。
 
+标准 CI / bot 入口是仓根的 `bash build.sh --mirror tencent x-humanoid/tianyi2.0`，它依据 `driver.yaml` 的 `build_context_extras`，将 `common/` 与 `robotera/q5_bundle/vendor/audio_msgs/` 分别复制到临时上下文根目录的 `common/`、`audio_msgs/`。专用脚本使用同一布局；Dockerfile 显式复制并编译 `audio_msgs`，缺少源目录时立即失败，不依赖 colcon 对未知包名的告警。源码上传须包含上述两个共享目录，不能只上传 Tianyi 子目录。标准入口配置仓库凭据时会推送，不能当作专用脚本的“仅构建”替代。
+
 ActuCore 使用配套主仓的普通 bundle 构建入口和遥操依赖，不沿用早期独立服务示例。Jetson 部署使用主仓 `deploy/build_actucore.sh --jp-version 6.1 --with-teleop`，具体镜像和设备架构由实际部署选择。该主仓脚本在配置仓库凭据时还会推送，使用前应核对其发布设置与授权。不能把 Jetson 产物当作 x86/G1 通用镜像。
 
 ## Driver 配置
@@ -53,6 +55,8 @@ python3 -m pytest -q \
 
 这些测试用假时钟、合成反馈、记录式发布器和本地 socket，不连接机器人。`tests/benchmark_feedback_scheduler.py` 则是真实 ROS 只读订阅工具，不能混同于离线测试，也不应在设备承担任务时擅自运行。
 
+构建上下文回归使用 `python3 -m pytest -q tests/test_tianyi_build_context.py`：在独立临时源码副本中运行两个真实 Shell 入口，用 Docker 记录器检查消息包及缺包失败，不连接 Docker daemon，不构建或推送镜像。实际 ARM64 编译和入口导入仍须由镜像构建验证。
+
 将源码中的 `tests/image_shadow_smoke.py` 只读挂载到候选容器；生产镜像默认不打包测试脚本。需在 network none、只读根、仅 /tmp 可写、无设备/真实配置/凭据的隔离环境中执行，并加载镜像 ROS 环境。它验证实际 bundle 双轮启停和 Shadow 拒绝 claim，硬件发布器必须为零。合成 ROS/MCP 测试不能替代真机。
 
 ## 发布前后检查
@@ -66,9 +70,11 @@ python3 -m pytest -q \
 
 ## 操作与验收
 
-在 Canvas 找到 ActuCore `teleop` 卡片，配置机器人、模式及映射，完成 PICO 连接/配对并查看状态。PICO 与卡片操作作用于同一个会话，不要求启动整个 Canvas 业务项目。
+在 Canvas 找到 ActuCore `teleop` 卡片，配置机器人、模式及映射，将其 `control/teleop` 输出连接到对应 Driver 的 `teleop_executor` 输入，完成 PICO 配对。先在 Canvas **开启智能控制**：Core 校验保存的连线和当前 Driver 声明，遥操卡片只进入 `armed`（等待 PICO 开始），尚不申请执行权或发送双臂目标。然后在 PICO 透视页点击 **开始遥操**，由 ActuCore 准备本次会话。未开启智能控制时不能从 PICO 开始；应用或服务重启不会恢复 `armed` 权限。
 
-开始后先松开两侧握把；同时握住才跟随，松开任意握把保持，重新握住按实测姿态重建相对基准。正常结束使用“结束并收臂”，由 ActuCore 生成并检查回自然姿态的轨迹，再确认停止释放。立即停止、断网或故障只请求保持，不自动收臂或张手。
+开始后先松开两侧握把；同时握住才跟随，松开任意握把保持，重新握住按实测姿态重建相对基准。正常结束在 PICO 或卡片选择 **结束并收臂**，也可在 Canvas **关闭智能控制**：ActuCore 停止输入，生成并检查回自然姿态的轨迹，确认到位及停止后释放控制权。关闭智能控制会同时撤销 `armed`，PICO 断连也可完成；收臂或释放失败会保留故障状态与反馈通路，处理原因后显式重试，不能将按钮受理当作完成。立即停止、断网或故障只请求保持，不自动收臂或张手。
+
+日常使用上述 Canvas / PICO 流程，不依赖后端脚本。历史独立启动、回放和准备脚本仅供离线或已授权的专项诊断，不作为绕过智能控制生命周期的日常入口。新连线和项目启停生命周期目前只有离线验证，需单独完成现场验收；此前现场跟随、恢复及收臂证据不自动覆盖它。
 
 首次试验与持续操作的开关及证据要求见执行契约。反馈中的 applied_sequence 与 last_vendor_command 不等于到位；验收必须比较实测 q/dq，记录方向、幅度、延迟、恢复和结束收臂。跟随误差如实报告，不额外设置精度门槛。碰撞、不可达、丢失反馈和停止故障保留首因，不能把 UI “运行中”当作硬件正在执行。
 
