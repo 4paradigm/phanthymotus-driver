@@ -19,10 +19,9 @@ def test_executor_uses_current_vendor_writers_with_correct_units_and_hand_polari
     arm._pos_publisher = Recorder()
     hand = device_mod.HandPlugin.__new__(device_mod.HandPlugin)
     hand._left_pub, hand._right_pub = Recorder(), Recorder()
-    executor = TeleopExecutor.__new__(TeleopExecutor)
-    executor.arm, executor.hand = arm, hand
+    executor = TeleopExecutor({}, 'test', None, arm, hand, [])
     executor._output_ready = True
-    executor.gate = SimpleNamespace(velocity=.6)
+    executor.gate.velocity = .6
     executor.profile = {"hands": {s: {"open": [0]*6, "closed": [80]*6}
                                    for s in ("left", "right")}}
     # Deliberately asymmetric targets expose mirroring and ordering errors.

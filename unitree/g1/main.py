@@ -140,6 +140,21 @@ class G1DeviceBundle:
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
             print("[bundle] ArmActionPlugin loaded")
 
+        # servo 默认**关闭**，和 arm 不同。arm 放的是厂商预设手势，经过内置控制器；
+        # servo 直接往 rt/arm_sdk 写关节指令，是这个驱动第一次驱动电机本身。
+        # 一个默认开启的执行器卡片，等于容器一重启就可以被 start —— 开关留给人。
+        if plugins_cfg.get("servo", {}).get("enabled", False):
+            from servo import G1ServoPlugin
+            self._plugins.append(G1ServoPlugin(plugins_cfg["servo"], namespace, executor))
+            print("[bundle] G1ServoPlugin loaded")
+
+        # servo_eef 同样默认关闭，理由比 servo 还多一条：它一次真机都没跑过。
+        if plugins_cfg.get("servo_eef", {}).get("enabled", False):
+            from servo_eef import G1ServoEefPlugin
+            self._plugins.append(
+                G1ServoEefPlugin(plugins_cfg["servo_eef"], namespace, executor))
+            print("[bundle] G1ServoEefPlugin loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from device import AsrPlugin
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, executor))

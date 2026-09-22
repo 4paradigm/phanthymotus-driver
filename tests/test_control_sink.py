@@ -101,6 +101,17 @@ def message(clock: FakeClock, values, *, seq=1, source="vla", priority=50,
 
 
 def make_sink(clock, apply, descriptor=None, **kwargs):
+    """**两个时钟都用同一个假时钟**，而这是一个显式的选择。
+
+    sink 内部用单调时钟计时，用墙钟和消息里的 `stamp_ms` 比 —— 因为那个字段是另一
+    个进程按 Unix 纪元打的。这里的用例自己构造消息、stamp 取自同一个 FakeClock，
+    所以两边合一才说得通。
+
+    但它必须**写出来**：默认不合一。「只注入 clock 就自动合一」曾经是这个文件的
+    行为，而那正是让「sink 拿单调时钟去减 Unix 时间戳」活到真机测试前一刻的原因
+    —— 每条用例都在一个真实链路上不成立的前提下跑。
+    """
+    kwargs.setdefault("wall_clock", clock)
     return ControlSink(
         descriptor or descriptor_dict(), apply, clock=clock, **kwargs
     )
@@ -594,3 +605,364 @@ def test_counters_separate_dropped_from_rejected():
     assert counters["applied"] == 1
     assert counters["dropped"] == 1
     assert counters["rejected"] == 1
+
+
+# ── 按段声明动作空间：一个向量里可以有两种空间 ───────────────────────────────
+
+
+def test_groups_inherit_the_descriptor_mode_when_they_do_not_declare_one():
+    """每一个已有的驱动都是单一空间，所以不写就是「和整体一样」，不是「未知」。
+
+    这条钉的是向后兼容：仓库里现存的每一份 descriptor 都没有按段的 mode，它们
+    必须继续解析出和从前一样的东西。
+    """
+    parsed = parse_descriptor(descriptor_dict())
+    assert parsed.groups
+    assert all(group.mode == parsed.mode for group in parsed.groups)
+
+
+def test_a_vector_can_carry_two_action_spaces_at_once():
+    """UnifoLM-VLA 的 G1 输出就是混的，这是这个字段存在的唯一理由。
+
+    23 维 = 2 × [末端 xyz(3) + R6 旋转(6) + 夹爪(1)] + 腰 rpy(3)：前面是笛卡尔
+    位姿，腰那三个是关节角。整个 descriptor 只有一个 mode 的话，这种向量声明
+    不出来 —— 只能谎报一个，而谎报的后果是位姿被当成关节角发给机械臂。
+    """
+    # 共享的 descriptor_dict() 只有 2 维，撑不下「位姿 + 腰」这个形状，所以这条
+    # 用例自己搭一个 —— 被测的是混合声明，不是那份 fixture。位姿那段是 7 维
+    # （xyz + 单位四元数 xyzw），规范化之后的标准布局，不是模型原生的 R6。
+    raw = descriptor_dict()
+    raw["dof"] = 8
+    raw["joint_names"] = ["x", "y", "z", "qx", "qy", "qz", "qw", "waist"]
+    raw["limits"] = {"lower": [-1.0] * 8, "upper": [1.0] * 8}
+    raw["groups"] = [
+        {"name": "eef", "offset": 0, "count": 7,
+         "unit": "m", "resource": "arm", "mode": "eef_pose"},
+        {"name": "waist", "offset": 7, "count": 1,
+         "unit": "rad", "resource": "waist"},          # 不写 → 继承 joint_position
+    ]
+    parsed = parse_descriptor(raw)
+    assert [g.mode for g in parsed.groups] == ["eef_pose", parsed.mode]
+    # 混合向量里只有位姿那段带四元数，腰不带 —— sink 的三处逐值检查就是靠这个
+    # 索引集合避开四元数的。
+    assert parsed.eef_quat_offsets == (3,)
+
+
+def test_a_group_mode_outside_the_vocabulary_is_refused():
+    """词汇表小是有意的：每个 mode 都是一份关于 `values` 含义的契约，
+    而一个没人实现的 mode 就是一个没人测过的 mode。"""
+    raw = descriptor_dict()
+    raw["groups"] = [{"name": "all", "offset": 0, "count": raw["dof"],
+                      "mode": "eef_r6_g1"}]
+    with pytest.raises(Exception) as caught:
+        parse_descriptor(raw)
+    assert "eef_r6_g1" in str(caught.value)
+
+
+# ── eef_pose：位姿段的四元数 ─────────────────────────────────────────────────
+#
+# 这一组测的是「为什么标准布局用四元数而不是 rpy 或 R6」。三种都是一串浮点数，
+# 接反了都不报错；四元数是其中唯一自带校验的那一个，而下面第一条就是那份校验。
+
+
+def eef_descriptor_dict(**overrides):
+    """一个末端位姿 + 一个腰关节：混合向量的最小形状。
+
+    `max_delta_per_step` 与 `max_velocity` 在 `qx` 那一格上是**弧度**，整段姿态
+    共用它 —— 另外三格不读。见 sink._clamp_step。
+    """
+    base = descriptor_dict()
+    base.update({
+        "dof": 8,
+        "joint_names": ["x", "y", "z", "qx", "qy", "qz", "qw", "waist"],
+        "limits": {
+            "lower": [-2.0] * 8,
+            "upper": [2.0] * 8,
+            "max_delta_per_step": [0.05, 0.05, 0.05, 0.2, 0.2, 0.2, 0.2, 0.1],
+            "max_velocity": [1.0, 1.0, 1.0, 6.0, 6.0, 6.0, 6.0, 1.0],
+        },
+        "groups": [
+            {"name": "eef", "offset": 0, "count": 7, "mode": "eef_pose"},
+            {"name": "waist", "offset": 7, "count": 1, "mode": "joint_position"},
+        ],
+    })
+    base.update(overrides)
+    return base
+
+
+def eef_message(clock, values, **overrides):
+    return message(clock, values, dof=8, **overrides)
+
+
+def identity_pose(waist=0.0):
+    return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, waist]
+
+
+def test_a_rotation_that_is_not_a_unit_quaternion_is_rejected():
+    """把 rpy 或者 R6 的前四个数填进四元数那四格，范数不会是 1。
+
+    **这是选四元数的全部理由。** 维度对得上、消息校验通过、延迟正常，而机械臂
+    会走到错误的地方 —— 除非有一条检查抓得住「这四个数根本不是一个旋转」。
+    """
+    clock, recorder = FakeClock(), Recorder()
+    sink = make_sink(clock, recorder, eef_descriptor_dict())
+
+    # rpy (0.1, 0.2, 0.3) 被当成 quat 的前三个数，第四格是 R6 漏进来的下一个值。
+    outcome = sink.submit(eef_message(clock, [0.0, 0.0, 0.0, 0.1, 0.2, 0.3, 0.4, 0.0]))
+    assert outcome.verdict is Verdict.REJECTED
+    assert "unit quaternion" in outcome.reason
+    assert recorder.calls == []
+
+
+def test_a_unit_quaternion_passes_and_a_slightly_off_one_still_does():
+    """容差要能容下 JSON 往返和 float32 的动作头，不能容下另一种表示。"""
+    clock, recorder = FakeClock(), Recorder()
+    sink = make_sink(clock, recorder, eef_descriptor_dict())
+
+    assert sink.submit(eef_message(clock, identity_pose())).applied
+    clock.advance(40)
+    nearly = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0 - 5e-4, 0.0]
+    assert sink.submit(eef_message(clock, nearly, seq=2)).applied
+
+
+def test_the_orientation_step_clamp_keeps_the_quaternion_unit_length():
+    """逐分量钳位会破坏单位范数，然后下一条消息在契约检查处被拒。
+
+    症状是「策略一动快就全被拒」，而那条报错一个字都不提钳位。所以姿态走
+    slerp 角度钳位，这条用例断言的正是「钳过之后它仍然是个合法四元数」。
+    """
+    import math
+
+    clock, recorder = FakeClock(), Recorder()
+    sink = make_sink(clock, recorder, eef_descriptor_dict())
+    assert sink.submit(eef_message(clock, identity_pose())).applied
+
+    # 绕 z 转 1.2 rad，远超每步 0.2 rad 的上限。
+    half = 1.2 / 2
+    clock.advance(40)
+    outcome = sink.submit(eef_message(
+        clock,
+        [0.0, 0.0, 0.0, 0.0, 0.0, math.sin(half), math.cos(half), 0.0],
+        seq=2,
+    ))
+
+    assert outcome.verdict is Verdict.CLAMPED
+    applied = recorder.calls[-1][0]
+    quaternion = applied[3:7]
+    assert abs(math.sqrt(sum(v * v for v in quaternion)) - 1.0) < 1e-9
+    # 走了 0.2 rad，不是 1.2。
+    travelled = 2 * math.acos(min(1.0, abs(quaternion[3])))
+    assert abs(travelled - 0.2) < 1e-6
+
+
+def test_the_opposite_sign_quaternion_is_the_same_orientation_not_a_half_turn():
+    """`q` 和 `-q` 是同一个朝向。策略输出翻个号不要钱，而按分量算就是 180°。
+
+    不处理的话，一个静止不动的末端会被判成每步都在极速翻转，然后被限速拒掉。
+    """
+    clock, recorder = FakeClock(), Recorder()
+    sink = make_sink(clock, recorder, eef_descriptor_dict())
+    assert sink.submit(eef_message(clock, identity_pose())).applied
+
+    clock.advance(40)
+    flipped = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0]
+    outcome = sink.submit(eef_message(clock, flipped, seq=2))
+    assert outcome.verdict is Verdict.APPLIED      # 没被钳，也没被限速拒
+
+
+def test_a_quaternion_component_is_not_checked_against_position_bounds():
+    """四元数分量的上下界没有物理意义 —— 任何单位四元数四个分量都在 [-1, 1]，
+    而同一个朝向可以把它们全取反。真正的边界是手臂的关节限位，那是 IK 的事。"""
+    clock, recorder = FakeClock(), Recorder()
+    raw = eef_descriptor_dict()
+    # 位置那三维收紧到 ±0.01，姿态四维给一个**荒谬的**窄区间：它应当被忽略。
+    raw["limits"]["lower"] = [-0.01, -0.01, -0.01, 0.9, 0.9, 0.9, 0.9, -2.0]
+    raw["limits"]["upper"] = [0.01, 0.01, 0.01, 0.95, 0.95, 0.95, 0.95, 2.0]
+    sink = make_sink(clock, recorder, raw)
+
+    assert sink.submit(eef_message(clock, identity_pose())).applied
+
+    # 而位置的限位照旧生效 —— 步长钳位先把 0.5 削到 0.05，仍然在界外。
+    clock.advance(40)
+    outcome = sink.submit(eef_message(
+        clock, [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], seq=2))
+    assert outcome.verdict is Verdict.REJECTED
+    assert outcome.reason.startswith("x at ") and "outside" in outcome.reason
+
+
+def test_an_eef_pose_group_whose_width_is_not_a_multiple_of_seven_is_refused():
+    """6 是 rpy 配 xyz，9 是 R6 配 xyz，8 是把夹爪塞了进来 —— 三种都会被逐位
+    读成四元数，不报错。宽度是能在解析期就抓住它们的地方。"""
+    for count in (3, 6, 8, 9):
+        raw = descriptor_dict()
+        raw["dof"] = count
+        raw["joint_names"] = [f"j{i}" for i in range(count)]
+        raw["limits"] = {"lower": [-1.0] * count, "upper": [1.0] * count}
+        raw["groups"] = [{"name": "eef", "offset": 0, "count": count,
+                          "mode": "eef_pose"}]
+        with pytest.raises(DescriptorError) as caught:
+            parse_descriptor(raw)
+        assert "eef_pose" in str(caught.value)
+
+
+def test_two_end_effectors_in_one_group_are_two_quaternions():
+    """双臂可以是一段 14 维，也可以是两段各 7 维。两种都要找得出两个朝向。"""
+    raw = descriptor_dict()
+    raw["dof"] = 14
+    raw["joint_names"] = [f"j{i}" for i in range(14)]
+    raw["limits"] = {"lower": [-1.0] * 14, "upper": [1.0] * 14}
+    raw["groups"] = [{"name": "arms", "offset": 0, "count": 14,
+                      "mode": "eef_pose"}]
+    assert parse_descriptor(raw).eef_quat_offsets == (3, 10)
+
+
+# ── 新鲜度比的是两个进程之间的时间，所以必须同一个纪元 ──────────────────────
+
+
+def test_a_wall_clock_stamp_is_actually_compared_against_wall_clock():
+    """**这条是整个文件里最重要的一条，因为它此前不存在。**
+
+    消息里的 `stamp_ms` / `obs_stamp_ms` 由**另一个进程**打上，`motus.control/1`
+    把它们定义成 Unix 毫秒（`actucore` 发的就是 `int(time.time() * 1000)`）。而
+    sink 原本拿 `time.monotonic()` 去减它们 —— 「本机开机至今」减「1970 至今」，
+    约 -1.79e12。
+
+    后果不是报错，是整条新鲜度检查静音：`age` 永远是巨大的负数，永远小于任何
+    `ttl`。实测过：一条一小时前生成、基于一小时前观测的指令，verdict 是 `applied`。
+
+    这个 bug 能活到真机测试的前一刻，是因为**这个文件里每一条用例都注入 FakeClock**
+    —— 注入之后 stamp 和 now 自然同一个纪元，而那正是真实链路上不成立的前提。所以
+    这条用例故意**不注入** wall_clock，用真实的墙钟。
+    """
+    import time as real_time
+
+    clock, recorder = FakeClock(), Recorder()
+    # 只注入内部计时的那个时钟；wall_clock 留默认，也就是真的 time.time()。
+    sink = ControlSink(descriptor_dict(), recorder, clock=clock)
+
+    wall_now = int(real_time.time() * 1000)
+    stale = message(clock, [0.1, 0.1], ttl_ms=100)
+    stale["stamp_ms"] = wall_now - 3_600_000        # 一小时前生成
+    stale["obs_stamp_ms"] = wall_now - 3_600_000    # 基于一小时前的观测
+
+    outcome = sink.submit(stale)
+
+    assert outcome.verdict is Verdict.DROPPED, "过期指令必须被丢弃"
+    assert "expired" in outcome.reason
+    assert recorder.calls == [], "陈旧指令绝不能到达 apply"
+
+
+def test_a_fresh_wall_clock_command_still_passes():
+    """修复不能把正常的指令也挡掉 —— 否则整条流都停了。"""
+    import time as real_time
+
+    clock, recorder = FakeClock(), Recorder()
+    sink = ControlSink(descriptor_dict(), recorder, clock=clock)
+
+    wall_now = int(real_time.time() * 1000)
+    fresh = message(clock, [0.1, 0.1], ttl_ms=500)
+    fresh["stamp_ms"] = wall_now
+    fresh["obs_stamp_ms"] = wall_now
+
+    assert sink.submit(fresh).applied
+    assert recorder.last == (0.1, 0.1)
+
+
+def test_the_two_clocks_are_separate_on_purpose():
+    """内部计时仍然用单调时钟：时长测量不该被 NTP 跳变影响。
+
+    跨进程比较需要共同的纪元，时长测量不需要 —— 两件事两个时钟。
+    """
+    clock, recorder = FakeClock(), Recorder()
+    sink = ControlSink(descriptor_dict(), recorder, clock=clock)
+    assert sink._clock is clock
+    assert sink._wall_clock is not clock
+
+
+# ── advisory：收下但不执行 ───────────────────────────────────────────────────
+#
+# 这一组的由来是一次实测：G1 的 1 自由度腰上，`unifolm-vla-g1` 的 25 步动作块
+# **一步都没通过**，全数停在 `waist_roll at 0.1380 outside [-0.02, 0.02]`。那个
+# 限位没错（腰确实动不了），但它把**整条**指令拒掉了，连同两条手臂——而手臂的
+# 目标是绝对末端位姿，本来完全可以执行。
+#
+# advisory 说的是「这一段我收下但不执行」，于是它的限位、步长和速度都不再被检查：
+# 检查一个不会被执行的数没有意义。丢维的**许可**来自生产者（`motus.vla/1` 的
+# `optional`），在 actucore 的协商里对质，不在这里。
+
+
+def advisory_descriptor(**overrides):
+    """两维，第二维声明成 advisory。"""
+    raw = descriptor_dict(**overrides)
+    raw["groups"] = [
+        {"name": "driven", "offset": 0, "count": 1},
+        {"name": "ignored", "offset": 1, "count": 1, "advisory": True},
+    ]
+    return raw
+
+
+def test_a_value_outside_an_advisory_limit_does_not_reject_the_command():
+    """整组用例的核心：真机上就是这一条把整条管线挡在门外的。"""
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, parse_descriptor(advisory_descriptor()))
+    outcome = sink.submit(message(clock, [0.0, 99.0]))
+    assert outcome.verdict is Verdict.APPLIED
+    assert apply.last[0] == 0.0
+
+
+def test_the_driven_dimensions_are_still_checked(monkeypatch):
+    """advisory 是**按段**放行的，不是整条向量的开关。
+
+    如果它顺手放过了相邻的维，那就不是「丢掉一段」而是「关掉限位」，
+    而后者的症状是手臂走到限位外，没有任何一处报错。
+    """
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, parse_descriptor(advisory_descriptor()))
+    outcome = sink.submit(message(clock, [99.0, 0.0]))
+    assert outcome.verdict is Verdict.REJECTED
+    assert "shoulder" in outcome.reason
+
+
+def test_an_advisory_value_is_not_step_clamped():
+    """钳它只会让状态回报里那个数看起来被平滑过，而它根本没去过任何地方。"""
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, parse_descriptor(advisory_descriptor()))
+    sink.submit(message(clock, [0.0, 0.0]))
+    clock.advance(33)
+    sink.submit(message(clock, [0.0, 5.0], seq=2))
+    assert apply.last[1] == 5.0            # 逐位原样，limit 是 0.1
+
+
+def test_an_advisory_dimension_has_no_speed_limit_either():
+    """限位和速度是同一件事的两种说法，只放行一种等于没放行。"""
+    clock, apply = FakeClock(), Recorder()
+    raw = advisory_descriptor()
+    raw["limits"]["max_velocity"] = [1.0, 1.0]
+    raw["limits"]["max_delta_per_step"] = [100.0, 100.0]
+    sink = make_sink(clock, apply, parse_descriptor(raw))
+    sink.submit(message(clock, [0.0, 0.0]))
+    clock.advance(10)                       # 0.9 rad / 0.01 s = 90 rad/s
+    outcome = sink.submit(message(clock, [0.0, 0.9], seq=2))
+    assert outcome.verdict is Verdict.APPLIED
+
+
+def test_a_descriptor_without_advisory_executes_everything():
+    """缺省必须是「会执行」。
+
+    反过来——缺省可丢——会让今天每一个驱动的每一段悄悄变成可丢，而这个字段
+    存在的理由正好是不让丢维悄悄发生。
+    """
+    parsed = parse_descriptor(descriptor_dict())
+    assert parsed.advisory_indices == frozenset()
+    assert all(not group.advisory for group in parsed.groups)
+
+
+def test_a_non_boolean_advisory_is_refused():
+    """字符串 "false" 是真值，而这个字段的方向是**放行**。
+
+    填错的代价是一段本该被限位守住的动作变成不检查——一个静默放宽的约束。
+    """
+    raw = advisory_descriptor()
+    raw["groups"][1]["advisory"] = "false"
+    with pytest.raises(DescriptorError, match="advisory"):
+        parse_descriptor(raw)

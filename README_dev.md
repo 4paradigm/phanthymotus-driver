@@ -1347,6 +1347,47 @@ from it.
 descriptor that omits it, because omitting it is how a robot ends up assumed to
 have a protection it does not have.
 
+#### `groups` — 混合向量，以及 `advisory`
+
+一条 19 维的标准 G1 动作是两个末端位姿、两个夹爪、三个腰关节角。顶层一个 `mode`
+说不清，所以每段可以自己声明：
+
+```python
+"groups": [
+    {"name": "eef_l",  "offset": 0,  "count": 7, "unit": "m+quat",
+     "resource": "arm_l", "mode": "eef_pose"},
+    ...
+    {"name": "waist",  "offset": 16, "count": 3, "unit": "rad",
+     "resource": "waist", "mode": "joint_position", "advisory": True},
+]
+```
+
+段必须按顺序无缝铺满 `[0, dof)`。不写 `mode` 就继承顶层。
+
+**`advisory: true` 的意思是「这一段我收下，但不执行」。** `ControlSink` 因此跳过
+这一段的限位、步长与速度检查 —— 检查一个不会被执行的数没有意义，而更糟的是，
+一个为「这台机器人动不了这个轴」而卡死的限位会把**整条**指令拒掉，连同那些本可以
+执行的维。
+
+这不是「静默丢几维」这个仓库一直拒绝的那件事，区别在于**谁给的许可**：
+
+| 侧 | 字段 | 含义 |
+|---|---|---|
+| 生产者（`motus.vla/1` capabilities） | `optional` | 我会发这一段，但任务不要求它被执行 |
+| 驱动（这里） | `advisory` | 我收下这一段，但不执行 |
+
+两者在 `actucore/plugins/vla/negotiate.py` 相遇，规则只有一句：**驱动标了
+`advisory` 而生产者没标 `optional` → 拒绝协商**。两个名字故意不同，语义不对称，
+同名会让一次复制粘贴把「可以不执行」变成「已经没执行」。两个字段都缺省 `false`。
+
+只有**手段**能标 advisory，**目的**不能。判据是：丢掉它之后，还有没有东西能发现
+执行错了。G1 的腰能标（末端位姿是绝对的，IK 挂实测腰角照样把手送到被指令的位姿；
+真要因此够不着，残差会响亮地拒），末端位姿本身不能（丢了没有任何东西会发现）。
+
+**不执行的那一段，IK 要挂实测值而不是指令值。** 这是 advisory 和「干脆放宽限位」
+的全部区别：后者把一个机器人到不了的躯干姿态挂进链里，每一拍的手臂解都差同样
+一点，没有一处报错，看起来像标定问题。
+
 ### Message
 
 ```python

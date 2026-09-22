@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 from simulator.generic import acp
@@ -53,6 +54,10 @@ from simulator.generic.scenario import Scenario, discover
 BUNDLE_DIR = Path(__file__).resolve().parent
 DEFAULT_SCENARIO_DIRS = (BUNDLE_DIR / "scenarios", BUNDLE_DIR / "scenarios" / "user")
 DEFAULT_MAP_DIRS = (BUNDLE_DIR / "maps", BUNDLE_DIR / "maps" / "user")
+
+# 世界锁多久没续租就算过期。跑动每两秒轮询一次事实，所以这个数只要远大于轮询间隔
+# 就行；取 120 秒是为了容忍一次很慢的 LLM 轮次，又不至于让一把死锁挂太久。
+OWNER_TTL = 120.0
 
 
 class SimScenarioCard(Card):
@@ -101,6 +106,7 @@ class SimScenarioCard(Card):
         self._acp_posts: list[dict] = []
         self._injector = None
         self._owner = ""
+        self._owner_seen = 0.0
         self.refresh()
         world.add_step_listener(self._on_step)
         # What actually went to /api/acp/complete, not the world's internal job
@@ -179,11 +185,30 @@ class SimScenarioCard(Card):
         也就是**被测的 agent 能重置正在测它的那次测量**，而且重置之后什么痕迹都不
         剩，那次跑动只会记一个说不清的低分。跑动的持有者带 `owner` 过来，其他调用
         方在此期间被拒。
+
+        **锁不能活过它的持有者。** 原先唯一的释放路径是带着对的 owner 显式 abort，
+        于是 agent-core 重启、跑动被杀、容器被重建 —— 任何一种都让世界永久锁死。而
+        症状不是一条报错：agent 读到「地图加载不了」，很合理地告诉访客展厅在维护，
+        然后 finish()。Orin6 上就这么白跑过，每条日志都正常。
+
+        所以锁带一个心跳：跑动每隔两秒轮询一次 `sim_report`，那一下就是续租
+        （`touch_owner`）。持有者没了就没人续，`OWNER_TTL` 之后锁自己过期。
         """
         if self._owner and owner != self._owner:
+            idle = time.time() - self._owner_seen
+            if idle > OWNER_TTL:
+                print(f"[sim] 释放过期的世界锁：{self._owner} 已经 {idle:.0f}s 没有动静",
+                      flush=True)
+                self._owner = ""
+                return None
             return {"error": f"世界正被 {self._owner} 的基准测试跑动持有",
                     "owner": self._owner}
         return None
+
+    def touch_owner(self) -> None:
+        """续租。跑动每次轮询事实都会走到这儿 —— 见 `_held_by_someone_else`。"""
+        if self._owner:
+            self._owner_seen = time.time()
 
     # ---- actions ------------------------------------------------------
 
@@ -251,6 +276,7 @@ class SimScenarioCard(Card):
         if held:
             return held
         self._owner = owner or self._owner
+        self._owner_seen = time.time()
 
         if map:
             asset = self.maps().get(map)
@@ -278,6 +304,16 @@ class SimScenarioCard(Card):
 
         if self._active is None:
             return {"state": "idle", "reset": False}
+
+        # **从地图资产建出来的场景，它的 slug 是地图名，不是场景名。** 上面那个分支
+        # 用 `Scenario.from_dict({...}, slug=map)` 造它，所以拿这个 slug 去
+        # `do_load` 找场景文件必然找不到 —— 报出来是 `unknown scenario: bj-2f`，
+        # 一个看着像「用例写错了地图」的错误，而其实是重置自己走错了路。
+        #
+        # Orin6 上一个**不声明地图**的用例就撞上了：跑在当前世界上是新的默认，
+        # 而「当前世界」恰恰就是这种从资产建出来的场景。这种直接重建，不查表。
+        if self._active.slug not in self.refresh():
+            return self._load_active(seed=seed)
         return self.do_load(scenario=self._active.slug, owner=owner)
 
     # ---- 给导航卡的「地图」接口 ---------------------------------------
@@ -426,6 +462,10 @@ class SimReportCard(Card):
 
     def report(self) -> dict:
         card = self._scenario_card
+        # 跑动每两秒来问一次事实 —— 这一下就是世界锁的心跳。放在这里而不是让跑动
+        # 另外发一个请求，是因为它本来就在问，而多一条心跳协议就多一处会忘记发的地方。
+        if card is not None:
+            card.touch_owner()
         scenario = card.active if card else None
         events = self.world.events()
         if scenario is None:

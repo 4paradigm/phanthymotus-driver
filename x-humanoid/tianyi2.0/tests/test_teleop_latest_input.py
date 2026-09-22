@@ -18,7 +18,7 @@ def test_socket_discards_intermediate_targets_but_validates_latest(latest_bad):
         latest['mac'] = '0'*64
     elif latest_bad == 'joint_limit':
         latest = packet(seq=1, q=[2.]*14)
-    item = TeleopExecutor.__new__(TeleopExecutor)
+    item = TeleopExecutor({}, 'test', None, None, None, [])
     item.gate = gate
     receive, send = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
@@ -43,7 +43,7 @@ def test_socket_discards_intermediate_targets_but_validates_latest(latest_bad):
 
 def test_unbounded_backlog_cannot_starve_watchdog_or_apply_intermediate_packet():
     gate, _, writes, _, packet = rig()
-    item = TeleopExecutor.__new__(TeleopExecutor)
+    item = TeleopExecutor({}, 'test', None, None, None, [])
     item.gate = gate
     class Flood:
         count = 0

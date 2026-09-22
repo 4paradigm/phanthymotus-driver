@@ -1,8 +1,6 @@
 """No hardware: authenticated deadline, ownership and physical-stop receipt tests."""
-import sys
 from pathlib import Path
 import pytest
-sys.path.insert(0, str(Path(__file__).parents[1]))
 from motion_stream import MotionGate, PROTOCOL, sign
 
 

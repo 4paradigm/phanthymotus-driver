@@ -6,28 +6,23 @@ exposes the capabilities as MCP tools.
 
 ## ActuCore teleoperation execution
 
-The optional, disabled-by-default `teleop_executor` accepts fourteen arm joint
-targets and two calibrated hand closure values from the local ActuCore card.
-See [the execution contract](TELEOP.md) for the authenticated stream, confirmed
-hold/resume behavior, configuration and current validation limits. The arms-only
-trial configuration is deployed; the first Live trial did not visibly follow and
-latched a feedback fault. Physical following is not accepted. Latest-target
-socket draining, arms-only feedback and session baselines are deployed. The new,
-locally tested and ARM64-built continuation candidate keeps the 100 ms target deadline, permits
-fresh targets within a 300 ms continuation window after confirmed hold, and
-separates transient feedback holds from persistent faults. It also records the
-first fault and command/scheduler timing. Isolated ROS2/MCP continuation passed
-with synthetic feedback and zero hardware writes. Both new images are deployed
-with a passing zero-output calibration. The deployed startup fix then reached
-three applied targets; collision recovery exceeded its frame budget and lost a
-rotated lease reply. The Driver subsequently confirmed stop and released ownership.
-A recovery candidate separates IK validation from rearm and adds bounded,
-idempotent management receipts and cancellation. ActuCore's existing resume
-action rebuilds a faulted card session only after fresh confirmed release,
-without restarting containers. This candidate is not yet physically accepted.
-The two-service switch preserved the user's Agent Core configuration and container. See
-the execution contract for its exact limits. The existing `servo` card remains
-available, with shared actuator ownership enforced when teleoperation is enabled.
+The optional, disabled-by-default `teleop_executor` executes robot-space targets
+from the `teleop` card inside the normal ActuCore bundle. PICO pairing, controller
+mapping, IK, operator controls and the return-arm trajectory belong to ActuCore;
+the Driver owns actuator arbitration, bounded position output, feedback and
+confirmed stop. There is no separate PICO service in this Driver.
+
+Continuous targets use local domain-42 DDS; loopback MCP handles only preparation,
+control ownership and pause/resume/release. Arms-only operation explicitly disables
+hand output. Existing arm, gesture, hand, body, navigation and servo paths share
+the teleop execution gate, so acquiring control never silently preempts them.
+
+The Canvas `teleop` card and PICO operator controls are the user entry points;
+`teleop_executor` is the internal execution interface. See the
+[execution contract](TELEOP.md) and [build/deployment runbook](deploy/TELEOP_RUNBOOK.md)
+for configuration, recovery, diagnostics and acceptance limits. A site trial has
+reported usable dual-arm following and confirmed return-arm completion; this does
+not certify hand operation or process-crash behavior for every installation.
 
 ## Head camera snapshot card
 
