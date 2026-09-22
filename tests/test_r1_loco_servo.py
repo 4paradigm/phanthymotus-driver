@@ -59,6 +59,7 @@ class FakeClient:
     def __init__(self, fsm=loco_servo.STANDING_FSM, fsm_code=0):
         self.moves = []
         self.stops = 0
+        self.fsm_reads = 0
         self._fsm = fsm
         self._fsm_code = fsm_code
 
@@ -71,6 +72,7 @@ class FakeClient:
         return 0
 
     def GetFsmId(self):
+        self.fsm_reads += 1
         return self._fsm_code, self._fsm
 
 
@@ -241,27 +243,72 @@ def test_pause_for_explicit_command_reports_whether_it_did_anything():
 
 # ── posture ──────────────────────────────────────────────────────────────────
 
-def test_starting_is_refused_when_the_robot_is_not_standing():
+def test_starting_does_not_depend_on_posture():
+    """Starting is a wiring event, not a motion one.
+
+    A project comes up when someone opens the canvas, and the robot is very
+    often lying down at that moment. Refusing to start then blocks the whole
+    canvas — every other card with it — over a posture that says nothing about
+    whether the wiring is right, and that will very likely have changed by the
+    time the first command arrives.
+    """
     card = _card(FakeClient(fsm=1))          # damp, on the ground
     result = card.dispatch("start", {"input_topic": "/nav/cmd"})
-    assert result["state"] == "error"
-    assert "lie2standup" in result["message"]
+    assert "FSM" not in (result.get("message") or "")
 
 
-def test_starting_is_refused_when_the_fsm_cannot_be_read():
+def test_a_command_is_refused_while_the_robot_is_lying_down():
+    """The gate moved here — to the moment it can actually be answered."""
+    client = FakeClient(fsm=1)
+    card = _card(client)
+    _sink(card).submit(_command([0.3, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert client.moves == []
+    assert card._refused == 1
+    assert "lie2standup" in card.dispatch("info", {})["posture_problem"]
+
+
+def test_a_command_is_refused_when_the_fsm_cannot_be_read():
     """Acting on a failed read is how a safe call becomes a collapse — the same
     rule `switch_mode` already follows."""
-    card = _card(FakeClient(fsm_code=-1))
-    result = card.dispatch("start", {"input_topic": "/nav/cmd"})
-    assert result["state"] == "error"
+    client = FakeClient(fsm_code=-1)
+    card = _card(client)
+    _sink(card).submit(_command([0.3, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert client.moves == []
 
 
-def test_require_standing_can_be_turned_off_for_a_bench():
-    card = _card(FakeClient(fsm=1), require_standing=False)
-    # No ROS executor here, so it gets as far as the subscription and stops —
-    # the point is that it passed the posture gate rather than failing on it.
-    result = card.dispatch("start", {"input_topic": "/nav/cmd"})
-    assert "FSM" not in result.get("message", "")
+def test_standing_up_later_lets_commands_through():
+    """The case the start-time gate got wrong: posture changes after start."""
+    client = FakeClient(fsm=1)
+    card = _card(client)
+    sink = _sink(card)
+    sink.submit(_command([0.3, 0.0, 0.0, 0.0, 0.0, 0.0], seq=1))
+    assert client.moves == []
+
+    client._fsm = loco_servo.STANDING_FSM
+    card._fsm_checked_at = float("-inf")     # expire the cache, as time would
+    sink.submit(_command([0.3, 0.0, 0.0, 0.0, 0.0, 0.0], seq=2))
+    assert client.moves == [(0.3, 0.0, 0.0)]
+    assert card._refused == 0                # cleared once a command lands
+
+
+def test_the_fsm_is_not_read_once_per_command():
+    """At 10 Hz an RPC per command puts a round trip to the robot's own
+    controller in the path of every velocity."""
+    client = FakeClient()
+    card = _card(client)
+    sink = _sink(card)
+    for seq in range(1, 6):
+        sink.submit(_command([0.1, 0.0, 0.0, 0.0, 0.0, 0.0], seq=seq))
+    assert client.fsm_reads == 1
+    assert len(client.moves) == 5
+
+
+def test_require_standing_off_skips_the_check_entirely():
+    client = FakeClient(fsm=1)
+    card = _card(client, require_standing=False)
+    _sink(card).submit(_command([0.3, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert client.moves == [(0.3, 0.0, 0.0)]
+    assert client.fsm_reads == 0
 
 
 # ── plumbing ─────────────────────────────────────────────────────────────────
