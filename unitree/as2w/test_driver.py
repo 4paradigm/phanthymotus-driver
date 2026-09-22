@@ -138,7 +138,7 @@ class TestDriverContracts(unittest.TestCase):
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
         plugin._namespace = "test"
-        for name in ("imu", "joints", "joint_state", "battery", "loco_state"):
+        for name in ("imu", "joints", "joint_state", "battery", "loco_state", "odometry"):
             result = plugin.dispatch(name, {})
             self.assertEqual("running", result["state"])
             self.assertTrue(result["topic_out"][0]["topic"].startswith("/test/"))
@@ -185,9 +185,32 @@ class TestDriverContracts(unittest.TestCase):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []
         node.loco = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node.odometry = types.SimpleNamespace(publish=lambda message: None)
+        node._odometry_origin = None
         node._on_sport(types.SimpleNamespace(mode=2, velocity=[1, 2, 3], position=[4, 5, 6], body_height=0.2,
-                                              imu_state=types.SimpleNamespace(rpy=[7, 8, 9])))
+                                              yaw_speed=0, imu_state=types.SimpleNamespace(rpy=[7, 8, 9])))
         self.assertNotIn("imu_rpy_0", __import__("json").loads(published[0]))
+
+    def test_odometry_tracks_displacement_from_first_frame(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.loco = types.SimpleNamespace(publish=lambda message: None)
+        node.odometry = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node._odometry_origin = None
+
+        node._on_sport(types.SimpleNamespace(mode=2, velocity=[0.5, 0, 0], position=[1, 2, 0.3],
+                                              body_height=0.2, yaw_speed=0.1))
+        node._on_sport(types.SimpleNamespace(mode=2, velocity=[0.5, 0, 0], position=[4, 6, 0.3],
+                                              body_height=0.2, yaw_speed=0.1))
+
+        first, second = [__import__("json").loads(payload) for payload in published]
+        self.assertEqual([1.0, 2.0], first["origin_m"])
+        self.assertEqual({"dx": 0.0, "dy": 0.0, "distance": 0.0}, first["displacement_m"])
+        self.assertEqual([4.0, 6.0, 0.3], second["position_m"])
+        self.assertEqual({"forward": 0.5, "lateral": 0.0, "vertical": 0.0}, second["velocity_mps"])
+        self.assertEqual({"dx": 3.0, "dy": 4.0, "distance": 5.0}, second["displacement_m"])
+        self.assertEqual(0.1, second["yaw_speed_rad_s"])
+        self.assertIn("timestamp_ms", second)
 
     def test_loco_uses_presets_and_acp_completion(self):
         plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
