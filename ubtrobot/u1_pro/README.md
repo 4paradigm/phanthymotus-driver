@@ -10,8 +10,11 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 - `vision_capture`: photo/video capture built on the `camera_rgb` JPEG cache. It supports `capture_image`, timed `record_video`, continuous `start_recording`/`stop_recording`, `list`, `delete`, and `info`.
 - `doa_event`: an opt-in JSON sound-direction event stream.
 
-At startup the driver authorizes the vendor SDK from protected configuration or
-environment variables, then disables the vendor's built-in wake word. Authentication
+At startup the driver authorizes the vendor SDK from the read-only
+`U1_PRO_AUTH_FILE` JSON mount (the JSON's relative `license_file` is read beside
+it), or from the legacy protected environment variables, then disables the
+vendor's built-in wake word. The authorization files must be provisioned on the
+target host and must not be committed to the repository or image. Authentication
 is a driver deployment concern rather than an Agent Core action. The playback event
 topic remains an internal subscription used to complete `audio` actions; it is not
 exposed as a separate Agent Core card.

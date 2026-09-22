@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sys
 import io
+import json
+import os
 import threading
 import tempfile
 import types
@@ -411,6 +413,28 @@ class U1CardContractTests(unittest.TestCase):
         self.assertNotIn("do-not-log", text)
         self.assertIn("authorization request completed", text)
         self.assertIn("wake word disable request completed", text)
+
+    def test_authorization_loads_secret_file_and_license(self):
+        import device
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "robo.license").write_text('{"license":"test"}', encoding="utf-8")
+            (root / "robo_auth.json").write_text(json.dumps({
+                "appid": "app",
+                "api_key": "key",
+                "api_secret": "secret",
+                "device_id": "device",
+                "license_file": "robo.license",
+            }), encoding="utf-8")
+            nodes = object.__new__(device.U1Nodes)
+            nodes.config = {}
+            nodes.string_call = mock.Mock(return_value={"code": "OK"})
+            with mock.patch.dict(os.environ, {"U1_PRO_AUTH_FILE": str(root / "robo_auth.json")}, clear=False):
+                nodes.initialize_robot()
+            payload = nodes.string_call.call_args_list[0].args[1]
+            self.assertEqual(payload["appid"], "app")
+            self.assertEqual(payload["license"], '{"license":"test"}')
 
     def test_acp_error_log_escapes_action_id(self):
         import device

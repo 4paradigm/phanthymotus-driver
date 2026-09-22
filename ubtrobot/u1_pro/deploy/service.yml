@@ -7,9 +7,11 @@ ubtrobot-u1-pro:
   privileged: true
   volumes:
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /opt/phanthy-motus/secrets/ubtrobot/u1_pro:/run/ubtrobot-u1-pro-auth:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - U1_PRO_AUTH_FILE=/run/ubtrobot-u1-pro-auth/robo_auth.json
     - RCUTILS_COLORIZED_OUTPUT=0
     - PYTHONUNBUFFERED=1
   logging:

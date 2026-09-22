@@ -19,6 +19,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from pathlib import Path
 from typing import Any
 
 from common.vendor_runtime import action_schema, jsonable, tool
@@ -342,6 +343,27 @@ class U1Nodes:
             key: str(auth_config.get(key) or os.environ.get(env_names[key], ""))
             for key in env_names
         }
+        auth_file = os.environ.get("U1_PRO_AUTH_FILE") or self.config.get("auth_file")
+        if auth_file and any(not value for value in values.values()):
+            try:
+                file_path = Path(auth_file).resolve()
+                file_config = json.loads(file_path.read_text(encoding="utf-8"))
+                license_name = file_config.get("license_file")
+                license_path = (file_path.parent / license_name).resolve() if license_name else None
+                if license_path is None or file_path.parent not in license_path.parents:
+                    raise ValueError("license_file must stay next to the auth file")
+                file_values = {
+                    "appid": file_config.get("appid", ""),
+                    "api_key": file_config.get("api_key", ""),
+                    "api_secret": file_config.get("api_secret", ""),
+                    "device_id": file_config.get("device_id", ""),
+                    "license": license_path.read_text(encoding="utf-8"),
+                }
+                for key, value in file_values.items():
+                    if not values[key] and value:
+                        values[key] = str(value)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                print("[U1 init] authorization file could not be loaded", flush=True)
         missing = [key for key, value in values.items() if not value]
         if missing:
             print(f"[U1 init] authorization skipped; missing fields: {', '.join(missing)}", flush=True)
