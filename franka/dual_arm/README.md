@@ -1,6 +1,6 @@
 # Franka 双臂 Driver
 
-通过官方 franka_ros2 的 ROS 2 Action 接口控制**两台独立机械臂**，MCP 端口
+通过官方 franka_ros2 的 ROS 2 Action 接口控制**左右各一台 FR3**，MCP 端口
 15741。左右臂分别提供关节状态、点到点轨迹及取消；可选官方 Franka 夹爪。
 本包不安装/启动本体驱动，不在 Python 中实现 FCI 实时力矩循环。
 
@@ -11,7 +11,7 @@
   空间的 JointState 话题；轨迹控制器使用 ros2_control JTC 的 spline 插值。
 - 可选夹爪使用官方 `franka_gripper` 的 `control_msgs/action/GripperCommand`。
 - 本版没有 FR3 Duo 一体机控制器适配、双臂同步启动、Cartesian IK、环境/自碰撞
-  规划、遥操流接入或自动错误恢复。两套独立 FR3/Panda 的实际兼容性仍需现场确认。
+  规划、遥操流接入或自动错误恢复。两台 FR3 的固件和控制栈兼容性仍需现场确认。
 
 参考接口核对自 [franka_ros2 humble](https://github.com/frankarobotics/franka_ros2/tree/humble)、
 [官方 FR3 轨迹控制器配置](https://github.com/frankarobotics/franka_ros2/blob/humble/franka_fr3_moveit_config/config/fr3_ros_controllers.yaml)、
@@ -26,7 +26,7 @@
 1. 在 Linux 主机按厂商文档配置两台机械臂，分别使用 left/right 等独立 namespace。
    在对应域用 `ros2 action list -t`、`ros2 topic list -t` 核对真实接口。
 2. 将 config.yaml 复制到 `/opt/phanthy-motus/config/franka.yaml`。示例是两台独立
-   FR3 的名字，不会自动识别到货型号；按实际 ROS 图填写 Action、状态话题、7 个
+   FR3 的名字；按实际 ROS 图填写 Action、状态话题、7 个
    关节名。joint_state_topic 必须分开，即使两台使用相同的关节名称。
 3. 开启运动前，为每臂填入现场确认的 7 维 lower/upper（rad）、max_velocity
    （rad/s）、max_acceleration（rad/s²），并设 motion_enabled=true。

@@ -290,7 +290,11 @@ class FrankaPlugin:
             if action in ("start", "info"):
                 return motion.info()
             if action == "stop":
-                return motion.stop()
+                # Serialize with move preflight as well as goal submission.
+                # Otherwise stop can see an empty slot while an older move is
+                # still reading feedback, then that move submits after stop.
+                with self._lock:
+                    return motion.stop()
             if action == "move":
                 with self._lock:
                     if self._closed or self.cfg.get("motion_enabled") is not True:

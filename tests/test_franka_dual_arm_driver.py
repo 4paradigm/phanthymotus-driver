@@ -170,6 +170,38 @@ def test_left_and_right_commands_are_isolated(plugin):
     assert not p.motions["franka_right_arm"].active
 
 
+def test_stop_during_preflight_cancels_the_pending_move(plugin):
+    import threading
+    p, hw = plugin
+    entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+    original = hw["left"].state
+    def state():
+        entered.set()
+        assert release.wait(2)
+        return original()
+    hw["left"].state = state
+    mover = threading.Thread(target=lambda: p.dispatch("move", {
+        "_tool_name": "franka_left_arm", "joint": [.1] * 7, "duration": 2.}))
+    def stop():
+        p.dispatch("stop", {"_tool_name": "franka_left_arm"})
+        stopped.set()
+    stopper = threading.Thread(target=stop)
+    mover.start()
+    assert entered.wait(1)
+    stopper.start()
+    try:
+        assert not stopped.wait(.05)
+    finally:
+        release.set()
+        mover.join(timeout=2)
+        stopper.join(timeout=2)
+    assert stopped.is_set()
+    handle = Handle()
+    hw["left"].submission.set_result(handle)
+    assert handle.cancels == 1
+    terminal(handle, status=5)
+
+
 @pytest.mark.parametrize("target,duration", [([3.] * 7, 10), ([1.] * 7, .5), ([float("nan")] * 7, 10), ([True] * 7, 10), ([0.] * 6, 10)])
 def test_invalid_target_or_quintic_rate_limit_rejected(plugin, target, duration):
     p, hw = plugin
