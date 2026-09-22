@@ -440,6 +440,8 @@ class TeleopExecutor:
             try:
                 if set(packet) != {'_motion_route', 'packet'} or self.motion_control is None:
                     raise ValueError('control_interface_unavailable')
+                if type(packet['_motion_route']) is not str or type(packet['packet']) is not dict:
+                    raise ValueError('invalid_control_route_payload')
                 if packet['_motion_route'] == 'eef':
                     accepted = self.motion_control.receive_eef(packet['packet'])
                 elif packet['_motion_route'] == 'arm':
@@ -447,7 +449,7 @@ class TeleopExecutor:
                 else:
                     raise ValueError('invalid_control_route')
                 reason = None if accepted else 'hold_confirmation_or_time_fence'
-            except (ValueError, TypeError, KeyError, OverflowError) as exc:
+            except (ValueError, TypeError, KeyError, OverflowError, RecursionError) as exc:
                 accepted, reason = False, str(exc)
                 if self.motion_control is not None:
                     self.motion_control.rejected(packet.get('_motion_route'), packet.get('packet'), reason)
@@ -662,7 +664,7 @@ class TeleopExecutor:
                 return self.info()
             if action == "start":
                 self.start()
-                return self.info()
+                return {**self.info(), "execution_state": self.gate.state, "state": "ready"}
             if action == "end_operator_session":
                 if self.gate.session_id:
                     raise ValueError('operator_session_still_owned')
@@ -812,8 +814,9 @@ def run_local_bus(fd,namespace,control_v2=False):
             if len(msg.data) > 8192:return
             try:
                 packet = json.loads(msg.data, object_pairs_hook=TeleopExecutor._unique)
+                if type(packet) is not dict:return
                 wire.send(json.dumps({'_motion_route': route, 'packet': packet}, allow_nan=False).encode())
-            except (ValueError, TypeError, BlockingIOError):pass
+            except (ValueError, TypeError, RecursionError, BlockingIOError):pass
         node.create_subscription(String,f'/{namespace}/motion/control/command',lambda msg:routed('eef',msg),qos)
         node.create_subscription(String,f'/{namespace}/motion/arm/command',lambda msg:routed('arm',msg),qos)
         joint_pub = node.create_publisher(String,f'/{namespace}/motion/arm/command',qos)

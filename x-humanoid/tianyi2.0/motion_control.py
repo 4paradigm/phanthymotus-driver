@@ -29,6 +29,7 @@ class MotionControl:
         self._worker = None
         self._pending = None
         self._generation = 0
+        self._lifecycle_generation = 0
         self._preview = None
         self._preview_state = 'idle'
         self._live_session = None
@@ -119,8 +120,15 @@ class MotionControl:
         return result
 
     def start(self):
+        with self._lock:
+            generation = self._lifecycle_generation
+            if self._closed.is_set() and any(worker and worker.is_alive()
+                    for worker in (self._worker, self._finish_thread)):
+                raise RuntimeError('motion_control_thread_stop_unconfirmed')
         self.executor.start()
         with self._lock:
+            if generation != self._lifecycle_generation:
+                raise RuntimeError('motion_control_start_cancelled')
             if self._worker and self._worker.is_alive():
                 return
             self._closed.clear()
@@ -128,14 +136,23 @@ class MotionControl:
             self._worker.start()
 
     def stop(self):
-        self.cancel_pending()
-        self._finish_cancel.set()
-        self._closed.set()
-        self._wake.set()
-        if self._worker and self._worker is not threading.current_thread():
-            self._worker.join(.5)
-        if self._finish_thread and self._finish_thread is not threading.current_thread():
-            self._finish_thread.join(.5)
+        with self._lock:
+            self._lifecycle_generation += 1
+            self.cancel_pending()
+            self._finish_cancel.set()
+            self._closed.set()
+            self._wake.set()
+            workers = (self._worker, self._finish_thread)
+        for worker in workers:
+            if worker and worker is not threading.current_thread():
+                worker.join(.5)
+        if any(worker and worker.is_alive() for worker in workers):
+            raise RuntimeError('motion_control_thread_stop_unconfirmed')
+        with self._lock:
+            if self._worker is workers[0]:
+                self._worker = None
+            if self._finish_thread is workers[1]:
+                self._finish_thread = None
 
     def cancel_pending(self):
         with self._lock:
@@ -325,7 +342,7 @@ class MotionControl:
                         or any(binding.get(k) != v for k, v in expected.items())):
                     raise ValueError('motion_control_execution_binding_mismatch')
             self.start()
-            return self.info()
+            return {**self.info(), 'execution_state': self.gate.state, 'state': 'ready'}
         if action == 'calibrate':
             self.start()
             return self.calibrate()
@@ -359,6 +376,11 @@ class MotionControl:
             if action in ('release', 'stop', 'end_operator_session'):
                 self._preview = None
                 self._preview_state = 'idle'
+                if action == 'stop':
+                    self.stop()
+                    if self.gate.session_id:
+                        # A concurrent legacy claimant still owns the shared gate.
+                        return self.info()
                 return {'state': 'idle', 'stop_confirmed': True, 'ownership_held': False, 'preview': True}
             self._preview_state = 'hold'
             return {**self.info(), 'hold_confirmed': True}
@@ -385,6 +407,11 @@ class MotionControl:
             self._preview = None
             if action in ('stop', 'release'):
                 self._finish_cancel.set()
+            if action == 'stop':
+                self.stop()
+                # Stopping the IK card must not stop the shared feedback/watchdog.
+                # Its real hold/fault remains visible until ownership is released.
+                result = self.info()
         if not result.get('error') and action in ('claim', 'resume'):
             with self._lock:
                 changed = self._live_session != result['session_id']
@@ -398,6 +425,8 @@ class MotionControl:
 
     def receive_eef(self, packet):
         with self._lock:
+            if self._closed.is_set():
+                raise ValueError('motion_control_stopped')
             lease = self._lease()
             body = validate(packet, lease, mode='eef_pose', now=self.gate.clock(),
                 previous_seq=self._last_seq, previous_epoch=self._last_epoch, **self.versions)
@@ -419,6 +448,8 @@ class MotionControl:
 
     def receive_joint(self, packet):
         with self._lock:
+            if self._closed.is_set():
+                raise ValueError('motion_control_stopped')
             if self._preview:
                 raise ValueError('preview_cannot_execute')
             lease = self._lease()

@@ -28,7 +28,9 @@ QEMU 构建曾出现库文件存在、ELF 与编译器均为 AArch64、查找路
 
 镜像体积核验（2026-09-22）：registry 中 `release.260922.2255037` 的压缩层合计 **341,727,193 B**；其前 15 层与基础镜像 `sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f` 完全一致，基础层合计 **261,578,370 B**。该成功版本曾额外复制 audio_msgs（独立层 **743 B**）并与两个厂商包一起重编译（三包共同层 **6,754,542 B**）；后者不能全部计为 audio_msgs 增量。此前日志/overlay 修复已移除冗余副本和编译；下述三段架构迁移另外增加了锁定的数值依赖，不能沿用此前体积结论。由于前一失败版本没有可比成功镜像，新版本净体积变化需按新 manifest 实测，不声称“零增量”。此前日志修复只复用镜像已有 common。新 motion_control 的 NumPy/SciPy/Pinocchio 及 cmeel ABI 依赖由 tianyi_motion/requirements.lock 固定并验证哈希，必须另行构建并记录真实体积。
 
-ActuCore 使用配套主仓的普通 bundle 构建入口和遥操依赖，不沿用早期独立服务示例。Jetson 部署使用主仓 `deploy/build_actucore.sh --jp-version 6.1 --with-teleop`，具体镜像和设备架构由实际部署选择。该主仓脚本在配置仓库凭据时还会推送，使用前应核对其发布设置与授权。不能把 Jetson 产物当作 x86/G1 通用镜像。
+最新 `fc06778` 对应 bot 合并构建 `release.260922.78af409` 已通过，远端 ARM64 manifest 压缩层合计 **458,335,542 B**；与前述 `2255037` 相比净增 **116,608,349 B**，前 18 层相同。锁定数值依赖单层为 **116,854,261 B 压缩**；本机同源码镜像的该层为 **578,891,776 B 未压缩**，两种口径不能混用。这是 IK 从 ActuCore 移入 Driver 的直接成本：Pinocchio 解析 URDF/执行 FK，SciPy 与 NumPy 完成求解，cmeel 固定 ARM64 几何与 URDF ABI。既有 ROS/audio 基础镜像不提供这套版本；把它加入共享 base 会让无 IK 的其他 Driver 也承担体积。依赖保留在组件的 `tianyi_motion/requirements.in` 与带哈希 lock 中，G1 legacy 兼容暂不移除 ActuCore 数值栈，不宣称跨容器依赖零重复。
+
+ActuCore 使用配套主仓的普通 bundle 构建入口和遥操依赖，不沿用早期独立服务示例。Jetson 部署使用主仓 `deploy/build_actucore.sh --jp-version 6.1`，具体镜像和设备架构由实际部署选择。该主仓脚本在配置仓库凭据时还会推送，使用前应核对其发布设置与授权。不能把 Jetson 产物当作 x86/G1 通用镜像。
 
 ## Driver 配置
 

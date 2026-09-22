@@ -81,14 +81,16 @@ IK 每次最多 100 ms；关节报文生成时间为求解完成时，期限取�
 
 | 动作 | 返回及副作用 |
 |---|---|
-| info / start | 状态/描述符；start只准备总线与数值线程 |
+| info | 实际执行状态和接口描述符 |
+| start | 只准备总线与数值线程，返回 state=ready；execution_state 单独保留执行器状态，不 claim |
 | config | 空闲时验证并导入标定路径和速度；不驱动硬件，不改写标定文件 |
 | calibrate | 使用 Driver 本地文件；返回 calibrated、model_version、calibration_version、frame、effector_ids、eef_snapshot；持有执行权时拒绝 |
 | prepare_preview | 返回 boot_id/session_id/secret/preview:true 与版本；不 claim、不发布厂商命令 |
 | prepare_operator_session | 复用既有实测体位与验收准备，不 claim |
 | claim / resume | 获取/更新共享执行租约，沿用 request_id/request_valid_until_ns 幂等管理 |
 | pause / recoverable_hold | 保持；求解失败后仅新有效帧可在实测保持确认后续接 |
-| release / stop | 取消未完成输入/收臂，等待实际保持后释放；不能以停止发布充当成功 |
+| release | 取消未完成输入/收臂，等待实际保持后释放；保留卡片工作线程 |
+| stop | 按相同执行权规则请求保持及释放，并取消、等待本卡求解/收臂线程退出；共享反馈与看门狗继续运行 |
 | end_operator_session | 无执行权后清理准备状态 |
 | finish | 异步受理收臂，返回 operation_id、state、return_completed、authority_released |
 | finish_status | 可按 operation_id 查询；失败有 error/code，成功必须真实归零稳定并释放 |
@@ -96,6 +98,12 @@ IK 每次最多 100 ms；关节报文生成时间为求解完成时，期限取�
 框架在 Preview 下调用无密钥 stop/end_operator_session 只清理零输出会话；Live
 持有执行权时仍须正确密钥，不能借框架入口抢占。持续 finish 请求返回同一个
 任务；失败后显式重试才重新进入收臂，失败状态不假装完成。
+
+`stop` 后拒绝新连续输入，必须再次 `start` 或显式准备会话才能恢复卡片。
+线程未能退出时返回 `motion_control_thread_stop_unconfirmed`，不允许静默重启。
+软件线程退出不代表硬件已停止：实际控制权仍持有或停止未确认时继续返回 hold/fault，
+不伪报 idle；普通 pause/recoverable_hold 不关闭卡片。非法 JSON、非对象报文或
+错误的嵌套路由类型被拒绝，接收循环继续处理后续新帧。
 
 反馈保留既有实测位置、速度、时效、所有权、停止确认与诊断，追加：
 
@@ -109,7 +117,7 @@ Preview 的 ownership_held/output_active 恒为 false；hold_confirmed 仅指零
 
 ## 验证边界
 
-`tests/test_motion_control.py` 使用真实求解和门禁、独立有限速度 plant；实测 q
+`tests/test_motion_control.py` 与 `tests/test_motion_control_lifecycle.py` 使用真实求解和门禁、独立有限速度 plant；实测 q
 不会被目标发布直接覆盖。新增测试不连接机器人。实际 ARM64 构建、DDS
 跨进程延迟、Canvas+PICO 使用与新架构的真机跟随/收臂需单独验收，不沿用旧
 架构物理证据冒充已通过。跟随误差如实记录，不增加通过门槛或累计行程上限。
