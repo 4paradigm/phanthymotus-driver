@@ -13,7 +13,7 @@
  *     ② 回退:getRectStereoFrame 的 left/right(LONGLAT 矫正对)转灰度 → 自建
  *        cv::StereoBM(32,9) 算视差 → getCalibParams() 内参构造 Q 矩阵 →
  *        reprojectImageTo3D 反投影(针孔近似,兜底可用)。
- *   两路都做:有限值过滤 + Z∈[0.2,5.0]m 范围过滤 + stride 抽稀。
+ *   两路都做:有限值过滤 + Z∈[0.2,3.5]m 范围过滤 + 超过 40000 点自适应抽稀。
  *
  * ★ 相机初始化:必须走 UnitreeCamera(config_file)(会加载立体标定,深度/点云才出得来)。
  * ★ 热切:相机"客户端连上才开、断开就释放"。
@@ -24,7 +24,7 @@
  *            payload = [4字节大端 numPoints][numPoints × 3 × float32 (小端, x/y/z 米,相机系)]
  *
  * 用法:pointcloud_stream <port> <device_id> [stride]
- *   例:./bins/pointcloud_stream 9401 1 4      # front(dev1),端口 9401,抽稀 4
+ *   例:./bins/pointcloud_stream 9401 1 1      # front(dev1),端口 9401,全采样(自适应抽稀兜底)
  */
 #include <UnitreeCameraSDK.hpp>
 #include <opencv2/opencv.hpp>
@@ -48,8 +48,13 @@ static const float CY_DEFAULT = 178.71f;
 static const float TX_DEFAULT = 0.02443f;  // 基线(m)
 
 // 有效深度范围(米):过滤视差无效点(背景/遮挡/噪声)。
+// ★ 前端渲染器上限 40000 点;raw 185,600 点(464×400)若 stride=1 全发会超限。
+//   方案:Z 上限收紧到 3.5m(远场立体匹配噪声大、点也最密),nano 端先按面积
+//   比例目标 40000 自适应抽稀(stride=1 时 ≈1/5),近处密度优先保留。
 static const float Z_MIN = 0.2f;
-static const float Z_MAX = 5.0f;
+static const float Z_MAX = 3.5f;
+// 单帧目标点数上限(发送前自适应抽稀到此值以下)。
+static const size_t TARGET_POINTS = 40000;
 
 static bool send_all(int fd, const uint8_t *p, size_t n) {
     size_t sent = 0;
@@ -135,9 +140,21 @@ static void disp_to_xyz(const cv::Mat &disp, const cv::Mat &Q, int stride,
     }
 }
 
-// 发送一帧 xyz(米,相机系)。
-static bool send_frame(int cli, const std::vector<float> &xyz) {
-    uint32_t numPoints = (uint32_t)(xyz.size() / 3);
+// 发送一帧 xyz(米,相机系)。超过 TARGET_POINTS 时等距抽稀到上限以内
+// (渲染器 MAX_POINTS=40000,超限点会被丢弃,不如均匀保留)。
+static bool send_frame(int cli, std::vector<float> &xyz) {
+    size_t n = xyz.size() / 3;
+    if (n > TARGET_POINTS) {
+        size_t step = (n + TARGET_POINTS - 1) / TARGET_POINTS;   // ceil
+        size_t w = 0;
+        for (size_t i = 0; i < n; i += step) {
+            for (int k = 0; k < 3; ++k) xyz[w * 3 + k] = xyz[i * 3 + k];
+            ++w;
+        }
+        xyz.resize(w * 3);
+        n = w;
+    }
+    uint32_t numPoints = (uint32_t)n;
     uint32_t payloadLen = 4 + numPoints * 12;
     uint32_t beTotal = htonl(payloadLen);
     uint32_t beCount = htonl(numPoints);
@@ -303,7 +320,7 @@ int main(int argc, char *argv[]) {
     }
     int port      = atoi(argv[1]);
     int device_id = atoi(argv[2]);
-    int stride    = (argc > 3) ? atoi(argv[3]) : 4;
+    int stride    = (argc > 3) ? atoi(argv[3]) : 1;
     if (stride < 1) stride = 1;
     signal(SIGPIPE, SIG_IGN);
 

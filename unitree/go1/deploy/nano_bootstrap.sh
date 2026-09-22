@@ -69,15 +69,16 @@ if [ -f "$DEPLOY/camera/rgb_stream.cc" ] && [ -f "$DEPLOY/camera/nvjpeg_worker.c
         #   但抢相机/端口）。新路线服务名是 go1-rgb-<pos>，与旧名不冲突，这里只清旧的。
         bssh "$B" "echo $PW | sudo -S systemctl stop go1-camera-adapter.service go1-camera-adapter-front go1-camera-adapter-chin go1-camera-adapter-left go1-camera-adapter-right go1-camera-adapter-belly 2>/dev/null; echo $PW | sudo -S systemctl disable go1-camera-adapter.service go1-camera-adapter-front go1-camera-adapter-chin go1-camera-adapter-left go1-camera-adapter-right go1-camera-adapter-belly 2>/dev/null; true" 2>/dev/null
         log "camera: 在 $B 编 rgb_stream + 隔离 nvjpeg_worker(SDK=$SDK)…"
-        bssh "$B" "rm -f $SDK/bins/rgb_stream $SDK/bins/nvjpeg_worker" 2>/dev/null
+        # 编译缓存:两个源码都上传后,板上一次性判定"二进制在 且 双哈希匹配" → 跳过重编。
+        # rgb_stream 与 nvjpeg_worker 必须一起判定(编译链独立,但任一源码变化都要重编对应项)。
         bscp "$B" "$DEPLOY/camera/rgb_stream.cc" "$SDK/rgb_stream.cc" 2>/dev/null
         bscp "$B" "$DEPLOY/camera/nvjpeg_worker.cc" "$SDK/nvjpeg_worker.cc" 2>/dev/null
-        # 编法镜像 depth_stream：opencv4 用 pkg-config；.14 无 pkg-config → 显式 /usr/local + rpath。
-        # 🔴 /usr/local 回退必须链全 opencv 模块:SDK 的 libunitree_camera.a(StereoCameraCommon) 内部用
-        #   cv::VideoWriter(videoio)、cv::StereoSGBM/StereoBM(calib3d),只链 core/imgproc/imgcodecs 会
-        #   undefined reference → .14 编不过(left/right inactive)。pkg-config opencv4 自带全模块不受影响。
-        # rgb_stream 不链接 GStreamer，避免与 Unitree SDK 的 libjpeg ABI 冲突；独立 worker 才链接 nvjpegenc。
-        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; GST=\$(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 2>/dev/null); if [ -z \"\$GST\" ]; then echo missing-gstreamer-dev; exit 1; fi; g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/rgb_stream && g++ -O2 -std=c++14 -pthread nvjpeg_worker.cc \$GST -o bins/nvjpeg_worker 2>&1 | tail -8" 2>&1 | tail -8
+        CACHE_OK=$(bssh "$B" "cd $SDK && for n in rgb_stream nvjpeg_worker; do [ -x bins/\$n ] || exit 1; [ -f \$n.cc.sha256 ] || exit 1; [ \"\$(cat \$n.cc.sha256)\" = \"\$(sha256sum \$n.cc | awk '{print \$1}')\" ] || exit 1; done; echo yes" 2>/dev/null | tail -1)
+        if [ "$CACHE_OK" = "yes" ]; then
+          log "camera: $B rgb_stream+nvjpeg_worker 命中编译缓存,跳过重编。"
+        else
+          bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; GST=\$(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 2>/dev/null); if [ -z \"\$GST\" ]; then echo missing-gstreamer-dev; exit 1; fi; rm -f bins/rgb_stream bins/nvjpeg_worker && g++ -O2 -std=c++14 -pthread rgb_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/rgb_stream && g++ -O2 -std=c++14 -pthread nvjpeg_worker.cc \$GST -o bins/nvjpeg_worker && sha256sum rgb_stream.cc | awk '{print \$1}' > rgb_stream.cc.sha256 && sha256sum nvjpeg_worker.cc | awk '{print \$1}' > nvjpeg_worker.cc.sha256" 2>&1 | tail -8
+        fi
         CAM_DONE="$CAM_DONE $B"
         ;;
     esac
@@ -173,26 +174,36 @@ bscp(){ sshpass -p "$PW" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/
 PCL_DETECT='for d in $HOME/Unitree/sdk/UnitreeCameraSdk $HOME/UnitreecameraSDK $HOME/UnitreeCameraSDK; do [ -f "$d/include/UnitreeCameraSDK.hpp" ] && echo "$d" && break; done'
 
 if [ "${PCL_ENABLE}" = "1" ] && [ -f "$DEPLOY/camera/pointcloud_stream.cc" ]; then
-  PCL_DONE=""   # 本次已重编过的板(每板只编一次,但强制重编以匹配当前 .cc + 服务参数)
+  PCL_DONE=""   # 本次已处理过的板(每板只编译/判缓存一次)
   for row in "${PCL_ROWS[@]}"; do
     set -- $row; POS="$1"; B="$2"; DEVID="$3"; PORT="$4"
     if ! bssh "$B" 'echo ok' >/dev/null 2>&1; then log "point cloud: 板 $B 不可达 → 跳过 $POS"; continue; fi
     SDK=$(bssh "$B" "$PCL_DETECT" 2>/dev/null | tr -d '\r' | head -1)
     if [ -z "$SDK" ]; then log "point cloud: $B 无 UnitreeCameraSDK → 跳过 $POS"; continue; fi
-    # 本板首次:删旧二进制→强制重编。按 SDK 布局选编法:有 CMake build 用 CMake(SDK 自处理 opencv,
-    # .14/.15 的 ~/Unitree/sdk/UnitreeCameraSdk 用这个),否则 raw g++(.13 的 ~/UnitreecameraSDK)。
-    # 编失败则无二进制→下方跳过,绝不用陈旧/不匹配的二进制。
+    # 编译缓存:先传源码(按 SDK 布局选位置),板上"二进制在 且 源码哈希匹配" → 跳过重编;
+    # 不匹配才删旧重编,绝不沿用陈旧二进制。编法按 SDK 布局二选一:
+    # 有 CMake build 用 CMake(SDK 自处理 opencv,.14/.15 布局),否则 raw g++(.13 布局)。
     case " $PCL_DONE " in
       *" $B "*) : ;;
       *)
-        log "point cloud: 在 $B 编 pointcloud_stream(SDK=$SDK)…"
-        bssh "$B" "rm -f $SDK/bins/pointcloud_stream" 2>/dev/null
         if bssh "$B" "[ -d $SDK/build ] && [ -f $SDK/examples/CMakeLists.txt ]" 2>/dev/null; then
           bscp "$B" "$DEPLOY/camera/pointcloud_stream.cc" "$SDK/examples/pointcloud_stream.cc" 2>/dev/null
-          bssh "$B" "cd $SDK/examples && grep -q 'add_executable(pointcloud_stream' CMakeLists.txt || printf '\nadd_executable(pointcloud_stream ./pointcloud_stream.cc)\ntarget_link_libraries(pointcloud_stream \${SDKLIBS})\n' >> CMakeLists.txt; cd $SDK/build && cmake .. >/dev/null 2>&1 && make pointcloud_stream 2>&1 | tail -4" 2>&1 | tail -4
+          if bssh "$B" "[ -x $SDK/bins/pointcloud_stream ] && [ \"\$(cat $SDK/examples/pointcloud_stream.cc.sha256 2>/dev/null)\" = \"\$(sha256sum $SDK/examples/pointcloud_stream.cc | awk '{print \$1}')\" ]" 2>/dev/null; then
+            log "point cloud: $B 命中编译缓存,跳过重编。"
+          else
+            log "point cloud: 在 $B 编 pointcloud_stream(SDK=$SDK,CMake)…"
+            bssh "$B" "rm -f $SDK/bins/pointcloud_stream" 2>/dev/null
+            bssh "$B" "cd $SDK/examples && grep -q 'add_executable(pointcloud_stream' CMakeLists.txt || printf '\nadd_executable(pointcloud_stream ./pointcloud_stream.cc)\ntarget_link_libraries(pointcloud_stream \${SDKLIBS})\n' >> CMakeLists.txt; cd $SDK/build && cmake .. >/dev/null 2>&1 && make pointcloud_stream 2>&1 | tail -4; [ -x $SDK/bins/pointcloud_stream ] && sha256sum $SDK/examples/pointcloud_stream.cc | awk '{print \$1}' > $SDK/examples/pointcloud_stream.cc.sha256" 2>&1 | tail -4
+          fi
         else
           bscp "$B" "$DEPLOY/camera/pointcloud_stream.cc" "$SDK/pointcloud_stream.cc" 2>/dev/null
-          bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; g++ -O2 -std=c++14 -pthread pointcloud_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/pointcloud_stream 2>&1 | tail -6" 2>&1 | tail -6
+          if bssh "$B" "[ -x $SDK/bins/pointcloud_stream ] && [ \"\$(cat $SDK/pointcloud_stream.cc.sha256 2>/dev/null)\" = \"\$(sha256sum $SDK/pointcloud_stream.cc | awk '{print \$1}')\" ]" 2>/dev/null; then
+            log "point cloud: $B 命中编译缓存,跳过重编。"
+          else
+            log "point cloud: 在 $B 编 pointcloud_stream(SDK=$SDK)…"
+            bssh "$B" "rm -f $SDK/bins/pointcloud_stream" 2>/dev/null
+            bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); if [ -z \"\$OCV\" ]; then OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); fi; if [ -z \"\$OCV\" ] && [ -f /usr/local/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -lopencv_features2d -lopencv_flann -Wl,-rpath,/usr/local/lib\"; fi; if [ -z \"\$OCV\" ] && [ -f /usr/include/opencv4/opencv2/opencv.hpp ]; then OCV=\"-I/usr/include/opencv4 -L/usr/lib/aarch64-linux-gnu -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_calib3d -lopencv_videoio -lopencv_highgui -Wl,-rpath,/usr/lib/aarch64-linux-gnu\"; fi; g++ -O2 -std=c++14 -pthread pointcloud_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/pointcloud_stream && sha256sum pointcloud_stream.cc | awk '{print \$1}' > pointcloud_stream.cc.sha256" 2>&1 | tail -6
+          fi
         fi
         PCL_DONE="$PCL_DONE $B"
         ;;
@@ -210,7 +221,7 @@ After=network.target
 Type=simple
 User=unitree
 WorkingDirectory=$SDK
-ExecStart=$SDK/bins/pointcloud_stream $PORT $DEVID 2
+ExecStart=$SDK/bins/pointcloud_stream $PORT $DEVID 1
 Restart=always
 RestartSec=3
 [Install]
@@ -250,16 +261,20 @@ if [ "${DEPTH_ENABLE}" = "1" ] && [ -f "$DEPLOY/camera/depth_stream.cc" ]; then
     if ! bssh "$B" 'echo ok' >/dev/null 2>&1; then log "depth: 板 $B 不可达 → 跳过 $POS"; continue; fi
     SDK=$(bssh "$B" "$PCL_DETECT" 2>/dev/null | tr -d '\r' | head -1)
     if [ -z "$SDK" ]; then log "depth: $B 无 UnitreeCameraSDK → 跳过 $POS"; continue; fi
-    # 每块板首次:删旧二进制 → 强制重编(否则旧的崩溃版二进制会被沿用,修复装不上)。
+    # 编译缓存:先传源码,板上"二进制在 且 源码哈希匹配" → 跳过重编;不匹配才删旧重编。
     # opencv 探测:pkg-config opencv4 → opencv → 回退 /usr/local 并链该目录下全部 opencv 模块
     # (含 videoio,SDK 的 VideoWriter 需要;.14 无 opencv4.pc,靠这条兜底)。
     case " $DEPTH_DONE " in
       *" $B "*) : ;;
       *)
-        log "depth: 在 $B 编 depth_stream(SDK=$SDK)…"
-        bssh "$B" "rm -f $SDK/bins/depth_stream" 2>/dev/null
         bscp "$B" "$DEPLOY/camera/depth_stream.cc" "$SDK/depth_stream.cc" 2>/dev/null
-        bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -Wl,-rpath,/usr/local/lib \$(ls /usr/local/lib/libopencv_*.so 2>/dev/null | sed -E 's#.*/lib(opencv_[a-z0-9]+)\\.so#-l\\1#' | tr '\\n' ' ')\"; g++ -O2 -std=c++14 -pthread depth_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,-rpath,$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/depth_stream 2>&1 | tail -4" 2>&1 | tail -4
+        if bssh "$B" "[ -x $SDK/bins/depth_stream ] && [ \"\$(cat $SDK/depth_stream.cc.sha256 2>/dev/null)\" = \"\$(sha256sum $SDK/depth_stream.cc | awk '{print \$1}')\" ]" 2>/dev/null; then
+          log "depth: $B depth_stream 命中编译缓存,跳过重编。"
+        else
+          log "depth: 在 $B 编 depth_stream(SDK=$SDK)…"
+          bssh "$B" "rm -f $SDK/bins/depth_stream" 2>/dev/null
+          bssh "$B" "cd $SDK && mkdir -p bins && OCV=\$(pkg-config --cflags --libs opencv4 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\$(pkg-config --cflags --libs opencv 2>/dev/null); [ -z \"\$OCV\" ] && OCV=\"-I/usr/local/include/opencv4 -L/usr/local/lib -Wl,-rpath,/usr/local/lib \$(ls /usr/local/lib/libopencv_*.so 2>/dev/null | sed -E 's#.*/lib(opencv_[a-z0-9]+)\\.so#-l\\1#' | tr '\\n' ' ')\"; g++ -O2 -std=c++14 -pthread depth_stream.cc -I$SDK/include -I$SDK/thirdparty -L$SDK/lib/arm64 -Wl,-rpath,$SDK/lib/arm64 -Wl,--start-group -lunitree_camera -ltstc_V4L2_xu_camera -lsystemlog -ludev -Wl,--end-group \$OCV -o bins/depth_stream && sha256sum depth_stream.cc | awk '{print \$1}' > depth_stream.cc.sha256" 2>&1 | tail -4
+        fi
         DEPTH_DONE="$DEPTH_DONE $B"
         ;;
     esac
