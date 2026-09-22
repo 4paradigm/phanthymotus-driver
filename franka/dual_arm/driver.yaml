@@ -1,0 +1,18 @@
+id: franka-dual-arm-driver
+name: Franka dual arm (ROS 2 actions)
+category: driver
+hardware_provider: franka
+hardware_model: dual-arm
+image_name: franka-dual-arm
+port: 15741
+mcp_url: http://localhost:15741/mcp
+description: "Two independent Franka arm controllers: measured joints, quintic point-to-point trajectories, native cancellation and optional official Franka grippers. Requires configured franka_ros2 installation."
+build_context_extras:
+  - ../../common
+cards:
+  - {name: franka_left_state, type: sensor}
+  - {name: franka_right_state, type: sensor}
+  - {name: franka_left_arm, type: actuator}
+  - {name: franka_right_arm, type: actuator}
+  - {name: franka_left_gripper, type: actuator}
+  - {name: franka_right_gripper, type: actuator}

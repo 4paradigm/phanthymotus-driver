@@ -1,0 +1,17 @@
+franka-dual-arm:
+  container_name: embodied-franka-dual-arm
+  image: __IMAGE__
+  network_mode: host
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - ${FRANKA_CONFIG_PATH:-/opt/phanthy-motus/config/franka.yaml}:/work/config.yaml:ro
+    - ${FRANKA_CA_DIR:-/opt/phanthy-motus/data/certs}:/work/certs:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - ROS_LOCALHOST_ONLY=0
+    - PYTHONUNBUFFERED=1
+    - AGENT_CORE_URL=${AGENT_CORE_URL:-https://localhost:15678}
+    - AGENT_CORE_CA_CERT=/work/certs/cert.pem
+  restart: always
