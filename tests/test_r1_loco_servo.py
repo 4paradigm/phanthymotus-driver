@@ -129,7 +129,8 @@ def test_max_velocity_is_not_declared():
     acceleration cap and is the field that does the work here."""
     limits = loco_servo.build_descriptor()["limits"]
     assert "max_velocity" not in limits
-    assert limits["max_delta_per_step"][0] == loco_servo.VX_ACCEL
+    assert limits["max_delta_per_step"][0] == loco_servo._step_limit(
+        loco_servo.VX_ACCEL, loco_servo.MIN_VX)
 
 
 def test_unactuatable_axes_are_pinned_to_zero():
@@ -392,3 +393,33 @@ def test_the_descriptor_declares_the_robots_deadband():
 
 def test_the_deadband_does_not_break_descriptor_parsing():
     parse_descriptor(loco_servo.build_descriptor())
+
+
+def test_the_step_clamp_is_never_finer_than_the_deadband():
+    """An acceleration cap below the floor is dead time, not a cap.
+
+    The sink clamps the command the policy sends, so a 0.30 rad/s cap against a
+    1.0 rad/s floor ramps 0.30 → 0.60 → 0.90 → 1.0 and the robot executes none of
+    the first three. Three ticks of silence and then full speed, while every
+    layer reports success — that is the lurch.
+    """
+    limits = loco_servo.build_descriptor()["limits"]
+    for index, floor in enumerate(limits["min_magnitude"]):
+        assert limits["max_delta_per_step"][index] >= floor, (
+            f"axis {index} can be commanded in steps the robot cannot execute")
+
+
+def test_a_ramp_from_rest_reaches_an_executable_speed_on_its_first_step():
+    """The property the test above is really about, as the sink actually runs it."""
+    from common.control.sink import ControlSink
+
+    descriptor = loco_servo.build_descriptor()
+    floor = descriptor["limits"]["min_magnitude"][5]
+    applied = []
+    sink = ControlSink(parse_descriptor(descriptor),
+                       lambda values, _g=None: applied.append(values[5]))
+    for seq in range(1, 4):
+        sink.submit(_command([0.0, 0.0, 0.0, 0.0, 0.0, 1.5], seq=seq))
+    assert abs(applied[0]) >= floor, (
+        f"first step was {applied[0]:.2f} rad/s, under the {floor} floor — "
+        "the robot would stand still for it")
