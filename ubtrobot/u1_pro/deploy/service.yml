@@ -8,6 +8,9 @@ ubtrobot-u1-pro:
   volumes:
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /opt/phanthy-motus/secrets/ubtrobot/u1_pro:/run/ubtrobot-u1-pro-auth:ro
+    # Adapter-created IPC files are live runtime state, not persistent data.
+    - /tmp/robo/ipc:/tmp/robo/ipc
+    - /dev/shm:/dev/shm
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

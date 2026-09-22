@@ -31,6 +31,12 @@ BGRA/mono raw formats and rejects unknown encodings rather than publishing
 corrupt images. The video shared-memory path must be visible inside the driver
 container, as required by the vendor SDK deployment.
 
+The deployment shares the Adapter's live `/tmp/robo/ipc` directory and
+`/dev/shm` with the driver. These are runtime IPC resources, not persistent
+data: the Adapter recreates `video.stream`, `audio.stream`, and its socket
+after a restart. Do not copy these files to the data volume; keep the bind
+mounts present while both containers are running.
+
 Captured media is stored under `/opt/phanthy-motus/data/vision_capture/u1_pro`,
 which is mounted from the host by the deployment. `capture_image` returns a JPG
 path immediately after a fresh frame arrives. `record_video` returns an action ID

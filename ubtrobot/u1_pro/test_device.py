@@ -130,6 +130,12 @@ class FakeNodes:
 
 
 class U1CardContractTests(unittest.TestCase):
+    def test_deployment_shares_vendor_runtime_ipc(self):
+        service = Path(__file__).with_name("deploy") / "service.yml"
+        text = service.read_text()
+        self.assertIn("/tmp/robo/ipc:/tmp/robo/ipc", text)
+        self.assertIn("/dev/shm:/dev/shm", text)
+
     def test_stream_topics_match_robot_contract(self):
         import device
 
