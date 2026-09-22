@@ -64,6 +64,7 @@ COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
+COPY loco_servo.py /work/loco_servo.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

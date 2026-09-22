@@ -100,8 +100,22 @@ class R1DeviceBundle:
         if plugins_cfg.get("loco", {}).get("enabled", False):
             from device import LocoStatePlugin, LocoPlugin
             self._plugins.append(LocoStatePlugin(plugins_cfg["loco"], namespace, executor))
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client))
+            loco = LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client)
+            self._plugins.append(loco)
             print("[bundle] LocoStatePlugin + LocoPlugin loaded")
+
+            # The streaming counterpart to `loco`. Constructed here, right after
+            # it, because it needs a reference to `loco` to arbitrate over the
+            # chassis — and it must exist before SmartMotionPlugin below, which
+            # looks it up by PREFIX and would otherwise interrupt only half the
+            # ways this robot can be moving.
+            if plugins_cfg.get("loco_servo", {}).get("enabled", False):
+                from loco_servo import LocoServoPlugin
+                self._plugins.append(LocoServoPlugin(
+                    plugins_cfg["loco_servo"], namespace, executor, loco_client,
+                    loco_plugin=loco,
+                ))
+                print("[bundle] LocoServoPlugin loaded")
 
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
@@ -133,12 +147,16 @@ class R1DeviceBundle:
             from device import SmartMotionPlugin
             speaker_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'speaker'), None)
             loco_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'loco'), None)
+            servo_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'locoservo'), None)
             self._plugins.append(SmartMotionPlugin(
                 plugins_cfg.get("smart_motion", {}), namespace, executor,
                 speaker_plugin=speaker_plugin,
                 loco_plugin=loco_plugin,
+                loco_servo_plugin=servo_plugin,
             ))
-            print(f"[bundle] SmartMotionPlugin loaded (speaker={'yes' if speaker_plugin else 'no'}, loco={'yes' if loco_plugin else 'no'})")
+            print(f"[bundle] SmartMotionPlugin loaded (speaker={'yes' if speaker_plugin else 'no'}, "
+                  f"loco={'yes' if loco_plugin else 'no'}, "
+                  f"loco_servo={'yes' if servo_plugin else 'no'})")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
