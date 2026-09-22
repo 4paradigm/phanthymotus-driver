@@ -84,6 +84,9 @@ MAX_OBS_AGE_MS = 500
 # or mid-transition.
 STANDING_FSM = 811
 
+# How long an FSM reading stays good for. See `_posture_problem`.
+FSM_CACHE_S = 1.0
+
 AXIS_NAMES = ["vx", "vy", "vz", "wx", "wy", "wz"]
 DOF = 6
 
@@ -139,7 +142,8 @@ class LocoServoPlugin:
         # is wire it up and watch, and a card that drives a chassis the first time
         # it is connected is the wrong default for that.
         self._dry_run = bool(config.get("dry_run", True))
-        # Whether to refuse starting unless the robot is standing. Configurable
+        # Whether a command requires the robot to be standing. Checked per
+        # command rather than at start — see `_posture_problem`. Configurable
         # only because a bench with no chassis attached cannot reach FSM 811.
         self._require_standing = bool(config.get("require_standing", True))
 
@@ -156,6 +160,10 @@ class LocoServoPlugin:
         self._last_command = None
         self._applied = 0
         self._holds = 0
+        self._refused = 0
+        self._fsm_problem = ""
+        # -inf rather than 0: the first command must actually read the FSM.
+        self._fsm_checked_at = float("-inf")
 
         if loco_plugin is not None and hasattr(loco_plugin, "attach_servo"):
             # Lets `loco.move` pause this card before it touches the chassis.
@@ -244,10 +252,6 @@ class LocoServoPlugin:
         if conflict:
             return {"state": "error", "message": conflict}
 
-        posture = self._posture_problem()
-        if posture:
-            return {"state": "error", "message": posture}
-
         if self._executor is None:
             return {"state": "error", "message": "没有 ROS 上下文，无法订阅"}
 
@@ -334,6 +338,11 @@ class LocoServoPlugin:
                 "dry_run": self._dry_run,
                 "applied": self._applied,
                 "holds": self._holds,
+                "refused": self._refused,
+                # Empty when the posture is fine. A card that is subscribed and
+                # running but refusing every command looks identical from the
+                # canvas to one that is working, and this is the difference.
+                "posture_problem": self._fsm_problem,
                 "last": self._last_command,
                 "control_interface": self._descriptor_raw,
             }
@@ -354,19 +363,46 @@ class LocoServoPlugin:
         return ""
 
     def _posture_problem(self) -> str:
+        """Why this chassis must not be driven right now, or "".
+
+        **Checked per command, not at start.** Starting is a wiring event: a
+        project comes up when someone opens the canvas, and the robot is very
+        often lying down at that moment. Refusing to start then blocks the whole
+        canvas — every other card with it — over a posture that says nothing
+        about whether the wiring is right. It was also, in practice, simply
+        wrong about the future: by the time a command arrives the robot may well
+        have stood up, and by the time it *has* started the robot may have lain
+        down again. Only the moment of the command can answer this.
+
+        Cached, because at `expected_hz` an RPC per command would put a
+        round-trip to the robot's own controller in the path of every velocity.
+        The window is short enough that a posture change is noticed within a few
+        commands, which is far inside the driver's own reaction time.
+        """
         if not self._require_standing:
             return ""
+
+        now = time.monotonic()
+        if now - self._fsm_checked_at < FSM_CACHE_S:
+            return self._fsm_problem
+
+        self._fsm_checked_at = now
         try:
             code, fsm = self._client.GetFsmId()
         except Exception as exc:                              # noqa: BLE001
-            return f"读不到 FSM 状态（{exc}），拒绝启动"
-        if code != 0:
-            return (f"读不到 FSM 状态（code={code}），拒绝启动 —— "
-                    "在未知姿态下开始收速度流是最糟的一种启动")
-        if fsm != STANDING_FSM:
-            return (f"机器人当前 FSM={fsm}，不是 loco_mode({STANDING_FSM})。"
-                    "请先用 switch_mode 的 lie2standup 让它站起来。")
-        return ""
+            self._fsm_problem = f"读不到 FSM 状态（{exc}）"
+        else:
+            if code != 0:
+                # Acting on a failed read is how a "safe" call becomes a fall —
+                # the same rule `switch_mode` already follows.
+                self._fsm_problem = f"读不到 FSM 状态（code={code}）"
+            elif fsm != STANDING_FSM:
+                self._fsm_problem = (
+                    f"机器人当前 FSM={fsm}，不是 loco_mode({STANDING_FSM})，"
+                    "不执行速度指令。请先用 switch_mode 的 lie2standup 让它站起来")
+            else:
+                self._fsm_problem = ""
+        return self._fsm_problem
 
     def pause_for_explicit_command(self, reason: str = "") -> bool:
         """Called by `loco` before it drives the chassis itself.
@@ -420,6 +456,22 @@ class LocoServoPlugin:
 
     def _apply(self, values, _gripper=None):
         vx, vy, wz = float(values[0]), float(values[1]), float(values[5])
+
+        # The posture gate lives here, on the command, not on `start`.
+        posture = self._posture_problem()
+        if posture:
+            self._refused += 1
+            # Announced on the transition only. At `expected_hz` a line per
+            # refused command would bury every other log the robot produces,
+            # and the first one already says everything the rest would.
+            if self._refused == 1 or self._refused % 100 == 0:
+                print(f"[loco_servo] 拒绝执行（第 {self._refused} 条）：{posture}",
+                      flush=True)
+            self._last_command = {"verdict": "REFUSED", "reason": posture,
+                                  "at": time.time()}
+            return
+
+        self._refused = 0
         self._applied += 1
         if self._dry_run:
             print(f"[loco_servo] DRY RUN Move(vx={vx:+.3f}, vy={vy:+.3f}, "
