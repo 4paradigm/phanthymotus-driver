@@ -6,7 +6,7 @@ hardware_model: dual-arm
 image_name: franka-dual-arm
 port: 15741
 mcp_url: http://localhost:15741/mcp
-description: "Left and right FR3 controllers: measured joints, quintic point-to-point trajectories, native cancellation and optional official Franka grippers. Requires configured franka_ros2 installation."
+description: "Left/right FR3 joint trajectories, cancellation, optional grippers and timestamped ROS 2 telemetry: measured/desired joints, TCP and estimated wrench. Requires configured franka_ros2 installation."
 build_context_extras:
   - ../../common
 cards:

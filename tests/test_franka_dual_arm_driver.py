@@ -246,15 +246,17 @@ def test_gripper_width_converted_to_single_finger_position():
     assert sent[0].command.max_effort == 12.
 
 
-def test_measured_state_reorders_joint_names_and_ignores_partial_packet():
+def test_measured_state_reorders_joint_names_and_invalidates_partial_packet():
     import threading
     hw = object.__new__(hardware.RosArm)
     hw.joints = [f"j{i}" for i in range(7)]
     hw._lock, hw._sample, hw._received = threading.Lock(), None, 0.
+    hw._samples, hw._sample_errors, hw._sequence = {}, {}, 0
     hw._state(SimpleNamespace(name=list(reversed(hw.joints)), position=list(range(7)), velocity=[0.] * 7))
     assert hw.state()["position"] == list(reversed(range(7)))
     hw._state(SimpleNamespace(name=["j0"], position=[99], velocity=[0]))
-    assert hw.state()["position"] == list(reversed(range(7)))
+    with pytest.raises(RuntimeError, match="fresh"):
+        hw.state()
     hw._received = 0.
     with pytest.raises(RuntimeError, match="fresh"):
         hw.state()
@@ -323,3 +325,135 @@ def test_mcp_http_initialize_list_read_and_invalid_motion(plugin):
         server.shutdown()
         server.server_close()
         worker.join(timeout=1)
+
+
+def telemetry_arm():
+    import threading
+    hw = object.__new__(hardware.RosArm)
+    hw.joints = [f"j{i}" for i in range(7)]
+    hw._lock, hw._sample, hw._received = threading.Lock(), None, 0.
+    hw._samples, hw._sample_errors, hw._sequence = {}, {}, 0
+    return hw
+
+
+def joint_message(**kwargs):
+    fields = {"name": [f"j{i}" for i in range(7)], "position": [.1] * 7,
+              "velocity": [0.] * 7, "effort": [2.] * 7,
+              "header": SimpleNamespace(stamp=SimpleNamespace(sec=12, nanosec=34), frame_id="left_base")}
+    return SimpleNamespace(**{**fields, **kwargs})
+
+
+def test_telemetry_preserves_source_stamp_effort_and_receipt_age():
+    hw = telemetry_arm()
+    hw._state(joint_message())
+    sample = hw.state()
+    assert sample["source_stamp_ns"] == 12_000_000_034
+    assert sample["frame_id"] == "left_base" and sample["effort"] == [2.] * 7
+    assert sample["received_at_ns"] > 12_000_000_034
+    first = hw.telemetry()["measured"]["sample"]
+    second = hw.telemetry()["measured"]["sample"]
+    assert first == second  # Publishing does not manufacture a new source sample.
+    hw._samples["measured"]["received_monotonic_ns"] -= 1_000_000_000
+    assert hw.telemetry()["measured"]["sample"] is None
+    assert not hw.telemetry()["measured"]["fresh"]
+
+
+def test_optional_effort_and_missing_channels_are_not_zero_filled():
+    hw = telemetry_arm()
+    hw._state(joint_message(effort=[]))
+    assert hw.state()["effort"] is None
+    for name in ("desired", "eef_pose", "external_wrench"):
+        assert hw.telemetry()[name]["sample"] is None
+    hw._state(joint_message(effort=[float("nan")] * 7))
+    assert hw.telemetry()["measured"]["error"]
+    with pytest.raises(RuntimeError, match="fresh"):
+        hw.state()
+
+
+def test_desired_and_measured_samples_remain_separate():
+    hw = telemetry_arm()
+    hw._state(joint_message(position=[.1] * 7))
+    hw._desired_state(joint_message(position=[.2] * 7))
+    output = hw.telemetry()
+    assert output["measured"]["sample"]["position"] == [.1] * 7
+    assert output["desired"]["sample"]["position"] == [.2] * 7
+
+
+def test_pose_wrench_frames_and_invalid_quaternion():
+    hw = telemetry_arm()
+    header = joint_message().header
+    pose = SimpleNamespace(header=header, pose=SimpleNamespace(
+        position=SimpleNamespace(x=.1, y=.2, z=.3),
+        orientation=SimpleNamespace(x=0., y=0., z=0., w=1.)))
+    hw._pose(pose)
+    assert hw.telemetry()["eef_pose"]["sample"]["quaternion_xyzw"] == [0., 0., 0., 1.]
+    hw._wrench(SimpleNamespace(header=header, wrench=SimpleNamespace(
+        force=SimpleNamespace(x=1., y=2., z=3.), torque=SimpleNamespace(x=4., y=5., z=6.))))
+    sample = hw.telemetry()["external_wrench"]["sample"]
+    assert sample["frame_id"] == "left_base" and sample["force_n"] == [1., 2., 3.]
+    pose.pose.orientation.w = 0.
+    hw._pose(pose)
+    assert hw.telemetry()["eef_pose"]["sample"] is None
+
+
+def test_ros_telemetry_publish_pause_resume_and_teardown(plugin):
+    import json
+    p, hw = plugin
+    for side, arm in hw.items():
+        arm.telemetry = lambda side=side: {"measured": {"sample": {"side": side}}}
+    nodes = []
+    class Node:
+        def __init__(self, *args, **kwargs):
+            self.messages, self.destroyed = {}, False
+            nodes.append(self)
+        def create_publisher(self, kind, topic, qos):
+            self.messages[topic] = []
+            return SimpleNamespace(publish=lambda message: self.messages[topic].append(json.loads(message.data)))
+        def create_timer(self, period, callback):
+            self.period, self.tick = period, callback
+        def destroy_node(self):
+            self.destroyed = True
+    executor = SimpleNamespace(add_node=lambda n: None, remove_node=lambda n: None)
+    p._ros2 = SimpleNamespace(ctx_core=None, executor_core=executor)
+    modules = {"rclpy.node": SimpleNamespace(Node=Node),
+               "rclpy.qos": SimpleNamespace(qos_profile_sensor_data=None),
+               "std_msgs.msg": SimpleNamespace(String=SimpleNamespace)}
+    with patch.dict(sys.modules, modules):
+        p.start()
+        nodes[0].tick()
+        left, right = p._topics["left"], p._topics["right"]
+        assert nodes[0].messages[left][0]["observations"]["measured"]["sample"]["side"] == "left"
+        assert nodes[0].messages[right][0]["side"] == "right"
+        p.dispatch("stop", {"_tool_name": "franka_left_state"})
+        nodes[0].tick()
+        assert len(nodes[0].messages[left]) == 1 and len(nodes[0].messages[right]) == 2
+        assert not hw["left"].commands
+        p.dispatch("start", {"_tool_name": "franka_left_state"})
+        nodes[0].tick()
+        assert len(nodes) == 1 and len(nodes[0].messages[left]) == 2
+        p.stop()
+        nodes[0].tick()
+        assert nodes[0].destroyed and hw["left"].closed == 1
+
+
+def test_goal_telemetry_is_a_request_not_measured_position(plugin):
+    p, hw = plugin
+    result = p.dispatch("move", {"_tool_name": "franka_left_arm", "joint": [.1] * 7, "duration": 2.})
+    slot = p.motions["franka_left_arm"]
+    info = slot.info()
+    assert info["goal"]["target"] == [.1] * 7 and info["accepted_at_ns"] is None
+    assert info["submitted_at_ns"]
+    handle = Handle()
+    hw["left"].submission.set_result(handle)
+    assert slot.info()["accepted_at_ns"] >= info["submitted_at_ns"]
+    terminal(handle)
+    last = slot.info()["last_completion"]
+    assert last["action_id"] == result["action_id"] and last["goal"]["target"] == [.1] * 7
+
+
+def test_duplicate_optional_telemetry_topics_rejected():
+    cfg = config()
+    cfg["arms"]["left"]["eef_pose_topic"] = "/same/current_pose"
+    cfg["arms"]["right"]["eef_pose_topic"] = "/same/current_pose"
+    with pytest.raises(ValueError, match="distinct"):
+        device.validate_config(cfg)

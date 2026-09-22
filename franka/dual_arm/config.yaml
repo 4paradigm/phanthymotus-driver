@@ -6,12 +6,18 @@ ros:
   core_domain_id: 42
 franka:
   motion_enabled: false
+  telemetry_hz: 20
   # Left and right FR3 arms; configure namespaces from the actual ROS graph.
   # These values do not identify or configure a native FR3 Duo installation.
   arms:
     left:
       trajectory_action: /left/fr3_arm_controller/follow_joint_trajectory
       joint_state_topic: /left/joint_states
+      # Standard convenience topics from official franka_robot_state_broadcaster.
+      # Leave optional topics empty if that broadcaster is not installed.
+      desired_joint_state_topic: /left/franka_robot_state_broadcaster/desired_joint_states
+      eef_pose_topic: /left/franka_robot_state_broadcaster/current_pose
+      external_wrench_topic: /left/franka_robot_state_broadcaster/external_wrench_in_base_frame
       joints: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
       # Required before enabling motion: actual joint limits and site limits.
       lower: []
@@ -23,6 +29,9 @@ franka:
     right:
       trajectory_action: /right/fr3_arm_controller/follow_joint_trajectory
       joint_state_topic: /right/joint_states
+      desired_joint_state_topic: /right/franka_robot_state_broadcaster/desired_joint_states
+      eef_pose_topic: /right/franka_robot_state_broadcaster/current_pose
+      external_wrench_topic: /right/franka_robot_state_broadcaster/external_wrench_in_base_frame
       joints: [fr3_joint1, fr3_joint2, fr3_joint3, fr3_joint4, fr3_joint5, fr3_joint6, fr3_joint7]
       lower: []
       upper: []

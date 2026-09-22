@@ -28,6 +28,7 @@ def vector(value, name):
 
 
 def validate_config(config):
+    number(config.get("telemetry_hz", 20), "telemetry_hz", 1, 100)
     arms = config.get("arms", {})
     if set(arms) != {"left", "right"}:
         raise ValueError("configure exactly left and right arms")
@@ -43,6 +44,9 @@ def validate_config(config):
                 raise ValueError(f"{side}: configure an absolute {key}")
         endpoints.append(arm["trajectory_action"])
         topics.append(arm["joint_state_topic"])
+        for key in ("desired_joint_state_topic", "eef_pose_topic", "external_wrench_topic"):
+            if arm.get(key) and (not isinstance(arm[key], str) or not arm[key].startswith("/")):
+                raise ValueError(f"{side}: {key} must be an absolute ROS topic")
         if config.get("motion_enabled") is True:
             for key in ("lower", "upper", "max_velocity", "max_acceleration"):
                 vector(arm.get(key), key)
@@ -57,6 +61,9 @@ def validate_config(config):
             number(arm.get("gripper_max_force"), "gripper_max_force", .1, 200)
     if len(set(endpoints)) != len(endpoints) or len(set(topics)) != 2:
         raise ValueError("left/right endpoints and state topics must be distinct")
+    for key in ("desired_joint_state_topic", "eef_pose_topic", "external_wrench_topic"):
+        if arms["left"].get(key) and arms["left"][key] == arms["right"].get(key):
+            raise ValueError(f"left/right {key} must be distinct")
 
 
 def complete(action_id, status, result, tool_name):
@@ -90,7 +97,8 @@ class Motion:
             if not self.hardware.ready(self.kind):
                 raise RuntimeError("configured action server is unavailable")
             record = {"action_id": uuid4().hex, "handle": None, "cancel": False,
-                      "state": "awaiting_acceptance", "timer": None}
+                      "state": "awaiting_acceptance", "timer": None,
+                      "goal": copy.deepcopy(command), "submitted_at_ns": time.time_ns()}
             self.active = record
             # Keep the reservation on send failure: submission can have reached
             # the server before transport failure; do not authorize another move.
@@ -118,6 +126,7 @@ class Motion:
                     self._finish(record, "failed", "controller rejected goal")
                     return
                 record["handle"] = handle
+                record["accepted_at_ns"] = time.time_ns()
                 record["state"] = "running"
                 handle.get_result_async().add_done_callback(lambda future: self._result(record, future))
                 if record["cancel"] and self.active is record:
@@ -192,7 +201,9 @@ class Motion:
             record["timer"].cancel()
         self.active = None
         self.last = {"action_id": record["action_id"], "status": status,
-                     "result": {"reason": reason}, "callback": "pending"}
+                     "result": {"reason": reason}, "callback": "pending",
+                     "goal": record["goal"], "submitted_at_ns": record["submitted_at_ns"],
+                     "completed_at_ns": time.time_ns()}
         report = self.last
         threading.Thread(target=self._report, args=(report,), daemon=True).start()
 
@@ -209,15 +220,25 @@ class Motion:
         with self.lock:
             return {"state": self.active["state"] if self.active else "idle",
                     "action_id": self.active["action_id"] if self.active else None,
+                    "goal": copy.deepcopy(self.active["goal"]) if self.active else None,
+                    "submitted_at_ns": self.active["submitted_at_ns"] if self.active else None,
+                    "accepted_at_ns": self.active.get("accepted_at_ns") if self.active else None,
                     "last_completion": copy.deepcopy(self.last)}
 
 
 class FrankaPlugin:
-    def __init__(self, config, hardware, callback=complete):
+    def __init__(self, config, hardware, callback=complete, *, ros2=None, namespace="franka"):
         validate_config(config)
         self.cfg, self.hardware = config, hardware
         self._lock = threading.RLock()
         self._closed = False
+        self._ros2 = ros2
+        self._telemetry_node = None
+        self._publishers = {}
+        self._stream_sides = set()
+        self._telemetry_errors = {}
+        self._topics = {side: f"/{namespace.strip('/') or 'franka'}/franka/{side}/state"
+                        for side in ("left", "right")}
         self.motions = {}
         for side, hw in hardware.items():
             self.motions[f"franka_{side}_arm"] = Motion(hw, "arm", f"franka_{side}_arm", callback)
@@ -226,13 +247,58 @@ class FrankaPlugin:
                 self.motions[name] = Motion(hw, "gripper", name, callback)
 
     def start(self):
-        pass  # Connecting ROS endpoints must never home or move a robot.
+        # Read-only telemetry never homes or moves a robot.
+        with self._lock:
+            if self._closed or self._telemetry_node is not None or self._ros2 is None:
+                return
+            from rclpy.node import Node
+            from rclpy.qos import qos_profile_sensor_data
+            from std_msgs.msg import String
+            self._message_type = String
+            node = Node("franka_telemetry", context=self._ros2.ctx_core)
+            self._publishers = {side: node.create_publisher(String, topic, qos_profile_sensor_data)
+                                for side, topic in self._topics.items()}
+            node.create_timer(1 / self.cfg.get("telemetry_hz", 20), self._publish_telemetry)
+            self._telemetry_node = node
+            self._stream_sides.update(("left", "right"))
+            self._ros2.executor_core.add_node(node)
+
+    def snapshot(self, side):
+        observations = self.hardware[side].telemetry()
+        # These channels have independent source timestamps. A JSON envelope is
+        # not evidence of a synchronized sensor acquisition.
+        return {"format": "data/json", "timestamp_ms": time.time_ns() // 1_000_000,
+                "side": side, "units": {"position": "rad", "velocity": "rad/s", "effort": "Nm"},
+                "observations": observations, "motion": self.motions[f"franka_{side}_arm"].info(),
+                "gripper": (self.motions[f"franka_{side}_gripper"].info()
+                            if f"franka_{side}_gripper" in self.motions else None)}
+
+    def _publish_telemetry(self):
+        with self._lock:
+            if self._closed:
+                return
+            for side in self._stream_sides:
+                try:
+                    message = self._message_type()
+                    message.data = json.dumps(self.snapshot(side), allow_nan=False)
+                    self._publishers[side].publish(message)
+                    self._telemetry_errors.pop(side, None)
+                except Exception:
+                    self._telemetry_errors[side] = "telemetry unavailable"
+
+    def _topic_out(self, side):
+        return [{"topic": self._topics[side], "format": "data/json"}]
 
     def stop(self):
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            self._stream_sides.clear()
+            if self._telemetry_node is not None:
+                self._ros2.executor_core.remove_node(self._telemetry_node)
+                self._telemetry_node.destroy_node()
+                self._telemetry_node = None
             for motion in self.motions.values():
                 with motion.lock:
                     motion.closed = True
@@ -251,9 +317,11 @@ class FrankaPlugin:
         for side in ("left", "right"):
             definitions.append(tool(f"franka_{side}_state", "sensor", f"{side} measured joints (rad, rad/s)",
                                     action_schema({"get": ([], "Read fresh measured state"),
-                                                   "start": ([], "Read measured state"),
-                                                   "stop": ([], "Stop reading"),
-                                                   "info": ([], "Controller availability")}, {})))
+                                                   "start": ([], "Publish timed telemetry"),
+                                                   "stop": ([], "Pause telemetry; leave motion unchanged"),
+                                                   "diagnostics": ([], "Measured/desired joints, TCP, estimated wrench and goal status"),
+                                                   "info": ([], "Controller and stream availability")}, {}),
+                                    topic_out=self._topic_out(side)))
         for name, motion in self.motions.items():
             side = name.split("_")[1]
             arm = motion.kind == "arm"
@@ -279,12 +347,26 @@ class FrankaPlugin:
         side = name.split("_")[1]
         hw, cfg = self.hardware[side], self.cfg["arms"][side]
         if name.endswith("_state"):
-            if action in ("get", "start"):
+            if action == "get":
                 return hw.state()
+            if action == "diagnostics":
+                return self.snapshot(side)
+            if action == "start":
+                self.start()
+                with self._lock:
+                    if self._closed or self._telemetry_node is None:
+                        raise RuntimeError("ROS telemetry publisher unavailable")
+                    self._stream_sides.add(side)
+                    return {"state": "streaming", "topic_out": self._topic_out(side)}
             if action == "info":
-                return {"arm_controller_ready": hw.ready("arm"), "gripper_ready": hw.ready("gripper")}
+                with self._lock:
+                    return {"arm_controller_ready": hw.ready("arm"), "gripper_ready": hw.ready("gripper"),
+                            "streaming": side in self._stream_sides,
+                            "topic_out": self._topic_out(side), "publish_error": self._telemetry_errors.get(side)}
             if action == "stop":
-                return {"state": "idle"}
+                with self._lock:
+                    self._stream_sides.discard(side)
+                    return {"state": "idle"}
         motion = self.motions.get(name)
         if motion:
             if action in ("start", "info"):
@@ -327,4 +409,4 @@ def build_plugins(config, namespace, ros2):
     cfg = config["franka"]
     validate_config(cfg)
     hardware = {side: RosArm(ros2, arm, side) for side, arm in cfg["arms"].items()}
-    return [FrankaPlugin(cfg, hardware)]
+    return [FrankaPlugin(cfg, hardware, ros2=ros2, namespace=namespace)]

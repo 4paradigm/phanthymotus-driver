@@ -1,7 +1,7 @@
 FROM ros:humble-ros-base
 WORKDIR /work
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip ros-humble-control-msgs ros-humble-trajectory-msgs ros-humble-sensor-msgs \
+    python3-pip ros-humble-control-msgs ros-humble-trajectory-msgs ros-humble-sensor-msgs ros-humble-geometry-msgs \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt /work/
 RUN pip3 install --no-cache-dir -r requirements.txt
