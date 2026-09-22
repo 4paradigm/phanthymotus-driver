@@ -72,6 +72,20 @@ WZ_ACCEL = 0.30
 # rejects zero, and their real bound is the `lower == upper == 0` above anyway.
 PINNED_ACCEL = 1e-6
 
+# Below these the robot does nothing at all. Measured on r1_sz by commanding one
+# axis at a time: wz needs 1.0 rad/s, vx and vy need 0.4 m/s. Anything smaller
+# is accepted by the SDK, returns 0, and produces no motion whatsoever.
+#
+# A legged robot has to assemble a whole gait cycle to move, so there is no
+# "creep slowly" regime the way a wheeled base has. This is a property of the
+# robot, which is why it is declared here and not assumed by whatever is driving
+# it: a policy emitting a smooth ramp towards zero would spend its whole life in
+# this band, commanding motion and producing none, with every layer in between
+# reporting success.
+MIN_VX = 0.4
+MIN_VY = 0.4
+MIN_WZ = 1.0
+
 DEFAULT_EXPECTED_HZ = 10.0
 MAX_HZ = 20.0
 # Generous next to an arm's 200 ms because a chassis at 0.4 m/s travels 12 cm in
@@ -104,6 +118,10 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ) -> dict:
             # Acceleration, not velocity — see the module docstring.
             "max_delta_per_step": [VX_ACCEL, VY_ACCEL, PINNED_ACCEL,
                                    PINNED_ACCEL, PINNED_ACCEL, WZ_ACCEL],
+            # The deadband, per axis. 0 means "no threshold on this axis".
+            # Consumers should either command 0 or at least this much — see
+            # MIN_VX above.
+            "min_magnitude": [MIN_VX, MIN_VY, 0.0, 0.0, 0.0, MIN_WZ],
             # no max_velocity: it would be jerk here, and a declared limit
             # nobody can interpret is worse than an absent one.
         },
@@ -146,6 +164,19 @@ class LocoServoPlugin:
         # command rather than at start — see `_posture_problem`. Configurable
         # only because a bench with no chassis attached cannot reach FSM 811.
         self._require_standing = bool(config.get("require_standing", True))
+        # Turn in place only: vx and vy are zeroed before they reach the SDK.
+        #
+        # A deliberate restriction of the robot, not a rejection of the policy —
+        # which is why it clamps rather than refusing. Pinning vx/vy in the
+        # descriptor instead would make `ControlSink` reject the *whole*
+        # command whenever the policy asked to move forward, taking the yaw
+        # with it, so the robot would not even turn. The point of this switch is
+        # that it still turns.
+        #
+        # It is loud on purpose: a card that quietly drops two thirds of every
+        # command is exactly the failure this file keeps warning about.
+        self._rotate_only = bool(config.get("rotate_only", False))
+        self._suppressed = 0
 
         self._descriptor_raw = build_descriptor(self._expected_hz)
         self._descriptor = parse_descriptor(self._descriptor_raw)
@@ -161,6 +192,8 @@ class LocoServoPlugin:
         self._applied = 0
         self._holds = 0
         self._refused = 0
+        self._sdk_errors = 0
+        self._last_ret = 0
         self._fsm_problem = ""
         # -inf rather than 0: the first command must actually read the FSM.
         self._fsm_checked_at = float("-inf")
@@ -280,6 +313,7 @@ class LocoServoPlugin:
         print(f"[loco_servo] streaming from {topic} "
               f"(dry_run={self._dry_run})", flush=True)
         return {"state": "running", "input": topic, "dry_run": self._dry_run,
+                "rotate_only": self._rotate_only,
                 "control_interface": self._descriptor_raw}
 
     def _halt(self, halted: bool):
@@ -336,9 +370,17 @@ class LocoServoPlugin:
                           "paused" if self._running else "idle"),
                 "input": self._input_topic,
                 "dry_run": self._dry_run,
+                # Visible, always — an operator looking at a robot that only
+                # spins needs this on the same screen as the command values.
+                "rotate_only": self._rotate_only,
+                "suppressed_translations": self._suppressed,
                 "applied": self._applied,
                 "holds": self._holds,
                 "refused": self._refused,
+                # SDK 侧的拒绝。和 refused（我们自己拒绝）是两回事：那个说
+                # 「我们没发」，这个说「发了，机器人不要」。
+                "sdk_errors": self._sdk_errors,
+                "last_ret": self._last_ret,
                 # Empty when the posture is fine. A card that is subscribed and
                 # running but refusing every command looks identical from the
                 # canvas to one that is working, and this is the difference.
@@ -457,6 +499,13 @@ class LocoServoPlugin:
     def _apply(self, values, _gripper=None):
         vx, vy, wz = float(values[0]), float(values[1]), float(values[5])
 
+        if self._rotate_only and (vx or vy):
+            if self._suppressed == 0:
+                print(f"[loco_servo] rotate_only: 抑制平移 vx={vx:+.3f} "
+                      f"vy={vy:+.3f}，只执行 vyaw={wz:+.3f}", flush=True)
+            self._suppressed += 1
+            vx = vy = 0.0
+
         # The posture gate lives here, on the command, not on `start`.
         posture = self._posture_problem()
         if posture:
@@ -477,7 +526,27 @@ class LocoServoPlugin:
             print(f"[loco_servo] DRY RUN Move(vx={vx:+.3f}, vy={vy:+.3f}, "
                   f"vyaw={wz:+.3f})", flush=True)
             return
-        self._client.Move(vx, vy, wz, True)
+
+        # **接住返回码。** 丢掉它，一个逐条拒绝我们的 SDK 和一个正常工作的 SDK
+        # 从外面看完全一样：applied 照涨、没有报错、机器人不动。真机上就是这样
+        # 花了时间才想到要看这里 —— `loco` 的 move 一直是把 ret 报出来的，这张
+        # 卡片抄的时候漏了。
+        ret = self._client.Move(vx, vy, wz, True)
+        if ret != 0:
+            self._sdk_errors += 1
+            self._last_ret = ret
+            # 只在状态翻转和每 100 条时打印：10 Hz 下每条一行会把其余日志埋掉，
+            # 而第一条已经说明了一切。
+            if self._sdk_errors == 1 or self._sdk_errors % 100 == 0:
+                print(f"[loco_servo] SDK 拒绝了指令（第 {self._sdk_errors} 条）："
+                      f"Move(vx={vx:+.3f}, vy={vy:+.3f}, vyaw={wz:+.3f}) "
+                      f"-> ret={ret}", flush=True)
+        else:
+            if self._sdk_errors:
+                print(f"[loco_servo] SDK 恢复接受指令（此前拒绝 "
+                      f"{self._sdk_errors} 条）", flush=True)
+            self._sdk_errors = 0
+            self._last_ret = 0
 
     def _hold(self, *_args):
         """Watchdog, abort, pause and teardown all land here.
