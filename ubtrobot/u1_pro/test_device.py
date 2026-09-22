@@ -136,12 +136,12 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
         self.assertEqual(device.EVENT_TOPICS["doa_event"], "/robo/audio/subscribe/doa_event")
 
-    def test_u1_cyclonedds_config_uses_robot_multicast_interface(self):
+    def test_u1_cyclonedds_config_matches_official_sdk_runtime(self):
         config = Path(__file__).with_name("config.yaml").read_text(encoding="utf-8")
-        self.assertIn('robot_interface: "rgmii0"', config)
+        self.assertIn("robot_domain_id: 20", config)
+        self.assertIn('robot_interface: "lo"', config)
         self.assertIn("NetworkInterface name='lo'", config)
-        self.assertIn("NetworkInterface name='rgmii0'", config)
-        self.assertIn("AllowMulticast>true", config)
+        self.assertIn("AllowMulticast>false", config)
         self.assertIn("MaxAutoParticipantIndex>200", config)
 
     def test_mic_service_error_does_not_enable_forwarding(self):

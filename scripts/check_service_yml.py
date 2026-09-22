@@ -65,10 +65,10 @@ OWN_PROFILE = {
 # Drivers a FastDDS profile cannot isolate, with what they would need instead. Reported,
 # not fatal — the point is that the gap stays visible rather than passing as compliant.
 KNOWN_GAPS = {
-    'ubtrobot/u1_pro': 'RMW is rmw_cyclonedds_cpp and both ROS contexts share a '
-                       'CYCLONEDDS_URI allowing lo and the U1 multicast-capable rgmii0; '
-                       'per-participant isolation is unavailable and the FastDDS fleet profile '
-                       'is inert and must not be applied.',
+    'ubtrobot/u1_pro': 'RMW is rmw_cyclonedds_cpp; the U1 SDK robot domain defaults to '
+                       '20 and the driver binds its explicitly configured contexts to '
+                       'loopback through CYCLONEDDS_URI. The FastDDS fleet profile is '
+                       'inert and must not be applied.',
     'engineai/t800': 'RMW is rmw_cyclonedds_cpp (Dockerfile T800_PREFERRED_RMW), so '
                      'FASTRTPS_DEFAULT_PROFILES_FILE is inert; its CYCLONEDDS_URI binds '
                      'NETWORK_INTERFACE for both contexts, leaving the domain-42 one on '
