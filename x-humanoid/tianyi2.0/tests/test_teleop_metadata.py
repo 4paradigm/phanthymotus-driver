@@ -57,6 +57,10 @@ def test_target_descriptor_matches_local_bus_topics(monkeypatch, namespace):
         DurabilityPolicy=SimpleNamespace(VOLATILE="volatile")))
     monkeypatch.setitem(sys.modules, "std_msgs", ModuleType("std_msgs"))
     monkeypatch.setitem(sys.modules, "std_msgs.msg", SimpleNamespace(String=object))
+    # This test invokes the child body in pytest itself. Log installation in an
+    # actual fresh process is covered by test_teleop_logsafe.py.
+    monkeypatch.setitem(sys.modules, "common", SimpleNamespace(
+        logsafe=SimpleNamespace(install=lambda **kwargs: None)))
     monkeypatch.setenv("FASTRTPS_DEFAULT_PROFILES_FILE", "/isolated/dds.xml")
     monkeypatch.setattr(Path, "read_bytes", lambda self: b"isolated-dds-profile")
     monkeypatch.setattr(module.socket, "socket", lambda **kwargs: SimpleNamespace(

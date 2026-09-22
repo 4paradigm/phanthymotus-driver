@@ -14,9 +14,13 @@ bash src/driver/x-humanoid/tianyi2.0/deploy/build_teleop.sh \
   > evidence/driver-build.log 2>&1
 ```
 
-脚本只构建，不推送、不启动服务。临时上下文复用仓内 common 和 audio_msgs；厂商消息编译或实际主入口导入失败立即报错。基础镜像按 digest 固定，apt 保留签名验证；镜像 ID 与源码哈希应写入本次私有部署记录。
+脚本只构建，不推送、不启动服务。临时上下文复用仓内 common；audio_msgs 使用基础镜像已有的 `/ros_ws/install` 环境，不再复制和重复编译。厂商消息编译或实际主入口导入失败立即报错。基础镜像按 digest 固定，apt 保留签名验证；镜像 ID 与源码哈希应写入本次私有部署记录。
 
-标准 CI / bot 入口是仓根的 `bash build.sh --mirror tencent x-humanoid/tianyi2.0`，它依据 `driver.yaml` 的 `build_context_extras`，将 `common/` 与 `robotera/q5_bundle/vendor/audio_msgs/` 分别复制到临时上下文根目录的 `common/`、`audio_msgs/`。专用脚本使用同一布局；Dockerfile 显式复制并编译 `audio_msgs`，缺少源目录时立即失败，不依赖 colcon 对未知包名的告警。源码上传须包含上述两个共享目录，不能只上传 Tianyi 子目录。标准入口配置仓库凭据时会推送，不能当作专用脚本的“仅构建”替代。
+标准 CI / bot 入口是仓根的 `bash build.sh --mirror tencent x-humanoid/tianyi2.0`，它依据 `driver.yaml` 的 `build_context_extras` 将仓根 `common/` 复制到临时上下文的同名目录。专用脚本使用同一布局；源码上传须包含该共享目录，不能只上传 Tianyi 子目录。标准入口配置仓库凭据时会推送，不能当作专用脚本的“仅构建”替代。
+
+Docker 构建的 RUN 不执行基础镜像 ENTRYPOINT。编译和导入检查因此显式加载 `/opt/ros/humble` → `/ros_ws/install`，完成编译后再加载 `/tianyi_ws/install`；运行 CMD 也使用相同顺序。替换 ROS_BASE_IMAGE 时必须保留兼容的 audio_msgs overlay，缺失时构建或启动明确失败，不忽略错误。`AudioChunk` 与实际 Tianyi 主入口导入检查保留。
+
+镜像体积核验（2026-09-22）：registry 中 `release.260922.2255037` 的压缩层合计 **341,727,193 B**；其前 15 层与基础镜像 `sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f` 完全一致，基础层合计 **261,578,370 B**。该成功版本曾额外复制 audio_msgs（独立层 **743 B**）并与两个厂商包一起重编译（三包共同层 **6,754,542 B**）；后者不能全部计为 audio_msgs 增量。本修复已移除冗余副本和编译，保留必要的环境加载及导入检查，不新增依赖。由于前一失败版本没有可比成功镜像，新版本净体积变化需按新 manifest 实测，不声称“零增量”。本轮日志修复只复用镜像已有 common，不增加依赖或基础设施层。
 
 ActuCore 使用配套主仓的普通 bundle 构建入口和遥操依赖，不沿用早期独立服务示例。Jetson 部署使用主仓 `deploy/build_actucore.sh --jp-version 6.1 --with-teleop`，具体镜像和设备架构由实际部署选择。该主仓脚本在配置仓库凭据时还会推送，使用前应核对其发布设置与授权。不能把 Jetson 产物当作 x86/G1 通用镜像。
 
@@ -55,7 +59,9 @@ python3 -m pytest -q \
 
 这些测试用假时钟、合成反馈、记录式发布器和本地 socket，不连接机器人。`tests/benchmark_feedback_scheduler.py` 则是真实 ROS 只读订阅工具，不能混同于离线测试，也不应在设备承担任务时擅自运行。
 
-构建上下文回归使用 `python3 -m pytest -q tests/test_tianyi_build_context.py`：在独立临时源码副本中运行两个真实 Shell 入口，用 Docker 记录器检查消息包及缺包失败，不连接 Docker daemon，不构建或推送镜像。实际 ARM64 编译和入口导入仍须由镜像构建验证。
+构建回归使用 `python3 -m pytest -q tests/test_tianyi_build_context.py`：在独立临时源码副本中运行两个真实 Shell 入口，用 Docker 记录器检查上下文；提取 Dockerfile 的编译、导入、启动 Shell 命令，在临时环境中验证 overlay 加载顺序及缺失失败。不连接 Docker daemon，不构建或推送镜像；实际 ARM64 编译和依赖导入仍须由镜像构建验证。
+
+`tests/test_teleop_logsafe.py`（相对 Tianyi 目录）真实启动 `teleop_executor.py --bus` 子进程，以 ROS stub 和匿名本地 socketpair 验证：源码/镜像布局均在导入 ROS 前安装 common.logsafe，stdout、stderr 的 Python 输出及启动异常移除控制字符并按行写入。它不创建 DDS 参与者；logsafe 不包装 C/C++ 库直接写文件描述符的原生日志，不能据此声称所有原生输出已受保护。
 
 将源码中的 `tests/image_shadow_smoke.py` 只读挂载到候选容器；生产镜像默认不打包测试脚本。需在 network none、只读根、仅 /tmp 可写、无设备/真实配置/凭据的隔离环境中执行，并加载镜像 ROS 环境。它验证实际 bundle 双轮启停和 Shadow 拒绝 claim，硬件发布器必须为零。合成 ROS/MCP 测试不能替代真机。
 

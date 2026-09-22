@@ -1,17 +1,17 @@
 """Run both real Tianyi build scripts with a Docker recorder, never a daemon.
 
-The standard CI build once omitted audio_msgs while the candidate helper staged
-it. colcon only warned about the unknown selected package, so the error surfaced
-later when main imported ext_devices. Check both generated contexts and the ROS
-sources that the Dockerfile actually copies, including missing-source failures.
+audio_msgs already exists in ros-base. Docker RUN does not execute the base's
+entrypoint, so the compile/import commands must explicitly source that overlay.
+Check real context staging and execute the Dockerfile's shell commands in an
+isolated substitute filesystem; ROS compilation remains an image-build check.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -21,7 +21,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = Path("x-humanoid/tianyi2.0")
-AUDIO = Path("robotera/q5_bundle/vendor/audio_msgs")
 
 
 @pytest.fixture
@@ -29,7 +28,7 @@ def build_tree(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     shutil.copy2(ROOT / "build.sh", repo / "build.sh")
-    for path in (DRIVER, Path("common"), AUDIO):
+    for path in (DRIVER, Path("common")):
         shutil.copytree(ROOT / path, repo / path)
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -100,10 +99,8 @@ def test_build_stages_message_packages_used_by_dockerfile(build_tree, entrypoint
     assert "--platform" in record["args"] and "linux/arm64" in record["args"]
     assert "--push" not in record["args"]
 
-    for path in (ROOT / AUDIO).rglob("*"):
-        if path.is_file():
-            staged = str(Path("audio_msgs") / path.relative_to(ROOT / AUDIO))
-            assert record["files"][staged] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert "common/logsafe.py" in record["files"]
+    assert not any("audio_msgs/" in name for name in record["files"])
 
     # Inspect the actual Dockerfile COPY operands rather than assuming that a
     # package somewhere in the context will be available to colcon.
@@ -119,18 +116,56 @@ def test_build_stages_message_packages_used_by_dockerfile(build_tree, entrypoint
         prefix = source.rstrip("/") + "/"
         for name in record["files"]:
             if name.startswith(prefix) and name.endswith("/package.xml"):
-                original = repo / AUDIO / "package.xml" if name.startswith("audio_msgs/") else repo / DRIVER / name
+                original = repo / DRIVER / name
                 packages.add(ET.parse(original).findtext("name"))
-    assert {"bodyctrl_msgs", "lyre_msgs", "audio_msgs"} <= packages
+    assert {"bodyctrl_msgs", "lyre_msgs"} == packages
     assert 'from audio_msgs.msg import AudioChunk' in record["dockerfile"]
+    selected = next(line.split('--packages-select ', 1)[1].split()
+                    for line in record["dockerfile"].splitlines() if 'colcon build ' in line)
+    assert selected == ['bodyctrl_msgs', 'lyre_msgs']
 
 
-@pytest.mark.parametrize("entrypoint", ["standard", "candidate"])
-def test_missing_audio_source_cannot_produce_successful_build(build_tree, entrypoint):
-    repo, env, _ = build_tree
-    shutil.rmtree(repo / AUDIO)  # Only the private pytest fixture copy.
-    result, _ = run_build(build_tree, entrypoint)
-    assert result.returncode != 0
-    assert "audio_msgs" in result.stdout + result.stderr
-    if entrypoint == "candidate":
-        assert list(Path(env["TMPDIR"]).iterdir()) == []
+@pytest.mark.parametrize('phase', ['compile', 'import', 'runtime'])
+@pytest.mark.parametrize('missing_overlay', [False, True])
+def test_docker_shell_sources_base_overlay_and_fails_if_missing(tmp_path, phase, missing_overlay):
+    dockerfile = (ROOT / DRIVER / 'Dockerfile').read_text().replace('\\\n', '')
+    lines = dockerfile.splitlines()
+    if phase == 'compile':
+        command = next(line[4:] for line in lines if line.startswith('RUN cd /tianyi_ws'))
+    elif phase == 'import':
+        command = shlex.split(next(line[4:] for line in lines
+                                  if line.startswith('RUN bash -c')))[2]
+    else:
+        command = json.loads(next(line[4:] for line in lines if line.startswith('CMD ')))[2]
+
+    root = tmp_path / 'isolated root'
+    for prefix, label in (('/opt/ros/humble', 'ros'), ('/ros_ws/install', 'audio'),
+                          ('/tianyi_ws/install', 'tianyi')):
+        folder = root / prefix.lstrip('/')
+        folder.mkdir(parents=True)
+        for extension in ('sh', 'bash'):
+            if label != 'audio' or not missing_overlay:
+                (folder / ('setup.' + extension)).write_text(
+                    'export OVERLAY_TRACE="${OVERLAY_TRACE:+${OVERLAY_TRACE},}' + label + '"\n')
+    for prefix in ('/opt/ros', '/ros_ws', '/tianyi_ws', '/work'):
+        command = command.replace(prefix, shlex.quote(str(root / prefix.lstrip('/'))))
+
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    for name in ('python3', 'colcon'):
+        probe = bindir / name
+        probe.write_text('#!/bin/sh\n'
+                         '[ "$OVERLAY_TRACE" = "$EXPECTED_OVERLAYS" ] || exit 97\n'
+                         'printf "overlay-ready\\n"\n')
+        probe.chmod(0o755)
+    env = {'PATH': str(bindir) + os.pathsep + os.defpath,
+           'EXPECTED_OVERLAYS': 'ros,audio' if phase == 'compile' else 'ros,audio,tianyi'}
+    result = subprocess.run(['bash', '-c', command], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=10)
+    if missing_overlay:
+        assert result.returncode != 0
+        assert result.stdout == ''  # Never reaches compilation/import/startup.
+        assert 'ros_ws/install/setup.' in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == 'overlay-ready\n'

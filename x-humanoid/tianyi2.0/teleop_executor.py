@@ -730,6 +730,16 @@ class TeleopExecutor:
 
 def run_local_bus(fd,namespace):
     """Only process allowed to receive teleop DDS commands; no robot-side context."""
+    try:
+        from common import logsafe
+    except ModuleNotFoundError as exc:
+        if exc.name != 'common':
+            raise
+        # Same checkout layout as main.py; the image stages common beside us.
+        # Resolve from this source file, never from cwd or an environment path.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from common import logsafe
+    logsafe.install(check_fd=False)
     expected=Path(__file__).with_name('dds-local.xml').read_bytes()
     configured=Path(os.environ['FASTRTPS_DEFAULT_PROFILES_FILE']).read_bytes()
     if configured!=expected:raise RuntimeError('local_dds_profile_mismatch')

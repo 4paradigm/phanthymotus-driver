@@ -62,6 +62,21 @@
 
 MCP claim/resume 支持可选的 32 位小写十六进制 `request_id` 和 `request_valid_until_ns`（最长 300 ms）。同一身份与期限的重复请求只返回原结果，不重复接管或旋转租约。取消只作用于该请求创建的租约；取消先到时，迟到请求不能重新接管。管理超时本身不代表已取消或已停止。
 
+## 与通用 ControlSink 的边界
+
+此入口保留配套 ActuCore 已使用的 `motus.motion-target.v1`，不是 `motus.control/1` 消费者；`control/teleop` 只是 Canvas topic 格式，不能据此把通用 VLA 命令接入此入口。现有 `servo` 继续使用 `common.control.ControlSink` 及其原有测试，两者写同一执行器时仍受共享执行权约束。
+
+| 契约 | 通用 ControlSink | 本遥操 MotionGate |
+|---|---|---|
+| 报文 | descriptor 约束的 schema/mode/values | 固定 14 关节 q 与可选手部开合 |
+| 新鲜度 | 消息 Unix 毫秒时间戳、观测时间及 TTL | 同机 boot/session、单调纳秒时间及原始有效期 |
+| 仲裁 | source/priority 与每来源递增序号 | MCP 独占租约、HMAC-SHA256 签名及会话内递增序号 |
+| 保持与恢复 | 看门狗回调、可恢复 stand-down、力矩故障锁存 | 后续实测反馈确认保持/释放，短时同会话续接与显式新会话恢复 |
+
+不能只改字段名称并直接套用 ControlSink，否则会丢失租约鉴权、旧会话隔离、管理请求幂等及实测停止确认，或把两套看门狗叠加在同一目标上。本轮不重写已验证执行状态机；未来合并公共校验时，需明确协议转换和唯一状态机，并重跑两端停止/恢复测试，不声明目前兼容。
+
+对应 ROS-free 覆盖位于 `tests/test_motion_stream.py`（签名、旧会话、限位、反馈及停止）、`tests/test_teleop_management.py`（请求幂等与取消）、`tests/test_teleop_continuation.py` / `tests/test_teleop_recovery.py`（续接与恢复），均相对本 Tianyi 目录。通用 sink 的单独回归仍在仓根 `tests/test_control_sink.py`；它不能代替上述遥操协议测试。
+
 ## 位置控制与恢复
 
 执行循环默认 50 Hz，只使用位置接口。每周期从上一下发目标推进，步长最多为配置速度乘 20 ms；目标领先实测的上界为配置速度乘 200 ms。速度默认 0.2 rad/s，由标定设置且不超过 URDF 限制与厂商接口上限 1.5 rad/s。该领先界不是本体急停承诺：Driver 崩溃后本体剩余目标行为必须单独验收。

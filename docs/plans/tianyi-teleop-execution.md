@@ -47,12 +47,16 @@
 - 北京 G1 的卡片展示/部署属于主仓独立工作，不复用天轶模型、14 关节映射或停止证据。
 - 手部验收、长时运行和崩溃边界保留为未完成项，后续需新的设备窗口及对应授权。
 
-## 2026-09-22：bot 标准构建缺失 audio_msgs
+## 2026-09-22：bot 构建、日志及协议审查修复
 
-PR #321 在 `6b6d767` 的 bot ARM64 构建失败于 `main.py → ext_devices.py → audio_msgs` 导入。标准 `build.sh` 只复制元数据声明的 common，而专用 `build_teleop.sh` 额外注入 audio_msgs；colcon 对缺失的已选包只告警，未阻止后续步骤。这是构建上下文不一致，不修改运行期执行协议或移除入口导入检查。
+PR #321 在 `6b6d767` 的 ARM64 构建失败于 `main.py → ext_devices.py → audio_msgs` 导入。第一轮把专用脚本额外注入的消息源纳入标准上下文，离线 26 项通过，`2255037` bot 构建也成功（10 分 04 秒）。但这只消除了症状：“上下文缺包”不是完整根因。
 
-修复范围：在 Tianyi `driver.yaml` 声明现有 Apache-2.0 `audio_msgs` 源目录，两个入口统一将它放在上下文根目录；Dockerfile 显式 COPY 后构建，缺包立即报错，并显式检查 AudioChunk 导入。仓根 Dockerfile 路径检查识别元数据声明的 extras，新增隔离运行两个真实脚本的上下文及缺包回归。通用 `build.sh`、机器人配置和服务均不修改。
+随后只读 registry manifest/config，确认 `2255037` 前 15 层与基础镜像 `82d45949…649f` 完全一致，基底早已编译 audio_msgs 并由 ENTRYPOINT 加载 `/ros_ws/install`。Docker RUN 不执行该 ENTRYPOINT，旧导入检查漏加载此 overlay。最终修复撤销额外消息源、COPY 和重复 audio_msgs 编译，两个入口只准备 Tianyi/common；编译、导入和运行明确按 ROS → 基底 audio → Tianyi 顺序加载。缺 overlay 或真实消息导入失败仍阻断，不再忽略 setup 失败。标准 build.sh 保持不变。
 
-验证：在原始 `6b6d767` 的隔离 git archive 中复现标准入口缺包；修复后两个入口及缺包路径共 4 项通过，仓内所有 21 个 Dockerfile 源路径检查通过，Tianyi 导入文件覆盖检查通过（共 26 项）。`bash -n` 与 `git diff --check` 通过。本轮未运行实际 Docker 构建，ARM64 编译/导入结果等待最新提交的 bot 构建；不将上下文测试视为镜像或真机通过。
+镜像体积按 registry 压缩层实测：`2255037` 为 341,727,193 B，基础层为 261,578,370 B；冗余 audio_msgs 源 COPY 独立层 743 B，三包共同编译层 6,754,542 B，不能把后者全部归因于 audio_msgs。当前移除冗余，新镜像净差待最新构建 manifest 确认；不声称零增量，也不拿不同 Dockerfile 的总量差充当包增量。
 
-文档复核：构建 runbook 已补标准入口、共享源码清单及测试证据边界；README 继续指向该 runbook，无需重复构建说明。同时补齐上轮生命周期文档遗漏：runbook 与执行契约明确“Canvas 开启智能控制仅 armed → PICO 开始才准备”，以及关闭智能控制撤权、收臂、释放与失败重试；历史独立脚本只作诊断。此处对齐配套主仓已有实现，不改 Driver 执行协议，也不新增现场验收结论。代码、测试和本节随同一次范围化提交交付。
+同一 HEAD 的 bot 指出 DDS `--bus` 子进程未安装安全日志。现于子入口最前面复用 `common.logsafe.install(check_fd=False)`，在 ROS 导入与配置检查之前保护 Python stdout/stderr。镜像直接导入已 COPY 的 common；源码仅按 main.py 的仓根布局解析，不增加任意环境路径入口。原生库直接写 fd 不在 logsafe 范围内。
+
+验证：真实启动源码/镜像布局的子进程，使用 ROS stub 与匿名 socketpair 验证 stdout/stderr 原子写入、控制字符清理、导入异常；原 `2255037` 隔离副本能复现未安装保护。两个构建入口及 Dockerfile 编译/导入/运行 Shell 的加载顺序、缺 overlay 失败均在临时目录实际运行。上述测试加 MotionGate、管理/续接/恢复、生命周期、元数据、通用 ControlSink 与全仓 Dockerfile 源路径检查共 **181 项通过**（4.14 秒）；bash 语法和 diff 检查通过。实际修复后镜像与 bot 最新审查仍待提交后验证，本轮未访问机器人。
+
+文档复核：runbook 同步真实根因、构建源码清单、体积与日志证据边界；执行契约解释 motus.motion-target.v1 与 motus.control/1 在时钟、鉴权、仲裁及实测停止上的区别，并列明独立测试。README 继续指向相关文档，无需重复说明。上轮 Canvas 仅 armed → PICO 开始才准备，以及收臂/释放/失败重试说明保留，不新增现场验收结论。代码、测试和相关文档同次范围化提交。
