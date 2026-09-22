@@ -120,7 +120,7 @@ def test_build_stages_message_packages_used_by_dockerfile(build_tree, entrypoint
                 packages.add(ET.parse(original).findtext("name"))
     assert {"bodyctrl_msgs", "lyre_msgs"} == packages
     assert 'from audio_msgs.msg import AudioChunk' in record["dockerfile"]
-    selected = next(line.split('--packages-select ', 1)[1].split()
+    selected = next(line.split('--packages-select ', 1)[1].split(';', 1)[0].split()
                     for line in record["dockerfile"].splitlines() if 'colcon build ' in line)
     assert selected == ['bodyctrl_msgs', 'lyre_msgs']
 

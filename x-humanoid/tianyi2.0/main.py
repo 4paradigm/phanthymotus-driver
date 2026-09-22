@@ -611,9 +611,14 @@ class TianyiDeviceBundle:
             teleop_cfg = dict(cfg.get('teleop', {}))
             if cfg.get('motion_control', {}).get('calibration_path'):
                 teleop_cfg['calibration_path'] = cfg['motion_control']['calibration_path']
-            if teleop_cfg.get('live_enabled') is True and (arm is None or hand is None):
-                raise ValueError("live teleop requires arm and hand plugins")
             self._teleop = TeleopExecutor(teleop_cfg, namespace, ros2, arm, hand, self._plugins)
+            if teleop_cfg.get('live_enabled') is True:
+                # Only a successfully loaded, explicitly arms-only profile
+                # permits the new controller to run without a hand card.
+                arms_only = (cfg.get('motion_control', {}).get('enabled', False)
+                             and (self._teleop.profile or {}).get('hands_enabled') is False)
+                if arm is None or (hand is None and not arms_only):
+                    raise ValueError("live teleop requires arm and hand plugins unless motion_control has a validated arms-only profile")
             self._plugins.append(self._teleop)
             if cfg.get('motion_control', {}).get('enabled', False):
                 from motion_control import MotionControl
