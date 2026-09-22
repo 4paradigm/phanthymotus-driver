@@ -86,6 +86,26 @@ MIN_VX = 0.4
 MIN_VY = 0.4
 MIN_WZ = 1.0
 
+
+def _step_limit(accel: float, floor: float) -> float:
+    """The acceleration cap, widened to at least the axis' deadband.
+
+    **An acceleration cap finer than the deadband is not a cap — it is dead
+    time.** The step clamp is applied to the command the policy sends, so a
+    0.30 rad/s cap against a 1.0 rad/s floor ramps 0.30 → 0.60 → 0.90 → 1.0, and
+    the robot executes precisely none of the first three: three ticks of
+    silence, then the turn starts at full speed. That asymmetry — slow to start,
+    instant to stop, because the ramp *down* crosses the floor on its first
+    step — is what a lurch is made of, and neither the sink nor the SDK reports
+    anything, because from their side every command was accepted.
+
+    So the smallest meaningful step on a deadbanded axis is the deadband. Above
+    the floor the configured cap is coarser than intended, which is a real cost
+    and the honest one: it is the granularity the chassis has. Shaping
+    acceleration below the floor is the gait controller's job, not ours.
+    """
+    return max(accel, floor)
+
 DEFAULT_EXPECTED_HZ = 10.0
 MAX_HZ = 20.0
 # Generous next to an arm's 200 ms because a chassis at 0.4 m/s travels 12 cm in
@@ -115,9 +135,12 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ) -> dict:
         "limits": {
             "lower": [-VX_LIMIT, -VY_LIMIT, 0.0, 0.0, 0.0, -WZ_LIMIT],
             "upper": [VX_LIMIT, VY_LIMIT, 0.0, 0.0, 0.0, WZ_LIMIT],
-            # Acceleration, not velocity — see the module docstring.
-            "max_delta_per_step": [VX_ACCEL, VY_ACCEL, PINNED_ACCEL,
-                                   PINNED_ACCEL, PINNED_ACCEL, WZ_ACCEL],
+            # Acceleration, not velocity — see the module docstring. Never finer
+            # than the deadband on the same axis; see `_step_limit`.
+            "max_delta_per_step": [_step_limit(VX_ACCEL, MIN_VX),
+                                   _step_limit(VY_ACCEL, MIN_VY),
+                                   PINNED_ACCEL, PINNED_ACCEL, PINNED_ACCEL,
+                                   _step_limit(WZ_ACCEL, MIN_WZ)],
             # The deadband, per axis. 0 means "no threshold on this axis".
             # Consumers should either command 0 or at least this much — see
             # MIN_VX above.

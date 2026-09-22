@@ -1490,6 +1490,41 @@ commanding vertical motion.
 First implementation: `unitree/r1/loco_servo.py`. Measured motion comes back on
 `motus.odom/1`, whose axes are these axes — see that section.
 
+### `limits.min_magnitude` — declare the speed below which your robot does nothing
+
+A legged base has to assemble a whole gait cycle, so unlike a wheeled one it has
+no creep regime: below some speed it does not move **at all**. R1 needs 0.4 m/s
+and 1.0 rad/s. Under that the SDK accepts the command, returns 0, and the robot
+stands still — 159 commands applied, no errors at any layer, no motion.
+
+That is a property of the robot, so the robot declares it and the thing driving
+it reads it. Per axis, in that axis' own units; `0` means no threshold.
+
+```python
+"min_magnitude": [0.4, 0.4, 0.0, 0.0, 0.0, 1.0],
+```
+
+Two consequences, and each one was a real robot standing still while every log
+said it was moving:
+
+**The step clamp must never be finer than the deadband on the same axis.** The
+clamp is applied to the command, so a 0.30 rad/s acceleration cap against a
+1.0 rad/s floor ramps 0.30 → 0.60 → 0.90 → 1.0 and the robot executes none of
+the first three: three ticks of silence, then the turn arrives at full speed.
+The ramp *down* crosses the floor on its first step, so it stops instantly —
+slow to start, instant to stop, which is what a lurch is made of. Take
+`max(accel, min_magnitude)` per axis (`loco_servo._step_limit`). Above the floor
+the cap is then coarser than you wanted; below it, shaping acceleration is the
+gait controller's job and never was yours.
+
+**A consumer's own ceiling must sit above the floor.** Not your problem to
+enforce, but say it in your card's docs: a policy whose `wz_max` is 0.8 against
+a 1.0 floor has an entire output range the robot cannot execute, so every
+command snaps to 0 or ±1.0 and the robot turns in a square wave. The navi card
+reads `min_magnitude` at negotiation and raises its own ceilings off it
+(`plugins/navi/policy.py::adopt_limits`) — that is the pattern to copy, not a
+number to hard-code.
+
 ### Use `common/control.ControlSink` — do not write the checks yourself
 
 There are fourteen bundles here. A safety chain copied fourteen times diverges
