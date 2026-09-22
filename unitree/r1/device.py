@@ -690,9 +690,14 @@ class SmartMotionPlugin:
     PREFIX = "smart_motion"
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 speaker_plugin=None, loco_plugin=None):
+                 speaker_plugin=None, loco_plugin=None, loco_servo_plugin=None):
         self._speaker = speaker_plugin
         self._loco = loco_plugin
+        # There are two ways the chassis moves, and an interrupt that knows about
+        # only one of them stops the robot in the demo and not in the case that
+        # matters. `loco.stop_move` does nothing about a policy that is still
+        # publishing velocities 10 times a second.
+        self._loco_servo = loco_servo_plugin
 
     def get_tool(self) -> dict:
         return {
@@ -762,9 +767,22 @@ class SmartMotionPlugin:
         return {"error": "no speaker plugin"}
 
     def _do_interrupt_motion(self) -> dict | None:
+        """Stop both paths to the chassis.
+
+        The streaming card is paused **first**: pausing it after `stop_move`
+        would leave a window in which its next published command restarts the
+        robot the operator just stopped.
+        """
+        out = {}
+        if self._loco_servo:
+            out["loco_servo"] = self._loco_servo.dispatch("pause", {})
         if self._loco:
-            return self._loco.dispatch("stop_move", {})
-        return {"error": "no loco plugin"}
+            out["loco"] = self._loco.dispatch("stop_move", {})
+        if not out:
+            return {"error": "no loco plugin"}
+        # Keep the old single-card shape when that is all there is, so nothing
+        # reading this response has to learn a new one for no reason.
+        return out["loco"] if list(out) == ["loco"] else out
 
 
 # ── LedPlugin (actuator) ─────────────────────────────────────────────────────
@@ -897,9 +915,15 @@ class _LocoStateNode(Node):
 
     _ODOM_INTERVAL = 0.1  # 10 Hz throttle
 
-    def __init__(self, odom_topic: str):
+    def __init__(self, odom_topic: str, motion_topic: str = ""):
         super().__init__("r1_loco_state")
         self._odom_pub = self.create_publisher(String, odom_topic, _LOW_LAT_QOS)
+        # Second publisher, carrying the same reading in motus.odom/1. Published
+        # *alongside* the vendor-shaped topic above rather than replacing it:
+        # that one has consumers not visible from inside this bundle, and a 10 Hz
+        # duplicate is much cheaper than finding out which.
+        self._motion_pub = (self.create_publisher(String, motion_topic, _LOW_LAT_QOS)
+                            if motion_topic else None)
         self._last_state: dict = {}
         self._lock = threading.Lock()
         self._last_odom_time: float = 0.0
@@ -944,24 +968,81 @@ class _LocoStateNode(Node):
         out = String()
         out.data = json.dumps(state)
         self._odom_pub.publish(out)
+        self._publish_motion(state)
+
+    def _publish_motion(self, state: dict) -> None:
+        """The same reading as motus.odom/1.
+
+        `vz`, `wx` and `wy` are `None`, not zero: R1's SportModeState reports a
+        three-component `velocity` whose third entry has no documented meaning
+        (Go1's driver names the same field `velocity_index_2_raw`, which says it
+        plainly), and reports no roll or pitch rate at all. Reporting zero for
+        those would tell a consumer this robot measured no vertical motion, which
+        is a different claim from the true one — and the one that makes a
+        stuck-detector fire on a robot that simply cannot answer.
+        """
+        if self._motion_pub is None:
+            return
+        try:
+            from common.odom import build_sample
+
+            velocity = state.get("velocity") or []
+            sample = build_sample(
+                stamp_ms=int(time.time() * 1000),
+                twist=[
+                    velocity[0] if len(velocity) > 0 else None,
+                    velocity[1] if len(velocity) > 1 else None,
+                    None, None, None,
+                    state.get("yaw_speed"),
+                ],
+                vendor={"mode": state.get("mode"),
+                        "gait_type": state.get("gait_type"),
+                        "body_height": state.get("body_height"),
+                        "rpy": (state.get("imu") or {}).get("rpy")},
+            )
+        except Exception as exc:                              # noqa: BLE001
+            self.get_logger().warn(f"motus.odom/1 publish failed: {exc}")
+            return
+        message = String()
+        message.data = json.dumps(sample)
+        self._motion_pub.publish(message)
 
 
 class LocoStatePlugin:
     PREFIX = "loco_state"
 
+    # Which axes of the six this chassis genuinely measures. `vz`/`wx`/`wy` are
+    # absent rather than listed-and-null so a consumer can decide at start
+    # whether it can do its job at all, instead of discovering it at 10 Hz.
+    ODOM_AXES = ("vx", "vy", "wz")
+
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._odom_topic = f"/{namespace}/loco/state"
-        self._node = _LocoStateNode(self._odom_topic)
+        self._motion_topic = f"/{namespace}/state/odom"
+        self._node = _LocoStateNode(self._odom_topic, self._motion_topic)
         executor.add_node(self._node)
+
+    def _odom_interface(self) -> dict:
+        from common.odom import build_interface
+
+        return build_interface(
+            provides=self.ODOM_AXES,
+            rate_hz=10,
+            # Legged dead reckoning. Good for "how fast am I going" and "how far
+            # have I turned in the last few seconds", useless as an absolute
+            # position and must not be accumulated into a map.
+            pose_drift="unbounded",
+        )
 
     def get_tool(self) -> dict:
         return {
             "name": "loco_state",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"R1 locomotion state (always active) — mode, velocity, position, body_height, IMU. Publishes at 10Hz to {self._odom_topic}",
+            "description": f"R1 locomotion state (always active) — mode, velocity, position, body_height, IMU. Publishes at 10Hz to {self._odom_topic}, and the same reading as motus.odom/1 to {self._motion_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._odom_topic, "format": "data/json"}],
+            "topic_out": [{"topic": self._odom_topic, "format": "data/json"},
+                          {"topic": self._motion_topic, "format": "state/odom"}],
         }
 
     def start(self) -> None:
@@ -976,7 +1057,14 @@ class LocoStatePlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._odom_topic, "format": "data/json"}]}
+            return {
+                "state": "running",
+                "topic_out": [{"topic": self._odom_topic, "format": "data/json"},
+                              {"topic": self._motion_topic, "format": "state/odom"}],
+                # Read once at start by anything that needs to know whether this
+                # robot reports its own motion, and which axes of it.
+                "odom_interface": self._odom_interface(),
+            }
         return None
 
 
@@ -1059,6 +1147,33 @@ class LocoPlugin:
         self._fsm_busy = threading.Lock()
         self._fsm_active: str | None = None
         self._stop_move_ret: int | None = None
+        # Whether a `move` is still in effect. `Move(..., True)` sets a velocity
+        # that persists until StopMove, so "is this card driving the chassis"
+        # is a fact only this plugin knows — and loco_servo has to ask it before
+        # it starts writing to the same RpcProxy.
+        self._moving = False
+        # Set by LocoServoPlugin at construction. `loco` is built first, so the
+        # link cannot be a constructor argument in this direction.
+        self._servo = None
+
+    def attach_servo(self, servo) -> None:
+        """Let the streaming chassis card be paused before we drive it ourselves."""
+        self._servo = servo
+
+    def is_moving(self) -> bool:
+        return self._moving
+
+    def _preempt_servo(self, reason: str) -> bool:
+        """An explicit `loco` action outranks a streaming policy.
+
+        This direction is not negotiable: a person or the LLM saying "stop" or
+        "go left" must win over a policy that is mid-plan, and the reverse would
+        mean a policy could override a human instruction 100 ms after it was
+        given.
+        """
+        if self._servo is None:
+            return False
+        return bool(self._servo.pause_for_explicit_command(reason))
 
     def get_tools(self) -> list:
         return [self._loco_tool(), self._switch_mode_tool(), self._arm_tool()]
@@ -1194,6 +1309,7 @@ class LocoPlugin:
 
     def stop(self) -> None:
         self._client.StopMove()
+        self._moving = False
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
@@ -1211,15 +1327,35 @@ class LocoPlugin:
             vyaw = max(-2.0, min(2.0, float(args.get("vyaw", 0))))
             duration = float(args.get("duration", 0))
 
+            # Before touching the chassis, not after: otherwise this command and
+            # the policy's next one race, and which one the robot ends up obeying
+            # depends on timing nobody controls.
+            preempted = self._preempt_servo(f"loco.move({vx}, {vy}, {vyaw})")
+
             if duration > 0:
                 ret = self._client.SetVelocity(vx, vy, vyaw, duration)
+                # SetVelocity stops by itself, so it leaves no standing claim on
+                # the chassis for loco_servo to trip over.
+                self._moving = False
             else:
                 ret = self._client.Move(vx, vy, vyaw, True)
+                # Persists until StopMove. Zero velocity is still a claim: the
+                # card is holding the chassis at rest, and a second writer would
+                # be fighting that just as much as a moving one.
+                self._moving = True
 
-            return {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+            out = {"ret": ret, "vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration}
+            if preempted:
+                out["preempted_loco_servo"] = True
+            return out
         elif action == "stop_move":
+            preempted = self._preempt_servo("loco.stop_move")
             ret = self._client.StopMove()
-            return {"ret": ret}
+            self._moving = False
+            out = {"ret": ret}
+            if preempted:
+                out["preempted_loco_servo"] = True
+            return out
         elif action == "switch_mode":
             mode = args.get("mode", "")
             code, current_fsm = self._client.GetFsmId()
