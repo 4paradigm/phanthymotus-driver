@@ -8,6 +8,22 @@
 
 用户通过 Canvas 的 ActuCore `teleop` 卡片配置连接、模式和映射，并通过卡片或 PICO 的操作控件开始、结束或立即停止。Driver 的 `teleop_executor` 是卡片使用的内部接口，不应要求操作者逐帧调用它。普通 ActuCore 提供同一 MCP 服务；不另部署独立遥操 ActuCore。
 
+在 Canvas 中，将 ActuCore `teleop` 的 `control/teleop` 输出连接到对应机器人的 `teleop_executor` 输入。Driver 工具元数据顶层及 `info` 返回相同的 `x-teleop-target` 描述符：
+
+```json
+{
+  "protocol_version": 1,
+  "robot_profile": "tianyi2",
+  "namespace": "<Driver 实际 namespace>",
+  "command_topic": "/<Driver 实际 namespace>/motion/teleop/command",
+  "feedback_topic": "/<Driver 实际 namespace>/motion/teleop/feedback"
+}
+```
+
+这些路径来自执行器实际使用的命名空间，和本机 DDS 子进程创建的订阅、发布一致；命令输入格式为 `control/teleop`，反馈输出仍为 `data/json`。Agent Core 从所连卡片的 MCP 注册项与描述符解析目标，不通过固定端口或手工拼接路径猜测机器人。描述符版本是 Canvas 绑定契约版本，不改变下述 `motus.motion-target.v1` 连续目标协议。
+
+开启智能控制后的遥操准备由 ActuCore 负责；PICO 开始、结束以及关闭智能控制时的收臂编排也由 ActuCore 处理。这个描述符本身不获取执行权、不启动运动，也没有为 Driver 新增项目级开始、结束或自动回零动作；原有租约、反馈与停止检查保持不变。
+
 双臂专用配置必须在标定中显式设置 `hands_enabled: false`。此时既不要求手部开合端点，也不创建手部输出发布器；即使报文携带非零 hands，厂商写入路径仍屏蔽手部命令。省略此字段表示启用手部，非布尔值拒绝。手部启用时，使用已标定端点和现有 HandPlugin 转换，暂停不自动张手。
 
 ## 管理面与数据面

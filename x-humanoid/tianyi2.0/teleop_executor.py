@@ -160,6 +160,9 @@ class TeleopExecutor:
         actions = ["info", "start", "stop", "claim", "release", "pause", "recoverable_hold", "resume", "prepare_first_acceptance", "prepare_operator_session", "end_operator_session", "trace_start", "trace_stop"]
         return {"name": "teleop_executor", "type": "actuator", "multiInstance": False,
             "description": "天轶运动执行入口：仅供同机 ActuCore 获取控制权与停止，不接收 PICO 输入。",
+            "x-teleop-target": {"protocol_version": 1, "robot_profile": "tianyi2",
+                "namespace": self.ns, "command_topic": self.topic + "/command",
+                "feedback_topic": self.topic + "/feedback"},
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": actions},
                 "session_id": {"type": "string"}, "secret": {"type": "string", "format": "password"},
@@ -169,7 +172,7 @@ class TeleopExecutor:
                 "x-action-params": {a: {"params": (["session_id", "secret"] if a in ("release", "pause", "stop", "resume", "recoverable_hold") else [])
                     + (["request_id", "request_valid_until_ns"] if a in ("claim", "resume", "release") else [])}
                                     for a in actions}},
-            "topic_in": [{"topic": self.topic + "/command", "format": "data/json"}],
+            "topic_in": [{"topic": self.topic + "/command", "format": "control/teleop"}],
             "topic_out": [{"topic": self.topic + "/feedback", "format": "data/json"}]}
 
     def subscribe_feedback(self):
@@ -490,6 +493,7 @@ class TeleopExecutor:
                    for p in self.plugins)
 
     def info(self):
+        tool = self.get_tool()
         return {**self.gate.status(), "calibration_error": self.profile_error,
                 "watchdog_timing": dict(getattr(self, '_watchdog_timing', {})),
                 "last_vendor_command": copy.deepcopy(getattr(self, "_last_vendor_command", None)),
@@ -498,7 +502,8 @@ class TeleopExecutor:
                 "hands_enabled": (self.profile or {}).get('hands_enabled', True),
                 "calibration_sha256": self.profile_sha256, "foreign_publishers": self._foreign_publishers,
                 "publisher_present": self._output_ready,
-                "topic_in": self.get_tool()["topic_in"], "topic_out": self.get_tool()["topic_out"]}
+                "x-teleop-target": tool["x-teleop-target"],
+                "topic_in": tool["topic_in"], "topic_out": tool["topic_out"]}
 
     def dispatch(self, action, args):
         if action == 'info':
