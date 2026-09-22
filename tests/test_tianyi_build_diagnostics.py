@@ -59,8 +59,9 @@ def test_reports_missing_library_architecture_and_only_selected_metadata(tmp_pat
         assert item["link_target"] == "absent-rcutils.so"
 
 
-@pytest.mark.parametrize("build_status,diagnostic_fails", [(0, False), (37, False), (37, True)])
-def test_docker_compile_keeps_original_failure_status(tmp_path, build_status, diagnostic_fails):
+@pytest.mark.parametrize("build_status,diagnostic_fails,compiler_status", [
+    (0, False, 0), (37, False, 0), (37, True, 0), (0, False, 23)])
+def test_docker_compile_keeps_original_failure_status(tmp_path, build_status, diagnostic_fails, compiler_status):
     text = (DRIVER / "Dockerfile").read_text().replace("\\\n", "")
     command = next(line[4:] for line in text.splitlines() if line.startswith("RUN cd /tianyi_ws"))
     for prefix in ("/opt/ros/humble", "/ros_ws/install", "/tianyi_ws"):
@@ -72,17 +73,27 @@ def test_docker_compile_keeps_original_failure_status(tmp_path, build_status, di
     reporter.write_text("print('DIAGNOSTIC_CALLED')\nraise SystemExit(86)\n" if diagnostic_fails
                         else REPORTER.read_text())
     command = command.replace("/tmp/tianyi-cmake-failure.py", shlex.quote(str(reporter)))
+    command = command.replace('/tmp/tianyi-cmake-errno', str(tmp_path / 'guard'))
+    command = command.replace('LD_PRELOAD=', 'TEST_BUILD_PRELOAD=')
+    (tmp_path / 'guard.c').write_text('temporary build source')
     bindir = tmp_path / "bin"
     bindir.mkdir()
     colcon = bindir / "colcon"
     colcon.write_text("#!/bin/sh\nexit " + str(build_status) + "\n")
     colcon.chmod(0o755)
+    compiler = bindir / 'cc'
+    compiler.write_text('#!/bin/sh\nfor output do :; done\nprintf compiled > "$output"\nexit '
+                        + str(compiler_status) + '\n')
+    compiler.chmod(0o755)
     (bindir / "python3").symlink_to(sys.executable)
     env = {"PATH": str(bindir) + os.pathsep + os.defpath}
     result = subprocess.run(["/bin/sh", "-c", command], env=env, text=True,
                             capture_output=True, timeout=10)
-    assert result.returncode == build_status, result.stderr
-    if build_status == 0:
+    expected_status = compiler_status or build_status
+    assert result.returncode == expected_status, result.stderr
+    assert not (tmp_path / 'guard.c').exists()
+    assert not (tmp_path / 'guard.so').exists()
+    if expected_status == 0:
         assert result.stdout == ""  # Successful builds do not execute diagnostics.
     elif diagnostic_fails:
         assert "DIAGNOSTIC_CALLED" in result.stdout

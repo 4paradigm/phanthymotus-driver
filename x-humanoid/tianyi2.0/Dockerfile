@@ -32,10 +32,13 @@ RUN pip3 install --no-cache-dir --require-hashes --only-binary=:all: \
 # audio_msgs is inherited from ros-base's /ros_ws overlay, not rebuilt here.
 COPY msgs/ /tianyi_ws/src/
 COPY deploy/cmake_failure_diagnostics.py /tmp/tianyi-cmake-failure.py
+COPY deploy/cmake_readdir_errno.c /tmp/tianyi-cmake-errno.c
 RUN cd /tianyi_ws && \
     . /opt/ros/humble/setup.sh && \
     . /ros_ws/install/setup.sh && \
-    (colcon build --packages-select bodyctrl_msgs lyre_msgs; \
+    (trap 'rm -f /tmp/tianyi-cmake-errno.so /tmp/tianyi-cmake-errno.c' EXIT; \
+     cc -shared -fPIC -Wall -Wextra -Werror /tmp/tianyi-cmake-errno.c -ldl -o /tmp/tianyi-cmake-errno.so && \
+     LD_PRELOAD=/tmp/tianyi-cmake-errno.so colcon build --packages-select bodyctrl_msgs lyre_msgs; \
      build_status=$?; \
      if [ "$build_status" -ne 0 ]; then \
        python3 /tmp/tianyi-cmake-failure.py || true; \

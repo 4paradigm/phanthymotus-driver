@@ -149,14 +149,17 @@ def test_docker_shell_sources_base_overlay_and_fails_if_missing(tmp_path, phase,
                     'export OVERLAY_TRACE="${OVERLAY_TRACE:+${OVERLAY_TRACE},}' + label + '"\n')
     for prefix in ('/opt/ros', '/ros_ws', '/tianyi_ws', '/work'):
         command = command.replace(prefix, shlex.quote(str(root / prefix.lstrip('/'))))
+    command = command.replace('/tmp/tianyi-cmake-errno', str(tmp_path / 'guard'))
+    # This test checks shell routing/overlays; the Linux CMake A/B test loads the real guard.
+    command = command.replace('LD_PRELOAD=', 'TEST_BUILD_PRELOAD=')
 
     bindir = tmp_path / 'bin'
     bindir.mkdir()
-    for name in ('python3', 'colcon'):
+    for name in ('python3', 'colcon', 'cc'):
         probe = bindir / name
         probe.write_text('#!/bin/sh\n'
-                         '[ "$OVERLAY_TRACE" = "$EXPECTED_OVERLAYS" ] || exit 97\n'
-                         'printf "overlay-ready\\n"\n')
+                         '[ "$OVERLAY_TRACE" = "$EXPECTED_OVERLAYS" ] || exit 97\n' +
+                         ('printf "overlay-ready\\n"\n' if name != 'cc' else ':\n'))
         probe.chmod(0o755)
     env = {'PATH': str(bindir) + os.pathsep + os.defpath,
            'EXPECTED_OVERLAYS': 'ros,audio' if phase == 'compile' else 'ros,audio,tianyi'}

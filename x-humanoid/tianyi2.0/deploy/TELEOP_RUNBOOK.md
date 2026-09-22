@@ -22,6 +22,10 @@ Docker 构建的 RUN 不执行基础镜像 ENTRYPOINT。编译和导入检查因
 
 消息编译失败时，构建会输出 `TIANYI_CMAKE_DIAGNOSTIC`：rcutils 库存在性、符号链接和 ELF 架构，CMake 版本/前缀、rcutils 导出的查找参数，以及两个消息包中白名单内的 CMakeCache/编译器架构字段。它不打印完整环境、缓存或认证配置，不重新配置或修复库；诊断本身失败也保留原 colcon 退出码。成功编译不执行诊断。ARM64 原生构建与非 ARM64 主机经 QEMU 构建应分别记录，不能用前者通过直接解释后者的库查找失败。
 
+QEMU 构建曾出现库文件存在、ELF 与编译器均为 AArch64、查找路径正确，但只有部分消息包返回 `NOTFOUND` 的情况。[上游原始调查](https://github.com/ros2/rcutils/issues/525#issuecomment-4049423490)指出 CMake/KWSys 的目录遍历只在整个循环前清除 errno，循环内成功的内存分配仍可能遗留 errno，导致正确目录被当作读取失败。本镜像在消息编译时临时编译 `cmake_readdir_errno.c`，只对 colcon **及该构建进程树**设置 LD_PRELOAD，在每次真实 readdir/readdir64 调用前清零 errno；真实调用返回的错误保留。正常退出或失败均清理临时源码和共享库，最终 ENV/CMD 不含 LD_PRELOAD，不影响 Driver 运行。未修改 ROS 导出文件、atomic 链接、依赖版本或缺库检查。
+
+离线真实 CMake 注入验证覆盖：旧 errno 可复现“库存在但找不到”，修正后找到该库；真正 EIO 和库缺失仍然失败。它证明针对该机制的修复有效，不能冒充在 bot 上捕获了 malloc 系统调用或已经通过 QEMU 构建；最终仍以新 bot 构建结果为准。
+
 镜像体积核验（2026-09-22）：registry 中 `release.260922.2255037` 的压缩层合计 **341,727,193 B**；其前 15 层与基础镜像 `sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f` 完全一致，基础层合计 **261,578,370 B**。该成功版本曾额外复制 audio_msgs（独立层 **743 B**）并与两个厂商包一起重编译（三包共同层 **6,754,542 B**）；后者不能全部计为 audio_msgs 增量。此前日志/overlay 修复已移除冗余副本和编译；下述三段架构迁移另外增加了锁定的数值依赖，不能沿用此前体积结论。由于前一失败版本没有可比成功镜像，新版本净体积变化需按新 manifest 实测，不声称“零增量”。此前日志修复只复用镜像已有 common。新 motion_control 的 NumPy/SciPy/Pinocchio 及 cmeel ABI 依赖由 tianyi_motion/requirements.lock 固定并验证哈希，必须另行构建并记录真实体积。
 
 ActuCore 使用配套主仓的普通 bundle 构建入口和遥操依赖，不沿用早期独立服务示例。Jetson 部署使用主仓 `deploy/build_actucore.sh --jp-version 6.1 --with-teleop`，具体镜像和设备架构由实际部署选择。该主仓脚本在配置仓库凭据时还会推送，使用前应核对其发布设置与授权。不能把 Jetson 产物当作 x86/G1 通用镜像。
@@ -65,6 +69,8 @@ python3 -m pytest -q \
 这些测试用假时钟、合成反馈、记录式发布器和本地 socket，不连接机器人。`tests/benchmark_feedback_scheduler.py` 则是真实 ROS 只读订阅工具，不能混同于离线测试，也不应在设备承担任务时擅自运行。
 
 构建回归使用 `python3 -m pytest -q tests/test_tianyi_build_context.py tests/test_tianyi_build_diagnostics.py`：在独立临时源码副本中运行两个真实 Shell 入口，用 Docker 记录器检查上下文；提取 Dockerfile 的编译、导入、启动 Shell 命令，在临时环境中验证 overlay 加载顺序、缺失失败及诊断不改变原退出码。诊断子进程覆盖存在/缺失/断链库、架构和敏感字段排除。不连接 Docker daemon，不构建或推送镜像；实际 ARM64 编译和依赖导入仍须由镜像构建验证。
+
+Linux/glibc 环境另运行 `tests/test_tianyi_cmake_errno.py`，使用真实 cc、CMake 和故障注入库进行上述对照；其他系统明确跳过，需在禁网只读 ARM64 容器内验证，并为测试临时目录配置可执行 tmpfs。测试不注册 QEMU、不改宿主系统库。
 
 `tests/test_teleop_logsafe.py`（相对 Tianyi 目录）真实启动 `teleop_executor.py --bus` 子进程，以 ROS stub 和匿名本地 socketpair 验证：源码/镜像布局均在导入 ROS 前安装 common.logsafe，stdout、stderr 的 Python 输出及启动异常移除控制字符并按行写入。它不创建 DDS 参与者；logsafe 不包装 C/C++ 库直接写文件描述符的原生日志，不能据此声称所有原生输出已受保护。
 
