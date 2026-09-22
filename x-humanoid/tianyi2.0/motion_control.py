@@ -12,7 +12,7 @@ import time
 from types import SimpleNamespace
 
 from motion_stream import PROTOCOL, sign, vector
-from tianyi_motion.protocol import SCHEMA, envelope, validate
+from tianyi_motion.protocol import SCHEMA, envelope, validate, validate_descriptor
 
 
 class MotionControl:
@@ -99,6 +99,8 @@ class MotionControl:
             'topic_in': [{'port_id': 'targets', 'topic': self.arm_topic, 'format': 'control/joint'}]}
 
     def control_interface(self, mode='eef_pose'):
+        if mode not in ('eef_pose', 'joint_position'):
+            raise ValueError('invalid_control_interface')
         profile = self.solver.profile if self.solver else (self.executor.profile or {})
         versions = self.versions if self.solver else {'model_version': profile.get('urdf_sha256'),
             'calibration_version': self.executor.profile_sha256, 'frame': profile.get('torso_frame')}
@@ -329,12 +331,15 @@ class MotionControl:
         if action == 'start':
             if args.get('input_topic') not in (None, self.topic+'/command'):
                 raise ValueError('motion_control_input_topic_mismatch')
-            interface = args.get('control_interface') or args.get('control_interfaces', {}).get('joints')
-            if interface is not None:
-                expected = self.control_interface('joint_position')
-                if not isinstance(interface, dict) or any(interface.get(k) != expected[k]
-                        for k in ('control_interface', 'mode', 'dof', 'joint_names', 'units', 'groups')):
-                    raise ValueError('motion_control_execution_binding_mismatch')
+            try:
+                interfaces = args.get('control_interfaces', {})
+                if not isinstance(interfaces, dict):
+                    raise ValueError('invalid_control_descriptor')
+                for source, name in ((args, 'control_interface'), (interfaces, 'joints')):
+                    if name in source:
+                        validate_descriptor(source[name], self.control_interface('joint_position'))
+            except ValueError:
+                raise ValueError('motion_control_execution_binding_mismatch') from None
             binding = args.get('execution_binding')
             if binding is not None:
                 expected = self.arm_metadata()['x-control-target']

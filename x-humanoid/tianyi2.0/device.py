@@ -3217,10 +3217,12 @@ class ArmPlugin:
             if args.get('input_topic') not in (None, self._motion_control.arm_topic):
                 return {'state': 'error', 'code': 'arm_input_topic_mismatch', 'error': 'arm_input_topic_mismatch'}
             interface = args.get('control_interface')
-            expected = self._motion_control.control_interface('joint_position')
-            if interface is not None and (not isinstance(interface, dict) or any(
-                    interface.get(k) != expected[k] for k in ('control_interface', 'mode', 'dof', 'joint_names', 'units', 'groups'))):
-                return {'state': 'error', 'code': 'arm_control_interface_mismatch', 'error': 'arm_control_interface_mismatch'}
+            if 'control_interface' in args:
+                from tianyi_motion.protocol import validate_descriptor
+                try:
+                    validate_descriptor(interface, self._motion_control.control_interface('joint_position'))
+                except ValueError:
+                    return {'state': 'error', 'code': 'arm_control_interface_mismatch', 'error': 'arm_control_interface_mismatch'}
             if self._pos_publisher is None:self.start()
             return {'state': 'ready', **self._motion_control.arm_metadata()}
         if action == 'stop' and getattr(self, '_motion_control', None) is not None:

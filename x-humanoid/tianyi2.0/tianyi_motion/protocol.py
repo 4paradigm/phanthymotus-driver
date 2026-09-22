@@ -1,11 +1,72 @@
 """Strict, authenticated domain-42 control/2 envelopes (no hardware access)."""
 import hmac
+import math
 from motion_stream import sign, vector
 
 SCHEMA = 'motus.control/2'
 FIELDS = frozenset(('schema', 'boot_id', 'session_id', 'seq', 'source_seq',
     'mapping_epoch', 'generated_ns', 'valid_until_ns', 'mode', 'dof', 'values',
     'model_version', 'calibration_version', 'frame'))
+
+
+def validate_descriptor(value, expected):
+    """Validate a /2 action-space declaration against this Driver's capability.
+
+    Core forwards the downstream declaration without negotiating rate/limits.
+    Unknown extension fields are allowed, but cannot replace required fields.
+    This is separate from the /1 ControlSink contract and per-frame validation.
+    """
+    def require(condition):
+        if not condition:
+            raise ValueError('invalid_control_descriptor')
+
+    def number(item):
+        try:
+            return type(item) in (int, float) and math.isfinite(item)
+        except OverflowError:
+            return False
+
+    require(isinstance(value, dict))
+    mode = value.get('mode')
+    require(mode in ('eef_pose', 'joint_position') and mode == expected['mode'])
+    require(value.get('control_interface') == SCHEMA and value.get('schema') == SCHEMA)
+    require(type(value.get('protocol_version')) is int and value['protocol_version'] == 2)
+    require(type(value.get('dof')) is int and value['dof'] == 14)
+    for name in ('model_version', 'calibration_version', 'frame'):
+        require(isinstance(value.get(name), str) and bool(value[name])
+                and value[name] == expected[name])
+    units = value.get('units')
+    require(isinstance(units, dict))
+    require(all(units.get(name) == unit for name, unit in expected['units'].items()))
+    groups = value.get('groups')
+    require(isinstance(groups, list) and len(groups) == len(expected['groups']))
+    for group, reference in zip(groups, expected['groups']):
+        require(isinstance(group, dict))
+        for name in ('offset', 'count'):
+            require(type(group.get(name)) is int and group[name] == reference[name])
+        for name in ('name', 'mode', 'unit', 'resource'):
+            require(group.get(name) == reference[name])
+    rate = value.get('rate')
+    require(isinstance(rate, dict))
+    for name in ('max_hz', 'expected_hz', 'watchdog_ms'):
+        item = rate.get(name)
+        require(number(item) and item > 0 and item == expected['rate'][name])
+    require(rate['expected_hz'] <= rate['max_hz'])
+    if mode == 'eef_pose':
+        require(value.get('effector_ids') == expected['effector_ids'])
+    else:
+        names = value.get('joint_names')
+        require(isinstance(names, list) and len(names) == 14
+                and all(isinstance(name, str) and bool(name) for name in names))
+        require(len(set(names)) == 14 and names == expected['joint_names'])
+        limits = value.get('limits')
+        require(isinstance(limits, dict))
+        for name in ('lower', 'upper', 'max_velocity'):
+            items = limits.get(name)
+            require(isinstance(items, list) and len(items) == 14 and all(number(x) for x in items))
+            require(items == expected['limits'][name])
+        require(all(lo <= hi and velocity > 0 for lo, hi, velocity in zip(
+            limits['lower'], limits['upper'], limits['max_velocity'])))
 
 
 def validate(packet, lease, *, mode, now, model_version, calibration_version,

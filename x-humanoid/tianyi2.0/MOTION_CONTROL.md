@@ -38,7 +38,34 @@ command_topic、feedback_topic 和 resources（arm_l、arm_r）。`control_inter
 
 `motion_control.start` 可接收 input_topic、instance_id、control_interface、
 control_interfaces 和 execution_binding。接口必须匹配本机 arm 的模式、14 维
-关节序、单位、分组及目标 namespace/topic；不允许另指一台机器。此步骤无 claim。
+关节序、单位、分组、模型/标定版本、坐标系、速率与限位，以及目标 namespace/topic；
+不允许另指一台机器。此步骤无 claim。
+
+### v2 动作空间描述符
+
+`motus.control/2` 与旧 `motus.control/1` 的描述符分别验证，不使用旧 ControlSink
+解析器套用字段。`motion_control.start` 接收其下游 arm 的 joint_position 描述符，
+`arm.start` 若收到描述符也执行相同校验；单项 control_interface 和按端口传入的
+control_interfaces.joints 同时存在时必须分别有效。兼容不携带描述符的旧启动调用，
+但显式传入空对象、null 或不完整声明会失败，且不会启动线程或取得执行权。
+
+| 必需字段 | 规则 |
+|---|---|
+| control_interface、schema、protocol_version | 两个 schema 均为 `motus.control/2`；版本为整数 2 |
+| mode、dof | eef_pose 或 joint_position；维数为整数 14，不接受浮点数或布尔值 |
+| model_version、calibration_version、frame | 非空字符串，与当前 Driver 标定的模型哈希、标定哈希、胸部坐标系一致 |
+| units | EEF 为 position=m、orientation=xyzw、time=s；joint 为 angle=rad、time=s |
+| groups | 有序 arm_l、arm_r 两组；offset 为整数 0、7，count 均为整数 7；name、mode、unit、resource 均与本机声明一致 |
+| rate | max_hz=50、expected_hz=50；watchdog_ms 为 EEF 300、joint 100，均为有限正数 |
+| EEF 专属 effector_ids | 有序 left、right；14 维表示两份 xyz+xyzw，不是 14 个末端自由度 |
+| joint 专属 joint_names、limits | 14 个唯一关节名且顺序一致；lower、upper、max_velocity 各为 14 个有限数，匹配共享 MotionGate 的当前限位与速度；lower≤upper、速度>0 |
+
+Core 当前原样传递下游描述符，没有速率/限位协商；改变这些声明不能改变 Driver
+能力，因此启动时拒绝不一致值。速率、限位允许数值相等的 int/float 表示，版本、
+维数及分组索引严格为整数。未知扩展字段可保留，但不代替上述必需字段，也不启用
+新的控制能力。EEF 不要求 joint_names 或关节 limits；可达范围和碰撞仍由 Driver
+模型检查。当前两种位置控制模式不提供力控，`force_torque` 不是本 v2 契约的必需项。
+启动校验不代替下文逐帧签名、期限及实际执行门禁；v1 行为保持不变。
 
 ## 连续命令
 
