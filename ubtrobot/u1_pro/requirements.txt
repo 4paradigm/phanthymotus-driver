@@ -1,2 +1,2 @@
 pyyaml
-numpy
+numpy==1.26.4

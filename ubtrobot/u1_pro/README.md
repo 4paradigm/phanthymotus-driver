@@ -30,10 +30,11 @@ vendor event topics, because a different DDS message type would not match the ro
 
 The camera card relies on the SDK video service response fields `path`,
 `frame_payload_size`, and `max_frames`, and on video metadata fields `width`,
-`height`, `step`, and `encoding`. It supports the documented packed RGB/BGR/RGBA/
-BGRA/mono raw formats and rejects unknown encodings rather than publishing
-corrupt images. The video shared-memory path must be visible inside the driver
-container, as required by the vendor SDK deployment.
+`height`, `step`, and `encoding`. It supports packed RGB/BGR/RGBA/BGRA/mono and
+the U1 camera's `yuv422_yuy2` frames, converting them to JPEG; unknown encodings
+are rejected rather than publishing corrupt images. The video shared-memory
+path must be visible inside the driver container, as required by the vendor SDK
+deployment.
 
 The deployment shares the Adapter's live `/tmp/robo/ipc` directory and
 `/dev/shm` with the driver. These are runtime IPC resources, not persistent
@@ -68,11 +69,14 @@ The image installs `python3-pil` for the documented raw-video-to-JPEG conversion
 and `ffmpeg` for MP4 capture,
 and `python3-colcon-common-extensions`, `cmake`, and `build-essential`
 only to build the local ROS interface packages during the image build. It installs the
-CycloneDDS RMW used by the dual-domain runtime and `PyYAML` used by the shared driver
-configuration loader. The official U1 SDK ROS2 runtime defaults to robot domain
-`20` and binds CycloneDDS to host loopback. The deployment keeps Agent Core on
-domain `42`; `ROS_LOCALHOST_ONLY` remains unset because the two contexts are
-configured explicitly by the driver. `MaxAutoParticipantIndex` is increased to
+CycloneDDS RMW used by the dual-domain runtime, `PyYAML` used by the shared driver
+configuration loader, and NumPy 1.26.4 for vectorized conversion of the camera's
+YUY2 frames. NumPy adds a Python wheel to this component image; the exact version
+is pinned for reproducible ARM64/Python 3.10 builds. The official U1 SDK ROS2
+runtime defaults to robot domain `20` and binds CycloneDDS to host loopback. The
+deployment keeps Agent Core on domain `42`; `ROS_LOCALHOST_ONLY` remains unset
+because the two contexts are configured explicitly by the driver.
+`MaxAutoParticipantIndex` is increased to
 200 because the U1 host already runs many ROS participants.
 
 Local contract checks:

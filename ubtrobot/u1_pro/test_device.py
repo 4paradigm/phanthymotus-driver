@@ -679,6 +679,21 @@ class U1CardContractTests(unittest.TestCase):
         plugin = device.AudioPlugin(FakeNodes())
         self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
 
+    def test_head_stop_cancellation_keeps_head_tool_name(self):
+        import device
+
+        nodes = FakeNodes()
+        nodes.string_call = mock.Mock(return_value={"data": {"motion_info_list": [
+            {"motion_id": "A014", "motion_name": "点头"},
+        ]}})
+        head = device.HeadPlugin(device.AudioPlugin(nodes))
+        head.dispatch("play", {"name": "nod", "action_id": "head-stop-1"})
+        with mock.patch.object(device, "_acp_notify") as notify:
+            head.stop()
+        self.assertEqual(notify.call_args.args[0], "head-stop-1")
+        self.assertEqual(notify.call_args.args[1], "cancelled")
+        self.assertEqual(notify.call_args.args[3], "head")
+
     def test_tts_interrupt_is_an_explicit_alias_for_stop(self):
         import device
 
@@ -716,6 +731,15 @@ class U1CardContractTests(unittest.TestCase):
         ]}})
         head = device.HeadPlugin(device.AudioPlugin(nodes))
         self.assertEqual(head.dispatch("list_actions", {})["actions"], [{"name": "nod", "label": "点头"}])
+        head_schema = head.get_tool()["inputSchema"]
+        self.assertEqual(head_schema["x-completion"]["actions"], ["play"])
+        self.assertEqual(head_schema["x-completion"]["timeout"], 120)
+        head.dispatch("play", {"name": "nod", "action_id": "head-1"})
+        vendor_uuid = head.audio._active["vendor_uuid"]
+        with mock.patch.object(device, "_acp_notify") as notify:
+            head.audio._on_playback_state({"uuid": vendor_uuid, "phase": "result", "success": True, "state_name": "COMPLETED"})
+        self.assertEqual(notify.call_args.args[0], "head-1")
+        self.assertEqual(notify.call_args.args[3], "head")
         with self.assertRaisesRegex(ValueError, "not available"):
             head.dispatch("play", {"name": "shake"})
 
@@ -729,6 +753,10 @@ class U1CardContractTests(unittest.TestCase):
         vision = device._SystemSwitchPlugin(nodes, "visual_follow_control", "vision_enabled", "vision_enabled_state", "vision")
         self.assertEqual(wakeup.dispatch("disable", {}), {"ok": True})
         self.assertEqual(vision.dispatch("status", {}), {"enabled": False})
+        self.assertEqual(wakeup.dispatch("start", {}), {"state": "ready"})
+        self.assertEqual(wakeup.dispatch("stop", {}), {"state": "idle"})
+        self.assertEqual(wakeup.get_tool()["inputSchema"]["properties"]["action"]["enum"],
+                         ["start", "stop", "enable", "disable", "status"])
         nodes.set_system_enabled.assert_called_once_with("wakeup_enabled", False)
         nodes.get_system_enabled.assert_called_once_with("vision_enabled_state")
 
@@ -781,6 +809,7 @@ class U1CardContractTests(unittest.TestCase):
             plugin._on_playback_state({"code": "EVENT", "data": {"uuid": vendor_uuid, "phase": "result", "success": True, "state": "COMPLETED", "message": "x" * 1000, "unexpected": "drop"}})
             notify.assert_called_once()
             self.assertEqual(notify.call_args.args[1], "completed")
+            self.assertEqual(notify.call_args.args[3], "tts")
             playback = notify.call_args.args[2]["playback"]
             self.assertEqual(playback["message"], "x" * 512)
             self.assertNotIn("unexpected", playback)

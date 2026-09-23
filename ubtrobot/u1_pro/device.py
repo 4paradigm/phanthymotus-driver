@@ -810,7 +810,7 @@ class AudioPlugin:
             except Exception as exc:
                 result["interrupt_error"] = str(exc)
             finally:
-                _acp_notify(active["action_id"], "cancelled", {"state": "cancelled", "action_id": active["action_id"]})
+                _acp_notify(active["action_id"], "cancelled", {"state": "cancelled", "action_id": active["action_id"]}, active["tool_name"])
         self.running = False
         return result
 
@@ -821,7 +821,7 @@ class AudioPlugin:
             vendor_uuid = str(uuid.uuid4())
             vendor_payload = dict(payload)
             vendor_payload["uuid"] = vendor_uuid
-            self._active = {"action_id": action_id, "vendor_uuid": vendor_uuid, "kind": kind}
+            self._active = {"action_id": action_id, "vendor_uuid": vendor_uuid, "kind": kind, "tool_name": tool_name}
         try:
             result = self.nodes.string_call(kind, vendor_payload)
         except Exception as exc:
@@ -846,7 +846,7 @@ class AudioPlugin:
         failed = state_name == "FAILED" or data.get("success") is False
         success = not failed and (data.get("success") is True or state_name == "COMPLETED")
         status = "completed" if success else "error"
-        _acp_notify(active["action_id"], status, {"state": state_name.lower() or status, "action_id": active["action_id"], "playback": _bounded_playback(data)})
+        _acp_notify(active["action_id"], status, {"state": state_name.lower() or status, "action_id": active["action_id"], "playback": _bounded_playback(data)}, active["tool_name"])
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1438,6 +1438,8 @@ class _SystemSwitchPlugin:
 
     def get_tool(self):
         actions = {
+            "start": ([], "Prepare this U1 Pro system switch card."),
+            "stop": ([], "Stop this U1 Pro system switch card without changing the robot capability setting."),
             "enable": ([], "Enable this U1 Pro system capability."),
             "disable": ([], "Disable this U1 Pro system capability."),
             "status": ([], "Read the current U1 Pro system capability state."),
@@ -1446,13 +1448,17 @@ class _SystemSwitchPlugin:
                     action_schema(actions, {}))
 
     def start(self):
-        return self.dispatch("status", {})
+        return {"state": "ready"}
 
     def stop(self):
-        return None
+        return {"state": "idle"}
 
     def dispatch(self, action, args):
         del args
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
         if action == "enable":
             return self.nodes.set_system_enabled(self.set_name, True)
         if action == "disable":
@@ -1486,13 +1492,15 @@ class HeadPlugin:
             "stop": ([], "Interrupt the current head motion."),
             "info": ([], "Read head action card state."),
         }
+        schema = action_schema(actions, {
+            "name": {"type": "string", "enum": sorted(self.HEAD_ACTIONS),
+                     "description": "Readable name returned by list_actions."},
+            "action_id": {"type": "string", "description": "Optional caller correlation ID."},
+        })
+        schema["x-completion"] = {"actions": ["play"], "timeout": 120}
         return tool(self.PREFIX, "actuator",
                     "U1 Pro preset head motions such as nod, shake, tilt, look up, and look down. It does not expose raw joint angles.",
-                    action_schema(actions, {
-                        "name": {"type": "string", "enum": sorted(self.HEAD_ACTIONS),
-                                 "description": "Readable name returned by list_actions."},
-                        "action_id": {"type": "string", "description": "Optional caller correlation ID."},
-                    }))
+                    schema)
 
     def start(self):
         self.running = True
