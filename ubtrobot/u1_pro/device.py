@@ -26,11 +26,10 @@ from common.vendor_runtime import action_schema, jsonable, tool
 
 
 SERVICE_TIMEOUT = 3.0
+MIC_TOPIC = "/sys/device/audio_in/raw"
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
-SDK_AUDIO_OPEN = "/robo/audio/call/open_stream"
-SDK_AUDIO_STATE = "/robo/audio/call/stream_state"
-SDK_AUDIO_CLOSE = "/robo/audio/call/close_stream"
+MIC_SAMPLE_FORMATS = {"s16", "s16le", "s16_le", "signed_16", "pcm_s16le", "int16"}
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
 VIDEO_METADATA_TOPIC = "/robo/video/subscribe/metadata"
 VIDEO_OPEN = "/robo/video/call/open_stream"
@@ -175,10 +174,10 @@ def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
 
 
 class VideoSharedMemoryReader:
-    """Read a U1 SDK fixed-slot shared-memory ring (audio or video)."""
+    """Read a U1 SDK fixed-slot video shared-memory ring."""
 
     _RING_HEADER = struct.Struct("<8Q")  # 64-byte, cache-line-aligned SDK header
-    _HEADER = struct.Struct("<4Q")  # sequence, timestamp, payload size, reserved
+    _HEADER = struct.Struct("<8Q")  # alignas(64): sequence, timestamp, payload size, reserved
 
     def __init__(self, config: dict, metadata_getter, frame_callback):
         self.config = dict(config)
@@ -253,9 +252,9 @@ class VideoSharedMemoryReader:
                             offset = data_offset + index * slot_size
                             frame_header = self._HEADER.unpack_from(shared, offset)
                             sequence, timestamp_ns, size = frame_header[:3]
-                            if sequence <= self._last_sequence or size <= 0 or size > payload_size:
+                            if write_index == 0 or sequence >= write_index:
                                 continue
-                            if write_index == 0:
+                            if sequence <= self._last_sequence or size <= 0 or size > payload_size:
                                 continue
                             if newest is None or sequence > newest[0]:
                                 newest = (sequence, timestamp_ns, bytes(shared[offset + self._HEADER.size:offset + self._HEADER.size + size]))
@@ -317,8 +316,9 @@ class U1Nodes:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
-        from audio_msgs.msg import AudioChunk, AudioOutData
+        from audio_msgs.msg import AudioChunk, AudioInData, AudioOutData
         from audio_msgs.srv import SetAudioVolume
+        from std_msgs.msg import UInt8
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
         from sensor_msgs.msg import CompressedImage
@@ -344,22 +344,31 @@ class U1Nodes:
         self.namespace = namespace
         self.mic_topic = f"/{namespace}/mic/audio"
         self.AudioChunk = AudioChunk
+        self.AudioInData = AudioInData
         self.AudioOutData = AudioOutData
+        self.UInt8 = UInt8
         self.String = String
         self.CompressedImage = CompressedImage
         self._speaker_publisher = self.audio_device.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
+        self._volume = None
+        self._volume_subscription = self.audio_device.create_subscription(
+            UInt8, "/sys/device/audio_out/current_volume", self._volume_callback, 10)
         self._speaker_subscription = None
         self._speaker_forwarding = False
         self._speaker_uuid = ""
+        self._speaker_frames = 0
 
         reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self._audio_qos = best_effort
         self._mic_publisher = self.core.create_publisher(AudioChunk, self.mic_topic, best_effort)
         self._event_publishers = {}
         self._event_forwarding = {}
         self._mic_forwarding = False
-        self._mic_reader = None
-        self._mic_stream = {}
+        self._mic_frames = 0
+        self._mic_frame_event = threading.Event()
+        self._mic_subscription = self.audio_device.create_subscription(
+            AudioInData, MIC_TOPIC, self._mic_callback, best_effort)
         self._playback_listeners = []
         self._video_metadata = {}
         self._video_metadata_lock = threading.Lock()
@@ -381,9 +390,6 @@ class U1Nodes:
             "video_open": self.robot.create_client(Trigger, VIDEO_OPEN),
             "video_state": self.robot.create_client(Trigger, VIDEO_STATE),
             "video_close": self.robot.create_client(Trigger, VIDEO_CLOSE),
-            "audio_open": self.robot.create_client(Trigger, SDK_AUDIO_OPEN),
-            "audio_state": self.robot.create_client(Trigger, SDK_AUDIO_STATE),
-            "audio_close": self.robot.create_client(Trigger, SDK_AUDIO_CLOSE),
         }
 
     def _spin_audio_device(self) -> None:
@@ -464,6 +470,28 @@ class U1Nodes:
         with self._video_metadata_lock:
             return dict(self._video_metadata)
 
+    def _volume_callback(self, message) -> None:
+        self._volume = int(message.data)
+
+    def get_volume(self) -> dict:
+        if self._volume is None:
+            raise RuntimeError("U1 Pro speaker volume has not been published yet")
+        return {"volume": self._volume}
+
+    def _mic_callback(self, message) -> None:
+        if not self._mic_forwarding or message.sample_rate != 16000 or message.channels != 1:
+            return
+        sample_format = str(getattr(message, "sample_format", "")).strip().lower()
+        if sample_format not in MIC_SAMPLE_FORMATS:
+            return
+        chunk = self.AudioChunk()
+        chunk.header = message.header
+        chunk.format = AUDIO_FORMAT
+        chunk.data = list(message.data.data)
+        self._mic_publisher.publish(chunk)
+        self._mic_frames += 1
+        self._mic_frame_event.set()
+
     def call(self, name: str, request) -> Any:
         client = self._clients[name]
         if not client.wait_for_service(timeout_sec=SERVICE_TIMEOUT):
@@ -478,49 +506,18 @@ class U1Nodes:
 
     def set_mic_enabled(self, enabled: bool) -> dict:
         if not enabled:
-            self.stop_mic_reader()
-            return self.trigger_call("audio_close")
-        opened = self.trigger_call("audio_open")
-        state = self.trigger_call("audio_state")
-        stream = _stream_config(opened, state)
-        if not stream.get("path") or not stream.get("frame_payload_size") or not stream.get("max_frames"):
             self._mic_forwarding = False
-            try:
-                self.trigger_call("audio_close")
-            except Exception:
-                pass
-            raise RuntimeError("U1 Pro audio stream state did not provide shared-memory configuration")
-        self._mic_stream = stream
-        self._mic_reader = VideoSharedMemoryReader(stream, lambda: {}, self._publish_mic_frame)
-        try:
-            self._mic_reader.start()
-        except Exception:
-            self._mic_reader = None
-            self._mic_stream = {}
-            try:
-                self.trigger_call("audio_close")
-            except Exception:
-                pass
-            raise
+            return {"state": "idle", "source_topic": MIC_TOPIC}
+        self._mic_frames = 0
+        self._mic_frame_event.clear()
         self._mic_forwarding = True
-        return {"open": opened, "state": state, "stream": stream}
+        return {"state": "running", "source_topic": MIC_TOPIC}
+
+    def wait_for_mic_frame(self, timeout: float) -> bool:
+        return self._mic_frame_event.wait(timeout)
 
     def stop_mic_reader(self) -> None:
         self._mic_forwarding = False
-        if self._mic_reader:
-            self._mic_reader.stop()
-            self._mic_reader = None
-        self._mic_stream = {}
-
-    def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
-        if not self._mic_forwarding:
-            return
-        chunk = self.AudioChunk()
-        chunk.format = AUDIO_FORMAT
-        chunk.data = list(payload)
-        chunk.header.stamp.sec = timestamp_ns // 1_000_000_000
-        chunk.header.stamp.nanosec = timestamp_ns % 1_000_000_000
-        self._mic_publisher.publish(chunk)
 
     def set_event_enabled(self, name: str, enabled: bool) -> None:
         self._event_forwarding[name] = enabled
@@ -560,7 +557,12 @@ class U1Nodes:
         from audio_msgs.srv import SetAudioVolume
         request = SetAudioVolume.Request()
         request.volume = max(0, min(100, int(volume)))
-        return jsonable(self.call("volume", request))
+        response = self.call("volume", request)
+        code = getattr(response, "code", 0)
+        if int(code) != 0:
+            raise RuntimeError(f"U1 Pro volume service failed with code {code}")
+        self._volume = request.volume
+        return jsonable(response)
 
     def close_speaker_subscription(self) -> None:
         self._speaker_forwarding = False
@@ -571,7 +573,9 @@ class U1Nodes:
     def connect_speaker(self, input_topic: str) -> dict:
         self.close_speaker_subscription()
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
-        self._speaker_subscription = self.core.create_subscription(self.AudioChunk, input_topic, self._speaker_callback, 10)
+        self._speaker_frames = 0
+        self._speaker_subscription = self.core.create_subscription(
+            self.AudioChunk, input_topic, self._speaker_callback, self._audio_qos)
         self._speaker_forwarding = True
         return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
 
@@ -585,15 +589,13 @@ class U1Nodes:
         output.uuid = self._speaker_uuid
         output.data.data = list(message.data)
         self._speaker_publisher.publish(output)
+        self._speaker_frames += 1
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         self._mic_forwarding = False
-        if self._mic_reader:
-            self._mic_reader.stop()
-            self._mic_reader = None
         self._event_forwarding.clear()
         self.close_speaker_subscription()
         self._audio_executor.remove_node(self.audio_device)
@@ -625,6 +627,8 @@ class MicPlugin:
         self._enable_requested = True
         try:
             self.nodes.set_mic_enabled(True)
+            if not self.nodes.wait_for_mic_frame(2.0):
+                raise TimeoutError("no PCM frames received from the U1 microphone topic")
         except Exception as exc:
             self._enable_requested = False
             self.running = False
@@ -667,10 +671,11 @@ class SpeakerPlugin:
         actions = {
             "start": (["input_topic"], "Start playing the connected PCM audio stream."),
             "set_volume": (["volume"], "Set U1 Pro speaker volume from 0 to 100."),
+            "get_volume": ([], "Read the current U1 Pro device speaker volume."),
             "stop": ([], "Stop consuming the connected audio stream."),
             "info": ([], "Read speaker connection state."),
         }
-        return {"name": self.PREFIX, "type": "actuator", "multiInstance": False, "description": "U1 Pro speaker. Connect an audio/pcm-16k stream such as TTS or mic audio, then start playback.", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "Connected audio/pcm-16k input topic"}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
+        return {"name": self.PREFIX, "type": "actuator", "multiInstance": False, "description": "U1 Pro speaker output stream. Connect a TTS or other audio/pcm-16k output to this card to play it live. Volume can be read or set from 0 to 100.", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "Connected audio/pcm-16k input topic, normally supplied by the Agent Core stream connection."}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
 
     def start(self):
         # The input topic is supplied by Agent Core when the stream is connected;
@@ -689,23 +694,26 @@ class SpeakerPlugin:
         if action == "start":
             topic = str(args.get("input_topic", "")).strip()
             if not topic:
-                return self.start()
+                return {"state": "waiting_for_input", "message": "Connect an audio/pcm-16k output stream to speaker before starting playback."}
             self.input_topic = topic
             result = self.nodes.connect_speaker(topic)
             self.running = True
             return result
         if action == "set_volume":
             return self.nodes.set_volume(args.get("volume", 100))
+        if action == "get_volume":
+            return self.nodes.get_volume()
         if action == "stop":
             self.stop()
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running" if self.running else "idle", "input_topic": self.input_topic}
+            return {"state": "running" if self.running else "idle", "input_topic": self.input_topic,
+                    "frames_received": self.nodes._speaker_frames}
         return None
 
 
 class AudioPlugin:
-    PREFIX = "audio"
+    PREFIX = "tts"
 
     def __init__(self, nodes: U1Nodes):
         self.nodes = nodes
@@ -716,23 +724,17 @@ class AudioPlugin:
 
     def get_tool(self):
         actions = {
-            "start": ([], "Prepare the U1 Pro audio action card."),
-            "list_actions": ([], "List command motion IDs available on the U1 Pro."),
-            "play_action": (["motion_id"], "Play one documented command motion by its motion_id, such as A029."),
-            "play_text": (["text"], "Speak text through the U1 Pro voice output, optionally with a motion and persistence."),
-            "stop": ([], "Interrupt the current U1 Pro speech or motion."),
-            "info": ([], "Read the U1 Pro audio card and active playback state."),
+            "speak": (["text"], "Convert the supplied text to speech and play it through the U1 Pro.",),
+            "stop": ([], "Interrupt the current U1 Pro text-to-speech playback."),
+            "info": ([], "Read TTS readiness and any active playback."),
         }
         properties = {
-            "motion_id": {"type": "string", "minLength": 1, "description": "Vendor command motion_id returned by list_actions, for example A029."},
             "text": {"type": "string", "minLength": 1, "description": "Text to speak."},
-            "motion": {"type": "string", "description": "Optional vendor motion parameter for play_text."},
-            "save": {"type": "boolean", "default": False, "description": "Whether the vendor should persist the generated audio."},
             "action_id": {"type": "string", "description": "Optional caller correlation ID; otherwise a UUID is generated."},
         }
         schema = action_schema(actions, properties)
-        schema["x-completion"] = {"actions": ["play_action", "play_text"], "timeout": 120}
-        return tool(self.PREFIX, "actuator", "U1 Pro preset motion and text playback. Use list_actions to discover motion IDs; play calls return queued and complete asynchronously from playback_state.", schema)
+        schema["x-completion"] = {"actions": ["speak"], "timeout": 120}
+        return tool(self.PREFIX, "actuator", "U1 Pro text-to-speech output. Submit text to speak; this card does not expose preset motion or raw audio playback.", schema)
 
     def start(self):
         self.running = True
@@ -794,23 +796,12 @@ class AudioPlugin:
             with self._lock:
                 active = dict(self._active) if self._active else None
             return {"state": "ready" if self.running else "idle", "active": active}
-        if action == "list_actions":
-            return self.nodes.string_call("motion_list", {})
-        if action == "play_action":
-            motion_id = str(args.get("motion_id", "")).strip()
-            if not motion_id:
-                raise ValueError("audio.play_action requires motion_id")
-            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
-            return self._queue("play_action", {"action": motion_id}, action_id)
-        if action == "play_text":
+        if action == "speak":
             text = str(args.get("text", "")).strip()
             if not text:
-                raise ValueError("audio.play_text requires text")
+                raise ValueError("tts.speak requires text")
             action_id = str(args.get("action_id") or uuid.uuid4())[:128]
-            payload = {"text": text[:4096], "save": bool(args.get("save", False))}
-            if args.get("motion"):
-                payload["motion"] = str(args["motion"])
-            return self._queue("play_text", payload, action_id)
+            return self._queue("play_text", {"text": text[:4096]}, action_id, "tts")
         if action == "stop":
             return self.stop()
         return None
@@ -861,6 +852,7 @@ class CameraRgbPlugin:
         self.running = False
         self._publisher = None
         self._reader = None
+        self._frame_ready = threading.Event()
         self._metadata = {}
         self._frame_condition = threading.Condition()
         self._latest_jpeg = None
@@ -879,6 +871,7 @@ class CameraRgbPlugin:
     def start(self):
         if self.running:
             return self._state()
+        self._frame_ready.clear()
         try:
             if self._publisher is None:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
@@ -896,10 +889,17 @@ class CameraRgbPlugin:
                 raise RuntimeError("U1 Pro video stream response is missing: " + ", ".join(missing))
             self._reader = VideoSharedMemoryReader(reader_config, self.nodes.video_metadata, self._publish_frame)
             self._reader.start()
+            if not self._frame_ready.wait(3.0):
+                raise TimeoutError("U1 Pro camera stream opened but no frames arrived")
             self.running = True
             self._last_error = ""
         except Exception as exc:
             self._last_error = str(exc)[:256]
+            if self._reader:
+                self._reader.stop()
+                self._reader = None
+            self.running = False
+            self._frame_ready.set()
             try:
                 self.nodes.close_video()
             except Exception:
@@ -910,7 +910,7 @@ class CameraRgbPlugin:
         if self._reader:
             self._reader.stop()
             self._reader = None
-        if self.running:
+        if self.running or self._last_error:
             try:
                 self.nodes.close_video()
             except Exception as exc:
@@ -932,8 +932,10 @@ class CameraRgbPlugin:
                 self._frame_sequence += 1
                 self._frames += 1
                 self._frame_condition.notify_all()
+            self._frame_ready.set()
         except Exception as exc:
             self._last_error = str(exc)[:256]
+            self._frame_ready.set()
 
     def wait_for_jpeg(self, after_sequence=None, timeout_s=5.0):
         deadline = time.monotonic() + max(0.0, float(timeout_s))
@@ -1250,6 +1252,24 @@ class ExpressionPlugin:
         "A019", "A020", "A021", "A022", "A023", "A024", "A025", "A026",
         "A027", "A028", "A029", "A030", "A031", "A032", "A033", "A034",
     }
+    EXPRESSIONS = {
+        "blink": ("A001", "眨眼"), "raise_eyebrow": ("A002", "挑眉"),
+        "gaze": ("A003", "注视"), "close_eyes": ("A004", "闭眼"),
+        "frown": ("A005", "皱眉"), "open_mouth": ("A006", "张嘴"),
+        "smile": ("A007", "笑"), "pout": ("A008", "嘟嘴"),
+        "blow_kiss": ("A009", "飞吻"), "tilt_head": ("A010", "歪头"),
+        "shake_head": ("A011", "摇头"), "look_down": ("A012", "低头"),
+        "look_up": ("A013", "抬头"), "nod": ("A014", "点头"),
+        "wake_up": ("A017", "苏醒"), "shy": ("A018", "害羞"),
+        "affectionate": ("A019", "撒娇"), "angry": ("A020", "生气"),
+        "sad": ("A021", "伤心/难过"), "surprised": ("A022", "惊讶"),
+        "happy": ("A023", "开心"), "distracted": ("A024", "发呆"),
+        "confused": ("A025", "困惑"), "anxious": ("A026", "焦虑"),
+        "contempt": ("A027", "轻蔑"), "afraid": ("A028", "恐惧"),
+        "thinking": ("A029", "思考"), "got_it": ("A030", "想到了"),
+        "sleepy": ("A031", "困"), "good_night": ("A032", "睡吧"),
+        "laugh": ("A033", "大笑"), "silly_face": ("A034", "鬼脸"),
+    }
 
     def __init__(self, audio: AudioPlugin):
         self.audio = audio
@@ -1258,13 +1278,13 @@ class ExpressionPlugin:
     def get_tool(self):
         actions = {
             "start": ([], "Prepare the U1 Pro expression action card."),
-            "list_actions": ([], "List the vendor's documented face and light gesture motions. Only returned motion_id values are accepted by play."),
-            "play": (["motion_id"], "Play one motion_id returned by list_actions. Do not invent motion IDs."),
+            "list_actions": ([], "List available expressions by readable name."),
+            "play": (["name"], "Play an expression using its readable name from list_actions."),
             "stop": ([], "Interrupt the current U1 Pro expression or audio motion."),
             "info": ([], "Read the expression card and active playback state."),
         }
         schema = action_schema(actions, {
-            "motion_id": {"type": "string", "minLength": 1, "description": "Exact face or light-gesture motion_id returned by list_actions."},
+            "name": {"type": "string", "enum": sorted(self.EXPRESSIONS), "description": "Readable expression name returned by list_actions, such as smile or blink."},
             "action_id": {"type": "string", "description": "Optional caller correlation ID."},
         })
         schema["x-completion"] = {"actions": ["play"], "timeout": 120}
@@ -1285,11 +1305,13 @@ class ExpressionPlugin:
             response = self.audio.nodes.string_call("motion_list", {})
             return self._expression_actions(response)
         if action == "play":
-            motion_id = str(args.get("motion_id", "")).strip()
-            if not motion_id:
-                raise ValueError("expression.play requires motion_id from expression.list_actions")
-            if motion_id not in self.EXPRESSION_IDS:
-                raise ValueError("expression.play accepts only face or light-gesture motion IDs returned by expression.list_actions")
+            name = str(args.get("name", "")).strip().lower()
+            if name not in self.EXPRESSIONS:
+                raise ValueError("expression.play requires a readable name returned by expression.list_actions")
+            available = self._expression_actions(self.audio.nodes.string_call("motion_list", {}))["actions"]
+            if name not in {item["name"] for item in available}:
+                raise ValueError(f"expression {name!r} is not available on this robot firmware")
+            motion_id = self.EXPRESSIONS[name][0]
             action_id = str(args.get("action_id") or uuid.uuid4())[:128]
             return self.audio._queue("play_action", {"action": motion_id}, action_id, "expression")
         if action == "stop":
@@ -1303,16 +1325,28 @@ class ExpressionPlugin:
     @classmethod
     def _expression_actions(cls, response):
         """Keep only documented expression/gesture IDs from the dynamic vendor list."""
-        result = dict(response) if isinstance(response, dict) else {"result": response}
-        def filter_value(value):
+        if isinstance(response, str):
+            try:
+                response = json.loads(response)
+            except json.JSONDecodeError:
+                return {"actions": []}
+        available_ids = set()
+        def collect(value):
             if isinstance(value, list):
-                return [item for item in value if not isinstance(item, dict) or
-                        str(item.get("motion_id", item.get("id", ""))) in cls.EXPRESSION_IDS]
+                for item in value:
+                    collect(item)
             if isinstance(value, dict):
-                return {key: filter_value(child) if isinstance(child, (dict, list)) else child
-                        for key, child in value.items()}
-            return value
-        return filter_value(result)
+                motion_id = str(value.get("motion_id", value.get("id", "")))
+                if motion_id:
+                    available_ids.add(motion_id)
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        collect(child)
+        collect(response)
+        actions = [{"name": name, "label": label}
+                   for name, (motion_id, label) in cls.EXPRESSIONS.items()
+                   if motion_id in available_ids]
+        return {"actions": actions}
 
 
 class _LifecyclePlugin:

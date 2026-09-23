@@ -56,6 +56,7 @@ def _install_stubs():
     std_msg = types.ModuleType("std_msgs.msg")
     std_msg.String = type("String", (), {})
     std_msg.Header = type("Header", (), {})
+    std_msg.UInt8 = type("UInt8", (), {})
     std.msg = std_msg
     sys.modules.update({"std_msgs": std, "std_msgs.msg": std_msg})
 
@@ -92,7 +93,7 @@ def _install_stubs():
 
 _install_stubs()
 
-from device import PLAYBACK_TOPIC, SDK_AUDIO_CLOSE, SDK_AUDIO_OPEN, SDK_AUDIO_STATE, SPEAKER_TOPIC  # noqa: E402
+from device import MIC_TOPIC, PLAYBACK_TOPIC, SPEAKER_TOPIC  # noqa: E402
 
 
 class FakePublisher:
@@ -131,6 +132,9 @@ class FakeNodes:
     def set_mic_enabled(self, enabled):
         self.mic_enabled.append(enabled)
         return {"code": 0}
+
+    def wait_for_mic_frame(self, timeout):
+        return True
 
     def set_event_enabled(self, name, enabled):
         self.event_enabled.append((name, enabled))
@@ -184,9 +188,7 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
-        self.assertEqual(SDK_AUDIO_OPEN, "/robo/audio/call/open_stream")
-        self.assertEqual(SDK_AUDIO_STATE, "/robo/audio/call/stream_state")
-        self.assertEqual(SDK_AUDIO_CLOSE, "/robo/audio/call/close_stream")
+        self.assertEqual(MIC_TOPIC, "/sys/device/audio_in/raw")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
         self.assertEqual(device.EVENT_TOPICS["doa_event"], "/robo/audio/subscribe/doa_event")
 
@@ -198,28 +200,18 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIn("AllowMulticast>false", config)
         self.assertIn("MaxAutoParticipantIndex>200", config)
 
-    def test_mic_uses_sdk_shared_stream_and_closes_it(self):
+    def test_mic_uses_verified_adapter_raw_topic(self):
         import device
 
         nodes = object.__new__(device.U1Nodes)
         nodes._mic_forwarding = False
-        nodes.trigger_call = mock.Mock(side_effect=[
-            {"success": True},
-            {"success": True, "data": {"path": "/tmp/robo/ipc/audio.stream",
-                                        "frame_payload_size": 3200, "max_frames": 64}},
-            {"success": True},
-        ])
-        nodes._mic_reader = None
-        nodes._mic_stream = {}
-        reader = mock.Mock()
-        with mock.patch.object(device, "VideoSharedMemoryReader", return_value=reader):
-            result = nodes.set_mic_enabled(True)
+        nodes._mic_frames = 0
+        nodes._mic_frame_event = threading.Event()
+        result = nodes.set_mic_enabled(True)
         self.assertTrue(nodes._mic_forwarding)
-        self.assertEqual(result["stream"]["path"], "/tmp/robo/ipc/audio.stream")
-        reader.start.assert_called_once_with()
+        self.assertEqual(result["source_topic"], MIC_TOPIC)
         nodes.set_mic_enabled(False)
-        reader.stop.assert_called_once_with()
-        self.assertEqual(nodes.trigger_call.call_args.args, ("audio_close",))
+        self.assertFalse(nodes._mic_forwarding)
 
     def test_event_bridge_keeps_sdk_string_payloads(self):
         import device
@@ -249,7 +241,7 @@ class U1CardContractTests(unittest.TestCase):
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
-            "lifecycle", "mic", "speaker", "audio", "expression",
+            "lifecycle", "mic", "speaker", "tts", "expression",
             "camera_rgb", "vision_capture", "doa_event",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
@@ -328,12 +320,11 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
             self.assertEqual(len(nodes.robot.subscriptions), 3)
-            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 0)
+            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 2)
             self.assertEqual(initialized_domains[0][1], 2)
-            self.assertEqual(nodes.robot.clients["/robo/audio/call/open_stream"].srv_name,
-                             "/robo/audio/call/open_stream")
             self.assertEqual(nodes.audio_device.clients["/sys/device/audio_out/set_volume"].srv_name,
                              "/sys/device/audio_out/set_volume")
+            self.assertIn("/sys/device/audio_in/raw", [sub[1] for sub in nodes.audio_device.subscriptions])
             self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name, "/robo/audio/call/play_action")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
             nodes.close()
@@ -396,7 +387,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIsNone(device.MicPlugin(nodes).dispatch("unknown", {}))
         self.assertIsNone(device.SpeakerPlugin(nodes).dispatch("unknown", {}))
         self.assertIsNone(device.AudioPlugin(nodes).dispatch("unknown", {}))
-        self.assertEqual(device.SpeakerPlugin(nodes).dispatch("start", {}), {"state": "ready"})
+        self.assertEqual(device.SpeakerPlugin(nodes).dispatch("start", {})["state"], "waiting_for_input")
 
     def test_camera_contract_and_expression_contract(self):
         import device
@@ -412,7 +403,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(expression_tool["name"], "expression")
         self.assertIn("play", expression_tool["inputSchema"]["properties"]["action"]["enum"])
         with self.assertRaises(ValueError):
-            expression.dispatch("play", {})
+            expression.dispatch("play", {"name": "not-an-expression"})
 
     def test_expression_excludes_songs_from_dynamic_action_list(self):
         import device
@@ -420,13 +411,13 @@ class U1CardContractTests(unittest.TestCase):
         audio = device.AudioPlugin(FakeNodes())
         expression = device.ExpressionPlugin(audio)
         audio.nodes.string_call = mock.Mock(return_value={"data": {"motion_info_list": [
-            {"motion_id": "A001", "motion_name": "blink"},
+            {"motion_id": "A001", "motion_name": "眨眼"},
             {"motion_id": "A101", "motion_name": "song"},
         ]}})
         result = expression.dispatch("list_actions", {})
-        self.assertEqual(result["data"]["motion_info_list"], [{"motion_id": "A001", "motion_name": "blink"}])
-        with self.assertRaisesRegex(ValueError, "only face or light-gesture"):
-            expression.dispatch("play", {"motion_id": "A101"})
+        self.assertEqual(result["actions"], [{"name": "blink", "label": "眨眼"}])
+        with self.assertRaisesRegex(ValueError, "not available"):
+            expression.dispatch("play", {"name": "smile"})
 
     def test_vision_capture_saves_a_fresh_jpeg(self):
         import device
@@ -561,7 +552,7 @@ class U1CardContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "audio.stream"
             ring_header = device.VideoSharedMemoryReader._RING_HEADER.pack(1, 1, 4, 0, 0, 0, 0, 0)
-            frame_header = device.VideoSharedMemoryReader._HEADER.pack(0, 1234567890, 4, 0)
+            frame_header = device.VideoSharedMemoryReader._HEADER.pack(0, 1234567890, 4, 0, 0, 0, 0, 0)
             path.write_bytes(ring_header + frame_header + b"abcd")
             frames = []
             reader = device.VideoSharedMemoryReader(
@@ -570,19 +561,58 @@ class U1CardContractTests(unittest.TestCase):
             reader._run()
             self.assertEqual(frames, [(b"abcd", 1234567890)])
 
-    def test_mic_publishes_shared_memory_frames_with_sdk_timestamp(self):
+    def test_mic_converts_adapter_raw_message_and_preserves_header(self):
         import device
 
         publisher = FakePublisher()
         nodes = types.SimpleNamespace(
             _mic_forwarding=True,
+            _mic_frames=0,
+            _mic_frame_event=threading.Event(),
             AudioChunk=FakeAudioChunk,
             _mic_publisher=publisher,
         )
-        device.U1Nodes._publish_mic_frame(nodes, b"\x01\x02\x03", {}, 12_000_000_034)
+        message = types.SimpleNamespace(
+            sample_rate=16000, channels=1, sample_format="s16_le",
+            header=types.SimpleNamespace(frame_id="mic"),
+            data=types.SimpleNamespace(data=[1, 2, 3]))
+        device.U1Nodes._mic_callback(nodes, message)
         self.assertEqual(len(publisher.messages), 1)
-        self.assertEqual(publisher.messages[0].header.stamp.sec, 12)
-        self.assertEqual(publisher.messages[0].header.stamp.nanosec, 34)
+        self.assertIs(publisher.messages[0].header, message.header)
+        self.assertEqual(publisher.messages[0].data, [1, 2, 3])
+
+    def test_mic_drops_unsupported_sample_format(self):
+        import device
+
+        publisher = FakePublisher()
+        nodes = types.SimpleNamespace(
+            _mic_forwarding=True,
+            _mic_frames=0,
+            _mic_frame_event=threading.Event(),
+            AudioChunk=FakeAudioChunk,
+            _mic_publisher=publisher,
+        )
+        message = types.SimpleNamespace(
+            sample_rate=16000, channels=1, sample_format="float32",
+            header=types.SimpleNamespace(), data=types.SimpleNamespace(data=[1, 2, 3]))
+        device.U1Nodes._mic_callback(nodes, message)
+        self.assertEqual(publisher.messages, [])
+
+    def test_expression_maps_readable_action_name_to_vendor_id(self):
+        import device
+
+        nodes = FakeNodes()
+        nodes.string_call = mock.Mock(side_effect=[
+            {"data": {"motion_info_list": [{"motion_id": "A007", "motion_name": "笑"}]}},
+            {"accepted": True},
+        ])
+        expression = device.ExpressionPlugin(device.AudioPlugin(nodes))
+        with mock.patch.object(device, "_acp_notify"):
+            result = expression.dispatch("play", {"name": "smile", "action_id": "expr-1"})
+        self.assertEqual(result["state"], "queued")
+        self.assertEqual(nodes.string_call.call_args_list[0].args, ("motion_list", {}))
+        self.assertEqual(nodes.string_call.call_args_list[1].args[0], "play_action")
+        self.assertEqual(nodes.string_call.call_args_list[1].args[1]["action"], "A007")
 
     def test_lifecycle_initializes_robot_defaults(self):
         import device
@@ -592,42 +622,44 @@ class U1CardContractTests(unittest.TestCase):
         lifecycle.start()
         nodes.initialize_robot.assert_called_once_with()
 
-    def test_audio_stop_interrupts_vendor_playback(self):
+    def test_tts_stop_interrupts_vendor_playback(self):
         import device
 
         nodes = FakeNodes()
         plugin = device.AudioPlugin(nodes)
         self.assertEqual(plugin.dispatch("start", {}), {"state": "ready"})
-        plugin.dispatch("play_action", {"motion_id": "A029"})
+        plugin.dispatch("speak", {"text": "hello"})
         with mock.patch.object(device, "_acp_notify"):
             result = plugin.dispatch("stop", {})
         self.assertEqual(nodes.interrupts, 1)
         self.assertEqual(result["state"], "idle")
         self.assertFalse(plugin.running)
 
-    def test_audio_idle_stop_is_stable(self):
+    def test_tts_idle_stop_is_stable(self):
         import device
 
         plugin = device.AudioPlugin(FakeNodes())
         self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
 
-    def test_audio_schema_has_lifecycle_and_completion_contract(self):
+    def test_tts_schema_has_completion_contract(self):
         import device
 
-        schema = device.AudioPlugin(FakeNodes()).get_tool()["inputSchema"]
-        self.assertEqual(schema["properties"]["action"]["enum"], ["start", "list_actions", "play_action", "play_text", "stop", "info"])
-        self.assertEqual(schema["x-completion"]["actions"], ["play_action", "play_text"])
+        tool = device.AudioPlugin(FakeNodes()).get_tool()
+        schema = tool["inputSchema"]
+        self.assertEqual(tool["name"], "tts")
+        self.assertEqual(schema["properties"]["action"]["enum"], ["speak", "stop", "info"])
+        self.assertEqual(schema["x-completion"]["actions"], ["speak"])
 
-    def test_audio_uses_documented_string_call_payloads(self):
+    def test_tts_uses_documented_play_text_payload(self):
         import device
 
         nodes = FakeNodes()
         plugin = device.AudioPlugin(nodes)
         plugin.start()
-        action = plugin.dispatch("play_action", {"motion_id": "A029", "action_id": "request-1"})
+        action = plugin.dispatch("speak", {"text": "hello", "action_id": "request-1"})
         self.assertEqual(action["state"], "queued")
-        self.assertEqual(nodes.string_calls[0][0], "play_action")
-        self.assertEqual(nodes.string_calls[0][1]["action"], "A029")
+        self.assertEqual(nodes.string_calls[0][0], "play_text")
+        self.assertEqual(nodes.string_calls[0][1]["text"], "hello")
         vendor_uuid = nodes.string_calls[0][1]["uuid"]
         self.assertTrue(vendor_uuid)
         self.assertNotEqual(vendor_uuid, "request-1")
@@ -639,7 +671,7 @@ class U1CardContractTests(unittest.TestCase):
         nodes = FakeNodes()
         plugin = device.AudioPlugin(nodes)
         plugin.start()
-        plugin.dispatch("play_text", {"text": "hello", "action_id": "request-2"})
+        plugin.dispatch("speak", {"text": "hello", "action_id": "request-2"})
         vendor_uuid = plugin._active["vendor_uuid"]
         with mock.patch.object(device, "_acp_notify") as notify:
             plugin._on_playback_state({"uuid": "old", "phase": "result", "success": True, "state_name": "COMPLETED"})
@@ -659,6 +691,7 @@ class U1CardContractTests(unittest.TestCase):
         publisher = FakePublisher()
         nodes = types.SimpleNamespace(
             _speaker_forwarding=True,
+            _speaker_frames=0,
             AudioOutData=FakeAudioOutData,
             _speaker_uuid="u1-test",
             _speaker_publisher=publisher,
