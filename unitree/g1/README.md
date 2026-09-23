@@ -6,13 +6,13 @@ G1 Driver 通过 MCP 提供运动控制、机械臂动作、麦克风、扬声�
 
 ## 双臂遥操
 
-`teleop_control` 接收设备 Driver 的输入，在 G1 Driver 内完成相对映射、独立进程 IK 和双臂位置下发。目前模型适用于原厂 G1_23（每臂 5 关节）。Core 和 ActuCore 无需遥操专用修改。
+`teleop_control` 接收设备 Driver 的输入，在 G1 Driver 内完成相对映射、独立进程 IK 和双臂位置下发。默认注册该卡，市场清单包含 `teleop_control`。随镜像提供原厂 G1_23（每臂 5 关节、固定假手）的完整固定几何 profile；不依赖现场临时标定脚本或用户填写路径。Core 和 ActuCore 无需遥操专用修改。
 
 1. 安装 PICO Driver，在 Canvas 添加 `teleop_device` 和 `teleop_control`，连接命令输出与控制卡输入。
 2. 在设备卡齿轮页查看安装和配对说明，连接 PICO。
 3. 启动项目，先松开双握把；控制卡收到有效输入后建立初始相对基准。
 4. 同时按住双握把控制双臂。松开任一握把暂停，重新握住沿用原基准；跟踪空间重置后需松握重新就绪。
-5. 从 Canvas 停止项目；收臂复用既有 `arm.release`。Driver 重启后需停止再启动项目恢复绑定，无需删线重连。
+5. 从 Canvas 停止项目；收臂复用既有 `arm.release`，它先取消遥操输入及待发目标再交还 SDK，之后需从 Canvas 重新启动遥操。Driver 重启后也需停止再启动项目恢复绑定，无需删线重连。
 
 用户不需要填写实例 ID、模型路径、位移比例或 Shadow/Live。这些由框架和 Driver 预设管理；启动项目本身不发送运动目标。支持 FSM 500、801，不自动切换本体模式。
 
@@ -22,6 +22,14 @@ G1 Driver 通过 MCP 提供运动控制、机械臂动作、麦克风、扬声�
 | 控制卡 → Canvas 监控 | `/teleop/state` | `data/teleop-state` |
 
 设备输入为左右控制器位姿、握把、跟踪状态、身份、代次、序号与时效。设备卡不订阅机器人反馈；PICO 只显示连接状态和握把提示。URDF、关节顺序、数值求解与执行均在机器人 Driver 内。
+
+## 机型 profile 与每轮基准
+
+`g1_motion/g1_23_fixed_hand.json` 固定关节映射、URDF SHA、双掌 TCP（腕轴前方 0.2 m）和手柄局部变换，沿用本轮 r11b 已实测的原厂固定手配置。该文件不包含某次现场腰腿角度，也不填写 acceptance 通过标记。每次初始化映射时，从同一份新鲜 LowState 采集双臂和 13 个腰腿关节，为数值工作进程生成本轮临时 profile；工作进程重启沿用同一份基准，新的遥操会话重新采样。缺失、过期或非有限实测值会明确报告，不用零值猜测机器人姿态。松握重握不重新标定。
+
+适用范围是原厂 G1_23 固定假手；不宣称自动适配 G1_29、灵巧手或改装 TCP。附加碰撞检查仍关闭，旧现场预览空间盒未纳入默认 profile，不能将其当作碰撞验收结果。模型及上述 TCP 有本轮现场使用依据，但没有补造独立尺寸或长时机械验收记录。
+
+卡片注册、info、默认启用及空闲 stop 不申请运动权、不创建 SDK 命令通道。`servo`、`servo_eef` 可以同时注册；本实现不新增统一控制器仲裁，也不在装载时因其他卡片 enabled 而拒绝遥操。旧会话/过期指令隔离与本遥操的停止取消仍保留。
 
 ## 执行与平滑
 
@@ -42,3 +50,8 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 ### 平滑与轨迹衔接的参考来源
 
 感谢 **@jsmy-CTH** 在 [PR #322：提供实际下发状态用于轨迹衔接](https://github.com/4paradigm/phanthymotus-driver/pull/322) 中的贡献。本实现参考其“以实际成功下发的关节参考作为后续轨迹衔接起点”的做法，避免反复以存在滞后的实测位置作为推进起点。请将 #322 作为这部分设计来源保留。120ms一阶指数平滑及本卡1rad/s、dt最大50ms的组合是本次G1适配追加的实现，不冒称为#322原有全部算法，也不将参考部分描述为本PR独立首创。
+
+
+## 离线回归
+
+常规测试位于 `unitree/g1/tests/`。`scripts/compare_g1_teleop_baseline.py` 使用明确 Git 基线、同一 profile 及已有录制，分别比较相对映射和固定时钟执行输出；它使用 SDK 替身，不是完整 IK 回放或真机验收。旧四卡专用、依赖外部 mapper 的 `validate_g1_offline.py` 已移除。真实模型 profile 对照见 `test_motion_control_numeric.py`。

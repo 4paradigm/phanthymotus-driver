@@ -2110,6 +2110,7 @@ class ArmActionPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, arm_client):
         self._client = arm_client
         self._stream = None
+        self._teleop_control = None
 
     def get_tool(self) -> dict:
         tool = {
@@ -2156,6 +2157,10 @@ class ArmActionPlugin:
         if self._stream is not None: self._stream.stop()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        release = action in ('release', 'finish') or (action == 'execute' and
+            (args.get('action_id') == 99 or str(args.get('gesture', '')).strip().lower() == 'release arm'))
+        if release and self._teleop_control is not None:
+            self._teleop_control.cancel_for_arm_release()
         if action == 'info' and self._stream is not None:
             metadata = (self._stream.motion_control.arm_metadata()
                         if getattr(self._stream, 'public_motion_topics', True) else {})

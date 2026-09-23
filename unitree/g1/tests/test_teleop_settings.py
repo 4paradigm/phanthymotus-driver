@@ -88,3 +88,17 @@ def test_monitor_summary_has_execution_state_and_escapes_html(tmp_path):
     value=card.feedback()
     assert '执行：idle' in value['text'] and '&lt;test&gt;' in value['text']
     assert '<test>' not in value['text']
+
+
+def test_arm_release_fences_input_until_explicit_canvas_start(tmp_path):
+    card, frame = input_card(tmp_path)
+    cancelled = []
+    card.motion.cancel_pending = lambda: cancelled.append(True)
+    assert card.receive(frame)
+    card._operator = 'previous-session'
+    generation = card._generation
+    card.cancel_for_arm_release()
+    assert card._closed.is_set() and card._operator is None and card._latest is None
+    assert card._generation == generation+1 and cancelled == [True]
+    frame['sequence'] += 1
+    assert card.receive(frame) is False

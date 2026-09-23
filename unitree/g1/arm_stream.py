@@ -24,6 +24,7 @@ from common.motion.protocol import validate, validate_descriptor, vector
 JOINT_NAMES = tuple(f'{s}_{j}_joint' for s in ('left', 'right') for j in
                    ('shoulder_pitch', 'shoulder_roll', 'shoulder_yaw', 'elbow', 'wrist_roll'))
 MOTOR_IDS = (15, 16, 17, 18, 19, 22, 23, 24, 25, 26)
+LOCKED_MOTOR_IDS = tuple(range(13))
 LOCKED_NAMES = tuple(f'{s}_{j}_joint' for s in ('left', 'right') for j in
                     ('hip_pitch', 'hip_roll', 'hip_yaw', 'knee', 'ankle_pitch', 'ankle_roll')) + ('waist_yaw_joint',)
 PROFILE = 'unitree_g1_23_dual_arm_relative_v1'
@@ -185,7 +186,9 @@ class ArmStreamExecutor:
             with self.lock:
                 self._source_tick = tick
                 self._feedback = {'q':q,'dq':dq,'arm_ns':self.clock(),
-                    'source_tick':tick, 'motor_telemetry':telemetry}
+                    'source_tick':tick, 'motor_telemetry':telemetry,
+                    'locked_joints': dict(zip(LOCKED_NAMES,
+                        vector([float(motors[i].q) for i in LOCKED_MOTOR_IDS], 13, 'body_q')))}
         except Exception as exc:
             with self.lock:
                 self._feedback = {**self._feedback,'error':type(exc).__name__}

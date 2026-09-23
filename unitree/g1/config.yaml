@@ -120,11 +120,11 @@ motion_control:
   joint_velocity_rad_s: 1.0
   calibration_path: ""
 
-# PICO device <-> G1 control: ordinary gear configuration, disabled by default.
-# Enabling exposes the card and reads feedback; begin + both grips are required.
+# Register the dual-arm card by default; registration does not acquire or move arms.
+# Canvas start plus fresh tracked input and both grips are required for motion.
 teleop_control:
-  enabled: false
+  enabled: true
   # Internal deployment setting; Canvas users do not select an execution mode.
   mode: live
-  calibration_path: ""
+  calibration_path: /work/g1_motion/g1_23_fixed_hand.json
   position_scale: 1.0

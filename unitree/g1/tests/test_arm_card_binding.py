@@ -54,3 +54,12 @@ def test_current_metadata_is_exposed_by_discovery_and_info():
     assert tool['control_interface']==info['control_interface']==descriptor
     assert tool['topic_in']==info['topic_in']==metadata['topic_in']
     assert {'release','finish','finish_status','info','start','stop'} <= set(tool['inputSchema']['properties']['action']['enum'])
+
+
+@pytest.mark.parametrize('action,args', [('release',{}),('execute',{'action_id':99}),('execute',{'gesture':'release arm'})])
+def test_release_cancels_teleop_before_stream_handback(action,args):
+    arm,calls=plugin()
+    arm._teleop_control=SimpleNamespace(cancel_for_arm_release=lambda:calls.append(('cancel',)))
+    arm._stream=SimpleNamespace(dispatch=lambda verb,body:calls.append((verb,body)) or {'state':'accepted'})
+    assert arm.dispatch(action,args)=={'state':'accepted'}
+    assert calls==[('cancel',),('release',args)]

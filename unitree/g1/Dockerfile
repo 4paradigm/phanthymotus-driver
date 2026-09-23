@@ -1,6 +1,6 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
-FROM mambaorg/micromamba:2.3.2 AS motion-numeric-installer
+FROM mambaorg/micromamba:2.3.2@sha256:555746adba7e231c903aab4f59d51a4b11ad35bc1cab50e3d78024652508bd64 AS motion-numeric-installer
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 

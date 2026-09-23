@@ -1,8 +1,9 @@
 """Versioned two-Driver teleoperation wire contract; no ROS or robot dependencies.
 
-High-rate input and reliable operation receipts share DDS topics but never the
-same application latest-value slot. All deadlines use the receiving host boot
-clock, not the headset clock. Identity/order admission remains consumer state.
+The device publishes input only. Optional controls/extensions preserve device
+capabilities without changing the mandatory dual-arm fields. Historical operation
+and feedback helpers remain for existing robot consumers. All deadlines use the
+receiving host boot clock, not the headset clock.
 """
 from __future__ import annotations
 
@@ -122,6 +123,46 @@ def _pose(value, name, *, controller=False):
     if controller:
         for key in ("grip", "trigger"):
             _number(value.get(key), key, lower=0, upper=1)
+        if "controls" in value:
+            validate_controls(value["controls"])
+
+
+def validate_controls(value):
+    """Validate named optional inputs without stripping future capabilities.
+
+    Unavailable inputs carry no fabricated measurement. Unknown optional fields
+    are retained; the enclosing message still enforces finite JSON and size.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("invalid_controls")
+    for group in ("buttons", "axes"):
+        entries = value.get(group, {})
+        if not isinstance(entries, dict):
+            raise ValueError("invalid_controls_" + group)
+        for name, state in entries.items():
+            _text(name, "control_name", maximum=64)
+            if not isinstance(state, dict) or type(state.get("available")) is not bool:
+                raise ValueError("invalid_control_availability")
+            measurements = ("value", "pressed", "touched") if group == "buttons" else ("value",)
+            if not state["available"]:
+                if any(key in state for key in measurements):
+                    raise ValueError("unavailable_control_has_measurement")
+                continue
+            if group == "buttons":
+                if "value" in state:
+                    _number(state["value"], "button_value", lower=0, upper=1)
+                for key in ("pressed", "touched"):
+                    if key in state and type(state[key]) is not bool:
+                        raise ValueError("invalid_button_" + key)
+            else:
+                vector = state.get("value")
+                if not isinstance(vector, list) or not vector:
+                    raise ValueError("invalid_axis_value")
+                if name == "thumbstick" and len(vector) != 2:
+                    raise ValueError("invalid_thumbstick_dimensions")
+                for component in vector:
+                    _number(component, "axis_value", lower=-1, upper=1)
+    return value
 
 
 def validate_input(value, *, instance_id, clock_id, now_ns, max_age_ns=MAX_INPUT_AGE_NS):
@@ -136,6 +177,8 @@ def validate_input(value, *, instance_id, clock_id, now_ns, max_age_ns=MAX_INPUT
     _pose(value.get("head_reference"), "head_reference")
     for side in ("left", "right"):
         _pose(value.get(side), side, controller=True)
+    if "extensions" in value and not isinstance(value["extensions"], dict):
+        raise ValueError("invalid_extensions")
     return copy.deepcopy(value)
 
 

@@ -1,13 +1,12 @@
 """G1 two-card operator session; only ArmStreamExecutor emits hardware commands.
 
-Session admission/receipts derive from Tianyi PR321 49997cc6 (Apache-2.0).
+Session admission derives from Tianyi PR321 49997cc6 (Apache-2.0).
 G1 uses ten arm joints and the existing release/action 99, not Tianyi homing.
 
 Mapping derives from the former ActuCore DualArmMapping (Apache-2.0). A grip is
 an enable signal, never a new coordinate calibration. Numerical work remains in
 MotionControl's isolated worker, and DDS in the existing local-profile helper.
 """
-from collections import OrderedDict
 import copy
 import html
 import json
@@ -19,7 +18,7 @@ import secrets
 import threading
 import time
 
-from common.teleop_contract import (binding_from_topic, topics, validate_input, validate_operation,
+from common.teleop_contract import (binding_from_topic, topics, validate_input,
                                     FEEDBACK_SCHEMA, canonical_instance)
 from common.motion.protocol import envelope
 
@@ -104,8 +103,7 @@ class TeleopControl:
         self.instance_id = 'teleop_control'
         self._latest = None
         self._input_identity = None
-        self._input_sequence = self._operation_sequence = -1
-        self._operation_identity = None
+        self._input_sequence = -1
         self._mapping_identity = None
         self._processed = None
         self._generation = self._sequence = self._feedback_sequence = 0
@@ -115,12 +113,6 @@ class TeleopControl:
         self._hold_kind = None
         self._needs_calibration = False
         self._state, self._reason = 'idle', None
-        self._receipts = OrderedDict()
-        self._operation_packets = {}
-        self._active_operation = None
-        self._operation_threads = set()
-        self._stop_operation = None
-        self._stop_aliases = set()
         self._auto_retry_after_ns = 0
         self._config_error = None
         self._config_path = Path(cfg.get('state_path', '/opt/phanthy-motus/data/g1-teleop-control.json'))
@@ -167,7 +159,7 @@ class TeleopControl:
         candidate = {**self.cfg, **{k:v for k,v in args.items() if k in keys}}
         self._validate_config(candidate)
         with self._lock:
-            if self._operator or self._active_operation or self.motion.gate.session_id:
+            if self._operator or self.motion.gate.session_id:
                 raise ValueError('configuration_requires_idle')
             old_motion = self.motion.config_snapshot()
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -230,12 +222,11 @@ class TeleopControl:
                 binding['instance_id'] = self.binding['instance_id']
                 if not self._closed.is_set() and self._thread and self._thread.is_alive():
                     return self.info()
-            if self.binding and not same_topics and (self._operator or self._active_operation):
+            if self.binding and not same_topics and self._operator:
                 raise ValueError('binding_requires_idle')
             if not same_topics or self._closed.is_set():
-                self._latest = self._input_identity = self._operation_identity = None
-                self._input_sequence = self._operation_sequence = -1
-                self._receipts.clear(); self._operation_packets.clear()
+                self._latest = self._input_identity = None
+                self._input_sequence = -1
                 self.mapping.anchor = None
             self.binding = binding
             self.instance_id = args.get('instance_id') or 'teleop_control'
@@ -262,26 +253,7 @@ class TeleopControl:
                 source = canonical_instance(value.get('instance_id'))
                 validate_input(value, instance_id=source, clock_id=self.clock_id, now_ns=self.clock())
                 self.binding['instance_id'] = source
-        is_stop = value.get('kind') == 'operation' and value.get('action') == 'stop'
-        if self._closed.is_set() and not is_stop:return False
-        if value.get('kind') == 'operation':
-            try:return self._receive_operation(value)
-            except ValueError as exc:
-                # Admission failures of a valid request are terminal receipts;
-                # do not make the user wait for a generic transport timeout.
-                with self._lock:
-                    if value.get('request_id') in self._receipts:raise
-                    validate_operation(value, instance_id=self.binding['instance_id'],
-                                       clock_id=self.clock_id, now_ns=self.clock())
-                    key=value['request_id']
-                    self._receipts[key]={'request_id': key, 'action': value['action'],
-                        **{k:value[k] for k in ('device_id','connection_epoch','space_epoch')},
-                        'status': 'failed', 'error': str(exc), 'result': {}}
-                    self._operation_packets[key]=copy.deepcopy(value)
-                    while len(self._receipts)>32:
-                        removed,_=self._receipts.popitem(last=False);self._operation_packets.pop(removed,None)
-                        self._stop_aliases.discard(removed)
-                return False
+        if self._closed.is_set():return False
         frame = validate_input(value, instance_id=self.binding['instance_id'], clock_id=self.clock_id,
                                now_ns=self.clock())
         identity = self._identity(frame)
@@ -298,87 +270,8 @@ class TeleopControl:
             self._wake.set()
         return True
 
-    def _receive_operation(self, value):
-        with self._lock:
-            existing = self._receipts.get(value.get('request_id'))
-            original = getattr(self, '_operation_packets', {}).get(value.get('request_id'))
-            if existing is not None:
-                if original != value: raise ValueError('operation_identity_conflict')
-                return True
-        op = validate_operation(value, instance_id=self.binding['instance_id'], clock_id=self.clock_id,
-                                now_ns=self.clock())
-        identity = self._identity(op)
-        is_stop = op['action'] == 'stop'
-        with self._lock:
-            request = op['request_id']
-            if request in self._receipts:
-                if self._receipts[request]['action'] != op['action']: raise ValueError('operation_identity_conflict')
-                return True
-            old = self._operation_identity
-            if not is_stop and old and identity[0] == old[0] and (identity[1] < old[1] or identity[2] < old[2]):
-                raise ValueError('old_operation_generation')
-            if not is_stop and self._input_identity and identity != self._input_identity:
-                raise ValueError('operation_input_generation_mismatch')
-            if not is_stop and identity == old and op['sequence'] <= self._operation_sequence:
-                raise ValueError('old_operation_sequence')
-            if op['action'] != 'stop' and (self._active_operation or self._operation_threads):
-                raise ValueError('operation_busy')
-            # Stop needs a valid bound request, not a live pose or grip. It may
-            # arrive over WSS after RTC reconnect or shutdown; never lower the
-            # ordinary operation watermark as a side effect of accepting it.
-            if (not is_stop or old is None or
-                    identity == old and op['sequence'] > self._operation_sequence or
-                    identity[0] == old[0] and identity[1] >= old[1] and identity[2] >= old[2] and identity != old):
-                self._operation_identity, self._operation_sequence = identity, op['sequence']
-            self._receipts[request] = {'request_id': request, 'action': op['action'], 'status': 'accepted',
-                                       **{k:op[k] for k in ('device_id','connection_epoch','space_epoch')},
-                                       'error': None, 'result': {}}
-            self._operation_packets[request] = copy.deepcopy(op)
-            while len(self._receipts) > 32:
-                removed, _ = self._receipts.popitem(last=False)
-                self._operation_packets.pop(removed, None)
-                self._stop_aliases.discard(removed)
-            if op['action'] == 'stop' and self._stop_operation is not None:
-                # Multiple callers can stop, but they do not allocate unbounded
-                # workers or repeat release. Each gets the same final outcome.
-                self._stop_aliases.add(request)
-                return True
-            self._active_operation = request
-            self._generation += 1
-            generation = self._generation
-            if op['action'] in ('stop', 'finish'):
-                self._operator = None  # Disarm before any blocking management/IK operation.
-            if op['action'] == 'stop':self._stop_operation = request
-            thread = threading.Thread(target=self._operation, args=(op, generation), daemon=True,
-                                      name='g1-teleop-'+op['action'])
-            self._operation_threads.add(thread)
-            thread.start()
-        return True
-
     def _check_generation(self, generation):
         if generation != self._generation or self._closed.is_set(): raise ValueError('operation_cancelled')
-
-    def _operation(self, op, generation):
-        try:
-            if op['action'] in ('begin', 'calibrate'): result = self._begin(generation, op['action'], self._identity(op))
-            elif op['action'] == 'finish': result = self._finish(generation)
-            else: result = self._stop_motion()
-            status, error = 'completed', None
-        except Exception as exc:
-            status, error, result = 'failed', str(exc), {}
-        with self._lock:
-            receipt = self._receipts.get(op['request_id'])
-            if receipt: receipt.update(status=status, error=error, result=result)
-            if self._stop_operation == op['request_id']:
-                for alias in self._stop_aliases:
-                    receipt = self._receipts.get(alias)
-                    if receipt:receipt.update(status=status, error=error, result=copy.deepcopy(result))
-                self._stop_operation = None
-                self._stop_aliases.clear()
-            if self._active_operation == op['request_id']: self._active_operation = None
-            if error and generation == self._generation:
-                self._state, self._reason = 'fault', error
-            self._operation_threads.discard(threading.current_thread())
 
     def _latest_fresh(self):
         frame = copy.deepcopy(self._latest)
@@ -467,7 +360,7 @@ class TeleopControl:
 
     def step(self):
         with self._lock:
-            if self._closed.is_set() or self._active_operation or not self.binding: return
+            if self._closed.is_set() or not self.binding: return
             generation = self._generation
             initialize = not self._operator or self._needs_calibration
         if initialize:
@@ -498,7 +391,7 @@ class TeleopControl:
             if hold_reason:
                 self._hold(hold_reason, grip=True); return
             # SDK acquisition/resume must not own the input/operation lock:
-            # the stop receipt can fence us while a channel is still opening.
+            # cancellation can fence us while a channel is still opening.
             state = self.motion.gate.status()
             if self.live:
                 if state['state'] == 'fault': raise ValueError('driver_fault')
@@ -570,26 +463,17 @@ class TeleopControl:
             self._paused = False
         return result
 
-    def _finish(self, generation):
+    def cancel_for_arm_release(self):
+        # The existing arm.release is an explicit operator cancellation, not a
+        # global controller arbiter. Stop accepting teleop before SDK handback.
         with self._lock:
-            self._check_generation(generation)
-            if not self.live:
-                result = self.motion.dispatch('finish', self._credentials())
-            else:
-                # G1's existing arm.release/action 99 is the return path.
-                # Admission is short; the SDK handback and RPC run in arm.
-                result = self.executor.dispatch('finish', self._credentials())
-        deadline = time.monotonic()+11.
-        while result.get('state') not in ('idle', 'completed', 'failed', 'unknown', 'error') and time.monotonic() < deadline:
-            self._check_generation(generation)
-            time.sleep(.02)
-            result = self.executor.dispatch('finish_status', {'operation_id': result['operation_id']})
-        if not result.get('return_completed') or not result.get('authority_released'):
-            raise ValueError(result.get('error') or result.get('reason') or 'return_unconfirmed')
-        with self._lock:
-            self._check_generation(generation)
-            self._state, self._reason = 'idle', None
-        return result
+            self._generation += 1
+            self._operator = None
+            self._latest = None
+            self._closed.set()
+            self._wake.set()
+            self._state, self._reason = 'idle', 'arm_release'
+        self.motion.cancel_pending()
 
     def stop(self):
         with self._lock:
@@ -639,7 +523,7 @@ class TeleopControl:
                 'space_epoch': self._input_identity[2] if self._input_identity else 0,
                 'operator_session_id': self._operator, 'mapping_epoch': self.mapping.epoch,
                 'state': self._state, 'reason': self._reason, 'capabilities': list(self.CAPABILITIES),
-                'input_status': input_status, 'execution': execution, 'receipts': copy.deepcopy(list(self._receipts.values()))}
+                'input_status': input_status, 'execution': execution, 'receipts': []}
 
     def info(self):
         with self._lock:

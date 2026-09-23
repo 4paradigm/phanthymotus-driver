@@ -153,8 +153,6 @@ class G1DeviceBundle:
             arm = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'arm'), None)
             if arm is None:
                 raise ValueError('motion_control requires arm plugin')
-            if any(plugins_cfg.get(name, {}).get('enabled', False) for name in ('servo', 'servo_eef')):
-                raise ValueError('motion_control conflicts with other arm_sdk writers')
             effective = dict(control_cfg if control_enabled else motion_cfg)
             effective['servo_position'] = control_enabled
             stream = ArmStreamExecutor(effective, namespace, arm_client)
@@ -165,6 +163,7 @@ class G1DeviceBundle:
                 from teleop_control import TeleopControl
                 from teleop_bus import TeleopBus
                 control = TeleopControl(dict(control_cfg), motion)
+                arm._teleop_control = control
                 stream.public_motion_topics = False
                 self._motion_bus = TeleopBus(executor, control)
                 self._plugins.append(control)

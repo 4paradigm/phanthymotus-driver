@@ -123,3 +123,52 @@ def test_default_collision_policy_does_not_block_inward_targets(tmp_path):
     invalid=q.copy();invalid[0]=100.
     with pytest.raises(ValueError,match='joint_limit'):
         solver.motion_envelope(q,q,invalid)
+
+
+def test_packaged_geometry_matches_existing_solver_with_same_measured_posture(tmp_path):
+    from g1_motion.profile import session_profile
+    path, directory = session_profile(DRIVER/'g1_motion/g1_23_fixed_hand.json',
+        {'arm_ns': 1_000_000_000, 'locked_joints': dict.fromkeys(
+            json.loads((DRIVER/'g1_motion/g1_23_fixed_hand.json').read_text())['locked_joint_names'], 0.)},
+        1_000_000_000)
+    try:
+        current, previous = G1IK(path), G1IK(profile(tmp_path))
+        q = np.zeros(10)
+        current.self_test(q); previous.self_test(q)
+        for joint, offset in ((0,.1),(1,.1),(3,.2),(6,-.1),(8,.2)):
+            target = q.copy(); target[joint] = offset
+            poses = previous.palms(target)
+            before = previous.solve(poses, q, q, deadline_monotonic=time.monotonic()+1.)
+            after = current.solve(poses, q, q, deadline_monotonic=time.monotonic()+1.)
+            assert np.allclose(after, before, atol=1e-9, rtol=0)
+    finally:
+        directory.cleanup()
+
+
+def test_default_profile_real_worker_lifetime_and_no_hardware(tmp_path):
+    from types import SimpleNamespace
+    from arm_stream import ArmStreamExecutor, LOCKED_NAMES
+    from motion_control import MotionControl
+    config = {'calibration_path': str(DRIVER/'g1_motion/g1_23_fixed_hand.json'),
+              'servo_position': True, 'joint_velocity_rad_s': 1.}
+    baseline = {'waist': .01}
+    def feedback():
+        joints = dict.fromkeys(LOCKED_NAMES, 0.)
+        joints['waist_yaw_joint'] = baseline['waist']
+        return {'q': [0.]*10, 'dq': [0.]*10, 'arm_ns': time.monotonic_ns(), 'locked_joints': joints}
+    arm = ArmStreamExecutor(config, 'offline', SimpleNamespace(), snapshot=feedback)
+    motion = MotionControl(dict(config), arm)
+    try:
+        assert motion.calibrate()['calibrated']
+        first = Path(motion.solver.path)
+        assert first.is_file() and motion.solver.profile['locked_joints']['waist_yaw_joint'] == .01
+        assert arm._channel is None and arm.session_id is None
+        baseline['waist'] = -.02
+        assert motion.calibrate()['calibrated']
+        assert not first.exists()
+        second = Path(motion.solver.path)
+        assert second.is_file() and motion.solver.profile['locked_joints']['waist_yaw_joint'] == -.02
+        assert arm._channel is None and arm.session_id is None
+    finally:
+        motion.stop()
+    assert not second.exists()

@@ -12,6 +12,7 @@ import time
 from common.motion.envelope import IDENTITY, MotionEnvelope
 from common.motion.protocol import SCHEMA, envelope, validate, validate_descriptor, vector
 from g1_motion.worker import NumericalWorker
+from g1_motion.profile import session_profile
 
 JOINT_NAMES = tuple(f'{side}_{joint}_joint' for side in ('left', 'right') for joint in
                     ('shoulder_pitch', 'shoulder_roll', 'shoulder_yaw', 'elbow', 'wrist_roll'))
@@ -26,6 +27,7 @@ class MotionControl:
         self.feedback_topic = f'/{self.ns}/motion/teleop/feedback'
         self.solver_factory = solver_factory
         self.solver = None
+        self._profile_directory = None
         self._lock = threading.RLock()
         self._management_lock = threading.RLock()
         self._closed, self._wake = threading.Event(), threading.Event()
@@ -146,6 +148,9 @@ class MotionControl:
         if worker and worker is not threading.current_thread(): worker.join(.5)
         if worker and worker.is_alive(): raise RuntimeError('motion_control_thread_stop_unconfirmed')
         if solver: solver.close()
+        if self._profile_directory:
+            self._profile_directory.cleanup()
+            self._profile_directory = None
         with self._lock: self._worker = self.solver = None
 
     def calibrate(self, candidate=None):
@@ -153,26 +158,32 @@ class MotionControl:
         cfg = self.cfg if candidate is None else candidate
         path = cfg.get('calibration_path')
         if not isinstance(path, str) or not path: raise ValueError('calibration_missing')
+        state, _ = self._fresh()
+        resolved_path, directory = session_profile(path, state['feedback'], self.gate.clock())
         factory = self.solver_factory or NumericalWorker
-        solver = factory(path, cfg.get('joint_velocity_rad_s', 1.))
+        solver = None
         try:
+            solver = factory(resolved_path, cfg.get('joint_velocity_rad_s', 1.))
             if solver.profile.get('arm_joint_names') != list(JOINT_NAMES): raise ValueError('g1_joint_order')
             _, q = self._fresh()
             solver.self_test(q)
             # Candidate numerical checks finish before changing the idle arm's
             # profile. Execution keeps its own independent model and Data.
-            self.executor.configure_profile(path, velocity=solver.velocity,
+            self.executor.configure_profile(resolved_path, velocity=solver.velocity,
                 expected_sha256=solver.profile_sha256)
             if getattr(self.executor, 'profile_sha256', None) != solver.profile_sha256:
                 raise ValueError('executor_calibration_mismatch')
         except BaseException:
-            solver.close()
+            if solver: solver.close()
+            if directory: directory.cleanup()
             raise
         with self._lock:
             self.cancel_pending()
+            old_directory, self._profile_directory = self._profile_directory, directory
             old, self.solver = self.solver, solver
             self.cfg.update(cfg)
         if old: old.close()
+        if old_directory: old_directory.cleanup()
         self._refresh_snapshot()
         return {'calibrated': True, 'effector_ids': ['left', 'right'], **self.versions, 'eef_snapshot': copy.deepcopy(self._snapshot)}
 
