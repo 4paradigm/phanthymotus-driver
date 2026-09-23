@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
 const {chromium} = await import(process.env.PLAYWRIGHT_MODULE);
-const result = spawnSync(process.env.PYTHON || 'python3', ['-c', 'from common.ext_vr.admin_page import PAGE; print(PAGE)'], {encoding:'utf8'});
+const result = spawnSync(process.env.PYTHON || 'python3', ['-c', "import sys; sys.path.insert(0, 'pico/4ultra'); from ext_vr.admin_page import PAGE; print(PAGE)"], {encoding:'utf8'});
 assert.equal(result.status, 0, result.stderr);
 const browser = await chromium.launch({headless:true, executablePath:process.env.CHROME_BINARY});
 const page = await browser.newPage({viewport:{width:900,height:1000}});

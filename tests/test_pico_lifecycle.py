@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 """Real localhost TLS/MCP pairing and configuration; no robot or headset IO."""
 
 import asyncio
@@ -9,7 +11,8 @@ import urllib.request
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 import pytest
-from common.ext_vr.plugin import ExtVrPlugin
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'pico/4ultra'))
+from ext_vr.plugin import ExtVrPlugin
 from test_pico_device import load_driver_module
 
 

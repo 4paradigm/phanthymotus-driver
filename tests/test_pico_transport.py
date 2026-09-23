@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 """Real localhost WebSocket + WebRTC and TLS lifecycle; no PICO/robot I/O."""
 
 import asyncio
@@ -8,12 +10,13 @@ import unittest
 from unittest.mock import patch
 from aiohttp.test_utils import TestClient, TestServer
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCSessionDescription
-from common.ext_vr.capture import CaptureManager
-from common.ext_vr.capture_server import create_capture_app, visualization_stream
-from common.ext_vr.protocol import TicketCodec, TicketVerifier
-from common.ext_vr.rtc import RtcManager
-from common.ext_vr.runtime import DeviceRuntime
-from common.ext_vr.descriptor import CAPTURE_PROTOCOL, RTC_FRAME_PROTOCOL
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'pico/4ultra'))
+from ext_vr.capture import CaptureManager
+from ext_vr.capture_server import create_capture_app, visualization_stream
+from ext_vr.protocol import TicketCodec, TicketVerifier
+from ext_vr.rtc import RtcManager
+from ext_vr.runtime import DeviceRuntime
+from ext_vr.descriptor import CAPTURE_PROTOCOL, RTC_FRAME_PROTOCOL
 from test_pico_device import frame
 
 

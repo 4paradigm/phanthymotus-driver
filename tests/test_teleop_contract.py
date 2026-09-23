@@ -142,3 +142,45 @@ def test_stop_receipt_identity_is_independent_of_last_pose_epoch():
     message = feedback(); receipt = message["receipts"][0]
     receipt.update(action="stop", connection_epoch=11)
     assert validate_feedback(message, **OPTIONS)["receipts"][0]["connection_epoch"] == 11
+
+
+def test_optional_controls_and_future_tracking_survive_round_trip():
+    frame = input_frame()
+    frame['left']['controls'] = {
+        'buttons': {'x': {'available': True, 'pressed': True, 'touched': False},
+                    'grip': {'available': True, 'value': .7},
+                    'menu': {'available': False}},
+        'axes': {'thumbstick': {'available': True, 'value': [.3, -.4]}},
+        'future_sensor': {'sample': [1, 2]},
+    }
+    frame['extensions'] = {'trackers': {'left_foot': {'tracked': False}}}
+    frame['future_metadata'] = {'revision': 2}
+    admitted = validate_input(json.loads(json.dumps(frame)), **OPTIONS)
+    assert admitted == frame
+    frame['left']['controls']['axes']['thumbstick']['value'][0] = 1
+    assert admitted['left']['controls']['axes']['thumbstick']['value'] == [.3, -.4]
+
+
+@pytest.mark.parametrize('controls', [
+    None, [], {'buttons': []},
+    {'buttons': {'x': {'available': 'yes', 'pressed': True}}},
+    {'buttons': {'x': {'available': True, 'pressed': 1}}},
+    {'buttons': {'x': {'available': True, 'value': 1.1}}},
+    {'buttons': {'x': {'available': False, 'value': 0}}},
+    {'axes': {'thumbstick': {'available': True, 'value': [.3]}}},
+    {'axes': {'thumbstick': {'available': True, 'value': [2, 0]}}},
+    {'axes': {'thumbstick': {'available': False, 'value': [0, 0]}}},
+])
+def test_malformed_known_controls_are_not_silently_accepted(controls):
+    frame = input_frame()
+    frame['left']['controls'] = controls
+    with pytest.raises(ValueError):
+        validate_input(frame, **OPTIONS)
+
+
+@pytest.mark.parametrize('extension', [[], 'unknown', {'future': float('nan')}])
+def test_extension_keeps_finite_json_object_contract(extension):
+    frame = input_frame()
+    frame['extensions'] = extension
+    with pytest.raises(ValueError):
+        validate_input(frame, **OPTIONS)

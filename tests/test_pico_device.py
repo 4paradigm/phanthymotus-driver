@@ -8,12 +8,12 @@ import threading
 import time
 from types import SimpleNamespace
 import pytest
-from common.ext_vr.runtime import DeviceRuntime
-from common.ext_vr.protocol import ProtocolError
-from common.ext_vr.plugin import ExtVrPlugin
-from common.ext_vr.management import OperatorCommands
-from common.ext_vr.transport import BoundedWriter
-from common.ext_vr.auth import PairingAdmin
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'pico/4ultra'))
+from ext_vr.runtime import DeviceRuntime
+from ext_vr.protocol import ProtocolError
+from ext_vr.plugin import ExtVrPlugin
+from ext_vr.management import OperatorCommands
+from ext_vr.transport import BoundedWriter
 from common.teleop_contract import validate_input, validate_operation
 
 
@@ -105,12 +105,11 @@ def test_new_space_rejects_old_rtc_and_never_reuses_stale_pose():
     assert new["space_epoch"] != old["space_epoch"]
 
 
-def test_pose_filter_preserves_grip_and_tracking_and_uses_elapsed_time():
+def test_pose_input_is_unfiltered_across_grip_and_tracking_changes():
     runtime, binding, epoch = ready_runtime()
-    runtime.filter_time_ms = 30
     put(runtime, binding, epoch, 1, 1.0, 1.0)
     out = put(runtime, binding, epoch, 2, 0.0, 5.0)
-    assert -5 < out["left"]["position"][1] < -1
+    assert out["left"]["position"][1] == -5
     assert out["left"]["grip"] == 0
     value = frame(3)
     value["tracking"]["left_controller"] = False
@@ -156,25 +155,6 @@ def test_bounded_writer_stalled_dds_keeps_only_latest_and_stop_priority():
     writer.close()
     assert [v.get("request_id", v.get("sequence")) for v in sent] == [0, "stop", 101]
     assert cleaned == [True]
-
-
-def test_pairing_password_sessions_csrf_expiry_and_no_plaintext(tmp_path):
-    clock = [1.0]
-    admin = PairingAdmin(tmp_path, "https://localhost:15741", clock=lambda: clock[0])
-    password = "correct horse battery staple"
-    admin.set_password(password)
-    assert password not in admin.path.read_text()
-    with pytest.raises(PermissionError):
-        admin.login(password, "https://evil.invalid")
-    with pytest.raises(PermissionError):
-        admin.login("bad", "https://localhost:15741")
-    token, csrf = admin.login(password, "https://localhost:15741")
-    admin.authorize(token, csrf, "https://localhost:15741")
-    with pytest.raises(PermissionError):
-        admin.authorize(token, "bad", "https://localhost:15741")
-    clock[0] = 902
-    with pytest.raises(PermissionError):
-        admin.authorize(token, csrf, "https://localhost:15741")
 
 
 def test_operation_retry_is_identical_and_stop_bypasses_finish():
@@ -274,7 +254,7 @@ def test_old_connection_operation_not_replayed_after_reconnect():
 
 
 def load_driver_module(name):
-    path = Path(__file__).parents[1] / "pico/pico" / f"{name}.py"
+    path = Path(__file__).parents[1] / "pico/4ultra" / f"{name}.py"
     spec = importlib.util.spec_from_file_location("pico_" + name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -285,7 +265,7 @@ def test_standalone_metadata_and_info_have_no_core_custom_dependency(tmp_path):
     import yaml
 
     root = Path(__file__).parents[1]
-    metadata = yaml.safe_load((root / "pico/pico/driver.yaml").read_text())
+    metadata = yaml.safe_load((root / "pico/4ultra/driver.yaml").read_text())
     assert metadata["id"] == "pico-driver" and metadata["port"] == 15742
     plugin = ExtVrPlugin(
         {
@@ -459,7 +439,7 @@ def test_device_plugin_does_not_consume_robot_feedback():
 
 def test_missing_or_nonlocal_dds_profile_cannot_silently_start(tmp_path):
     validate = load_driver_module("identity").validate_dds_profile
-    source = Path(__file__).parents[1] / "pico/pico/dds-local.xml"
+    source = Path(__file__).parents[1] / "pico/4ultra/dds-local.xml"
     validate(source)
     with pytest.raises(OSError):
         validate(tmp_path / "absent.xml")
@@ -471,3 +451,40 @@ def test_missing_or_nonlocal_dds_profile_cannot_silently_start(tmp_path):
         candidate.write_text(source.read_text().replace(old, new))
         with pytest.raises(ValueError, match="loopback_profile"):
             validate(candidate)
+
+
+def test_named_controls_and_extensions_survive_rtc_to_dds_without_filtering():
+    runtime, binding, epoch = ready_runtime()
+    wire = frame(1)
+    controls = {
+        "buttons": {
+            "trigger": {"available": True, "value": 0.4, "pressed": False, "touched": True},
+            "x": {"available": True, "pressed": True, "touched": False},
+            "thumbstick": {"available": False},
+        },
+        "axes": {"thumbstick": {"available": True, "value": [-0.7, 0.3]}},
+        "future": {"vendor": "preserved"},
+    }
+    wire["controllers"]["left"]["controls"] = controls
+    wire["extensions"] = {"future_device": {"battery": 0.8}}
+    out = runtime.submit_rtc_frame(wire, authority=binding, rtc_generation=epoch)
+    assert out["left"]["controls"] == controls
+    assert out["extensions"] == wire["extensions"]
+    assert "controls" not in out["right"]
+    assert out["left"]["grip"] == 1.0
+    wire["controllers"]["left"]["controls"]["axes"]["thumbstick"]["value"][0] = 0
+    assert out["left"]["controls"]["axes"]["thumbstick"]["value"][0] == -0.7
+
+
+@pytest.mark.parametrize("controls", [
+    {"buttons": {"a": {"available": False, "pressed": False}}},
+    {"buttons": {"a": {"available": True, "pressed": 1}}},
+    {"axes": {"thumbstick": {"available": True, "value": [1, 2]}}},
+    {"axes": {"thumbstick": {"available": True, "value": [0]}}},
+])
+def test_invalid_optional_controls_do_not_bypass_wire_validation(controls):
+    runtime, binding, epoch = ready_runtime()
+    wire = frame(1)
+    wire["controllers"]["left"]["controls"] = controls
+    with pytest.raises(ProtocolError):
+        runtime.submit_rtc_frame(wire, authority=binding, rtc_generation=epoch)

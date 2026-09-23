@@ -16,9 +16,10 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from common.ext_vr.enrollment import Enrollment
-from common.ext_vr.capture import CaptureError
-from common.ext_vr.onboarding import package_metadata
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'pico/4ultra'))
+from ext_vr.enrollment import Enrollment
+from ext_vr.capture import CaptureError
+from ext_vr.onboarding import package_metadata
 
 
 class Capture:
@@ -165,7 +166,7 @@ def test_fetch_cached_fixed_artifact_and_no_insecure_source(tmp_path):
     manifest = artifact(tmp_path)
     script = (
         Path(__file__).parents[1]
-        / "common/ext_vr/openxr_capture_native/scripts/fetch_apk.py"
+        / "pico/4ultra/ext_vr/openxr_capture_native/scripts/fetch_apk.py"
     )
     spec = importlib.util.spec_from_file_location("fetch_apk", script)
     module = importlib.util.module_from_spec(spec)
@@ -204,7 +205,7 @@ def test_compressed_build_artifact_is_bounded_and_verified_before_install(
         manifest["size_bytes"] -= 1
     script = (
         Path(__file__).parents[1]
-        / "common/ext_vr/openxr_capture_native/scripts/fetch_apk.py"
+        / "pico/4ultra/ext_vr/openxr_capture_native/scripts/fetch_apk.py"
     )
     spec = importlib.util.spec_from_file_location("fetch_apk_compressed", script)
     module = importlib.util.module_from_spec(spec)
@@ -233,7 +234,7 @@ def test_compressed_build_artifact_is_bounded_and_verified_before_install(
 
 def test_http_download_and_invitation_routes(tmp_path, monkeypatch):
     from aiohttp.test_utils import TestClient, TestServer
-    import common.ext_vr.capture_server as server
+    import ext_vr.capture_server as server
 
     async def run():
         artifact(tmp_path)
@@ -264,8 +265,8 @@ def test_http_download_and_invitation_routes(tmp_path, monkeypatch):
 
 
 def test_invitation_cannot_replace_pairing_that_wins_handshake_race():
-    from common.ext_vr.capture import CaptureManager
-    from common.ext_vr.descriptor import CAPTURE_PROTOCOL, RTC_FRAME_PROTOCOL
+    from ext_vr.capture import CaptureManager
+    from ext_vr.descriptor import CAPTURE_PROTOCOL, RTC_FRAME_PROTOCOL
 
     async def run():
         e, _ = enrollment()
@@ -315,7 +316,7 @@ def test_old_or_debug_client_never_advertised_as_installable(tmp_path):
 def test_normal_build_requires_matching_published_client(tmp_path):
     script = (
         Path(__file__).parents[1]
-        / "common/ext_vr/openxr_capture_native/scripts/fetch_apk.py"
+        / "pico/4ultra/ext_vr/openxr_capture_native/scripts/fetch_apk.py"
     )
     spec = importlib.util.spec_from_file_location("ext_vr_fetch_guard", script)
     module = importlib.util.module_from_spec(spec)

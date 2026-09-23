@@ -51,10 +51,11 @@ def main():
         from fastapi.staticfiles import StaticFiles
         from api import canvas, config as core_config, mcp_manage, solutions
         import config
-        from common.ext_vr.plugin import ExtVrPlugin
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'pico/4ultra'))
+        from ext_vr.plugin import ExtVrPlugin
         from test_pico_device import frame
 
-        cfg = load("pico_identity", root / "pico/pico/identity.py").prepare_config(
+        cfg = load("pico_identity", root / "pico/4ultra/identity.py").prepare_config(
             {
                 "public_host": "127.0.0.1",
                 "state_dir": private,
@@ -72,7 +73,7 @@ def main():
                 pass
 
         plugin = ExtVrPlugin(cfg, "pico", transport_factory=lambda *a: Sink())
-        handler = load("pico_main", root / "pico/pico/main.py").make_handler(plugin)
+        handler = load("pico_main", root / "pico/4ultra/main.py").make_handler(plugin)
         mcp = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=mcp.serve_forever, daemon=True)
         thread.start()

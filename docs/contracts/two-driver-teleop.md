@@ -28,6 +28,12 @@ Canvas 连接 `teleop_device` 输出到机器人 `teleop_control` 输入。设�
 - `tracking_frame`：`tracking_x_forward_y_left_z_up`，右手坐标系，X 前、Y 左、Z 上。
 - `head_reference`、`left`、`right`：`tracked`、位置 `position`（米）、单位四元数 `orientation_xyzw`；控制器额外携带 `[0,1]` 的 `grip` 和 `trigger`。
 
+- 每侧可选 `controls`：`buttons` 按名称提供 `trigger/grip/thumbstick`、左 `x/y`、右 `a/b`；各项 `available` 为布尔，`value`（0–1）、`pressed`、`touched` 按设备实际支持情况提供。
+- `controls.axes.thumbstick`：`available` 和二维 `value: [x,y]`（各分量 −1–1）。不可用项仅包含 `available=false`，不填零值或按键状态。
+- 根级可选 `extensions` 为 JSON 对象。消费者不拒绝未知可选扩展；核心字段的有限值、类型和时效校验不变。缺少 `controls` 的既有消息仍有效。
+
+输入 Driver 不做滤波，设备采集到的有效帧直接转换坐标并输出。动作平滑与执行属于机器人控制端。
+
 未跟踪对象的位姿为 null。消费者校验格式、有限值、身份、代次、序号和时效；默认输入年龄上限为 300 ms。转发、心跳和滤波不得把旧采样时间刷新为当前时间。完整字段验证见 `common/teleop_contract.py` 的 `validate_input`。
 
 ## 生命周期与显示
@@ -36,4 +42,4 @@ Canvas 连接 `teleop_device` 输出到机器人 `teleop_control` 输入。设�
 
 PICO 显示连接状态、透视画面及握把提示，不发送 begin/finish/stop 操作请求，不订阅机器人执行反馈。机器人卡的 `/teleop/state` 用于 Canvas 监控，不是设备卡的输入或输出。共享模块中保留的历史操作/反馈辅助接口，不属于当前设备接线契约。
 
-安装、配对与局域网发现的使用说明见 [PICO Driver](../../pico/pico/README.md)。
+安装、配对与局域网发现的使用说明见 [PICO Driver](../../pico/4ultra/README.md)。
