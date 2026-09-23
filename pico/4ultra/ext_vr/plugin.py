@@ -199,10 +199,11 @@ class ExtVrPlugin:
             state = Path(self.config["state_dir"])
             saved = {p.name.removesuffix(".config.json") for p in state.glob("*.config.json")}
             # Older start-without-config flows still persisted headset credentials.
+            from .capture import read_private_state
             for path in state.glob("*.json"):
-                if path.name.endswith(".config.json"):
+                if path.name.endswith(".config.json") or path.name in {"management-pin.json", "pairing-admin.json"}:
                     continue
-                value = json.loads(path.read_text())
+                value = read_private_state(path)
                 if isinstance(value, dict) and set(value) == {"schema_version", "capture"}:
                     saved.add(path.stem)
             if len(saved) > 1:

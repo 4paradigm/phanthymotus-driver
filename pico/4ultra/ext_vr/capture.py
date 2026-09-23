@@ -76,6 +76,35 @@ class CaptureConnection:
     events: asyncio.Queue[dict] = field(default_factory=asyncio.Queue)
 
 
+def read_private_state(path: Path):
+    """Read bounded JSON from one opened private file, never a followed link."""
+    directory = None
+    try:
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if stat.S_IMODE(os.fstat(directory).st_mode) != 0o700:
+            raise ValueError("Capture state directory must be private 0700")
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+                raise ValueError("Capture state file must be a regular 0600 file")
+            # One headset record is small. Bound the read even if the file grows.
+            payload = stream.read(8193)
+            if len(payload) > 8192:
+                raise ValueError("Capture state file is too large")
+            value = json.loads(payload)
+            if not isinstance(value, dict):
+                raise ValueError("Capture state file schema is invalid")
+            return value
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Capture state file is unreadable or invalid") from exc
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+
 class CaptureManager:
     """Own exactly one paired headset and one active control connection."""
 
@@ -128,15 +157,11 @@ class CaptureManager:
 
     def _load_state(self) -> None:
         path = self._state_file
-        if path is None or not path.exists():
+        if path is None:
             return
-        metadata = path.stat()
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise ValueError("Capture state file must be a regular 0600 file")
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("Capture state file is unreadable or invalid") from exc
+        payload = read_private_state(path)
+        if payload is None:
+            return
         if not isinstance(payload, dict) or set(payload) != {"schema_version", "capture"}:
             raise ValueError("Capture state file schema is invalid")
         if payload["schema_version"] != 1:

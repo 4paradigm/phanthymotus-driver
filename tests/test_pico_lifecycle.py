@@ -248,3 +248,66 @@ def test_pin_changes_and_card_migration_preserve_headset_reconnect(device, legac
         asyncio.run_coroutine_threadsafe(reconnect(), restored.loop).result(3)
     finally:
         restored.close()
+
+
+@pytest.mark.parametrize("replace_when", ["before_open", "after_open"])
+def test_capture_loader_reads_checked_descriptor_during_path_replacement(tmp_path, monkeypatch, replace_when):
+    import os
+    from ext_vr.capture import CaptureManager
+    state = tmp_path / "capture.json"
+    state.write_text(json.dumps({"schema_version": 1, "capture": None}))
+    state.chmod(0o600)
+    other = tmp_path / "untrusted.json"
+    other.write_text("not capture state")
+    original_open = os.open
+    replaced = []
+
+    def replace():
+        state.unlink()
+        state.symlink_to(other)
+        replaced.append(True)
+
+    def racing_open(path, flags, *args, **kwargs):
+        if path == state.name and kwargs.get("dir_fd") is not None:
+            if replace_when == "before_open":
+                replace()
+            fd = original_open(path, flags, *args, **kwargs)
+            if replace_when == "after_open":
+                replace()
+            return fd
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    if replace_when == "before_open":
+        with pytest.raises(ValueError, match="unreadable or invalid"):
+            CaptureManager(None, None, None, state_file=state)
+    else:
+        manager = CaptureManager(None, None, None, state_file=state)
+        assert manager._captures == {}  # Original opened file, not replacement.
+    assert replaced == [True]
+    assert other.read_text() == "not capture state"
+
+
+@pytest.mark.parametrize("invalid", ["symlink", "fifo", "permissions", "parent", "oversize", "null"])
+def test_capture_loader_rejects_nonprivate_or_invalid_state(tmp_path, invalid):
+    import os
+    from ext_vr.capture import CaptureManager
+    state = tmp_path / "capture.json"
+    state.write_text(json.dumps({"schema_version": 1, "capture": None}))
+    state.chmod(0o600)
+    if invalid == "symlink":
+        state.rename(tmp_path / "target.json")
+        state.symlink_to(tmp_path / "target.json")
+    elif invalid == "fifo":
+        state.unlink()
+        os.mkfifo(state, mode=0o600)
+    elif invalid == "permissions":
+        state.chmod(0o644)
+    elif invalid == "parent":
+        tmp_path.chmod(0o755)
+    elif invalid == "oversize":
+        state.write_text(" " * 8193)
+    elif invalid == "null":
+        state.write_text("null")
+    with pytest.raises(ValueError):
+        CaptureManager(None, None, None, state_file=state)
