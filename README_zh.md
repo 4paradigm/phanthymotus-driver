@@ -10,12 +10,14 @@
 
 | 驱动 | 硬件 | 端口 | 说明 |
 |------|------|------|------|
-| `unitree/g1` | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态监控 |
+| [unitree/g1](unitree/g1/README.md) | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态监控 |
 | `engineai/t800` | 众擎 T800 开发版 | 15708 | ROS2/Native SDK、全身状态、舞蹈/手势序列、虚拟手柄、运动与高低层控制 |
 | `deep_robotics/lynx_m20` | 云深处山猫 M20 | 15716 | 官方 ROS 2/Fast DDS 接口与 basic_server TCP/UDP 原生控制，隔离标准版和 Pro 能力 |
 | `chasing/qianjiao_p200_pro` | 潜行科技潜鲛 P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF 运动控制、锁定/解锁、心跳和连接状态 |
  | `brainco/revo2` | BrainCo Revo 2 灵巧手 | 15706 | 手指位置/预设手势/LED 控制、状态遥测，触觉版附带指尖触觉遥测 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
+
+[G1 双臂运动契约](docs/plans/g1-dual-arm-motion-contract.md)目前是 Draft 实施与验收计划；拟新增的 `motion_control → arm` 遥操链路尚未实现或通过真机验收，现有 Driver 功能说明仍然有效。
 
 ## 快速开始
 
