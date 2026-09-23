@@ -459,3 +459,27 @@ def test_the_descriptor_still_parses_with_the_footprint_on_it():
     """It is an addition to `motus.control/1`, so every existing consumer has to
     keep working without knowing about it."""
     parse_descriptor(loco_servo.build_descriptor())
+
+
+def test_the_yaw_deadband_is_declared_twice_because_it_is_not_one_number():
+    """Standing, R1 does nothing under 1.0 rad/s. Walking, 0.05 rad/s is
+    visible — twenty times smaller, because a gait cycle that is already
+    running can be steered a little per step and one that has to be started
+    cannot.
+
+    A consumer that treats the standing figure as a constant overshoots every
+    small correction mid-approach by that factor, reverses, and overshoots
+    again. On r1_sz that looked like the robot weaving left and right on its
+    way to a target it was already facing.
+    """
+    limits = loco_servo.build_descriptor()["limits"]
+    standing = limits["min_magnitude"]
+    moving = limits["min_magnitude_moving"]
+    assert moving[5] < standing[5] / 10, "the whole point is that it collapses"
+    assert moving[:2] == standing[:2], (
+        "nothing has measured whether the translation floors move; inventing a "
+        "smaller one would be the same mistake in the other direction")
+
+
+def test_the_moving_floors_are_an_addition_the_sink_still_accepts():
+    parse_descriptor(loco_servo.build_descriptor())

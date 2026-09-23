@@ -72,19 +72,33 @@ WZ_ACCEL = 0.30
 # rejects zero, and their real bound is the `lower == upper == 0` above anyway.
 PINNED_ACCEL = 1e-6
 
-# Below these the robot does nothing at all. Measured on r1_sz by commanding one
-# axis at a time: wz needs 1.0 rad/s, vx and vy need 0.4 m/s. Anything smaller
-# is accepted by the SDK, returns 0, and produces no motion whatsoever.
+# Below these the robot does nothing at all — **measured standing still, one
+# axis at a time**, and that phrasing is a limitation rather than a credential.
 #
-# A legged robot has to assemble a whole gait cycle to move, so there is no
-# "creep slowly" regime the way a wheeled base has. This is a property of the
-# robot, which is why it is declared here and not assumed by whatever is driving
-# it: a policy emitting a smooth ramp towards zero would spend its whole life in
-# this band, commanding motion and producing none, with every layer in between
-# reporting success.
+# A legged robot has to assemble a whole gait cycle to move, so from a standstill
+# there is no "creep slowly" regime the way a wheeled base has. Commanding less
+# is accepted by the SDK, returns 0, and produces no motion whatsoever.
 MIN_VX = 0.4
 MIN_VY = 0.4
 MIN_WZ = 1.0
+
+# **The yaw deadband collapses once the robot is already walking.** A gait cycle
+# that is running can be steered a little per step; one that has to be started
+# cannot. Measured on r1_sz: standing, nothing below 1.0 rad/s moves the robot
+# at all; translating, a commanded 0.05 rad/s is visible. Twenty times smaller.
+#
+# This is why the standstill numbers above must not be treated as constants. A
+# consumer that lifts every yaw command to 1.0 while the robot is mid-approach
+# overshoots a 0.05 rad/s correction by a factor of twenty, then reverses, then
+# overshoots again — which on r1_sz looked like the robot weaving left and right
+# on its way to a target it was already facing.
+#
+# So the deadband is declared twice: `min_magnitude` for an axis moving on its
+# own, `min_magnitude_moving` for the same axis while translation is already
+# under way. vx/vy are repeated unchanged because nothing has measured whether
+# *their* floor moves, and inventing a smaller one would be the same mistake in
+# the other direction.
+MIN_WZ_MOVING = 0.05
 
 
 def _step_limit(accel: float, floor: float) -> float:
@@ -162,10 +176,15 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ) -> dict:
                                    _step_limit(VY_ACCEL, MIN_VY),
                                    PINNED_ACCEL, PINNED_ACCEL, PINNED_ACCEL,
                                    _step_limit(WZ_ACCEL, MIN_WZ)],
-            # The deadband, per axis. 0 means "no threshold on this axis".
-            # Consumers should either command 0 or at least this much — see
-            # MIN_VX above.
+            # The deadband, per axis, **standing still**. 0 means "no
+            # threshold on this axis". Consumers should either command 0 or at
+            # least this much — see MIN_VX above.
             "min_magnitude": [MIN_VX, MIN_VY, 0.0, 0.0, 0.0, MIN_WZ],
+            # ...and the same thing while translation is already under way,
+            # which on a legged robot is a different number entirely. See
+            # MIN_WZ_MOVING.
+            "min_magnitude_moving": [MIN_VX, MIN_VY, 0.0, 0.0, 0.0,
+                                     MIN_WZ_MOVING],
             # no max_velocity: it would be jerk here, and a declared limit
             # nobody can interpret is worse than an absent one.
         },
