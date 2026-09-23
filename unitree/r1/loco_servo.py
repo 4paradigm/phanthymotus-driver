@@ -232,10 +232,22 @@ class LocoServoPlugin:
         self._expected_hz = float(config.get("expected_hz", DEFAULT_EXPECTED_HZ))
         if not 0 < self._expected_hz <= MAX_HZ:
             raise ValueError(f"loco_servo.expected_hz must be in (0, {MAX_HZ}]")
-        # Defaults to **on**. The first thing anyone does with a new command card
-        # is wire it up and watch, and a card that drives a chassis the first time
-        # it is connected is the wrong default for that.
-        self._dry_run = bool(config.get("dry_run", True))
+        # **Defaults to off. A deployed chassis should be able to move.**
+        #
+        # It used to default on, on the argument that a card should not drive a
+        # chassis the first time it is connected. That argument is wrong about
+        # this card: `start()` is inert, and it acts only on a command stream
+        # somebody wired up, started a policy on, and gave a target to. Three
+        # deliberate acts, each with its own gate.
+        #
+        # What the old default actually bought was a **silently dead** chassis
+        # on every freshly deployed robot: commands arrive, pass every check,
+        # report APPLIED, and nothing moves. Indistinguishable from a broken
+        # robot from outside — it cost an afternoon on r1_sz immediately after a
+        # deploy, with `applied: 33, refused: 0, sdk_errors: 0` on the screen the
+        # whole time. A safety default whose normal case is a silent failure
+        # only teaches people to switch it off without reading why it is there.
+        self._dry_run = bool(config.get("dry_run", False))
         # Whether a command requires the robot to be standing. Checked per
         # command rather than at start — see `_posture_problem`. Configurable
         # only because a bench with no chassis attached cannot reach FSM 811.
@@ -251,6 +263,9 @@ class LocoServoPlugin:
         #
         # It is loud on purpose: a card that quietly drops two thirds of every
         # command is exactly the failure this file keeps warning about.
+        # Off for the same reason: a chassis that silently drops two thirds of
+        # every command is harder to diagnose than one that does what it was
+        # told.
         self._rotate_only = bool(config.get("rotate_only", False))
         self._suppressed = 0
 
@@ -390,7 +405,7 @@ class LocoServoPlugin:
               f"(dry_run={self._dry_run})", flush=True)
         return {"state": "running", "input": topic, "dry_run": self._dry_run,
                 "rotate_only": self._rotate_only,
-                "control_interface": self._descriptor_raw}
+                "control_interface": self._interface()}
 
     def _halt(self, halted: bool):
         """`pause` / `resume`. Stops the chassis but keeps the subscription.
@@ -463,8 +478,24 @@ class LocoServoPlugin:
                 # canvas to one that is working, and this is the difference.
                 "posture_problem": self._fsm_problem,
                 "last": self._last_command,
-                "control_interface": self._descriptor_raw,
+                "control_interface": self._interface(),
             }
+
+    def _interface(self) -> dict:
+        """The descriptor, plus whether this chassis is currently a no-op.
+
+        `dry_run` and `rotate_only` ride along because the card upstream has no
+        other way to find out. A policy whose commands are being swallowed looks
+        exactly like one that is working — same verdicts, same counters, same
+        silence — and the upstream card's `degraded` list is the only place that
+        difference can reach an operator.
+        """
+        out = dict(self._descriptor_raw)
+        if self._dry_run:
+            out["dry_run"] = True
+        if self._rotate_only:
+            out["rotate_only"] = True
+        return out
 
     # ── arbitration with the call-shaped card ────────────────────────────────
 
