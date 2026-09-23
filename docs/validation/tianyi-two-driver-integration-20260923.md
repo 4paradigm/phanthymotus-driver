@@ -1,6 +1,6 @@
 # 双 Driver 本轮集成记录
 
-对应 #329 `teleop_device` 与 #321 `teleop_control`，2026-09-23。只修改 Driver 仓；Agent Core / ActuCore 无代码变更。未切换天轶业务容器、未发送真实动作、未申请 BOT review。构建和隔离测试在已核实的天轶 Orin 个人目录执行，测试容器无网络、无硬件挂载。
+对应 #329 `teleop_device` 与 #321 `teleop_control`，2026-09-23。只修改 Driver 仓；Agent Core / ActuCore 无代码变更。本节离线阶段未切换天轶业务容器、未发送真实动作、未申请 BOT review；后续切换与并发更新见[现场记录](two-driver-site-20260923.md)。构建和隔离测试在已核实的天轶 Orin 个人目录执行，测试容器无网络、无硬件挂载。
 
 ## 代码与普通宿主验证
 
@@ -81,4 +81,4 @@ TIANYI_FROZEN_TELEOP_DIR=/private/tmp/two-driver-baseline-20260923/frozen-actuco
 - 同一录制的完整冻结执行链 A/B 与实际厂商 `/arm/cmd_pos`、`/arm/status` 跟随证据。
 - 开发真机测试、随后针对精确提交的 BOT review、最终真机验收。
 
-本轮末次只读检查，Canvas 无编辑锁但项目正在运行，因此没有切换业务服务。进入部署前仍须重新核对使用情况、实际配置与控制状态；不能把历史空闲、构建通过或隔离 plant 当成部署/动作授权。
+离线交付时的只读检查显示 Canvas 无编辑锁但项目正在运行，当时未切换业务服务。进入部署前仍须重新核对使用情况、实际配置与控制状态；不能把历史空闲、构建通过或隔离 plant 当成部署/动作授权。
