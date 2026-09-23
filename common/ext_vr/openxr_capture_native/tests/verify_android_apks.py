@@ -108,8 +108,8 @@ def verify_apk(
     badging = run(str(build_tools / "aapt2"), "dump", "badging", str(apk))
     for fragment in (
         f"package: name='{expected['package']}'",
-        "versionCode='25'",
-        "versionName='0.4.1-pico1-operator1-ikview2'",
+        "versionCode='27'",
+        "versionName='0.4.3-pico-input'",
         "minSdkVersion:'29'",
         "targetSdkVersion:'35'",
         f"application-label:'{expected['label']}'",

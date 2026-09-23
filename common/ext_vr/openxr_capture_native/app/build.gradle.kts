@@ -18,8 +18,8 @@ android {
         applicationId = "com.phanthymotus.questcapture"
         minSdk = 29
         targetSdk = 35
-        versionCode = 25
-        versionName = "0.4.1-pico1-operator1-ikview2"
+        versionCode = 27
+        versionName = "0.4.3-pico-input"
 
         ndk {
             abiFilters += "arm64-v8a"

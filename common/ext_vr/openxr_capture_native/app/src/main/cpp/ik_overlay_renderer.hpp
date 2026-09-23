@@ -68,7 +68,15 @@ class IkOverlayRenderer {
         x+=.017f;
       }
     };
-    if(panel.enabled){
+    if(panel.enabled && panel.input_only){
+      for(const auto& pixel:kOperatorLabelPixels){
+        const bool status=pixel[0]==(panel.armed?4:5);
+        if(!status && pixel[0]!=6)continue;
+        const float x=(status?-.12f:-.20f)+pixel[1]*.002f;
+        const float y=(status?.52f:.44f)-pixel[2]*.002f;
+        line({x,y,-1.3f},{x+.0016f,y,-1.3f},panel.armed?green:gray);
+      }
+    } else if(panel.enabled){
       for(int i=0;i<3;++i){
         const float x=OperatorPanel::center(i),y=OperatorPanel::y,w=OperatorPanel::width/2,h=OperatorPanel::height/2,z=OperatorPanel::z;
         IkPoint color=i==0 && !panel.armed?IkPoint{.28f,.3f,.32f}:(i==panel.hover?orange:(i==2?pink:gray));

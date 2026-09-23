@@ -398,7 +398,6 @@ async def capture_websocket_handler(request: web.Request) -> web.StreamResponse:
 
 
 ENROLLMENT_KEY = web.AppKey("teleop_enrollment", Enrollment)
-ADMIN_KEY = web.AppKey("pico_pairing_admin", object)
 
 
 async def management_page(request):
@@ -417,7 +416,6 @@ async def management_page(request):
 
 
 async def management_handler(request):
-    admin = request.app[ADMIN_KEY]
     try:
         if (
             request.query_string
@@ -427,34 +425,6 @@ async def management_handler(request):
             raise CaptureError("pairing_request_invalid")
         data = capture_json(await request.text())
         operation = request.match_info["operation"]
-        origin = request.headers.get("Origin")
-        if operation == "login":
-            # A bounded admission counter also limits password hashing work.
-            now = asyncio.get_running_loop().time()
-            if now - admin.last_login < 1:
-                raise CaptureError("pairing_login_rate_limited", status=429)
-            admin.last_login = now
-            token, csrf = await asyncio.to_thread(
-                admin.login, data.get("password"), origin
-            )
-            result = web.json_response(
-                {"csrf": csrf}, headers={"Cache-Control": "no-store"}
-            )
-            result.set_cookie(
-                admin.COOKIE,
-                token,
-                max_age=900,
-                secure=True,
-                httponly=True,
-                samesite="Strict",
-                path="/manage",
-            )
-            return result
-        admin.authorize(
-            request.cookies.get(admin.COOKIE),
-            request.headers.get("X-Pico-CSRF"),
-            origin,
-        )
         enrollment = request.app[ENROLLMENT_KEY]
         capture = request.app[CAPTURE_KEY]
         if operation == "status":
@@ -534,7 +504,7 @@ async def package_handler(request):
 
 
 def create_capture_app(
-    manager: CaptureManager, enrollment=None, admin=None
+    manager: CaptureManager, enrollment=None
 ) -> web.Application:
     app = web.Application(client_max_size=MAX_CAPTURE_MESSAGE_BYTES)
     app[CAPTURE_KEY] = manager
@@ -542,10 +512,8 @@ def create_capture_app(
     app.router.add_get("/onboarding/apk", package_handler)
     app.router.add_get("/", management_page)
     app.router.add_get("/onboarding", management_page)
-    if admin is not None:
-        app[ADMIN_KEY] = admin
-        app.router.add_post("/manage/{operation}", management_handler)
     if enrollment is not None:
+        app.router.add_post("/manage/{operation}", management_handler)
         app[ENROLLMENT_KEY] = enrollment
         app.router.add_post(
             "/pairing/{operation:request|poll|invite}", enrollment_handler
@@ -566,11 +534,6 @@ class CaptureWssServer:
             capture_certificate_base64(config),
             public_wss_url=config.get("public_wss_url"),
         )
-        from .auth import PairingAdmin
-
-        url = urlsplit(config["public_wss_url"])
-        self.admin = PairingAdmin(config["state_dir"], "https://" + url.netloc)
-        self.admin.last_login = -float("inf")
         self._discovery = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -589,7 +552,7 @@ class CaptureWssServer:
         if self._runner is not None:
             return
         runner = web.AppRunner(
-            create_capture_app(self._manager, self.enrollment, self.admin)
+            create_capture_app(self._manager, self.enrollment)
         )
         await runner.setup()
         try:

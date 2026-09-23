@@ -298,14 +298,12 @@ def test_standalone_metadata_and_info_have_no_core_custom_dependency(tmp_path):
         tool = plugin.get_tool()
         assert tool["name"] == "teleop_device"
         assert "management_binding" not in json.dumps(tool)
-        assert (
-            tool["configSchema"]["properties"]["pairing_admin_password"]["format"]
-            == "password"
-        )
         info = plugin.dispatch("info", {"instance_id": "card-vr"})
-        assert info["topic_out"][0]["topic"] == "/pico/teleop/card_vr/command"
-        assert info["feedback_topic"] == "/pico/teleop/card_vr/feedback"
-        assert not info["config"]["driver_installed"]
+        assert info["topic_out"][0]["topic"] == "/teleop/command"
+        assert "feedback_topic" not in info
+        assert info["config"]["driver_installed"]
+        assert set(tool["configSchema"]["properties"]) == {"usage_guide"}
+        assert info["installation_url"] in tool["configSchema"]["description"]
         assert plugin.instances == {}
     finally:
         plugin.close()
@@ -454,28 +452,9 @@ def test_stop_after_rtc_loss_does_not_require_tracking_or_feedback():
     asyncio.run(run())
 
 
-def test_plugin_keeps_stop_receipt_when_top_level_pose_epoch_is_old():
-    runtime, binding, epoch = ready_runtime()
-    runtime.mark_rtc_disconnected(epoch, "focus_lost")
-    received = []
-    plugin = ExtVrPlugin.__new__(ExtVrPlugin)
-    plugin._lock = threading.RLock()
-    item = {
-        "runtime": runtime,
-        "retired_epochs": set(),
-        "server_epoch": None,
-        "feedback_sequence": -1,
-        "feedback": None,
-        "operators": SimpleNamespace(feedback=lambda v, **kw: received.append((v, kw))),
-    }
-    value = feedback(runtime)
-    value["connection_epoch"] = epoch
-    plugin._accept_feedback(item, value)
-    assert received == [(value, {"update_status": False})]
-    assert item["feedback"] is None
-    # Replayed server sequence still cannot replay a receipt.
-    plugin._accept_feedback(item, value)
-    assert len(received) == 1
+def test_device_plugin_does_not_consume_robot_feedback():
+    assert not hasattr(ExtVrPlugin, 'feedback')
+    assert not hasattr(ExtVrPlugin, '_accept_feedback')
 
 
 def test_missing_or_nonlocal_dds_profile_cannot_silently_start(tmp_path):

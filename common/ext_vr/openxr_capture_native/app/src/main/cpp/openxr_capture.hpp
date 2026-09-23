@@ -29,6 +29,10 @@ class OpenXrCapture final {
 
   void Initialize(android_app* app);
   void PollEvents();
+  void SetDevicePanel(bool connected) {
+    panel_.enabled=true;panel_.input_only=true;panel_.armed=connected;
+    panel_.pending.clear();panel_.pointing=false;
+  }
   void SetOperatorPanel(bool enabled,bool armed,const std::string& state,const std::string& mode,const std::string& error) {
     panel_.enabled=enabled;panel_.armed=armed;panel_.state=state;panel_.mode=mode;panel_.error=error;
   }

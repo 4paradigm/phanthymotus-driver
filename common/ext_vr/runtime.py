@@ -283,7 +283,7 @@ class DeviceRuntime:
                 and age_ms <= 300
             )
             return {
-                "state": "collecting" if self.running else "idle",
+                "state": "running" if self.running else "idle",
                 "generation": self.generation,
                 "last_sequence": self._sequence,
                 "error": self.error,

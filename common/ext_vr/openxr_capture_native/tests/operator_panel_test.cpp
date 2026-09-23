@@ -36,4 +36,7 @@ int main(){
  sample.left_input.buttons[0]=1;sample.right_input.buttons[0]=1;panel.Sample(sample.head,aims,sample);
  assert(panel.pending=="stop");
  panel.pending.clear();sample.head.valid=false;panel.Sample(sample.head,aims,sample);assert(panel.pending.empty() && panel.hover==-1);
+ panel.input_only=true;panel.pending="start";sample.head.valid=true;
+ panel.Sample(sample.head,aims,sample);
+ assert(panel.pending.empty() && panel.hover==-1 && !panel.pointing);
 }

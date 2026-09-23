@@ -25,7 +25,7 @@ namespace {
 
 constexpr char kLogTag[] = "MotusOpenXrCapture";
 constexpr char kPreferencesName[] = "motus_capture";
-constexpr char kAppVersion[] = "0.4.1-pico1-operator1-ikview2";
+constexpr char kAppVersion[] = "0.4.2-pico-input";
 
 struct AndroidLifecycle {
   bool resumed{false};
@@ -399,7 +399,6 @@ void android_main(android_app* app) {
     transport->Start();
 
     bool last_focused = false;
-    bool operator_input_blocked = false;
     auto disconnected_since = std::chrono::steady_clock::now();
     while (app->destroyRequested == 0 && !xr.exit_requested()) {
       for (;;) {
@@ -428,8 +427,7 @@ void android_main(android_app* app) {
         last_focused = focused;
       }
       transport->Tick();
-      xr.SetVisualization(transport->visualization());
-      xr.SetOperatorPanel(transport->operator_enabled(),transport->operator_armed(),transport->operator_state(),transport->operator_mode(),transport->operator_error());
+      xr.SetDevicePanel(transport->paired_connected());
       const auto link = transport->link_state();
       if (link == CaptureLinkState::kStandby || link == CaptureLinkState::kNegotiating ||
           link == CaptureLinkState::kStreaming) {
@@ -443,16 +441,6 @@ void android_main(android_app* app) {
       if (xr.session_running()) {
         FrameSample sample;
         if (xr.RenderFrame(&sample) && focused) {
-          const auto action=xr.TakeOperatorAction();
-          if(!action.empty()){
-            operator_input_blocked=action!="start";
-            transport->SendOperatorCommand(action);
-          }
-          if(operator_input_blocked){
-            sample.left_input.squeeze_pressed=false;sample.right_input.squeeze_pressed=false;
-            if(sample.left_input.buttons.size()>1)sample.left_input.buttons[1]=0;
-            if(sample.right_input.buttons.size()>1)sample.right_input.buttons[1]=0;
-          }
           transport->SendFrame(sample);
         }
       } else {

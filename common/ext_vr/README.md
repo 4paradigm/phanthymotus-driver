@@ -1,38 +1,25 @@
 # PICO 设备实现（teleop_device）
 
-本模块由独立 [PICO Driver](../../pico/pico/README.md) 加载，复用原生 OpenXR、WSS/RTC、安装配对和最新输入缓存。它不加载机器人模型，不求解 IK，不申请运动租约，不调用 ActuCore。实现依据为 [#329 两 Driver 契约](../../docs/plans/pico-teleop-device.md)。`ext_vr` 保留为内部源目录名，不再是公开卡片名。
+本模块由独立 [PICO Driver](../../pico/pico/README.md) 加载，负责 OpenXR 输入、WSS/WebRTC、下载、配对与最新输入缓存。不加载机器人模型、不求解 IK、不申请运动控制权、不调用 ActuCore。`ext_vr` 是内部目录名，公开卡片名为 `teleop_device`。
 
-## 公共接口
+## 接口与传输
 
-普通 MCP 工具 `teleop_device` 提供 `info/config/start/stop`，服务位于本机 15742。`info(instance_id)` 在未配置、未启动时也返回真实 DDS 路径；第一次配置初始化设备 HTTPS/WSS 15741，项目未启动也可下载与配对。一个服务只允许一个头显实例，第二实例明确拒绝。
+MCP 服务位于 15742，提供 `info/config/start/stop`；HTTPS/WSS 位于 15741。一个服务支持一个头显实例。设备唯一输出为 `/teleop/command`，format `data/teleop-cmd`，schema `motus.teleop.command/1`，只发送输入，不订阅机器人反馈。字段与生命周期见[输入契约](../../docs/contracts/two-driver-teleop.md)。
 
-| 方向 | topic | 格式/schema |
-|---|---|---|
-| 设备输出 | `/<namespace>/teleop/<instance>/command` | `data/teleop-cmd` / `motus.teleop.command/1` |
-| 执行反馈 | 同一实例 `/feedback` | `data/teleop-state` / `motus.teleop.feedback/1` |
+DDS 使用同机 domain 42、RELIABLE / KEEP_LAST(16) / VOLATILE。独立 writer 隔离阻塞发布，应用层仅保留最新待发姿态。OpenXR 位置转换为 `[-z,-x,y]`，四元数转换为 `[-qz,-qx,qy,qw]` 并归一化，得到 X 前、Y 左、Z 上的设备跟踪系，单位为米；这不是机器人基座坐标系。
 
-Canvas 只画设备到控制卡的正向连线；反向由双方从该输入绑定派生。协议校验复用 `common/teleop_contract.py`。DDS 使用本机 domain 42、RELIABLE / KEEP_LAST(16) / VOLATILE；应用层只有一个待发姿态和最多16个待发操作。独立 writer 隔离阻塞发布，满队列不会阻塞 RTC、配对服务或停止请求的受理。
+输入携带设备身份、连接与跟踪空间代次、序号、接收主机时钟身份和采样时间。断流、心跳和重发不刷新旧位姿时效。松握仍采集；再次握住是新的输入帧，设备不负责重标定。
 
-输入沿用头显平铺字段，显式带 `kind=input`。OpenXR 转换为位置 `[-z,-x,y]`、四元数 `[-qz,-qx,qy,qw]` 并归一化，单位米，跟踪系 X前/Y左/Z上，不是机器人基座系。原始采样时钟仅用于源端顺序；接收时间带 Linux boot ID，心跳不刷新旧位姿。
+## 安装与连接
 
-**松握与再次双握都是输入数据，设备不标定。** 松握期间继续采集；重握首帧是最新当前位置，连接和空间代次不变。实际断连或 OpenXR 空间重置另行使旧空间失效。输入滤波默认关闭以便冻结对照；可设30ms进行独立A/B。滤波只作用位姿，不延迟握把、跟踪失效或停止。
+齿轮页显示固定使用说明和下载网址，网址由 Driver 生成，不作为用户配置。普通 Core 仅显示文本，用户复制网址到 PICO 浏览器。下载 App 后返回网页，按连接入口打开已填机器人地址的 App；已配对 App 会自动重连。
 
-## 操作与回执
+配对不要求密码或管理登录。一次性邀请有有效期；手动发现配对需要打开 120 秒窗口并核对指纹。管理操作校验同源。配对只建立输入连接，不授权机器人动作。发现使用 `_motus-teleop._tcp` 的 mDNS/DNS-SD 广播；跨网段或组播隔离环境用网址连接。
 
-PICO 的开始映射为 `begin`，结束为 `finish`，立即停止为 `stop`；保留 `calibrate` 协议能力供控制端显式使用。操作带独立 request_id 和原始5秒入站截止时间，100ms有界重试不更新时间。受理后等待反馈最终结果，完成状态不由显示或HTTP成功推断。60秒仍无最终反馈时报告结果未知，不重建会话、不自动释放或补发新开始。
+PICO 只显示配对、连接、透视与握把提示；机器人执行状态由控制卡在 Canvas 监控中显示。生命周期修改串行处理，输入采集不等待配置锁。
 
-操作缓存与姿态分开；停止可取消旧操作重试并优先发出。回执最多保留256项，普通动作淘汰后的ID仍防重放；幂等停止只按实际保留的回执精确去重，不受概率过滤器误判或普通请求容量阻塞。RTC跟踪丢失时，只要已认证WSS仍连接，停止仍可发送。连接代次变化后取消旧请求。回执按原操作的device_id/connection_epoch/space_epoch匹配，不依赖反馈顶层最后姿态的代次；旧姿态不能更新当前连接的可启动状态。反馈校验绑定、时钟、生产者代次和顺序，未知旧生产者不能恢复显示。
+## 依赖与来源
 
-原生App内部沿用已验证的WSS操作/显示协议。默认关闭骨架，反馈只用于按钮和状态；头显透视、输入和停止不等待模型绘制。
+`aiohttp` 提供 HTTPS/WSS，`aiortc` 及其锁定依赖提供 WebRTC 数据通道，`zeroconf` 提供局域网发现，`cryptography` 用于证书。`PyYAML` 用于 Driver 配置。运行依赖由现有镜像构建安装，APK 从带 SHA256 的制品清单下载，不将 APK 或 Android 构建工具纳入 Git。
 
-## 配置与配对鉴权
-
-齿轮配置包含安装确认（默认否）、设备名、Driver生成的安装地址、输入滤波以及敏感密码字段。普通Core不执行readOnly提示，Driver仍拒绝更改安装地址。未手动确认安装不开始采集。运行中拒绝修改，保存后原子写入并读回。生命周期修改串行，兼容Core保存后立即启动时的重复配置请求；采集和反馈不等待该锁。普通 Core 不需要专用Header、管理绑定或密钥注入。
-
-配对管理页由Driver自身HTTPS托管。用户在齿轮设置至少12字符的管理密码；Driver只持久化PBKDF2哈希，不把密码或哈希返回info/DDS。网页登录得到15分钟Secure/HttpOnly/SameSite会话，写操作还验证同源与CSRF。下载只读；批准、撤销和邀请不可匿名执行。邀请单次、有期且只授权配对，不授权运动。没有配置密码时明确提示从齿轮设置，不生成需要找后台文件的秘密。
-
-用户已接受首版在普通齿轮复制网址后打开Driver配对页，无需Core增量。隔离浏览器已验证真实Core字段渲染、保存、分享脱敏、启动/停止和专用格式的文字监控。PICO系统浏览器对独立自签TLS的首次信任、下载安装仍需设备验收，研发ADB不代替该流程。
-
-## 复用与验证
-
-原始来源、许可证及采用文件摘要见 [NOTICE](NOTICE.md)、[ADOPTED_SOURCE](ADOPTED_SOURCE.json)。客户端编译说明见 [原生App](openxr_capture_native/README.md)。本机Python tests覆盖实际localhost MCP、HTTPS、WSS/RTC、配置、认证、重握、latest缓存、堵塞writer和操作恢复；不是PICO、真实DDS或机器人验收。
+来源与许可证见 [NOTICE](NOTICE.md)、[ADOPTED_SOURCE](ADOPTED_SOURCE.json)；客户端构建见[原生 App](openxr_capture_native/README.md)。测试覆盖本地 MCP、HTTPS、WSS/RTC、生命周期及配对页面；这些测试不等于实体头显、真实 DDS 或机器人验收。

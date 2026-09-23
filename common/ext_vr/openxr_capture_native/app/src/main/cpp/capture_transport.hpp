@@ -46,6 +46,7 @@ class CaptureTransport final
   void SetXrFocused(bool focused);
   void SendFrame(const FrameSample& sample);
   void SendOperatorCommand(const std::string& action);
+  bool paired_connected() const {return state_.authenticated;}
   bool operator_enabled() const {return state_.authenticated && !operator_connection_.empty();}
   bool operator_armed() const {return operator_armed_;}
   const std::string& operator_state() const {return operator_state_;}

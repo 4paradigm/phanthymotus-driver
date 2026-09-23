@@ -130,6 +130,9 @@ def register(stop, config):
 
 
 def main():
+    from common import logsafe
+
+    logsafe.install()
     from identity import prepare_config, validate_dds_profile
     import rclpy
     from rclpy.context import Context

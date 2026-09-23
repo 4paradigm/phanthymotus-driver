@@ -27,36 +27,28 @@ try {
     const sidebar = await import('/js/sidebar.js');
     await sidebar.openInstanceConfigModal(mcpId, tool.name, 'vr-card-1', tool.configSchema, tool.description);
   }, {mcpId, tool: fixture.tool});
-  assert.equal(await page.locator('[data-key=driver_installed]').inputValue(), 'false');
-  assert.equal(await page.locator('[data-key=pairing_admin_password]').getAttribute('type'), 'password');
-  assert.ok((await page.locator('#tool-config-body').textContent()).includes('PICO 设备安装步骤'));
-  const url = page.locator('[data-key=installation_url]');
-  const urlBehavior = {tag: await url.evaluate(e => e.tagName), readOnly: await url.evaluate(e => e.readOnly), anchors: await page.locator('#tool-config-body a').count()};
-  // Record the known host gap; do not call this a clickable/readonly entry.
-  assert.deepEqual(urlBehavior, {tag: 'INPUT', readOnly: false, anchors: 0});
-  await page.locator('[data-key=driver_installed]').selectOption('true');
-  await page.locator('[data-key=pairing_admin_password]').fill('isolated fixture password');
-  await page.locator('[data-key=input_filter_ms]').fill('30');
+  assert.equal(await page.locator('[data-key=usage_guide]').inputValue(), '无需配置');
+  assert.equal(await page.locator('#tool-config-body [data-key]').count(), 1);
+  assert.ok((await page.locator('#tool-config-body').textContent()).includes('/onboarding'));
+  assert.ok((await page.locator('#tool-config-body').textContent()).includes('无需配对密码'));
+  const urlBehavior = {editableUrl: await page.locator('[data-key=installation_url]').count(), password: await page.locator('input[type=password]').count()};
+  assert.deepEqual(urlBehavior, {editableUrl: 0, password: 0});
   await page.screenshot({path: evidencePath.replace(/\.json$/, '-gear.png'), fullPage: true});
   await page.locator('#tool-config-save').click();
   await page.waitForFunction(() => document.getElementById('tool-config-overlay').classList.contains('hidden'));
   const saved = await (await page.request.get(base + `/api/canvas/tool-config/${mcpId}/teleop_device/vr-card-1`)).json();
-  assert.equal(saved.data.driver_installed, true);
-  assert.equal(saved.data.input_filter_ms, 30);
-  const packed = await (await page.request.get(base + '/fixture/pack')).json();
-  assert.equal(packed.canvas.toolConfigs['d0:teleop_device:vr-card-1'].pairing_admin_password, '');
-  assert.ok(!JSON.stringify(packed).includes('isolated fixture password'));
+  assert.equal(saved.data.usage_guide, '无需配置');
   const started = await (await page.request.post(base + '/api/config/start-project')).json();
   assert.equal(started.ok, true, JSON.stringify(started));
   let driver;
   for (let i = 0; i < 50; i++) {
     driver = await (await page.request.get(base + '/fixture/driver-state')).json();
-    if (driver.state === 'collecting') break;
+    if (driver.state === 'running') break;
     await new Promise(r => setTimeout(r, 100));
   }
-  assert.equal(driver.state, 'collecting', JSON.stringify(driver));
+  assert.equal(driver.state, 'running', JSON.stringify(driver));
   assert.equal(driver.topic_out[0].format, 'data/teleop-cmd');
-  assert.equal(driver.topic_out[0].topic, '/pico/teleop/vr_card_1/command');
+  assert.equal(driver.topic_out[0].topic, '/teleop/command');
   const input = await (await page.request.get(base + '/fixture/input')).json();
   const displayed = await page.evaluate(async input => {
     const {ActivityRenderer} = await import('/js/renderers/activity.js');
@@ -76,9 +68,9 @@ try {
   fs.writeFileSync(evidencePath, JSON.stringify({
     core_sha: fixture.core_sha, core_source_sha256: fixture.core_source_sha256,
     source_mode: 'unchanged git archive; real Core JS/API/SQLite and Driver MCP; DDS sink',
-    checks: ['registration_discovery', 'gear_default_and_password', 'browser_save_and_typed_config',
-      'solution_password_redaction', 'project_start_and_topic', 'activity_monitor_input_text', 'project_stop_routes_to_instance'],
-    installation_url_gap: urlBehavior, frontend_errors: errors, result: 'PASS_WITH_KNOWN_URL_GAP'
+    checks: ['registration_discovery', 'gear_fixed_guide_no_password', 'browser_save_and_typed_config',
+      'generated_url_in_description', 'project_start_and_topic', 'activity_monitor_input_text', 'project_stop_routes_to_instance'],
+    installation_url_gap: urlBehavior, frontend_errors: errors, result: 'PASS'
   }, null, 2) + '\n');
-  console.log('CORE INTEGRATION PASS; URL remains non-clickable/editable host input');
+  console.log('CORE INTEGRATION PASS; URL is description text, no password or editable URL');
 } finally { await browser.close(); }

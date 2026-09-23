@@ -98,18 +98,10 @@ class RosTransport:
             depth=16,
             durability=DurabilityPolicy.VOLATILE,
         )
-        command, feedback = topics(namespace, instance_id)
+        command = "/teleop/command"
         self.pub = self.node.create_publisher(String, command, qos)
 
-        def receive(msg):
-            if len(msg.data) > 65536:
-                return
-            try:
-                feedback_callback(json.loads(msg.data))
-            except (ValueError, TypeError):
-                pass
-
-        self.sub = self.node.create_subscription(String, feedback, receive, qos)
+        self.sub = None  # Device is an input source; no robot feedback subscription.
         self.executor.add_node(self.node)
         self.writer = BoundedWriter(self._send, self._cleanup)
 

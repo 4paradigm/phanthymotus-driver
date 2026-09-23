@@ -68,8 +68,9 @@ def test_real_mcp_configuration_and_null_error_success(device):
             return json.load(response)
 
     try:
-        rejected = call("start")
-        assert "confirm_driver_installation" in rejected["error"]["message"]
+        started_without_checkbox = call("start")
+        assert not started_without_checkbox["result"]["isError"]
+        assert not call("stop")["result"]["isError"]
         configured = call(
             "config",
             driver_installed=True,
@@ -89,71 +90,32 @@ def test_real_mcp_configuration_and_null_error_success(device):
         thread.join(3)
 
 
-def test_https_pairing_management_requires_own_password_and_csrf(device):
+def test_https_pairing_management_without_password(device):
     import aiohttp
-
     plugin, config = device
-    plugin.dispatch(
-        "config",
-        {
-            "instance_id": "test-vr",
-            "driver_installed": True,
-            "pairing_admin_password": "long fixture password",
-        },
-    )
+    plugin.dispatch("config", {"instance_id": "test-vr"})
     origin = config["public_wss_url"].replace("wss://", "https://").split("/ws/")[0]
-    ssl_context = ssl.create_default_context(cafile=config["tls_cert_file"])
-
+    context = ssl.create_default_context(cafile=config["tls_cert_file"])
     async def run():
-        async with aiohttp.ClientSession(
-            cookie_jar=aiohttp.CookieJar(unsafe=True),
-            connector=aiohttp.TCPConnector(ssl=ssl_context),
-        ) as session:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=context)) as session:
             async with session.get(origin + "/onboarding") as response:
-                assert (
-                    response.status == 200 and "配对管理密码" in await response.text()
-                )
-            async with session.post(
-                origin + "/manage/approve", json={}, headers={"Origin": origin}
-            ) as response:
-                assert response.status == 403
-            async with session.post(
-                origin + "/manage/login",
-                json={"password": "long fixture password"},
-                headers={"Origin": origin},
-            ) as response:
+                html = await response.text()
+                assert response.status == 200 and '无需密码' in html and 'id="login"' not in html
+            async with session.post(origin + "/manage/open", json={}) as response:
                 assert response.status == 200
-                csrf = (await response.json())["csrf"]
-                cookie = response.cookies["motus_pico_admin"]
-                assert cookie["secure"] and cookie["httponly"]
-            headers = {"Origin": origin, "X-Pico-CSRF": csrf}
-            async with session.post(
-                origin + "/manage/invite", json={}, headers=headers
-            ) as response:
+                assert (await response.json())["pairing"]["window_open"]
+            async with session.post(origin + "/manage/invite", json={}) as response:
                 assert response.status == 200
                 invitation = await response.json()
-                assert invitation["deep_link"].startswith("motus-teleop://connect#")
-            async with session.post(
-                origin + "/manage/status", json={}, headers=headers
-            ) as response:
-                status = await response.json()
-                assert invitation["token"] not in json.dumps(status)
-                assert "digest" not in json.dumps(status)
-            async with session.post(
-                origin + "/manage/revoke_invitation",
-                json={},
-                headers={"Origin": "https://other.invalid", "X-Pico-CSRF": csrf},
-            ) as response:
-                assert response.status == 403
-            async with session.post(
-                origin + "/manage/revoke_invitation", json={}, headers=headers
-            ) as response:
+                assert invitation['deep_link'].startswith('motus-teleop://connect#')
+            async with session.post(origin + "/manage/status", json={}) as response:
                 assert response.status == 200
-
+                assert invitation['token'] not in json.dumps(await response.json())
+            async with session.post(origin + "/manage/revoke_invitation", json={}) as response:
+                assert response.status == 200
     asyncio.run(run())
     info = plugin.dispatch("info", {"instance_id": "test-vr"})
-    assert info["pairing_password_set"] and "digest" not in json.dumps(info)
-    assert "long fixture password" not in json.dumps(info)
+    assert info['pairing_password_required'] is False
 
 
 def test_concurrent_core_save_and_start_reapply_are_serialized(device):
@@ -169,5 +131,21 @@ def test_concurrent_core_save_and_start_reapply_are_serialized(device):
     with ThreadPoolExecutor(max_workers=4) as pool:
         calls = [pool.submit(plugin.dispatch, "config", values) for _ in range(4)]
         assert all(call.result()["confirmed"] for call in calls)
-    assert plugin.dispatch("start", {"instance_id": "test-vr"})["state"] == "collecting"
+    assert plugin.dispatch("start", {"instance_id": "test-vr"})["state"] == "running"
     assert plugin.dispatch("stop", {"instance_id": "test-vr"})["state"] == "idle"
+
+
+def test_legacy_settings_do_not_override_device_presets(device):
+    plugin, _ = device
+    result = plugin.dispatch("config", {"instance_id": "test-vr", "driver_installed": False,
+        "display_name": "old name", "input_filter_ms": 123, "installation_url": "https://old-host/"})
+    assert result["config"] == plugin._defaults()
+    assert plugin.dispatch("start", {"instance_id": "test-vr"})["state"] == "running"
+    plugin.dispatch("stop", {"instance_id": "test-vr"})
+
+
+def test_legacy_password_is_ignored_and_not_persisted(device):
+    plugin, config = device
+    plugin.dispatch("config", {"instance_id": "test-vr", "pairing_admin_password": "short"})
+    assert not (Path(config['state_dir']) / 'pairing-admin.json').exists()
+    assert plugin.dispatch("info", {"instance_id": "test-vr"})['pairing_password_required'] is False

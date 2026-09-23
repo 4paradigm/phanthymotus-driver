@@ -1,17 +1,21 @@
-"""Small same-origin pairing page served by the PICO Driver itself."""
+"""Same-origin installation and pairing flow served by the PICO Driver."""
 
-PAGE = r"""<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PICO 安装与配对</title>
-<style>body{font:18px system-ui;max-width:760px;margin:32px auto;padding:16px;line-height:1.6}button,input{font:inherit;padding:10px;margin:6px 0}button,a{touch-action:manipulation}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f3f4f6;padding:16px}section{margin:20px 0}a{display:inline-block;padding:8px}</style>
-<h1>PICO 安装与配对</h1><p>1. 在机器人 Canvas 部署 PICO 与天轶 Driver。2. 下载 App 并在头显确认安装。3. 返回本页，打开并连接当前设备。连接不会自动启动机器人。</p>
-<a href="/onboarding/apk">下载 PICO App</a><p id="package"></p>
-<section><h2>配对管理</h2><p>首次使用请在 Canvas 齿轮页设置“配对管理密码”（至少 12 个字符），并确认已经安装遥操驱动。配对操作只授权设备连接，不授予机器人运动权限。</p>
-<input id="password" type="password" autocomplete="current-password" placeholder="配对管理密码"><button id="login">登录</button></section>
-<section id="controls" hidden><button data-action="status">刷新状态</button><button data-action="open">允许新设备配对</button><button data-action="invite">生成一次性连接邀请</button><button data-action="revoke_invitation">撤销邀请</button><button data-action="approve">批准当前指纹</button><button data-action="reject">拒绝</button><button data-action="revoke_headset">撤销已配对设备</button><p>批准前核对下面指纹与头显显示一致。</p><a id="connect" hidden>打开并连接当前设备</a></section><pre id="status">尚未登录</pre>
+PAGE = r"""<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>连接机器人 · PhanthyMotus</title>
+<style>body{font:18px system-ui;max-width:680px;margin:24px auto;padding:20px;line-height:1.7;color:#26221f}section{border:1px solid #ddd;border-radius:14px;padding:20px;margin:20px 0}button,a{font:inherit;touch-action:manipulation}button,.primary{display:inline-block;background:#b65d32;color:white;border:0;border-radius:8px;padding:12px 20px;text-decoration:none;cursor:pointer}button:disabled{opacity:.5}small{color:#666}details{margin-top:24px}details button{background:#eee;color:#333;margin:8px 0}#error{color:#a32616}[hidden]{display:none!important}#fingerprint{overflow-wrap:anywhere}</style>
+<h1>连接这台机器人</h1><p>请在 PICO 浏览器打开本页。无需密码，连接后不会自动运动。</p>
+<section><h2>1 · 安装 App</h2><a class="primary" href="/onboarding/apk">下载 PICO App</a><p id="package">正在检查安装包…</p><small>下载后确认安装，再返回本页。已经安装可直接进行下一步。</small></section>
+<section><h2>2 · 打开并连接</h2><p id="status" role="status">正在读取连接状态…</p><button id="prepare">连接这台机器人</button><a id="connect" class="primary" hidden>打开 App 并连接</a><p><small>如果在电脑上查看，请把当前网址复制到 PICO 浏览器。已配对的 App 再次打开会自动重连。</small></p>
+<div id="pending" hidden><p>发现待配对设备，请核对头显中显示的指纹：</p><strong id="fingerprint"></strong><p><button data-action="approve">指纹一致，允许连接</button> <button data-action="reject">不是我的设备</button></p></div></section>
+<p id="error" role="alert"></p>
+<details><summary>其他连接方式与设备管理</summary><p>App 的“刷新局域网机器人”通过同一局域网的服务广播发现机器人，不扫描 IP。访客 Wi-Fi、组播隔离或跨网段时可能找不到；优先使用上方连接入口。</p><button data-action="open">允许 App 手动发现配对（120 秒）</button><p><small>随后在 App 选择机器人，按提示核对指纹。本页会自动显示配对请求。</small></p><button data-action="revoke_headset">忘记已配对的 PICO</button><p><small>只有更换头显或重新配对时才需要忘记设备。</small></p></details>
 <script>
-let csrf='', pending=null;const status=document.querySelector('#status');
-async function call(action,values={}) {const r=await fetch('/manage/'+action,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Pico-CSRF':csrf},body:JSON.stringify(values)});const v=await r.json();if(!r.ok)throw Error(v.error||'请求失败');return v;}
-function show(v){status.textContent=JSON.stringify(v,null,2);if(v.pairing)pending=v.pairing.pending;if(v.deep_link){const a=document.querySelector('#connect');a.href=v.deep_link;a.hidden=false;}}
-document.querySelector('#login').onclick=async()=>{try{const p=document.querySelector('#password');const v=await call('login',{password:p.value});p.value='';csrf=v.csrf;document.querySelector('#controls').hidden=false;show(await call('status'));}catch(e){status.textContent=e.message;}};
-for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{try{const a=b.dataset.action;let data={};if(a==='approve'||a==='reject'){if(!pending)throw Error('没有等待配对的设备');data={request_id:pending.request_id,fingerprint:pending.fingerprint};}if(a==='revoke_headset'&&!confirm('撤销后需要重新配对，继续？'))return;show(await call(a,data));}catch(e){status.textContent=e.message;}};
-fetch('/onboarding/package').then(r=>r.json()).then(v=>{document.querySelector('#package').textContent=v.available?`${v.version} · SHA256 ${v.sha256}`:'安装包尚未就绪，请联系部署人员。';});
+const el=id=>document.getElementById(id);let pending=null,busy=false;
+const errors={pairing_window_closed:'配对窗口已关闭，请重新允许手动配对。',revoke_existing_headset_first:'已有配对设备；请直接打开已配对的 App。更换头显时，在设备管理中忘记旧设备。',invitation_expired:'连接邀请已过期，请重新点击连接。'};
+async function call(action,values={}){const r=await fetch('/manage/'+action,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});const v=await r.json();if(!r.ok)throw Error(errors[v.error]||v.error||'请求失败，请重试');return v;}
+function show(v){if(v.pairing){pending=v.pairing.pending;if(!v.pairing.invitation)el('connect').hidden=true;el('pending').hidden=!pending;el('fingerprint').textContent=pending?pending.fingerprint:'';}if(v.capture){el('status').textContent=v.capture.connected?'PICO 已连接。在 App 进入透视采集，按住双握把开始遥操。':v.capture.paired_devices?'已配对，请打开 PICO App 自动重连。':'尚未配对，点击下方按钮，App 将自动填好这台机器人的地址。';el('prepare').hidden=!!v.capture.paired_devices||!el('connect').hidden;if(v.capture.paired_devices)el('connect').hidden=true;}}
+async function refresh(){if(busy)return;try{show(await call('status'));}catch(e){el('error').textContent='暂时无法读取状态：'+e.message;}}
+el('prepare').onclick=async()=>{busy=true;el('prepare').disabled=true;el('error').textContent='';try{const v=await call('invite');el('connect').href=v.deep_link;el('connect').hidden=false;el('prepare').hidden=true;el('status').textContent='地址已准备好，点击“打开 App 并连接”，无需手动填写。';}catch(e){el('error').textContent=e.message;}finally{busy=false;el('prepare').disabled=false;}};
+for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{busy=true;b.disabled=true;el('error').textContent='';try{const a=b.dataset.action;let data={};if(a==='approve'||a==='reject'){if(!pending)throw Error('当前没有待配对设备');data={request_id:pending.request_id,fingerprint:pending.fingerprint};}if(a==='revoke_headset'&&!confirm('忘记设备后需要重新连接，继续？'))return;show(await call(a,data));if(a==='revoke_headset')el('connect').hidden=true;}catch(e){el('error').textContent=e.message;}finally{busy=false;b.disabled=false;await refresh();}};
+refresh();setInterval(refresh,2000);
+fetch('/onboarding/package').then(r=>r.json()).then(v=>{el('package').textContent=v.available?'版本 '+v.version:'安装包尚未就绪，请联系部署人员。';}).catch(()=>{el('package').textContent='暂时无法读取安装包信息，请刷新页面。';});
 </script></html>"""

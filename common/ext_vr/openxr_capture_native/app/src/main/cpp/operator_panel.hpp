@@ -12,6 +12,7 @@ inline bool OperatorCommandAllowed(bool enabled, bool armed, std::string_view ac
 // All coordinates are head-relative metres, matching the stereo overlay.
 struct OperatorPanel {
   bool enabled=false;
+  bool input_only=false;
   bool armed=false;
   std::string state, mode, error;
   int hover=-1;
@@ -30,6 +31,7 @@ struct OperatorPanel {
   }
   void Sample(const PoseSample& head,const std::array<PoseSample,2>& aim,const FrameSample& frame){
     hover=-1;pointing=false;
+    if(input_only){pending.clear();return;}
     const ControllerSample* inputs[]{&frame.left_input,&frame.right_input};
     for(int i=0;i<2;++i){
       const auto& input=*inputs[i];

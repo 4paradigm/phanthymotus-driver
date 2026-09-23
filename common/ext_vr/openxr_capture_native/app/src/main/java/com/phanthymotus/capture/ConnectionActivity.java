@@ -52,7 +52,7 @@ public final class ConnectionActivity extends Activity {
         layout.setPadding(32, 24, 32, 24); scroll.addView(layout); setContentView(scroll);
         TextView title = new TextView(this); title.setText("PhanthyMotus · 连接机器人"); title.setTextSize(24); layout.addView(title);
         TextView legend = new TextView(this);
-        legend.setText("透视调试视图：绿=实测手臂，橙=期望手臂姿态（IK），粉=手柄映射目标。\n模型显示在眼前，不与现实机器人重合；Shadow不驱动机器人；天轶暂停时暗橙线保留最后有效姿态，过期实测线隐藏。");
+        legend.setText("首次连接：在 PICO 浏览器打开机器人下载页，安装后点击打开 App 并连接。\n已配对后会自动重连；进入透视采集，按住双握把开始遥操。执行状态请查看 Canvas 监控。");
         legend.setTextSize(16); layout.addView(legend);
         status = new TextView(this); status.setTextSize(18); layout.addView(status);
         devices = new LinearLayout(this); devices.setOrientation(LinearLayout.VERTICAL); layout.addView(devices);
@@ -111,7 +111,7 @@ public final class ConnectionActivity extends Activity {
 
     private void discover() {
         stopDiscovery(); devices.removeAllViews();
-        message("正在发现机器人；未发现时检查同一局域网，或输入备用地址。先在卡片内打开允许配对。");
+        message("正在发现机器人；未发现时检查同一局域网，或输入备用地址。如需手动配对，请先在机器人下载页的设备管理中允许配对。");
         nsd = (NsdManager)getSystemService(NSD_SERVICE);
         WifiManager wifi = (WifiManager)getApplicationContext().getSystemService(WIFI_SERVICE);
         multicast = wifi.createMulticastLock("motus-discovery"); multicast.setReferenceCounted(false); multicast.acquire();

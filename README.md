@@ -6,13 +6,12 @@ Hardware drivers for the **[Phanthy Motus](https://github.com/4paradigm/phanthym
 
 Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server that exposes hardware capabilities as tools. Drivers automatically register with the [Phanthy Motus Agent Core](https://github.com/4paradigm/phanthymotus) on startup.
 
-遥操候选采用 PICO `teleop_device` → 天轶 `teleop_control` 两张 Driver 卡片，Agent Core / ActuCore 零改动。实现与验收契约见 [PICO #329](https://github.com/4paradigm/phanthymotus-driver/pull/329) 和 [天轶 #321](https://github.com/4paradigm/phanthymotus-driver/pull/321)。代码、离线测试、构建、部署与真机验收分别记录；历史四卡方案不再作为本轮契约。
 
 ## Available Drivers
 
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
-| `pico/pico` | PICO 4 Ultra | 15742 | Independent teleop_device; signed App, pairing, DDS input and operation receipts (in development) |
+| `pico/pico` | PICO 4 Ultra | 15742 | Independent teleop_device; signed App, pairing, DDS controller input |
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
 | `unitree/go1` | Unitree Go1 (EDU) Quadruped | 15715 | State, locomotion, camera (RGB/depth/pointcloud), ext peripherals, URDF |
 | `unitree/go2` | Unitree Go2 Quadruped | 15703 | Locomotion, obstacle avoidance, voice, video, navigation |
