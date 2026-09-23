@@ -208,11 +208,19 @@ def test_dry_run_reaches_neither_move_nor_stop():
     assert card._applied == 1          # it still counted, so info() is truthful
 
 
-def test_dry_run_is_the_default():
-    """A newly wired card must not drive a chassis the first time it is
-    connected. Off is a decision someone makes after watching the logs."""
+def test_dry_run_is_not_the_default():
+    """This test used to assert the opposite, on the argument that a newly
+    wired card must not drive a chassis the first time it is connected.
+
+    The argument does not hold for this card. `start()` is inert; it acts only
+    on a command stream somebody wired up, started a policy on, and gave a
+    target to — three deliberate acts, each with its own gate. What the old
+    default bought instead was a silently dead chassis on every freshly
+    deployed robot, reporting `applied: 33, refused: 0, sdk_errors: 0` while
+    standing still. That is indistinguishable from broken, and it cost an
+    afternoon on r1_sz immediately after a deploy."""
     card = loco_servo.LocoServoPlugin({}, "r1", None, FakeClient())
-    assert card._dry_run is True
+    assert card._dry_run is False
 
 
 # ── arbitration with the call-shaped card ────────────────────────────────────
@@ -483,3 +491,35 @@ def test_the_yaw_deadband_is_declared_twice_because_it_is_not_one_number():
 
 def test_the_moving_floors_are_an_addition_the_sink_still_accepts():
     parse_descriptor(loco_servo.build_descriptor())
+
+
+def test_a_deployed_chassis_can_move():
+    """`dry_run` used to default on, so every freshly deployed robot had a
+    silently dead chassis: commands arrive, pass every check, report APPLIED,
+    and nothing moves — `applied: 33, refused: 0, sdk_errors: 0` while the robot
+    stands there. Indistinguishable from broken, and it cost an afternoon on
+    r1_sz right after a deploy.
+
+    The argument for the old default does not hold for this card: `start()` is
+    inert, and it acts only on a command stream somebody wired up, started a
+    policy on, and gave a target to."""
+    card = _card()
+    assert card._dry_run is False
+    assert card._rotate_only is False
+
+
+def test_dry_run_is_still_available_and_still_announced():
+    card = _card(dry_run=True)
+    assert card._dry_run is True
+    assert card._info()["dry_run"] is True
+
+
+def test_a_swallowed_command_stream_is_visible_to_the_card_upstream():
+    """A policy whose commands are being dropped looks exactly like one that is
+    working. The descriptor is the only channel back, so it carries the fact."""
+    plain = _card()._info()["control_interface"]
+    assert "dry_run" not in plain and "rotate_only" not in plain
+
+    muted = _card(dry_run=True, rotate_only=True)._info()["control_interface"]
+    assert muted["dry_run"] is True and muted["rotate_only"] is True
+    assert muted["mode"] == "twist", "still a valid descriptor"
