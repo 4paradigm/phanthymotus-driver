@@ -203,6 +203,16 @@ class DdsLink:
         with self._lock:
             return self._ready
 
+    @property
+    def interface(self) -> str:
+        """The interface that actually worked, raw — "" means the SDK's own
+        auto-detection won. Callers that need to bring up a *second* DDS
+        participant (r1's RpcProxy subprocess does) have to be given this one
+        rather than the configured name, or the two can land on different
+        interfaces and only one of them talks to the robot."""
+        with self._lock:
+            return self._interface
+
     def status(self) -> dict:
         """For a card's `info()`. **A card that cannot subscribe must say so
         there**, or it is indistinguishable on the canvas from one that works.

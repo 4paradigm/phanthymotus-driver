@@ -369,8 +369,10 @@ def main():
     # RPC Proxy — runs LocoClient + AudioClient in a subprocess to avoid GIL contention.
     # The main process has many threads (ROS2 executor, camera, mic) which starve
     # CycloneDDS listener callbacks, causing RPC response timeouts (3104).
-    # Use the same interface that succeeded for main process DDS.
-    rpc_iface = iface if dds_ok else network_iface
+    # Use the same interface that succeeded for main process DDS — the link
+    # reports which one that was, which is not necessarily the configured name
+    # (the fallback scan may have found another, or auto-detect may have won).
+    rpc_iface = _link.interface if _link.ready else network_iface
     rpc_proxy = RpcProxy(network_iface=rpc_iface)
     print("[bundle] RpcProxy subprocess started")
 

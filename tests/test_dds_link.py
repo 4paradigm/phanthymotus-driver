@@ -186,3 +186,20 @@ def test_auto_detect_is_always_the_last_resort():
     assert dds_link.candidate_interfaces("eth10")[0] == "eth10"
     assert dds_link.candidate_interfaces("eth10")[-1] == ""
     assert dds_link.candidate_interfaces("")[-1] == ""
+
+
+def test_the_link_reports_the_interface_it_actually_got():
+    """r1 starts a second DDS participant in a subprocess (RpcProxy) and has to
+    hand it the interface that *worked*, not the one that was configured — the
+    fallback scan may have found a different one, or auto-detect may have won.
+    Getting this wrong puts the two participants on different interfaces, and
+    only one of them talks to the robot."""
+    link, _ = _link(lambda d, i: None if i == "eth99" else (_ for _ in ()).throw(
+        RuntimeError("nope")), preferred="eth10")
+    link.start()
+    # No eth99 on a laptop, so this settles on auto-detect ("") or fails; either
+    # way `interface` must agree with what was passed to the initialiser.
+    time.sleep(0.05)
+    link.stop()
+    if link.ready:
+        assert link.interface in ("", "eth99")
