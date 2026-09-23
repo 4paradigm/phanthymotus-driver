@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
+import tempfile
 import threading
 import time
 
@@ -20,15 +22,42 @@ class ManagementPin:
     def __init__(self, path, clock=time.monotonic):
         self.path, self.clock = Path(path), clock
         self._lock = threading.RLock()
-        self._record = json.loads(self.path.read_text()) if self.path.exists() else None
+        self._record = self._read_record()
         if self._record is not None:
-            if (set(self._record) != {"salt", "digest"}
+            if (not isinstance(self._record, dict)
+                    or set(self._record) != {"salt", "digest"}
+                    or not all(isinstance(v, str) for v in self._record.values())
                     or len(bytes.fromhex(self._record["salt"])) != 16
                     or len(bytes.fromhex(self._record["digest"])) != 32):
                 raise ValueError("management_pin_state_invalid")
         self._sessions = {}
         self._failures = 0
         self._blocked_until = 0
+
+    def _check_directory(self):
+        metadata = self.path.parent.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise ValueError("management_pin_directory_must_be_private_0700")
+
+    def _read_record(self):
+        if self.path.parent.exists() or self.path.parent.is_symlink():
+            self._check_directory()
+        try:
+            metadata = self.path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise ValueError("management_pin_file_must_be_regular_0600")
+        # Check the opened object too; never follow a replacement symlink or
+        # block on a FIFO inserted between lstat and open.
+        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "r") as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or stat.S_IMODE(opened.st_mode) != 0o600:
+                raise ValueError("management_pin_file_must_be_regular_0600")
+            if opened.st_size > 1024:
+                raise ValueError("management_pin_state_invalid")
+            return json.load(stream)
 
     @property
     def configured(self):
@@ -47,14 +76,15 @@ class ManagementPin:
         """Only called by the existing local MCP configuration entry."""
         self.validate(pin)
         with self._lock:
-            if self._record and hmac.compare_digest(
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            existing = self._read_record()
+            if existing == self._record and self._record and hmac.compare_digest(
                     self._record["digest"], self._digest(pin, self._record["salt"])):
                 return False
             salt = secrets.token_hex(16)
             record = {"salt": salt, "digest": self._digest(pin, salt)}
-            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            temporary = self.path.with_suffix(".tmp")
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd, name = tempfile.mkstemp(prefix=".management-pin-", suffix=".tmp", dir=self.path.parent)
+            temporary = Path(name)
             try:
                 with os.fdopen(fd, "w") as stream:
                     json.dump(record, stream)

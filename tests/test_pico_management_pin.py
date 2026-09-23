@@ -122,3 +122,64 @@ def test_restart_keeps_pin_but_invalidates_sessions(manager):
     restarted = ManagementPin(auth.path, clock=lambda: now[0])
     rejected("management_session_expired", 401, restarted.authorize, token)
     restarted.authorize(restarted.login("1234"))
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o666, 0o400])
+def test_existing_pin_file_with_wrong_permissions_is_rejected(manager, mode):
+    auth, _ = manager
+    auth.configure("1234")
+    auth.path.chmod(mode)
+    with pytest.raises(ValueError, match="regular_0600"):
+        ManagementPin(auth.path)
+    with pytest.raises(ValueError, match="regular_0600"):
+        auth.configure("1234")
+    assert stat.S_IMODE(auth.path.stat().st_mode) == mode  # No silent chmod.
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o750, 0o777])
+def test_existing_pin_parent_must_be_private(manager, mode):
+    auth, _ = manager
+    auth.configure("1234")
+    auth.path.parent.chmod(mode)
+    with pytest.raises(ValueError, match="private_0700"):
+        ManagementPin(auth.path)
+    with pytest.raises(ValueError, match="private_0700"):
+        auth.configure("5678")
+    assert stat.S_IMODE(auth.path.parent.stat().st_mode) == mode
+
+
+def test_pin_symlink_and_parent_symlink_are_rejected(manager, tmp_path):
+    auth, _ = manager
+    auth.configure("1234")
+    original = auth.path.read_bytes()
+    alias = auth.path.parent / "linked.json"
+    alias.symlink_to(auth.path)
+    with pytest.raises(ValueError, match="regular_0600"):
+        ManagementPin(alias)
+    parent_alias = tmp_path / "linked-state"
+    parent_alias.symlink_to(auth.path.parent, target_is_directory=True)
+    with pytest.raises(ValueError, match="private_0700"):
+        ManagementPin(parent_alias / auth.path.name)
+    assert auth.path.read_bytes() == original
+
+
+def test_nonregular_pin_state_rejected_without_opening(manager):
+    import os
+    auth, _ = manager
+    auth.path.parent.mkdir(mode=0o700)
+    os.mkfifo(auth.path, mode=0o600)
+    with pytest.raises(ValueError, match="regular_0600"):
+        ManagementPin(auth.path)
+
+
+def test_pin_atomic_save_never_uses_existing_predictable_temporary(manager, tmp_path):
+    auth, _ = manager
+    auth.configure("1234")
+    unrelated = tmp_path / "unrelated"
+    unrelated.write_text("keep")
+    old_temporary = auth.path.with_suffix(".tmp")
+    old_temporary.symlink_to(unrelated)
+    auth.configure("5678")
+    assert unrelated.read_text() == "keep"
+    assert old_temporary.is_symlink()
+    assert not list(auth.path.parent.glob(".management-pin-*.tmp"))

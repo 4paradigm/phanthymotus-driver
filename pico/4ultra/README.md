@@ -17,7 +17,7 @@
 - 硬件目录与镜像为 `pico/4ultra`，显示名为 `PICO 4 Ultra`；Driver ID `pico-driver`，MCP只监听loopback 15742；HTTPS/WSS在15741，与原App端点兼容。
 - `PICO_PUBLIC_HOST` 或机器配置 `pico.public_host` 指定头显可达地址；未指定时通过本机路由选择地址，不发送探测数据。TLS与配对保存在 `/var/lib/motus/pico`。普通重建不换证书，IP改变也不静默覆盖信任身份。
 - 配置默认空闲，无安装确认门槛。首次齿轮保存或项目启动建立监听；`info`可无ROS/TLS实例地解析端口。
-- 管理 PIN 由用户首次在齿轮配置中设置，没有默认 PIN；只接受四位 ASCII 数字（可含前导零）。Driver 只保存加盐哈希，文件权限 0600，不通过 `info/config` 返回 PIN。配置声明 `format=password` 和 `x-sensitive`，由普通 Core 的既有敏感字段机制处理导出脱敏。普通 Core 的本地配置数据库仍保存该配置值，密码类型仅提供界面掩码与分享脱敏，不代表 Core 数据库加密。齿轮字段沿用 `scope=instance` 以适配现有表单，Driver 只保存一份 PIN。旧 `pairing_admin_password` 不迁移为 PIN。
+- 管理 PIN 由用户首次在齿轮配置中设置，没有默认 PIN；只接受四位 ASCII 数字（可含前导零）。Driver 只保存加盐哈希，不通过 `info/config` 返回 PIN。新旧 PIN 文件都必须为普通文件且权限 0600，父目录必须为非符号链接目录且权限 0700；加载和保存均核验，不合规时报错，不静默改权限或使用不安全状态。写入使用独占随机临时文件再原子替换，不覆盖可预测临时路径。配置声明 `format=password` 和 `x-sensitive`，由普通 Core 的既有敏感字段机制处理导出脱敏。普通 Core 的本地配置数据库仍保存该配置值，密码类型仅提供界面掩码与分享脱敏，不代表 Core 数据库加密。齿轮字段沿用 `scope=instance` 以适配现有表单，Driver 只保存一份 PIN。旧 `pairing_admin_password` 不迁移为 PIN。
 - 下载页面和 APK 公开；`/manage/login` 使用 JSON POST 验证 PIN，生成 Secure/HttpOnly/SameSite=Strict Cookie。管理状态、生成邀请、打开配对窗口、批准/拒绝与撤销均需该会话。会话固定 15 分钟；连续五次错误后暂停登录五分钟。限次全服务共享，会话与限次仅存内存，重启后会话失效、限次重新开始；不是公网账户系统。修改 PIN 撤销管理会话、未使用邀请和待批准请求，不删除已配对头显。已配对 App 重连无需 PIN。
 - MCP 配置入口仅监听 loopback，依赖现有主机/Core 的访问控制；PIN 保护的是局域网 HTTPS 配对管理，不能替代主机权限。不要把设备凭据和私钥加入 Git。
 - 普通Core通过既有注册与MCP调用工作；无需 `X-Ext-VR-Management`、`X-Teleop-Management` 或 `management_binding`。
