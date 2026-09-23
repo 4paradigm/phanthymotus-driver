@@ -37,8 +37,12 @@ The checked-in `resource/as2w.urdf` kinematic model is based on Unitree's
 official `unitree_ros/robots/as2w_description`; it retains inertial and joint
 limits but omits the vendor STL visual/collision meshes. The driver only needs
 the kinematic chain for the `joints` skeleton card, avoiding large binary
-assets in the repository. As2W has 16 movable joints (12 leg joints plus 4
-continuous wheel-foot joints) and the fixed JT128 sensor mount.
+assets in the repository. As2W publishes 12 active leg joints in `rt/lowstate`.
+The skeleton names use the canonical `*_joint` suffix and match the URDF joint
+names exactly. Its fixed-size motor array also contains four reserved zero
+slots. The driver publishes only the 12 active joints so the skeleton does not
+interpret reserved slots as foot pose data. The model retains the four continuous wheel-foot joints
+and the fixed JT128 sensor mount.
 
 `controlled_spatial` is a thin adapter for Unitree's documented `slam_operate`
 service: mapping, relocalization, and point-goal navigation. The latest AS2
@@ -47,9 +51,68 @@ documented common RPC contract directly in an isolated CycloneDDS process. It
 requires the vendor `unitree_slam` service to be installed and already running
 on the robot or extension host; the driver does not start that service.
 
-`special_action` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
+The `mic` card receives the robot-body microphone's Unitree audio multicast
+stream (`239.168.123.161:5555`) and republishes it to
+`/<namespace>/mic/audio` as `audio_msgs/AudioChunk` (`audio/pcm-16k`). It does
+not read an extension-board ALSA device. This is the same raw PCM path used by
+the upstream Unitree SDK example `example/a2/audio/a2_audio_client_example.cpp`;
+that example also subscribes to `rt/audio_msg` for ASR text. The AS2
+`AudioClient` exposes playback, TTS, volume, and LED APIs, but not a raw capture
+RPC, so the multicast receiver is the appropriate robot-body input path. The `speaker`
+card subscribes to `/<namespace>/speaker/audio` by default; callers may provide
+an optional `input_topic` to use another `AudioChunk` stream. It streams bounded
+PCM blocks through the AS2 `voice` service and exposes volume get/set actions.
+Audio service availability depends on the AS2 firmware configuration.
+
+The `camera_rgb` card polls the verified AS2 `videohub.GetImageSample()` service
+and publishes JPEG `sensor_msgs/CompressedImage` frames to
+`/<namespace>/camera/rgb`. The current AS2 SDK and machine expose no depth-camera
+service or ROS2 depth topic, so `camera_depth` is intentionally not registered
+until a real depth source is identified.
+
+`special_motion` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
 continuous `loco` control card.
 
+The RPC proxy runs sport, speaker-audio, LED-audio, and video clients in separate
+workers. State DDS callbacks only replace a latest-value cache; a 60 Hz publisher
+worker serializes and publishes the newest joint and locomotion samples instead
+of draining stale samples. The microphone's multicast receiver publishes
+compliant 16 kHz mono PCM frames.
+
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.
+
+Change scope and validation notes:
+
+- The audio, video, LED, locomotion, and state changes are intentional parts of
+  the AS2W hardware card bundle. The Dockerfile does not add an APT or pip
+  package for these cards. It sources `/ros_ws/install/setup.bash` because the
+  runtime imports the shared `audio_msgs` message package; the image and
+  runtime dependency are otherwise unchanged.
+- The `driver.yaml` changes only advertise the cards that are registered by
+  this bundle; metadata does not add image contents.
+- Run `python3 -m unittest unitree/as2w/test_driver.py` for the no-hardware
+  contract suite, `python3 -m compileall -q unitree/as2w` for syntax checks,
+  and `git diff --check` before submitting. Hardware-dependent audio multicast,
+  AS2 voice, videohub, and sport behavior still require validation against the
+  target robot firmware.
+
+Loco examples:
+
+```json
+{"action":"move","vx":0.3,"vy":0,"vyaw":0,"duration":2}
+{"action":"move","vx":0.2,"vy":0,"vyaw":0,"duration":-1}
+{"action":"stop_move"}
+{"action":"speed_level","speed_preset":"slow"}
+{"action":"auto_recovery","flag":true}
+{"action":"switch_joystick","flag":false}
+{"action":"left_side_gait","flag":true}
+```
+
+`flag` is not a generic parameter: it enables or disables automatic fall
+recovery, gives or removes joystick control, or enters/exits a side gait.
+`special_motion` requires `confirm: true`; flips are one-shot actions, while
+`handstand` and `biped_stand` use `enter: true` to enter and `enter: false` to
+exit. These motions are posture- and firmware-dependent and require a clear
+safety area.

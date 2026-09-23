@@ -81,8 +81,10 @@ class _LidarNode:
     def _report(self):
         now = time.monotonic()
         with self._lock:
+            timed_out_source = None
             if (self._active_source and
                     now - self._last_seen[self._active_source] > _SOURCE_TIMEOUT_SECONDS):
+                timed_out_source = self._active_source
                 self.node.get_logger().warning(
                     f"As2W lidar source {self._active_source} timed out; waiting for another source")
                 self._active_source = None
@@ -93,6 +95,14 @@ class _LidarNode:
         timing = f"published={published}, dropped={dropped}, avg_convert={processing / published * 1000:.1f}ms" if published else "published=0"
         if active:
             self.node.get_logger().info(f"As2W lidar active source {active}; {summary}; {timing}")
+        elif timed_out_source or any(frames.values()):
+            # A source can publish a burst and then go quiet while the robot
+            # is idle.  That is different from never receiving a cloud; the
+            # old message caused a misleading watchdog alarm after every
+            # burst and hid the actual received/published counters.
+            self.node.get_logger().warning(
+                "As2W lidar sources are currently inactive; "
+                f"last source={timed_out_source or 'none'}; {summary}; {timing}")
         else:
             self.node.get_logger().warning(
                 "As2W lidar has received no PointCloud2 frames. "

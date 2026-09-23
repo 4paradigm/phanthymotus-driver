@@ -26,14 +26,20 @@ def load_config():
 
 class Bundle:
     def __init__(self, cfg, namespace, executor, proxy, interface, dds_ready=True):
-        from device import StatePlugin, LocoPlugin, SpecialActionPlugin
+        from device import (StatePlugin, LocoPlugin, SpecialActionPlugin,
+                            MicPlugin, SpeakerPlugin, LedPlugin, CameraPlugin)
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
+        if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor))
+        if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, proxy))
+        if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
+        if dds_ready and p.get("camera_rgb", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera_rgb", {}), namespace, executor, proxy))
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
-        if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy))
+        special_cfg = p.get("special_motion", p.get("special_action", {}))
+        if special_cfg.get("enabled", True): self.plugins.append(SpecialActionPlugin(special_cfg, namespace, executor, proxy))
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
     def start_all(self):
@@ -66,9 +72,15 @@ def handler(bundle):
             print(f"[mcp] {self.address_string()} {safe}", flush=True)
         def _send_json(self, status, payload):
             body = json.dumps(payload).encode()
-            self.send_response(status); self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers(); self.wfile.write(body)
+            try:
+                self.send_response(status); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers(); self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # MCP clients are allowed to cancel a request.  A cancelled
+                # response must not produce a noisy traceback in the driver
+                # container or obscure the next hardware error.
+                return
         def _send_sse(self, event, data):
             try:
                 self.wfile.write(f"event: {event}\\ndata: {data}\\n\\n".encode())
