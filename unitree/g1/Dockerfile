@@ -60,7 +60,7 @@ COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
 COPY servo.py /work/servo.py
 COPY arm_sdk.py /work/arm_sdk.py
-COPY arm_stream.py motion_control.py motion_bus.py teleop_control.py teleop_bus.py /work/
+COPY arm_stream.py motion_control.py motion_bus.py teleop_control.py teleop_bus.py ros_spin.py /work/
 COPY g1_motion/ /work/g1_motion/
 COPY dds-local.xml /work/dds-local.xml
 COPY --from=motion-numeric-installer /bin/micromamba /usr/local/bin/micromamba

@@ -17,14 +17,14 @@ def setup_servo(tmp_path):
     return arm, sample, channel, advance, gravity, sdk
 
 
-def test_new_target_written_once_without_gravity(tmp_path):
+def test_new_target_written_once_with_smoothing_without_gravity(tmp_path):
     arm, sample, channel, advance, gravity, sdk = setup_servo(tmp_path)
     assert arm._gravity is None
     assert arm.accept_control(packet(arm, target=.5))
     for _ in range(5):
         advance(10); arm.tick()
     assert len(channel.positions) == 1
-    assert channel.positions[0][0] == pytest.approx([.5]*10)
+    assert channel.positions[0][0] == pytest.approx([.01]*10)
     assert gravity == channel.writes == sdk == []
 
 
@@ -39,7 +39,7 @@ def test_timeout_holds_without_new_target_and_fresh_input_resumes(tmp_path):
     session = arm.session_id
     arm.accept_control(packet(arm, seq=2, target=.1)); advance(10); arm.tick()
     assert arm.session_id == session and arm.applied_seq == 2
-    assert channel.positions[-1][0] == pytest.approx([.1]*10)
+    assert all(0 < x < .1 for x in channel.positions[-1][0])
     assert gravity == sdk == []
 
 
@@ -75,3 +75,46 @@ def test_first_ik_rejection_does_not_wait_for_uncommanded_motion(tmp_path):
     assert not arm.status()['continuation_ready']
     with pytest.raises(ValueError,match='hold_not_resumable'):
         arm.accept_control(packet(arm,seq=3,target=.3))
+
+
+def test_regrip_can_resume_while_moving_and_large_gap_is_smoothed(tmp_path):
+    arm, sample, channel, advance, _, _ = setup_servo(tmp_path)
+    arm.accept_control(packet(arm,seq=1,target=.5));advance(10);arm.tick()
+    previous=channel.positions[-1][0][:]
+    arm.hold('operator_pause',recoverable=False)
+    sample['dq']=[.1]*10
+    advance(10);arm.tick()
+    assert not arm.status()['hold_confirmed'] and arm.status()['resume_ready']
+    result=arm.dispatch('resume',{'session_id':arm.session_id,'secret':arm.secret})
+    assert result['state']=='ready'
+    advance(2000)
+    assert arm.accept_control(packet(arm,seq=1,target=-.5))
+    advance(10);arm.tick()
+    current=channel.positions[-1][0]
+    assert all(-.5 < x < p for x,p in zip(current,previous))
+    assert max(abs(x-p) for x,p in zip(current,previous)) < .2
+    assert not arm.status()['stop_confirmed']
+
+
+def test_smoothing_converges_without_resetting_to_measured(tmp_path):
+    arm,sample,channel,advance,_,_=setup_servo(tmp_path)
+    for seq in range(1,41):
+        assert arm.accept_control(packet(arm,seq=seq,target=.5))
+        advance(50,follow=False);arm.tick()
+    values=[x[0][0] for x in channel.positions]
+    assert all(a < b < .5 for a,b in zip(values,values[1:]))
+    assert values[-1] == pytest.approx(.5,abs=1e-5)
+    assert sample['q']==[0.]*10
+
+
+def test_joint_reference_speed_bound_with_irregular_inputs_and_gaps(tmp_path):
+    arm,sample,channel,advance,_,_=setup_servo(tmp_path)
+    previous=[0.]*10
+    for seq,ms in enumerate([5,20,50,150,10,80],1):
+        advance(ms,follow=False)
+        target=.8 if seq%2 else -.8
+        assert arm.accept_control(packet(arm,seq=seq,target=target))
+        arm.tick()
+        current=channel.positions[-1][0]
+        assert max(abs(a-b) for a,b in zip(current,previous)) <= min(ms/1000,.05)+1e-12
+        previous=current

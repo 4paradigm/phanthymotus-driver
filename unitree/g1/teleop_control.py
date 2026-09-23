@@ -100,6 +100,7 @@ class TeleopControl:
         self._closed, self._wake = threading.Event(), threading.Event()
         self._thread = None
         self.binding = None
+        self.transport_status = None
         self.instance_id = 'teleop_control'
         self._latest = None
         self._input_identity = None
@@ -221,9 +222,17 @@ class TeleopControl:
         binding = {'namespace': namespace, 'instance_id': source_instance,
                    'command_topic': command_topic, 'feedback_topic': feedback_topic}
         with self._lock:
-            if self.binding and binding != self.binding and (self._operator or self._active_operation):
+            same_topics = bool(self.binding and all(self.binding.get(k) == binding[k]
+                               for k in ('command_topic', 'feedback_topic')))
+            if same_topics:
+                # Source pinning is not a transport rebind. Repeated Canvas
+                # start must not erase identity or remap an active operator.
+                binding['instance_id'] = self.binding['instance_id']
+                if not self._closed.is_set() and self._thread and self._thread.is_alive():
+                    return self.info()
+            if self.binding and not same_topics and (self._operator or self._active_operation):
                 raise ValueError('binding_requires_idle')
-            if self.binding != binding:
+            if not same_topics or self._closed.is_set():
                 self._latest = self._input_identity = self._operation_identity = None
                 self._input_sequence = self._operation_sequence = -1
                 self._receipts.clear(); self._operation_packets.clear()
@@ -498,7 +507,7 @@ class TeleopControl:
                     if claimed.get('error'): raise ValueError(claimed.get('code', claimed['error']))
                     with self._lock: self._sequence = 0
                 elif state['state'] == 'hold':
-                    if not state['hold_confirmed'] and not state.get('continuation_ready'):
+                    if not state['hold_confirmed'] and not state.get('continuation_ready') and not state.get('resume_ready'):
                         with self._lock: self._state, self._reason = 'hold', 'waiting_hold_confirmation'
                         return
                     if self._paused or not state.get('continuation_ready'):
@@ -592,6 +601,23 @@ class TeleopControl:
         if worker and worker is not threading.current_thread(): worker.join(.5)
         return result
 
+    def input_status(self):
+        transport = self.transport_status() if self.transport_status else None
+        age = None if self._latest is None else max(0., (self.clock()-self._latest['received_monotonic_ns'])/1e6)
+        if not self.binding:
+            state, hint = 'waiting_binding', 'Driver 重启后请在 Canvas 停止并重新启动项目；无需重新连线'
+        elif self._closed.is_set():
+            state, hint = 'stopped', '请从 Canvas 启动项目'
+        elif transport and not transport['executor']['healthy']:
+            state, hint = 'transport_error', 'ROS 接收线程异常，请查看 transport 诊断'
+        elif age is None:
+            state, hint = 'waiting_input', '已绑定，等待 teleop_device 新输入'
+        elif age > 300.:
+            state, hint = 'input_stale', '没有新的有效输入，请查看收帧序号与拒绝原因'
+        else:
+            state, hint = 'fresh', ''
+        return {'state': state, 'hint': hint, 'age_ms': age, 'transport': transport}
+
     def feedback(self):
         with self._lock:
             self._feedback_sequence += 1
@@ -602,8 +628,9 @@ class TeleopControl:
                              started=bool(self._operator), mode=self.cfg.get('mode', 'live'))
             execution['decision'] = copy.deepcopy(self.motion._decision)
             execution['finish'] = copy.deepcopy(self.motion._finish)
+            input_status = self.input_status()
             return {'schema': FEEDBACK_SCHEMA,
-                'text': html.escape(f"遥操：{self._state} | 输入帧：{self._input_sequence} | 执行：{state['state']} | 已下发：{state['applied_sequence']} | 输出：{state['output_active']} | 原因：{self._reason or state['reason'] or '无'}"),
+                'text': html.escape(f"遥操：{self._state} | 输入：{input_status['state']} | 输入帧：{self._input_sequence} | 执行：{state['state']} | 已下发：{state['applied_sequence']} | 输出：{state['output_active']} | 原因：{self._reason or state['reason'] or '无'}"),
                 'instance_id': self.binding['instance_id'] if self.binding else '',
                 'control_instance_id': self.instance_id, 'server_epoch': self.server_epoch,
                 'sequence': self._feedback_sequence, 'emitted_monotonic_ns': self.clock(),
@@ -612,7 +639,7 @@ class TeleopControl:
                 'space_epoch': self._input_identity[2] if self._input_identity else 0,
                 'operator_session_id': self._operator, 'mapping_epoch': self.mapping.epoch,
                 'state': self._state, 'reason': self._reason, 'capabilities': list(self.CAPABILITIES),
-                'execution': execution, 'receipts': copy.deepcopy(list(self._receipts.values()))}
+                'input_status': input_status, 'execution': execution, 'receipts': copy.deepcopy(list(self._receipts.values()))}
 
     def info(self):
         with self._lock:
@@ -620,6 +647,7 @@ class TeleopControl:
                 'config': copy.deepcopy(self.cfg),
                 'effective_config': {k:self.cfg.get(k,v.get('default')) for k,v in self.get_tool()['configSchema']['properties'].items()},
                 'config_error': self._config_error, 'binding': copy.deepcopy(self.binding),
+                'input_status': self.input_status(),
                 'mapping_epoch': self.mapping.epoch, 'operator_session_id': self._operator,
                 'capabilities': list(self.CAPABILITIES), 'feedback': self.feedback() if self.binding else None,
                 **{k:self.get_tool()[k] for k in ('topic_in','topic_out')}}

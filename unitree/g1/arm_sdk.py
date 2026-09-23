@@ -520,6 +520,9 @@ class ArmSdkChannel:
             if self._arm_pub is None or self._message is None:
                 raise RuntimeError('arm_stream_not_open')
             self._weight = float(weight)
+            for motor_id in self._driven_arm_ids:
+                cmd = self._message.motor_cmd[motor_id]
+                cmd.kp, cmd.kd = (40.0, 1.5) if motor_id in WRIST_MOTOR_IDS else (80.0, 3.0)
         return self.publish_arms(radians)
 
     def publish_stream(self, radians, tau_ff, *, weight):

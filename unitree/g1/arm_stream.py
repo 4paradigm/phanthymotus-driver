@@ -351,10 +351,20 @@ class ArmStreamExecutor:
         if ident is not None and (not isinstance(ident,str) or not 1<=len(ident)<=128):
             raise ValueError('invalid_operation_id')
         with self.lock:
+            if (cancel_pending and not action99 and not self.session_id
+                    and not self._opening and not self._channel_open and not self._legacy_pending
+                    and not (self._rpc_thread and self._rpc_thread.is_alive())
+                    and (self._operation is None or self._operation['state']=='completed')):
+                # Canvas can stop both arm and teleop_control. If no SDK control
+                # was acquired, there is nothing to hand back or physically confirm.
+                # Do not create an operation that would itself manufacture ownership.
+                return {'state':'completed','authority_released':True,'return_required':False,
+                        'return_completed':False,'physical_confirmed':False,'no_op':True}
             if cancel_pending and self._operation and self._operation['state'] not in ('completed','failed','unknown'):
                 op=self._operation
                 op['cancel_requested']=True
-                if op['state'] in ('holding','handback','confirming_handback'):
+                if (op['state'] in ('holding','handback','confirming_handback')
+                        or op['state']=='awaiting_feedback' and op['action_id'] is None):
                     # Continue the safe SDK handback, but do not start a vendor
                     # gesture after an explicit stop cancelled its pending work.
                     op['action_id']=None
@@ -461,7 +471,7 @@ class ArmStreamExecutor:
             if action=='resume':
                 if not self._authorized(args):raise ValueError('invalid_lease')
                 with self.lock:
-                    if self.state!='hold' or not self._hold_confirmed or self.release_requested:raise ValueError('hold_not_resumable')
+                    if self.state!='hold' or self.release_requested or not (self._hold_confirmed or self.cfg.get('servo_position') and self._hold_ns is not None):raise ValueError('hold_not_resumable')
                     self._fresh();self.state,self.reason='ready',None
                     self.session_id,self.secret=secrets.token_hex(16),secrets.token_hex(32)
                     self.seq=self.applied_seq=self._epoch=-1
@@ -601,7 +611,18 @@ class ArmStreamExecutor:
                 if servo and self.applied_seq == self.latest['seq']:return
                 dt=max(0.,min((now-self.last_emit)/1e9,.02))
                 limit=self.velocity*dt
-                next_q=list(self.latest['values']) if servo else [p+max(-limit,min(limit,t-p)) for p,t in zip(self.last_q,self.latest['values'])]
+                if servo:
+                    # Follow the last successfully written reference (PR322),
+                    # not measured-position noise. Cap dt after input gaps so
+                    # a regrip cannot skip smoothing by accumulating idle time.
+                    smooth_dt=max(0.,min((now-self.last_emit)/1e9,.05))
+                    alpha=-math.expm1(-smooth_dt/.12)
+                    # 1 rad/s reference slew limit, independent for each joint.
+                    max_step=1.0*smooth_dt
+                    next_q=[p+max(-max_step,min(max_step,alpha*(t-p)))
+                            for p,t in zip(self.last_q,self.latest['values'])]
+                else:
+                    next_q=[p+max(-limit,min(limit,t-p)) for p,t in zip(self.last_q,self.latest['values'])]
                 if (not self._proof or not self._proof.allows(self.latest,q,self.last_q,next_q,now_ns=now)
                         or any(not lo<=x<=hi for x,(lo,hi) in zip(next_q,self.limits))):
                     self.hold('motion_envelope_exceeded',recoverable=True);return
@@ -646,6 +667,7 @@ class ArmStreamExecutor:
                 'hold_confirmed':self._hold_confirmed,'hold_confirmed_ns':self._hold_confirmed_ns,
                 'continuation_ready':self._continuation_after() is not None,
                 'continuation_after_ns':self._continuation_after(),
+                'resume_ready':self.state=='hold' and not self.release_requested and bool(self._hold_confirmed or self.cfg.get('servo_position') and self._hold_ns is not None),
                 'release_requested':self.release_requested,'weight':self._weight,'monotonic_ns':self.clock(),
                 'timing_policy':{'target_max_ms':300,'feedback_hold_ms':100,'feedback_fault_timeout_ms':300,
                                  'recoverable_hold':True,'management_retry_ms':300},

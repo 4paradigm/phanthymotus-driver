@@ -523,9 +523,15 @@ def main():
     _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion, network_iface=network_iface)
     _bundle.start_all()
 
+    from ros_spin import SpinHealth, supervised_spin
+    from rclpy.impl.implementation_singleton import rclpy_implementation
+    InvalidHandle = rclpy_implementation.InvalidHandle
+    from rclpy.executors import ExternalShutdownException, ShutdownException
+    executor._driver_spin_health = SpinHealth()
+
     def _spin():
-        while rclpy.ok():
-            executor.spin_once(timeout_sec=0.1)
+        supervised_spin(executor, rclpy.ok, executor._driver_spin_health,
+                        InvalidHandle, (ExternalShutdownException, ShutdownException))
 
     spin_thread = threading.Thread(target=_spin, daemon=True, name="bundle_spin")
     spin_thread.start()
@@ -549,9 +555,16 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _bundle.stop_all()
-        executor.shutdown()
-        rclpy.shutdown()
+        try:
+            _bundle.stop_all()
+        finally:
+            # Join the dedicated teleop owner before shutting down its context.
+            # A stop RPC failure must not strand the ROS lifecycle thread.
+            bus = _bundle._motion_bus
+            if bus is not None and getattr(bus, 'shared_executor', None) is executor:
+                bus.close()
+            executor.shutdown()
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

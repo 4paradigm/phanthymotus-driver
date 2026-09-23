@@ -124,7 +124,33 @@ r8 已接收新输入，但记录反复为 torso_collision，applied_sequence=-1
 
 机上 r9 禁网只读数值验证通过：独立 worker 报 collision_checks_enabled=false，向内目标求解返回10个有限关节值，无硬件输出。当前运行卡片尚未加载求解器，info 的 collision_checks_enabled=null，不能将 null 解释成已完成运行态标定。真实跟随及失败恢复等待用户启动 Canvas/握把验收。
 
+### 2026-09-24 平滑与 1 rad/s 限速（r10 已部署，待实测）
 
-## r9 可回退运动基线
+参考 PR #322 从上一条实际下发位置接续的原则，G1 先做120ms时间常数的一阶平滑，再将各关节增量裁剪到 ±1 rad/s × dt。dt 使用成功下发间隔，最大50ms，避免断帧或重握积累大步长；基准不是每帧实测位置。只处理最新输入，不排队补发旧目标。此限制约束下发位置参考的变化速率，不是实测电机速度的硬保证。
 
-用户确认实体双臂可以运动，同时报告磨齿/咔嚓声；仅作为已观察到运动的基线，不代表机械、连续稳定性或整体验收通过。镜像 local/phanthy-motus/g1:recovery-20260924-r9，image ID sha256:a7b1105c770ebeea0d36133122ee54fe6c39e69485be25c5ab069c44ff351b38。arm_sdk、arm_stream、teleop_control、teleop_bus、main 已与保留镜像逐文件 SHA256 对照相同。无机上标定/凭据入库；部署参数另行提供，不自动回退运行设备。后续 kp80、平滑、限速和 ROS 接收修复不属于本提交。
+遥操专用肩肘 kp=80/kd=3，腕部40/1.5；不修改普通 servo 的全局增益。松握重握在清空旧待发目标后可 resume，无需速度或位置静止确认；显式停止确认仍独立保留。已部署 r10，当前空闲、无控制权；异响原因及新一轮实体跟随仍待验收。
+
+2026-09-24 r10：用户停止 Canvas 后旧会话 release_confirmed，ownership_held=false。机上构建 smoothing-20260924-r10，禁网只读 SDK 替身核验肩肘80/3、腕40/1.5通过；manifest核对通过。仅切 G1 Driver，实际容器 df3c0a2f036a，Core/ActuCore ID 保持不变。启动后 idle、无执行权、无输出，反馈年龄约3.05ms。没有主动发动作；此前磨齿/咔嚓声仍未确定原因，不宣称降低增益已解决机械异响。
+
+
+## 2026-09-24 基线提交与 ROS 接收修复（未部署）
+
+r9 运动基线已提交/推送 PR #330，commit `8a0fe61f2c1695da1906fdf786dff19710b5858d`。用户确认能动且有咔嚓声。基线镜像 image ID `sha256:a7b1105c770ebeea0d36133122ee54fe6c39e69485be25c5ab069c44ff351b38`；arm_sdk、arm_stream、teleop_control、teleop_bus、main 与保存镜像逐文件哈希一致。97项接口/执行、5项数值测试通过；不是整体验收或异响消除。r10及新ROS修复留在工作树，未混入基线。
+
+当前修复116项单元/接口回归通过。真实 ROS 隔离脚本为 `scripts/validate_g1_ros_lifecycle.py`：在 G1 的既有 r10 镜像中覆盖内存模块源码执行，Docker --network none --read-only、临时 /tmp、无挂载/硬件/服务端口，不启动 main 或厂商SDK。540帧接收、20次topic切换、3次注入 InvalidHandle 后持续接收；创建/销毁均为 g1-teleop-ros 唯一线程。错误保持和下一有效帧清除通过，正常退出join通过。脚本要求 G1_TELEOP_ISOLATED_TEST=1；普通执行会拒绝。
+
+首次隔离运行发现 `rclpy.handle` 在机上Humble不存在；改用 `rclpy.impl.implementation_singleton.rclpy_implementation.InvalidHandle` 后重测通过。未重启或切换运行服务，未发动作。普通Core完整重启/重新启动画布联调、完整新镜像构建与实机跟随未验证。
+
+
+## r11b 部署验证
+
+r11 镜像真实ROS隔离收发540帧、20次换topic和3次异常注入通过。切换前发现旧版空闲stop制造释放占用；未强行切换。用户重启旧Driver后，加入两项stop幂等修复，119项回归通过。r11b机上禁网构建，镜像内三次空闲stop均no_op，无SDK通道、无释放任务、无控制权；不表示物理停止验收。
+
+仅更新G1 Compose image，容器cd6d0395038a、镜像local/phanthy-motus/g1:ros-receive-20260924-r11b。Core4723e02be334、ActuCoref9b09d66534d、PICO容器ID逐项核对未变。启动后arm idle、ownership/output=false、序号-1、无标定错误；两个ROS执行器心跳正常，invalid_handle_count=0。项目保持停止、binding=null，监控正确为waiting_binding。保留旧配置before.compose.json及deployment-check.json，位于机上个人更新目录。实体PICO跟随等待用户启动，未自动执行动作。
+
+
+## r11b 实体 PICO 跟随反馈
+
+用户在部署后启动项目并测试。机上 `input-observation.jsonl` 的18秒窗口：有效输入3219→4526、subscription_generation=1、ROS健康；执行目标序号非负，松开后operator_pause且hold_confirmed/resume_ready为true。执行会话恢复会重置序号，不将不同会话序号作连续比较。后续arm静态采样的last-command与实测差约1.312rad，处于松握保持且已forget_target，不能把该旧指令差当作运动期间跟随误差，也不能据此断言跟随误差合格。
+
+用户反馈“这次的效果很满意”，对跟随、松开重握和声响的追问回复“正常的”。记录为本轮用户现场体验正常；没有独立噪声测量、长时测试或全轨迹误差统计。用户授权提交PR，Core/ActuCore仍未改变。

@@ -382,3 +382,34 @@ def test_raw_motor_telemetry_does_not_gate_arm_but_invalid_sample_does(tmp_path)
     assert arm._fresh()[0]['motor_telemetry'][0]['temperature']==[150,150]
     msg.tick=4;msg.motor_state=[];arm._on_state(msg)
     with pytest.raises(ValueError,match='arm_feedback_invalid'): arm._fresh()
+
+
+def test_idle_canvas_stop_does_not_manufacture_release_ownership(tmp_path):
+    arm,_,ch,advance,_,sdk=rig(tmp_path,claim=False)
+    arm._channel_open=False  # Real unclaimed executor has not opened an SDK writer.
+    for _ in range(3):
+        result=arm.dispatch('stop',{})
+        assert result['no_op'] and result['authority_released']
+        assert not result['physical_confirmed']
+        advance(10);arm.tick()
+        assert not arm.status()['ownership_held'] and arm._operation is None
+    assert not ch.writes and not sdk
+
+
+def test_duplicate_stop_while_awaiting_feedback_does_not_invent_vendor_action(tmp_path):
+    arm,_,ch,advance,_,sdk=rig(tmp_path)
+    arm.dispatch('stop',{})
+    progress_release(arm,advance,'awaiting_feedback')
+    ident=arm._operation['operation_id']
+    for _ in range(3):
+        result=arm.dispatch('stop',{})
+        assert result['state']=='awaiting_feedback' and result['operation_id']==ident
+    progress_release(arm,advance,'completed')
+    assert not sdk and not arm.status()['ownership_held']
+
+
+def test_idle_stop_does_not_clear_unknown_prior_release(tmp_path):
+    arm,_,_,_,_,_=rig(tmp_path,claim=False);arm._channel_open=False
+    arm._operation={'state':'unknown'}
+    result=arm.dispatch('stop',{})
+    assert result['code']=='release_result_unknown' and arm.status()['ownership_held']
