@@ -1,13 +1,15 @@
 # 天轶双臂 motion_control / arm：四卡实施与验收契约
 
+关联 PR：[ext_vr #329](https://github.com/4paradigm/phanthymotus-driver/pull/329) · [teleop #259](https://github.com/4paradigm/phanthymotus/pull/259) · [天轶执行 #321](https://github.com/4paradigm/phanthymotus-driver/pull/321) · [G1 执行 #330](https://github.com/4paradigm/phanthymotus-driver/pull/330)。
+
 让天轶 Driver 接收通用末端目标，由 `motion_control` 解算为关节参考，再由现有 `arm` 连续执行。本文件同时作为 [Driver #321](https://github.com/4paradigm/phanthymotus-driver/pull/321) 的实施依据与现场验收清单。配套主仓 [#259](https://github.com/4paradigm/phanthymotus/pull/259)；ext_vr 和北京 G1 执行各用独立新 PR。
 
-**状态：Draft，2026-09-23 修订。基于 #321 远端 `86de1680703d68eab2c6c610801f70c73a406bc2` 整理契约，本次仅改文档，没有采用旧工作树的代码候选。现有三卡实现及其历史验证，与下述待完成的四卡要求分开记录；未完成新架构验收。** 历史 PR 正文及原始构建、测试和部署回执保留在[历史归档](../validation/teleop-pr321-history-20260923.md)，不得作为本轮通过记录。
+**状态：Draft，2026-09-23 修订。基于 [#321](https://github.com/4paradigm/phanthymotus-driver/pull/321) 远端 `86de1680703d68eab2c6c610801f70c73a406bc2` 整理契约，本次仅改文档，没有采用旧工作树的代码候选。现有三卡实现及其历史验证，与下述待完成的四卡要求分开记录；未完成新架构验收。** 历史 PR 正文及原始构建、测试和部署回执保留在[历史归档](../validation/teleop-pr321-history-20260923.md)，不得作为本轮通过记录。
 
 ## 确定的架构
 
 ```mermaid
-flowchart LR
+flowchart TD
     P[PICO App] <--> X[Driver ext_vr]
     X -->|标准输入| T[ActuCore teleop]
     T -->|末端目标| M[天轶 motion_control]
@@ -22,7 +24,7 @@ flowchart LR
 | 组件 | 职责和边界 |
 |---|---|
 | ext_vr，独立 PR | PICO App、下载邀请、配对、采集、标准输入、显示传输及设备监控；不解算模型或持有运动租约 |
-| teleop，#259 | 通用输入绑定、使能策略、相对映射、开始/结束编排；不加载天轶 URDF，不运行 IK，不中转显示帧 |
+| teleop，[#259](https://github.com/4paradigm/phanthymotus/pull/259) | 通用输入绑定、使能策略、相对映射、开始/结束编排；不加载天轶 URDF，不运行 IK，不中转显示帧 |
 | motion_control，本 PR | 天轶 URDF/TCP/标定、FK/IK、碰撞验证、关节参考、实测末端与显示数据、既有收臂编排 |
 | arm，本 PR | 连续目标入口、执行权、实际反馈、插补限速、最终运动放行、保持停止及厂商下发 |
 
