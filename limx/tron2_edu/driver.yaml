@@ -1,0 +1,19 @@
+id: limx-tron2-edu-driver
+name: LimX TRON 2 EDU
+category: driver
+hardware_provider: limx
+hardware_model: tron2-edu
+image_name: limx-tron2-edu
+port: 15740
+mcp_url: http://localhost:15740/mcp
+description: "TRON 2 EDU timed ROS 2 telemetry, optional gripper/mobile module state, and leased leg/wheel velocity. Arm motion pending vendor interrupt contract."
+build_context_extras:
+  - ../../common
+cards:
+  - {name: tron2_connection, type: sensor}
+  - {name: tron2_robot_info, type: sensor}
+  - {name: tron2_telemetry, type: sensor}
+  - {name: tron2_joint_states, type: sensor}
+  - {name: tron2_eef_pose, type: sensor}
+  - {name: tron2_arm_target, type: sensor}
+  - {name: tron2_velocity, type: actuator}
