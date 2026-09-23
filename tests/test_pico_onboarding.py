@@ -162,6 +162,18 @@ def test_artifact_tamper_and_symlinks_rejected(tmp_path):
     assert not package_metadata(tmp_path)["available"]
 
 
+def test_runtime_reports_hash_pinning_not_manifest_signer_verification(tmp_path):
+    manifest = artifact(tmp_path)
+    # A manifest claim cannot turn these fixture bytes into a signed APK.
+    manifest["signing_certificate_sha256"] = "f" * 64
+    (tmp_path / "package.json").write_text(json.dumps(manifest))
+    metadata = package_metadata(tmp_path)
+    assert metadata["available"]
+    assert metadata["verification"] == "sha256"
+    assert metadata["signature_verified"] is False
+    assert "signing_certificate_sha256" not in metadata
+
+
 def test_fetch_cached_fixed_artifact_and_no_insecure_source(tmp_path):
     manifest = artifact(tmp_path)
     script = (

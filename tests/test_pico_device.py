@@ -454,7 +454,7 @@ def test_missing_or_nonlocal_dds_profile_cannot_silently_start(tmp_path):
             validate(candidate)
 
 
-def test_named_controls_and_extensions_survive_rtc_to_dds_without_filtering():
+def test_named_controls_and_extensions_survive_rtc_to_dds_without_filtering(monkeypatch):
     runtime, binding, epoch = ready_runtime()
     wire = frame(1)
     controls = {
@@ -475,6 +475,50 @@ def test_named_controls_and_extensions_survive_rtc_to_dds_without_filtering():
     assert out["left"]["grip"] == 1.0
     wire["controllers"]["left"]["controls"]["axes"]["thumbstick"]["value"][0] = 0
     assert out["left"]["controls"]["axes"]["thumbstick"]["value"][0] == -0.7
+    # Replace only middleware classes: run the actual card publish loop,
+    # bounded writer and ROS String serializer before validating the wire JSON.
+    published, bindings, sent = [], [], threading.Event()
+
+    class Node:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_publisher(self, message_type, topic, qos):
+            bindings.append((topic, qos.depth))
+
+            def publish(message):
+                published.append(json.loads(message.data))
+                sent.set()
+            return SimpleNamespace(publish=publish)
+
+        def destroy_node(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "rclpy.node", SimpleNamespace(Node=Node))
+    monkeypatch.setitem(sys.modules, "rclpy.qos", SimpleNamespace(
+        QoSProfile=lambda **kwargs: SimpleNamespace(**kwargs),
+        ReliabilityPolicy=SimpleNamespace(RELIABLE="reliable"),
+        HistoryPolicy=SimpleNamespace(KEEP_LAST="keep_last"),
+        DurabilityPolicy=SimpleNamespace(VOLATILE="volatile")))
+    monkeypatch.setitem(sys.modules, "std_msgs.msg", SimpleNamespace(String=SimpleNamespace))
+    from ext_vr.transport import RosTransport
+    executor = SimpleNamespace(context=SimpleNamespace(get_domain_id=lambda: 42),
+                               add_node=lambda node: None, remove_node=lambda node: None)
+    transport = RosTransport(executor, "ignored-brand", "vr-1", None)
+
+    async def publish():
+        task = asyncio.create_task(ExtVrPlugin._publish(None, {"runtime": runtime, "transport": transport}))
+        try:
+            assert await asyncio.to_thread(sent.wait, 2)
+        finally:
+            runtime.stop()
+            await task
+            transport.close()
+    asyncio.run(publish())
+    assert bindings == [("/teleop/command", 16)]
+    assert published == [out]
+    validate_input(published[0], instance_id="vr_1", clock_id=runtime.clock_id,
+                   now_ns=published[0]["received_monotonic_ns"])
 
 
 @pytest.mark.parametrize("controls", [

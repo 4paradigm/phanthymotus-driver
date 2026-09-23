@@ -71,6 +71,28 @@ PICO 显示连接状态、透视画面及握把提示，不发送 begin/finish/s
 
 从Driver仓执行普通 `./build.sh pico/4ultra`；构建上下文自动纳入common；镜像只复制共享日志/输入契约及本bundle运行源码，不携带原生App源码、测试和构建缓存。无新增构建开关。Dockerfile安装锁定的通信依赖并核验固定正式APK。清单与源码版本不符会失败，不静默装旧APK。
 
+### 镜像依赖与体积
+
+PICO 是独立进程，复用 `ros-base` 提供的 ROS/Python，不依赖另一个服务容器的 Python 包。普通 `pip install` 不使用 `--upgrade` 或 `--force-reinstall`：已满足锁定版本的包会复用；基础镜像中版本不满足锁定版本的包才补充。基础镜像并未声明提供本卡所需的完整 WebRTC 依赖组合。
+
+| 依赖 | 本卡用途 |
+|---|---|
+| PyYAML | 读取 Driver 配置；固定 6.0.2，避免随基础镜像中的系统版本变化 |
+| aiohttp | HTTPS 管理、下载与 WSS 信令 |
+| aiortc、aioice、pylibsrtp、av 等传递依赖 | WebRTC 数据通道、ICE/DTLS/SCTP；即使不用视频，aiortc 的标准安装/导入仍需要其传递依赖，不裁剪未验证的私有分支 |
+| cryptography、pyOpenSSL/cffi 等 | TLS 证书、配对公钥验证以及 WebRTC 加密依赖 |
+| zeroconf | 局域网 DNS-SD/mDNS 发现 |
+
+2026-09-24 从 registry manifest 核对 `release.260923.46aee15`：压缩层合计 **304.76 MiB**，其完全相同的基础层合计 **249.46 MiB**，新增 **55.30 MiB**，其中通信依赖层 **52.15 MiB**、PyYAML 层 **0.74 MiB**、APK 层 **2.31 MiB**，其余为源码/配置。此为压缩传输层统计，不是解压磁盘占用；基础 config digest 为 `sha256:cf6b24578bf4e9d75812923f11d0386d3d13c03df92ff0bbf4f0672be2e58238`，不是永久固定的 `latest` 大小。
+
+本卡明确接受这部分局部增长，以提供原生 WebRTC 接入和离线可用的安装包；不扩大其他 Driver 或基础镜像。APK 在构建时按清单下载入镜像，使部署完成后的局域网下载不再依赖 COS 在线，且 APK 与该 Driver 版本固定绑定。移动到启动时下载只会转移到容器可写层，并增加现场网络依赖。镜像不包含 SDK、JDK、Android 源码或构建缓存，不增加 BOT 开关。基础镜像 config 未设置 `PYTHONUNBUFFERED` / `RCUTILS_COLORIZED_OUTPUT`，本卡显式设置用于日志及时性和禁用 ROS ANSI 颜色。
+
+### APK 校验边界
+
+发布 APK 前，`stage_apk.py` 用 Android `apksigner verify` 验证真实签名，提取证书指纹，并用 aapt2/zipalign 核验包信息与对齐。清单中的证书指纹是**发布元数据**，不是容器运行时验签结果。
+
+普通 Docker 构建的 `fetch_apk.py` 核对下载字节（含 gzip 源与解压后的 APK）的大小和 SHA256；下载接口 `package_metadata()` 再核对镜像内 APK 的大小和 SHA256，只报告 `verification=sha256`、`signature_verified=false`，不返回未经运行时提取的签名证书指纹。`available=true` 只表示与受版本控制的清单字节一致，不是独立签名认证；清单与发布流程是信任边界。容器不安装 Android 验签工具。
+
 本地软件测试：
 
 ```sh

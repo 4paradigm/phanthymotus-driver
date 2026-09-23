@@ -4,7 +4,7 @@
 
 ## 安装、连接与使用
 
-从Canvas PICO卡齿轮复制网址，在 PICO 浏览器进入Driver托管的安装配对页。先下载安装App，再回到网页依次点击“连接这台机器人”和“打开 App 并连接”，预填当前设备地址和证书身份；不能假设系统安装器首次打开会继承网页URL。短网址为兜底；扫码能力需要PICO实机确认。安装、权限及MR安全边界仍需头显确认。
+从Canvas PICO卡齿轮复制网址，在 PICO 浏览器进入Driver托管的安装配对页。先下载安装App，再回到网页输入齿轮中设置的四位管理 PIN，依次点击“连接这台机器人”和“打开 App 并连接”，预填当前设备地址和证书身份；不能假设系统安装器首次打开会继承网页URL。短网址为兜底；扫码能力需要PICO实机确认。安装、权限及MR安全边界仍需头显确认。
 
 配对后冷启动自动连接保存的设备，普通断网按退避重连。改变配对证书不会静默重新信任；同签名覆盖升级保留本地配对，卸载会丢失配对。配对服务WSS15741路径保留 `/ws/teleop-capture`。首次浏览器自签TLS信任和网页唤起必须在实机验证，不以ADB安装替代。
 
@@ -25,7 +25,7 @@ python3 tests/verify_android_apks.py --platform pico --build-type release
 
 Release需要现有稳定签名变量 `MOTUS_APK_KEYSTORE/MOTUS_APK_STORE_PASSWORD/MOTUS_APK_KEY_ALIAS/MOTUS_APK_KEY_PASSWORD`；密钥和密码不写Git、Docker context或日志。不得回退debug假装可覆盖升级。若用户全局Gradle init脚本改写仓库规则，使用独立 `GRADLE_USER_HOME`，不修改用户全局配置。
 
-构建后 `scripts/stage_apk.py` 校验真实包信息、签名与对齐，生成正式制品。维护者发布不可变文件后更新 `package-manifest.json` 并核实下载字节；普通Driver镜像自动下载和验包，不要求用户传构建开关。当前远端清单是否已更新以实际验证记录为准，APK构建不等于普通镜像已包含它。
+构建后 `scripts/stage_apk.py` 校验真实包信息、签名与对齐，生成正式制品。维护者发布不可变文件后更新 `package-manifest.json` 并核实下载字节；普通Driver镜像自动下载并核对大小/SHA256，不再次执行 APK 签名验证，不要求用户传构建开关。清单证书指纹仅为发布元数据，运行时下载接口明确报告仅哈希校验、不报告签名已验证。当前远端清单是否已更新以实际验证记录为准，APK构建不等于普通镜像已包含它。
 
 包名固定 `com.phanthymotus.picocapture`，只构建arm64。PICO4 Ultra为首轮设备。系统/loader具体兼容性仍按实机记录，不扩大支持声明。
 

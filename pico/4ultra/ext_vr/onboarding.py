@@ -1,4 +1,4 @@
-"""Fixed APK artifact verification. No arbitrary paths or remote download URLs."""
+"""Fixed APK byte/hash verification, not APK signature verification."""
 from __future__ import annotations
 
 import hashlib
@@ -25,9 +25,9 @@ def package_metadata(directory=APK_DIRECTORY):
                 or type(data['size_bytes']) is not int or not 0 < data['size_bytes'] <= 256*1024*1024
                 or data['size_bytes'] != apk.stat().st_size):
             raise ValueError('invalid_artifact')
-        for key in ('sha256', 'signing_certificate_sha256'):
-            if len(data[key]) != 64 or any(c not in '0123456789abcdef' for c in data[key]):
-                raise ValueError('invalid_artifact')
+        if (not isinstance(data['sha256'], str) or len(data['sha256']) != 64
+                or any(c not in '0123456789abcdef' for c in data['sha256'])):
+            raise ValueError('invalid_artifact')
         digest = hashlib.sha256()
         with apk.open('rb') as stream:
             for chunk in iter(lambda: stream.read(1024*1024), b''):
@@ -35,8 +35,11 @@ def package_metadata(directory=APK_DIRECTORY):
         if digest.hexdigest() != data['sha256']:
             raise ValueError('artifact_digest_mismatch')
         metadata = {k: data[k] for k in ('filename', 'application_id', 'build_type', 'version',
-                'version_code', 'size_bytes', 'sha256', 'signing_certificate_sha256')}
-        metadata.update(available=True, mime_type=MIME_TYPE)
+                'version_code', 'size_bytes', 'sha256')}
+        # The manifest's signer fingerprint is release provenance only. Do not
+        # echo it as though this runtime extracted or verified a certificate.
+        metadata.update(available=True, mime_type=MIME_TYPE,
+                        verification='sha256', signature_verified=False)
         return metadata
     except (OSError, ValueError, KeyError, TypeError):
         return {'available': False, 'reason': 'apk_artifact_missing_or_invalid'}
