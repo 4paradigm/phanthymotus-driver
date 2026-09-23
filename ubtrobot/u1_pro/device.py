@@ -429,6 +429,25 @@ class U1Nodes:
 
     def initialize_robot(self) -> None:
         """Authorize the SDK and disable its built-in wake word on startup."""
+        try:
+            auth_state = self.trigger_call("auth_state")
+        except Exception:
+            auth_state = None
+        if (isinstance(auth_state, dict)
+                and auth_state.get("code") == "OK"
+                and isinstance(auth_state.get("data"), dict)
+                and auth_state["data"].get("authorized") is True):
+            print("[U1 init] vendor SDK is already authorized", flush=True)
+        else:
+            U1Nodes._authorize_from_credentials(self)
+
+        try:
+            self.string_call("wakeup_enabled", {"enabled": False})
+            print("[U1 init] built-in wake word disable request completed", flush=True)
+        except Exception:
+            print("[U1 init] built-in wake word disable request failed", flush=True)
+
+    def _authorize_from_credentials(self) -> None:
         env_names = {
             "appid": "U1_PRO_APPID",
             "api_key": "U1_PRO_API_KEY",
@@ -476,12 +495,6 @@ class U1Nodes:
                 and response["data"].get("authorized") is True):
             raise RuntimeError("U1 Pro authorization was rejected")
         print("[U1 init] authorization request completed", flush=True)
-
-        try:
-            self.string_call("wakeup_enabled", {"enabled": False})
-            print("[U1 init] built-in wake word disable request completed", flush=True)
-        except Exception:
-            print("[U1 init] built-in wake word disable request failed", flush=True)
 
     def _event_callback(self, name: str):
         def callback(message):

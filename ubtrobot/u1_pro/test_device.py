@@ -580,6 +580,35 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIn("authorization request completed", text)
         self.assertIn("wake word disable request completed", text)
 
+    def test_existing_vendor_authorization_skips_credential_submission(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            config={},
+            trigger_call=mock.Mock(return_value={"code": "OK", "data": {"authorized": True}}),
+            string_call=mock.Mock(return_value={"ok": True, "code": "OK", "data": {"authorized": True}}),
+        )
+        device.U1Nodes.initialize_robot(nodes)
+        nodes.trigger_call.assert_called_once_with("auth_state")
+        nodes.string_call.assert_called_once_with("wakeup_enabled", {"enabled": False})
+
+    def test_unauthorized_vendor_state_performs_authorization(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            config={"auth": {key: "present" for key in ("appid", "api_key", "api_secret", "device_id", "license")}},
+            trigger_call=mock.Mock(return_value={"code": "UNAUTHORIZED", "data": {"authorized": False}}),
+            string_call=mock.Mock(side_effect=[
+                {"ok": True, "code": "OK", "data": {"authorized": True}},
+                {"ok": True, "code": "OK", "data": {}},
+            ]),
+        )
+        device.U1Nodes.initialize_robot(nodes)
+        self.assertEqual(nodes.string_call.call_args_list[0].args,
+                         ("authorize", mock.ANY))
+        self.assertEqual(nodes.string_call.call_args_list[1].args,
+                         ("wakeup_enabled", {"enabled": False}))
+
     def test_authorization_loads_secret_file_and_license(self):
         import device
 
@@ -639,7 +668,9 @@ class U1CardContractTests(unittest.TestCase):
     def test_authorization_failure_does_not_disable_wakeup_or_expose_plugins(self):
         import device
 
-        initialize_robot = device.U1Nodes.initialize_robot
+        def fail_authorization():
+            raise RuntimeError("U1 Pro authorization was rejected")
+
         nodes = types.SimpleNamespace(
             config={"auth": {key: "present" for key in ("appid", "api_key", "api_secret", "device_id", "license")}},
             namespace="test",
@@ -647,13 +678,14 @@ class U1CardContractTests(unittest.TestCase):
             add_playback_listener=lambda listener: None,
             close=mock.Mock(),
             string_call=mock.Mock(return_value={"ok": False, "code": "AUTHORIZE_FAILED", "data": {}}),
-            initialize_robot=lambda: initialize_robot(nodes),
+            trigger_call=mock.Mock(return_value={"code": "UNAUTHORIZED", "data": {"authorized": False}}),
+            initialize_robot=fail_authorization,
         )
         ros = mock.Mock()
         with mock.patch.object(device, "U1Nodes", return_value=nodes):
             with self.assertRaisesRegex(RuntimeError, "authorization was rejected"):
                 device.build_plugins({}, "test", ros)
-        nodes.string_call.assert_called_once_with("authorize", mock.ANY)
+        nodes.string_call.assert_not_called()
         nodes.close.assert_called_once_with()
         ros.shutdown.assert_called_once_with()
 
