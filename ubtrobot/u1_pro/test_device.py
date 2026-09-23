@@ -19,11 +19,38 @@ def _install_stubs():
     common = types.ModuleType("rclpy")
     node = types.ModuleType("rclpy.node")
     node.Node = object
+    context = types.ModuleType("rclpy.context")
+    context.Context = type("Context", (), {})
+
+    class Executor:
+        def __init__(self, context=None):
+            self.nodes = []
+
+        def add_node(self, value):
+            self.nodes.append(value)
+
+        def remove_node(self, value):
+            self.nodes.remove(value)
+
+        def spin_once(self, timeout_sec=None):
+            pass
+
+        def shutdown(self):
+            pass
+
+    executors = types.ModuleType("rclpy.executors")
+    executors.MultiThreadedExecutor = Executor
+    common.init = lambda **kwargs: None
+    common.ok = lambda **kwargs: False
+    common.shutdown = lambda **kwargs: None
+    common.executors = executors
+    common.context = context
     qos = types.ModuleType("rclpy.qos")
     qos.QoSProfile = lambda **kwargs: kwargs
     qos.ReliabilityPolicy = types.SimpleNamespace(RELIABLE=1, BEST_EFFORT=2)
     common.node, common.qos = node, qos
-    sys.modules.update({"rclpy": common, "rclpy.node": node, "rclpy.qos": qos})
+    sys.modules.update({"rclpy": common, "rclpy.node": node, "rclpy.qos": qos,
+                        "rclpy.context": context, "rclpy.executors": executors})
 
     std = types.ModuleType("std_msgs")
     std_msg = types.ModuleType("std_msgs.msg")
@@ -130,6 +157,13 @@ class FakeNodes:
 
 
 class U1CardContractTests(unittest.TestCase):
+    def test_audio_device_domain_matches_vendor_adapter_runtime(self):
+        import yaml
+
+        config = yaml.safe_load(Path(__file__).with_name("config.yaml").read_text())
+        self.assertEqual(config["ros"]["robot_domain_id"], 20)
+        self.assertEqual(config["ros"]["audio_device_domain_id"], 2)
+
     def test_cyclonedds_config_overrides_inherited_uri(self):
         import common.vendor_runtime as runtime
 
@@ -260,14 +294,29 @@ class U1CardContractTests(unittest.TestCase):
                 pass
 
         original_node = sys.modules["rclpy.node"].Node
+        original_context = sys.modules["rclpy.context"].Context
+        original_init = sys.modules["rclpy"].init
+        original_ok = sys.modules["rclpy"].ok
+        original_shutdown = sys.modules["rclpy"].shutdown
         sys.modules["rclpy.node"].Node = FakeNode
+        class FakeContext:
+            pass
+
+        initialized_domains = []
+        sys.modules["rclpy.context"].Context = FakeContext
+        sys.modules["rclpy"].init = lambda context, domain_id: initialized_domains.append((context, domain_id))
+        sys.modules["rclpy"].ok = lambda context: False
+        sys.modules["rclpy"].shutdown = lambda context: None
         try:
             ros = FakeRos()
             nodes = device.U1Nodes({}, "test", ros)
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
-            self.assertEqual(len(nodes.robot.subscriptions), 4)
-            self.assertTrue(all(subscription[0] is sys.modules["std_msgs.msg"].String for subscription in nodes.robot.subscriptions[:3]))
+            self.assertEqual(len(nodes.robot.subscriptions), 3)
+            self.assertEqual(len(nodes.audio_device.subscriptions), 1)
+            self.assertEqual(initialized_domains[0][1], 2)
+            self.assertEqual(nodes.audio_device.clients["/sys/device/audio_in/enable"].srv_name,
+                             "/sys/device/audio_in/enable")
             self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name, "/robo/audio/call/play_action")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
             nodes.close()
@@ -275,6 +324,10 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(ros.executor_core.nodes, [])
         finally:
             sys.modules["rclpy.node"].Node = original_node
+            sys.modules["rclpy.context"].Context = original_context
+            sys.modules["rclpy"].init = original_init
+            sys.modules["rclpy"].ok = original_ok
+            sys.modules["rclpy"].shutdown = original_shutdown
 
     def test_event_start_stop_controls_forwarding(self):
         import device

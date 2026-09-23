@@ -269,6 +269,9 @@ def _decode_vendor_result(response: Any) -> Any:
 
 class U1Nodes:
     def __init__(self, config: dict, namespace: str, ros) -> None:
+        import rclpy
+        import rclpy.executors
+        from rclpy.context import Context
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
@@ -280,6 +283,16 @@ class U1Nodes:
 
         self.robot = Node("u1_pro_driver", context=ros.ctx_robot)
         self.core = Node("u1_pro_bridge", namespace=namespace, context=ros.ctx_core)
+        self._rclpy = rclpy
+        self._audio_context = Context()
+        audio_domain_id = int(config.get("ros", {}).get("audio_device_domain_id", 2))
+        rclpy.init(context=self._audio_context, domain_id=audio_domain_id)
+        self._audio_executor = rclpy.executors.MultiThreadedExecutor(context=self._audio_context)
+        self.audio_device = Node("u1_pro_audio_device", context=self._audio_context)
+        self._audio_executor.add_node(self.audio_device)
+        self._audio_thread = threading.Thread(target=self._spin_audio_device, daemon=True,
+                                              name="u1-audio-device-ros")
+        self._audio_thread.start()
         self._executor_robot = ros.executor_robot
         self._executor_core = ros.executor_core
         self._executor_robot.add_node(self.robot)
@@ -312,10 +325,11 @@ class U1Nodes:
             self._event_publishers[name] = self.core.create_publisher(String, output_topic, reliable)
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
         self._robot_subscriptions.append(self.robot.create_subscription(String, VIDEO_METADATA_TOPIC, self._metadata_callback, reliable))
-        self._robot_subscriptions.append(self.robot.create_subscription(AudioInData, MIC_TOPIC, self._mic_callback, best_effort))
+        self._mic_subscription = self.audio_device.create_subscription(
+            AudioInData, MIC_TOPIC, self._mic_callback, best_effort)
 
         self._clients = {
-            "mic_enable": self.robot.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
+            "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
             "volume": self.robot.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
             "motion_list": self.robot.create_client(StringCall, "/robo/audio/call/get_motion_info_list"),
             "play_action": self.robot.create_client(StringCall, "/robo/audio/call/play_action"),
@@ -328,6 +342,10 @@ class U1Nodes:
             "video_state": self.robot.create_client(Trigger, VIDEO_STATE),
             "video_close": self.robot.create_client(Trigger, VIDEO_CLOSE),
         }
+
+    def _spin_audio_device(self) -> None:
+        while self._rclpy.ok(context=self._audio_context):
+            self._audio_executor.spin_once(timeout_sec=0.1)
 
     def initialize_robot(self) -> None:
         """Authorize the SDK and disable its built-in wake word on startup."""
@@ -512,6 +530,12 @@ class U1Nodes:
         self._mic_forwarding = False
         self._event_forwarding.clear()
         self.close_speaker_subscription()
+        self._audio_executor.remove_node(self.audio_device)
+        self._audio_executor.shutdown()
+        self.audio_device.destroy_node()
+        if self._rclpy.ok(context=self._audio_context):
+            self._rclpy.shutdown(context=self._audio_context)
+        self._audio_thread.join(timeout=1.0)
         self._executor_robot.remove_node(self.robot)
         self._executor_core.remove_node(self.core)
         self.robot.destroy_node()

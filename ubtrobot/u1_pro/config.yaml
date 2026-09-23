@@ -2,6 +2,8 @@ mcp_port: 15740
 ros_namespace: ""
 ros:
   robot_domain_id: 20
+  # The device audio bridge in the vendor Adapter runtime runs on domain 2.
+  audio_device_domain_id: 2
   core_domain_id: 42
   # The official U1 SDK ROS2 runtime defaults to domain 20 and localhost.
   robot_interface: "lo"

@@ -47,6 +47,13 @@ manual lifecycle action: it returns a `recording_id` immediately and keeps
 recording until `stop_recording`; the final result is returned by
 `stop_recording` and `info`, rather than being treated as a finite ACP task.
 
+The official Adapter runtime currently exposes device-level microphone enable
+and raw audio on ROS domain `2`, while its `/robo/...` SDK services use domain
+`20`. The driver therefore uses a dedicated audio-device context for
+`/sys/device/audio_in/enable` and `/audio/sense/audio_data_to_asr`; this is
+separate from the SDK context and Agent Core context. Configure
+`audio_device_domain_id` if the vendor Adapter deployment changes that domain.
+
 The image installs `python3-pil` for the documented raw-video-to-JPEG conversion
 and `ffmpeg` for MP4 capture,
 and `python3-colcon-common-extensions`, `cmake`, and `build-essential`
