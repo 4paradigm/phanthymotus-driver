@@ -3,7 +3,7 @@ import copy
 import json
 import pytest
 from common.teleop_contract import (
-    COMMAND_SCHEMA, FEEDBACK_SCHEMA, TRACKING_FRAME, command_from_input,
+    COMMAND_SCHEMA, FEEDBACK_SCHEMA, COMMAND_TOPIC, STATE_TOPIC, TRACKING_FRAME, command_from_input,
     topics, binding_from_topic, validate_input, validate_operation, validate_feedback,
 )
 
@@ -56,15 +56,16 @@ def test_json_round_trip_and_detached_snapshot(factory, validator):
     assert result["instance_id"] == original["instance_id"]
 
 
-def test_topic_binding_round_trip():
-    assert topics("/robot/fleet", "pico-1") == (
-        "/robot/fleet/teleop/pico_1/command", "/robot/fleet/teleop/pico_1/feedback")
-    assert binding_from_topic(topics("robot/fleet", "pico-1")[0]) == ("robot/fleet", "pico_1")
+@pytest.mark.parametrize("arguments", [(), ("pico", "default"), ("/robot/fleet", "pico-1")])
+def test_fixed_topics_do_not_derive_source_identity(arguments):
+    assert topics(*arguments) == (COMMAND_TOPIC, STATE_TOPIC) == (
+        "/teleop/command", "/teleop/state")
+    assert binding_from_topic(topics(*arguments)[0]) == ("", None)
 
 
 @pytest.mark.parametrize("value", ["a", "/x/command", "/x/teleop//command",
     "/x/teleop/pico/feedback", "/x//teleop/pico/command", "/../teleop/pico/command",
-    "/x/teleop/pico-1/command"])
+    "/x/teleop/pico-1/command", "/pico/teleop/default/command", "/teleop/state"])
 def test_invalid_binding_rejected(value):
     with pytest.raises(ValueError): binding_from_topic(value)
 

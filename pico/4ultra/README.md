@@ -42,6 +42,8 @@ Canvas 连接 `teleop_device` 输出到机器人 `teleop_control` 输入。设�
 
 卡片声明 `multiInstance=false`，当前同一 ROS domain 支持一个设备输入源。升级时复用唯一已有实例配置或配对文件（兼容旧版直接启动后配对、未保存配置的情况），改变画布卡 ID 不再新建第二个设备源；发现多份旧配置时报明确错误，不猜测采用哪份。设备和实例身份放在消息中，topic 不拼接品牌、日期或实例 ID。应用层仅保留最新待发姿态；DDS 历史深度不代表允许排队执行历史动作。
 
+共享模块 `COMMAND_TOPIC` / `STATE_TOPIC` 与实际发布器使用相同固定值。`topics()` 固定返回命令和控制卡监控 topic，旧 namespace/instance 参数不再影响路径；`binding_from_topic()` 只接受 `/teleop/command`，返回空 namespace 与未绑定的实例 `None`。消费者从有效消息绑定设备身份，不从 topic 推导，也不接受旧实例路径作为本契约入口。
+
 ### 输入消息
 
 `kind` 固定为 `input`。主要字段：
@@ -92,6 +94,8 @@ PICO 是独立进程，复用 `ros-base` 提供的 ROS/Python，不依赖另一�
 发布 APK 前，`stage_apk.py` 用 Android `apksigner verify` 验证真实签名，提取证书指纹，并用 aapt2/zipalign 核验包信息与对齐。清单中的证书指纹是**发布元数据**，不是容器运行时验签结果。
 
 普通 Docker 构建的 `fetch_apk.py` 核对下载字节（含 gzip 源与解压后的 APK）的大小和 SHA256；下载接口 `package_metadata()` 再核对镜像内 APK 的大小和 SHA256，只报告 `verification=sha256`、`signature_verified=false`，不返回未经运行时提取的签名证书指纹。`available=true` 只表示与受版本控制的清单字节一致，不是独立签名认证；清单与发布流程是信任边界。容器不安装 Android 验签工具。
+
+测试已纳入本仓根目录 `tests/`（不是外部测试记录，也不另建 `pico/4ultra/tests`）：`test_teleop_contract.py` 覆盖固定 topic helper 与旧路径拒绝，`test_pico_device.py` 覆盖实际发布 JSON 与共享校验，`test_pico_lifecycle.py` 覆盖真实 loopback MCP/HTTPS、配置与启停。
 
 本地软件测试：
 

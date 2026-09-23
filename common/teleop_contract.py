@@ -16,6 +16,8 @@ COMMAND_SCHEMA = "motus.teleop.command/1"
 FEEDBACK_SCHEMA = "motus.teleop.feedback/1"
 COMMAND_FORMAT = "data/teleop-cmd"
 FEEDBACK_FORMAT = "data/teleop-state"
+COMMAND_TOPIC = "/teleop/command"
+STATE_TOPIC = "/teleop/state"
 TRACKING_FRAME = "tracking_x_forward_y_left_z_up"
 MAX_INPUT_AGE_NS = 300_000_000
 MAX_OPERATION_AGE_NS = 5_000_000_000
@@ -53,26 +55,22 @@ def canonical_instance(value):
     return normalized
 
 
-def topics(namespace, instance_id):
-    namespace = _text(namespace, "namespace").strip("/")
-    parts = namespace.split("/")
-    if any(not _TOKEN.fullmatch(part) for part in parts):
-        raise ValueError("invalid_namespace")
-    root = "/" + namespace + "/teleop/" + canonical_instance(instance_id)
-    return root + "/command", root + "/feedback"
+def topics(namespace=None, instance_id=None):
+    """Fixed single-source topics; legacy arguments never select a destination.
+
+    State is the robot card's monitor output, not a device feedback subscription.
+    Device identity belongs in the message, independently of these topic names.
+    """
+    return COMMAND_TOPIC, STATE_TOPIC
 
 
 def binding_from_topic(input_topic):
     value = _text(input_topic, "input_topic", maximum=512)
-    if not value.startswith("/") or not value.endswith("/command"):
+    if value != COMMAND_TOPIC:
         raise ValueError("invalid_input_topic")
-    parts = value.split("/")
-    if len(parts) < 5 or parts[-3] != "teleop":
-        raise ValueError("invalid_input_topic")
-    namespace, instance = "/".join(parts[1:-3]), parts[-2]
-    if topics(namespace, instance)[0] != value:
-        raise ValueError("invalid_input_topic")
-    return namespace, instance
+    # Keep the consumer tuple shape without inventing an identity from a topic.
+    # The consumer must bind/validate the source from the received message.
+    return "", None
 
 
 def _wire(value):

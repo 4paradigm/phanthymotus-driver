@@ -8,7 +8,7 @@ import secrets
 import threading
 from pathlib import Path
 from urllib.parse import urlsplit
-from common.teleop_contract import canonical_instance
+from common.teleop_contract import COMMAND_TOPIC, canonical_instance
 from .runtime import DeviceRuntime
 
 
@@ -210,7 +210,7 @@ class ExtVrPlugin:
             if saved:
                 instance = next(iter(saved))
                 canonical_instance(instance)
-        command = "/teleop/command"
+        command = COMMAND_TOPIC
         ports = {
             "topic_out": [
                 {

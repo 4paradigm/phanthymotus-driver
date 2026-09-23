@@ -1,10 +1,10 @@
-"""The device owns two local DDS endpoints; no Core-specific binding."""
+"""One local DDS input publisher; no robot feedback subscription."""
 
 import json
 import copy
 import threading
 from collections import OrderedDict
-from common.teleop_contract import topics
+from common.teleop_contract import COMMAND_TOPIC
 
 
 class BoundedWriter:
@@ -98,7 +98,7 @@ class RosTransport:
             depth=16,
             durability=DurabilityPolicy.VOLATILE,
         )
-        command = "/teleop/command"
+        command = COMMAND_TOPIC
         self.pub = self.node.create_publisher(String, command, qos)
 
         self.sub = None  # Device is an input source; no robot feedback subscription.
