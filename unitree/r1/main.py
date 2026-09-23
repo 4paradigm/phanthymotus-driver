@@ -339,32 +339,23 @@ def main():
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
-    # DDS init — try specified interface, fallback to interface holding 192.168.123.164
-    dds_ok = False
-    ifaces_to_try = [network_iface]
-    # Detect interface for 192.168.123.x subnet as fallback
-    try:
-        import netifaces
-        for iface_name in netifaces.interfaces():
-            addrs = netifaces.ifaddresses(iface_name).get(netifaces.AF_INET, [])
-            for addr in addrs:
-                if addr["addr"].startswith("192.168.123."):
-                    if iface_name not in ifaces_to_try:
-                        ifaces_to_try.append(iface_name)
-    except ImportError:
-        pass
-    ifaces_to_try.append("")  # auto-detect as last resort
+    # DDS init — retried in the background, not attempted once and abandoned.
+    #
+    # On r1_sz this bundle started three seconds before eth10 existed, the one
+    # attempt failed, and every state topic on that robot stayed empty from boot
+    # while the cards publishing them looked healthy on the canvas. The
+    # interface list is recomputed on every attempt, because the thing being
+    # waited for is an interface that does not exist yet. See common/dds_link.py.
+    from common import dds_link as _dds_link
 
-    for iface in ifaces_to_try:
-        try:
-            ChannelFactoryInitialize(0, iface)
-            print(f"[bundle] DDS initialized on interface: {iface or '(auto)'}")
-            dds_ok = True
-            break
-        except Exception as e:
-            print(f"[bundle] DDS init failed on '{iface}': {e}")
-    if not dds_ok:
-        print("[bundle] WARNING: DDS unavailable — robot communication disabled, MCP server still starting")
+    _link = _dds_link.install(network_iface)
+    # A short wait so the common case — the interface is already there — still
+    # looks synchronous in the log and cards subscribe before the first tool
+    # call. Failing this wait is not fatal: the link keeps trying, and anything
+    # registered through `on_ready` subscribes the moment it succeeds.
+    if not _link.wait(5.0):
+        print("[bundle] DDS 还没连上，后台继续重试 —— MCP 照常启动，"
+              "机器人状态话题在连上之前是空的", flush=True)
 
     # NOTE: this used to redirect fd 1 to /dev/null and move the real log pipe
     # to a dup'd high fd, to "suppress C++ layer stdout". That was wrong on both

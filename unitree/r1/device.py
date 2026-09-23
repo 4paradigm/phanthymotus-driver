@@ -959,15 +959,55 @@ class _LocoStateNode(Node):
         self._last_state: dict = {}
         self._lock = threading.Lock()
         self._last_odom_time: float = 0.0
+        self._samples = 0
+        self._subscribed = False
+        self._subscribe_error = ""
+        self._odom_topic_name = odom_topic
 
+        # Deferred until the DDS link is up, instead of attempted once in the
+        # constructor. The old version caught the failure, logged one warning,
+        # and left the card registered and declaring `topic_out` — so a robot
+        # whose network interface came up three seconds late published nothing
+        # for the rest of the day while looking perfectly healthy. See
+        # common/dds_link.py.
+        from common import dds_link as _dds_link
+
+        link = _dds_link.get_link() or _dds_link.install()
+        self._link = link
+        link.on_ready(self._subscribe)
+
+    def _subscribe(self) -> None:
+        """Runs on the DDS link's thread once the domain is live."""
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
             self._odom_sub = ChannelSubscriber("rt/odommodestate", SportModeState_)
             self._odom_sub.Init(self._on_odom, 10)
-            self.get_logger().info(f"LocoStateNode subscribed rt/odommodestate → {odom_topic}")
-        except Exception as e:
-            self.get_logger().warn(f"LocoStateNode: failed to subscribe rt/odommodestate: {e}")
+            self._subscribed = True
+            self._subscribe_error = ""
+            self.get_logger().info(
+                f"LocoStateNode subscribed rt/odommodestate → {self._odom_topic_name}")
+        except Exception as exc:                               # noqa: BLE001
+            self._subscribe_error = f"{type(exc).__name__}: {exc}"
+            self.get_logger().warn(
+                f"LocoStateNode: failed to subscribe rt/odommodestate: {exc}")
+
+    def health(self) -> dict:
+        """Whether this node is actually receiving, not merely constructed.
+
+        **"Subscribed" and "receiving" are different facts** and only the second
+        one means the topic has data — on r1_sz the robot was publishing
+        `rt/odommodestate` at 495 Hz while this card's topic was empty, and
+        nothing anywhere distinguished the two states.
+        """
+        out = {"subscribed": self._subscribed, "samples": self._samples,
+               "dds": self._link.status() if self._link else None}
+        if self._subscribe_error:
+            out["error"] = self._subscribe_error
+        if self._subscribed and self._samples == 0:
+            out["message"] = ("已订阅 rt/odommodestate 但一条都没收到 —— "
+                              "机器人在发但我们收不到，或者它确实没在发")
+        return out
 
     def _on_odom(self, msg) -> None:
         now = time.monotonic()
@@ -997,6 +1037,7 @@ class _LocoStateNode(Node):
 
         with self._lock:
             self._last_state = state
+            self._samples += 1
         out = String()
         out.data = json.dumps(state)
         self._odom_pub.publish(out)
@@ -1065,6 +1106,26 @@ class LocoStatePlugin:
             # position and must not be accumulated into a map.
             pose_drift="unbounded",
         )
+
+    def dispatch(self, action: str, args: dict):
+        if action == "info":
+            return self._info()
+        return None
+
+    def _info(self) -> dict:
+        """What this card is actually doing, as opposed to what it declares.
+
+        `topic_out` promises 10 Hz unconditionally; this is where a reader finds
+        out whether anything is coming out of it.
+        """
+        health = self._node.health()
+        return {
+            "state": "running" if health.get("samples") else "idle",
+            "topic_out": [{"topic": self._odom_topic, "format": "data/json"},
+                          {"topic": self._motion_topic, "format": "state/odom"}],
+            "odom_interface": self._odom_interface(),
+            **health,
+        }
 
     def get_tool(self) -> dict:
         return {
