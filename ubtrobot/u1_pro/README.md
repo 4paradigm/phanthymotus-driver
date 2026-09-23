@@ -4,8 +4,12 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 
 - `mic`: the vendor 16 kHz mono input stream as `audio/pcm-16k`.
 - `speaker`: an Agent Core `audio/pcm-16k` input stream forwarded to the vendor output topic.
-- `tts`: text-to-speech through the documented `play_text` service, with interruption and asynchronous completion. Raw audio and preset actions are intentionally not exposed by this card.
+- `tts`: text-to-speech through the documented `play_text` service, with `interrupt`/`stop` and asynchronous completion. Raw audio and preset actions are intentionally not exposed by this card.
+- `tts` also controls the shared U1 speaker volume with `set_volume` and `get_volume`; TTS and live speaker streams use the same device output volume.
 - `expression`: face and gesture actions listed by readable names such as `smile` or `blink`; the driver maps these names to documented vendor IDs and only lists actions present in the robot's live command-motion list.
+- `agent`: enables, disables, or queries the vendor's built-in wakeup and voice-interaction entry point. This is the documented `wakeup_enabled` switch, not a process/container lifecycle control.
+- `vision`: enables, disables, or queries the documented visual system switch. Disabling it stops visual decisions, visual following, and visual idle actions, so it is the supported way to turn off built-in person-follow behavior.
+- `head`: plays documented preset head motions (`nod`, `shake`, `tilt`, `look_up`, and `look_down`) by readable name. The SDK does not expose arbitrary head angles or low-level neck-joint control.
 - `camera_rgb`: the documented U1 video stream. It opens the vendor stream, reads the section 4.5 shared-memory ring, and publishes `/namespace/camera/rgb` as `image/jpeg`.
 - `vision_capture`: photo/video capture built on the `camera_rgb` JPEG cache. It supports `capture_image`, timed `record_video`, continuous `start_recording`/`stop_recording`, `list`, `delete`, and `info`.
 - `doa_event`: an opt-in JSON sound-direction event stream.

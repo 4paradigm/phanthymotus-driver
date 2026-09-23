@@ -387,6 +387,11 @@ class U1Nodes:
             "authorize": self.robot.create_client(StringCall, "/robo/auth/call/authorize"),
             "auth_state": self.robot.create_client(Trigger, "/robo/auth/call/auth_state"),
             "wakeup_enabled": self.robot.create_client(StringCall, "/robo/system/call/set_wakeup_enabled"),
+            "wakeup_enabled_state": self.robot.create_client(Trigger, "/robo/system/call/get_wakeup_enabled"),
+            "vision_enabled": self.robot.create_client(StringCall, "/robo/system/call/set_vision_enabled"),
+            "vision_enabled_state": self.robot.create_client(Trigger, "/robo/system/call/get_vision_enabled"),
+            "wakeup_followup": self.robot.create_client(StringCall, "/robo/system/call/set_wakeup_followup"),
+            "wakeup_followup_state": self.robot.create_client(Trigger, "/robo/system/call/get_wakeup_followup"),
             "video_open": self.robot.create_client(Trigger, VIDEO_OPEN),
             "video_state": self.robot.create_client(Trigger, VIDEO_STATE),
             "video_close": self.robot.create_client(Trigger, VIDEO_CLOSE),
@@ -543,6 +548,12 @@ class U1Nodes:
         if isinstance(response, dict):
             return response
         return {"success": bool(getattr(response, "success", False)), "message": message}
+
+    def set_system_enabled(self, name: str, enabled: bool) -> dict:
+        return self.string_call(name, {"enabled": bool(enabled)})
+
+    def get_system_enabled(self, name: str) -> dict:
+        return self.trigger_call(name)
 
     def open_video(self) -> dict:
         opened = self.trigger_call("video_open")
@@ -725,11 +736,15 @@ class AudioPlugin:
     def get_tool(self):
         actions = {
             "speak": (["text"], "Convert the supplied text to speech and play it through the U1 Pro.",),
+            "set_volume": (["volume"], "Set the U1 Pro TTS speaker volume from 0 to 100."),
+            "get_volume": ([], "Read the U1 Pro TTS speaker volume."),
+            "interrupt": ([], "Interrupt the current U1 Pro text-to-speech playback immediately."),
             "stop": ([], "Interrupt the current U1 Pro text-to-speech playback."),
             "info": ([], "Read TTS readiness and any active playback."),
         }
         properties = {
             "text": {"type": "string", "minLength": 1, "description": "Text to speak."},
+            "volume": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Speaker volume from 0 to 100."},
             "action_id": {"type": "string", "description": "Optional caller correlation ID; otherwise a UUID is generated."},
         }
         schema = action_schema(actions, properties)
@@ -796,13 +811,17 @@ class AudioPlugin:
             with self._lock:
                 active = dict(self._active) if self._active else None
             return {"state": "ready" if self.running else "idle", "active": active}
+        if action == "set_volume":
+            return self.nodes.set_volume(args.get("volume", 100))
+        if action == "get_volume":
+            return self.nodes.get_volume()
         if action == "speak":
             text = str(args.get("text", "")).strip()
             if not text:
                 raise ValueError("tts.speak requires text")
             action_id = str(args.get("action_id") or uuid.uuid4())[:128]
             return self._queue("play_text", {"text": text[:4096]}, action_id, "tts")
-        if action == "stop":
+        if action in ("interrupt", "stop"):
             return self.stop()
         return None
 
@@ -1349,6 +1368,106 @@ class ExpressionPlugin:
         return {"actions": actions}
 
 
+class _SystemSwitchPlugin:
+    """Expose one documented vendor system switch as a small Agent card."""
+
+    def __init__(self, nodes: U1Nodes, prefix: str, set_name: str, get_name: str,
+                 description: str):
+        self.nodes = nodes
+        self.PREFIX = prefix
+        self.set_name = set_name
+        self.get_name = get_name
+        self.description = description
+
+    def get_tool(self):
+        actions = {
+            "enable": ([], "Enable this U1 Pro system capability."),
+            "disable": ([], "Disable this U1 Pro system capability."),
+            "status": ([], "Read the current U1 Pro system capability state."),
+        }
+        return tool(self.PREFIX, "actuator", self.description,
+                    action_schema(actions, {}))
+
+    def start(self):
+        return self.dispatch("status", {})
+
+    def stop(self):
+        return None
+
+    def dispatch(self, action, args):
+        del args
+        if action == "enable":
+            return self.nodes.set_system_enabled(self.set_name, True)
+        if action == "disable":
+            return self.nodes.set_system_enabled(self.set_name, False)
+        if action == "status":
+            return self.nodes.get_system_enabled(self.get_name)
+        return None
+
+
+class HeadPlugin:
+    """Play documented, safe preset head motions; raw joint control is unsupported."""
+
+    PREFIX = "head"
+    HEAD_ACTIONS = {
+        "tilt": ("A010", "歪头"),
+        "shake": ("A011", "摇头"),
+        "look_down": ("A012", "低头"),
+        "look_up": ("A013", "抬头"),
+        "nod": ("A014", "点头"),
+    }
+
+    def __init__(self, audio: AudioPlugin):
+        self.audio = audio
+        self.running = False
+
+    def get_tool(self):
+        actions = {
+            "start": ([], "Prepare the U1 Pro head action card."),
+            "list_actions": ([], "List available preset head motions by readable name."),
+            "play": (["name"], "Play a documented preset head motion by readable name."),
+            "stop": ([], "Interrupt the current head motion."),
+            "info": ([], "Read head action card state."),
+        }
+        return tool(self.PREFIX, "actuator",
+                    "U1 Pro preset head motions such as nod, shake, tilt, look up, and look down. It does not expose raw joint angles.",
+                    action_schema(actions, {
+                        "name": {"type": "string", "enum": sorted(self.HEAD_ACTIONS),
+                                 "description": "Readable name returned by list_actions."},
+                        "action_id": {"type": "string", "description": "Optional caller correlation ID."},
+                    }))
+
+    def start(self):
+        self.running = True
+        return {"state": "ready"}
+
+    def stop(self):
+        self.running = False
+        return self.audio.stop()
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "list_actions":
+            available = ExpressionPlugin._expression_actions(
+                self.audio.nodes.string_call("motion_list", {}))["actions"]
+            return {"actions": [item for item in available if item["name"] in self.HEAD_ACTIONS]}
+        if action == "play":
+            name = str(args.get("name", "")).strip().lower()
+            if name not in self.HEAD_ACTIONS:
+                raise ValueError("head.play requires a readable name returned by head.list_actions")
+            available = {item["name"] for item in self.dispatch("list_actions", {})["actions"]}
+            if name not in available:
+                raise ValueError(f"head action {name!r} is not available on this robot firmware")
+            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
+            return self.audio._queue("play_action", {"action": self.HEAD_ACTIONS[name][0]}, action_id, "head")
+        if action == "stop":
+            return self.stop()
+        if action == "info":
+            return {"state": "ready" if self.running else "idle"}
+        return None
+
+
 class _LifecyclePlugin:
     """Close the shared ROS nodes after all functional cards have stopped."""
 
@@ -1384,7 +1503,12 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     audio = AudioPlugin(nodes)
     camera = CameraRgbPlugin(nodes, config)
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
-               ExpressionPlugin(audio), camera,
+               ExpressionPlugin(audio), HeadPlugin(audio),
+               _SystemSwitchPlugin(nodes, "agent", "wakeup_enabled", "wakeup_enabled_state",
+                                    "Enable or disable the U1 Pro built-in wakeup and voice-interaction entry point."),
+               _SystemSwitchPlugin(nodes, "vision", "vision_enabled", "vision_enabled_state",
+                                    "Enable or disable U1 Pro visual behavior, including visual following."),
+               camera,
                VisionCapturePlugin(camera, config.get("vision_capture", {}))]
     descriptions = {
         "doa_event": "Microphone-array sound direction with azimuth and confidence.",

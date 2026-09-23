@@ -241,7 +241,7 @@ class U1CardContractTests(unittest.TestCase):
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
-            "lifecycle", "mic", "speaker", "tts", "expression",
+            "lifecycle", "mic", "speaker", "tts", "expression", "head", "agent", "vision",
             "camera_rgb", "vision_capture", "doa_event",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
@@ -327,6 +327,10 @@ class U1CardContractTests(unittest.TestCase):
             self.assertIn("/sys/device/audio_in/raw", [sub[1] for sub in nodes.audio_device.subscriptions])
             self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name, "/robo/audio/call/play_action")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
+            self.assertEqual(nodes.robot.clients["/robo/system/call/set_vision_enabled"].srv_name,
+                             "/robo/system/call/set_vision_enabled")
+            self.assertEqual(nodes.robot.clients["/robo/system/call/get_vision_enabled"].srv_name,
+                             "/robo/system/call/get_vision_enabled")
             nodes.close()
             self.assertEqual(ros.executor_robot.nodes, [])
             self.assertEqual(ros.executor_core.nodes, [])
@@ -641,14 +645,58 @@ class U1CardContractTests(unittest.TestCase):
         plugin = device.AudioPlugin(FakeNodes())
         self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
 
+    def test_tts_interrupt_is_an_explicit_alias_for_stop(self):
+        import device
+
+        nodes = FakeNodes()
+        plugin = device.AudioPlugin(nodes)
+        plugin.dispatch("speak", {"text": "hello"})
+        with mock.patch.object(device, "_acp_notify"):
+            result = plugin.dispatch("interrupt", {})
+        self.assertEqual(result["state"], "idle")
+        self.assertEqual(nodes.interrupts, 1)
+
     def test_tts_schema_has_completion_contract(self):
         import device
 
         tool = device.AudioPlugin(FakeNodes()).get_tool()
         schema = tool["inputSchema"]
         self.assertEqual(tool["name"], "tts")
-        self.assertEqual(schema["properties"]["action"]["enum"], ["speak", "stop", "info"])
+        self.assertEqual(schema["properties"]["action"]["enum"], ["speak", "set_volume", "get_volume", "interrupt", "stop", "info"])
         self.assertEqual(schema["x-completion"]["actions"], ["speak"])
+
+    def test_tts_exposes_shared_speaker_volume_controls(self):
+        import device
+
+        actions = device.AudioPlugin(FakeNodes()).get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("set_volume", actions)
+        self.assertIn("get_volume", actions)
+
+    def test_head_card_uses_readable_preset_names(self):
+        import device
+
+        nodes = FakeNodes()
+        nodes.string_call = mock.Mock(return_value={"data": {"motion_info_list": [
+            {"motion_id": "A014", "motion_name": "点头"},
+            {"motion_id": "A101", "motion_name": "歌曲_1"},
+        ]}})
+        head = device.HeadPlugin(device.AudioPlugin(nodes))
+        self.assertEqual(head.dispatch("list_actions", {})["actions"], [{"name": "nod", "label": "点头"}])
+        with self.assertRaisesRegex(ValueError, "not available"):
+            head.dispatch("play", {"name": "shake"})
+
+    def test_system_switch_cards_use_documented_vendor_services(self):
+        import device
+
+        nodes = mock.Mock()
+        nodes.set_system_enabled.return_value = {"ok": True}
+        nodes.get_system_enabled.return_value = {"enabled": False}
+        agent = device._SystemSwitchPlugin(nodes, "agent", "wakeup_enabled", "wakeup_enabled_state", "agent")
+        vision = device._SystemSwitchPlugin(nodes, "vision", "vision_enabled", "vision_enabled_state", "vision")
+        self.assertEqual(agent.dispatch("disable", {}), {"ok": True})
+        self.assertEqual(vision.dispatch("status", {}), {"enabled": False})
+        nodes.set_system_enabled.assert_called_once_with("wakeup_enabled", False)
+        nodes.get_system_enabled.assert_called_once_with("vision_enabled_state")
 
     def test_tts_uses_documented_play_text_payload(self):
         import device
