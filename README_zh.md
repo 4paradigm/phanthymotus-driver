@@ -17,7 +17,6 @@
  | `brainco/revo2` | BrainCo Revo 2 灵巧手 | 15706 | 手指位置/预设手势/LED 控制、状态遥测，触觉版附带指尖触觉遥测 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 
-[G1 双臂运动契约](docs/plans/g1-dual-arm-motion-contract.md)目前是 Draft 实施与验收计划；拟新增的 `motion_control → arm` 遥操链路尚未实现或通过真机验收，现有 Driver 功能说明仍然有效。
 
 ## 快速开始
 

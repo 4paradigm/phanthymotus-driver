@@ -265,6 +265,12 @@ def serve(sock, solver_module, solver_class, visualization_module):
 
 
 if __name__ == '__main__':
+    # A fresh Python process does not inherit the parent's stream wrappers.
+    # Resolve common from both the checkout and /work image layout before
+    # importing numerical packages, whose diagnostics may include ANSI output.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from common import logsafe
+    logsafe.install()
     try:
         sys.path.insert(0, sys.argv[2])
         serve(socket.socket(fileno=int(sys.argv[1])), *sys.argv[3:6])
