@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import secrets
 import stat
-import tempfile
+from contextlib import contextmanager
 import threading
 import time
 
@@ -34,30 +34,46 @@ class ManagementPin:
         self._failures = 0
         self._blocked_until = 0
 
-    def _check_directory(self):
-        metadata = self.path.parent.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700:
-            raise ValueError("management_pin_directory_must_be_private_0700")
+    @contextmanager
+    def _open_directory(self):
+        try:
+            directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            yield None
+            return
+        except OSError as exc:
+            raise ValueError("management_pin_directory_must_be_private_0700") from exc
+        try:
+            metadata = os.fstat(directory)
+            if stat.S_IMODE(metadata.st_mode) != 0o700 or metadata.st_uid != os.geteuid():
+                raise ValueError("management_pin_directory_must_be_private_0700")
+            yield directory
+        finally:
+            os.close(directory)
 
     def _read_record(self):
-        if self.path.parent.exists() or self.path.parent.is_symlink():
-            self._check_directory()
+        with self._open_directory() as directory:
+            return self._read_at(directory)
+
+    def _read_at(self, directory):
+        if directory is None:
+            return None
         try:
-            metadata = self.path.lstat()
+            fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory)
         except FileNotFoundError:
             return None
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
-            raise ValueError("management_pin_file_must_be_regular_0600")
-        # Check the opened object too; never follow a replacement symlink or
-        # block on a FIFO inserted between lstat and open.
-        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as exc:
+            raise ValueError("management_pin_file_must_be_regular_0600") from exc
         with os.fdopen(fd, "r") as stream:
             opened = os.fstat(stream.fileno())
-            if not stat.S_ISREG(opened.st_mode) or stat.S_IMODE(opened.st_mode) != 0o600:
+            if (not stat.S_ISREG(opened.st_mode) or stat.S_IMODE(opened.st_mode) != 0o600
+                    or opened.st_uid != os.geteuid()):
                 raise ValueError("management_pin_file_must_be_regular_0600")
-            if opened.st_size > 1024:
+            text = stream.read(1025)
+            if len(text) > 1024:
                 raise ValueError("management_pin_state_invalid")
-            return json.load(stream)
+            return json.loads(text)
 
     @property
     def configured(self):
@@ -77,22 +93,29 @@ class ManagementPin:
         self.validate(pin)
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            existing = self._read_record()
-            if existing == self._record and self._record and hmac.compare_digest(
-                    self._record["digest"], self._digest(pin, self._record["salt"])):
-                return False
-            salt = secrets.token_hex(16)
-            record = {"salt": salt, "digest": self._digest(pin, salt)}
-            fd, name = tempfile.mkstemp(prefix=".management-pin-", suffix=".tmp", dir=self.path.parent)
-            temporary = Path(name)
-            try:
-                with os.fdopen(fd, "w") as stream:
-                    json.dump(record, stream)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, self.path)
-            finally:
-                temporary.unlink(missing_ok=True)
+            with self._open_directory() as directory:
+                if directory is None:
+                    raise ValueError("management_pin_directory_missing")
+                existing = self._read_at(directory)
+                if existing == self._record and self._record and hmac.compare_digest(
+                        self._record["digest"], self._digest(pin, self._record["salt"])):
+                    return False
+                salt = secrets.token_hex(16)
+                record = {"salt": salt, "digest": self._digest(pin, salt)}
+                temporary = ".management-pin-" + secrets.token_hex(16) + ".tmp"
+                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+                try:
+                    with os.fdopen(fd, "w") as stream:
+                        json.dump(record, stream)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, self.path.name, src_dir_fd=directory, dst_dir_fd=directory)
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
             self._record = record
             self._sessions.clear()
             self._failures = 0

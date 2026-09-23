@@ -183,3 +183,38 @@ def test_pin_atomic_save_never_uses_existing_predictable_temporary(manager, tmp_
     assert unrelated.read_text() == "keep"
     assert old_temporary.is_symlink()
     assert not list(auth.path.parent.glob(".management-pin-*.tmp"))
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+def test_parent_replaced_after_open_cannot_redirect_pin(manager, tmp_path, monkeypatch, operation):
+    import os
+    auth, _ = manager
+    auth.configure("1234")
+    attacker = ManagementPin(tmp_path / "attacker" / auth.path.name)
+    attacker.configure("9999")
+    attacker_before = attacker.path.read_bytes()
+    original_directory = auth.path.parent
+    retained = tmp_path / "retained"
+    real_open = os.open
+    replaced = False
+
+    def swap_parent(path, flags, *args, **kwargs):
+        nonlocal replaced
+        fd = real_open(path, flags, *args, **kwargs)
+        if Path(path) == original_directory and not replaced:
+            replaced = True
+            original_directory.rename(retained)
+            original_directory.symlink_to(attacker.path.parent, target_is_directory=True)
+        return fd
+
+    monkeypatch.setattr(os, "open", swap_parent)
+    if operation == "read":
+        restored = ManagementPin(auth.path)
+        restored.authorize(restored.login("1234"))
+    else:
+        auth.configure("5678")
+        restored = ManagementPin(retained / auth.path.name)
+        restored.authorize(restored.login("5678"))
+    assert replaced
+    assert attacker.path.read_bytes() == attacker_before
+    assert not list(retained.glob(".management-pin-*.tmp"))
