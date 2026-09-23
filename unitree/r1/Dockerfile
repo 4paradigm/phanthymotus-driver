@@ -62,6 +62,10 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+# Sibling of device.py — the camera cards' motus.camera/1 declaration lives here
+# rather than in device.py so it can be tested without rclpy. Missing it makes
+# every camera tool fail on the first info().
+COPY camera_specs.py /work/camera_specs.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY loco_servo.py /work/loco_servo.py

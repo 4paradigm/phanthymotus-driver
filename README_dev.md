@@ -1878,3 +1878,149 @@ migration across fourteen of them.
 - [ ] vendor-specific fields are under `vendor`, not at the top level
 - [ ] `pose_drift` is honest; `unbounded` unless there is a correction source
 - [ ] a unit test calls `parse_interface()` on your declaration
+
+## Camera Parameters (`camera_info`)
+
+The third of the three declarations a driver makes about itself.
+`motus.control/1` says what a robot can be *told*; `motus.odom/1` says what it
+*reports*; this one says what a camera *sees* — and unlike the other two it does
+not stop at the driver. It travels along the canvas connections, and each
+processor it passes through rewrites the parts its own processing changed.
+
+Implementation: `common/camera_info.py`. Tests: `tests/test_camera_info.py`.
+Reference declaration: `unitree/r1/camera_specs.py`.
+
+### Why a camera has to say this itself
+
+Nothing in an image carries geometry. A depth map is 640x480 numbers, each a
+distance, and nothing in it says how wide the lens was. But the decisions made
+from it are metric — "is there room for my 0.36 m shoulders" — so somewhere a
+pixel column has to become a lateral offset in metres, and that conversion needs
+the field of view.
+
+Until this existed, that number lived in the *navigation policy's* config file,
+typed in by hand. On r1_sz it read 0.55 rad (~63 deg full, an ordinary lens)
+against a lens that measures 0.888 (~102 deg, ultra-wide). The avoidance corridor
+is metric — half-width 0.329 m — so every frame it converted that width back into
+a column range, and with the field of view understated the slice came out too
+wide: at 1 m it sampled 84% of the picture's half-width, which really spans
+±0.93 m. **The corridor was 1.86 m wide, wider than any door.** Every doorframe
+counted as dead ahead, the clearance reading was the distance to the door plane
+rather than through the opening, and the robot turned away 0.6 m short of a gap
+it fitted through.
+
+The value had been measured on that robot the day before. It went into a report
+and not into a config file, and nothing anywhere noticed.
+
+**Note how it failed.** A wrong deadband makes a robot stutter and you see it in
+the first second. A wrong field of view makes a robot refuse doorways *while the
+depth map reports clear ahead* — the only evidence is the behaviour. That is why
+this is a declaration and not a setting: the camera knows, and had no way to say
+so.
+
+Same rule as `limits.min_magnitude` and `footprint`, which the chassis declares
+and `navi` adopts at start. Camera parameters were the last exception.
+
+### The four rules
+
+**1. A quantity that is not known is `null`, never a guess.** A plausible number
+makes the consumer believe it knows. The consumer must be able to tell "nobody
+told me" from "I was told", so it can fall back conservatively *and report that
+it did*. R1 declares `half_fov_rad` for `camera_main` and `null` for the other
+three, because only one has been measured.
+
+**2. Meaning and units are fixed by this document.** `half_fov_rad` is the
+**horizontal half** field of view, in radians. The vertical angle is a separate
+field and **cannot be derived from the aspect ratio** — a processor that resizes
+1280x720 into 640x480 stretches the picture, so the pixels are no longer square
+and the two angles are no longer related by the frame's shape.
+
+**3. `source` is required.** `measured` / `vendor-spec` / `derived-from-K` /
+`inherited` / `manual` / `unknown`. Whether a number can be trusted is mostly a
+question of where it came from, and `unknown` is a legitimate answer that has to
+be *stated* rather than left out.
+
+**4. `id` survives the chain, `width`/`height` are rewritten at each stop,
+`pipeline` records who touched it.** Downstream cards look up their own tables by
+`id` (a depth calibration is a property of camera × model, so it lives with the
+model and is *keyed* by the camera). `width`/`height` describe the image **this
+port publishes**, not the original. `pipeline` is what makes a wrong number
+traceable to the stage that changed it.
+
+### Shape: ROS first, convenience second
+
+The core is `sensor_msgs/CameraInfo`'s — `width`, `height`, `distortion_model`,
+`D`, `K` — so anything with a real calibration fills it mechanically. A fisheye's
+distortion is a thing only `D` can express: `tan(theta)` overstates the lateral
+offset towards the edges of a wide lens, so the pinhole model consumers use today
+is an approximation that holds near the centre.
+
+`half_fov_rad` sits alongside as a derived convenience, because an angle is what
+consumers actually need and because a tape measure produces one directly while
+producing no `K` at all. **When both are present `K` wins** (`resolve_half_fov()`):
+a calibration matrix is solved from many observations, the angle beside it is
+usually a tape measure and some trigonometry.
+
+```json
+"camera_info": [
+  {"schema": "motus.camera/1",
+   "topic": "/ubuntu/camera/main",
+   "format": "image/jpeg",
+   "id": "unitree/r1/camera_main",
+   "width": 1280, "height": 720,
+   "distortion_model": "unknown",
+   "D": null, "K": null,
+   "half_fov_rad": 0.888,
+   "half_fov_v_rad": null,
+   "source": "measured",
+   "measured_on": "r1_sz, 2026-09-23",
+   "pipeline": ["unitree/r1/camera_main"],
+   "vendor": {"note": "约 102 度全视场（超广角）"}}
+]
+```
+
+It is a **list**, one entry per output port, each naming its own `topic`. A card
+may publish several ports and a consumer may have several inputs, so neither side
+can join on list position — and joining on the upstream *card's name* would undo
+the reason cards dispatch inputs by what they carry.
+
+### How it reaches a consumer
+
+Returned from the camera tool's `info()`. agent-core already calls `info()` on
+every card right after it starts (`api/config.py` `_resolve_and_register`), and at
+project start a card's sources are always started first — so the declaration is
+already in hand with no extra round trip. agent-core collects the declarations on
+a card's **inbound connections**, keys them by topic, and passes them as
+`camera_info` on that card's `start`.
+
+This mirrors `control_interface`, which travels the other way (a command producer
+is handed its *consumer's* action space). Two consequences worth knowing:
+
+- **An upstream that declares nothing is not an error.** Most cards have never
+  heard of this format. The consumer degrades and says so.
+- **Starting a single card from the canvas does not carry it**, same as
+  `control_interface` today. The consumer must tolerate its absence.
+
+### Implementing this for another driver
+
+1. For each camera output port, call `common.camera_info.build()` once and return
+   the list under `camera_info` from that tool's `info()`. It is a declaration,
+   not runtime state, so answer it whether or not the camera is streaming.
+2. Put the numbers in a module that does **not** import `rclpy`
+   (`unitree/r1/camera_specs.py` is the model), so a unit test can assert them on
+   a laptop. These are exactly the numbers that must not reach a robot unchecked.
+3. `id` is `"<vendor>/<model>/<port>"`, stable across reboots and across every
+   unit of that model.
+4. To measure a lens: `phanthymotus/actucore/tools/measure_fov.py` — a plane of
+   known width at a tape-measured distance. **Re-measure after any lens change.**
+
+Checklist before you call it done:
+
+- [ ] every camera tool's `info()` carries a `camera_info` entry for its topic
+- [ ] unmeasured lenses report `half_fov_rad: null` with `source: "unknown"`
+- [ ] `half_fov_rad` is the **half** angle (`build()` refuses a full one, but
+      only when it exceeds 90 deg — below that nothing can catch the mistake)
+- [ ] `width`/`height` describe what that port publishes
+- [ ] the spec module is listed in the bundle's Dockerfile `COPY` lines
+      (`tests/test_dockerfile_copies.py` checks this)
+- [ ] a unit test calls `parse()` on every declaration the driver can emit

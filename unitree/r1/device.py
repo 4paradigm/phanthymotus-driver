@@ -2205,6 +2205,18 @@ class CameraPlugin:
         self._depth_topic = f"/{namespace}/camera/depth"
         self._node = _CameraNode(self._main_topic, self._left_topic, self._right_topic, self._depth_topic)
 
+    def _camera_info(self, tool_name: str, topic: str, fmt: str) -> list:
+        """This port's optics — `motus.camera/1`, see `camera_specs.py`.
+
+        The numbers live in a module that does not import rclpy, so they can be
+        asserted on a laptop. A field of view that is wrong by a factor of 1.6
+        does not raise anything; it makes the robot refuse doorways while the
+        depth map reports clear ahead.
+        """
+        from camera_specs import declare
+
+        return declare(tool_name, topic, fmt)
+
     def get_tools(self) -> list:
         return [self._main_tool(), self._left_tool(), self._right_tool(), self._depth_tool()]
 
@@ -2269,6 +2281,8 @@ class CameraPlugin:
             }
             if tool_name in topic_map:
                 topic, fmt = topic_map[tool_name]
-                return {"state": self._node.state, "topic_out": [{"topic": topic, "format": fmt}]}
+                return {"state": self._node.state,
+                        "topic_out": [{"topic": topic, "format": fmt}],
+                        "camera_info": self._camera_info(tool_name, topic, fmt)}
             return {"state": self._node.state}
         return None
