@@ -92,7 +92,7 @@ def _install_stubs():
 
 _install_stubs()
 
-from device import MIC_TOPIC, PLAYBACK_TOPIC, SPEAKER_TOPIC  # noqa: E402
+from device import PLAYBACK_TOPIC, SDK_AUDIO_CLOSE, SDK_AUDIO_OPEN, SDK_AUDIO_STATE, SPEAKER_TOPIC  # noqa: E402
 
 
 class FakePublisher:
@@ -183,8 +183,10 @@ class U1CardContractTests(unittest.TestCase):
     def test_stream_topics_match_robot_contract(self):
         import device
 
-        self.assertEqual(MIC_TOPIC, "/audio/sense/audio_data_to_asr")
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
+        self.assertEqual(SDK_AUDIO_OPEN, "/robo/audio/call/open_stream")
+        self.assertEqual(SDK_AUDIO_STATE, "/robo/audio/call/stream_state")
+        self.assertEqual(SDK_AUDIO_CLOSE, "/robo/audio/call/close_stream")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
         self.assertEqual(device.EVENT_TOPICS["doa_event"], "/robo/audio/subscribe/doa_event")
 
@@ -196,15 +198,28 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIn("AllowMulticast>false", config)
         self.assertIn("MaxAutoParticipantIndex>200", config)
 
-    def test_mic_service_error_does_not_enable_forwarding(self):
+    def test_mic_uses_sdk_shared_stream_and_closes_it(self):
         import device
 
         nodes = object.__new__(device.U1Nodes)
         nodes._mic_forwarding = False
-        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=7))
-        with self.assertRaisesRegex(RuntimeError, "microphone enable failed"):
-            nodes.set_mic_enabled(True)
-        self.assertFalse(nodes._mic_forwarding)
+        nodes.trigger_call = mock.Mock(side_effect=[
+            {"success": True},
+            {"success": True, "data": {"path": "/tmp/robo/ipc/audio.stream",
+                                        "frame_payload_size": 3200, "max_frames": 64}},
+            {"success": True},
+        ])
+        nodes._mic_reader = None
+        nodes._mic_stream = {}
+        reader = mock.Mock()
+        with mock.patch.object(device, "VideoSharedMemoryReader", return_value=reader):
+            result = nodes.set_mic_enabled(True)
+        self.assertTrue(nodes._mic_forwarding)
+        self.assertEqual(result["stream"]["path"], "/tmp/robo/ipc/audio.stream")
+        reader.start.assert_called_once_with()
+        nodes.set_mic_enabled(False)
+        reader.stop.assert_called_once_with()
+        self.assertEqual(nodes.trigger_call.call_args.args, ("audio_close",))
 
     def test_event_bridge_keeps_sdk_string_payloads(self):
         import device
@@ -313,10 +328,12 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
             self.assertEqual(len(nodes.robot.subscriptions), 3)
-            self.assertEqual(len(nodes.audio_device.subscriptions), 1)
+            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 0)
             self.assertEqual(initialized_domains[0][1], 2)
-            self.assertEqual(nodes.audio_device.clients["/sys/device/audio_in/enable"].srv_name,
-                             "/sys/device/audio_in/enable")
+            self.assertEqual(nodes.robot.clients["/robo/audio/call/open_stream"].srv_name,
+                             "/robo/audio/call/open_stream")
+            self.assertEqual(nodes.audio_device.clients["/sys/device/audio_out/set_volume"].srv_name,
+                             "/sys/device/audio_out/set_volume")
             self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name, "/robo/audio/call/play_action")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
             nodes.close()
@@ -396,6 +413,20 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIn("play", expression_tool["inputSchema"]["properties"]["action"]["enum"])
         with self.assertRaises(ValueError):
             expression.dispatch("play", {})
+
+    def test_expression_excludes_songs_from_dynamic_action_list(self):
+        import device
+
+        audio = device.AudioPlugin(FakeNodes())
+        expression = device.ExpressionPlugin(audio)
+        audio.nodes.string_call = mock.Mock(return_value={"data": {"motion_info_list": [
+            {"motion_id": "A001", "motion_name": "blink"},
+            {"motion_id": "A101", "motion_name": "song"},
+        ]}})
+        result = expression.dispatch("list_actions", {})
+        self.assertEqual(result["data"]["motion_info_list"], [{"motion_id": "A001", "motion_name": "blink"}])
+        with self.assertRaisesRegex(ValueError, "only face or light-gesture"):
+            expression.dispatch("play", {"motion_id": "A101"})
 
     def test_vision_capture_saves_a_fresh_jpeg(self):
         import device
@@ -524,7 +555,22 @@ class U1CardContractTests(unittest.TestCase):
         jpeg = device._jpeg_from_frame(payload, metadata)
         self.assertTrue(jpeg.startswith(b"\xff\xd8\xff"))
 
-    def test_mic_callback_drops_audio_after_stop(self):
+    def test_shared_memory_reader_uses_sdk_cacheline_headers(self):
+        import device
+
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "audio.stream"
+            ring_header = device.VideoSharedMemoryReader._RING_HEADER.pack(1, 1, 4, 0, 0, 0, 0, 0)
+            frame_header = device.VideoSharedMemoryReader._HEADER.pack(0, 1234567890, 4, 0)
+            path.write_bytes(ring_header + frame_header + b"abcd")
+            frames = []
+            reader = device.VideoSharedMemoryReader(
+                {"path": str(path), "frame_payload_size": 4, "max_frames": 1},
+                lambda: {}, lambda payload, _meta, timestamp: (frames.append((payload, timestamp)), reader._stop.set()))
+            reader._run()
+            self.assertEqual(frames, [(b"abcd", 1234567890)])
+
+    def test_mic_publishes_shared_memory_frames_with_sdk_timestamp(self):
         import device
 
         publisher = FakePublisher()
@@ -533,15 +579,10 @@ class U1CardContractTests(unittest.TestCase):
             AudioChunk=FakeAudioChunk,
             _mic_publisher=publisher,
         )
-        message = types.SimpleNamespace(
-            sample_rate=16000,
-            channels=1,
-            data=types.SimpleNamespace(data=[1, 2, 3]),
-        )
-        device.U1Nodes._mic_callback(nodes, message)
-        nodes._mic_forwarding = False
-        device.U1Nodes._mic_callback(nodes, message)
+        device.U1Nodes._publish_mic_frame(nodes, b"\x01\x02\x03", {}, 12_000_000_034)
         self.assertEqual(len(publisher.messages), 1)
+        self.assertEqual(publisher.messages[0].header.stamp.sec, 12)
+        self.assertEqual(publisher.messages[0].header.stamp.nanosec, 34)
 
     def test_lifecycle_initializes_robot_defaults(self):
         import device

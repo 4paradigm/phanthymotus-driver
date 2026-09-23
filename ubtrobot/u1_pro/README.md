@@ -47,12 +47,13 @@ manual lifecycle action: it returns a `recording_id` immediately and keeps
 recording until `stop_recording`; the final result is returned by
 `stop_recording` and `info`, rather than being treated as a finite ACP task.
 
-The official Adapter runtime currently exposes device-level microphone enable
-and raw audio on ROS domain `2`, while its `/robo/...` SDK services use domain
-`20`. The driver therefore uses a dedicated audio-device context for
-`/sys/device/audio_in/enable` and `/audio/sense/audio_data_to_asr`; this is
-separate from the SDK context and Agent Core context. Configure
-`audio_device_domain_id` if the vendor Adapter deployment changes that domain.
+Microphone capture uses the documented SDK audio stream services on domain
+`20` and reads `/tmp/robo/ipc/audio.stream` using the SDK's cache-line-aligned
+shared-memory ring format. Its ring header is 64 bytes and each frame header
+is 32 bytes. The Adapter's speaker output and volume controls use
+the device interfaces on domain `2`, accessed through a dedicated context.
+`audio_device_domain_id` selects that context. The same SDK ring reader is used
+for audio and video.
 
 The image installs `python3-pil` for the documented raw-video-to-JPEG conversion
 and `ffmpeg` for MP4 capture,

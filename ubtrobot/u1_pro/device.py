@@ -26,9 +26,11 @@ from common.vendor_runtime import action_schema, jsonable, tool
 
 
 SERVICE_TIMEOUT = 3.0
-MIC_TOPIC = "/audio/sense/audio_data_to_asr"
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
+SDK_AUDIO_OPEN = "/robo/audio/call/open_stream"
+SDK_AUDIO_STATE = "/robo/audio/call/stream_state"
+SDK_AUDIO_CLOSE = "/robo/audio/call/close_stream"
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
 VIDEO_METADATA_TOPIC = "/robo/video/subscribe/metadata"
 VIDEO_OPEN = "/robo/video/call/open_stream"
@@ -173,24 +175,35 @@ def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
 
 
 class VideoSharedMemoryReader:
-    """Read the U1 SDK's fixed-slot video ring described in PDF section 4.5."""
+    """Read a U1 SDK fixed-slot shared-memory ring (audio or video)."""
 
-    _HEADER = struct.Struct("<QQQ")  # sequence, timestamp_ns, payload_size
+    _RING_HEADER = struct.Struct("<8Q")  # 64-byte, cache-line-aligned SDK header
+    _HEADER = struct.Struct("<4Q")  # sequence, timestamp, payload size, reserved
 
     def __init__(self, config: dict, metadata_getter, frame_callback):
         self.config = dict(config)
         self.metadata_getter = metadata_getter
         self.frame_callback = frame_callback
         self._stop = threading.Event()
+        self._ready = threading.Event()
         self._thread = None
         self._last_sequence = -1
+        self._error = ""
 
     def start(self):
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._ready.clear()
+        self._error = ""
         self._thread = threading.Thread(target=self._run, name="u1-video-reader", daemon=True)
         self._thread.start()
+        if not self._ready.wait(SERVICE_TIMEOUT):
+            self.stop()
+            raise RuntimeError(self._error or "timed out waiting for U1 shared-memory stream")
+        if self._error:
+            self.stop()
+            raise RuntimeError(self._error)
 
     def stop(self):
         self._stop.set()
@@ -207,16 +220,42 @@ class VideoSharedMemoryReader:
             return
         slot_size = self._HEADER.size + payload_size
         try:
-            with open(path, "rb") as handle:
+            deadline = time.monotonic() + SERVICE_TIMEOUT
+            handle = None
+            while not self._stop.is_set() and time.monotonic() < deadline:
+                try:
+                    handle = open(path, "rb")
+                    if os.fstat(handle.fileno()).st_size >= self._RING_HEADER.size:
+                        break
+                    handle.close()
+                    handle = None
+                except FileNotFoundError:
+                    pass
+                self._stop.wait(0.05)
+            if handle is None:
+                raise FileNotFoundError(path)
+            with handle:
                 with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as shared:
-                    if len(shared) < slot_size * max_frames:
+                    data_offset = self._RING_HEADER.size
+                    if len(shared) < data_offset + slot_size * max_frames:
                         raise ValueError("video shared-memory file is smaller than configured ring")
+                    ring_header = self._RING_HEADER.unpack_from(shared, 0)
+                    if ring_header[1] != max_frames or ring_header[2] != payload_size:
+                        raise ValueError("shared-memory ring header does not match stream configuration")
+                    self._ready.set()
                     while not self._stop.is_set():
                         newest = None
+                        ring_header = self._RING_HEADER.unpack_from(shared, 0)
+                        write_index, ring_frames, ring_payload = ring_header[:3]
+                        if ring_frames != max_frames or ring_payload != payload_size:
+                            raise ValueError("shared-memory ring header does not match stream configuration")
                         for index in range(max_frames):
-                            offset = index * slot_size
-                            sequence, timestamp_ns, size = self._HEADER.unpack_from(shared, offset)
+                            offset = data_offset + index * slot_size
+                            frame_header = self._HEADER.unpack_from(shared, offset)
+                            sequence, timestamp_ns, size = frame_header[:3]
                             if sequence <= self._last_sequence or size <= 0 or size > payload_size:
+                                continue
+                            if write_index == 0:
                                 continue
                             if newest is None or sequence > newest[0]:
                                 newest = (sequence, timestamp_ns, bytes(shared[offset + self._HEADER.size:offset + self._HEADER.size + size]))
@@ -226,9 +265,12 @@ class VideoSharedMemoryReader:
                         else:
                             self._stop.wait(0.005)
         except FileNotFoundError:
-            print(f"[U1 camera] shared-memory path does not exist: {path}", flush=True)
+            self._error = f"U1 shared-memory path is unavailable: {path}"
+            print(f"[U1 stream] shared-memory path is unavailable: {path}", flush=True)
         except Exception as exc:
-            print(f"[U1 camera] shared-memory reader stopped: {exc}", flush=True)
+            self._error = str(exc)[:256]
+            print(f"[U1 stream] shared-memory reader stopped: {self._error}", flush=True)
+            self._ready.set()
 
 
 def _acp_notify(action_id: str | None, status: str, result: dict, tool_name: str = "audio") -> None:
@@ -275,8 +317,8 @@ class U1Nodes:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
-        from audio_msgs.msg import AudioChunk, AudioInData, AudioOutData
-        from audio_msgs.srv import EnableAudioIn, SetAudioVolume
+        from audio_msgs.msg import AudioChunk, AudioOutData
+        from audio_msgs.srv import SetAudioVolume
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
         from sensor_msgs.msg import CompressedImage
@@ -305,7 +347,7 @@ class U1Nodes:
         self.AudioOutData = AudioOutData
         self.String = String
         self.CompressedImage = CompressedImage
-        self._speaker_publisher = self.robot.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
+        self._speaker_publisher = self.audio_device.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
         self._speaker_subscription = None
         self._speaker_forwarding = False
         self._speaker_uuid = ""
@@ -316,6 +358,8 @@ class U1Nodes:
         self._event_publishers = {}
         self._event_forwarding = {}
         self._mic_forwarding = False
+        self._mic_reader = None
+        self._mic_stream = {}
         self._playback_listeners = []
         self._video_metadata = {}
         self._video_metadata_lock = threading.Lock()
@@ -325,12 +369,8 @@ class U1Nodes:
             self._event_publishers[name] = self.core.create_publisher(String, output_topic, reliable)
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
         self._robot_subscriptions.append(self.robot.create_subscription(String, VIDEO_METADATA_TOPIC, self._metadata_callback, reliable))
-        self._mic_subscription = self.audio_device.create_subscription(
-            AudioInData, MIC_TOPIC, self._mic_callback, best_effort)
-
         self._clients = {
-            "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
-            "volume": self.robot.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
+            "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
             "motion_list": self.robot.create_client(StringCall, "/robo/audio/call/get_motion_info_list"),
             "play_action": self.robot.create_client(StringCall, "/robo/audio/call/play_action"),
             "play_text": self.robot.create_client(StringCall, "/robo/audio/call/play_text"),
@@ -341,6 +381,9 @@ class U1Nodes:
             "video_open": self.robot.create_client(Trigger, VIDEO_OPEN),
             "video_state": self.robot.create_client(Trigger, VIDEO_STATE),
             "video_close": self.robot.create_client(Trigger, VIDEO_CLOSE),
+            "audio_open": self.robot.create_client(Trigger, SDK_AUDIO_OPEN),
+            "audio_state": self.robot.create_client(Trigger, SDK_AUDIO_STATE),
+            "audio_close": self.robot.create_client(Trigger, SDK_AUDIO_CLOSE),
         }
 
     def _spin_audio_device(self) -> None:
@@ -421,16 +464,6 @@ class U1Nodes:
         with self._video_metadata_lock:
             return dict(self._video_metadata)
 
-    def _mic_callback(self, message) -> None:
-        if not self._mic_forwarding:
-            return
-        if message.sample_rate != 16000 or message.channels != 1:
-            return
-        chunk = self.AudioChunk()
-        chunk.format = "audio/pcm-16k"
-        chunk.data = list(message.data.data)
-        self._mic_publisher.publish(chunk)
-
     def call(self, name: str, request) -> Any:
         client = self._clients[name]
         if not client.wait_for_service(timeout_sec=SERVICE_TIMEOUT):
@@ -444,20 +477,50 @@ class U1Nodes:
         return future.result()
 
     def set_mic_enabled(self, enabled: bool) -> dict:
-        from std_msgs.msg import Header
-        from audio_msgs.srv import EnableAudioIn
         if not enabled:
+            self.stop_mic_reader()
+            return self.trigger_call("audio_close")
+        opened = self.trigger_call("audio_open")
+        state = self.trigger_call("audio_state")
+        stream = _stream_config(opened, state)
+        if not stream.get("path") or not stream.get("frame_payload_size") or not stream.get("max_frames"):
             self._mic_forwarding = False
-        request = EnableAudioIn.Request()
-        request.header = Header()
-        request.enable = enabled
-        response = jsonable(self.call("mic_enable", request))
-        if enabled and response.get("code", 0) not in (0, "0", None):
-            self._mic_forwarding = False
-            raise RuntimeError(f"vendor microphone enable failed (code={response.get('code')})")
-        if enabled:
-            self._mic_forwarding = True
-        return response
+            try:
+                self.trigger_call("audio_close")
+            except Exception:
+                pass
+            raise RuntimeError("U1 Pro audio stream state did not provide shared-memory configuration")
+        self._mic_stream = stream
+        self._mic_reader = VideoSharedMemoryReader(stream, lambda: {}, self._publish_mic_frame)
+        try:
+            self._mic_reader.start()
+        except Exception:
+            self._mic_reader = None
+            self._mic_stream = {}
+            try:
+                self.trigger_call("audio_close")
+            except Exception:
+                pass
+            raise
+        self._mic_forwarding = True
+        return {"open": opened, "state": state, "stream": stream}
+
+    def stop_mic_reader(self) -> None:
+        self._mic_forwarding = False
+        if self._mic_reader:
+            self._mic_reader.stop()
+            self._mic_reader = None
+        self._mic_stream = {}
+
+    def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
+        if not self._mic_forwarding:
+            return
+        chunk = self.AudioChunk()
+        chunk.format = AUDIO_FORMAT
+        chunk.data = list(payload)
+        chunk.header.stamp.sec = timestamp_ns // 1_000_000_000
+        chunk.header.stamp.nanosec = timestamp_ns % 1_000_000_000
+        self._mic_publisher.publish(chunk)
 
     def set_event_enabled(self, name: str, enabled: bool) -> None:
         self._event_forwarding[name] = enabled
@@ -528,6 +591,9 @@ class U1Nodes:
             return
         self._closed = True
         self._mic_forwarding = False
+        if self._mic_reader:
+            self._mic_reader.stop()
+            self._mic_reader = None
         self._event_forwarding.clear()
         self.close_speaker_subscription()
         self._audio_executor.remove_node(self.audio_device)
@@ -1178,6 +1244,12 @@ class ExpressionPlugin:
     """Semantic Agent card for vendor-provided face and local motions."""
 
     PREFIX = "expression"
+    EXPRESSION_IDS = {
+        "A001", "A002", "A003", "A004", "A005", "A006", "A007", "A008",
+        "A009", "A010", "A011", "A012", "A013", "A014", "A017", "A018",
+        "A019", "A020", "A021", "A022", "A023", "A024", "A025", "A026",
+        "A027", "A028", "A029", "A030", "A031", "A032", "A033", "A034",
+    }
 
     def __init__(self, audio: AudioPlugin):
         self.audio = audio
@@ -1186,17 +1258,17 @@ class ExpressionPlugin:
     def get_tool(self):
         actions = {
             "start": ([], "Prepare the U1 Pro expression action card."),
-            "list_actions": ([], "List vendor-provided command motions that can be used for expressions or light head/face movements."),
+            "list_actions": ([], "List the vendor's documented face and light gesture motions. Only returned motion_id values are accepted by play."),
             "play": (["motion_id"], "Play one motion_id returned by list_actions. Do not invent motion IDs."),
             "stop": ([], "Interrupt the current U1 Pro expression or audio motion."),
             "info": ([], "Read the expression card and active playback state."),
         }
         schema = action_schema(actions, {
-            "motion_id": {"type": "string", "minLength": 1, "description": "Exact vendor motion_id from list_actions, such as A029."},
+            "motion_id": {"type": "string", "minLength": 1, "description": "Exact face or light-gesture motion_id returned by list_actions."},
             "action_id": {"type": "string", "description": "Optional caller correlation ID."},
         })
         schema["x-completion"] = {"actions": ["play"], "timeout": 120}
-        return tool(self.PREFIX, "actuator", "U1 Pro face and light motion control through vendor preset actions. Discover available motion IDs first; the card does not guess aliases because the vendor list is firmware-dependent.", schema)
+        return tool(self.PREFIX, "actuator", "Control U1 Pro preset face expressions and light gestures, such as smile, blink, nod, or head tilt. Discover available actions first; songs and unrelated motions are excluded.", schema)
 
     def start(self):
         self.running = True
@@ -1210,11 +1282,14 @@ class ExpressionPlugin:
         if action == "start":
             return self.start()
         if action == "list_actions":
-            return self.audio.nodes.string_call("motion_list", {})
+            response = self.audio.nodes.string_call("motion_list", {})
+            return self._expression_actions(response)
         if action == "play":
             motion_id = str(args.get("motion_id", "")).strip()
             if not motion_id:
                 raise ValueError("expression.play requires motion_id from expression.list_actions")
+            if motion_id not in self.EXPRESSION_IDS:
+                raise ValueError("expression.play accepts only face or light-gesture motion IDs returned by expression.list_actions")
             action_id = str(args.get("action_id") or uuid.uuid4())[:128]
             return self.audio._queue("play_action", {"action": motion_id}, action_id, "expression")
         if action == "stop":
@@ -1224,6 +1299,20 @@ class ExpressionPlugin:
                 active = dict(self.audio._active) if self.audio._active else None
             return {"state": "ready" if self.running else "idle", "active": active}
         return None
+
+    @classmethod
+    def _expression_actions(cls, response):
+        """Keep only documented expression/gesture IDs from the dynamic vendor list."""
+        result = dict(response) if isinstance(response, dict) else {"result": response}
+        def filter_value(value):
+            if isinstance(value, list):
+                return [item for item in value if not isinstance(item, dict) or
+                        str(item.get("motion_id", item.get("id", ""))) in cls.EXPRESSION_IDS]
+            if isinstance(value, dict):
+                return {key: filter_value(child) if isinstance(child, (dict, list)) else child
+                        for key, child in value.items()}
+            return value
+        return filter_value(result)
 
 
 class _LifecyclePlugin:
