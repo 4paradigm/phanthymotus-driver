@@ -1574,6 +1574,47 @@ either — consumers currently work from a configured half-FOV, which is a guess
 with no provenance at all. That is the same declaration in the perception layer,
 and it is the next one to add.
 
+### Bring the robot's DDS up with `common/dds_link`, not with one attempt
+
+A bundle that calls `ChannelFactoryInitialize` once at start and carries on is
+betting that its network interface already exists. On r1_sz that bet lost by
+three seconds:
+
+```
+09:12:40  [bundle] namespace=ubuntu mcp_port=15702
+09:12:43  [bundle] DDS init failed on 'eth10': channel factory init error.
+          python3: eth10: does not match an available interface.
+```
+
+eth10 came up a moment later and stayed up all day. Nothing retried, so every
+state topic on that robot — odometry, IMU, joints, battery, mainboard — was
+empty from boot, while the cards publishing them sat on the canvas looking
+healthy and declaring 10 Hz in `topic_out`. The robot itself was publishing
+`rt/odommodestate` at 495 Hz the whole time.
+
+```python
+from common import dds_link
+
+link = dds_link.install(network_iface)   # starts retrying in the background
+link.wait(5.0)                           # optional: the common case looks synchronous
+...
+link.on_ready(self._subscribe)           # runs now if up, later if not
+```
+
+Three rules come out of that failure, and each is a separate way to stay broken:
+
+* **Recompute the interface list on every attempt.** The fallback scan for an
+  address on `192.168.123.x` ran at the same instant as the failure and found
+  nothing either. The thing being waited for is an interface that does not
+  exist yet, so a list captured at start cannot contain it.
+* **Subscribe from `on_ready`, not from a constructor.** A constructor runs
+  once, at the worst possible moment, and its `except` clause is where the
+  failure goes to be forgotten.
+* **Put the link state in `info()`.** `topic_out` promises a rate
+  unconditionally; `info()` is the only place a reader can find out whether
+  anything is coming out. And report *received* as well as *subscribed* —
+  those are different facts and only the second one means the topic has data.
+
 ### Use `common/control.ControlSink` — do not write the checks yourself
 
 There are fourteen bundles here. A safety chain copied fourteen times diverges
