@@ -226,7 +226,7 @@ def test_latest_input_epoch_and_deadline_never_replay_superseded_result(chain):
     sent = chain.commands[-1]
     assert sent['source_seq'] == second['source_seq'] and sent['mapping_epoch'] == 2
     assert sent['valid_until_ns'] <= second['valid_until_ns']
-    assert 0 < sent['valid_until_ns']-sent['generated_ns'] <= 100_000_000
+    assert 0 < sent['valid_until_ns']-sent['generated_ns'] <= 300_000_000
     assert not c.process_latest()
 
 
@@ -312,7 +312,9 @@ def test_return_failure_never_reports_completion_and_retry_can_finish(chain):
     assert not failed['return_completed'] and not failed['authority_released']
     assert e.gate.session_id
     p.frozen = False
-    wait_for(lambda: e.gate.status()['hold_confirmed'])
+    # A prolonged stale-feedback fault remains visible; fresh physical stop
+    # is the receipt needed by an explicit return retry, not a fabricated HOLD.
+    wait_for(lambda: e.gate.status()['stop_confirmed'])
     c.dispatch('finish', lease)
     wait_for(lambda: c.dispatch('finish_status', {})['state'] != 'returning', 4)
     final = c.dispatch('finish_status', {})
@@ -405,11 +407,20 @@ def test_live_speed_is_not_multiplied_by_two_rate_limits(chain):
     c.receive_eef(packet(c, lease, q=target))
     assert c.process_latest()
     commanded = np.asarray(chain.commands[-1]['values'])
-    assert .015 < np.max(np.abs(commanded)) <= .02+1e-9
-    # A full 20 ms elapsed watchdog tick can apply the same limit, not half.
+    assert np.max(np.abs(commanded)) > .3  # Full IK reference, not one frame's speed quota.
     e.gate.last_emit = e.gate.clock()-20_000_000
+    previous_emit = e.gate.last_emit
     e.gate.tick()
-    assert np.allclose(p.writes[-1], commanded, atol=1e-9)
+    actual_budget = min(.1, (e.gate.last_emit-previous_emit)/1e9)*e.gate.velocity
+    assert .015 < np.max(np.abs(p.writes[-1])) <= actual_budget+1e-9
+    # Without a second input frame, the arm continues on its own clock.
+    p.tick()
+    previous_target = p.writes[-1][3]
+    e.gate.last_emit = e.gate.clock()-20_000_000
+    previous_emit = e.gate.last_emit
+    e.gate.tick()
+    actual_budget = min(.1, (e.gate.last_emit-previous_emit)/1e9)*e.gate.velocity
+    assert .035 < p.writes[-1][3] <= previous_target+actual_budget+1e-9
 
 
 def test_card_config_validates_atomically_and_requires_recalibration(chain):

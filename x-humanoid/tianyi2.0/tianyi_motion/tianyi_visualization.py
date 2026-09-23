@@ -45,7 +45,7 @@ def snapshot(adapter):
         neutral = chains(solver, np.zeros(14))
         left, right = neutral[0][0], neutral[1][0]
         height = (left[2]+right[2])/2
-        body = [[left, [0, left[1], 0], [0, right[1], 0], right, left],
+        torso = [[left, [0, left[1], 0], [0, right[1], 0], right, left],
                 [[0, 0, 0], [0, 0, height+.06]],
                 [[0, -.06, height+.06], [0, .06, height+.06],
                  [0, .06, height+.20], [0, -.06, height+.20], [0, -.06, height+.06]]]
@@ -66,6 +66,6 @@ def snapshot(adapter):
                 # These calibrated boxes are safety bounds, NOT a claim that
                 # every enclosed pose is reachable.
                 'workspace_bounds': [solver.workspace[s] for s in ('left', 'right')],
-                'body': body, 'shoulder_height': height}
+                'torso': torso, 'shoulder_height': height}
     except (ValueError, KeyError, TypeError):
         return {'schema': SCHEMA, 'available': False, 'reason': 'feedback_unavailable'}

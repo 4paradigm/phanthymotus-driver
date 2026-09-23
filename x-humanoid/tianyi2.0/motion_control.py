@@ -1,10 +1,12 @@
 """Tianyi end-effector controller in the Driver, sharing one hardware MotionGate.
 
 The numerical worker never publishes vendor messages. Its authenticated joint
-envelope returns through the local DDS arm input; only TeleopExecutor's watchdog
-can emit. Preview credentials can never authorize that input.
+envelope reaches the existing arm receiver directly for teleop_control, or via
+the legacy local DDS arm input. Only TeleopExecutor's watchdog can emit.
+Preview credentials can never authorize the hardware input.
 """
 import copy
+from pathlib import Path
 import math
 import secrets
 import threading
@@ -12,6 +14,7 @@ import time
 from types import SimpleNamespace
 
 from motion_stream import PROTOCOL, sign, vector
+from tianyi_motion.worker import NumericalWorker
 from tianyi_motion.protocol import SCHEMA, envelope, validate, validate_descriptor
 
 
@@ -45,6 +48,8 @@ class MotionControl:
         self._finish_auth = None
         self._finish_cancel = threading.Event()
         self._last_joint = None
+        clock_file = Path("/proc/sys/kernel/random/boot_id")
+        self.clock_id = clock_file.read_text().strip() if clock_file.exists() else None
 
     @property
     def versions(self):
@@ -105,13 +110,13 @@ class MotionControl:
         versions = self.versions if self.solver else {'model_version': profile.get('urdf_sha256'),
             'calibration_version': self.executor.profile_sha256, 'frame': profile.get('torso_frame')}
         result = {'control_interface': SCHEMA, 'schema': SCHEMA, 'protocol_version': 2,
-            'mode': mode, 'dof': 14, **versions,
+            'mode': mode, 'dof': 14, 'force_torque': None, **versions,
             'units': {'position': 'm', 'orientation': 'xyzw', 'time': 's'} if mode == 'eef_pose'
                      else {'angle': 'rad', 'time': 's'},
             'groups': [{'name': 'arm_'+suffix, 'offset': offset, 'count': 7,
                 'mode': mode, 'unit': 'pose' if mode == 'eef_pose' else 'rad', 'resource': 'arm_'+suffix}
                 for suffix, offset in (('l', 0), ('r', 7))],
-            'rate': {'max_hz': 50, 'expected_hz': 50, 'watchdog_ms': 300 if mode == 'eef_pose' else 100}}
+            'rate': {'max_hz': 50, 'expected_hz': 50, 'watchdog_ms': 300}}
         if mode == 'eef_pose':
             result['effector_ids'] = ['left', 'right']
         else:
@@ -145,11 +150,16 @@ class MotionControl:
             self._closed.set()
             self._wake.set()
             workers = (self._worker, self._finish_thread)
+        numerical = self.solver if isinstance(self.solver, NumericalWorker) else None
+        if numerical:numerical.interrupt()
         for worker in workers:
             if worker and worker is not threading.current_thread():
                 worker.join(.5)
         if any(worker and worker.is_alive() for worker in workers):
             raise RuntimeError('motion_control_thread_stop_unconfirmed')
+        if numerical:
+            numerical.close()
+            self.solver = None
         with self._lock:
             if self._worker is workers[0]:
                 self._worker = None
@@ -189,15 +199,16 @@ class MotionControl:
     def _solver_for(self, path, cfg=None):
         factory = self.solver_factory
         if factory is None:
-            from tianyi_motion.kinematics import TianyiIK
-            factory = TianyiIK
+            factory = lambda path: NumericalWorker(path, (self.cfg if cfg is None else cfg).get('joint_velocity_rad_s'))
         solver = factory(path)
         if solver.hands_enabled:
+            if isinstance(solver, NumericalWorker):solver.close()
             raise ValueError('motion_control_requires_arms_only')
         cfg = self.cfg if cfg is None else cfg
         velocity = cfg.get('joint_velocity_rad_s', solver.velocity)
         if (type(velocity) not in (int, float) or not math.isfinite(velocity)
                 or not 0 < velocity <= min(1.5, float(min(solver.model.velocityLimit)))):
+            if isinstance(solver, NumericalWorker):solver.close()
             raise ValueError('joint_velocity_limit')
         solver.velocity = float(velocity)
         return solver
@@ -218,6 +229,7 @@ class MotionControl:
             profile, limits, digest = load_profile(path)
             solver = self._solver_for(path, candidate)
             if solver.profile_sha256 != digest:
+                if isinstance(solver, NumericalWorker):solver.close()
                 raise ValueError('calibration_changed_during_load')
             with self._lock:
                 self.cancel_pending()
@@ -228,7 +240,9 @@ class MotionControl:
                 self.executor._fixed_baseline = None
                 self.gate.limits, self.gate.velocity = limits, solver.velocity
                 self.gate.hands_enabled = False
-                self.solver = None  # A new actual-state calibration is still required.
+                old_solver, self.solver = self.solver, None  # Requires actual-state calibration.
+                if isinstance(old_solver, NumericalWorker):old_solver.close()
+                if isinstance(solver, NumericalWorker):solver.close()
                 self._snapshot = None
                 self._visualization = {'schema': 'motus.tianyi-visualization.v1',
                                        'available': False, 'reason': 'calibration_required'}
@@ -249,13 +263,19 @@ class MotionControl:
                 raise ValueError('calibration_missing')
             solver = self._solver_for(path)
             if solver.profile_sha256 != self.executor.profile_sha256:
+                if isinstance(solver, NumericalWorker):solver.close()
                 raise ValueError('executor_calibration_mismatch')
-            _, q = self._fresh()
-            solver.self_test(q)
+            try:
+                _, q = self._fresh()
+                solver.self_test(q)
+            except Exception:
+                if isinstance(solver, NumericalWorker):solver.close()
+                raise
             with self._lock:
                 self.cancel_pending()
                 self._preview = None
-                self.solver = solver
+                old_solver, self.solver = self.solver, solver
+                if isinstance(old_solver, NumericalWorker):old_solver.close()
                 # Constructor validates this against the actual URDF limits.
                 self.gate.velocity = solver.velocity
             self._refresh_snapshot()
@@ -268,6 +288,22 @@ class MotionControl:
             solver = self.solver
             versions = self.versions if solver is not None else None
         if solver is None:
+            return
+        if isinstance(solver, NumericalWorker):
+            state = self.gate.status()
+            rendered = solver.render(state,
+                {'state': self._decision.get('state', state['state']), 'code': self._decision.get('reason')},
+                bool(self._live_session and self.gate.session_id), generation)
+            with self._lock:
+                if generation != self._generation or solver is not self.solver:
+                    return
+                if rendered['poses'] is not None:
+                    stamp = state['feedback']['arm_ns']
+                    if not self._snapshot or self._snapshot['monotonic_ns'] != stamp:
+                        self._state_seq += 1
+                    self._snapshot = {'poses': rendered['poses'], **versions,
+                                      'state_seq': self._state_seq, 'monotonic_ns': stamp}
+                self._visualization = rendered['visualization']
             return
         from scipy.spatial.transform import Rotation
         from tianyi_motion.tianyi_visualization import snapshot
@@ -300,7 +336,8 @@ class MotionControl:
                 self.cancel_pending()
                 self._preview = None
                 self._decision = {'state': 'hold', 'reason': 'preview_revoked_by_execution'}
-            data = {'control_interface': self.control_interface(),
+            data = {'schema': 'motus.motion.feedback/1', 'clock_id': self.clock_id,
+                'control_interface': self.control_interface(),
                 'control_interfaces': {'joints': self.control_interface('joint_position')},
                 'eef_snapshot': copy.deepcopy(self._snapshot), 'visualization': copy.deepcopy(self._visualization),
                 'control_decision': copy.deepcopy(self._decision), 'finish': copy.deepcopy(self._finish),
@@ -398,9 +435,11 @@ class MotionControl:
         if (action in ('stop', 'release', 'pause') and self._finish_auth
                 and self._authorized(args, self._finish_auth)
                 and self.gate.session_id == self._live_session
-                and self._finish_thread and self._finish_thread.is_alive()):
-            # The return worker may rotate its internal lease. The original
-            # accepted finish credentials can only cancel that same operation.
+                and (self._finish.get('state') == 'error'
+                     or self._finish_thread and self._finish_thread.is_alive())):
+            # The return worker may rotate its internal lease. Its original
+            # credentials must still STOP that operation after worker failure;
+            # a new owner/claim clears this identity and cannot be affected.
             self._finish_cancel.set()
             args = self._lease()
         previous_session = self._live_session
@@ -410,6 +449,10 @@ class MotionControl:
             if action not in ('claim', 'resume') or result.get('session_id') != previous_session:
                 self.cancel_pending()
             self._preview = None
+            if action == 'prepare_operator_session':
+                # A new, output-free operator session supersedes the old
+                # completed return, even if no grip/claim follows preparation.
+                with self._lock:self._finish_auth = None
             if action in ('stop', 'release'):
                 self._finish_cancel.set()
             if action == 'stop':
@@ -443,8 +486,9 @@ class MotionControl:
                 self.cancel_pending()
                 # A clutch establishes a different target frame. Retire the
                 # old epoch's display and numerical seed as well as its queue.
-                self.solver.visualization_sample = None
-                self.solver.last_valid_visualization = None
+                if not isinstance(self.solver, NumericalWorker):
+                    self.solver.visualization_sample = None
+                    self.solver.last_valid_visualization = None
                 self._visualization = {**self._visualization, 'ik': [], 'held_ik': [], 'targets': []}
             self._last_seq, self._last_epoch = body['seq'], body['mapping_epoch']
             self._pending = (body, lease, self._generation, bool(self._preview))
@@ -466,7 +510,7 @@ class MotionControl:
             old = dict(protocol=PROTOCOL, boot_id=body['boot_id'], session_id=body['session_id'],
                 seq=body['seq'], generated_ns=body['generated_ns'], valid_for_ms=ttl,
                 q=body['values'], hands=[0., 0.])
-            accepted = self.gate.accept({**old, 'mac': sign(old, lease['secret'])})
+            accepted = self.gate.accept({**old, 'mac': sign(old, lease['secret'])}, max_valid_for_ms=300, motion_command=body)
             if accepted:
                 self._last_joint = body
             return accepted
@@ -487,8 +531,21 @@ class MotionControl:
         # A joint target is produced now, but cannot outlive its source input.
         command = envelope(lease, seq=self._joint_seq, source_seq=body['source_seq'],
             mapping_epoch=body['mapping_epoch'], generated_ns=now,
-            valid_until_ns=min(body['valid_until_ns'], now+100_000_000),
+            valid_until_ns=body['valid_until_ns'],
             mode='joint_position', values=q, **self.versions)
+        proof = getattr(self.solver, 'last_envelope', None)
+        if not isinstance(proof, dict):
+            raise ValueError('motion_envelope_missing')
+        state, _ = self._fresh()
+        from tianyi_motion.envelope import IDENTITY, MotionEnvelope
+        record = {**{key: command[key] for key in IDENTITY},
+                  'schema': 'motus.motion.envelope/1',
+                  **copy.deepcopy(proof)}
+        checked = MotionEnvelope.from_record(record, dof=14)
+        previous = state.get('commanded_q') or state['feedback']['q']
+        if not checked.contains(state['feedback']['q']) or not checked.contains(previous):
+            raise ValueError('motion_envelope_stale_start')
+        self.executor.install_motion_envelope(record)
         self.executor.publish_joint_command(command)
         return command
 
@@ -496,10 +553,10 @@ class MotionControl:
         with self._lock:
             work, self._pending = self._pending, None
         if work is None:
+            self._refresh_snapshot()
             return False
         body, lease, generation, preview = work
         try:
-            from tianyi_motion.kinematics import transform
             state, q = self._fresh()
             if not preview and state['state'] == 'hold' and (
                     not state.get('continuation_ready') or
@@ -508,19 +565,37 @@ class MotionControl:
                     self._decision = {'state': 'hold', 'reason': 'waiting_fresh_input_after_hold',
                                       'source_seq': body['source_seq'], 'seq': body['seq']}
                 return False
-            values = body['values']
-            targets = [transform({'position': values[i:i+3], 'orientation': values[i+3:i+7]})
-                       for i in (0, 7)]
-            result = self.solver.solve(targets, q, state.get('commanded_q'),
-                deadline_monotonic=body['valid_until_ns']/1e9)
+            if isinstance(self.solver, NumericalWorker):
+                result = self.solver.solve_frame(body, state, generation)
+            else:  # Explicit in-process solver injection for deterministic unit tests.
+                from tianyi_motion.kinematics import transform
+                values = body['values']
+                targets = [transform({'position': values[i:i+3], 'orientation': values[i+3:i+7]})
+                           for i in (0, 7)]
+                result = self.solver.solve(targets, q, state.get('commanded_q'),
+                    deadline_monotonic=body['valid_until_ns']/1e9)
+                self.solver.last_envelope['measured_ns'] = state['feedback']['arm_ns']
+            result = vector(result, 14, 'ik_q')
             with self._lock:
                 if (generation != self._generation or body['mapping_epoch'] != self._last_epoch
                         or lease != self._lease()):
-                    self.solver.visualization_sample = None
-                    self.solver.last_valid_visualization = None
+                    if not isinstance(self.solver, NumericalWorker):
+                        self.solver.visualization_sample = None
+                        self.solver.last_valid_visualization = None
                     return False
                 if self.gate.clock() >= body['valid_until_ns']:
                     raise ValueError('command_expired')
+                # The physical state can change while the worker is solving.
+                # Recheck the ORIGINAL EEF timestamp, not the new joint packet
+                # timestamp, against a hold confirmed during computation.
+                current, _ = self._fresh()
+                if not preview:
+                    if current['state'] == 'hold' and (
+                            not current.get('continuation_ready') or
+                            body['generated_ns'] < (current.get('hold_confirmed_ns') or 2**63)):
+                        raise ValueError('waiting_fresh_input_after_hold')
+                    if current['state'] not in ('ready', 'active', 'hold'):
+                        raise ValueError('motion_not_armed')
                 if preview:
                     self._preview_state = 'active'
                 else:
@@ -533,6 +608,8 @@ class MotionControl:
         except (ValueError, RuntimeError) as exc:
             with self._lock:
                 if generation == self._generation:
+                    if str(exc).startswith('ik_worker_'):
+                        self.cancel_pending()  # Inputs queued before restart cannot execute.
                     self._decision = {'state': 'hold', 'reason': str(exc), 'seq': body['seq'],
                         'source_seq': body['source_seq'], 'monotonic_ns': self.gate.clock()}
                     if not preview and self.gate.session_id == lease['session_id']:
@@ -550,10 +627,27 @@ class MotionControl:
             self._wake.wait(.02)
             self._wake.clear()
             try:
-                if not self.process_latest():
-                    self._refresh_snapshot()
+                # process_latest refreshes both idle and processed input. A
+                # False result also covers IK failure/hold, already refreshed
+                # by its finally block; rendering it twice delays fresh input.
+                self.process_latest()
             except Exception as exc:
                 with self._lock:
+                    if str(exc).startswith('ik_worker_'):
+                        self.cancel_pending()
+                        # Rendering uses the same numerical child as IK. A
+                        # failed idle/display RPC must preserve recoverable
+                        # hold too, otherwise its restart outlasts the ordinary
+                        # command-timeout window and retires a healthy session.
+                        # Never turn an explicit pause/release/fault into resume.
+                        state = self.gate.status()
+                        if (self._live_session and state.get('session_id') == self._live_session
+                                and not self.gate.release_requested
+                                and (state['state'] in ('ready', 'active')
+                                     or (state['state'] == 'hold' and state.get('reason') in
+                                         ('command_timeout', 'command_expired', 'ik_recoverable')))):
+                            try:self.gate.hold('ik_recoverable', recoverable=True)
+                            except ValueError:pass
                     self._decision = {'state': 'error', 'reason': str(exc)[:160] or type(exc).__name__,
                                       'error_type': type(exc).__name__}
 
@@ -563,11 +657,21 @@ class MotionControl:
                 if not self._authorized(args, self._finish_auth or self._lease()):
                     raise ValueError('invalid_lease')
                 return copy.deepcopy(self._finish)
+            if (not self._preview and self._finish_auth and not self.gate.session_id
+                    and self._finish.get('return_completed') is True
+                    and self._finish.get('authority_released') is True):
+                # A reply may be lost after the worker released its lease. Keep
+                # this receipt for that authenticated operation, rather than
+                # replacing it with a new no-motion operation or returning again.
+                # A successful new claim/resume clears _finish_auth below.
+                if not self._authorized(args, self._finish_auth):raise ValueError('invalid_lease')
+                return copy.deepcopy(self._finish)
             if self._preview:
                 if not self._authorized(args, self._preview):
                     raise ValueError('invalid_lease')
                 self.cancel_pending()
                 self._preview = None
+                self._finish_auth = None
                 self._finish = {'state': 'idle', 'return_completed': True, 'authority_released': True,
                                 'preview': True, 'operation_id': secrets.token_hex(16)}
                 return dict(self._finish)
@@ -576,6 +680,7 @@ class MotionControl:
             if self.gate.session_id and not (retry_authorized or self._authorized(args, self._lease())):
                 raise ValueError('invalid_lease')
             if not self._used_live:
+                if args.get('session_id') or args.get('secret'):raise ValueError('invalid_lease')
                 self._finish = {'state': 'idle', 'return_completed': True, 'authority_released': True,
                     'motion_requested': False, 'operation_id': secrets.token_hex(16)}
                 return dict(self._finish)
@@ -588,6 +693,43 @@ class MotionControl:
             self._finish_thread.start()
             return dict(self._finish)
 
+    def _return_claim_or_resume(self, action, deadline):
+        # A latched hold receipt and a newer velocity sample need not agree.
+        # Wait for the existing gate to accept fresh stationary feedback rather
+        # than aborting the return or rotating/releasing its lease on one sample.
+        until = min(deadline, time.monotonic()+2.5)
+        result = None
+        while time.monotonic() < until:
+            if self._finish_cancel.is_set():raise ValueError('return_cancelled')
+            if not self._management_lock.acquire(timeout=.02):continue
+            try:
+                if self._finish_cancel.is_set():raise ValueError('return_cancelled')
+                result = self.executor.dispatch(action, self._lease() if action == 'resume' else {})
+                if not result.get('error'):
+                    self._live_session = result['session_id']
+                    return result
+                if result.get('code') != 'robot_not_stopped':return result
+            finally:
+                self._management_lock.release()
+            time.sleep(.02)
+        if result is not None:return result
+        raise ValueError('return_timeout')
+
+    def _wait_return_hold(self, deadline, *, explicit_retry=False):
+        """An explicit return waits for physical hold, never fabricates its receipt."""
+        until = min(deadline, time.monotonic()+2.5)
+        while time.monotonic() < until:
+            if self._finish_cancel.is_set():raise ValueError('return_cancelled')
+            state = self.gate.status()
+            if state['session_id'] != self._live_session:raise ValueError('invalid_lease')
+            if state['state'] == 'fault':
+                if explicit_retry and state['stop_confirmed']:return
+                raise ValueError('return_driver_fault')
+            if self.gate.release_requested:raise ValueError('return_cancelled')
+            if state['hold_confirmed']:return
+            time.sleep(.02)
+        raise ValueError('stop_unconfirmed')
+
     def _return_arms(self):
         import numpy as np
         deadline = time.monotonic()+45.
@@ -596,18 +738,22 @@ class MotionControl:
             solver = self.solver
             if solver is None or solver.hands_enabled:
                 raise ValueError('return_requires_calibrated_arms_only')
-            lower = solver.model.lowerPositionLimit[solver.indices]
-            upper = solver.model.upperPositionLimit[solver.indices]
+            if isinstance(solver, NumericalWorker):
+                lower, upper = np.asarray(solver.lower), np.asarray(solver.upper)
+            else:
+                lower = solver.model.lowerPositionLimit[solver.indices]
+                upper = solver.model.upperPositionLimit[solver.indices]
             if np.any(lower > 0) or np.any(upper < 0):
                 raise ValueError('neutral_outside_limits')
             if not self.gate.session_id:
                 prepared = self.executor.dispatch('prepare_operator_session', {})
                 if prepared.get('error'):raise ValueError(prepared['code'])
-                result = self.executor.dispatch('claim', {})
+                result = self._return_claim_or_resume('claim', deadline)
                 if result.get('error'):raise ValueError(result['code'])
                 self._live_session = result['session_id']
             elif self.gate.state in ('hold', 'fault'):
-                result = self.executor.dispatch('resume', self._lease())
+                self._wait_return_hold(deadline, explicit_retry=True)
+                result = self._return_claim_or_resume('resume', deadline)
                 if result.get('error'):
                     # An explicit retry may reconcile a previously latched
                     # fault, but only after fresh physical stop and release.
@@ -623,13 +769,31 @@ class MotionControl:
                         raise ValueError('stop_unconfirmed')
                     prepared = self.executor.dispatch('prepare_operator_session', {})
                     if prepared.get('error'):raise ValueError(prepared['code'])
-                    result = self.executor.dispatch('claim', {})
+                    result = self._return_claim_or_resume('claim', deadline)
                     if result.get('error'):raise ValueError(result['code'])
                 self._live_session = result['session_id']
             self._last_epoch = max(0, self._last_epoch)
             while time.monotonic() < deadline:
                 if self._finish_cancel.is_set():raise ValueError('return_cancelled')
-                state, q = self._fresh()
+                state = self.gate.status()
+                if state['state'] == 'fault':raise ValueError('return_driver_fault')
+                if state['state'] == 'hold':
+                    # The explicit return remains pending across a transient
+                    # feedback/command hold. Resume only after its real receipt;
+                    # solve a NEW step from current joints, never replay one.
+                    self._wait_return_hold(deadline)
+                    resumed = self._return_claim_or_resume('resume', deadline)
+                    if resumed.get('error'):raise ValueError(resumed['code'])
+                    self._live_session = resumed['session_id']
+                    continue
+                try:
+                    state, q = self._fresh()
+                except ValueError as exc:
+                    if str(exc) != 'arm_feedback_stale':raise
+                    # No solve/publication from stale joints. The independent
+                    # gate enforces hold/fault; the overall return deadline stays.
+                    time.sleep(.02)
+                    continue
                 q = np.asarray(q)
                 dq = np.asarray(state['feedback']['dq'])
                 if state['state'] == 'fault':raise ValueError('return_driver_fault')
@@ -651,20 +815,18 @@ class MotionControl:
                         raise ValueError('stop_unconfirmed')
                 else:
                     settled = None
-                if state['state'] == 'hold':
-                    if not state['hold_confirmed'] or not state.get('continuation_allowed'):
-                        raise ValueError('return_driver_hold:'+str(state.get('reason')))
                 previous = np.asarray(state.get('commanded_q') or q.tolist())
-                step = previous+np.clip(-previous, -solver.velocity*.02, solver.velocity*.02)
-                step = np.clip(step, q-solver.velocity*.2, q+solver.velocity*.2)
-                step = np.clip(step, lower, upper)
                 cycle = min(deadline, time.monotonic()+.1)
                 def budget():
                     if self._finish_cancel.is_set():raise ValueError('return_cancelled')
                     if time.monotonic() >= cycle:raise ValueError('return_geometry_timeout')
-                with solver.lock:
-                    solver._safe_transition(q, step, budget)
-                    solver._safe_transition(previous, step, budget)
+                if isinstance(solver, NumericalWorker):
+                    step = np.asarray(solver.return_step(q, previous, cycle, state['feedback']['arm_ns']))
+                else:
+                    step = np.zeros_like(q)
+                    with solver.lock:
+                        solver.last_envelope = {**solver.motion_envelope(q, previous, step, budget),
+                            'measured_ns': state['feedback']['arm_ns']}
                 with self._lock:
                     budget()
                     now = self.gate.clock()

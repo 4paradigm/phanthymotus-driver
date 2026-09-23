@@ -94,6 +94,7 @@ def arm_chain_xml(model_bytes, torso, names):
 
 
 class TianyiIK(ArmWorkspace):
+    velocity_limit = 1.5
     def __init__(self, calibration_path):
         import pinocchio as pin
         from scipy.optimize import least_squares
@@ -163,6 +164,58 @@ class TianyiIK(ArmWorkspace):
                 continue
             return trial,scale
         raise failure if failure is not None else ValueError('joint_limit')
+
+    def motion_envelope(self, measured, previous, target, budget=lambda: None):
+        measured, previous, target = (finite(v, (14,)) for v in (measured, previous, target))
+        lower = self.model.lowerPositionLimit[self.indices]
+        upper = self.model.upperPositionLimit[self.indices]
+        lead = self.velocity*POSITION_LEAD_SECONDS
+        def trial(horizon):
+            near = previous+np.clip(target-previous, -self.velocity*horizon, self.velocity*horizon)
+            return np.clip(np.clip(near,measured-lead,measured+lead),lower,upper)
+        def prove(near,check,padding=0.):
+            lo = np.minimum(np.minimum(measured,previous),near)
+            hi = np.maximum(np.maximum(measured,previous),near)
+            if np.any(lo < lower) or np.any(hi > upper):
+                raise ValueError('motion_envelope_joint_limit')
+            # Prove the complete independent joint box, including any rounding
+            # or feedback padding. Tolerance is never added by the arm thread.
+            lo=np.maximum(lower,np.nextafter(lo-padding,-np.inf))
+            hi=np.minimum(upper,np.nextafter(hi+padding,np.inf))
+            self._safe_transition(lo,hi,check)
+            check()
+            return {'lower':lo.tolist(),'upper':hi.tolist()}
+        # Frozen r4 proves a 20 ms step and backs it off near a boundary. Start
+        # there, rather than rejecting a valid short advance merely because a
+        # much larger box toward the complete IK reference intersects the body.
+        near,self.last_advance_scale=self._safe_advance(measured,previous,trial(.02),budget)
+        proof=prove(near,budget)
+        # A larger proved region lets 20 Hz inputs progress on the independent
+        # execution clock. Expansion is optional, bounded and cannot replace a
+        # successful short proof with collision/timeout. Full IK stays intact.
+        expansion_end=time.monotonic()+.010
+        def expand_budget():
+            if time.monotonic() >= expansion_end:raise ValueError('envelope_expansion_budget')
+            budget()
+        for horizon in (.2,.1,.05,.025):
+            try:
+                candidate=prove(trial(horizon),expand_budget)
+                proof=candidate
+                near=trial(horizon)
+                break
+            except WorkspaceViolation:
+                continue
+            except ValueError as exc:
+                if str(exc)=='envelope_expansion_budget':break
+                raise
+        try:
+            proof=prove(near,expand_budget,padding=.002)
+        except WorkspaceViolation:
+            pass
+        except ValueError as exc:
+            if str(exc)!='envelope_expansion_budget':raise
+        budget()
+        return proof
 
     def palms(self,q):
         with self.lock:
@@ -258,17 +311,11 @@ class TianyiIK(ArmWorkspace):
             check_budget()
             if any(np.linalg.norm(a[:3,3]-b[:3,3])>0.015 or np.linalg.norm(a[:3,:3]-b[:3,:3])>0.15 for a,b in zip(actual,targets)):
                 raise ValueError('ik_target_unreachable')
-            # Immutable display snapshot is the full IK result, before rate limiting.
+            # Publish the complete IK reference. The arm owns execution timing.
+            # A separate, conservatively proved box grants only near-term travel.
             preview_q=q.copy()
-            # Slew from the last command while bounding outstanding physical travel
-            # to 200 ms of configured speed. This is travel, not command TTL.
-            # Validate the entire independently interpolated joint box.
             previous=measured if commanded is None else finite(commanded,(14,))
-            # Preserve the validated fixed 20 ms command increment.
-            q=previous+np.clip(q-previous,-self.velocity*.02,self.velocity*.02)
-            q=np.clip(q,measured-self.velocity*POSITION_LEAD_SECONDS,measured+self.velocity*POSITION_LEAD_SECONDS)
-            q=np.clip(q,lower,upper)
-            q,self.last_advance_scale=self._safe_advance(measured,previous,q,check_budget)
+            self.last_envelope = self.motion_envelope(measured, previous, q, check_budget)
             self.last_ms=(time.monotonic()-begin)*1000
             if self.last_ms>100:raise ValueError('ik_timeout')
             self.visualization_sample={'monotonic_ns':time.monotonic_ns(),

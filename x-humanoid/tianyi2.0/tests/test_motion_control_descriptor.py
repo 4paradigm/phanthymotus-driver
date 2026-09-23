@@ -57,7 +57,7 @@ BAD_FIELDS = [
     (('joint_names',), []),
     (('rate', 'max_hz'), 60),
     (('rate', 'expected_hz'), 20),
-    (('rate', 'watchdog_ms'), 300),
+    (('rate', 'watchdog_ms'), 200),
     (('rate', 'max_hz'), float('nan')),
     (('rate', 'max_hz'), 10**400),
     (('rate', 'expected_hz'), True),
@@ -117,7 +117,7 @@ def test_required_fields_cannot_be_omitted(chain, mode, field):
 ])
 def test_eef_has_pose_contract_not_joint_metadata(chain, path, replacement):
     good = chain.c.control_interface('eef_pose')
-    assert 'joint_names' not in good and 'limits' not in good and 'force_torque' not in good
+    assert 'joint_names' not in good and 'limits' not in good and good['force_torque'] is None
     validate_descriptor(good, good)
     bad = copy.deepcopy(good)
     set_field(bad, path, replacement)
@@ -133,7 +133,7 @@ def test_start_allows_extensions_and_equal_numeric_capabilities(cards, tool):
     value.update(display_name='future optional field', force_torque=None)
     value['groups'][0]['display_name'] = 'left'
     value['units']['display_hint'] = 'radians'
-    value['rate'].update(max_hz=50.0, expected_hz=50.0, watchdog_ms=100.0, extension=True)
+    value['rate'].update(max_hz=50.0, expected_hz=50.0, watchdog_ms=300.0, extension=True)
     value['limits'].update(lower=[-2]*14, upper=[2]*14, max_velocity=[1]*14, extension=True)
     assert target.dispatch('start', {'control_interface': value})['state'] == 'ready'
     assert not cards.e.gate.session_id and not cards.p.writes

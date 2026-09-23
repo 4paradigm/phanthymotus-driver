@@ -603,31 +603,45 @@ class TianyiDeviceBundle:
             print("[bundle] LightPlugin loaded")
 
         self._teleop = None
-        if cfg.get("teleop", {}).get("enabled", False) or cfg.get('motion_control', {}).get('enabled', False):
+        control_cfg = cfg.get('teleop_control', {})
+        control_enabled = control_cfg.get('enabled', False)
+        if control_enabled or cfg.get("teleop", {}).get("enabled", False) or cfg.get('motion_control', {}).get('enabled', False):
             from teleop_executor import TeleopExecutor
             from device import ArmPlugin, HandPlugin
             arm = next((p for p in self._plugins if isinstance(p, ArmPlugin)), None)
             hand = next((p for p in self._plugins if isinstance(p, HandPlugin)), None)
             teleop_cfg = dict(cfg.get('teleop', {}))
+            if control_enabled:
+                teleop_cfg.update(live_enabled=control_cfg.get('mode', 'shadow') == 'live',
+                                  operator_session_enabled=control_cfg.get('mode', 'shadow') == 'live')
+                if control_cfg.get('calibration_path'):
+                    teleop_cfg['calibration_path'] = control_cfg['calibration_path']
             if cfg.get('motion_control', {}).get('calibration_path'):
                 teleop_cfg['calibration_path'] = cfg['motion_control']['calibration_path']
             self._teleop = TeleopExecutor(teleop_cfg, namespace, ros2, arm, hand, self._plugins)
             if teleop_cfg.get('live_enabled') is True:
                 # Only a successfully loaded, explicitly arms-only profile
                 # permits the new controller to run without a hand card.
-                arms_only = (cfg.get('motion_control', {}).get('enabled', False)
+                arms_only = ((control_enabled or cfg.get('motion_control', {}).get('enabled', False))
                              and (self._teleop.profile or {}).get('hands_enabled') is False)
                 if arm is None or (hand is None and not arms_only):
                     raise ValueError("live teleop requires arm and hand plugins unless motion_control has a validated arms-only profile")
-            self._plugins.append(self._teleop)
-            if cfg.get('motion_control', {}).get('enabled', False):
+            if not control_enabled or cfg.get('teleop', {}).get('enabled', False):
+                self._plugins.append(self._teleop)
+            if control_enabled or cfg.get('motion_control', {}).get('enabled', False):
                 from motion_control import MotionControl
                 if arm is None:
                     raise ValueError('motion_control requires arm plugin')
-                controller = MotionControl(cfg['motion_control'], self._teleop)
+                controller = MotionControl(control_cfg if control_enabled else cfg['motion_control'], self._teleop)
                 self._teleop.motion_control = controller
                 arm._motion_control = controller
-                self._plugins.append(controller)
+                if control_enabled:
+                    from teleop_control import TeleopControl
+                    control = TeleopControl(control_cfg, controller)
+                    self._teleop.teleop_control = control
+                    self._plugins.append(control)
+                else:
+                    self._plugins.append(controller)
 
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
     _ALWAYS_START = {
@@ -873,7 +887,7 @@ def make_handler():
                     ok({"tools": _bundle.get_all_tools()})
                 elif method == "tools/call":
                     name   = params.get("name", "")
-                    if name in ("teleop_executor", "motion_control"):
+                    if name in ("teleop_executor", "motion_control", "teleop_control"):
                         import ipaddress
                         if self.headers.get("Origin") or not ipaddress.ip_address(self.client_address[0]).is_loopback:
                             err(-32600, "teleop executor requires loopback")
@@ -891,7 +905,7 @@ def make_handler():
                         }
                         if (isinstance(result, dict)
                                 and (result.get("state") == "error"
-                                     or "error" in result)):
+                                     or bool(result.get("error")))):
                             tool_result["isError"] = True
                         ok(tool_result)
                 else:

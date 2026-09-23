@@ -6,6 +6,8 @@ Hardware drivers for the **[Phanthy Motus](https://github.com/4paradigm/phanthym
 
 Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server that exposes hardware capabilities as tools. Drivers automatically register with the [Phanthy Motus Agent Core](https://github.com/4paradigm/phanthymotus) on startup.
 
+天轶遥操候选已简化为 PICO `teleop_device` → 天轶 `teleop_control` 两张 Driver 卡片，Core/ActuCore 零改动。使用与验收状态见[双 Driver 契约](docs/plans/tianyi-teleop-control.md)；离线及构建结果不代表真机通过。
+
 ## Available Drivers
 
 | Driver | Hardware | Port | Description |

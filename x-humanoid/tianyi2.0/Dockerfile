@@ -2,7 +2,8 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
-ARG UBUNTU_PORTS_MIRROR=
+# The robot build host is outside Tencent VPC; normal build.sh needs a public apt source.
+ARG UBUNTU_PORTS_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
 
 WORKDIR /work
 
@@ -57,11 +58,11 @@ ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/lyre
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py device.py servo.py joints_bridge.py light.py nav_client.py ext_devices.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py /work/
-COPY motion_stream.py teleop_executor.py motion_control.py dds-local.xml /work/
+COPY motion_stream.py teleop_executor.py motion_control.py teleop_control.py dds-local.xml /work/
 COPY tianyi_motion/ /work/tianyi_motion/
 COPY dds-local.xml /opt/phanthy-motus/
 COPY deploy/     /deploy/
-RUN bash -c 'source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /tianyi_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk; from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus, CmdSetMotorPosition; from teleop_executor import TeleopExecutor; from motion_control import MotionControl; import pinocchio, scipy; from main import TianyiDeviceBundle"'
+RUN bash -c 'source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && source /tianyi_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk; from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus, CmdSetMotorPosition; from teleop_executor import TeleopExecutor; from motion_control import MotionControl; from teleop_control import TeleopControl; import pinocchio, scipy; from main import TianyiDeviceBundle"'
 RUN mkdir -p /opt/phanthy-motus/data/maps
 
 EXPOSE 15707

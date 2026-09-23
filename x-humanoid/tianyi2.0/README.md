@@ -1,31 +1,30 @@
 # Tianyi 2.0 Pro Driver
 
-> 遥操说明对应历史三卡实现 `86de168`，不是当前设备部署状态。后续四卡职责与验收以[天轶双臂契约](../../docs/plans/tianyi-dual-arm-motion-contract.md)为准：设备连接归ext_vr，motion反馈直达teleop/ext_vr；新方案尚待实现和验收。
+> 当前候选采用两个 Driver 卡片：PICO `teleop_device` → 天轶 `teleop_control`。Agent Core / ActuCore 不改动；本地测试、DDS 集成、镜像构建和真机验收分别记录。实现依据为[双 Driver 契约](../../docs/plans/tianyi-teleop-control.md)，本说明不表示已经部署或通过真机验收。
 
 Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
-## 三段遥操与旧执行接口
+## 双 Driver 遥操
 
-新遥操在同一 Canvas 连接 `teleop → motion_control → arm`：普通 ActuCore
-内的 `teleop` 负责 PICO 配对、双握把和相对末端映射；本 Driver 的
-`motion_control` 负责天轶模型、IK、碰撞检查、可视化及显式结束收臂；
-现有 `arm` 增加连续关节入口，复用位置发布与共享执行权。
-不会启动第二个 ActuCore，也没有 Driver 内的 PICO 服务。
+Canvas 只连接 `teleop_device → teleop_control`；反向状态 topic 由同一设备实例派生，
+无需额外反馈边。PICO Driver 负责安装、配对、采集与设备状态；本 Driver 负责双握把
+使能、一次性相对映射、天轶 IK/碰撞与现有 arm 的持续位置执行。首版仅双臂，手、腿、
+底盘不在此入口执行。不存在第二个 ActuCore 或额外遥操核心服务。
 
-新入口显式启用 `motion_control.enabled`，默认关闭。Canvas 开启智能控制
-只准备链路；PICO 开始遥操后才准备操作会话，握把使能才获取执行权。
-Preview 只求解和显示，独立凭据不能进入 arm 硬件入口；结束或项目关闭
-请求 Driver 收臂并等待实测停止/释放，断开头显不会取消已经受理的收臂。
+`teleop_control.enabled` 注册卡片，默认 Shadow。齿轮中设置模式、标定文件、位移比例
+和速度；Canvas 开启只准备接口，PICO **开始遥操**才建立操作会话。模型冷准备完成后
+取最新有效输入与实测 FK 建立一次映射；松握保持、重握处理下一有效帧，**不重置映射**。
+执行租约重建也保留映射；空间重置要求显式重新标定。
 
-旧 `teleop_executor` / `motus.motion-target.v1` 继续兼容旧 ActuCore 的关节输出，
-原动作、servo 和新流共用同一个 MotionGate，不能并行写同一执行器。
-参见[三段接口与使用说明](MOTION_CONTROL.md)、[旧执行协议](TELEOP.md)和
-[构建部署说明](deploy/TELEOP_RUNBOOK.md)。`388fe78` 已部署为 Shadow（Live 关闭），
-真实 ROS 预览链收到 45 帧末端输入、44 个关联决策及 190 帧反馈，ActuCore 收到 IK
-显示数据；关节输出及厂商 `cmd_pos` / `cmd_ctrl` 命令均为零，Preview 释放成功。
-这不是物理跟随验收；后续 bus 异常帧与日志修复仅完成离线验证，尚未部署。
+PICO **结束并收臂**复用自然下垂流程，实测完成后释放。**立即停止**与 Canvas 停止仅
+保持，不追加收臂。IK 工作进程与执行主进程隔离，保留厂商 DDS / 本机 DDS 辅助进程。
+最新目标缓存、操作请求和最终回执互不覆盖；卡片和会话恢复不补播旧帧。
+
+完整配置、协议和离线入口见 [TELEOP_CONTROL.md](TELEOP_CONTROL.md)。旧三卡
+[MOTION_CONTROL.md](MOTION_CONTROL.md) 与 [TELEOP.md](TELEOP.md) 仅供兼容路径参考，
+不作为本次两卡的使用步骤或验收证据。普通 arm、gesture、servo 继续使用现有执行门禁。
 
 ## Head camera snapshot card
 

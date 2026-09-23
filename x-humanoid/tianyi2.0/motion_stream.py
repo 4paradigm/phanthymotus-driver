@@ -15,6 +15,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
+from collections import OrderedDict
 
 PROTOCOL = "motus.motion-target.v1"
 POSITION_LEAD_SECONDS = .2
@@ -95,6 +96,12 @@ class MotionGate:
                             "last_command": None, "last_rejected_command": None,
                             "last_tick_ns": None, "max_tick_gap_ms": 0., "continuations": 0}
         self._checked_feedback = None
+        self._motion_envelopes = OrderedDict()
+        self._motion_command = None
+        self._motion_envelope = None
+        self._continuous_v2 = False
+        self.acceleration = None
+        self._command_velocity = [0.] * 14
 
     def _event(self, code):
         now = self.clock()
@@ -172,6 +179,7 @@ class MotionGate:
         self.seq, self.latest = -1, None
         self.applied_seq = -1
         self.last_q, self.last_emit = q, self.clock()
+        self._command_velocity = [0.] * 14
         self.stop_target = self.stop_sent_ns = None
         self.release_requested = False
         self.output_active = False
@@ -182,6 +190,9 @@ class MotionGate:
         self._continuation = False
         self._continuation_deadline = None
         self._recoverable_hold = False
+        self._motion_envelopes.clear()
+        self._motion_command = self._motion_envelope = None
+        self._continuous_v2 = False
         self.diagnostics = {**self.diagnostics, "first_hold": None, "first_fault": None,
                             "last_fault": None, "last_command": None, "last_rejected_command": None,
                             "continuations": 0}
@@ -203,7 +214,22 @@ class MotionGate:
                 raise ValueError("robot_not_stopped")
             return self._new_session(q)
 
-    def accept(self, packet):
+    def install_motion_envelope(self, record):
+        """Install an internal numerical proof, never a public wire assertion."""
+        from common.motion.envelope import MotionEnvelope
+        proof = MotionEnvelope.from_record(record, dof=14)
+        with self.lock:
+            if (not self.session_id or record['boot_id'] != self.boot_id
+                    or record['session_id'] != self.session_id):
+                raise ValueError('motion_envelope_session')
+            if not proof.matches(record, now_ns=self.clock()):
+                raise ValueError('motion_envelope_expired')
+            self._motion_envelopes[record['seq']] = proof
+            self._motion_envelopes.move_to_end(record['seq'])
+            while len(self._motion_envelopes) > 8:
+                self._motion_envelopes.popitem(last=False)
+
+    def accept(self, packet, *, max_valid_for_ms=100, motion_command=None):
         with self.lock:
             continuing = self._can_continue()
             if not self.session_id or (self.state not in ("ready", "active") and not continuing):
@@ -211,7 +237,10 @@ class MotionGate:
             received = self.clock()
             expired_continuation = False
             foreign_session = False
+            proof = None
             try:
+                if max_valid_for_ms not in (100, 300) or (max_valid_for_ms == 300 and motion_command is None):
+                    raise ValueError('invalid_deadline_policy')
                 if not isinstance(packet, dict) or set(packet) != FIELDS | {"mac"}:
                     raise ValueError("invalid_command_fields")
                 body = {k: v for k, v in packet.items() if k != "mac"}
@@ -232,7 +261,7 @@ class MotionGate:
                     raise ValueError("invalid_deadline")
                 ttl = body["valid_for_ms"]
                 age = self.clock() - body["generated_ns"]
-                if not 1 <= ttl <= 100 or age < 0:
+                if not 1 <= ttl <= max_valid_for_ms or age < 0:
                     raise ValueError("command_expired")
                 q = vector(body["q"], 14, "q")
                 hands = vector(body["hands"], 2, "hands")
@@ -245,6 +274,17 @@ class MotionGate:
                     # without extending the last valid command's wait window.
                     expired_continuation = True
                     raise ValueError("command_expired")
+                if motion_command is not None:
+                    # The coordinator already authenticates v2; bind that exact
+                    # command to the independently issued internal proof here.
+                    proof = self._motion_envelopes.get(body['seq'])
+                    if (not isinstance(motion_command, dict)
+                            or motion_command.get('values') != q
+                            or any(motion_command.get(k) != body[k]
+                                   for k in ('boot_id', 'session_id', 'seq', 'generated_ns'))
+                            or not body['generated_ns'] + ttl*1_000_000 <= motion_command.get('valid_until_ns', 0)
+                            or proof is None or not proof.matches(motion_command, now_ns=self.clock())):
+                        raise ValueError('motion_envelope_unavailable')
                 if continuing:
                     # Do not buffer a packet while waiting for a confirmed hold.
                     # Only a later, still-valid packet can resume the same stream.
@@ -258,6 +298,8 @@ class MotionGate:
                         expired_continuation = True
                         raise ValueError("command_expired")
                     self.state, self.reason = "ready", None
+                    self.last_emit = self.clock()  # No motion credit from the hold interval.
+                    self._command_velocity = [0.] * 14
                     self._continuation = False
                     self._recoverable_hold = False
                     self._stop_confirmed = False
@@ -265,6 +307,9 @@ class MotionGate:
                     self.diagnostics["continuations"] += 1
                 self.seq = body["seq"]
                 self.latest = {**body, "q": q, "hands": hands}
+                self._motion_command = copy.deepcopy(motion_command)
+                self._motion_envelope = proof
+                self._continuous_v2 = motion_command is not None
                 self.lease_deadline = body["generated_ns"] + ttl * 1_000_000
                 self._continuation_deadline = received + self.continuation_timeout_ns
                 self.diagnostics["last_command"] = {
@@ -278,7 +323,10 @@ class MotionGate:
                     "foreign_session": foreign_session,
                     "sequence": packet.get('seq') if isinstance(packet,dict) and type(packet.get('seq')) is int else None}
                 if not foreign_session:
-                    self.hold(str(exc), continuation=expired_continuation)
+                    recoverable = (str(exc) == 'motion_envelope_unavailable'
+                                   and self.state in ('ready', 'active'))
+                    self.hold(str(exc), continuation=expired_continuation,
+                              recoverable=recoverable)
                 raise ValueError(str(exc)) from exc
 
     def hold(self, reason="operator_pause", release=False, *, continuation=False, recoverable=False):
@@ -297,6 +345,8 @@ class MotionGate:
             self._continuation = bool((continuation and self.seq >= 0 or self._recoverable_hold)
                                       and not self.release_requested and self.state != "fault")
             self.latest = None
+            self._command_velocity = [0.] * 14
+            self._motion_command = self._motion_envelope = None
             if self.diagnostics["first_hold"] is None:
                 self.diagnostics["first_hold"] = self._event(reason)
             if self.state not in ("hold", "fault"):
@@ -321,7 +371,7 @@ class MotionGate:
                 now = self.clock()
                 if self.state in ("ready", "active") and now >= self.lease_deadline:
                     self.hold("command_timeout", release=self.state=="ready" and self.seq==-1,
-                              continuation=True)
+                              continuation=True, recoverable=self._continuous_v2 and self.seq >= 0)
                 if self.state in ("hold", "fault"):
                     if self.stop_sent_ns is None:
                         self.emit(measured, None)  # Never open the hands on stop.
@@ -365,13 +415,50 @@ class MotionGate:
                 # Slew the command, rather than repeatedly resetting it to measured.
                 # Bound outstanding position travel to 200 ms at the configured
                 # velocity, including when an actuator stops responding.
-                dt = min((now - self.last_emit) / 1e9, 0.02)
+                dt = min((now - self.last_emit) / 1e9, 0.1 if self._continuous_v2 else 0.02)
                 limit = self.velocity * max(dt, 0)
                 lead = self.velocity * POSITION_LEAD_SECONDS
-                target = [max(lo, m-lead, min(hi, m+lead, previous + max(-limit, min(limit, t-previous))))
-                          for m, previous, t, (lo, hi) in zip(measured, self.last_q, self.latest["q"], self.limits)]
+                if self.acceleration is not None and self._continuous_v2:
+                    steps = []
+                    for previous, target_q, speed in zip(self.last_q, self.latest["q"], self._command_velocity):
+                        delta = target_q - previous
+                        braking_speed = math.sqrt((self.acceleration*dt)**2+2*self.acceleration*abs(delta))-self.acceleration*dt
+                        desired = math.copysign(min(self.velocity, max(0., braking_speed)), delta)
+                        speed += max(-self.acceleration*dt, min(self.acceleration*dt, desired-speed))
+                        step = speed*dt
+                        if abs(step) > abs(delta) and step*delta >= 0:step = delta
+                        steps.append(step)
+                else:
+                    steps = [max(-limit, min(limit, t-previous)) for previous,t in zip(self.last_q,self.latest["q"])]
+                target = [max(lo, m-lead, min(hi, m+lead, previous+step))
+                          for m, previous, step, (lo, hi) in zip(measured, self.last_q, steps, self.limits)]
+                if self._motion_command is not None:
+                    if self._motion_envelope is not None:
+                        # The full IK reference may extend past this short
+                        # proof. Advance only to its verified boundary without
+                        # turning that ordinary boundary into a pause/resume.
+                        target = [max(lo,min(hi,q)) for q,lo,hi in zip(target,
+                            self._motion_envelope.lower,self._motion_envelope.upper)]
+                    if (self._motion_envelope is None
+                            or not self._motion_envelope.allows(self._motion_command,
+                                measured, self.last_q, target, now_ns=self.clock())):
+                        self.hold('motion_envelope_exceeded', recoverable=True)
+                        # Holding uses measured feedback; it never steps toward
+                        # an unproved target while the worker recomputes.
+                        self.emit(measured, None)
+                        self.last_q, self.last_emit = list(measured), self.clock()
+                        self.stop_target, self.stop_sent_ns = list(measured), self.last_emit
+                        self._stop_started_ns = self.last_emit
+                        self._stop_settle, self._stop_reheld = None, False
+                        return
+                # Numerical/observer work never grants extra source lifetime.
+                if self.clock() >= self.lease_deadline:
+                    self.hold('command_timeout', continuation=True,
+                              recoverable=self._continuous_v2)
+                    return
+                self._command_velocity = [(t-p)/dt if dt > 0 else 0. for t,p in zip(target,self.last_q)]
                 self.emit(target, self.latest["hands"])
-                self.last_q, self.last_hands, self.last_emit = target, self.latest["hands"], now
+                self.last_q, self.last_hands, self.last_emit = target, self.latest["hands"], self.clock()
                 self.applied_seq = self.latest["seq"]
                 if self.diagnostics["last_command"]["applied_ns"] is None:
                     self.diagnostics["last_command"]["applied_ns"] = self.clock()
@@ -413,7 +500,7 @@ class MotionGate:
                     "first_acceptance_deadline_ns": self.first_acceptance_deadline_ns,
                     "continuation_allowed": self._can_continue(),
                     "continuation_ready": self._can_continue() and self._stop_confirmed,
-                    "timing_policy": {"target_max_ms": 100, "feedback_hold_ms": 100,
+                    "timing_policy": {"target_max_ms": 300 if self._continuous_v2 else 100, "feedback_hold_ms": 100,
                                       "management_retry_ms": 300, "recoverable_hold": True,
                                       "ready_timeout_ms": self.continuation_timeout_ns//1_000_000,
                                       "continuation_timeout_ms": self.continuation_timeout_ns//1_000_000,

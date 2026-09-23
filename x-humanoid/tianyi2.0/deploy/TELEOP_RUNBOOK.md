@@ -1,6 +1,6 @@
 # 天轶遥操：构建、配置与部署
 
-> **历史三卡操作手册。** 下文保留 `86de168` 阶段的构建与操作方式，不作为尚未交付的四卡部署步骤。新职责、并行安排和验收顺序见[天轶双臂契约](../../../docs/plans/tianyi-dual-arm-motion-contract.md)；实现完成时再更新实际配置与操作步骤。
+> **历史三卡操作手册。** 下文保留 `86de168` 阶段的操作方式。本轮两卡继续复用机上与标准构建入口，但不修改 Core / ActuCore、不配置其管理代理或反馈边。当前配置、接线和生命周期见 [TELEOP_CONTROL.md](../TELEOP_CONTROL.md)，发布验收依据为[双 Driver 契约](../../../docs/plans/tianyi-teleop-control.md)；下文旧三卡使用和服务切换步骤不能直接用于新卡。
 
 遥操输入接入与末端映射运行在普通 ActuCore 内；同一 Driver 的 motion_control 提供 IK、碰撞和收臂，arm 提供连续关节执行。Canvas 的 `teleop` 卡片是用户配置/连接入口；PICO 的开始、结束并收臂和立即停止控件使用同一会话。不要部署第二个 ActuCore，也不要把本说明当成绕过当前占用或设备验收的授权。
 

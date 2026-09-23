@@ -129,7 +129,13 @@ class TeleopExecutor:
         self.node = None
         self._bus_socket=None;self._bus_process=None
         self.motion_control = None
+        self.teleop_control = None
         self._bus_send_lock = threading.Lock()
+        self._status_thread = None
+        self._bus_recovery_thread = None
+        self._bus_recovery_lock = threading.Lock()
+        self._bus_retry_after_ns = 0
+        self._bus_health = {'generation': 0, 'state': 'stopped', 'status_dropped': 0}
 
     def _execution_accepted(self):
         if not self.profile:
@@ -239,35 +245,130 @@ class TeleopExecutor:
 
     def _start(self):
         self.subscribe_feedback()
+        self._bus_socket, self._bus_process = self._spawn_bus()
+        self._closed.clear()
+        self._bus_health.update(state='ready', generation=self._bus_health['generation']+1)
+        self._status_thread = threading.Thread(target=self._status_loop,
+            name='tianyi-motion-status', daemon=True)
+        self._status_thread.start()
+        self._thread = threading.Thread(target=self._watchdog_loop, name="tianyi-motion-watchdog", daemon=True)
+        self._thread.start()
+
+    def _spawn_bus(self):
         # The vendor process uses its own DDS profile. The command receiver must
         # run in a separate process so domain 42 really uses loopback-only DDS.
         parent,child=socket.socketpair(socket.AF_UNIX,socket.SOCK_DGRAM)
         parent.setblocking(False)
         env={**os.environ,'ROS_DOMAIN_ID':'42','RMW_IMPLEMENTATION':'rmw_fastrtps_cpp',
              'FASTRTPS_DEFAULT_PROFILES_FILE':'/opt/phanthy-motus/dds-local.xml'}
-        self._bus_socket=parent
         try:
-            self._bus_process=subprocess.Popen([sys.executable,__file__,'--bus',str(child.fileno()),self.ns]
+            process=subprocess.Popen([sys.executable,__file__,'--bus',str(child.fileno()),self.ns]
                 + (['--control-v2'] if self.motion_control is not None else []),
                 pass_fds=(child.fileno(),),env=env)
+        except Exception:
+            parent.close()
+            raise
         finally:
             child.close()
-        self._closed.clear()
-        self._thread = threading.Thread(target=self._watchdog_loop, name="tianyi-motion-watchdog", daemon=True)
-        self._thread.start()
+        return parent, process
+
+    def _communication_hold(self, reason):
+        # A communication outage must not convert a recoverable v2 stream into
+        # a permanent pause, or reopen an explicit pause/release/hardware fault.
+        if (getattr(self.gate, '_continuous_v2', False)
+                and (self.gate.state in ('ready', 'active') or self.gate._can_continue())):
+            self.gate.hold(reason, recoverable=True)
+        else:
+            self.gate.hold(reason)
+
+    def _request_bus_recovery(self, reason):
+        self._communication_hold(reason)
+        self._bus_health.update(state='recovering', reason=reason)
+        with self._bus_recovery_lock:
+            if (self._closed.is_set() or time.monotonic_ns() < self._bus_retry_after_ns
+                    or self._bus_recovery_thread and self._bus_recovery_thread.is_alive()):
+                return
+            self._bus_retry_after_ns = time.monotonic_ns()+250_000_000
+            self._bus_recovery_thread = threading.Thread(target=self._recover_bus,
+                name='tianyi-motion-bus-recovery', daemon=True)
+            self._bus_recovery_thread.start()
+
+    @staticmethod
+    def _close_bus(wire, process):
+        if wire is not None:
+            wire.close()
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=.5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=.5)
+
+    def _recover_bus(self):
+        # Only transport resources change; gate, credentials, release request
+        # and motion finish receipts remain owned by their original objects.
+        try:
+            with self._bus_send_lock:
+                old = self._bus_socket, self._bus_process
+                self._bus_socket = self._bus_process = None
+            self._close_bus(*old)
+            if self._closed.is_set():
+                return
+            wire, process = self._spawn_bus()
+            with self._bus_send_lock:
+                if self._closed.is_set():
+                    self._close_bus(wire, process)
+                    return
+                self._bus_socket, self._bus_process = wire, process
+                self._bus_health.update(state='ready', reason=None,
+                    generation=self._bus_health['generation']+1)
+        except Exception as exc:
+            self._bus_health.update(state='unavailable', reason=type(exc).__name__)
+
+    def _send_bus(self, raw):
+        if not self._bus_send_lock.acquire(blocking=False):
+            raise BlockingIOError('local_bus_writer_busy')
+        try:
+            wire = self._bus_socket
+            if wire is None:
+                raise OSError('local_dds_unavailable')
+            return wire.send(raw)
+        finally:
+            self._bus_send_lock.release()
+
+    def _status_once(self):
+        try:
+            if self.teleop_control is not None and self.teleop_control.binding:
+                value = {'teleop_device_binding': copy.deepcopy(self.teleop_control.binding),
+                         'teleop_feedback': self.teleop_control.feedback()}
+            else:
+                value = self.info()
+            self._send_bus(json.dumps(value, allow_nan=False).encode())
+        except BlockingIOError:
+            # Latest-only status: congestion is not a new hardware fault or a
+            # reason to revoke the owner's ability to continue with fresh data.
+            self._bus_health['status_dropped'] += 1
+        except OSError:
+            self._request_bus_recovery('feedback_transport_failed')
+        except Exception as exc:
+            self._bus_health['status_error'] = type(exc).__name__
+
+    def _status_loop(self):
+        while not self._closed.is_set():
+            self._status_once()
+            self._closed.wait(.02)
 
     def _watchdog_loop(self):
         while not self._closed.is_set():
             started = time.monotonic_ns()
-            if self._bus_process.poll() is not None:self.gate.hold("local_dds_process_exited")
+            if self._bus_process is None or self._bus_process.poll() is not None:
+                self._request_bus_recovery('local_dds_process_exited')
             self._receive_latest_command()
             received = time.monotonic_ns()
             self.tick()
             executed = time.monotonic_ns()
-            try:
-                with self._bus_send_lock:
-                    self._bus_socket.send(json.dumps(self.info(),allow_nan=False).encode())
-            except (OSError,ValueError):self.gate.hold("feedback_publish_failed")
             finished = time.monotonic_ns()
             self._watchdog_timing = {"started_ns": started,
                 "command_receive_ms": (received-started)/1e6,
@@ -283,31 +384,55 @@ class TeleopExecutor:
         # DDS depth=1 does not bound the downstream datagram socket queue.
         # Never let an expired intermediate packet pre-empt a fresh latest one.
         latest = {}
+        operations = []
         received = 0
+        wire = self._bus_socket
+        if wire is None:
+            return
         for _ in range(128):
             try:
-                raw = self._bus_socket.recv(16385)
+                raw = wire.recv(65_665)  # 64 KiB public contract plus bounded IPC route wrapper.
                 try:
                     value = json.loads(raw, object_pairs_hook=self._unique)
                     route = value.get('_motion_route', 'legacy') if isinstance(value, dict) else 'legacy'
-                    if route not in ('eef', 'arm'):
+                    if route == 'teleop_operation':
+                        operations.append(value.get('packet'))
+                        received += 1
+                        continue
+                    if route not in ('eef', 'arm', 'teleop_input'):
                         route = 'legacy'
                 except (ValueError, TypeError, RecursionError):
                     route = 'legacy'
                 latest[route] = raw
                 received += 1
             except BlockingIOError:
+                # Input identity is current before admitting operations, but stop
+                # outranks any begin/finish in this bounded receive batch.
+                if 'teleop_input' in latest:
+                    self._command(SimpleNamespace(data=latest.pop('teleop_input')))
+                if self.teleop_control is not None:
+                    operations.sort(key=lambda p: 0 if isinstance(p,dict) and p.get('action')=='stop' else 1)
+                    for operation in operations:
+                        try:self.teleop_control.receive(operation)
+                        except (ValueError, KeyError, TypeError) as exc:
+                            self._trace('teleop_operation_rejected', reason=str(exc))
                 if latest:
                     self._trace('receive_batch', received=received, superseded=received-len(latest))
                     for raw in latest.values():
                         self._command(SimpleNamespace(data=raw))
                 return
             except OSError:
-                self.gate.hold('local_dds_receive_failed')
+                self._request_bus_recovery('local_dds_receive_failed')
                 return
+        if self.teleop_control is not None:
+            for operation in operations:
+                if isinstance(operation,dict) and operation.get('action')=='stop':
+                    try:self.teleop_control.receive(operation)
+                    except (ValueError, KeyError, TypeError) as exc:
+                        self._trace('teleop_operation_rejected', reason=str(exc))
         # A sustained flood must not monopolize the watchdog or apply a packet
         # whose position in the queue is unknown. Holding never replays it.
-        self.gate.hold('local_dds_command_backlog')
+        self._communication_hold('local_dds_command_backlog')
         self._trace('receive_backlog', received=received, discarded=received)
 
     def tick(self):
@@ -430,12 +555,22 @@ class TeleopExecutor:
         received_ns = time.monotonic_ns()
         packet = None
         try:
-            if len(msg.data) > 16384:raise ValueError('command_too_large')
+            if len(msg.data) > 65_664:raise ValueError('command_too_large')
             packet = json.loads(msg.data, object_pairs_hook=self._unique)
         except (ValueError, TypeError, RecursionError):
             self.gate.hold('invalid_command')
             self._trace('command_decision',received_ns=received_ns,accepted=False,reason='invalid_command')
             return
+        if (isinstance(packet, dict) and packet.get('_motion_route') == 'teleop_input'
+                and self.teleop_control is not None):
+            try:return self.teleop_control.receive(packet['packet'])
+            except (ValueError, KeyError, TypeError) as exc:
+                self._trace('teleop_input_rejected', reason=str(exc))
+                return False
+        if len(msg.data) > 16384:
+            self.gate.hold('invalid_command')
+            self._trace('command_decision',received_ns=received_ns,accepted=False,reason='invalid_command')
+            return False
         if isinstance(packet, dict) and '_motion_route' in packet:
             try:
                 if set(packet) != {'_motion_route', 'packet'} or self.motion_control is None:
@@ -507,15 +642,19 @@ class TeleopExecutor:
                     raise ValueError("hand_publish_failed")
 
     def publish_joint_command(self, packet):
-        """Numerical worker -> local DDS arm input, never directly to hardware."""
+        """Validated numerical result -> arm receiver; only its gate emits."""
+        if self.teleop_control is not None:
+            return self.arm.accept_control(packet)  # Internal arm reuse, no extra Canvas/DDS hop.
         raw = json.dumps({'_motion_route': 'joint_output', 'packet': packet}, allow_nan=False).encode()
         if self._bus_socket is None:
             raise ValueError('local_dds_unavailable')
         try:
-            with self._bus_send_lock:
-                self._bus_socket.send(raw)
+            self._send_bus(raw)
         except OSError as exc:
             raise ValueError('joint_publish_failed') from exc
+
+    def install_motion_envelope(self, record):
+        return self.gate.install_motion_envelope(record)
 
     def foreign_publishers(self):
         owned={(n.get_namespace(),n.get_name()) for p in self.plugins
@@ -540,6 +679,7 @@ class TeleopExecutor:
     def info(self):
         tool = self.get_tool()
         return {**self.gate.status(), "calibration_error": self.profile_error,
+                "bus": dict(self._bus_health),
                 "watchdog_timing": dict(getattr(self, '_watchdog_timing', {})),
                 "last_vendor_command": copy.deepcopy(getattr(self, "_last_vendor_command", None)),
                 "trace": self._trace_snapshot(),
@@ -549,7 +689,10 @@ class TeleopExecutor:
                 "publisher_present": self._output_ready,
                 "x-teleop-target": tool["x-teleop-target"],
                 "topic_in": tool["topic_in"], "topic_out": tool["topic_out"],
-                **(self.motion_control.feedback_fields() if self.motion_control is not None else {})}
+                **(self.motion_control.feedback_fields() if self.motion_control is not None else {}),
+                **({'teleop_device_binding': copy.deepcopy(self.teleop_control.binding),
+                    'teleop_feedback': self.teleop_control.feedback()}
+                   if self.teleop_control is not None and self.teleop_control.binding else {})}
 
     def dispatch(self, action, args):
         if action == 'info':
@@ -678,7 +821,8 @@ class TeleopExecutor:
                         or not self.gate.live_enabled):
                     raise ValueError('first_acceptance_disabled')
                 if (not self.profile or self.profile.get('hands_enabled') is not False
-                        or not accepted(self.profile, first_acceptance=True)):
+                        or not (accepted(self.profile, first_acceptance=True)
+                                or operator and accepted(self.profile))):
                     raise ValueError('first_acceptance_prerequisites_missing')
                 if self.gate.session_id or self.legacy_busy():
                     raise ValueError('first_acceptance_requires_idle')
@@ -752,6 +896,13 @@ class TeleopExecutor:
             if self._thread.is_alive():
                 raise RuntimeError('executor_thread_stop_unconfirmed')
             self._thread = None
+        for name in ('_status_thread', '_bus_recovery_thread'):
+            thread = getattr(self, name, None)
+            if thread is not None:
+                thread.join(timeout=2)
+                if thread.is_alive():
+                    raise RuntimeError(name.strip('_')+'_stop_unconfirmed')
+                setattr(self, name, None)
         self._feedback_closed.set()
         if self._feedback_thread:
             self._feedback_thread.join(timeout=1)
@@ -809,6 +960,32 @@ def run_local_bus(fd,namespace,control_v2=False):
     node.create_subscription(String,topic+'/command',command,qos)
     pub=node.create_publisher(String,topic+'/feedback',qos)
     joint_pub = None
+    external_sub = external_pub = None
+    external_topic = None
+    def configure_external(value):
+        nonlocal external_sub, external_pub, external_topic
+        binding = value.get('teleop_device_binding')
+        if not isinstance(binding, dict):return
+        from common.teleop_contract import binding_from_topic, topics
+        command_topic, feedback_topic = topics(*binding_from_topic(binding['command_topic']))
+        if feedback_topic != binding.get('feedback_topic'):raise ValueError('invalid_feedback_binding')
+        if external_topic == command_topic:return
+        if external_sub is not None:node.destroy_subscription(external_sub)
+        if external_pub is not None:node.destroy_publisher(external_pub)
+        def external_command(msg):
+            if len(msg.data) > 65536:return
+            try:
+                packet = json.loads(msg.data, object_pairs_hook=TeleopExecutor._unique)
+                if len(json.dumps(packet,allow_nan=False).encode()) > 65536:return
+                route = 'teleop_operation' if packet.get('kind') == 'operation' else 'teleop_input'
+                wire.send(json.dumps({'_motion_route': route, 'packet': packet}, allow_nan=False).encode())
+            except (ValueError, TypeError, AttributeError, BlockingIOError):pass
+        # Transport history is bounded; operations are retried/acknowledged by request ID.
+        external_qos=QoSProfile(depth=16,reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,durability=DurabilityPolicy.VOLATILE)
+        external_sub=node.create_subscription(String,command_topic,external_command,external_qos)
+        external_pub=node.create_publisher(String,feedback_topic,external_qos)
+        external_topic=command_topic
     if control_v2:
         def routed(route, msg):
             if len(msg.data) > 8192:return
@@ -840,12 +1017,17 @@ def run_local_bus(fd,namespace,control_v2=False):
                                 or type(value['packet']) is not dict):continue
                         latest_joint=json.dumps(value['packet'],allow_nan=False)
                     else:
+                        configure_external(value)
                         latest=json.dumps(value,allow_nan=False)
                 except (ValueError,TypeError,RecursionError):continue
             if latest_joint is not None and joint_pub is not None:
                 msg=String();msg.data=latest_joint;joint_pub.publish(msg)
             if latest:
                 msg=String();msg.data=latest;pub.publish(msg)
+                if external_pub is not None:
+                    feedback=json.loads(latest).get('teleop_feedback')
+                    if isinstance(feedback,dict):
+                        msg=String();msg.data=json.dumps(feedback,allow_nan=False);external_pub.publish(msg)
     except (ExternalShutdownException, KeyboardInterrupt):
         pass  # SIGTERM can already have shut down the ROS context.
     finally:
