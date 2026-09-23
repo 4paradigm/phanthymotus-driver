@@ -16,6 +16,7 @@ from cryptography import x509
 
 from .enrollment import Enrollment
 from .management_pin import ManagementPin
+from .tls_files import load_tls_context, read_tls_file
 from .onboarding import APK_DIRECTORY, APK_FILENAME, MIME_TYPE, package_metadata
 
 from .capture import (
@@ -65,12 +66,9 @@ def capture_certificate_base64(config: dict) -> str:
             )
         )
     )
-    if not certificate_path.is_file() or certificate_path.is_symlink():
-        raise CaptureTlsError(f"Capture TLS certificate is missing: {certificate_path}")
     try:
-        with certificate_path.open("rb") as certificate_file:
-            certificate = certificate_file.read(MAX_CAPTURE_CA_PEM_BYTES + 1)
-    except OSError as exc:
+        certificate = read_tls_file(certificate_path)
+    except (OSError, ValueError) as exc:
         raise CaptureTlsError(
             f"Capture TLS certificate is unreadable: {certificate_path}"
         ) from exc
@@ -94,7 +92,6 @@ def build_capture_ssl_context(config: dict) -> ssl.SSLContext:
         config.get("public_wss_url"),
         expected_port=port,
     )
-    capture_certificate_base64(config)
     certificate_path = Path(
         str(
             config.get(
@@ -124,14 +121,13 @@ def build_capture_ssl_context(config: dict) -> ssl.SSLContext:
             raise CaptureTlsError(
                 "Capture TLS material must not reuse the Agent Core certificate directory"
             )
-    if not key_path.is_file() or key_path.is_symlink():
-        raise CaptureTlsError(f"Capture TLS private key is missing: {key_path}")
     if certificate_path.resolve() == key_path.resolve():
         raise CaptureTlsError(
             "Capture TLS certificate and private key must be separate files"
         )
     try:
-        certificate = x509.load_pem_x509_certificate(certificate_path.read_bytes())
+        context, certificate_bytes = load_tls_context(certificate_path, key_path)
+        certificate = x509.load_pem_x509_certificate(certificate_bytes)
         alternatives = certificate.extensions.get_extension_for_class(
             x509.SubjectAlternativeName
         ).value
@@ -162,12 +158,6 @@ def build_capture_ssl_context(config: dict) -> ssl.SSLContext:
         raise CaptureTlsError(
             "Capture TLS certificate SAN does not match capture.public_wss_url host"
         )
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    try:
-        context.load_cert_chain(str(certificate_path), str(key_path))
-    except (OSError, ssl.SSLError) as exc:
-        raise CaptureTlsError("Capture TLS certificate/key pair is invalid") from exc
     return context
 
 

@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import threading
+import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 from common.teleop_contract import COMMAND_TOPIC, canonical_instance
@@ -280,13 +281,16 @@ class ExtVrPlugin:
                     enrollment.pending = None
                     enrollment.deadline = 0
             # Legacy saved passwords are ignored and never persisted or used.
-            temporary = item["config_file"].with_suffix(".tmp")
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as stream:
-                json.dump(candidate, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, item["config_file"])
+            fd, name = tempfile.mkstemp(prefix=".device-config-", suffix=".tmp", dir=item["config_file"].parent)
+            temporary = Path(name)
+            try:
+                with os.fdopen(fd, "w") as stream:
+                    json.dump(candidate, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, item["config_file"])
+            finally:
+                temporary.unlink(missing_ok=True)
             confirmed = self._read_config(instance)
             if confirmed != candidate:
                 raise ValueError("configuration_readback_mismatch")

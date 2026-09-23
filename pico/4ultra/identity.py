@@ -10,6 +10,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+from ext_vr.tls_files import open_tls_directory, read_tls_file
 
 
 def validate_dds_profile(path):
@@ -96,10 +97,14 @@ def prepare_config(config):
             ),
             (cert_path, cert.public_bytes(serialization.Encoding.PEM)),
         ):
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(data)
+            with open_tls_directory(tls) as directory:
+                fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(data)
     # Existing identity is never silently rotated when host configuration changes.
+    # Validate existing as well as newly-created material without following paths.
+    read_tls_file(cert_path)
+    read_tls_file(key_path)
     hostname = "[" + host + "]" if ":" in host else host
     result.update(
         state_dir=str(root),

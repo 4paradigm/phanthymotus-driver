@@ -311,3 +311,67 @@ def test_capture_loader_rejects_nonprivate_or_invalid_state(tmp_path, invalid):
         state.write_text("null")
     with pytest.raises(ValueError):
         CaptureManager(None, None, None, state_file=state)
+
+
+@pytest.mark.parametrize("target", ["tls_cert_file", "tls_key_file", "directory"])
+def test_existing_tls_permissions_rejected_in_setup_and_server(device, target):
+    from ext_vr.capture_server import build_capture_ssl_context, CaptureTlsError
+    _, config = device
+    path = Path(config["tls_key_file"]).parent if target == "directory" else Path(config[target])
+    path.chmod(0o755 if target == "directory" else 0o644)
+    with pytest.raises(ValueError, match="pico_tls_"):
+        load_driver_module("identity").prepare_config(config)
+    with pytest.raises(CaptureTlsError):
+        build_capture_ssl_context(config)
+
+
+def test_existing_tls_owner_is_checked(device, monkeypatch):
+    import os
+    from ext_vr.tls_files import read_tls_file
+    _, config = device
+    original = os.fstat
+
+    def wrong_file_owner(fd):
+        value = original(fd)
+        import stat
+        if stat.S_ISREG(value.st_mode):
+            fields = list(value)
+            fields[4] = value.st_uid + 1
+            return os.stat_result(fields)
+        return value
+    monkeypatch.setattr(os, "fstat", wrong_file_owner)
+    with pytest.raises(ValueError, match="owned_regular_0600"):
+        read_tls_file(config["tls_key_file"])
+
+
+def test_tls_openssl_uses_checked_descriptors_after_original_paths_replaced(device, monkeypatch):
+    from ext_vr.capture_server import build_capture_ssl_context
+    _, config = device
+    original_load = ssl.SSLContext.load_cert_chain
+    called = []
+
+    def replace_before_openssl(context, certfile, keyfile, *args, **kwargs):
+        assert certfile.startswith(("/dev/fd/", "/proc/self/fd/"))
+        assert keyfile.startswith(("/dev/fd/", "/proc/self/fd/"))
+        for key in ("tls_cert_file", "tls_key_file"):
+            path = Path(config[key])
+            path.unlink()
+            path.symlink_to(path.parent / "nonexistent")
+        called.append(True)
+        return original_load(context, certfile, keyfile, *args, **kwargs)
+    monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", replace_before_openssl)
+    assert isinstance(build_capture_ssl_context(config), ssl.SSLContext)
+    assert called == [True]
+
+
+def test_config_save_does_not_follow_predictable_temporary_symlink(device, tmp_path):
+    plugin, config = device
+    plugin.dispatch("config", {"instance_id": "test-vr"})
+    other = tmp_path / "unrelated.txt"
+    other.write_text("keep")
+    link = Path(config["state_dir"]) / "test-vr.config.tmp"
+    link.symlink_to(other)
+    assert plugin.dispatch("config", {"instance_id": "test-vr"})["confirmed"]
+    assert other.read_text() == "keep"
+    assert link.is_symlink()
+    assert not list(Path(config["state_dir"]).glob(".device-config-*.tmp"))
