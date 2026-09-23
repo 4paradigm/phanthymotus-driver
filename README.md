@@ -24,7 +24,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 
-The [G1 dual-arm motion contract](docs/plans/g1-dual-arm-motion-contract.md) is a Draft implementation and acceptance plan. The proposed `motion_control → arm` teleoperation path is not implemented or robot-accepted yet; existing driver features remain documented separately.
+The [G1 two-Driver offline plan](docs/plans/g1-two-driver-offline.md) audits PICO input and G1 execution before deployment. The earlier [four-card contract](docs/plans/g1-dual-arm-motion-contract.md) remains historical design context; its component tests do not establish two-Driver compatibility or robot acceptance.
 
 ## Quick Start
 

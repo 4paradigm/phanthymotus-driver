@@ -1,5 +1,6 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
+FROM mambaorg/micromamba:2.3.2 AS motion-numeric-installer
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
@@ -59,6 +60,14 @@ COPY controlled_spatial_map.py /work/controlled_spatial_map.py
 COPY pointcloud_utils.py /work/pointcloud_utils.py
 COPY servo.py /work/servo.py
 COPY arm_sdk.py /work/arm_sdk.py
+COPY arm_stream.py motion_control.py motion_bus.py teleop_control.py teleop_bus.py /work/
+COPY g1_motion/ /work/g1_motion/
+COPY dds-local.xml /work/dds-local.xml
+COPY --from=motion-numeric-installer /bin/micromamba /usr/local/bin/micromamba
+RUN micromamba create --yes --prefix /opt/g1-motion --file /work/g1_motion/requirements.numeric-linux-aarch64.lock && \
+    micromamba clean --all --yes && \
+    /opt/g1-motion/bin/python -c 'import numpy, casadi, pinocchio; from pinocchio import casadi as cpin; assert numpy.__version__ == "1.26.4"; assert casadi.__version__ == "3.6.7"; assert pinocchio.__version__ == "3.1.0"' && \
+    python3 /work/g1_motion/fetch_assets.py && python3 /work/g1_motion/fetch_assets.py --check
 COPY servo_eef.py /work/servo_eef.py
 COPY test_slam_rpc.py /work/test_slam_rpc.py
 COPY config.yaml /work/config.yaml

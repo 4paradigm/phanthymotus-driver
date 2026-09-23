@@ -2109,9 +2109,10 @@ class ArmActionPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, executor, arm_client):
         self._client = arm_client
+        self._stream = None
 
     def get_tool(self) -> dict:
-        return {
+        tool = {
             "name": "arm",
             "type": "actuator",
             "multiInstance": False,
@@ -2136,13 +2137,32 @@ class ArmActionPlugin:
             },
         }
 
+        if self._stream is not None:
+            motion = self._stream.motion_control
+            if getattr(self._stream, 'public_motion_topics', True):
+                tool.update(motion.arm_metadata())
+            tool['control_interface'] = motion.control_interface('joint_position')
+            props = tool['inputSchema']['properties']
+            props['action']['enum'] += ['info', 'start', 'stop', 'finish', 'finish_status']
+            props.update(instance_id={'type':'string'}, input_topic={'type':'string'},
+                         control_interface={'type':'object'}, control_interfaces={'type':'object'},
+                         operation_id={'type':'string'}, retry={'type':'boolean'})
+        return tool
+
     def start(self) -> None:
-        pass
+        if self._stream is not None: self._stream.start()
 
     def stop(self) -> None:
-        pass
+        if self._stream is not None: self._stream.stop()
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == 'info' and self._stream is not None:
+            metadata = (self._stream.motion_control.arm_metadata()
+                        if getattr(self._stream, 'public_motion_topics', True) else {})
+            return {**self._stream.info(), **metadata,
+                    'control_interface': self._stream.motion_control.control_interface('joint_position')}
+        if self._stream is not None and action in ('info','start','stop','finish','finish_status','release'):
+            return self._stream.dispatch(action, args)
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
@@ -2159,7 +2179,13 @@ class ArmActionPlugin:
                     return {"error": f"Unknown gesture: {args['gesture']}. Available: {list(_ARM_ACTION_MAP)}"}
             else:
                 return {"error": "Provide 'gesture' name or 'action_id'"}
-            ret = self._client.ExecuteAction(action_id)
+            if self._stream is not None:
+                if action_id == 99:
+                    return self._stream.dispatch('release', args)
+                with self._stream.legacy():
+                    ret = self._client.ExecuteAction(action_id)
+            else:
+                ret = self._client.ExecuteAction(action_id)
             return {"ret": ret, "action_id": action_id, "gesture": _ARM_ID_MAP.get(action_id, "unknown")}
         elif action == "release":
             ret = self._client.ExecuteAction(99)
