@@ -85,6 +85,10 @@ def _copied_names(dockerfile: Path) -> set:
     return names | {d + '/' for d in whole_dirs}
 
 
+def _is_test_module(stem: str) -> bool:
+    return stem.startswith('test_') or stem.endswith('_test') or stem == 'conftest'
+
+
 def _sibling_imports(driver_dir: Path) -> dict:
     """`{module: [files that import it]}` for imports of sibling modules.
 
@@ -104,6 +108,12 @@ def _sibling_imports(driver_dir: Path) -> dict:
     pattern = re.compile(r'^\s*(?:from|import)\s+([a-z_][a-z0-9_.]*)', re.M)
     found: dict = {}
     for source in driver_dir.glob('*.py'):
+        # A driver's own tests live beside it and are deliberately not copied
+        # into the image, so what *they* import says nothing about what the
+        # image needs. Counting them made `pndbotics/adam` fail for importing
+        # one test module from another — a red with no defect behind it.
+        if _is_test_module(source.stem):
+            continue
         for dotted in pattern.findall(source.read_text(errors='ignore')):
             # Bare name, or the last component of a dotted path — either can name
             # a sibling module in this directory.

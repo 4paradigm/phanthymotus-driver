@@ -8,9 +8,17 @@ import unittest
 from unittest import mock
 import zlib
 
-import cv2
 import numpy as np
-import test_realman_pick_place as fixtures
+import pytest
+
+# The code under test decodes frames with cv2 (`pick_place.inputs` imports it
+# to imdecode/resize), so there is nothing honest to run without it. Skipped
+# rather than stubbed: opencv ships in the driver image, and a module-level
+# `import cv2` here aborted *collection* of the whole suite on a host without
+# it, which reads as 366 broken tests instead of one unavailable dependency.
+cv2 = pytest.importorskip("cv2", reason="opencv is only present in the driver image")
+
+import test_realman_pick_place as fixtures  # noqa: E402
 from pick_place.inputs import ObservationInputs, resolve_topics
 from pick_place.alignment import decode_depth, validate_calibration
 
