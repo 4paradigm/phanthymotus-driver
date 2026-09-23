@@ -1,3 +1,4 @@
 string params
 ---
-string result
+bool success
+string message

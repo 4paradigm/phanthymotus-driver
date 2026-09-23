@@ -321,12 +321,22 @@ def _acp_notify(action_id: str | None, status: str, result: dict, tool_name: str
 
 def _decode_vendor_result(response: Any) -> Any:
     """Decode robo_sdk's JSON envelope while preserving non-JSON responses."""
-    value = getattr(response, "result", response)
+    success = getattr(response, "success", None)
+    value = getattr(response, "message", None)
+    if value is None:
+        value = getattr(response, "result", response)
     if isinstance(value, str):
         try:
-            return json.loads(value)
+            decoded = json.loads(value)
+            if success is False and isinstance(decoded, dict):
+                decoded.setdefault("ok", False)
+            return decoded
         except json.JSONDecodeError:
+            if success is False:
+                return {"ok": False, "message": value}
             return {"result": value}
+    if success is False:
+        return {"ok": False, "message": str(value)}
     return jsonable(value)
 
 
@@ -441,11 +451,18 @@ class U1Nodes:
         else:
             U1Nodes._authorize_from_credentials(self)
 
+        for name in ("wakeup_enabled", "wakeup_followup", "vision_enabled"):
+            try:
+                result = self.set_system_enabled(name, False)
+                if result.get("enabled") is not False:
+                    raise RuntimeError("state readback did not confirm disabled")
+                print(f"[U1 init] {name} disabled and verified", flush=True)
+            except Exception as exc:
+                print(f"[U1 init] {name} disable/verification failed: {type(exc).__name__}", flush=True)
         try:
-            self.string_call("wakeup_enabled", {"enabled": False})
-            print("[U1 init] built-in wake word disable request completed", flush=True)
+            self.trigger_call("interrupt")
         except Exception:
-            print("[U1 init] built-in wake word disable request failed", flush=True)
+            pass
 
     def _authorize_from_credentials(self) -> None:
         env_names = {
@@ -600,7 +617,16 @@ class U1Nodes:
         return {"success": bool(getattr(response, "success", False)), "message": message}
 
     def set_system_enabled(self, name: str, enabled: bool) -> dict:
-        return self.string_call(name, {"enabled": bool(enabled)})
+        requested = bool(enabled)
+        response = self.string_call(name, {"enabled": requested})
+        if isinstance(response, dict) and response.get("ok") is False:
+            raise RuntimeError(f"U1 Pro {name} request failed: {response.get('code', 'unknown error')}")
+        state_name = name.replace("set_", "") + "_state"
+        state = self.get_system_enabled(state_name)
+        actual = state.get("data", {}).get("enabled") if isinstance(state, dict) else None
+        if actual is not requested:
+            raise RuntimeError(f"U1 Pro {name} state mismatch: requested {requested}, got {actual!r}")
+        return {"ok": True, "requested": requested, "enabled": actual, "state": state}
 
     def get_system_enabled(self, name: str) -> dict:
         return self.trigger_call(name)
@@ -1492,6 +1518,19 @@ class _SystemSwitchPlugin:
         return None
 
 
+class WakeupFollowupPlugin(_SystemSwitchPlugin):
+    """Control whether the robot continues its built-in dialog after wakeup."""
+
+    PREFIX = "wakeup_followup_control"
+
+    def __init__(self, nodes: U1Nodes):
+        super().__init__(
+            nodes, self.PREFIX, "wakeup_followup", "wakeup_followup_state",
+            "Allow or block the U1 Pro's built-in interaction after a wakeup. "
+            "This does not disable wakeup detection; use wakeup_control for that.",
+        )
+
+
 class HeadPlugin:
     """Play documented, safe preset head motions; raw joint control is unsupported."""
 
@@ -1607,6 +1646,7 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
                ExpressionPlugin(audio), HeadPlugin(audio),
                _SystemSwitchPlugin(nodes, "wakeup_control", "wakeup_enabled", "wakeup_enabled_state",
                                     "Enable or disable the U1 Pro built-in wakeup and voice-interaction entry point."),
+               WakeupFollowupPlugin(nodes),
                _SystemSwitchPlugin(nodes, "visual_follow_control", "vision_enabled", "vision_enabled_state",
                                     "Enable or disable U1 Pro visual behavior, including visual following."),
                camera,

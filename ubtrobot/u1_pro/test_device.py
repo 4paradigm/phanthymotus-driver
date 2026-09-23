@@ -275,7 +275,7 @@ class U1CardContractTests(unittest.TestCase):
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
-            "lifecycle", "mic", "speaker", "tts", "expression", "head", "wakeup_control", "visual_follow_control",
+            "lifecycle", "mic", "speaker", "tts", "expression", "head", "wakeup_control", "wakeup_followup_control", "visual_follow_control",
             "camera_rgb", "vision_capture", "doa_event",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
@@ -494,6 +494,27 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(device.ExpressionPlugin._expression_actions(response)["actions"],
                          [{"name": "affectionate", "label": "撒娇"}])
 
+    def test_vendor_string_call_message_envelope_decodes_motion_list(self):
+        import device
+
+        response = types.SimpleNamespace(
+            success=True,
+            message=json.dumps({"data": [{"motion_id": "A019", "motion_name": "撒娇"},
+                                         {"motion_id": "A014", "motion_name": "点头"}]}),
+        )
+        decoded = device._decode_vendor_result(response)
+        self.assertEqual(device.ExpressionPlugin._expression_actions(decoded)["actions"], [
+            {"name": "nod", "label": "点头"},
+            {"name": "affectionate", "label": "撒娇"},
+        ])
+
+    def test_vendor_string_call_failure_envelope_is_preserved(self):
+        import device
+
+        self.assertEqual(device._decode_vendor_result(types.SimpleNamespace(
+            success=False, message='{"code":"FAILED"}')),
+            {"code": "FAILED", "ok": False})
+
     def test_vision_capture_saves_a_fresh_jpeg(self):
         import device
 
@@ -569,7 +590,11 @@ class U1CardContractTests(unittest.TestCase):
 
         nodes = types.SimpleNamespace(
             config={"auth": {key: "secret-value" for key in ("appid", "api_key", "api_secret", "device_id", "license")}},
-            string_call=mock.Mock(return_value={"ok": True, "code": "OK", "data": {"authorized": True, "token": "do-not-log", "license": "private"}}),
+            trigger_call=mock.Mock(return_value={"code": "UNAUTHORIZED", "data": {"authorized": False}}),
+            string_call=mock.Mock(side_effect=[
+                {"ok": True, "code": "OK", "data": {"authorized": True, "token": "do-not-log", "license": "private"}},
+            ]),
+            set_system_enabled=mock.Mock(return_value={"enabled": False}),
         )
         output = io.StringIO()
         with redirect_stdout(output):
@@ -578,7 +603,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertNotIn("secret-value", text)
         self.assertNotIn("do-not-log", text)
         self.assertIn("authorization request completed", text)
-        self.assertIn("wake word disable request completed", text)
+        self.assertIn("wakeup_enabled disabled and verified", text)
 
     def test_existing_vendor_authorization_skips_credential_submission(self):
         import device
@@ -586,11 +611,18 @@ class U1CardContractTests(unittest.TestCase):
         nodes = types.SimpleNamespace(
             config={},
             trigger_call=mock.Mock(return_value={"code": "OK", "data": {"authorized": True}}),
+            call=mock.Mock(),
             string_call=mock.Mock(return_value={"ok": True, "code": "OK", "data": {"authorized": True}}),
+            set_system_enabled=mock.Mock(return_value={"enabled": False}),
         )
         device.U1Nodes.initialize_robot(nodes)
-        nodes.trigger_call.assert_called_once_with("auth_state")
-        nodes.string_call.assert_called_once_with("wakeup_enabled", {"enabled": False})
+        nodes.trigger_call.assert_has_calls([mock.call("auth_state"), mock.call("interrupt")])
+        self.assertEqual(nodes.set_system_enabled.call_args_list, [
+            mock.call("wakeup_enabled", False),
+            mock.call("wakeup_followup", False),
+            mock.call("vision_enabled", False),
+        ])
+        nodes.trigger_call.assert_any_call("interrupt")
 
     def test_unauthorized_vendor_state_performs_authorization(self):
         import device
@@ -600,14 +632,18 @@ class U1CardContractTests(unittest.TestCase):
             trigger_call=mock.Mock(return_value={"code": "UNAUTHORIZED", "data": {"authorized": False}}),
             string_call=mock.Mock(side_effect=[
                 {"ok": True, "code": "OK", "data": {"authorized": True}},
-                {"ok": True, "code": "OK", "data": {}},
             ]),
+            call=mock.Mock(),
+            set_system_enabled=mock.Mock(return_value={"enabled": False}),
         )
         device.U1Nodes.initialize_robot(nodes)
         self.assertEqual(nodes.string_call.call_args_list[0].args,
                          ("authorize", mock.ANY))
-        self.assertEqual(nodes.string_call.call_args_list[1].args,
-                         ("wakeup_enabled", {"enabled": False}))
+        self.assertEqual(nodes.set_system_enabled.call_args_list, [
+            mock.call("wakeup_enabled", False),
+            mock.call("wakeup_followup", False),
+            mock.call("vision_enabled", False),
+        ])
 
     def test_authorization_loads_secret_file_and_license(self):
         import device
@@ -879,18 +915,30 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = mock.Mock()
-        nodes.set_system_enabled.return_value = {"ok": True}
-        nodes.get_system_enabled.return_value = {"enabled": False}
+        nodes.string_call.return_value = {"ok": True}
+        nodes.trigger_call.side_effect = [
+            {"code": "OK", "data": {"enabled": False}},
+            {"code": "OK", "data": {"enabled": False}},
+        ]
+        nodes.get_system_enabled.side_effect = [
+            {"code": "OK", "data": {"enabled": False}},
+            {"code": "OK", "data": {"enabled": False}},
+        ]
         wakeup = device._SystemSwitchPlugin(nodes, "wakeup_control", "wakeup_enabled", "wakeup_enabled_state", "wakeup")
         vision = device._SystemSwitchPlugin(nodes, "visual_follow_control", "vision_enabled", "vision_enabled_state", "vision")
-        self.assertEqual(wakeup.dispatch("disable", {}), {"ok": True})
-        self.assertEqual(vision.dispatch("status", {}), {"enabled": False})
+        self.assertEqual(device.U1Nodes.set_system_enabled(nodes, "wakeup_enabled", False), {
+            "ok": True, "requested": False, "enabled": False,
+            "state": {"code": "OK", "data": {"enabled": False}},
+        })
+        self.assertEqual(vision.dispatch("status", {}), {"code": "OK", "data": {"enabled": False}})
         self.assertEqual(wakeup.dispatch("start", {}), {"state": "ready"})
         self.assertEqual(wakeup.dispatch("stop", {}), {"state": "idle"})
         self.assertEqual(wakeup.get_tool()["inputSchema"]["properties"]["action"]["enum"],
                          ["start", "stop", "enable", "disable", "status"])
-        nodes.set_system_enabled.assert_called_once_with("wakeup_enabled", False)
-        nodes.get_system_enabled.assert_called_once_with("vision_enabled_state")
+        nodes.string_call.assert_called_once_with("wakeup_enabled", {"enabled": False})
+        nodes.get_system_enabled.assert_has_calls([
+            mock.call("wakeup_enabled_state"), mock.call("vision_enabled_state"),
+        ])
 
     def test_speaker_enables_device_output_before_forwarding(self):
         import device
