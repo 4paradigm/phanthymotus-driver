@@ -72,19 +72,74 @@ WZ_ACCEL = 0.30
 # rejects zero, and their real bound is the `lower == upper == 0` above anyway.
 PINNED_ACCEL = 1e-6
 
-# Below these the robot does nothing at all. Measured on r1_sz by commanding one
-# axis at a time: wz needs 1.0 rad/s, vx and vy need 0.4 m/s. Anything smaller
-# is accepted by the SDK, returns 0, and produces no motion whatsoever.
+# Below these the robot does nothing at all — **measured standing still, one
+# axis at a time**, and that phrasing is a limitation rather than a credential.
 #
-# A legged robot has to assemble a whole gait cycle to move, so there is no
-# "creep slowly" regime the way a wheeled base has. This is a property of the
-# robot, which is why it is declared here and not assumed by whatever is driving
-# it: a policy emitting a smooth ramp towards zero would spend its whole life in
-# this band, commanding motion and producing none, with every layer in between
-# reporting success.
+# A legged robot has to assemble a whole gait cycle to move, so from a standstill
+# there is no "creep slowly" regime the way a wheeled base has. Commanding less
+# is accepted by the SDK, returns 0, and produces no motion whatsoever.
 MIN_VX = 0.4
 MIN_VY = 0.4
 MIN_WZ = 1.0
+
+# **The yaw deadband collapses once the robot is already walking.** A gait cycle
+# that is running can be steered a little per step; one that has to be started
+# cannot. Measured on r1_sz: standing, nothing below 1.0 rad/s moves the robot
+# at all; translating, a commanded 0.05 rad/s is visible. Twenty times smaller.
+#
+# This is why the standstill numbers above must not be treated as constants. A
+# consumer that lifts every yaw command to 1.0 while the robot is mid-approach
+# overshoots a 0.05 rad/s correction by a factor of twenty, then reverses, then
+# overshoots again — which on r1_sz looked like the robot weaving left and right
+# on its way to a target it was already facing.
+#
+# So the deadband is declared twice: `min_magnitude` for an axis moving on its
+# own, `min_magnitude_moving` for the same axis while translation is already
+# under way. vx/vy are repeated unchanged because nothing has measured whether
+# *their* floor moves, and inventing a smaller one would be the same mistake in
+# the other direction.
+MIN_WZ_MOVING = 0.05
+
+
+def _step_limit(accel: float, floor: float) -> float:
+    """The acceleration cap, widened to at least the axis' deadband.
+
+    **An acceleration cap finer than the deadband is not a cap — it is dead
+    time.** The step clamp is applied to the command the policy sends, so a
+    0.30 rad/s cap against a 1.0 rad/s floor ramps 0.30 → 0.60 → 0.90 → 1.0, and
+    the robot executes precisely none of the first three: three ticks of
+    silence, then the turn starts at full speed. That asymmetry — slow to start,
+    instant to stop, because the ramp *down* crosses the floor on its first
+    step — is what a lurch is made of, and neither the sink nor the SDK reports
+    anything, because from their side every command was accepted.
+
+    So the smallest meaningful step on a deadbanded axis is the deadband. Above
+    the floor the configured cap is coarser than intended, which is a real cost
+    and the honest one: it is the granularity the chassis has. Shaping
+    acceleration below the floor is the gait controller's job, not ours.
+    """
+    return max(accel, floor)
+
+# ── the space this robot occupies ────────────────────────────────────────────
+#
+# Declared for the same reason `min_magnitude` is: it is a fact about the robot,
+# and a policy that hard-codes it is a policy that is wrong on the next chassis.
+# A navigation card testing a fixed angular slice of its camera is testing a
+# *different width at every distance* — at R1's numbers the slice is narrower
+# than the robot below about 1.1 m, which is to say precisely where it matters —
+# so the consumer needs the metric envelope to build a corridor out of.
+#
+# From Unitree's own spec sheet: 1230 x 357 x 190 mm (H x W x D).
+#
+# **This is the static envelope with the arms at rest.** A walking gait swings a
+# leg past the torso box and a raised arm leaves it entirely, so a consumer is
+# expected to add its own margin rather than treat these as clearances. That is
+# also why `source` is declared: an estimate and a measurement should not be
+# treated with equal confidence.
+FOOTPRINT_HALF_WIDTH = 0.179     # m, half of 357 mm
+FOOTPRINT_FRONT = 0.095          # m, half of 190 mm — torso only
+FOOTPRINT_REAR = 0.095
+FOOTPRINT_HEIGHT = 1.23
 
 DEFAULT_EXPECTED_HZ = 10.0
 MAX_HZ = 20.0
@@ -115,13 +170,21 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ) -> dict:
         "limits": {
             "lower": [-VX_LIMIT, -VY_LIMIT, 0.0, 0.0, 0.0, -WZ_LIMIT],
             "upper": [VX_LIMIT, VY_LIMIT, 0.0, 0.0, 0.0, WZ_LIMIT],
-            # Acceleration, not velocity — see the module docstring.
-            "max_delta_per_step": [VX_ACCEL, VY_ACCEL, PINNED_ACCEL,
-                                   PINNED_ACCEL, PINNED_ACCEL, WZ_ACCEL],
-            # The deadband, per axis. 0 means "no threshold on this axis".
-            # Consumers should either command 0 or at least this much — see
-            # MIN_VX above.
+            # Acceleration, not velocity — see the module docstring. Never finer
+            # than the deadband on the same axis; see `_step_limit`.
+            "max_delta_per_step": [_step_limit(VX_ACCEL, MIN_VX),
+                                   _step_limit(VY_ACCEL, MIN_VY),
+                                   PINNED_ACCEL, PINNED_ACCEL, PINNED_ACCEL,
+                                   _step_limit(WZ_ACCEL, MIN_WZ)],
+            # The deadband, per axis, **standing still**. 0 means "no
+            # threshold on this axis". Consumers should either command 0 or at
+            # least this much — see MIN_VX above.
             "min_magnitude": [MIN_VX, MIN_VY, 0.0, 0.0, 0.0, MIN_WZ],
+            # ...and the same thing while translation is already under way,
+            # which on a legged robot is a different number entirely. See
+            # MIN_WZ_MOVING.
+            "min_magnitude_moving": [MIN_VX, MIN_VY, 0.0, 0.0, 0.0,
+                                     MIN_WZ_MOVING],
             # no max_velocity: it would be jerk here, and a declared limit
             # nobody can interpret is worse than an absent one.
         },
@@ -137,6 +200,19 @@ def build_descriptor(expected_hz: float = DEFAULT_EXPECTED_HZ) -> dict:
         # The chassis reports no force-torque. Declared null rather than omitted
         # so the absent protection is visible; parse_descriptor requires it.
         "force_torque": None,
+        # What this robot will hit things with. See FOOTPRINT_HALF_WIDTH.
+        "footprint": {
+            "shape": "box",
+            "half_width": FOOTPRINT_HALF_WIDTH,
+            "front": FOOTPRINT_FRONT,
+            "rear": FOOTPRINT_REAR,
+            "height": FOOTPRINT_HEIGHT,
+            # "vendor-spec" | "measured" | "estimate". Provenance matters here:
+            # this box is off a datasheet, not off this robot with a tape
+            # measure, and it says nothing about where the arms are.
+            "source": "vendor-spec",
+            "arms": "at-rest",
+        },
     }
 
 
@@ -156,10 +232,22 @@ class LocoServoPlugin:
         self._expected_hz = float(config.get("expected_hz", DEFAULT_EXPECTED_HZ))
         if not 0 < self._expected_hz <= MAX_HZ:
             raise ValueError(f"loco_servo.expected_hz must be in (0, {MAX_HZ}]")
-        # Defaults to **on**. The first thing anyone does with a new command card
-        # is wire it up and watch, and a card that drives a chassis the first time
-        # it is connected is the wrong default for that.
-        self._dry_run = bool(config.get("dry_run", True))
+        # **Defaults to off. A deployed chassis should be able to move.**
+        #
+        # It used to default on, on the argument that a card should not drive a
+        # chassis the first time it is connected. That argument is wrong about
+        # this card: `start()` is inert, and it acts only on a command stream
+        # somebody wired up, started a policy on, and gave a target to. Three
+        # deliberate acts, each with its own gate.
+        #
+        # What the old default actually bought was a **silently dead** chassis
+        # on every freshly deployed robot: commands arrive, pass every check,
+        # report APPLIED, and nothing moves. Indistinguishable from a broken
+        # robot from outside — it cost an afternoon on r1_sz immediately after a
+        # deploy, with `applied: 33, refused: 0, sdk_errors: 0` on the screen the
+        # whole time. A safety default whose normal case is a silent failure
+        # only teaches people to switch it off without reading why it is there.
+        self._dry_run = bool(config.get("dry_run", False))
         # Whether a command requires the robot to be standing. Checked per
         # command rather than at start — see `_posture_problem`. Configurable
         # only because a bench with no chassis attached cannot reach FSM 811.
@@ -175,6 +263,9 @@ class LocoServoPlugin:
         #
         # It is loud on purpose: a card that quietly drops two thirds of every
         # command is exactly the failure this file keeps warning about.
+        # Off for the same reason: a chassis that silently drops two thirds of
+        # every command is harder to diagnose than one that does what it was
+        # told.
         self._rotate_only = bool(config.get("rotate_only", False))
         self._suppressed = 0
 
@@ -314,7 +405,7 @@ class LocoServoPlugin:
               f"(dry_run={self._dry_run})", flush=True)
         return {"state": "running", "input": topic, "dry_run": self._dry_run,
                 "rotate_only": self._rotate_only,
-                "control_interface": self._descriptor_raw}
+                "control_interface": self._interface()}
 
     def _halt(self, halted: bool):
         """`pause` / `resume`. Stops the chassis but keeps the subscription.
@@ -387,8 +478,24 @@ class LocoServoPlugin:
                 # canvas to one that is working, and this is the difference.
                 "posture_problem": self._fsm_problem,
                 "last": self._last_command,
-                "control_interface": self._descriptor_raw,
+                "control_interface": self._interface(),
             }
+
+    def _interface(self) -> dict:
+        """The descriptor, plus whether this chassis is currently a no-op.
+
+        `dry_run` and `rotate_only` ride along because the card upstream has no
+        other way to find out. A policy whose commands are being swallowed looks
+        exactly like one that is working — same verdicts, same counters, same
+        silence — and the upstream card's `degraded` list is the only place that
+        difference can reach an operator.
+        """
+        out = dict(self._descriptor_raw)
+        if self._dry_run:
+            out["dry_run"] = True
+        if self._rotate_only:
+            out["rotate_only"] = True
+        return out
 
     # ── arbitration with the call-shaped card ────────────────────────────────
 
