@@ -1,25 +1,37 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
 ARG ROS_APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu
-FROM ${ROS_BASE_IMAGE}
+FROM ${ROS_BASE_IMAGE} AS interface-builder
 ARG PYPI_MIRROR
 ARG ROS_APT_MIRROR
 
-WORKDIR /work
 RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
         { echo "ERROR: base image is missing /usr/share/keyrings/ros2-archive-keyring.gpg"; exit 1; } && \
     . /etc/os-release && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros2-archive-keyring.gpg] ${ROS_APT_MIRROR} ${UBUNTU_CODENAME} main" \
         > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip python3-pil ffmpeg python3-colcon-common-extensions cmake build-essential \
-    ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt /tmp/u1-requirements.txt
-RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt && rm /tmp/u1-requirements.txt
+    python3-colcon-common-extensions cmake build-essential && rm -rf /var/lib/apt/lists/*
 WORKDIR /u1_ws
 COPY vendor/ /u1_ws/src/
 RUN . /opt/ros/humble/setup.sh && colcon build --merge-install
+
+FROM ${ROS_BASE_IMAGE} AS runtime
+ARG PYPI_MIRROR
+ARG ROS_APT_MIRROR
+
+RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
+        { echo "ERROR: base image is missing /usr/share/keyrings/ros2-archive-keyring.gpg"; exit 1; } && \
+    . /etc/os-release && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros2-archive-keyring.gpg] ${ROS_APT_MIRROR} ${UBUNTU_CODENAME} main" \
+        > /etc/apt/sources.list.d/ros2.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip python3-pil ffmpeg ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /tmp/u1-requirements.txt
+RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt && rm /tmp/u1-requirements.txt
+
 WORKDIR /work
+COPY --from=interface-builder /u1_ws/install /u1_ws/install
 COPY common/ /work/common/
 COPY main.py device.py config.yaml driver.yaml /work/
 COPY deploy/ /deploy/

@@ -685,9 +685,15 @@ class MicPlugin:
             if not self.nodes.wait_for_mic_frame(2.0):
                 raise TimeoutError("no PCM frames received from the U1 microphone topic")
         except Exception as exc:
-            self._enable_requested = False
+            message = f"U1 Pro microphone unavailable: {str(exc)[:256]}"
+            try:
+                self.nodes.set_mic_enabled(False)
+            except Exception as cleanup_exc:
+                message += f"; microphone disable failed: {str(cleanup_exc)[:192]}"
+            else:
+                self._enable_requested = False
             self.running = False
-            return {"state": "error", "message": f"U1 Pro microphone unavailable: {str(exc)[:256]}", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+            return {"state": "error", "message": message, "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
         else:
             self.running = True
             return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}

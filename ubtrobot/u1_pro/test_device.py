@@ -171,12 +171,23 @@ class U1CardContractTests(unittest.TestCase):
     def test_cyclonedds_config_overrides_inherited_uri(self):
         import common.vendor_runtime as runtime
 
+        configured = "<CycloneDDS><Domain><Tracing><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
         with mock.patch.dict(os.environ, {"CYCLONEDDS_URI": "<invalid/>"}, clear=False):
             runtime.configure_cyclonedds({"ros": {
                 "robot_interface": "lo",
-                "cyclonedds_uri": "<CycloneDDS><Domain><Tracing><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>",
+                "cyclonedds_uri": configured,
             }})
-            self.assertIn("/dev/null", os.environ["CYCLONEDDS_URI"])
+            self.assertEqual(os.environ["CYCLONEDDS_URI"], configured)
+
+    def test_cyclonedds_uses_generated_uri_when_config_uri_is_absent(self):
+        import common.vendor_runtime as runtime
+
+        with mock.patch.dict(os.environ, {"CYCLONEDDS_URI": "<inherited/>"}, clear=False):
+            interface = runtime.configure_cyclonedds({"ros": {"robot_interface": "lo"}})
+            self.assertEqual(interface, "lo")
+            uri = os.environ["CYCLONEDDS_URI"]
+            self.assertIn("NetworkInterface name='lo'", uri)
+            self.assertIn("<OutputFile>/dev/null</OutputFile>", uri)
 
     def test_deployment_shares_vendor_runtime_ipc(self):
         service = Path(__file__).with_name("deploy") / "service.yml"
@@ -393,12 +404,39 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = FakeNodes()
-        nodes.set_mic_enabled = mock.Mock(side_effect=RuntimeError("service unavailable"))
+        nodes.set_mic_enabled = mock.Mock(side_effect=[RuntimeError("service unavailable"), {"code": 0}])
         plugin = device.MicPlugin(nodes)
         result = plugin.dispatch("start", {})
         self.assertEqual(result["state"], "error")
         self.assertFalse(plugin.running)
         self.assertFalse(plugin._enable_requested)
+        self.assertEqual(nodes.set_mic_enabled.call_args_list[1].args, (False,))
+
+    def test_mic_no_frame_timeout_disables_device(self):
+        import device
+
+        nodes = FakeNodes()
+        nodes.wait_for_mic_frame = mock.Mock(return_value=False)
+        plugin = device.MicPlugin(nodes)
+        result = plugin.start()
+        self.assertEqual(result["state"], "error")
+        self.assertIn("no PCM frames received", result["message"])
+        self.assertEqual(nodes.mic_enabled, [True, False])
+        self.assertFalse(plugin._enable_requested)
+        self.assertFalse(plugin.running)
+
+    def test_mic_timeout_reports_disable_failure_and_keeps_cleanup_pending(self):
+        import device
+
+        nodes = FakeNodes()
+        nodes.wait_for_mic_frame = mock.Mock(return_value=False)
+        nodes.set_mic_enabled = mock.Mock(side_effect=[{"code": 0}, RuntimeError("disable service timeout")])
+        plugin = device.MicPlugin(nodes)
+        result = plugin.start()
+        self.assertEqual(result["state"], "error")
+        self.assertIn("disable failed: disable service timeout", result["message"])
+        self.assertTrue(plugin._enable_requested)
+        self.assertFalse(plugin.running)
 
     def test_unknown_actions_return_none(self):
         import device
