@@ -4,7 +4,7 @@
 
 ## 接口与传输
 
-MCP 服务位于 15742，提供 `info/config/start/stop`；HTTPS/WSS 位于 15741。一个服务支持一个头显实例。设备唯一输出为 `/teleop/command`，format `data/teleop-cmd`，schema `motus.teleop.command/1`，只发送输入，不订阅机器人反馈。字段与生命周期见[输入契约](../../../docs/contracts/two-driver-teleop.md)。
+MCP 服务位于 15742，提供 `info/config/start/stop`；HTTPS/WSS 位于 15741。一个服务支持一个头显实例。设备唯一输出为 `/teleop/command`，format `data/teleop-cmd`，schema `motus.teleop.command/1`，只发送输入，不订阅机器人反馈。字段与生命周期见[输入契约](../README.md#输入契约)。
 
 DDS 使用同机 domain 42、RELIABLE / KEEP_LAST(16) / VOLATILE。独立 writer 隔离阻塞发布，应用层仅保留最新待发姿态。OpenXR 位置转换为 `[-z,-x,y]`，四元数转换为 `[-qz,-qx,qy,qw]` 并归一化，得到 X 前、Y 左、Z 上的设备跟踪系，单位为米；这不是机器人基座坐标系。
 
