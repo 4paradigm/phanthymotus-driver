@@ -1,5 +1,7 @@
 # ext_vr 设备接入设计与验收契约
 
+关联 PR：[ext_vr #329](https://github.com/4paradigm/phanthymotus-driver/pull/329) · [teleop #259](https://github.com/4paradigm/phanthymotus/pull/259) · [天轶执行 #321](https://github.com/4paradigm/phanthymotus-driver/pull/321) · [G1 执行 #330](https://github.com/4paradigm/phanthymotus-driver/pull/330)。
+
 将 PICO 客户端、安装配对和采集传输从 ActuCore teleop 拆为 Driver 的 `ext_vr` 设备卡，复用现有 ext 设备的 bundle、齿轮配置页和数据监控方式。目标是让实体 PICO 的安装、配对、输入采集与显示可独立验收，不等待机器人运动链通过。
 
 **Draft · 本提交仅文档。** 日期：2026-09-23。本提交确定职责、接口、使用步骤与验收标准，不实现运行时代码，不代表已经完成构建、部署、设备测试或 BOT review。主仓配套改动关联 [phanthymotus #259](https://github.com/4paradigm/phanthymotus/pull/259)。
@@ -7,7 +9,7 @@
 ## 确定的架构
 
 ```mermaid
-flowchart LR
+flowchart TD
     Pico[PICO 客户端] -->|WSS / RTC| Ext[Driver ext_vr]
     Ext -->|唯一 input topic| Teleop[ActuCore teleop]
     Teleop -->|EEF 目标| Motion[Driver motion_control]
@@ -42,10 +44,10 @@ flowchart LR
 | 责任 | 仓库与提交范围 |
 |---|---|
 | ext_vr 功能 owner | 本 Driver PR：共享设备实现、App/制品、邀请配对、输入、显示、天轶/G1 bundle 的薄接入以及相应测试、许可证和文档。安装、配对和设备状态业务不留给 teleop。 |
-| Core 宿主 writer | 主仓 #259 单列 ext_vr 伴随提交：复用齿轮页托管设备交互、固定下载代理、认证调用、配置确认及必要绑定。由 ext_vr owner 提供契约并负责设备验收，#259 owner 独占主仓共享文件写入；不建设通用 UI/安装框架。 |
-| teleop、天轶执行、G1 执行 | #259 的 teleop 提交处理输入消费和运动会话；两份机器人执行 PR 各自处理 motion_control/arm。四个 PR 同时推进，机器人执行实现不混入本设备 PR。 |
+| Core 宿主 writer | 主仓 [#259](https://github.com/4paradigm/phanthymotus/pull/259) 单列 ext_vr 伴随提交：复用齿轮页托管设备交互、固定下载代理、认证调用、配置确认及必要绑定。由 ext_vr owner 提供契约并负责设备验收，[#259](https://github.com/4paradigm/phanthymotus/pull/259) owner 独占主仓共享文件写入；不建设通用 UI/安装框架。 |
+| teleop、天轶执行、G1 执行 | [#259](https://github.com/4paradigm/phanthymotus/pull/259) 的 teleop 提交处理输入消费和运动会话；两份机器人执行 PR 各自处理 motion_control/arm。四个 PR 同时推进，机器人执行实现不混入本设备 PR。 |
 
-Driver PR 不包含 Core 仓库文件，也不为这次 UI 接线增开第五个 PR。Core 的伴随候选是设备齿轮页验收的版本依赖，但无须先完成 #259 的整链运动验收。涉及 bundle 的公共加载文件时，先固定本 PR 的设备接入提交，再由对应执行负责人基于该明确版本追加运动接入，不并发改写同一段。
+Driver PR 不包含 Core 仓库文件，也不为这次 UI 接线增开第五个 PR。Core 的伴随候选是设备齿轮页验收的版本依赖，但无须先完成 [#259](https://github.com/4paradigm/phanthymotus/pull/259) 的整链运动验收。涉及 bundle 的公共加载文件时，先固定本 PR 的设备接入提交，再由对应执行负责人基于该明确版本追加运动接入，不并发改写同一段。
 
 ## 使用与范围
 
@@ -70,7 +72,7 @@ PICO App 保持现有 applicationId 和签名边界，迁移客户端来源及�
 
 - [x] 确定本设计/验收契约，并在 README 标记为“计划/未实现”入口。
 - [ ] 实现共享 ext_vr、两个 bundle 接入、App/制品与设备生命周期。
-- [ ] 完成 #259 的 Core 伴随接线并记录兼容提交。
+- [ ] 完成 [#259](https://github.com/4paradigm/phanthymotus/pull/259) 的 Core 伴随接线并记录兼容提交。
 - [ ] 完成目标架构构建、离线/隔离验证、开发实体 PICO 测试、BOT review 和最终实体 PICO 验收。
 
 本次仅新增文档和计划入口，没有运行功能测试、构建镜像、安装 APK、连接设备、部署或申请 BOT review。下表均为待执行验收，不将旧 teleop 实现或历史真机记录记为本 PR 通过。
@@ -82,7 +84,7 @@ PICO App 保持现有 applicationId 和签名边界，迁移客户端来源及�
 | 编号 | 前置条件 | 步骤 | 预期结果 | 当前结果 |
 |---|---|---|---|---|
 | EXT-01 | 两个 bundle 的离线候选与隔离环境就绪 | 分别启动只启用设备链的配置，查询工具和实例 info，再禁用插件 | 复用原 MCP/注册身份；topic 可预先解析；没有独立 MCP、运动租约或运动发布；禁用不影响其他卡 | 未执行 |
-| EXT-02 | #259 Core 伴随候选可用，项目未启动 | 添加实例、打开齿轮页，再检查卡体和查看数据流入口 | 安装/配对/配置只在齿轮页；未启动项目可操作；卡体无设备动作表单 | 未执行 |
+| EXT-02 | [#259](https://github.com/4paradigm/phanthymotus/pull/259) Core 伴随候选可用，项目未启动 | 添加实例、打开齿轮页，再检查卡体和查看数据流入口 | 安装/配对/配置只在齿轮页；未启动项目可操作；卡体无设备动作表单 | 未执行 |
 | EXT-03 | 配置接口可控制成功、拒绝、超时和读回不一致 | 逐项保存配置并重新打开齿轮页；过程中关闭弹窗/切换实例 | 只有确认且读回一致的值持久化；失败不报成功；迟到结果不污染其他实例 | 未执行 |
 | EXT-04 | 固定输入 fixture、单调时钟及队列观测可用 | 注入正常、旧序号/代次、失效跟踪、时钟不匹配和积压输入 | 仅一个 input topic；字段/单位正确；旧值被拒绝或标无效；只保留最新帧，头显时间不冒充主机时间 | 未执行 |
 | EXT-05 | 可注入 motion feedback，尚无机器人动作 | 让 teleop 与 ext_vr 订阅同一反馈，注入新鲜/过期/错误会话数据并使显示消费变慢 | 无 relay/status topic；显示区分有效与历史；采集和管理不阻塞；ext_vr 不求解或申请执行权 | 未执行 |
@@ -105,7 +107,7 @@ PICO App 保持现有 applicationId 和签名边界，迁移客户端来源及�
 | 编号/阶段 | EXT-xx；离线、开发实体、BOT 或最终实体 |
 | 对象与前置 | 天轶或北京 G1 的设备标识、PICO 标识及版本、空闲/操作条件、相关实例与绑定；公开记录只保留可共享标识 |
 | Driver 源码 | 仓库、PR、完整 commit SHA、dirty 状态；最终验收必须对应审查通过的确定候选 |
-| Core/teleop 依赖 | #259 的完整 commit SHA、Core 伴随提交、使用到的 teleop 版本；未使用时明确填不涉及 |
+| Core/teleop 依赖 | [#259](https://github.com/4paradigm/phanthymotus/pull/259) 的完整 commit SHA、Core 伴随提交、使用到的 teleop 版本；未使用时明确填不涉及 |
 | 镜像 | Driver/Core 镜像名称、不可变 digest、目标架构；不能只填可变 tag |
 | APK | applicationId、versionName/versionCode、文件 SHA256、签名证书 SHA256、实际浏览器下载/安装方式 |
 | 配置/契约 | 脱敏配置或配置哈希、schema 版本、实例/绑定身份、topic/type/QoS、时钟域和可复现实验参数 |
