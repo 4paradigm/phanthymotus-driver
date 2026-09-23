@@ -1,5 +1,7 @@
 # G1 双臂 motion_control / arm 契约与验收计划
 
+关联 PR：[ext_vr #329](https://github.com/4paradigm/phanthymotus-driver/pull/329) · [teleop #259](https://github.com/4paradigm/phanthymotus/pull/259) · [天轶执行 #321](https://github.com/4paradigm/phanthymotus-driver/pull/321) · [G1 执行 #330](https://github.com/4paradigm/phanthymotus-driver/pull/330)。
+
 本 PR 将北京 G1 的双臂遥操接入 `ext_vr → ActuCore teleop → Driver motion_control → arm`，使输入频率与执行频率解耦，并复用现有 `arm.release` 完成 SDK 控制权交还。
 
 **状态：Draft，运行时尚未实现。当前变更仅包含计划与 README；未修改运行时代码，未构建、部署、执行真机动作或取得 BOT review。本文新增流接口均为待实现契约，release 为现有能力的复用与补强，验收项均未执行。**
