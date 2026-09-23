@@ -464,13 +464,18 @@ class U1Nodes:
                 print("[U1 init] authorization file could not be loaded", flush=True)
         missing = [key for key, value in values.items() if not value]
         if missing:
-            print(f"[U1 init] authorization skipped; missing fields: {', '.join(missing)}", flush=True)
-        else:
-            try:
-                self.string_call("authorize", values)
-                print("[U1 init] authorization request completed", flush=True)
-            except Exception:
-                print("[U1 init] authorization request failed", flush=True)
+            raise RuntimeError(f"U1 Pro authorization cannot start; missing fields: {', '.join(missing)}")
+        try:
+            response = self.string_call("authorize", values)
+        except Exception as exc:
+            raise RuntimeError("U1 Pro authorization request failed") from exc
+        if not (isinstance(response, dict)
+                and response.get("ok") is True
+                and response.get("code") == "OK"
+                and isinstance(response.get("data"), dict)
+                and response["data"].get("authorized") is True):
+            raise RuntimeError("U1 Pro authorization was rejected")
+        print("[U1 init] authorization request completed", flush=True)
 
         try:
             self.string_call("wakeup_enabled", {"enabled": False})
@@ -1554,7 +1559,6 @@ class _LifecyclePlugin:
     def start(self):
         if self.closed:
             raise RuntimeError("U1 Pro lifecycle is already closed")
-        self.nodes.initialize_robot()
 
     def stop(self):
         if self.closed:
@@ -1569,6 +1573,19 @@ class _LifecyclePlugin:
 
 def build_plugins(config: dict, namespace: str, ros) -> list:
     nodes = U1Nodes(config, namespace, ros)
+    # Authenticate before DriverBundle is created or the MCP endpoint is registered.
+    try:
+        nodes.initialize_robot()
+    except Exception:
+        try:
+            nodes.close()
+        except Exception:
+            pass
+        try:
+            ros.shutdown()
+        except Exception:
+            pass
+        raise
     # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
     # card has disabled its vendor resources and stopped publishing.
     audio = AudioPlugin(nodes)

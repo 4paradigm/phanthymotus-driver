@@ -10,6 +10,7 @@ import threading
 import tempfile
 import types
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from contextlib import redirect_stdout
 from unittest import mock
@@ -186,8 +187,12 @@ class U1CardContractTests(unittest.TestCase):
             interface = runtime.configure_cyclonedds({"ros": {"robot_interface": "lo"}})
             self.assertEqual(interface, "lo")
             uri = os.environ["CYCLONEDDS_URI"]
-            self.assertIn("NetworkInterface name='lo'", uri)
-            self.assertIn("<OutputFile>/dev/null</OutputFile>", uri)
+            root = ET.fromstring(uri)
+            general = root.find("./Domain/General")
+            self.assertIsNotNone(general)
+            self.assertEqual(general.findtext("AllowMulticast"), "false")
+            self.assertEqual(general.find("./Interfaces/NetworkInterface").attrib["name"], "lo")
+            self.assertIsNotNone(root.find("./Domain/Tracing/OutputFile"))
 
     def test_deployment_shares_vendor_runtime_ipc(self):
         service = Path(__file__).with_name("deploy") / "service.yml"
@@ -262,9 +267,11 @@ class U1CardContractTests(unittest.TestCase):
             namespace="test",
             mic_topic="/test/mic/audio",
             add_playback_listener=lambda listener: None,
+            initialize_robot=mock.Mock(),
         )
         with mock.patch.object(device, "U1Nodes", return_value=nodes):
             plugins = device.build_plugins({}, "test", object())
+        nodes.initialize_robot.assert_called_once_with()
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
@@ -562,7 +569,7 @@ class U1CardContractTests(unittest.TestCase):
 
         nodes = types.SimpleNamespace(
             config={"auth": {key: "secret-value" for key in ("appid", "api_key", "api_secret", "device_id", "license")}},
-            string_call=mock.Mock(return_value={"token": "do-not-log", "license": "private"}),
+            string_call=mock.Mock(return_value={"ok": True, "code": "OK", "data": {"authorized": True, "token": "do-not-log", "license": "private"}}),
         )
         output = io.StringIO()
         with redirect_stdout(output):
@@ -588,12 +595,67 @@ class U1CardContractTests(unittest.TestCase):
             }), encoding="utf-8")
             nodes = object.__new__(device.U1Nodes)
             nodes.config = {}
-            nodes.string_call = mock.Mock(return_value={"code": "OK"})
+            nodes.string_call = mock.Mock(return_value={"ok": True, "code": "OK", "data": {"authorized": True}})
             with mock.patch.dict(os.environ, {"U1_PRO_AUTH_FILE": str(root / "robo_auth.json")}, clear=False):
                 nodes.initialize_robot()
             payload = nodes.string_call.call_args_list[0].args[1]
             self.assertEqual(payload["appid"], "app")
             self.assertEqual(payload["license"], '{"license":"test"}')
+
+    def test_authorization_fails_closed_for_missing_credentials(self):
+        import device
+
+        nodes = object.__new__(device.U1Nodes)
+        nodes.config = {}
+        nodes.string_call = mock.Mock()
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(RuntimeError, "missing fields"):
+            nodes.initialize_robot()
+        nodes.string_call.assert_not_called()
+
+    def test_authorization_fails_closed_for_malformed_auth_file(self):
+        import device
+
+        with tempfile.TemporaryDirectory() as directory:
+            auth_path = Path(directory) / "robo_auth.json"
+            auth_path.write_text("not json", encoding="utf-8")
+            nodes = object.__new__(device.U1Nodes)
+            nodes.config = {}
+            nodes.string_call = mock.Mock()
+            with mock.patch.dict(os.environ, {"U1_PRO_AUTH_FILE": str(auth_path)}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "missing fields"):
+                    nodes.initialize_robot()
+            nodes.string_call.assert_not_called()
+
+    def test_authorization_fails_closed_for_rejected_vendor_response(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            config={"auth": {key: "present" for key in ("appid", "api_key", "api_secret", "device_id", "license")}},
+            string_call=mock.Mock(return_value={"ok": False, "code": "AUTHORIZE_FAILED", "data": {}}),
+        )
+        with self.assertRaisesRegex(RuntimeError, "authorization was rejected"):
+            device.U1Nodes.initialize_robot(nodes)
+
+    def test_authorization_failure_does_not_disable_wakeup_or_expose_plugins(self):
+        import device
+
+        initialize_robot = device.U1Nodes.initialize_robot
+        nodes = types.SimpleNamespace(
+            config={"auth": {key: "present" for key in ("appid", "api_key", "api_secret", "device_id", "license")}},
+            namespace="test",
+            mic_topic="/test/mic/audio",
+            add_playback_listener=lambda listener: None,
+            close=mock.Mock(),
+            string_call=mock.Mock(return_value={"ok": False, "code": "AUTHORIZE_FAILED", "data": {}}),
+            initialize_robot=lambda: initialize_robot(nodes),
+        )
+        ros = mock.Mock()
+        with mock.patch.object(device, "U1Nodes", return_value=nodes):
+            with self.assertRaisesRegex(RuntimeError, "authorization was rejected"):
+                device.build_plugins({}, "test", ros)
+        nodes.string_call.assert_called_once_with("authorize", mock.ANY)
+        nodes.close.assert_called_once_with()
+        ros.shutdown.assert_called_once_with()
 
     def test_acp_error_log_escapes_action_id(self):
         import device
@@ -690,13 +752,13 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(nodes.string_call.call_args_list[1].args[0], "play_action")
         self.assertEqual(nodes.string_call.call_args_list[1].args[1]["action"], "A007")
 
-    def test_lifecycle_initializes_robot_defaults(self):
+    def test_lifecycle_start_does_not_repeat_robot_initialization(self):
         import device
 
         nodes = mock.Mock()
         lifecycle = device._LifecyclePlugin(nodes)
         lifecycle.start()
-        nodes.initialize_robot.assert_called_once_with()
+        nodes.initialize_robot.assert_not_called()
 
     def test_tts_stop_interrupts_vendor_playback(self):
         import device

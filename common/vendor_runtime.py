@@ -51,7 +51,7 @@ def configure_cyclonedds(config: dict) -> str:
     os.environ["CYCLONEDDS_URI"] = (
         "<CycloneDDS><Domain><General><Interfaces>"
         f"<NetworkInterface name='{interface}'/>"
-        "</Interfaces></General><AllowMulticast>false</AllowMulticast>"
+        "</Interfaces><AllowMulticast>false</AllowMulticast></General>"
         "<Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile>"
         "</Tracing></Domain></CycloneDDS>"
     )
