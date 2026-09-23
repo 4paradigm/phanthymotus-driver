@@ -1,0 +1,20 @@
+{
+  "source_repository": "https://github.com/4paradigm/phanthymotus",
+  "source_commit": "302801605764d360571a7ce9bed2828dc5d54c9a",
+  "source_path": "actucore/plugins/teleop",
+  "license": "Apache-2.0",
+  "scope": "Device transport only; no runtime motion, URDF, IK or execution implementation adopted",
+  "original_prs": {
+    "transport": "https://github.com/4paradigm/phanthymotus-driver/pull/152",
+    "native_client": "https://github.com/4paradigm/phanthymotus-driver/pull/151"
+  },
+  "files_sha256": {
+    "capture.py": "b72297ae7c31504832b9510d21baced9ec121f87a40b2ec1dd4412e8cc858411",
+    "capture_server.py": "e95ee9be619fdabd4dda9b637fe3484183f237270cecc841fb59fa7a0d7d1271",
+    "enrollment.py": "45e459205c18b6c8ed1ee0c4fe59e0dbad350ae78e748b79766dbdcae4732c99",
+    "rtc.py": "d5a15db2bf2c0c5962dd4178a6597ad6bf43a165131b3d102bce49239c360ca2",
+    "protocol.py": "c04d47158089c7606d1692572969b3abc4ae73f527771f870ead78e340080b51",
+    "onboarding.py": "79677a9028f0df307a653f2a407055e1ebc486fc272d770dfc9dade0a9f2f1f4",
+    "requirements.transport.lock": "983982b1dc3ac537134d1e69b9f1ea24efcbec1c882d3b40e067be692a60f0c8"
+  }
+}

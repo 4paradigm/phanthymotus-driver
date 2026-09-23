@@ -1,3 +1,5 @@
+> 历史四卡方案，已被 [双 Driver 当前实施契约](pico-teleop-device.md) 替代。以下内容仅供历史对照，不作为本轮实现或验收要求。
+
 # ext_vr 设备接入设计与验收契约
 
 关联 PR：[ext_vr #329](https://github.com/4paradigm/phanthymotus-driver/pull/329) · [teleop #259](https://github.com/4paradigm/phanthymotus/pull/259) · [天轶执行 #321](https://github.com/4paradigm/phanthymotus-driver/pull/321) · [G1 执行 #330](https://github.com/4paradigm/phanthymotus-driver/pull/330)。

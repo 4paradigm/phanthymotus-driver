@@ -1,0 +1,10 @@
+**/__pycache__
+**/*.pyc
+**/.gradle
+**/.cxx
+**/build
+**/*.jks
+**/*.keystore
+**/*.pem
+**/*.key
+**/local.properties
