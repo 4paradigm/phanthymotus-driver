@@ -6,6 +6,8 @@ Hardware drivers for the **[Phanthy Motus](https://github.com/4paradigm/phanthym
 
 Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server that exposes hardware capabilities as tools. Drivers automatically register with the [Phanthy Motus Agent Core](https://github.com/4paradigm/phanthymotus) on startup.
 
+计划/未实现：[ext_vr 设备接入设计与验收契约](docs/plans/ext-vr-contract.md)说明在现有机器人 Driver bundle 内接入 PICO 的方案；当前仅交付文档，不代表已支持或通过设备验收。
+
 ## Available Drivers
 
 | Driver | Hardware | Port | Description |
