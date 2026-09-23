@@ -48,13 +48,13 @@ class ExtVrPlugin:
             "type": "sensor",
             "description": (
                 "PICO 设备安装步骤：1. 部署 PICO 和机器人遥操 Driver；"
-                "2. 保存配置以启动设备接入；无需配对密码；"
+                "2. 首次设置四位管理 PIN 并保存配置；下载 App 无需 PIN；"
                 "3. 复制网址下载 App 并在网页配对，连接 teleop_control 后开启项目；佩戴头显，松开双握把就绪后按住双握把遥操。"
                 + "下载与配对网址：" + origin + "/onboarding。"
                 +
                 "本卡只采集输入，不直接执行机器人动作。"
             ),
-            "multiInstance": True,
+            "multiInstance": False,
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -69,7 +69,17 @@ class ExtVrPlugin:
             "configSchema": {
                 "type": "object",
                 "description": "App 下载与配对网址（复制到浏览器）：" + origin + "/onboarding。地址由 Driver 自动生成。配对不会启动机器人。",
-                "properties": {"usage_guide": {"type": "string", "title": "使用说明（固定，无需配置）", "enum": ["无需配置"], "default": "无需配置", "scope": "instance"}},
+                "properties": {
+                    "management_pin": {
+                        "type": "string", "title": "管理 PIN（四位数字）",
+                        "description": "首次自行设置，之后固定保存；留空保留已有 PIN。仅用于网页配对管理，下载和已配对设备重连无需输入。",
+                        "format": "password", "x-sensitive": True,
+                        "pattern": "^([0-9]{4})?$", "maxLength": 4,
+                        # Ordinary Canvas gear renders instance-scoped fields.
+                        # Storage remains global to this single-device Driver.
+                        "scope": "instance",
+                    }
+                },
             },
             "topic_out": [
                 {
@@ -181,6 +191,25 @@ class ExtVrPlugin:
         canonical_instance(instance)
         if len(instance) > 64 or "/" in instance:
             raise ValueError("invalid_instance_id")
+        # One physical input source, regardless of the Canvas card's identity.
+        # Retain the old per-card pairing file when upgrading to single-instance.
+        if self.instances:
+            instance = next(iter(self.instances))
+        else:
+            state = Path(self.config["state_dir"])
+            saved = {p.name.removesuffix(".config.json") for p in state.glob("*.config.json")}
+            # Older start-without-config flows still persisted headset credentials.
+            for path in state.glob("*.json"):
+                if path.name.endswith(".config.json"):
+                    continue
+                value = json.loads(path.read_text())
+                if isinstance(value, dict) and set(value) == {"schema_version", "capture"}:
+                    saved.add(path.stem)
+            if len(saved) > 1:
+                raise ValueError("multiple_saved_device_instances")
+            if saved:
+                instance = next(iter(saved))
+                canonical_instance(instance)
         command = "/teleop/command"
         ports = {
             "topic_out": [
@@ -211,6 +240,7 @@ class ExtVrPlugin:
                 "config": dict(item["config"]),
                 "configured": True,
                 "pairing_password_required": False,
+                "management_pin_configured": item["server"].management_pin.configured,
                 "installation": item["server"].installation_info(),
                 "capture": await item["manager"].status(),
                 **ports,
@@ -231,6 +261,7 @@ class ExtVrPlugin:
                 "pairing_admin_password",
                 "installation_url",
                 "usage_guide",
+                "management_pin",
             }:
                 raise ValueError("unsupported_device_config")
             if runtime.running:
@@ -239,6 +270,14 @@ class ExtVrPlugin:
             # Accept old saved field names for migration, but use driver presets.
             candidate = self._defaults()
             self._validate_config(candidate)
+            pin = values.get("management_pin", "")
+            if pin != "":
+                changed = await asyncio.to_thread(item["server"].management_pin.configure, pin)
+                if changed:
+                    enrollment = item["server"].enrollment
+                    enrollment.revoke_invitation()
+                    enrollment.pending = None
+                    enrollment.deadline = 0
             # Legacy saved passwords are ignored and never persisted or used.
             temporary = item["config_file"].with_suffix(".tmp")
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -256,6 +295,7 @@ class ExtVrPlugin:
                 "confirmed": True,
                 "config": dict(confirmed),
                 "pairing_password_required": False,
+                "management_pin_configured": item["server"].management_pin.configured,
             }
         if action == "start":
             if not runtime.running:

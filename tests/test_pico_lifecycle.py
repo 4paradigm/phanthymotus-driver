@@ -93,32 +93,81 @@ def test_real_mcp_configuration_and_null_error_success(device):
         thread.join(3)
 
 
-def test_https_pairing_management_without_password(device):
+def test_https_pairing_management_requires_pin(device):
     import aiohttp
     plugin, config = device
     plugin.dispatch("config", {"instance_id": "test-vr"})
     origin = config["public_wss_url"].replace("wss://", "https://").split("/ws/")[0]
     context = ssl.create_default_context(cafile=config["tls_cert_file"])
+
     async def run():
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=context)) as session:
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=context),
+                                        cookie_jar=aiohttp.CookieJar(unsafe=True)) as session:
             async with session.get(origin + "/onboarding") as response:
-                html = await response.text()
-                assert response.status == 200 and '无需密码' in html and 'id="login"' not in html
-            async with session.post(origin + "/manage/open", json={}) as response:
+                assert response.status == 200 and 'PIN' in await response.text()
+            async with session.get(origin + "/onboarding/package") as response:
                 assert response.status == 200
-                assert (await response.json())["pairing"]["window_open"]
+            async with session.post(origin + "/manage/login", json={"pin": "0412"}) as response:
+                assert response.status == 503
+            configured = plugin.dispatch("config", {"management_pin": "0412"})
+            assert configured["management_pin_configured"] and "0412" not in json.dumps(configured)
+            for operation in ("status", "open", "invite", "revoke_invitation", "approve", "reject", "revoke_headset"):
+                async with session.post(origin + "/manage/" + operation, json={}) as response:
+                    assert response.status == 401, operation
+            assert not plugin.instances["test-vr"]["server"].enrollment.status()["window_open"]
+            async with session.post(origin + "/manage/login", json={"pin": "9999"}) as response:
+                assert response.status == 403
+            async with session.post(origin + "/manage/login", json={"pin": "0412"}) as response:
+                assert response.status == 200
+                cookie = response.headers['Set-Cookie']
+                assert all(flag in cookie for flag in ('Secure', 'HttpOnly', 'SameSite=Strict', 'Path=/'))
+                assert '0412' not in cookie and '0412' not in await response.text()
+            async with session.post(origin + "/manage/invite", json={}, headers={"Origin": "https://other.invalid"}) as response:
+                assert response.status == 403
+            async with session.post(origin + "/manage/invite", data="{}") as response:
+                assert response.status == 415
+            async with session.post(origin + "/manage/open", json={}) as response:
+                assert response.status == 200 and (await response.json())["pairing"]["window_open"]
             async with session.post(origin + "/manage/invite", json={}) as response:
                 assert response.status == 200
                 invitation = await response.json()
                 assert invitation['deep_link'].startswith('motus-teleop://connect#')
+            plugin.dispatch("config", {"management_pin": ""})
+            plugin.dispatch("config", {"management_pin": "0412"})
             async with session.post(origin + "/manage/status", json={}) as response:
                 assert response.status == 200
                 assert invitation['token'] not in json.dumps(await response.json())
-            async with session.post(origin + "/manage/revoke_invitation", json={}) as response:
+            plugin.dispatch("config", {"management_pin": "1234"})
+            async with session.post(origin + "/manage/status", json={}) as response:
+                assert response.status == 401
+            async with session.post(origin + "/pairing/invite", json={
+                k: invitation[k] for k in ("invitation_id", "token", "device_id")
+            } | {"device_name": "test"}) as response:
+                assert response.status == 403
+            async with session.post(origin + "/manage/login", json={"pin": "1234"}) as response:
                 assert response.status == 200
+            async with session.post(origin + "/manage/logout", json={}) as response:
+                assert response.status == 200
+            async with session.post(origin + "/manage/status", json={}) as response:
+                assert response.status == 401
     asyncio.run(run())
-    info = plugin.dispatch("info", {"instance_id": "test-vr"})
+    info = plugin.dispatch("info", {})
     assert info['pairing_password_required'] is False
+    assert info['management_pin_configured'] is True
+    assert '0412' not in json.dumps(info)
+
+
+def test_single_instance_upgrade_preserves_pairing_identity(device):
+    plugin, config = device
+    path = Path(config["state_dir"]) / "old-card.config.json"
+    path.write_text(json.dumps(plugin._defaults()))
+    plugin.dispatch("config", {"management_pin": "0412"})
+    assert list(plugin.instances) == ["old-card"]
+    plugin.dispatch("config", {"instance_id": "new-card", "management_pin": ""})
+    assert list(plugin.instances) == ["old-card"]
+    assert not (path.parent / "new-card.config.json").exists()
+    assert plugin.dispatch("info", {})["instance_id"] == "old-card"
+    assert plugin.get_tool()["multiInstance"] is False
 
 
 def test_concurrent_core_save_and_start_reapply_are_serialized(device):
@@ -152,3 +201,50 @@ def test_legacy_password_is_ignored_and_not_persisted(device):
     plugin.dispatch("config", {"instance_id": "test-vr", "pairing_admin_password": "short"})
     assert not (Path(config['state_dir']) / 'pairing-admin.json').exists()
     assert plugin.dispatch("info", {"instance_id": "test-vr"})['pairing_password_required'] is False
+
+
+@pytest.mark.parametrize("legacy_without_config", [False, True])
+def test_pin_changes_and_card_migration_preserve_headset_reconnect(device, legacy_without_config):
+    from ext_vr.capture import CAPTURE_PROTOCOL, RTC_FRAME_PROTOCOL
+    plugin, config = device
+    plugin.dispatch("config", {"instance_id": "legacy-card", "management_pin": "0412"})
+    manager = plugin.instances["legacy-card"]["manager"]
+
+    async def pair():
+        invitation = await manager.create_pairing()
+        connection, ack = await manager.connect({
+            "type": "pair", "pairing_id": invitation["pairing_id"],
+            "pairing_code": invitation["pairing_code"],
+            "capture_protocol": CAPTURE_PROTOCOL, "frame_protocol": RTC_FRAME_PROTOCOL,
+            "client_kind": "native_openxr", "app_version": "0.4.4-pico-input",
+        })
+        await manager.disconnect(connection)
+        return ack
+
+    ack = asyncio.run_coroutine_threadsafe(pair(), plugin.loop).result(3)
+    pairing_file = Path(config["state_dir"]) / "legacy-card.json"
+    before = pairing_file.read_bytes()
+    plugin.dispatch("config", {"management_pin": "5678"})
+    assert pairing_file.read_bytes() == before
+    plugin.close()
+    if legacy_without_config:
+        (Path(config["state_dir"]) / "legacy-card.config.json").unlink()
+    restored = ExtVrPlugin(config, "pico")
+    try:
+        restored.dispatch("config", {"management_pin": ""})
+        assert list(restored.instances) == ["legacy-card"]
+        assert restored.instances["legacy-card"]["server"].management_pin.configured
+
+        async def reconnect():
+            capture = restored.instances["legacy-card"]["manager"]
+            conn, reply = await capture.connect({
+                "type": "credential", "capture_id": ack["capture_id"],
+                "capture_credential": ack["capture_credential"],
+                "capture_protocol": CAPTURE_PROTOCOL, "frame_protocol": RTC_FRAME_PROTOCOL,
+                "client_kind": "native_openxr", "app_version": "0.4.4-pico-input",
+            })
+            assert reply["type"] == "connected"
+            await capture.disconnect(conn)
+        asyncio.run_coroutine_threadsafe(reconnect(), restored.loop).result(3)
+    finally:
+        restored.close()

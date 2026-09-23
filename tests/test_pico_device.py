@@ -282,7 +282,8 @@ def test_standalone_metadata_and_info_have_no_core_custom_dependency(tmp_path):
         assert info["topic_out"][0]["topic"] == "/teleop/command"
         assert "feedback_topic" not in info
         assert info["config"]["driver_installed"]
-        assert set(tool["configSchema"]["properties"]) == {"usage_guide"}
+        assert set(tool["configSchema"]["properties"]) == {"management_pin"}
+        assert tool["configSchema"]["properties"]["management_pin"]["x-sensitive"] is True
         assert info["installation_url"] in tool["configSchema"]["description"]
         assert plugin.instances == {}
     finally:

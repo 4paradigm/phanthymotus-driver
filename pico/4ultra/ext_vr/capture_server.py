@@ -15,6 +15,7 @@ from aiohttp import web
 from cryptography import x509
 
 from .enrollment import Enrollment
+from .management_pin import ManagementPin
 from .onboarding import APK_DIRECTORY, APK_FILENAME, MIME_TYPE, package_metadata
 
 from .capture import (
@@ -398,6 +399,7 @@ async def capture_websocket_handler(request: web.Request) -> web.StreamResponse:
 
 
 ENROLLMENT_KEY = web.AppKey("teleop_enrollment", Enrollment)
+MANAGEMENT_PIN_KEY = web.AppKey("teleop_management_pin", ManagementPin)
 
 
 async def management_page(request):
@@ -423,8 +425,29 @@ async def management_handler(request):
             or request.content_length > 4096
         ):
             raise CaptureError("pairing_request_invalid")
+        if request.content_type != "application/json":
+            raise CaptureError("management_json_required", status=415)
+        origin = request.headers.get("Origin")
+        if origin is not None and origin != request.scheme + "://" + request.host:
+            raise CaptureError("management_origin_rejected", status=403)
         data = capture_json(await request.text())
         operation = request.match_info["operation"]
+        auth = request.app.get(MANAGEMENT_PIN_KEY)
+        if auth is None:
+            raise CaptureError("management_pin_not_configured", status=503)
+        if operation == "login":
+            token = await asyncio.to_thread(auth.login, data.get("pin"))
+            response = web.json_response({"authenticated": True}, headers={"Cache-Control": "no-store"})
+            response.set_cookie(auth.COOKIE, token, max_age=auth.SESSION_SECONDS,
+                                secure=True, httponly=True, samesite="Strict", path="/")
+            return response
+        token = request.cookies.get(auth.COOKIE)
+        auth.authorize(token)
+        if operation == "logout":
+            auth.logout(token)
+            response = web.json_response({"authenticated": False}, headers={"Cache-Control": "no-store"})
+            response.del_cookie(auth.COOKIE, secure=True, httponly=True, samesite="Strict", path="/")
+            return response
         enrollment = request.app[ENROLLMENT_KEY]
         capture = request.app[CAPTURE_KEY]
         if operation == "status":
@@ -504,7 +527,7 @@ async def package_handler(request):
 
 
 def create_capture_app(
-    manager: CaptureManager, enrollment=None
+    manager: CaptureManager, enrollment=None, management_pin=None
 ) -> web.Application:
     app = web.Application(client_max_size=MAX_CAPTURE_MESSAGE_BYTES)
     app[CAPTURE_KEY] = manager
@@ -515,6 +538,8 @@ def create_capture_app(
     if enrollment is not None:
         app.router.add_post("/manage/{operation}", management_handler)
         app[ENROLLMENT_KEY] = enrollment
+        if management_pin is not None:
+            app[MANAGEMENT_PIN_KEY] = management_pin
         app.router.add_post(
             "/pairing/{operation:request|poll|invite}", enrollment_handler
         )
@@ -534,6 +559,7 @@ class CaptureWssServer:
             capture_certificate_base64(config),
             public_wss_url=config.get("public_wss_url"),
         )
+        self.management_pin = ManagementPin(Path(config["state_dir"]) / "management-pin.json")
         self._discovery = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -552,7 +578,7 @@ class CaptureWssServer:
         if self._runner is not None:
             return
         runner = web.AppRunner(
-            create_capture_app(self._manager, self.enrollment)
+            create_capture_app(self._manager, self.enrollment, self.management_pin)
         )
         await runner.setup()
         try:
