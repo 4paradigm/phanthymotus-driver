@@ -76,7 +76,7 @@ def _install_stubs():
     for name in ("AudioChunk", "AudioInData", "AudioOutData"):
         setattr(audio_msg, name, message(name))
     audio_srv = types.ModuleType("audio_msgs.srv")
-    for name in ("EnableAudioIn", "SetAudioVolume"):
+    for name in ("EnableAudioIn", "EnableAudioOut", "SetAudioVolume"):
         setattr(audio_srv, name, type(name, (), {"Request": message("Request")}))
     audio.msg, audio.srv = audio_msg, audio_srv
     sys.modules.update({"audio_msgs": audio, "audio_msgs.msg": audio_msg, "audio_msgs.srv": audio_srv})
@@ -204,13 +204,29 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = object.__new__(device.U1Nodes)
+        class EnableRequest:
+            pass
+        nodes.EnableAudioIn = types.SimpleNamespace(Request=EnableRequest)
+        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0, message=""))
         nodes._mic_forwarding = False
         nodes._mic_frames = 0
         nodes._mic_frame_event = threading.Event()
         result = nodes.set_mic_enabled(True)
         self.assertTrue(nodes._mic_forwarding)
+        self.assertTrue(nodes.call.call_args.args[1].enable)
         self.assertEqual(result["source_topic"], MIC_TOPIC)
         nodes.set_mic_enabled(False)
+        self.assertFalse(nodes._mic_forwarding)
+
+    def test_mic_enable_service_failure_is_reported(self):
+        import device
+
+        nodes = object.__new__(device.U1Nodes)
+        nodes.EnableAudioIn = types.SimpleNamespace(Request=type("Request", (), {}))
+        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=7, message="device busy"))
+        nodes._mic_forwarding = True
+        with self.assertRaisesRegex(RuntimeError, "code 7"):
+            nodes.set_mic_enabled(True)
         self.assertFalse(nodes._mic_forwarding)
 
     def test_event_bridge_keeps_sdk_string_payloads(self):
@@ -241,7 +257,7 @@ class U1CardContractTests(unittest.TestCase):
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
-            "lifecycle", "mic", "speaker", "tts", "expression", "head", "agent", "vision",
+            "lifecycle", "mic", "speaker", "tts", "expression", "head", "wakeup_control", "visual_follow_control",
             "camera_rgb", "vision_capture", "doa_event",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
@@ -423,6 +439,16 @@ class U1CardContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not available"):
             expression.dispatch("play", {"name": "smile"})
 
+    def test_expression_parses_nested_json_motion_list(self):
+        import device
+
+        response = {"data": json.dumps({"motion_info_list": [
+            {"motion_id": "A019", "motion_name": "撒娇"},
+            {"motion_id": "A101", "motion_name": "歌曲_1"},
+        ]}, ensure_ascii=False)}
+        self.assertEqual(device.ExpressionPlugin._expression_actions(response)["actions"],
+                         [{"name": "affectionate", "label": "撒娇"}])
+
     def test_vision_capture_saves_a_fresh_jpeg(self):
         import device
 
@@ -547,6 +573,14 @@ class U1CardContractTests(unittest.TestCase):
         metadata = {"width": 2, "height": 2, "step": 8, "encoding": "rgb8"}
         payload = bytes((255, 0, 0, 0, 255, 0, 99, 99,
                          0, 0, 255, 255, 255, 255, 88, 88))
+        jpeg = device._jpeg_from_frame(payload, metadata)
+        self.assertTrue(jpeg.startswith(b"\xff\xd8\xff"))
+
+    def test_video_frame_conversion_supports_yuy2_encoding(self):
+        import device
+
+        metadata = {"width": 2, "height": 2, "step": 4, "encoding": "yuv422_yuy2"}
+        payload = bytes((100, 128, 150, 128, 80, 128, 120, 128))
         jpeg = device._jpeg_from_frame(payload, metadata)
         self.assertTrue(jpeg.startswith(b"\xff\xd8\xff"))
 
@@ -691,12 +725,30 @@ class U1CardContractTests(unittest.TestCase):
         nodes = mock.Mock()
         nodes.set_system_enabled.return_value = {"ok": True}
         nodes.get_system_enabled.return_value = {"enabled": False}
-        agent = device._SystemSwitchPlugin(nodes, "agent", "wakeup_enabled", "wakeup_enabled_state", "agent")
-        vision = device._SystemSwitchPlugin(nodes, "vision", "vision_enabled", "vision_enabled_state", "vision")
-        self.assertEqual(agent.dispatch("disable", {}), {"ok": True})
+        wakeup = device._SystemSwitchPlugin(nodes, "wakeup_control", "wakeup_enabled", "wakeup_enabled_state", "wakeup")
+        vision = device._SystemSwitchPlugin(nodes, "visual_follow_control", "vision_enabled", "vision_enabled_state", "vision")
+        self.assertEqual(wakeup.dispatch("disable", {}), {"ok": True})
         self.assertEqual(vision.dispatch("status", {}), {"enabled": False})
         nodes.set_system_enabled.assert_called_once_with("wakeup_enabled", False)
         nodes.get_system_enabled.assert_called_once_with("vision_enabled_state")
+
+    def test_speaker_enables_device_output_before_forwarding(self):
+        import device
+
+        nodes = object.__new__(device.U1Nodes)
+        nodes.EnableAudioOut = types.SimpleNamespace(Request=type("Request", (), {}))
+        nodes._speaker_subscription = None
+        nodes._speaker_uuid = ""
+        nodes._speaker_frames = 0
+        nodes._audio_qos = object()
+        nodes._speaker_forwarding = False
+        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0, message=""))
+        nodes.core = types.SimpleNamespace(create_subscription=mock.Mock(return_value="subscription"))
+        nodes.AudioChunk = object
+        result = nodes.connect_speaker("/tts/audio")
+        self.assertTrue(nodes.call.call_args.args[1].enable)
+        self.assertEqual(result["input_topic"], "/tts/audio")
+        self.assertTrue(nodes._speaker_forwarding)
 
     def test_tts_uses_documented_play_text_payload(self):
         import device

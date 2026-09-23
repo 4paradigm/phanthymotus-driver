@@ -155,6 +155,28 @@ def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
         mode, rawmode, channels = "RGBA", "BGRA", 4
     elif encoding in {"mono8", "8uc1"}:
         mode, rawmode, channels = "L", "L", 1
+    elif encoding in {"yuv422_yuy2", "yuy2", "yuyv", "yuv422_yuyv"}:
+        import numpy as np
+
+        row_bytes = width * 2
+        step = step or row_bytes
+        if width % 2 or step < row_bytes or len(payload) < step * height:
+            raise ValueError("U1 Pro YUY2 frame payload is smaller than metadata dimensions")
+        packed = np.frombuffer(payload, dtype=np.uint8).reshape(height, step)[:, :row_bytes]
+        yuyv = packed.reshape(height, width // 2, 4).astype(np.int32)
+        y = np.empty((height, width), dtype=np.int32)
+        y[:, 0::2], y[:, 1::2] = yuyv[:, :, 0], yuyv[:, :, 2]
+        u = np.repeat(yuyv[:, :, 1], 2, axis=1) - 128
+        v = np.repeat(yuyv[:, :, 3], 2, axis=1) - 128
+        c = np.maximum(y - 16, 0)
+        rgb = np.stack(((298 * c + 409 * v + 128) >> 8,
+                        (298 * c - 100 * u - 208 * v + 128) >> 8,
+                        (298 * c + 516 * u + 128) >> 8), axis=-1)
+        image = Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8), "RGB")
+        import io
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=85, optimize=False)
+        return output.getvalue()
     else:
         raise ValueError(f"unsupported U1 Pro video encoding: {encoding!r}")
     row_bytes = width * channels
@@ -317,7 +339,7 @@ class U1Nodes:
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
         from audio_msgs.msg import AudioChunk, AudioInData, AudioOutData
-        from audio_msgs.srv import SetAudioVolume
+        from audio_msgs.srv import EnableAudioIn, EnableAudioOut, SetAudioVolume
         from std_msgs.msg import UInt8
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
@@ -345,6 +367,8 @@ class U1Nodes:
         self.mic_topic = f"/{namespace}/mic/audio"
         self.AudioChunk = AudioChunk
         self.AudioInData = AudioInData
+        self.EnableAudioIn = EnableAudioIn
+        self.EnableAudioOut = EnableAudioOut
         self.AudioOutData = AudioOutData
         self.UInt8 = UInt8
         self.String = String
@@ -379,6 +403,8 @@ class U1Nodes:
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
         self._robot_subscriptions.append(self.robot.create_subscription(String, VIDEO_METADATA_TOPIC, self._metadata_callback, reliable))
         self._clients = {
+            "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
+            "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
             "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
             "motion_list": self.robot.create_client(StringCall, "/robo/audio/call/get_motion_info_list"),
             "play_action": self.robot.create_client(StringCall, "/robo/audio/call/play_action"),
@@ -510,8 +536,14 @@ class U1Nodes:
         return future.result()
 
     def set_mic_enabled(self, enabled: bool) -> dict:
+        self._mic_forwarding = False
+        request = self.EnableAudioIn.Request()
+        request.enable = bool(enabled)
+        response = self.call("mic_enable", request)
+        code = int(getattr(response, "code", -1))
+        if code != 0:
+            raise RuntimeError(f"U1 Pro microphone enable service failed with code {code}")
         if not enabled:
-            self._mic_forwarding = False
             return {"state": "idle", "source_topic": MIC_TOPIC}
         self._mic_frames = 0
         self._mic_frame_event.clear()
@@ -580,9 +612,21 @@ class U1Nodes:
         if self._speaker_subscription is not None:
             self.core.destroy_subscription(self._speaker_subscription)
             self._speaker_subscription = None
+            try:
+                request = self.EnableAudioOut.Request()
+                request.enable = False
+                self.call("speaker_enable", request)
+            except Exception:
+                pass
 
     def connect_speaker(self, input_topic: str) -> dict:
         self.close_speaker_subscription()
+        request = self.EnableAudioOut.Request()
+        request.enable = True
+        response = self.call("speaker_enable", request)
+        code = int(getattr(response, "code", -1))
+        if code != 0:
+            raise RuntimeError(f"U1 Pro speaker enable service failed with code {code}")
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
         self._speaker_frames = 0
         self._speaker_subscription = self.core.create_subscription(
@@ -1351,15 +1395,28 @@ class ExpressionPlugin:
                 return {"actions": []}
         available_ids = set()
         def collect(value):
+            if isinstance(value, str):
+                try:
+                    collect(json.loads(value))
+                except json.JSONDecodeError:
+                    pass
+                return
             if isinstance(value, list):
                 for item in value:
                     collect(item)
             if isinstance(value, dict):
-                motion_id = str(value.get("motion_id", value.get("id", "")))
+                motion_id = str(value.get("motion_id", value.get("motionId",
+                                  value.get("action_id", value.get("actionId", value.get("id", ""))))))
                 if motion_id:
                     available_ids.add(motion_id)
+                name_id = str(value.get("motion_name", value.get("motionName", "")))
+                if name_id:
+                    normalized = name_id.strip().lower()
+                    for name, (_known_id, label) in cls.EXPRESSIONS.items():
+                        if normalized in {name, label.lower()}:
+                            available_ids.add(_known_id)
                 for child in value.values():
-                    if isinstance(child, (dict, list)):
+                    if isinstance(child, (dict, list, str)):
                         collect(child)
         collect(response)
         actions = [{"name": name, "label": label}
@@ -1504,9 +1561,9 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     camera = CameraRgbPlugin(nodes, config)
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
                ExpressionPlugin(audio), HeadPlugin(audio),
-               _SystemSwitchPlugin(nodes, "agent", "wakeup_enabled", "wakeup_enabled_state",
+               _SystemSwitchPlugin(nodes, "wakeup_control", "wakeup_enabled", "wakeup_enabled_state",
                                     "Enable or disable the U1 Pro built-in wakeup and voice-interaction entry point."),
-               _SystemSwitchPlugin(nodes, "vision", "vision_enabled", "vision_enabled_state",
+               _SystemSwitchPlugin(nodes, "visual_follow_control", "vision_enabled", "vision_enabled_state",
                                     "Enable or disable U1 Pro visual behavior, including visual following."),
                camera,
                VisionCapturePlugin(camera, config.get("vision_capture", {}))]

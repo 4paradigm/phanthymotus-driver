@@ -15,8 +15,8 @@ cards:
   - { name: tts, type: actuator }
   - { name: expression, type: actuator }
   - { name: head, type: actuator }
-  - { name: agent, type: actuator }
-  - { name: vision, type: actuator }
+  - { name: wakeup_control, type: actuator }
+  - { name: visual_follow_control, type: actuator }
   - { name: camera_rgb, type: sensor }
   - { name: vision_capture, type: actuator }
   - { name: doa_event, type: sensor }

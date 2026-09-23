@@ -7,8 +7,8 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 - `tts`: text-to-speech through the documented `play_text` service, with `interrupt`/`stop` and asynchronous completion. Raw audio and preset actions are intentionally not exposed by this card.
 - `tts` also controls the shared U1 speaker volume with `set_volume` and `get_volume`; TTS and live speaker streams use the same device output volume.
 - `expression`: face and gesture actions listed by readable names such as `smile` or `blink`; the driver maps these names to documented vendor IDs and only lists actions present in the robot's live command-motion list.
-- `agent`: enables, disables, or queries the vendor's built-in wakeup and voice-interaction entry point. This is the documented `wakeup_enabled` switch, not a process/container lifecycle control.
-- `vision`: enables, disables, or queries the documented visual system switch. Disabling it stops visual decisions, visual following, and visual idle actions, so it is the supported way to turn off built-in person-follow behavior.
+- `wakeup_control`: enables, disables, or queries the vendor's built-in wakeup and voice-interaction entry point. This is the documented `wakeup_enabled` switch, not a process/container lifecycle control.
+- `visual_follow_control`: controls the documented visual system switch. Disabling it stops visual decisions, visual following, and visual idle actions, so it is the supported way to turn off built-in person-follow behavior.
 - `head`: plays documented preset head motions (`nod`, `shake`, `tilt`, `look_up`, and `look_down`) by readable name. The SDK does not expose arbitrary head angles or low-level neck-joint control.
 - `camera_rgb`: the documented U1 video stream. It opens the vendor stream, reads the section 4.5 shared-memory ring, and publishes `/namespace/camera/rgb` as `image/jpeg`.
 - `vision_capture`: photo/video capture built on the `camera_rgb` JPEG cache. It supports `capture_image`, timed `record_video`, continuous `start_recording`/`stop_recording`, `list`, `delete`, and `info`.
@@ -51,10 +51,12 @@ manual lifecycle action: it returns a `recording_id` immediately and keeps
 recording until `stop_recording`; the final result is returned by
 `stop_recording` and `info`, rather than being treated as a finite ACP task.
 
-Microphone input subscribes to the Adapter's `/sys/device/audio_in/raw` topic on
-domain `2` and converts its 16 kHz mono `AudioInData` messages to the Agent Core
-`audio/pcm-16k` stream. Startup reports an error unless a supported PCM frame
-arrives. Speaker output publishes Agent Core PCM frames to
+Microphone input enables the Adapter's `/sys/device/audio_in/enable` service,
+then subscribes to its `/sys/device/audio_in/raw` topic on domain `2` and
+converts 16 kHz mono `AudioInData` messages to the Agent Core `audio/pcm-16k`
+stream. Startup reports an error unless a supported PCM frame arrives. Speaker
+output enables `/sys/device/audio_out/enable` when a connected stream starts and
+publishes Agent Core PCM frames to
 `/sys/device/audio_out/raw`; volume is read from `/sys/device/audio_out/current_volume`
 and set through `/sys/device/audio_out/set_volume`. These device interfaces use
 a dedicated domain `2` context selected by `audio_device_domain_id`.
