@@ -1,5 +1,7 @@
 # 天轶三段末端遥操架构实施计划
 
+> **历史三卡方案。** 下文保留 `86de168` 阶段的实现范围和验证记录；后续四卡实施、天轶与北京G1并行及验收顺序以[天轶双臂契约](tianyi-dual-arm-motion-contract.md)为准。旧证据不代表新要求已通过。
+
 ## 范围
 
 用户已授权离线实现 `ActuCore teleop → Driver motion_control → Driver arm`。

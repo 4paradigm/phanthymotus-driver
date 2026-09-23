@@ -1,5 +1,7 @@
 # Tianyi 2.0 Pro Driver
 
+> 遥操说明对应历史三卡实现 `86de168`，不是当前设备部署状态。后续四卡职责与验收以[天轶双臂契约](../../docs/plans/tianyi-dual-arm-motion-contract.md)为准：设备连接归ext_vr，motion反馈直达teleop/ext_vr；新方案尚待实现和验收。
+
 Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.

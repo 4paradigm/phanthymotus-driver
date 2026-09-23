@@ -1,5 +1,7 @@
 # 天轶 motion_control 与 arm 连续入口
 
+> **适用版本：历史三卡实现 `86de168`。** 下文接口与行为保留作已有实现参考；新四卡边界、motion反馈直达teleop/ext_vr及恢复要求见[天轶双臂契约](../../docs/plans/tianyi-dual-arm-motion-contract.md)，尚不声明这些新要求已实现。
+
 Canvas 接线为 `teleop → motion_control → arm`。普通 ActuCore 的 teleop 只处理
 设备连接、双握把和相对末端映射；本 Driver 持有天轶模型、IK、碰撞检查、反馈显示
 和显式收臂。模型与原厂 URDF 的来源见 [NOTICE](tianyi_motion/NOTICE.md)。
