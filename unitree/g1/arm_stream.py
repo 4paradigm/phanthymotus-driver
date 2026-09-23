@@ -612,8 +612,11 @@ class ArmStreamExecutor:
                 dt=max(0.,min((now-self.last_emit)/1e9,.02))
                 limit=self.velocity*dt
                 if servo:
-                    # Follow the last successfully written reference (PR322),
-                    # not measured-position noise. Cap dt after input gaps so
+                    # Continuity/reference handoff follows jsmy-CTH's PR #322:
+                    # https://github.com/4paradigm/phanthymotus-driver/pull/322
+                    # Use the last successful output, not measured-position noise.
+                    # The 120ms exponential filter is an addition in this PR.
+                    # Cap dt after input gaps so
                     # a regrip cannot skip smoothing by accumulating idle time.
                     smooth_dt=max(0.,min((now-self.last_emit)/1e9,.05))
                     alpha=-math.expm1(-smooth_dt/.12)
