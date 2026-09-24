@@ -314,6 +314,52 @@ class LocoPlugin:
         self._last_cmd_time: float = 0.0
         self._move_thread: threading.Thread | None = None
         self._move_stop_event = threading.Event()
+        # Set by LocoServoPlugin at construction. `loco` is built first, so the
+        # link cannot be a constructor argument in this direction.
+        self._servo = None
+
+    def attach_servo(self, servo) -> None:
+        """Let the streaming chassis card be paused before we drive it ourselves."""
+        self._servo = servo
+
+    def is_moving(self) -> bool:
+        """Whether a `move` thread is still publishing velocities.
+
+        A fact only this plugin knows, and `loco_servo` has to ask it before it
+        starts writing to the same `HighController` — two threads publishing at
+        different rates into one SDK reads on the robot as a stutter and in the
+        logs as nothing at all.
+        """
+        thread = self._move_thread
+        return bool(thread is not None and thread.is_alive())
+
+    def publish_velocity(self, x: float, y: float, z: float) -> None:
+        """One normalised velocity command, through this plugin's rate limiter.
+
+        `loco_servo` routes through here rather than holding `high_ctrl` itself
+        so that both cards share one lock and one >=2 ms spacing. Two writers
+        with separate limiters can interleave inside a single publish, and the
+        SDK has no way to tell us that happened.
+        """
+        self._publish_cmd(x, y, z, _get_default_cmd(), 0)
+
+    def _preempt_servo(self, reason: str) -> bool:
+        """An explicit action outranks a streaming policy.
+
+        This direction is not negotiable: a person or the LLM saying "stop" or
+        "dance" must win over a policy that is mid-plan, and the reverse would
+        mean a policy could override a human instruction 100 ms after it was
+        given.
+
+        Called from **every** action on this plugin that moves the robot, not
+        just `loco.move`. The posture, preset and teaching actions all change
+        `workmode` out from under a running stream, and a stream that keeps
+        publishing velocities into a robot that is being told to lie down is the
+        one combination none of the individual cards can see.
+        """
+        if self._servo is None:
+            return False
+        return bool(self._servo.pause_for_explicit_command(reason))
 
     def get_tools(self) -> list:
         return [
@@ -469,22 +515,39 @@ class LocoPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
+            # The streaming card goes first. Stopping the chassis and leaving a
+            # policy publishing into it means the next command restarts the
+            # robot somebody just stopped, within 100 ms and with nothing in the
+            # log connecting the two.
+            self._preempt_servo("loco.stop")
             self._stop_move()
             return {"state": "idle"}
 
         tool_name = args.pop('_tool_name', '')
 
+        handler = None
         if tool_name == "loco" and action == "move":
-            return self._do_move(args)
-        if tool_name == "loco" and action == "stop_move":
-            return self._stop_move()
-        if tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
-            return self._do_posture_action(action, args)
-        if tool_name == "semantic_action" and action in _PRESET_ACTIONS:
-            return self._do_preset_action(action)
-        if tool_name == "action_recording" and action in _TEACHING_ACTIONS:
-            return self._do_teaching_action(action, args)
-        return None
+            handler = lambda: self._do_move(args)
+        elif tool_name == "loco" and action == "stop_move":
+            handler = self._stop_move
+        elif tool_name == "stand_up_lie_prone" and action in _POSTURE_ACTIONS:
+            handler = lambda: self._do_posture_action(action, args)
+        elif tool_name == "semantic_action" and action in _PRESET_ACTIONS:
+            handler = lambda: self._do_preset_action(action)
+        elif tool_name == "action_recording" and action in _TEACHING_ACTIONS:
+            handler = lambda: self._do_teaching_action(action, args)
+        if handler is None:
+            return None
+
+        # Before touching the robot, not after: otherwise this command and the
+        # policy's next one race, and which one the robot ends up obeying
+        # depends on timing nobody controls. Every action reachable from here
+        # moves the body, so every one of them preempts.
+        preempted = self._preempt_servo(f"{tool_name}.{action}")
+        result = handler()
+        if preempted and isinstance(result, dict):
+            result["preempted_loco_servo"] = True
+        return result
 
     def _publish_cmd(self, x: float, y: float, z: float, action_cmd, index: int = 0):
         """Send command with rate limiting (≥2ms between calls). action_cmd is ControlCmd enum."""
@@ -1560,6 +1623,37 @@ def _camera_subprocess(namespace: str):
 
     print(f"[camera_subprocess] publishing color→{color_topic} depth→{depth_topic}", flush=True)
 
+    # **The camera knows its own optics; say so out loud.** navi's avoidance
+    # corridor is metric, so every frame it converts its half-width back into a
+    # range of image columns using the horizontal field of view — and a wrong
+    # value there does not raise anything, it makes the robot refuse doorways
+    # while the depth map reports clear ahead. The D435i reports real intrinsics
+    # for the exact profile that was negotiated, which is the only source that
+    # accounts for the 4:3 crop this driver asks the 16:9 RGB sensor for.
+    #
+    # Sent over stdout because the parent already forwards it: no second pipe,
+    # no file, and the line stays in `docker logs` where somebody debugging a
+    # wrong field of view will look first. See `camera_specs.INTRINSICS_MARKER`.
+    try:
+        import json as _json
+        _streams = {}
+        for _name, _stream in (("color", rs.stream.color), ("depth", rs.stream.depth)):
+            _intr = (pipeline.get_active_profile()
+                     .get_stream(_stream).as_video_stream_profile().intrinsics)
+            _streams[_name] = {
+                "width": _intr.width, "height": _intr.height,
+                "fx": _intr.fx, "fy": _intr.fy,
+                "ppx": _intr.ppx, "ppy": _intr.ppy,
+                "model": str(_intr.model).rsplit(".", 1)[-1],
+                "coeffs": list(_intr.coeffs),
+            }
+        print("[camera_subprocess] INTRINSICS " + _json.dumps(_streams), flush=True)
+    except Exception as _e:
+        # Not fatal: the cards fall back to the datasheet-derived declaration in
+        # `camera_specs.SPECS` and say `source` accordingly. Losing the camera
+        # over a failed introspection call would be the worse trade.
+        print(f"[camera_subprocess] intrinsics unavailable: {_e}", flush=True)
+
     frame_count = 0
     t_start = _time.monotonic()
     try:
@@ -1670,6 +1764,33 @@ class CameraPlugin:
         self._proc: subprocess.Popen | None = None
         self._frame_node = _CameraFrameNode(self._color_topic)
         executor.add_node(self._frame_node)
+        # What the RealSense reported about itself, keyed by stream name. Filled
+        # in by the stdout forwarder below once the pipeline negotiates a
+        # profile; empty until then, which is why `camera_specs` also carries a
+        # fallback — the declaration has to be answerable before the camera runs.
+        self._intrinsics: dict = {}
+        self._intrinsics_lock = threading.Lock()
+
+    def _camera_info(self, tool_name: str, topic: str, fmt: str) -> list:
+        """This port's optics — `motus.camera/1`, see `camera_specs.py`.
+
+        The numbers live in a module that does not import rclpy, so they can be
+        asserted on a laptop. A field of view that is wrong by a factor of 1.6
+        does not raise anything; it makes the robot refuse doorways while the
+        depth map reports clear ahead.
+        """
+        from camera_specs import declare
+
+        with self._intrinsics_lock:
+            intrinsics = dict(self._intrinsics)
+        try:
+            return declare(tool_name, topic, fmt, intrinsics)
+        except Exception as exc:                              # noqa: BLE001
+            # A declaration this driver cannot build is a bug in this driver,
+            # and it must not take the camera's `info()` down with it — the
+            # consumer's own fallback is conservative and says so.
+            print(f"[camera] camera_info for {tool_name} failed: {exc}", flush=True)
+            return []
 
     def get_tools(self) -> list:
         return [
@@ -1702,8 +1823,20 @@ class CameraPlugin:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         def _fwd():
+            from camera_specs import parse_intrinsics_line
+
             for line in self._proc.stdout:
-                print(line.decode(errors='replace').rstrip(), flush=True)
+                text = line.decode(errors='replace').rstrip()
+                # Printed either way: the declaration is what the cards serve,
+                # but the line itself is what somebody debugging a wrong field
+                # of view will grep for in `docker logs`.
+                print(text, flush=True)
+                payload = parse_intrinsics_line(text)
+                if payload:
+                    with self._intrinsics_lock:
+                        self._intrinsics = payload
+                    print("[camera] adopted RealSense intrinsics for "
+                          + ", ".join(sorted(payload)), flush=True)
         threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
@@ -1724,10 +1857,15 @@ class CameraPlugin:
             return {"state": "idle"}
         if action == "info":
             tool_name = args.get('_tool_name', '')
-            if tool_name == "camera":
-                return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
-            if tool_name == "depth":
-                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
+            topic_map = {
+                "camera": (self._color_topic, "image/jpeg"),
+                "depth": (self._depth_topic, "image/depth-zlib"),
+            }
+            if tool_name in topic_map:
+                topic, fmt = topic_map[tool_name]
+                return {"state": "running",
+                        "topic_out": [{"topic": topic, "format": fmt}],
+                        "camera_info": self._camera_info(tool_name, topic, fmt)}
             return {"state": "running"}
         return None
 
@@ -1809,14 +1947,27 @@ class _MotionStateNode(Node):
         self._high_ctrl = high_ctrl
         self._topic = f"/{namespace}/motion/state"
         self._pub = self.create_publisher(String, self._topic, 10)
+        # Second publisher, carrying the robot's own motion in motus.odom/1.
+        # Published *alongside* the vendor-shaped topic above rather than
+        # replacing it: that one has consumers not visible from inside this
+        # bundle, and a 10 Hz duplicate is much cheaper than finding out which.
+        self._odom_topic = f"/{namespace}/state/odom"
+        self._odom_pub = self.create_publisher(String, self._odom_topic, 10)
         self._interval_s = interval_s
         self._activity_velocity_threshold = activity_velocity_threshold
         self._running = False
         self._thread = None
+        self._odom_thread = None
+        self._odom_samples = 0
+        self._odom_burst_size = 0
 
     @property
     def topic(self) -> str:
         return self._topic
+
+    @property
+    def odom_topic(self) -> str:
+        return self._odom_topic
 
     def start_polling(self):
         if self._running:
@@ -1824,11 +1975,82 @@ class _MotionStateNode(Node):
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="bumi_motion_state")
         self._thread.start()
+        self._odom_thread = threading.Thread(target=self._odom_loop, daemon=True,
+                                             name="bumi_odom")
+        self._odom_thread.start()
 
     def stop_polling(self):
         self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+        for thread in (self._thread, self._odom_thread):
+            if thread and thread.is_alive():
+                thread.join(timeout=1.0)
+
+    # ── motus.odom/1 ─────────────────────────────────────────────────────────
+
+    def odom_health(self) -> dict:
+        import odom_spec
+
+        return {
+            "odom_samples": self._odom_samples,
+            # Raw IMU readings behind the last published average. Five on a
+            # healthy loop; 0 means nothing was read in the window and every
+            # axis of that sample was `null`, which is a different statement
+            # from a robot holding still.
+            "odom_burst_samples": self._odom_burst_size,
+            "odom_note": odom_spec.HEALTH_NOTE,
+        }
+
+    def _odom_loop(self):
+        """Read the IMU fast, publish the average slowly.
+
+        The shape of what goes out lives in `odom_spec`, which imports no rclpy
+        and is therefore assertable on a laptop — the `None`s in a sample are
+        the part of this that fails silently, so they are the part that must not
+        only be checkable on a robot.
+        """
+        import odom_spec
+
+        burst = []
+        last_publish = 0.0
+        while self._running:
+            try:
+                imu = self._high_ctrl.get_imu_data()
+                burst.append(odom_spec.reading(imu.angular_vel))
+            except Exception as exc:                          # noqa: BLE001
+                # A reading we could not take is not a reading of zero.
+                # Dropping it leaves the window holding only what was
+                # understood, and an empty window publishes all-`None`.
+                self.get_logger().warn(f"motus.odom/1 read failed: {exc}")
+
+            now = time.monotonic()
+            if now - last_publish < odom_spec.PUBLISH_S:
+                time.sleep(odom_spec.SAMPLE_S)
+                continue
+            last_publish = now
+
+            readings, burst = burst, []
+            self._odom_burst_size = len(readings)
+            try:
+                mode = None
+                mode_name = ""
+                try:
+                    mode = int(self._high_ctrl.get_mode())
+                    mode_name = _WORKMODE_NAMES.get(mode, "unknown")
+                except Exception:                             # noqa: BLE001
+                    pass
+                sample = odom_spec.sample(
+                    readings, received_ms=int(time.time() * 1000),
+                    workmode=mode, workmode_name=mode_name)
+            except Exception as exc:                          # noqa: BLE001
+                self.get_logger().warn(f"motus.odom/1 publish failed: {exc}")
+                time.sleep(odom_spec.SAMPLE_S)
+                continue
+
+            message = String()
+            message.data = json.dumps(sample, ensure_ascii=False)
+            self._odom_pub.publish(message)
+            self._odom_samples += 1
+            time.sleep(odom_spec.SAMPLE_S)
 
     def _loop(self):
         while self._running:
@@ -1952,12 +2174,24 @@ class MotionStatePlugin:
         self._node = _MotionStateNode(namespace, high_ctrl, interval, activity_threshold)
         executor.add_node(self._node)
 
+    def _odom_interface(self) -> dict:
+        import odom_spec
+
+        return odom_spec.interface()
+
     def get_tool(self) -> dict:
         return {
             "name": "motion_state", "type": "sensor", "multiInstance": False,
-            "description": "Bumi 整机运动状态：持续输出工作模式、保护状态、运动判断、IMU 姿态与动态、关节运动统计、已确认的电机故障，以及全部 21 个关节的位置、速度、力矩、温度和原始错误值。不包含电池信息，也不控制机器人。",
+            "description": (
+                "Bumi 整机运动状态：持续输出工作模式、保护状态、运动判断、IMU 姿态与动态、"
+                "关节运动统计、已确认的电机故障，以及全部 21 个关节的位置、速度、力矩、温度"
+                f"和原始错误值。不包含电池信息，也不控制机器人。同一份 IMU 角速度另按 "
+                f"motus.odom/1 以 10 Hz 发到 {self._node.odom_topic}（机体系；"
+                "Bumi 的 SDK 不提供平移速度，vx/vy/vz 恒为 null）。"
+            ),
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
+            "topic_out": [{"topic": self._node.topic, "format": "data/json"},
+                          {"topic": self._node.odom_topic, "format": "state/odom"}],
         }
 
     def start(self):
@@ -1971,6 +2205,17 @@ class MotionStatePlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            return {
+                "state": "running",
+                "topic_out": [{"topic": self._node.topic, "format": "data/json"},
+                              {"topic": self._node.odom_topic,
+                               "format": "state/odom"}],
+                # Read once at start by anything that needs to know whether this
+                # robot reports its own motion, and which axes of it.
+                "odom_interface": self._odom_interface(),
+                **self._node.odom_health(),
+            }
         return None
 
 
