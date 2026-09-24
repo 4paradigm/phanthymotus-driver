@@ -22,6 +22,8 @@ import sqlite3
 import threading
 import time
 
+from safety_harness import NAV_ARRIVAL_RADIUS_M
+
 
 # ── RPC Error Codes ──────────────────────────────────────────────────────────
 
@@ -285,6 +287,27 @@ def _bearing_label(dx: float, dy: float) -> str:
         return "behind"
 
 
+# ── Navigation arrival ───────────────────────────────────────────────────────
+#
+# The G1 SLAM service does **not** publish `ctrl_info`, so `is_arrived` never
+# arrives — verified on the robot (rt/slam_info carries only `robot_data`,
+# `pos_info` and `mapping_info`) and already noted in safety_harness.py. The one
+# arrival signal that exists is the pose stream: the robot is there when it is
+# within this radius of the target.
+#
+# That radius is `NAV_ARRIVAL_RADIUS_M`, imported at the top of this file rather
+# than repeated here: there are two wait paths (SmartMotion's and the one below)
+# and a robot that "arrives" at a different distance depending on which process is
+# watching is a bug waiting to be blamed on the map.
+#
+# A pose only means "where the robot is now" while `pos_info` is flowing. It stops
+# the moment localization is lost, and `_current_pose` then keeps reporting the
+# last fix forever. Declaring arrival off such a reading would report a navigation
+# that never started as complete, if the robot happened to be parked near the
+# target — so a stale pose decides nothing and the stall timeout handles it.
+POSE_FRESH_S = 3.0
+
+
 # ── ACP Helper ───────────────────────────────────────────────────────────────
 
 def _acp_notify(action_id: str, status: str, result: dict, tool: str = "controlled_spatial"):
@@ -345,7 +368,9 @@ class ControlledSpatialPlugin:
         self._active_map: str | None = None
         self._is_mapping: bool = False
         self._current_pose: dict | None = None
+        self._pose_ts: float = 0.0  # monotonic stamp of _current_pose
         self._map_status: str = "idle"  # idle | mapping | localized
+        self._nav_target_pose: dict | None = None  # {x, y} of the nav in flight
         self._nav_arrived = threading.Event()
         self._nav_error: str | None = None
         self._nav_action_id: str | None = None  # current navigate ACP action_id
@@ -463,6 +488,7 @@ class ControlledSpatialPlugin:
                         "y": pose_data["y"],
                         "yaw": round(yaw, 3),
                     }
+                    self._pose_ts = time.monotonic()
                     if msg_type == "pos_info":
                         self._map_status = "localized"
                     elif msg_type == "mapping_info":
@@ -482,6 +508,26 @@ class ControlledSpatialPlugin:
     def _get_pose(self) -> dict | None:
         with self._lock:
             return dict(self._current_pose) if self._current_pose else None
+
+    def _get_fresh_pose(self, max_age: float = POSE_FRESH_S) -> dict | None:
+        """The current pose, or None if `pos_info` has gone quiet for `max_age`."""
+        with self._lock:
+            if not self._current_pose:
+                return None
+            if time.monotonic() - self._pose_ts > max_age:
+                return None
+            return dict(self._current_pose)
+
+    def _arrived_at(self, target_pose: dict | None) -> float | None:
+        """Distance to `target_pose` if a fresh pose says we are inside the arrival
+        radius, else None. The one place the arrival rule is spelled out."""
+        if not target_pose:
+            return None
+        pose = self._get_fresh_pose()
+        if not pose:
+            return None
+        dist = math.hypot(pose["x"] - target_pose["x"], pose["y"] - target_pose["y"])
+        return dist if dist < NAV_ARRIVAL_RADIUS_M else None
 
     def _wait_for_localization(self, timeout: float = 10.0) -> bool:
         """Wait until SLAM reports localization (pos_info via rt/slam_info)."""
@@ -505,8 +551,14 @@ class ControlledSpatialPlugin:
 
     # ── ACP completion thread ────────────────────────────────────────────────
 
-    def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90):
-        """Wait for navigation to complete, then fire ACP callback."""
+    def _acp_wait_nav(self, action_id: str, target: str, stall_timeout: float = 90,
+                      target_pose: dict | None = None):
+        """Wait for navigation to complete, then fire ACP callback.
+
+        `target_pose` ({x, y}) is what the fallback path below measures arrival
+        against. It is not optional in practice — without it that path has no
+        arrival signal at all, because `is_arrived` never comes.
+        """
         self._nav_action_id = action_id
         t0 = time.time()
 
@@ -540,13 +592,30 @@ class ControlledSpatialPlugin:
                 })
             return
 
-        # Fallback: no SmartMotion — poll local DDS callback + stall detection
+        # Fallback: no SmartMotion — this is the path the isolated subprocess takes,
+        # since _controlled_spatial_process constructs the plugin with
+        # smart_motion=None. Arrival here is decided by the pose stream, exactly as
+        # SmartMotion decides it; `is_arrived` below is kept only for the day the
+        # SLAM service starts publishing ctrl_info.
         last_pose = self._get_pose()
         last_move_time = time.time()
 
+        def _superseded() -> bool:
+            if self._nav_action_id == action_id:
+                return False
+            print(f'[ControlledSpatial] _acp_wait_nav {action_id} superseded, skipping notify',
+                  flush=True)
+            return True
+
         while True:
+            if _superseded():
+                return
+
             if self._nav_arrived.wait(timeout=1.0):
                 elapsed = round(time.time() - t0, 1)
+                if _superseded():
+                    return
+                self._nav_action_id = None
                 if self._nav_error:
                     error = self._nav_error
                     self._nav_error = None
@@ -557,7 +626,24 @@ class ControlledSpatialPlugin:
                     pose = self._get_pose()
                     _acp_notify(action_id, "completed", {
                         "target": target, "pose": pose, "elapsed": elapsed,
+                        "via": "ctrl_info",
                     })
+                return
+
+            # Primary arrival signal on this path: close enough, on a fresh fix.
+            dist = self._arrived_at(target_pose)
+            if dist is not None:
+                elapsed = round(time.time() - t0, 1)
+                if _superseded():
+                    return
+                self._nav_action_id = None
+                pose = self._get_pose()
+                print(f"[ControlledSpatial] nav arrived via pose after {elapsed}s, "
+                      f"dist={dist:.3f}m, pose={pose}", flush=True)
+                _acp_notify(action_id, "completed", {
+                    "target": target, "pose": pose, "elapsed": elapsed,
+                    "distance": round(dist, 3), "via": "pose",
+                })
                 return
 
             current_pose = self._get_pose()
@@ -575,6 +661,9 @@ class ControlledSpatialPlugin:
             if time.time() - last_move_time > stall_timeout:
                 if self._client:
                     self._client.PauseNav()
+                if _superseded():
+                    return
+                self._nav_action_id = None
                 _acp_notify(action_id, "error", {
                     "target": target,
                     "error": f"stall_timeout ({stall_timeout}s)",
@@ -583,6 +672,9 @@ class ControlledSpatialPlugin:
                 return
 
             if time.time() - t0 > 180:
+                if _superseded():
+                    return
+                self._nav_action_id = None
                 _acp_notify(action_id, "error", {
                     "target": target, "error": "timeout_180s",
                     "elapsed": 180,
@@ -764,6 +856,7 @@ class ControlledSpatialPlugin:
                     mode = 1  # 强制停障模式，不允许绕障
                 self._nav_arrived.clear()
                 self._nav_error = None
+                self._nav_target_pose = {"x": poi["x"], "y": poi["y"]}
                 result = self._smart_motion.navigate_to(poi["x"], poi["y"], yaw, tag_name,
                                                      speed=speed, mode=mode)
                 # ACP: spawn completion thread
@@ -772,7 +865,8 @@ class ControlledSpatialPlugin:
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    args=(action_id, tag_name, float(args.get("stall_timeout", 90)),
+                          {"x": poi["x"], "y": poi["y"]}),
                     daemon=True,
                 ).start()
                 return result
@@ -786,13 +880,15 @@ class ControlledSpatialPlugin:
                 mode = 1  # 强制停障模式，不允许绕障
             self._nav_arrived.clear()
             self._nav_error = None
+            self._nav_target_pose = {"x": poi["x"], "y": poi["y"]}
             code, resp = self._client.NavigateTo(poi["x"], poi["y"], 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, tag_name, float(args.get("stall_timeout", 90))),
+                    args=(action_id, tag_name, float(args.get("stall_timeout", 90)),
+                          {"x": poi["x"], "y": poi["y"]}),
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target": tag_name,
@@ -816,13 +912,15 @@ class ControlledSpatialPlugin:
                     mode = 1  # 强制停障模式，不允许绕障
                 self._nav_arrived.clear()
                 self._nav_error = None
+                self._nav_target_pose = {"x": x, "y": y}
                 result = self._smart_motion.navigate_to(x, y, yaw, speed=speed, mode=mode)
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 result["action_id"] = action_id
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)),
+                          {"x": x, "y": y}),
                     daemon=True,
                 ).start()
                 return result
@@ -833,13 +931,15 @@ class ControlledSpatialPlugin:
             mode = int(args.get("mode", 1))
             self._nav_arrived.clear()
             self._nav_error = None
+            self._nav_target_pose = {"x": x, "y": y}
             code, resp = self._client.NavigateTo(x, y, 0, 0, 0, q_z, q_w, speed=speed, mode=mode)
             if code == 0:
                 from uuid import uuid4
                 action_id = f"g1_nav_{uuid4().hex[:8]}"
                 threading.Thread(
                     target=self._acp_wait_nav,
-                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90))),
+                    args=(action_id, f"pose({x},{y})", float(args.get("stall_timeout", 90)),
+                          {"x": x, "y": y}),
                     daemon=True,
                 ).start()
                 return {"status": "navigating", "target_pose": {"x": x, "y": y, "yaw": yaw},
@@ -855,10 +955,12 @@ class ControlledSpatialPlugin:
             if self._smart_motion:
                 return self._smart_motion.wait_nav_done(stall_timeout=stall_timeout)
 
-            # Fallback: poll local DDS callback (may be unreliable due to GIL contention)
+            # Fallback: decide arrival from the pose stream, the same way
+            # _acp_wait_nav does — `is_arrived` below never fires on this robot.
             poll_interval = 1.0
             last_pose = self._get_pose()
             stall_start = time.time()
+            target_pose = self._nav_target_pose
 
             while True:
                 if self._nav_arrived.is_set():
@@ -866,7 +968,12 @@ class ControlledSpatialPlugin:
                         error = self._nav_error
                         self._nav_error = None
                         return {"status": "error", "error": error}
-                    return {"status": "arrived", "pose": self._get_pose()}
+                    return {"status": "arrived", "pose": self._get_pose(), "via": "ctrl_info"}
+
+                dist = self._arrived_at(target_pose)
+                if dist is not None:
+                    return {"status": "arrived", "pose": self._get_pose(),
+                            "distance": round(dist, 3), "via": "pose"}
 
                 time.sleep(poll_interval)
                 current_pose = self._get_pose()
@@ -929,6 +1036,13 @@ def _controlled_spatial_process(plugin_config: dict, namespace: str, command_que
 
         child_config = dict(plugin_config)
         child_config["isolated_process"] = False
+        # smart_motion=None is not a placeholder to be filled in later: SmartMotionProxy
+        # owns queues, threads and a live process, none of which survive a spawn. The
+        # child therefore always takes the plugin's *fallback* paths — its own
+        # _SlamRpcProxy for RPC, and its own pose watch for arrival. That is why
+        # _acp_wait_nav's fallback has to detect arrival on its own; when it did not,
+        # every navigation on an isolated card ran to stall_timeout and was reported
+        # as an error, because `is_arrived` never arrives.
         plugin = ControlledSpatialPlugin(child_config, namespace, None, slam_client=None, smart_motion=None)
         plugin.start()
         tool_def = plugin.get_tools()
