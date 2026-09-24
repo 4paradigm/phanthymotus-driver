@@ -83,10 +83,8 @@ def _install_stubs():
     for name in ("AudioChunk", "AudioInData", "AudioOutData", "AudioInfo"):
         setattr(audio_msg, name, message(name))
     audio_srv = types.ModuleType("audio_msgs.srv")
-    request = message("Request")
-    request.ADD = 0
     for name in ("EnableAudioIn", "EnableAudioOut", "SetAudioVolume"):
-        setattr(audio_srv, name, type(name, (), {"Request": request}))
+        setattr(audio_srv, name, type(name, (), {"Request": message("Request")}))
     audio.msg, audio.srv = audio_msg, audio_srv
     sys.modules.update({"audio_msgs": audio, "audio_msgs.msg": audio_msg, "audio_msgs.srv": audio_srv})
 
@@ -284,7 +282,7 @@ class U1CardContractTests(unittest.TestCase):
 
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
-            "lifecycle", "mic", "speaker", "tts", "expression", "head", "wakeup_control", "wakeup_followup_control", "visual_follow_control",
+            "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls",
             "camera_left", "camera_right", "vision_capture", "doa_event",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
@@ -930,10 +928,7 @@ class U1CardContractTests(unittest.TestCase):
             {"code": "OK", "data": {"enabled": False}},
             {"code": "OK", "data": {"enabled": False}},
         ]
-        nodes.get_system_enabled.side_effect = [
-            {"code": "OK", "data": {"enabled": False}},
-            {"code": "OK", "data": {"enabled": False}},
-        ]
+        nodes.get_system_enabled.return_value = {"code": "OK", "data": {"enabled": False}}
         wakeup = device._SystemSwitchPlugin(nodes, "wakeup_control", "wakeup_enabled", "wakeup_enabled_state", "wakeup")
         vision = device._SystemSwitchPlugin(nodes, "visual_follow_control", "vision_enabled", "vision_enabled_state", "vision")
         self.assertEqual(device.U1Nodes.set_system_enabled(nodes, "wakeup_enabled", False), {
@@ -943,8 +938,9 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(vision.dispatch("status", {}), {"code": "OK", "data": {"enabled": False}})
         self.assertEqual(wakeup.dispatch("start", {}), {"state": "ready"})
         self.assertEqual(wakeup.dispatch("stop", {}), {"state": "idle"})
-        self.assertEqual(wakeup.get_tool()["inputSchema"]["properties"]["action"]["enum"],
-                         ["start", "stop", "enable", "disable", "status"])
+        controls = device.SystemControlsPlugin(nodes)
+        all_state = controls.dispatch("status", {"control": "all"})
+        self.assertEqual(set(all_state), {"wakeup", "wakeup_followup", "visual_behavior"})
         nodes.string_call.assert_called_once_with("wakeup_enabled", {"enabled": False})
         nodes.get_system_enabled.assert_has_calls([
             mock.call("wakeup_enabled_state"), mock.call("vision_enabled_state"),

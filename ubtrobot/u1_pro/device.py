@@ -401,6 +401,7 @@ class U1Nodes:
         reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._audio_qos = best_effort
+        self._sensor_qos = best_effort
         self._mic_publisher = self.core.create_publisher(AudioChunk, self.mic_topic, best_effort)
         self._event_publishers = {}
         self._event_forwarding = {}
@@ -668,7 +669,7 @@ class U1Nodes:
                 request.header = self._audio_header()
                 request.enable = False
                 request.info = self._audio_info()
-                request.mode = request.ADD
+                request.mode = 0
                 request.gain = 0.0
                 self.call("speaker_enable", request)
             except Exception:
@@ -680,7 +681,7 @@ class U1Nodes:
         request.header = self._audio_header()
         request.enable = True
         request.info = self._audio_info()
-        request.mode = request.ADD
+        request.mode = 0
         request.gain = 0.0
         response = self.call("speaker_enable", request)
         code = int(getattr(response, "code", -1))
@@ -782,6 +783,8 @@ class MicPlugin:
             self.running = False
 
     def dispatch(self, action, args):
+        if action not in {"start", "stop", "status", "enable", "disable"}:
+            return None
         if action == "start":
             return self.start()
         elif action == "stop":
@@ -1017,7 +1020,7 @@ class EyeCameraPlugin:
             if self._publisher is None:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
             self._subscription = self.nodes.robot.create_subscription(
-                self.nodes.Image6m, self.source_topic, self._on_frame, 10)
+                self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
             if not self._frame_ready.wait(3.0):
                 raise TimeoutError(f"no frames received from {self.source_topic}")
             self.running = True
@@ -1433,12 +1436,14 @@ class ExpressionPlugin:
             return self.start()
         if action == "list_actions":
             response = self.audio.nodes.string_call("motion_list", {})
-            return self._expression_actions(response)
+            result = self._expression_actions(response)
+            return {"actions": [item for item in result["actions"]
+                                if item["name"] not in {"tilt_head", "shake_head", "look_down", "look_up", "nod"}]}
         if action == "play":
             name = str(args.get("name", "")).strip().lower()
             if name not in self.EXPRESSIONS:
                 raise ValueError("expression.play requires a readable name returned by expression.list_actions")
-            available = self._expression_actions(self.audio.nodes.string_call("motion_list", {}))["actions"]
+            available = self.dispatch("list_actions", {})["actions"]
             if name not in {item["name"] for item in available}:
                 raise ValueError(f"expression {name!r} is not available on this robot firmware")
             motion_id = self.EXPRESSIONS[name][0]
@@ -1535,17 +1540,66 @@ class _SystemSwitchPlugin:
         return None
 
 
-class WakeupFollowupPlugin(_SystemSwitchPlugin):
-    """Control whether the robot continues its built-in dialog after wakeup."""
+class SystemControlsPlugin:
+    """Control the three independent vendor switches from one Agent card."""
 
-    PREFIX = "wakeup_followup_control"
+    PREFIX = "system_controls"
+    SWITCHES = {
+        "wakeup": ("wakeup_enabled", "wakeup_enabled_state"),
+        "wakeup_followup": ("wakeup_followup", "wakeup_followup_state"),
+        "visual_behavior": ("vision_enabled", "vision_enabled_state"),
+    }
 
     def __init__(self, nodes: U1Nodes):
-        super().__init__(
-            nodes, self.PREFIX, "wakeup_followup", "wakeup_followup_state",
-            "Allow or block the U1 Pro's built-in interaction after a wakeup. "
-            "This does not disable wakeup detection; use wakeup_control for that.",
-        )
+        self.nodes = nodes
+
+    def get_tool(self):
+        actions = {
+            "start": ([], "Prepare the system controls card."),
+            "stop": ([], "Stop the card without changing robot settings."),
+            "status": (["control"], "Read one or all current U1 Pro system control states."),
+            "enable": (["control"], "Enable one U1 Pro system behavior."),
+            "disable": (["control"], "Disable one U1 Pro system behavior."),
+        }
+        return tool(self.PREFIX, "actuator",
+                    "Control built-in wakeup, post-wakeup dialog, and autonomous visual behavior. "
+                    "Disabling visual behavior stops vendor visual following/idle behavior, but "
+                    "does not prevent head motions explicitly requested through expression/head cards.",
+                    action_schema(actions, {"control": {
+                        "type": "string", "enum": ["wakeup", "wakeup_followup", "visual_behavior", "all"],
+                        "description": "Which independent system behavior to control.",
+                    }}))
+
+    def start(self):
+        return {"state": "ready"}
+
+    def stop(self):
+        return {"state": "idle"}
+
+    def _read(self, control):
+        set_name, get_name = self.SWITCHES[control]
+        return self.nodes.get_system_enabled(get_name)
+
+    def dispatch(self, action, args):
+        if action not in {"start", "stop", "status", "enable", "disable"}:
+            return None
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
+        control = args.get("control")
+        targets = list(self.SWITCHES) if control == "all" else [control]
+        if any(item not in self.SWITCHES for item in targets):
+            raise ValueError("control must be wakeup, wakeup_followup, visual_behavior, or all")
+        if action == "status":
+            states = {item: self._read(item) for item in targets}
+            return states if control == "all" else states[control]
+        if action in {"enable", "disable"}:
+            enabled = action == "enable"
+            results = {item: self.nodes.set_system_enabled(self.SWITCHES[item][0], enabled)
+                       for item in targets}
+            return results if control == "all" else results[control]
+        return None
 
 
 class HeadPlugin:
@@ -1662,11 +1716,7 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     camera_right = EyeCameraPlugin(nodes, "right")
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
                ExpressionPlugin(audio), HeadPlugin(audio),
-               _SystemSwitchPlugin(nodes, "wakeup_control", "wakeup_enabled", "wakeup_enabled_state",
-                                    "Enable or disable the U1 Pro built-in wakeup and voice-interaction entry point."),
-               WakeupFollowupPlugin(nodes),
-               _SystemSwitchPlugin(nodes, "visual_follow_control", "vision_enabled", "vision_enabled_state",
-                                    "Enable or disable U1 Pro visual behavior, including visual following."),
+               SystemControlsPlugin(nodes),
                camera_left, camera_right,
                VisionCapturePlugin(camera_left, config.get("vision_capture", {}))]
     descriptions = {
