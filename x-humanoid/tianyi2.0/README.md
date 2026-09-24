@@ -1,6 +1,6 @@
 # Tianyi 2.0 Pro Driver
 
-> 当前候选采用两个 Driver 卡片：PICO `teleop_device` → 天轶 `teleop_control`。Agent Core / ActuCore 不改动；本地测试、DDS 集成、镜像构建和真机验收分别记录。实现依据为[双 Driver 契约](../../docs/plans/tianyi-teleop-control.md)，本说明不表示已经部署或通过真机验收。
+> 两卡遥操：`teleop_device` → `teleop_control`；Core / ActuCore 零改动。使用方式见 [遥操说明](TELEOP_CONTROL.md)。离线验证、镜像构建与真机验收分别记录。
 
 Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
@@ -8,23 +8,17 @@ exposes the capabilities as MCP tools.
 
 ## 双 Driver 遥操
 
-Canvas 只连接 `teleop_device → teleop_control`；反向状态 topic 由同一设备实例派生，
-无需额外反馈边。PICO Driver 负责安装、配对、采集与设备状态；本 Driver 负责双握把
-使能、一次性相对映射、天轶 IK/碰撞与现有 arm 的持续位置执行。首版仅双臂，手、腿、
-底盘不在此入口执行。不存在第二个 ActuCore 或额外遥操核心服务。
+Canvas 连接设备的 `data/teleop-cmd` 输出到本卡，固定 `/teleop/command`。
+状态发布 `/teleop/state` 供 Canvas 监控；不返回 PICO、不需要额外反馈边。
+模型、TCP 和速度预设随镜像提供，齿轮只显示说明；普通用户无需填写标定路径或切换 Shadow/Live。
 
-`teleop_control.enabled` 注册卡片，默认 Shadow。齿轮中设置模式、标定文件、位移比例
-和速度；Canvas 开启只准备接口，PICO **开始遥操**才建立操作会话。模型冷准备完成后
-取最新有效输入与实测 FK 建立一次映射；松握保持、重握处理下一有效帧，**不重置映射**。
-执行租约重建也保留映射；空间重置要求显式重新标定。
+启动项目后保持双握把松开，Driver 以新鲜输入和实测 FK 建立初始映射；双握把跟随，
+松握保持、重握沿用原映射。停止项目结束遥操，不自动收臂。
+需要收臂时使用已有 `arm_gesture.reset`，选择 `both`；该入口先终止遥操，再执行原中性姿态流程。
+空间重置需停止再启动项目。恢复不会重放旧目标或自动清除硬件故障。
 
-PICO **结束并收臂**复用自然下垂流程，实测完成后释放。**立即停止**与 Canvas 停止仅
-保持，不追加收臂。IK 工作进程与执行主进程隔离，保留厂商 DDS / 本机 DDS 辅助进程。
-最新目标缓存、操作请求和最终回执互不覆盖；卡片和会话恢复不补播旧帧。
-
-完整配置、协议和离线入口见 [TELEOP_CONTROL.md](TELEOP_CONTROL.md)。旧三卡
-[MOTION_CONTROL.md](MOTION_CONTROL.md) 与 [TELEOP.md](TELEOP.md) 仅供兼容路径参考，
-不作为本次两卡的使用步骤或验收证据。普通 arm、gesture、servo 继续使用现有执行门禁。
+首版仅双臂，不驱动手、腿或底盘。IK 子进程和厂商/本地 DDS 隔离保持不变。
+原 `arm`、`arm_gesture` 和 `servo` 接口保留。详见 [TELEOP_CONTROL.md](TELEOP_CONTROL.md)。
 
 ## Head camera snapshot card
 

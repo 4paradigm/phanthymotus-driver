@@ -9,7 +9,7 @@ import teleop_executor
 from teleop_executor import TeleopExecutor
 
 
-def test_device_input_operation_feedback_topics_share_binding_and_reliable_qos(monkeypatch):
+def test_device_input_and_monitor_use_fixed_latest_only_topics(monkeypatch):
     parent, child = socket.socketpair(socket.AF_UNIX,socket.SOCK_DGRAM)
     parent.settimeout(1)
     subscriptions, publications, quality = {}, [], {}
@@ -24,18 +24,21 @@ def test_device_input_operation_feedback_topics_share_binding_and_reliable_qos(m
         def destroy_subscription(self,topic):subscriptions.pop(topic)
         def destroy_publisher(self,pub):pass
         def destroy_node(self):pass
-    command='/robot/teleop/pico_1/command';feedback='/robot/teleop/pico_1/feedback'
+    command='/teleop/command';feedback='/teleop/state'
     def spin(node,timeout_sec):
         calls[0]+=1
         if calls[0]==1:
             parent.send(json.dumps({'teleop_device_binding':{'command_topic':command,'feedback_topic':feedback},
                                    'teleop_feedback':{'state':'ready','receipts':[]}}).encode())
         elif calls[0]==2:
-            for packet in ({'kind':'input','sequence':10},{'kind':'operation','action':'stop','request_id':'stop-1'}):
+            assert not any(topic==feedback for topic,_ in publications)
+            for packet in ({'kind':'input','sequence':10},):
                 subscriptions[command](SimpleNamespace(data=json.dumps(packet)))
                 result=json.loads(parent.recv(4096))
                 assert result['packet']==packet
                 assert result['_motion_route']=='teleop_'+packet['kind']
+            parent.send(json.dumps({'teleop_device_binding':{'command_topic':command,'feedback_topic':feedback},
+                'teleop_feedback':{'instance_id':'pico_1','state':'ready','receipts':[]}}).encode())
     monkeypatch.setitem(sys.modules,'rclpy',SimpleNamespace(init=lambda **kw:None,
         ok=lambda:calls[0]<2,spin_once=spin,try_shutdown=lambda:None))
     monkeypatch.setitem(sys.modules,'rclpy.node',SimpleNamespace(Node=Node))
@@ -49,9 +52,9 @@ def test_device_input_operation_feedback_topics_share_binding_and_reliable_qos(m
     monkeypatch.setenv('FASTRTPS_DEFAULT_PROFILES_FILE',str(Path(teleop_executor.__file__).with_name('dds-local.xml')))
     try:teleop_executor.run_local_bus(child.detach(),'robot',True)
     finally:parent.close();child.close()
-    assert quality[command]['depth']==quality[feedback]['depth']==16
-    assert quality[command]['reliability']==quality[feedback]['reliability']==1
-    assert (feedback,{'state':'ready','receipts':[]}) in publications
+    assert quality[command]['depth']==quality[feedback]['depth']==1
+    assert quality[command]['reliability']==quality[feedback]['reliability']==0
+    assert (feedback,{'instance_id':'pico_1','state':'ready','receipts':[]}) in publications
 
 
 def test_latest_pose_is_separate_from_operations_and_stop_is_first():

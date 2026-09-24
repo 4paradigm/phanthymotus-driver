@@ -4,7 +4,6 @@ Mapping derives from the former ActuCore DualArmMapping (Apache-2.0). A grip is
 an enable signal, never a new coordinate calibration. Numerical work remains in
 MotionControl's isolated worker, and DDS in the existing local-profile helper.
 """
-from collections import OrderedDict
 import copy
 import json
 import math
@@ -15,7 +14,7 @@ import secrets
 import threading
 import time
 
-from common.teleop_contract import (binding_from_topic, topics, validate_input, validate_operation,
+from common.teleop_contract import (binding_from_topic, topics, validate_input, canonical_instance,
                                     FEEDBACK_SCHEMA)
 from tianyi_motion.protocol import envelope
 
@@ -99,8 +98,7 @@ class TeleopControl:
         self.instance_id = 'teleop_control'
         self._latest = None
         self._input_identity = None
-        self._input_sequence = self._operation_sequence = -1
-        self._operation_identity = None
+        self._input_sequence = -1
         self._mapping_identity = None
         self._processed = None
         self._generation = self._sequence = self._feedback_sequence = 0
@@ -110,59 +108,41 @@ class TeleopControl:
         self._hold_kind = None
         self._needs_calibration = False
         self._state, self._reason = 'idle', None
-        self._receipts = OrderedDict()
-        self._operation_packets = {}
-        self._active_operation = None
-        self._operation_threads = set()
-        self._stop_operation = None
-        self._stop_aliases = set()
         self._config_error = None
+        self._auto_retry_after_ns = 0
         self._config_path = Path(cfg.get('state_path', '/opt/phanthy-motus/data/teleop-control.json'))
         try:
             if self._config_path.is_file():
                 saved = json.loads(self._config_path.read_text())
-                keys = self.get_tool()['configSchema']['properties']
+                keys = {'mode','calibration_path','position_scale','joint_velocity_rad_s','joint_acceleration_rad_s2','trajectory_smoothing','usage_guide'}
                 if not isinstance(saved, dict) or set(saved)-set(keys):raise ValueError('invalid_saved_config')
-                self._validate_config({**self.cfg, **saved})
-                self.cfg.update(saved)
-                self.mapping.scale = self.cfg.get('position_scale', .5)
+                # Deployment presets own motion parameters; legacy UI values are ignored.
         except (ValueError, OSError) as exc:
             self._config_error = str(exc)
         self.motion.gate.live_enabled = self.live
         self.executor.cfg['live_enabled'] = self.live
         self.executor.cfg['operator_session_enabled'] = self.live
-        self.motion.gate.acceleration = (self.cfg.get('joint_acceleration_rad_s2', 2.)
-                                        if self.cfg.get('trajectory_smoothing', False) else None)
+        self.motion.gate.smoothing_seconds = .12
+        self.motion.gate.resume_without_settle = True
 
     @property
-    def live(self): return self.cfg.get('mode', 'shadow') == 'live'
+    def live(self): return self.cfg.get('mode', 'live') == 'live'
 
     def get_tool(self):
-        fields = {
-            'mode': {'type': 'string', 'enum': ['shadow', 'live'], 'default': 'shadow',
-                     'description': 'Shadow仅求解；Live显式允许双臂执行，开始前检查真实反馈。'},
-            'calibration_path': {'type': 'string', 'x-sensitive': True,
-                     'description': '机器人Driver内已挂载的模型/标定JSON，仅空闲时修改。'},
-            'position_scale': {'type': 'number', 'default': .5, 'exclusiveMinimum': 0, 'maximum': 1},
-            'joint_velocity_rad_s': {'type': 'number', 'default': 1., 'exclusiveMinimum': 0, 'maximum': 1.5},
-            'joint_acceleration_rad_s2': {'type': 'number', 'default': 2., 'exclusiveMinimum': 0, 'maximum': 10},
-            'trajectory_smoothing': {'type': 'boolean', 'default': False,
-                     'description': '单独启用加速度平滑进行对照；关闭时保留现有限速行为。'},
-        }
-        for field in fields.values(): field['scope'] = 'instance'
+        fields = {'usage_guide': {'type': 'string', 'title': '使用说明（固定，无需配置）',
+                    'enum': ['无需配置'], 'default': '无需配置', 'scope': 'instance'}}
         return {'name': 'teleop_control', 'type': 'actuator', 'multiInstance': False,
-            'description': '天轶双臂遥操：连接PICO设备卡；开始、双握把跟随、结束收臂由头显操作。停止智能控制仅保持。',
+            'description': '天轶双臂遥操：先安装遥操设备 Driver，在画布添加 teleop_device 并连接本卡；在设备卡齿轮页获取 App 下载和配对入口。启动项目后松开双握把建立初始基准，再按住双握把跟随。松握保持，再握不重标定；在监控面板查看执行状态。停止项目停止遥操；收臂使用 arm_gesture reset（both）。',
             'configSchema': {'type': 'object', 'additionalProperties': False, 'properties': fields},
-            'inputSchema': {'type': 'object', 'required': ['action'], 'additionalProperties': False,
+            'inputSchema': {'type': 'object', 'required': ['action'],
                 'properties': {'action': {'type': 'string', 'enum': ['info', 'config', 'start', 'stop']},
-                    'input_topic': {'type': 'string'}, 'instance_id': {'type': 'string'}, **fields},
+                    'input_topic': {'type': 'string'}},
                 'x-resource': ['arm_l', 'arm_r'],
-                'x-action-params': {'info': {'params': []}, 'config': {'params': list(fields)},
-                    'start': {'params': ['input_topic', 'instance_id']}, 'stop': {'params': []}}},
+                'x-action-params': {'info': {'params': []}, 'config': {'params': []},
+                    'start': {'params': ['input_topic']}, 'stop': {'params': []}}},
             'topic_in': [{'port_id': 'command', 'format': 'data/teleop-cmd',
                 **({'topic': self.binding['command_topic']} if self.binding else {})}],
-            'topic_out': [{'port_id': 'feedback', 'format': 'data/teleop-state',
-                **({'topic': self.binding['feedback_topic']} if self.binding else {})}]}
+            'topic_out': [{'port_id': 'state', 'format': 'data/teleop-state', 'topic': '/teleop/state'}]}
 
     @staticmethod
     def _validate_config(candidate):
@@ -179,7 +159,7 @@ class TeleopControl:
         candidate = {**self.cfg, **{k:v for k,v in args.items() if k in keys}}
         self._validate_config(candidate)
         with self._lock:
-            if self._operator or self._active_operation or self.motion.gate.session_id:
+            if self._operator or self.motion.gate.session_id:
                 raise ValueError('configuration_requires_idle')
             old_motion = self.motion.config_snapshot()
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -227,18 +207,32 @@ class TeleopControl:
         args = args or {}
         if not args.get('input_topic'):
             return {**self.info(), 'state': 'waiting_binding', 'reason': 'input_topic_required'}
-        namespace, source_instance = binding_from_topic(args['input_topic'])
-        command_topic, feedback_topic = topics(namespace, source_instance)
+        if args['input_topic'] == '/teleop/command':
+            namespace, source_instance = '', None
+            command_topic, feedback_topic = '/teleop/command', '/teleop/state'
+        else:
+            namespace, source_instance = binding_from_topic(args['input_topic'])
+            command_topic, _ = topics(namespace, source_instance)
+            feedback_topic = '/teleop/state'
         binding = {'namespace': namespace, 'instance_id': source_instance,
                    'command_topic': command_topic, 'feedback_topic': feedback_topic}
         with self._lock:
-            if self.binding and binding != self.binding and (self._operator or self._active_operation):
+            same_topics = bool(self.binding and all(self.binding.get(k) == binding[k]
+                               for k in ('command_topic', 'feedback_topic')))
+            if same_topics:
+                # Source pinning is not a transport rebind. Repeated Canvas
+                # start must not erase identity or remap an active operator.
+                binding['instance_id'] = self.binding['instance_id']
+                if not self._closed.is_set() and self._thread and self._thread.is_alive():
+                    return self.info()
+            if self.binding and not same_topics and self._operator:
                 raise ValueError('binding_requires_idle')
-            if self.binding != binding:
-                self._latest = self._input_identity = self._operation_identity = None
-                self._input_sequence = self._operation_sequence = -1
-                self._receipts.clear(); self._operation_packets.clear()
+            if not same_topics or self._closed.is_set():
+                self._latest = self._input_identity = None
+                self._input_sequence = -1
                 self.mapping.anchor = None
+                self._needs_calibration = False
+                self._mapping_identity = None
             self.binding = binding
             self.instance_id = args.get('instance_id') or 'teleop_control'
             self._closed.clear()
@@ -256,26 +250,15 @@ class TeleopControl:
 
     def receive(self, value):
         if not self.binding:return False
-        is_stop = value.get('kind') == 'operation' and value.get('action') == 'stop'
-        if self._closed.is_set() and not is_stop:return False
-        if value.get('kind') == 'operation':
-            try:return self._receive_operation(value)
-            except ValueError as exc:
-                # Admission failures of a valid request are terminal receipts;
-                # do not make the user wait for a generic transport timeout.
-                with self._lock:
-                    if value.get('request_id') in self._receipts:raise
-                    validate_operation(value, instance_id=self.binding['instance_id'],
-                                       clock_id=self.clock_id, now_ns=self.clock())
-                    key=value['request_id']
-                    self._receipts[key]={'request_id': key, 'action': value['action'],
-                        **{k:value[k] for k in ('device_id','connection_epoch','space_epoch')},
-                        'status': 'failed', 'error': str(exc), 'result': {}}
-                    self._operation_packets[key]=copy.deepcopy(value)
-                    while len(self._receipts)>32:
-                        removed,_=self._receipts.popitem(last=False);self._operation_packets.pop(removed,None)
-                        self._stop_aliases.discard(removed)
-                return False
+        # The single-device topic carries identity in JSON, not in its path.
+        if value.get('kind') != 'input':
+            raise ValueError('device_input_only')
+        with self._lock:
+            if self.binding['instance_id'] is None:
+                source = canonical_instance(value.get('instance_id'))
+                validate_input(value, instance_id=source, clock_id=self.clock_id, now_ns=self.clock())
+                self.binding['instance_id'] = source
+        if self._closed.is_set():return False
         frame = validate_input(value, instance_id=self.binding['instance_id'], clock_id=self.clock_id,
                                now_ns=self.clock())
         identity = self._identity(frame)
@@ -292,87 +275,10 @@ class TeleopControl:
             self._wake.set()
         return True
 
-    def _receive_operation(self, value):
-        with self._lock:
-            existing = self._receipts.get(value.get('request_id'))
-            original = getattr(self, '_operation_packets', {}).get(value.get('request_id'))
-            if existing is not None:
-                if original != value: raise ValueError('operation_identity_conflict')
-                return True
-        op = validate_operation(value, instance_id=self.binding['instance_id'], clock_id=self.clock_id,
-                                now_ns=self.clock())
-        identity = self._identity(op)
-        is_stop = op['action'] == 'stop'
-        with self._lock:
-            request = op['request_id']
-            if request in self._receipts:
-                if self._receipts[request]['action'] != op['action']: raise ValueError('operation_identity_conflict')
-                return True
-            old = self._operation_identity
-            if not is_stop and old and identity[0] == old[0] and (identity[1] < old[1] or identity[2] < old[2]):
-                raise ValueError('old_operation_generation')
-            if not is_stop and self._input_identity and identity != self._input_identity:
-                raise ValueError('operation_input_generation_mismatch')
-            if not is_stop and identity == old and op['sequence'] <= self._operation_sequence:
-                raise ValueError('old_operation_sequence')
-            if op['action'] != 'stop' and (self._active_operation or self._operation_threads):
-                raise ValueError('operation_busy')
-            # Stop needs a valid bound request, not a live pose or grip. It may
-            # arrive over WSS after RTC reconnect or shutdown; never lower the
-            # ordinary operation watermark as a side effect of accepting it.
-            if (not is_stop or old is None or
-                    identity == old and op['sequence'] > self._operation_sequence or
-                    identity[0] == old[0] and identity[1] >= old[1] and identity[2] >= old[2] and identity != old):
-                self._operation_identity, self._operation_sequence = identity, op['sequence']
-            self._receipts[request] = {'request_id': request, 'action': op['action'], 'status': 'accepted',
-                                       **{k:op[k] for k in ('device_id','connection_epoch','space_epoch')},
-                                       'error': None, 'result': {}}
-            self._operation_packets[request] = copy.deepcopy(op)
-            while len(self._receipts) > 32:
-                removed, _ = self._receipts.popitem(last=False)
-                self._operation_packets.pop(removed, None)
-                self._stop_aliases.discard(removed)
-            if op['action'] == 'stop' and self._stop_operation is not None:
-                # Multiple callers can stop, but they do not allocate unbounded
-                # workers or repeat release. Each gets the same final outcome.
-                self._stop_aliases.add(request)
-                return True
-            self._active_operation = request
-            self._generation += 1
-            generation = self._generation
-            if op['action'] in ('stop', 'finish'):
-                self._operator = None  # Disarm before any blocking management/IK operation.
-            if op['action'] == 'stop':self._stop_operation = request
-            thread = threading.Thread(target=self._operation, args=(op, generation), daemon=True,
-                                      name='tianyi-teleop-'+op['action'])
-            self._operation_threads.add(thread)
-            thread.start()
-        return True
 
     def _check_generation(self, generation):
         if generation != self._generation or self._closed.is_set(): raise ValueError('operation_cancelled')
 
-    def _operation(self, op, generation):
-        try:
-            if op['action'] in ('begin', 'calibrate'): result = self._begin(generation, op['action'], self._identity(op))
-            elif op['action'] == 'finish': result = self._finish(generation)
-            else: result = self._stop_motion()
-            status, error = 'completed', None
-        except Exception as exc:
-            status, error, result = 'failed', str(exc), {}
-        with self._lock:
-            receipt = self._receipts.get(op['request_id'])
-            if receipt: receipt.update(status=status, error=error, result=result)
-            if self._stop_operation == op['request_id']:
-                for alias in self._stop_aliases:
-                    receipt = self._receipts.get(alias)
-                    if receipt:receipt.update(status=status, error=error, result=copy.deepcopy(result))
-                self._stop_operation = None
-                self._stop_aliases.clear()
-            if self._active_operation == op['request_id']: self._active_operation = None
-            if error and generation == self._generation:
-                self._state, self._reason = 'fault', error
-            self._operation_threads.discard(threading.current_thread())
 
     def _latest_fresh(self):
         frame = copy.deepcopy(self._latest)
@@ -461,38 +367,61 @@ class TeleopControl:
 
     def step(self):
         with self._lock:
-            if not self._operator or self._closed.is_set() or self._active_operation: return
+            if self._closed.is_set() or not self.binding: return
             generation = self._generation
+            initialize = not self._operator
+            if self._needs_calibration:
+                self._state, self._reason = "hold", "needs_calibration"
+                return
+        if initialize:
+            if self.clock() < self._auto_retry_after_ns: return
             try:
-                if self._needs_calibration:
-                    self._hold('needs_calibration', grip=True); return
+                frame = self._latest_fresh()
+                if any(frame[s]['grip'] >= .5 for s in ('left', 'right')):
+                    with self._lock: self._state, self._reason = 'ready', 'release_grips_before_enable'
+                    return
+                self._begin(generation, 'begin')
+            except (ValueError, RuntimeError, OSError) as exc:
+                with self._lock: self._state, self._reason = 'hold', str(exc)
+                self._auto_retry_after_ns = self.clock() + 500_000_000
+            return
+        try:
+            with self._lock:
+                self._check_generation(generation)
+                if self._needs_calibration: raise ValueError('needs_calibration')
                 frame = self._latest_fresh()
                 if not all(frame[s]['grip'] >= .5 for s in ('left','right')):
                     self._release_seen = True
-                    self._hold('operator_pause', grip=True)
-                    return
-                if not self._release_seen:
-                    self._hold('release_grips_before_enable', grip=True); return
+                    hold_reason = 'operator_pause'
+                elif not self._release_seen:
+                    hold_reason = 'release_grips_before_enable'
+                else: hold_reason = None
                 key = (*self._identity(frame), frame['sequence'])
-                if key == self._processed: return
-                state = self.motion.gate.status()
-                if self.live:
-                    if state['state'] == 'fault': raise ValueError('driver_fault')
-                    if not state['ownership_held']:
-                        claimed = self.motion.dispatch('claim', {})
-                        if claimed.get('error'): raise ValueError(claimed.get('code', claimed['error']))
-                        self._sequence = 0
-                    elif state['state'] == 'hold':
-                        if not state['hold_confirmed']:
-                            self._state, self._reason = 'hold', 'waiting_hold_confirmation'; return
-                        if self._paused or not state.get('continuation_allowed'):
-                            resumed = self.motion.dispatch('resume', self._credentials())
-                            if resumed.get('error'): raise ValueError(resumed.get('code', resumed['error']))
-                            self._sequence = 0
-                elif self._paused and self.motion._preview_state == 'hold':
-                    resumed = self.motion.dispatch('resume', self._credentials())
-                    if resumed.get('error'): raise ValueError(resumed.get('code', resumed['error']))
-                    self._sequence = 0
+                if not hold_reason and key == self._processed: return
+            if hold_reason:
+                self._hold(hold_reason, grip=True); return
+            # SDK acquisition/resume must not own the input/operation lock:
+            # cancellation can fence us while a channel is still opening.
+            state = self.motion.gate.status()
+            if self.live:
+                if state['state'] == 'fault': raise ValueError('driver_fault')
+                if not state['ownership_held']:
+                    claimed = self.motion.dispatch('claim', {})
+                    if claimed.get('error'): raise ValueError(claimed.get('code', claimed['error']))
+                    with self._lock: self._sequence = 0
+                elif state['state'] == 'hold':
+                    if not state['hold_confirmed'] and not state.get('continuation_ready') and not state.get('resume_ready'):
+                        with self._lock: self._state, self._reason = 'hold', 'waiting_hold_confirmation'
+                        return
+                    if self._paused or not state.get('continuation_ready'):
+                        resumed = self.motion.dispatch('resume', self._credentials())
+                        if resumed.get('error'): raise ValueError(resumed.get('code', resumed['error']))
+                        with self._lock: self._sequence = 0
+            elif self._paused and self.motion._preview_state == 'hold':
+                resumed = self.motion.dispatch('resume', self._credentials())
+                if resumed.get('error'): raise ValueError(resumed.get('code', resumed['error']))
+                with self._lock: self._sequence = 0
+            with self._lock:
                 self._check_generation(generation)
                 now = self.clock()
                 values = self.mapping.targets(frame)
@@ -505,9 +434,11 @@ class TeleopControl:
                 self._processed = key
                 self._paused, self._hold_kind = False, None
                 self._state, self._reason = 'active', None
-            except (ValueError, RuntimeError, OSError) as exc:
-                code = str(exc)
-                self._hold(code, grip=code in ('driver_fault','needs_calibration'))
+        except (ValueError, RuntimeError, OSError) as exc:
+            with self._lock:
+                if generation != self._generation or self._closed.is_set(): return
+            code = str(exc)
+            self._hold(code, grip=code in ('driver_fault','needs_calibration'))
 
     def _run(self):
         while not self._closed.is_set():
@@ -540,24 +471,6 @@ class TeleopControl:
             self._paused = False
         return {'state': 'idle', 'authority_released': True, 'return_required': False}
 
-    def _finish(self, generation):
-        with self._lock:
-            self._check_generation(generation)
-            # Atomically order short return admission against stop's generation
-            # fence. Do not wait for the long model-management lock here; only
-            # the existing return worker performs preparation/IK afterwards.
-            result = self.motion._start_finish(self._credentials())
-        deadline = time.monotonic()+46.
-        while result.get('state') == 'returning' and time.monotonic() < deadline:
-            self._check_generation(generation)
-            time.sleep(.05)
-            result = self.motion.dispatch('finish_status', {'operation_id': result['operation_id']})
-        if not result.get('return_completed') or not result.get('authority_released'):
-            raise ValueError(result.get('error') or result.get('reason') or 'return_unconfirmed')
-        with self._lock:
-            self._check_generation(generation)
-            self._state, self._reason = 'idle', None
-        return result
 
     def stop(self):
         with self._lock:
@@ -576,8 +489,9 @@ class TeleopControl:
             execution = {k:copy.deepcopy(state[k]) for k in ('state','reason','output_active','ownership_held',
                 'hold_confirmed','stop_confirmed','applied_sequence','feedback')}
             execution.update(armed=bool(self.binding and not self._closed.is_set()),
-                             started=bool(self._operator), mode=self.cfg.get('mode', 'shadow'))
+                             started=bool(self._operator), mode=self.cfg.get('mode', 'live'))
             execution['decision'] = copy.deepcopy(self.motion._decision)
+            execution['transport'] = copy.deepcopy(getattr(self.executor, '_bus_health', {}))
             execution['finish'] = copy.deepcopy(self.motion._finish)
             return {'schema': FEEDBACK_SCHEMA, 'instance_id': self.binding['instance_id'] if self.binding else '',
                 'control_instance_id': self.instance_id, 'server_epoch': self.server_epoch,
@@ -587,11 +501,11 @@ class TeleopControl:
                 'space_epoch': self._input_identity[2] if self._input_identity else 0,
                 'operator_session_id': self._operator, 'mapping_epoch': self.mapping.epoch,
                 'state': self._state, 'reason': self._reason, 'capabilities': list(self.CAPABILITIES),
-                'execution': execution, 'receipts': copy.deepcopy(list(self._receipts.values()))}
+                'execution': execution, 'receipts': []}
 
     def info(self):
         with self._lock:
-            return {'state': self._state, 'reason': self._reason, 'mode': self.cfg.get('mode', 'shadow'),
+            return {'state': self._state, 'reason': self._reason, 'mode': self.cfg.get('mode', 'live'),
                 'config': copy.deepcopy(self.cfg),
                 'effective_config': {k:self.cfg.get(k,v.get('default')) for k,v in self.get_tool()['configSchema']['properties'].items()},
                 'config_error': self._config_error, 'binding': copy.deepcopy(self.binding),

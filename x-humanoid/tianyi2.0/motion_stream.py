@@ -101,6 +101,8 @@ class MotionGate:
         self._motion_envelope = None
         self._continuous_v2 = False
         self.acceleration = None
+        self.smoothing_seconds = None
+        self.resume_without_settle = False
         self._command_velocity = [0.] * 14
 
     def _event(self, code):
@@ -168,7 +170,7 @@ class MotionGate:
             if self._legacy_calls or (legacy_busy() if callable(legacy_busy) else legacy_busy):
                 raise ValueError("legacy_motion_pending")
             _, q, dq = self._feedback()
-            if max(map(abs, dq)) > 0.02:
+            if not self.resume_without_settle and max(map(abs, dq)) > 0.02:
                 raise ValueError("robot_not_stopped")
             return self._new_session(q)
 
@@ -210,7 +212,7 @@ class MotionGate:
             if not self.live_enabled or not self.acceptance_check():
                 raise ValueError("live_acceptance_missing")
             _, q, dq = self._feedback()
-            if max(map(abs, dq)) > 0.02:
+            if not self.resume_without_settle and max(map(abs, dq)) > 0.02:
                 raise ValueError("robot_not_stopped")
             return self._new_session(q)
 
@@ -382,7 +384,8 @@ class MotionGate:
                         return
                     newer = self._checked_feedback["arm_ns"] > self.stop_sent_ns
                     close = max(abs(a-b) for a, b in zip(measured, self.stop_target)) <= 0.02
-                    if newer and close and max(map(abs, dq)) <= 0.02:
+                    if newer and ((self.resume_without_settle and self.state == "hold" and not self.release_requested)
+                                  or close and max(map(abs, dq)) <= 0.02):
                         self.output_active = False
                         if not self._stop_confirmed:self._stop_confirmed_ns = now
                         self._stop_confirmed = True
@@ -415,10 +418,17 @@ class MotionGate:
                 # Slew the command, rather than repeatedly resetting it to measured.
                 # Bound outstanding position travel to 200 ms at the configured
                 # velocity, including when an actuator stops responding.
-                dt = min((now - self.last_emit) / 1e9, 0.1 if self._continuous_v2 else 0.02)
+                dt = min((now - self.last_emit) / 1e9,
+                         0.05 if self.smoothing_seconds else (0.1 if self._continuous_v2 else 0.02))
                 limit = self.velocity * max(dt, 0)
                 lead = self.velocity * POSITION_LEAD_SECONDS
-                if self.acceleration is not None and self._continuous_v2:
+                if self.smoothing_seconds and self._continuous_v2:
+                    # PR #322 / G1 #330: start from the last successfully sent
+                    # reference; 120ms exponential smoothing and 1rad/s are our adaptation.
+                    alpha = -math.expm1(-max(dt, 0.) / self.smoothing_seconds)
+                    steps = [max(-limit, min(limit, alpha*(t-p)))
+                             for p,t in zip(self.last_q, self.latest["q"])]
+                elif self.acceleration is not None and self._continuous_v2:
                     steps = []
                     for previous, target_q, speed in zip(self.last_q, self.latest["q"], self._command_velocity):
                         delta = target_q - previous
@@ -456,8 +466,8 @@ class MotionGate:
                     self.hold('command_timeout', continuation=True,
                               recoverable=self._continuous_v2)
                     return
-                self._command_velocity = [(t-p)/dt if dt > 0 else 0. for t,p in zip(target,self.last_q)]
                 self.emit(target, self.latest["hands"])
+                self._command_velocity = [(t-p)/dt if dt > 0 else 0. for t,p in zip(target,self.last_q)]
                 self.last_q, self.last_hands, self.last_emit = target, self.latest["hands"], self.clock()
                 self.applied_seq = self.latest["seq"]
                 if self.diagnostics["last_command"]["applied_ns"] is None:

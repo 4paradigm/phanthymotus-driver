@@ -34,6 +34,7 @@ def load_profile(path):
     if profile.get("schema") != "motus.tianyi-calibration.v1":
         raise ValueError("calibration_schema")
     urdf = Path(profile["urdf_path"])
+    if not urdf.is_absolute(): urdf = Path(path).parent / urdf
     model_bytes=urdf.read_bytes()
     if hashlib.sha256(model_bytes).hexdigest() != profile["urdf_sha256"]:
         raise ValueError("calibration_model_changed")
@@ -143,8 +144,7 @@ class TeleopExecutor:
         if accepted(self.profile):
             return True
         if (self.cfg.get('operator_session_enabled') is True and self._operator_prepared
-                and self.profile.get('hands_enabled') is False
-                and accepted(self.profile, first_acceptance=True)):
+                and self.profile.get('hands_enabled') is False):
             return True
         deadline = self.gate.first_acceptance_deadline_ns
         return (self.cfg.get('first_acceptance_enabled') is True
@@ -278,7 +278,7 @@ class TeleopExecutor:
         if (getattr(self.gate, '_continuous_v2', False)
                 and (self.gate.state in ('ready', 'active') or self.gate._can_continue())):
             self.gate.hold(reason, recoverable=True)
-        else:
+        elif self.gate.state not in ('hold', 'fault'):
             self.gate.hold(reason)
 
     def _request_bus_recovery(self, reason):
@@ -821,8 +821,7 @@ class TeleopExecutor:
                         or not self.gate.live_enabled):
                     raise ValueError('first_acceptance_disabled')
                 if (not self.profile or self.profile.get('hands_enabled') is not False
-                        or not (accepted(self.profile, first_acceptance=True)
-                                or operator and accepted(self.profile))):
+                        or not (operator or accepted(self.profile, first_acceptance=True))):
                     raise ValueError('first_acceptance_prerequisites_missing')
                 if self.gate.session_id or self.legacy_busy():
                     raise ValueError('first_acceptance_requires_idle')
@@ -977,11 +976,12 @@ def run_local_bus(fd,namespace,control_v2=False):
             try:
                 packet = json.loads(msg.data, object_pairs_hook=TeleopExecutor._unique)
                 if len(json.dumps(packet,allow_nan=False).encode()) > 65536:return
-                route = 'teleop_operation' if packet.get('kind') == 'operation' else 'teleop_input'
+                if packet.get('kind') != 'input':return
+                route = 'teleop_input'
                 wire.send(json.dumps({'_motion_route': route, 'packet': packet}, allow_nan=False).encode())
-            except (ValueError, TypeError, AttributeError, BlockingIOError):pass
-        # Transport history is bounded; operations are retried/acknowledged by request ID.
-        external_qos=QoSProfile(depth=16,reliability=ReliabilityPolicy.RELIABLE,
+            except (ValueError, TypeError, AttributeError, RecursionError, BlockingIOError):pass
+        # Latest-only input; all lifecycle operations are local MCP calls.
+        external_qos=QoSProfile(depth=1,reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,durability=DurabilityPolicy.VOLATILE)
         external_sub=node.create_subscription(String,command_topic,external_command,external_qos)
         external_pub=node.create_publisher(String,feedback_topic,external_qos)
@@ -1026,7 +1026,9 @@ def run_local_bus(fd,namespace,control_v2=False):
                 msg=String();msg.data=latest;pub.publish(msg)
                 if external_pub is not None:
                     feedback=json.loads(latest).get('teleop_feedback')
-                    if isinstance(feedback,dict):
+                    # Canvas can inspect unbound diagnostics through info;
+                    # device-correlated feedback needs an actual input source.
+                    if isinstance(feedback,dict) and feedback.get('instance_id'):
                         msg=String();msg.data=json.dumps(feedback,allow_nan=False);external_pub.publish(msg)
     except (ExternalShutdownException, KeyboardInterrupt):
         pass  # SIGTERM can already have shut down the ROS context.

@@ -109,6 +109,7 @@ class TianyiIK(ArmWorkspace):
         if type(self.hands_enabled) is not bool:
             raise ValueError('hands_enabled_boolean_required')
         urdf=Path(self.profile['urdf_path'])
+        if not urdf.is_absolute(): urdf=Path(calibration_path).parent/urdf
         model_bytes=urdf.read_bytes()
         if hashlib.sha256(model_bytes).hexdigest()!=self.profile['urdf_sha256']:
             raise ValueError('calibration_model_changed')

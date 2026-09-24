@@ -603,8 +603,12 @@ class TianyiDeviceBundle:
             print("[bundle] LightPlugin loaded")
 
         self._teleop = None
-        control_cfg = cfg.get('teleop_control', {})
-        control_enabled = control_cfg.get('enabled', False)
+        control_cfg = {'enabled': True, 'mode': 'live', 'position_scale': .5,
+                       'joint_velocity_rad_s': 1.,
+                       'calibration_path': str(Path(__file__).with_name('tianyi_motion') / 'tianyi2_dual_arm.json'),
+                       **cfg.get('teleop_control', {})}
+        control_enabled = control_cfg.get('enabled', True) and (
+            'teleop_control' in cfg or not (cfg.get('motion_control', {}).get('enabled') or cfg.get('teleop', {}).get('enabled')))
         if control_enabled or cfg.get("teleop", {}).get("enabled", False) or cfg.get('motion_control', {}).get('enabled', False):
             from teleop_executor import TeleopExecutor
             from device import ArmPlugin, HandPlugin
@@ -693,6 +697,11 @@ class TianyiDeviceBundle:
             from teleop_executor import MOTION_TOOLS
             if tool_name in MOTION_TOOLS and args.get('action') != 'info':
                 try:
+                    if tool_name == 'arm_gesture' and args.get('action') == 'reset':
+                        control = getattr(teleop, 'teleop_control', None)
+                        if control is not None:
+                            stopped = control.dispatch('stop', {})
+                            if stopped.get('error'):return stopped
                     with teleop.gate.legacy():
                         return self._dispatch(tool_name, dict(args))
                 except ValueError as exc:

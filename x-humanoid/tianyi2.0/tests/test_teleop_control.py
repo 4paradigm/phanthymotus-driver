@@ -23,13 +23,12 @@ def control(chain):
     c = TeleopControl({'mode': 'shadow'}, chain.c)
     c.clock_id = 'offline-boot'
     c.binding = {'namespace': 'offline', 'instance_id': 'pico_1',
-                 'command_topic': '/offline/teleop/pico_1/command',
-                 'feedback_topic': '/offline/teleop/pico_1/feedback'}
+                 'command_topic': '/teleop/command',
+                 'feedback_topic': '/teleop/state'}
     c._state = 'ready'
     yield c
     c._closed.set()
     c._generation += 1
-    for worker in list(c._operation_threads): worker.join(1)
 
 
 def frame(c, sequence, *, grip=0, x=0., space=0, conn=0, received=None):
@@ -57,7 +56,7 @@ def op(c, action, seq=0, request=None):
 
 
 def begin(c, continuous=False):
-    feed(c,0)
+    c.receive(frame(c,0))
     if not continuous:
         c._begin(c._generation,'begin');return 0
     closed=threading.Event()
@@ -73,7 +72,7 @@ def begin(c, continuous=False):
 
 def test_begin_anchors_after_cold_calibration_latest_input(control, monkeypatch):
     c=control
-    feed(c,0,x=0.)
+    c.receive(frame(c,0,x=0.))
     original=c.motion.dispatch
     def delayed(action,args):
         result=original(action,args)
@@ -116,48 +115,6 @@ def test_space_reset_needs_explicit_calibration_not_grip(control):
     # An explicit operation, rather than grip, is the new reference authority.
     c._begin(c._generation,'calibrate')
     assert c.mapping.epoch==2
-
-
-def test_input_sequence_does_not_erase_operation_sequence_and_retry_receipt(control):
-    c=control;feed(c,1000)
-    request=op(c,'begin',seq=0)
-    assert c.receive(request)
-    wait_for(lambda:c._receipts['op-0']['status']!='accepted')
-    assert c._receipts['op-0']['status']=='completed'
-    epoch=c.mapping.epoch
-    assert c.receive(copy.deepcopy(request))
-    assert c.mapping.epoch==epoch
-    assert validate_feedback(c.feedback(),instance_id='pico_1',clock_id=c.clock_id,now_ns=c.clock())
-    changed=dict(request,action='finish')
-    with pytest.raises(ValueError,match='identity_conflict'):c.receive(changed)
-
-
-def test_stale_retry_reads_original_receipt_without_restart(control, monkeypatch):
-    c=control;feed(c,0)
-    request=op(c,'begin')
-    c.receive(request)
-    wait_for(lambda:c._receipts['op-0']['status']=='completed')
-    monkeypatch.setattr(c,'clock',lambda:request['expires_monotonic_ns']+1)
-    assert c.receive(request)
-    assert c.mapping.epoch==1
-
-
-def test_stop_cancels_slow_begin_without_waiting_for_numerics(control, monkeypatch):
-    c=control;feed(c,0)
-    waiting,proceed=threading.Event(),threading.Event()
-    real=c.motion.dispatch
-    def delayed(action,args):
-        if action=='calibrate':
-            waiting.set();proceed.wait(2)
-        return real(action,args)
-    monkeypatch.setattr(c.motion,'dispatch',delayed)
-    c.receive(op(c,'begin',seq=1));assert waiting.wait(.5)
-    started=time.monotonic();c.receive(op(c,'stop',seq=2))
-    wait_for(lambda:c._receipts['op-2']['status']=='completed')
-    assert time.monotonic()-started<.5
-    proceed.set()
-    wait_for(lambda:c._receipts['op-1']['status']=='failed')
-    assert c.mapping.epoch==0 and not c._operator and not c.motion.gate.session_id
 
 
 def test_canvas_stop_only_holds_and_does_not_call_finish(control, monkeypatch):
@@ -212,45 +169,6 @@ def test_live_regrip_rotation_preserves_anchor_with_real_plant(control, chain):
     assert result['authority_released'] and not chain.e.gate.session_id
 
 
-def test_stop_does_not_wait_for_actual_model_management_lock(control, monkeypatch):
-    c=control;feed(c,0)
-    waiting,proceed=threading.Event(),threading.Event()
-    original=c.motion._solver_for
-    def slow_load(*args,**kwargs):
-        waiting.set();proceed.wait(2)
-        return original(*args,**kwargs)
-    monkeypatch.setattr(c.motion,'_solver_for',slow_load)
-    c.receive(op(c,'begin',seq=1));assert waiting.wait(.5)
-    started=time.monotonic();c.receive(op(c,'stop',seq=2))
-    wait_for(lambda:c._receipts['op-2']['status']=='completed',timeout=.4)
-    assert time.monotonic()-started<.5
-    proceed.set()
-    wait_for(lambda:c._receipts['op-1']['status']=='failed')
-    assert not c._operator and not c.motion.gate.session_id
-
-
-def test_config_persists_effective_values_and_failure_keeps_last_applied(chain, tmp_path):
-    path=tmp_path/'state.json'
-    c=TeleopControl({'state_path':str(path)},chain.c)
-    result=c.dispatch('config',{'position_scale':.7,'trajectory_smoothing':True,
-                              'joint_acceleration_rad_s2':1.5})
-    assert result['effective_config']['position_scale']==.7 and path.is_file()
-    other=TeleopControl({'state_path':str(path)},chain.c)
-    assert other.info()['effective_config']['position_scale']==.7
-    assert other.mapping.scale==.7 and other.motion.gate.acceleration==1.5
-    bad=other.dispatch('config',{'position_scale':20})
-    assert bad['error']=='invalid_position_scale'
-    assert other.info()['effective_config']['position_scale']==.7
-    assert other.info()['config_error']=='invalid_position_scale'
-
-
-def test_invalid_saved_config_does_not_enable_live(chain,tmp_path):
-    path=tmp_path/'invalid.json';path.write_text('{"mode":"live","position_scale":-1}')
-    c=TeleopControl({'state_path':str(path)},chain.c)
-    assert not c.live and not c.motion.gate.live_enabled
-    assert c.info()['config_error']=='invalid_position_scale'
-
-
 def test_model_config_save_failure_reports_error_with_previous_effective_values(control, chain, tmp_path, monkeypatch):
     import teleop_control
     c=control;c._config_path=tmp_path/'state.json'
@@ -278,21 +196,20 @@ def test_new_card_bundle_constructs_one_control_no_external_tokens(bundle_class,
 
 @pytest.mark.parametrize('phase',['calibrate','prepare_preview'])
 def test_connection_change_during_begin_cannot_inherit_old_request(control,monkeypatch,phase):
-    c=control;feed(c,0)
+    c=control;c.receive(frame(c,0))
     original=c.motion.dispatch
     def changed(action,args):
         result=original(action,args)
         if action==phase:c.receive(frame(c,1,conn=1))
         return result
     monkeypatch.setattr(c.motion,'dispatch',changed)
-    c.receive(op(c,'begin'))
-    wait_for(lambda:c._receipts['op-0']['status']=='failed')
-    assert c._receipts['op-0']['error']=='operation_input_generation_changed'
+    with pytest.raises(ValueError,match='operation_input_generation_changed'):
+        c._begin(c._generation,'begin')
     assert c.mapping.epoch==0 and not c._operator and c.motion._preview is None
 
 
 def test_anchor_refreshes_input_and_measured_fk_after_prepare(control,chain,monkeypatch):
-    c=control;feed(c,0)
+    c=control;c.receive(frame(c,0))
     original=c.motion.dispatch
     def changed(action,args):
         result=original(action,args)
@@ -310,109 +227,39 @@ def test_anchor_refreshes_input_and_measured_fk_after_prepare(control,chain,monk
     assert c.mapping.anchor[1][0][3:]==pytest.approx(Rotation.from_matrix(actual[0][:3,:3]).as_quat())
 
 
-def test_stop_completes_while_prepare_is_blocked_then_late_setup_is_cancelled(control,monkeypatch):
-    c=control;feed(c,0)
-    waiting,proceed=threading.Event(),threading.Event();original=c.motion.dispatch
-    def slow(action,args):
-        if action=='prepare_preview':waiting.set();proceed.wait(2)
-        return original(action,args)
-    monkeypatch.setattr(c.motion,'dispatch',slow)
-    c.receive(op(c,'begin',seq=1));assert waiting.wait(.5)
-    c.receive(op(c,'stop',seq=2))
-    wait_for(lambda:c._receipts['op-2']['status']=='completed',timeout=.4)
-    proceed.set();wait_for(lambda:c._receipts['op-1']['status']=='failed')
-    assert not c._operator and c.motion._preview is None and c.mapping.epoch==0
+def test_canvas_auto_prepares_and_rejects_old_headset_operations(control):
+    c=control
+    feed(c,0,grip=1)
+    assert c.mapping.anchor is None
+    feed(c,1)
+    assert c.mapping.epoch == 1 and c._operator
+    with pytest.raises(ValueError, match='device_input_only'):
+        c.receive(op(c,'begin'))
+    assert validate_feedback(c.feedback(), instance_id='pico_1',clock_id=c.clock_id,now_ns=c.clock())
 
 
-def test_concurrent_stop_requests_share_one_bounded_worker_and_final_receipts(control,monkeypatch):
-    c=control;feed(c,0)
-    waiting,proceed=threading.Event(),threading.Event();calls=[]
-    original=c._stop_motion
-    def slow():
-        calls.append(1);waiting.set();proceed.wait(2);return original()
-    monkeypatch.setattr(c,'_stop_motion',slow)
-    c.receive(op(c,'stop',seq=1));assert waiting.wait(.5)
-    for seq in range(2,51):c.receive(op(c,'stop',seq=seq))
-    assert len(c._operation_threads)==1 and len(c._receipts)==32
-    proceed.set();wait_for(lambda:not c._operation_threads)
-    assert calls==[1]
-    assert all(r['status']=='completed' and r['result']['authority_released'] for r in c._receipts.values())
+def test_legacy_ui_config_cannot_override_robot_preset(chain,tmp_path):
+    path=tmp_path/'state.json';path.write_text('{"mode":"shadow","position_scale":-1}')
+    c=TeleopControl({'state_path':str(path),'position_scale':.5},chain.c)
+    assert c.live and c.mapping.scale == .5
+    assert set(c.get_tool()['configSchema']['properties']) == {'usage_guide'}
+    assert 'instance_id' not in c.get_tool()['inputSchema']['properties']
 
 
-@pytest.mark.parametrize('closed',[False,True])
-def test_stop_without_fresh_rtc_or_matching_input_generation_remains_available(control,closed):
-    c=control;feed(c,0,grip=1)
-    request=op(c,'stop',seq=1)
-    request['connection_epoch']=2
-    c._latest['received_monotonic_ns']=0
-    if closed:c._closed.set()
-    assert c.receive(request)
-    wait_for(lambda:c._receipts['op-1']['status']=='completed')
-    assert c._receipts['op-1']['result']['authority_released']
-    assert c._receipts['op-1']['connection_epoch']==2
-    assert c._receipts['op-1']['device_id']==request['device_id']
-
-
-def test_stop_still_rejects_expired_or_wrong_binding_requests(control):
-    c=control;feed(c,0)
-    expired=op(c,'stop',seq=1);expired['expires_monotonic_ns']=c.clock()-1
-    with pytest.raises(ValueError):c.receive(expired)
-    wrong=op(c,'stop',seq=2);wrong['instance_id']='another_pico'
-    with pytest.raises(ValueError,match='input_binding_mismatch'):c.receive(wrong)
-    assert not c._receipts and not c._operation_threads
-
-
-def test_public_finish_waits_for_finite_speed_plant_and_survives_input_loss(control,chain):
-    from tianyi_motion.worker import NumericalWorker
-    c=control;c.cfg['mode']='live';chain.e.gate.live_enabled=True
-    c._test_fk=c.motion.solver;c.motion.solver_factory=NumericalWorker
-    chain.e.cfg['operator_session_enabled']=True;chain.p.run(chain.e.gate)
-    base=begin(c,continuous=True)
-    progress=[]
-    for seq in range(1,9):
-        feed_reachable(c,base+seq,.1);c.motion.process_latest();time.sleep(.04)
-        state=chain.e.gate.status()
-        progress.append({'state':c._state,'reason':c._reason,'decision':copy.deepcopy(c.motion._decision),
-                         'gate_state':state['state'],'gate_reason':state['reason'],'seq':state['applied_sequence']})
-    assert np.max(np.abs(chain.p.q))>.005,json.dumps(progress)
-    request=op(c,'finish',seq=1);c.receive(request)
-    c._latest['received_monotonic_ns']=0
-    wait_for(lambda:c._receipts['op-1']['status']!='accepted',timeout=4)
-    receipt=c._receipts['op-1']
-    assert receipt['status']=='completed',receipt
-    assert receipt['result']['return_completed'] and receipt['result']['authority_released']
-    assert np.max(np.abs(chain.p.q))<.025 and not chain.e.gate.session_id
-    count=len(chain.p.writes)
-    assert c.receive(request)
-    assert len(chain.p.writes)==count and not c._operator
-
-
-def test_late_finish_after_completed_stop_cannot_reclaim_or_emit(control,chain,monkeypatch):
-    c=control;feed(c,0)
-    # A completed earlier live session makes an unfenced finish capable of
-    # reacquiring for return; no current lease is needed to expose the bug.
-    c.motion._used_live=True
-    waiting,proceed=threading.Event(),threading.Event();original=c._finish
-    def delayed(generation):
-        waiting.set();proceed.wait(2);return original(generation)
-    monkeypatch.setattr(c,'_finish',delayed)
-    calls=[];admit=c.motion._start_finish
-    def admission(args):calls.append('finish');return admit(args)
-    monkeypatch.setattr(c.motion,'_start_finish',admission)
-    c.receive(op(c,'finish',seq=1));assert waiting.wait(.5)
-    c.receive(op(c,'stop',seq=2))
-    wait_for(lambda:c._receipts['op-2']['status']=='completed',timeout=.5)
-    proceed.set();wait_for(lambda:c._receipts['op-1']['status']=='failed')
-    assert c._receipts['op-1']['error']=='operation_cancelled'
-    assert not calls and not chain.p.writes and not chain.e.gate.session_id
-    assert c.motion._finish_thread is None and not c._operator
-
-
-def test_cancelled_finish_completion_cannot_overwrite_new_lifecycle_state(control,monkeypatch):
-    c=control;begin(c)
-    def delayed_result(args):
-        c._generation+=1;c._state='ready';c._reason='new_canvas_start'
-        return {'state':'idle','return_completed':True,'authority_released':True}
-    monkeypatch.setattr(c.motion,'_start_finish',delayed_result)
-    with pytest.raises(ValueError,match='operation_cancelled'):c._finish(c._generation)
-    assert c._state=='ready' and c._reason=='new_canvas_start'
+@pytest.mark.parametrize('phase',['calibrate','prepare_preview'])
+def test_canvas_stop_fences_blocked_preparation(control,monkeypatch,phase):
+    c=control;c.receive(frame(c,0))
+    entered,release=threading.Event(),threading.Event()
+    real=c.motion.dispatch
+    def delayed(action,args):
+        if action==phase:entered.set();release.wait(2)
+        return real(action,args)
+    monkeypatch.setattr(c.motion,'dispatch',delayed)
+    worker=threading.Thread(target=c.step);worker.start()
+    assert entered.wait(1)
+    try:
+        before=time.monotonic();assert c.stop()['authority_released']
+        assert time.monotonic()-before < .5
+    finally:release.set();worker.join(2)
+    assert not c._operator and not c.motion.gate.session_id
+    assert c.motion._preview is None

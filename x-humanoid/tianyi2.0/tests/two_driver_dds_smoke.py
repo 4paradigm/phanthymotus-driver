@@ -3,7 +3,7 @@
 Run only in a network-none container, with read-only source mounts and /tmp
 writable. This harness imports each Driver's own common package in a separate
 process. It replaces vendor feedback/publishers with the existing offline
-Plant, while retaining real DeviceRuntime, OperatorCommands, ROS transport,
+Plant, while retaining real DeviceRuntime, ROS transport,
 TeleopControl, NumericalWorker, arm receiver and MotionGate.
 """
 import argparse
@@ -24,8 +24,15 @@ from types import SimpleNamespace
 def guard():
     if os.environ.get('TIANYI_ISOLATED_DDS') != '1':
         raise RuntimeError('set TIANYI_ISOLATED_DDS=1 only in network-none/no-devices container')
-    if sys.platform != 'linux' or sorted(p.name for p in Path('/sys/class/net').iterdir()) != ['lo']:
-        raise RuntimeError('network-none container required')
+    if sys.platform != 'linux':
+        raise RuntimeError('Linux network-none container required')
+    # Docker Desktop may expose dormant kernel tunnel devices even with
+    # --network none. Reject every non-loopback UP interface and IPv4 route.
+    interfaces=[p for p in Path('/sys/class/net').iterdir() if (p/'flags').is_file()]
+    if any(p.name!='lo' and int((p/'flags').read_text(),16)&1 for p in interfaces):
+        raise RuntimeError('non-loopback interface is up')
+    if any(line.split()[0]!='lo' for line in Path('/proc/net/route').read_text().splitlines()[1:]):
+        raise RuntimeError('external route present')
     if list(Path('/dev').glob('ttyUSB*')) or list(Path('/dev').glob('ttyACM*')):
         raise RuntimeError('physical serial devices are not permitted')
     os.environ.update(ROS_DOMAIN_ID='42', RMW_IMPLEMENTATION='rmw_fastrtps_cpp',
@@ -84,7 +91,7 @@ def control(args):
     plant.thread=threading.Thread(target=plant_loop,daemon=True);plant.thread.start()
     stream=(output/'control.jsonl').open('w')
     try:
-        card.start({'input_topic':'/offline/teleop/pico_1/command','instance_id':'control_1'})
+        card.start({'input_topic':'/teleop/command','instance_id':'control_1'})
         result=motion.dispatch('calibrate',{});assert not result.get('error'),result
         assert isinstance(motion.solver,NumericalWorker)
         poses=[]
@@ -111,18 +118,17 @@ def control(args):
 
 
 async def producer(args):
-    root=Path(args.pico_root);sys.path.insert(0,str(root))
+    root=Path(args.pico_root);sys.path[:0]=[str(root/'pico/4ultra'),str(root)]
     import numpy as np
     from scipy.spatial.transform import Rotation
     import rclpy
     from rclpy.executors import SingleThreadedExecutor
-    from common.ext_vr.runtime import DeviceRuntime
-    from common.ext_vr.management import OperatorCommands
-    from common.ext_vr.transport import RosTransport
+    from ext_vr.runtime import DeviceRuntime
+    from ext_vr.transport import RosTransport
     from common.teleop_contract import validate_feedback
     output=Path(args.output);poses=json.loads((output/'ready.json').read_text())['poses']
     stream=(output/'producer.jsonl').open('w')
-    runtime=DeviceRuntime('pico_1',filter_time_ms=0);runtime.start()
+    runtime=DeviceRuntime('pico_1');runtime.start()
     authority,generation=runtime.bind_capture('offline-pico')
     connection=SimpleNamespace(connection_id='offline-connection',capture_id='offline-pico',events=asyncio.Queue(maxsize=32))
     manager=SimpleNamespace(_connection=connection,presence_expired=lambda c:False)
@@ -131,15 +137,23 @@ async def producer(args):
     def publish(value):
         transport.publish(value)
         event(stream,'command',packet=value)
-    commands=OperatorCommands(manager,runtime,publish);commands.bind(True)
     latest={};errors=[]
     def feedback(value):
         try:
             validate_feedback(value,instance_id='pico_1',clock_id=runtime.clock_id,now_ns=runtime.clock_ns())
-            latest.clear();latest.update(value);commands.feedback(value)
+            latest.clear();latest.update(value)
             event(stream,'feedback',packet=value)
         except Exception as exc:errors.append(str(exc))
-    transport=RosTransport(ros_executor,'offline','pico_1',feedback)
+    transport=RosTransport(ros_executor,'offline','pico_1',None)
+    # Independent Canvas-monitor subscriber, not a device feedback dependency.
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile,ReliabilityPolicy,HistoryPolicy,DurabilityPolicy
+    from std_msgs.msg import String
+    monitor=Node('offline_canvas_monitor')
+    monitor.create_subscription(String,'/teleop/state',lambda msg:feedback(json.loads(msg.data)),
+        QoSProfile(depth=1,reliability=ReliabilityPolicy.BEST_EFFORT,
+                   history=HistoryPolicy.KEEP_LAST,durability=DurabilityPolicy.VOLATILE))
+    ros_executor.add_node(monitor)
     basis=np.array([[0.,0.,-1.],[-1.,0.,0.],[0.,1.,0.]])
     def raw_pose(position,quaternion):
         return {'position':(basis.T@position).tolist(),
@@ -172,17 +186,10 @@ async def producer(args):
                 next_input=now+.05
             if until and until():return
             await asyncio.sleep(.005)
-        if until:raise AssertionError({'timeout':timeout,'last_feedback':latest,'pending':list(commands.pending)})
-    async def operation(action,rid):
-        await commands.submit(connection,{'connection_id':connection.connection_id,'request_id':rid,'action':action})
-        key=(connection.capture_id,rid)
-        await pump(until=lambda:commands.receipts[key]['state']!='accepted')
-        receipt=commands.receipts[key]
-        assert receipt['state']=='completed',receipt
-        return receipt
+        if until:raise AssertionError({'timeout':timeout,'last_feedback':latest})
     try:
         await pump(until=lambda:bool(latest.get('execution',{}).get('armed')))
-        await operation('start','begin-1')
+        await pump(until=lambda:bool(latest.get('operator_session_id')))
         epoch=latest['mapping_epoch'];operator=latest['operator_session_id']
         assert epoch==1 and operator
         settings.update(grip=1.,pose=1)
@@ -208,19 +215,13 @@ async def producer(args):
         await pump(until=lambda:latest.get('execution',{}).get('output_active'))
         assert latest['mapping_epoch']==epoch and latest['operator_session_id']==operator
         await pump(.3)
-        # No new capture input after finish admission: return must complete
-        # from actual plant feedback, rather than requiring the headset.
         settings['enabled']=False
-        await operation('finish','finish-1')
-        runtime.capture_hold('offline-pico',generation,'test_rtc_loss')
-        await operation('stop','stop-after-rtc-loss')
-        assert not latest['execution']['ownership_held']
         summary={'pass':True,'input_frames':sequence,'mapping_epoch':epoch,
-            'transport':'RosTransport/BoundedWriter','writer_error':transport.writer.last_error,'regrip_cycles':10,
-            'operator_session_id':operator,'final_feedback':latest,'receipts':list(commands.receipts.values())}
+            'transport':'RosTransport/BoundedWriter','writer_error':transport.writer.last_error,
+            'regrip_cycles':10,'operator_session_id':operator,'final_feedback':latest}
         (output/'producer.result.json').write_text(json.dumps(summary,indent=2))
     finally:
-        await commands.close();runtime.stop();transport.close();ros_executor.shutdown();rclpy.shutdown();stream.close()
+        runtime.stop();transport.close();ros_executor.remove_node(monitor);monitor.destroy_node();ros_executor.shutdown();rclpy.shutdown();stream.close()
         (output/'producer.done').write_text('complete\n')
 
 
