@@ -1933,18 +1933,59 @@ skewed clock be quoted, and on a clock that drifts rather than merely sits offse
 that decays into a wrong answer which still looks principled. `stamp_skew_ms` is
 reported so the skew can be measured first.
 
+### Verifying `frame`, and why the robot cannot be its own witness
+
+`frame` is the one field a consumer cannot sanity-check — `common/odom.py` takes it
+as given and so does actucore's reader, which only checks that a sample *says*
+body. Get it wrong and `vx`/`vy` swap at any non-zero heading: plausible numbers,
+no error, nothing anywhere to notice. So it has to be measured, and measuring it on
+R1 took four walks and produced two lessons worth more than the answer.
+
+**Do not verify it against the robot's own position.** The obvious test differences
+`position` against the integral of `velocity`, with and without the heading
+rotation, and takes whichever fits. That presumes `position` is trustworthy. On
+r1_sz it is not: over a **tape-measured 3 m straight walk** `position` reported
+**0.81 m** — 73% short — with a path 2.3x its own net displacement, so it loses the
+*shape* of the trajectory and not merely the origin. Three runs came back "neither
+hypothesis explains the path", which was true and said nothing about frames.
+
+**Separate scale from rotation and the frame question survives a broken reference.**
+Fit one *complex* gain per hypothesis: the magnitude is how far the two sources
+disagree about distance, the phase is the rotation the hypothesis still needs. Only
+the phase answers the frame question, and it does not care about scale. On r1_sz the
+body hypothesis needed **+0.2°** and the world one **−144°**, decided from the same
+run whose magnitudes disagreed fourfold. Report the magnitude separately, as its own
+finding rather than as a failure.
+
+**Fix the ground truth before the robot moves.** Nothing inside the robot can say
+which of two disagreeing sources is right. Three segments, each 30 seconds, each
+isolating one quantity, all read out per-source by
+`scripts/probe_r1_odom_frame.py` (read-only — it publishes nothing):
+
+| segment | what you fix beforehand | what it settles |
+|---|---|---|
+| straight line, tape-measured | distance, and zero turn | the **scale** of `velocity` and of `position`, independently |
+| one full turn in place | 360°, and zero displacement | the scale of `wz` — needs no measuring tool |
+| closed loop back to a taped mark | net displacement is zero | the frame, and whether the integration closes |
+
+Run the straight line first; it alone tells you which source is wrong and by how
+much. On r1_sz: `velocity` 3.62 m against a measured 3 m (**20% high**, straightness
+1.03), `position` 0.81 m (**73% short**, straightness 2.30).
+
+**Record the measurement where the next person will find it**, not only in a commit
+message — R1 keeps it in `health()` under `odom_measured` and `position_unusable`.
+And do not correct a 20% overread with a scalar: one measurement against an
+approximate distance is not a calibration, and a magic number makes a wrong figure
+look authoritative. State it, and check it is inside the margin that matters — 20%
+cannot push a stalled robot over navi's "below 20% of commanded" stuck threshold.
+
 ### Checklist for a new driver
 
 - [ ] `provides` lists only axes genuinely measured — not the ones the SDK has a
       field for
 - [ ] every unmeasured axis is `None` in `twist`, and no `or 0.0` anywhere near it
 - [ ] `frame` is right; if it is `world`, say so rather than relabelling it body.
-      **Check it, do not infer it from the topic's name** — a topic called
-      `odommodestate` carrying a world-frame `position` is not evidence about the
-      frame of the `velocity` beside it, in either direction. R1's is settled by
-      `scripts/probe_r1_odom_frame.py`, which differences `position` against the
-      integral of `velocity` with and without the heading rotation; the same
-      method works for any driver reporting both
+      **Check it against a trajectory you know in advance** — see below
 - [ ] `stamp_ms` comes from `resolve_stamp_ms`, and its provenance is in `vendor`
 - [ ] the 10 Hz publish averages the window with `mean_twist` rather than
       publishing one reading out of every N

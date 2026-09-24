@@ -165,7 +165,7 @@ def test_position_jitter_does_not_collapse_the_verdict(frame):
 def test_jitter_leaves_the_residual_well_under_the_path():
     rows = jitter(republish(walk(frame="body", yaw_rate=0.4, seconds=40.0)))
     result = probe.analyse(rows)
-    assert result["residual_fraction"] < probe.MAX_RESIDUAL_FRACTION
+    assert abs(result["scale"]["body"]["rotation_deg"]) < probe.MAX_FRAME_ROTATION_DEG
 
 
 def test_the_scale_fit_recovers_a_magnitude_error():
@@ -195,41 +195,82 @@ def test_the_scale_fit_does_not_rescue_a_wrong_frame():
     assert result["scale"]["world"]["k"] == pytest.approx(1.0, rel=0.02)
 
 
-def test_a_velocity_that_does_not_integrate_to_position_is_refused():
-    """The third outcome, and the one that would be a real finding about R1.
+def test_a_magnitude_error_does_not_block_the_frame_verdict():
+    """The whole point of separating scale from rotation.
 
-    If `velocity` is a filtered estimate rather than the derivative of the
-    reported `position`, both hypotheses are wrong and the ratio between two wrong
-    models means nothing. Here the velocity is scaled to 40% of the truth, which
-    no rotation can repair.
+    This used to assert the opposite — that a magnitude disagreement made the frame
+    undecidable — and that is what the script did for three hardware runs, because
+    it ranked hypotheses by residual against a `position` that was itself wrong by
+    a factor of four. The frame question is about direction, so a scale error must
+    not touch it: here the velocity is 40% of the truth and the frame is still
+    named, with the magnitude reported separately as its own finding.
     """
     rows = republish(walk(frame="body", yaw_rate=0.4, seconds=40.0))
     crippled = [(t, x, y, vx * 0.4, vy * 0.4, yaw) for t, x, y, vx, vy, yaw in rows]
     result = probe.analyse(crippled)
-    assert result["verdict"] == "indeterminate"
-    assert "neither hypothesis explains the path" in result["why"]
+    assert result["verdict"] == "body"
+    assert result["scale"]["body"]["k"] == pytest.approx(2.5, rel=0.02)
+    assert "disagree about distance" in result["magnitude_note"]
 
 
-def test_short_blocks_reproduce_the_hardware_failure():
-    """Pins the mechanism, not just the symptom.
+def test_a_correct_run_gets_no_magnitude_note():
+    """The note has to mean something, so it must not fire on agreement."""
+    result = probe.analyse(republish(walk(frame="body", yaw_rate=0.4, seconds=40.0)))
+    assert "magnitude_note" not in result
 
-    Same data, same code, only the block length changed: at one second the verdict
-    is emphatic (ratio > 20, residual a few percent of the path); shrunk to the
-    sample interval — which is what differencing adjacent samples amounts to — it
-    collapses to indeterminate with the residual exceeding half the path. That is
-    the shape of the r1_sz run, and it says the block length is load-bearing
-    rather than incidental tuning.
+
+def test_the_verdict_does_not_depend_on_the_block_length():
+    """The property that replaced a workaround.
+
+    An earlier version of this test asserted the opposite — that shrinking the
+    block collapsed the verdict — and that was true of the estimator it was
+    written against, which summed the *magnitude* of each block's residual. Such a
+    sum accumulates noise as fast as signal, so it needed long blocks to survive.
+
+    The complex-gain fit is a least-squares estimator over vectors, so the noise
+    cancels in the fit instead of accumulating, and the block length stops
+    mattering: verdict and scale come out the same at 1 s and at 0.05 s. Pinned
+    here because "this threshold is load-bearing" and "this threshold is
+    irrelevant" are both worth knowing, and the first claim was wrong.
     """
     rows = jitter(republish(walk(frame="body", yaw_rate=0.4, seconds=40.0)))
     original = probe.BLOCK_S
     try:
-        assert probe.analyse(rows)["ratio"] > 20
+        long_blocks = probe.analyse(rows)
         probe.BLOCK_S = 0.05
-        degraded = probe.analyse(rows)
+        short_blocks = probe.analyse(rows)
     finally:
         probe.BLOCK_S = original
-    assert degraded["verdict"] == "indeterminate"
-    assert degraded["residual_fraction"] > 0.5
+    assert long_blocks["verdict"] == short_blocks["verdict"] == "body"
+    assert short_blocks["scale"]["body"]["k"] == pytest.approx(
+        long_blocks["scale"]["body"]["k"], rel=0.02)
+
+
+def test_a_reading_may_carry_extra_columns():
+    """A reading is a record with a stable prefix, not a fixed-width tuple.
+
+    `yaw_speed` was added as a seventh column and `analyse` still unpacked six,
+    which crashed *after* a robot had been walked and the readings saved — the one
+    moment when a crash costs somebody a repeat of the physical experiment. The
+    saved file survived it, which is the only reason it cost nothing.
+    """
+    rows = [(*row, 0.1) for row in republish(walk(frame="body", yaw_rate=0.4))]
+    assert probe.analyse(rows)["verdict"] == "body"
+    assert probe.kinematics(rows)["wz_turned_deg"] is not None
+
+
+def test_kinematics_reports_each_source_separately():
+    """The readout that does not presuppose which source is right.
+
+    On r1_sz a measured 3 m straight walk produced 3.62 m from `velocity` and
+    0.81 m from `position`; nothing internal to the robot could have told those
+    apart, and the tape measure did.
+    """
+    rows = republish(walk(frame="body", yaw_rate=0.0, speed=0.5, seconds=20.0))
+    k = probe.kinematics(rows)
+    assert k["velocity"]["net_m"] == pytest.approx(10.0, rel=0.05)
+    assert k["position"]["net_m"] == pytest.approx(10.0, rel=0.05)
+    assert abs(k["heading_turned_deg"]) < 1.0
 
 
 # ── blocks ───────────────────────────────────────────────────────────────────
