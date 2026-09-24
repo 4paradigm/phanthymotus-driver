@@ -2,6 +2,7 @@
 
 Plugins:
   StatePlugin  — DDS rt/lowstate → ROS2 skeleton/IMU/battery
+  LocoStatePlugin — read-only RL locomotion state → ROS2 JSON
   EStopPlugin  — read-only PAC physical emergency-stop state
   LocoPlugin   — gRPC locomotion control
   PosturePlugin / MotionPlugin / TrackingMotionPlugin — focused RL execution cards
@@ -923,6 +924,156 @@ class StatePlugin:
                         "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._node._topic_skeleton, "format": "sensor/skeleton"}]}
+        return None
+
+
+# ===========================================================================
+# LocoStatePlugin — read-only RL locomotion state
+# ===========================================================================
+
+class _LocoStatePublisherNode(Node):
+    """Publishes the RL controller state without changing robot state."""
+
+    def __init__(self, namespace: str):
+        super().__init__("adam_loco_state_publisher")
+        self._topic = f"/{namespace}/loco/state"
+        self._publisher = self.create_publisher(String, self._topic, _reliable_qos())
+
+    def publish_state(self, state: dict):
+        msg = String()
+        msg.data = json.dumps(state)
+        self._publisher.publish(msg)
+
+
+class LocoStatePlugin:
+    """Read-only view of the RL gRPC controller state."""
+
+    PREFIX = "loco_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 grpc_client, **kwargs):
+        self._grpc = grpc_client
+        self._executor = executor
+        self._running = False
+        self._poll_rate_hz = float(plugin_config.get("publish_rate_hz", 10.0))
+        if not math.isfinite(self._poll_rate_hz) or self._poll_rate_hz <= 0:
+            raise ValueError("loco_state publish_rate_hz must be positive")
+        self._node = _LocoStatePublisherNode(namespace)
+        executor.add_node(self._node)
+        self._lifecycle_lock = threading.Lock()
+        self._poll_thread = None
+        self._stop_event = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "loco_state",
+            "type": "sensor",
+            "readOnly": True,
+            "description": "Adam RL locomotion state — FSM, velocity, height and available capabilities",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+        }
+
+    @staticmethod
+    def _payload(state: dict) -> dict:
+        if not isinstance(state, dict):
+            raise TypeError("GetRobotState must return an object")
+        payload = {
+            "success": bool(state.get("success", False)),
+            "timestamp_ms": int(time.time() * 1000),
+        }
+        for field in (
+                "code", "message", "fsm_state", "vx", "vy", "vyaw", "height",
+                "current_motion_file", "motion_playing", "current_tracking_motion",
+                "tracking_playing", "switchable_states", "available_actions"):
+            if field in state:
+                value = state[field]
+                if field in ("switchable_states", "available_actions"):
+                    value = list(value)
+                payload[field] = value
+        return payload
+
+    def _poll(self, stop_event: threading.Event):
+        interval = 1.0 / self._poll_rate_hz
+        try:
+            while not stop_event.is_set():
+                started = time.monotonic()
+                try:
+                    state = self._grpc.get_robot_state()
+                    payload = self._payload(state)
+                except Exception as exc:
+                    payload = self._payload({
+                        "success": False,
+                        "code": "STATE_UNAVAILABLE",
+                        "message": str(exc),
+                    })
+                try:
+                    self._node.publish_state(payload)
+                except Exception:
+                    if stop_event.wait(0.1):
+                        break
+                stop_event.wait(max(0.0, interval - (time.monotonic() - started)))
+        finally:
+            with self._lifecycle_lock:
+                if self._stop_event is stop_event:
+                    self._running = False
+                    self._poll_thread = None
+                    self._stop_event = None
+
+    def start(self):
+        with self._lifecycle_lock:
+            if self._poll_thread is not None and self._poll_thread.is_alive():
+                return
+            self._running = True
+            stop_event = threading.Event()
+            self._stop_event = stop_event
+            self._poll_thread = threading.Thread(
+                target=self._poll,
+                args=(stop_event,),
+                daemon=True,
+                name="adam_loco_state_poll",
+            )
+            self._poll_thread.start()
+
+    def stop(self):
+        with self._lifecycle_lock:
+            self._running = False
+            thread = self._poll_thread
+            stop_event = self._stop_event
+            if stop_event is not None:
+                stop_event.set()
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(1.5)
+        with self._lifecycle_lock:
+            if not thread.is_alive() and self._stop_event is stop_event:
+                self._poll_thread = None
+                self._stop_event = None
+
+    def close(self):
+        self.stop()
+        with self._lifecycle_lock:
+            thread = self._poll_thread
+        if thread is not None and thread.is_alive():
+            thread.join(4.0)
+        _destroy_ros_node(self._executor, self._node)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "info":
+            return {
+                "state": "running" if self._running else "idle",
+                "topic_out": [{"topic": self._node._topic, "format": "data/json"}],
+            }
         return None
 
 
@@ -4974,6 +5125,14 @@ class AdamDeviceBundle:
                 grpc_client=grpc_client,
             )
             self._plugins.append(p)
+
+        # Read-only RL state is separate from the actuator card so observing the
+        # controller can never trigger a control-domain or FSM transition.
+        loco_state_cfg = plugins_cfg.get("loco_state", {})
+        if loco_state_cfg.get("enabled", True) and self._ros2_enabled:
+            self._plugins.append(LocoStatePlugin(
+                loco_state_cfg, namespace, executor, grpc_client=grpc_client,
+            ))
 
         # The default LocoPlugin preserves the historic dashboard contract;
         # the RL variant exposes the full pnd.robot gRPC API.

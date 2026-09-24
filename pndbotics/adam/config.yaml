@@ -25,6 +25,9 @@ plugins:
     state_timeout_sec: 5
     pac_url: "http://10.10.20.127:8626"
     http_timeout_sec: 2
+  loco_state:
+    enabled: true
+    publish_rate_hz: 10
   loco:
     enabled: true
     grpc_api: "rl"

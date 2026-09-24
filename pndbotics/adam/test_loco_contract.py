@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import device
 from device import (
+    LocoStatePlugin,
     MotionPlugin,
     RlLocoPlugin,
 )
@@ -67,7 +68,139 @@ class _Grpc:
         return {"success": True}
 
 
+class _Publisher:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, message):
+        self.messages.append(message.data)
+
+
+class _LocoStateNode:
+    def __init__(self, namespace):
+        self._topic = f"/{namespace}/loco/state"
+        self._publisher = _Publisher()
+
+    def publish_state(self, state):
+        message = types.SimpleNamespace(data=__import__("json").dumps(state))
+        self._publisher.publish(message)
+
+
+class _Executor:
+    def add_node(self, node):
+        self.node = node
+
+    def remove_node(self, node):
+        self.removed = node
+
+
 class LocoContractTests(unittest.TestCase):
+    def setUp(self):
+        self._original_loco_state_node = device._LocoStatePublisherNode
+        device._LocoStatePublisherNode = _LocoStateNode
+
+    def tearDown(self):
+        device._LocoStatePublisherNode = self._original_loco_state_node
+
+    def _wait_for_messages(self, publisher, count=1, timeout=1.0):
+        deadline = time.monotonic() + timeout
+        while len(publisher.messages) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(
+            len(publisher.messages), count, "loco_state publish timed out")
+
+    def test_loco_state_is_read_only_and_flattens_grpc_state(self):
+        grpc = _Grpc()
+        executor = _Executor()
+        plugin = LocoStatePlugin({"publish_rate_hz": 20}, "adam", executor, grpc)
+        publisher = plugin._node._publisher
+
+        tool = plugin.get_tool()
+        self.assertEqual("loco_state", tool["name"])
+        self.assertEqual("sensor", tool["type"])
+        self.assertTrue(tool["readOnly"])
+        self.assertFalse(tool["inputSchema"]["additionalProperties"])
+        self.assertEqual(
+            [{"topic": "/adam/loco/state", "format": "data/json"}],
+            tool["topic_out"],
+        )
+        self.assertFalse(hasattr(grpc, "velocity"))
+
+        plugin.start()
+        self._wait_for_messages(publisher)
+        plugin.stop()
+
+        payload = __import__("json").loads(publisher.messages[-1])
+        self.assertTrue(payload["success"])
+        self.assertEqual("STOP", payload["fsm_state"])
+        self.assertEqual(["SetMotion", "SetTrackingMotion"], payload["available_actions"])
+        __import__("json").dumps(payload)
+        self.assertIn("timestamp_ms", payload)
+        self.assertFalse(hasattr(grpc, "velocity"))
+
+    def test_loco_state_publishes_grpc_errors_without_writes(self):
+        class FailingGrpc(_Grpc):
+            def get_robot_state(self):
+                raise RuntimeError("controller unavailable")
+
+        grpc = FailingGrpc()
+        executor = _Executor()
+        plugin = LocoStatePlugin({"publish_rate_hz": 20}, "adam", executor, grpc)
+        publisher = plugin._node._publisher
+
+        plugin.start()
+        self._wait_for_messages(publisher)
+        plugin.stop()
+
+        payload = __import__("json").loads(publisher.messages[-1])
+        self.assertFalse(payload["success"])
+        self.assertEqual("STATE_UNAVAILABLE", payload["code"])
+        self.assertIn("controller unavailable", payload["message"])
+        self.assertIsNone(grpc.mode)
+        self.assertFalse(hasattr(grpc, "domain_id"))
+        self.assertFalse(hasattr(grpc, "velocity"))
+
+    def test_loco_state_converts_malformed_state_to_error(self):
+        class MalformedGrpc(_Grpc):
+            def get_robot_state(self):
+                return None
+
+        plugin = LocoStatePlugin(
+            {"publish_rate_hz": 20}, "adam", _Executor(), MalformedGrpc())
+        publisher = plugin._node._publisher
+
+        plugin.start()
+        self._wait_for_messages(publisher)
+        plugin.stop()
+
+        payload = __import__("json").loads(publisher.messages[-1])
+        self.assertFalse(payload["success"])
+        self.assertEqual("STATE_UNAVAILABLE", payload["code"])
+        self.assertIn("must return an object", payload["message"])
+
+    def test_loco_state_survives_publish_failure(self):
+        grpc = _Grpc()
+        plugin = LocoStatePlugin(
+            {"publish_rate_hz": 20}, "adam", _Executor(), grpc)
+        publisher = plugin._node._publisher
+        publish = publisher.publish
+        failures = [True]
+
+        def fail_once(message):
+            if failures:
+                failures.pop()
+                raise RuntimeError("publisher unavailable")
+            publish(message)
+
+        publisher.publish = fail_once
+        plugin.start()
+        self._wait_for_messages(publisher, timeout=1.5)
+        plugin.stop()
+
+        payload = __import__("json").loads(publisher.messages[-1])
+        self.assertTrue(payload["success"])
+        self.assertFalse(plugin._running)
+
     def test_loco_hides_mode_and_automatically_enters_walking_state(self):
         grpc = _Grpc()
         plugin = RlLocoPlugin({}, "adam", None, grpc)
