@@ -9,24 +9,28 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 
 | Catalog entry | Driver tool | Notes |
 |---|---|---|
-| `/aima/hal/imu/chest/state`, `/aima/hal/imu/torso/state` | `imu` | merged into one `data/json` stream |
-| `/aima/hal/joint/hand/state` | `hand_state` | `HandStateArray`, includes touch sensors |
-| `/aima/hal/joint/hand/command` | `hand_command` | |
+| `/aima/hal/imu/chest/state`, `/aima/hal/imu/torso/state` | `imu` | merged into one flat `data/json` stream (`chest_*`/`torso_*` scalar fields; roll/pitch/yaw in degrees). Quaternion retained as scalars; covariance is one nested list when unset (all zeros), otherwise expanded scalars. |
+| `/aima/hal/audio/capture` | `mic` | `aimdk_msgs/msg/AudioCapture` (currently 6-channel S16LE/16 kHz on X2) is downmixed across microphone channels and converted to `audio_msgs/msg/AudioChunk` at `/agibot_x2/agibot_x2/mic/audio`; publishes 1024-byte mono chunks for ASR. |
+| `/aima/mc/leg_odometry` | `leg_odometry` | `nav_msgs/msg/Odometry`, flattened as position (m), quaternion and roll/pitch/yaw (deg), linear velocity (m/s), angular velocity (rad/s/deg/s), and 6x6 pose/twist covariance (nested list if unset/all zeros, else expanded scalars); locomotion/leg odometry, not SLAM localization |
+| `/aima/hal/joint/hand/state` | `hand_state` (optional) | `HandStateArray`, includes touch sensors. Disabled by default: the verified X2 reports `HandType.NONE` and empty joint arrays on both sides. |
+| `/aima/hal/sensor/touch_head` | `head_touch` | `TouchState`, confirmed publisher on the X2 unit |
+| `/aima/hal/pmu/state` | `pmu_state` | `PmuState`, confirmed publisher on the X2 unit |
+| `/aima/hal/joint/hand/command` | `hand_command` (optional) | Disabled by default with `hand_state`; enable only after dexterous-hand hardware is present. |
 | `/aima/hal/joint/*/command` | `joint_command` | wildcard resolved to `leg`/`waist`/`arm`/`head` |
-| `/aima/hal/pmu/state` | — | not currently exposed as a tool (no card in the approved plan) |
-| `/aima/hal/sensor/lidar_chest_front/lidar_pointcloud` | `lidar` | `sensor/pointcloud` |
+| `/aima/hal/sensor/lidar_chest_front/lidar_pointcloud` | `lidar` (optional) | `sensor/pointcloud`; disabled by default because the verified unit has no publisher. |
 | `/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed` | `camera_rgb` | catalog documents `rgbd_head_front/rgb_image/compressed` instead, but on real hardware that topic has zero publishers — confirmed via `ros2 topic info` that `rgb_head_front_center` is what's actually live (30Hz); see below |
-| `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` | zero publishers on real hardware, and no depth topic exists anywhere in the live `ros2 topic list` on this unit — depth appears to not be active/available on this X2 at all, kept wired to the documented name pending vendor confirmation |
+| `/aima/hal/sensor/rgb_head_front_center/camera_info` | internal calibration input for `camera_rgb_frame` | `CameraInfo`, confirmed publisher on the X2 unit; intentionally not exposed as a separate card |
+| `/aima/hal/sensor/rgbd_head_front/depth_image` | `camera_depth` (optional) | zero publishers on real hardware, and no depth topic exists anywhere in the live `ros2 topic list` on this unit. Disabled by default pending vendor confirmation. |
 | `/aima/mc/locomotion/velocity` | `locomotion` | |
-| `/integrated_command` | `slam_control` | plain `std_msgs/String`, not a service |
-| `/relocalization_pose` | `slam_control` | |
-| `/slam/lidar_odom` | `slam_pose` | |
+| `/integrated_command` | `slam_control` (optional) | plain `std_msgs/String`, not a service; disabled by default because SLAM is an optional vendor module and this unit has no subscriber. |
+| `/relocalization_pose` | `slam_control` (optional) | disabled with SLAM; this unit has no subscriber. |
+| `/slam/lidar_odom` | `slam_pose` (optional) | disabled by default because this unit has no publisher. |
 | `/aimdk_5Fmsgs/srv/GetAllJointState` | `joint_state` | |
 | `/aimdk_5Fmsgs/srv/GetHandType` | `hand_state` (action `info`) | |
-| `/aimdk_5Fmsgs/srv/GetMcAction` | `mc_state` | no broadcast topic exists, so this is call-on-demand |
-| `/aimdk_5Fmsgs/srv/SetMcAction` | `mc_mode` | |
+| `/aimdk_5Fmsgs/srv/GetMcAction`, `/aima/mc/common/state` | `mc_state`, `mc_mode` ACP confirmation | `GetMcAction` remains call-on-demand; the verified X2 also broadcasts `McCommonState`, whose `action_info.action_desc/status` confirms a requested mode has become active. |
+| `/aimdk_5Fmsgs/srv/SetMcAction` | `mc_mode` | SDK enum is not a firmware capability list. This X2 rejected `STAND_UP_DEFAULT` and `ZERO_TORQUE_DEFAULT` with `can not find action`; `PASSIVE_DEFAULT`/`STAND_DEFAULT` only acknowledged the request, while `DAMPING_DEFAULT` is the sole observed end-to-end working mode. The driver exposes only `DAMPING_DEFAULT` by default and confirms activation from `/aima/mc/common/state`. |
 | `/aimdk_5Fmsgs/srv/SetMcPresetMotion` | `preset_motion` | |
-| `/aimdk_5Fmsgs/srv/SetMcInputSource`, `GetCurrentInputSource` | `locomotion` (action `register`/`disable`) | |
+| `/aimdk_5Fmsgs/srv/SetMcInputSource`, `GetCurrentInputSource` | `locomotion` | AimDK requires external locomotion to register and publish with a distinct source name. The driver registers `motus_x2` at priority 81 (one above `rc=80`) via a short-lived domain-0 client with AimDK-style retries (shared dual-domain spin_once can starve SetMcInputSource under sensor load), publishes at 50 Hz, and deletes it on cancel/completion/stop so native control immediately regains arbitration. `move.angular` is deg/s → rad/s. Timed `move` stops on **duration** (not distance). Field evidence of ~2× travel is treated as velocity tracking gain: `plugins.locomotion.velocity_command_scale` plus optional adaptive scale from `leg_odometry` twist; odom displacement is only a safety abort if travel ≫ speed×time. |
 | `/aimdk_5Fmsgs/srv/GetSystemState` | `system_state` | |
 | `/aimdk_5Fmsgs/srv/GetRobotResources` | `linkcraft_catalog` | |
 | `/aimdk_5Fmsgs/srv/ExecuteActionResource` | `linkcraft` | |
@@ -43,12 +47,10 @@ new plugin in `device.py` if a use case comes up:
 
 - `/agent/process_audio_output`, `/face_ui_proxy/status` — top-level status topics, purpose not
   fully documented in the SDK's public catalog.
-- `/aima/hal/audio/capture`, `/aima/hal/audio/playback`, `/aima/hal/audio/focus_response`,
-  `/aima/hal/audio/play_state` — raw audio I/O topics; this driver relies on `tts`/`PlayTts`
-  instead of raw audio playback.
+- `/aima/hal/audio/playback`, `/aima/hal/audio/focus_response`, `/aima/hal/audio/play_state` —
+  remaining raw audio I/O topics; the internal capture stream is exposed by the `mic` card.
 - `/aima/hal/sensor/rgb_head_rear/*`, `/aima/hal/sensor/stereo_head_front_{left,right}/*` —
   additional cameras beyond the front RGBD pair this driver exposes.
-- `/aima/hal/sensor/touch_head` — head touch sensor, no dedicated tool yet.
 - `/aimdk_5Fmsgs/srv/AbandonAudioFocus`, `RequestAudioFocus`, `GetMute`, `SetMute`, `GetVolume`,
   `SetVolume` — audio focus/volume management.
 - `/aimdk_5Fmsgs/srv/PlayAudioFile`, `PlayVideo`, `PlayVideoGroup` — media playback beyond TTS.
