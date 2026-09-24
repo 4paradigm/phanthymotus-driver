@@ -1579,6 +1579,13 @@ class ArmControlPlugin:
         u = max(0.0, min(1.0, progress))
         return u * u * u * (10.0 + u * (-15.0 + 6.0 * u))
 
+    def _sample_segment(self, now: float) -> list[float]:
+        current_q = list(self._seg_current)
+        eased = self._ease((now - self._seg_started_at) / max(1e-6, self._seg_span))
+        for index, start in self._seg_start.items():
+            current_q[index] = start + (self._target_q[index] - start) * eased
+        return current_q
+
     def _write_command(self, dt: float):
         with self._lock:
             if not self._state_ready.is_set() or self._hold_q is None:
@@ -1610,11 +1617,7 @@ class ArmControlPlugin:
             # gesture eases over several seconds — and retargeting mid-motion
             # starts from the current output rather than jumping back to the
             # old start.
-            span = max(1e-6, self._seg_span)
-            eased = self._ease((now - self._seg_started_at) / span)
-            current_q = list(self._seg_current)
-            for index, start in self._seg_start.items():
-                current_q[index] = start + (targets[index] - start) * eased
+            current_q = self._sample_segment(now)
             self._seg_current = list(current_q)
 
         try:
@@ -1861,14 +1864,14 @@ class ArmControlPlugin:
             target_q = self._target_q.copy()
             target_q.update({self._joint_index(name): value
                              for name, value in targets.items()})
-            # Start a new smooth segment from the pose currently being written
-            # (not from the previous target), so mid-motion retargets are
-            # continuous and the eased profile always ends exactly at the
-            # newest goal.
+            # Sample the in-flight segment at the retarget instant, including
+            # time elapsed since the worker's most recent write.
+            now = time.monotonic()
+            self._seg_current = self._sample_segment(now)
             self._target_q = target_q
             self._seg_start = {index: self._seg_current[index]
                                for index in self._target_q}
-            self._seg_started_at = time.monotonic()
+            self._seg_started_at = now
             max_distance = 0.0
             for index in self._target_q:
                 max_distance = max(
@@ -3182,15 +3185,12 @@ class HandPlugin:
                     if command is None:
                         command = list(target)
                     max_step = max(1.0, self._max_val / (self._transition_seconds * self._control_rate_hz))
-                    converged = True
                     for i in range(len(command)):
                         diff = target[i] - command[i]
                         if diff > max_step:
                             command[i] += max_step
-                            converged = False
                         elif diff < -max_step:
                             command[i] -= max_step
-                            converged = False
                         elif diff != 0:
                             command[i] = target[i]
                     write_positions = [round(p) for p in command]
@@ -3200,10 +3200,6 @@ class HandPlugin:
                         continue
                     with self._lock:
                         self._command_positions = list(command)
-                        if converged:
-                            # Reached the target; stop actively writing to save
-                            # CPU/bus until a new target arrives.
-                            self._active = False
                 if self._wake_event.wait(period):
                     self._wake_event.clear()
                     if stop_event.is_set():
