@@ -27,6 +27,7 @@ cards:
   - { name: battery,      type: sensor }
   - { name: joints,       type: sensor }
   - { name: mainboard,    type: sensor }
+  - { name: health_check, type: actuator }
   - { name: model,        type: resource }
   - { name: asr,          type: sensor }
   - { name: camera_main,  type: sensor }

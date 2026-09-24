@@ -117,10 +117,19 @@ class R1DeviceBundle:
                 ))
                 print("[bundle] LocoServoPlugin loaded")
 
+        state_plugin = None
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
-            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor))
+            state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor)
+            self._plugins.append(state_plugin)
             print("[bundle] StatePlugin loaded")
+
+        if plugins_cfg.get("health_check", {}).get("enabled", False):
+            from health_check import HealthCheckPlugin
+            self._plugins.append(HealthCheckPlugin(
+                plugins_cfg["health_check"], state_plugin=state_plugin,
+            ))
+            print("[bundle] HealthCheckPlugin loaded")
 
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from device import AsrPlugin

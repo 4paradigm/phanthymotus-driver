@@ -33,6 +33,11 @@ plugins:
     rotate_only: false
   state:
     enabled: true
+  health_check:
+    enabled: true
+    battery_min_soc: 20
+    # Only add temperature_limits after the team confirms R1 EDU limits and units.
+    # Example shape: temperature_limits: {battery: 60, imu: 70, joints: 80, mainboard: 75}
   asr:
     enabled: true
   camera:

@@ -1843,8 +1843,7 @@ class _LowStateNode(Node):
         self._battery_pub   = self.create_publisher(String, battery_topic,   _LOW_LAT_QOS)
         self._joints_pub    = self.create_publisher(String, joints_topic,    _LOW_LAT_QOS)
         self._mainboard_pub = self.create_publisher(String, mainboard_topic, _LOW_LAT_QOS)
-        self._last_imu:     dict = {}
-        self._last_battery: dict = {}
+        self._health_samples: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._last_joints_time:    float = 0.0
         self._last_imu_time:       float = 0.0
@@ -1892,8 +1891,7 @@ class _LowStateNode(Node):
                 "rpy":           list(imu.rpy),
                 "temperature":   float(imu.temperature),
             }
-            with self._lock:
-                self._last_imu = imu_data
+            self._record_health_sample("imu", imu_data)
 
             imu_out = String()
             imu_out.data = json.dumps(imu_data)
@@ -1916,8 +1914,10 @@ class _LowStateNode(Node):
                     "tau": round(float(m.tau_est), 3),
                     "temp": list(m.temperature),
                 })
+            joints_data = {"joints": joints, "imu_quat": list(msg.imu_state.quaternion)}
+            self._record_health_sample("joints", joints_data)
             joints_out = String()
-            joints_out.data = json.dumps({"joints": joints, "imu_quat": list(msg.imu_state.quaternion)})
+            joints_out.data = json.dumps(joints_data)
             self._joints_pub.publish(joints_out)
 
     def _on_bms(self, msg) -> None:
@@ -1935,8 +1935,7 @@ class _LowStateNode(Node):
             "temperature": [int(t) for t in msg.temperature if t > 0],
             "cycle":       int(msg.cycle),
         }
-        with self._lock:
-            self._last_battery = bms_data
+        self._record_health_sample("battery", bms_data)
 
         bat_out = String()
         bat_out.data = json.dumps(bms_data)
@@ -1954,9 +1953,24 @@ class _LowStateNode(Node):
             "value":       [round(float(v), 2) for v in msg.value if v != 0.0],
             "state":       [int(s) for s in msg.state if s > 0],
         }
+        self._record_health_sample("mainboard", mb_data)
         mb_out = String()
         mb_out.data = json.dumps(mb_data)
         self._mainboard_pub.publish(mb_out)
+
+    def _record_health_sample(self, source: str, data: dict) -> None:
+        # Each DDS callback replaces one immutable snapshot; health checks never
+        # hold this lock while evaluating or waiting for hardware.
+        with self._lock:
+            self._health_samples[source] = {
+                "data": data,
+                "received_monotonic": time.monotonic(),
+                "received_at": time.time(),
+            }
+
+    def health_snapshot(self) -> dict[str, dict]:
+        with self._lock:
+            return {name: sample.copy() for name, sample in self._health_samples.items()}
 
 
 class StatePlugin:
@@ -1972,6 +1986,9 @@ class StatePlugin:
 
     def get_tools(self) -> list:
         return [self._imu_tool(), self._battery_tool(), self._joints_tool(), self._mainboard_tool(), self._model_tool()]
+
+    def health_snapshot(self) -> dict[str, dict]:
+        return self._node.health_snapshot()
 
     def _imu_tool(self) -> dict:
         return {
