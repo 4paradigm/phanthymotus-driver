@@ -1,5 +1,6 @@
 """Save a fresh JPEG from an already running Go1 RGB camera card."""
 
+import os
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -64,17 +65,22 @@ class CameraSnapshotPlugin:
             return {"ok": False, "code": "CAMERA_UNAVAILABLE",
                     "message": f"no fresh JPEG from {position} within 10 seconds"}
 
-        path = None
+        temporary_path = None
         try:
             self._output_dir.mkdir(parents=True, exist_ok=True)
             path = self._output_dir / (
                 f"{position}_{datetime.now():%Y%m%d_%H%M%S_%f}_{uuid4().hex[:8]}.jpg")
-            with path.open("xb") as output:
+            temporary_path = path.with_name(f".{path.name}.tmp")
+            # 中文说明：先写入并同步临时文件，再公开 JPEG 路径，避免重启后留下空照片。
+            with temporary_path.open("xb") as output:
                 output.write(jpeg)
+                output.flush()
+                os.fsync(output.fileno())
+            temporary_path.replace(path)
             return {"ok": True, "position": position, "media_type": "photo",
                     "file_path": str(path),
                     "captured_at": datetime.now().astimezone().isoformat(timespec="seconds")}
         except OSError as exc:
-            if path is not None:
-                path.unlink(missing_ok=True)
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
             return {"ok": False, "code": "SAVE_FAILED", "message": str(exc)}

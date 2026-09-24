@@ -55,6 +55,29 @@ def test_snapshot_rejects_unavailable_or_stalled_camera(tmp_path):
     assert list(tmp_path.rglob("*.jpg")) == []
 
 
+def test_snapshot_does_not_leave_a_partial_photo_when_publish_fails(tmp_path, monkeypatch):
+    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+
+    class RunningStream:
+        def frame_sequence(self):
+            return 0
+
+        def wait_for_frame(self, sequence, timeout_s):
+            return b"\xff\xd8photo\xff\xd9"
+
+    class RgbCard:
+        def running_stream(self, position):
+            return RunningStream()
+
+    def fail_publish(self, target):
+        raise OSError("storage interrupted")
+
+    monkeypatch.setattr(Path, "replace", fail_publish)
+    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)}, RgbCard())
+    assert card.dispatch("capture_photo", {"position": "front"})["code"] == "SAVE_FAILED"
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_go1_manifest_lists_snapshot_card():
     driver = (Path(__file__).resolve().parents[1] / "driver.yaml").read_text(encoding="utf-8")
     assert "name: camera_snapshot" in driver
