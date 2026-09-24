@@ -19,6 +19,14 @@ from device import (
 )
 
 
+class _RepeatedValues:
+    def __init__(self, values):
+        self._values = values
+
+    def __iter__(self):
+        return iter(self._values)
+
+
 class _Grpc:
     def __init__(self):
         self.mode = None
@@ -137,6 +145,17 @@ class LocoContractTests(unittest.TestCase):
         __import__("json").dumps(payload)
         self.assertIn("timestamp_ms", payload)
         self.assertFalse(hasattr(grpc, "velocity"))
+
+    def test_loco_state_converts_protobuf_repeated_values(self):
+        payload = LocoStatePlugin._payload({
+            "success": True,
+            "switchable_states": _RepeatedValues(["ZERO"]),
+            "available_actions": _RepeatedValues(["SetMotion"]),
+        })
+
+        self.assertEqual(["ZERO"], payload["switchable_states"])
+        self.assertEqual(["SetMotion"], payload["available_actions"])
+        __import__("json").dumps(payload)
 
     def test_loco_state_publishes_grpc_errors_without_writes(self):
         class FailingGrpc(_Grpc):
