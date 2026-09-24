@@ -288,7 +288,7 @@ class U1CardContractTests(unittest.TestCase):
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
             "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls",
-            "camera_left", "camera_right", "vision_capture", "doa_event",
+            "camera_left", "camera_right", "doa_event",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
         for plugin in plugins:
@@ -365,7 +365,7 @@ class U1CardContractTests(unittest.TestCase):
             nodes = device.U1Nodes({}, "test", ros)
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
-            self.assertEqual(len(nodes.robot.subscriptions), 3)
+            self.assertEqual(len(nodes.robot.subscriptions), 2)
             self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 2)
             self.assertEqual(initialized_domains[0][1], 2)
             self.assertEqual(nodes.audio_device.clients["/sys/device/audio_out/set_volume"].srv_name,
@@ -572,76 +572,6 @@ class U1CardContractTests(unittest.TestCase):
             success=False, message='{"code":"FAILED"}')),
             {"code": "FAILED", "ok": False})
 
-    def test_vision_capture_saves_a_fresh_jpeg(self):
-        import device
-
-        class FakeCamera:
-            running = True
-
-            def frame_sequence(self):
-                return 0
-
-            def wait_for_jpeg(self, after_sequence, timeout_s):
-                self.request = (after_sequence, timeout_s)
-                return b"\xff\xd8\xfffake-jpeg\xff\xd9", 1
-
-            def _state(self):
-                return {"state": "running"}
-
-        with tempfile.TemporaryDirectory() as output_dir:
-            plugin = device.VisionCapturePlugin(FakeCamera(), {"output_dir": output_dir})
-            result = plugin.dispatch("capture_image", {"image_name": "test"})
-            self.assertEqual(result["state"], "captured")
-            self.assertEqual(result["filename"], "test.jpg")
-            with open(result["path"], "rb") as handle:
-                self.assertEqual(handle.read(), b"\xff\xd8\xfffake-jpeg\xff\xd9")
-            self.assertEqual(plugin.dispatch("list", {})["files"][0]["filename"], "test.jpg")
-
-    def test_vision_capture_schema_matches_tianyi_actions(self):
-        import device
-
-        class FakeCamera:
-            running = False
-
-        plugin = device.VisionCapturePlugin(FakeCamera(), {})
-        actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
-        self.assertEqual(actions, ["capture_image", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "start", "stop"])
-        self.assertEqual(plugin.get_tool()["inputSchema"]["x-completion"]["actions"], ["record_video"])
-
-    def test_manual_recording_has_explicit_id_without_acp_completion(self):
-        import device
-
-        plugin = device.VisionCapturePlugin(types.SimpleNamespace(), {})
-        with mock.patch.object(plugin, "_start_recording", return_value={"state": "recording", "recording_id": "u1-recording-test"}) as start:
-            result = plugin.dispatch("start_recording", {"video_name": "demo"})
-        self.assertEqual(result["recording_id"], "u1-recording-test")
-        start.assert_called_once_with({"video_name": "demo"}, None)
-        self.assertNotIn("action_id", result)
-
-    def test_recording_failure_keeps_recording_id(self):
-        import device
-
-        class Camera:
-            def frame_sequence(self):
-                return 0
-
-            def wait_for_jpeg(self, after_sequence, timeout_s):
-                return None, after_sequence
-
-        with tempfile.TemporaryDirectory() as output_dir:
-            plugin = device.VisionCapturePlugin(Camera(), {"output_dir": output_dir})
-            active = {
-                "recording_id": "u1-recording-failed",
-                "duration": None,
-                "continuous": True,
-                "path": output_dir + "/failed.mp4",
-                "action_id": None,
-                "cancel": threading.Event(),
-            }
-            plugin._record_worker(active)
-        self.assertEqual(plugin._last_recording["state"], "error")
-        self.assertEqual(plugin._last_recording["recording_id"], "u1-recording-failed")
-
     def test_authorization_logs_do_not_include_vendor_response(self):
         import device
 
@@ -800,21 +730,6 @@ class U1CardContractTests(unittest.TestCase):
         payload = bytes((100, 128, 150, 128, 80, 128, 120, 128))
         jpeg = device._jpeg_from_frame(payload, metadata)
         self.assertTrue(jpeg.startswith(b"\xff\xd8\xff"))
-
-    def test_shared_memory_reader_uses_sdk_cacheline_headers(self):
-        import device
-
-        with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "audio.stream"
-            ring_header = device.VideoSharedMemoryReader._RING_HEADER.pack(1, 1, 4, 0, 0, 0, 0, 0)
-            frame_header = device.VideoSharedMemoryReader._HEADER.pack(0, 1234567890, 4, 0, 0, 0, 0, 0)
-            path.write_bytes(ring_header + frame_header + b"abcd")
-            frames = []
-            reader = device.VideoSharedMemoryReader(
-                {"path": str(path), "frame_payload_size": 4, "max_frames": 1},
-                lambda: {}, lambda payload, _meta, timestamp: (frames.append((payload, timestamp)), reader._stop.set()))
-            reader._run()
-            self.assertEqual(frames, [(b"abcd", 1234567890)])
 
     def test_mic_converts_adapter_raw_message_and_preserves_header(self):
         import device

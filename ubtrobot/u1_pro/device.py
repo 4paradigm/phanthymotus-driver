@@ -8,13 +8,9 @@ management call. The robot's public ROS graph provides useful contracts:
 from __future__ import annotations
 
 import json
-import mmap
 import os
 import re
-import shutil
 import ssl
-import struct
-import subprocess
 import threading
 import time
 import urllib.request
@@ -31,10 +27,6 @@ SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
 MIC_SAMPLE_FORMATS = {"s16", "s16le", "s16_le", "signed_16", "pcm_s16le", "int16"}
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
-VIDEO_METADATA_TOPIC = "/robo/video/subscribe/metadata"
-VIDEO_OPEN = "/robo/video/call/open_stream"
-VIDEO_STATE = "/robo/video/call/stream_state"
-VIDEO_CLOSE = "/robo/video/call/close_stream"
 
 # The U1 Pro SDK document declares all five event topics as
 # std_msgs/msg/String.  Their String.data value is a JSON envelope.  Keep
@@ -114,25 +106,6 @@ def _unwrap_result(value: Any) -> dict:
     return result
 
 
-def _stream_config(*values: Any) -> dict:
-    """Find the documented shared-memory fields in nested service results."""
-    keys = {"stream", "state", "path", "frame_payload_size", "max_frames"}
-    merged = {}
-    def visit(value):
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except json.JSONDecodeError:
-                return
-        if isinstance(value, dict):
-            merged.update({key: value[key] for key in keys if key in value})
-            for child in value.values():
-                visit(child)
-    for value in values:
-        visit(value)
-    return merged
-
-
 def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
     """Convert one SDK raw frame to JPEG using only documented metadata."""
     if payload.startswith(b"\xff\xd8\xff"):
@@ -193,105 +166,6 @@ def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=85, optimize=False)
     return output.getvalue()
-
-
-class VideoSharedMemoryReader:
-    """Read a U1 SDK fixed-slot video shared-memory ring."""
-
-    _RING_HEADER = struct.Struct("<8Q")  # 64-byte, cache-line-aligned SDK header
-    _HEADER = struct.Struct("<8Q")  # alignas(64): sequence, timestamp, payload size, reserved
-
-    def __init__(self, config: dict, metadata_getter, frame_callback):
-        self.config = dict(config)
-        self.metadata_getter = metadata_getter
-        self.frame_callback = frame_callback
-        self._stop = threading.Event()
-        self._ready = threading.Event()
-        self._thread = None
-        self._last_sequence = -1
-        self._error = ""
-
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._ready.clear()
-        self._error = ""
-        self._thread = threading.Thread(target=self._run, name="u1-video-reader", daemon=True)
-        self._thread.start()
-        if not self._ready.wait(SERVICE_TIMEOUT):
-            self.stop()
-            raise RuntimeError(self._error or "timed out waiting for U1 shared-memory stream")
-        if self._error:
-            self.stop()
-            raise RuntimeError(self._error)
-
-    def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-        self._thread = None
-
-    def _run(self):
-        path = str(self.config.get("path", ""))
-        payload_size = int(self.config.get("frame_payload_size", 0))
-        max_frames = int(self.config.get("max_frames", 0))
-        if not path or payload_size <= 0 or max_frames <= 0:
-            print("[U1 camera] invalid shared-memory video configuration", flush=True)
-            return
-        slot_size = self._HEADER.size + payload_size
-        try:
-            deadline = time.monotonic() + SERVICE_TIMEOUT
-            handle = None
-            while not self._stop.is_set() and time.monotonic() < deadline:
-                try:
-                    handle = open(path, "rb")
-                    if os.fstat(handle.fileno()).st_size >= self._RING_HEADER.size:
-                        break
-                    handle.close()
-                    handle = None
-                except FileNotFoundError:
-                    pass
-                self._stop.wait(0.05)
-            if handle is None:
-                raise FileNotFoundError(path)
-            with handle:
-                with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as shared:
-                    data_offset = self._RING_HEADER.size
-                    if len(shared) < data_offset + slot_size * max_frames:
-                        raise ValueError("video shared-memory file is smaller than configured ring")
-                    ring_header = self._RING_HEADER.unpack_from(shared, 0)
-                    if ring_header[1] != max_frames or ring_header[2] != payload_size:
-                        raise ValueError("shared-memory ring header does not match stream configuration")
-                    self._ready.set()
-                    while not self._stop.is_set():
-                        newest = None
-                        ring_header = self._RING_HEADER.unpack_from(shared, 0)
-                        write_index, ring_frames, ring_payload = ring_header[:3]
-                        if ring_frames != max_frames or ring_payload != payload_size:
-                            raise ValueError("shared-memory ring header does not match stream configuration")
-                        for index in range(max_frames):
-                            offset = data_offset + index * slot_size
-                            frame_header = self._HEADER.unpack_from(shared, offset)
-                            sequence, timestamp_ns, size = frame_header[:3]
-                            if write_index == 0 or sequence >= write_index:
-                                continue
-                            if sequence <= self._last_sequence or size <= 0 or size > payload_size:
-                                continue
-                            if newest is None or sequence > newest[0]:
-                                newest = (sequence, timestamp_ns, bytes(shared[offset + self._HEADER.size:offset + self._HEADER.size + size]))
-                        if newest is not None:
-                            self._last_sequence = newest[0]
-                            self.frame_callback(newest[2], self.metadata_getter(), newest[1])
-                        else:
-                            self._stop.wait(0.005)
-        except FileNotFoundError:
-            self._error = f"U1 shared-memory path is unavailable: {path}"
-            print(f"[U1 stream] shared-memory path is unavailable: {path}", flush=True)
-        except Exception as exc:
-            self._error = str(exc)[:256]
-            print(f"[U1 stream] shared-memory reader stopped: {self._error}", flush=True)
-            self._ready.set()
 
 
 def _acp_notify(action_id: str | None, status: str, result: dict, tool_name: str = "audio") -> None:
@@ -411,14 +285,11 @@ class U1Nodes:
         self._mic_subscription = self.audio_device.create_subscription(
             AudioInData, MIC_TOPIC, self._mic_callback, best_effort)
         self._playback_listeners = []
-        self._video_metadata = {}
-        self._video_metadata_lock = threading.Lock()
         self._robot_subscriptions = []
         for name, topic in EVENT_TOPICS.items():
             output_topic = f"/{namespace}/u1_pro/{name}"
             self._event_publishers[name] = self.core.create_publisher(String, output_topic, reliable)
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
-        self._robot_subscriptions.append(self.robot.create_subscription(String, VIDEO_METADATA_TOPIC, self._metadata_callback, reliable))
         self._clients = {
             "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
             "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
@@ -435,9 +306,6 @@ class U1Nodes:
             "vision_enabled_state": self.robot.create_client(Trigger, "/robo/system/call/get_vision_enabled"),
             "wakeup_followup": self.robot.create_client(StringCall, "/robo/system/call/set_wakeup_followup"),
             "wakeup_followup_state": self.robot.create_client(Trigger, "/robo/system/call/get_wakeup_followup"),
-            "video_open": self.robot.create_client(Trigger, VIDEO_OPEN),
-            "video_state": self.robot.create_client(Trigger, VIDEO_STATE),
-            "video_close": self.robot.create_client(Trigger, VIDEO_CLOSE),
         }
 
     def _spin_audio_device(self) -> None:
@@ -445,7 +313,7 @@ class U1Nodes:
             self._audio_executor.spin_once(timeout_sec=0.1)
 
     def initialize_robot(self) -> None:
-        """Authorize the SDK and disable its built-in wake word on startup."""
+        """Authorize the SDK without changing vendor autonomous settings."""
         try:
             auth_state = self.trigger_call("auth_state")
         except Exception:
@@ -520,16 +388,6 @@ class U1Nodes:
                 return
             self._event_publishers[name].publish(output)
         return callback
-
-    def _metadata_callback(self, message) -> None:
-        value = _json_value(_event_json(message))
-        data = _event_data(value)
-        with self._video_metadata_lock:
-            self._video_metadata = dict(data)
-
-    def video_metadata(self) -> dict:
-        with self._video_metadata_lock:
-            return dict(self._video_metadata)
 
     def _volume_callback(self, message) -> None:
         self._volume = int(message.data)
@@ -626,15 +484,6 @@ class U1Nodes:
 
     def get_system_enabled(self, name: str) -> dict:
         return self.trigger_call(name)
-
-    def open_video(self) -> dict:
-        opened = self.trigger_call("video_open")
-        state = self.trigger_call("video_state")
-        return {"open": opened, "state": state,
-                "stream": _stream_config(opened, state)}
-
-    def close_video(self) -> dict:
-        return self.trigger_call("video_close")
 
     def set_volume(self, volume: int) -> dict:
         from audio_msgs.srv import SetAudioVolume
@@ -1104,274 +953,6 @@ def _message_text(value):
     return str(value)
 
 
-class VisionCapturePlugin:
-    """Save fresh U1 JPEG frames and encode them as MP4 for Agent Core."""
-
-    PREFIX = "vision_capture"
-
-    def __init__(self, camera: EyeCameraPlugin, config: dict):
-        self.camera = camera
-        self.config = dict(config or {})
-        self.output_dir = os.path.abspath(str(self.config.get(
-            "output_dir", "/opt/phanthy-motus/data/vision_capture/u1_pro")))
-        self.channel_dir = str(self.config.get("channel_output_dir") or self.output_dir)
-        self.fps = max(1.0, min(30.0, float(self.config.get("video_fps", 15))))
-        self.default_seconds = max(1.0, min(60.0, float(self.config.get("default_video_seconds", 5))))
-        self.max_seconds = max(self.default_seconds, min(60.0, float(self.config.get("max_video_seconds", 60))))
-        self._lock = threading.Lock()
-        self._active = None
-        self._last_recording = None
-
-    def get_tool(self):
-        actions = {
-            "capture_image": (["image_name"], "Capture a fresh U1 Pro RGB image as a JPEG."),
-            "record_video": (["video_name", "duration"], "Record a fresh U1 Pro RGB video as an MP4; duration defaults to 5 seconds and is capped at 60 seconds."),
-            "start_recording": (["video_name"], "Start manual continuous recording; use stop_recording to finalize it. The final result is returned by stop_recording and info, not ACP."),
-            "stop_recording": (["recording_id"], "Stop the selected manual recording and finalize its MP4."),
-            "list": ([], "List saved U1 Pro photos and videos."),
-            "delete": (["name"], "Delete one saved .jpg or .mp4 file by its complete filename."),
-            "info": ([], "Show camera readiness, output paths, and recording state."),
-            "start": ([], "Prepare the U1 Pro capture card."),
-            "stop": ([], "Stop an active recording and release capture state."),
-        }
-        schema = action_schema(actions, {
-            "image_name": {"type": "string", "description": "Optional filename stem without .jpg."},
-            "video_name": {"type": "string", "description": "Optional filename stem without .mp4."},
-            "duration": {"type": "number", "minimum": 1, "maximum": 60, "default": self.default_seconds, "description": "Video duration in seconds."},
-            "name": {"type": "string", "description": "Complete saved filename, ending in .jpg or .mp4."},
-            "recording_id": {"type": "string", "description": "Recording ID returned by start_recording."},
-        })
-        schema["x-completion"] = {"actions": ["record_video"], "timeout": int(self.max_seconds + 15)}
-        return tool(
-            self.PREFIX, "actuator",
-            "U1 Pro RGB photo and video capture using the left-eye camera, saves media under the configured shared data directory, and returns a channel-visible path.",
-            schema,
-        )
-
-    @staticmethod
-    def _safe_stem(value, field):
-        if value in (None, ""):
-            return None
-        value = str(value).strip()
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", value):
-            raise ValueError(f"{field} must contain only letters, numbers, '.', '_' or '-' and be at most 100 characters")
-        return value
-
-    def _path(self, stem, suffix, prefix):
-        stem = self._safe_stem(stem, "name") or f"{prefix}_{time.time_ns()}"
-        path = os.path.join(self.output_dir, stem + suffix)
-        if os.path.exists(path):
-            raise ValueError(f"file already exists: {os.path.basename(path)}")
-        return path
-
-    def _result_path(self, path, mime, state):
-        return {"state": state, "filename": os.path.basename(path), "path": path,
-                "channel_reply_path": os.path.join(self.channel_dir, os.path.basename(path)),
-                "mime": mime, "size": os.path.getsize(path)}
-
-    def _ensure_camera(self):
-        if not self.camera.running:
-            state = self.camera.start()
-            if state.get("state") == "error":
-                raise RuntimeError(state.get("message", "U1 Pro camera is unavailable"))
-
-    def start(self):
-        return {"state": "ready"}
-
-    def stop(self):
-        result = self._stop_recording()
-        return result or {"state": "idle"}
-
-    def _info(self):
-        with self._lock:
-            active = None
-            if self._active:
-                active = {key: self._active[key] for key in (
-                    "recording_id", "state", "path", "duration", "started_at")}
-        return {"state": "recording" if active else "ready", "camera": self.camera._state(),
-                "output_dir": self.output_dir, "channel_output_dir": self.channel_dir,
-                "photos_dir": self.output_dir, "videos_dir": self.output_dir,
-                "fps": self.fps, "active_recording": active,
-                "last_recording": self._last_recording}
-
-    def _list(self):
-        if not os.path.isdir(self.output_dir):
-            return {"state": "listed", "files": []}
-        files = []
-        for name in sorted(os.listdir(self.output_dir)):
-            path = os.path.join(self.output_dir, name)
-            if os.path.isfile(path) and os.path.splitext(name)[1].lower() in (".jpg", ".mp4"):
-                files.append({"filename": name, "path": path, "size": os.path.getsize(path),
-                              "mime": "image/jpeg" if name.lower().endswith(".jpg") else "video/mp4"})
-        return {"state": "listed", "files": files}
-
-    def _delete(self, name):
-        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\.(?:jpg|mp4)", name, re.IGNORECASE):
-            return {"state": "error", "message": "name must be a complete .jpg or .mp4 filename"}
-        path = os.path.join(self.output_dir, name)
-        if not os.path.isfile(path):
-            return {"state": "error", "message": f"file not found: {name}"}
-        os.remove(path)
-        return {"state": "deleted", "filename": name}
-
-    def _capture_image(self, args):
-        try:
-            self._ensure_camera()
-            sequence = self.camera.frame_sequence()
-            frame, _ = self.camera.wait_for_jpeg(sequence, 5.0)
-            if frame is None:
-                return {"state": "error", "message": "no fresh U1 Pro camera frame received"}
-            os.makedirs(self.output_dir, exist_ok=True)
-            path = self._path(args.get("image_name"), ".jpg", "IMG")
-            with open(path, "wb") as handle:
-                handle.write(frame)
-            return self._result_path(path, "image/jpeg", "captured")
-        except Exception as exc:
-            return {"state": "error", "message": str(exc)}
-
-    def _start_recording(self, args, duration, action_id=None):
-        try:
-            self._ensure_camera()
-            if shutil.which("ffmpeg") is None:
-                return {"state": "error", "message": "ffmpeg is required for MP4 recording"}
-            with self._lock:
-                if self._active:
-                    return {"state": "error", "message": "a U1 Pro recording is already active"}
-                os.makedirs(self.output_dir, exist_ok=True)
-                path = self._path(args.get("video_name"), ".mp4", "VID")
-                active = {"state": "recording", "path": path, "duration": duration,
-                          "recording_id": f"u1-recording-{uuid.uuid4().hex}",
-                          "action_id": action_id, "cancel": threading.Event(),
-                          "continuous": duration is None,
-                          "started_at": time.time()}
-                self._last_recording = None
-                self._active = active
-                thread = threading.Thread(target=self._record_worker, args=(active,), daemon=True, name="u1-vision-recording")
-                active["thread"] = thread
-                thread.start()
-            result = {"state": "recording", "filename": os.path.basename(path), "path": path,
-                      "channel_reply_path": os.path.join(self.channel_dir, os.path.basename(path)), "mime": "video/mp4"}
-            if action_id:
-                result["action_id"] = action_id
-            else:
-                result["recording_id"] = active["recording_id"]
-            return result
-        except Exception as exc:
-            return {"state": "error", "message": str(exc)}
-
-    def _record_worker(self, active):
-        process = None
-        result = None
-        try:
-            baseline = self.camera.frame_sequence()
-            frame, sequence = self.camera.wait_for_jpeg(baseline, 5.0)
-            if frame is None:
-                raise RuntimeError("no fresh U1 Pro camera frame received")
-            duration = active["duration"]
-            total_frames = int(round(duration * self.fps)) if duration else None
-            command = ["ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-framerate", str(self.fps),
-                       "-i", "pipe:0", "-an", "-vf", "scale=ceil(iw/2)*2:ceil(ih/2)*2",
-                       "-c:v", "libx264", "-pix_fmt", "yuv420p"]
-            if total_frames:
-                command.extend(["-frames:v", str(total_frames)])
-            command.extend(["-movflags", "+faststart", active["path"]])
-            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            active["process"] = process
-            index = 0
-            next_tick = time.monotonic()
-            while not active["cancel"].is_set() and (total_frames is None or index < total_frames):
-                process.stdin.write(frame)
-                process.stdin.flush()
-                index += 1
-                next_tick += 1.0 / self.fps
-                remaining = max(0.0, next_tick - time.monotonic())
-                if remaining:
-                    new_frame, new_sequence = self.camera.wait_for_jpeg(sequence, remaining)
-                    if new_frame is not None:
-                        frame, sequence = new_frame, new_sequence
-                    else:
-                        time.sleep(remaining)
-            process.stdin.close()
-            return_code = process.wait(timeout=15)
-            if active["cancel"].is_set() and not active["continuous"]:
-                raise RuntimeError("recording cancelled")
-            if return_code != 0 or not os.path.isfile(active["path"]):
-                error = process.stderr.read().decode("utf-8", "replace")[-512:]
-                raise RuntimeError(error or "ffmpeg failed to create MP4")
-            result = self._result_path(active["path"], "video/mp4", "recorded")
-            result["recording_id"] = active["recording_id"]
-        except Exception as exc:
-            result = {
-                "state": "cancelled" if active["cancel"].is_set() else "error",
-                "recording_id": active["recording_id"],
-                "message": str(exc),
-            }
-            try:
-                if active.get("path") and os.path.exists(active["path"]):
-                    os.remove(active["path"])
-            except OSError:
-                pass
-        finally:
-            if process and process.poll() is None:
-                process.kill()
-                process.wait()
-            with self._lock:
-                self._last_recording = result
-                self._active = None
-            if active.get("action_id"):
-                status = "completed" if result and result.get("state") == "recorded" else (
-                    "cancelled" if result and result.get("state") == "cancelled" else "error")
-                _acp_notify(active["action_id"], status, result or {"state": "error"}, "vision_capture")
-
-    def _stop_recording(self, recording_id=None):
-        with self._lock:
-            active = self._active
-        if not active:
-            return None
-        if recording_id and recording_id != active["recording_id"]:
-            return {"state": "error", "message": "recording_id does not match the active recording"}
-        active["cancel"].set()
-        process = active.get("process")
-        active["thread"].join(timeout=15)
-        if active["thread"].is_alive() and process and process.poll() is None:
-            process.kill()
-            active["thread"].join(timeout=2)
-        if active["thread"].is_alive():
-            return {
-                "state": "stopping",
-                "recording_id": active["recording_id"],
-                "message": "recording stop is still in progress",
-            }
-        with self._lock:
-            return self._last_recording or {"state": "cancelled", "recording_id": active["recording_id"]}
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return self.start()
-        if action == "stop":
-            return self.stop()
-        if action == "info":
-            return self._info()
-        if action == "list":
-            return self._list()
-        if action == "delete":
-            return self._delete(args.get("name"))
-        if action == "capture_image":
-            return self._capture_image(args)
-        if action == "start_recording":
-            return self._start_recording(args, None)
-        if action == "stop_recording":
-            return self._stop_recording(args.get("recording_id")) or {"state": "idle", "message": "no active recording"}
-        if action == "record_video":
-            try:
-                duration = max(1.0, min(self.max_seconds, float(args.get("duration", self.default_seconds))))
-            except (TypeError, ValueError):
-                return {"state": "error", "message": "duration must be a number between 1 and 60"}
-            action_id = str(args.get("action_id") or f"u1-vision-{uuid.uuid4().hex}")[:128]
-            return self._start_recording(args, duration, action_id)
-        return None
-
-
 class ExpressionPlugin:
     """Semantic Agent card for vendor-provided face and local motions."""
 
@@ -1714,8 +1295,7 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
                ExpressionPlugin(audio), HeadPlugin(audio),
                SystemControlsPlugin(nodes),
-               camera_left, camera_right,
-               VisionCapturePlugin(camera_left, config.get("vision_capture", {}))]
+               camera_left, camera_right]
     descriptions = {
         "doa_event": "Microphone-array sound direction with azimuth and confidence.",
     }
