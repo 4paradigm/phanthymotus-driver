@@ -991,7 +991,10 @@ class LocoStatePlugin:
                 "current_motion_file", "motion_playing", "current_tracking_motion",
                 "tracking_playing", "switchable_states", "available_actions"):
             if field in state:
-                payload[field] = state[field]
+                value = state[field]
+                if field in ("switchable_states", "available_actions"):
+                    value = list(value)
+                payload[field] = value
         return payload
 
     def _poll(self, stop_event: threading.Event):

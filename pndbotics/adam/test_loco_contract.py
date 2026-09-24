@@ -134,6 +134,7 @@ class LocoContractTests(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual("STOP", payload["fsm_state"])
         self.assertEqual(["SetMotion", "SetTrackingMotion"], payload["available_actions"])
+        __import__("json").dumps(payload)
         self.assertIn("timestamp_ms", payload)
         self.assertFalse(hasattr(grpc, "velocity"))
 
