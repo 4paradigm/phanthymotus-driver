@@ -146,6 +146,62 @@ Two formats are cleared automatically and need no marking, because their values
 only mean something on the machine they were set on: `channel-select` (a local
 channel id) and `audio-input-device` (a local sound-card device).
 
+#### Showing a QR code (`"format": "qr"`)
+
+When a plugin needs the user to do something with a phone — install a companion
+app, point an app at this robot to pair it — declare a `qr` field. The dashboard
+renders a row of options and a QR code for the selected one, inside this tool's
+own config form (the sidebar gear for `shared` scope, the card gear for
+`instance` scope).
+
+```python
+"configSchema": {
+    "type": "object",
+    "properties": {
+        "install": {
+            "type": "string",
+            "format": "qr",
+            "description": "扫码安装手机 App",
+            "x-qr-options": [
+                {"label": "iOS",     "url": "https://apps.apple.com/app/id123"},
+                {"label": "Android", "url": "{origin}/downloads/motus.apk"},
+                {"label": "配网",    "url": "motus://setup?h={host}&p={port}"},
+            ],
+        },
+    },
+}
+```
+
+**The field is display-only.** It collects nothing, never appears in the saved
+config, and does not count towards "configured" — a tool whose only field is a
+QR will not show the unconfigured warning. Do not put it in `required`.
+
+Four placeholders are substituted, and nothing else (an unrecognised `{name}` is
+left alone rather than silently emptied):
+
+| Placeholder | Becomes |
+|-------------|---------|
+| `{host}`   | This machine's LAN address, from `GET /api/network/reachable` |
+| `{port}`   | The port the dashboard is served on |
+| `{scheme}` | `http` or `https` |
+| `{origin}` | `{scheme}://{host}:{port}` |
+
+`{host}` is a **network-interface address, not `location.host`**. A browser open
+on the robot itself sees `localhost`, and over an SSH tunnel `127.0.0.1`; either
+one baked into a QR gives the phone a link it cannot dial, with no error to
+explain why. On a multi-homed robot the user gets a pill row to pick the
+interface — shown only for options that actually reference `{host}`/`{origin}`.
+
+**`{token}` is refused.** A template containing it renders an error in place of
+the code instead of the code. The access token drives motors, and `configSchema`
+is written by the driver author — it does not get to decide who receives that
+key. The one QR that carries it is the built-in 我的 → 手机接入 card, which is
+covered by default and auto-hides.
+
+Hosting the file is the driver image's own business: agent-core serves its whole
+`./web` directory at `/` with no auth, so a file the image drops there is
+reachable at `{origin}/…` with no work on the agent-core side.
+
 ---
 
 ## x-action-params Specification
