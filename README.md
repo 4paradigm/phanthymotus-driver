@@ -79,6 +79,8 @@ Want to add support for new hardware? See the **[Driver Development Guide](READM
 - MCP protocol implementation (JSON-RPC 2.0 methods)
 - Tool definition spec (`inputSchema`, `configSchema`, `multiInstance`, `x-action-params`)
 - Instance management (`multiInstance` flag, `scope` for config fields)
+- Config field formats — masked secrets (`format: "password"`, `x-sensitive`) and a QR code
+  for "install the app on your phone" / "point your phone at this robot" (`format: "qr"`)
 - Plugin lifecycle (`__init__`, `get_tool`, `start`, `stop`, `dispatch`)
 - `driver.yaml` and `config.yaml` metadata format
 - Registration and heartbeat with Agent Core
