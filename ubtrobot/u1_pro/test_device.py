@@ -526,6 +526,15 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(header.stamp.nanosec, 8)
         self.assertEqual(header.frame_id, "left-camera")
         self.assertTrue(publisher.messages[0].data)
+        self.assertEqual(camera._state()["metadata"]["width"], 1)
+
+    def test_event_lifecycle_methods_return_state(self):
+        import device
+
+        nodes = FakeNodes()
+        plugin = device.EventPlugin(nodes, "doa_event", "test event")
+        self.assertEqual(plugin.start(), {"state": "running"})
+        self.assertEqual(plugin.stop(), {"state": "idle"})
 
     def test_camera_bad_frame_does_not_report_running(self):
         import device

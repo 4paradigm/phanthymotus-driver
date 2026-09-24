@@ -799,15 +799,17 @@ class EventPlugin:
 
     def start(self):
         if self.running:
-            return
+            return {"state": "running"}
         self.nodes.set_event_enabled(self.name, True)
         self.running = True
+        return {"state": "running"}
 
     def stop(self):
         if not self.running:
-            return
+            return {"state": "idle"}
         self.nodes.set_event_enabled(self.name, False)
         self.running = False
+        return {"state": "idle"}
 
     def dispatch(self, action, args):
         if action == "start":
@@ -901,6 +903,7 @@ class EyeCameraPlugin:
             message.format = "jpeg"
             message.data = list(jpeg)
             self._publisher.publish(message)
+            self._metadata = metadata
             with self._frame_condition:
                 self._latest_jpeg = jpeg
                 self._frame_sequence += 1
@@ -1209,7 +1212,7 @@ class HeadPlugin:
         })
         schema["x-completion"] = {"actions": ["play"], "timeout": 120}
         return tool(self.PREFIX, "actuator",
-                    "U1 Pro preset head motions such as nod, shake, tilt, look up, and look down. It does not expose raw joint angles.",
+                    "U1 Pro preset head motions available in the current robot firmware. Use list_actions before play; it does not expose raw joint angles.",
                     schema)
 
     def start(self):
