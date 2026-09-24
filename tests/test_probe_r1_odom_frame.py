@@ -120,7 +120,126 @@ def test_a_stationary_robot_cannot_decide():
 def test_too_few_readings_cannot_decide():
     result = probe.analyse(walk(frame="body", yaw_rate=0.4, seconds=1.0))
     assert result["verdict"] == "indeterminate"
-    assert "pairs" in result["why"]
+    assert "blocks" in result["why"]
+
+
+# ── position jitter, which is what the second hardware run tripped on ─────────
+
+def jitter(rows, sigma=0.004, seed=7):
+    """Add zero-mean noise to the reported position, as a real odometry does.
+
+    `sigma` is the order measured on r1_sz: adjacent readings arrive ~7 ms apart
+    and disagree by millimetres, which is the same size as the 2 mm of genuine
+    displacement between them.
+    """
+    state = seed
+    out = []
+    for t, x, y, vx, vy, yaw in rows:
+        # A small deterministic PRNG: the test must not depend on the platform's
+        # `random` implementation, and a fixed sequence keeps a failure reportable.
+        state = (state * 1103515245 + 12345) % (2 ** 31)
+        nx = ((state / 2 ** 31) - 0.5) * 2 * sigma
+        state = (state * 1103515245 + 12345) % (2 ** 31)
+        ny = ((state / 2 ** 31) - 0.5) * 2 * sigma
+        out.append((t, x + nx, y + ny, vx, vy, yaw))
+    return out
+
+
+@pytest.mark.parametrize("frame", ["body", "world"])
+def test_position_jitter_does_not_collapse_the_verdict(frame):
+    """The second hardware regression.
+
+    A 14 m walk with a full circle of turning — about as informative as a run can
+    be — returned indeterminate at ratio 1.30, because the estimator differenced
+    adjacent samples whose displacement was the same size as the jitter on them.
+    Summing per-pair error over thousands of pairs accumulates noise as fast as
+    signal. Integrating over one-second blocks first is the fix, and this is the
+    test that fails without it.
+    """
+    rows = republish(walk(frame=frame, yaw_rate=0.4, seconds=40.0))
+    result = probe.analyse(jitter(rows))
+    assert result["verdict"] == frame
+    assert result["ratio"] > 1.5
+
+
+def test_jitter_leaves_the_residual_well_under_the_path():
+    rows = jitter(republish(walk(frame="body", yaw_rate=0.4, seconds=40.0)))
+    result = probe.analyse(rows)
+    assert result["residual_fraction"] < probe.MAX_RESIDUAL_FRACTION
+
+
+def test_the_scale_fit_recovers_a_magnitude_error():
+    """What turns "neither hypothesis fits" from a dead end into a lead.
+
+    On r1_sz the better hypothesis left 34.6 m of residual against 9.6 m walked.
+    If a single scalar makes the integral line up, the frame is settled and what
+    is left is a magnitude disagreement — a unit, a rate assumption, or a velocity
+    that is not the derivative of the reported position.
+    """
+    rows = republish(walk(frame="body", yaw_rate=0.4, seconds=40.0))
+    crippled = [(t, x, y, vx * 0.4, vy * 0.4, yaw) for t, x, y, vx, vy, yaw in rows]
+    fit = probe.analyse(crippled)["scale"]["body"]
+    assert fit["k"] == pytest.approx(1 / 0.4, rel=0.02)
+    assert fit["residual_m"] < 0.05 * probe.analyse(crippled)["travel_m"]
+
+
+def test_the_scale_fit_does_not_rescue_a_wrong_frame():
+    """A scalar must not be able to turn a rotation error into a fit.
+
+    Otherwise the diagnostic would report that everything is explainable by a
+    magnitude, and the frame question would become unanswerable in principle.
+    """
+    rows = republish(walk(frame="world", yaw_rate=0.4, seconds=40.0))
+    result = probe.analyse(rows)
+    assert result["scale"]["body"]["residual_m"] > 0.3 * result["travel_m"]
+    assert result["scale"]["world"]["k"] == pytest.approx(1.0, rel=0.02)
+
+
+def test_a_velocity_that_does_not_integrate_to_position_is_refused():
+    """The third outcome, and the one that would be a real finding about R1.
+
+    If `velocity` is a filtered estimate rather than the derivative of the
+    reported `position`, both hypotheses are wrong and the ratio between two wrong
+    models means nothing. Here the velocity is scaled to 40% of the truth, which
+    no rotation can repair.
+    """
+    rows = republish(walk(frame="body", yaw_rate=0.4, seconds=40.0))
+    crippled = [(t, x, y, vx * 0.4, vy * 0.4, yaw) for t, x, y, vx, vy, yaw in rows]
+    result = probe.analyse(crippled)
+    assert result["verdict"] == "indeterminate"
+    assert "neither hypothesis explains the path" in result["why"]
+
+
+def test_short_blocks_reproduce_the_hardware_failure():
+    """Pins the mechanism, not just the symptom.
+
+    Same data, same code, only the block length changed: at one second the verdict
+    is emphatic (ratio > 20, residual a few percent of the path); shrunk to the
+    sample interval — which is what differencing adjacent samples amounts to — it
+    collapses to indeterminate with the residual exceeding half the path. That is
+    the shape of the r1_sz run, and it says the block length is load-bearing
+    rather than incidental tuning.
+    """
+    rows = jitter(republish(walk(frame="body", yaw_rate=0.4, seconds=40.0)))
+    original = probe.BLOCK_S
+    try:
+        assert probe.analyse(rows)["ratio"] > 20
+        probe.BLOCK_S = 0.05
+        degraded = probe.analyse(rows)
+    finally:
+        probe.BLOCK_S = original
+    assert degraded["verdict"] == "indeterminate"
+    assert degraded["residual_fraction"] > 0.5
+
+
+# ── blocks ───────────────────────────────────────────────────────────────────
+
+def test_blocks_break_on_a_gap_rather_than_integrating_across_it():
+    """Position moved by an unknown amount while nobody was listening."""
+    rows = walk(frame="body", yaw_rate=0.4, seconds=6.0)
+    with_gap = rows[:30] + [(r[0] + 30.0, *r[1:]) for r in rows[30:]]
+    for block in probe._blocks(with_gap, probe.BLOCK_S):
+        assert max(b[0] - a[0] for a, b in zip(block, block[1:])) < 0.5
 
 
 def test_position_unrelated_to_velocity_is_indeterminate_not_a_verdict():
