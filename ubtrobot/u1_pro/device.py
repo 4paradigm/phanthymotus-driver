@@ -770,6 +770,19 @@ class AudioPlugin:
                     self._active = None
             _acp_notify(action_id, "error", {"state": "error", "message": str(exc)}, tool_name)
             raise
+        # Some vendor services report rejection in their normal response
+        # envelope instead of raising. Do not leave the action barrier active
+        # when that happens, because no matching playback event may follow.
+        rejected = isinstance(result, dict) and (
+            result.get("ok") is False or result.get("success") is False)
+        if rejected:
+            with self._lock:
+                if self._active and self._active["action_id"] == action_id:
+                    self._active = None
+            message = str(result.get("message") or result.get("error") or "vendor rejected the request")
+            error = {"state": "error", "message": message[:512], "action_id": action_id}
+            _acp_notify(action_id, "error", error, tool_name)
+            raise RuntimeError(message)
         return {"state": "queued", "action_id": action_id, "request": result}
 
     def _on_playback_state(self, event: dict) -> None:

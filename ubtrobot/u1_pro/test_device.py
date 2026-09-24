@@ -839,6 +839,22 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(result["state"], "idle")
         self.assertFalse(plugin.running)
 
+    def test_tts_rejected_request_clears_active_action_and_notifies_acp(self):
+        import device
+
+        nodes = FakeNodes()
+        nodes.string_call = mock.Mock(return_value={"ok": False, "code": "BUSY", "message": "vendor busy"})
+        plugin = device.AudioPlugin(nodes)
+        with mock.patch.object(device, "_acp_notify") as notify:
+            with self.assertRaisesRegex(RuntimeError, "vendor busy"):
+                plugin.dispatch("speak", {"text": "hello", "action_id": "rejected-1"})
+        self.assertIsNone(plugin._active)
+        notify.assert_called_once_with(
+            "rejected-1", "error",
+            {"state": "error", "message": "vendor busy", "action_id": "rejected-1"},
+            "tts",
+        )
+
     def test_tts_idle_stop_is_stable(self):
         import device
 
