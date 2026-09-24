@@ -1033,23 +1033,44 @@ class _LocoStateNode(Node):
                # window and every axis of that sample was `null`.
                "odom_burst_samples": self._burst_size,
                **self._stamp_provenance,
-               # **Not verified on hardware.** `motus.odom/1` is declared body
-               # frame, which is what the format is for, but the numbers come off
-               # `rt/odommodestate`, whose `position` is odometry-frame — and a
-               # velocity in the same message is unlikely to be in a different
-               # frame from the position beside it. If it is world frame, then
-               # `vx`/`vy` swap whenever the robot is not facing along world x,
-               # which is precisely the failure rule 3 of the format exists to
-               # prevent, and it produces plausible numbers rather than an error.
+               # **Measured on r1_sz, 2026-09-24**, with `scripts/probe_r1_odom_frame.py`
+               # against a tape-measured 3 m straight walk and a human-observed
+               # loop. Recorded here rather than only in a commit message because
+               # it is the kind of number the next person will otherwise re-derive
+               # from the same two days of walking a robot.
                #
-               # Resolve it with `scripts/probe_r1_odom_frame.py` (read-only) and
-               # then delete this key. Until then a reader gets the warning
-               # instead of a silent guess.
-               "frame_unverified": (
-                   "frame=body 未在真机验证：rt/odommodestate 的 position 是里程计"
-                   "(世界)系，同一条消息里的 velocity 可能也是。若是，则航向非零时"
-                   "vx/vy 会互换，卡死检测与自运动补偿同时给出貌似合理的错数。"
-                   "用 scripts/probe_r1_odom_frame.py 判定后删掉这一条。")}
+               # `frame: "body"` is **correct**. Fitting one complex gain per
+               # hypothesis separates scale from rotation, and the body hypothesis
+               # needs +0.2 deg of extra rotation while the world one needs -144;
+               # the straight walk then integrates straight (path/net = 1.03).
+               # This was a real risk, not a formality: the numbers come off
+               # `rt/odommodestate`, whose `position` *is* odometry-frame, and had
+               # the velocity been too, `vx`/`vy` would swap at any non-zero
+               # heading — rule 3's failure, which produces plausible numbers
+               # rather than an error and which nothing in either repo detects.
+               #
+               # `velocity` reads about **20% high**: 3.62 m over a measured 3 m.
+               # Deliberately not corrected here. One measurement against an
+               # approximate distance is not a calibration, and a scalar baked in
+               # would make a wrong number look authoritative — the same trap as
+               # scaling a depth threshold per robot. It is well inside the margin
+               # that matters: navi's stuck detector fires below 20% of the
+               # commanded speed, and reading 20% high cannot push a stalled robot
+               # over that.
+               "odom_measured": (
+                   "frame=body 已在 r1_sz 实测确认（旋转拟合 +0.2°，world 假设需 -144°）。"
+                   "velocity 量级偏高约 20%（实测 3 m 直线报 3.62 m），未做补偿。"),
+               # Why `pose` stays `null` — and this one is worth stating as a
+               # measurement, because "legged dead reckoning drifts" understates
+               # it by a lot. `position` is not a drifting estimate of where the
+               # robot is; over a 3 m straight walk it reported 0.81 m and never
+               # left a 0.53 x 0.61 m box, with a path 2.3x its own net
+               # displacement — so it loses the *shape* of the trajectory, not
+               # just the origin. Anything that accumulates it gets a map of a
+               # robot that shuffled in place.
+               "position_unusable": (
+                   "rt/odommodestate 的 position 不可用：3 m 直线实测只报 0.81 m（短 73%），"
+                   "且路程是净位移的 2.3 倍 —— 形状也丢了。因此 pose 恒为 null。")}
         if self._subscribe_error:
             out["error"] = self._subscribe_error
         if self._subscribed and self._samples == 0:

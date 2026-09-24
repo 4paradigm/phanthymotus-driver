@@ -20,23 +20,40 @@ Nothing detects the mistake. `common/odom.py` takes the declared frame as given,
 and so does the consumer (`actucore/plugins/navi/odom.py` only checks that the
 sample *says* body). So the robot has to be asked.
 
-── the method ───────────────────────────────────────────────────────────────
+── the method, and the assumption it must not make ──────────────────────────
 
-One message carries `position` (world), `velocity` (unknown frame) and
-`imu.rpy[2]` (world yaw). Between two messages, `position` moves by `dp`. Then:
+One message carries `position`, `velocity` and `imu.rpy[2]` (world yaw). Between
+two messages, `position` moves by `dp`. Then:
 
     velocity is world  ⟹  dp ≈ v · dt
     velocity is body   ⟹  dp ≈ R(yaw) · v · dt
 
-Integrate both residuals over the run and compare. This uses only quantities the
-robot already reports, so it needs no ruler, no calibration and no commands.
+The first version of this script compared the two residuals and took the smaller
+one. That **assumed `position` was trustworthy**, and on r1_sz it is not: over a
+walk a human described as roughly twelve metres of path with three metres of net
+displacement, `velocity` integrated to 12.39 m path / 3.14 m net while `position`
+claimed 6.35 m / 0.97 m and never left a 0.91 x 0.73 m box. Position understates
+the path by about 2x and the net displacement by 3x. So a residual against it
+cannot settle anything, and for three runs the script kept reporting "neither
+hypothesis fits" — which was true, and not because either frame was wrong.
 
-**Yaw has to vary, or the test cannot answer.** At yaw ≈ 0 the rotation is the
-identity and the two hypotheses are the same arithmetic — a robot walking
-straight ahead from its start pose satisfies both. So the run is rejected as
-indeterminate unless the robot both travelled and turned, and the thresholds for
-that are printed rather than hidden. An honest "cannot tell" is the point: the
-alternative is a confident answer from a run that carried no information.
+**What survives is the rotation, because it is scale-free.** Fitting one complex
+gain per hypothesis separates the two questions: its phase is the rotation the
+hypothesis still needs, its magnitude is how far the two sources disagree about
+distance. A hypothesis in the right frame needs ~0 deg of extra rotation whatever
+its scale. On r1_sz: body +0.2 deg, world -144 deg. That is the verdict, and it
+holds even though the magnitudes disagree 4x.
+
+The magnitude disagreement is then reported as its own finding rather than as a
+failure — this method cannot say which of the two sources is wrong, so it prints
+both reconstructed trajectories (net displacement, path length, bounding box) for
+a human who watched the walk to recognise. That is what settled it here.
+
+**Yaw has to vary, or the test cannot answer.** At constant yaw the rotation is a
+constant and the two hypotheses differ by that constant rather than by their
+shape, so a straight walk satisfies both. The run is refused unless the robot both
+travelled and turned. An honest "cannot tell" is the point: the alternative is a
+confident answer from a run that carried no information.
 
 ── running it ───────────────────────────────────────────────────────────────
 
@@ -61,6 +78,7 @@ re-analysis (`--load`) never costs another walk.
 from __future__ import annotations
 
 import argparse
+import cmath
 import json
 import math
 import os
@@ -84,10 +102,14 @@ AMPLE_TRAVEL_M = 3.0
 # enough that a hundred of them fit in a walk somebody is willing to perform.
 BLOCK_S = 1.0
 MIN_BLOCKS = 10
-# The winning hypothesis has to actually explain the path, not merely explain it
-# less badly than the other one. Without this, two wrong models still produce a
-# verdict as soon as one of them is 1.5x less wrong.
-MAX_RESIDUAL_FRACTION = 0.35
+# How much residual rotation a frame may still need and be called right. A frame
+# that is right needs none; this is slack for yaw noise and for the heading being
+# estimated rather than measured.
+MAX_FRAME_ROTATION_DEG = 30.0
+# How much better the winner must be than the loser. At near-constant heading the
+# two hypotheses are the same arithmetic and both angles collapse together, so
+# without this a straight walk would return whichever won by a degree.
+MIN_FRAME_ROTATION_MARGIN_DEG = 30.0
 
 
 def _collect(seconds: float, interface: str, until_decisive: bool = False) -> list:
@@ -115,7 +137,14 @@ def _collect(seconds: float, interface: str, until_decisive: bool = False) -> li
             rows.append((time.monotonic(),
                          float(msg.position[0]), float(msg.position[1]),
                          float(msg.velocity[0]), float(msg.velocity[1]),
-                         float(imu.rpy[2])))
+                         float(imu.rpy[2]),
+                         # `yaw_speed` is the `wz` axis of motus.odom/1 and was
+                         # not recorded by the first version of this script, so
+                         # the one axis navi's ego-motion compensation leans on
+                         # hardest could not be checked at all. Integrating it
+                         # over a known turn is the cheapest calibration here:
+                         # a full circle is 2 pi and needs no tape measure.
+                         float(msg.yaw_speed)))
         except Exception:                                       # noqa: BLE001
             pass
 
@@ -208,7 +237,13 @@ def analyse(rows: list) -> dict:
         blocks += 1
 
         wx = wy = bx = by = 0.0
-        for (ta, xa, ya, vxa, vya, yawa), (tb, xb, yb, vxb, vyb, yawb) in zip(block, block[1:]):
+        # Indexed rather than unpacked by name: a reading grew a seventh column
+        # (`yaw_speed`) and a fixed-width unpack turned that into a crash *after*
+        # the robot had been walked and the readings saved. A row is a record with
+        # a stable prefix, so read the prefix.
+        for a, b in zip(block, block[1:]):
+            ta, vxa, vya, yawa = a[0], a[3], a[4], a[5]
+            tb, vxb, vyb, yawb = b[0], b[3], b[4], b[5]
             dt = tb - ta
             # Midpoint of the two samples bracketing the interval: the trapezoid
             # rule, which is what a reported position is the integral of.
@@ -254,37 +289,137 @@ def analyse(rows: list) -> dict:
                       "Walk it along two clearly different directions.")
         return out
 
-    world, body = out["world_residual_m"], out["body_residual_m"]
-    ratio = (max(world, body) / max(min(world, body), 1e-9))
-    out["ratio"] = ratio
-    out["residual_fraction"] = min(world, body) / max(travel, 1e-9)
+    # ── the verdict comes from the rotation, which is scale-free ──────────────
+    #
+    # Not from the residual. A residual is measured *against `position`*, and on
+    # r1_sz `position` is short by 73% over a tape-measured 3 m walk — so both
+    # hypotheses carry a huge residual there and ranking them by it says nothing
+    # about frames. Three runs were spent learning that.
+    #
+    # The complex gain splits the question in two. Its magnitude is how far the
+    # two sources disagree about *distance*, which is the broken part; its phase
+    # is the rotation the hypothesis still needs, which is the part under test and
+    # which does not care about scale at all. A hypothesis in the right frame
+    # needs ~0 deg however wrong the magnitudes are. Measured: body +0.2 deg,
+    # world -144 deg.
+    world_fit, body_fit = out["scale"]["world"], out["scale"]["body"]
+    if world_fit["k"] is None or body_fit["k"] is None:
+        out["verdict"] = "indeterminate"
+        out["why"] = "the velocity integral is zero — nothing to fit"
+        return out
 
-    # Does the better hypothesis actually explain the path? Asked before the
-    # ratio, because "one model is 1.5x less wrong than the other" is a verdict
-    # only if at least one of them is right, and the interesting failure here is
-    # both being wrong — which is what it looks like if `velocity` is a filtered
-    # estimate that does not integrate to the reported `position`.
-    if out["residual_fraction"] > MAX_RESIDUAL_FRACTION:
+    angles = {"world": abs(world_fit["rotation_deg"]),
+              "body": abs(body_fit["rotation_deg"])}
+    winner = min(angles, key=angles.get)
+    out["rotation_deg"] = angles
+    out["ratio"] = max(angles.values()) / max(min(angles.values()), 1e-9)
+
+    if angles[winner] > MAX_FRAME_ROTATION_DEG:
         out["verdict"] = "indeterminate"
         out["why"] = (
-            f"neither hypothesis explains the path: the better of the two leaves "
-            f"{min(world, body):.1f} m of residual against {travel:.1f} m "
-            f"travelled ({out['residual_fraction'] * 100:.0f}%, "
-            f"need under {MAX_RESIDUAL_FRACTION * 100:.0f}%). `position` is not "
-            "the integral of `velocity` in either frame, so the declaration "
-            "cannot be settled this way — and that is itself a finding about "
-            "what `velocity` is.")
+            f"neither frame lines up: the better of the two still needs "
+            f"{angles[winner]:.0f}° of rotation (world {angles['world']:.0f}°, "
+            f"body {angles['body']:.0f}°), and a frame that is right needs none. "
+            "Either the reported yaw is not the heading these velocities are "
+            "expressed against, or the run carries too little turning.")
         return out
 
-    if ratio < 1.5:
+    loser = "body" if winner == "world" else "world"
+    if angles[loser] - angles[winner] < MIN_FRAME_ROTATION_MARGIN_DEG:
         out["verdict"] = "indeterminate"
-        out["why"] = (f"the two hypotheses fit equally well (ratio {ratio:.2f}) — "
-                      "the run carries too little turning to tell them apart. "
-                      "Walk it along two clearly different directions.")
+        out["why"] = (
+            f"both frames need about the same rotation (world {angles['world']:.0f}°, "
+            f"body {angles['body']:.0f}°) — at near-constant heading they are the "
+            "same arithmetic. Walk it along two clearly different directions.")
         return out
 
-    out["verdict"] = "world" if world < body else "body"
+    out["verdict"] = winner
+    # The magnitude disagreement is a finding in its own right, not a failure of
+    # the frame test. Which of the two sources is wrong is not knowable from
+    # inside the robot — that is what the `kinematics` readout and a measured
+    # distance are for.
+    k = out["scale"][winner]["k"]
+    if k and abs(math.log(abs(k))) > math.log(1.2):
+        out["magnitude_note"] = (
+            f"frame is {winner}, but the two sources disagree about distance: the "
+            f"velocity integral is {1 / abs(k):.2f}x the displacement `position` "
+            "reports. This method cannot say which of them is wrong — compare both "
+            "trajectories above against a distance you measured.")
     return out
+
+
+def kinematics(rows: list) -> dict:
+    """What each source claims about the run, in quantities a human can verify.
+
+    **This is the part that does not need `position` to be trustworthy.** Every
+    number here is reported separately per source, so a protocol that fixes the
+    truth *before* the robot moves — walk 4.8 m in a straight line, turn exactly
+    one full circle, return to a taped mark — can be compared against each source
+    independently. That is the difference between measuring the robot and
+    inferring what it did, and three runs on r1_sz were spent on the latter.
+
+    `wz_turned_deg` integrates the reported `yaw_speed`; `heading_turned_deg` sums
+    the wrapped differences of the reported yaw. They measure the same physical
+    angle by different routes, so a known turn calibrates both at once — and one
+    full circle is 360 degrees whatever the room, which needs no tape measure.
+    """
+    rows, _ = _dedupe(rows)
+    moving = _moving_window(rows)
+    out = {"readings": len(rows), "moving_s": 0.0}
+    if len(moving) < 2:
+        return out
+    out["moving_s"] = moving[-1][0] - moving[0][0]
+
+    px = [r[1] for r in moving]
+    py = [r[2] for r in moving]
+    out["position"] = {
+        "net_m": math.hypot(px[-1] - px[0], py[-1] - py[0]),
+        "path_m": sum(math.hypot(b[1] - a[1], b[2] - a[2])
+                      for a, b in zip(moving, moving[1:])),
+        "bbox_m": (max(px) - min(px), max(py) - min(py)),
+    }
+
+    # Body-frame velocity carried into the world by the reported heading. If the
+    # frame is right this is a trajectory; if it is wrong it is a scribble.
+    zx = zy = path = 0.0
+    turned_wz = turned_yaw = 0.0
+    for a, b in zip(moving, moving[1:]):
+        dt = b[0] - a[0]
+        vx, vy = (a[3] + b[3]) / 2.0, (a[4] + b[4]) / 2.0
+        yaw = math.atan2((math.sin(a[5]) + math.sin(b[5])) / 2.0,
+                         (math.cos(a[5]) + math.cos(b[5])) / 2.0)
+        sx = (vx * math.cos(yaw) - vy * math.sin(yaw)) * dt
+        sy = (vx * math.sin(yaw) + vy * math.cos(yaw)) * dt
+        zx += sx
+        zy += sy
+        path += math.hypot(sx, sy)
+        turned_yaw += math.atan2(math.sin(b[5] - a[5]), math.cos(b[5] - a[5]))
+        if len(a) > 6 and len(b) > 6:
+            turned_wz += (a[6] + b[6]) / 2.0 * dt
+    out["velocity"] = {"net_m": math.hypot(zx, zy), "path_m": path}
+    out["heading_turned_deg"] = math.degrees(turned_yaw)
+    out["wz_turned_deg"] = math.degrees(turned_wz) if turned_wz else None
+    return out
+
+
+def _moving_window(rows: list) -> list:
+    """The readings between the first and last second in which velocity was nonzero.
+
+    Keyed on the *velocity* rather than on the position, because which of the two
+    can be trusted is the question under test and the window must not presuppose
+    an answer. A protocol run starts and ends stationary, so this finds the walk
+    without being told when it happened.
+    """
+    live = [block for block in _blocks(rows, BLOCK_S) if _block_speed(block) > 0.05]
+    if not live:
+        return []
+    start, end = live[0][0][0], live[-1][-1][0]
+    return [row for row in rows if start <= row[0] <= end]
+
+
+def _block_speed(block: list) -> float:
+    return sum(math.hypot((a[3] + b[3]) / 2.0, (a[4] + b[4]) / 2.0) * (b[0] - a[0])
+               for a, b in zip(block, block[1:]))
 
 
 def _fit_scales(integrals: list) -> dict:
@@ -303,20 +438,27 @@ def _fit_scales(integrals: list) -> dict:
     """
     out = {}
     for index, name in ((1, "world"), (2, "body")):
-        num = den = 0.0
+        # Complex least squares, so scale and rotation are fitted *together* and
+        # reported apart: `k = |c|` is the distance disagreement, `phase(c)` is the
+        # rotation still needed. Fitting only a real scale would fold a frame error
+        # into the residual, which is exactly what made the residual useless here.
+        num = 0j
+        den = 0.0
         for dp, *hypotheses in integrals:
-            ix, iy = hypotheses[index - 1]
-            num += dp[0] * ix + dp[1] * iy
-            den += ix * ix + iy * iy
+            i = complex(*hypotheses[index - 1])
+            num += complex(*dp) * i.conjugate()
+            den += abs(i) ** 2
         if den <= 1e-12:
-            out[name] = {"k": None, "residual_m": None}
+            out[name] = {"k": None, "rotation_deg": None, "residual_m": None}
             continue
-        k = num / den
+        c = num / den
         residual = 0.0
         for dp, *hypotheses in integrals:
-            ix, iy = hypotheses[index - 1]
-            residual += math.hypot(dp[0] - k * ix, dp[1] - k * iy)
-        out[name] = {"k": k, "residual_m": residual}
+            i = complex(*hypotheses[index - 1])
+            residual += abs(complex(*dp) - c * i)
+        out[name] = {"k": abs(c),
+                     "rotation_deg": math.degrees(cmath.phase(c)),
+                     "residual_m": residual}
     return out
 
 
@@ -386,6 +528,31 @@ def _yaw_spread(yaws: list) -> float:
     return max(abs(math.atan2(math.sin(y - mean), math.cos(y - mean))) for y in yaws) * 2.0
 
 
+def report_kinematics(rows: list) -> None:
+    """The ground-truth-comparable readout. Print this before any verdict.
+
+    Deliberately makes no claim about which source is right — it states what each
+    one says and leaves the comparison to whoever fixed the truth beforehand.
+    """
+    k = kinematics(rows)
+    print()
+    print(f"── what each source claims ({k['moving_s']:.1f}s of motion, "
+          f"{k['readings']} readings) ──")
+    if "velocity" not in k:
+        print("  the robot did not move")
+        return
+    p, v = k["position"], k["velocity"]
+    print(f"  velocity → path {v['path_m']:6.2f} m   net {v['net_m']:6.2f} m")
+    print(f"  position → path {p['path_m']:6.2f} m   net {p['net_m']:6.2f} m"
+          f"   bbox {p['bbox_m'][0]:.2f} x {p['bbox_m'][1]:.2f} m")
+    print(f"  heading  → turned {k['heading_turned_deg']:+.0f}° (from rpy)", end="")
+    if k.get("wz_turned_deg") is not None:
+        print(f", {k['wz_turned_deg']:+.0f}° (from yaw_speed)")
+    else:
+        print("   [yaw_speed not in this recording]")
+    print("  compare against the distance you measured / the turn you commanded.")
+
+
 def report(result: dict) -> int:
     print()
     print(f"integration blocks    {result['blocks']} x {BLOCK_S:.1f}s")
@@ -402,22 +569,30 @@ def report(result: dict) -> int:
         for name, fit in (result.get("scale") or {}).items():
             if fit.get("k") is None:
                 continue
-            print(f"  best-fit scale {name:5s} k={fit['k']:.3f} "
-                  f"→ residual {fit['residual_m']:.3f} m"
-                  + ("   ← a scalar explains it" if fit["residual_m"]
-                     < MAX_RESIDUAL_FRACTION * result["travel_m"] else ""))
+            print(f"  fit {name:5s} scale={fit['k']:.3f} "
+                  f"residual={fit['residual_m']:.2f} m"
+                  + f"  rotation {fit['rotation_deg']:+6.1f}°")
     print()
 
     verdict = result["verdict"]
     if verdict == "indeterminate":
         print(f"INDETERMINATE — {result['why']}")
         return 2
-    print(f"VERDICT: velocity is in the {verdict.upper()} frame "
-          f"({result['ratio']:.1f}x better fit)")
+    angles = result["rotation_deg"]
+    # The two angles, not a ratio of them. A ratio reads as a confidence and is not
+    # one: 0.2 deg against 144 deg prints as "781x", which says nothing a reader can
+    # check, while the pair says exactly what was measured.
+    print(f"VERDICT: velocity is in the {verdict.upper()} frame — it needs "
+          f"{angles[verdict]:.1f}° of residual rotation, the alternative needs "
+          f"{angles['world' if verdict == 'body' else 'body']:.0f}°")
+    if result.get("magnitude_note"):
+        print()
+        print(f"NOTE: {result['magnitude_note']}")
     print()
     if verdict == "body":
-        print("The declaration in unitree/r1/device.py is right. Delete the")
-        print("`frame_unverified` key from _LocoStateNode.health().")
+        print("This matches what unitree/r1/device.py declares. Confirmed on r1_sz")
+        print("2026-09-24; the measurement is recorded in _LocoStateNode.health()")
+        print("under `odom_measured`, so it does not have to be taken again.")
     else:
         print("The declaration is WRONG. `motus.odom/1` says body frame and this")
         print("is world frame, so vx/vy swap at non-zero heading. Two fixes, and")
@@ -456,6 +631,7 @@ def main() -> int:
         with open(args.load) as handle:
             rows = [tuple(json.loads(line)) for line in handle if line.strip()]
         print(f"re-analysing {len(rows)} saved readings from {args.load}")
+        report_kinematics(rows)
         return report(analyse(rows))
 
     rows = _collect(args.seconds, args.interface, args.until_decisive)
@@ -469,6 +645,7 @@ def main() -> int:
                 handle.write(json.dumps(list(row)) + "\n")
         print(f"saved {len(rows)} readings to {args.save} — "
               f"re-analyse with --load {args.save}, no robot needed")
+    report_kinematics(rows)
     return report(analyse(rows))
 
 
