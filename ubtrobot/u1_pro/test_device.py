@@ -179,7 +179,7 @@ class U1CardContractTests(unittest.TestCase):
         import common.vendor_runtime as runtime
 
         configured = "<CycloneDDS><Domain><Tracing><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
-        with mock.patch.dict(os.environ, {"CYCLONEDDS_URI": "<invalid/>"}, clear=False):
+        with mock.patch.dict(os.environ, {"CYCLONEDDS_URI": "<invalid/>"}, clear=True):
             runtime.configure_cyclonedds({"ros": {
                 "robot_interface": "lo",
                 "cyclonedds_uri": configured,
