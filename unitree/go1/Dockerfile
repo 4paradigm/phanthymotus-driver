@@ -42,6 +42,7 @@ COPY sensors.py        /work/sensors.py
 COPY controllers.py    /work/controllers.py
 COPY ext_devices.py    /work/ext_devices.py
 COPY camera.py         /work/camera.py
+COPY camera_snapshot.py /work/camera_snapshot.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 COPY resource/         /work/resource/

@@ -188,6 +188,11 @@ class Go1Bundle:
             self._plugins.append(camera.make_camera_rgb(pc["camera_rgb"], namespace, executor, client))
             print("[bundle] camera_rgb loaded")
 
+        if pc.get("camera_snapshot", {}).get("enabled", False):
+            from camera_snapshot import CameraSnapshotPlugin
+            self._plugins.append(CameraSnapshotPlugin(pc["camera_snapshot"]))
+            print("[bundle] camera_snapshot loaded")
+
         if pc.get("camera_depth", {}).get("enabled", False):
             import camera
             self._plugins.append(camera.make_camera_depth(pc["camera_depth"], namespace, executor, client))

@@ -17,6 +17,13 @@ camera, opens it only after the Pi connects, and exits on disconnect so systemd
 returns it to idle. A physical camera can therefore serve only one of RGB,
 depth, and point cloud at a time.
 
+`camera_snapshot` connects directly to the selected RGB port for one JPEG and
+then disconnects. In the canvas, call `camera_snapshot` with
+`{"action":"capture_photo","position":"front"}` (or chin/left/right/belly);
+`camera_rgb` does not need to be started. The result contains `file_path` under
+`/opt/phanthy-motus/data/camera_snapshot`. Stop any active stream on the same
+physical camera before taking a photo.
+
 ## RGB path
 
 `rgb_stream.cc` reads calibration from the camera, applies CMei undistortion,

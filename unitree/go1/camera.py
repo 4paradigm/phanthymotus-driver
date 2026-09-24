@@ -540,6 +540,15 @@ class Plugin:
             self._streams[iid] = self._stream_cls(self._node, self._topic(iid))
         return self._streams[iid]
 
+    def running_stream(self, position: str):
+        """Return the active RGB stream for a physical camera position."""
+        if self._type != "rgb":
+            return None
+        for stream in tuple(self._streams.values()):
+            if stream._run and stream.position == position:
+                return stream
+        return None
+
     # ── 生命周期 ──
 
     def start(self):
