@@ -6,7 +6,7 @@ hardware_model: "u1_pro"
 image_name: ubtrobot-u1-pro
 port: 15740
 mcp_url: "http://localhost:15740/mcp"
-description: "UBTECH U1 Pro microphone, live speaker PCM, text-to-speech, named expressions, RGB camera, and sound direction"
+description: "优必选 U1 Pro：麦克风、扬声器、TTS、表情与头部动作、左右眼摄像头、系统行为控制和声源定位"
 build_context_extras:
   - ../../common
 cards:

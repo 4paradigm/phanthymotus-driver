@@ -607,7 +607,7 @@ class MicPlugin:
         self._enable_requested = False
 
     def get_tool(self):
-        return tool(self.PREFIX, "sensor", "U1 Pro microphone array: live 16 kHz mono PCM audio for ASR.", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
+        return tool(self.PREFIX, "sensor", "U1 Pro 麦克风阵列：输出 16 kHz 单声道 PCM 音频流，可供语音识别使用。", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
 
     def start(self):
         if self.running:
@@ -663,13 +663,13 @@ class SpeakerPlugin:
 
     def get_tool(self):
         actions = {
-            "start": (["input_topic"], "Start playing the connected PCM audio stream."),
-            "set_volume": (["volume"], "Set U1 Pro speaker volume from 0 to 100."),
-            "get_volume": ([], "Read the current U1 Pro device speaker volume."),
-            "stop": ([], "Stop consuming the connected audio stream."),
-            "info": ([], "Read speaker connection state."),
+            "start": (["input_topic"], "播放已连接的 PCM 音频流。"),
+            "set_volume": (["volume"], "设置 U1 Pro 扬声器音量，范围为 0 到 100。"),
+            "get_volume": ([], "读取 U1 Pro 当前扬声器音量。"),
+            "stop": ([], "停止播放已连接的音频流。"),
+            "info": ([], "读取扬声器连接状态。"),
         }
-        return {"name": self.PREFIX, "type": "actuator", "multiInstance": False, "description": "U1 Pro speaker output stream. Connect a TTS or other audio/pcm-16k output to this card to play it live. Volume can be read or set from 0 to 100.", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "Connected audio/pcm-16k input topic, normally supplied by the Agent Core stream connection."}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
+        return {"name": self.PREFIX, "type": "actuator", "multiInstance": False, "description": "U1 Pro 扬声器音频输出。连接 TTS 或其他 audio/pcm-16k 音频流后即可播放，并支持读取和设置音量。", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "已连接的 audio/pcm-16k 输入话题，通常由 Agent Core 的流连接提供。"}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
 
     def start(self):
         # The input topic is supplied by Agent Core when the stream is connected;
@@ -718,22 +718,22 @@ class AudioPlugin:
 
     def get_tool(self):
         actions = {
-            "start": ([], "Start the U1 Pro text-to-speech card."),
-            "speak": (["text"], "Convert the supplied text to speech and play it through the U1 Pro.",),
-            "set_volume": (["volume"], "Set the U1 Pro TTS speaker volume from 0 to 100."),
-            "get_volume": ([], "Read the U1 Pro TTS speaker volume."),
-            "interrupt": ([], "Interrupt the current U1 Pro text-to-speech playback immediately."),
-            "stop": ([], "Interrupt the current U1 Pro text-to-speech playback."),
-            "info": ([], "Read TTS readiness and any active playback."),
+            "start": ([], "启动 U1 Pro 文本转语音卡片。"),
+            "speak": (["text"], "将文本转换为语音并通过 U1 Pro 播放。",),
+            "set_volume": (["volume"], "设置 TTS 扬声器音量，范围为 0 到 100。"),
+            "get_volume": ([], "读取 TTS 扬声器音量。"),
+            "interrupt": ([], "立即打断当前 TTS 播放。"),
+            "stop": ([], "打断当前 TTS 播放。"),
+            "info": ([], "读取 TTS 就绪状态和当前播放任务。"),
         }
         properties = {
-            "text": {"type": "string", "minLength": 1, "description": "Text to speak."},
-            "volume": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Speaker volume from 0 to 100."},
-            "action_id": {"type": "string", "description": "Optional caller correlation ID; otherwise a UUID is generated."},
+            "text": {"type": "string", "minLength": 1, "description": "要播放的文本。"},
+            "volume": {"type": "integer", "minimum": 0, "maximum": 100, "description": "扬声器音量，范围为 0 到 100。"},
+            "action_id": {"type": "string", "description": "可选的调用关联 ID；未提供时自动生成 UUID。"},
         }
         schema = action_schema(actions, properties)
         schema["x-completion"] = {"actions": ["speak"], "timeout": 120}
-        return tool(self.PREFIX, "actuator", "U1 Pro text-to-speech output. Submit text to speak; this card does not expose preset motion or raw audio playback.", schema)
+        return tool(self.PREFIX, "actuator", "U1 Pro 文本转语音输出。提交文本即可播报；本卡不提供预设动作或原始音频播放。", schema)
 
     def start(self):
         self.running = True
@@ -886,7 +886,7 @@ class EyeCameraPlugin:
     def get_tool(self):
         return tool(
             self.PREFIX, "sensor",
-            f"U1 Pro {self.eye} eye RGB camera. Publishes the physical {self.eye} camera as JPEG images.",
+            f"U1 Pro {('左' if self.eye == 'left' else '右')}眼 RGB 摄像头：以 JPEG 图像流输出物理摄像头画面。",
             _sensor_schema(),
             topic_out=[{"topic": self.topic, "format": "image/jpeg"}],
         )
@@ -1031,7 +1031,7 @@ class ExpressionPlugin:
         schema = action_schema(actions, {
             "name": {"type": "string", "enum": sorted(self.EXPRESSIONS), "description": "Declared readable expression name, such as smile or blink."},
         })
-        return tool(self.PREFIX, "actuator", "Control U1 Pro preset face expressions and light gestures, such as smile or blink. Head motions are exposed by the head card.", schema)
+        return tool(self.PREFIX, "actuator", "控制 U1 Pro 预设表情和轻量手势，例如微笑和眨眼；头部动作由 head 卡片提供。", schema)
 
     def start(self):
         self.running = True
@@ -1191,7 +1191,7 @@ class HeadPlugin:
                      "description": "Readable head motion name."},
         })
         return tool(self.PREFIX, "actuator",
-                    "U1 Pro preset head motions. It does not expose raw joint angles.",
+                    "控制 U1 Pro 预设头部动作，不提供原始关节角度控制。",
                     schema)
 
     def start(self):
@@ -1270,7 +1270,7 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
                SystemControlsPlugin(nodes),
                camera_left, camera_right]
     descriptions = {
-        "doa_event": "Microphone-array sound direction with azimuth and confidence.",
+        "doa_event": "麦克风阵列声源定位事件，输出方位角和置信度。",
     }
     plugins.extend(EventPlugin(nodes, name, description) for name, description in descriptions.items())
     return plugins
