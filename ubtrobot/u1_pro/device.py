@@ -458,18 +458,6 @@ class U1Nodes:
         else:
             U1Nodes._authorize_from_credentials(self)
 
-        for name in ("wakeup_enabled", "wakeup_followup", "vision_enabled"):
-            try:
-                result = self.set_system_enabled(name, False)
-                if result.get("enabled") is not False:
-                    raise RuntimeError("state readback did not confirm disabled")
-                print(f"[U1 init] {name} disabled and verified", flush=True)
-            except Exception as exc:
-                raise RuntimeError(f"U1 Pro startup could not disable {name}") from exc
-        try:
-            self.trigger_call("interrupt")
-        except Exception:
-            pass
 
     def _authorize_from_credentials(self) -> None:
         env_names = {

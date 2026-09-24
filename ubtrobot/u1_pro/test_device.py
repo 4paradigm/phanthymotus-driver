@@ -611,7 +611,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertNotIn("secret-value", text)
         self.assertNotIn("do-not-log", text)
         self.assertIn("authorization request completed", text)
-        self.assertIn("wakeup_enabled disabled and verified", text)
+        self.assertIn("authorization request completed", text)
 
     def test_existing_vendor_authorization_skips_credential_submission(self):
         import device
@@ -624,13 +624,8 @@ class U1CardContractTests(unittest.TestCase):
             set_system_enabled=mock.Mock(return_value={"enabled": False}),
         )
         device.U1Nodes.initialize_robot(nodes)
-        nodes.trigger_call.assert_has_calls([mock.call("auth_state"), mock.call("interrupt")])
-        self.assertEqual(nodes.set_system_enabled.call_args_list, [
-            mock.call("wakeup_enabled", False),
-            mock.call("wakeup_followup", False),
-            mock.call("vision_enabled", False),
-        ])
-        nodes.trigger_call.assert_any_call("interrupt")
+        nodes.trigger_call.assert_called_once_with("auth_state")
+        nodes.set_system_enabled.assert_not_called()
 
     def test_unauthorized_vendor_state_performs_authorization(self):
         import device
@@ -647,11 +642,7 @@ class U1CardContractTests(unittest.TestCase):
         device.U1Nodes.initialize_robot(nodes)
         self.assertEqual(nodes.string_call.call_args_list[0].args,
                          ("authorize", mock.ANY))
-        self.assertEqual(nodes.set_system_enabled.call_args_list, [
-            mock.call("wakeup_enabled", False),
-            mock.call("wakeup_followup", False),
-            mock.call("vision_enabled", False),
-        ])
+        nodes.set_system_enabled.assert_not_called()
 
     def test_authorization_loads_secret_file_and_license(self):
         import device
