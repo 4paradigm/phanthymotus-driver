@@ -21,7 +21,7 @@ from typing import Any
 from common.vendor_runtime import action_schema, jsonable, tool
 
 
-SERVICE_TIMEOUT = 3.0
+SERVICE_TIMEOUT = 10.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
@@ -293,6 +293,7 @@ class U1Nodes:
             "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
             "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
             "play_motion": self.robot.create_client(PlayMotion, "/action/controller/pay_motion"),
+            "play_action": self.robot.create_client(StringCall, "/action/controller/pay_motion"),
             "play_text": self.robot.create_client(StringCall, "/robo/audio/call/play_text"),
             "interrupt": self.robot.create_client(Trigger, "/robo/audio/call/interrupt_action_audio"),
             "authorize": self.robot.create_client(StringCall, "/robo/auth/call/authorize"),
@@ -454,12 +455,17 @@ class U1Nodes:
         request.params = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
         return _decode_vendor_result(self.call(name, request))
 
-    def play_motion(self, motion_type: int, motion_name: str) -> dict:
+    def play_motion(self, motion_type: int, motion_name: str, legacy_action: str | None = None) -> dict:
         """Play a named vendor motion through the official typed service."""
         request = self.PlayMotion.Request()
         request.motion_type = int(motion_type)
         request.motion_name = str(motion_name)
-        response = self.call("play_motion", request)
+        try:
+            response = self.call("play_motion", request)
+        except (RuntimeError, TimeoutError):
+            if not legacy_action:
+                raise
+            return self.string_call("play_action", {"action": str(legacy_action)})
         code = int(getattr(response, "code", -1))
         message = str(getattr(response, "message", "") or "")
         if code != 0:
@@ -879,7 +885,9 @@ class EyeCameraPlugin:
         try:
             if self._publisher is None:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
-            self._subscription = self.nodes.robot.create_subscription(
+            # The U1 Adapter publishes physical camera streams on its device
+            # domain (2), while vendor control remains on the robot domain.
+            self._subscription = self.nodes.audio_device.create_subscription(
                 self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
             if not self._frame_ready.wait(3.0):
                 raise TimeoutError(f"no frames received from {self.source_topic}")
@@ -890,7 +898,7 @@ class EyeCameraPlugin:
         except Exception as exc:
             self._last_error = str(exc)[:256]
             if self._subscription:
-                self.nodes.robot.destroy_subscription(self._subscription)
+                self.nodes.audio_device.destroy_subscription(self._subscription)
                 self._subscription = None
             self.running = False
             self._frame_ready.set()
@@ -898,7 +906,7 @@ class EyeCameraPlugin:
 
     def stop(self):
         if self._subscription:
-            self.nodes.robot.destroy_subscription(self._subscription)
+            self.nodes.audio_device.destroy_subscription(self._subscription)
             self._subscription = None
         self.running = False
         return self._state()
@@ -980,15 +988,20 @@ class ExpressionPlugin:
 
     PREFIX = "expression"
     EXPRESSIONS = {
-        "blink": "眨眼", "raise_eyebrow": "挑眉", "gaze": "注视",
-        "close_eyes": "闭眼", "frown": "皱眉", "open_mouth": "张嘴",
-        "smile": "笑", "pout": "嘟嘴", "blow_kiss": "飞吻",
-        "wake_up": "苏醒", "shy": "害羞", "affectionate": "撒娇",
-        "angry": "生气", "sad": "伤心/难过", "surprised": "惊讶",
-        "happy": "开心", "distracted": "发呆", "confused": "困惑",
-        "anxious": "焦虑", "contempt": "轻蔑", "afraid": "恐惧",
-        "thinking": "思考", "got_it": "想到了", "sleepy": "困",
-        "good_night": "睡吧", "laugh": "大笑", "silly_face": "鬼脸",
+        "blink": ("A001", "眨眼"), "raise_eyebrow": ("A002", "挑眉"),
+        "gaze": ("A003", "注视"), "close_eyes": ("A004", "闭眼"),
+        "frown": ("A005", "皱眉"), "open_mouth": ("A006", "张嘴"),
+        "smile": ("A007", "笑"), "pout": ("A008", "嘟嘴"),
+        "blow_kiss": ("A009", "飞吻"), "wake_up": ("A017", "苏醒"),
+        "shy": ("A018", "害羞"), "affectionate": ("A019", "撒娇"),
+        "angry": ("A020", "生气"), "sad": ("A021", "伤心/难过"),
+        "surprised": ("A022", "惊讶"), "happy": ("A023", "开心"),
+        "distracted": ("A024", "发呆"), "confused": ("A025", "困惑"),
+        "anxious": ("A026", "焦虑"), "contempt": ("A027", "轻蔑"),
+        "afraid": ("A028", "恐惧"), "thinking": ("A029", "思考"),
+        "got_it": ("A030", "想到了"), "sleepy": ("A031", "困"),
+        "good_night": ("A032", "睡吧"), "laugh": ("A033", "大笑"),
+        "silly_face": ("A034", "鬼脸"),
     }
 
     def __init__(self, audio: AudioPlugin):
@@ -1022,7 +1035,8 @@ class ExpressionPlugin:
             name = str(args.get("name", "")).strip().lower()
             if name not in self.EXPRESSIONS:
                 raise ValueError("expression.play requires one of the declared expression names")
-            return self.audio.nodes.play_motion(2, self.EXPRESSIONS[name])
+            legacy_action, motion_name = self.EXPRESSIONS[name]
+            return self.audio.nodes.play_motion(2, motion_name, legacy_action)
         if action == "stop":
             return self.stop()
         if action == "info":
@@ -1141,11 +1155,11 @@ class HeadPlugin:
 
     PREFIX = "head"
     HEAD_ACTIONS = {
-        "look_down": "低头",
-        "look_up": "抬头",
-        "nod": "点头",
-        "shake": "摇头",
-        "tilt": "歪头",
+        "look_down": ("A012", "低头"),
+        "look_up": ("A013", "抬头"),
+        "nod": ("A014", "点头"),
+        "shake": ("A011", "摇头"),
+        "tilt": ("A010", "歪头"),
     }
 
     def __init__(self, audio: AudioPlugin):
@@ -1182,7 +1196,8 @@ class HeadPlugin:
             name = str(args.get("name", "")).strip().lower()
             if name not in self.HEAD_ACTIONS:
                 raise ValueError("head.play requires one of the declared head motion names")
-            return self.audio.nodes.play_motion(2, self.HEAD_ACTIONS[name])
+            legacy_action, motion_name = self.HEAD_ACTIONS[name]
+            return self.audio.nodes.play_motion(2, motion_name, legacy_action)
         if action == "stop":
             return self.stop()
         if action == "info":

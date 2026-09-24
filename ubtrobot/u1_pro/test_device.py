@@ -170,7 +170,7 @@ class FakeNodes:
         self.string_calls.append((name, params))
         return {"ok": True, "code": "OK", "data": {}}
 
-    def play_motion(self, motion_type, motion_name):
+    def play_motion(self, motion_type, motion_name, legacy_action=None):
         self.string_calls.append(("play_motion", {
             "motion_type": motion_type, "motion_name": motion_name,
         }))

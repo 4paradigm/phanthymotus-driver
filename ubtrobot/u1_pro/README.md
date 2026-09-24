@@ -54,7 +54,7 @@ CycloneDDS RMW used by the dual-domain runtime, `PyYAML` used by the shared driv
 configuration loader, and NumPy 1.26.4 for vectorized conversion of the camera's
 YUY2 frames. NumPy adds a Python wheel to this component image; the exact version
 is pinned for reproducible ARM64/Python 3.10 builds. The official U1 SDK ROS2
-runtime defaults to robot domain `20` and binds CycloneDDS to host loopback. The
+runtime exposes vendor control services on robot domain `20` and device streams on domain `2`, and binds CycloneDDS to host loopback. The
 deployment keeps Agent Core on domain `42`; `ROS_LOCALHOST_ONLY` remains unset
 because the two contexts are configured explicitly by the driver.
 `MaxAutoParticipantIndex` is increased to
