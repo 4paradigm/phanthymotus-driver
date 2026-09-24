@@ -222,6 +222,7 @@ class U1Nodes:
         from audio_msgs.srv import EnableAudioIn, EnableAudioOut, SetAudioVolume
         from std_msgs.msg import UInt8
         from robo_sdk.srv import StringCall
+        from uworld_action_msgs.srv import PlayMotion
         from std_srvs.srv import Trigger
         from sensor_msgs.msg import CompressedImage
         try:
@@ -259,6 +260,7 @@ class U1Nodes:
         self.String = String
         self.CompressedImage = CompressedImage
         self.Image6m = Image6m
+        self.PlayMotion = PlayMotion
         self._speaker_publisher = self.audio_device.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
         self._volume = None
         self._volume_subscription = self.audio_device.create_subscription(
@@ -290,8 +292,7 @@ class U1Nodes:
             "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
             "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
             "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
-            "motion_list": self.robot.create_client(StringCall, "/action/controller/get_motion_info_list"),
-            "play_action": self.robot.create_client(StringCall, "/action/controller/pay_motion"),
+            "play_motion": self.robot.create_client(PlayMotion, "/action/controller/pay_motion"),
             "play_text": self.robot.create_client(StringCall, "/robo/audio/call/play_text"),
             "interrupt": self.robot.create_client(Trigger, "/robo/audio/call/interrupt_action_audio"),
             "authorize": self.robot.create_client(StringCall, "/robo/auth/call/authorize"),
@@ -452,6 +453,23 @@ class U1Nodes:
         request = StringCall.Request()
         request.params = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
         return _decode_vendor_result(self.call(name, request))
+
+    def play_motion(self, motion_type: int, motion_name: str) -> dict:
+        """Play a named vendor motion through the official typed service."""
+        request = self.PlayMotion.Request()
+        request.motion_type = int(motion_type)
+        request.motion_name = str(motion_name)
+        response = self.call("play_motion", request)
+        code = int(getattr(response, "code", -1))
+        message = str(getattr(response, "message", "") or "")
+        if code != 0:
+            raise RuntimeError(message or f"U1 Pro motion service failed with code {code}")
+        return {
+            "code": code,
+            "message": message,
+            "motion_type": request.motion_type,
+            "motion_name": request.motion_name,
+        }
 
     def trigger_call(self, name: str) -> dict:
         from std_srvs.srv import Trigger
@@ -961,30 +979,16 @@ class ExpressionPlugin:
     """Semantic Agent card for vendor-provided face and local motions."""
 
     PREFIX = "expression"
-    EXPRESSION_IDS = {
-        "A001", "A002", "A003", "A004", "A005", "A006", "A007", "A008",
-        "A009", "A010", "A011", "A012", "A013", "A014", "A017", "A018",
-        "A019", "A020", "A021", "A022", "A023", "A024", "A025", "A026",
-        "A027", "A028", "A029", "A030", "A031", "A032", "A033", "A034",
-    }
-    HEAD_NAMES = {"tilt_head", "shake_head", "look_down", "look_up", "nod"}
     EXPRESSIONS = {
-        "blink": ("A001", "眨眼"), "raise_eyebrow": ("A002", "挑眉"),
-        "gaze": ("A003", "注视"), "close_eyes": ("A004", "闭眼"),
-        "frown": ("A005", "皱眉"), "open_mouth": ("A006", "张嘴"),
-        "smile": ("A007", "笑"), "pout": ("A008", "嘟嘴"),
-        "blow_kiss": ("A009", "飞吻"), "tilt_head": ("A010", "歪头"),
-        "shake_head": ("A011", "摇头"), "look_down": ("A012", "低头"),
-        "look_up": ("A013", "抬头"), "nod": ("A014", "点头"),
-        "wake_up": ("A017", "苏醒"), "shy": ("A018", "害羞"),
-        "affectionate": ("A019", "撒娇"), "angry": ("A020", "生气"),
-        "sad": ("A021", "伤心/难过"), "surprised": ("A022", "惊讶"),
-        "happy": ("A023", "开心"), "distracted": ("A024", "发呆"),
-        "confused": ("A025", "困惑"), "anxious": ("A026", "焦虑"),
-        "contempt": ("A027", "轻蔑"), "afraid": ("A028", "恐惧"),
-        "thinking": ("A029", "思考"), "got_it": ("A030", "想到了"),
-        "sleepy": ("A031", "困"), "good_night": ("A032", "睡吧"),
-        "laugh": ("A033", "大笑"), "silly_face": ("A034", "鬼脸"),
+        "blink": "眨眼", "raise_eyebrow": "挑眉", "gaze": "注视",
+        "close_eyes": "闭眼", "frown": "皱眉", "open_mouth": "张嘴",
+        "smile": "笑", "pout": "嘟嘴", "blow_kiss": "飞吻",
+        "wake_up": "苏醒", "shy": "害羞", "affectionate": "撒娇",
+        "angry": "生气", "sad": "伤心/难过", "surprised": "惊讶",
+        "happy": "开心", "distracted": "发呆", "confused": "困惑",
+        "anxious": "焦虑", "contempt": "轻蔑", "afraid": "恐惧",
+        "thinking": "思考", "got_it": "想到了", "sleepy": "困",
+        "good_night": "睡吧", "laugh": "大笑", "silly_face": "鬼脸",
     }
 
     def __init__(self, audio: AudioPlugin):
@@ -994,17 +998,14 @@ class ExpressionPlugin:
     def get_tool(self):
         actions = {
             "start": ([], "Prepare the U1 Pro expression action card."),
-            "list_actions": ([], "List available expressions by readable name."),
-            "play": (["name"], "Play an expression using its readable name from list_actions."),
+            "play": (["name"], "Play an expression using its declared readable name."),
             "stop": ([], "Interrupt the current U1 Pro expression or audio motion."),
             "info": ([], "Read the expression card and active playback state."),
         }
         schema = action_schema(actions, {
-            "name": {"type": "string", "enum": sorted(self.EXPRESSIONS), "description": "Readable expression name returned by list_actions, such as smile or blink."},
-            "action_id": {"type": "string", "description": "Optional caller correlation ID."},
+            "name": {"type": "string", "enum": sorted(self.EXPRESSIONS), "description": "Declared readable expression name, such as smile or blink."},
         })
-        schema["x-completion"] = {"actions": ["play"], "timeout": 120}
-        return tool(self.PREFIX, "actuator", "Control U1 Pro preset face expressions and light gestures, such as smile, blink, nod, or head tilt. Discover available actions first; songs and unrelated motions are excluded.", schema)
+        return tool(self.PREFIX, "actuator", "Control U1 Pro preset face expressions and light gestures, such as smile or blink. Head motions are exposed by the head card.", schema)
 
     def start(self):
         self.running = True
@@ -1017,21 +1018,11 @@ class ExpressionPlugin:
     def dispatch(self, action, args):
         if action == "start":
             return self.start()
-        if action == "list_actions":
-            response = self.audio.nodes.string_call("motion_list", {})
-            result = self._expression_actions(response)
-            return {"actions": [item for item in result["actions"]
-                                if item["name"] not in self.HEAD_NAMES]}
         if action == "play":
             name = str(args.get("name", "")).strip().lower()
             if name not in self.EXPRESSIONS:
-                raise ValueError("expression.play requires a readable name returned by expression.list_actions")
-            available = self.dispatch("list_actions", {})["actions"]
-            if name not in {item["name"] for item in available}:
-                raise ValueError(f"expression {name!r} is not available on this robot firmware")
-            motion_id = self.EXPRESSIONS[name][0]
-            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
-            return self.audio._queue("play_action", {"action": motion_id}, action_id, "expression")
+                raise ValueError("expression.play requires one of the declared expression names")
+            return self.audio.nodes.play_motion(2, self.EXPRESSIONS[name])
         if action == "stop":
             return self.stop()
         if action == "info":
@@ -1039,46 +1030,6 @@ class ExpressionPlugin:
                 active = dict(self.audio._active) if self.audio._active else None
             return {"state": "ready" if self.running else "idle", "active": active}
         return None
-
-    @classmethod
-    def _expression_actions(cls, response):
-        """Keep only documented expression/gesture IDs from the dynamic vendor list."""
-        if isinstance(response, str):
-            try:
-                response = json.loads(response)
-            except json.JSONDecodeError:
-                return {"actions": []}
-        available_ids = set()
-        def collect(value):
-            if isinstance(value, str):
-                try:
-                    collect(json.loads(value))
-                except json.JSONDecodeError:
-                    pass
-                return
-            if isinstance(value, list):
-                for item in value:
-                    collect(item)
-            if isinstance(value, dict):
-                motion_id = str(value.get("motion_id", value.get("motionId",
-                                  value.get("action_id", value.get("actionId", value.get("id", ""))))))
-                if motion_id:
-                    available_ids.add(motion_id)
-                name_id = str(value.get("motion_name", value.get("motionName", "")))
-                if name_id:
-                    normalized = name_id.strip().lower()
-                    for name, (_known_id, label) in cls.EXPRESSIONS.items():
-                        if normalized in {name, label.lower()}:
-                            available_ids.add(_known_id)
-                for child in value.values():
-                    if isinstance(child, (dict, list, str)):
-                        collect(child)
-        collect(response)
-        actions = [{"name": name, "label": label}
-                   for name, (motion_id, label) in cls.EXPRESSIONS.items()
-                   if motion_id in available_ids]
-        return {"actions": actions}
-
 
 class _SystemSwitchPlugin:
     """Expose one documented vendor system switch as a small Agent card."""
@@ -1190,9 +1141,11 @@ class HeadPlugin:
 
     PREFIX = "head"
     HEAD_ACTIONS = {
-        "look_down": ("A012", "低头"),
-        "look_up": ("A013", "抬头"),
-        "nod": ("A014", "点头"),
+        "look_down": "低头",
+        "look_up": "抬头",
+        "nod": "点头",
+        "shake": "摇头",
+        "tilt": "歪头",
     }
 
     def __init__(self, audio: AudioPlugin):
@@ -1202,19 +1155,16 @@ class HeadPlugin:
     def get_tool(self):
         actions = {
             "start": ([], "Prepare the U1 Pro head action card."),
-            "list_actions": ([], "List available preset head motions by readable name."),
             "play": (["name"], "Play a documented preset head motion by readable name."),
             "stop": ([], "Interrupt the current head motion."),
             "info": ([], "Read head action card state."),
         }
         schema = action_schema(actions, {
             "name": {"type": "string", "enum": sorted(self.HEAD_ACTIONS),
-                     "description": "Readable name returned by list_actions."},
-            "action_id": {"type": "string", "description": "Optional caller correlation ID."},
+                     "description": "Readable head motion name."},
         })
-        schema["x-completion"] = {"actions": ["play"], "timeout": 120}
         return tool(self.PREFIX, "actuator",
-                    "U1 Pro preset head motions available in the current robot firmware. Use list_actions before play; it does not expose raw joint angles.",
+                    "U1 Pro preset head motions. It does not expose raw joint angles.",
                     schema)
 
     def start(self):
@@ -1228,19 +1178,11 @@ class HeadPlugin:
     def dispatch(self, action, args):
         if action == "start":
             return self.start()
-        if action == "list_actions":
-            available = ExpressionPlugin._expression_actions(
-                self.audio.nodes.string_call("motion_list", {}))["actions"]
-            return {"actions": [item for item in available if item["name"] in self.HEAD_ACTIONS]}
         if action == "play":
             name = str(args.get("name", "")).strip().lower()
             if name not in self.HEAD_ACTIONS:
-                raise ValueError("head.play requires a readable name returned by head.list_actions")
-            available = {item["name"] for item in self.dispatch("list_actions", {})["actions"]}
-            if name not in available:
-                raise ValueError(f"head action {name!r} is not available on this robot firmware")
-            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
-            return self.audio._queue("play_action", {"action": self.HEAD_ACTIONS[name][0]}, action_id, "head")
+                raise ValueError("head.play requires one of the declared head motion names")
+            return self.audio.nodes.play_motion(2, self.HEAD_ACTIONS[name])
         if action == "stop":
             return self.stop()
         if action == "info":

@@ -6,11 +6,11 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 - `speaker`: an Agent Core `audio/pcm-16k` input stream forwarded to the vendor output topic.
 - `tts`: text-to-speech through the documented `play_text` service, with `interrupt`/`stop` and asynchronous completion. Raw audio and preset actions are intentionally not exposed by this card.
 - `tts` also controls the shared U1 speaker volume with `set_volume` and `get_volume`; TTS and live speaker streams use the same device output volume.
-- `expression`: face and gesture actions listed by readable names such as `smile` or `blink`; the driver maps these names to documented vendor IDs and only lists actions present in the robot's live command-motion list.
+- `expression`: face and gesture actions exposed by declared readable names such as `smile` or `blink`; head motions are kept in the separate `head` card.
 - `system_controls`: controls the three independent vendor switches `wakeup`, `wakeup_followup`, and `visual_behavior` from one card. Disabling `visual_behavior` stops vendor visual decisions, visual following, and visual idle actions; it does not stop explicitly requested expression/head motions.
 
 The U1 SDK does not expose a documented switch for stopping or disabling the vendor's internal Agent process itself. Use `system_controls` to choose whether new wakeups, post-wakeup dialog continuation, and visual decisions/following/idle behavior are enabled; the driver does not change these settings during startup. It can interrupt current vendor playback/action through `tts.interrupt`. It cannot disable vendor ROS services, system processes, safety/control loops, or an already explicitly requested motion; those remain vendor-owned.
-- `head`: plays the supported preset head motions `look_down`, `look_up`, and `nod` by readable name. Unsupported firmware actions are not exposed. The SDK does not expose arbitrary head angles or low-level neck-joint control.
+- `head`: plays the named preset head motions `look_down`, `look_up`, `nod`, `shake`, and `tilt` through the official typed motion service. The SDK does not expose arbitrary head angles or low-level neck-joint control.
 - `camera_left` and `camera_right`: the physical left- and right-eye RGB cameras exposed by the U1 perception runtime, published as separate JPEG topics.
 - `doa_event`: an opt-in JSON sound-direction event stream.
 

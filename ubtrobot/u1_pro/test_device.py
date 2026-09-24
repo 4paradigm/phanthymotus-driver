@@ -98,6 +98,15 @@ def _install_stubs():
     robo_srv.StringCall = type("StringCall", (), {"Request": type("Request", (), {"__init__": lambda self: setattr(self, "params", "")})})
     robo.srv = robo_srv
     sys.modules.update({"robo_sdk": robo, "robo_sdk.srv": robo_srv})
+    action = types.ModuleType("uworld_action_msgs")
+    action_srv = types.ModuleType("uworld_action_msgs.srv")
+    action_srv.PlayMotion = type("PlayMotion", (), {
+        "Request": type("Request", (), {
+            "__init__": lambda self: (setattr(self, "motion_type", 0), setattr(self, "motion_name", ""))[-1]
+        })
+    })
+    action.srv = action_srv
+    sys.modules.update({"uworld_action_msgs": action, "uworld_action_msgs.srv": action_srv})
     std_srv = types.ModuleType("std_srvs.srv")
     std_srv.Trigger = type("Trigger", (), {"Request": message("Request")})
     sys.modules.update({"std_srvs.srv": std_srv})
@@ -160,6 +169,12 @@ class FakeNodes:
     def string_call(self, name, params):
         self.string_calls.append((name, params))
         return {"ok": True, "code": "OK", "data": {}}
+
+    def play_motion(self, motion_type, motion_name):
+        self.string_calls.append(("play_motion", {
+            "motion_type": motion_type, "motion_name": motion_name,
+        }))
+        return {"code": 0, "message": "", "motion_type": motion_type, "motion_name": motion_name}
 
     def trigger_call(self, name):
         self.interrupts += name == "interrupt"
@@ -567,43 +582,21 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(camera._state()["state"], "error")
         self.assertFalse(camera.running)
 
-    def test_expression_excludes_songs_from_dynamic_action_list(self):
+    def test_expression_and_head_use_declared_names_without_list_actions(self):
         import device
 
-        audio = device.AudioPlugin(FakeNodes())
-        expression = device.ExpressionPlugin(audio)
-        audio.nodes.string_call = mock.Mock(return_value={"data": {"motion_info_list": [
-            {"motion_id": "A001", "motion_name": "眨眼"},
-            {"motion_id": "A101", "motion_name": "song"},
-        ]}})
-        result = expression.dispatch("list_actions", {})
-        self.assertEqual(result["actions"], [{"name": "blink", "label": "眨眼"}])
-        with self.assertRaisesRegex(ValueError, "not available"):
-            expression.dispatch("play", {"name": "smile"})
-
-    def test_expression_parses_nested_json_motion_list(self):
-        import device
-
-        response = {"data": json.dumps({"motion_info_list": [
-            {"motion_id": "A019", "motion_name": "撒娇"},
-            {"motion_id": "A101", "motion_name": "歌曲_1"},
-        ]}, ensure_ascii=False)}
-        self.assertEqual(device.ExpressionPlugin._expression_actions(response)["actions"],
-                         [{"name": "affectionate", "label": "撒娇"}])
-
-    def test_vendor_string_call_message_envelope_decodes_motion_list(self):
-        import device
-
-        response = types.SimpleNamespace(
-            success=True,
-            message=json.dumps({"data": [{"motion_id": "A019", "motion_name": "撒娇"},
-                                         {"motion_id": "A014", "motion_name": "点头"}]}),
-        )
-        decoded = device._decode_vendor_result(response)
-        self.assertEqual(device.ExpressionPlugin._expression_actions(decoded)["actions"], [
-            {"name": "nod", "label": "点头"},
-            {"name": "affectionate", "label": "撒娇"},
-        ])
+        expression = device.ExpressionPlugin(device.AudioPlugin(FakeNodes()))
+        head = device.HeadPlugin(expression.audio)
+        expression_schema = expression.get_tool()["inputSchema"]
+        head_schema = head.get_tool()["inputSchema"]
+        self.assertNotIn("list_actions", expression_schema["properties"]["action"]["enum"])
+        self.assertNotIn("list_actions", head_schema["properties"]["action"]["enum"])
+        self.assertNotIn("look_down", expression_schema["properties"]["name"]["enum"])
+        self.assertNotIn("look_up", expression_schema["properties"]["name"]["enum"])
+        self.assertNotIn("nod", expression_schema["properties"]["name"]["enum"])
+        self.assertEqual(head_schema["properties"]["name"]["enum"],
+                         ["look_down", "look_up", "nod", "shake", "tilt"])
+        self.assertIsNone(expression.dispatch("list_actions", {}))
 
     def test_vendor_string_call_failure_envelope_is_preserved(self):
         import device
@@ -808,21 +801,22 @@ class U1CardContractTests(unittest.TestCase):
         device.U1Nodes._mic_callback(nodes, message)
         self.assertEqual(publisher.messages, [])
 
-    def test_expression_maps_readable_action_name_to_vendor_id(self):
+    def test_expression_and_head_call_official_motion_service(self):
         import device
 
         nodes = FakeNodes()
-        nodes.string_call = mock.Mock(side_effect=[
-            {"data": {"motion_info_list": [{"motion_id": "A007", "motion_name": "笑"}]}},
-            {"accepted": True},
-        ])
         expression = device.ExpressionPlugin(device.AudioPlugin(nodes))
-        with mock.patch.object(device, "_acp_notify"):
-            result = expression.dispatch("play", {"name": "smile", "action_id": "expr-1"})
-        self.assertEqual(result["state"], "queued")
-        self.assertEqual(nodes.string_call.call_args_list[0].args, ("motion_list", {}))
-        self.assertEqual(nodes.string_call.call_args_list[1].args[0], "play_action")
-        self.assertEqual(nodes.string_call.call_args_list[1].args[1]["action"], "A007")
+        result = expression.dispatch("play", {"name": "smile"})
+        self.assertEqual(result["motion_type"], 2)
+        self.assertEqual(result["motion_name"], "笑")
+        head = device.HeadPlugin(expression.audio)
+        result = head.dispatch("play", {"name": "shake"})
+        self.assertEqual(result["motion_type"], 2)
+        self.assertEqual(result["motion_name"], "摇头")
+        self.assertEqual(nodes.string_calls, [
+            ("play_motion", {"motion_type": 2, "motion_name": "笑"}),
+            ("play_motion", {"motion_type": 2, "motion_name": "摇头"}),
+        ])
 
     def test_lifecycle_start_does_not_repeat_robot_initialization(self):
         import device
@@ -850,21 +844,6 @@ class U1CardContractTests(unittest.TestCase):
 
         plugin = device.AudioPlugin(FakeNodes())
         self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
-
-    def test_head_stop_cancellation_keeps_head_tool_name(self):
-        import device
-
-        nodes = FakeNodes()
-        nodes.string_call = mock.Mock(return_value={"data": {"motion_info_list": [
-            {"motion_id": "A014", "motion_name": "点头"},
-        ]}})
-        head = device.HeadPlugin(device.AudioPlugin(nodes))
-        head.dispatch("play", {"name": "nod", "action_id": "head-stop-1"})
-        with mock.patch.object(device, "_acp_notify") as notify:
-            head.stop()
-        self.assertEqual(notify.call_args.args[0], "head-stop-1")
-        self.assertEqual(notify.call_args.args[1], "cancelled")
-        self.assertEqual(notify.call_args.args[3], "head")
 
     def test_tts_interrupt_is_an_explicit_alias_for_stop(self):
         import device
@@ -897,22 +876,13 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = FakeNodes()
-        nodes.string_call = mock.Mock(return_value={"data": {"motion_info_list": [
-            {"motion_id": "A014", "motion_name": "点头"},
-            {"motion_id": "A101", "motion_name": "歌曲_1"},
-        ]}})
         head = device.HeadPlugin(device.AudioPlugin(nodes))
-        self.assertEqual(head.dispatch("list_actions", {})["actions"], [{"name": "nod", "label": "点头"}])
         head_schema = head.get_tool()["inputSchema"]
-        self.assertEqual(head_schema["x-completion"]["actions"], ["play"])
-        self.assertEqual(head_schema["x-completion"]["timeout"], 120)
-        head.dispatch("play", {"name": "nod", "action_id": "head-1"})
-        vendor_uuid = head.audio._active["vendor_uuid"]
-        with mock.patch.object(device, "_acp_notify") as notify:
-            head.audio._on_playback_state({"uuid": vendor_uuid, "phase": "result", "success": True, "state_name": "COMPLETED"})
-        self.assertEqual(notify.call_args.args[0], "head-1")
-        self.assertEqual(notify.call_args.args[3], "head")
-        self.assertEqual(head.get_tool()["inputSchema"]["properties"]["name"]["enum"], ["look_down", "look_up", "nod"])
+        self.assertNotIn("x-completion", head_schema)
+        self.assertEqual(head_schema["properties"]["name"]["enum"],
+                         ["look_down", "look_up", "nod", "shake", "tilt"])
+        result = head.dispatch("play", {"name": "tilt"})
+        self.assertEqual(result["motion_name"], "歪头")
 
     def test_system_switch_cards_use_documented_vendor_services(self):
         import device
