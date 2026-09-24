@@ -161,32 +161,6 @@ class _RgbStream:
         self._MIN_INTERVAL_MS = 30       # 最多发布约 30fps
         # 单次最多从内核接收队列取 1 MiB；循环会立即继续 drain，避免在持续来帧时长期霸占线程。
         self._MAX_DRAIN_BYTES = 1_048_576
-        self._frame_condition = threading.Condition()
-        self._frame_sequence = 0
-        self._latest_frame = None
-
-    def frame_sequence(self):
-        with self._frame_condition:
-            return self._frame_sequence
-
-    def wait_for_frame(self, after_sequence, timeout_s):
-        deadline = time.monotonic() + timeout_s
-        with self._frame_condition:
-            while self._run:
-                if self._frame_sequence > after_sequence:
-                    return self._latest_frame
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                self._frame_condition.wait(remaining)
-        return None
-
-    def _note_frame(self, jpeg):
-        # 中文说明：抓拍只读取现有 RGB 流；序号保证拿到调用之后的新帧。
-        with self._frame_condition:
-            self._latest_frame = jpeg
-            self._frame_sequence += 1
-            self._frame_condition.notify_all()
 
     def start(self, position: str, host: str, port: int):
         self._run = True
@@ -200,8 +174,6 @@ class _RgbStream:
         self._run = False
         self._gen += 1        # 让在跑的 loop 线程退出并断开 → Nano 侧 _exit(0) 释放相机
         self.connected = False
-        with self._frame_condition:
-            self._frame_condition.notify_all()
 
     def _loop(self, gen, position, host, port):
         while self._run and gen == self._gen:
@@ -276,7 +248,6 @@ class _RgbStream:
                         try:
                             self._pub.publish(msg)
                             self._last_publish_ms = now_ms
-                            self._note_frame(latest)
                         except Exception:
                             break
             except Exception as e:  # noqa: BLE001
