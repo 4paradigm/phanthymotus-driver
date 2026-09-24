@@ -102,6 +102,10 @@ AMPLE_TRAVEL_M = 3.0
 # enough that a hundred of them fit in a walk somebody is willing to perform.
 BLOCK_S = 1.0
 MIN_BLOCKS = 10
+# Standing still for longer than this ends a manoeuvre. Long enough not to split
+# a walk at a hesitation, short enough to separate two deliberate segments of a
+# protocol — a person pausing between them takes seconds, not one.
+PAUSE_S = 3.0
 # How much residual rotation a frame may still need and be called right. A frame
 # that is right needs none; this is slack for yaw noise and for the heading being
 # estimated rather than measured.
@@ -365,25 +369,47 @@ def kinematics(rows: list) -> dict:
     """
     rows, _ = _dedupe(rows)
     moving = _moving_window(rows)
-    out = {"readings": len(rows), "moving_s": 0.0}
+    out = {"readings": len(rows), "moving_s": 0.0,
+           # One entry per manoeuvre, so a protocol run is read segment by
+           # segment rather than as one meaningless total. See `_episodes`.
+           "episodes": [_episode_summary(e) for e in _episodes(rows)]}
     if len(moving) < 2:
         return out
-    out["moving_s"] = moving[-1][0] - moving[0][0]
+    out["moving_s"] = sum(e["seconds"] for e in out["episodes"])
 
-    px = [r[1] for r in moving]
-    py = [r[2] for r in moving]
-    out["position"] = {
-        "net_m": math.hypot(px[-1] - px[0], py[-1] - py[0]),
-        "path_m": sum(math.hypot(b[1] - a[1], b[2] - a[2])
-                      for a, b in zip(moving, moving[1:])),
-        "bbox_m": (max(px) - min(px), max(py) - min(py)),
-    }
+    # Aggregates kept for the `--until-decisive` progress line, which needs one
+    # number to compare against a threshold. Every *conclusion* is drawn per
+    # episode; these are a progress indicator, not a measurement.
+    eps = out["episodes"]
+    out["position"] = {"net_m": max(e["position"]["net_m"] for e in eps),
+                       "path_m": sum(e["position"]["path_m"] for e in eps),
+                       "bbox_m": max((e["position"]["bbox_m"] for e in eps),
+                                     key=lambda b: b[0] * b[1])}
+    out["velocity"] = {"net_m": max(e["velocity"]["net_m"] for e in eps),
+                       "path_m": sum(e["velocity"]["path_m"] for e in eps)}
+    # Summed over episodes, which is right for "how much heading has this run
+    # seen" (the `--until-decisive` gate) and wrong for "how far did it turn"
+    # (that is per-episode, and reading it across a pause is what made one turn
+    # look like two).
+    out["heading_turned_deg"] = sum(e["heading_deg"] for e in eps)
+    wz = [e["wz_deg"] for e in eps if e["wz_deg"] is not None]
+    out["wz_turned_deg"] = sum(wz) if wz else None
+    return out
 
-    # Body-frame velocity carried into the world by the reported heading. If the
-    # frame is right this is a trajectory; if it is wrong it is a scribble.
+
+def _episode_summary(episode: list) -> dict:
+    """One manoeuvre, as each source describes it. The unit a protocol compares.
+
+    Both headings are reported: `heading_deg` accumulates the wrapped differences
+    of the reported yaw, `wz_deg` integrates the reported `yaw_speed`. They reach
+    the same physical angle by different routes, so a commanded turn calibrates
+    both at once and their disagreement bounds either.
+    """
+    px = [r[1] for r in episode]
+    py = [r[2] for r in episode]
     zx = zy = path = 0.0
-    turned_wz = turned_yaw = 0.0
-    for a, b in zip(moving, moving[1:]):
+    turned_yaw = turned_wz = 0.0
+    for a, b in zip(episode, episode[1:]):
         dt = b[0] - a[0]
         vx, vy = (a[3] + b[3]) / 2.0, (a[4] + b[4]) / 2.0
         yaw = math.atan2((math.sin(a[5]) + math.sin(b[5])) / 2.0,
@@ -396,25 +422,53 @@ def kinematics(rows: list) -> dict:
         turned_yaw += math.atan2(math.sin(b[5] - a[5]), math.cos(b[5] - a[5]))
         if len(a) > 6 and len(b) > 6:
             turned_wz += (a[6] + b[6]) / 2.0 * dt
-    out["velocity"] = {"net_m": math.hypot(zx, zy), "path_m": path}
-    out["heading_turned_deg"] = math.degrees(turned_yaw)
-    out["wz_turned_deg"] = math.degrees(turned_wz) if turned_wz else None
-    return out
+    return {
+        "seconds": episode[-1][0] - episode[0][0],
+        "velocity": {"net_m": math.hypot(zx, zy), "path_m": path},
+        "position": {
+            "net_m": math.hypot(px[-1] - px[0], py[-1] - py[0]),
+            "path_m": sum(math.hypot(b[1] - a[1], b[2] - a[2])
+                          for a, b in zip(episode, episode[1:])),
+            "bbox_m": (max(px) - min(px), max(py) - min(py)),
+        },
+        "heading_deg": math.degrees(turned_yaw),
+        "wz_deg": math.degrees(turned_wz) if turned_wz else None,
+    }
 
 
-def _moving_window(rows: list) -> list:
-    """The readings between the first and last second in which velocity was nonzero.
+def _episodes(rows: list) -> list:
+    """Each separate burst of motion, split on standing still. One per manoeuvre.
 
-    Keyed on the *velocity* rather than on the position, because which of the two
-    can be trusted is the question under test and the window must not presuppose
-    an answer. A protocol run starts and ends stationary, so this finds the walk
-    without being told when it happened.
+    **A pause is a boundary, not part of the motion.** The first version returned
+    one window spanning the first to the last moving block, which silently welded
+    separate manoeuvres together: on r1_sz segment B the robot turned one full
+    circle, stood still for 35 seconds, then turned another, and the readout
+    reported a single -731 deg turn against a commanded 360. That reads as an
+    instrument off by a factor of two. Split on the pause and the first turn is
+    -364.4 deg — the instrument is accurate to about a percent, and the factor of
+    two was mine.
+
+    Any protocol worth running is several manoeuvres separated by pauses, so this
+    is the shape the readout has to have.
     """
     live = [block for block in _blocks(rows, BLOCK_S) if _block_speed(block) > 0.05]
     if not live:
         return []
-    start, end = live[0][0][0], live[-1][-1][0]
-    return [row for row in rows if start <= row[0] <= end]
+    spans = [[live[0][0][0], live[0][-1][0]]]
+    for block in live[1:]:
+        if block[0][0] - spans[-1][1] > PAUSE_S:
+            spans.append([block[0][0], block[-1][0]])
+        else:
+            spans[-1][1] = block[-1][0]
+    return [[row for row in rows if start <= row[0] <= end] for start, end in spans]
+
+
+def _moving_window(rows: list) -> list:
+    """Every reading that belongs to some episode, pauses excluded."""
+    out = []
+    for episode in _episodes(rows):
+        out.extend(episode)
+    return out
 
 
 def _block_speed(block: list) -> float:
@@ -535,22 +589,29 @@ def report_kinematics(rows: list) -> None:
     one says and leaves the comparison to whoever fixed the truth beforehand.
     """
     k = kinematics(rows)
+    episodes = k.get("episodes") or []
     print()
-    print(f"── what each source claims ({k['moving_s']:.1f}s of motion, "
-          f"{k['readings']} readings) ──")
-    if "velocity" not in k:
+    print(f"── what each source claims ({len(episodes)} manoeuvre(s), "
+          f"{k['moving_s']:.1f}s of motion, {k['readings']} readings) ──")
+    if not episodes:
         print("  the robot did not move")
         return
-    p, v = k["position"], k["velocity"]
-    print(f"  velocity → path {v['path_m']:6.2f} m   net {v['net_m']:6.2f} m")
-    print(f"  position → path {p['path_m']:6.2f} m   net {p['net_m']:6.2f} m"
-          f"   bbox {p['bbox_m'][0]:.2f} x {p['bbox_m'][1]:.2f} m")
-    print(f"  heading  → turned {k['heading_turned_deg']:+.0f}° (from rpy)", end="")
-    if k.get("wz_turned_deg") is not None:
-        print(f", {k['wz_turned_deg']:+.0f}° (from yaw_speed)")
-    else:
-        print("   [yaw_speed not in this recording]")
-    print("  compare against the distance you measured / the turn you commanded.")
+    # One block per manoeuvre. Summing them would weld separate segments of a
+    # protocol into a total that matches none of them — which is how one full
+    # turn plus a pause plus another full turn came out as a single -731 deg
+    # reading against a commanded 360.
+    for index, e in enumerate(episodes, 1):
+        p, v = e["position"], e["velocity"]
+        print(f"  [{index}] {e['seconds']:5.1f}s")
+        print(f"      velocity → path {v['path_m']:6.2f} m   net {v['net_m']:6.2f} m")
+        print(f"      position → path {p['path_m']:6.2f} m   net {p['net_m']:6.2f} m"
+              f"   bbox {p['bbox_m'][0]:.2f} x {p['bbox_m'][1]:.2f} m")
+        print(f"      heading  → {e['heading_deg']:+.1f}° (rpy)", end="")
+        if e.get("wz_deg") is not None:
+            print(f"   {e['wz_deg']:+.1f}° (yaw_speed)")
+        else:
+            print("   [yaw_speed not in this recording]")
+    print("  compare each against the distance you measured / the turn you commanded.")
 
 
 def report(result: dict) -> int:
