@@ -20,4 +20,5 @@ cards:
   - { name: battery, type: sensor }
   - { name: loco_state, type: sensor }
   - { name: odometry, type: sensor }
+  - { name: remote_controller, type: sensor }
   - { name: lidar_cloud, type: sensor }

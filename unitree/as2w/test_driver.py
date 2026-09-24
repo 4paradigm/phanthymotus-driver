@@ -138,16 +138,63 @@ class TestDriverContracts(unittest.TestCase):
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
         plugin._namespace = "test"
-        for name in ("imu", "joints", "joint_state", "battery", "loco_state", "odometry"):
+        for name in ("imu", "joints", "joint_state", "battery", "loco_state", "odometry", "remote_controller"):
             result = plugin.dispatch(name, {})
             self.assertEqual("running", result["state"])
             self.assertTrue(result["topic_out"][0]["topic"].startswith("/test/"))
+
+    def test_remote_controller_rejects_short_wireless_data(self):
+        payload = self.device._parse_wireless_remote(bytes(23))
+        self.assertEqual({
+            "available": False,
+            "fresh": False,
+            "control_level": "LOWLEVEL",
+        }, payload)
+
+    def test_remote_controller_decodes_as2w_buttons_and_axes(self):
+        import struct
+        raw = bytearray(40)
+        raw[2] = (1 << 5) | (1 << 3) | (1 << 0)
+        raw[3] = (1 << 7) | (1 << 4) | (1 << 1)
+        for offset, value in ((4, 0.25), (8, -0.5), (12, 0.05), (20, 1.0)):
+            raw[offset:offset + 4] = struct.pack("f", value)
+
+        payload = self.device._parse_wireless_remote(raw)
+        self.assertTrue(payload["available"])
+        self.assertTrue(payload["active"])
+        self.assertTrue(payload["buttons"]["LT"])
+        self.assertTrue(payload["buttons"]["back"])
+        self.assertTrue(payload["buttons"]["RB"])
+        self.assertTrue(payload["buttons"]["left"])
+        self.assertTrue(payload["buttons"]["up"])
+        self.assertTrue(payload["buttons"]["B"])
+        self.assertEqual({"lx": 0.25, "rx": -0.5, "ry": 0.05, "ly": 1.0}, payload["axes"])
+
+    def test_lowstate_publishes_remote_controller(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.remote_controller = types.SimpleNamespace(
+            publish=lambda message: published.append(message.data)
+        )
+        node.imu = node.joints = node.joint_state = node.battery = types.SimpleNamespace(
+            publish=lambda message: None
+        )
+        node._on_low(types.SimpleNamespace(
+            wireless_remote=bytes(40),
+            imu_state=types.SimpleNamespace(quaternion=[], gyroscope=[], accelerometer=[], rpy=[]),
+            motor_state=[],
+        ))
+        payload = __import__("json").loads(published[0])
+        self.assertTrue(payload["available"])
+        self.assertFalse(payload["active"])
+        self.assertIn("timestamp_ms", payload)
 
     def test_lowstate_extra_motor_slots_are_ignored(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []
         node.imu = node.joints = node.joint_state = node.battery = types.SimpleNamespace(
             publish=lambda message: published.append(message.data))
+        node.remote_controller = types.SimpleNamespace(publish=lambda message: None)
         motors = [types.SimpleNamespace(q=float(i), dq=0, tau_est=0, temperature=0) for i in range(20)]
         imu = types.SimpleNamespace(quaternion=[], gyroscope=[], accelerometer=[], rpy=[])
         node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors, bms_state=None))
@@ -160,6 +207,7 @@ class TestDriverContracts(unittest.TestCase):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []
         node.imu = node.joint_state = node.battery = types.SimpleNamespace(publish=lambda message: None)
+        node.remote_controller = types.SimpleNamespace(publish=lambda message: None)
         node.joints = types.SimpleNamespace(publish=lambda message: published.append(message.data))
         motors = [types.SimpleNamespace(q=float(i), dq=0, tau_est=0, temperature=[0, 0]) for i in range(16)]
         imu = types.SimpleNamespace(quaternion=[1, 0, 0, 0], gyroscope=[], accelerometer=[], rpy=[])
