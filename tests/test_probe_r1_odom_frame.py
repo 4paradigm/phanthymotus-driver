@@ -138,6 +138,59 @@ def test_position_unrelated_to_velocity_is_indeterminate_not_a_verdict():
     assert result["verdict"] == "indeterminate"
 
 
+# ── republication, which is what the first hardware run actually tripped on ──
+
+def republish(rows, times=4):
+    """Send each reading `times` times, as R1 does — measured at ~3.7x on r1_sz.
+
+    The timestamps still advance, so a repeat looks exactly like "the robot did
+    not move during this interval while claiming to be moving".
+    """
+    out = []
+    t = 0.0
+    for row in rows:
+        for _ in range(times):
+            out.append((t, *row[1:]))
+            t += DT / times
+    return out
+
+
+@pytest.mark.parametrize("frame", ["body", "world"])
+def test_a_republished_run_is_still_decided(frame):
+    """The regression. On hardware this returned indeterminate from a real walk.
+
+    Every duplicated pair contributes pure residual to both hypotheses, and at
+    73% duplication that swamped the difference between them — ratio 1.22 against
+    a threshold of 1.5, from a robot that was genuinely walking and turning.
+    """
+    result = probe.analyse(republish(walk(frame=frame, yaw_rate=0.4)))
+    assert result["verdict"] == frame
+    assert result["repeats"] > 0
+
+
+def test_residuals_larger_than_the_path_are_the_tell():
+    """What made the hardware run diagnosable, kept as an assertion.
+
+    A correct analysis of a consistent run cannot produce more error than there
+    was movement. If this ever holds again, something is fabricating residual.
+    """
+    result = probe.analyse(republish(walk(frame="body", yaw_rate=0.4)))
+    assert result["body_residual_m"] < result["travel_m"]
+
+
+def test_a_stationary_robot_keeps_its_velocity_noise():
+    """Dedupe on the whole reading, not on position.
+
+    A robot standing still republishes the same position with fresh velocity
+    noise every time, and those readings are real evidence. Collapsing them by
+    position alone would throw away the only samples such a run has.
+    """
+    rows = [(i * DT, 1.0, 2.0, 0.001 * (-1) ** i, 0.0, 0.5) for i in range(200)]
+    kept, dropped = probe._dedupe(rows)
+    assert dropped == 0
+    assert len(kept) == 200
+
+
 # ── the discriminator itself ─────────────────────────────────────────────────
 
 def test_yaw_spread_is_circular():
