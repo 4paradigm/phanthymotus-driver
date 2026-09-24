@@ -330,9 +330,50 @@ class LocoServoPlugin:
             },
             "topic_in": [{"format": "control/velocity",
                           "desc": "motus.control/1 twist，6 维 [vx,vy,vz,wx,wy,wz]"}],
+            # Three switches that decide **how much of a command reaches the
+            # motors**, and until now they existed only in `config.yaml` — so
+            # changing one meant editing a file inside a container and
+            # restarting the bundle. That is the wrong shape for these in
+            # particular: `dry_run` is the thing an operator reaches for when a
+            # policy is about to be tried on a real robot for the first time,
+            # and it has to be reachable in the second before that happens, not
+            # after a redeploy.
+            #
+            # **Defaults leave the robot movable.** `dry_run` stays off, as it
+            # has been since the comment in `__init__` explained what the old
+            # `True` default actually bought: a silently dead chassis on every
+            # freshly deployed robot, indistinguishable from a broken one. A
+            # safety default whose normal case is a silent failure only teaches
+            # people to switch it off without reading why it is there.
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "空跑：照常接收、检查、计数，但不调用 SDK —— "
+                                       "机器人不会动。第一次在真机上试一个新策略时"
+                                       "先打开它，看它想发什么",
+                    },
+                    "rotate_only": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "只转不走：vx / vy 在到达 SDK 前被清零，"
+                                       "保留 vyaw。场地窄或只想验转向时用",
+                    },
+                    "require_standing": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "要求机器人处于站立状态才执行指令。"
+                                       "关掉它只在没有接底盘的台架上有意义",
+                    },
+                },
+            },
         }
 
     def dispatch(self, action: str, args: dict):
+        if action == "config":
+            return self._config(args)
         if action == "start":
             return self._start(args)
         if action == "stop":
@@ -344,6 +385,51 @@ class LocoServoPlugin:
         if action == "info":
             return self._info()
         return None
+
+    # `configSchema` fields, and the only keys `config` is allowed to touch.
+    # Named rather than "whatever arrived": `config` and `start` share an
+    # argument dict on this card, so an unfiltered assignment would let a stray
+    # `input_topic` or `action` become an attribute.
+    _TOGGLES = ("dry_run", "rotate_only", "require_standing")
+
+    def _config(self, args: dict) -> dict:
+        """Apply the operator's switches, **including while streaming**.
+
+        Taking effect only at the next `start` is the tempting implementation
+        and the wrong one. `dry_run` is reached for when a robot is doing
+        something the operator wants stopped *now*; a toggle that flips in the
+        UI, reports success, and changes nothing until a restart is the exact
+        shape of failure this bundle keeps running into — a setting that looks
+        applied and is not.
+
+        The reverse direction is live too, and is the one to be careful about:
+        clearing `dry_run` on a card that is already subscribed hands a running
+        command stream to the motors without any further deliberate act. That is
+        the operator's decision to make, so it is honoured — and logged, because
+        the alternative is a robot that starts moving with nothing in the log
+        saying why.
+
+        Only keys that are actually present are applied. A form that renders an
+        unchecked box for a field the caller never set would otherwise send
+        `require_standing: false` and silently drop a posture check.
+        """
+        changed = {}
+        with self._lock:
+            for key in self._TOGGLES:
+                if key not in args:
+                    continue
+                new = bool(args[key])
+                attr = f"_{key}"
+                if getattr(self, attr) != new:
+                    changed[key] = new
+                setattr(self, attr, new)
+            state = ("running" if self._running and not self._paused else
+                     "paused" if self._running else "idle")
+        if changed:
+            print(f"[loco_servo] config changed while {state}: "
+                  + ", ".join(f"{k}={v}" for k, v in changed.items()), flush=True)
+        return {"ok": True, "state": state,
+                **{key: getattr(self, f"_{key}") for key in self._TOGGLES}}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -464,6 +550,11 @@ class LocoServoPlugin:
                 # Visible, always — an operator looking at a robot that only
                 # spins needs this on the same screen as the command values.
                 "rotate_only": self._rotate_only,
+                # Reported for the same reason as the other two: all three are
+                # now operator-settable at runtime, so "what is this card
+                # actually enforcing right now" must be readable from `info`
+                # rather than inferred from config.yaml.
+                "require_standing": self._require_standing,
                 "suppressed_translations": self._suppressed,
                 "applied": self._applied,
                 "holds": self._holds,
