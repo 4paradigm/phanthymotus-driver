@@ -971,7 +971,12 @@ class EventPlugin:
 
 
 class EyeCameraPlugin:
-    """Expose one physical U1 eye camera from its ROS image topic."""
+    """Expose one physical U1 eye camera from its verified ROS image topic.
+
+    The U1 SDK's ``open_stream`` service controls a separate single shared-memory
+    stream and does not select the left or right eye. The physical eye cards use
+    the vendor's ``Image6m`` DDS topics instead.
+    """
 
     def __init__(self, nodes: U1Nodes, eye: str):
         self.nodes = nodes
@@ -1035,7 +1040,13 @@ class EyeCameraPlugin:
             payload = bytes(frame.data[:frame.step * frame.height])
             jpeg = _jpeg_from_frame(payload, metadata)
             message = self.nodes.CompressedImage()
-            message.header = frame.header
+            # Image6m uses shm_msgs/Header; CompressedImage requires std_msgs/Header.
+            # Copy the fields explicitly so rclpy does not reject the vendor type.
+            from std_msgs.msg import Header
+            message.header = Header()
+            message.header.stamp.sec = int(getattr(frame.header.stamp, "sec", 0))
+            message.header.stamp.nanosec = int(getattr(frame.header.stamp, "nanosec", 0))
+            message.header.frame_id = metadata["frame_id"]
             message.format = "jpeg"
             message.data = list(jpeg)
             self._publisher.publish(message)

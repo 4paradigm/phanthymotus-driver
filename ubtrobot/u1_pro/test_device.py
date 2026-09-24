@@ -56,7 +56,12 @@ def _install_stubs():
     std = types.ModuleType("std_msgs")
     std_msg = types.ModuleType("std_msgs.msg")
     std_msg.String = type("String", (), {})
-    std_msg.Header = type("Header", (), {})
+    std_msg.Header = type("Header", (), {
+        "__init__": lambda self: (
+            setattr(self, "stamp", types.SimpleNamespace(sec=0, nanosec=0)),
+            setattr(self, "frame_id", ""),
+        )[-1]
+    })
     std_msg.UInt8 = type("UInt8", (), {})
     std.msg = std_msg
     sys.modules.update({"std_msgs": std, "std_msgs.msg": std_msg})
@@ -65,7 +70,7 @@ def _install_stubs():
     sensor_msg = types.ModuleType("sensor_msgs.msg")
     sensor_msg.CompressedImage = type("CompressedImage", (), {
         "__init__": lambda self: setattr(self, "header", types.SimpleNamespace(
-            stamp=types.SimpleNamespace(sec=0, nanosec=0)))})
+            stamp=types.SimpleNamespace(sec=0, nanosec=0), frame_id=""))})
     sensor.msg = sensor_msg
     sys.modules.update({"sensor_msgs": sensor, "sensor_msgs.msg": sensor_msg})
 
@@ -477,6 +482,50 @@ class U1CardContractTests(unittest.TestCase):
         self.assertIn("play", expression_tool["inputSchema"]["properties"]["action"]["enum"])
         with self.assertRaises(ValueError):
             expression.dispatch("play", {"name": "not-an-expression"})
+
+    def test_camera_converts_vendor_header_before_publishing(self):
+        import device
+
+        publisher = FakePublisher()
+        class Header:
+            def __init__(self):
+                self.stamp = types.SimpleNamespace(sec=0, nanosec=0)
+                self.frame_id = ""
+
+        class CompressedImage:
+            def __init__(self):
+                self.header = Header()
+                self.format = ""
+                self.data = []
+
+        nodes = types.SimpleNamespace(
+            namespace="test",
+            CompressedImage=CompressedImage,
+            Image6m=types.SimpleNamespace,
+            core=types.SimpleNamespace(create_publisher=lambda *args: publisher),
+            robot=types.SimpleNamespace(create_subscription=lambda *args: None),
+            _sensor_qos=None,
+        )
+        camera = device.EyeCameraPlugin(nodes, "left")
+        camera._publisher = publisher
+        frame = types.SimpleNamespace(
+            width=1,
+            height=1,
+            step=3,
+            encoding="rgb8",
+            header=types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=7, nanosec=8),
+                frame_id="left-camera",
+            ),
+            data=[255, 0, 0],
+        )
+        camera._on_frame(frame)
+        self.assertEqual(len(publisher.messages), 1)
+        header = publisher.messages[0].header
+        self.assertEqual(header.stamp.sec, 7)
+        self.assertEqual(header.stamp.nanosec, 8)
+        self.assertEqual(header.frame_id, "left-camera")
+        self.assertTrue(publisher.messages[0].data)
 
     def test_expression_excludes_songs_from_dynamic_action_list(self):
         import device
