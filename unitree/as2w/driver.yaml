@@ -19,4 +19,5 @@ cards:
   - { name: joint_state, type: sensor }
   - { name: battery, type: sensor }
   - { name: loco_state, type: sensor }
+  - { name: odometry, type: sensor }
   - { name: lidar_cloud, type: sensor }
