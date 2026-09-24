@@ -1190,6 +1190,8 @@ class HeadPlugin:
 
     PREFIX = "head"
     HEAD_ACTIONS = {
+        "look_down": ("A012", "低头"),
+        "look_up": ("A013", "抬头"),
         "nod": ("A014", "点头"),
     }
 

@@ -912,7 +912,7 @@ class U1CardContractTests(unittest.TestCase):
             head.audio._on_playback_state({"uuid": vendor_uuid, "phase": "result", "success": True, "state_name": "COMPLETED"})
         self.assertEqual(notify.call_args.args[0], "head-1")
         self.assertEqual(notify.call_args.args[3], "head")
-        self.assertNotIn("shake", head.get_tool()["inputSchema"]["properties"]["name"]["enum"])
+        self.assertEqual(head.get_tool()["inputSchema"]["properties"]["name"]["enum"], ["look_down", "look_up", "nod"])
 
     def test_system_switch_cards_use_documented_vendor_services(self):
         import device
