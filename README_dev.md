@@ -1868,13 +1868,140 @@ alongside whatever the driver already sends. The old shape has consumers you
 cannot see from inside the bundle, and a 10 Hz duplicate is far cheaper than a
 migration across fourteen of them.
 
+### Downsampling: average, do not pick
+
+Every vendor publishes state far faster than 10 Hz — R1 sends `rt/odommodestate`
+at about 495 Hz — so a card publishing at 10 Hz discards roughly 49 readings out
+of every 50. **Where the throttle sits decides whether they are averaged or
+aliased.** Returning early from the callback and publishing the one reading that
+survived is an unfiltered decimation: the noise averaging would have removed is
+folded into the output instead, and the consumer this format was shaped around is
+a stuck-detector reading a threshold crossing, which a noisy sample crosses when
+it should not.
+
+So read every message and publish the mean:
+
+```python
+from common.odom import mean_twist
+
+def _on_state(self, msg):
+    self._burst.append([vel[0], vel[1], None, None, None, msg.yaw_speed])
+    if time.monotonic() - self._last < 0.1:
+        return                                  # throttle the publish, not the read
+    self._last = time.monotonic()
+    burst, self._burst = self._burst, []
+    sample = build_sample(stamp_ms=…, twist=mean_twist(burst), …)
+```
+
+`mean_twist` keeps the null rule through the average: an axis is averaged over the
+readings that carry a number and stays `None` when none of them do. `sum() / len()`
+is the obvious thing to write here and it turns an unmeasured axis into a measured
+one. An empty window gives all-`None` — nothing arrived, which is not the same
+fact as a robot standing still, so report how many readings the average came from
+(R1 puts it in `vendor.samples`).
+
+Do **not** average the vendor block. A gait enum has no mean; take it from
+whichever message is current at publish time. The twist and the vendor fields then
+describe slightly different instants, which is correct for what each one is: a
+measurement to be filtered, and a label to be reported.
+
+### `stamp_ms` has two jobs, and a robot's own clock may only do one
+
+The checklist below asks for when the reading was *taken*, and a vendor message
+normally carries that. But `stamp_ms` is also what `is_fresh` subtracts from the
+**consumer's** clock. A robot whose clock is not synchronised with the host
+satisfies the first job and destroys the second: every sample reads as minutes old
+or as arriving from the future, and a consumer that trusts it stops the robot for
+blindness it does not have. Neither symptom mentions a clock.
+
+`common.odom.resolve_stamp_ms` picks between the two and records which it used:
+
+```python
+stamp_ms, provenance = resolve_stamp_ms(
+    vendor_ms=_timespec_ms(msg.stamp),        # None if the SDK has no stamp
+    received_ms=int(time.time() * 1000),
+)
+sample = build_sample(stamp_ms=stamp_ms, twist=…, vendor={**provenance, …})
+```
+
+A vendor stamp is quoted only when it is plausible as a wall clock *and* within
+`MAX_CLOCK_SKEW_MS` of ours; otherwise the arrival time is published, which is at
+least comparable. Either way `vendor.stamp_source` says which one arrived, so a
+consumer never has to guess and the fallback is not a silent approximation. It is
+deliberately **not** offset-corrected: subtracting a measured offset would let a
+skewed clock be quoted, and on a clock that drifts rather than merely sits offset
+that decays into a wrong answer which still looks principled. `stamp_skew_ms` is
+reported so the skew can be measured first.
+
+### Verifying `frame`, and why the robot cannot be its own witness
+
+`frame` is the one field a consumer cannot sanity-check — `common/odom.py` takes it
+as given and so does actucore's reader, which only checks that a sample *says*
+body. Get it wrong and `vx`/`vy` swap at any non-zero heading: plausible numbers,
+no error, nothing anywhere to notice. So it has to be measured, and measuring it on
+R1 took four walks and produced two lessons worth more than the answer.
+
+**Do not verify it against the robot's own position.** The obvious test differences
+`position` against the integral of `velocity`, with and without the heading
+rotation, and takes whichever fits. That presumes `position` is trustworthy. On
+r1_sz it is not: over a **tape-measured 3 m straight walk** `position` reported
+**0.81 m** — 73% short — with a path 2.3x its own net displacement, so it loses the
+*shape* of the trajectory and not merely the origin. Three runs came back "neither
+hypothesis explains the path", which was true and said nothing about frames.
+
+**Separate scale from rotation and the frame question survives a broken reference.**
+Fit one *complex* gain per hypothesis: the magnitude is how far the two sources
+disagree about distance, the phase is the rotation the hypothesis still needs. Only
+the phase answers the frame question, and it does not care about scale. On r1_sz the
+body hypothesis needed **+0.2°** and the world one **−144°**, decided from the same
+run whose magnitudes disagreed fourfold. Report the magnitude separately, as its own
+finding rather than as a failure.
+
+**Fix the ground truth before the robot moves.** Nothing inside the robot can say
+which of two disagreeing sources is right. Three segments, each 30 seconds, each
+isolating one quantity, all read out per-source by
+`scripts/probe_r1_odom_frame.py` (read-only — it publishes nothing):
+
+| segment | what you fix beforehand | what it settles |
+|---|---|---|
+| straight line, tape-measured | distance, and zero turn | the **scale** of `velocity` and of `position`, independently |
+| one full turn in place | 360°, and zero displacement | the scale of `wz` — needs no measuring tool |
+| closed loop back to a taped mark | net displacement is zero | the frame, and whether the integration closes |
+
+Run the straight line first; it alone tells you which source is wrong and by how
+much. Measured on r1_sz:
+
+| segment | truth | `velocity` | `position` |
+|---|---|---|---|
+| straight line | 3 m | 3.62 m (**+21%**), straightness 1.03 | 0.81 m (**−73%**), straightness 2.30 |
+| turn in place ×2 | 360° each | `wz` 362.9° / 349.1° (**±3%**) | — |
+
+**Report each manoeuvre separately, and split on the pause between them.** The
+readout first summed everything between the first and last moving sample, so
+segment B — one full turn, 35 seconds of standing still, then another full turn —
+came out as a single **−731°** against a commanded 360. That reads as an
+instrument off by a factor of two, which is exactly the kind of wrong answer this
+protocol exists to prevent; split on the pause and each turn is within 3%. Any
+protocol worth running is several manoeuvres with pauses between them, so
+aggregating across them cannot be the default.
+
+**Record the measurement where the next person will find it**, not only in a commit
+message — R1 keeps it in `health()` under `odom_measured` and `position_unusable`.
+And do not correct a 20% overread with a scalar: one measurement against an
+approximate distance is not a calibration, and a magic number makes a wrong figure
+look authoritative. State it, and check it is inside the margin that matters — 20%
+cannot push a stalled robot over navi's "below 20% of commanded" stuck threshold.
+
 ### Checklist for a new driver
 
 - [ ] `provides` lists only axes genuinely measured — not the ones the SDK has a
       field for
 - [ ] every unmeasured axis is `None` in `twist`, and no `or 0.0` anywhere near it
-- [ ] `frame` is right; if it is `world`, say so rather than relabelling it body
-- [ ] `stamp_ms` is when the reading was *taken*, not when it was published
+- [ ] `frame` is right; if it is `world`, say so rather than relabelling it body.
+      **Check it against a trajectory you know in advance** — see below
+- [ ] `stamp_ms` comes from `resolve_stamp_ms`, and its provenance is in `vendor`
+- [ ] the 10 Hz publish averages the window with `mean_twist` rather than
+      publishing one reading out of every N
 - [ ] vendor-specific fields are under `vendor`, not at the top level
 - [ ] `pose_drift` is honest; `unbounded` unless there is a correction source
 - [ ] a unit test calls `parse_interface()` on your declaration
