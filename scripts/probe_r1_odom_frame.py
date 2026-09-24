@@ -53,6 +53,7 @@ those forty seconds.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import statistics
@@ -66,7 +67,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 # rather than reporting whichever residual happened to come out smaller.
 MIN_TRAVEL_M = 0.30
 MIN_YAW_SPREAD_RAD = 0.35        # about 20 degrees of heading variation
-MIN_PAIRS = 50
+# Blocks, not sample pairs — see `analyse`. One second is long enough that the
+# robot's displacement dwarfs the jitter on its reported position, and short
+# enough that a hundred of them fit in a walk somebody is willing to perform.
+BLOCK_S = 1.0
+MIN_BLOCKS = 10
+# The winning hypothesis has to actually explain the path, not merely explain it
+# less badly than the other one. Without this, two wrong models still produce a
+# verdict as soon as one of them is 1.5x less wrong.
+MAX_RESIDUAL_FRACTION = 0.35
 
 
 def _collect(seconds: float, interface: str) -> list:
@@ -123,37 +132,59 @@ def analyse(rows: list) -> dict:
     travel = 0.0
     world_err = []
     body_err = []
-    yaws = []
-    pairs = 0
+    yaws = [row[5] for row in rows]
 
-    for (t0, x0, y0, vx0, vy0, yaw0), (t1, x1, y1, vx1, vy1, yaw1) in zip(rows, rows[1:]):
-        dt = t1 - t0
-        if dt <= 0 or dt > 0.5:
-            continue
+    # **Integrate over blocks, do not difference adjacent samples.**
+    #
+    # The obvious estimator compares each consecutive pair: `dp` against `v·dt`.
+    # It is wrong here, and the second hardware run is what showed it. R1's state
+    # updates every ~7 ms, so an adjacent pair moves about 2 mm — the same order
+    # as the jitter on the reported position. Summing the magnitude of the error
+    # over nine thousand such pairs accumulates that noise linearly, and the
+    # frame difference accumulates alongside it, so the ratio between the two
+    # hypotheses collapses towards 1: measured 1.30 on a walk of 14.34 m with a
+    # full circle of turning, which is about as informative a run as one can ask
+    # for. Residuals of 23 m and 30 m against a 14 m path were the symptom.
+    #
+    # Over a one-second block the robot moves ~0.3 m while the jitter stays at
+    # millimetres, so the same comparison carries two orders of magnitude more
+    # signal. Nothing else changes: within a block the velocity is still
+    # integrated sample by sample, with the heading applied per sample, because
+    # the heading turns during the block and that is the whole discriminator.
+    blocks = 0
+    integrals = []
+    for block in _blocks(rows, BLOCK_S):
+        (t0, x0, y0, *_), (t1, x1, y1, *_) = block[0], block[-1]
         dpx, dpy = x1 - x0, y1 - y0
         travel += math.hypot(dpx, dpy)
-        yaws.append(yaw0)
-        pairs += 1
+        blocks += 1
 
-        # Midpoint velocity, which is the right one to compare against a finite
-        # difference of position: a forward difference of position is centred
-        # half a step behind the later sample.
-        vx, vy = (vx0 + vx1) / 2.0, (vy0 + vy1) / 2.0
-        yaw = math.atan2((math.sin(yaw0) + math.sin(yaw1)) / 2.0,
-                         (math.cos(yaw0) + math.cos(yaw1)) / 2.0)
+        wx = wy = bx = by = 0.0
+        for (ta, xa, ya, vxa, vya, yawa), (tb, xb, yb, vxb, vyb, yawb) in zip(block, block[1:]):
+            dt = tb - ta
+            # Midpoint of the two samples bracketing the interval: the trapezoid
+            # rule, which is what a reported position is the integral of.
+            vx, vy = (vxa + vxb) / 2.0, (vya + vyb) / 2.0
+            wx += vx * dt
+            wy += vy * dt
+            yaw = math.atan2((math.sin(yawa) + math.sin(yawb)) / 2.0,
+                             (math.cos(yawa) + math.cos(yawb)) / 2.0)
+            # v_world = R(yaw) · v_body
+            bx += (vx * math.cos(yaw) - vy * math.sin(yaw)) * dt
+            by += (vx * math.sin(yaw) + vy * math.cos(yaw)) * dt
 
-        world_err.append(math.hypot(dpx - vx * dt, dpy - vy * dt))
-        # v_world = R(yaw) · v_body
-        bx = vx * math.cos(yaw) - vy * math.sin(yaw)
-        by = vx * math.sin(yaw) + vy * math.cos(yaw)
-        body_err.append(math.hypot(dpx - bx * dt, dpy - by * dt))
+        world_err.append(math.hypot(dpx - wx, dpy - wy))
+        body_err.append(math.hypot(dpx - bx, dpy - by))
+        integrals.append(((dpx, dpy), (wx, wy), (bx, by)))
 
-    out = {"pairs": pairs, "travel_m": travel, "repeats": repeats,
-           "world_residual_m": sum(world_err), "body_residual_m": sum(body_err)}
+    out = {"blocks": blocks, "travel_m": travel, "repeats": repeats,
+           "world_residual_m": sum(world_err), "body_residual_m": sum(body_err),
+           "scale": _fit_scales(integrals)}
 
-    if pairs < MIN_PAIRS:
+    if blocks < MIN_BLOCKS:
         out["verdict"] = "indeterminate"
-        out["why"] = f"only {pairs} usable sample pairs (need {MIN_PAIRS})"
+        out["why"] = (f"only {blocks} usable {BLOCK_S:.1f}s blocks "
+                      f"(need {MIN_BLOCKS}) — run it for longer")
         return out
     if travel < MIN_TRAVEL_M:
         out["verdict"] = "indeterminate"
@@ -178,16 +209,92 @@ def analyse(rows: list) -> dict:
     world, body = out["world_residual_m"], out["body_residual_m"]
     ratio = (max(world, body) / max(min(world, body), 1e-9))
     out["ratio"] = ratio
+    out["residual_fraction"] = min(world, body) / max(travel, 1e-9)
+
+    # Does the better hypothesis actually explain the path? Asked before the
+    # ratio, because "one model is 1.5x less wrong than the other" is a verdict
+    # only if at least one of them is right, and the interesting failure here is
+    # both being wrong — which is what it looks like if `velocity` is a filtered
+    # estimate that does not integrate to the reported `position`.
+    if out["residual_fraction"] > MAX_RESIDUAL_FRACTION:
+        out["verdict"] = "indeterminate"
+        out["why"] = (
+            f"neither hypothesis explains the path: the better of the two leaves "
+            f"{min(world, body):.1f} m of residual against {travel:.1f} m "
+            f"travelled ({out['residual_fraction'] * 100:.0f}%, "
+            f"need under {MAX_RESIDUAL_FRACTION * 100:.0f}%). `position` is not "
+            "the integral of `velocity` in either frame, so the declaration "
+            "cannot be settled this way — and that is itself a finding about "
+            "what `velocity` is.")
+        return out
+
     if ratio < 1.5:
         out["verdict"] = "indeterminate"
         out["why"] = (f"the two hypotheses fit equally well (ratio {ratio:.2f}) — "
-                      "either the run still carries too little turning, or "
-                      "`position` is not the integral of `velocity` at all, "
-                      "which would mean neither hypothesis is right and the "
-                      "declaration cannot be settled this way")
+                      "the run carries too little turning to tell them apart. "
+                      "Walk it along two clearly different directions.")
         return out
 
     out["verdict"] = "world" if world < body else "body"
+    return out
+
+
+def _fit_scales(integrals: list) -> dict:
+    """Best single scale factor relating each integral to the measured path.
+
+    Exists because "neither hypothesis explains the path" is a dead end as stated
+    and a lead as measured. If one scalar `k` makes an integral line up with the
+    reported displacement, the frame question is answered and the leftover is a
+    *magnitude* disagreement — a unit, a sample-rate assumption, or a velocity
+    that is not the derivative of the reported position. If no `k` helps, the
+    disagreement is in direction, which is a different investigation.
+
+    Least squares, so `k = Σ(dp·I) / Σ(I·I)`, with the residual reported at that
+    `k`. Reported for both hypotheses because which frame wins can change once
+    the magnitudes are commensurate — a 4x error swamps a rotation.
+    """
+    out = {}
+    for index, name in ((1, "world"), (2, "body")):
+        num = den = 0.0
+        for dp, *hypotheses in integrals:
+            ix, iy = hypotheses[index - 1]
+            num += dp[0] * ix + dp[1] * iy
+            den += ix * ix + iy * iy
+        if den <= 1e-12:
+            out[name] = {"k": None, "residual_m": None}
+            continue
+        k = num / den
+        residual = 0.0
+        for dp, *hypotheses in integrals:
+            ix, iy = hypotheses[index - 1]
+            residual += math.hypot(dp[0] - k * ix, dp[1] - k * iy)
+        out[name] = {"k": k, "residual_m": residual}
+    return out
+
+
+def _blocks(rows: list, seconds: float):
+    """Split into contiguous runs of roughly `seconds`, breaking on any gap.
+
+    A gap is a block boundary rather than something to integrate across: the
+    position moved by an unknown amount while we were not listening, and folding
+    that into a block would charge the difference to both hypotheses.
+    """
+    out = []
+    current = []
+    for row in rows:
+        if current:
+            if row[0] - current[-1][0] > 0.5:          # a gap, not an interval
+                if row[0] - current[0][0] >= seconds * 0.5 and len(current) > 1:
+                    out.append(current)
+                current = []
+            elif row[0] - current[0][0] >= seconds:
+                current.append(row)
+                out.append(current)
+                current = [row]
+                continue
+        current.append(row)
+    if len(current) > 1 and current[-1][0] - current[0][0] >= seconds * 0.5:
+        out.append(current)
     return out
 
 
@@ -233,13 +340,24 @@ def _yaw_spread(yaws: list) -> float:
 
 def report(result: dict) -> int:
     print()
-    print(f"usable sample pairs   {result['pairs']}")
-    print(f"republished readings  {result['repeats']} (dropped — a repeat is not a measurement)")
+    print(f"integration blocks    {result['blocks']} x {BLOCK_S:.1f}s")
+    print(f"republished samples   {result['repeats']} dropped (a repeat is not a measurement)")
     print(f"distance travelled    {result['travel_m']:.2f} m")
     if "yaw_spread_rad" in result:
         print(f"heading variation     {math.degrees(result['yaw_spread_rad']):.0f}°")
     print(f"residual if world     {result['world_residual_m']:.3f} m")
     print(f"residual if body      {result['body_residual_m']:.3f} m")
+    # Only once there was motion to explain. A least-squares scale against a path
+    # of two centimetres fits noise to noise, and prints a confident `k=-629.561`
+    # that means nothing — worse than silence, because it looks like a measurement.
+    if result["travel_m"] >= MIN_TRAVEL_M:
+        for name, fit in (result.get("scale") or {}).items():
+            if fit.get("k") is None:
+                continue
+            print(f"  best-fit scale {name:5s} k={fit['k']:.3f} "
+                  f"→ residual {fit['residual_m']:.3f} m"
+                  + ("   ← a scalar explains it" if fit["residual_m"]
+                     < MAX_RESIDUAL_FRACTION * result["travel_m"] else ""))
     print()
 
     verdict = result["verdict"]
@@ -271,13 +389,34 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=40.0)
     ap.add_argument("--interface", default="",
                     help="network interface for the robot's DDS; auto-detected if omitted")
+    # **Every run is saved.** Collecting one costs a person walking a robot for a
+    # minute, so the analysis must never be the reason to ask for another. Two of
+    # the three runs on r1_sz were spent rediscovering a defect in the estimator
+    # rather than measuring the robot, and each cost a walk that a saved file
+    # would have made free.
+    ap.add_argument("--save", default="/tmp/r1_odom_probe.jsonl",
+                    help="where to write the raw readings (empty string to skip)")
+    ap.add_argument("--load", default="",
+                    help="re-analyse a saved run instead of collecting; needs no robot")
     args = ap.parse_args()
+
+    if args.load:
+        with open(args.load) as handle:
+            rows = [tuple(json.loads(line)) for line in handle if line.strip()]
+        print(f"re-analysing {len(rows)} saved readings from {args.load}")
+        return report(analyse(rows))
 
     rows = _collect(args.seconds, args.interface)
     if not rows:
         print("no readings at all — the robot is not publishing rt/odommodestate, "
               "or DDS came up on the wrong interface")
         return 1
+    if args.save:
+        with open(args.save, "w") as handle:
+            for row in rows:
+                handle.write(json.dumps(list(row)) + "\n")
+        print(f"saved {len(rows)} readings to {args.save} — "
+              f"re-analyse with --load {args.save}, no robot needed")
     return report(analyse(rows))
 
 
