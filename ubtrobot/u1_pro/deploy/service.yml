@@ -1,0 +1,25 @@
+ubtrobot-u1-pro:
+  image: __IMAGE__
+  container_name: embodied-ubtrobot-u1-pro
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /opt/phanthy-motus/secrets/ubtrobot/u1_pro:/run/ubtrobot-u1-pro-auth:ro
+    # Adapter-created IPC files are live runtime state, not persistent data.
+    - /tmp/robo/ipc:/tmp/robo/ipc
+    - /dev/shm:/dev/shm
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    - U1_PRO_AUTH_FILE=/run/ubtrobot-u1-pro-auth/robo_auth.json
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

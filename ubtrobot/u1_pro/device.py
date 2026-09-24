@@ -1,0 +1,1276 @@
+"""UBTECH U1 Pro ROS 2 adapter.
+
+The cards in this module are Agent capabilities, not a mirror of every SDK
+management call. The robot's public ROS graph provides useful contracts:
+16 kHz microphone PCM, live speaker PCM input, motion playback, and audio events.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import ssl
+import threading
+import time
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any
+
+from common.vendor_runtime import action_schema, jsonable, tool
+
+
+SERVICE_TIMEOUT = 10.0
+MIC_TOPIC = "/sys/device/audio_in/raw"
+SPEAKER_TOPIC = "/sys/device/audio_out/raw"
+AUDIO_FORMAT = "audio/pcm-16k"
+MIC_SAMPLE_FORMATS = {"s16", "s16le", "s16_le", "signed_16", "pcm_s16le", "int16"}
+PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
+
+EVENT_TOPICS = {
+    "doa_event": "/audio/sense/doa_event",
+    "playback_state": PLAYBACK_TOPIC,
+}
+
+
+def _sensor_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"]}},
+        "required": ["action"],
+    }
+
+
+def _event_json(message: Any) -> str:
+    if hasattr(message, "data") and isinstance(message.data, str):
+        return message.data
+    return json.dumps(jsonable(message), ensure_ascii=False)
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return jsonable(value)
+
+
+def _event_data(event: Any) -> dict:
+    """Unwrap the SDK's JSON event envelope for internal consumers."""
+    current = _json_value(event)
+    for _ in range(4):
+        if not isinstance(current, dict) or "data" not in current:
+            break
+        nested = _json_value(current["data"])
+        if not isinstance(nested, dict):
+            break
+        current = nested
+    return current if isinstance(current, dict) else {}
+
+
+def _bounded_playback(data: dict) -> dict:
+    """Forward only the bounded playback fields needed by Agent Core."""
+    allowed = ("uuid", "request_type", "phase", "state", "state_name", "code", "success", "message")
+    result = {key: data[key] for key in allowed if key in data}
+    if isinstance(result.get("message"), str):
+        result["message"] = result["message"][:512]
+    if isinstance(result.get("uuid"), str):
+        result["uuid"] = result["uuid"][:128]
+    return result
+
+
+def _unwrap_result(value: Any) -> dict:
+    """Return the JSON object carried by a Trigger/StringCall response."""
+    if isinstance(value, dict):
+        result = value
+    else:
+        result = _decode_vendor_result(value)
+    for _ in range(4):
+        if not isinstance(result, dict):
+            return {}
+        nested = result.get("data", result.get("result"))
+        if isinstance(nested, str):
+            try:
+                nested = json.loads(nested)
+            except json.JSONDecodeError:
+                return result
+        if not isinstance(nested, dict):
+            return result
+        result = nested
+    return result
+
+
+def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
+    """Convert one SDK raw frame to JPEG using only documented metadata."""
+    if payload.startswith(b"\xff\xd8\xff"):
+        return payload
+    from PIL import Image
+
+    width = int(metadata.get("width", 0))
+    height = int(metadata.get("height", 0))
+    step = int(metadata.get("step", 0))
+    encoding = str(metadata.get("encoding", "")).lower().replace("-", "_")
+    if width <= 0 or height <= 0:
+        raise ValueError("video metadata must contain positive width and height")
+    if encoding in {"rgb8", "8uc3"}:
+        mode, rawmode, channels = "RGB", "RGB", 3
+    elif encoding == "bgr8":
+        mode, rawmode, channels = "RGB", "BGR", 3
+    elif encoding == "rgba8":
+        mode, rawmode, channels = "RGBA", "RGBA", 4
+    elif encoding == "bgra8":
+        mode, rawmode, channels = "RGBA", "BGRA", 4
+    elif encoding in {"mono8", "8uc1"}:
+        mode, rawmode, channels = "L", "L", 1
+    elif encoding in {"yuv422_yuy2", "yuy2", "yuyv", "yuv422_yuyv"}:
+        import numpy as np
+
+        row_bytes = width * 2
+        step = step or row_bytes
+        if width % 2 or step < row_bytes or len(payload) < step * height:
+            raise ValueError("U1 Pro YUY2 frame payload is smaller than metadata dimensions")
+        packed = np.frombuffer(payload, dtype=np.uint8).reshape(height, step)[:, :row_bytes]
+        yuyv = packed.reshape(height, width // 2, 4).astype(np.int32)
+        y = np.empty((height, width), dtype=np.int32)
+        y[:, 0::2], y[:, 1::2] = yuyv[:, :, 0], yuyv[:, :, 2]
+        u = np.repeat(yuyv[:, :, 1], 2, axis=1) - 128
+        v = np.repeat(yuyv[:, :, 3], 2, axis=1) - 128
+        c = np.maximum(y - 16, 0)
+        rgb = np.stack(((298 * c + 409 * v + 128) >> 8,
+                        (298 * c - 100 * u - 208 * v + 128) >> 8,
+                        (298 * c + 516 * u + 128) >> 8), axis=-1)
+        image = Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8), "RGB")
+        import io
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=85, optimize=False)
+        return output.getvalue()
+    else:
+        raise ValueError(f"unsupported U1 Pro video encoding: {encoding!r}")
+    row_bytes = width * channels
+    step = step or row_bytes
+    if step < row_bytes or len(payload) < step * height:
+        raise ValueError("U1 Pro video frame payload is smaller than metadata dimensions")
+    # Strip row padding before handing the data to Pillow. The SDK payload is
+    # a bounded raw frame, not a ROS Image message, so step is significant.
+    packed = b"".join(payload[row * step:row * step + row_bytes] for row in range(height))
+    image = Image.frombytes(mode, (width, height), packed, "raw", rawmode)
+    if mode == "RGBA":
+        image = image.convert("RGB")
+    import io
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=85, optimize=False)
+    return output.getvalue()
+
+
+def _acp_notify(action_id: str | None, status: str, result: dict, tool_name: str = "audio") -> None:
+    if not action_id:
+        return
+    base = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool_name,
+        "ts": time.time(),
+    }).encode()
+    request = urllib.request.Request(
+        f"{base}/api/acp/complete",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    context = ssl._create_unverified_context() if base.startswith("https://") else None
+    try:
+        urllib.request.urlopen(request, timeout=5, context=context).read()
+    except Exception:
+        safe_id = str(action_id).encode("unicode_escape").decode("ascii")[:128]
+        print(f"[U1 ACP] completion request failed for action_id={safe_id}", flush=True)
+
+
+def _decode_vendor_result(response: Any) -> Any:
+    """Decode robo_sdk's JSON envelope while preserving non-JSON responses."""
+    success = getattr(response, "success", None)
+    value = getattr(response, "message", None)
+    if value is None:
+        value = getattr(response, "result", response)
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            if success is False and isinstance(decoded, dict):
+                decoded.setdefault("ok", False)
+            return decoded
+        except json.JSONDecodeError:
+            if success is False:
+                return {"ok": False, "message": value}
+            return {"result": value}
+    if success is False:
+        return {"ok": False, "message": str(value)}
+    return jsonable(value)
+
+
+class U1Nodes:
+    def __init__(self, config: dict, namespace: str, ros) -> None:
+        import rclpy
+        import rclpy.executors
+        from rclpy.context import Context
+        from rclpy.node import Node
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
+        from std_msgs.msg import String
+        from audio_msgs.msg import AudioChunk, AudioInData, AudioOutData, AudioInfo
+        from audio_msgs.srv import EnableAudioIn, EnableAudioOut, SetAudioVolume
+        from std_msgs.msg import UInt8
+        from robo_sdk.srv import StringCall
+        from uworld_action_msgs.srv import PlayMotion
+        from std_srvs.srv import Trigger
+        from sensor_msgs.msg import CompressedImage
+        try:
+            from shm_msgs.msg import Image6m
+        except ImportError as exc:
+            raise RuntimeError("U1 Pro camera runtime is missing shm_msgs/Image6m") from exc
+
+        self.robot = Node("u1_pro_driver", context=ros.ctx_robot)
+        self.core = Node("u1_pro_bridge", namespace=namespace, context=ros.ctx_core)
+        self._rclpy = rclpy
+        self._audio_context = Context()
+        audio_domain_id = int(config.get("ros", {}).get("audio_device_domain_id", 2))
+        rclpy.init(context=self._audio_context, domain_id=audio_domain_id)
+        self._audio_executor = rclpy.executors.MultiThreadedExecutor(context=self._audio_context)
+        self.audio_device = Node("u1_pro_audio_device", context=self._audio_context)
+        self._audio_executor.add_node(self.audio_device)
+        self._audio_thread = threading.Thread(target=self._spin_audio_device, daemon=True,
+                                              name="u1-audio-device-ros")
+        self._audio_thread.start()
+        self._executor_robot = ros.executor_robot
+        self._executor_core = ros.executor_core
+        self._executor_robot.add_node(self.robot)
+        self._executor_core.add_node(self.core)
+        self._closed = False
+        self.config = config
+        self.namespace = namespace
+        self.mic_topic = f"/{namespace}/mic/audio"
+        self.AudioChunk = AudioChunk
+        self.AudioInData = AudioInData
+        self.EnableAudioIn = EnableAudioIn
+        self.EnableAudioOut = EnableAudioOut
+        self.AudioOutData = AudioOutData
+        self.AudioInfo = AudioInfo
+        self.UInt8 = UInt8
+        self.String = String
+        self.CompressedImage = CompressedImage
+        self.Image6m = Image6m
+        self.PlayMotion = PlayMotion
+        self._speaker_publisher = self.audio_device.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
+        self._volume = None
+        self._volume_subscription = self.audio_device.create_subscription(
+            UInt8, "/sys/device/audio_out/current_volume", self._volume_callback, 10)
+        self._speaker_subscription = None
+        self._speaker_forwarding = False
+        self._speaker_uuid = ""
+        self._speaker_frames = 0
+
+        reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self._audio_qos = best_effort
+        self._sensor_qos = best_effort
+        self._mic_publisher = self.core.create_publisher(AudioChunk, self.mic_topic, best_effort)
+        self._event_publishers = {}
+        self._event_forwarding = {}
+        self._mic_forwarding = False
+        self._mic_frames = 0
+        self._mic_frame_event = threading.Event()
+        self._mic_subscription = self.audio_device.create_subscription(
+            AudioInData, MIC_TOPIC, self._mic_callback, best_effort)
+        self._playback_listeners = []
+        self._robot_subscriptions = []
+        for name, topic in EVENT_TOPICS.items():
+            output_topic = f"/{namespace}/u1_pro/{name}"
+            self._event_publishers[name] = self.core.create_publisher(String, output_topic, reliable)
+            self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
+        self._clients = {
+            "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
+            "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
+            "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
+            "play_motion": self.robot.create_client(PlayMotion, "/action/controller/pay_motion"),
+            "play_action": self.robot.create_client(StringCall, "/action/controller/pay_motion"),
+            "play_text": self.robot.create_client(StringCall, "/robo/audio/call/play_text"),
+            "interrupt": self.robot.create_client(Trigger, "/robo/audio/call/interrupt_action_audio"),
+            "authorize": self.robot.create_client(StringCall, "/robo/auth/call/authorize"),
+            "auth_state": self.robot.create_client(Trigger, "/robo/auth/call/auth_state"),
+            "wakeup_enabled": self.robot.create_client(StringCall, "/robo/system/call/set_wakeup_enabled"),
+            "wakeup_enabled_state": self.robot.create_client(Trigger, "/robo/system/call/get_wakeup_enabled"),
+            "vision_enabled": self.robot.create_client(StringCall, "/robo/system/call/set_vision_enabled"),
+            "vision_enabled_state": self.robot.create_client(Trigger, "/robo/system/call/get_vision_enabled"),
+            "wakeup_followup": self.robot.create_client(StringCall, "/robo/system/call/set_wakeup_followup"),
+            "wakeup_followup_state": self.robot.create_client(Trigger, "/robo/system/call/get_wakeup_followup"),
+        }
+
+    def _spin_audio_device(self) -> None:
+        while self._rclpy.ok(context=self._audio_context):
+            self._audio_executor.spin_once(timeout_sec=0.1)
+
+    def initialize_robot(self) -> None:
+        """Authorize the SDK without changing vendor autonomous settings."""
+        try:
+            auth_state = self.trigger_call("auth_state")
+        except Exception:
+            auth_state = None
+        if (isinstance(auth_state, dict)
+                and auth_state.get("code") == "OK"
+                and isinstance(auth_state.get("data"), dict)
+                and auth_state["data"].get("authorized") is True):
+            print("[U1 init] vendor SDK is already authorized", flush=True)
+        else:
+            U1Nodes._authorize_from_credentials(self)
+
+
+    def _authorize_from_credentials(self) -> None:
+        env_names = {
+            "appid": "U1_PRO_APPID",
+            "api_key": "U1_PRO_API_KEY",
+            "api_secret": "U1_PRO_API_SECRET",
+            "device_id": "U1_PRO_DEVICE_ID",
+            "license": "U1_PRO_LICENSE",
+        }
+        auth_config = self.config.get("auth", {})
+        values = {
+            key: str(auth_config.get(key) or os.environ.get(env_names[key], ""))
+            for key in env_names
+        }
+        auth_file = os.environ.get("U1_PRO_AUTH_FILE") or self.config.get("auth_file")
+        if auth_file and any(not value for value in values.values()):
+            try:
+                file_path = Path(auth_file).resolve()
+                file_config = json.loads(file_path.read_text(encoding="utf-8"))
+                license_name = file_config.get("license_file")
+                license_path = (file_path.parent / license_name).resolve() if license_name else None
+                if license_path is None or file_path.parent not in license_path.parents:
+                    raise ValueError("license_file must stay next to the auth file")
+                file_values = {
+                    "appid": file_config.get("appid", ""),
+                    "api_key": file_config.get("api_key", ""),
+                    "api_secret": file_config.get("api_secret", ""),
+                    "device_id": file_config.get("device_id", ""),
+                    "license": license_path.read_text(encoding="utf-8"),
+                }
+                for key, value in file_values.items():
+                    if not values[key] and value:
+                        values[key] = str(value)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                print("[U1 init] authorization file could not be loaded", flush=True)
+        missing = [key for key, value in values.items() if not value]
+        if missing:
+            raise RuntimeError(f"U1 Pro authorization cannot start; missing fields: {', '.join(missing)}")
+        try:
+            response = self.string_call("authorize", values)
+        except Exception as exc:
+            raise RuntimeError("U1 Pro authorization request failed") from exc
+        if not (isinstance(response, dict)
+                and response.get("ok") is True
+                and response.get("code") == "OK"
+                and isinstance(response.get("data"), dict)
+                and response["data"].get("authorized") is True):
+            raise RuntimeError("U1 Pro authorization was rejected")
+        print("[U1 init] authorization request completed", flush=True)
+
+    def _event_callback(self, name: str):
+        def callback(message):
+            output = self.String()
+            output.data = _event_json(message)
+            if name == "playback_state":
+                event = _json_value(output.data)
+                for listener in tuple(self._playback_listeners):
+                    listener(event)
+            if not self._event_forwarding.get(name, False):
+                return
+            self._event_publishers[name].publish(output)
+        return callback
+
+    def _volume_callback(self, message) -> None:
+        self._volume = int(message.data)
+
+    def get_volume(self) -> dict:
+        if self._volume is None:
+            raise RuntimeError("U1 Pro speaker volume has not been published yet")
+        return {"volume": self._volume}
+
+    def _mic_callback(self, message) -> None:
+        if not self._mic_forwarding or message.sample_rate != 16000 or message.channels != 1:
+            return
+        sample_format = str(getattr(message, "sample_format", "")).strip().lower()
+        if sample_format not in MIC_SAMPLE_FORMATS:
+            return
+        chunk = self.AudioChunk()
+        chunk.header = message.header
+        chunk.format = AUDIO_FORMAT
+        chunk.data = list(message.data.data)
+        self._mic_publisher.publish(chunk)
+        self._mic_frames += 1
+        self._mic_frame_event.set()
+
+    def call(self, name: str, request) -> Any:
+        client = self._clients[name]
+        if not client.wait_for_service(timeout_sec=SERVICE_TIMEOUT):
+            raise RuntimeError(f"service unavailable: {client.srv_name}")
+        future = client.call_async(request)
+        deadline = time.monotonic() + SERVICE_TIMEOUT
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise TimeoutError(f"service timeout: {client.srv_name}")
+        return future.result()
+
+    def set_mic_enabled(self, enabled: bool) -> dict:
+        self._mic_forwarding = False
+        request = self.EnableAudioIn.Request()
+        request.header = self._audio_header()
+        request.enable = bool(enabled)
+        response = self.call("mic_enable", request)
+        code = int(getattr(response, "code", -1))
+        if code != 0:
+            raise RuntimeError(f"U1 Pro microphone enable service failed with code {code}")
+        if not enabled:
+            return {"state": "idle", "source_topic": MIC_TOPIC}
+        self._mic_frames = 0
+        self._mic_frame_event.clear()
+        self._mic_forwarding = True
+        return {"state": "running", "source_topic": MIC_TOPIC}
+
+    def wait_for_mic_frame(self, timeout: float) -> bool:
+        return self._mic_frame_event.wait(timeout)
+
+    def stop_mic_reader(self) -> None:
+        self._mic_forwarding = False
+
+    def set_event_enabled(self, name: str, enabled: bool) -> None:
+        self._event_forwarding[name] = enabled
+
+    def add_playback_listener(self, listener) -> None:
+        self._playback_listeners.append(listener)
+
+    def string_call(self, name: str, params: dict) -> dict:
+        from robo_sdk.srv import StringCall
+        request = StringCall.Request()
+        request.params = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+        return _decode_vendor_result(self.call(name, request))
+
+    def play_motion(self, motion_type: int, motion_name: str, legacy_action: str | None = None) -> dict:
+        """Play a named vendor motion through the official typed service."""
+        request = self.PlayMotion.Request()
+        request.motion_type = int(motion_type)
+        request.motion_name = str(motion_name)
+        try:
+            response = self.call("play_motion", request)
+        except (RuntimeError, TimeoutError):
+            if not legacy_action:
+                raise
+            return self.string_call("play_action", {"action": str(legacy_action)})
+        code = int(getattr(response, "code", -1))
+        message = str(getattr(response, "message", "") or "")
+        if code != 0:
+            raise RuntimeError(message or f"U1 Pro motion service failed with code {code}")
+        return {
+            "code": code,
+            "message": message,
+            "motion_type": request.motion_type,
+            "motion_name": request.motion_name,
+        }
+
+    def trigger_call(self, name: str) -> dict:
+        from std_srvs.srv import Trigger
+        response = self.call(name, Trigger.Request())
+        message = getattr(response, "message", "")
+        if isinstance(message, str) and message:
+            try:
+                return json.loads(message)
+            except json.JSONDecodeError:
+                pass
+        if isinstance(response, dict):
+            return response
+        return {"success": bool(getattr(response, "success", False)), "message": message}
+
+    def set_system_enabled(self, name: str, enabled: bool) -> dict:
+        requested = bool(enabled)
+        response = self.string_call(name, {"enabled": requested})
+        if isinstance(response, dict) and response.get("ok") is False:
+            raise RuntimeError(f"U1 Pro {name} request failed: {response.get('code', 'unknown error')}")
+        state_name = name.replace("set_", "") + "_state"
+        state = self.get_system_enabled(state_name)
+        actual = state.get("data", {}).get("enabled") if isinstance(state, dict) else None
+        if actual is not requested:
+            raise RuntimeError(f"U1 Pro {name} state mismatch: requested {requested}, got {actual!r}")
+        return {"ok": True, "requested": requested, "enabled": actual, "state": state}
+
+    def get_system_enabled(self, name: str) -> dict:
+        return self.trigger_call(name)
+
+    def set_volume(self, volume: int) -> dict:
+        from audio_msgs.srv import SetAudioVolume
+        request = SetAudioVolume.Request()
+        request.volume = max(0, min(100, int(volume)))
+        response = self.call("volume", request)
+        code = getattr(response, "code", 0)
+        if int(code) != 0:
+            raise RuntimeError(f"U1 Pro volume service failed with code {code}")
+        self._volume = request.volume
+        return jsonable(response)
+
+    def close_speaker_subscription(self) -> None:
+        self._speaker_forwarding = False
+        if self._speaker_subscription is not None:
+            self.core.destroy_subscription(self._speaker_subscription)
+            self._speaker_subscription = None
+            try:
+                request = self.EnableAudioOut.Request()
+                request.header = self._audio_header()
+                request.enable = False
+                request.info = self._audio_info()
+                request.mode = 0
+                request.gain = 0.0
+                self.call("speaker_enable", request)
+            except Exception:
+                pass
+
+    def connect_speaker(self, input_topic: str) -> dict:
+        self._speaker_forwarding = False
+        if self._speaker_subscription is not None:
+            self.core.destroy_subscription(self._speaker_subscription)
+            self._speaker_subscription = None
+        request = self.EnableAudioOut.Request()
+        request.header = self._audio_header()
+        request.enable = True
+        request.info = self._audio_info()
+        request.mode = 0
+        request.gain = 0.0
+        response = self.call("speaker_enable", request)
+        code = int(getattr(response, "code", -1))
+        if code != 0:
+            raise RuntimeError(f"U1 Pro speaker enable service failed with code {code}")
+        self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
+        self._speaker_frames = 0
+        self._speaker_subscription = self.core.create_subscription(
+            self.AudioChunk, input_topic, self._speaker_callback, self._audio_qos)
+        self._speaker_forwarding = True
+        return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
+
+    @staticmethod
+    def _audio_header():
+        from std_msgs.msg import Header
+        return Header()
+
+    def _audio_info(self):
+        info = self.AudioInfo()
+        info.uuid = self._speaker_uuid or f"u1-{uuid.uuid4().hex}"
+        info.channels = 1
+        info.sample_rate = 16000
+        info.sample_format = "S16LE"
+        return info
+
+    def _speaker_callback(self, message) -> None:
+        if not self._speaker_forwarding:
+            return
+        if getattr(message, "format", "") != AUDIO_FORMAT:
+            return
+        output = self.AudioOutData()
+        output.header = message.header
+        output.uuid = self._speaker_uuid
+        output.data.data = list(message.data)
+        self._speaker_publisher.publish(output)
+        self._speaker_frames += 1
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._mic_forwarding = False
+        self._event_forwarding.clear()
+        self.close_speaker_subscription()
+        self._audio_executor.remove_node(self.audio_device)
+        self._audio_executor.shutdown()
+        self.audio_device.destroy_node()
+        if self._rclpy.ok(context=self._audio_context):
+            self._rclpy.shutdown(context=self._audio_context)
+        self._audio_thread.join(timeout=1.0)
+        self._executor_robot.remove_node(self.robot)
+        self._executor_core.remove_node(self.core)
+        self.robot.destroy_node()
+        self.core.destroy_node()
+
+
+class MicPlugin:
+    PREFIX = "mic"
+
+    def __init__(self, nodes: U1Nodes):
+        self.nodes = nodes
+        self.running = False
+        self._enable_requested = False
+
+    def get_tool(self):
+        return tool(self.PREFIX, "sensor", "U1 Pro 麦克风阵列：输出 16 kHz 单声道 PCM 音频流，可供语音识别使用。", _sensor_schema(), topic_out=[{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}])
+
+    def start(self):
+        if self.running:
+            return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+        self._enable_requested = True
+        try:
+            self.nodes.set_mic_enabled(True)
+            if not self.nodes.wait_for_mic_frame(2.0):
+                raise TimeoutError("no PCM frames received from the U1 microphone topic")
+        except Exception as exc:
+            message = f"U1 Pro microphone unavailable: {str(exc)[:256]}"
+            try:
+                self.nodes.set_mic_enabled(False)
+            except Exception as cleanup_exc:
+                message += f"; microphone disable failed: {str(cleanup_exc)[:192]}"
+            else:
+                self._enable_requested = False
+            self.running = False
+            return {"state": "error", "message": message, "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+        else:
+            self.running = True
+            return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+
+    def stop(self):
+        if not self._enable_requested:
+            return
+        self._enable_requested = False
+        try:
+            self.nodes.set_mic_enabled(False)
+        except Exception:
+            pass
+        finally:
+            self.running = False
+
+    def dispatch(self, action, args):
+        if action not in {"start", "stop", "info"}:
+            return None
+        if action == "start":
+            return self.start()
+        elif action == "stop":
+            self.stop()
+            return {"state": "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+        return {"state": "running" if self.running else "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+
+
+class SpeakerPlugin:
+    PREFIX = "speaker"
+
+    def __init__(self, nodes: U1Nodes):
+        self.nodes = nodes
+        self.running = False
+        self.input_topic = ""
+
+    def get_tool(self):
+        actions = {
+            "start": (["input_topic"], "播放已连接的 PCM 音频流。"),
+            "set_volume": (["volume"], "设置 U1 Pro 扬声器音量，范围为 0 到 100。"),
+            "get_volume": ([], "读取 U1 Pro 当前扬声器音量。"),
+            "stop": ([], "停止播放已连接的音频流。"),
+            "info": ([], "读取扬声器连接状态。"),
+        }
+        return {"name": self.PREFIX, "type": "actuator", "multiInstance": False, "description": "U1 Pro 扬声器音频输出。连接 TTS 或其他 audio/pcm-16k 音频流后即可播放，并支持读取和设置音量。", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "已连接的 audio/pcm-16k 输入话题，通常由 Agent Core 的流连接提供。"}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
+
+    def start(self):
+        # The input topic is supplied by Agent Core when the stream is connected;
+        # there is nothing to subscribe to during bundle startup.
+        self.nodes.close_speaker_subscription()
+        self.running = False
+        self.input_topic = ""
+        return {"state": "ready"}
+
+    def stop(self):
+        self.nodes.close_speaker_subscription()
+        self.running = False
+        self.input_topic = ""
+
+    def dispatch(self, action, args):
+        if action == "start":
+            topic = str(args.get("input_topic", "")).strip()
+            if not topic:
+                return {"state": "waiting_for_input", "message": "Connect an audio/pcm-16k output stream to speaker before starting playback."}
+            self.input_topic = topic
+            result = self.nodes.connect_speaker(topic)
+            self.running = True
+            return result
+        if action == "set_volume":
+            return self.nodes.set_volume(args.get("volume", 100))
+        if action == "get_volume":
+            return self.nodes.get_volume()
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running" if self.running else "idle", "input_topic": self.input_topic,
+                    "frames_received": self.nodes._speaker_frames}
+        return None
+
+
+class AudioPlugin:
+    PREFIX = "tts"
+
+    def __init__(self, nodes: U1Nodes):
+        self.nodes = nodes
+        self.running = False
+        self._lock = threading.Lock()
+        self._active: dict | None = None
+        self.nodes.add_playback_listener(self._on_playback_state)
+
+    def get_tool(self):
+        actions = {
+            "start": ([], "启动 U1 Pro 文本转语音卡片。"),
+            "speak": (["text"], "将文本转换为语音并通过 U1 Pro 播放。",),
+            "set_volume": (["volume"], "设置 TTS 扬声器音量，范围为 0 到 100。"),
+            "get_volume": ([], "读取 TTS 扬声器音量。"),
+            "interrupt": ([], "立即打断当前 TTS 播放。"),
+            "stop": ([], "打断当前 TTS 播放。"),
+            "info": ([], "读取 TTS 就绪状态和当前播放任务。"),
+        }
+        properties = {
+            "text": {"type": "string", "minLength": 1, "description": "要播放的文本。"},
+            "volume": {"type": "integer", "minimum": 0, "maximum": 100, "description": "扬声器音量，范围为 0 到 100。"},
+            "action_id": {"type": "string", "description": "可选的调用关联 ID；未提供时自动生成 UUID。"},
+        }
+        schema = action_schema(actions, properties)
+        schema["x-completion"] = {"actions": ["speak"], "timeout": 120}
+        return tool(self.PREFIX, "actuator", "U1 Pro 文本转语音输出。提交文本即可播报；本卡不提供预设动作或原始音频播放。", schema)
+
+    def start(self):
+        self.running = True
+        return {"state": "ready"}
+
+    def stop(self):
+        with self._lock:
+            active = self._active
+            self._active = None
+        result = {"state": "idle"}
+        if active:
+            try:
+                result["interrupt"] = self.nodes.trigger_call("interrupt")
+            except Exception as exc:
+                result["interrupt_error"] = str(exc)
+            finally:
+                _acp_notify(active["action_id"], "cancelled", {"state": "cancelled", "action_id": active["action_id"]}, active["tool_name"])
+        self.running = False
+        return result
+
+    def _queue(self, kind: str, payload: dict, action_id: str, tool_name: str = "audio") -> dict:
+        with self._lock:
+            if self._active:
+                return {"state": "error", "message": "another U1 Pro audio action is active", "action_id": self._active["action_id"]}
+            vendor_uuid = str(uuid.uuid4())
+            vendor_payload = dict(payload)
+            vendor_payload["uuid"] = vendor_uuid
+            self._active = {"action_id": action_id, "vendor_uuid": vendor_uuid, "kind": kind, "tool_name": tool_name}
+        try:
+            result = self.nodes.string_call(kind, vendor_payload)
+        except Exception as exc:
+            with self._lock:
+                if self._active and self._active["action_id"] == action_id:
+                    self._active = None
+            _acp_notify(action_id, "error", {"state": "error", "message": str(exc)}, tool_name)
+            raise
+        # Some vendor services report rejection in their normal response
+        # envelope instead of raising. Do not leave the action barrier active
+        # when that happens, because no matching playback event may follow.
+        rejected = isinstance(result, dict) and (
+            result.get("ok") is False or result.get("success") is False)
+        if rejected:
+            with self._lock:
+                if self._active and self._active["action_id"] == action_id:
+                    self._active = None
+            message = str(result.get("message") or result.get("error") or "vendor rejected the request")
+            error = {"state": "error", "message": message[:512], "action_id": action_id}
+            _acp_notify(action_id, "error", error, tool_name)
+            raise RuntimeError(message)
+        return {"state": "queued", "action_id": action_id, "request": result}
+
+    def _on_playback_state(self, event: dict) -> None:
+        data = _event_data(event)
+        if data.get("phase") != "result":
+            return
+        event_uuid = data.get("uuid")
+        with self._lock:
+            active = self._active
+            if not active or not event_uuid or event_uuid != active["vendor_uuid"]:
+                return
+            self._active = None
+        state_name = str(data.get("state_name") or data.get("state") or "").upper()
+        failed = state_name == "FAILED" or data.get("success") is False
+        success = not failed and (data.get("success") is True or state_name == "COMPLETED")
+        status = "completed" if success else "error"
+        _acp_notify(active["action_id"], status, {"state": state_name.lower() or status, "action_id": active["action_id"], "playback": _bounded_playback(data)}, active["tool_name"])
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "info":
+            with self._lock:
+                active = dict(self._active) if self._active else None
+            return {"state": "ready" if self.running else "idle", "active": active}
+        if action == "set_volume":
+            return self.nodes.set_volume(args.get("volume", 100))
+        if action == "get_volume":
+            return self.nodes.get_volume()
+        if action == "speak":
+            text = str(args.get("text", "")).strip()
+            if not text:
+                raise ValueError("tts.speak requires text")
+            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
+            return self._queue("play_text", {"text": text[:4096]}, action_id, "tts")
+        if action in ("interrupt", "stop"):
+            return self.stop()
+        return None
+
+
+class EventPlugin:
+    PREFIX = "event"
+
+    def __init__(self, nodes: U1Nodes, name: str, description: str):
+        self.nodes, self.name, self.description = nodes, name, description
+        self.PREFIX = name
+        self.running = False
+
+    def get_tool(self):
+        return tool(self.name, "sensor", self.description, _sensor_schema(), topic_out=[{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}])
+
+    def start(self):
+        if self.running:
+            return {"state": "running"}
+        self.nodes.set_event_enabled(self.name, True)
+        self.running = True
+        return {"state": "running"}
+
+    def stop(self):
+        if not self.running:
+            return {"state": "idle"}
+        self.nodes.set_event_enabled(self.name, False)
+        self.running = False
+        return {"state": "idle"}
+
+    def dispatch(self, action, args):
+        if action == "start":
+            self.start()
+        elif action == "stop":
+            self.stop()
+        elif action != "info":
+            return None
+        return {"state": "running" if self.running else "idle", "topic_out": [{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}]}
+
+
+class EyeCameraPlugin:
+    """Expose one physical U1 eye camera from its verified ROS image topic.
+
+    The U1 SDK's ``open_stream`` service controls a separate single shared-memory
+    stream and does not select the left or right eye. The physical eye cards use
+    the vendor's ``Image6m`` DDS topics instead.
+    """
+
+    def __init__(self, nodes: U1Nodes, eye: str):
+        self.nodes = nodes
+        self.eye = eye
+        self.PREFIX = f"camera_{eye}"
+        self.source_topic = f"/sensor/camera/{eye}_eye/color/raw"
+        self.topic = f"/{nodes.namespace}/camera/{eye}"
+        self.running = False
+        self._publisher = None
+        self._subscription = None
+        self._frame_ready = threading.Event()
+        self._metadata = {}
+        self._frame_condition = threading.Condition()
+        self._latest_jpeg = None
+        self._frame_sequence = 0
+        self._frames = 0
+        self._last_error = ""
+
+    def get_tool(self):
+        return tool(
+            self.PREFIX, "sensor",
+            f"U1 Pro {('左' if self.eye == 'left' else '右')}眼 RGB 摄像头：以 JPEG 图像流输出物理摄像头画面。",
+            _sensor_schema(),
+            topic_out=[{"topic": self.topic, "format": "image/jpeg"}],
+        )
+
+    def start(self):
+        if self.running:
+            return self._state()
+        self._frame_ready.clear()
+        try:
+            if self._publisher is None:
+                self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
+            # The U1 Adapter publishes physical camera streams on its device
+            # domain (2), while vendor control remains on the robot domain.
+            self._subscription = self.nodes.audio_device.create_subscription(
+                self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
+            if not self._frame_ready.wait(3.0):
+                raise TimeoutError(f"no frames received from {self.source_topic}")
+            if self._last_error:
+                raise RuntimeError(self._last_error)
+            self.running = True
+            self._last_error = ""
+        except Exception as exc:
+            self._last_error = str(exc)[:256]
+            if self._subscription:
+                self.nodes.audio_device.destroy_subscription(self._subscription)
+                self._subscription = None
+            self.running = False
+            self._frame_ready.set()
+        return self._state()
+
+    def stop(self):
+        if self._subscription:
+            self.nodes.audio_device.destroy_subscription(self._subscription)
+            self._subscription = None
+        self.running = False
+        return self._state()
+
+    def _on_frame(self, frame):
+        try:
+            metadata = {"width": int(frame.width), "height": int(frame.height),
+                        "step": int(frame.step), "encoding": _message_text(frame.encoding),
+                        "frame_id": _message_text(frame.header.frame_id)}
+            payload = bytes(frame.data[:frame.step * frame.height])
+            jpeg = _jpeg_from_frame(payload, metadata)
+            message = self.nodes.CompressedImage()
+            # Image6m uses shm_msgs/Header; CompressedImage requires std_msgs/Header.
+            # Copy the fields explicitly so rclpy does not reject the vendor type.
+            from std_msgs.msg import Header
+            message.header = Header()
+            message.header.stamp.sec = int(getattr(frame.header.stamp, "sec", 0))
+            message.header.stamp.nanosec = int(getattr(frame.header.stamp, "nanosec", 0))
+            message.header.frame_id = metadata["frame_id"]
+            message.format = "jpeg"
+            message.data = list(jpeg)
+            self._publisher.publish(message)
+            self._metadata = metadata
+            with self._frame_condition:
+                self._latest_jpeg = jpeg
+                self._frame_sequence += 1
+                self._frames += 1
+                self._frame_condition.notify_all()
+            self._frame_ready.set()
+        except Exception as exc:
+            self._last_error = str(exc)[:256]
+
+    def wait_for_jpeg(self, after_sequence=None, timeout_s=5.0):
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._frame_condition:
+            baseline = self._frame_sequence if after_sequence is None else after_sequence
+            while self._latest_jpeg is None or self._frame_sequence <= baseline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None, self._frame_sequence
+                self._frame_condition.wait(timeout=remaining)
+            return self._latest_jpeg, self._frame_sequence
+
+    def frame_sequence(self):
+        with self._frame_condition:
+            return self._frame_sequence
+
+    def _state(self):
+        result = {
+            "state": "running" if self.running else ("error" if self._last_error else "idle"),
+            "topic_out": [{"topic": self.topic, "format": "image/jpeg"}],
+            "frames_published": self._frames,
+            "metadata": dict(self._metadata),
+        }
+        if self._last_error:
+            result["message"] = self._last_error
+        return result
+
+    def dispatch(self, action, args):
+        del args
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
+        if action == "info":
+            return self._state()
+        return None
+
+
+def _message_text(value):
+    value = getattr(value, "data", value)
+    if isinstance(value, (list, tuple, bytes, bytearray)):
+        return bytes(value).split(b"\0", 1)[0].decode("utf-8", "replace")
+    return str(value)
+
+
+class ExpressionPlugin:
+    """Semantic Agent card for vendor-provided face and local motions."""
+
+    PREFIX = "expression"
+    EXPRESSIONS = {
+        "blink": ("A001", "眨眼"), "raise_eyebrow": ("A002", "挑眉"),
+        "gaze": ("A003", "注视"), "close_eyes": ("A004", "闭眼"),
+        "frown": ("A005", "皱眉"), "open_mouth": ("A006", "张嘴"),
+        "smile": ("A007", "笑"), "pout": ("A008", "嘟嘴"),
+        "blow_kiss": ("A009", "飞吻"), "wake_up": ("A017", "苏醒"),
+        "shy": ("A018", "害羞"), "affectionate": ("A019", "撒娇"),
+        "angry": ("A020", "生气"), "sad": ("A021", "伤心/难过"),
+        "surprised": ("A022", "惊讶"), "happy": ("A023", "开心"),
+        "distracted": ("A024", "发呆"), "confused": ("A025", "困惑"),
+        "anxious": ("A026", "焦虑"), "contempt": ("A027", "轻蔑"),
+        "afraid": ("A028", "恐惧"), "thinking": ("A029", "思考"),
+        "got_it": ("A030", "想到了"), "sleepy": ("A031", "困"),
+        "good_night": ("A032", "睡吧"), "laugh": ("A033", "大笑"),
+        "silly_face": ("A034", "鬼脸"),
+    }
+
+    def __init__(self, audio: AudioPlugin):
+        self.audio = audio
+        self.running = False
+
+    def get_tool(self):
+        actions = {
+            "start": ([], "Prepare the U1 Pro expression action card."),
+            "play": (["name"], "Play an expression using its declared readable name."),
+            "stop": ([], "Interrupt the current U1 Pro expression or audio motion."),
+            "info": ([], "Read the expression card and active playback state."),
+        }
+        schema = action_schema(actions, {
+            "name": {"type": "string", "enum": sorted(self.EXPRESSIONS), "description": "Declared readable expression name, such as smile or blink."},
+        })
+        return tool(self.PREFIX, "actuator", "控制 U1 Pro 预设表情和轻量手势，例如微笑和眨眼；头部动作由 head 卡片提供。", schema)
+
+    def start(self):
+        self.running = True
+        return {"state": "ready"}
+
+    def stop(self):
+        self.running = False
+        return self.audio.stop()
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "play":
+            name = str(args.get("name", "")).strip().lower()
+            if name not in self.EXPRESSIONS:
+                raise ValueError("expression.play requires one of the declared expression names")
+            legacy_action, motion_name = self.EXPRESSIONS[name]
+            return self.audio.nodes.play_motion(2, motion_name, legacy_action)
+        if action == "stop":
+            return self.stop()
+        if action == "info":
+            with self.audio._lock:
+                active = dict(self.audio._active) if self.audio._active else None
+            return {"state": "ready" if self.running else "idle", "active": active}
+        return None
+
+class _SystemSwitchPlugin:
+    """Expose one documented vendor system switch as a small Agent card."""
+
+    def __init__(self, nodes: U1Nodes, prefix: str, set_name: str, get_name: str,
+                 description: str):
+        self.nodes = nodes
+        self.PREFIX = prefix
+        self.set_name = set_name
+        self.get_name = get_name
+        self.description = description
+
+    def get_tool(self):
+        actions = {
+            "start": ([], "Prepare this U1 Pro system switch card."),
+            "stop": ([], "Stop this U1 Pro system switch card without changing the robot capability setting."),
+            "enable": ([], "Enable this U1 Pro system capability."),
+            "disable": ([], "Disable this U1 Pro system capability."),
+            "status": ([], "Read the current U1 Pro system capability state."),
+        }
+        return tool(self.PREFIX, "actuator", self.description,
+                    action_schema(actions, {}))
+
+    def start(self):
+        return {"state": "ready"}
+
+    def stop(self):
+        return {"state": "idle"}
+
+    def dispatch(self, action, args):
+        del args
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
+        if action == "enable":
+            return self.nodes.set_system_enabled(self.set_name, True)
+        if action == "disable":
+            return self.nodes.set_system_enabled(self.set_name, False)
+        if action == "status":
+            return self.nodes.get_system_enabled(self.get_name)
+        return None
+
+
+class SystemControlsPlugin:
+    """Control the three independent vendor switches from one Agent card."""
+
+    PREFIX = "system_controls"
+    SWITCHES = {
+        "wakeup": ("wakeup_enabled", "wakeup_enabled_state"),
+        "wakeup_followup": ("wakeup_followup", "wakeup_followup_state"),
+        "visual_behavior": ("vision_enabled", "vision_enabled_state"),
+    }
+
+    def __init__(self, nodes: U1Nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        actions = {
+            "start": ([], "Prepare the system controls card."),
+            "stop": ([], "Stop the card without changing robot settings."),
+            "status": (["control"], "Read one or all current U1 Pro system control states."),
+            "enable": (["control"], "Enable one U1 Pro system behavior."),
+            "disable": (["control"], "Disable one U1 Pro system behavior."),
+        }
+        return tool(self.PREFIX, "actuator",
+                    "Control built-in wakeup, post-wakeup dialog, and autonomous visual behavior. "
+                    "Disabling visual behavior stops vendor visual following/idle behavior, but "
+                    "does not prevent head motions explicitly requested through expression/head cards.",
+                    action_schema(actions, {"control": {
+                        "type": "string", "enum": ["wakeup", "wakeup_followup", "visual_behavior", "all"],
+                        "description": "Which independent system behavior to control.",
+                    }}))
+
+    def start(self):
+        return {"state": "ready"}
+
+    def stop(self):
+        return {"state": "idle"}
+
+    def _read(self, control):
+        set_name, get_name = self.SWITCHES[control]
+        return self.nodes.get_system_enabled(get_name)
+
+    def dispatch(self, action, args):
+        if action not in {"start", "stop", "status", "enable", "disable"}:
+            return None
+        if action == "start":
+            return self.start()
+        if action == "stop":
+            return self.stop()
+        control = args.get("control")
+        targets = list(self.SWITCHES) if control == "all" else [control]
+        if any(item not in self.SWITCHES for item in targets):
+            raise ValueError("control must be wakeup, wakeup_followup, visual_behavior, or all")
+        if action == "status":
+            states = {item: self._read(item) for item in targets}
+            return states if control == "all" else states[control]
+        if action in {"enable", "disable"}:
+            enabled = action == "enable"
+            results = {item: self.nodes.set_system_enabled(self.SWITCHES[item][0], enabled)
+                       for item in targets}
+            return results if control == "all" else results[control]
+        return None
+
+
+class HeadPlugin:
+    """Play documented, safe preset head motions; raw joint control is unsupported."""
+
+    PREFIX = "head"
+    HEAD_ACTIONS = {
+        "look_down": ("A012", "低头"),
+        "look_up": ("A013", "抬头"),
+        "nod": ("A014", "点头"),
+        "shake": ("A011", "摇头"),
+        "tilt": ("A010", "歪头"),
+    }
+
+    def __init__(self, audio: AudioPlugin):
+        self.audio = audio
+        self.running = False
+
+    def get_tool(self):
+        actions = {
+            "start": ([], "Prepare the U1 Pro head action card."),
+            "play": (["name"], "Play a documented preset head motion by readable name."),
+            "stop": ([], "Interrupt the current head motion."),
+            "info": ([], "Read head action card state."),
+        }
+        schema = action_schema(actions, {
+            "name": {"type": "string", "enum": sorted(self.HEAD_ACTIONS),
+                     "description": "Readable head motion name."},
+        })
+        return tool(self.PREFIX, "actuator",
+                    "控制 U1 Pro 预设头部动作，不提供原始关节角度控制。",
+                    schema)
+
+    def start(self):
+        self.running = True
+        return {"state": "ready"}
+
+    def stop(self):
+        self.running = False
+        return self.audio.stop()
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return self.start()
+        if action == "play":
+            name = str(args.get("name", "")).strip().lower()
+            if name not in self.HEAD_ACTIONS:
+                raise ValueError("head.play requires one of the declared head motion names")
+            legacy_action, motion_name = self.HEAD_ACTIONS[name]
+            return self.audio.nodes.play_motion(2, motion_name, legacy_action)
+        if action == "stop":
+            return self.stop()
+        if action == "info":
+            return {"state": "ready" if self.running else "idle"}
+        return None
+
+
+class _LifecyclePlugin:
+    """Close the shared ROS nodes after all functional cards have stopped."""
+
+    PREFIX = "lifecycle"
+
+    def __init__(self, nodes: U1Nodes):
+        self.nodes = nodes
+        self.closed = False
+
+    def get_tools(self):
+        return []
+
+    def start(self):
+        if self.closed:
+            raise RuntimeError("U1 Pro lifecycle is already closed")
+
+    def stop(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.nodes.close()
+
+    def dispatch(self, action, args):
+        del action, args
+        return None
+
+
+def build_plugins(config: dict, namespace: str, ros) -> list:
+    nodes = U1Nodes(config, namespace, ros)
+    # Authenticate before DriverBundle is created or the MCP endpoint is registered.
+    try:
+        nodes.initialize_robot()
+    except Exception:
+        try:
+            nodes.close()
+        except Exception:
+            pass
+        try:
+            ros.shutdown()
+        except Exception:
+            pass
+        raise
+    # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
+    # card has disabled its vendor resources and stopped publishing.
+    audio = AudioPlugin(nodes)
+    camera_left = EyeCameraPlugin(nodes, "left")
+    camera_right = EyeCameraPlugin(nodes, "right")
+    plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
+               ExpressionPlugin(audio), HeadPlugin(audio),
+               SystemControlsPlugin(nodes),
+               camera_left, camera_right]
+    descriptions = {
+        "doa_event": "麦克风阵列声源定位事件，输出方位角和置信度。",
+    }
+    plugins.extend(EventPlugin(nodes, name, description) for name, description in descriptions.items())
+    return plugins

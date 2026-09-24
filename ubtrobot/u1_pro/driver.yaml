@@ -1,0 +1,21 @@
+id: ubtrobot-u1-pro-driver
+name: UBTECH U1 Pro Driver
+category: driver
+hardware_provider: ubtrobot
+hardware_model: "u1_pro"
+image_name: ubtrobot-u1-pro
+port: 15740
+mcp_url: "http://localhost:15740/mcp"
+description: "优必选 U1 Pro：麦克风、扬声器、TTS、表情与头部动作、左右眼摄像头、系统行为控制和声源定位"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: mic, type: sensor }
+  - { name: speaker, type: actuator }
+  - { name: tts, type: actuator }
+  - { name: expression, type: actuator }
+  - { name: head, type: actuator }
+  - { name: system_controls, type: actuator }
+  - { name: camera_left, type: sensor }
+  - { name: camera_right, type: sensor }
+  - { name: doa_event, type: sensor }

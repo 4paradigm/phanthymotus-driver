@@ -1,0 +1,8 @@
+std_msgs/Header header
+bool enable
+AudioInfo info
+uint8 mode
+float32 gain
+---
+int32 code
+string message

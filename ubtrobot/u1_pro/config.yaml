@@ -1,0 +1,11 @@
+mcp_port: 15740
+ros_namespace: ""
+ros:
+  # Vendor control, authorization, TTS, and motion services run on domain 20.
+  robot_domain_id: 20
+  # The device audio bridge in the vendor Adapter runtime runs on domain 2.
+  audio_device_domain_id: 2
+  core_domain_id: 42
+  # The Adapter's vendor graph uses localhost; device streams use domain 2.
+  robot_interface: "lo"
+  cyclonedds_uri: "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='lo'/></Interfaces><AllowMulticast>false</AllowMulticast></General><Discovery><MaxAutoParticipantIndex>200</MaxAutoParticipantIndex></Discovery><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>"
