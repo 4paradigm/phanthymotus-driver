@@ -119,6 +119,7 @@ def analyse(rows: list) -> dict:
     tests/test_probe_r1_odom_frame.py, which generates a run in each frame and
     checks this picks the right one.
     """
+    rows, repeats = _dedupe(rows)
     travel = 0.0
     world_err = []
     body_err = []
@@ -147,7 +148,7 @@ def analyse(rows: list) -> dict:
         by = vx * math.sin(yaw) + vy * math.cos(yaw)
         body_err.append(math.hypot(dpx - bx * dt, dpy - by * dt))
 
-    out = {"pairs": pairs, "travel_m": travel,
+    out = {"pairs": pairs, "travel_m": travel, "repeats": repeats,
            "world_residual_m": sum(world_err), "body_residual_m": sum(body_err)}
 
     if pairs < MIN_PAIRS:
@@ -190,6 +191,37 @@ def analyse(rows: list) -> dict:
     return out
 
 
+def _dedupe(rows: list):
+    """Drop republished readings, keeping the first of each run. Returns `(rows, dropped)`.
+
+    **R1 sends each reading about 3.7 times.** Measured on r1_sz: 4938 messages in
+    ten seconds, of which 3602 consecutive pairs carried a bit-identical position —
+    the DDS topic runs at ~490 Hz while the state behind it updates at roughly
+    130. A repeat is not a measurement, and differencing across one asks the
+    arithmetic to explain how the robot moved 0 m in 2 ms while reporting
+    0.23 m/s. Every such pair contributes pure residual to *both* hypotheses.
+
+    That is what made the first hardware run indeterminate. The robot was really
+    walking — 1.69 m of path, yaw sweeping through the ±π wrap — and the verdict
+    was still "neither hypothesis fits", with residuals of 4.15 m and 3.40 m
+    against a path of 1.69 m. Residuals larger than the path were the tell: the
+    numbers were dominated by 73% of the pairs being repeats rather than by
+    anything about a frame.
+
+    Deduplicating on the whole reading rather than on position alone, because a
+    robot that is genuinely stationary reports the same position with fresh
+    velocity noise, and those pairs are real evidence — thin, but not fabricated.
+    """
+    out = []
+    dropped = 0
+    for row in rows:
+        if out and row[1:] == out[-1][1:]:
+            dropped += 1
+            continue
+        out.append(row)
+    return out, dropped
+
+
 def _yaw_spread(yaws: list) -> float:
     """How much the heading varied, as an angle. Circular, so 359°→1° is 2°."""
     if len(yaws) < 2:
@@ -202,6 +234,7 @@ def _yaw_spread(yaws: list) -> float:
 def report(result: dict) -> int:
     print()
     print(f"usable sample pairs   {result['pairs']}")
+    print(f"republished readings  {result['repeats']} (dropped — a repeat is not a measurement)")
     print(f"distance travelled    {result['travel_m']:.2f} m")
     if "yaw_spread_rad" in result:
         print(f"heading variation     {math.degrees(result['yaw_spread_rad']):.0f}°")
