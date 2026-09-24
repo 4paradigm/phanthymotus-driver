@@ -354,6 +354,10 @@ class U1Nodes:
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
         from sensor_msgs.msg import CompressedImage
+        try:
+            from shm_msgs.msg import Image6m
+        except ImportError as exc:
+            raise RuntimeError("U1 Pro camera runtime is missing shm_msgs/Image6m") from exc
 
         self.robot = Node("u1_pro_driver", context=ros.ctx_robot)
         self.core = Node("u1_pro_bridge", namespace=namespace, context=ros.ctx_core)
@@ -384,6 +388,7 @@ class U1Nodes:
         self.UInt8 = UInt8
         self.String = String
         self.CompressedImage = CompressedImage
+        self.Image6m = Image6m
         self._speaker_publisher = self.audio_device.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
         self._volume = None
         self._volume_subscription = self.audio_device.create_subscription(
@@ -976,18 +981,18 @@ class EventPlugin:
         return {"state": "running" if self.running else "idle", "topic_out": [{"topic": f"/{self.nodes.namespace}/u1_pro/{self.name}", "format": "data/json"}]}
 
 
-class CameraRgbPlugin:
-    """Expose the SDK video shared-memory stream as Agent Core JPEG frames."""
+class EyeCameraPlugin:
+    """Expose one physical U1 eye camera from its ROS image topic."""
 
-    PREFIX = "camera_rgb"
-
-    def __init__(self, nodes: U1Nodes, config: dict):
+    def __init__(self, nodes: U1Nodes, eye: str):
         self.nodes = nodes
-        self.config = config
-        self.topic = f"/{nodes.namespace}/camera/rgb"
+        self.eye = eye
+        self.PREFIX = f"camera_{eye}"
+        self.source_topic = f"/sensor/camera/{eye}_eye/color/raw"
+        self.topic = f"/{nodes.namespace}/camera/{eye}"
         self.running = False
         self._publisher = None
-        self._reader = None
+        self._subscription = None
         self._frame_ready = threading.Event()
         self._metadata = {}
         self._frame_condition = threading.Condition()
@@ -999,7 +1004,7 @@ class CameraRgbPlugin:
     def get_tool(self):
         return tool(
             self.PREFIX, "sensor",
-            "U1 Pro RGB camera stream. Starts the documented vendor video stream, reads its shared-memory raw frames, and publishes JPEG images on the Agent Core camera topic.",
+            f"U1 Pro {self.eye} eye RGB camera. Publishes the physical {self.eye} camera as JPEG images.",
             _sensor_schema(),
             topic_out=[{"topic": self.topic, "format": "image/jpeg"}],
         )
@@ -1011,55 +1016,37 @@ class CameraRgbPlugin:
         try:
             if self._publisher is None:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
-            response = self.nodes.open_video()
-            stream = dict(response.get("stream") or {})
-            if str(stream.get("state", "OPEN")).upper() == "CLOSED":
-                raise RuntimeError("U1 Pro video stream remained closed after open_stream")
-            self._metadata = self.nodes.video_metadata()
-            reader_config = {**stream, **dict(self.config.get("video", {}))}
-            reader_config.setdefault("path", stream.get("path"))
-            reader_config.setdefault("frame_payload_size", stream.get("frame_payload_size"))
-            reader_config.setdefault("max_frames", stream.get("max_frames"))
-            missing = [key for key in ("path", "frame_payload_size", "max_frames") if not reader_config.get(key)]
-            if missing:
-                raise RuntimeError("U1 Pro video stream response is missing: " + ", ".join(missing))
-            self._reader = VideoSharedMemoryReader(reader_config, self.nodes.video_metadata, self._publish_frame)
-            self._reader.start()
+            self._subscription = self.nodes.robot.create_subscription(
+                self.nodes.Image6m, self.source_topic, self._on_frame, 10)
             if not self._frame_ready.wait(3.0):
-                raise TimeoutError("U1 Pro camera stream opened but no frames arrived")
+                raise TimeoutError(f"no frames received from {self.source_topic}")
             self.running = True
             self._last_error = ""
         except Exception as exc:
             self._last_error = str(exc)[:256]
-            if self._reader:
-                self._reader.stop()
-                self._reader = None
+            if self._subscription:
+                self.nodes.robot.destroy_subscription(self._subscription)
+                self._subscription = None
             self.running = False
             self._frame_ready.set()
-            try:
-                self.nodes.close_video()
-            except Exception:
-                pass
         return self._state()
 
     def stop(self):
-        if self._reader:
-            self._reader.stop()
-            self._reader = None
-        if self.running or self._last_error:
-            try:
-                self.nodes.close_video()
-            except Exception as exc:
-                self._last_error = str(exc)[:256]
+        if self._subscription:
+            self.nodes.robot.destroy_subscription(self._subscription)
+            self._subscription = None
         self.running = False
         return self._state()
 
-    def _publish_frame(self, payload: bytes, metadata: dict, timestamp_ns: int):
+    def _on_frame(self, frame):
         try:
+            metadata = {"width": int(frame.width), "height": int(frame.height),
+                        "step": int(frame.step), "encoding": _message_text(frame.encoding),
+                        "frame_id": _message_text(frame.header.frame_id)}
+            payload = bytes(frame.data[:frame.step * frame.height])
             jpeg = _jpeg_from_frame(payload, metadata)
             message = self.nodes.CompressedImage()
-            message.header.stamp.sec = int(timestamp_ns // 1_000_000_000)
-            message.header.stamp.nanosec = int(timestamp_ns % 1_000_000_000)
+            message.header = frame.header
             message.format = "jpeg"
             message.data = list(jpeg)
             self._publisher.publish(message)
@@ -1110,12 +1097,19 @@ class CameraRgbPlugin:
         return None
 
 
+def _message_text(value):
+    value = getattr(value, "data", value)
+    if isinstance(value, (list, tuple, bytes, bytearray)):
+        return bytes(value).split(b"\0", 1)[0].decode("utf-8", "replace")
+    return str(value)
+
+
 class VisionCapturePlugin:
     """Save fresh U1 JPEG frames and encode them as MP4 for Agent Core."""
 
     PREFIX = "vision_capture"
 
-    def __init__(self, camera: CameraRgbPlugin, config: dict):
+    def __init__(self, camera: EyeCameraPlugin, config: dict):
         self.camera = camera
         self.config = dict(config or {})
         self.output_dir = os.path.abspath(str(self.config.get(
@@ -1150,7 +1144,7 @@ class VisionCapturePlugin:
         schema["x-completion"] = {"actions": ["record_video"], "timeout": int(self.max_seconds + 15)}
         return tool(
             self.PREFIX, "actuator",
-            "U1 Pro RGB photo and video capture. Reuses camera_rgb, saves media under the configured shared data directory, and returns a channel-visible path.",
+            "U1 Pro RGB photo and video capture using the left-eye camera, saves media under the configured shared data directory, and returns a channel-visible path.",
             schema,
         )
 
@@ -1664,7 +1658,8 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
     # card has disabled its vendor resources and stopped publishing.
     audio = AudioPlugin(nodes)
-    camera = CameraRgbPlugin(nodes, config)
+    camera_left = EyeCameraPlugin(nodes, "left")
+    camera_right = EyeCameraPlugin(nodes, "right")
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
                ExpressionPlugin(audio), HeadPlugin(audio),
                _SystemSwitchPlugin(nodes, "wakeup_control", "wakeup_enabled", "wakeup_enabled_state",
@@ -1672,8 +1667,8 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
                WakeupFollowupPlugin(nodes),
                _SystemSwitchPlugin(nodes, "visual_follow_control", "vision_enabled", "vision_enabled_state",
                                     "Enable or disable U1 Pro visual behavior, including visual following."),
-               camera,
-               VisionCapturePlugin(camera, config.get("vision_capture", {}))]
+               camera_left, camera_right,
+               VisionCapturePlugin(camera_left, config.get("vision_capture", {}))]
     descriptions = {
         "doa_event": "Microphone-array sound direction with azimuth and confidence.",
     }

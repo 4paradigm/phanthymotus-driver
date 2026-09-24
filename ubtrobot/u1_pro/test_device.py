@@ -69,6 +69,12 @@ def _install_stubs():
     sensor.msg = sensor_msg
     sys.modules.update({"sensor_msgs": sensor, "sensor_msgs.msg": sensor_msg})
 
+    shm = types.ModuleType("shm_msgs")
+    shm_msg = types.ModuleType("shm_msgs.msg")
+    shm_msg.Image6m = type("Image6m", (), {})
+    shm.msg = shm_msg
+    sys.modules.update({"shm_msgs": shm, "shm_msgs.msg": shm_msg})
+
     def message(name):
         return type(name, (), {"__init__": lambda self: None})
 
@@ -279,7 +285,7 @@ class U1CardContractTests(unittest.TestCase):
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
             "lifecycle", "mic", "speaker", "tts", "expression", "head", "wakeup_control", "wakeup_followup_control", "visual_follow_control",
-            "camera_rgb", "vision_capture", "doa_event",
+            "camera_left", "camera_right", "vision_capture", "doa_event",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
         for plugin in plugins:
@@ -462,10 +468,11 @@ class U1CardContractTests(unittest.TestCase):
 
         nodes = FakeNodes()
         audio = device.AudioPlugin(nodes)
-        camera = device.CameraRgbPlugin(nodes, {})
+        camera = device.EyeCameraPlugin(nodes, "left")
         camera_tool = camera.get_tool()
-        self.assertEqual(camera_tool["name"], "camera_rgb")
-        self.assertEqual(camera_tool["topic_out"], [{"topic": "/test/camera/rgb", "format": "image/jpeg"}])
+        self.assertEqual(camera_tool["name"], "camera_left")
+        self.assertEqual(camera_tool["topic_out"], [{"topic": "/test/camera/left", "format": "image/jpeg"}])
+        self.assertEqual(camera.source_topic, "/sensor/camera/left_eye/color/raw")
         expression = device.ExpressionPlugin(audio)
         expression_tool = expression.get_tool()
         self.assertEqual(expression_tool["name"], "expression")

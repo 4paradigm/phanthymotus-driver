@@ -10,8 +10,8 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 - `wakeup_control`: enables, disables, or queries the vendor's built-in wakeup and voice-interaction entry point. This is the documented `wakeup_enabled` switch, not a process/container lifecycle control.
 - `visual_follow_control`: controls the documented visual system switch. Disabling it stops visual decisions, visual following, and visual idle actions, so it is the supported way to turn off built-in person-follow behavior.
 - `head`: plays documented preset head motions (`nod`, `shake`, `tilt`, `look_up`, and `look_down`) by readable name. The SDK does not expose arbitrary head angles or low-level neck-joint control.
-- `camera_rgb`: the documented U1 video stream. It opens the vendor stream, reads the section 4.5 shared-memory ring, and publishes `/namespace/camera/rgb` as `image/jpeg`.
-- `vision_capture`: photo/video capture built on the `camera_rgb` JPEG cache. It supports `capture_image`, timed `record_video`, continuous `start_recording`/`stop_recording`, `list`, `delete`, and `info`.
+- `camera_left` and `camera_right`: the physical left- and right-eye RGB cameras exposed by the U1 perception runtime, published as separate JPEG topics.
+- `vision_capture`: photo/video capture built on the left-eye JPEG cache. It supports `capture_image`, timed `record_video`, continuous `start_recording`/`stop_recording`, `list`, `delete`, and `info`.
 - `doa_event`: an opt-in JSON sound-direction event stream.
 
 Before exposing or registering any Agent Core cards, the driver authorizes the

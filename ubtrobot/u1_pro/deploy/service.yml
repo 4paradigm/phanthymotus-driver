@@ -11,6 +11,7 @@ ubtrobot-u1-pro:
     # Adapter-created IPC files are live runtime state, not persistent data.
     - /tmp/robo/ipc:/tmp/robo/ipc
     - /dev/shm:/dev/shm
+    - /opt/rosa/shm_msgs:/opt/rosa/shm_msgs:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

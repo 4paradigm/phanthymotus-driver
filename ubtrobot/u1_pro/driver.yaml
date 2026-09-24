@@ -17,6 +17,7 @@ cards:
   - { name: head, type: actuator }
   - { name: wakeup_control, type: actuator }
   - { name: visual_follow_control, type: actuator }
-  - { name: camera_rgb, type: sensor }
+  - { name: camera_left, type: sensor }
+  - { name: camera_right, type: sensor }
   - { name: vision_capture, type: actuator }
   - { name: doa_event, type: sensor }
