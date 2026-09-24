@@ -30,6 +30,8 @@ plugins:
       left:  {board_ip: "192.168.123.14", image_port: 9203, depth_port: 9103, pcl_port: 9403}
       right: {board_ip: "192.168.123.14", image_port: 9204, depth_port: 9104, pcl_port: 9404}
       belly: {board_ip: "192.168.123.15", image_port: 9205, depth_port: 9105, pcl_port: 9405}
+  camera_snapshot:
+    enabled: true
   camera_depth:
     enabled: true               # Nano 端 depth_stream 服务已由 nano_bootstrap 部署(DEPTH_ENABLE=1),真机 9101 已验证出流
     default_position: "front"

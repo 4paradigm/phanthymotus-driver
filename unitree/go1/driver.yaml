@@ -6,7 +6,7 @@ hardware_model: "go1"
 image_name: go1
 port: 15715
 mcp_url: "http://localhost:15715/mcp"
-description: "Unitree Go1 — 状态感知 + 运动控制 + 步态/姿态 + 表演动作 + 五机位 RGB/深度/点云视觉 + 蜂鸣/扬声器"
+description: "Unitree Go1 — 状态感知 + 运动控制 + 步态/姿态 + 表演动作 + 五机位 RGB/深度/点云视觉与抓拍 + 蜂鸣/扬声器"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -28,6 +28,7 @@ cards:
   - { name: battery,            type: sensor }
   - { name: face_light,         type: actuator }
   - { name: camera_rgb,         type: sensor }
+  - { name: camera_snapshot,    type: actuator }
   - { name: camera_depth,       type: sensor }
   - { name: camera_pointcloud,  type: sensor }
   - { name: imu,                type: sensor }

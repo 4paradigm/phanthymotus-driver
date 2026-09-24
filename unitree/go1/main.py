@@ -185,8 +185,16 @@ class Go1Bundle:
         # 相机 - 三张独立卡仍由同一个 camera.py 聚合文件提供。
         if pc.get("camera_rgb", {}).get("enabled", False):
             import camera
-            self._plugins.append(camera.make_camera_rgb(pc["camera_rgb"], namespace, executor, client))
+            camera_rgb = camera.make_camera_rgb(pc["camera_rgb"], namespace, executor, client)
+            self._plugins.append(camera_rgb)
             print("[bundle] camera_rgb loaded")
+        else:
+            camera_rgb = None
+
+        if pc.get("camera_snapshot", {}).get("enabled", False):
+            from camera_snapshot import CameraSnapshotPlugin
+            self._plugins.append(CameraSnapshotPlugin(pc["camera_snapshot"], camera_rgb))
+            print("[bundle] camera_snapshot loaded")
 
         if pc.get("camera_depth", {}).get("enabled", False):
             import camera
