@@ -265,3 +265,105 @@ def is_fresh(sample: dict, now_ms: int, max_age_ms: int) -> bool:
     if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
         return False
     return 0 <= (now_ms - stamp) <= max_age_ms
+
+
+# ── producing a sample from a high-rate vendor topic ─────────────────────────
+#
+# Every driver adopting this format faces the same two problems, because every
+# vendor publishes its state far faster than 10 Hz and stamps it with its own
+# clock. Both are solved here rather than in each bundle: the mistakes are
+# identical in all of them, and both are silent.
+
+
+def mean_twist(readings) -> list:
+    """Average a burst of twist readings into one, per axis.
+
+    **Downsample by averaging, not by picking.** A vendor publishing at 495 Hz
+    and a card publishing at 10 Hz means 49 readings are discarded per sample,
+    and taking the first one of each window is an unfiltered decimation — the
+    noise that averaging would have removed is aliased into the output instead.
+    That matters for exactly the consumer this format was shaped around: a
+    stuck-detector comparing a commanded speed against a measured one is reading
+    a threshold crossing, and a noisy sample crosses thresholds it should not.
+
+    **`None` survives.** An axis is averaged over the readings that carry a
+    number, and stays `None` when none of them do — never 0.0, which is the one
+    rule this whole module exists to protect. An axis the robot reports
+    intermittently (Go1-shaped partial knowledge) averages over what arrived,
+    because the alternative is discarding the only measurements there are.
+
+    An empty burst gives all-`None`: nothing arrived, so nothing is known. That
+    is the honest answer and not the same as a robot standing still.
+    """
+    totals = [0.0] * len(AXES)
+    counts = [0] * len(AXES)
+    for reading in readings or ():
+        values = list(reading or ())
+        for index in range(min(len(values), len(AXES))):
+            value = values[index]
+            if value is None or isinstance(value, bool):
+                continue
+            if not isinstance(value, (int, float)):
+                continue
+            totals[index] += float(value)
+            counts[index] += 1
+    return [totals[i] / counts[i] if counts[i] else None
+            for i in range(len(AXES))]
+
+
+# How far a robot's own clock may sit from ours before we stop quoting it. Two
+# seconds is far wider than any transport delay and far narrower than the offset
+# an unsynchronised clock shows, so it separates the two cases without needing
+# to know which robot this is.
+MAX_CLOCK_SKEW_MS = 2000
+
+
+def resolve_stamp_ms(*, vendor_ms, received_ms, max_skew_ms=MAX_CLOCK_SKEW_MS):
+    """Pick the timestamp to publish, and say where it came from.
+
+    Returns `(stamp_ms, provenance)`; put the provenance straight into the
+    sample's `vendor` block.
+
+    The spec asks for **when the reading was taken**, and a vendor message
+    normally carries that, so quote it. But `stamp_ms` has a second job the spec
+    does not spell out: `is_fresh` subtracts it from the *consumer's* clock. A
+    robot whose clock is not synchronised with ours satisfies the first job and
+    destroys the second — every sample reads as minutes old, or as arriving from
+    the future, and a consumer that trusts it stops the robot for blindness it
+    does not have. Neither failure says anything about a clock.
+
+    So a vendor stamp is used only when it is plausible as a wall clock *and*
+    close to ours; otherwise the arrival time is published, which is at least
+    comparable, and the reason is recorded where a reader will find it. Falling
+    back is not a silent approximation — `stamp_source` distinguishes the two,
+    and nothing downstream has to guess which it got.
+
+    Deliberately **not** offset-corrected. Subtracting a measured offset would
+    let a skewed clock be quoted, and on a robot whose clock drifts rather than
+    merely sits offset it would decay into a wrong answer that still looks
+    principled. Measure the skew first — `stamp_skew_ms` is reported for that
+    purpose — and add correction only if it turns out to be constant.
+    """
+    received = int(received_ms)
+    # NaN and infinity are in this list because a vendor SDK deserialising a
+    # float field can produce them, and `int(nan)` raises — a driver's odometry
+    # would then stop on a bad reading rather than publish a fallback.
+    if (vendor_ms is None or isinstance(vendor_ms, bool)
+            or not isinstance(vendor_ms, (int, float))
+            or vendor_ms != vendor_ms or vendor_ms in (float("inf"), float("-inf"))):
+        return received, {"stamp_source": "received",
+                          "stamp_reason": "vendor message carried no usable stamp"}
+    vendor = int(vendor_ms)
+    # A boot-relative clock (seconds since power-on) lands here: a small number
+    # that is a perfectly good relative time and a nonsensical absolute one.
+    if vendor < 1_000_000_000_000:
+        return received, {"stamp_source": "received",
+                          "stamp_reason": "vendor stamp is not a wall clock "
+                                          f"({vendor} ms)",
+                          "stamp_skew_ms": received - vendor}
+    skew = received - vendor
+    if abs(skew) > int(max_skew_ms):
+        return received, {"stamp_source": "received",
+                          "stamp_reason": f"vendor clock is {skew} ms off ours",
+                          "stamp_skew_ms": skew}
+    return vendor, {"stamp_source": "robot", "stamp_skew_ms": skew}

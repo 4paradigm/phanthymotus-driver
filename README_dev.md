@@ -1868,13 +1868,86 @@ alongside whatever the driver already sends. The old shape has consumers you
 cannot see from inside the bundle, and a 10 Hz duplicate is far cheaper than a
 migration across fourteen of them.
 
+### Downsampling: average, do not pick
+
+Every vendor publishes state far faster than 10 Hz — R1 sends `rt/odommodestate`
+at about 495 Hz — so a card publishing at 10 Hz discards roughly 49 readings out
+of every 50. **Where the throttle sits decides whether they are averaged or
+aliased.** Returning early from the callback and publishing the one reading that
+survived is an unfiltered decimation: the noise averaging would have removed is
+folded into the output instead, and the consumer this format was shaped around is
+a stuck-detector reading a threshold crossing, which a noisy sample crosses when
+it should not.
+
+So read every message and publish the mean:
+
+```python
+from common.odom import mean_twist
+
+def _on_state(self, msg):
+    self._burst.append([vel[0], vel[1], None, None, None, msg.yaw_speed])
+    if time.monotonic() - self._last < 0.1:
+        return                                  # throttle the publish, not the read
+    self._last = time.monotonic()
+    burst, self._burst = self._burst, []
+    sample = build_sample(stamp_ms=…, twist=mean_twist(burst), …)
+```
+
+`mean_twist` keeps the null rule through the average: an axis is averaged over the
+readings that carry a number and stays `None` when none of them do. `sum() / len()`
+is the obvious thing to write here and it turns an unmeasured axis into a measured
+one. An empty window gives all-`None` — nothing arrived, which is not the same
+fact as a robot standing still, so report how many readings the average came from
+(R1 puts it in `vendor.samples`).
+
+Do **not** average the vendor block. A gait enum has no mean; take it from
+whichever message is current at publish time. The twist and the vendor fields then
+describe slightly different instants, which is correct for what each one is: a
+measurement to be filtered, and a label to be reported.
+
+### `stamp_ms` has two jobs, and a robot's own clock may only do one
+
+The checklist below asks for when the reading was *taken*, and a vendor message
+normally carries that. But `stamp_ms` is also what `is_fresh` subtracts from the
+**consumer's** clock. A robot whose clock is not synchronised with the host
+satisfies the first job and destroys the second: every sample reads as minutes old
+or as arriving from the future, and a consumer that trusts it stops the robot for
+blindness it does not have. Neither symptom mentions a clock.
+
+`common.odom.resolve_stamp_ms` picks between the two and records which it used:
+
+```python
+stamp_ms, provenance = resolve_stamp_ms(
+    vendor_ms=_timespec_ms(msg.stamp),        # None if the SDK has no stamp
+    received_ms=int(time.time() * 1000),
+)
+sample = build_sample(stamp_ms=stamp_ms, twist=…, vendor={**provenance, …})
+```
+
+A vendor stamp is quoted only when it is plausible as a wall clock *and* within
+`MAX_CLOCK_SKEW_MS` of ours; otherwise the arrival time is published, which is at
+least comparable. Either way `vendor.stamp_source` says which one arrived, so a
+consumer never has to guess and the fallback is not a silent approximation. It is
+deliberately **not** offset-corrected: subtracting a measured offset would let a
+skewed clock be quoted, and on a clock that drifts rather than merely sits offset
+that decays into a wrong answer which still looks principled. `stamp_skew_ms` is
+reported so the skew can be measured first.
+
 ### Checklist for a new driver
 
 - [ ] `provides` lists only axes genuinely measured — not the ones the SDK has a
       field for
 - [ ] every unmeasured axis is `None` in `twist`, and no `or 0.0` anywhere near it
-- [ ] `frame` is right; if it is `world`, say so rather than relabelling it body
-- [ ] `stamp_ms` is when the reading was *taken*, not when it was published
+- [ ] `frame` is right; if it is `world`, say so rather than relabelling it body.
+      **Check it, do not infer it from the topic's name** — a topic called
+      `odommodestate` carrying a world-frame `position` is not evidence about the
+      frame of the `velocity` beside it, in either direction. R1's is settled by
+      `scripts/probe_r1_odom_frame.py`, which differences `position` against the
+      integral of `velocity` with and without the heading rotation; the same
+      method works for any driver reporting both
+- [ ] `stamp_ms` comes from `resolve_stamp_ms`, and its provenance is in `vendor`
+- [ ] the 10 Hz publish averages the window with `mean_twist` rather than
+      publishing one reading out of every N
 - [ ] vendor-specific fields are under `vendor`, not at the top level
 - [ ] `pose_drift` is honest; `unbounded` unless there is a correction source
 - [ ] a unit test calls `parse_interface()` on your declaration
