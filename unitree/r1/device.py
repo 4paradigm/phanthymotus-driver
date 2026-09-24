@@ -942,6 +942,23 @@ class LedPlugin:
 
 # ── LocoStatePlugin (sensor) ─────────────────────────────────────────────────
 
+def _timespec_ms(stamp):
+    """`unitree_go.msg.dds_.TimeSpec_` as epoch milliseconds, or None.
+
+    Returns None rather than 0 for anything unreadable, so that
+    `resolve_stamp_ms` sees "no stamp" instead of "1970" — the two produce the
+    same fallback but only one of them says why in the sample.
+    """
+    try:
+        sec = int(stamp.sec)
+        nanosec = int(stamp.nanosec)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if sec <= 0 and nanosec <= 0:
+        return None
+    return sec * 1000 + nanosec // 1_000_000
+
+
 class _LocoStateNode(Node):
     """Subscribes to DDS rt/odommodestate (IMUState_) and republishes as JSON to ROS2."""
 
@@ -963,6 +980,14 @@ class _LocoStateNode(Node):
         self._subscribed = False
         self._subscribe_error = ""
         self._odom_topic_name = odom_topic
+        # Every reading received since the last publish, as twist rows. The
+        # robot sends at ~495 Hz and this card publishes at 10, so the window
+        # holds about fifty of them; they are averaged rather than thrown away.
+        # Touched only on the DDS callback thread.
+        self._burst: list = []
+        self._burst_size = 0
+        self._stamp_ms = 0
+        self._stamp_provenance: dict = {}
 
         # Deferred until the DDS link is up, instead of attempted once in the
         # constructor. The old version caught the failure, logged one warning,
@@ -1001,7 +1026,30 @@ class _LocoStateNode(Node):
         nothing anywhere distinguished the two states.
         """
         out = {"subscribed": self._subscribed, "samples": self._samples,
-               "dds": self._link.status() if self._link else None}
+               "dds": self._link.status() if self._link else None,
+               # Raw readings behind the last published average. Around 50 on a
+               # healthy link; 1 means the robot is publishing at our own rate
+               # and there is nothing to average; 0 means nothing arrived in the
+               # window and every axis of that sample was `null`.
+               "odom_burst_samples": self._burst_size,
+               **self._stamp_provenance,
+               # **Not verified on hardware.** `motus.odom/1` is declared body
+               # frame, which is what the format is for, but the numbers come off
+               # `rt/odommodestate`, whose `position` is odometry-frame — and a
+               # velocity in the same message is unlikely to be in a different
+               # frame from the position beside it. If it is world frame, then
+               # `vx`/`vy` swap whenever the robot is not facing along world x,
+               # which is precisely the failure rule 3 of the format exists to
+               # prevent, and it produces plausible numbers rather than an error.
+               #
+               # Resolve it with `scripts/probe_r1_odom_frame.py` (read-only) and
+               # then delete this key. Until then a reader gets the warning
+               # instead of a silent guess.
+               "frame_unverified": (
+                   "frame=body 未在真机验证：rt/odommodestate 的 position 是里程计"
+                   "(世界)系，同一条消息里的 velocity 可能也是。若是，则航向非零时"
+                   "vx/vy 会互换，卡死检测与自运动补偿同时给出貌似合理的错数。"
+                   "用 scripts/probe_r1_odom_frame.py 判定后删掉这一条。")}
         if self._subscribe_error:
             out["error"] = self._subscribe_error
         if self._subscribed and self._samples == 0:
@@ -1010,7 +1058,18 @@ class _LocoStateNode(Node):
         return out
 
     def _on_odom(self, msg) -> None:
+        """Every reading is measured; one in fifty is published.
+
+        The throttle used to return here, before anything was read off the
+        message, so forty-nine readings out of fifty were discarded unseen and
+        the fiftieth was published raw. Now the cheap part — six scalars and a
+        timestamp — runs on every reading and the expensive part (the dict, the
+        JSON, the two publishes) still runs at 10 Hz. See `common.odom.mean_twist`
+        for why decimating a 495 Hz signal to 10 Hz without averaging is not a
+        neutral choice.
+        """
         now = time.monotonic()
+        self._accumulate(msg)
         if now - self._last_odom_time < self._ODOM_INTERVAL:
             return
         self._last_odom_time = now
@@ -1043,35 +1102,86 @@ class _LocoStateNode(Node):
         self._odom_pub.publish(out)
         self._publish_motion(state)
 
-    def _publish_motion(self, state: dict) -> None:
-        """The same reading as motus.odom/1.
+    def _accumulate(self, msg) -> None:
+        """Read one vendor message into the averaging window. ~495 Hz — stay cheap.
 
-        `vz`, `wx` and `wy` are `None`, not zero: R1's SportModeState reports a
-        three-component `velocity` whose third entry has no documented meaning
-        (Go1's driver names the same field `velocity_index_2_raw`, which says it
-        plainly), and reports no roll or pitch rate at all. Reporting zero for
-        those would tell a consumer this robot measured no vertical motion, which
-        is a different claim from the true one — and the one that makes a
-        stuck-detector fire on a robot that simply cannot answer.
+        Only the six twist axes and the timestamp are taken. The vendor block
+        (`mode`, `gait_type`, IMU) is read at publish time from the message that
+        happens to be current, because averaging a gait enum is meaningless and
+        the cost of building that dict fifty times over is not worth paying.
+
+        The vendor stamp is resolved per reading rather than per publish: which
+        of the two clocks is usable is a property of the reading, and the answer
+        is wanted for the reading whose time we are about to quote.
+        """
+        # Nothing drains the window when there is no motus.odom/1 publisher, so
+        # filling it would be a 495 Hz leak for the life of the process.
+        if self._motion_pub is None:
+            return
+        try:
+            from common.odom import resolve_stamp_ms
+
+            velocity = msg.velocity
+            row = [
+                velocity[0] if len(velocity) > 0 else None,
+                velocity[1] if len(velocity) > 1 else None,
+                # `velocity[2]`, roll rate and pitch rate stay `None`, not zero.
+                # R1's third velocity component has no documented meaning (Go1's
+                # driver calls the same field `velocity_index_2_raw`, which says
+                # it plainly), and this message carries no roll or pitch rate at
+                # all. Reporting zero would claim this robot measured no vertical
+                # motion, which is a different statement from the true one — and
+                # the one that makes a stuck-detector fire on a robot that simply
+                # cannot answer.
+                None, None, None,
+                msg.yaw_speed,
+            ]
+            stamp_ms, provenance = resolve_stamp_ms(
+                vendor_ms=_timespec_ms(getattr(msg, "stamp", None)),
+                received_ms=int(time.time() * 1000),
+            )
+        except Exception as exc:                              # noqa: BLE001
+            # A message shape we cannot read is not an averaging window of zeros.
+            # Dropping the reading leaves the window holding only what was
+            # understood, and an empty window publishes all-`None`.
+            self.get_logger().warn(f"motus.odom/1 read failed: {exc}")
+            return
+        self._burst.append(row)
+        self._stamp_ms = stamp_ms
+        self._stamp_provenance = provenance
+
+    def _publish_motion(self, state: dict) -> None:
+        """The averaged window as one motus.odom/1 sample.
+
+        `state` supplies only the vendor block; every number a consumer acts on
+        comes from the window. The two therefore describe slightly different
+        instants — the twist is the last 100 ms, the gait enum is right now —
+        which is correct for what each is: one is a measurement to be filtered,
+        the other a label to be reported.
         """
         if self._motion_pub is None:
             return
         try:
-            from common.odom import build_sample
+            from common.odom import build_sample, mean_twist
 
-            velocity = state.get("velocity") or []
+            burst, self._burst = self._burst, []
+            self._burst_size = len(burst)
             sample = build_sample(
-                stamp_ms=int(time.time() * 1000),
-                twist=[
-                    velocity[0] if len(velocity) > 0 else None,
-                    velocity[1] if len(velocity) > 1 else None,
-                    None, None, None,
-                    state.get("yaw_speed"),
-                ],
+                # When the reading was taken, when that is knowable — see
+                # `resolve_stamp_ms`. It used to be `time.time()` at publish, i.e.
+                # up to 100 ms of throttle plus a DDS hop after the measurement,
+                # and this driver's own checklist asks for the other one.
+                stamp_ms=self._stamp_ms or int(time.time() * 1000),
+                twist=mean_twist(burst),
                 vendor={"mode": state.get("mode"),
                         "gait_type": state.get("gait_type"),
                         "body_height": state.get("body_height"),
-                        "rpy": (state.get("imu") or {}).get("rpy")},
+                        "rpy": (state.get("imu") or {}).get("rpy"),
+                        # How many raw readings this average came from. Zero means
+                        # the window was empty and every axis is `null` — worth
+                        # being able to tell apart from a robot that stopped.
+                        "samples": self._burst_size,
+                        **self._stamp_provenance},
             )
         except Exception as exc:                              # noqa: BLE001
             self.get_logger().warn(f"motus.odom/1 publish failed: {exc}")
