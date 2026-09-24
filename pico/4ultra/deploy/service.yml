@@ -1,0 +1,20 @@
+pico-driver:
+  image: __IMAGE__
+  container_name: embodied-pico
+  network_mode: host
+  env_file:
+    - /opt/phanthy-motus/.env
+  volumes:
+    - /opt/phanthy-motus/data/pico:/var/lib/motus/pico
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always
