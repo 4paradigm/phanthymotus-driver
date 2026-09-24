@@ -28,12 +28,8 @@ AUDIO_FORMAT = "audio/pcm-16k"
 MIC_SAMPLE_FORMATS = {"s16", "s16le", "s16_le", "signed_16", "pcm_s16le", "int16"}
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
 
-# The U1 Pro SDK document declares all five event topics as
-# std_msgs/msg/String.  Their String.data value is a JSON envelope.  Keep
-# these wire types separate from the local audio bridge messages below; using
-# a custom audio_msgs event type would prevent DDS matching on the robot.
 EVENT_TOPICS = {
-    "doa_event": "/robo/audio/subscribe/doa_event",
+    "doa_event": "/audio/sense/doa_event",
     "playback_state": PLAYBACK_TOPIC,
 }
 
@@ -294,8 +290,8 @@ class U1Nodes:
             "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
             "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
             "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
-            "motion_list": self.robot.create_client(StringCall, "/robo/audio/call/get_motion_info_list"),
-            "play_action": self.robot.create_client(StringCall, "/robo/audio/call/play_action"),
+            "motion_list": self.robot.create_client(StringCall, "/action/controller/get_motion_info_list"),
+            "play_action": self.robot.create_client(StringCall, "/action/controller/pay_motion"),
             "play_text": self.robot.create_client(StringCall, "/robo/audio/call/play_text"),
             "interrupt": self.robot.create_client(Trigger, "/robo/audio/call/interrupt_action_audio"),
             "authorize": self.robot.create_client(StringCall, "/robo/auth/call/authorize"),
@@ -513,7 +509,10 @@ class U1Nodes:
                 pass
 
     def connect_speaker(self, input_topic: str) -> dict:
-        self.close_speaker_subscription()
+        self._speaker_forwarding = False
+        if self._speaker_subscription is not None:
+            self.core.destroy_subscription(self._speaker_subscription)
+            self._speaker_subscription = None
         request = self.EnableAudioOut.Request()
         request.header = self._audio_header()
         request.enable = True
@@ -965,6 +964,7 @@ class ExpressionPlugin:
         "A019", "A020", "A021", "A022", "A023", "A024", "A025", "A026",
         "A027", "A028", "A029", "A030", "A031", "A032", "A033", "A034",
     }
+    HEAD_NAMES = {"tilt_head", "shake_head", "look_down", "look_up", "nod"}
     EXPRESSIONS = {
         "blink": ("A001", "眨眼"), "raise_eyebrow": ("A002", "挑眉"),
         "gaze": ("A003", "注视"), "close_eyes": ("A004", "闭眼"),
@@ -1018,7 +1018,7 @@ class ExpressionPlugin:
             response = self.audio.nodes.string_call("motion_list", {})
             result = self._expression_actions(response)
             return {"actions": [item for item in result["actions"]
-                                if item["name"] not in {"tilt_head", "shake_head", "look_down", "look_up", "nod"}]}
+                                if item["name"] not in self.HEAD_NAMES]}
         if action == "play":
             name = str(args.get("name", "")).strip().lower()
             if name not in self.EXPRESSIONS:
@@ -1187,10 +1187,6 @@ class HeadPlugin:
 
     PREFIX = "head"
     HEAD_ACTIONS = {
-        "tilt": ("A010", "歪头"),
-        "shake": ("A011", "摇头"),
-        "look_down": ("A012", "低头"),
-        "look_up": ("A013", "抬头"),
         "nod": ("A014", "点头"),
     }
 

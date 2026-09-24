@@ -217,7 +217,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
         self.assertEqual(MIC_TOPIC, "/sys/device/audio_in/raw")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
-        self.assertEqual(device.EVENT_TOPICS["doa_event"], "/robo/audio/subscribe/doa_event")
+        self.assertEqual(device.EVENT_TOPICS["doa_event"], "/audio/sense/doa_event")
 
     def test_u1_cyclonedds_config_matches_official_sdk_runtime(self):
         config = Path(__file__).with_name("config.yaml").read_text(encoding="utf-8")
@@ -371,7 +371,7 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(nodes.audio_device.clients["/sys/device/audio_out/set_volume"].srv_name,
                              "/sys/device/audio_out/set_volume")
             self.assertIn("/sys/device/audio_in/raw", [sub[1] for sub in nodes.audio_device.subscriptions])
-            self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name, "/robo/audio/call/play_action")
+            self.assertEqual(nodes.robot.clients["/action/controller/pay_motion"].srv_name, "/action/controller/pay_motion")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
             self.assertEqual(nodes.robot.clients["/robo/system/call/set_vision_enabled"].srv_name,
                              "/robo/system/call/set_vision_enabled")
@@ -903,8 +903,7 @@ class U1CardContractTests(unittest.TestCase):
             head.audio._on_playback_state({"uuid": vendor_uuid, "phase": "result", "success": True, "state_name": "COMPLETED"})
         self.assertEqual(notify.call_args.args[0], "head-1")
         self.assertEqual(notify.call_args.args[3], "head")
-        with self.assertRaisesRegex(ValueError, "not available"):
-            head.dispatch("play", {"name": "shake"})
+        self.assertNotIn("shake", head.get_tool()["inputSchema"]["properties"]["name"]["enum"])
 
     def test_system_switch_cards_use_documented_vendor_services(self):
         import device

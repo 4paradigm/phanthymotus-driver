@@ -10,7 +10,7 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 - `system_controls`: controls the three independent vendor switches `wakeup`, `wakeup_followup`, and `visual_behavior` from one card. Disabling `visual_behavior` stops vendor visual decisions, visual following, and visual idle actions; it does not stop explicitly requested expression/head motions.
 
 The U1 SDK does not expose a documented switch for stopping or disabling the vendor's internal Agent process itself. Use `system_controls` to choose whether new wakeups, post-wakeup dialog continuation, and visual decisions/following/idle behavior are enabled; the driver does not change these settings during startup. It can interrupt current vendor playback/action through `tts.interrupt`. It cannot disable vendor ROS services, system processes, safety/control loops, or an already explicitly requested motion; those remain vendor-owned.
-- `head`: plays documented preset head motions (`nod`, `shake`, `tilt`, `look_up`, and `look_down`) by readable name. The SDK does not expose arbitrary head angles or low-level neck-joint control.
+- `head`: plays the preset head motions reported by the robot firmware, by readable name. Unsupported firmware actions are not exposed. The SDK does not expose arbitrary head angles or low-level neck-joint control.
 - `camera_left` and `camera_right`: the physical left- and right-eye RGB cameras exposed by the U1 perception runtime, published as separate JPEG topics.
 - `doa_event`: an opt-in JSON sound-direction event stream.
 
@@ -27,10 +27,9 @@ deployment concern rather than an Agent Core action. The playback event topic
 remains an internal subscription used to complete `tts` actions; it is not exposed
 as a separate Agent Core card.
 
-The SDK document defines the event topics as `std_msgs/msg/String`. The `String.data`
-field contains the vendor JSON envelope. The local `audio_msgs` package therefore only
-contains the bridge audio messages and audio service definitions; it does not redefine the
-vendor event topics, because a different DDS message type would not match the robot.
+The U1 perception runtime publishes sound-direction events on
+`/audio/sense/doa_event` as `audio_msgs/msg/DoaEvent`. The event card forwards
+those events only while it is running; this is an event stream, not continuous audio.
 
 The camera cards subscribe to the verified U1 perception runtime DDS topics
 `/sensor/camera/left_eye/color/raw` and `/sensor/camera/right_eye/color/raw`,
