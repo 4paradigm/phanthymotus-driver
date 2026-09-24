@@ -695,6 +695,7 @@ class AudioPlugin:
 
     def get_tool(self):
         actions = {
+            "start": ([], "Start the U1 Pro text-to-speech card."),
             "speak": (["text"], "Convert the supplied text to speech and play it through the U1 Pro.",),
             "set_volume": (["volume"], "Set the U1 Pro TTS speaker volume from 0 to 100."),
             "get_volume": ([], "Read the U1 Pro TTS speaker volume."),

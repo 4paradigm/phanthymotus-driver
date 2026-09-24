@@ -843,7 +843,7 @@ class U1CardContractTests(unittest.TestCase):
         tool = device.AudioPlugin(FakeNodes()).get_tool()
         schema = tool["inputSchema"]
         self.assertEqual(tool["name"], "tts")
-        self.assertEqual(schema["properties"]["action"]["enum"], ["speak", "set_volume", "get_volume", "interrupt", "stop", "info"])
+        self.assertEqual(schema["properties"]["action"]["enum"], ["start", "speak", "set_volume", "get_volume", "interrupt", "stop", "info"])
         self.assertEqual(schema["x-completion"]["actions"], ["speak"])
 
     def test_tts_exposes_shared_speaker_volume_controls(self):

@@ -48,8 +48,7 @@ publishes Agent Core PCM frames to
 and set through `/sys/device/audio_out/set_volume`. These device interfaces use
 a dedicated domain `2` context selected by `audio_device_domain_id`.
 
-The image installs `python3-pil` for the documented raw-video-to-JPEG conversion
-and `ffmpeg` for MP4 capture,
+The image installs `python3-pil` for the documented raw-video-to-JPEG conversion,
 and `python3-colcon-common-extensions`, `cmake`, and `build-essential`
 only to build the local ROS interface packages during the image build. It installs the
 CycloneDDS RMW used by the dual-domain runtime, `PyYAML` used by the shared driver

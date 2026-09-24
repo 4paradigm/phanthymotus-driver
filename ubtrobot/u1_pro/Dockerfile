@@ -26,7 +26,7 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros2-archive-keyring.gpg] ${ROS_APT_MIRROR} ${UBUNTU_CODENAME} main" \
         > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
-    python3-pip python3-pil ffmpeg ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
+    python3-pip python3-pil ros-humble-rmw-cyclonedds-cpp && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt /tmp/u1-requirements.txt
 RUN pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/u1-requirements.txt && rm /tmp/u1-requirements.txt
 
