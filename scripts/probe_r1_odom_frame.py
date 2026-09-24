@@ -41,13 +41,21 @@ alternative is a confident answer from a run that carried no information.
 ── running it ───────────────────────────────────────────────────────────────
 
 Needs `unitree_sdk2py` and the robot's DDS, so the simplest place is inside the
-driver container on the robot:
+driver container on the robot (the image flattens the bundle, so the script lands
+at `/work/`, not `/work/scripts/`):
 
-    ssh unitree@10.100.130.6
-    docker exec -it embodied-unitree-r1 python3 /work/scripts/probe_r1_odom_frame.py --seconds 40
+    ssh unitree@10.100.128.238          # r1_sz; r1_bj is unitree@10.100.130.6
+    docker exec -it embodied-unitree-r1 python3 -u /work/probe_r1_odom_frame.py \
+        --until-decisive --seconds 600
 
-Then walk the robot around — **including at least one substantial turn** — for
-those forty seconds.
+`--until-decisive` is the one to use when a person has to walk the robot: it waits
+for the motion instead of for a clock, printing how much travel and heading change
+it has so far, and stops as soon as the data can answer. Five runs on r1_sz were
+taken with a fixed window and three of them caught a stationary robot.
+
+Walk it **3 m or more with at least one substantial turn** — a straight line
+cannot answer the question, for the reason given above. Every run is saved, so
+re-analysis (`--load`) never costs another walk.
 """
 
 from __future__ import annotations
@@ -67,6 +75,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 # rather than reporting whichever residual happened to come out smaller.
 MIN_TRAVEL_M = 0.30
 MIN_YAW_SPREAD_RAD = 0.35        # about 20 degrees of heading variation
+# Enough motion that an undecided verdict is a statement about the robot rather
+# than about the run. Used only by `--until-decisive`, to know when to stop
+# waiting for a better walk than the one it already has.
+AMPLE_TRAVEL_M = 3.0
 # Blocks, not sample pairs — see `analyse`. One second is long enough that the
 # robot's displacement dwarfs the jitter on its reported position, and short
 # enough that a hundred of them fit in a walk somebody is willing to perform.
@@ -78,8 +90,8 @@ MIN_BLOCKS = 10
 MAX_RESIDUAL_FRACTION = 0.35
 
 
-def _collect(seconds: float, interface: str) -> list:
-    """Every reading arriving in the window, as `(t, x, y, vx, vy, yaw)`."""
+def _collect(seconds: float, interface: str, until_decisive: bool = False) -> list:
+    """Readings as `(t, x, y, vx, vy, yaw)`, until the window ends or data suffices."""
     from common.dds_link import candidate_interfaces
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
@@ -110,14 +122,50 @@ def _collect(seconds: float, interface: str) -> list:
     sub = ChannelSubscriber("rt/odommodestate", SportModeState_)
     sub.Init(on_msg, 10)
 
-    print(f"listening on rt/odommodestate for {seconds:.0f}s — "
-          "move the robot now, and turn it at least once")
     deadline = time.monotonic() + seconds
+    if not until_decisive:
+        print(f"listening on rt/odommodestate for {seconds:.0f}s — "
+              "move the robot now, and turn it at least once")
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            print(f"  {len(rows)} readings, {deadline - time.monotonic():.0f}s left",
+                  end="\r", flush=True)
+        print()
+        return rows
+
+    # **Wait for the robot to move rather than for a clock to run out.**
+    #
+    # A fixed window makes the measurement depend on somebody starting to walk
+    # inside it, and that turned out to be the hardest part of taking it: of five
+    # runs on r1_sz, three caught a stationary robot, each costing a round trip
+    # and asking for another walk. Nothing about the physics needs a deadline —
+    # the run is over when it carries enough travel and enough heading change to
+    # decide, which is a property of the data and is already computed.
+    #
+    # So the deadline becomes a backstop and the gates become the exit condition.
+    # Whoever is walking the robot can start whenever they like.
+    print(f"listening on rt/odommodestate — walk the robot whenever you are "
+          f"ready (giving up after {seconds:.0f}s if nothing happens)")
     while time.monotonic() < deadline:
-        time.sleep(0.5)
-        print(f"  {len(rows)} readings, {deadline - time.monotonic():.0f}s left",
-              end="\r", flush=True)
-    print()
+        time.sleep(2.0)
+        if len(rows) < 500:
+            continue
+        progress = analyse(list(rows))
+        travel = progress["travel_m"]
+        spread = math.degrees(progress.get("yaw_spread_rad") or 0.0)
+        print(f"  {len(rows)} readings | travelled {travel:.2f}/{MIN_TRAVEL_M} m "
+              f"| heading {spread:.0f}/{math.degrees(MIN_YAW_SPREAD_RAD):.0f}° "
+              f"| {deadline - time.monotonic():.0f}s before giving up", flush=True)
+        if progress["verdict"] != "indeterminate":
+            print("  enough data to decide — stopping")
+            break
+        # Still indeterminate, but with plenty of motion in hand: the answer is
+        # genuinely "neither frame explains this" or "too close to call", and more
+        # walking will not change it. Stop rather than burn the backstop — the
+        # verdict text says which of the two it is.
+        if travel >= AMPLE_TRAVEL_M and spread >= math.degrees(MIN_YAW_SPREAD_RAD):
+            print("  the run carries ample motion and still cannot decide — stopping")
+            break
     return rows
 
 
@@ -398,6 +446,10 @@ def main() -> int:
                     help="where to write the raw readings (empty string to skip)")
     ap.add_argument("--load", default="",
                     help="re-analyse a saved run instead of collecting; needs no robot")
+    ap.add_argument("--until-decisive", action="store_true",
+                    help="stop once the data can decide, rather than after --seconds; "
+                         "--seconds then acts as a give-up backstop. Use this when a "
+                         "person has to walk the robot — they can start whenever")
     args = ap.parse_args()
 
     if args.load:
@@ -406,7 +458,7 @@ def main() -> int:
         print(f"re-analysing {len(rows)} saved readings from {args.load}")
         return report(analyse(rows))
 
-    rows = _collect(args.seconds, args.interface)
+    rows = _collect(args.seconds, args.interface, args.until_decisive)
     if not rows:
         print("no readings at all — the robot is not publishing rt/odommodestate, "
               "or DDS came up on the wrong interface")
