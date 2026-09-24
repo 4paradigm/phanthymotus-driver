@@ -189,7 +189,7 @@ class U1CardContractTests(unittest.TestCase):
     def test_cyclonedds_uses_generated_uri_when_config_uri_is_absent(self):
         import common.vendor_runtime as runtime
 
-        with mock.patch.dict(os.environ, {"CYCLONEDDS_URI": "<inherited/>"}, clear=False):
+        with mock.patch.dict(os.environ, {}, clear=True):
             interface = runtime.configure_cyclonedds({"ros": {"robot_interface": "lo"}})
             self.assertEqual(interface, "lo")
             uri = os.environ["CYCLONEDDS_URI"]
@@ -669,6 +669,7 @@ class U1CardContractTests(unittest.TestCase):
             nodes = object.__new__(device.U1Nodes)
             nodes.config = {}
             nodes.string_call = mock.Mock(return_value={"ok": True, "code": "OK", "data": {"authorized": True}})
+            nodes.set_system_enabled = mock.Mock(return_value={"enabled": False})
             with mock.patch.dict(os.environ, {"U1_PRO_AUTH_FILE": str(root / "robo_auth.json")}, clear=False):
                 nodes.initialize_robot()
             payload = nodes.string_call.call_args_list[0].args[1]

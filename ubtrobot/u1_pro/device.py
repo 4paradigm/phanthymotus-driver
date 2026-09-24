@@ -465,7 +465,7 @@ class U1Nodes:
                     raise RuntimeError("state readback did not confirm disabled")
                 print(f"[U1 init] {name} disabled and verified", flush=True)
             except Exception as exc:
-                print(f"[U1 init] {name} disable/verification failed: {type(exc).__name__}", flush=True)
+                raise RuntimeError(f"U1 Pro startup could not disable {name}") from exc
         try:
             self.trigger_call("interrupt")
         except Exception:
@@ -783,15 +783,13 @@ class MicPlugin:
             self.running = False
 
     def dispatch(self, action, args):
-        if action not in {"start", "stop", "status", "enable", "disable"}:
+        if action not in {"start", "stop", "info"}:
             return None
         if action == "start":
             return self.start()
         elif action == "stop":
             self.stop()
             return {"state": "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
-        elif action != "info":
-            return None
         return {"state": "running" if self.running else "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
 
 

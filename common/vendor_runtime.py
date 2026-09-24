@@ -48,13 +48,14 @@ def configure_cyclonedds(config: dict) -> str:
         # tracing output, so it must not override the component configuration.
         os.environ["CYCLONEDDS_URI"] = str(configured_uri)
         return interface
-    os.environ["CYCLONEDDS_URI"] = (
+    if "CYCLONEDDS_URI" not in os.environ:
+        os.environ["CYCLONEDDS_URI"] = (
         "<CycloneDDS><Domain><General><Interfaces>"
         f"<NetworkInterface name='{interface}'/>"
         "</Interfaces><AllowMulticast>false</AllowMulticast></General>"
         "<Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile>"
         "</Tracing></Domain></CycloneDDS>"
-    )
+        )
     return interface
 
 
