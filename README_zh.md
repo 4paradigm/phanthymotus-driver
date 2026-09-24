@@ -72,6 +72,8 @@ python main.py
 - MCP 协议实现（JSON-RPC 2.0 方法）
 - 工具定义规范（`inputSchema`、`configSchema`、`multiInstance`、`x-action-params`）
 - 实例管理（`multiInstance` 标志、configSchema `scope` 字段）
+- 配置字段格式 —— 敏感字段（`format: "password"`、`x-sensitive`），以及「扫码装 App」
+  「用手机连上这台机器人」的二维码（`format: "qr"`）
 - Plugin 生命周期（`__init__`、`get_tool`、`start`、`stop`、`dispatch`）
 - `driver.yaml` 和 `config.yaml` 元数据格式
 - 注册与心跳机制
