@@ -348,7 +348,7 @@ class U1Nodes:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
-        from audio_msgs.msg import AudioChunk, AudioInData, AudioOutData
+        from audio_msgs.msg import AudioChunk, AudioInData, AudioOutData, AudioInfo
         from audio_msgs.srv import EnableAudioIn, EnableAudioOut, SetAudioVolume
         from std_msgs.msg import UInt8
         from robo_sdk.srv import StringCall
@@ -380,6 +380,7 @@ class U1Nodes:
         self.EnableAudioIn = EnableAudioIn
         self.EnableAudioOut = EnableAudioOut
         self.AudioOutData = AudioOutData
+        self.AudioInfo = AudioInfo
         self.UInt8 = UInt8
         self.String = String
         self.CompressedImage = CompressedImage
@@ -573,6 +574,7 @@ class U1Nodes:
     def set_mic_enabled(self, enabled: bool) -> dict:
         self._mic_forwarding = False
         request = self.EnableAudioIn.Request()
+        request.header = self._audio_header()
         request.enable = bool(enabled)
         response = self.call("mic_enable", request)
         code = int(getattr(response, "code", -1))
@@ -658,7 +660,11 @@ class U1Nodes:
             self._speaker_subscription = None
             try:
                 request = self.EnableAudioOut.Request()
+                request.header = self._audio_header()
                 request.enable = False
+                request.info = self._audio_info()
+                request.mode = request.ADD
+                request.gain = 0.0
                 self.call("speaker_enable", request)
             except Exception:
                 pass
@@ -666,7 +672,11 @@ class U1Nodes:
     def connect_speaker(self, input_topic: str) -> dict:
         self.close_speaker_subscription()
         request = self.EnableAudioOut.Request()
+        request.header = self._audio_header()
         request.enable = True
+        request.info = self._audio_info()
+        request.mode = request.ADD
+        request.gain = 0.0
         response = self.call("speaker_enable", request)
         code = int(getattr(response, "code", -1))
         if code != 0:
@@ -677,6 +687,19 @@ class U1Nodes:
             self.AudioChunk, input_topic, self._speaker_callback, self._audio_qos)
         self._speaker_forwarding = True
         return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
+
+    @staticmethod
+    def _audio_header():
+        from std_msgs.msg import Header
+        return Header()
+
+    def _audio_info(self):
+        info = self.AudioInfo()
+        info.uuid = self._speaker_uuid or f"u1-{uuid.uuid4().hex}"
+        info.channels = 1
+        info.sample_rate = 16000
+        info.sample_format = "S16LE"
+        return info
 
     def _speaker_callback(self, message) -> None:
         if not self._speaker_forwarding:

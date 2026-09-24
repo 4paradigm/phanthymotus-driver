@@ -74,11 +74,13 @@ def _install_stubs():
 
     audio = types.ModuleType("audio_msgs")
     audio_msg = types.ModuleType("audio_msgs.msg")
-    for name in ("AudioChunk", "AudioInData", "AudioOutData"):
+    for name in ("AudioChunk", "AudioInData", "AudioOutData", "AudioInfo"):
         setattr(audio_msg, name, message(name))
     audio_srv = types.ModuleType("audio_msgs.srv")
+    request = message("Request")
+    request.ADD = 0
     for name in ("EnableAudioIn", "EnableAudioOut", "SetAudioVolume"):
-        setattr(audio_srv, name, type(name, (), {"Request": message("Request")}))
+        setattr(audio_srv, name, type(name, (), {"Request": request}))
     audio.msg, audio.srv = audio_msg, audio_srv
     sys.modules.update({"audio_msgs": audio, "audio_msgs.msg": audio_msg, "audio_msgs.srv": audio_srv})
 
@@ -224,6 +226,7 @@ class U1CardContractTests(unittest.TestCase):
             pass
         nodes.EnableAudioIn = types.SimpleNamespace(Request=EnableRequest)
         nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0, message=""))
+        nodes._audio_header = lambda: types.SimpleNamespace()
         nodes._mic_forwarding = False
         nodes._mic_frames = 0
         nodes._mic_frame_event = threading.Event()
@@ -944,7 +947,9 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = object.__new__(device.U1Nodes)
-        nodes.EnableAudioOut = types.SimpleNamespace(Request=type("Request", (), {}))
+        nodes.EnableAudioOut = types.SimpleNamespace(Request=type("Request", (), {"ADD": 0}))
+        nodes.AudioInfo = type("AudioInfo", (), {})
+        nodes._audio_header = lambda: types.SimpleNamespace()
         nodes._speaker_subscription = None
         nodes._speaker_uuid = ""
         nodes._speaker_frames = 0
@@ -955,6 +960,9 @@ class U1CardContractTests(unittest.TestCase):
         nodes.AudioChunk = object
         result = nodes.connect_speaker("/tts/audio")
         self.assertTrue(nodes.call.call_args.args[1].enable)
+        info = nodes.call.call_args.args[1].info
+        self.assertEqual((info.channels, info.sample_rate, info.sample_format), (1, 16000, "S16LE"))
+        self.assertEqual((nodes.call.call_args.args[1].mode, nodes.call.call_args.args[1].gain), (0, 0.0))
         self.assertEqual(result["input_topic"], "/tts/audio")
         self.assertTrue(nodes._speaker_forwarding)
 

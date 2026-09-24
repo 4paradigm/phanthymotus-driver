@@ -8,6 +8,7 @@ find_package(rosidl_default_generators REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AudioChunk.msg"
   "msg/AudioData.msg"
+  "msg/AudioInfo.msg"
   "msg/AudioInData.msg"
   "msg/AudioOutData.msg"
   "srv/EnableAudioIn.srv"
