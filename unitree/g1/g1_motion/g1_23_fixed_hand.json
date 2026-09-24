@@ -1,0 +1,117 @@
+{
+  "schema": "motus.g1-calibration.v1",
+  "profile_id": "unitree_g1_23_dual_arm_relative_v1",
+  "version": "g1-23-fixed-hand-v1",
+  "arm_joint_names": [
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint"
+  ],
+  "urdf_path": "models/g1_body23.urdf",
+  "urdf_sha256": "b1af86fb023c0b6f8e52723d224be6cad70916eaff2778e7dbe09e6f91faa9b9",
+  "torso_frame": "pelvis",
+  "joint_velocity_rad_s": 1.0,
+  "feedforward_limit_nm": [
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0
+  ],
+  "palm_frames": {
+    "left": {
+      "position": [
+        0.2,
+        0.0,
+        0.0
+      ],
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "right": {
+      "position": [
+        0.2,
+        0.0,
+        0.0
+      ],
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  },
+  "controller_to_palm": {
+    "left": {
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "right": {
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "orientation": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  },
+  "safety": {
+    "fsm_id": 500,
+    "allowed_fsm_ids": [
+      500,
+      801
+    ]
+  },
+  "runtime_baseline": "fresh_low_state",
+  "locked_joint_names": [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint"
+  ],
+  "provenance": {
+    "geometry": "Original G1_23 fixed hands; 0.2 m wrist TCP used by the r11b field-tested implementation.",
+    "model": "Bundled model checksum; original factory joint directions and zero positions.",
+    "scope": "Dual arms only; no claim of complete collision or mechanical acceptance."
+  }
+}

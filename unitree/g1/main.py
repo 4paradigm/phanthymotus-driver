@@ -140,6 +140,37 @@ class G1DeviceBundle:
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
             print("[bundle] ArmActionPlugin loaded")
 
+        self._motion_bus = None
+        motion_cfg = cfg.get('motion_control', {})
+        control_cfg = cfg.get('teleop_control', {})
+        control_enabled = control_cfg.get('enabled', False)
+        if control_enabled and motion_cfg.get('enabled', False):
+            raise ValueError('select teleop_control or legacy motion_control')
+        if control_enabled or motion_cfg.get('enabled', False):
+            from arm_stream import ArmStreamExecutor
+            from motion_control import MotionControl
+            from motion_bus import MotionBus
+            arm = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'arm'), None)
+            if arm is None:
+                raise ValueError('motion_control requires arm plugin')
+            effective = dict(control_cfg if control_enabled else motion_cfg)
+            effective['servo_position'] = control_enabled
+            stream = ArmStreamExecutor(effective, namespace, arm_client)
+            motion = MotionControl(dict(effective), stream)
+            stream.motion_control = motion
+            arm._stream = stream
+            if control_enabled:
+                from teleop_control import TeleopControl
+                from teleop_bus import TeleopBus
+                control = TeleopControl(dict(control_cfg), motion)
+                arm._teleop_control = control
+                stream.public_motion_topics = False
+                self._motion_bus = TeleopBus(executor, control)
+                self._plugins.append(control)
+            else:
+                self._motion_bus = MotionBus(namespace, executor, motion, stream)
+                self._plugins.append(motion)
+
         # servo 默认**关闭**，和 arm 不同。arm 放的是厂商预设手势，经过内置控制器；
         # servo 直接往 rt/arm_sdk 写关节指令，是这个驱动第一次驱动电机本身。
         # 一个默认开启的执行器卡片，等于容器一重启就可以被 start —— 开关留给人。
@@ -367,6 +398,11 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    if name in ('motion_control', 'teleop_control'):
+                        import ipaddress
+                        if self.headers.get('Origin') or not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                            err(-32600, 'teleop control requires loopback')
+                            return
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
@@ -468,7 +504,11 @@ def main():
     print("[bundle] MotionSwitcherClient ready")
 
     # ROS2
-    rclpy.init()
+    if (cfg.get('motion_control', {}).get('enabled', False)
+            or cfg.get('teleop_control', {}).get('enabled', False)):
+        os.environ['ROS_DOMAIN_ID'] = '42'
+        os.environ['FASTRTPS_DEFAULT_PROFILES_FILE'] = str(Path(__file__).with_name('dds-local.xml'))
+    rclpy.init(domain_id=42)
     executor = rclpy.executors.MultiThreadedExecutor()
 
     # Safety Harness (SmartMotion) — independent subprocess
@@ -482,9 +522,15 @@ def main():
     _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, msc_client, smart_motion=smart_motion, network_iface=network_iface)
     _bundle.start_all()
 
+    from ros_spin import SpinHealth, supervised_spin
+    from rclpy.impl.implementation_singleton import rclpy_implementation
+    InvalidHandle = rclpy_implementation.InvalidHandle
+    from rclpy.executors import ExternalShutdownException, ShutdownException
+    executor._driver_spin_health = SpinHealth()
+
     def _spin():
-        while rclpy.ok():
-            executor.spin_once(timeout_sec=0.1)
+        supervised_spin(executor, rclpy.ok, executor._driver_spin_health,
+                        InvalidHandle, (ExternalShutdownException, ShutdownException))
 
     spin_thread = threading.Thread(target=_spin, daemon=True, name="bundle_spin")
     spin_thread.start()
@@ -508,9 +554,16 @@ def main():
     try:
         server.serve_forever()
     finally:
-        _bundle.stop_all()
-        executor.shutdown()
-        rclpy.shutdown()
+        try:
+            _bundle.stop_all()
+        finally:
+            # Join the dedicated teleop owner before shutting down its context.
+            # A stop RPC failure must not strand the ROS lifecycle thread.
+            bus = _bundle._motion_bus
+            if bus is not None and getattr(bus, 'shared_executor', None) is executor:
+                bus.close()
+            executor.shutdown()
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

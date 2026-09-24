@@ -27,6 +27,7 @@ cards:
   - { name: switch_mode,            type: actuator }
   - { name: switch_mode_expert,     type: actuator }
   - { name: arm,                    type: actuator }
+  - { name: teleop_control,         type: actuator }
   - { name: posture,                type: sensor }
   - { name: imu,                    type: sensor }
   - { name: battery,                type: sensor }

@@ -113,3 +113,18 @@ safety_harness:
   comm_timeout: 0.5
   motor_temp_decel: 75
   motor_temp_stop: 85
+
+# Four-card dual-arm path; start registers/reads feedback without acquiring arms.
+motion_control:
+  enabled: false
+  joint_velocity_rad_s: 1.0
+  calibration_path: ""
+
+# Register the dual-arm card by default; registration does not acquire or move arms.
+# Canvas start plus fresh tracked input and both grips are required for motion.
+teleop_control:
+  enabled: true
+  # Internal deployment setting; Canvas users do not select an execution mode.
+  mode: live
+  calibration_path: /work/g1_motion/g1_23_fixed_hand.json
+  position_scale: 1.0
