@@ -37,6 +37,8 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  vision_capture:
+    enabled: true
   ext_mic:
     enabled: true
   ext_camera:

@@ -7,6 +7,7 @@ unitree-r1:
   privileged: true
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
     - /dev:/dev
   environment:
     - ROS_DOMAIN_ID=42

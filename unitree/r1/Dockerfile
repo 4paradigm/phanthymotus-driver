@@ -15,6 +15,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
         git \
         libusb-1.0-0 \
         libportaudio2 \
+        ffmpeg \
         libasound2-dev && \
     rm -rf /var/lib/apt/lists/*
 
@@ -66,6 +67,7 @@ COPY device.py /work/device.py
 # rather than in device.py so it can be tested without rclpy. Missing it makes
 # every camera tool fail on the first info().
 COPY camera_specs.py /work/camera_specs.py
+COPY vision_capture.py /work/vision_capture.py
 COPY rpc_proxy.py /work/rpc_proxy.py
 COPY ext_devices.py /work/ext_devices.py
 COPY loco_servo.py /work/loco_servo.py
