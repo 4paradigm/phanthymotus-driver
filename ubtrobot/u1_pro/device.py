@@ -864,6 +864,8 @@ class EyeCameraPlugin:
                 self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
             if not self._frame_ready.wait(3.0):
                 raise TimeoutError(f"no frames received from {self.source_topic}")
+            if self._last_error:
+                raise RuntimeError(self._last_error)
             self.running = True
             self._last_error = ""
         except Exception as exc:
@@ -908,7 +910,6 @@ class EyeCameraPlugin:
             self._frame_ready.set()
         except Exception as exc:
             self._last_error = str(exc)[:256]
-            self._frame_ready.set()
 
     def wait_for_jpeg(self, after_sequence=None, timeout_s=5.0):
         deadline = time.monotonic() + max(0.0, float(timeout_s))

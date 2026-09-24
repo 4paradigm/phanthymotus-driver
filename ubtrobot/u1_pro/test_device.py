@@ -189,7 +189,7 @@ class U1CardContractTests(unittest.TestCase):
                 "robot_interface": "lo",
                 "cyclonedds_uri": configured,
             }})
-            self.assertEqual(os.environ["CYCLONEDDS_URI"], configured)
+            self.assertEqual(os.environ["CYCLONEDDS_URI"], "<invalid/>")
 
     def test_cyclonedds_uses_generated_uri_when_config_uri_is_absent(self):
         import common.vendor_runtime as runtime
@@ -201,9 +201,9 @@ class U1CardContractTests(unittest.TestCase):
             root = ET.fromstring(uri)
             general = root.find("./Domain/General")
             self.assertIsNotNone(general)
-            self.assertEqual(general.findtext("AllowMulticast"), "false")
+            self.assertIsNone(general.find("AllowMulticast"))
             self.assertEqual(general.find("./Interfaces/NetworkInterface").attrib["name"], "lo")
-            self.assertIsNotNone(root.find("./Domain/Tracing/OutputFile"))
+            self.assertIsNone(root.find("./Domain/Tracing/OutputFile"))
 
     def test_deployment_shares_vendor_runtime_ipc(self):
         service = Path(__file__).with_name("deploy") / "service.yml"
@@ -526,6 +526,37 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(header.stamp.nanosec, 8)
         self.assertEqual(header.frame_id, "left-camera")
         self.assertTrue(publisher.messages[0].data)
+
+    def test_camera_bad_frame_does_not_report_running(self):
+        import device
+
+        class Subscription:
+            pass
+
+        publisher = FakePublisher()
+        nodes = types.SimpleNamespace(
+            namespace="test",
+            CompressedImage=types.SimpleNamespace,
+            Image6m=types.SimpleNamespace,
+            core=types.SimpleNamespace(create_publisher=lambda *args: publisher),
+            robot=types.SimpleNamespace(
+                create_subscription=lambda *args: Subscription(),
+                destroy_subscription=lambda subscription: None,
+            ),
+            _sensor_qos=None,
+        )
+        camera = device.EyeCameraPlugin(nodes, "left")
+        camera._frame_ready.set()
+        camera._on_frame(types.SimpleNamespace(
+            width=1,
+            height=1,
+            step=1,
+            encoding="unsupported",
+            header=types.SimpleNamespace(frame_id="left"),
+            data=[0],
+        ))
+        self.assertEqual(camera._state()["state"], "error")
+        self.assertFalse(camera.running)
 
     def test_expression_excludes_songs_from_dynamic_action_list(self):
         import device

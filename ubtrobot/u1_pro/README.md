@@ -51,7 +51,7 @@ a dedicated domain `2` context selected by `audio_device_domain_id`.
 The image installs `python3-pil` for the documented raw-video-to-JPEG conversion,
 and `python3-colcon-common-extensions`, `cmake`, and `build-essential`
 only to build the local ROS interface packages during the image build. It installs the
-CycloneDDS RMW supplied by the ROS base image for the dual-domain runtime, `PyYAML` used by the shared driver
+CycloneDDS RMW used by the dual-domain runtime, `PyYAML` used by the shared driver
 configuration loader, and NumPy 1.26.4 for vectorized conversion of the camera's
 YUY2 frames. NumPy adds a Python wheel to this component image; the exact version
 is pinned for reproducible ARM64/Python 3.10 builds. The official U1 SDK ROS2

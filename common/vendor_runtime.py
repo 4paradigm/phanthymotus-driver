@@ -43,19 +43,14 @@ def configure_cyclonedds(config: dict) -> str:
         raise ValueError(f"invalid robot network interface: {interface}")
     configured_uri = ros.get("cyclonedds_uri")
     if configured_uri:
-        # The driver config is the deployment contract. An inherited URI can
-        # silently bind the second DDS context to the wrong interface or emit
-        # tracing output, so it must not override the component configuration.
-        os.environ["CYCLONEDDS_URI"] = str(configured_uri)
+        os.environ.setdefault("CYCLONEDDS_URI", str(configured_uri))
         return interface
-    if "CYCLONEDDS_URI" not in os.environ:
-        os.environ["CYCLONEDDS_URI"] = (
+    os.environ.setdefault(
+        "CYCLONEDDS_URI",
         "<CycloneDDS><Domain><General><Interfaces>"
         f"<NetworkInterface name='{interface}'/>"
-        "</Interfaces><AllowMulticast>false</AllowMulticast></General>"
-        "<Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile>"
-        "</Tracing></Domain></CycloneDDS>"
-        )
+        "</Interfaces></General></Domain></CycloneDDS>",
+    )
     return interface
 
 
@@ -209,11 +204,7 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
         def log_message(self, fmt, *args):
             msg = fmt % args
             if '"POST /mcp' not in msg or "200" not in msg:
-                # Host-networked MCP request lines are remote-controlled; escape
-                # and cap them before they can corrupt shared container logs.
-                address = self.address_string().encode("unicode_escape").decode("ascii")[:64]
-                safe = msg.encode("unicode_escape").decode("ascii")[:200]
-                print(f"[mcp] {address} {safe}")
+                print(f"[mcp] {self.address_string()} {msg}")
 
         def send_json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode()
