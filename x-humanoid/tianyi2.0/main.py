@@ -405,7 +405,17 @@ class DualDomainROS2:
         def _spin(executor, name):
             try:
                 while rclpy.ok(context=executor.context):
-                    executor.spin_once(timeout_sec=0.1)
+                    if name == "domain0":
+                        # High-rate body feedback otherwise keeps the shared GIL
+                        # busy continuously. Keep DDS/QoS and callback groups;
+                        # bound scheduling work before yielding to the watchdog.
+                        for _ in range(10):
+                            if not rclpy.ok(context=executor.context):
+                                return
+                            executor.spin_once(timeout_sec=0.0)
+                        time.sleep(0.005)
+                    else:
+                        executor.spin_once(timeout_sec=0.1)
             except Exception:
                 pass
             print(f"[ros2] {name} spin exited")
@@ -592,10 +602,55 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+        self._teleop = None
+        control_cfg = {'enabled': True, 'mode': 'live', 'position_scale': .5,
+                       'joint_velocity_rad_s': 1.,
+                       'calibration_path': str(Path(__file__).with_name('tianyi_motion') / 'tianyi2_dual_arm.json'),
+                       **cfg.get('teleop_control', {})}
+        control_enabled = control_cfg.get('enabled', True) and (
+            'teleop_control' in cfg or not (cfg.get('motion_control', {}).get('enabled') or cfg.get('teleop', {}).get('enabled')))
+        if control_enabled or cfg.get("teleop", {}).get("enabled", False) or cfg.get('motion_control', {}).get('enabled', False):
+            from teleop_executor import TeleopExecutor
+            from device import ArmPlugin, HandPlugin
+            arm = next((p for p in self._plugins if isinstance(p, ArmPlugin)), None)
+            hand = next((p for p in self._plugins if isinstance(p, HandPlugin)), None)
+            teleop_cfg = dict(cfg.get('teleop', {}))
+            if control_enabled:
+                teleop_cfg.update(live_enabled=control_cfg.get('mode', 'shadow') == 'live',
+                                  operator_session_enabled=control_cfg.get('mode', 'shadow') == 'live')
+                if control_cfg.get('calibration_path'):
+                    teleop_cfg['calibration_path'] = control_cfg['calibration_path']
+            if cfg.get('motion_control', {}).get('calibration_path'):
+                teleop_cfg['calibration_path'] = cfg['motion_control']['calibration_path']
+            self._teleop = TeleopExecutor(teleop_cfg, namespace, ros2, arm, hand, self._plugins)
+            if teleop_cfg.get('live_enabled') is True:
+                # Only a successfully loaded, explicitly arms-only profile
+                # permits the new controller to run without a hand card.
+                arms_only = ((control_enabled or cfg.get('motion_control', {}).get('enabled', False))
+                             and (self._teleop.profile or {}).get('hands_enabled') is False)
+                if arm is None or (hand is None and not arms_only):
+                    raise ValueError("live teleop requires arm and hand plugins unless motion_control has a validated arms-only profile")
+            if not control_enabled or cfg.get('teleop', {}).get('enabled', False):
+                self._plugins.append(self._teleop)
+            if control_enabled or cfg.get('motion_control', {}).get('enabled', False):
+                from motion_control import MotionControl
+                if arm is None:
+                    raise ValueError('motion_control requires arm plugin')
+                controller = MotionControl(control_cfg if control_enabled else cfg['motion_control'], self._teleop)
+                self._teleop.motion_control = controller
+                arm._motion_control = controller
+                if control_enabled:
+                    from teleop_control import TeleopControl
+                    control = TeleopControl(control_cfg, controller)
+                    self._teleop.teleop_control = control
+                    self._plugins.append(control)
+                else:
+                    self._plugins.append(controller)
+
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
     _ALWAYS_START = {
         'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
-        'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
+        'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin', 'TeleopExecutor',
     }
 
     def start_all(self) -> None:
@@ -618,7 +673,9 @@ class TianyiDeviceBundle:
         print(f"[bundle] {started} plugins auto-started, {lazy} lazy (total {started+lazy})", flush=True)
 
     def stop_all(self) -> None:
-        for p in self._plugins:
+        teleop = getattr(self, "_teleop", None)
+        ordered = ([teleop] if teleop else []) + [p for p in self._plugins if p is not teleop]
+        for p in ordered:
             try:
                 p.stop()
             except Exception:
@@ -635,6 +692,23 @@ class TianyiDeviceBundle:
         return tools
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
+        teleop = getattr(self, "_teleop", None)
+        if teleop is not None:
+            from teleop_executor import MOTION_TOOLS
+            if tool_name in MOTION_TOOLS and args.get('action') != 'info':
+                try:
+                    if tool_name == 'arm_gesture' and args.get('action') == 'reset':
+                        control = getattr(teleop, 'teleop_control', None)
+                        if control is not None:
+                            stopped = control.dispatch('stop', {})
+                            if stopped.get('error'):return stopped
+                    with teleop.gate.legacy():
+                        return self._dispatch(tool_name, dict(args))
+                except ValueError as exc:
+                    return {"state": "error", "code": str(exc), "error": str(exc)}
+        return self._dispatch(tool_name, dict(args))
+
+    def _dispatch(self, tool_name: str, args: dict) -> dict | None:
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
@@ -822,6 +896,11 @@ def make_handler():
                     ok({"tools": _bundle.get_all_tools()})
                 elif method == "tools/call":
                     name   = params.get("name", "")
+                    if name in ("teleop_executor", "motion_control", "teleop_control"):
+                        import ipaddress
+                        if self.headers.get("Origin") or not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                            err(-32600, "teleop executor requires loopback")
+                            return
                     args   = params.get("arguments") or {}
                     result = _bundle.dispatch(name, args)
                     if result is None:
@@ -835,7 +914,7 @@ def make_handler():
                         }
                         if (isinstance(result, dict)
                                 and (result.get("state") == "error"
-                                     or "error" in result)):
+                                     or bool(result.get("error")))):
                             tool_result["isError"] = True
                         ok(tool_result)
                 else:
