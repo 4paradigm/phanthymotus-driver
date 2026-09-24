@@ -259,6 +259,28 @@ def test_a_reading_may_carry_extra_columns():
     assert probe.kinematics(rows)["wz_turned_deg"] is not None
 
 
+def test_a_pause_splits_the_run_into_separate_manoeuvres():
+    """The r1_sz segment-B regression, and the worst failure of the four.
+
+    The robot turned one full circle, stood still for 35 s, then turned another.
+    The readout summed across the pause and reported -731° against a commanded
+    360 — which reads as an instrument off by a factor of two, and is the one
+    kind of wrong answer this whole exercise exists to avoid. Split on the pause
+    and each turn is within 3% of 360.
+
+    Every protocol worth running is several manoeuvres with pauses between them,
+    so aggregating across them cannot be the default.
+    """
+    turn = walk(frame="body", yaw_rate=math.radians(45), seconds=8.0, speed=0.1)
+    gap = 30.0
+    second = [(t + turn[-1][0] + gap, x, y, vx, vy, yaw)
+              for t, x, y, vx, vy, yaw in turn]
+    k = probe.kinematics(turn + second)
+    assert len(k["episodes"]) == 2
+    for episode in k["episodes"]:
+        assert episode["heading_deg"] == pytest.approx(360.0, rel=0.05)
+
+
 def test_kinematics_reports_each_source_separately():
     """The readout that does not presuppose which source is right.
 

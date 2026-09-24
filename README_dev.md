@@ -1969,8 +1969,21 @@ isolating one quantity, all read out per-source by
 | closed loop back to a taped mark | net displacement is zero | the frame, and whether the integration closes |
 
 Run the straight line first; it alone tells you which source is wrong and by how
-much. On r1_sz: `velocity` 3.62 m against a measured 3 m (**20% high**, straightness
-1.03), `position` 0.81 m (**73% short**, straightness 2.30).
+much. Measured on r1_sz:
+
+| segment | truth | `velocity` | `position` |
+|---|---|---|---|
+| straight line | 3 m | 3.62 m (**+21%**), straightness 1.03 | 0.81 m (**−73%**), straightness 2.30 |
+| turn in place ×2 | 360° each | `wz` 362.9° / 349.1° (**±3%**) | — |
+
+**Report each manoeuvre separately, and split on the pause between them.** The
+readout first summed everything between the first and last moving sample, so
+segment B — one full turn, 35 seconds of standing still, then another full turn —
+came out as a single **−731°** against a commanded 360. That reads as an
+instrument off by a factor of two, which is exactly the kind of wrong answer this
+protocol exists to prevent; split on the pause and each turn is within 3%. Any
+protocol worth running is several manoeuvres with pauses between them, so
+aggregating across them cannot be the default.
 
 **Record the measurement where the next person will find it**, not only in a commit
 message — R1 keeps it in `health()` under `odom_measured` and `position_unusable`.

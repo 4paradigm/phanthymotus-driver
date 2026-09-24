@@ -1057,9 +1057,17 @@ class _LocoStateNode(Node):
                # that matters: navi's stuck detector fires below 20% of the
                # commanded speed, and reading 20% high cannot push a stalled robot
                # over that.
+               #
+               # `wz` is good: two independent full turns in place read 362.9 deg
+               # and 349.1 deg against a commanded 360, and agreed with the yaw
+               # taken from `imu.rpy` to within 0.4% in both. Worth having
+               # measured rather than assumed — it is the axis navi's ego-motion
+               # compensation leans on hardest, and nothing else in this project
+               # would have caught it being wrong.
                "odom_measured": (
                    "frame=body 已在 r1_sz 实测确认（旋转拟合 +0.2°，world 假设需 -144°）。"
-                   "velocity 量级偏高约 20%（实测 3 m 直线报 3.62 m），未做补偿。"),
+                   "velocity 量级偏高约 20%（实测 3 m 直线报 3.62 m），未做补偿。"
+                   "wz 准确（原地整圈实测 362.9° / 349.1°，真值 360°）。"),
                # Why `pose` stays `null` — and this one is worth stating as a
                # measurement, because "legged dead reckoning drifts" understates
                # it by a lot. `position` is not a drifting estimate of where the
