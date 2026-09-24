@@ -27,6 +27,17 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+# The robot has arrived when it is this close to the target. There is no other
+# arrival signal: the G1 SLAM service does not publish `ctrl_info`, so
+# `is_arrived` never comes (see on_slam_info below).
+#
+# Exported because controlled_spatial.py has a second wait path — the one the
+# isolated subprocess runs, where no SmartMotion exists — and a robot that
+# "arrives" at a different distance depending on which process is watching is a
+# bug that gets blamed on the map.
+NAV_ARRIVAL_RADIUS_M = 0.3
+
+
 # ── Enums & Data Classes (shared between processes) ──────────────────────────
 
 class MotionState(enum.Enum):
@@ -741,7 +752,7 @@ def _run_smart_motion_process(namespace: str, config: dict, network_iface: str,
                 tx = nav_cmd["target_pose"]["x"]
                 ty = nav_cmd["target_pose"]["y"]
                 dist = math.sqrt((pose["x"] - tx)**2 + (pose["y"] - ty)**2)
-                if dist < 0.3:
+                if dist < NAV_ARRIVAL_RADIUS_M:
                     state = MotionState.IDLE
                     nav_cmd = None
                     speed_zone = SpeedZone.NORMAL
