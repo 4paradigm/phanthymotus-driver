@@ -534,9 +534,13 @@ class VendoredContractTests(unittest.TestCase):
     def test_cyclonedds_container_logs_are_muzzled_without_losing_interface_selection(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertIn("ENV RCUTILS_COLORIZED_OUTPUT=0", dockerfile)
-        self.assertIn("<Tracing><Verbosity>severe</Verbosity>", dockerfile)
-        self.assertIn("<OutputFile>/dev/null</OutputFile></Tracing>", dockerfile)
-        self.assertIn("NetworkInterface name='${NETWORK_INTERFACE:-eth1}'", dockerfile)
+        # Profile creation belongs to main, where both configured domain IDs
+        # are known. The shell must not preempt it with one all-domain NIC.
+        self.assertNotIn("export CYCLONEDDS_URI=", dockerfile)
+        main = (ROOT / "main.py").read_text()
+        self.assertIn("<Tracing><Verbosity>severe</Verbosity>", main)
+        self.assertIn("<OutputFile>/dev/null</OutputFile></Tracing>", main)
+        self.assertIn("NetworkInterface name='{interface}'", main)
 
     def test_acp_uses_agent_core_certificate_and_matching_hostname(self):
         service = (ROOT / "deploy" / "service.yml").read_text()
