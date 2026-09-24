@@ -25,16 +25,16 @@ def _values(value):
         return [value]
 
 
-def _acp_notify(action_id, status, result):
+def _acp_notify(action_id, status, result, tool="loco"):
     import os, ssl, urllib.request
     payload = json.dumps({"action_id": action_id, "status": status,
-                          "result": result, "tool": "loco", "ts": time.time()}).encode()
+                          "result": result, "tool": tool, "ts": time.time()}).encode()
     try:
         request = urllib.request.Request(f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete",
             data=payload, headers={"Content-Type": "application/json"}, method="POST")
         urllib.request.urlopen(request, timeout=5, context=ssl._create_unverified_context())
     except Exception as exc:
-        print(f"[loco] ACP callback failed for {action_id}: {exc}", flush=True)
+        print(f"[{tool}] ACP callback failed for {action_id}: {exc}", flush=True)
 
 
 class _StateNode:
@@ -271,16 +271,19 @@ class LocoPlugin:
         return None
 
 
-class SpecialActionPlugin:
+class SpecialMotionPlugin:
     """As2W-specific discrete motions provided by the official SportClient."""
-    PREFIX = "special_action"
+    PREFIX = "special_motion"
 
     def __init__(self, config, namespace, executor, proxy):
         self.proxy = proxy
+        self._active_posture = None
+        self._state_lock = threading.Lock()
+        self._motion_lock = threading.Lock()
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
-        return {"name": "special_action", "type": "actuator", "multiInstance": False,
+        return {"name": "special_motion", "type": "actuator", "multiInstance": False,
                 "description": "As2W discrete acrobatic motions via the official SportClient. Requires a clear safety area.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions},
@@ -288,6 +291,7 @@ class SpecialActionPlugin:
                     "confirm": {"type": "boolean", "description": "Required true for hazardous motions."}},
                     "required": ["action"],
                     "x-is-dangerous": True,
+                    "x-completion": {"actions": actions, "timeout": 30},
                     "x-action-params": {
                         "front_flip": {"params": ["confirm"], "description": "DANGEROUS forward flip; requires confirm=true."},
                         "back_flip": {"params": ["confirm"], "description": "DANGEROUS backward flip; requires confirm=true."},
@@ -295,18 +299,73 @@ class SpecialActionPlugin:
                         "biped_stand": {"params": ["enter", "confirm"], "description": "DANGEROUS biped stand; requires confirm=true."}}}}
 
     def start(self): pass
-    def stop(self): pass
+    def stop(self):
+        with self._state_lock:
+            posture = self._active_posture
+        ret = 0
+        if posture == "handstand":
+            ret = self.proxy.HandStand(0)
+        elif posture == "biped_stand":
+            ret = self.proxy.BipedStand(0)
+        if ret == 0:
+            with self._state_lock:
+                if self._active_posture == posture:
+                    self._active_posture = None
+        return ret
+
+    def _run_motion(self, action_id, action, enter):
+        result = {"action": action}
+        if action in ("handstand", "biped_stand"):
+            result["enter"] = enter
+        try:
+            if action == "front_flip":
+                ret = self.proxy.FrontFlip()
+            elif action == "back_flip":
+                ret = self.proxy.BackFlip()
+            elif action == "handstand":
+                ret = self.proxy.HandStand(1 if enter else 0)
+            else:
+                ret = self.proxy.BipedStand(1 if enter else 0)
+            result["ret"] = ret
+            if ret == 0 and action in ("handstand", "biped_stand"):
+                with self._state_lock:
+                    self._active_posture = action if enter else None
+            status = "completed" if ret == 0 else "error"
+        except Exception as exc:
+            status = "error"
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._motion_lock.release()
+        _acp_notify(action_id, status, result, tool="special_motion")
+
+    def _start_motion(self, action, args):
+        if not self._motion_lock.acquire(blocking=False):
+            return {"error": "another special motion is still running"}
+        action_id = f"as2w_special_motion_{uuid4().hex[:8]}"
+        enter = bool(args.get("enter", True))
+        try:
+            threading.Thread(target=self._run_motion,
+                             args=(action_id, action, enter), daemon=True).start()
+        except Exception:
+            self._motion_lock.release()
+            raise
+        return {"accepted": True, "status": "running", "action": action,
+                "action_id": action_id}
 
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
-        if action == "stop": return {"state": "idle"}
+        if action == "stop":
+            return {"state": "idle", "ret": self.stop()}
         if action in ("front_flip", "back_flip", "handstand", "biped_stand") and not args.get("confirm", False):
-            return {"error": "special action requires confirm=true"}
-        if action == "front_flip": return {"ret": self.proxy.FrontFlip()}
-        if action == "back_flip": return {"ret": self.proxy.BackFlip()}
-        if action == "handstand": return {"ret": self.proxy.HandStand(1 if args.get("enter", True) else 0)}
-        if action == "biped_stand": return {"ret": self.proxy.BipedStand(1 if args.get("enter", True) else 0)}
+            return {"error": "special motion requires confirm=true"}
+        if action in ("front_flip", "back_flip", "handstand", "biped_stand"):
+            return self._start_motion(action, args)
         return None
+
+
+# Import compatibility for deployments that imported the old Python class.
+# Only the ``special_motion`` tool is advertised by the bundle.
+SpecialActionPlugin = SpecialMotionPlugin
 
 
 _AS2_JOINT_NAMES = [

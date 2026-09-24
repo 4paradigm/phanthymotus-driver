@@ -16,8 +16,15 @@ COPY requirements.txt /work/requirements.txt
 # packages also purges ros-humble-rclpy under this image's APT dependency graph.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt && \
     pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
+# audio_msgs is a ROS workspace package supplied by the shared ROS base image,
+# not a PyPI dependency.  Fail the image build here instead of letting the
+# driver crash at module import after deployment.
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
+    test -f /ros_ws/install/setup.bash && \
+    source /ros_ws/install/setup.bash && \
+    python3 -c "from audio_msgs.msg import AudioChunk"'
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
-COPY main.py device.py lidar.py controlled_spatial.py rpc_proxy.py config.yaml /work/
+COPY main.py device.py multimedia.py lidar.py controlled_spatial.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY deploy/ /deploy/
@@ -27,4 +34,4 @@ ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 \
     RCUTILS_COLORIZED_OUTPUT=0 \
     CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 EXPOSE 15709
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-}"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-}"]

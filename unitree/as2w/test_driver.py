@@ -27,12 +27,28 @@ def _install_device_stubs():
     std_msgs.UInt8MultiArray = type("UInt8MultiArray", (), {})
     sys.modules["std_msgs"] = types.ModuleType("std_msgs")
     sys.modules["std_msgs.msg"] = std_msgs
+    rclpy = types.ModuleType("rclpy")
+    rclpy_node = types.ModuleType("rclpy.node")
+    class Node:
+        def __init__(self, *_args, **_kwargs): pass
+    rclpy_node.Node = Node
+    rclpy.node = rclpy_node
+    sys.modules["rclpy"] = rclpy
+    sys.modules["rclpy.node"] = rclpy_node
     qos = types.ModuleType("rclpy.qos")
     qos.DurabilityPolicy = types.SimpleNamespace(VOLATILE=1)
     qos.HistoryPolicy = types.SimpleNamespace(KEEP_LAST=1)
     qos.ReliabilityPolicy = types.SimpleNamespace(BEST_EFFORT=1)
     qos.QoSProfile = lambda **kwargs: kwargs
     sys.modules["rclpy.qos"] = qos
+    audio_msgs = types.ModuleType("audio_msgs.msg")
+    audio_msgs.AudioChunk = type("AudioChunk", (), {})
+    sys.modules["audio_msgs"] = types.ModuleType("audio_msgs")
+    sys.modules["audio_msgs.msg"] = audio_msgs
+    sensor_msgs = types.ModuleType("sensor_msgs.msg")
+    sensor_msgs.CompressedImage = type("CompressedImage", (), {})
+    sys.modules["sensor_msgs"] = types.ModuleType("sensor_msgs")
+    sys.modules["sensor_msgs.msg"] = sensor_msgs
     for name in ("unitree_sdk2py", "unitree_sdk2py.core", "unitree_sdk2py.idl",
                  "unitree_sdk2py.idl.unitree_go", "unitree_sdk2py.idl.unitree_go.msg",
                  "unitree_sdk2py.idl.sensor_msgs", "unitree_sdk2py.idl.sensor_msgs.msg",
@@ -72,6 +88,7 @@ class TestDriverContracts(unittest.TestCase):
     def setUpClass(cls):
         _install_device_stubs()
         cls.device = _load("as2w_device_under_test", ROOT / "device.py")
+        cls.multimedia = _load("as2w_multimedia_under_test", ROOT / "multimedia.py")
         cls.spatial = _load("as2w_spatial_under_test", ROOT / "controlled_spatial.py")
 
     def test_card_stop_cancels_continuous_move(self):
@@ -86,11 +103,236 @@ class TestDriverContracts(unittest.TestCase):
 
     def test_special_actions_are_schema_marked_and_confirmed(self):
         proxy = _Proxy()
-        plugin = self.device.SpecialActionPlugin({}, "test", None, proxy)
+        plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
         schema = plugin.get_tool()["inputSchema"]
+        self.assertEqual("special_motion", plugin.get_tool()["name"])
         self.assertTrue(schema["x-is-dangerous"])
+        self.assertEqual(
+            {"front_flip", "back_flip", "handstand", "biped_stand"},
+            set(schema["x-completion"]["actions"]),
+        )
+        self.assertEqual(30, schema["x-completion"]["timeout"])
         self.assertIn("confirm", schema["x-action-params"]["front_flip"]["params"])
         self.assertIn("error", plugin.dispatch("front_flip", {}))
+
+    def test_special_motion_stop_exits_sustained_posture(self):
+        calls = []
+        proxy = types.SimpleNamespace(
+            HandStand=lambda flag: calls.append(("handstand", flag)) or 0,
+            BipedStand=lambda flag: calls.append(("biped_stand", flag)) or 0,
+        )
+        plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
+        completed = __import__("threading").Event()
+        with patch.object(self.device, "_acp_notify", side_effect=lambda *_args, **_kwargs: completed.set()):
+            result = plugin.dispatch("handstand", {"confirm": True, "enter": True})
+            self.assertTrue(result["action_id"].startswith("as2w_special_motion_"))
+            self.assertTrue(completed.wait(1))
+        self.assertEqual("handstand", plugin._active_posture)
+        self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+        self.assertEqual([("handstand", 1), ("handstand", 0)], calls)
+
+    def test_special_motion_returns_immediately_and_reports_acp_completion(self):
+        entered = __import__("threading").Event()
+        release = __import__("threading").Event()
+        notified = []
+
+        def front_flip():
+            entered.set()
+            release.wait(1)
+            return 0
+
+        proxy = types.SimpleNamespace(FrontFlip=front_flip)
+        plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
+        with patch.object(
+                self.device, "_acp_notify",
+                side_effect=lambda *args, **kwargs: notified.append((args, kwargs))):
+            result = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertTrue(result["accepted"])
+            self.assertEqual("running", result["status"])
+            self.assertTrue(result["action_id"].startswith("as2w_special_motion_"))
+            self.assertTrue(entered.wait(1))
+            self.assertEqual([], notified)
+            self.assertIn("error", plugin.dispatch("back_flip", {"confirm": True}))
+            release.set()
+            for _ in range(100):
+                if notified:
+                    break
+                __import__("time").sleep(.01)
+
+        self.assertEqual(1, len(notified))
+        args, kwargs = notified[0]
+        self.assertEqual(result["action_id"], args[0])
+        self.assertEqual("completed", args[1])
+        self.assertEqual(0, args[2]["ret"])
+        self.assertEqual("special_motion", kwargs["tool"])
+
+    def test_special_motion_exception_reports_error_and_releases_slot(self):
+        notified = []
+        completed = __import__("threading").Event()
+
+        def fail():
+            raise RuntimeError("motion failed")
+
+        proxy = types.SimpleNamespace(FrontFlip=fail)
+        plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
+        with patch.object(
+                self.device, "_acp_notify",
+                side_effect=lambda *args, **kwargs: (notified.append((args, kwargs)), completed.set())):
+            first = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertTrue(completed.wait(1))
+            self.assertEqual(first["action_id"], notified[0][0][0])
+            self.assertEqual("error", notified[0][0][1])
+            self.assertIn("RuntimeError", notified[0][0][2]["error"])
+
+            proxy.FrontFlip = lambda: 0
+            completed.clear()
+            second = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertTrue(second["accepted"])
+            self.assertNotEqual(first["action_id"], second["action_id"])
+            self.assertTrue(completed.wait(1))
+            self.assertEqual("completed", notified[1][0][1])
+
+    def test_multimedia_card_contracts_match_verified_hardware(self):
+        mic = self.multimedia.MicPlugin.__new__(self.multimedia.MicPlugin)
+        mic._topic = "/test/mic/audio"
+        speaker = self.multimedia.SpeakerPlugin.__new__(self.multimedia.SpeakerPlugin)
+        camera = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
+        camera._topic = "/test/camera/front"
+
+        self.assertEqual("audio/pcm-16k", mic.get_tool()["topic_out"][0]["format"])
+        self.assertEqual("audio/pcm-16k", speaker.get_tool()["topic_in"][0]["format"])
+        self.assertEqual("camera", camera.get_tool()["name"])
+        self.assertEqual("image/jpeg", camera.get_tool()["topic_out"][0]["format"])
+
+    def test_speaker_info_returns_authoritative_input_topic(self):
+        plugin = self.multimedia.SpeakerPlugin.__new__(self.multimedia.SpeakerPlugin)
+        plugin._node = types.SimpleNamespace(
+            state="ready",
+            topic="/current/audio",
+            _backend=types.SimpleNamespace(is_available=lambda: True),
+        )
+        inferred = plugin.dispatch("info", {"input_topic": "/wired/audio"})
+        self.assertEqual(
+            [{"topic": "/wired/audio", "format": "audio/pcm-16k"}],
+            inferred["topic_in"],
+        )
+        current = plugin.dispatch("info", {})
+        self.assertEqual("/current/audio", current["topic_in"][0]["topic"])
+
+        plugin._node.topic = ""
+        unwired = plugin.dispatch("info", {})
+        self.assertEqual([{"format": "audio/pcm-16k"}], unwired["topic_in"])
+
+    def test_speaker_lifecycle_recreates_backend_after_stop(self):
+        created = []
+
+        class FakeBackend:
+            def __init__(self, interface, merge_bytes):
+                self.interface = interface
+                self.merge_bytes = merge_bytes
+                self.error = ""
+                self.alive = True
+                created.append(self)
+            def is_available(self): return self.alive
+            def close(self): self.alive = False
+            def call(self, *_args, **_kwargs): return {"ok": True}
+            def put(self, _pcm): pass
+
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        with patch.object(self.multimedia, "_SpeakerBackend", FakeBackend):
+            plugin = self.multimedia.SpeakerPlugin(
+                {"buffer_ms": 300}, "test", executor, "eth0")
+            self.assertIsNone(plugin._node._backend)
+            self.assertTrue(plugin.start()["ok"])
+            first = plugin._node._backend
+            self.assertEqual("ready", plugin._node.state)
+            plugin.stop()
+            self.assertIsNone(plugin._node._backend)
+            self.assertEqual("idle", plugin._node.state)
+            self.assertTrue(plugin.start()["ok"])
+            second = plugin._node._backend
+            self.assertIsNot(first, second)
+            self.assertFalse(first.alive)
+            self.assertTrue(second.alive)
+            self.assertEqual(2, len(created))
+
+    def test_docker_image_validates_audio_msgs_at_build_time(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("test -f /ros_ws/install/setup.bash", dockerfile)
+        self.assertIn("from audio_msgs.msg import AudioChunk", dockerfile)
+
+    def test_camera_worker_is_pinned_to_verified_videohub_client(self):
+        source = (ROOT / "multimedia.py").read_text()
+        self.assertIn("unitree_sdk2py.go2.video.video_client", source)
+        self.assertNotIn("unitree_sdk2py.b2.front_video.front_video_client", source)
+
+    def test_camera_worker_publishes_only_valid_jpeg(self):
+        channel = sys.modules["unitree_sdk2py.core.channel"]
+        channel.ChannelFactoryInitialize = lambda *_: None
+        video_pkg = types.ModuleType("unitree_sdk2py.go2.video")
+        video_client = types.ModuleType("unitree_sdk2py.go2.video.video_client")
+
+        class FakeVideoClient:
+            def SetTimeout(self, _timeout): pass
+            def Init(self): pass
+            def GetImageSample(self): return 0, list(b"\xff\xd8frame\xff\xd9")
+
+        video_client.VideoClient = FakeVideoClient
+        sys.modules["unitree_sdk2py.go2.video"] = video_pkg
+        sys.modules["unitree_sdk2py.go2.video.video_client"] = video_client
+        frames, statuses = __import__("queue").Queue(2), __import__("queue").Queue(4)
+        stopped = __import__("threading").Event()
+        thread = __import__("threading").Thread(
+            target=self.multimedia._camera_worker,
+            args=(frames, statuses, stopped, "eth0", 10, 1, .1), daemon=True)
+        thread.start()
+        self.assertEqual(b"\xff\xd8frame\xff\xd9", frames.get(timeout=1))
+        stopped.set()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+
+    def test_speaker_worker_uses_a2_voice_service(self):
+        channel = sys.modules["unitree_sdk2py.core.channel"]
+        channel.ChannelFactoryInitialize = lambda *_: None
+        for name in ("unitree_sdk2py.a2", "unitree_sdk2py.a2.audio"):
+            sys.modules[name] = types.ModuleType(name)
+        audio_client = types.ModuleType("unitree_sdk2py.a2.audio.audio_client")
+
+        class FakeAudioClient:
+            def SetTimeout(self, _timeout): pass
+            def Init(self): pass
+            def PlayStop(self, _app): return 0
+            def PlayStream(self, *_args): return 0
+            def GetVolume(self): return 0, {"volume": 100}
+            def SetVolume(self, _volume): return 0
+
+        audio_client.AudioClient = FakeAudioClient
+        sys.modules["unitree_sdk2py.a2.audio.audio_client"] = audio_client
+        q = __import__("queue")
+        control, results, pcm = q.Queue(), q.Queue(), q.Queue()
+        thread = __import__("threading").Thread(
+            target=self.multimedia._speaker_worker,
+            args=(control, results, pcm, "eth0", 9600), daemon=True)
+        thread.start()
+        self.assertTrue(results.get(timeout=1)["ok"])
+        control.put(("volume", "get_volume", None))
+        self.assertEqual((0, {"volume": 100}), results.get(timeout=1)["result"])
+        control.put(("close", "close", None))
+        self.assertTrue(results.get(timeout=1)["ok"])
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+
+    def test_mic_waiting_state_explains_voice_assistant_precondition(self):
+        node = self.multimedia._MicNode.__new__(self.multimedia._MicNode)
+        node.state = "waiting"
+        node._started_at = self.multimedia.time.monotonic() - 10
+        node.startup_grace_s = 3
+        node.last_error = ""
+        node.packet_count = 0
+        node.last_packet_ts = 0
+        result = node.status()
+        self.assertEqual("waiting", result["state"])
+        self.assertIn("voice assistant", result["message"])
 
     def test_navigation_declares_completion(self):
         plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
