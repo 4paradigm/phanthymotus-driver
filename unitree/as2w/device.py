@@ -1,6 +1,7 @@
 """Unitree As2W driver plugins (official AS2 SDK SportClient)."""
 import json
 import math
+import struct
 import threading
 import time
 from uuid import uuid4
@@ -25,6 +26,54 @@ def _values(value):
         return [value]
 
 
+_REMOTE_BUTTONS_BYTE2 = (
+    ("LT", 5), ("RT", 4), ("back", 3), ("start", 2),
+    ("LB", 1), ("RB", 0),
+)
+_REMOTE_BUTTONS_BYTE3 = (
+    ("left", 7), ("down", 6), ("right", 5), ("up", 4),
+    ("Y", 3), ("X", 2), ("B", 1), ("A", 0),
+)
+_REMOTE_AXIS_DEADZONE = 0.1
+_REMOTE_CONTROL_LEVEL = "LOWLEVEL"
+
+
+def _parse_wireless_remote(raw):
+    if raw is None or len(raw) < 24:
+        return {
+            "available": False,
+            "fresh": False,
+            "control_level": _REMOTE_CONTROL_LEVEL,
+        }
+
+    b2, b3 = int(raw[2]), int(raw[3])
+    buttons = {
+        name: bool(byte >> bit & 1)
+        for byte, definitions in (
+            (b2, _REMOTE_BUTTONS_BYTE2),
+            (b3, _REMOTE_BUTTONS_BYTE3),
+        )
+        for name, bit in definitions
+    }
+    axes = {
+        name: round(struct.unpack("f", bytes(raw[offset:offset + 4]))[0], 4)
+        for name, offset in (
+            ("lx", 4), ("rx", 8), ("ry", 12), ("ly", 20),
+        )
+    }
+    return {
+        "available": True,
+        "fresh": True,
+        "control_level": _REMOTE_CONTROL_LEVEL,
+        "buttons": buttons,
+        "axes": axes,
+        "active": (
+            any(buttons.values())
+            or any(abs(value) > _REMOTE_AXIS_DEADZONE for value in axes.values())
+        ),
+    }
+
+
 def _acp_notify(action_id, status, result):
     import os, ssl, urllib.request
     payload = json.dumps({"action_id": action_id, "status": status,
@@ -46,6 +95,9 @@ class _StateNode:
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", 10)
         self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", 10)
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", 10)
+        self.remote_controller = self.node.create_publisher(
+            String, f"/{namespace}/state/remote_controller", 10
+        )
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
         # AS2/As2W's official sport-state example uses the lf namespace.
@@ -73,6 +125,9 @@ class _StateNode:
         return {f"{prefix}_{i}": float(value) for i, value in enumerate(values)}
 
     def _on_low(self, msg):
+        remote = _parse_wireless_remote(getattr(msg, "wireless_remote", None))
+        remote["timestamp_ms"] = int(time.time() * 1000)
+        self._publish(self.remote_controller, remote)
         imu = getattr(msg, "imu_state", getattr(msg, "imu", None))
         if imu is not None:
             imu_data = {}
@@ -130,7 +185,8 @@ class StatePlugin:
                  ("joints", "state/joints", "sensor/skeleton", "As2W 16-joint skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "As2W raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "As2W BMS state; current_ma is mA"),
-                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"))
+                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"),
+                 ("remote_controller", "state/remote_controller", "data/json", "As2W wireless remote buttons and axes"))
         return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
                  "inputSchema": {"type": "object", "properties": {}},
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
@@ -158,13 +214,14 @@ class StatePlugin:
                      "joints": ("state/joints", "sensor/skeleton"),
                      "joint_state": ("state/joint_state", "data/json"),
                      "battery": ("state/battery", "data/json"),
-                     "loco_state": ("loco/state", "data/json")}
+                     "loco_state": ("loco/state", "data/json"),
+                     "remote_controller": ("state/remote_controller", "data/json")}
             if name in paths:
                 path, fmt = paths[name]
                 return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
             return {"state": "running"}
-        if action in ("imu", "joints", "joint_state", "battery", "loco_state"):
-            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
+        if action in ("imu", "joints", "joint_state", "battery", "loco_state", "remote_controller"):
+            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state", "remote_controller": "state/remote_controller"}[action]
             fmt = "sensor/skeleton" if action == "joints" else "data/json"
             return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
         return {"state": "running"} if action == "info" else None
