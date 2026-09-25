@@ -129,8 +129,20 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("loco", {}).get("enabled", False) and high_ctrl is not None:
             from device import LocoPlugin
-            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, high_ctrl))
+            loco = LocoPlugin(plugins_cfg["loco"], namespace, executor, high_ctrl)
+            self._plugins.append(loco)
             print("[bundle] LocoPlugin loaded")
+
+            # The streaming counterpart to `loco`. Constructed here, right after
+            # it, because it needs a reference to `loco` both to arbitrate over
+            # the chassis and to publish through its rate limiter.
+            if plugins_cfg.get("loco_servo", {}).get("enabled", False):
+                from loco_servo import LocoServoPlugin
+                self._plugins.append(LocoServoPlugin(
+                    plugins_cfg["loco_servo"], namespace, executor, high_ctrl,
+                    loco_plugin=loco,
+                ))
+                print("[bundle] LocoServoPlugin loaded")
 
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
