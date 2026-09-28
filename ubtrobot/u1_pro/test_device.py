@@ -754,6 +754,7 @@ class U1CardContractTests(unittest.TestCase):
             string_call=mock.Mock(side_effect=[
                 {"ok": True, "code": "OK", "data": {"authorized": True, "token": "do-not-log", "license": "private"}},
             ]),
+            get_system_enabled=mock.Mock(return_value={"code": "OK", "data": {"enabled": False}}),
         )
         output = io.StringIO()
         with redirect_stdout(output):
@@ -762,7 +763,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertNotIn("secret-value", text)
         self.assertNotIn("do-not-log", text)
         self.assertIn("authorization request completed", text)
-        self.assertIn("system behaviors are unchanged", text)
+        self.assertIn("autonomous behavior switches are disabled", text)
 
     def test_existing_vendor_authorization_skips_credential_submission(self):
         import device
@@ -772,11 +773,13 @@ class U1CardContractTests(unittest.TestCase):
             trigger_call=mock.Mock(return_value={"code": "OK", "data": {"authorized": True}}),
             call=mock.Mock(),
             string_call=mock.Mock(return_value={"ok": True, "code": "OK", "data": {"authorized": True}}),
-            set_system_enabled=mock.Mock(side_effect=RuntimeError("switch service unavailable")),
+            get_system_enabled=mock.Mock(return_value={"code": "OK", "data": {"enabled": False}}),
+            set_system_enabled=mock.Mock(),
         )
         device.U1Nodes.initialize_robot(nodes)
         nodes.trigger_call.assert_called_once_with("auth_state")
         nodes.set_system_enabled.assert_not_called()
+        self.assertEqual(nodes.get_system_enabled.call_count, 3)
 
     def test_unauthorized_vendor_state_performs_authorization(self):
         import device
@@ -788,7 +791,8 @@ class U1CardContractTests(unittest.TestCase):
                 {"ok": True, "code": "OK", "data": {"authorized": True}},
             ]),
             call=mock.Mock(),
-            set_system_enabled=mock.Mock(side_effect=RuntimeError("switch service unavailable")),
+            get_system_enabled=mock.Mock(return_value={"code": "OK", "data": {"enabled": False}}),
+            set_system_enabled=mock.Mock(),
         )
         device.U1Nodes.initialize_robot(nodes)
         self.assertEqual(nodes.string_call.call_args_list[0].args,
@@ -876,16 +880,35 @@ class U1CardContractTests(unittest.TestCase):
         nodes.close.assert_called_once_with()
         ros.shutdown.assert_called_once_with()
 
-    def test_startup_does_not_change_autonomous_behavior_switches(self):
+    def test_startup_fails_if_an_enabled_behavior_cannot_be_disabled(self):
         import device
 
         nodes = types.SimpleNamespace(
             config={},
             trigger_call=mock.Mock(return_value={"code": "OK", "data": {"authorized": True}}),
+            get_system_enabled=mock.Mock(return_value={"code": "OK", "data": {"enabled": True}}),
             set_system_enabled=mock.Mock(side_effect=RuntimeError("vendor switch unavailable")),
         )
+        with self.assertRaisesRegex(RuntimeError, "vendor switch unavailable"):
+            device.U1Nodes.initialize_robot(nodes)
+        nodes.set_system_enabled.assert_called_once_with("wakeup_enabled", False)
+
+    def test_startup_accepts_rejected_redundant_disable_when_state_is_off(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            config={},
+            trigger_call=mock.Mock(return_value={"code": "OK", "data": {"authorized": True}}),
+            get_system_enabled=mock.Mock(side_effect=[
+                {"code": "OK", "data": {"enabled": False}},
+                {"code": "OK", "data": {"enabled": False}},
+                {"code": "OK", "data": {"enabled": True}},
+                {"code": "OK", "data": {"enabled": False}},
+            ]),
+            set_system_enabled=mock.Mock(side_effect=RuntimeError("SET_VISION_ENABLED_FAILED")),
+        )
         device.U1Nodes.initialize_robot(nodes)
-        nodes.set_system_enabled.assert_not_called()
+        nodes.set_system_enabled.assert_called_once_with("vision_enabled", False)
 
     def test_acp_error_log_escapes_action_id(self):
         import device

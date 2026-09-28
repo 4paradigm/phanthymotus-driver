@@ -495,7 +495,7 @@ class U1Nodes:
                 time.sleep(0.05)
 
     def initialize_robot(self) -> None:
-        """Authorize the SDK without changing robot behavior settings."""
+        """Authorize the SDK and ensure autonomous behavior switches are off."""
         try:
             auth_state = self.trigger_call("auth_state")
         except Exception:
@@ -507,7 +507,23 @@ class U1Nodes:
             print("[U1 init] vendor SDK is already authorized", flush=True)
         else:
             U1Nodes._authorize_from_credentials(self)
-        print("[U1 init] system behaviors are unchanged; use system_controls to manage them", flush=True)
+        for name in ("wakeup_enabled", "wakeup_followup", "vision_enabled"):
+            state_name = f"{name}_state"
+            try:
+                current = U1Nodes._system_enabled_value(self.get_system_enabled(state_name))
+            except Exception:
+                current = None
+            if current is False:
+                continue
+            try:
+                self.set_system_enabled(name, False)
+            except Exception:
+                # A firmware can reject a redundant set(false); an authoritative
+                # readback is enough to establish the required startup state.
+                actual = U1Nodes._system_enabled_value(self.get_system_enabled(state_name))
+                if actual is not False:
+                    raise
+        print("[U1 init] autonomous behavior switches are disabled", flush=True)
 
 
     def _authorize_from_credentials(self) -> None:
@@ -822,17 +838,22 @@ class U1Nodes:
         # Some adapter builds report a false ROS Trigger transport status
         # while the JSON business envelope is successful. Prefer the
         # business payload when it contains the authoritative enabled field.
-        state_payload = _unwrap_result(state)
-        actual = state_payload.get("enabled") if isinstance(state_payload, dict) else None
-        if actual is None and isinstance(state, dict):
-            data = state.get("data")
-            if isinstance(data, dict):
-                actual = data.get("enabled")
+        actual = U1Nodes._system_enabled_value(state)
         if actual is None:
             raise RuntimeError(f"U1 Pro {name} state readback failed")
         if actual is not requested:
             raise RuntimeError(f"U1 Pro {name} state mismatch: requested {requested}, got {actual!r}")
         return {"ok": True, "requested": requested, "enabled": actual, "state": state}
+
+    @staticmethod
+    def _system_enabled_value(state: Any) -> bool | None:
+        payload = _unwrap_result(state)
+        actual = payload.get("enabled") if isinstance(payload, dict) else None
+        if actual is None and isinstance(state, dict):
+            data = state.get("data")
+            if isinstance(data, dict):
+                actual = data.get("enabled")
+        return actual if isinstance(actual, bool) else None
 
     def get_system_enabled(self, name: str) -> dict:
         return self.trigger_call(name)
