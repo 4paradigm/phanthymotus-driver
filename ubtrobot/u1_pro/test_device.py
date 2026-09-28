@@ -89,10 +89,18 @@ def _install_stubs():
     for name in ("AudioChunk", "AudioInData", "AudioOutData", "AudioInfo", "DoaEvent"):
         setattr(audio_msg, name, message(name))
     audio_srv = types.ModuleType("audio_msgs.srv")
-    for name in ("EnableAudioIn", "EnableAudioOut", "SetAudioVolume"):
+    for name in ("EnableAudioIn", "EnableAudioOut", "GetAudioVolume", "SetAudioVolume",
+                 "AudioDeviceInfoList", "SetAudioDevice"):
         setattr(audio_srv, name, type(name, (), {"Request": message("Request")}))
     audio.msg, audio.srv = audio_msg, audio_srv
     sys.modules.update({"audio_msgs": audio, "audio_msgs.msg": audio_msg, "audio_msgs.srv": audio_srv})
+
+    driver = types.ModuleType("driver_msgs")
+    driver_srv = types.ModuleType("driver_msgs.srv")
+    for name in ("GetManagerState", "SetManagerState"):
+        setattr(driver_srv, name, type(name, (), {"Request": message("Request")}))
+    driver.srv = driver_srv
+    sys.modules.update({"driver_msgs": driver, "driver_msgs.srv": driver_srv})
 
     robo = types.ModuleType("robo_sdk")
     robo_srv = types.ModuleType("robo_sdk.srv")
@@ -1212,15 +1220,26 @@ class U1CardContractTests(unittest.TestCase):
         nodes._speaker_forwarding = False
         nodes.EnableAudioOut = types.SimpleNamespace(Request=type("Request", (), {}))
         nodes.AudioInfo = type("AudioInfo", (), {})
+        nodes._prepare_audio_device = mock.Mock()
         nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock(return_value="subscription"))
         nodes.AudioChunk = object
         result = nodes.connect_speaker("/tts/audio")
-        nodes.call.assert_not_called()
+        nodes.call.assert_called_once_with("speaker_enable", mock.ANY)
         nodes.core.create_subscription.assert_called_once()
         self.assertEqual(nodes.core.create_subscription.call_args.args[1], "/tts/audio")
         self.assertEqual(result["input_topic"], "/tts/audio")
         self.assertTrue(nodes._speaker_forwarding)
+
+    def test_get_volume_uses_vendor_get_volume_service(self):
+        import device
+
+        nodes = object.__new__(device.U1Nodes)
+        nodes._volume = None
+        nodes.call = mock.Mock(return_value=types.SimpleNamespace(volume=37))
+        result = nodes.get_volume()
+        self.assertEqual(result, {"volume": 37})
+        nodes.call.assert_called_once_with("volume_get", mock.ANY)
 
     def test_tts_uses_documented_play_text_payload(self):
         import device
