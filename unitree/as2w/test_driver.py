@@ -522,10 +522,12 @@ class TestDriverContracts(unittest.TestCase):
         created = []
 
         class FakeBackend:
-            def __init__(self, interface, block_bytes, prefill_bytes, max_lead_s):
+            def __init__(self, interface, block_bytes, prefill_bytes,
+                         continuation_prefill_bytes, max_lead_s):
                 self.interface = interface
                 self.block_bytes = block_bytes
                 self.prefill_bytes = prefill_bytes
+                self.continuation_prefill_bytes = continuation_prefill_bytes
                 self.max_lead_s = max_lead_s
                 self.error = ""
                 self.alive = True
@@ -545,6 +547,7 @@ class TestDriverContracts(unittest.TestCase):
             first = plugin._node._backend
             self.assertEqual(9600, first.block_bytes)
             self.assertEqual(22400, first.prefill_bytes)
+            self.assertEqual(16000, first.continuation_prefill_bytes)
             self.assertEqual(.24, first.max_lead_s)
             self.assertEqual("ready", plugin._node.state)
             plugin.stop()
@@ -619,13 +622,13 @@ class TestDriverContracts(unittest.TestCase):
         control, results, pcm = q.Queue(), q.Queue(), q.Queue()
         thread = __import__("threading").Thread(
             target=self.multimedia._speaker_worker,
-            args=(control, results, pcm, "eth0", 9600, 22400, .24),
+            args=(control, results, pcm, "eth0", 9600, 22400, 16000, .24),
             daemon=True)
         thread.start()
         self.assertTrue(results.get(timeout=1)["ok"])
         pcm.put(b"\x00" * 19200)
-        # A synthesis gap longer than the 200ms running-stream flush threshold
-        # must not bypass the independent 700ms startup jitter prefill.
+        # A synthesis gap must not bypass the independent 700ms startup jitter
+        # prefill used for the TTS stream.
         __import__("time").sleep(.3)
         self.assertEqual([], FakeAudioClient.instance.played)
         pcm.put(b"\x00" * 3200)
@@ -645,12 +648,101 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(3200, status["buffered_bytes"])
         self.assertEqual(9600, status["block_bytes"])
         self.assertEqual(22400, status["prefill_bytes"])
+        self.assertEqual(16000, status["continuation_prefill_bytes"])
         control.put(("volume", "get_volume", None))
         self.assertEqual((0, {"volume": 100}), results.get(timeout=1)["result"])
         control.put(("close", "close", None))
         self.assertTrue(results.get(timeout=1)["ok"])
         thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
+
+    def test_speaker_rebuffers_after_underflow_and_uses_eof_continuation_prefill(self):
+        channel = sys.modules["unitree_sdk2py.core.channel"]
+        channel.ChannelFactoryInitialize = lambda *_: None
+        for name in ("unitree_sdk2py.a2", "unitree_sdk2py.a2.audio"):
+            sys.modules[name] = types.ModuleType(name)
+        audio_client = types.ModuleType("unitree_sdk2py.a2.audio.audio_client")
+
+        class FakeAudioClient:
+            instance = None
+            def __init__(self):
+                self.played = []
+                FakeAudioClient.instance = self
+            def SetTimeout(self, _timeout): pass
+            def Init(self): pass
+            def PlayStop(self, _app): return 0
+            def PlayStream(self, _app, _stream, pcm):
+                self.played.append(pcm)
+                return 0, None
+            def GetVolume(self): return 0, {"volume": 100}
+            def SetVolume(self, _volume): return 0
+
+        audio_client.AudioClient = FakeAudioClient
+        sys.modules["unitree_sdk2py.a2.audio.audio_client"] = audio_client
+        q = __import__("queue")
+        control, results, pcm = q.Queue(), q.Queue(), q.Queue()
+
+        def status():
+            control.put(("status", "status", None))
+            return results.get(timeout=1)
+
+        with patch.object(self.multimedia, "_SPEAKER_EMPTY_POLL_S", .01), \
+                patch.object(self.multimedia, "_SPEAKER_FLUSH_AFTER_IDLE", 1000), \
+                patch.object(self.multimedia, "_SPEAKER_PREFILL_FALLBACK_IDLE", 1000):
+            thread = __import__("threading").Thread(
+                target=self.multimedia._speaker_worker,
+                args=(control, results, pcm, "eth0", 320, 960, 640, 0),
+                daemon=True)
+            thread.start()
+            self.assertTrue(results.get(timeout=1)["ok"])
+
+            pcm.put(b"\x00" * 960)
+            current = None
+            for _ in range(100):
+                current = status()
+                if current["underflows"]:
+                    break
+                __import__("time").sleep(.01)
+            self.assertEqual(1, current["underflows"])
+            self.assertFalse(current["draining"])
+            self.assertEqual(960, current["prefill_target_bytes"])
+
+            # One block after starvation must wait for a complete rebuffer.
+            played_before = current["play_calls"]
+            pcm.put(b"\x00" * 320)
+            __import__("time").sleep(.03)
+            current = status()
+            self.assertEqual(played_before, current["play_calls"])
+            self.assertEqual(320, current["buffered_bytes"])
+
+            # Completing the full prefill resumes smoothly.  EOF then selects
+            # the shorter continuation prefill used by split TTS segments.
+            pcm.put(b"\x00" * 640)
+            pcm.put(self.multimedia._AUDIO_EOF_MAGIC)
+            for _ in range(100):
+                current = status()
+                if current["rebuffer_count"] and current["eof_count"]:
+                    break
+                __import__("time").sleep(.01)
+            self.assertEqual(1, current["rebuffer_count"])
+            self.assertEqual(640, current["prefill_target_bytes"])
+
+            pcm.put(b"\x00" * 320)
+            __import__("time").sleep(.03)
+            self.assertEqual(current["play_calls"], status()["play_calls"])
+            pcm.put(b"\x00" * 320)
+            pcm.put(self.multimedia._AUDIO_EOF_MAGIC)
+            for _ in range(100):
+                current = status()
+                if current["continuation_resumes"]:
+                    break
+                __import__("time").sleep(.01)
+            self.assertEqual(1, current["continuation_resumes"])
+
+            control.put(("close", "close", None))
+            self.assertTrue(results.get(timeout=1)["ok"])
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
 
     def test_speaker_worker_reports_playstream_errors_and_flushes_eof(self):
         channel = sys.modules["unitree_sdk2py.core.channel"]
@@ -673,7 +765,7 @@ class TestDriverContracts(unittest.TestCase):
         control, results, pcm = q.Queue(), q.Queue(), q.Queue()
         thread = __import__("threading").Thread(
             target=self.multimedia._speaker_worker,
-            args=(control, results, pcm, "eth0", 9600, 22400, .24),
+            args=(control, results, pcm, "eth0", 9600, 22400, 16000, .24),
             daemon=True)
         thread.start()
         self.assertTrue(results.get(timeout=1)["ok"])

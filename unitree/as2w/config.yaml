@@ -14,6 +14,7 @@ plugins:
     enabled: true
     block_ms: 300
     prefill_ms: 700
+    continuation_prefill_ms: 500
     max_lead_ms: 240
   camera:
     enabled: true

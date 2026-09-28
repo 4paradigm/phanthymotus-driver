@@ -287,7 +287,7 @@ _AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
 _SPEAKER_APP_NAME = "as2w_speaker"
 _SPEAKER_BYTES_PER_SECOND = 32000.0
 _SPEAKER_EMPTY_POLL_S = 0.1
-_SPEAKER_FLUSH_AFTER_IDLE = 2
+_SPEAKER_FLUSH_AFTER_IDLE = 5
 _SPEAKER_PREFILL_FALLBACK_IDLE = 10
 _SPEAKER_EXIT_AFTER_IDLE = 15
 
@@ -302,7 +302,7 @@ def _next_speaker_deadline(deadline, started_at, finished_at, duration):
 
 def _speaker_worker(
         control_queue, result_queue, pcm_queue, interface,
-        block_bytes, prefill_bytes, max_lead_s):
+        block_bytes, prefill_bytes, continuation_prefill_bytes, max_lead_s):
     _install_logsafe()
     try:
         from unitree_sdk2py.a2.audio.audio_client import AudioClient
@@ -324,6 +324,9 @@ def _speaker_worker(
     stream_id = "as2w_{}".format(uuid4().hex)
     deadline = None
     draining = False
+    prefill_target = prefill_bytes
+    continuation_pending = False
+    rebuffering = False
     idle_polls = 0
     play_calls = 0
     play_errors = 0
@@ -332,6 +335,8 @@ def _speaker_worker(
     partial_flushes = 0
     prefill_fallbacks = 0
     underflows = 0
+    rebuffer_count = 0
+    continuation_resumes = 0
     underflow_active = False
     eof_count = 0
     rpc_total_ms = 0.0
@@ -398,6 +403,9 @@ def _speaker_worker(
                     client.PlayStop(_SPEAKER_APP_NAME)
                     deadline = None
                     draining = False
+                    prefill_target = prefill_bytes
+                    continuation_pending = False
+                    rebuffering = False
                     idle_polls = 0
                     underflow_active = False
                     paused = False
@@ -434,9 +442,13 @@ def _speaker_worker(
                         partial_flushes=partial_flushes,
                         prefill_fallbacks=prefill_fallbacks,
                         underflows=underflows,
+                        rebuffer_count=rebuffer_count,
+                        continuation_resumes=continuation_resumes,
                         eof_count=eof_count,
                         block_bytes=block_bytes,
                         prefill_bytes=prefill_bytes,
+                        continuation_prefill_bytes=continuation_prefill_bytes,
+                        prefill_target_bytes=prefill_target,
                         max_lead_ms=max_lead_s * 1000.0,
                         rpc_avg_ms=(rpc_total_ms / play_calls if play_calls else 0.0),
                         rpc_max_ms=rpc_max_ms,
@@ -471,19 +483,27 @@ def _speaker_worker(
                 deadline = play(buffered, deadline)
                 buffered.clear()
                 idle_polls = 0
+            elif (draining and not buffered and deadline is not None
+                  and time.monotonic() >= deadline and not underflow_active):
+                underflows += 1
+                underflow_active = True
+                # Do not resume a starved TTS stream one block at a time.  Go
+                # back to the full jitter prefill so a delayed scheduler tick
+                # cannot turn into repeated audible gaps.
+                draining = False
+                deadline = None
+                prefill_target = prefill_bytes
+                continuation_pending = False
+                rebuffering = True
+                idle_polls = 0
             elif (draining and not buffered
                   and idle_polls >= _SPEAKER_EXIT_AFTER_IDLE):
                 draining = False
                 deadline = None
                 underflow_active = False
                 idle_polls = 0
-            elif (draining and not buffered and deadline is not None
-                  and time.monotonic() >= deadline and not underflow_active):
-                underflows += 1
-                underflow_active = True
             continue
         idle_polls = 0
-        underflow_active = False
         if pcm == _AUDIO_EOF_MAGIC:
             eof_count += 1
             if muted_until_eof:
@@ -491,22 +511,38 @@ def _speaker_worker(
                 buffered.clear()
                 draining = False
                 deadline = None
+                prefill_target = prefill_bytes
+                continuation_pending = False
+                rebuffering = False
                 continue
             if buffered:
                 draining = True
                 deadline = play(buffered, deadline)
                 buffered.clear()
-            # Each utterance gets a fresh jitter prefill.  Retaining draining
-            # across EOF would make the next utterance start after one block
-            # and defeat the separate prefill_bytes setting.
+            # TTS uses EOF for every internally split text segment.  Preserve
+            # the playback timeline and use a smaller, still jitter-safe
+            # prefill for the next segment instead of treating it as a cold
+            # stream start.  _next_speaker_deadline() safely re-anchors the
+            # timeline if synthesis of the next segment takes longer.
             draining = False
-            deadline = None
+            prefill_target = continuation_prefill_bytes
+            continuation_pending = True
+            rebuffering = False
+            underflow_active = False
             continue
         if not active or muted_until_eof:
             continue
         buffered.extend(pcm)
-        if not draining and len(buffered) >= prefill_bytes:
+        if not draining and len(buffered) >= prefill_target:
             draining = True
+            if rebuffering:
+                rebuffer_count += 1
+            if continuation_pending:
+                continuation_resumes += 1
+            rebuffering = False
+            continuation_pending = False
+            underflow_active = False
+            prefill_target = prefill_bytes
         while draining and len(buffered) >= block_bytes:
             block = bytes(buffered[:block_bytes])
             del buffered[:block_bytes]
@@ -514,7 +550,8 @@ def _speaker_worker(
 
 
 class _SpeakerBackend:
-    def __init__(self, interface, block_bytes, prefill_bytes, max_lead_s):
+    def __init__(self, interface, block_bytes, prefill_bytes,
+                 continuation_prefill_bytes, max_lead_s):
         context = multiprocessing.get_context("spawn")
         self._control = context.Queue()
         self._results = context.Queue()
@@ -529,7 +566,8 @@ class _SpeakerBackend:
         self._process = context.Process(
             target=_speaker_worker,
             args=(self._control, self._results, self._pcm, interface,
-                  block_bytes, prefill_bytes, max_lead_s),
+                  block_bytes, prefill_bytes, continuation_prefill_bytes,
+                  max_lead_s),
             name="as2w_speaker",
             daemon=True,
         )
@@ -614,11 +652,13 @@ class _SpeakerBackend:
 
 
 class _SpeakerNode(Node):
-    def __init__(self, interface, block_bytes, prefill_bytes, max_lead_s):
+    def __init__(self, interface, block_bytes, prefill_bytes,
+                 continuation_prefill_bytes, max_lead_s):
         super().__init__("as2w_speaker")
         self._interface = interface
         self._block_bytes = block_bytes
         self._prefill_bytes = prefill_bytes
+        self._continuation_prefill_bytes = continuation_prefill_bytes
         self._max_lead_s = max_lead_s
         self._backend = None
         self._subscription = None
@@ -636,6 +676,7 @@ class _SpeakerNode(Node):
             self._interface,
             self._block_bytes,
             self._prefill_bytes,
+            self._continuation_prefill_bytes,
             self._max_lead_s,
         )
         if self._backend.error:
@@ -706,11 +747,16 @@ class SpeakerPlugin:
             100, min(1000, int(config.get("block_ms", config.get("buffer_ms", 300)))))
         prefill_ms = max(
             block_ms, min(3000, int(config.get("prefill_ms", 700))))
+        continuation_prefill_ms = max(
+            block_ms,
+            min(prefill_ms, int(config.get("continuation_prefill_ms", 500))),
+        )
         max_lead_ms = max(0, min(1000, int(config.get("max_lead_ms", 240))))
         self._node = _SpeakerNode(
             network_iface,
             block_ms * 32,
             prefill_ms * 32,
+            continuation_prefill_ms * 32,
             max_lead_ms / 1000.0,
         )
         executor.add_node(self._node)
