@@ -280,6 +280,7 @@ class SpecialMotionPlugin:
         self._active_posture = None
         self._state_lock = threading.Lock()
         self._motion_lock = threading.Lock()
+        self._motion_generation = 0
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]
@@ -301,6 +302,10 @@ class SpecialMotionPlugin:
     def start(self): pass
     def stop(self):
         with self._state_lock:
+            # Invalidate an enter operation before inspecting active posture.
+            # If its vendor RPC is still blocked, the worker observes the new
+            # generation after the RPC returns and sends the matching exit.
+            self._motion_generation += 1
             posture = self._active_posture
         ret = 0
         if posture == "handstand":
@@ -313,10 +318,12 @@ class SpecialMotionPlugin:
                     self._active_posture = None
         return ret
 
-    def _run_motion(self, action_id, action, enter):
+    def _run_motion(self, action_id, action, enter, generation):
         result = {"action": action}
         if action in ("handstand", "biped_stand"):
             result["enter"] = enter
+        ret = None
+        failure = None
         try:
             if action == "front_flip":
                 ret = self.proxy.FrontFlip()
@@ -327,15 +334,50 @@ class SpecialMotionPlugin:
             else:
                 ret = self.proxy.BipedStand(1 if enter else 0)
             result["ret"] = ret
-            if ret == 0 and action in ("handstand", "biped_stand"):
-                with self._state_lock:
-                    self._active_posture = action if enter else None
-            status = "completed" if ret == 0 else "error"
         except Exception as exc:
-            status = "error"
+            failure = exc
             result["error"] = f"{type(exc).__name__}: {exc}"
-        finally:
-            self._motion_lock.release()
+
+        sustained = action in ("handstand", "biped_stand")
+        cancelled = False
+        if sustained and enter:
+            with self._state_lock:
+                cancelled = generation != self._motion_generation
+                if ret == 0 and not cancelled:
+                    self._active_posture = action if enter else None
+        elif sustained and ret == 0:
+            with self._state_lock:
+                self._active_posture = None
+
+        if cancelled:
+            try:
+                cancel_ret = (
+                    self.proxy.HandStand(0) if action == "handstand"
+                    else self.proxy.BipedStand(0)
+                )
+                result["cancel_ret"] = cancel_ret
+                result["cancelled"] = True
+                if cancel_ret == 0:
+                    status = "cancelled"
+                else:
+                    status = "error"
+                    result["error"] = (
+                        "stop requested while entering posture, but exit returned {}"
+                        .format(cancel_ret)
+                    )
+            except Exception as exc:
+                status = "error"
+                result["cancelled"] = True
+                result["error"] = (
+                    "stop requested while entering posture, but exit failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        elif failure is not None:
+            status = "error"
+        else:
+            status = "completed" if ret == 0 else "error"
+
+        self._motion_lock.release()
         _acp_notify(action_id, status, result, tool="special_motion")
 
     def _start_motion(self, action, args):
@@ -343,9 +385,13 @@ class SpecialMotionPlugin:
             return {"error": "another special motion is still running"}
         action_id = f"as2w_special_motion_{uuid4().hex[:8]}"
         enter = bool(args.get("enter", True))
+        with self._state_lock:
+            self._motion_generation += 1
+            generation = self._motion_generation
         try:
             threading.Thread(target=self._run_motion,
-                             args=(action_id, action, enter), daemon=True).start()
+                             args=(action_id, action, enter, generation),
+                             daemon=True).start()
         except Exception:
             self._motion_lock.release()
             raise

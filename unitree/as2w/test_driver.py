@@ -241,6 +241,58 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
         self.assertEqual([("handstand", 1), ("handstand", 0)], calls)
 
+    def test_special_motion_stop_cancels_inflight_posture_enter(self):
+        for action, method_name in (
+                ("handstand", "HandStand"),
+                ("biped_stand", "BipedStand")):
+            with self.subTest(action=action):
+                entered = __import__("threading").Event()
+                release = __import__("threading").Event()
+                exited = __import__("threading").Event()
+                notified = []
+                calls = []
+
+                def posture(flag):
+                    calls.append(flag)
+                    if flag:
+                        entered.set()
+                        release.wait(1)
+                    else:
+                        exited.set()
+                    return 0
+
+                proxy = types.SimpleNamespace(**{method_name: posture})
+                plugin = self.device.SpecialMotionPlugin(
+                    {}, "test", None, proxy)
+                with patch.object(
+                        self.device, "_acp_notify",
+                        side_effect=lambda *args, **kwargs:
+                        notified.append((args, kwargs))):
+                    result = plugin.dispatch(
+                        action, {"confirm": True, "enter": True})
+                    self.assertTrue(entered.wait(1))
+
+                    stopped = plugin.dispatch("stop", {})
+                    self.assertEqual("idle", stopped["state"])
+                    self.assertEqual([1], calls)
+
+                    release.set()
+                    self.assertTrue(exited.wait(1))
+                    for _ in range(100):
+                        if notified:
+                            break
+                        __import__("time").sleep(.01)
+
+                self.assertEqual([1, 0], calls)
+                self.assertIsNone(plugin._active_posture)
+                self.assertEqual(1, len(notified))
+                args, kwargs = notified[0]
+                self.assertEqual(result["action_id"], args[0])
+                self.assertEqual("cancelled", args[1])
+                self.assertTrue(args[2]["cancelled"])
+                self.assertEqual(0, args[2]["cancel_ret"])
+                self.assertEqual("special_motion", kwargs["tool"])
+
     def test_special_motion_returns_immediately_and_reports_acp_completion(self):
         entered = __import__("threading").Event()
         release = __import__("threading").Event()
