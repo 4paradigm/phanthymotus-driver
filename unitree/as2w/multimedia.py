@@ -801,6 +801,9 @@ class CameraPlugin:
             self.stop()
         if action in ("start", "stop", "info"):
             result = self._node.status()
+            if action == "start":
+                result["readiness"] = result["state"]
+                result["state"] = "running"
             result["topic_out"] = [{"topic": self._topic, "format": "image/jpeg"}]
             return result
         return None

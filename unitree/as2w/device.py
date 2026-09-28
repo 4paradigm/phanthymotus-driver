@@ -356,9 +356,14 @@ class SpecialMotionPlugin:
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
             return {"state": "idle", "ret": self.stop()}
-        if action in ("front_flip", "back_flip", "handstand", "biped_stand") and not args.get("confirm", False):
-            return {"error": "special motion requires confirm=true"}
-        if action in ("front_flip", "back_flip", "handstand", "biped_stand"):
+        motions = ("front_flip", "back_flip", "handstand", "biped_stand")
+        if action in motions and args.get("confirm") is not True:
+            return {
+                "ok": False,
+                "code": "INVALID_ARGUMENT",
+                "error": "special motion requires boolean confirm=true",
+            }
+        if action in motions:
             return self._start_motion(action, args)
         return None
 

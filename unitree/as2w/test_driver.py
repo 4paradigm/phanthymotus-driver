@@ -207,6 +207,24 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn("confirm", schema["x-action-params"]["front_flip"]["params"])
         self.assertIn("error", plugin.dispatch("front_flip", {}))
 
+    def test_special_motion_requires_literal_boolean_confirmation(self):
+        proxy = types.SimpleNamespace(FrontFlip=lambda: 0)
+        plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
+
+        for confirm in (None, False, "false", "true", 0, 1, {}, []):
+            with self.subTest(confirm=confirm):
+                result = plugin.dispatch("front_flip", {"confirm": confirm})
+                self.assertFalse(result["ok"])
+                self.assertEqual("INVALID_ARGUMENT", result["code"])
+
+        completed = __import__("threading").Event()
+        with patch.object(
+                self.device, "_acp_notify",
+                side_effect=lambda *_args, **_kwargs: completed.set()):
+            result = plugin.dispatch("front_flip", {"confirm": True})
+            self.assertTrue(result["accepted"])
+            self.assertTrue(completed.wait(1))
+
     def test_special_motion_stop_exits_sustained_posture(self):
         calls = []
         proxy = types.SimpleNamespace(
@@ -295,6 +313,72 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("audio/pcm-16k", speaker.get_tool()["topic_in"][0]["format"])
         self.assertEqual("camera", camera.get_tool()["name"])
         self.assertEqual("image/jpeg", camera.get_tool()["topic_out"][0]["format"])
+
+    def test_degraded_bundle_omits_microphone_card(self):
+        created = []
+
+        class FakeMicPlugin:
+            def __init__(self, *_args):
+                created.append("mic")
+
+        device = types.ModuleType("device")
+        device.StatePlugin = device.LocoPlugin = device.SpecialMotionPlugin = object
+        multimedia = types.ModuleType("multimedia")
+        multimedia.CameraPlugin = multimedia.SpeakerPlugin = object
+        multimedia.MicPlugin = FakeMicPlugin
+        lidar = types.ModuleType("lidar")
+        lidar.LidarPlugin = object
+        spatial = types.ModuleType("controlled_spatial")
+        spatial.ControlledSpatialPlugin = object
+        config = {"plugins": {
+            "state": {"enabled": False},
+            "loco": {"enabled": False},
+            "special_motion": {"enabled": False},
+            "mic": {"enabled": True},
+            "speaker": {"enabled": False},
+            "camera": {"enabled": False},
+            "lidar": {"enabled": False},
+            "controlled_spatial": {"enabled": False},
+        }}
+
+        modules = {
+            "device": device,
+            "multimedia": multimedia,
+            "lidar": lidar,
+            "controlled_spatial": spatial,
+        }
+        with patch.dict(sys.modules, modules):
+            degraded = self.main.Bundle(
+                config, "test", object(), object(), None, dds_ready=False)
+            ready = self.main.Bundle(
+                config, "test", object(), object(), "eth0", dds_ready=True)
+
+        self.assertEqual([], degraded.plugins)
+        self.assertEqual(["mic"], created)
+        self.assertEqual(1, len(ready.plugins))
+
+    def test_camera_start_returns_running_with_async_readiness(self):
+        plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
+        plugin._topic = "/test/camera/front"
+        node = types.SimpleNamespace(state="idle")
+
+        def start_capture():
+            node.state = "starting"
+
+        node.start_capture = start_capture
+        node.status = lambda: {
+            "state": node.state,
+            "frames": 0,
+            "last_frame_ago_ms": -1,
+            "last_error": "",
+        }
+        plugin._node = node
+
+        result = plugin.dispatch("start", {})
+
+        self.assertEqual("running", result["state"])
+        self.assertEqual("starting", result["readiness"])
+        self.assertEqual("starting", plugin.dispatch("info", {})["state"])
 
     def test_zero_pcm_has_no_variation(self):
         self.assertFalse(self.multimedia._pcm_has_variation(b"\x00" * 1024))
