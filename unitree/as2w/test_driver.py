@@ -327,7 +327,38 @@ class TestDriverContracts(unittest.TestCase):
 
         self.assertEqual("error", state)
         self.assertEqual("error", plugin._node.state)
-        self.assertIn("L1+L2", message)
+        self.assertEqual(
+            "收到静音数据。请同时按下 L1+L2，将语音状态切换为唤醒模式，"
+            "然后重新开启智能控制。",
+            message,
+        )
+
+    def test_mic_start_without_multicast_returns_wakeup_hint(self):
+        plugin = self.multimedia.MicPlugin.__new__(self.multimedia.MicPlugin)
+        plugin._node = types.SimpleNamespace(
+            packet_count=0,
+            varying_chunk_count=0,
+            state="waiting",
+            last_error="",
+        )
+        now = [0.0]
+
+        def monotonic():
+            now[0] += 0.1
+            return now[0]
+
+        with patch.object(self.multimedia.time, "monotonic", side_effect=monotonic), \
+                patch.object(self.multimedia.time, "sleep", return_value=None):
+            state, message = plugin._self_check()
+
+        self.assertEqual("error", state)
+        self.assertEqual("error", plugin._node.state)
+        self.assertEqual(
+            "未收到麦克风组播数据。请同时按下 L1+L2，"
+            "将语音状态切换为唤醒模式，"
+            "然后重新开启智能控制。",
+            message,
+        )
 
     def test_speaker_info_returns_authoritative_input_topic(self):
         plugin = self.multimedia.SpeakerPlugin.__new__(self.multimedia.SpeakerPlugin)

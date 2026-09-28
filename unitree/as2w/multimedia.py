@@ -37,6 +37,11 @@ _IMAGE_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+_MIC_WAKEUP_INSTRUCTION = (
+    "请同时按下 L1+L2，将语音状态切换为唤醒模式，"
+    "然后重新开启智能控制。"
+)
+
 
 def _install_logsafe():
     try:
@@ -232,7 +237,9 @@ class MicPlugin:
                 time.sleep(0.1)
         if self._node.packet_count == 0:
             self._node.state = "error"
-            self._node.last_error = "no multicast packets received in 3s"
+            self._node.last_error = (
+                "未收到麦克风组播数据。" + _MIC_WAKEUP_INSTRUCTION
+            )
             return "error", self._node.last_error
 
         # The robot can keep sending flat PCM while voice wake-up mode is off.
@@ -248,9 +255,7 @@ class MicPlugin:
         if self._node.varying_chunk_count == varying_before:
             self._node.state = "error"
             self._node.last_error = (
-                "麦克风启动失败：收到音频数据，但没有检测到声音波动。"
-                "请使用机器人遥控器同时按下 L1+L2，将语音状态切换为唤醒模式，"
-                "然后重新启动。"
+                "收到静音数据。" + _MIC_WAKEUP_INSTRUCTION
             )
             return "error", self._node.last_error
 
