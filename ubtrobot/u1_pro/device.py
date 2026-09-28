@@ -740,17 +740,6 @@ class U1Nodes:
         self._mic_frames += 1
         self._mic_frame_event.set()
 
-    def _doa_topic_callback(self, message) -> None:
-        """Bridge the device-domain DOA message into the Agent JSON stream."""
-        output = self.String()
-        output.data = json.dumps({
-            "event": "doa",
-            "azimuth": float(getattr(message, "azimuth", 0.0)),
-            "confidence": float(getattr(message, "confidence", 0.0)),
-        }, ensure_ascii=False, separators=(",", ":"))
-        if self._event_forwarding.get("doa_event", False):
-            self._event_publishers["doa_event"].publish(output)
-
     def wait_for_mic_frame(self, timeout: float) -> bool:
         if self._mic_frame_event.wait(timeout):
             return True
@@ -1277,18 +1266,21 @@ class EyeCameraPlugin:
         try:
             if self._publisher is None:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
-            response = self.nodes.open_video()
-            self._video_open = True
-            stream = dict(response.get("stream") or {})
-            if str(stream.get("state", "OPEN")).upper() == "CLOSED":
-                raise RuntimeError("U1 Pro video stream remained closed after open_stream")
-            self._metadata = self.nodes.video_metadata()
             # The SDK ring is a single stream and has no eye-selection input.
             # Keep each card bound to its verified physical-eye DDS topic;
             # use ring frames only if their metadata explicitly identifies
             # this eye, so a generic stream is never mislabeled as stereo.
             self._subscription = self.nodes.audio_device.create_subscription(
                 self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
+            # Subscribe before opening the shared stream. The adapter can
+            # publish the eye topics immediately after video_open returns;
+            # registering first avoids losing that startup window.
+            response = self.nodes.open_video()
+            self._video_open = True
+            stream = dict(response.get("stream") or {})
+            if str(stream.get("state", "OPEN")).upper() == "CLOSED":
+                raise RuntimeError("U1 Pro video stream remained closed after open_stream")
+            self._metadata = self.nodes.video_metadata()
             # Use the SDK ring when it identifies a physical eye. Some
             # firmware builds publish only the eye-specific DDS topics, so a
             # ring that does not become ready is optional.

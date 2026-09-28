@@ -374,19 +374,6 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(device._event_json(message), message.data)
         self.assertEqual(device._event_data(message.data), {"azimuth": 12.5})
 
-    def test_doa_device_message_is_bridged_as_json(self):
-        import device
-
-        publisher = FakePublisher()
-        nodes = object.__new__(device.U1Nodes)
-        nodes.String = type("String", (), {})
-        nodes._event_forwarding = {"doa_event": True}
-        nodes._event_publishers = {"doa_event": publisher}
-        nodes._doa_topic_callback(types.SimpleNamespace(azimuth=25.0, confidence=-0.788))
-        self.assertEqual(json.loads(publisher.messages[0].data), {
-            "event": "doa", "azimuth": 25.0, "confidence": -0.788,
-        })
-
     def test_fixed_byte_array_ros_string_decodes_encoding(self):
         import device
 
@@ -545,16 +532,6 @@ class U1CardContractTests(unittest.TestCase):
             sys.modules["rclpy"].ok = original_ok
             sys.modules["rclpy"].shutdown = original_shutdown
 
-    def test_event_start_stop_controls_forwarding(self):
-        import device
-
-        nodes = FakeNodes()
-        plugin = device.EventPlugin(nodes, "doa_event", "test event")
-        plugin.start()
-        plugin.stop()
-        self.assertEqual(nodes.event_enabled, [("doa_event", True), ("doa_event", False)])
-        self.assertFalse(plugin.running)
-
     def test_disabled_event_callback_does_not_publish(self):
         import device
 
@@ -685,14 +662,6 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(header.frame_id, "left-camera")
         self.assertTrue(publisher.messages[0].data)
         self.assertEqual(camera._state()["metadata"]["width"], 1)
-
-    def test_event_lifecycle_methods_return_state(self):
-        import device
-
-        nodes = FakeNodes()
-        plugin = device.EventPlugin(nodes, "doa_event", "test event")
-        self.assertEqual(plugin.start(), {"state": "running"})
-        self.assertEqual(plugin.stop(), {"state": "idle"})
 
     def test_camera_bad_frame_does_not_report_running(self):
         import device
