@@ -25,6 +25,7 @@ from common.vendor_runtime import action_schema, jsonable, tool
 
 SERVICE_TIMEOUT = 10.0
 CAMERA_FRAME_TIMEOUT = 3.0
+CAMERA_RIGHT_RETRY_TIMEOUT = 5.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
@@ -1298,7 +1299,18 @@ class EyeCameraPlugin:
             except Exception:
                 self._reader.stop()
                 self._reader = None
-            if not self._frame_ready.wait(CAMERA_FRAME_TIMEOUT):
+            ready = self._frame_ready.wait(CAMERA_FRAME_TIMEOUT)
+            if not ready and self.eye == "right":
+                # The U1 adapter can bring up the right-eye DDS writer after
+                # the shared video service has opened. Recreate only this
+                # subscription once instead of relabeling another eye's data.
+                self.nodes.audio_device.destroy_subscription(self._subscription)
+                self._subscription = None
+                self._frame_ready.clear()
+                self._subscription = self.nodes.audio_device.create_subscription(
+                    self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
+                ready = self._frame_ready.wait(CAMERA_RIGHT_RETRY_TIMEOUT)
+            if not ready:
                 reader_error = getattr(self._reader, "_error", "")
                 raise RuntimeError(reader_error or self._last_error or
                                    f"no valid JPEG frames received from {self.source_topic} "

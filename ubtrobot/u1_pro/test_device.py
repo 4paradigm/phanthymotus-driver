@@ -741,6 +741,58 @@ class U1CardContractTests(unittest.TestCase):
         nodes.close_video.assert_called_once_with()
         self.assertFalse(camera.running)
 
+    def test_right_camera_retries_device_subscription(self):
+        import device
+
+        publisher = FakePublisher()
+        subscribe_count = 0
+
+        def subscribe(_msg_type, _topic, callback, _qos):
+            nonlocal subscribe_count
+            subscribe_count += 1
+            if subscribe_count == 2:
+                callback(types.SimpleNamespace(
+                    width=1, height=1, step=3, encoding="rgb8", data=[255, 0, 0],
+                    header=types.SimpleNamespace(
+                        frame_id="right_eye",
+                        stamp=types.SimpleNamespace(sec=1, nanosec=2))))
+            return f"camera-subscription-{subscribe_count}"
+
+        nodes = types.SimpleNamespace(
+            namespace="test",
+            CompressedImage=sys.modules["sensor_msgs.msg"].CompressedImage,
+            Image6m=object,
+            core=types.SimpleNamespace(create_publisher=lambda *args: publisher),
+            audio_device=types.SimpleNamespace(
+                create_subscription=subscribe,
+                destroy_subscription=mock.Mock()),
+            _sensor_qos=object(),
+            open_video=mock.Mock(return_value={"stream": {
+                "state": "OPEN", "path": "/tmp/u1-video", "frame_payload_size": 8,
+                "max_frames": 2}}),
+            close_video=mock.Mock(return_value={"state": "closed"}),
+            video_metadata=mock.Mock(return_value={}),
+        )
+        camera = device.EyeCameraPlugin(nodes, "right")
+
+        class IdleReader:
+            def __init__(self, config, metadata_getter, callback):
+                self._error = ""
+
+            def start(self, timeout=0.5):
+                pass
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(device, "VideoSharedMemoryReader", IdleReader), \
+                mock.patch.object(device, "CAMERA_FRAME_TIMEOUT", 0.01), \
+                mock.patch.object(device, "CAMERA_RIGHT_RETRY_TIMEOUT", 0.01):
+            result = camera.start()
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(subscribe_count, 2)
+        self.assertEqual(camera._frames, 1)
+
     def test_expression_and_head_use_declared_names_without_list_actions(self):
         import device
 
