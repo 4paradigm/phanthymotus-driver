@@ -5,8 +5,8 @@
 ## 卡片
 
 - `mic`：调用 U1 SDK 的音频 `open_stream`/`stream_state`，并同时接收设备 raw 与 `/audio/sense/audio_data_to_asr` 的 `AudioInData`。驱动会按消息中的采样率、声道和格式转换为统一的 `audio/pcm-16k`，启动时等待首个 PCM 帧；失败会关闭流并报告错误。
-- `speaker`：订阅连接到卡片的 `audio/pcm-16k` 输入，并转发为设备 domain 上的 `/sys/device/audio_out/raw`。此路径不调用已观测到会超时的 `audio_out/enable` 服务；驱动能确认收到并转发了音频帧，但是否实际发声仍取决于真机固件对该 topic 的处理。
-- `tts`：通过 U1 SDK `play_text` 进行文本播报，支持音量读写、打断和 ACP 异步完成回报。TTS 与实时扬声器输入共用设备音量。
+- `speaker`：订阅连接到卡片的 `audio/pcm-16k` 输入，并转发为设备 domain 上的 `/sys/device/audio_out/raw`。此路径不调用已观测到会超时的音频启停、音量或静音服务；是否实际发声仍取决于真机固件对该 topic 的处理。
+- `tts`：通过 U1 SDK `play_text` 进行文本播报，支持打断和 ACP 异步完成回报。真机音量服务不纳入本驱动能力。
 - `expression`、`head`：通过 SDK `play_action` 播放声明的动作名称。动作提交后以 ACP 关联播放结果；`interrupt`/`stop` 会调用 SDK 中断服务。两张卡共享同一个动作执行队列。
 - `system_controls`：统一控制 `wakeup`、`wakeup_followup` 和 `visual_behavior` 三个固件行为开关。
 - `camera_left`、`camera_right`：打开 SDK video stream，并分别订阅 domain `2` 的 `/sensor/camera/left_eye/color/raw`、`/sensor/camera/right_eye/color/raw`，转换后输出 JPEG。SDK 共享内存视频流没有选择左右眼的参数；只有元数据明确标记了对应眼睛时，才会将环形缓冲帧作为该眼的备用输入，避免把一幅画面伪装成左右两路。

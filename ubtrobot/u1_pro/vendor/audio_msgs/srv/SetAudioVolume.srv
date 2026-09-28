@@ -1,4 +1,0 @@
-uint8 volume
----
-int32 code
-string message

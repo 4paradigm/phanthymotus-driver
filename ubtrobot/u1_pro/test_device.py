@@ -63,7 +63,6 @@ def _install_stubs():
             setattr(self, "frame_id", ""),
         )[-1]
     })
-    std_msg.UInt8 = type("UInt8", (), {})
     std.msg = std_msg
     sys.modules.update({"std_msgs": std, "std_msgs.msg": std_msg})
 
@@ -89,7 +88,7 @@ def _install_stubs():
     for name in ("AudioChunk", "AudioInData", "AudioOutData", "AudioInfo", "DoaEvent"):
         setattr(audio_msg, name, message(name))
     audio_srv = types.ModuleType("audio_msgs.srv")
-    for name in ("EnableAudioIn", "EnableAudioOut", "GetAudioVolume", "SetAudioVolume",
+    for name in ("EnableAudioIn", "EnableAudioOut",
                  "AudioDeviceInfoList", "SetAudioDevice"):
         setattr(audio_srv, name, type(name, (), {"Request": message("Request")}))
     audio.msg, audio.srv = audio_msg, audio_srv
@@ -501,12 +500,8 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
             self.assertEqual(len(nodes.robot.subscriptions), 2)
-            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 3)
+            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 2)
             self.assertEqual(initialized_domains[0][1], 2)
-            self.assertEqual(nodes.audio_device.clients["/sys/device/audio_out/set_volume"].srv_name,
-                             "/sys/device/audio_out/set_volume")
-            self.assertIn("/sys/device/audio_out/current_volume",
-                          [sub[1] for sub in nodes.audio_device.subscriptions])
             self.assertIn("/sys/device/audio_in/raw",
                           [sub[1] for sub in nodes.audio_device.subscriptions])
             self.assertEqual(nodes.robot.clients["/robo/audio/call/open_stream"].srv_name,
@@ -1170,15 +1165,8 @@ class U1CardContractTests(unittest.TestCase):
         tool = device.AudioPlugin(FakeNodes()).get_tool()
         schema = tool["inputSchema"]
         self.assertEqual(tool["name"], "tts")
-        self.assertEqual(schema["properties"]["action"]["enum"], ["start", "speak", "set_volume", "get_volume", "interrupt", "stop", "info"])
+        self.assertEqual(schema["properties"]["action"]["enum"], ["start", "speak", "interrupt", "stop", "info"])
         self.assertEqual(schema["x-completion"]["actions"], ["speak"])
-
-    def test_tts_exposes_shared_speaker_volume_controls(self):
-        import device
-
-        actions = device.AudioPlugin(FakeNodes()).get_tool()["inputSchema"]["properties"]["action"]["enum"]
-        self.assertIn("set_volume", actions)
-        self.assertIn("get_volume", actions)
 
     def test_head_card_uses_readable_preset_names(self):
         import device
@@ -1252,16 +1240,6 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(nodes.core.create_subscription.call_args.args[1], "/tts/audio")
         self.assertEqual(result["input_topic"], "/tts/audio")
         self.assertTrue(nodes._speaker_forwarding)
-
-    def test_get_volume_uses_vendor_get_volume_service(self):
-        import device
-
-        nodes = object.__new__(device.U1Nodes)
-        nodes._volume = None
-        nodes.call = mock.Mock(return_value=types.SimpleNamespace(volume=37))
-        result = nodes.get_volume()
-        self.assertEqual(result, {"volume": 37})
-        nodes.call.assert_called_once_with("volume_get", mock.ANY)
 
     def test_tts_uses_documented_play_text_payload(self):
         import device

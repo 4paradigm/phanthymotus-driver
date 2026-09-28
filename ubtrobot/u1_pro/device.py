@@ -37,6 +37,7 @@ SDK_AUDIO_STATE = "/robo/audio/call/stream_state"
 SDK_AUDIO_CLOSE = "/robo/audio/call/close_stream"
 ASR_AUDIO_TOPIC = "/audio/sense/audio_data_to_asr"
 MOTION_LIST_SERVICE = "/robo/audio/call/get_motion_info_list"
+JPEG_MAX_PIXELS = 1280 * 720
 
 EVENT_TOPICS = {"playback_state": PLAYBACK_TOPIC}
 
@@ -318,9 +319,16 @@ def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
         step = step or row_bytes
         if width % 2 or step < row_bytes or len(payload) < step * height:
             raise ValueError("U1 Pro YUY2 frame payload is smaller than metadata dimensions")
+        # The physical stream is 2048x1536.  Encoding both full-resolution
+        # eyes as JPEG is more expensive than the Agent display needs and
+        # causes visible queueing.  Subsample before YUV conversion so the
+        # expensive RGB allocation is bounded, rather than resizing after it.
+        scale = 2 if width * height > JPEG_MAX_PIXELS else 1
         packed = np.frombuffer(payload, dtype=np.uint8).reshape(height, step)[:, :row_bytes]
-        yuyv = packed.reshape(height, width // 2, 4).astype(np.int32)
-        y = np.empty((height, width), dtype=np.int32)
+        yuyv = packed.reshape(height, width // 2, 4)[::scale, ::scale].astype(np.int32)
+        out_height = yuyv.shape[0]
+        out_width = yuyv.shape[1] * 2
+        y = np.empty((out_height, out_width), dtype=np.int32)
         y[:, 0::2], y[:, 1::2] = yuyv[:, :, 0], yuyv[:, :, 2]
         u = np.repeat(yuyv[:, :, 1], 2, axis=1) - 128
         v = np.repeat(yuyv[:, :, 3], 2, axis=1) - 128
@@ -331,7 +339,7 @@ def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
         image = Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8))
         import io
         output = io.BytesIO()
-        image.save(output, format="JPEG", quality=85, optimize=False)
+        image.save(output, format="JPEG", quality=75, optimize=False)
         return output.getvalue()
     else:
         raise ValueError(f"unsupported U1 Pro video encoding: {encoding!r}")
@@ -347,7 +355,7 @@ def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
         image = image.convert("RGB")
     import io
     output = io.BytesIO()
-    image.save(output, format="JPEG", quality=85, optimize=False)
+    image.save(output, format="JPEG", quality=75, optimize=False)
     return output.getvalue()
 
 
@@ -410,8 +418,6 @@ class U1Nodes:
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
         from audio_msgs.msg import AudioChunk, AudioInData, AudioInfo, AudioOutData
-        from audio_msgs.srv import GetAudioVolume, SetAudioVolume
-        from std_msgs.msg import UInt8
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
         from sensor_msgs.msg import CompressedImage
@@ -444,15 +450,10 @@ class U1Nodes:
         self.AudioInData = AudioInData
         self.AudioInfo = AudioInfo
         self.AudioOutData = AudioOutData
-        self.UInt8 = UInt8
         self.String = String
         self.CompressedImage = CompressedImage
         self.Image6m = Image6m
         self._speaker_publisher = self.audio_device.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
-        self._volume = None
-        self._volume_subscription = self.audio_device.create_subscription(
-            UInt8, "/sys/device/audio_out/current_volume", self._volume_callback, 10)
-        self.GetAudioVolume = GetAudioVolume
         self._speaker_subscription = None
         self._speaker_forwarding = False
         self._speaker_uuid = ""
@@ -495,8 +496,6 @@ class U1Nodes:
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
         self._robot_subscriptions.append(self.robot.create_subscription(String, VIDEO_METADATA_TOPIC, self._metadata_callback, reliable))
         self._clients = {
-            "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
-            "volume_get": self.audio_device.create_client(GetAudioVolume, "/sys/device/audio_out/get_volume"),
             "video_open": self.robot.create_client(Trigger, "/robo/video/call/open_stream"),
             "video_state": self.robot.create_client(Trigger, "/robo/video/call/stream_state"),
             "video_close": self.robot.create_client(Trigger, "/robo/video/call/close_stream"),
@@ -630,19 +629,6 @@ class U1Nodes:
     def video_metadata(self) -> dict:
         with self._video_metadata_lock:
             return dict(self._video_metadata)
-
-    def _volume_callback(self, message) -> None:
-        self._volume = int(message.data)
-
-    def get_volume(self) -> dict:
-        try:
-            from audio_msgs.srv import GetAudioVolume
-            response = self.call("volume_get", GetAudioVolume.Request())
-            self._volume = int(response.volume)
-        except Exception:
-            if self._volume is None:
-                raise
-        return {"volume": self._volume}
 
     def call(self, name: str, request) -> Any:
         client = self._clients[name]
@@ -896,17 +882,6 @@ class U1Nodes:
     def get_system_enabled(self, name: str) -> dict:
         return self.trigger_call(name)
 
-    def set_volume(self, volume: int) -> dict:
-        from audio_msgs.srv import SetAudioVolume
-        request = SetAudioVolume.Request()
-        request.volume = max(0, min(100, int(volume)))
-        response = self.call("volume", request)
-        code = getattr(response, "code", 0)
-        if int(code) != 0:
-            raise RuntimeError(f"U1 Pro volume service failed with code {code}")
-        self._volume = request.volume
-        return jsonable(response)
-
     def close_speaker_subscription(self) -> None:
         self._speaker_forwarding = False
         if self._speaker_subscription is not None:
@@ -1062,12 +1037,10 @@ class SpeakerPlugin:
     def get_tool(self):
         actions = {
             "start": (["input_topic"], "播放已连接的 PCM 音频流。"),
-            "set_volume": (["volume"], "设置 U1 Pro 扬声器音量，范围为 0 到 100。"),
-            "get_volume": ([], "读取 U1 Pro 当前扬声器音量。"),
             "stop": ([], "停止播放已连接的音频流。"),
             "info": ([], "读取扬声器连接状态。"),
         }
-        return {"name": self.PREFIX, "type": "actuator", "multiInstance": False, "description": "U1 Pro 扬声器音频输出。连接 TTS 或其他 audio/pcm-16k 音频流后即可播放，并支持读取和设置音量。", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "已连接的 audio/pcm-16k 输入话题，通常由 Agent Core 的流连接提供。"}, "volume": {"type": "integer", "minimum": 0, "maximum": 100}}), "topic_in": [{"format": "audio/pcm-16k"}]}
+        return {"name": self.PREFIX, "type": "actuator", "multiInstance": False, "description": "U1 Pro 扬声器音频输出。连接 audio/pcm-16k 输入流后尝试播放。", "inputSchema": action_schema(actions, {"input_topic": {"type": "string", "description": "已连接的 audio/pcm-16k 输入话题，通常由 Agent Core 的流连接提供。"}}), "topic_in": [{"format": "audio/pcm-16k"}]}
 
     def start(self):
         # The input topic is supplied by Agent Core when the stream is connected;
@@ -1091,10 +1064,6 @@ class SpeakerPlugin:
             result = self.nodes.connect_speaker(topic)
             self.running = True
             return result
-        if action == "set_volume":
-            return self.nodes.set_volume(args.get("volume", 100))
-        if action == "get_volume":
-            return self.nodes.get_volume()
         if action == "stop":
             self.stop()
             return {"state": "idle"}
@@ -1118,15 +1087,12 @@ class AudioPlugin:
         actions = {
             "start": ([], "启动 U1 Pro 文本转语音卡片。"),
             "speak": (["text"], "将文本转换为语音并通过 U1 Pro 播放。",),
-            "set_volume": (["volume"], "设置 TTS 扬声器音量，范围为 0 到 100。"),
-            "get_volume": ([], "读取 TTS 扬声器音量。"),
             "interrupt": ([], "立即打断当前 TTS 播放。"),
             "stop": ([], "打断当前 TTS 播放。"),
             "info": ([], "读取 TTS 就绪状态和当前播放任务。"),
         }
         properties = {
             "text": {"type": "string", "minLength": 1, "description": "要播放的文本。"},
-            "volume": {"type": "integer", "minimum": 0, "maximum": 100, "description": "扬声器音量，范围为 0 到 100。"},
             "action_id": {"type": "string", "description": "可选的调用关联 ID；未提供时自动生成 UUID。"},
         }
         schema = action_schema(actions, properties)
@@ -1209,10 +1175,6 @@ class AudioPlugin:
             with self._lock:
                 active = dict(self._active) if self._active else None
             return {"state": "ready" if self.running else "idle", "active": active}
-        if action == "set_volume":
-            return self.nodes.set_volume(args.get("volume", 100))
-        if action == "get_volume":
-            return self.nodes.get_volume()
         if action == "speak":
             text = str(args.get("text", "")).strip()
             if not text:

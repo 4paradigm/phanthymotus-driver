@@ -14,8 +14,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DoaEvent.msg"
   "srv/EnableAudioIn.srv"
   "srv/EnableAudioOut.srv"
-  "srv/GetAudioVolume.srv"
-  "srv/SetAudioVolume.srv"
   DEPENDENCIES std_msgs
 )
 
