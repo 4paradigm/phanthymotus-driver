@@ -59,6 +59,11 @@ frames returned by the Go2-compatible `videohub` service. `mic` listens for the
 official A2 multicast stream at `239.168.123.161:5555`; when the robot's voice
 assistant / wake-up conversation mode is disabled, the card remains in a
 diagnostic `waiting` state and automatically recovers when packets appear.
+The speaker prebuffers and sends PCM in byte-counted blocks (300 ms by default),
+keeps a bounded 240 ms lead over the playback timeline, and keeps its drain
+session alive across short upstream stalls. Its `info` response reports input
+gaps, queue drops, partial flushes, `PlayStream` failures, and average/maximum
+RPC latency so playback gaps can be diagnosed without changing the audio path.
 The shared ROS base workspace must provide `audio_msgs`; the Docker build
 sources `/ros_ws/install/setup.bash` and imports `AudioChunk` as a mandatory
 build-time validation, so a base-image mismatch fails before deployment.

@@ -449,7 +449,10 @@ class TestDriverContracts(unittest.TestCase):
         plugin._node = types.SimpleNamespace(
             state="ready",
             topic="/current/audio",
-            _backend=types.SimpleNamespace(is_available=lambda: True),
+            _backend=types.SimpleNamespace(
+                is_available=lambda: True,
+                status=lambda: {"ok": True, "queue_drops": 0},
+            ),
         )
         inferred = plugin.dispatch("info", {"input_topic": "/wired/audio"})
         self.assertEqual(
@@ -539,10 +542,16 @@ class TestDriverContracts(unittest.TestCase):
         audio_client = types.ModuleType("unitree_sdk2py.a2.audio.audio_client")
 
         class FakeAudioClient:
+            instance = None
+            def __init__(self):
+                self.played = []
+                FakeAudioClient.instance = self
             def SetTimeout(self, _timeout): pass
             def Init(self): pass
             def PlayStop(self, _app): return 0
-            def PlayStream(self, *_args): return 0
+            def PlayStream(self, _app, _stream, pcm):
+                self.played.append(pcm)
+                return 0, None
             def GetVolume(self): return 0, {"volume": 100}
             def SetVolume(self, _volume): return 0
 
@@ -555,12 +564,106 @@ class TestDriverContracts(unittest.TestCase):
             args=(control, results, pcm, "eth0", 9600), daemon=True)
         thread.start()
         self.assertTrue(results.get(timeout=1)["ok"])
+        pcm.put(b"\x00" * 6400)
+        __import__("time").sleep(.05)
+        self.assertEqual([], FakeAudioClient.instance.played)
+        pcm.put(b"\x00" * 3200)
+        for _ in range(100):
+            if FakeAudioClient.instance.played:
+                break
+            __import__("time").sleep(.01)
+        self.assertEqual([b"\x00" * 9600], FakeAudioClient.instance.played)
+        control.put(("status", "status", None))
+        status = results.get(timeout=1)
+        self.assertEqual(1, status["play_calls"])
+        self.assertEqual(0, status["play_errors"])
+        self.assertEqual(9600, status["played_bytes"])
         control.put(("volume", "get_volume", None))
         self.assertEqual((0, {"volume": 100}), results.get(timeout=1)["result"])
         control.put(("close", "close", None))
         self.assertTrue(results.get(timeout=1)["ok"])
         thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
+
+    def test_speaker_worker_reports_playstream_errors_and_flushes_eof(self):
+        channel = sys.modules["unitree_sdk2py.core.channel"]
+        channel.ChannelFactoryInitialize = lambda *_: None
+        for name in ("unitree_sdk2py.a2", "unitree_sdk2py.a2.audio"):
+            sys.modules[name] = types.ModuleType(name)
+        audio_client = types.ModuleType("unitree_sdk2py.a2.audio.audio_client")
+
+        class FailingAudioClient:
+            def SetTimeout(self, _timeout): pass
+            def Init(self): pass
+            def PlayStop(self, _app): return 0
+            def PlayStream(self, _app, _stream, _pcm): return 7, None
+            def GetVolume(self): return 0, {"volume": 100}
+            def SetVolume(self, _volume): return 0
+
+        audio_client.AudioClient = FailingAudioClient
+        sys.modules["unitree_sdk2py.a2.audio.audio_client"] = audio_client
+        q = __import__("queue")
+        control, results, pcm = q.Queue(), q.Queue(), q.Queue()
+        thread = __import__("threading").Thread(
+            target=self.multimedia._speaker_worker,
+            args=(control, results, pcm, "eth0", 9600), daemon=True)
+        thread.start()
+        self.assertTrue(results.get(timeout=1)["ok"])
+        pcm.put(b"\x01" * 3200)
+        pcm.put(self.multimedia._AUDIO_EOF_MAGIC)
+        status = None
+        for _ in range(100):
+            control.put(("status", "status", None))
+            status = results.get(timeout=1)
+            if status["play_calls"]:
+                break
+            __import__("time").sleep(.01)
+        self.assertEqual(1, status["play_calls"])
+        self.assertEqual(1, status["play_errors"])
+        self.assertEqual(1, status["eof_count"])
+        self.assertEqual(3200, status["attempted_bytes"])
+        self.assertEqual(0, status["played_bytes"])
+        self.assertIn("7", status["last_play_error"])
+        control.put(("close", "close", None))
+        self.assertTrue(results.get(timeout=1)["ok"])
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+
+    def test_speaker_deadline_reanchors_after_slow_rpc(self):
+        advance = self.multimedia._next_speaker_deadline
+        self.assertAlmostEqual(1.3, advance(None, 1.0, 1.02, .3))
+        self.assertAlmostEqual(5.0, advance(1.3, 1.4, 5.0, .3))
+
+    def test_speaker_queue_overflow_is_counted(self):
+        backend = self.multimedia._SpeakerBackend.__new__(
+            self.multimedia._SpeakerBackend)
+        backend.error = ""
+        backend._stats_lock = __import__("threading").Lock()
+        backend._received_chunks = 0
+        backend._received_bytes = 0
+        backend._queue_drops = 0
+        backend._last_input_ts = 0.0
+        backend._max_input_gap_ms = 0.0
+
+        class FullOnceQueue:
+            def __init__(self):
+                self.puts = 0
+                self.items = [b"old"]
+            def put_nowait(self, value):
+                self.puts += 1
+                if self.puts == 1:
+                    raise __import__("queue").Full
+                self.items.append(value)
+            def get_nowait(self):
+                return self.items.pop(0)
+
+        backend._pcm = FullOnceQueue()
+        backend.put(b"new")
+
+        self.assertEqual(1, backend._queue_drops)
+        self.assertEqual(1, backend._received_chunks)
+        self.assertEqual(3, backend._received_bytes)
+        self.assertEqual([b"new"], backend._pcm.items)
 
     def test_mic_waiting_state_explains_voice_assistant_precondition(self):
         node = self.multimedia._MicNode.__new__(self.multimedia._MicNode)

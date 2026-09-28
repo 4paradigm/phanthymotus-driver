@@ -285,6 +285,19 @@ class MicPlugin:
 
 _AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
 _SPEAKER_APP_NAME = "as2w_speaker"
+_SPEAKER_BYTES_PER_SECOND = 32000.0
+_SPEAKER_EMPTY_POLL_S = 0.1
+_SPEAKER_FLUSH_AFTER_IDLE = 2
+_SPEAKER_EXIT_AFTER_IDLE = 15
+_SPEAKER_MAX_LEAD_S = 0.24
+
+
+def _next_speaker_deadline(deadline, started_at, finished_at, duration):
+    """Advance a bounded audio timeline, re-anchoring after a slow RPC."""
+    deadline = (started_at if deadline is None else deadline) + duration
+    if deadline < finished_at:
+        deadline = finished_at
+    return deadline
 
 
 def _speaker_worker(control_queue, result_queue, pcm_queue, interface, merge_bytes):
@@ -307,25 +320,54 @@ def _speaker_worker(control_queue, result_queue, pcm_queue, interface, merge_byt
     paused = False
     muted_until_eof = False
     stream_id = "as2w_{}".format(uuid4().hex)
-    deadline = time.monotonic()
-    last_pcm = 0.0
+    deadline = None
+    draining = False
+    idle_polls = 0
+    play_calls = 0
+    play_errors = 0
+    attempted_bytes = 0
+    played_bytes = 0
+    partial_flushes = 0
+    eof_count = 0
+    rpc_total_ms = 0.0
+    rpc_max_ms = 0.0
+    last_play_error = ""
 
     def respond(request_id, **payload):
         payload["id"] = request_id
         result_queue.put(payload)
 
-    def play(block):
-        nonlocal deadline
+    def play(block, current_deadline):
+        nonlocal play_calls, play_errors, attempted_bytes, played_bytes
+        nonlocal rpc_total_ms, rpc_max_ms, last_play_error
         if not block or not active or paused:
-            return
-        result = client.PlayStream(_SPEAKER_APP_NAME, stream_id, bytes(block))
-        duration = len(block) / 32000.0
-        now = time.monotonic()
-        deadline = max(deadline, now - 0.24) + duration
-        wait = deadline - time.monotonic() - 0.24
+            return current_deadline
+        started_at = time.monotonic()
+        try:
+            result = client.PlayStream(
+                _SPEAKER_APP_NAME, stream_id, bytes(block))
+            code = result[0] if isinstance(result, tuple) else result
+            if code != 0:
+                play_errors += 1
+                last_play_error = "PlayStream returned {}".format(code)
+            else:
+                played_bytes += len(block)
+        except Exception as exc:
+            play_errors += 1
+            last_play_error = "{}: {}".format(type(exc).__name__, exc)
+        finished_at = time.monotonic()
+        rpc_ms = (finished_at - started_at) * 1000.0
+        play_calls += 1
+        attempted_bytes += len(block)
+        rpc_total_ms += rpc_ms
+        rpc_max_ms = max(rpc_max_ms, rpc_ms)
+        duration = len(block) / _SPEAKER_BYTES_PER_SECOND
+        current_deadline = _next_speaker_deadline(
+            current_deadline, started_at, finished_at, duration)
+        wait = current_deadline - time.monotonic() - _SPEAKER_MAX_LEAD_S
         if wait > 0:
             time.sleep(wait)
-        return result
+        return current_deadline
 
     running = True
     while running:
@@ -349,7 +391,9 @@ def _speaker_worker(control_queue, result_queue, pcm_queue, interface, merge_byt
                         except queue.Empty:
                             break
                     client.PlayStop(_SPEAKER_APP_NAME)
-                    deadline = time.monotonic()
+                    deadline = None
+                    draining = False
+                    idle_polls = 0
                     paused = False
                     active = operation != "stop"
                     muted_until_eof = operation == "interrupt"
@@ -361,12 +405,30 @@ def _speaker_worker(control_queue, result_queue, pcm_queue, interface, merge_byt
                 elif operation == "resume":
                     active = True
                     paused = False
-                    deadline = time.monotonic()
+                    deadline = None
                     respond(request_id, ok=True)
                 elif operation == "get_volume":
                     respond(request_id, ok=True, result=client.GetVolume())
                 elif operation == "set_volume":
                     respond(request_id, ok=True, result=client.SetVolume(int(value)))
+                elif operation == "status":
+                    respond(
+                        request_id,
+                        ok=True,
+                        buffered_bytes=len(buffered),
+                        draining=draining,
+                        play_calls=play_calls,
+                        play_errors=play_errors,
+                        attempted_bytes=attempted_bytes,
+                        played_bytes=played_bytes,
+                        partial_flushes=partial_flushes,
+                        eof_count=eof_count,
+                        prefill_bytes=merge_bytes,
+                        max_lead_ms=_SPEAKER_MAX_LEAD_S * 1000.0,
+                        rpc_avg_ms=(rpc_total_ms / play_calls if play_calls else 0.0),
+                        rpc_max_ms=rpc_max_ms,
+                        last_play_error=last_play_error,
+                    )
                 else:
                     respond(request_id, ok=False, error="unsupported operation")
             except Exception as exc:
@@ -377,28 +439,43 @@ def _speaker_worker(control_queue, result_queue, pcm_queue, interface, merge_byt
             time.sleep(0.05)
             continue
         try:
-            pcm = pcm_queue.get(timeout=0.1)
+            pcm = pcm_queue.get(timeout=_SPEAKER_EMPTY_POLL_S)
         except queue.Empty:
-            if buffered and active and not paused and time.monotonic() - last_pcm >= 0.2:
-                play(buffered)
+            idle_polls += 1
+            if (buffered and active and not paused
+                    and idle_polls >= _SPEAKER_FLUSH_AFTER_IDLE):
+                draining = True
+                partial_flushes += 1
+                deadline = play(buffered, deadline)
                 buffered.clear()
+                idle_polls = 0
+            elif (draining and not buffered
+                  and idle_polls >= _SPEAKER_EXIT_AFTER_IDLE):
+                draining = False
+                deadline = None
+                idle_polls = 0
             continue
+        idle_polls = 0
         if pcm == _AUDIO_EOF_MAGIC:
+            eof_count += 1
             if muted_until_eof:
                 muted_until_eof = False
                 buffered.clear()
                 continue
-            play(buffered)
-            buffered.clear()
+            if buffered:
+                draining = True
+                deadline = play(buffered, deadline)
+                buffered.clear()
             continue
         if not active or muted_until_eof:
             continue
         buffered.extend(pcm)
-        last_pcm = time.monotonic()
-        while len(buffered) >= merge_bytes:
+        if not draining and len(buffered) >= merge_bytes:
+            draining = True
+        while draining and len(buffered) >= merge_bytes:
             block = bytes(buffered[:merge_bytes])
             del buffered[:merge_bytes]
-            play(block)
+            deadline = play(block, deadline)
 
 
 class _SpeakerBackend:
@@ -408,6 +485,12 @@ class _SpeakerBackend:
         self._results = context.Queue()
         self._pcm = context.Queue(maxsize=64)
         self._lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._received_chunks = 0
+        self._received_bytes = 0
+        self._queue_drops = 0
+        self._last_input_ts = 0.0
+        self._max_input_gap_ms = 0.0
         self._process = context.Process(
             target=_speaker_worker,
             args=(self._control, self._results, self._pcm, interface, merge_bytes),
@@ -427,14 +510,46 @@ class _SpeakerBackend:
     def put(self, pcm):
         if self.error:
             return
+        now = time.monotonic()
+        with self._stats_lock:
+            self._received_chunks += 1
+            self._received_bytes += len(pcm)
+            if pcm == _AUDIO_EOF_MAGIC:
+                self._last_input_ts = 0.0
+            else:
+                if self._last_input_ts:
+                    self._max_input_gap_ms = max(
+                        self._max_input_gap_ms,
+                        (now - self._last_input_ts) * 1000.0,
+                    )
+                self._last_input_ts = now
         try:
             self._pcm.put_nowait(pcm)
         except queue.Full:
+            with self._stats_lock:
+                self._queue_drops += 1
             try:
                 self._pcm.get_nowait()
                 self._pcm.put_nowait(pcm)
             except (queue.Empty, queue.Full):
                 pass
+
+    def status(self):
+        worker = self.call("status", timeout=2.0)
+        worker.pop("id", None)
+        with self._stats_lock:
+            local = {
+                "received_chunks": self._received_chunks,
+                "received_bytes": self._received_bytes,
+                "queue_drops": self._queue_drops,
+                "max_input_gap_ms": self._max_input_gap_ms,
+                "last_input_ago_ms": (
+                    (time.monotonic() - self._last_input_ts) * 1000.0
+                    if self._last_input_ts else -1
+                ),
+            }
+        worker.update(local)
+        return worker
 
     def call(self, operation, value=None, timeout=6.0):
         if self.error:
@@ -602,7 +717,10 @@ class SpeakerPlugin:
             result["volume"] = volume
         elif action == "info":
             backend = self._node._backend
-            result = {"ok": backend is not None and backend.is_available()}
+            if backend is not None and backend.is_available():
+                result = backend.status()
+            else:
+                result = {"ok": False}
             input_topic = args.get("input_topic") or self._node.topic
             reported_topic = input_topic
             descriptor = {"format": "audio/pcm-16k"}
