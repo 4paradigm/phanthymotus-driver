@@ -35,6 +35,7 @@ SDK_AUDIO_OPEN = "/robo/audio/call/open_stream"
 SDK_AUDIO_STATE = "/robo/audio/call/stream_state"
 SDK_AUDIO_CLOSE = "/robo/audio/call/close_stream"
 ASR_AUDIO_TOPIC = "/audio/sense/audio_data_to_asr"
+MOTION_LIST_SERVICE = "/robo/audio/call/get_motion_info_list"
 
 EVENT_TOPICS = {"playback_state": PLAYBACK_TOPIC}
 
@@ -400,6 +401,10 @@ class U1Nodes:
         import rclpy
         import rclpy.executors
         from rclpy.context import Context
+        try:
+            from rclpy.callback_groups import ReentrantCallbackGroup
+        except ImportError:
+            ReentrantCallbackGroup = None
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
@@ -453,6 +458,10 @@ class U1Nodes:
         self._speaker_frames = 0
         self._speaker_enabled = False
         self._audio_service_lock = threading.Lock()
+        # Image6m callbacks perform a bounded JPEG conversion. Keep them in
+        # their own re-entrant group so left/right conversion does not block
+        # microphone/audio callbacks on the device executor.
+        self._camera_callback_group = ReentrantCallbackGroup() if ReentrantCallbackGroup else None
         self._video_users = 0
         self._video_stream = {}
         self._video_lock = threading.Lock()
@@ -463,6 +472,7 @@ class U1Nodes:
         best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._audio_qos = best_effort
         self._sensor_qos = best_effort
+        self._camera_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._mic_publisher = self.core.create_publisher(AudioChunk, self.mic_topic, best_effort)
         self._event_publishers = {}
         self._event_forwarding = {}
@@ -496,6 +506,7 @@ class U1Nodes:
             # adapter. The similarly named typed controller service is not
             # usable on the target firmware.
             "play_action": self.robot.create_client(StringCall, "/robo/audio/call/play_action"),
+            "motion_list": self.robot.create_client(StringCall, MOTION_LIST_SERVICE),
             "play_text": self.robot.create_client(StringCall, "/robo/audio/call/play_text"),
             "interrupt": self.robot.create_client(Trigger, "/robo/audio/call/interrupt_action_audio"),
             "authorize": self.robot.create_client(StringCall, "/robo/auth/call/authorize"),
@@ -773,6 +784,24 @@ class U1Nodes:
         if not legacy_action:
             raise ValueError("U1 Pro motion requires a vendor action id")
         return self.string_call("play_action", {"action": str(legacy_action)})
+
+    def motion_catalog(self) -> dict[str, dict[str, Any]]:
+        """Read the firmware motion catalog; return an empty map on failure."""
+        try:
+            response = self.string_call("motion_list", {})
+            data = _unwrap_result(response)
+            entries = data.get("motion_info_list", [])
+            catalog = {}
+            for item in entries if isinstance(entries, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                motion_id = str(item.get("motion_id", "")).strip()
+                if motion_id:
+                    catalog[motion_id] = item
+            return catalog
+        except Exception as exc:
+            print(f"[U1 init] motion catalog unavailable: {str(exc)[:160]}", flush=True)
+            return {}
 
     def trigger_call(self, name: str) -> dict:
         from std_srvs.srv import Trigger
@@ -1270,8 +1299,13 @@ class EyeCameraPlugin:
             # Keep each card bound to its verified physical-eye DDS topic;
             # use ring frames only if their metadata explicitly identifies
             # this eye, so a generic stream is never mislabeled as stereo.
+            camera_kwargs = {}
+            camera_group = getattr(self.nodes, "_camera_callback_group", None)
+            if camera_group is not None:
+                camera_kwargs["callback_group"] = camera_group
             self._subscription = self.nodes.audio_device.create_subscription(
-                self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
+                self.nodes.Image6m, self.source_topic, self._on_frame,
+                getattr(self.nodes, "_camera_qos", self.nodes._sensor_qos), **camera_kwargs)
             # Subscribe before opening the shared stream. The adapter can
             # publish the eye topics immediately after video_open returns;
             # registering first avoids losing that startup window.
@@ -1299,8 +1333,13 @@ class EyeCameraPlugin:
                 self.nodes.audio_device.destroy_subscription(self._subscription)
                 self._subscription = None
                 self._frame_ready.clear()
+                camera_kwargs = {}
+                camera_group = getattr(self.nodes, "_camera_callback_group", None)
+                if camera_group is not None:
+                    camera_kwargs["callback_group"] = camera_group
                 self._subscription = self.nodes.audio_device.create_subscription(
-                    self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
+                    self.nodes.Image6m, self.source_topic, self._on_frame,
+                    getattr(self.nodes, "_camera_qos", self.nodes._sensor_qos), **camera_kwargs)
                 ready = self._frame_ready.wait(CAMERA_RIGHT_RETRY_TIMEOUT)
             if not ready:
                 reader_error = getattr(self._reader, "_error", "")
@@ -1463,9 +1502,12 @@ class ExpressionPlugin:
         "silly_face": ("A034", "鬼脸"),
     }
 
-    def __init__(self, audio: AudioPlugin):
+    def __init__(self, audio: AudioPlugin, motion_catalog: dict[str, dict[str, Any]] | None = None):
         self.audio = audio
         self.running = False
+        if motion_catalog:
+            self.EXPRESSIONS = {name: value for name, value in self.EXPRESSIONS.items()
+                                if value[0] in motion_catalog}
 
     def get_tool(self):
         actions = {
@@ -1625,9 +1667,12 @@ class HeadPlugin:
         "tilt": ("A010", "歪头"),
     }
 
-    def __init__(self, audio: AudioPlugin):
+    def __init__(self, audio: AudioPlugin, motion_catalog: dict[str, dict[str, Any]] | None = None):
         self.audio = audio
         self.running = False
+        if motion_catalog:
+            self.HEAD_ACTIONS = {name: value for name, value in self.HEAD_ACTIONS.items()
+                                 if value[0] in motion_catalog}
 
     def get_tool(self):
         actions = {
@@ -1717,10 +1762,15 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
     # card has disabled its vendor resources and stopped publishing.
     audio = AudioPlugin(nodes)
+    # The firmware catalog is authoritative when available.  A temporary
+    # static fallback preserves startup on older adapters that do not expose
+    # get_motion_info_list; song motions (A1xx) are intentionally not mapped
+    # into either semantic card.
+    motion_catalog = nodes.motion_catalog() if hasattr(nodes, "motion_catalog") else {}
     camera_left = EyeCameraPlugin(nodes, "left")
     camera_right = EyeCameraPlugin(nodes, "right")
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
-               ExpressionPlugin(audio), HeadPlugin(audio),
+               ExpressionPlugin(audio, motion_catalog), HeadPlugin(audio, motion_catalog),
                SystemControlsPlugin(nodes),
                camera_left, camera_right]
     return plugins
