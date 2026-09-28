@@ -429,6 +429,7 @@ class U1Nodes:
         self._speaker_uuid = ""
         self._speaker_frames = 0
         self._speaker_enabled = False
+        self._audio_service_lock = threading.Lock()
         self._video_users = 0
         self._video_stream = {}
         self._video_lock = threading.Lock()
@@ -487,7 +488,11 @@ class U1Nodes:
 
     def _spin_audio_device(self) -> None:
         while self._rclpy.ok(context=self._audio_context):
-            self._audio_executor.spin_once(timeout_sec=0.1)
+            try:
+                self._audio_executor.spin_once(timeout_sec=0.1)
+            except Exception as exc:
+                print(f"[U1 audio ROS] executor callback failed: {str(exc)[:256]}", flush=True)
+                time.sleep(0.05)
 
     def initialize_robot(self) -> None:
         """Authorize the SDK and disable autonomous behaviors at startup."""
@@ -664,7 +669,8 @@ class U1Nodes:
         request = self.EnableAudioIn.Request()
         request.header = self._audio_header()
         request.enable = bool(enabled)
-        response = self.call("mic_enable", request)
+        with self._audio_service_lock:
+            response = self.call("mic_enable", request)
         code = int(getattr(response, "code", 0))
         if code != 0:
             raise RuntimeError(f"U1 Pro microphone enable service failed with code {code}")
@@ -868,7 +874,8 @@ class U1Nodes:
         request.info = self._audio_info()
         request.mode = 0
         request.gain = 0.0
-        response = self.call("speaker_enable", request)
+        with self._audio_service_lock:
+            response = self.call("speaker_enable", request)
         code = int(getattr(response, "code", 0))
         if code != 0:
             raise RuntimeError(f"U1 Pro speaker enable service failed with code {code}")
@@ -885,7 +892,8 @@ class U1Nodes:
         request.info = self._audio_info()
         request.mode = 0
         request.gain = 0.0
-        self.call("speaker_enable", request)
+        with self._audio_service_lock:
+            self.call("speaker_enable", request)
 
     def _audio_info(self):
         info = self.AudioInfo()
@@ -962,16 +970,21 @@ class MicPlugin:
         if self.running:
             return {"state": "running", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
         self._enable_requested = True
+        microphone_enabled = False
         try:
             self.nodes.set_mic_enabled(True)
+            microphone_enabled = True
             if not self.nodes.wait_for_mic_frame(2.0):
-                raise TimeoutError("no PCM frames received from the U1 audio shared-memory stream")
+                raise TimeoutError(f"no PCM frames received from {MIC_TOPIC}")
         except Exception as exc:
             message = f"U1 Pro microphone unavailable: {str(exc)[:256]}"
-            try:
-                self.nodes.set_mic_enabled(False)
-            except Exception as cleanup_exc:
-                message += f"; microphone disable failed: {str(cleanup_exc)[:192]}"
+            if microphone_enabled:
+                try:
+                    self.nodes.set_mic_enabled(False)
+                except Exception as cleanup_exc:
+                    message += f"; microphone disable failed: {str(cleanup_exc)[:192]}"
+                else:
+                    self._enable_requested = False
             else:
                 self._enable_requested = False
             self.running = False
@@ -1394,9 +1407,15 @@ class EyeCameraPlugin:
 
 
 def _message_text(value):
+    size = getattr(value, "size", None)
     value = getattr(value, "data", value)
-    if isinstance(value, (list, tuple, bytes, bytearray)):
-        return bytes(value).split(b"\0", 1)[0].decode("utf-8", "replace")
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple, bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        if isinstance(size, int) and 0 <= size <= len(raw):
+            raw = raw[:size]
+        return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
     return str(value)
 
 
@@ -1682,7 +1701,7 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
                SystemControlsPlugin(nodes),
                camera_left, camera_right]
     descriptions = {
-        "doa_event": "麦克风阵列声源定位事件，输出方位角和置信度。",
+        "doa_event": "麦克风阵列声源定位事件。检测到有效声源时输出方位角和置信度；这是事件流，环境安静时不会持续产生数据。",
     }
     plugins.extend(EventPlugin(nodes, name, description) for name, description in descriptions.items())
     return plugins

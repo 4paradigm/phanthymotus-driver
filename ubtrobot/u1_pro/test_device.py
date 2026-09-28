@@ -248,6 +248,7 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = object.__new__(device.U1Nodes)
+        nodes._audio_service_lock = threading.Lock()
         nodes.EnableAudioIn = types.SimpleNamespace(Request=type("Request", (), {}))
         nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
         nodes.trigger_call = mock.Mock(side_effect=[
@@ -282,6 +283,7 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = object.__new__(device.U1Nodes)
+        nodes._audio_service_lock = threading.Lock()
         nodes.EnableAudioIn = types.SimpleNamespace(Request=type("Request", (), {}))
         nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
         nodes.trigger_call = mock.Mock(side_effect=RuntimeError("device busy"))
@@ -297,6 +299,7 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = object.__new__(device.U1Nodes)
+        nodes._audio_service_lock = threading.Lock()
         nodes.EnableAudioIn = types.SimpleNamespace(Request=type("Request", (), {}))
         nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
         nodes.trigger_call = mock.Mock(side_effect=[
@@ -364,6 +367,31 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(json.loads(publisher.messages[0].data), {
             "event": "doa", "azimuth": 25.0, "confidence": -0.788,
         })
+
+    def test_fixed_byte_array_ros_string_decodes_encoding(self):
+        import device
+
+        raw = list(b"yuv422_yuy2\0") + [0] * (256 - len(b"yuv422_yuy2\0"))
+        value = types.SimpleNamespace(data=types.SimpleNamespace(tolist=lambda: raw))
+        self.assertEqual(device._message_text(value), "yuv422_yuy2")
+
+    def test_fixed_byte_array_ros_string_honors_declared_size(self):
+        import device
+
+        value = types.SimpleNamespace(data=list(b"rgb8junk"), size=4)
+        self.assertEqual(device._message_text(value), "rgb8")
+
+    def test_audio_domain_executor_survives_callback_exception(self):
+        import device
+
+        nodes = object.__new__(device.U1Nodes)
+        nodes._audio_context = object()
+        nodes._audio_executor = mock.Mock()
+        nodes._audio_executor.spin_once.side_effect = [RuntimeError("callback error"), None]
+        nodes._rclpy = types.SimpleNamespace(ok=mock.Mock(side_effect=[True, True, False]))
+        with mock.patch.object(device.time, "sleep"):
+            nodes._spin_audio_device()
+        self.assertEqual(nodes._audio_executor.spin_once.call_count, 2)
 
     def test_agent_facing_plugins_exist(self):
         import device
@@ -534,13 +562,13 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = FakeNodes()
-        nodes.set_mic_enabled = mock.Mock(side_effect=[RuntimeError("service unavailable"), {"code": 0}])
+        nodes.set_mic_enabled = mock.Mock(side_effect=RuntimeError("service unavailable"))
         plugin = device.MicPlugin(nodes)
         result = plugin.dispatch("start", {})
         self.assertEqual(result["state"], "error")
         self.assertFalse(plugin.running)
         self.assertFalse(plugin._enable_requested)
-        self.assertEqual(nodes.set_mic_enabled.call_args_list[1].args, (False,))
+        nodes.set_mic_enabled.assert_called_once_with(True)
 
     def test_mic_no_frame_timeout_disables_device(self):
         import device
@@ -1161,6 +1189,7 @@ class U1CardContractTests(unittest.TestCase):
         nodes._speaker_uuid = ""
         nodes._speaker_frames = 0
         nodes._speaker_enabled = False
+        nodes._audio_service_lock = threading.Lock()
         nodes._audio_qos = object()
         nodes._speaker_forwarding = False
         nodes.EnableAudioOut = types.SimpleNamespace(Request=type("Request", (), {}))
