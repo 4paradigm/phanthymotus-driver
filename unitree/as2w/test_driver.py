@@ -470,9 +470,11 @@ class TestDriverContracts(unittest.TestCase):
         created = []
 
         class FakeBackend:
-            def __init__(self, interface, merge_bytes):
+            def __init__(self, interface, block_bytes, prefill_bytes, max_lead_s):
                 self.interface = interface
-                self.merge_bytes = merge_bytes
+                self.block_bytes = block_bytes
+                self.prefill_bytes = prefill_bytes
+                self.max_lead_s = max_lead_s
                 self.error = ""
                 self.alive = True
                 created.append(self)
@@ -484,10 +486,14 @@ class TestDriverContracts(unittest.TestCase):
         executor = types.SimpleNamespace(add_node=lambda _node: None)
         with patch.object(self.multimedia, "_SpeakerBackend", FakeBackend):
             plugin = self.multimedia.SpeakerPlugin(
-                {"buffer_ms": 300}, "test", executor, "eth0")
+                {"block_ms": 300, "prefill_ms": 700, "max_lead_ms": 240},
+                "test", executor, "eth0")
             self.assertIsNone(plugin._node._backend)
             self.assertTrue(plugin.start()["ok"])
             first = plugin._node._backend
+            self.assertEqual(9600, first.block_bytes)
+            self.assertEqual(22400, first.prefill_bytes)
+            self.assertEqual(.24, first.max_lead_s)
             self.assertEqual("ready", plugin._node.state)
             plugin.stop()
             self.assertIsNone(plugin._node._backend)
@@ -561,23 +567,32 @@ class TestDriverContracts(unittest.TestCase):
         control, results, pcm = q.Queue(), q.Queue(), q.Queue()
         thread = __import__("threading").Thread(
             target=self.multimedia._speaker_worker,
-            args=(control, results, pcm, "eth0", 9600), daemon=True)
+            args=(control, results, pcm, "eth0", 9600, 22400, .24),
+            daemon=True)
         thread.start()
         self.assertTrue(results.get(timeout=1)["ok"])
-        pcm.put(b"\x00" * 6400)
-        __import__("time").sleep(.05)
+        pcm.put(b"\x00" * 19200)
+        # A synthesis gap longer than the 200ms running-stream flush threshold
+        # must not bypass the independent 700ms startup jitter prefill.
+        __import__("time").sleep(.3)
         self.assertEqual([], FakeAudioClient.instance.played)
         pcm.put(b"\x00" * 3200)
         for _ in range(100):
-            if FakeAudioClient.instance.played:
+            if len(FakeAudioClient.instance.played) == 2:
                 break
             __import__("time").sleep(.01)
-        self.assertEqual([b"\x00" * 9600], FakeAudioClient.instance.played)
+        self.assertEqual(
+            [b"\x00" * 9600, b"\x00" * 9600],
+            FakeAudioClient.instance.played,
+        )
         control.put(("status", "status", None))
         status = results.get(timeout=1)
-        self.assertEqual(1, status["play_calls"])
+        self.assertEqual(2, status["play_calls"])
         self.assertEqual(0, status["play_errors"])
-        self.assertEqual(9600, status["played_bytes"])
+        self.assertEqual(19200, status["played_bytes"])
+        self.assertEqual(3200, status["buffered_bytes"])
+        self.assertEqual(9600, status["block_bytes"])
+        self.assertEqual(22400, status["prefill_bytes"])
         control.put(("volume", "get_volume", None))
         self.assertEqual((0, {"volume": 100}), results.get(timeout=1)["result"])
         control.put(("close", "close", None))
@@ -606,7 +621,8 @@ class TestDriverContracts(unittest.TestCase):
         control, results, pcm = q.Queue(), q.Queue(), q.Queue()
         thread = __import__("threading").Thread(
             target=self.multimedia._speaker_worker,
-            args=(control, results, pcm, "eth0", 9600), daemon=True)
+            args=(control, results, pcm, "eth0", 9600, 22400, .24),
+            daemon=True)
         thread.start()
         self.assertTrue(results.get(timeout=1)["ok"])
         pcm.put(b"\x01" * 3200)
@@ -623,6 +639,7 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(1, status["eof_count"])
         self.assertEqual(3200, status["attempted_bytes"])
         self.assertEqual(0, status["played_bytes"])
+        self.assertFalse(status["draining"])
         self.assertIn("7", status["last_play_error"])
         control.put(("close", "close", None))
         self.assertTrue(results.get(timeout=1)["ok"])

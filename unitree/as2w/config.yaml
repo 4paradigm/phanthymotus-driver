@@ -12,7 +12,9 @@ plugins:
     chunk_bytes: 1024
   speaker:
     enabled: true
-    buffer_ms: 300
+    block_ms: 300
+    prefill_ms: 700
+    max_lead_ms: 240
   camera:
     enabled: true
     backend: videohub
