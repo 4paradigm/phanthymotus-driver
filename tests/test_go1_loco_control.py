@@ -336,7 +336,117 @@ class LocoTests(unittest.TestCase):
                 accepted = self.card.dispatch(action, {'confirm': True})
                 result = self.finished(accepted['action_id'])
                 self.assertEqual(result['status'], 'completed')
+                self.assertTrue(result['holding_control'])
+                self.assertEqual(self.client.owner, accepted['action_id'])
+                self.assertTrue(self.card.dispatch('stop_move', {})['stop_confirmed'])
         self.assertEqual(self.card._notify.call_count, 5)
+
+    def hold_posture(self):
+        accepted = self.card.dispatch('balance_stand', {})
+        self.assertEqual(self.finished(accepted['action_id'])['status'], 'completed')
+        return accepted['action_id']
+
+    def test_held_posture_blocks_new_job_until_explicit_stop(self):
+        aid = self.hold_posture()
+        self.assertEqual(self.move()['code'], 'RESOURCE_BUSY')
+        self.assertEqual(self.card.dispatch('stand_down', {})['code'], 'RESOURCE_BUSY')
+        self.assertEqual(self.card.dispatch('start', {}), {'state': 'ready'})
+        self.assertEqual(self.client.owner, aid)
+        self.assertTrue(self.card.dispatch('stop_move', {})['stop_confirmed'])
+        self.assertIsNone(self.client.owner)
+        self.assertFalse(self.card.dispatch('status', {'action_id': aid})['holding_control'])
+        self.assertTrue(self.move()['ok'])
+
+    def test_lifecycle_stop_releases_held_posture_only_after_latching(self):
+        self.hold_posture()
+        original = self.client.release_control
+        def release(owner):
+            self.assertEqual(self.client.calls[-1], 'stop')
+            original(owner)
+        with mock.patch.object(self.client, 'release_control', side_effect=release):
+            self.assertEqual(self.card.dispatch('stop', {}), {'state': 'idle'})
+        self.assertIsNone(self.card._held)
+        self.assertIsNone(self.client.owner)
+        self.assertEqual(self.card.dispatch('start', {}), {'state': 'ready'})
+        self.assertTrue(self.move()['ok'])
+
+    def test_failed_held_release_is_retained_for_stop_retry(self):
+        aid = self.hold_posture()
+        with mock.patch.object(self.client, 'release_control', side_effect=
+                               sdk_proxy.SdkError('SDK_TIMEOUT', 'unknown release')):
+            result = self.card.dispatch('stop', {})
+        self.assertEqual(result['code'], 'SDK_TIMEOUT')
+        self.assertEqual(self.card._held['id'], aid)
+        self.card.start()
+        self.assertEqual(self.move()['code'], 'RESOURCE_BUSY')
+        self.assertTrue(self.card.dispatch('stop_move', {})['stop_confirmed'])
+        self.assertIsNone(self.card._held)
+
+    def test_failed_stop_does_not_release_held_posture_or_leak_stopping(self):
+        aid = self.hold_posture()
+        with mock.patch.object(self.client, 'request_stop', side_effect=RuntimeError('stop failed')):
+            with self.assertRaisesRegex(RuntimeError, 'stop failed'):
+                self.card.dispatch('stop_move', {})
+        self.assertEqual(self.client.owner, aid)
+        self.assertEqual(self.card._stopping, 0)
+        self.assertTrue(self.card.dispatch('stop_move', {})['stop_confirmed'])
+
+    def test_stop_racing_posture_completion_does_not_leave_held_owner(self):
+        entered, resume = threading.Event(), threading.Event()
+        def monitor(job):
+            self.client.control_posture(job['id'], job['epoch'], 1)
+            entered.set()
+            self.assertTrue(resume.wait(2))
+            return {}
+        with mock.patch.object(self.card, '_monitor', side_effect=monitor):
+            accepted = self.card.dispatch('balance_stand', {})
+            try:
+                self.assertTrue(entered.wait(1))
+                self.card.stop()
+            finally:
+                resume.set()
+            self.assertEqual(self.finished(accepted['action_id'])['status'], 'cancelled')
+        self.assertIsNone(self.card._held)
+        self.assertIsNone(self.client.owner)
+
+    def test_completed_posture_rejects_real_legacy_card_via_worker_arbitration(self):
+        import controllers
+        with mock.patch.object(go1_sdk_client.Go1HighSdkClient, '_init_sdk'):
+            sdk = go1_sdk_client.Go1HighSdkClient()
+        sdk.available = True
+        sdk._control_owner = None
+        sdk.snapshot = self.client.snapshot
+        proxy = sdk_proxy.SdkProxy.__new__(sdk_proxy.SdkProxy)
+        proxy._epoch = multiprocessing.Value('Q', 0)
+        proxy._stop_signal = sdk._stop_signal
+        def call(cmd, args=None, kwargs=None, timeout=1., owner=None, epoch=None):
+            return sdk_proxy._execute(sdk, dict(cmd=cmd, args=args or [], kwargs=kwargs or {},
+                owner=owner, epoch=proxy.control_epoch if epoch is None else epoch,
+                deadline=time.monotonic()+timeout), proxy._stop_signal, proxy._epoch)
+        proxy._call = call
+        proxy.available = True
+        self.card._client = proxy
+        aid = self.hold_posture()
+        self.assertEqual(sdk._control_owner, aid)
+        original_pose = dict(sdk._posture)
+        old = controllers.make_loco({}, '', None, proxy)
+        for action, args in [('stand_down', {}), ('move', {'vx': .1}), ('stop', {})]:
+            with self.subTest(action=action):
+                with self.assertRaises(sdk_proxy.SdkError) as error:
+                    old.dispatch(action, args)
+                self.assertEqual(error.exception.code, 'RESOURCE_BUSY')
+        self.assertEqual(sdk._posture, original_pose)
+        self.assertTrue(self.card.dispatch('stop_move', {})['stop_confirmed'])
+        self.assertIsNone(sdk._control_owner)
+        with self.assertRaises(sdk_proxy.SdkError) as error:
+            old.dispatch('stand_down', {})
+        self.assertEqual(error.exception.code, 'STOP_LATCHED')
+        sdk._cmd = types.SimpleNamespace()
+        sdk._compose_cmd()
+        self.assertIsNone(sdk._posture)
+        # A new explicit confirmed action, not lifecycle start, rearms the SDK.
+        self.hold_posture()
+        self.assertIsNotNone(sdk._control_owner)
 
     def test_posture_not_reached_errors_and_stops(self):
         self.client.behavior = 'none'

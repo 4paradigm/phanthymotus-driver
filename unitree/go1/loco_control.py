@@ -42,6 +42,7 @@ class ConfirmedLocoPlugin:
         self._client = client
         self._lock = threading.RLock()
         self._active = None
+        self._held = None  # Completed posture still owns the SDK until explicit stop.
         self._stopping = 0
         self._closed = False
         self._history = OrderedDict()
@@ -64,7 +65,7 @@ class ConfirmedLocoPlugin:
                   'status': {'params': ['action_id'], 'description': '查询当前或最近动作的最终结果'}}
         for action in POSTURES:
             params[action] = {'params': ['confirm'] if action in ('damp', 'recovery_stand') else [],
-                              'description': '姿态切换并等待模式/姿态反馈；非紧急停止'}
+                              'description': '姿态确认后保持控制权；后续动作前先 stop_move；非紧急停止'}
         tool = {'name': 'loco_confirmed', 'type': 'actuator', 'multiInstance': False,
                 'description': 'Go1 有反馈运动控制；accepted 仅表示已接收，completed 才表示观察到结果。'
                                'stop_move 无遥测确认时返回 STOP_UNCONFIRMED，须遥控器接管；'
@@ -103,6 +104,16 @@ class ConfirmedLocoPlugin:
                 self._active['cancel'].set()
             if self._control_enabled:
                 self._client.request_stop()
+                self._release_held_after_stop()
+
+    def _release_held_after_stop(self):
+        # Caller holds _lock and has already latched stop. Never release a live
+        # posture first: legacy writes must remain blocked even during cleanup.
+        if self._held:
+            job = self._held
+            job['cancel'].set()
+            self._client.release_control(job['id'])
+            self._held = None  # Retain on RPC failure for explicit stop retry.
 
     def _result(self, action, status, **fields):
         return dict(card='loco_confirmed', action=action, status=status,
@@ -179,7 +190,9 @@ class ConfirmedLocoPlugin:
                 if not job:
                     return self._result(action, 'idle' if not aid else 'error', code='NO_ACTION',
                                         control_enabled=self._control_enabled)
-                return copy.deepcopy(job['result'])
+                result = copy.deepcopy(job['result'])
+                result['holding_control'] = self._held is job
+                return result
         if action != 'move' and action not in POSTURES:
             return None  # bundle converts this to JSON-RPC Unknown tool
         try:
@@ -207,8 +220,8 @@ class ConfirmedLocoPlugin:
             asynchronous = action in POSTURES or duration > 2
             aid = 'go1_loco_confirmed_' + uuid.uuid4().hex
             with self._lock:
-                if self._closed or self._active or self._stopping:
-                    raise ControlError('RESOURCE_BUSY', 'Previous action/stopping is still active')
+                if self._closed or self._active or self._stopping or self._held:
+                    raise ControlError('RESOURCE_BUSY', 'Action/stopping or held posture active; use stop_move first')
                 if generation != self._client.control_epoch:
                     raise ControlError('CANCELLED', 'Stop occurred during preflight')
                 job = {'id': aid, 'action': action, 'args': requested, 'duration': duration,
@@ -265,13 +278,25 @@ class ConfirmedLocoPlugin:
         except Exception as exc:
             failure = exc
         finally:
+            held = False
+            # Publish held ownership atomically against lifecycle/physical stop.
+            # A completed posture is NOT an idle SDK: its command remains latched.
+            with self._lock:
+                if may_own_control and job['action'] in POSTURES and failure is None:
+                    try:
+                        self._check_cancel(job)
+                    except Exception as exc:
+                        failure = exc
+                    else:
+                        self._held = job
+                        held = True
             # Successful posture is intentionally held. Every move/error/cancel
             # requests a stop before checking telemetry or delivering callbacks.
             if may_own_control and (job['action'] == 'move' or failure is not None):
                 self._client.request_stop()
                 stop_result = self._confirm_stop()
             try:
-                if may_own_control:
+                if may_own_control and not held:
                     self._client.release_control(job['id'])
             except Exception as exc:
                 failure = failure or exc
@@ -402,10 +427,12 @@ class ConfirmedLocoPlugin:
     def _stop_action(self, action):
         with self._lock:
             self._stopping += 1
-            if self._active:
-                self._active['cancel'].set()
-            self._client.request_stop()
         try:
+            with self._lock:
+                if self._active:
+                    self._active['cancel'].set()
+                self._client.request_stop()
+                self._release_held_after_stop()
             result = self._confirm_stop()
             return self._result(action, 'completed' if result['stop_confirmed'] else 'error', **result)
         finally:
