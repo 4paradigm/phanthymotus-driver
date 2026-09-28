@@ -39,7 +39,7 @@ class InstallerTests(unittest.TestCase):
     def test_missing_key_is_created_disabled(self):
         result = install(self.db)
         self.assertFalse(result['active'])
-        self.assertEqual(self.read()['installed'][0]['version'], '1.0.0')
+        self.assertEqual(self.read()['installed'][0]['version'], '1.1.3')
         self.assertTrue(Path(result['backup']).is_file())
 
     def test_reinstall_preserves_other_data_and_disabled_state(self):
