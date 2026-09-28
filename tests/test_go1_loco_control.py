@@ -193,34 +193,124 @@ class LocoTests(unittest.TestCase):
                 self.assertEqual(self.card.dispatch('move', args)['code'], 'INVALID_ARGUMENT')
         self.assertEqual(self.client.calls, [])
 
-    def test_stop_alias_and_interrupt_schema(self):
-        for action in ('stop', 'stop_move'):
-            result = self.card.dispatch(action, {})
-            self.assertTrue(result['stop_confirmed'])
+    def test_stop_move_and_lifecycle_schema(self):
+        result = self.card.dispatch('stop_move', {})
+        self.assertTrue(result['stop_confirmed'])
         schema = self.card.get_tool()['inputSchema']
         self.assertEqual(schema['x-hooks']['on_interrupt_motion']['action'], 'stop_move')
-        self.assertIn('stop_move', schema['properties']['action']['enum'])
+        for action in ('start', 'stop', 'stop_move'):
+            self.assertIn(action, schema['properties']['action']['enum'])
+            self.assertIn(action, schema['x-action-params'])
+            self.assertNotIn(action, schema['x-completion']['actions'])
+
+    def test_lifecycle_start_is_local_with_control_disabled_or_enabled(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                card = loco_control.make_loco_confirmed({'control_enabled': enabled}, '', None, self.client)
+                card._closed = True
+                self.client.available = False
+                with mock.patch.object(card, '_preflight', side_effect=AssertionError('hardware read')):
+                    self.assertEqual(card.dispatch('start', {}), {'state': 'ready'})
+                    self.assertEqual(card.dispatch('start', {}), {'state': 'ready'})
+                self.assertFalse(card._closed)
+                self.assertEqual(card._control_enabled, enabled)
+                self.assertEqual(self.client.calls, [])
+                self.assertEqual(self.client.control_epoch, 0)
+
+    def test_disabled_lifecycle_stop_is_local_and_start_does_not_enable_control(self):
+        card = loco_control.make_loco_confirmed({}, '', None, self.client)
+        with mock.patch.object(card, '_confirm_stop', side_effect=AssertionError('hardware read')):
+            self.assertEqual(card.dispatch('stop', {}), {'state': 'idle'})
+            self.assertEqual(card.dispatch('stop', {}), {'state': 'idle'})
+        self.assertTrue(card._closed)
+        self.assertEqual(card.dispatch('start', {}), {'state': 'ready'})
+        self.assertEqual(card.dispatch('move', {'vx': .1})['code'], 'CONTROL_DISABLED')
+        self.assertEqual(card.dispatch('stop_move', {})['code'], 'CONTROL_DISABLED')
+        self.assertEqual(self.client.calls, [])
+
+    def test_lifecycle_idle_does_not_claim_physical_stop(self):
+        self.client.stop_works = False
+        self.client.velocity = [.2, 0.]
+        self.client.fresh = False
+        with mock.patch.object(self.card, '_confirm_stop', side_effect=AssertionError('must not wait')):
+            self.assertEqual(self.card.dispatch('stop', {}), {'state': 'idle'})
+        self.assertEqual(self.client.calls, ['stop'])
+        self.assertEqual(self.client.velocity, [.2, 0.])
+        self.assertTrue(self.card._closed)
+        self.assertEqual(self.move()['code'], 'CARD_STOPPED')
+        # Physical-stop check is still available while the lifecycle is idle.
+        self.assertEqual(self.card.dispatch('stop_move', {})['code'], 'STOP_UNCONFIRMED')
+
+    def test_lifecycle_restart_does_not_rearm_or_resurrect_old_job(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def monitor(job):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError('test did not release monitor')
+            self.card._check_cancel(job)
+
+        with mock.patch.object(self.card, '_monitor', side_effect=monitor):
+            accepted = self.card.dispatch('move', dict(vx=.1, duration=3))
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(self.card.dispatch('stop', {}), {'state': 'idle'})
+                stopped_epoch = self.client.control_epoch
+                self.assertEqual(self.card.dispatch('start', {}), {'state': 'ready'})
+                self.assertEqual(self.client.control_epoch, stopped_epoch)
+                self.assertTrue(self.card._active['cancel'].is_set())
+                self.assertEqual(self.move()['code'], 'RESOURCE_BUSY')
+            finally:
+                release.set()
+            self.assertEqual(self.finished(accepted['action_id'])['status'], 'cancelled')
+            self.assertNotIn('move', self.client.calls)
+        self.assertTrue(self.move()['ok'])
+
+    def test_lifecycle_stop_failure_is_not_silently_reported_as_success(self):
+        with mock.patch.object(self.client, 'request_stop', side_effect=
+                               sdk_proxy.SdkError('SDK_UNAVAILABLE', 'offline')):
+            result = self.card.dispatch('stop', {})
+        self.assertEqual(result['state'], 'idle')
+        self.assertFalse(result['ok'])
+        self.assertFalse(result['stop_confirmed'])
+        self.assertEqual(result['code'], 'SDK_UNAVAILABLE')
+        self.assertTrue(self.card._closed)
+        self.assertEqual(self.move()['code'], 'CARD_STOPPED')
+
+    def test_zero_velocity_uses_physical_stop_without_closing_lifecycle(self):
+        result = self.card.dispatch('move', {'vx': 0})
+        self.assertTrue(result['stop_confirmed'])
+        self.assertEqual(result['action'], 'stop_move')
+        self.assertFalse(self.card._closed)
+
+    def test_image_uses_mounted_dds_profile_without_transport_override(self):
+        root = Path(loco_control.__file__).parent
+        self.assertNotIn('FASTDDS_BUILTIN_TRANSPORTS', (root / 'Dockerfile').read_text())
+        fragment = (root / 'deploy/service.yml').read_text()
+        self.assertNotIn('FASTDDS_BUILTIN_TRANSPORTS', fragment)
+        self.assertIn('/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro', fragment)
+        self.assertIn('FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml', fragment)
 
     def test_stop_unavailable_still_latches(self):
         self.client.fresh = False
-        self.assertEqual(self.card.dispatch('stop', {})['code'], 'STOP_UNCONFIRMED')
+        self.assertEqual(self.card.dispatch('stop_move', {})['code'], 'STOP_UNCONFIRMED')
         self.assertEqual(self.client.calls[0], 'stop')
 
     def test_stop_still_moving_not_confirmed(self):
         self.client.stop_works = False
         self.client.velocity = [.2, 0.]
-        self.assertFalse(self.card.dispatch('stop', {})['stop_confirmed'])
+        self.assertFalse(self.card.dispatch('stop_move', {})['stop_confirmed'])
 
     def test_replayed_sample_cannot_confirm_stop(self):
         self.client.frozen = True
-        self.assertFalse(self.card.dispatch('stop', {})['stop_confirmed'])
+        self.assertFalse(self.card.dispatch('stop_move', {})['stop_confirmed'])
 
     def test_async_cancel_and_no_old_command_resurrection(self):
         accepted = self.card.dispatch('move', dict(vx=.1, duration=3))
         self.assertEqual(accepted['status'], 'accepted')
         self.assertFalse(accepted['executed'])
         self.assertEqual(self.move()['code'], 'RESOURCE_BUSY')
-        self.assertTrue(self.card.dispatch('stop', {})['stop_confirmed'])
+        self.assertTrue(self.card.dispatch('stop_move', {})['stop_confirmed'])
         result = self.finished(accepted['action_id'])
         self.assertEqual(result['status'], 'cancelled')
         after_stop = self.client.calls[self.client.calls.index('stop') + 1:]
@@ -289,13 +379,15 @@ class LocoTests(unittest.TestCase):
         self.assertEqual(set(tools), {'loco', 'loco_confirmed'})
         self.assertNotIn('stop_move', tools['loco']['inputSchema']['properties']['action']['enum'])
         self.assertNotIn('x-hooks', tools['loco_confirmed']['inputSchema'])
+        self.assertEqual(bundle.dispatch('loco_confirmed', {'action': 'start'}), {'state': 'ready'})
+        self.assertEqual(bundle.dispatch('loco_confirmed', {'action': 'stop'}), {'state': 'idle'})
         self.assertEqual(bundle.dispatch('loco_confirmed', {'action': 'stop_move'})['code'], 'CONTROL_DISABLED')
         self.assertEqual(bundle.dispatch('loco', {'action': 'start'}), {'state': 'ready'})
         self.assertEqual(self.client.calls, [])
 
     def test_new_card_disabled_by_default_without_affecting_original(self):
         card = loco_control.make_loco_confirmed({}, '', None, self.client)
-        for action in ['move', 'stop', 'stop_move'] + list(loco_control.POSTURES):
+        for action in ['move', 'stop_move'] + list(loco_control.POSTURES):
             self.assertEqual(card.dispatch(action, {'vx': .1})['code'], 'CONTROL_DISABLED')
         card.start()
         card.stop()

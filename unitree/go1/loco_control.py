@@ -55,18 +55,20 @@ class ConfirmedLocoPlugin:
         self._settle = .15
 
     def get_tool(self):
-        actions = ['move', 'stop', 'stop_move'] + list(POSTURES) + ['status']
+        actions = ['start', 'stop', 'move', 'stop_move'] + list(POSTURES) + ['status']
         params = {'move': {'params': ['vx', 'vy', 'vyaw', 'duration'],
                            'description': '有限时运动；短动作同步确认，长动作返回 accepted 和 action_id'},
-                  'stop': {'params': [], 'description': '优先请求停止并确认新鲜遥测已停稳'},
-                  'stop_move': {'params': [], 'description': 'stop 的兼容别名；中断入口'},
+                  'start': {'params': [], 'description': '卡片生命周期就绪；不启用控制、不发运动命令'},
+                  'stop': {'params': [], 'description': '卡片生命周期停止；idle 不代表真机停稳，停稳确认用 stop_move'},
+                  'stop_move': {'params': [], 'description': '优先请求运动停止并确认新鲜遥测已停稳；中断入口'},
                   'status': {'params': ['action_id'], 'description': '查询当前或最近动作的最终结果'}}
         for action in POSTURES:
             params[action] = {'params': ['confirm'] if action in ('damp', 'recovery_stand') else [],
                               'description': '姿态切换并等待模式/姿态反馈；非紧急停止'}
         tool = {'name': 'loco_confirmed', 'type': 'actuator', 'multiInstance': False,
                 'description': 'Go1 有反馈运动控制；accepted 仅表示已接收，completed 才表示观察到结果。'
-                               '停止无遥测确认时返回 STOP_UNCONFIRMED，须遥控器接管。',
+                               'stop_move 无遥测确认时返回 STOP_UNCONFIRMED，须遥控器接管；'
+                               'start/stop 仅返回生命周期状态，不证明真机运动或停稳。',
                 'inputSchema': {'type': 'object', 'required': ['action'],
                     'properties': {
                         'action': {'type': 'string', 'enum': actions},
@@ -89,7 +91,10 @@ class ConfirmedLocoPlugin:
         return tool
 
     def start(self):
-        pass
+        # Lifecycle readiness is independent of SDK availability/control opt-in.
+        # Never clear a pending cancellation or rearm the SDK stop latch here.
+        with self._lock:
+            self._closed = False
 
     def stop(self):
         with self._lock:
@@ -147,10 +152,23 @@ class ConfirmedLocoPlugin:
 
     def dispatch(self, action, args):
         args = args or {}
+        # Framework lifecycle markers must work even in observation-only mode.
+        if action == 'start':
+            self.start()
+            return {'state': 'ready'}
+        if action == 'stop':
+            try:
+                self.stop()  # Cancel/latch without waiting for physical feedback.
+            except Exception as exc:
+                return {'state': 'idle', 'ok': False,
+                        'code': getattr(exc, 'code', 'CONTROL_ERROR'),
+                        'message': str(exc), 'stop_confirmed': False,
+                        'recommended_action': 'remote_stop_and_inspect'}
+            return {'state': 'idle'}  # Card state, NOT stop confirmation.
         if not self._control_enabled and action not in ('status', 'info'):
             return self._result(action, 'error', code='CONTROL_DISABLED',
                                 message='New card is observation-only until controlled acceptance')
-        if action in ('stop', 'stop_move'):
+        if action == 'stop_move':
             return self._stop_action(action)
         if action in ('status', 'info'):
             with self._lock:
@@ -162,9 +180,12 @@ class ConfirmedLocoPlugin:
                     return self._result(action, 'idle' if not aid else 'error', code='NO_ACTION',
                                         control_enabled=self._control_enabled)
                 return copy.deepcopy(job['result'])
-        if action not in ('start', 'move') and action not in POSTURES:
+        if action != 'move' and action not in POSTURES:
             return None  # bundle converts this to JSON-RPC Unknown tool
         try:
+            with self._lock:
+                if self._closed:
+                    raise ControlError('CARD_STOPPED', 'Start the card lifecycle before requesting motion')
             # Validate before cancelling or otherwise affecting an existing action.
             requested = {}
             if action == 'move':
@@ -173,7 +194,7 @@ class ConfirmedLocoPlugin:
                 duration = number(args.get('duration', .5), 'duration', 0., self._max_duration) or .5
                 requested['duration'] = duration
                 if all(requested[k] == 0 for k in ('vx', 'vy', 'vyaw')):
-                    return self._stop_action('stop')
+                    return self._stop_action('stop_move')
                 for k, minimum in [('vx', .05), ('vy', .05), ('vyaw', 6.)]:
                     if 0 < abs(requested[k]) < minimum:
                         raise ControlError('INVALID_ARGUMENT', k + ' is below reliable feedback threshold')
@@ -183,8 +204,6 @@ class ConfirmedLocoPlugin:
                 raise ControlError('PRECONDITION_FAILED', 'Explicit confirm=true required')
             generation = self._client.control_epoch
             snap = self._preflight(action)
-            if action == 'start':
-                return self._result(action, 'ready', state='ready')
             asynchronous = action in POSTURES or duration > 2
             aid = 'go1_loco_confirmed_' + uuid.uuid4().hex
             with self._lock:

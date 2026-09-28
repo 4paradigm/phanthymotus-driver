@@ -55,7 +55,6 @@ COPY deploy/camera/           /deploy/camera/
 
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
 # ANSI colour codes are control bytes; in a non-tty container log they are

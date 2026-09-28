@@ -39,7 +39,7 @@
 | 卡片（= 文件） | 能力 | 关键动作 |
 |---|---|---|
 | `loco` | 原有基础运动（保留） | `move` / `stop` / `balance_stand` / `stand_up` / `stand_down` / `damp` / `recovery_stand` |
-| `loco_confirmed` | 新增有反馈运动控制（待真机验收） | `move` / `stop` / `stop_move` / `status` / 姿态动作；默认 control_enabled=false，详见 [LOCO_ACCEPTANCE.md](LOCO_ACCEPTANCE.md) |
+| `loco_confirmed` | 新增有反馈运动控制（待真机验收） | `start/stop` 为生命周期；`move` / `stop_move`（停稳确认）/ `status` / 姿态动作；默认 control_enabled=false，详见 [LOCO_ACCEPTANCE.md](LOCO_ACCEPTANCE.md) |
 | `body_pose` | 机身姿态与高度 | `set_attitude`（roll/pitch/yaw）/ `set_body_height` / `set_foot_raise_height` / `reset` |
 | `switch_gait` | 步态切换 | `idle` / `trot` / `trot_run` / `climb_stair` / `trot_obstacle`（高风险步态须 `confirm=true`） |
 | `special_motion` | 特殊动作 | `jump_yaw_left` / `straight_hand`（同步阻塞执行，须 `confirm=true`） |
