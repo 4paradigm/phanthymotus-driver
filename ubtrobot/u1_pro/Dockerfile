@@ -11,7 +11,8 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros2-archive-keyring.gpg] ${ROS_APT_MIRROR} ${UBUNTU_CODENAME} main" \
         > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
-    python3-colcon-common-extensions cmake build-essential && rm -rf /var/lib/apt/lists/*
+    python3-colcon-common-extensions cmake build-essential ros-humble-rcutils && \
+    ldconfig && rm -rf /var/lib/apt/lists/*
 WORKDIR /u1_ws
 COPY vendor/ /u1_ws/src/
 RUN . /opt/ros/humble/setup.sh && colcon build --merge-install
