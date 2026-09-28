@@ -754,7 +754,6 @@ class U1CardContractTests(unittest.TestCase):
             string_call=mock.Mock(side_effect=[
                 {"ok": True, "code": "OK", "data": {"authorized": True, "token": "do-not-log", "license": "private"}},
             ]),
-            set_system_enabled=mock.Mock(return_value={"enabled": False}),
         )
         output = io.StringIO()
         with redirect_stdout(output):
@@ -763,7 +762,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertNotIn("secret-value", text)
         self.assertNotIn("do-not-log", text)
         self.assertIn("authorization request completed", text)
-        self.assertIn("authorization request completed", text)
+        self.assertIn("system behaviors are unchanged", text)
 
     def test_existing_vendor_authorization_skips_credential_submission(self):
         import device
@@ -773,16 +772,11 @@ class U1CardContractTests(unittest.TestCase):
             trigger_call=mock.Mock(return_value={"code": "OK", "data": {"authorized": True}}),
             call=mock.Mock(),
             string_call=mock.Mock(return_value={"ok": True, "code": "OK", "data": {"authorized": True}}),
-            set_system_enabled=mock.Mock(return_value={"enabled": False}),
+            set_system_enabled=mock.Mock(side_effect=RuntimeError("switch service unavailable")),
         )
         device.U1Nodes.initialize_robot(nodes)
         nodes.trigger_call.assert_called_once_with("auth_state")
-        nodes.set_system_enabled.assert_has_calls([
-            mock.call("wakeup_enabled", False),
-            mock.call("wakeup_followup", False),
-            mock.call("vision_enabled", False),
-        ])
-        self.assertEqual(nodes.set_system_enabled.call_count, 3)
+        nodes.set_system_enabled.assert_not_called()
 
     def test_unauthorized_vendor_state_performs_authorization(self):
         import device
@@ -794,16 +788,12 @@ class U1CardContractTests(unittest.TestCase):
                 {"ok": True, "code": "OK", "data": {"authorized": True}},
             ]),
             call=mock.Mock(),
-            set_system_enabled=mock.Mock(return_value={"enabled": False}),
+            set_system_enabled=mock.Mock(side_effect=RuntimeError("switch service unavailable")),
         )
         device.U1Nodes.initialize_robot(nodes)
         self.assertEqual(nodes.string_call.call_args_list[0].args,
                          ("authorize", mock.ANY))
-        nodes.set_system_enabled.assert_has_calls([
-            mock.call("wakeup_enabled", False),
-            mock.call("wakeup_followup", False),
-            mock.call("vision_enabled", False),
-        ])
+        nodes.set_system_enabled.assert_not_called()
 
     def test_authorization_loads_secret_file_and_license(self):
         import device
@@ -886,22 +876,16 @@ class U1CardContractTests(unittest.TestCase):
         nodes.close.assert_called_once_with()
         ros.shutdown.assert_called_once_with()
 
-    def test_startup_fails_if_autonomous_behavior_cannot_be_disabled(self):
+    def test_startup_does_not_change_autonomous_behavior_switches(self):
         import device
 
         nodes = types.SimpleNamespace(
             config={},
             trigger_call=mock.Mock(return_value={"code": "OK", "data": {"authorized": True}}),
-            set_system_enabled=mock.Mock(side_effect=[
-                {"enabled": False}, RuntimeError("vendor switch unavailable"),
-            ]),
+            set_system_enabled=mock.Mock(side_effect=RuntimeError("vendor switch unavailable")),
         )
-        with self.assertRaisesRegex(RuntimeError, "vendor switch unavailable"):
-            device.U1Nodes.initialize_robot(nodes)
-        self.assertEqual(nodes.set_system_enabled.call_args_list, [
-            mock.call("wakeup_enabled", False),
-            mock.call("wakeup_followup", False),
-        ])
+        device.U1Nodes.initialize_robot(nodes)
+        nodes.set_system_enabled.assert_not_called()
 
     def test_acp_error_log_escapes_action_id(self):
         import device

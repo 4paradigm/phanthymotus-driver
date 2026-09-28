@@ -495,7 +495,7 @@ class U1Nodes:
                 time.sleep(0.05)
 
     def initialize_robot(self) -> None:
-        """Authorize the SDK and disable autonomous behaviors at startup."""
+        """Authorize the SDK without changing robot behavior settings."""
         try:
             auth_state = self.trigger_call("auth_state")
         except Exception:
@@ -507,9 +507,7 @@ class U1Nodes:
             print("[U1 init] vendor SDK is already authorized", flush=True)
         else:
             U1Nodes._authorize_from_credentials(self)
-        for name in ("wakeup_enabled", "wakeup_followup", "vision_enabled"):
-            self.set_system_enabled(name, False)
-        print("[U1 init] autonomous behavior disabled; use system_controls to enable it", flush=True)
+        print("[U1 init] system behaviors are unchanged; use system_controls to manage them", flush=True)
 
 
     def _authorize_from_credentials(self) -> None:
