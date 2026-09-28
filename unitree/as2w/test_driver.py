@@ -3,6 +3,7 @@
 Run with: python3 -m unittest unitree/as2w/test_driver.py
 """
 import importlib.util
+import struct
 import sys
 import types
 import unittest
@@ -294,6 +295,39 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("audio/pcm-16k", speaker.get_tool()["topic_in"][0]["format"])
         self.assertEqual("camera", camera.get_tool()["name"])
         self.assertEqual("image/jpeg", camera.get_tool()["topic_out"][0]["format"])
+
+    def test_zero_pcm_has_no_variation(self):
+        self.assertFalse(self.multimedia._pcm_has_variation(b"\x00" * 1024))
+
+    def test_constant_nonzero_pcm_has_no_variation(self):
+        pcm = struct.pack("<512h", *([123] * 512))
+        self.assertFalse(self.multimedia._pcm_has_variation(pcm))
+
+    def test_pcm_with_a_different_sample_has_variation(self):
+        pcm = struct.pack("<512h", *([0] * 511 + [1]))
+        self.assertTrue(self.multimedia._pcm_has_variation(pcm))
+
+    def test_mic_start_fails_when_received_pcm_stays_flat(self):
+        plugin = self.multimedia.MicPlugin.__new__(self.multimedia.MicPlugin)
+        plugin._node = types.SimpleNamespace(
+            packet_count=1,
+            varying_chunk_count=0,
+            state="waiting",
+            last_error="",
+        )
+        now = [0.0]
+
+        def monotonic():
+            now[0] += 0.1
+            return now[0]
+
+        with patch.object(self.multimedia.time, "monotonic", side_effect=monotonic), \
+                patch.object(self.multimedia.time, "sleep", return_value=None):
+            state, message = plugin._self_check()
+
+        self.assertEqual("error", state)
+        self.assertEqual("error", plugin._node.state)
+        self.assertIn("L1+L2", message)
 
     def test_speaker_info_returns_authoritative_input_topic(self):
         plugin = self.multimedia.SpeakerPlugin.__new__(self.multimedia.SpeakerPlugin)

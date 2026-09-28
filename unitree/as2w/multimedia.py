@@ -57,6 +57,15 @@ def _interface_ipv4(interface):
         sock.close()
 
 
+def _pcm_has_variation(pcm: bytes) -> bool:
+    """Return whether a PCM-16LE chunk contains more than one sample value."""
+    sample_count = len(pcm) // 2
+    if sample_count < 2:
+        return False
+    samples = struct.unpack_from(f"<{sample_count}h", pcm)
+    return min(samples) != max(samples)
+
+
 class _MicNode(Node):
     def __init__(self, topic, interface, group, port, chunk_bytes, startup_grace_s):
         super().__init__("as2w_mic")
@@ -69,6 +78,7 @@ class _MicNode(Node):
         self.publisher = self.create_publisher(AudioChunk, topic, _LOW_LAT_QOS)
         self.state = "idle"
         self.packet_count = 0
+        self.varying_chunk_count = 0
         self.last_packet_ts = 0.0
         self.last_error = ""
         self._socket = None
@@ -81,6 +91,7 @@ class _MicNode(Node):
             return
         self.stop_capture()
         self.packet_count = 0
+        self.varying_chunk_count = 0
         self.last_packet_ts = 0.0
         self.last_error = ""
         self._started_at = time.monotonic()
@@ -119,11 +130,14 @@ class _MicNode(Node):
                 break
             self.packet_count += 1
             self.last_packet_ts = time.monotonic()
-            self.state = "running"
             buffered.extend(data)
             while len(buffered) >= self.chunk_bytes and not stop_event.is_set():
                 chunk = bytes(buffered[:self.chunk_bytes])
                 del buffered[:self.chunk_bytes]
+                if _pcm_has_variation(chunk):
+                    self.varying_chunk_count += 1
+                    if self.state != "error":
+                        self.state = "running"
                 message = AudioChunk()
                 if hasattr(message, "header"):
                     message.header.stamp = self.get_clock().now().to_msg()
@@ -206,13 +220,59 @@ class MicPlugin:
     def stop(self):
         self._node.stop_capture()
 
+    def _self_check(self):
+        capture_thread = getattr(self._node, "_thread", None)
+        if (self._node.state == "error"
+                and (capture_thread is None or not capture_thread.is_alive())):
+            return "error", self._node.last_error
+
+        if self._node.packet_count == 0:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and self._node.packet_count == 0:
+                time.sleep(0.1)
+        if self._node.packet_count == 0:
+            self._node.state = "error"
+            self._node.last_error = "no multicast packets received in 3s"
+            return "error", self._node.last_error
+
+        # The robot can keep sending flat PCM while voice wake-up mode is off.
+        # Require a new chunk with actual sample variation before start succeeds.
+        varying_before = self._node.varying_chunk_count
+        deadline = time.monotonic() + 3.0
+        while (
+            time.monotonic() < deadline
+            and self._node.varying_chunk_count == varying_before
+        ):
+            time.sleep(0.1)
+
+        if self._node.varying_chunk_count == varying_before:
+            self._node.state = "error"
+            self._node.last_error = (
+                "麦克风启动失败：收到音频数据，但没有检测到声音波动。"
+                "请使用机器人遥控器同时按下 L1+L2，将语音状态切换为唤醒模式，"
+                "然后重新启动。"
+            )
+            return "error", self._node.last_error
+
+        self._node.state = "running"
+        self._node.last_error = ""
+        return "running", ""
+
     def dispatch(self, action, args):
         if action == "start":
             self.start()
+            result = self._node.status()
+            if result["rival_publishers"] == 0:
+                state, message = self._self_check()
+                result = self._node.status()
+                if state == "error":
+                    result["state"] = state
+                    result["message"] = message
         elif action == "stop":
             self.stop()
         if action in ("start", "stop", "info"):
-            result = self._node.status()
+            if action != "start":
+                result = self._node.status()
             result["topic_out"] = [{"topic": self._topic, "format": "audio/pcm-16k"}]
             return result
         return None
