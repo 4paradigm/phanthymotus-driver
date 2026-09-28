@@ -11,6 +11,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AudioInfo.msg"
   "msg/AudioInData.msg"
   "msg/AudioOutData.msg"
+  "msg/DoaEvent.msg"
   "srv/EnableAudioIn.srv"
   "srv/EnableAudioOut.srv"
   "srv/SetAudioVolume.srv"

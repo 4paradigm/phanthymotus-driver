@@ -85,7 +85,7 @@ def _install_stubs():
 
     audio = types.ModuleType("audio_msgs")
     audio_msg = types.ModuleType("audio_msgs.msg")
-    for name in ("AudioChunk", "AudioInData", "AudioOutData", "AudioInfo"):
+    for name in ("AudioChunk", "AudioInData", "AudioOutData", "AudioInfo", "DoaEvent"):
         setattr(audio_msg, name, message(name))
     audio_srv = types.ModuleType("audio_msgs.srv")
     for name in ("EnableAudioIn", "EnableAudioOut", "SetAudioVolume"):
@@ -234,7 +234,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
         self.assertEqual(MIC_TOPIC, "/sys/device/audio_in/raw")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
-        self.assertEqual(device.EVENT_TOPICS["doa_event"], "/robo/audio/subscribe/doa_event")
+        self.assertEqual(device.DOA_TOPIC, "/audio/sense/doa_event")
 
     def test_u1_cyclonedds_config_matches_official_sdk_runtime(self):
         config = Path(__file__).with_name("config.yaml").read_text(encoding="utf-8")
@@ -248,6 +248,8 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = object.__new__(device.U1Nodes)
+        nodes.EnableAudioIn = types.SimpleNamespace(Request=type("Request", (), {}))
+        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
         nodes.trigger_call = mock.Mock(side_effect=[
             {"ok": True, "data": {"path": "/tmp/audio.stream", "frame_payload_size": 8, "max_frames": 2}},
             {"ok": True, "data": {"state": "OPEN"}},
@@ -280,6 +282,8 @@ class U1CardContractTests(unittest.TestCase):
         import device
 
         nodes = object.__new__(device.U1Nodes)
+        nodes.EnableAudioIn = types.SimpleNamespace(Request=type("Request", (), {}))
+        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
         nodes.trigger_call = mock.Mock(side_effect=RuntimeError("device busy"))
         nodes._mic_forwarding = True
         nodes._mic_reader = None
@@ -289,10 +293,12 @@ class U1CardContractTests(unittest.TestCase):
             nodes.set_mic_enabled(True)
         self.assertFalse(nodes._mic_forwarding)
 
-    def test_mic_reader_start_failure_closes_the_sdk_stream(self):
+    def test_mic_uses_device_topic_when_sdk_ring_is_empty(self):
         import device
 
         nodes = object.__new__(device.U1Nodes)
+        nodes.EnableAudioIn = types.SimpleNamespace(Request=type("Request", (), {}))
+        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
         nodes.trigger_call = mock.Mock(side_effect=[
             {"ok": True, "data": {"path": "/tmp/audio.stream", "frame_payload_size": 8, "max_frames": 2}},
             {"ok": True, "data": {"state": "OPEN"}},
@@ -304,18 +310,11 @@ class U1CardContractTests(unittest.TestCase):
         nodes._mic_stream_open = False
         nodes._mic_frame_event = threading.Event()
         nodes._mic_frames = 0
-        class BrokenReader:
-            def __init__(self, *_args):
-                pass
-            def start(self):
-                raise RuntimeError("ring unavailable")
-            def stop(self):
-                pass
-
-        with mock.patch.object(device, "VideoSharedMemoryReader", BrokenReader):
-            with self.assertRaisesRegex(RuntimeError, "ring unavailable"):
-                nodes.set_mic_enabled(True)
-        self.assertFalse(nodes._mic_stream_open)
+        result = nodes.set_mic_enabled(True)
+        self.assertTrue(nodes._mic_stream_open)
+        self.assertIsNone(nodes._mic_reader)
+        self.assertEqual(result["source"], "U1 SDK audio shared-memory stream")
+        nodes.set_mic_enabled(False)
         self.assertEqual([call.args[0] for call in nodes.trigger_call.call_args_list],
                          ["audio_open", "audio_state", "audio_close"])
 
@@ -352,6 +351,19 @@ class U1CardContractTests(unittest.TestCase):
         message = types.SimpleNamespace(data='{"code":"EVENT","data":{"azimuth":12.5}}')
         self.assertEqual(device._event_json(message), message.data)
         self.assertEqual(device._event_data(message.data), {"azimuth": 12.5})
+
+    def test_doa_device_message_is_bridged_as_json(self):
+        import device
+
+        publisher = FakePublisher()
+        nodes = object.__new__(device.U1Nodes)
+        nodes.String = type("String", (), {})
+        nodes._event_forwarding = {"doa_event": True}
+        nodes._event_publishers = {"doa_event": publisher}
+        nodes._doa_topic_callback(types.SimpleNamespace(azimuth=25.0, confidence=-0.788))
+        self.assertEqual(json.loads(publisher.messages[0].data), {
+            "event": "doa", "azimuth": 25.0, "confidence": -0.788,
+        })
 
     def test_agent_facing_plugins_exist(self):
         import device
@@ -454,17 +466,19 @@ class U1CardContractTests(unittest.TestCase):
             nodes = device.U1Nodes({}, "test", ros)
             self.assertEqual(ros.executor_robot.nodes, [nodes.robot])
             self.assertEqual(ros.executor_core.nodes, [nodes.core])
-            self.assertEqual(len(nodes.robot.subscriptions), 3)
-            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 1)
+            self.assertEqual(len(nodes.robot.subscriptions), 2)
+            self.assertEqual(len(getattr(nodes.audio_device, "subscriptions", [])), 3)
             self.assertEqual(initialized_domains[0][1], 2)
             self.assertEqual(nodes.audio_device.clients["/sys/device/audio_out/set_volume"].srv_name,
                              "/sys/device/audio_out/set_volume")
             self.assertIn("/sys/device/audio_out/current_volume",
                           [sub[1] for sub in nodes.audio_device.subscriptions])
-            self.assertNotIn("/sys/device/audio_in/raw",
-                             [sub[1] for sub in nodes.audio_device.subscriptions])
+            self.assertIn("/sys/device/audio_in/raw",
+                          [sub[1] for sub in nodes.audio_device.subscriptions])
             self.assertEqual(nodes.robot.clients["/robo/audio/call/open_stream"].srv_name,
                              "/robo/audio/call/open_stream")
+            self.assertEqual(nodes.robot.clients["/robo/video/call/stream_state"].srv_name,
+                             "/robo/video/call/stream_state")
             self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name,
                              "/robo/audio/call/play_action")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
@@ -472,6 +486,8 @@ class U1CardContractTests(unittest.TestCase):
                              "/robo/system/call/set_vision_enabled")
             self.assertEqual(nodes.robot.clients["/robo/system/call/get_vision_enabled"].srv_name,
                              "/robo/system/call/get_vision_enabled")
+            self.assertIn("/sys/device/audio_in/raw",
+                          [sub[1] for sub in nodes.audio_device.subscriptions])
             nodes.close()
             self.assertEqual(ros.executor_robot.nodes, [])
             self.assertEqual(ros.executor_core.nodes, [])
@@ -1127,20 +1143,23 @@ class U1CardContractTests(unittest.TestCase):
             mock.call("wakeup_enabled_state"), mock.call("vision_enabled_state"),
         ])
 
-    def test_speaker_forwards_input_without_blocking_on_timed_out_enable_service(self):
+    def test_speaker_enables_device_before_forwarding_input(self):
         import device
 
         nodes = object.__new__(device.U1Nodes)
         nodes._speaker_subscription = None
         nodes._speaker_uuid = ""
         nodes._speaker_frames = 0
+        nodes._speaker_enabled = False
         nodes._audio_qos = object()
         nodes._speaker_forwarding = False
-        nodes.call = mock.Mock(side_effect=TimeoutError("service timeout"))
+        nodes.EnableAudioOut = types.SimpleNamespace(Request=type("Request", (), {}))
+        nodes.AudioInfo = type("AudioInfo", (), {})
+        nodes.call = mock.Mock(return_value=types.SimpleNamespace(code=0))
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock(return_value="subscription"))
         nodes.AudioChunk = object
         result = nodes.connect_speaker("/tts/audio")
-        nodes.call.assert_not_called()
+        nodes.call.assert_called_once_with("speaker_enable", mock.ANY)
         nodes.core.create_subscription.assert_called_once()
         self.assertEqual(nodes.core.create_subscription.call_args.args[1], "/tts/audio")
         self.assertEqual(result["input_topic"], "/tts/audio")

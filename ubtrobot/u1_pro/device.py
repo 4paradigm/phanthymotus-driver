@@ -33,12 +33,11 @@ VIDEO_METADATA_TOPIC = "/robo/video/subscribe/metadata"
 SDK_AUDIO_OPEN = "/robo/audio/call/open_stream"
 SDK_AUDIO_STATE = "/robo/audio/call/stream_state"
 SDK_AUDIO_CLOSE = "/robo/audio/call/close_stream"
+DOA_TOPIC = "/audio/sense/doa_event"
 
 EVENT_TOPICS = {
-    # The U1 adapter bridges sound-direction events on the SDK String topic.
-    # The domain-2 audio_msgs topic is a separate vendor endpoint and is not
-    # available through the driver's domain-20 participant.
-    "doa_event": "/robo/audio/subscribe/doa_event",
+    # Playback remains on the domain-20 SDK bridge. DOA is subscribed from
+    # the device domain below because its native message is audio_msgs/DoaEvent.
     "playback_state": PLAYBACK_TOPIC,
 }
 
@@ -379,8 +378,8 @@ class U1Nodes:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
-        from audio_msgs.msg import AudioChunk, AudioOutData
-        from audio_msgs.srv import SetAudioVolume
+        from audio_msgs.msg import AudioChunk, AudioInData, AudioInfo, AudioOutData, DoaEvent
+        from audio_msgs.srv import EnableAudioIn, EnableAudioOut, SetAudioVolume
         from std_msgs.msg import UInt8
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
@@ -411,7 +410,10 @@ class U1Nodes:
         self.namespace = namespace
         self.mic_topic = f"/{namespace}/mic/audio"
         self.AudioChunk = AudioChunk
+        self.AudioInData = AudioInData
+        self.AudioInfo = AudioInfo
         self.AudioOutData = AudioOutData
+        self.DoaEvent = DoaEvent
         self.UInt8 = UInt8
         self.String = String
         self.CompressedImage = CompressedImage
@@ -420,10 +422,13 @@ class U1Nodes:
         self._volume = None
         self._volume_subscription = self.audio_device.create_subscription(
             UInt8, "/sys/device/audio_out/current_volume", self._volume_callback, 10)
+        self.EnableAudioIn = EnableAudioIn
+        self.EnableAudioOut = EnableAudioOut
         self._speaker_subscription = None
         self._speaker_forwarding = False
         self._speaker_uuid = ""
         self._speaker_frames = 0
+        self._speaker_enabled = False
         self._video_users = 0
         self._video_stream = {}
         self._video_lock = threading.Lock()
@@ -443,6 +448,10 @@ class U1Nodes:
         self._mic_reader = None
         self._mic_stream = {}
         self._mic_stream_open = False
+        self._mic_subscription = self.audio_device.create_subscription(
+            AudioInData, MIC_TOPIC, self._mic_topic_callback, self._audio_qos)
+        self._doa_subscription = self.audio_device.create_subscription(
+            DoaEvent, DOA_TOPIC, self._doa_topic_callback, reliable)
         self._playback_listeners = []
         self._robot_subscriptions = []
         for name, topic in EVENT_TOPICS.items():
@@ -451,8 +460,11 @@ class U1Nodes:
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
         self._robot_subscriptions.append(self.robot.create_subscription(String, VIDEO_METADATA_TOPIC, self._metadata_callback, reliable))
         self._clients = {
+            "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
+            "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
             "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
             "video_open": self.robot.create_client(Trigger, "/robo/video/call/open_stream"),
+            "video_state": self.robot.create_client(Trigger, "/robo/video/call/stream_state"),
             "video_close": self.robot.create_client(Trigger, "/robo/video/call/close_stream"),
             "audio_open": self.robot.create_client(Trigger, SDK_AUDIO_OPEN),
             "audio_state": self.robot.create_client(Trigger, SDK_AUDIO_STATE),
@@ -589,12 +601,23 @@ class U1Nodes:
     def set_mic_enabled(self, enabled: bool) -> dict:
         if not enabled:
             self.stop_mic_reader()
-            if not self._mic_stream_open:
-                return {"state": "idle"}
-            response = self.trigger_call("audio_close")
-            if _vendor_request_failed(response):
-                raise RuntimeError("U1 Pro audio stream close was rejected")
-            self._mic_stream_open = False
+            close_error = None
+            if self._mic_stream_open:
+                try:
+                    response = self.trigger_call("audio_close")
+                    if _vendor_request_failed(response):
+                        raise RuntimeError("U1 Pro audio stream close was rejected")
+                except Exception as exc:
+                    close_error = exc
+                self._mic_stream_open = False
+            try:
+                response = self._set_audio_input_enabled(False)
+            except Exception as exc:
+                if close_error:
+                    raise RuntimeError(f"{close_error}; microphone disable failed: {exc}") from exc
+                raise
+            if close_error:
+                raise close_error
             return response
         if self._mic_stream_open and self._mic_reader is not None:
             self._mic_forwarding = True
@@ -604,6 +627,7 @@ class U1Nodes:
             self.set_mic_enabled(False)
         self._mic_forwarding = False
         self.stop_mic_reader()
+        self._set_audio_input_enabled(True)
         opened = self.trigger_call("audio_open")
         if _vendor_request_failed(opened):
             raise RuntimeError("U1 Pro audio stream open was rejected")
@@ -618,8 +642,13 @@ class U1Nodes:
             self._mic_frames = 0
             self._mic_frame_event.clear()
             self._mic_stream = stream
-            self._mic_reader = VideoSharedMemoryReader(stream, lambda: {}, self._publish_mic_frame)
-            self._mic_reader.start()
+            # The device-domain raw topic is a supported fallback on firmware
+            # builds where the SDK ring is opened but never populated.
+            self._mic_forwarding = True
+            # The domain-2 raw topic is the reliable live source on the
+            # target adapter. The generic SDK ring may remain empty while it
+            # is already publishing on the device topic, so it is optional.
+            self._mic_reader = None
         except Exception as exc:
             self.stop_mic_reader()
             try:
@@ -630,6 +659,16 @@ class U1Nodes:
         self._mic_forwarding = True
         return {"state": state, "stream": stream,
                 "source": "U1 SDK audio shared-memory stream"}
+
+    def _set_audio_input_enabled(self, enabled: bool) -> dict:
+        request = self.EnableAudioIn.Request()
+        request.header = self._audio_header()
+        request.enable = bool(enabled)
+        response = self.call("mic_enable", request)
+        code = int(getattr(response, "code", 0))
+        if code != 0:
+            raise RuntimeError(f"U1 Pro microphone enable service failed with code {code}")
+        return {"state": "running" if enabled else "idle", "source_topic": MIC_TOPIC}
 
     def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
         if not self._mic_forwarding:
@@ -643,6 +682,35 @@ class U1Nodes:
         self._mic_publisher.publish(chunk)
         self._mic_frames += 1
         self._mic_frame_event.set()
+
+    def _mic_topic_callback(self, message) -> None:
+        """Accept the device-domain raw topic when the SDK ring is unavailable."""
+        if not self._mic_forwarding:
+            return
+        data = getattr(getattr(message, "data", None), "data", None)
+        if data is None:
+            data = getattr(message, "data", None)
+        if not data:
+            return
+        chunk = self.AudioChunk()
+        chunk.format = AUDIO_FORMAT
+        chunk.data = list(data)
+        header = getattr(message, "header", None)
+        chunk.header = header if header is not None else self._audio_header()
+        self._mic_publisher.publish(chunk)
+        self._mic_frames += 1
+        self._mic_frame_event.set()
+
+    def _doa_topic_callback(self, message) -> None:
+        """Bridge the device-domain DOA message into the Agent JSON stream."""
+        output = self.String()
+        output.data = json.dumps({
+            "event": "doa",
+            "azimuth": float(getattr(message, "azimuth", 0.0)),
+            "confidence": float(getattr(message, "confidence", 0.0)),
+        }, ensure_ascii=False, separators=(",", ":"))
+        if self._event_forwarding.get("doa_event", False):
+            self._event_publishers["doa_event"].publish(output)
 
     def wait_for_mic_frame(self, timeout: float) -> bool:
         if self._mic_frame_event.wait(timeout):
@@ -773,6 +841,11 @@ class U1Nodes:
         if self._speaker_subscription is not None:
             self.core.destroy_subscription(self._speaker_subscription)
             self._speaker_subscription = None
+        if self._speaker_enabled:
+            try:
+                self._disable_speaker()
+            finally:
+                self._speaker_enabled = False
 
     def connect_speaker(self, input_topic: str) -> dict:
         self._speaker_forwarding = False
@@ -781,10 +854,38 @@ class U1Nodes:
             self._speaker_subscription = None
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
         self._speaker_frames = 0
+        request = self.EnableAudioOut.Request()
+        request.header = self._audio_header()
+        request.enable = True
+        request.info = self._audio_info()
+        request.mode = 0
+        request.gain = 0.0
+        response = self.call("speaker_enable", request)
+        code = int(getattr(response, "code", 0))
+        if code != 0:
+            raise RuntimeError(f"U1 Pro speaker enable service failed with code {code}")
+        self._speaker_enabled = True
         self._speaker_subscription = self.core.create_subscription(
             self.AudioChunk, input_topic, self._speaker_callback, self._audio_qos)
         self._speaker_forwarding = True
         return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
+
+    def _disable_speaker(self) -> None:
+        request = self.EnableAudioOut.Request()
+        request.header = self._audio_header()
+        request.enable = False
+        request.info = self._audio_info()
+        request.mode = 0
+        request.gain = 0.0
+        self.call("speaker_enable", request)
+
+    def _audio_info(self):
+        info = self.AudioInfo()
+        info.uuid = self._speaker_uuid or f"u1-{uuid.uuid4().hex}"
+        info.channels = 1
+        info.sample_rate = 16000
+        info.sample_format = "S16LE"
+        return info
 
     @staticmethod
     def _audio_header():
@@ -813,6 +914,12 @@ class U1Nodes:
             self.stop_mic_reader()
         self._event_forwarding.clear()
         self.close_speaker_subscription()
+        if self._mic_subscription is not None:
+            self.audio_device.destroy_subscription(self._mic_subscription)
+            self._mic_subscription = None
+        if self._doa_subscription is not None:
+            self.audio_device.destroy_subscription(self._doa_subscription)
+            self._doa_subscription = None
         if self._video_users:
             try:
                 self.trigger_call("video_close")
@@ -1147,9 +1254,10 @@ class EyeCameraPlugin:
             # this eye, so a generic stream is never mislabeled as stereo.
             self._subscription = self.nodes.audio_device.create_subscription(
                 self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
-            self._reader = VideoSharedMemoryReader(
-                stream, self.nodes.video_metadata, self._on_shared_frame)
-            self._reader.start()
+            # The SDK ring has no eye selector and may be empty even while
+            # the verified per-eye Image6m topics are active. Keep the SDK
+            # stream open, but use those topics as the readiness source.
+            self._reader = None
             if not self._frame_ready.wait(CAMERA_FRAME_TIMEOUT):
                 reader_error = getattr(self._reader, "_error", "")
                 raise RuntimeError(reader_error or self._last_error or
