@@ -12,4 +12,4 @@ if __name__ == "__main__":
     uri = config.get("ros", {}).get("cyclonedds_uri")
     if uri:
         os.environ["CYCLONEDDS_URI"] = str(uri)
-    run_driver(__file__, "ubtrobot-u1-pro-driver", "ubtrobot-u1-pro-device-bundle", build_plugins)
+    run_driver(__file__, "ubtrobot-u1-pro-driver", "ubtrobot-u1-pro", build_plugins)
