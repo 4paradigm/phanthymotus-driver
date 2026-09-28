@@ -229,9 +229,18 @@ class ConfirmedLocoPlugin:
         failure = None
         observed = None
         stop_result = None
+        may_own_control = False
         try:
             self._check_cancel(job)
-            self._client.claim_control(job['id'], job['epoch'])
+            # A timeout has an unknown outcome and must fail safe. An explicit
+            # rejection, however, must not stop a different card's movement.
+            may_own_control = True
+            try:
+                self._client.claim_control(job['id'], job['epoch'])
+            except Exception as exc:
+                if getattr(exc, 'code', None) in ('RESOURCE_BUSY', 'CANCELLED', 'STUB_MODE'):
+                    may_own_control = False
+                raise
             observed = self._monitor(job)
             self._check_cancel(job)
         except Exception as exc:
@@ -239,11 +248,12 @@ class ConfirmedLocoPlugin:
         finally:
             # Successful posture is intentionally held. Every move/error/cancel
             # requests a stop before checking telemetry or delivering callbacks.
-            if job['action'] == 'move' or failure is not None:
+            if may_own_control and (job['action'] == 'move' or failure is not None):
                 self._client.request_stop()
                 stop_result = self._confirm_stop()
             try:
-                self._client.release_control(job['id'])
+                if may_own_control:
+                    self._client.release_control(job['id'])
             except Exception as exc:
                 failure = failure or exc
                 self._client.request_stop()

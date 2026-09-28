@@ -340,6 +340,9 @@ class Go1HighSdkClient:
             with self._lock:
                 self._snapshot = out
                 self._snapshot_received_at = time.monotonic()
+                # Existing onboard temperature cards use this timestamp; keep
+                # it tied to receipt, not to each subsequent snapshot read.
+                self._snapshot["received_monotonic_s"] = self._snapshot_received_at
                 self._valid_packet_count = getattr(self, "_packet_count", 0)
         except Exception as e:
             print(f"[Go1HighSdk] parse_state error: {e}", flush=True)

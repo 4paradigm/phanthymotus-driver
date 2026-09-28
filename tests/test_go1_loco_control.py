@@ -126,6 +126,26 @@ class LocoTests(unittest.TestCase):
         self.assertEqual(result['code'], 'MOTION_NOT_OBSERVED')
         self.assertTrue(result['stop']['stop_confirmed'])
 
+    def test_rejected_claim_does_not_stop_existing_card(self):
+        self.client.velocity = [.1, 0.]
+        self.client.owner = 'original-card'
+        with mock.patch.object(self.client, 'claim_control', side_effect=
+                               sdk_proxy.SdkError('RESOURCE_BUSY', 'existing movement')):
+            result = self.move()
+        self.assertEqual(result['code'], 'RESOURCE_BUSY')
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.client.velocity, [.1, 0.])
+        self.assertEqual(self.client.owner, 'original-card')
+        self.assertEqual(self.client.control_epoch, 0)
+
+    def test_unknown_claim_outcome_still_requests_stop(self):
+        with mock.patch.object(self.client, 'claim_control', side_effect=
+                               sdk_proxy.SdkError('SDK_TIMEOUT', 'unknown outcome')):
+            result = self.move()
+        self.assertEqual(result['code'], 'SDK_TIMEOUT')
+        self.assertIn('stop', self.client.calls)
+        self.assertTrue(result['stop']['stop_confirmed'])
+
     def test_all_requested_axes_must_match(self):
         self.client.behavior = 'partial'
         self.assertEqual(self.move(vy=.1, vyaw=10)['code'], 'MOTION_NOT_OBSERVED')
@@ -407,6 +427,13 @@ class SdkTests(unittest.TestCase):
         self.client._snapshot = {'fresh': True}
         self.client._snapshot_received_at = time.monotonic() - 1
         self.assertFalse(self.client.snapshot()['fresh'])
+
+    def test_receipt_timestamp_survives_snapshot_reads(self):
+        self.client._parse_state(types.SimpleNamespace())
+        first = self.client.snapshot()
+        self.assertTrue(first['fresh'])
+        self.assertEqual(first['received_monotonic_s'], self.client._snapshot_received_at)
+        self.assertEqual(self.client.snapshot()['received_monotonic_s'], first['received_monotonic_s'])
 
     def test_send_positive_bytes_succeeds_zero_and_negative_fail(self):
         self.client._udp = mock.Mock()
