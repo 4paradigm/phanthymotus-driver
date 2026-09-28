@@ -6,6 +6,7 @@ import sys
 import io
 import json
 import os
+import struct
 import threading
 import tempfile
 import types
@@ -234,7 +235,17 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
         self.assertEqual(MIC_TOPIC, "/sys/device/audio_in/raw")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
-        self.assertEqual(device.DOA_TOPIC, "/audio/sense/doa_event")
+        self.assertEqual(device.ASR_AUDIO_TOPIC, "/audio/sense/audio_data_to_asr")
+
+    def test_audio_in_data_is_normalized_to_driver_pcm_contract(self):
+        import device
+
+        message = types.SimpleNamespace(sample_rate=8000, channels=2,
+                                        sample_format="S16LE")
+        payload = struct.pack("<hhhh", 1000, -1000, 2000, 0)
+        normalized = device._normalize_pcm16k(message, payload)
+        self.assertEqual(len(normalized), 8)
+        self.assertEqual(struct.unpack("<4h", normalized), (0, 333, 666, 1000))
 
     def test_u1_cyclonedds_config_matches_official_sdk_runtime(self):
         config = Path(__file__).with_name("config.yaml").read_text(encoding="utf-8")
@@ -417,7 +428,7 @@ class U1CardContractTests(unittest.TestCase):
         prefixes = [plugin.PREFIX for plugin in plugins]
         self.assertEqual(prefixes, [
             "lifecycle", "mic", "speaker", "tts", "expression", "head", "system_controls",
-            "camera_left", "camera_right", "doa_event",
+            "camera_left", "camera_right",
         ])
         self.assertEqual(len(prefixes), len(set(prefixes)))
         for plugin in plugins:
@@ -1188,7 +1199,7 @@ class U1CardContractTests(unittest.TestCase):
         }
         self.assertEqual(device.U1Nodes.set_system_enabled(nodes, "vision_enabled", False)["enabled"], False)
 
-    def test_speaker_enables_device_before_forwarding_input(self):
+    def test_speaker_forwards_input_without_blocking_audio_enable_service(self):
         import device
 
         nodes = object.__new__(device.U1Nodes)
@@ -1205,7 +1216,7 @@ class U1CardContractTests(unittest.TestCase):
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock(return_value="subscription"))
         nodes.AudioChunk = object
         result = nodes.connect_speaker("/tts/audio")
-        nodes.call.assert_called_once_with("speaker_enable", mock.ANY)
+        nodes.call.assert_not_called()
         nodes.core.create_subscription.assert_called_once()
         self.assertEqual(nodes.core.create_subscription.call_args.args[1], "/tts/audio")
         self.assertEqual(result["input_topic"], "/tts/audio")
