@@ -1,7 +1,29 @@
 # Go1 新卡 loco_confirmed：设计与测试说明
 
 更新：2026-09-28。分支：`feat/go1-loco-confirmed-card`。
-新增卡已部署；36 项离线回归及本次授权的单次短移/停止测试通过，供 Master 评审。这不覆盖所有姿态、长动作或平台中断链路。
+新增卡已部署；最新构建检查修订有 53 项离线回归通过。下述 Bot 版本的单次短移/停止测试通过，供 Master 评审；新提交需重新构建，不覆盖所有姿态、长动作或平台中断链路。
+
+## 最新：实际 SDK 属性读取检查与 Bot 镜像证据
+
+- 当前 C++ 源码已有 `py::class_<UDPState>` 和七个字段绑定，无需重复添加。Bot 提到的未绑定类型错误在 `3a92d79` 官方 ARM64 镜像中未复现。
+- 新增 `check_sdk_binding.py`，构造仅使用 loopback 和临时本地端口的 UDP 实例，实际读取 `udp.udpState`，校验类型及七个初始整数计数。任何类型转换或字段读取异常均令构建失败；不调用 Send/Recv、不启动 SDK 循环。
+- Dockerfile 用 `RUN --network=none python3 /work/check_sdk_binding.py` 替换只检查 `hasattr` 的弱验证。新增小型脚本，不新增依赖；网络隔离构建步骤需要 BuildKit。
+- 新增 5 项回归：正常读取、属性存在但实例转换报错、缺失字段、计数异常、Docker 构建接入。与现有测试共 53 项通过。
+- 新脚本已在现有官方 ARM64 镜像 `release.260928.6f8a95d` 中以 `--network none` 隔离运行通过；这不是本次新提交的完整镜像构建结果，新 Bot 构建仍需单独确认。
+
+### 已验证版本：3a92d79 / release.260928.6f8a95d
+
+镜像 ID：`sha256:31283aab27fccce748e32abb0e80fc3c467e7bc9fde759897dcaf17ae69fcb94`。
+
+- 拉取 Bot Try it 指定镜像后，为保留原卡使用现场 `main.py/config.yaml/sensors.py/camera_snapshot.py` 兼容层，保留 27 卡。不是原样执行 Try it 脚本后的部署；新卡、SDK client/proxy、controllers 和 SDK 二进制来自官方镜像。
+- 2026-09-28 动作前电量93%、最高电机温度47°C、遥测新鲜、静止站立。一次 `vx=0.1 m/s, duration=0.5 s` 返回 completed、ok=true、stop_confirmed=true，完整调用1.998秒。静止stop_move、非法参数拒绝和历史查询通过。
+- command_id：`go1_loco_confirmed_d19ce61e79d445ee9d3b16e89a314cca`。运动结果样本vx=0.1575 m/s；停稳样本vx=0.0007、vy=0.0017 m/s、yaw=0.0019 rad/s。设定速度不是实测速度上限，0.5秒不代表整个停稳耗时。
+- 现场用户确认前移后自行停稳，无外部介入。测试后恢复control_enabled=false，电量92%、最高温度48°C、遥测新鲜、静止站立。
+- 画布测试由现场用户操作并提供返回JSON：move返回CONTROL_DISABLED（timestamp_ms=1790575990465），status返回idle/NO_ACTION/control_enabled=false（timestamp_ms=1790576301519）。证明画布手动调用及返回、禁用保护有效，不证明decision_core连线或画布运动测试通过。
+- 开机后曾收发成功计数为0，重启唯一driver恢复；未根治启动遥测恢复问题。自动注册曾超时，Core日志亦有发现驱动及订阅主题记录，不据此推定所有平台链路通过。
+- 本次提交只改构建检查、回归和文档，没有追加真机动作；原样Try it、长动作、姿态、平台中断和旧卡混用仍未完整验收。
+
+以下为历史修订记录，部署状态以本节标注的版本为准。
 
 ## PR #348 生命周期与 DDS 审查修订
 
@@ -12,7 +34,7 @@
 - 删除 Dockerfile 中禁止设置的 `FASTDDS_BUILTIN_TRANSPORTS=DEFAULT`；保留 service.yml 里的 DDS profile 挂载及 `FASTRTPS_DEFAULT_PROFILES_FILE`，不新增包或基础镜像。这项源码修复不等同于已经验证发布镜像及现场 DDS 通信。
 - 新增 7 项生命周期/配置回归，包含真实 bundle dispatch、禁用/启用、无遥测、停止后重启、异常和零速度路径；与日志及原回归组合 **48 项离线测试通过**。
 
-最近日志修订的 Bot 构建 `release.260928.87f7036` 对应 `22ffc77`，**不包含本节新修复**。本节修订尚未真机部署，需要新提交重新构建。以下硬件测试仍只对应 `84e5234`，不能代替最新版本验收。
+当时的 Bot 构建 `release.260928.87f7036` 对应 `22ffc77`，不包含本节修复。后续生命周期修复已随 `3a92d79 / release.260928.6f8a95d` 测试，见文档顶部；文末早期硬件记录仍只对应 `84e5234`。
 
 ## PR #348 日志审查修订
 

@@ -31,8 +31,12 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
 COPY unitree_legged_sdk /opt/unitree_legged_sdk
 RUN cd /opt/unitree_legged_sdk && mkdir -p build && cd build && \
     cmake -DPYTHON_BUILD=ON .. && make -j"$(nproc)" && \
-    find /opt/unitree_legged_sdk/lib/python -name 'robot_interface*.so' -exec cp -v {} /work/ \; && \
-    cd /work && python3 -c "import robot_interface as r; assert hasattr(r.UDP, 'udpState')"
+    find /opt/unitree_legged_sdk/lib/python -name 'robot_interface*.so' -exec cp -v {} /work/ \;
+
+# Read the instance property: hasattr(UDP, ...) cannot catch an unbound C++ type.
+# No host networking, robot address, Send/Recv calls or SDK control loop.
+COPY check_sdk_binding.py /work/check_sdk_binding.py
+RUN --network=none python3 /work/check_sdk_binding.py
 
 COPY common/ /work/common/
 COPY main.py           /work/main.py
