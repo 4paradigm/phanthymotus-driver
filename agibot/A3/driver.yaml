@@ -1,0 +1,55 @@
+id: agibot-a3-driver
+name: AgiBot A3 (AimDK) Driver
+category: driver
+hardware_provider: agibot
+hardware_model: "a3-ultra"
+image_name: agibot-a3
+port: 15719
+mcp_url: "http://localhost:15719/mcp"
+description: "AgiBot A3 humanoid (AimDK v3.2, HTTP JSON RPC + ROS 2 Jazzy) — motion FSM/arm/waist/neck/hand control, locomotion, TTS/audio/volume, mic & interaction mode, camera/lidar/IMU/BMS/emergency sensing, alerts, resources, face play, motion & skill package playback, mapping/navigation"
+build_context_extras:
+  - ../../common
+# Cards this bundle exposes, for resource-center's driver marketplace listing.
+# Kept in sync by hand with config.yaml's plugin enabled flags — navigation/mapping/
+# relocalization/skillpilot cards only appear when the corresponding plugin is enabled.
+cards:
+  # --- sensors ---
+  - { name: mc_state,           type: sensor }
+  - { name: arm_state,          type: sensor }
+  - { name: hand_state,         type: sensor }
+  - { name: neck_state,         type: sensor }
+  - { name: imu,                type: sensor }
+  - { name: camera,             type: sensor }
+  - { name: lidar,              type: sensor }
+  - { name: bms,                type: sensor }
+  - { name: emergency,          type: sensor }
+  - { name: wakeup,             type: sensor }
+  - { name: skill_status,       type: sensor }
+  - { name: alerts,             type: sensor }
+  # --- resources / catalogs ---
+  - { name: model,              type: resource }
+  - { name: resource_list,      type: actuator }
+  # --- actuators ---
+  - { name: mc_mode,            type: actuator }
+  - { name: locomotion,         type: actuator }
+  - { name: arm_command,        type: actuator }
+  - { name: hand_command,       type: actuator }
+  - { name: neck_command,       type: actuator }
+  - { name: waist_command,      type: actuator }
+  - { name: arm_compliance,     type: actuator }
+  - { name: motion_play,        type: actuator }
+  - { name: tts,                type: actuator }
+  - { name: media_play,         type: actuator }
+  - { name: audio_play,         type: actuator }
+  - { name: volume,             type: actuator }
+  - { name: mic_source,         type: actuator }
+  - { name: interaction,        type: actuator }
+  - { name: face_play,          type: actuator }
+  - { name: skill_play,         type: actuator }
+  # --- config-gated advanced modules (mirrors X2's slam gating) ---
+  - { name: mapping,            type: actuator }
+  - { name: navigation,         type: actuator }
+  - { name: relocalization,     type: actuator }
+  - { name: auto_charging,      type: actuator }
+  # --- processors ---
+  - { name: map_get,            type: processor }

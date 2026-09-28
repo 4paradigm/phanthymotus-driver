@@ -1,0 +1,94 @@
+mcp_port: 15719
+# Explicit, not blank: a blank value falls back to socket.gethostname(), which under Docker
+# is the container's random hex short ID -- ROS topic names cannot start with a digit, so
+# roughly 5/8 of container (re)starts crashed on the very first create_publisher() call
+# (same flaky-deploy root cause documented on agibot/AimDK_X2).
+ros_namespace: "agibot_a3"
+
+# A3 splits its software across three compute units reached over fixed internal IPs
+# (AimDK v3.2 dev guide §7): HDU (interaction/audio/resources), ADU (mapping/navigation),
+# MDU (motion control/HDS alerts). The driver must run on a third-party compute unit
+# (NOT on the MDU), so all control goes through these HTTP JSON RPC endpoints.
+rpc:
+  hdu: "10.42.10.10"   # :59301 TTS/AgentControl, :56666 HalAudio, :51049 Resource
+  adu: "10.42.10.11"   # :50807 Mapping/Localization, :53176 Pnc navi, :50583 SLAM relocalization
+  mdu: "10.42.10.12"   # :56322 MotionControlAction/Motion, :56444 MotionCommand, :50587 HDS alerts
+  timeout: 5.0
+
+ros:
+  # Dev guide §3.2: third-party compute unit must join ROS_DOMAIN_ID 232 and copy
+  # ros_dds_configuration.xml from the HDU. core_domain stays on the phanthy fleet default.
+  robot_domain_id: 232
+  core_domain_id: 42
+  robot_interface: "eth0"
+
+plugins:
+  mc_state:
+    enabled: true
+  joints:
+    enabled: true
+  imu:
+    enabled: true
+  camera:
+    enabled: true
+    # Which camera streams to mirror; keys of the CAMERA_TOPICS table in device.py.
+    streams: ["head_left_fisheye", "chest_front_d457_rgb"]
+  lidar:
+    enabled: true
+  bms:
+    enabled: true
+  emergency:
+    enabled: true
+  wakeup:
+    enabled: true
+  skill_status:
+    enabled: true
+  alerts:
+    enabled: true
+    # Dev guide hard limit: alert polling must stay <= 0.2 Hz (one call / 5s).
+    poll_interval: 5.0
+  mc_mode:
+    enabled: true
+  locomotion:
+    enabled: true
+  arm_command:
+    enabled: true
+  hand_command:
+    enabled: true
+  neck_command:
+    enabled: true
+  waist_command:
+    enabled: true
+  arm_compliance:
+    enabled: true
+  motion_play:
+    enabled: true
+  tts:
+    enabled: true
+  media_play:
+    enabled: true
+  audio_play:
+    enabled: true
+  volume:
+    enabled: true
+    # Dev guide: volume above 70 risks hardware damage -- hard-clamped in device.py too.
+    max_volume: 70
+  mic_source:
+    enabled: true
+  interaction:
+    enabled: true
+  resources:
+    enabled: true
+  face_play:
+    enabled: true
+  skill_play:
+    enabled: true
+  # --- advanced modules, opt-in like X2's slam ---
+  mapping:
+    enabled: false
+  navigation:
+    enabled: false
+  relocalization:
+    enabled: false
+  auto_charging:
+    enabled: false

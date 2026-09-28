@@ -1,0 +1,34 @@
+agibot-a3:
+  image: __IMAGE__
+  container_name: embodied-agibot-a3
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    # AimDK 开发包 (dev kit): provides prebuilt/a3_aimdk wheel + ros2_plugin_proto.
+    # Per dev guide §5.2 the wheel is pip-installed at container start and the
+    # ros2_plugin_proto environment is sourced from here by the image CMD. Absent
+    # on a non-robot host -- device.py then falls back to its no-wheel code paths.
+    - /agibot/software/v0/entry:/agibot-devkit:ro
+  environment:
+    # Core (fleet) domain 42 here; the robot domain 232 lives in the driver's
+    # own rclpy context (config.yaml ros.robot_domain_id) -- DualDomainROS2
+    # creates a second context with its own domain id, so this env var only
+    # governs stray ROS processes inheriting the container environment.
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  # always, not unless-stopped: after a host reboot the robot must come back
+  # on its own (same reasoning as agibot-x2 / unitree-g1 -- a robot that stays
+  # down after a power cycle is indistinguishable from a broken deployment).
+  restart: always

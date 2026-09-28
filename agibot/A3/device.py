@@ -1,0 +1,2318 @@
+#!/usr/bin/env python3
+"""AgiBot A3 (AimDK v3.2) adaptation layer.
+
+Unlike X2, the A3's control surface is NOT a ROS 2 service package: AimDK v3.2 exposes
+HTTP JSON RPC endpoints split across three compute units (§7 of the dev guide) plus ROS 2
+topics for streaming/commands. So this driver is a requests-based RPC client for
+control/query, plus rclpy topic mirroring for sensor streams, on top of the same
+`common/vendor_runtime.py` bundle/MCP skeleton as `agibot/AimDK_X2`.
+
+Compute-unit layout (fixed internal IPs, dev guide §3.2):
+  - HDU 10.42.10.10 — interaction: :59301 TTS/AgentControl/MicSource, :56666 HalAudio
+    volume/PlayFile/StopPlay, :51049 ResourceService
+  - ADU 10.42.10.11 — :50807 Mapping/Localization/Topo, :53176 PncService navigation,
+    :50583 SLAM relocalization
+  - MDU 10.42.10.12 — :56322 MotionControlAction/MotionService, :56444 MotionCommand,
+    :50587 HDSService alerts
+The driver container must run on a third-party compute unit, never on the MDU.
+
+Protobuf-carrier topics use ros2_plugin_proto/msg/RosMsgWrapper (serialization_type
+"pb", payload in .data) and need the a3_aimdk wheel's aimdk.protocol_pb2 to encode.
+Plain-ROS topics (sensor_msgs JointState/Image/PointCloud2/Imu) are mirrored directly
+like on X2.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import threading
+import time
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from common.vendor_runtime import action_schema, jsonable, tool
+
+
+# ---------------------------------------------------------------------------
+# Vendor constants (AimDK v3.2 dev guide §7 — values taken verbatim from the docs)
+# ---------------------------------------------------------------------------
+
+# MotionControlActionService/SetAction actions. GetAvailableActions returns the live list;
+# these are the four the docs enumerate explicitly (GET_UP example + the FSM basics).
+MC_ACTIONS = {
+    "damping": ("MotionControlAction_DAMPING", "DAMPING"),
+    "get_up": ("MotionControlAction_GET_UP", "GET_UP"),
+    "lie_down": ("MotionControlAction_LIE_DOWN", "LIE_DOWN"),
+    "passive": ("MotionControlAction_PASSIVE", "PASSIVE"),
+}
+
+# 14 fixed arm joints (docs §7.1.4) — order matters, matches arm_joint_state.name.
+ARM_JOINTS = {
+    side: [f"{side}_{part}_joint" for part in (
+        "shoulder_pitch", "shoulder_roll", "shoulder_yaw",
+        "elbow", "wrist_roll", "wrist_pitch", "wrist_yaw",
+    )]
+    for side in ("left", "right")
+}
+
+# Arm joint position limits in rad (docs §7.1.4 table; left/right shoulder_roll mirror).
+# Keys are joint-name suffixes: `<side>_<part>_joint` matches by stripping the side prefix.
+ARM_JOINT_LIMITS = {
+    "shoulder_pitch": (-2.87979, 2.87979),
+    "shoulder_roll": (-2.79253, 2.79253),  # placeholder; per-side values below override
+    "shoulder_yaw": (-2.79253, 2.79253),
+    "elbow": (-0.95993, 1.74533),
+    "wrist_roll": (-2.79253, 2.79253),
+    "wrist_pitch": (-1.62316, 1.62316),
+    "wrist_yaw": (-1.62316, 1.62316),
+}
+ARM_JOINT_LIMITS["left_shoulder_roll_joint"] = (-0.08727, 2.61799)
+ARM_JOINT_LIMITS["right_shoulder_roll_joint"] = (-2.61799, 0.08727)
+
+
+def _joint_limit(name, limits):
+    """Look up a limit by full joint name, falling back to the side-less suffix."""
+    if name in limits:
+        return limits[name]
+    stripped = name.split("_", 1)[1] if name.startswith(("left_", "right_")) else name
+    stripped = stripped[:-len("_joint")] if stripped.endswith("_joint") else stripped
+    return limits[stripped]
+
+
+def _check_joint_limits(joints: dict, limits: dict):
+    for name, value in joints.items():
+        low, high = _joint_limit(name, limits)
+        _clamp(value, low, high, name)
+ARM_COMMAND_RATE_HZ = 100.0          # docs: 100 Hz, gap <= 30 ms
+ARM_MAX_VELOCITY = 4.0               # docs: joint velocity must be <= 4 rad/s
+
+# Waist (docs §7.1.7): pitch/yaw in rad, height in m.
+WAIST_LIMITS = {
+    "waist_pitch": (-1.6, 1.6),
+    "waist_yaw": (-1.6, 1.6),
+    "waist_height": (-0.3, 0.0),
+}
+
+# Neck (docs §7.1.6): yaw/pitch in rad.
+NECK_LIMITS = {
+    "head_yaw_joint": (-1.04720, 1.04720),
+    "head_pitch_joint": (-0.43633, 0.26180),
+}
+NECK_JOINTS = ("head_yaw_joint", "head_pitch_joint")
+
+# Hand (docs §7.1.5): command position 0 (open) .. 2000 (closed); state 0..4096.
+HAND_COMMAND_MAX = 2000
+HAND_TYPES = {"AgiHand": "agi_hand", "O10Hand": "o10_hand"}
+
+# Mic source (docs §7.3.5): 0=internal (v3.2 has a known hardware BUG — avoid),
+# 1=external (recommended).
+MIC_SOURCES = {"internal": 0, "external": 1}
+
+# TTS priority levels (docs §7.2.1 PlayTTS): INTERACTION_L6 is the documented example.
+TTS_PRIORITY_LEVELS = {"background": "BACKGROUND_L1", "service": "SERVICE_L2", "interaction": "INTERACTION_L6"}
+TTS_MAX_TEXT_BYTES = 1024  # docs: text <= 1024 bytes (~200 chars)
+
+# Volume (docs §7.2.3): 0-100 scale but >70 risks damage — clamped in dispatch too.
+VOLUME_HARD_MAX = 70
+
+# Resource types (docs §7.5.1 GetResourceList).
+RESOURCE_TYPES = {
+    "motion": 1, "emoticon": 2, "audio": 3, "skill": 6, "map": 7, "offring_work": 8,
+}
+RESOURCE_TYPE_NAMES = {
+    "motion": "RESOURCE_TYPE_MOTION", "emoticon": "RESOURCE_TYPE_EMOTICON",
+    "audio": "RESOURCE_TYPE_AUDIO", "skill": "RESOURCE_TYPE_SKILL",
+    "map": "RESOURCE_TYPE_MAP", "offring_work": "RESOURCE_TYPE_OFFRING_WORK",
+}
+
+# Sensor topics (docs §7.6.2 table) — only the practically-useful subset gets cards.
+# key -> (robot_topic, format, description)
+CAMERA_TOPICS = {
+    "head_left_fisheye": ("/hal/head_left_fisheye_camera/rgb", "image/raw", "头部左鱼眼相机 RGB"),
+    "head_right_fisheye": ("/hal/head_right_fisheye_camera/rgb", "image/raw", "头部右鱼眼相机 RGB"),
+    "head_rear_fisheye": ("/hal/head_rear_fisheye_camera/rgb", "image/raw", "头部后鱼眼相机 RGB"),
+    "chest_front_d457_rgb": ("/hal/chest_front_d457_camera/rgb", "image/raw", "胸前 D457 相机 RGB"),
+    "chest_front_d457_depth": ("/hal/chest_front_d457_camera/depth", "image/depth-z16", "胸前 D457 相机深度"),
+    "waist_front_d415_rgb": ("/hal/waist_front_d415_camera/rgb", "image/raw", "腰前 D415 相机 RGB"),
+    "waist_front_d415_depth": ("/hal/waist_front_d415_camera/depth", "image/depth-z16", "腰前 D415 相机深度"),
+    "wrist_left_d405_rgb": ("/hal/wrist_left_d405_camera/rgb", "image/raw", "左腕 D405 相机 RGB"),
+    "wrist_right_d405_rgb": ("/hal/wrist_right_d405_camera/rgb", "image/raw", "右腕 D405 相机 RGB"),
+}
+# H265 foxglove CompressedVideo streams exist too, but consumer-side H265 decode support
+# is inconsistent — mirror the raw sensor_msgs/Image feeds instead.
+
+RESOURCE_DIR = Path(__file__).with_name("resource")
+
+
+# ---------------------------------------------------------------------------
+# HTTP JSON RPC layer
+# ---------------------------------------------------------------------------
+
+def create_header(control_source: str = "ControlSource_SAFE") -> dict:
+    """Request header per the SDK's own S_SetAction.py example (§7.1.2)."""
+    now = datetime.now(timezone.utc)
+    return {
+        "timestamp": {
+            "seconds": int(now.timestamp()),
+            "nanos": now.microsecond * 1000,
+            "ms_since_epoch": int(now.timestamp() * 1000),
+        },
+        "control_source": control_source,
+        "uuid": "",
+        "trace_id": "phanthymotus_a3",
+        "domin": "",
+    }
+
+
+class RpcClient:
+    """Thin POST-only JSON RPC client aimed at one compute unit.
+
+    Kept injectable (`transport`) so unit tests can stub the HTTP layer without
+    any network, mirroring how X2's tests stub rclpy clients.
+    """
+
+    def __init__(self, host: str, timeout: float = 5.0, transport=None):
+        self.host = host
+        self.timeout = timeout
+        self._transport = transport  # callable(url, payload, timeout) -> response dict
+
+    def call(self, service: str, method: str, payload: dict | None = None) -> dict:
+        url = f"http://{self.host}/rpc/aimdk.protocol.{service}/{method}"
+        body = payload if payload is not None else {"header": create_header()}
+        if self._transport is not None:
+            response = self._transport(url, body, self.timeout)
+        else:
+            import requests
+            response = requests.post(url, json=body, timeout=self.timeout).json()
+        if not isinstance(response, dict):
+            raise ValueError(f"{service}/{method}: non-dict response {response!r}")
+        return response
+
+
+def _header_ok(response: dict) -> bool:
+    header = response.get("header") or {}
+    return str(header.get("code", "0")) == "0"
+
+
+def _strip_prefix(value: str, prefix: str) -> str:
+    return value[len(prefix):] if isinstance(value, str) and value.startswith(prefix) else value
+
+
+def _require(condition: bool, message: str):
+    if not condition:
+        raise ValueError(message)
+
+
+def _clamp(value: float, low: float, high: float, label: str) -> float:
+    value = float(value)
+    if value < low or value > high:
+        raise ValueError(f"{label}={value} 超出范围 [{low}, {high}]")
+    return value
+
+
+def _check_joint_limits(joints: dict, limits: dict):
+    for name, value in joints.items():
+        low, high = _joint_limit(name, limits)
+        _clamp(value, low, high, name)
+
+
+# ---------------------------------------------------------------------------
+# Node + topic plumbing
+# ---------------------------------------------------------------------------
+
+class _FakeClock:
+    """Minimal clock stand-in used when the robot node provides none (tests)."""
+
+    def now(self):
+        import datetime as _dt
+        return _FakeTime(_dt.datetime.now())
+
+
+class _FakeTime:
+    def __init__(self, when):
+        self._when = when
+
+    def to_msg(self):
+        stamp = type("Stamp", (), {})()
+        stamp.sec = int(self._when.timestamp())
+        stamp.nanosec = 0
+        return stamp
+
+
+def _fill_protobuf(message, payload):
+    """Recursively fill a protobuf message from a JSON-friendly dict."""
+    from google.protobuf.message import Message as _PbMessage
+
+    for key, value in payload.items():
+        if value is None:
+            continue
+        field = getattr(message, key, None)
+        if isinstance(value, dict):
+            if field is None:
+                continue
+            _fill_protobuf(field, value)
+        elif isinstance(value, list):
+            if isinstance(field, _PbMessage):
+                for item in value:
+                    if isinstance(item, dict):
+                        _fill_protobuf(field.add(), item)
+                    else:
+                        field.append(item)
+            elif field is not None:
+                try:
+                    field.extend(value)
+                except TypeError:
+                    for item in value:
+                        field.append(item)
+        else:
+            try:
+                setattr(message, key, value)
+            except (AttributeError, TypeError):
+                pass
+
+
+class A3Nodes:
+    """Robot-side ROS 2 node: mirrors sensor topics into the core domain (same pattern
+    as X2's AimdkNodes) and owns the command publishers that go straight to the robot."""
+
+    def __init__(self, config, namespace, ros2, rpc: A3Rpc):
+        from rclpy.node import Node
+        from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+        from sensor_msgs.msg import Image, Imu, JointState, PointCloud2
+        from std_msgs.msg import String
+
+        self.config = config
+        self.namespace = namespace
+        self.rpc = rpc
+        self.robot = Node("agibot_a3_driver_robot", context=ros2.ctx_robot)
+        self.core = Node("agibot_a3_driver_core", context=ros2.ctx_core)
+        ros2.executor_robot.add_node(self.robot)
+        ros2.executor_core.add_node(self.core)
+
+        self.lock = threading.RLock()
+        self.values = {}
+
+        self._String = String
+        self._JointState = JointState
+        self._Image = Image
+
+        sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+
+        self.streams = {}
+        self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
+        self._pb_topic = ''
+
+        def mirror(key, msg_type, robot_topic, fmt, qos=None, json_filter=None):
+            core_topic = f"/{namespace}/agibot_a3/{key}"
+            as_json = fmt == "data/json"
+            core_msg_type = String if as_json else msg_type
+            pub = self.core.create_publisher(core_msg_type, core_topic, 5)
+            self.robot.create_subscription(
+                msg_type, robot_topic,
+                self._callback(key, pub, as_json=as_json, json_filter=json_filter),
+                qos or sensor_qos,
+            )
+            self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
+
+        # -- joint / state streams (plain sensor_msgs types) --
+        mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json")
+        mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json")
+        mirror("neck_state", JointState, "/motion/control/neck_joint_state", "data/json")
+        mirror("lidar", PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud", "sensor/pointcloud")
+        mirror("imu_pelvis", Imu, "/ros2/body_drive/pelvis_imu/data", "data/json")
+        mirror("imu_torso", Imu, "/ros2/body_drive/torso_imu/data", "data/json")
+
+        # -- camera streams, config-selected subset --
+        camera_cfg = config.get("plugins", {}).get("camera", {})
+        selected = camera_cfg.get("streams") or ["head_left_fisheye", "chest_front_d457_rgb"]
+        for key in selected:
+            topic, fmt, _ = CAMERA_TOPICS[key]
+            mirror(f"camera_{key}", Image, topic, fmt)
+
+        # -- protobuf-carrier streams (RosMsgWrapper) — decoded to JSON via pb2 if the
+        # wheel is importable, otherwise subscribed raw and passed through opaquely --
+        self._pb = None
+        try:
+            from aimdk import protocol_pb2  # a3_aimdk wheel
+            self._pb = protocol_pb2
+        except ImportError:
+            pass
+
+        if self._pb is not None:
+            mirror("bms", self._wrapper_type(ros2), "/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel",
+                   "data/json", json_filter=self._decode_bms)
+            mirror("emergency", self._wrapper_type(ros2), "/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel",
+                   "data/json", json_filter=self._decode_emergency)
+            mirror("wakeup", self._wrapper_type(ros2), "/agent/wakeup/pb_3Aaimdk_2Eprotocol_2EWakeUpResult",
+                   "data/json", json_filter=self._decode_wakeup)
+            mirror("skill_status", self._wrapper_type(ros2), "/skill/pilot/skill_status",
+                   "data/json", json_filter=self._decode_skill_status)
+
+        # -- command publishers (robot domain) --
+        self.locomotion_pub = self.robot.create_publisher(
+            self._wrapper_type(ros2), "/motion/control/locomotion_velocity", 10)
+        self.waist_pub = self.robot.create_publisher(
+            self._wrapper_type(ros2), "/motion/control/move_waist", 10)
+        self.face_play_pub = self.robot.create_publisher(
+            self._wrapper_type(ros2), "/skill/pilot/face/play", 10)
+        self.arm_command_pub = self.robot.create_publisher(JointState, "/motion/control/arm_joint_command", 10)
+        self.neck_command_pub = self.robot.create_publisher(JointState, "/motion/control/neck_joint_command", 10)
+        self.hand_command_pub = self.robot.create_publisher(JointState, "/motion/control/hand_joint_command", 10)
+
+    # -- RosMsgWrapper helpers ------------------------------------------------
+
+    def _wrapper_type(self, ros2):
+        """Import ros2_plugin_proto/msg/RosMsgWrapper lazily (test stubs provide it)."""
+        if getattr(self, "_wrapper_msg_type", None) is None:
+            from ros2_plugin_proto.msg import RosMsgWrapper
+            self._wrapper_msg_type = RosMsgWrapper
+        return self._wrapper_msg_type
+
+    def _make_wrapper(self, proto_dict: dict, ros2=None):
+        """Serialize a protobuf payload dict into a RosMsgWrapper message.
+
+        With the a3_aimdk wheel installed the payload dict is encoded to real
+        protobuf bytes via the documented per-topic message types; without the
+        wheel the JSON dict is carried directly (sufficient for tests/dev, and
+        the on-robot image ships the wheel so production always takes the pb path).
+        """
+        wrapper = self._wrapper_type(ros2)()
+        wrapper.serialization_type = "pb"
+        wrapper.data = self._encode_pb(proto_dict)
+        return wrapper
+
+    _PB_TOPIC_MESSAGES = {
+        "/motion/control/locomotion_velocity": "LocomotionVelocity",
+        "/motion/control/move_waist": "MoveWaist",
+        "/skill/pilot/face/play": "FacePlayInfo",
+    }
+
+    def _encode_pb(self, proto_dict):
+        if self._pb is None:
+            return json.dumps(proto_dict, ensure_ascii=False).encode()
+        message_type = self._PB_TOPIC_MESSAGES.get(self._pb_topic, "")
+        cls = getattr(self._pb, message_type, None) if message_type else None
+        if cls is None:
+            return json.dumps(proto_dict, ensure_ascii=False).encode()
+        message = cls()
+        try:
+            _fill_protobuf(message, proto_dict)
+            return message.SerializeToString()
+        except Exception:
+            return json.dumps(proto_dict, ensure_ascii=False).encode()
+
+    def publish_wrapper(self, pub_attr, payload):
+        """Fill + publish a RosMsgWrapper command onto a robot-domain topic."""
+        publisher = getattr(self, pub_attr)
+        self._pb_topic = getattr(publisher, "topic_name", "") or getattr(publisher, "topic", "")
+        wrapper = self._make_wrapper(payload)
+        publisher.publish(wrapper)
+        self._pb_topic = ""
+
+    def publish_joint_command(self, pub_attr, positions, duration_ms=None, frame_id=""):
+        """Publish a JointState command frame, repeating at 100 Hz for duration_ms.
+
+        Dev guide §7.3: joint commands must stream at 100 Hz (<=30 ms gap);
+        velocity/effort must be zero. A single dispatch call therefore repeats
+        the same frame for the requested hold window on a background thread.
+        """
+        publisher = getattr(self, pub_attr)
+        JointState = self._JointState
+
+        def frame():
+            msg = JointState()
+            try:
+                stamp = self.clock.now().to_msg()
+                msg.header.stamp = stamp
+            except Exception:
+                pass
+            if frame_id:
+                msg.header.frame_id = frame_id
+            names = list(positions.keys())
+            msg.name = names
+            msg.position = [float(positions[name]) for name in names]
+            msg.velocity = [0.0] * len(names)
+            msg.effort = [0.0] * len(names)
+            return msg
+
+        publisher.publish(frame())
+        if duration_ms:
+            total = max(int(duration_ms), 0)
+
+            def hold():
+                deadline = time.monotonic() + total / 1000.0
+                while time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    try:
+                        publisher.publish(frame())
+                    except Exception:
+                        break
+
+            threading.Thread(target=hold, daemon=True).start()
+
+    # -- protobuf decoders (best-effort; fall back to raw wrapper fields) ------
+
+    def _decode_bms(self, msg):
+        if self._pb is None:
+            return jsonable(msg)
+        channel = self._pb.BmsStateChannel()
+        try:
+            channel.ParseFromString(bytes(msg.data))
+        except Exception:
+            return jsonable(msg)
+        return jsonable(channel)
+
+    def _decode_emergency(self, msg):
+        if self._pb is None:
+            return jsonable(msg)
+        channel = self._pb.EmergencyStateChannel()
+        try:
+            channel.ParseFromString(bytes(msg.data))
+        except Exception:
+            return jsonable(msg)
+        return jsonable(channel)
+
+    def _decode_wakeup(self, msg):
+        if self._pb is None:
+            return jsonable(msg)
+        result = self._pb.WakeUpResult()
+        try:
+            result.ParseFromString(bytes(msg.data))
+        except Exception:
+            return jsonable(msg)
+        return jsonable(result)
+
+    def _decode_skill_status(self, msg):
+        if self._pb is None:
+            return jsonable(msg)
+        status = self._pb.SkillPilotStatus()
+        try:
+            status.ParseFromString(bytes(msg.data))
+        except Exception:
+            return jsonable(msg)
+        return jsonable(status)
+
+    # -- generic mirror callback ------------------------------------------------
+
+    def _callback(self, key, publisher, *, as_json=False, json_filter=None):
+        def callback(msg):
+            if as_json:
+                value = json_filter(msg) if json_filter else jsonable(msg)
+                output = self._String()
+                output.data = json.dumps(value, ensure_ascii=False)
+                publisher.publish(output)
+                with self.lock:
+                    self.values[key] = value
+            else:
+                publisher.publish(msg)
+        return callback
+
+    def snapshot(self, key):
+        with self.lock:
+            return self.values.get(key, {})
+
+    def urdf_text(self, variant=None):
+        path = RESOURCE_DIR / "a3_ultra.urdf"
+        if not path.exists():
+            raise ValueError("no URDF vendored for A3 (placeholder resource)")
+        return path.read_text(encoding="utf-8")
+
+    def close(self):
+        self.robot.destroy_node()
+        self.core.destroy_node()
+
+
+class A3Rpc:
+    """The three compute-unit RPC clients, shared by every plugin.
+
+    A3 runs the same `aimdk.protocol.*` services on different ports per unit
+    (dev guide §7), so each (unit, port) pair gets its own RpcClient handle.
+    """
+
+    def __init__(self, config, transport=None):
+        rpc_cfg = config.get("rpc", {})
+        hdu = rpc_cfg.get("hdu", "10.42.10.10")
+        adu = rpc_cfg.get("adu", "10.42.10.11")
+        mdu = rpc_cfg.get("mdu", "10.42.10.12")
+        timeout = float(rpc_cfg.get("timeout", 5.0))
+        mk = lambda host: RpcClient(host, timeout, transport)
+        self.hdu = mk(hdu)            # port-less client unused directly
+        self.hdu_port = hdu
+        self.adu_port = adu
+        self.mdu_port = mdu
+        self.timeout = timeout
+        self.transport = transport
+
+    def _unit(self, host, port):
+        return RpcClient(f"{host}:{port}", self.timeout, self.transport)
+
+    # -- MDU :56322 MotionControlAction/MotionService --------------------------------
+
+    def set_action(self, action: str, ext_action: str) -> dict:
+        payload = {"header": create_header(),
+                   "command": {"action": action, "ext_action": ext_action}}
+        return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "SetAction", payload)
+
+    def get_action(self) -> dict:
+        return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "GetAction", {})
+
+    def get_available_actions(self) -> dict:
+        return self._unit(self.mdu_port, 56322).call("MotionControlActionService", "GetAvailableActions")
+
+    def arm_compliance(self, method: str) -> dict:
+        # EnableArmCompliance / DisableArmCompliance / CheckArmCompliance all take {}
+        rpc_method = {"enable": "EnableArmCompliance", "disable": "DisableArmCompliance",
+                      "check": "CheckArmCompliance"}[method]
+        return self._unit(self.mdu_port, 56322).call("MotionControlMotionService", rpc_method, {})
+
+    # -- MDU :56444 MotionCommandService ----------------------------------------------
+
+    def send_motion_command(self, motion_id: str, duration_ms: int = 0, cmd_end=True, cmd_pause=False,
+                            cmd_reset=False, cmd_repeat=False) -> dict:
+        payload = {"motion_id": str(motion_id), "duration_ms": int(duration_ms or 0),
+                   "cmd_end": bool(cmd_end), "cmd_pause": bool(cmd_pause),
+                   "cmd_reset": bool(cmd_reset), "cmd_repeat": bool(cmd_repeat)}
+        return self._unit(self.mdu_port, 56444).call("MotionCommandService", "SendMotionCommand", payload)
+
+    # -- MDU :50587 HDSService ---------------------------------------------------------
+
+    def get_alert_list(self) -> dict:
+        return self._unit(self.mdu_port, 50587).call("HDSService", "GetAlertList", {})
+
+    # -- HDU :59301 TTSService / AgentControlService / HalAudioService mic ------------
+
+    def play_tts(self, text: str, priority_level: str = "INTERACTION_L6", is_interrupted: bool = True,
+                 trace_id: str = "") -> dict:
+        payload = {"text": text, "priority_level": priority_level,
+                   "domain": "phanthymotus", "trace_id": str(trace_id or ""),
+                   "is_interrupted": bool(is_interrupted)}
+        return self._unit(self.hdu_port, 59301).call("TTSService", "PlayTTS", payload)
+
+    def play_media_file(self, file_name: str, is_interrupted: bool = True, trace_id: str = "") -> dict:
+        payload = {"file_name": file_name, "priority_level": "INTERACTION_L6",
+                   "domain": "phanthymotus", "trace_id": str(trace_id or ""),
+                   "is_interrupted": bool(is_interrupted)}
+        return self._unit(self.hdu_port, 59301).call("TTSService", "PlayMediaFile", payload)
+
+    def get_audio_status(self, trace_id: str) -> dict:
+        return self._unit(self.hdu_port, 59301).call("TTSService", "GetAudioStatus", {"trace_id": trace_id})
+
+    def stop_tts_trace_id(self, trace_id: str) -> dict:
+        return self._unit(self.hdu_port, 59301).call("TTSService", "StopTTSTraceId", {"trace_id": trace_id})
+
+    def set_voice_enable(self, enable: bool) -> dict:
+        return self._unit(self.hdu_port, 59301).call("AgentControlService", "SetVoiceEnable", {"enable_voice": bool(enable)})
+
+    def get_voice_enable(self) -> dict:
+        return self._unit(self.hdu_port, 59301).call("AgentControlService", "GetVoiceEnable", {})
+
+    def set_agent_properties(self, mode: str) -> dict:
+        # docs §7.3.4: properties {"2": "normal"|"only_voice"}; needs a reboot to apply
+        value = "only_voice" if mode == "only_voice" else "normal"
+        payload = {"contents": {"properties": {"2": value}}}
+        return self._unit(self.hdu_port, 59301).call("AgentControlService", "SetAgentPropertiesRequest", payload)
+
+    def get_agent_properties(self) -> dict:
+        return self._unit(self.hdu_port, 59301).call("AgentControlService", "GetAgentPropertiesRequest", {"property_ids": [2]})
+
+    def set_mic_source(self, source: int) -> dict:
+        return self._unit(self.hdu_port, 59301).call("HalAudioService", "SetMicSourceRequest", {"mic_source": int(source)})
+
+    def get_mic_source(self) -> dict:
+        return self._unit(self.hdu_port, 59301).call("HalAudioService", "GetMicSourceRequest", {})
+
+    # -- HDU :56666 HalAudioService volume / PlayFile --------------------------------
+
+    def get_audio_volume(self) -> dict:
+        return self._unit(self.hdu_port, 56666).call("HalAudioService", "GetAudioVolume", {})
+
+    def set_audio_volume(self, volume: int, is_mute: bool = False) -> dict:
+        payload = {"audio_volume": int(volume), "is_mute": bool(is_mute), "type": "SPEAKER_BUILT_IN"}
+        return self._unit(self.hdu_port, 56666).call("HalAudioService", "SetAudioVolume", payload)
+
+    def play_file(self, file_name: str, priority: str = "DEFAULT") -> dict:
+        payload = {"pkg_name": "", "file_name": file_name, "file_path": "",
+                   "priority": priority, "priority_weight": 0, "samplerate": 16000}
+        return self._unit(self.hdu_port, 56666).call("HalAudioService", "PlayFile", payload)
+
+    def stop_play(self) -> dict:
+        return self._unit(self.hdu_port, 56666).call("HalAudioService", "StopPlay", {})
+
+    # -- HDU :51049 ResourceService ---------------------------------------------------
+
+    def resource_list(self, resource_type: str) -> dict:
+        return self._unit(self.hdu_port, 51049).call(
+            "ResourceService", "GetResourceList",
+            {"header": create_header(), "resource_type": RESOURCE_TYPE_NAMES[resource_type]})
+
+    # -- ADU :50807 MappingService / LocalizationService -------------------------------
+
+    def get_2d_whole_map(self, map_id: str) -> dict:
+        payload = {"command": "MappingCommand_GET_2D_WHOLE_MAP", "map_id": map_id}
+        return self._unit(self.adu_port, 50807).call("MappingService", "Get2DWholeMap", payload)
+
+    def get_stored_map_names(self) -> dict:
+        payload = {"command": "MappingCommand_GET_STORED_MAP_NAME"}
+        return self._unit(self.adu_port, 50807).call("MappingService", "GetStoredMapNames", payload)
+
+    def get_current_working_map(self) -> dict:
+        payload = {"command": "MappingCommand_GET_CURRENT_WORKING_MAP"}
+        return self._unit(self.adu_port, 50807).call("MappingService", "GetCurrentWorkingMap", payload)
+
+    def get_topo_msgs(self, map_id) -> dict:
+        payload = {"command": "TopoCommand_GET_TOPO_MSG", "map_id": map_id}
+        return self._unit(self.adu_port, 50807).call("LocalizationService", "GetTopoMsgs", payload)
+
+    def start_mapping(self) -> dict:
+        payload = {"header": {}, "command": "MappingCommand_START_MAPPING", "no_realtime_data": True}
+        return self._unit(self.adu_port, 50807).call("MappingService", "StartMapping", payload)
+
+    def stop_mapping(self, map_name: str | None = None) -> dict:
+        if map_name:
+            payload = {"command": "MappingCommand_SAVING_MAP", "map_name": map_name}
+        else:
+            payload = {"command": "MappingCommand_STOP_MAPPING"}
+        return self._unit(self.adu_port, 50807).call("MappingService", "StopMapping", payload)
+
+    def rename_map(self, map_id: str, old_name: str, new_name: str) -> dict:
+        payload = {"command": "MappingCommand_RENAME_MAP", "map_id": map_id,
+                   "old_name": old_name, "new_name": new_name}
+        return self._unit(self.adu_port, 50807).call("MappingService", "RenameMap", payload)
+
+    # -- ADU :53176 PncService ---------------------------------------------------------
+
+    def navi(self, method: str, payload: dict) -> dict:
+        return self._unit(self.adu_port, 53176).call("PncService", method, payload)
+
+    def navi_state(self, task_id: int = 0) -> dict:
+        return self._unit(self.adu_port, 53176).call("PncService", "ActionGetState", {"task_id": int(task_id)})
+
+    # -- ADU :50583 SLAMRelocalization / SkillPilotService ------------------------------
+
+    def slam_start_normal_relocalization(self, related_map_dir: str) -> dict:
+        payload = {"header": {}, "related_map_dir": related_map_dir}
+        return self._unit(self.adu_port, 50583).call("SLAMRelocalizationService", "SLAMStartNormalRelocalization", payload)
+
+    def slam_stop_normal_relocalization(self, reloc_pose: dict | None = None) -> dict:
+        payload = {"header": {}, "command_type": 0, "reloc_pose": reloc_pose or {}}
+        return self._unit(self.adu_port, 50583).call("SLAMRelocalizationService", "SLAMStopNormalRelocalization", payload)
+
+    def auto_charging(self, command: str, trigger: str) -> dict:
+        payload = {"header": create_header(), "command": command, "trigger": trigger}
+        return self._unit(self.adu_port, 50583).call("SkillPilotService", "AutoCharging", payload)
+
+    def skill_package(self, command: str, path: str, session_id: str = "") -> dict:
+        payload = {"source": "custom", "command": command, "path": path, "session_id": session_id}
+        return self._unit(self.adu_port, 50583).call("SkillPilotService", "SkillPackage", payload)
+
+
+# ---------------------------------------------------------------------------
+# Plugins
+# ---------------------------------------------------------------------------
+
+def _stream_tool(key, stream, description):
+    return tool(key, "sensor", description, topic_out=[{"topic": stream["topic"], "format": stream["format"]}])
+
+
+class McStatePlugin:
+    """GetAction + GetAvailableActions — A3 has no status topic for the FSM."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("mc_state", "sensor", "查询运动控制状态机当前动作/状态（GetAction/GetAvailableActions）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running"}
+        if action == "available":
+            response = self.nodes.rpc.get_available_actions()
+            return {"commands": response.get("commands", [])}
+        response = self.nodes.rpc.get_action()
+        return response.get("info", response)
+
+
+class ArmStatePlugin:
+    def __init__(self, nodes, key=None):
+        self.nodes = nodes
+        self.key = key or "arm_state"
+
+    def get_tool(self):
+        return _stream_tool(self.key, self.nodes.streams[self.key], "14 自由度手臂关节状态流（position/velocity/effort）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        return {"state": "running", **self.nodes.streams[self.key]}
+
+
+class HandStatePlugin:
+    def __init__(self, nodes, key=None):
+        self.nodes = nodes
+        self.key = key or "hand_state"
+
+    def get_tool(self):
+        return _stream_tool(self.key, self.nodes.streams[self.key],
+                            "手指状态流（0-4096；frame_id 标识 AgiHand/O10Hand；O10Hand 含压力阵列）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        return {"state": "running", **self.nodes.streams[self.key]}
+
+
+class NeckStatePlugin:
+    def __init__(self, nodes, key=None):
+        self.nodes = nodes
+        self.key = key or "neck_state"
+
+    def get_tool(self):
+        return _stream_tool(self.key, self.nodes.streams[self.key], "头部偏航/俯仰关节状态流")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        return {"state": "running", **self.nodes.streams[self.key]}
+
+
+class ImuPlugin:
+    """Two body IMUs (pelvis/torso), mirrored individually — `imu` merges their latest
+    snapshots on demand instead of fabricating a second chained topic (X2 merges two
+    30Hz callbacks into one publisher; here the IMU rates are low enough that the
+    on-demand merge is simpler and avoids double-hop latency)."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("imu", "sensor", "骨盆+躯干 IMU 数据（pelvis/torso 最新快照）", {
+            "type": "object",
+            "properties": {},
+        })
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running"}
+        return {
+            "pelvis": self.nodes.snapshot("imu_pelvis"),
+            "torso": self.nodes.snapshot("imu_torso"),
+        }
+
+
+class CameraPlugin:
+    """One card per configured camera stream; the tool name is camera_<key> minus the
+    `camera_` prefix is NOT used — driver.yaml lists a single `camera` card, so all
+    selected streams are multiplexed through this one tool via the `stream` param."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.streams = {k: v for k, v in nodes.streams.items() if k.startswith("camera_")}
+
+    def get_tool(self):
+        options = list(self.streams)
+        return tool("camera", "sensor", "相机画面流（按 stream 参数选择；config.yaml plugins.camera.streams 决定可用路数）", {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "enum": options, "description": "相机流 key"},
+            },
+        })
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running", "streams": {k: s for k, s in self.streams.items()}}
+        key = f"camera_{args.get('stream', next(iter(self.streams)))}"
+        if key not in self.streams:
+            raise ValueError(f"camera: unknown stream {args.get('stream')!r}; available: {list(self.streams)}")
+        return {"state": "running", **self.streams[key]}
+
+
+class LidarPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return _stream_tool("lidar", self.nodes.streams["lidar"], "颈部 Livox 激光雷达点云")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        return {"state": "running", **self.nodes.streams["lidar"]}
+
+
+class BmsPlugin:
+    """RosMsgWrapper protobuf stream. With the a3_aimdk wheel the payload is decoded
+    (bms_datas[1]=in-use pack, [0]=absent); without it the raw wrapper fields pass through."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.has_stream = "bms" in nodes.streams
+
+    def get_tool(self):
+        if self.has_stream:
+            return _stream_tool("bms", self.nodes.streams["bms"], "电池状态流（电压/电流/电量/充电状态，双电池包）")
+        return tool("bms", "sensor", "电池状态（需要 a3_aimdk protobuf wheel 才能解码数据流）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        if self.has_stream:
+            return {"state": "running", **self.nodes.streams["bms"]}
+        return {"state": "running"}
+
+
+class EmergencyPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.has_stream = "emergency" in nodes.streams
+
+    def get_tool(self):
+        if self.has_stream:
+            return _stream_tool("emergency", self.nodes.streams["emergency"],
+                                "急停状态流（有线/无线/软件急停 + 各类传感器报警）")
+        return tool("emergency", "sensor", "急停状态（需要 a3_aimdk protobuf wheel 才能解码数据流）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        if self.has_stream:
+            return {"state": "running", **self.nodes.streams["emergency"]}
+        return {"state": "running"}
+
+
+class WakeupPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.has_stream = "wakeup" in nodes.streams
+
+    def get_tool(self):
+        if self.has_stream:
+            return _stream_tool("wakeup", self.nodes.streams["wakeup"], "语音唤醒事件流（关键词/置信度/语言）")
+        return tool("wakeup", "sensor", "语音唤醒事件（需要 a3_aimdk protobuf wheel 才能解码数据流）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        if self.has_stream:
+            return {"state": "running", **self.nodes.streams["wakeup"]}
+        return {"state": "running"}
+
+
+class SkillStatusPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.has_stream = "skill_status" in nodes.streams
+
+    def get_tool(self):
+        if self.has_stream:
+            return _stream_tool("skill_status", self.nodes.streams["skill_status"],
+                                "技能状态流（核数/电池/自主充电状态；默认 iceoryx，需开启 ros2 后端）")
+        return tool("skill_status", "sensor", "技能状态（需要 a3_aimdk protobuf wheel + skillpilot 开启 ros2 后端）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle"}
+        if self.has_stream:
+            return {"state": "running", **self.nodes.streams["skill_status"]}
+        return {"state": "running"}
+
+
+class AlertsPlugin:
+    """HDSService/GetAlertList — poll-on-demand sensor. Dev guide hard limit: poll
+    frequency <= 0.2 Hz, enforced by a monotonic-clock cooldown between real RPCs."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+        interval = float(nodes.config.get("plugins", {}).get("alerts", {}).get("poll_interval", 5.0))
+        self._cooldown = max(interval, 5.0)
+        self._last_poll = 0.0
+        self._cached = None
+
+    def get_tool(self):
+        return tool("alerts", "sensor", "查询 HDS 告警列表（GetAlertList；含告警码/等级/中英文描述，<=0.2Hz 限频）")
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running"}
+        now = time.monotonic()
+        if self._cached is None or now - self._last_poll >= self._cooldown:
+            response = self.nodes.rpc.get_alert_list()
+            self._cached = (response.get("data") or {}).get("alerts", [])
+            self._last_poll = now
+        return {"alerts": self._cached}
+
+
+class ModelPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("model", "resource", "返回 A3 Ultra 的 URDF 模型", {
+            "type": "object",
+            "properties": {},
+        })
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        return {"urdf": self.nodes.urdf_text()}
+
+
+class ResourceListPlugin:
+    ACTIONS = {
+        name: ([], f"查询 {desc} 资源列表")
+        for name, desc in (
+            ("motion", "动作"), ("emoticon", "表情"), ("audio", "音频"),
+            ("skill", "技能"), ("map", "地图"), ("offring_work", "演出作品"),
+        )
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("resource_list", "actuator", "查询机上资源列表（GetResourceList：动作/表情/音频/技能/地图/演出）",
+                    action_schema(self.ACTIONS, {}))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action not in RESOURCE_TYPES:
+            raise ValueError(f"resource_list: unknown action {action!r}")
+        response = self.nodes.rpc.resource_list(action)
+        return {"resources": (response.get("data") or {}).get("resources", [])}
+
+
+class McModePlugin:
+    """mc_mode 卡片：运动控制模式切换（GetUp / LieDown / Damping / Passive）。
+
+    对应 MDU MotionControlActionService/SetAction。切换是异步的——SetAction 返回
+    CommonState_PENDING，最终结果通过 mc_state 卡片轮询 GetAction 确认。
+    Damping 模式用于跌倒保护/整机关节卸力，切换前请确保机器人周围有足够空间。
+    """
+
+    ACTIONS = {
+        name: ([], desc)
+        for name, desc in (
+            ("damping", "进入 Damping 阻尼模式（关节卸力，用于软急停/跌倒保护）"),
+            ("get_up", "执行 GetUp 起身动作，从坐/躺恢复到站立平衡"),
+            ("lie_down", "执行 LieDown 坐/躺下动作"),
+            ("passive", "进入 Passive 拖动示教模式（关节可被手拖动）"),
+            ("get_state", "查询当前运动控制动作状态（GetAction，异步切换结果确认）"),
+        )
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("mc_mode", "actuator", "切换 A3 运动控制模式（SetAction：get_up/lie_down/damping/passive），"
+                                     "get_state 查询当前动作状态；切换为异步流程，结果经 mc_state 确认",
+                    action_schema(self.ACTIONS, {}))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "get_state":
+            return jsonable(self.nodes.rpc.get_action())
+        if action not in MC_ACTIONS:
+            raise ValueError(f"mc_mode: unknown action {action!r}")
+        service_action, short = MC_ACTIONS[action]
+        response = self.nodes.rpc.set_action(service_action, "")
+        return {"requested": short, "response": response}
+
+
+class LocomotionPlugin:
+    """locomotion 卡片：底盘行走速度控制。
+
+    对应 /motion/control/locomotion_velocity 话题（RosMsgWrapper + LocomotionVelocity
+    消息）。三个速度均为 -1.0~1.0 的归一化比例值：forward/lateral 对应最大
+    1.0 m/s，angular 对应最大 1.0 rad/s。注意事项（开发文档 §7.3）：
+      - 仅当运动控制处于 MOTION 状态时指令才生效；
+      - 指令需以一定频率持续下发，停止行走时下发全零速度；
+      - 大幅速度变化请分步过渡，避免急停/急转引起姿态失稳。
+    """
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("locomotion", "actuator", "下发底盘行走速度（话题 /motion/control/locomotion_velocity，"
+                                              "forward/lateral/angular ∈ [-1,1]，仅 MOTION 模式下生效；停止行走下发全 0）",
+                    action_schema(
+                        {"walk": (["forward", "lateral", "angular"], "下发行走速度比例（-1~1），持续下发维持运动，0 为停止")},
+                        {
+                            "forward": {"type": "number", "description": "前进速度比例 [-1,1]，正为前进，负为后退", "default": 0.0},
+                            "lateral": {"type": "number", "description": "横移速度比例 [-1,1]，正为左移", "default": 0.0},
+                            "angular": {"type": "number", "description": "旋转速度比例 [-1,1]，正为逆时针", "default": 0.0},
+                        },
+                    ))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action != "walk":
+            raise ValueError(f"locomotion: unknown action {action!r}")
+        forward = _clamp(args.get("forward", 0.0), -1.0, 1.0, "forward")
+        lateral = _clamp(args.get("lateral", 0.0), -1.0, 1.0, "lateral")
+        angular = _clamp(args.get("angular", 0.0), -1.0, 1.0, "angular")
+        payload = {
+            "mode": "MotionControl_LocomotionMode_DEFAULT",
+            "forward_velocity": forward,
+            "lateral_velocity": lateral,
+            "angular_velocity": angular,
+        }
+        self.nodes.publish_wrapper("locomotion_pub", payload)
+        return {"forward": forward, "lateral": lateral, "angular": angular,
+                "state": "published"}
+
+
+class ArmCommandPlugin:
+    """arm_command 卡片：左/右臂 14 关节位置控制。
+
+    对应 /motion/control/arm_joint_command 话题（sensor_msgs/JointState）。开发文档
+    §7.3 硬性要求：
+      - 需以 100 Hz 持续下发，指令间隔 ≤ 30 ms，否则机械臂将回到阻尼状态；
+      - 速度、力矩字段必须为 0（底层按位置插值规划）；
+      - 关节速度上限 4 rad/s；
+      - 仅 MOTION 状态下可用；直接控臂前必须先停止 motion_player（见 motion_play 卡片备注）。
+    单次调用只发送一帧指令；维持时间由调用方循环下发实现（上层 Agent 按运动规划循环）。
+    """
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("arm_command", "actuator", "下发双臂 14 关节位置指令（话题 /motion/control/arm_joint_command，"
+                                              "需 100Hz 连续下发、间隔 ≤30ms；velocity/effort 固定 0；先经 mc_mode get_up 站立并停止 motion_player）",
+                    action_schema(
+                        {"send": (["left", "right"], "下发一帧手臂关节位置指令（rad），需按 ~100Hz 循环调用")},
+                        {
+                            "left": {"type": "array", "items": {"type": "number"},
+                                     "description": "左臂 7 关节 rad，顺序：shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw"},
+                            "right": {"type": "array", "items": {"type": "number"},
+                                      "description": "右臂 7 关节 rad，顺序同左臂"},
+                            "duration_ms": {"type": "integer", "description": "保持时长（毫秒），期间以 100Hz 重复下发同一帧指令", "default": 100},
+                        },
+                    ))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action != "send":
+            raise ValueError(f"arm_command: unknown action {action!r}")
+        positions = {}
+        for side in ("left", "right"):
+            values = args.get(side)
+            if values is None:
+                continue
+            _require(len(values) == 7, f"{side} 臂需要 7 个关节值，收到 {len(values)} 个")
+            for joint, value in zip(ARM_JOINTS[side], values):
+                positions[joint] = float(value)
+        _require(positions, "至少提供 left 或 right 关节位置")
+        _check_joint_limits(positions, ARM_JOINT_LIMITS)
+        duration_ms = int(args.get("duration_ms", 100))
+        _require(duration_ms >= 0, "duration_ms 不能为负")
+        self.nodes.publish_joint_command("arm_command_pub", positions, duration_ms)
+        return {"joints": positions, "duration_ms": duration_ms, "state": "published"}
+
+
+class HandCommandPlugin:
+    """hand_command 卡片：灵巧手张合控制。
+
+    对应 /motion/control/hand_joint_command 话题（sensor_msgs/JointState）。
+    frame_id 标识手部类型：AgiHand（默认）或 O10Hand，当前安装类型可从
+    hand_state 卡片的 frame_id 读取。position 为 0~2000 的张合等级。
+    """
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("hand_command", "actuator", "下发灵巧手张合指令（话题 /motion/control/hand_joint_command，"
+                                               "position 0~2000，frame_id 区分 AgiHand/O10Hand）",
+                    action_schema(
+                        {"send": (["left", "right"], "下发双手张合等级 0(张开)~2000(握紧)")},
+                        {
+                            "left": {"type": "array", "items": {"type": "number"}, "description": "左手指张合等级列表 0~2000"},
+                            "right": {"type": "array", "items": {"type": "number"}, "description": "右手指张合等级列表 0~2000"},
+                            "hand_type": {"type": "string", "enum": ["AgiHand", "O10Hand"], "default": "AgiHand"},
+                        },
+                    ))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action != "send":
+            raise ValueError(f"hand_command: unknown action {action!r}")
+        hand_type = args.get("hand_type", "AgiHand")
+        _require(hand_type in HAND_TYPES, f"未知手部类型 {hand_type!r}，可选 {sorted(HAND_TYPES)}")
+        positions = {}
+        for side in ("left", "right"):
+            values = args.get(side)
+            if values is None:
+                continue
+            for i, value in enumerate(values):
+                positions[f"{side}_hand_joint_{i}"] = _clamp(float(value), 0.0, HAND_COMMAND_MAX, f"{side} 手指 {i}")
+        _require(positions, "至少提供 left 或 right 张合等级")
+        self.nodes.publish_joint_command("hand_command_pub", positions, frame_id=hand_type)
+        return {"hand_type": hand_type, "positions": positions, "state": "published"}
+
+
+class NeckCommandPlugin:
+    """neck_command 卡片：头部双关节控制。
+
+    对应 /motion/control/head_command 话题（sensor_msgs/JointState）。
+    """
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("neck_command", "actuator", "下发头部姿态指令（话题 /motion/control/head_command，"
+                                               "head_yaw ∈ [-1.047,1.047] rad，head_pitch ∈ [-0.436,0.262] rad）",
+                    action_schema(
+                        {"send": (["yaw", "pitch"], "下发一帧头部关节指令（rad）")},
+                        {
+                            "yaw": {"type": "number", "description": "头部偏航角 rad（左正右负）"},
+                            "pitch": {"type": "number", "description": "头部俯仰角 rad（抬头为正）"},
+                            "duration_ms": {"type": "integer", "description": "保持时长（毫秒）", "default": 100},
+                        },
+                    ))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action != "send":
+            raise ValueError(f"neck_command: unknown action {action!r}")
+        positions = {}
+        if args.get("yaw") is not None:
+            positions["head_yaw_joint"] = float(args["yaw"])
+        if args.get("pitch") is not None:
+            positions["head_pitch_joint"] = float(args["pitch"])
+        _require(positions, "至少提供 yaw 或 pitch")
+        _check_joint_limits(positions, NECK_LIMITS)
+        duration_ms = int(args.get("duration_ms", 100))
+        _require(duration_ms >= 0, "duration_ms 不能为负")
+        self.nodes.publish_joint_command("neck_command_pub", positions, duration_ms)
+        return {"joints": positions, "duration_ms": duration_ms, "state": "published"}
+
+
+class WaistCommandPlugin:
+    """waist_command 卡片：腰部三自由度控制。
+
+    对应 /motion/control/move_waist 话题（RosMsgWrapper + MoveWaist 消息）：
+    pitch（前倾后仰）、yaw（左右旋转）、height（升降，0 为最低位）。
+    """
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("waist_command", "actuator", "下发腰部控制指令（话题 /motion/control/move_waist："
+                                                "pitch/yaw ∈ [-1.6,1.6] rad，height ∈ [-0.3,0] m）",
+                    action_schema(
+                        {"send": (["pitch", "yaw", "height"], "下发腰部俯仰/旋转/升降指令")},
+                        {
+                            "pitch": {"type": "number", "description": "腰部俯仰 rad，正为前倾"},
+                            "yaw": {"type": "number", "description": "腰部偏航 rad，正为左转"},
+                            "height": {"type": "number", "description": "腰部高度偏移 m（-0.3~0，0 为站立基准）"},
+                        },
+                    ))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action != "send":
+            raise ValueError(f"waist_command: unknown action {action!r}")
+        payload = {}
+        for field in ("pitch", "yaw", "height"):
+            value = args.get(field)
+            if value is None:
+                continue
+            low, high = WAIST_LIMITS[f"waist_{field}"]
+            payload[f"waist_{field}"] = _clamp(float(value), low, high, field)
+        _require(payload, "至少提供 pitch/yaw/height 之一")
+        self.nodes.publish_wrapper("waist_pub", payload)
+        return {**payload, "state": "published"}
+
+
+class ArmCompliancePlugin:
+    """arm_compliance 卡片：手臂柔顺控制开关。
+
+    对应 MDU MotionControlMotionService/{Enable,Disable,Check}ArmCompliance。
+    柔顺模式下手臂可被外力拖动（示教/人机交互安全），关闭后恢复刚度控制。
+    """
+
+    ACTIONS = {
+        "enable": ([], "开启手臂柔顺模式（可被外力拖动）"),
+        "disable": ([], "关闭手臂柔顺模式（恢复刚度控制）"),
+        "check": ([], "查询手臂柔顺模式是否开启"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("arm_compliance", "actuator", "手臂柔顺控制（Enable/Disable/CheckArmCompliance RPC）",
+                    action_schema(self.ACTIONS, {}))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action not in self.ACTIONS:
+            raise ValueError(f"arm_compliance: unknown action {action!r}")
+        return jsonable(self.nodes.rpc.arm_compliance(action))
+
+
+class MotionPlayPlugin:
+    """motion_play 卡片：动作文件播放控制。
+
+    对应 MDU MotionCommandService/SendMotionCommand，播放 motion 资源
+    （resource_list motion 类）。注意事项（开发文档 §7.4）：
+      - 播放动作前若 motion_player 在运行，必须先停止：
+        登录 MDU 执行 curl -X POST http://127.0.0.1:50080/json/stop_app -d '{"app_name":"motion_player"}'
+      - 仅 MOTION 状态下可下发；
+      - 同一 motion_id 可重复下发实现连续播放，end 指令提前结束。
+    """
+
+    ACTIONS = {
+        "play": (["motion_id", "duration_ms"], "播放指定动作（motion_id 为 motion 资源文件绝对路径）"),
+        "pause": ([], "暂停当前动作播放"),
+        "stop_play": ([], "结束当前动作并自动恢复初始姿态（cmd_end）"),
+        "reset": ([], "立即中止当前动作并恢复初始姿态（cmd_reset）"),
+        "resume": ([], "恢复播放（撤销 pause）"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("motion_play", "actuator", "播放/暂停/停止动作文件（SendMotionCommand RPC；播放前先停止 MDU 上"
+                                              "的 motion_player 应用，且需 MOTION 模式）",
+                    action_schema(self.ACTIONS, {
+                        "motion_id": {"type": "integer", "description": "动作资源 id（resource_list → motion）"},
+                        "duration_ms": {"type": "integer", "description": "播放时长 ms（可选，缺省为播放到结束）"},
+                    }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "play":
+            # SendMotionCommand 入参为动作文件绝对路径 + 动作最长运行毫秒数；
+            # cmd_end=true 时播放完自动回初始姿态（默认 True）
+            motion_id = str(args.get("motion_id", ""))
+            _require(motion_id, "motion_id 不能为空")
+            duration_ms = args.get("duration_ms", 10000)
+            return jsonable(self.nodes.rpc.send_motion_command(
+                motion_id, int(duration_ms), cmd_end=True, cmd_pause=False))
+        if action == "pause":
+            return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=True))
+        if action == "resume":
+            return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=False))
+        if action == "stop_play":
+            return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True))
+        if action == "reset":
+            return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_reset=True))
+        if action == "stop":
+            return {"state": "idle"}
+        raise ValueError(f"motion_play: unknown action {action!r}")
+
+
+class TtsPlugin:
+    """tts 卡片：文本转语音播报。
+
+    对应 HDU TTSService/PlayTTS。text ≤ 1024 字节；priority_level 分
+    BACKGROUND_L1 / SERVICE_L2 / INTERACTION_L6；is_interrupted=true 可打断
+    当前播报。返回 trace_id 用于经 media_play status 查询播报状态或打断。
+    """
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("tts", "actuator", "文本转语音播报（PlayTTS RPC；text ≤1024 字节，返回 trace_id 用于状态查询）",
+                    action_schema(
+                        {"speak": (["text"], "播报一段中文/英文文本")},
+                        {
+                            "text": {"type": "string", "description": "播报文本（UTF-8，≤1024 字节）"},
+                            "priority_level": {"type": "string",
+                                              "enum": ["BACKGROUND_L1", "SERVICE_L2", "INTERACTION_L6"],
+                                              "default": "INTERACTION_L6",
+                                              "description": "播报优先级，INTERACTION_L6 默认可打断低优先级"},
+                            "is_interrupted": {"type": "boolean", "default": True, "description": "是否打断当前播报"},
+                            "trace_id": {"type": "string", "description": "自定义播报 id（可选），用于状态查询与打断"},
+                        },
+                    ))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action != "speak":
+            raise ValueError(f"tts: unknown action {action!r}")
+        text = args.get("text", "")
+        _require(len(text.encode("utf-8")) <= TTS_MAX_TEXT_BYTES,
+                 f"播报文本超长（>{TTS_MAX_TEXT_BYTES} 字节）")
+        priority = args.get("priority_level", "INTERACTION_L6")
+        _require(priority in TTS_PRIORITY_LEVELS.values() or priority in TTS_PRIORITY_LEVELS,
+                 f"未知优先级 {priority!r}")
+        response = self.nodes.rpc.play_tts(
+            text,
+            priority_level=priority if priority in TTS_PRIORITY_LEVELS.values() else TTS_PRIORITY_LEVELS[priority],
+            is_interrupted=bool(args.get("is_interrupted", True)),
+            trace_id=str(args.get("trace_id") or ""),
+        )
+        # PlayTTS 出参为扁平结构（trace_id 顶层字段，is_sucess 官方拼写如此）
+        trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
+        return {"trace_id": trace_id, "response": response}
+
+
+class MediaPlayPlugin:
+    """media_play 卡片：媒体文件播报与状态控制。
+
+    对应 HDU TTSService：PlayMediaFile 播放音频/视频文件，GetAudioStatus 按
+    trace_id 查询播报状态，StopTTSByTraceId 按 trace_id 打断。
+    """
+
+    ACTIONS = {
+        "play": (["file_name"], "播放媒体文件（audio 资源文件名，含扩展名）"),
+        "status": (["trace_id"], "查询播报状态（0 未播/1 播报中/2 播报完成/3 异常）"),
+        "stop_trace_id": (["trace_id"], "按 trace_id 打断指定播报"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("media_play", "actuator", "媒体文件播放/状态查询/按 id 打断（PlayMediaFile/GetAudioStatus/StopTTSByTraceId RPC）",
+                    action_schema(self.ACTIONS, {
+                        "file_name": {"type": "string", "description": "媒体文件名（resource_list → audio）"},
+                        "trace_id": {"type": "string", "description": "播报 id（play 返回或自定义传入）"},
+                    }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "play":
+            file_name = args.get("file_name", "")
+            _require(file_name, "file_name 不能为空")
+            response = self.nodes.rpc.play_media_file(file_name, is_interrupted=True)
+            # PlayMediaFile 出参同样为扁平结构
+            trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
+            return {"trace_id": trace_id, "response": response}
+        if action == "status":
+            return jsonable(self.nodes.rpc.get_audio_status(args.get("trace_id", "")))
+        if action == "stop_trace_id":
+            return jsonable(self.nodes.rpc.stop_tts_trace_id(args.get("trace_id", "")))
+        raise ValueError(f"media_play: unknown action {action!r}")
+
+
+class AudioPlayPlugin:
+    """audio_play 卡片：音频文件播放与停止。
+
+    对应 HDU HalAudioService：PlayFile 播放音频文件（DEFAULT 优先级），StopPlay
+    停止当前播放。
+    """
+
+    ACTIONS = {
+        "play": (["file_name"], "播放音频文件（audio 资源文件名）"),
+        "stop_play": ([], "停止当前正在播放的音频（HalAudioService/StopPlay）"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("audio_play", "actuator", "音频播放/停止（HalAudioService PlayFile/StopPlay RPC）",
+                    action_schema(self.ACTIONS, {
+                        "file_name": {"type": "string", "description": "音频文件名（resource_list → audio）"},
+                    }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "play":
+            file_name = args.get("file_name", "")
+            _require(file_name, "file_name 不能为空")
+            return jsonable(self.nodes.rpc.play_file(file_name))
+        if action == "stop_play":
+            return jsonable(self.nodes.rpc.stop_play())
+        if action == "stop":
+            return {"state": "idle"}
+        raise ValueError(f"audio_play: unknown action {action!r}")
+
+
+class VolumePlugin:
+    """volume 卡片：音量查询与调节。
+
+    对应 HDU HalAudioService/GetAudioVolume、SetAudioVolume。开发文档硬性限制：
+    音量 >70 有损坏硬件风险，本插件在 RPC 之外再次钳制 max_volume（默认 70）。
+    """
+
+    ACTIONS = {
+        "get": ([], "查询当前音量（返回 is_sucess —— 官方接口拼写如此）"),
+        "set": (["volume"], "设置音量 0~max_volume"),
+        "mute": ([], "静音（is_mute=true）"),
+        "unmute": ([], "取消静音（is_mute=false）"),
+    }
+
+    def __init__(self, nodes, max_volume=VOLUME_HARD_MAX):
+        self.nodes = nodes
+        self.max_volume = min(int(max_volume), VOLUME_HARD_MAX)
+
+    def get_tool(self):
+        return tool("volume", "actuator", f"音量查询/设置（0~{self.max_volume}，硬件上限 70，超限有损坏风险）",
+                    action_schema(self.ACTIONS, {
+                        "volume": {"type": "integer", "minimum": 0, "maximum": self.max_volume,
+                                   "description": "目标音量 0~70"},
+                    }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready", "max_volume": self.max_volume}
+        if action == "get":
+            return jsonable(self.nodes.rpc.get_audio_volume())
+        if action == "set":
+            volume = int(args.get("volume", 0))
+            _require(0 <= volume <= self.max_volume,
+                     f"音量必须在 0~{self.max_volume} 之间（开发文档限制 >70 有硬件损坏风险）")
+            return jsonable(self.nodes.rpc.set_audio_volume(volume, is_mute=False))
+        if action == "mute":
+            return jsonable(self.nodes.rpc.set_audio_volume(self.max_volume, is_mute=True))
+        if action == "unmute":
+            return jsonable(self.nodes.rpc.set_audio_volume(self.max_volume, is_mute=False))
+        raise ValueError(f"volume: unknown action {action!r}")
+
+
+class MicSourcePlugin:
+    """mic_source 卡片：拾音来源切换。
+
+    对应 HDU AgentControlService/SetAgentProperties、GetAgentProperties
+    （property_id=1 拾音来源：0 机内麦克风 / 1 外部麦克风）。
+    开发文档 v3.2 已知 BUG：机内麦克风（source=0）存在问题，建议使用外部麦克风（1）。
+    """
+
+    ACTIONS = {
+        "get": ([], "查询当前拾音来源（0 机内 / 1 外部）"),
+        "internal": ([], "切换到机内麦克风（v3.2 已知存在 BUG，不推荐）"),
+        "external": ([], "切换到外部麦克风（推荐）"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("mic_source", "actuator", "拾音来源查询/切换（机内 0 / 外部 1；v3.2 机内麦克风存在已知 BUG，推荐外部）",
+                    action_schema(self.ACTIONS, {}))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "get":
+            return jsonable(self.nodes.rpc.get_mic_source())
+        if action == "internal":
+            return jsonable(self.nodes.rpc.set_mic_source(0))
+        if action == "external":
+            return jsonable(self.nodes.rpc.set_mic_source(1))
+        raise ValueError(f"mic_source: unknown action {action!r}")
+
+
+class InteractionPlugin:
+    """interaction 卡片：语音交互总开关与工作模式。
+
+    对应 HDU AgentControlService：
+      - SetVoiceEnable / GetVoiceEnable —— 语音交互总开关；
+      - SetAgentProperties / GetAgentProperties（property_id=2 工作模式：
+        only_voice 纯语音交互 / normal 完整交互）。
+    注意：SetAgentProperties 修改需重启机器人后生效（开发文档明确说明）。
+    """
+
+    ACTIONS = {
+        "voice_enable": (["enable"], "开/关语音交互总开关"),
+        "voice_get": ([], "查询语音交互总开关状态"),
+        "mode_normal": ([], "设置为完整交互模式（重启后生效）"),
+        "mode_only_voice": ([], "设置为纯语音交互模式（重启后生效）"),
+        "mode_get": ([], "查询当前交互模式"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("interaction", "actuator", "语音交互开关与模式设置（SetVoiceEnable/SetAgentProperties RPC；"
+                                              "模式修改需重启生效）",
+                    action_schema(self.ACTIONS, {
+                        "enable": {"type": "boolean", "description": "true 开启 / false 关闭语音交互"},
+                    }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "voice_enable":
+            return jsonable(self.nodes.rpc.set_voice_enable(bool(args.get("enable", True))))
+        if action == "voice_get":
+            return jsonable(self.nodes.rpc.get_voice_enable())
+        if action == "mode_normal":
+            return jsonable(self.nodes.rpc.set_agent_properties("normal"))
+        if action == "mode_only_voice":
+            return jsonable(self.nodes.rpc.set_agent_properties("only_voice"))
+        if action == "mode_get":
+            return jsonable(self.nodes.rpc.get_agent_properties())
+        raise ValueError(f"interaction: unknown action {action!r}")
+
+
+class FacePlayPlugin:
+    """face_play 卡片：表情播放。
+
+    对应 /skill/pilot/face/play 话题（RosMsgWrapper + FacePlayInfo）。表情资源
+    路径/ID 经 resource_list emoticon 类获取；is_stop=true 可取消所有正在播放
+    的表情（此场景其余字段可空）。
+    """
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("face_play", "actuator", "播放/取消表情（话题 /skill/pilot/face/play；"
+                                             "e_path 为 emoticon 资源绝对路径，priority 固定 440）",
+                    action_schema(
+                        {"play": (["e_path"], "播放表情动画（e_id 可选，repeat 为重播次数）"),
+                         "cancel": ([], "取消所有表情播放（is_stop=true）")},
+                        {
+                            "e_path": {"type": "string", "description": "表情文件绝对路径（resource_list → emoticon）"},
+                            "e_id": {"type": "integer", "description": "表情资源 id（可选，与 e_path 二选一）"},
+                            "repeat": {"type": "integer", "default": 1, "description": "重播次数"},
+                        },
+                    ))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "play":
+            e_path = args.get("e_path", "")
+            _require(e_path or args.get("e_id") is not None, "需要 e_path 或 e_id")
+            payload = {
+                "header": create_header(),
+                "e_path": e_path,
+                "e_id": int(args.get("e_id", 0)),
+                "repeat": int(args.get("repeat", 1)),
+                "priority": 440,
+                "is_stop": False,
+            }
+            self.nodes.publish_wrapper("face_play_pub", payload)
+            return {**payload, "state": "published"}
+        if action == "cancel":
+            payload = {"header": create_header(), "e_path": "", "e_id": 0,
+                       "repeat": 0, "priority": 440, "is_stop": True}
+            self.nodes.publish_wrapper("face_play_pub", payload)
+            return {"state": "published", "is_stop": True}
+        if action == "stop":
+            return {"state": "idle"}
+        raise ValueError(f"face_play: unknown action {action!r}")
+
+
+class SkillPlayPlugin:
+    """skill_play 卡片：技能包（舞蹈）播放控制。
+
+    对应 ADU SkillPilotService/SkillPackage。path 为 skill 资源目录
+    （resource_list skill 类）；Start 返回 session_id，Pause/Stop 需回传。
+    舞蹈播放需要约 2 米安全净空（开发文档要求）。
+    """
+
+    ACTIONS = {
+        "play": (["path"], "播放技能包（返回 session_id）"),
+        "pause": (["session_id"], "暂停技能播放"),
+        "stop_play": (["session_id"], "停止技能播放"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("skill_play", "actuator", "技能包/舞蹈播放控制（SkillPackage RPC；播放需 ~2m 安全净空，"
+                                             "Start 返回 session_id 供暂停/停止使用）",
+                    action_schema(self.ACTIONS, {
+                        "path": {"type": "string", "description": "skill 资源目录绝对路径（resource_list → skill）"},
+                        "session_id": {"type": "string", "description": "技能会话 id（play 返回）"},
+                    }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "play":
+            path = args.get("path", "")
+            _require(path, "path 不能为空")
+            return jsonable(self.nodes.rpc.skill_package("Start", path))
+        if action == "pause":
+            return jsonable(self.nodes.rpc.skill_package("Pause", "", args.get("session_id", "")))
+        if action == "stop_play":
+            return jsonable(self.nodes.rpc.skill_package("Stop", "", args.get("session_id", "")))
+        if action == "stop":
+            return {"state": "idle"}
+        raise ValueError(f"skill_play: unknown action {action!r}")
+
+
+class MappingPlugin:
+    """mapping 卡片：建图控制与地图管理（config 门控，默认关闭）。
+
+    对应 ADU MappingService：StartMapping / StopMapping（含保存）/
+    GetStoredMapNames / GetCurrentWorkingMap / RenameMap，以及 SLAM 地图数据
+    Get2DWholeMap / GetTopoMsgs（供 map_get 卡片使用）。
+    """
+
+    ACTIONS = {
+        "start_mapping": ([], "开始建图（机器人行走采集环境）"),
+        "stop_save": (["map_name"], "结束建图并保存（map_name 为新地图名称）"),
+        "stop_discard": ([], "结束建图不保存"),
+        "list": ([], "查询已保存地图列表"),
+        "current": ([], "查询当前工作地图"),
+        "rename": (["map_id", "new_name"], "重命名地图"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("mapping", "actuator", "建图控制与地图管理（MappingService RPC；config 门控模块，默认关闭）",
+                    action_schema(self.ACTIONS, {
+                        "map_name": {"type": "string", "description": "保存时的新地图名称"},
+                        "map_id": {"type": "integer", "description": "目标地图 id（rename）"},
+                        "new_name": {"type": "string", "description": "新名称（rename）"},
+                    }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "start_mapping":
+            return jsonable(self.nodes.rpc.start_mapping())
+        if action == "stop_save":
+            return jsonable(self.nodes.rpc.stop_mapping(args.get("map_name")))
+        if action == "stop_discard":
+            return jsonable(self.nodes.rpc.stop_mapping(None))
+        if action == "list":
+            return jsonable(self.nodes.rpc.get_stored_map_names())
+        if action == "current":
+            return jsonable(self.nodes.rpc.get_current_working_map())
+        if action == "rename":
+            return jsonable(self.nodes.rpc.rename_map(int(args.get("map_id", 0)),
+                                                      args.get("old_name", ""),
+                                                      args.get("new_name", "")))
+        # 建图控制动作（schema 里 "start"/"stop_save"/"stop_discard" 与生命周期动作重名，
+        # 因此对外命名为 start_mapping，见上）
+        raise ValueError(f"mapping: unknown action {action!r}")
+
+
+class NavigationPlugin:
+    """navigation 卡片：导航任务下发与控制（config 门控，默认关闭）。
+
+    对应 ADU PncService。开发文档 §7.9 硬性约束：
+      - 导航前置条件：MC 处于 MOTION 模式（mc_mode get_up），且已完成重定位
+        （relocalization 卡片）并工作在与重定位时相同的 map_id 上；
+      - task_id 传 0 由底层自动分配，返回的 task_id 用于暂停/恢复/取消/查询；
+      - 到点精度最大约 0.4 米。
+    """
+
+    ACTIONS = {
+        "navi_to_goal": (["map_id", "target_id"], "按目标点 ID 规划导航（PlanningNaviToGoal）"),
+        "navi_to_pose": (["map_id", "x", "y", "angle"], "按位姿规划导航（PlanningNaviToPose2D）"),
+        "linear_to_goal": (["map_id", "target_id"], "直线导航到目标点（LinearNaviToGoal，先转后走）"),
+        "linear_to_pose": (["map_id", "x", "y", "angle"], "直线导航到位姿（LinearNaviToPose2D）"),
+        "move_forward": (["map_id", "distance"], "直线平移指定距离（MoveForward，朝向不变）"),
+        "spin_turn": (["map_id", "angle"], "原地旋转指定角度（SpinTurn，rad）"),
+        "cancel": (["task_id"], "取消导航任务"),
+        "pause": (["task_id"], "暂停导航任务"),
+        "resume": (["task_id"], "恢复暂停的任务"),
+        "state": (["task_id"], "查询任务状态（task_id=0 查询最近一次任务）"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.last_task_id = None
+
+    def get_tool(self):
+        return tool("navigation", "actuator", "导航任务下发/控制（PncService RPC；config 门控模块，默认关闭；"
+                                             "前置：MOTION 模式 + 已重定位；task_id 传 0 自动分配）",
+                    action_schema(self.ACTIONS, {
+                        "map_id": {"type": "integer", "description": "工作地图 id（需与重定位地图一致）"},
+                        "target_id": {"type": "integer", "description": "目标点 id（地图点位）"},
+                        "x": {"type": "number", "description": "目标点 x（m）"},
+                        "y": {"type": "number", "description": "目标点 y（m）"},
+                        "angle": {"type": "number", "description": "目标朝向角（rad）"},
+                        "distance": {"type": "number", "description": "平移距离（m，正为前进）"},
+                        "task_id": {"type": "integer", "description": "任务 id（0 自动分配；控制/查询动作可传空用最近任务）"},
+                    }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def _task_id(self, args):
+        value = args.get("task_id")
+        if value in (None, ""):
+            if self.last_task_id is None:
+                return 0
+            return self.last_task_id
+        return int(value)
+
+    def _remember(self, response):
+        task_id = (response or {}).get("task_id")
+        if task_id:
+            self.last_task_id = task_id
+        return jsonable(response)
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready", "last_task_id": self.last_task_id}
+        if action == "navi_to_goal":
+            return self._remember(self.nodes.rpc.navi("PlanningNaviToGoal", {
+                "task_id": 0, "map_id": int(args.get("map_id", 0)),
+                "target_id": int(args.get("target_id", 0)), "guide_line_id": 0,
+                "ackerman_mode": False}))
+        if action == "navi_to_pose":
+            return self._remember(self.nodes.rpc.navi("PlanningNaviToPose2D", {
+                "task_id": 0, "map_id": int(args.get("map_id", 0)),
+                "pose": {"position": {"x": float(args.get("x", 0)), "y": float(args.get("y", 0))},
+                         "angle": float(args.get("angle", 0))},
+                "ackerman_mode": False}))
+        if action == "linear_to_goal":
+            return self._remember(self.nodes.rpc.navi("LinearNaviToGoal", {
+                "task_id": 0, "map_id": int(args.get("map_id", 0)),
+                "target_id": int(args.get("target_id", 0))}))
+        if action == "linear_to_pose":
+            return self._remember(self.nodes.rpc.navi("LinearNaviToPose2D", {
+                "task_id": 0, "map_id": int(args.get("map_id", 0)),
+                "pose": {"position": {"x": float(args.get("x", 0)), "y": float(args.get("y", 0))},
+                         "angle": float(args.get("angle", 0))}}))
+        if action == "move_forward":
+            return self._remember(self.nodes.rpc.navi("MoveForward", {
+                "task_id": 0, "map_id": int(args.get("map_id", 0)),
+                "angle": 0, "distance": float(args.get("distance", 0))}))
+        if action == "spin_turn":
+            return self._remember(self.nodes.rpc.navi("SpinTurn", {
+                "task_id": 0, "map_id": int(args.get("map_id", 0)),
+                "angle": float(args.get("angle", 0))}))
+        if action == "cancel":
+            return jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": self._task_id(args)}))
+        if action == "pause":
+            return jsonable(self.nodes.rpc.navi("ActionPause", {"task_id": self._task_id(args)}))
+        if action == "resume":
+            return jsonable(self.nodes.rpc.navi("ActionResume", {"task_id": self._task_id(args)}))
+        if action == "state":
+            return jsonable(self.nodes.rpc.navi_state(self._task_id(args)))
+        raise ValueError(f"navigation: unknown action {action!r}")
+
+
+class RelocalizationPlugin:
+    """relocalization 卡片：SLAM 重定位（config 门控，默认关闭）。
+
+    对应 ADU SLAMRelocalizationService：StartNormalRelocalization /
+    StopNormalRelocalization。导航的硬性前置条件：在目标 map_id 上成功重定位。
+    stop 可选传入位姿（reloc_pose）辅助收敛。
+    """
+
+    ACTIONS = {
+        "start_normal": (["map_dir"], "在指定地图目录上启动普通重定位"),
+        "stop_normal": ([], "停止重定位（可带 reloc_pose 位姿参数辅助收敛）"),
+    }
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("relocalization", "actuator", "SLAM 重定位（SLAMRelocalizationService RPC；config 门控模块，"
+                                                 "默认关闭；导航前置条件）",
+                    action_schema(self.ACTIONS, {
+                        "map_dir": {"type": "string", "description": "地图目录（GetStoredMapNames → map_dir）"},
+                        "x": {"type": "number", "description": "stop 时可选 reloc_pose x"},
+                        "y": {"type": "number", "description": "stop 时可选 reloc_pose y"},
+                        "angle": {"type": "number", "description": "stop 时可选 reloc_pose 朝向（rad）"},
+                    }))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action == "start_normal":
+            return jsonable(self.nodes.rpc.slam_start_normal_relocalization(args.get("map_dir", "")))
+        if action == "stop_normal":
+            reloc_pose = None
+            if args.get("x") is not None or args.get("y") is not None or args.get("angle") is not None:
+                reloc_pose = {"x": float(args.get("x", 0)), "y": float(args.get("y", 0)),
+                              "angle": float(args.get("angle", 0))}
+            return jsonable(self.nodes.rpc.slam_stop_normal_relocalization(reloc_pose))
+        raise ValueError(f"relocalization: unknown action {action!r}")
+
+
+class AutoChargingPlugin:
+    """auto_charging 卡片：自主充电控制（config 门控，默认关闭）。
+
+    对应 ADU SkillPilotService/AutoCharging。command 取
+    AutoChargingCommand_START/STOP/RESET；trigger 为触发来源
+    （AGENT=1 智能体发起 / AIMMASTER=2 App 手动 / LOW_POWER=3 / IDLE_TIMEOUT=4）。
+    失败后先 STOP 再 RESET 复位（不调用则 10s 自动恢复 Idle）。
+    """
+
+    ACTIONS = {
+        "charge_start": ([], "启动自主充电流程（导航至充电桩并插枪）"),
+        "charge_stop": ([], "停止自主充电（导航中停止导航；充电中拔枪结束）"),
+        "reset": ([], "失败复位（在 charge_stop 之后调用，恢复 Idle 状态）"),
+        "state": ([], "查询技能状态（skill_status 话题缓存）"),
+    }
+
+    TRIGGERS = {"charge_start": "AutoChargingCommand_START",
+                "charge_stop": "AutoChargingCommand_STOP",
+                "reset": "AutoChargingCommand_RESET"}
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("auto_charging", "actuator", "自主充电控制（SkillPilotService AutoCharging RPC；config 门控模块，"
+                                                "默认关闭；失败后先 stop 再 reset 复位）",
+                    action_schema(self.ACTIONS, {}))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action in self.TRIGGERS:
+            return jsonable(self.nodes.rpc.auto_charging(self.TRIGGERS[action], "AutoChargingTrigger_AGENT"))
+        if action == "state":
+            return self.nodes.snapshot("skill_status") or {"state": "unknown"}
+        raise ValueError(f"auto_charging: unknown action {action!r}")
+
+
+class MapGetPlugin:
+    """map_get 处理器卡片：获取地图数据并换算像素坐标（config 门控，默认关闭）。
+
+    拉取 SLAM 全量栅格地图（Get2DWholeMap），将物理坐标 (x, y) 按分辨率换算为
+    像素坐标：pixel_x = origin_x + x*resolution，pixel_y = origin_y - y*resolution。
+    """
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def get_tool(self):
+        return tool("map_get", "processor", "获取 SLAM 2D 全量地图数据（含分辨率/原点/占用栅格），"
+                                         "并提供物理坐标→像素坐标换算",
+                    action_schema(
+                        {"query": (["map_id"], "获取指定地图的全量栅格数据与元信息；可选传 x/y 返回像素坐标换算")},
+                        {
+                            "map_id": {"type": "integer", "description": "地图 id（GetStoredMapNames 获取）"},
+                            "x": {"type": "number", "description": "物理坐标 x（m），可选"},
+                            "y": {"type": "number", "description": "物理坐标 y（m），可选"},
+                        },
+                    ))
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "ready"}
+        if action != "query":
+            raise ValueError(f"map_get: unknown action {action!r}")
+        response = self.nodes.rpc.get_2d_whole_map(int(args.get("map_id", 0)))
+        data = response.get("data") or {}
+        result = jsonable(response)
+        if args.get("x") is not None or args.get("y") is not None:
+            resolution = data.get("resolution") or 0.05
+            origin = data.get("origin") or {}
+            origin_x = origin.get("x", 0) if isinstance(origin, dict) else 0
+            origin_y = origin.get("y", 0) if isinstance(origin, dict) else 0
+            px = int(origin_x + float(args.get("x", 0)) * resolution)
+            py = int(origin_y - float(args.get("y", 0)) * resolution)
+            result["pixel"] = {"x": px, "y": py,
+                               "formula": "pixel_x = origin_x + x*resolution; pixel_y = origin_y - y*resolution"}
+        return result
+
+
+def build_plugins(config, namespace, ros2):
+    """Instantiate every enabled plugin, mirroring X2's build_plugins."""
+    rpc = A3Rpc(config)
+    nodes = A3Nodes(config, namespace, ros2, rpc)
+    plugins_cfg = config.get("plugins", {})
+
+    def enabled(name):
+        return bool(plugins_cfg.get(name, {}).get("enabled", False))
+
+    plugins = {}
+    if enabled("mc_state"):
+        plugins["mc_state"] = McStatePlugin(nodes)
+    if enabled("joints"):
+        plugins["arm_state"] = ArmStatePlugin(nodes, "arm_state")
+        plugins["hand_state"] = HandStatePlugin(nodes, "hand_state")
+        plugins["neck_state"] = NeckStatePlugin(nodes, "neck_state")
+    if enabled("imu"):
+        plugins["imu"] = ImuPlugin(nodes)
+    if enabled("camera"):
+        plugins["camera"] = CameraPlugin(nodes)
+    if enabled("lidar"):
+        plugins["lidar"] = LidarPlugin(nodes)
+    if enabled("bms"):
+        plugins["bms"] = BmsPlugin(nodes)
+    if enabled("emergency"):
+        plugins["emergency"] = EmergencyPlugin(nodes)
+    if enabled("wakeup"):
+        plugins["wakeup"] = WakeupPlugin(nodes)
+    if enabled("skill_status"):
+        plugins["skill_status"] = SkillStatusPlugin(nodes)
+    if enabled("alerts"):
+        plugins["alerts"] = AlertsPlugin(nodes)
+    if enabled("mc_mode"):
+        plugins["mc_mode"] = McModePlugin(nodes)
+    if enabled("locomotion"):
+        plugins["locomotion"] = LocomotionPlugin(nodes)
+    if enabled("arm_command"):
+        plugins["arm_command"] = ArmCommandPlugin(nodes)
+    if enabled("hand_command"):
+        plugins["hand_command"] = HandCommandPlugin(nodes)
+    if enabled("neck_command"):
+        plugins["neck_command"] = NeckCommandPlugin(nodes)
+    if enabled("waist_command"):
+        plugins["waist_command"] = WaistCommandPlugin(nodes)
+    if enabled("arm_compliance"):
+        plugins["arm_compliance"] = ArmCompliancePlugin(nodes)
+    if enabled("motion_play"):
+        plugins["motion_play"] = MotionPlayPlugin(nodes)
+    if enabled("tts"):
+        plugins["tts"] = TtsPlugin(nodes)
+    if enabled("media_play"):
+        plugins["media_play"] = MediaPlayPlugin(nodes)
+    if enabled("audio_play"):
+        plugins["audio_play"] = AudioPlayPlugin(nodes)
+    if enabled("volume"):
+        plugins["volume"] = VolumePlugin(nodes,
+                                          max_volume=plugins_cfg.get("volume", {}).get("max_volume", VOLUME_HARD_MAX))
+    if enabled("mic_source"):
+        plugins["mic_source"] = MicSourcePlugin(nodes)
+    if enabled("interaction"):
+        plugins["interaction"] = InteractionPlugin(nodes)
+    if enabled("face_play"):
+        plugins["face_play"] = FacePlayPlugin(nodes)
+    if enabled("skill_play"):
+        plugins["skill_play"] = SkillPlayPlugin(nodes)
+    if enabled("resources"):
+        plugins["model"] = ModelPlugin(nodes)
+        plugins["resource_list"] = ResourceListPlugin(nodes)
+    # --- advanced modules, config-gated (like X2's slam) ---
+    if enabled("mapping"):
+        plugins["mapping"] = MappingPlugin(nodes)
+        plugins["map_get"] = MapGetPlugin(nodes)
+    if enabled("navigation"):
+        plugins["navigation"] = NavigationPlugin(nodes)
+    if enabled("relocalization"):
+        plugins["relocalization"] = RelocalizationPlugin(nodes)
+    if enabled("auto_charging"):
+        plugins["auto_charging"] = AutoChargingPlugin(nodes)
+    return plugins
