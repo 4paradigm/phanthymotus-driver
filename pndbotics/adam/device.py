@@ -1497,6 +1497,11 @@ class ArmControlPlugin:
         self._release_started_at = None
         self._writes = 0
         self._last_error = None
+        # Every accepted upper-body target advances this generation. Sequence
+        # gestures may only append a segment while the generation from their
+        # previous segment is still current, so any newer shared-card command
+        # atomically supersedes stale sequence workers.
+        self._command_generation = 0
         # Smooth-segment state. Each _set_targets call opens a segment that
         # minimum-jerk blends from the pose being written when the call lands
         # (_seg_start, indexed by joint like _target_q) to the newest targets
@@ -1795,6 +1800,7 @@ class ArmControlPlugin:
 
     def stop(self):
         with self._lock:
+            self._command_generation += 1
             if self._active or self._streaming:
                 self._release_started_at = time.monotonic()
         # Give the official Kp ramp-down sequence a chance to reach zero.
@@ -1812,6 +1818,7 @@ class ArmControlPlugin:
     def _stop_and_wait(self):
         """Stop action lifecycle: ramp gains down, then end lowcmd ownership."""
         with self._lock:
+            self._command_generation += 1
             if not (self._active or self._streaming):
                 return {"success": True, "state": "idle"}
             self._release_started_at = time.monotonic()
@@ -1846,7 +1853,9 @@ class ArmControlPlugin:
 
     def _set_targets(self, targets: dict[str, float],
                      *, preferred_span: float | None = None,
-                     velocity_limit: float | None = None):
+                     velocity_limit: float | None = None,
+                     expected_generation: int | None = None,
+                     return_generation: bool = False):
         error = self._ready_error()
         if error:
             return error
@@ -1858,6 +1867,10 @@ class ArmControlPlugin:
             return {"success": False, "code": "INVALID_ARGUMENT",
                     "message": "no upper-body joints were selected"}
         with self._lock:
+            if (expected_generation is not None
+                    and self._command_generation != expected_generation):
+                return {"success": False, "code": "COMMAND_SUPERSEDED",
+                        "message": "upper-body command was superseded"}
             target_q = self._target_q.copy()
             target_q.update({self._joint_index(name): value
                              for name, value in targets.items()})
@@ -1906,6 +1919,8 @@ class ArmControlPlugin:
             self._active = True
             self._streaming = True
             self._soft_arms = False
+            self._command_generation += 1
+            generation = self._command_generation
         # The worker may need one 20ms tick. This confirms the protocol write,
         # not physical movement, which DDS does not acknowledge.
         before = self._writes
@@ -1915,7 +1930,7 @@ class ArmControlPlugin:
         if self._writes <= before:
             return {"success": False, "code": "DDS_WRITE_FAILED",
                     "message": self._last_error or "rt/lowcmd was not written"}
-        return None
+        return generation if return_generation else None
 
     def _preferred_span(self, args: dict) -> tuple[float | None, dict | None]:
         """Parse the optional ``duration_s`` request into a target span.
@@ -2461,11 +2476,16 @@ class ArmGesturePlugin:
     def _targets_for(self, pose: str, side: str) -> dict:
         """Resolve one pose plus a requested arm into absolute radian targets."""
         if pose == "neutral":
-            # `neutral` has no joint table of its own: it means "return the
-            # selected arm axes to their zero target", which is also how
-            # `reset` has always been expressed.
-            selected = {control: 0.0 for control in ARM_JOINT_CONTROLS
-                        if side == "both" or control.startswith(f"{side}_")}
+            if self._control._hold_q is None:
+                raise ValueError("No startup arm pose captured yet")
+            selected = {
+                control: self._control._hold_q[
+                    self._control._joint_index(details[1])]
+                for control, details in ARM_JOINT_CONTROLS.items()
+                if side == "both" or control.startswith(f"{side}_")
+            }
+            return {ARM_JOINT_CONTROLS[control][1]: value
+                    for control, value in selected.items()}
         else:
             values = ARM_POSES[pose][1]
             if self._symmetric_pose(pose):
@@ -2594,7 +2614,8 @@ class ArmGesturePlugin:
                 self._sequence_id = None
         _notify_action_completion(action_id, status, result, self.PREFIX)
 
-    def _play_wave(self, side: str, action_id: str, ready_span: float):
+    def _play_wave(self, side: str, action_id: str, ready_span: float,
+                   generation: int):
         status = "completed"
         result = {"gesture": "wave", "side": side}
         # The final step lowers the arm again: a greeting that leaves the hand
@@ -2616,13 +2637,19 @@ class ArmGesturePlugin:
                         result = {"gesture": "wave", "side": side,
                                   "reason": "superseded or stopped"}
                         return
-                    error = self._control._set_targets(
-                        self._targets_for(pose, side), preferred_span=hold_seconds)
+                    outcome = self._control._set_targets(
+                        self._targets_for(pose, side),
+                        preferred_span=hold_seconds,
+                        expected_generation=generation,
+                        return_generation=True)
                     actual_span = self._control._active_segment_span()
-                if error:
-                    status = "failed"
-                    result = {"gesture": "wave", "side": side, "error": error}
+                if isinstance(outcome, dict):
+                    status = ("cancelled" if outcome.get("code") == "COMMAND_SUPERSEDED"
+                              else "failed")
+                    result = {"gesture": "wave", "side": side,
+                              "reason" if status == "cancelled" else "error": outcome}
                     return
+                generation = outcome
                 if not self._hold_sequence(action_id, actual_span):
                     status = "cancelled"
                     result = {"gesture": "wave", "side": side,
@@ -2634,7 +2661,8 @@ class ArmGesturePlugin:
         finally:
             self._finish_sequence(action_id, status, result)
 
-    def _play_handshake(self, side: str, action_id: str, ready_span: float):
+    def _play_handshake(self, side: str, action_id: str, ready_span: float,
+                        generation: int):
         status = "completed"
         result = {"gesture": "handshake", "side": side}
         elbow_control = f"{side}_elbow"
@@ -2652,16 +2680,20 @@ class ArmGesturePlugin:
                         result = {"gesture": "handshake", "side": side,
                                   "reason": "superseded or stopped"}
                         return
-                    error = self._control._set_targets(
+                    outcome = self._control._set_targets(
                         {joint: target},
                         preferred_span=self._HANDSHAKE_SEGMENT_SECONDS,
-                        velocity_limit=self._GESTURE_VELOCITY_RAD_S)
+                        velocity_limit=self._GESTURE_VELOCITY_RAD_S,
+                        expected_generation=generation,
+                        return_generation=True)
                     actual_span = self._control._active_segment_span()
-                if error:
-                    status = "failed"
+                if isinstance(outcome, dict):
+                    status = ("cancelled" if outcome.get("code") == "COMMAND_SUPERSEDED"
+                              else "failed")
                     result = {"gesture": "handshake", "side": side,
-                              "error": error}
+                              "reason" if status == "cancelled" else "error": outcome}
                     return
+                generation = outcome
                 if not self._hold_sequence(action_id, actual_span):
                     status = "cancelled"
                     result = {"gesture": "handshake", "side": side,
@@ -2712,11 +2744,13 @@ class ArmGesturePlugin:
                      if sequence_action else None)
         with self._sequence_lock:
             self._sequence_id = None
-            error = self._control._set_targets(
+            outcome = self._control._set_targets(
                 targets, preferred_span=span,
-                velocity_limit=self._GESTURE_VELOCITY_RAD_S)
-            if error:
-                return error
+                velocity_limit=self._GESTURE_VELOCITY_RAD_S,
+                return_generation=True)
+            if isinstance(outcome, dict):
+                return outcome
+            generation = outcome
             ready_span = self._control._active_segment_span()
             hand_error = self._apply_gesture_hand(action, side)
             if not hand_error:
@@ -2742,8 +2776,9 @@ class ArmGesturePlugin:
         # The ready target is accepted synchronously, while the worker waits for
         # its actual velocity-limited span before starting the repeated motion.
         worker = self._play_wave if action == "wave" else self._play_handshake
-        threading.Thread(target=worker, args=(side, action_id, ready_span),
-                         daemon=True, name=f"adam_arm_{action}_{side}").start()
+        threading.Thread(
+            target=worker, args=(side, action_id, ready_span, generation),
+            daemon=True, name=f"adam_arm_{action}_{side}").start()
         sequence_segments = (len(self._WAVE_SEQUENCE) + 1 if action == "wave"
                              else len(self._HANDSHAKE_ELBOW_SEQUENCE))
         result = {"success": True, "state": "active", "gesture": action,
@@ -5013,13 +5048,15 @@ class AdamDeviceBundle:
                 plugins_cfg.get("vision_capture", {}), camera_plugin))
 
         # HandPlugin and the read-only hand-state sensor share one DDS cache.
+        hand_gesture = None
         if hand_enabled:
             p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
                            dds_hand_pub=dds_hand_pub,
                            state_cache=self._hand_state_cache)
             self._plugins.append(p)
             if plugins_cfg.get("hand_gesture", {}).get("enabled", True):
-                self._plugins.append(HandGesturePlugin(p))
+                hand_gesture = HandGesturePlugin(p)
+                self._plugins.append(hand_gesture)
 
         # Direct upper-body control is DDS-only and intentionally remains
         # available when ROS2 is absent or isolated on the Jetson.
@@ -5032,6 +5069,8 @@ class AdamDeviceBundle:
                 variant=variant,
             )
             self._plugins.append(p)
+            if plugins_cfg.get("arm_gesture", {}).get("enabled", True):
+                self._plugins.append(ArmGesturePlugin(p, hand_gesture))
             if plugins_cfg.get("waist", {}).get("enabled", True):
                 self._plugins.append(WaistControlPlugin(p))
             if plugins_cfg.get("head", {}).get("enabled", True):
