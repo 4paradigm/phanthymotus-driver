@@ -1143,6 +1143,16 @@ class U1CardContractTests(unittest.TestCase):
             mock.call("wakeup_enabled_state"), mock.call("vision_enabled_state"),
         ])
 
+    def test_system_switch_accepts_successful_business_state_with_false_transport_flag(self):
+        import device
+
+        nodes = mock.Mock()
+        nodes.string_call.return_value = {"ok": True}
+        nodes.get_system_enabled.return_value = {
+            "success": False, "code": "OK", "data": {"enabled": False},
+        }
+        self.assertEqual(device.U1Nodes.set_system_enabled(nodes, "vision_enabled", False)["enabled"], False)
+
     def test_speaker_enables_device_before_forwarding_input(self):
         import device
 

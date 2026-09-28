@@ -815,9 +815,17 @@ class U1Nodes:
             raise RuntimeError(f"U1 Pro {name} request failed: {response.get('code', 'unknown error')}")
         state_name = name.replace("set_", "") + "_state"
         state = self.get_system_enabled(state_name)
-        if _vendor_request_failed(state):
+        # Some adapter builds report a false ROS Trigger transport status
+        # while the JSON business envelope is successful. Prefer the
+        # business payload when it contains the authoritative enabled field.
+        state_payload = _unwrap_result(state)
+        actual = state_payload.get("enabled") if isinstance(state_payload, dict) else None
+        if actual is None and isinstance(state, dict):
+            data = state.get("data")
+            if isinstance(data, dict):
+                actual = data.get("enabled")
+        if actual is None:
             raise RuntimeError(f"U1 Pro {name} state readback failed")
-        actual = state.get("data", {}).get("enabled") if isinstance(state, dict) else None
         if actual is not requested:
             raise RuntimeError(f"U1 Pro {name} state mismatch: requested {requested}, got {actual!r}")
         return {"ok": True, "requested": requested, "enabled": actual, "state": state}
