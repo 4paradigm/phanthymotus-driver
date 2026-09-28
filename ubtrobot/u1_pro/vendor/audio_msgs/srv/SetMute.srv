@@ -1,0 +1,5 @@
+bool mute
+---
+int32 code
+string message
+uint8 current_volume

@@ -15,6 +15,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/EnableAudioIn.srv"
   "srv/EnableAudioOut.srv"
   "srv/GetAudioVolume.srv"
+  "srv/SetMute.srv"
+  "srv/SetRecordAudioSwitch.srv"
   "srv/SetAudioVolume.srv"
   DEPENDENCIES std_msgs
 )

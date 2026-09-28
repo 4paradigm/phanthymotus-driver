@@ -1,0 +1,9 @@
+std_msgs/Header header
+bool record_enable
+---
+int32 code
+string message
+string pcm_audio_path
+string splited_audio_path
+string aec_audio_path
+string ns_for_asr_audio_path

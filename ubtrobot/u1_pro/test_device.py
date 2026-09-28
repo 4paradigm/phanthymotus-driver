@@ -90,7 +90,7 @@ def _install_stubs():
         setattr(audio_msg, name, message(name))
     audio_srv = types.ModuleType("audio_msgs.srv")
     for name in ("EnableAudioIn", "EnableAudioOut", "GetAudioVolume", "SetAudioVolume",
-                 "AudioDeviceInfoList", "SetAudioDevice"):
+                 "AudioDeviceInfoList", "SetAudioDevice", "SetMute", "SetRecordAudioSwitch"):
         setattr(audio_srv, name, type(name, (), {"Request": message("Request")}))
     audio.msg, audio.srv = audio_msg, audio_srv
     sys.modules.update({"audio_msgs": audio, "audio_msgs.msg": audio_msg, "audio_msgs.srv": audio_srv})
