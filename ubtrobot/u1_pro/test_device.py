@@ -171,10 +171,9 @@ class FakeNodes:
         return {"ok": True, "code": "OK", "data": {}}
 
     def play_motion(self, motion_type, motion_name, legacy_action=None):
-        self.string_calls.append(("play_motion", {
-            "motion_type": motion_type, "motion_name": motion_name,
-        }))
-        return {"code": 0, "message": "", "motion_type": motion_type, "motion_name": motion_name}
+        del motion_type, motion_name
+        self.string_calls.append(("play_action", {"action": legacy_action}))
+        return {"ok": True, "code": "OK", "data": {}}
 
     def trigger_call(self, name):
         self.interrupts += name == "interrupt"
@@ -232,7 +231,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(SPEAKER_TOPIC, "/sys/device/audio_out/raw")
         self.assertEqual(MIC_TOPIC, "/sys/device/audio_in/raw")
         self.assertEqual(PLAYBACK_TOPIC, "/robo/media/subscribe/playback_state")
-        self.assertEqual(device.EVENT_TOPICS["doa_event"], "/audio/sense/doa_event")
+        self.assertEqual(device.EVENT_TOPICS["doa_event"], "/robo/audio/subscribe/doa_event")
 
     def test_u1_cyclonedds_config_matches_official_sdk_runtime(self):
         config = Path(__file__).with_name("config.yaml").read_text(encoding="utf-8")
@@ -386,7 +385,8 @@ class U1CardContractTests(unittest.TestCase):
             self.assertEqual(nodes.audio_device.clients["/sys/device/audio_out/set_volume"].srv_name,
                              "/sys/device/audio_out/set_volume")
             self.assertIn("/sys/device/audio_in/raw", [sub[1] for sub in nodes.audio_device.subscriptions])
-            self.assertEqual(nodes.robot.clients["/action/controller/pay_motion"].srv_name, "/action/controller/pay_motion")
+            self.assertEqual(nodes.robot.clients["/robo/audio/call/play_action"].srv_name,
+                             "/robo/audio/call/play_action")
             self.assertEqual(nodes.robot.clients["/robo/auth/call/authorize"].srv_name, "/robo/auth/call/authorize")
             self.assertEqual(nodes.robot.clients["/robo/system/call/set_vision_enabled"].srv_name,
                              "/robo/system/call/set_vision_enabled")
@@ -801,22 +801,47 @@ class U1CardContractTests(unittest.TestCase):
         device.U1Nodes._mic_callback(nodes, message)
         self.assertEqual(publisher.messages, [])
 
-    def test_expression_and_head_call_official_motion_service(self):
+    def test_expression_and_head_call_deployed_sdk_motion_service(self):
         import device
 
         nodes = FakeNodes()
         expression = device.ExpressionPlugin(device.AudioPlugin(nodes))
         result = expression.dispatch("play", {"name": "smile"})
-        self.assertEqual(result["motion_type"], 2)
-        self.assertEqual(result["motion_name"], "笑")
+        self.assertTrue(result["ok"])
         head = device.HeadPlugin(expression.audio)
         result = head.dispatch("play", {"name": "shake"})
-        self.assertEqual(result["motion_type"], 2)
-        self.assertEqual(result["motion_name"], "摇头")
+        self.assertTrue(result["ok"])
         self.assertEqual(nodes.string_calls, [
-            ("play_motion", {"motion_type": 2, "motion_name": "笑"}),
-            ("play_motion", {"motion_type": 2, "motion_name": "摇头"}),
+            ("play_action", {"action": "A007"}),
+            ("play_action", {"action": "A011"}),
         ])
+
+    def test_video_stream_is_shared_by_both_eye_cards(self):
+        import device
+
+        nodes = types.SimpleNamespace(
+            namespace="test",
+            core=types.SimpleNamespace(create_publisher=lambda *args: FakePublisher()),
+            audio_device=types.SimpleNamespace(
+                create_subscription=lambda *args: types.SimpleNamespace(),
+                destroy_subscription=lambda subscription: None,
+            ),
+            Image6m=object,
+            CompressedImage=object,
+            _sensor_qos=object(),
+            open_video_stream=mock.Mock(return_value={"state": "open"}),
+            close_video_stream=mock.Mock(return_value={"state": "closed"}),
+        )
+        left = device.EyeCameraPlugin(nodes, "left")
+        right = device.EyeCameraPlugin(nodes, "right")
+        left._frame_ready.wait = mock.Mock(return_value=True)
+        right._frame_ready.wait = mock.Mock(return_value=True)
+        left.start()
+        right.start()
+        self.assertEqual(nodes.open_video_stream.call_count, 2)
+        left.stop()
+        right.stop()
+        self.assertEqual(nodes.close_video_stream.call_count, 2)
 
     def test_lifecycle_start_does_not_repeat_robot_initialization(self):
         import device
@@ -898,7 +923,7 @@ class U1CardContractTests(unittest.TestCase):
         self.assertEqual(head_schema["properties"]["name"]["enum"],
                          ["look_down", "look_up", "nod", "shake", "tilt"])
         result = head.dispatch("play", {"name": "tilt"})
-        self.assertEqual(result["motion_name"], "歪头")
+        self.assertTrue(result["ok"])
 
     def test_system_switch_cards_use_documented_vendor_services(self):
         import device

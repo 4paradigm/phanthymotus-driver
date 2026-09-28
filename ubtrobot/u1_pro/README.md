@@ -10,7 +10,7 @@ This driver exposes the U1 Pro capabilities used by Agent Core:
 - `system_controls`: controls the three independent vendor switches `wakeup`, `wakeup_followup`, and `visual_behavior` from one card. Disabling `visual_behavior` stops vendor visual decisions, visual following, and visual idle actions; it does not stop explicitly requested expression/head motions.
 
 The U1 SDK does not expose a documented switch for stopping or disabling the vendor's internal Agent process itself. Use `system_controls` to choose whether new wakeups, post-wakeup dialog continuation, and visual decisions/following/idle behavior are enabled; the driver does not change these settings during startup. It can interrupt current vendor playback/action through `tts.interrupt`. It cannot disable vendor ROS services, system processes, safety/control loops, or an already explicitly requested motion; those remain vendor-owned.
-- `head`: plays the named preset head motions `look_down`, `look_up`, `nod`, `shake`, and `tilt` through the official typed motion service. These names are fixed mappings from the supported U1 Pro motion contract; the SDK does not expose arbitrary head angles or low-level neck-joint control.
+- `head`: plays the named preset head motions `look_down`, `look_up`, `nod`, `shake`, and `tilt` through the deployed U1 SDK action service. These names are fixed mappings from the supported U1 Pro motion contract; the SDK does not expose arbitrary head angles or low-level neck-joint control.
 - `camera_left` and `camera_right`: the physical left- and right-eye RGB cameras exposed by the U1 perception runtime, published as separate JPEG topics.
 - `doa_event`: an opt-in JSON sound-direction event stream.
 
@@ -27,15 +27,19 @@ deployment concern rather than an Agent Core action. The playback event topic
 remains an internal subscription used to complete `tts` actions; it is not exposed
 as a separate Agent Core card.
 
-The U1 perception runtime publishes sound-direction events on
-`/audio/sense/doa_event` as `audio_msgs/msg/DoaEvent`. The event card forwards
-those events only while it is running; this is an event stream, not continuous audio.
+The U1 adapter publishes sound-direction events on
+`/robo/audio/subscribe/doa_event` as `std_msgs/msg/String` JSON envelopes. The
+event card forwards those events only while it is running; this is a discrete
+event stream, not continuous audio. It emits only when the vendor sound-source
+detector reports an event, so an idle card is expected to have no output.
 
 The camera cards subscribe to the verified U1 perception runtime DDS topics
 `/sensor/camera/left_eye/color/raw` and `/sensor/camera/right_eye/color/raw`,
-converting each vendor `Image6m` frame to a JPEG output. The SDK
-`open_stream` shared-memory service is a separate single-stream interface and is
-not used for selecting the physical eyes.
+converting each vendor `Image6m` frame to a JPEG output. Starting either camera
+card opens the SDK's shared video stream; the stream is reference-counted while
+the two physical-eye subscriptions are active and is closed after both cards
+stop. The stream itself does not select an eye; the DDS topics select the
+physical left and right cameras.
 
 Microphone input enables the Adapter's `/sys/device/audio_in/enable` service,
 then subscribes to its `/sys/device/audio_in/raw` topic on domain `2` and

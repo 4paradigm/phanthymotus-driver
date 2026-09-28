@@ -29,7 +29,10 @@ MIC_SAMPLE_FORMATS = {"s16", "s16le", "s16_le", "signed_16", "pcm_s16le", "int16
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
 
 EVENT_TOPICS = {
-    "doa_event": "/audio/sense/doa_event",
+    # The U1 adapter bridges sound-direction events on the SDK String topic.
+    # The domain-2 audio_msgs topic is a separate vendor endpoint and is not
+    # available through the driver's domain-20 participant.
+    "doa_event": "/robo/audio/subscribe/doa_event",
     "playback_state": PLAYBACK_TOPIC,
 }
 
@@ -222,7 +225,6 @@ class U1Nodes:
         from audio_msgs.srv import EnableAudioIn, EnableAudioOut, SetAudioVolume
         from std_msgs.msg import UInt8
         from robo_sdk.srv import StringCall
-        from uworld_action_msgs.srv import PlayMotion
         from std_srvs.srv import Trigger
         from sensor_msgs.msg import CompressedImage
         try:
@@ -260,7 +262,6 @@ class U1Nodes:
         self.String = String
         self.CompressedImage = CompressedImage
         self.Image6m = Image6m
-        self.PlayMotion = PlayMotion
         self._speaker_publisher = self.audio_device.create_publisher(AudioOutData, SPEAKER_TOPIC, 10)
         self._volume = None
         self._volume_subscription = self.audio_device.create_subscription(
@@ -269,6 +270,8 @@ class U1Nodes:
         self._speaker_forwarding = False
         self._speaker_uuid = ""
         self._speaker_frames = 0
+        self._video_users = 0
+        self._video_lock = threading.Lock()
 
         reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -292,8 +295,12 @@ class U1Nodes:
             "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
             "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
             "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
-            "play_motion": self.robot.create_client(PlayMotion, "/action/controller/pay_motion"),
-            "play_action": self.robot.create_client(StringCall, "/action/controller/pay_motion"),
+            "video_open": self.robot.create_client(Trigger, "/robo/video/call/open_stream"),
+            "video_close": self.robot.create_client(Trigger, "/robo/video/call/close_stream"),
+            # This is the SDK action endpoint used by the deployed U1
+            # adapter. The similarly named typed controller service is not
+            # usable on the target firmware.
+            "play_action": self.robot.create_client(StringCall, "/robo/audio/call/play_action"),
             "play_text": self.robot.create_client(StringCall, "/robo/audio/call/play_text"),
             "interrupt": self.robot.create_client(Trigger, "/robo/audio/call/interrupt_action_audio"),
             "authorize": self.robot.create_client(StringCall, "/robo/auth/call/authorize"),
@@ -456,26 +463,11 @@ class U1Nodes:
         return _decode_vendor_result(self.call(name, request))
 
     def play_motion(self, motion_type: int, motion_name: str, legacy_action: str | None = None) -> dict:
-        """Play a named vendor motion through the official typed service."""
-        request = self.PlayMotion.Request()
-        request.motion_type = int(motion_type)
-        request.motion_name = str(motion_name)
-        try:
-            response = self.call("play_motion", request)
-        except (RuntimeError, TimeoutError):
-            if not legacy_action:
-                raise
-            return self.string_call("play_action", {"action": str(legacy_action)})
-        code = int(getattr(response, "code", -1))
-        message = str(getattr(response, "message", "") or "")
-        if code != 0:
-            raise RuntimeError(message or f"U1 Pro motion service failed with code {code}")
-        return {
-            "code": code,
-            "message": message,
-            "motion_type": request.motion_type,
-            "motion_name": request.motion_name,
-        }
+        """Play a declared motion through the deployed SDK StringCall API."""
+        del motion_type, motion_name
+        if not legacy_action:
+            raise ValueError("U1 Pro motion requires a vendor action id")
+        return self.string_call("play_action", {"action": str(legacy_action)})
 
     def trigger_call(self, name: str) -> dict:
         from std_srvs.srv import Trigger
@@ -489,6 +481,32 @@ class U1Nodes:
         if isinstance(response, dict):
             return response
         return {"success": bool(getattr(response, "success", False)), "message": message}
+
+    def open_video_stream(self) -> dict:
+        """Open the vendor video stream shared by the two physical eye topics."""
+        with self._video_lock:
+            if self._video_users:
+                self._video_users += 1
+                return {"state": "open", "users": self._video_users}
+            result = self.trigger_call("video_open")
+            if result.get("ok") is False:
+                raise RuntimeError(f"U1 Pro video stream open failed: {result.get('message', 'unknown error')}")
+            self._video_users = 1
+            return {"state": "open", "users": self._video_users, "vendor": result}
+
+    def close_video_stream(self) -> dict:
+        with self._video_lock:
+            if not self._video_users:
+                return {"state": "closed", "users": 0}
+            self._video_users -= 1
+            if self._video_users:
+                return {"state": "open", "users": self._video_users}
+            try:
+                result = self.trigger_call("video_close")
+            except Exception:
+                self._video_users = 0
+                raise
+            return {"state": "closed", "users": 0, "vendor": result}
 
     def set_system_enabled(self, name: str, enabled: bool) -> dict:
         requested = bool(enabled)
@@ -586,6 +604,12 @@ class U1Nodes:
         self._mic_forwarding = False
         self._event_forwarding.clear()
         self.close_speaker_subscription()
+        if self._video_users:
+            try:
+                self.trigger_call("video_close")
+            except Exception:
+                pass
+            self._video_users = 0
         self._audio_executor.remove_node(self.audio_device)
         self._audio_executor.shutdown()
         self.audio_device.destroy_node()
@@ -896,6 +920,7 @@ class EyeCameraPlugin:
             return self._state()
         self._frame_ready.clear()
         try:
+            self.nodes.open_video_stream()
             if self._publisher is None:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
             # The U1 Adapter publishes physical camera streams on its device
@@ -913,6 +938,10 @@ class EyeCameraPlugin:
             if self._subscription:
                 self.nodes.audio_device.destroy_subscription(self._subscription)
                 self._subscription = None
+            try:
+                self.nodes.close_video_stream()
+            except Exception:
+                pass
             self.running = False
             self._frame_ready.set()
         return self._state()
@@ -921,6 +950,10 @@ class EyeCameraPlugin:
         if self._subscription:
             self.nodes.audio_device.destroy_subscription(self._subscription)
             self._subscription = None
+        try:
+            self.nodes.close_video_stream()
+        except Exception:
+            pass
         self.running = False
         return self._state()
 
