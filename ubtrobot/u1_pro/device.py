@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import mmap
 import os
+import queue
 import re
 import ssl
 import struct
@@ -1279,6 +1280,9 @@ class EyeCameraPlugin:
         self._reader = None
         self._subscription = None
         self._video_open = False
+        self._frame_queue = queue.Queue(maxsize=1)
+        self._frame_worker = None
+        self._frame_worker_stop = threading.Event()
 
     def get_tool(self):
         return tool(
@@ -1292,6 +1296,10 @@ class EyeCameraPlugin:
         if self.running:
             return self._state()
         self._frame_ready.clear()
+        self._frame_worker_stop.clear()
+        self._frame_worker = threading.Thread(target=self._process_frames, daemon=True,
+                                              name=f"u1-camera-{self.eye}")
+        self._frame_worker.start()
         try:
             if self._publisher is None:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
@@ -1353,6 +1361,7 @@ class EyeCameraPlugin:
             if self._reader:
                 self._reader.stop()
                 self._reader = None
+            self._stop_frame_worker()
             if self._subscription:
                 self.nodes.audio_device.destroy_subscription(self._subscription)
                 self._subscription = None
@@ -1369,6 +1378,7 @@ class EyeCameraPlugin:
         if self._reader:
             self._reader.stop()
             self._reader = None
+        self._stop_frame_worker()
         if self._subscription:
             self.nodes.audio_device.destroy_subscription(self._subscription)
             self._subscription = None
@@ -1392,7 +1402,43 @@ class EyeCameraPlugin:
         has_right = "right" in labels
         if has_left == has_right or (self.eye == "left") != has_left:
             return
-        self._publish_frame(payload, metadata, timestamp_ns)
+        self._enqueue_frame(payload, metadata, timestamp_ns)
+
+    def _enqueue_frame(self, payload: bytes, metadata: dict, timestamp_ns: int):
+        """Keep only the newest frame so conversion never creates latency."""
+        item = (payload, dict(metadata), timestamp_ns)
+        try:
+            self._frame_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frame_queue.put_nowait(item)
+            except queue.Full:
+                pass
+
+    def _process_frames(self):
+        while not self._frame_worker_stop.is_set():
+            try:
+                payload, metadata, timestamp_ns = self._frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            self._publish_frame(payload, metadata, timestamp_ns)
+
+    def _stop_frame_worker(self):
+        worker = self._frame_worker
+        if worker is None:
+            return
+        self._frame_worker_stop.set()
+        worker.join(timeout=1.0)
+        self._frame_worker = None
+        while True:
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _publish_frame(self, payload: bytes, metadata: dict, timestamp_ns: int):
         try:
@@ -1429,7 +1475,12 @@ class EyeCameraPlugin:
         stamp = getattr(header, "stamp", None)
         timestamp = int(getattr(stamp, "sec", 0)) * 1_000_000_000
         timestamp += int(getattr(stamp, "nanosec", 0))
-        self._publish_frame(payload, metadata, timestamp)
+        if self._frame_worker is None:
+            # Preserve the direct callback contract used by ROS-free tests and
+            # by callers that feed a frame before card start.
+            self._publish_frame(payload, metadata, timestamp)
+        else:
+            self._enqueue_frame(payload, metadata, timestamp)
 
     def wait_for_jpeg(self, after_sequence=None, timeout_s=5.0):
         deadline = time.monotonic() + max(0.0, float(timeout_s))
@@ -1502,12 +1553,13 @@ class ExpressionPlugin:
         "silly_face": ("A034", "鬼脸"),
     }
 
-    def __init__(self, audio: AudioPlugin, motion_catalog: dict[str, dict[str, Any]] | None = None):
+    def __init__(self, audio: AudioPlugin, motion_catalog: dict[str, dict[str, Any]] | None = None,
+                 catalog_available: bool = False):
         self.audio = audio
         self.running = False
-        if motion_catalog:
+        if catalog_available:
             self.EXPRESSIONS = {name: value for name, value in self.EXPRESSIONS.items()
-                                if value[0] in motion_catalog}
+                                if motion_catalog and value[0] in motion_catalog}
 
     def get_tool(self):
         actions = {
@@ -1667,12 +1719,13 @@ class HeadPlugin:
         "tilt": ("A010", "歪头"),
     }
 
-    def __init__(self, audio: AudioPlugin, motion_catalog: dict[str, dict[str, Any]] | None = None):
+    def __init__(self, audio: AudioPlugin, motion_catalog: dict[str, dict[str, Any]] | None = None,
+                 catalog_available: bool = False):
         self.audio = audio
         self.running = False
-        if motion_catalog:
+        if catalog_available:
             self.HEAD_ACTIONS = {name: value for name, value in self.HEAD_ACTIONS.items()
-                                 if value[0] in motion_catalog}
+                                 if motion_catalog and value[0] in motion_catalog}
 
     def get_tool(self):
         actions = {
@@ -1762,15 +1815,17 @@ def build_plugins(config: dict, namespace: str, ros) -> list:
     # Keep cleanup first so DriverBundle.stop_all() runs it last, after every
     # card has disabled its vendor resources and stopped publishing.
     audio = AudioPlugin(nodes)
-    # The firmware catalog is authoritative when available.  A temporary
-    # static fallback preserves startup on older adapters that do not expose
-    # get_motion_info_list; song motions (A1xx) are intentionally not mapped
-    # into either semantic card.
+    # The firmware catalog is authoritative.  If it is unavailable, the
+    # motion cards remain present but expose no actions instead of advertising
+    # firmware-dependent static aliases. Song motions (A1xx) are intentionally
+    # not mapped into either semantic card.
     motion_catalog = nodes.motion_catalog() if hasattr(nodes, "motion_catalog") else {}
+    catalog_available = hasattr(nodes, "motion_catalog")
     camera_left = EyeCameraPlugin(nodes, "left")
     camera_right = EyeCameraPlugin(nodes, "right")
     plugins = [_LifecyclePlugin(nodes), MicPlugin(nodes), SpeakerPlugin(nodes), audio,
-               ExpressionPlugin(audio, motion_catalog), HeadPlugin(audio, motion_catalog),
+               ExpressionPlugin(audio, motion_catalog, catalog_available),
+               HeadPlugin(audio, motion_catalog, catalog_available),
                SystemControlsPlugin(nodes),
                camera_left, camera_right]
     return plugins

@@ -1068,6 +1068,7 @@ class U1CardContractTests(unittest.TestCase):
             ])
             left._on_shared_frame(b"\xff\xd8\xffjpeg", {"frame_id": "left_eye"}, 7)
             right._on_shared_frame(b"\xff\xd8\xffjpeg", {"frame_id": "left_eye"}, 7)
+            self.assertIsNotNone(left.wait_for_jpeg(after_sequence=1, timeout_s=1.0)[0])
             self.assertEqual(left._frames, 2)
             self.assertEqual(right._frames, 1)
             left.stop()
