@@ -8,9 +8,11 @@ management call. The robot's public ROS graph provides useful contracts:
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import re
 import ssl
+import struct
 import threading
 import time
 import urllib.request
@@ -22,11 +24,15 @@ from common.vendor_runtime import action_schema, jsonable, tool
 
 
 SERVICE_TIMEOUT = 10.0
+CAMERA_FRAME_TIMEOUT = 3.0
 MIC_TOPIC = "/sys/device/audio_in/raw"
 SPEAKER_TOPIC = "/sys/device/audio_out/raw"
 AUDIO_FORMAT = "audio/pcm-16k"
-MIC_SAMPLE_FORMATS = {"s16", "s16le", "s16_le", "signed_16", "pcm_s16le", "int16"}
 PLAYBACK_TOPIC = "/robo/media/subscribe/playback_state"
+VIDEO_METADATA_TOPIC = "/robo/video/subscribe/metadata"
+SDK_AUDIO_OPEN = "/robo/audio/call/open_stream"
+SDK_AUDIO_STATE = "/robo/audio/call/stream_state"
+SDK_AUDIO_CLOSE = "/robo/audio/call/close_stream"
 
 EVENT_TOPICS = {
     # The U1 adapter bridges sound-direction events on the SDK String topic.
@@ -105,6 +111,158 @@ def _unwrap_result(value: Any) -> dict:
     return result
 
 
+def _stream_config(*values: Any) -> dict:
+    """Extract the SDK shared-memory stream fields from nested envelopes."""
+    keys = {"stream", "state", "path", "frame_payload_size", "max_frames"}
+    merged = {}
+
+    def visit(value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return
+        if isinstance(value, dict):
+            merged.update({key: value[key] for key in keys if key in value})
+            for child in value.values():
+                visit(child)
+
+    for value in values:
+        visit(value)
+    return merged
+
+
+def _vendor_action_uuid(result: Any) -> str | None:
+    value = _unwrap_result(result)
+    for candidate in (value, result):
+        if isinstance(candidate, dict):
+            data = candidate.get("data")
+            if isinstance(data, dict) and data.get("uuid"):
+                return str(data["uuid"])[:128]
+            if candidate.get("uuid"):
+                return str(candidate["uuid"])[:128]
+    return None
+
+
+def _vendor_request_failed(result: Any) -> bool:
+    """Recognize both Trigger and SDK JSON error envelopes."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok") is False or result.get("success") is False:
+        return True
+    if result.get("accepted") is False:
+        return True
+    code = result.get("code")
+    if code not in (None, 0, "0", "OK"):
+        return True
+    data = result.get("data")
+    if isinstance(data, dict):
+        if data.get("accepted") is False:
+            return True
+        nested_code = data.get("code")
+        if nested_code not in (None, 0, "0", "OK"):
+            return True
+    return False
+
+
+class VideoSharedMemoryReader:
+    """Read one U1 SDK fixed-slot shared-memory stream."""
+
+    _RING_HEADER = struct.Struct("<8Q")
+    _HEADER = struct.Struct("<4Q")
+
+    def __init__(self, config: dict, metadata_getter, frame_callback):
+        self.config = dict(config)
+        self.metadata_getter = metadata_getter
+        self.frame_callback = frame_callback
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._thread = None
+        self._last_sequence = -1
+        self._error = ""
+
+    def start(self):
+        self._stop.clear()
+        self._ready.clear()
+        self._error = ""
+        self._thread = threading.Thread(target=self._run, name="u1-video-reader", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(SERVICE_TIMEOUT):
+            self.stop()
+            raise RuntimeError(self._error or "timed out waiting for U1 shared-memory stream")
+        if self._error:
+            self.stop()
+            raise RuntimeError(self._error)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._thread = None
+
+    def _run(self):
+        path = str(self.config.get("path", ""))
+        payload_size = int(self.config.get("frame_payload_size", 0))
+        max_frames = int(self.config.get("max_frames", 0))
+        if not path or payload_size <= 0 or max_frames <= 0:
+            self._error = "U1 shared-memory stream configuration is incomplete"
+            self._ready.set()
+            return
+        slot_size = self._HEADER.size + payload_size
+        try:
+            deadline = time.monotonic() + SERVICE_TIMEOUT
+            handle = None
+            while not self._stop.is_set() and time.monotonic() < deadline:
+                try:
+                    handle = open(path, "rb")
+                    if os.fstat(handle.fileno()).st_size >= self._RING_HEADER.size:
+                        break
+                    handle.close()
+                    handle = None
+                except FileNotFoundError:
+                    self._stop.wait(0.05)
+            if handle is None:
+                raise FileNotFoundError(path)
+            with handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as shared:
+                data_offset = self._RING_HEADER.size
+                if len(shared) < data_offset + slot_size * max_frames:
+                    raise ValueError("shared-memory ring is smaller than the stream configuration")
+                ring = self._RING_HEADER.unpack_from(shared, 0)
+                if ring[1] != max_frames or ring[2] != payload_size:
+                    raise ValueError("shared-memory ring header does not match stream configuration")
+                self._ready.set()
+                while not self._stop.is_set():
+                    newest = None
+                    write_index, ring_frames, ring_payload = self._RING_HEADER.unpack_from(shared, 0)[:3]
+                    if ring_frames != max_frames or ring_payload != payload_size:
+                        raise ValueError("shared-memory ring header changed unexpectedly")
+                    for index in range(max_frames):
+                        offset = data_offset + index * slot_size
+                        sequence, timestamp_ns, size = self._HEADER.unpack_from(shared, offset)[:3]
+                        if (sequence <= self._last_sequence or sequence >= write_index
+                                or not 0 < size <= payload_size):
+                            continue
+                        if newest is None or sequence > newest[0]:
+                            start = offset + self._HEADER.size
+                            payload = bytes(shared[start:start + size])
+                            after = self._HEADER.unpack_from(shared, offset)[:3]
+                            latest_write_index = self._RING_HEADER.unpack_from(shared, 0)[0]
+                            if after != (sequence, timestamp_ns, size) or sequence >= latest_write_index:
+                                continue
+                            newest = (sequence, timestamp_ns, payload)
+                    if newest is None:
+                        self._stop.wait(0.005)
+                    else:
+                        self._last_sequence = newest[0]
+                        self.frame_callback(newest[2], self.metadata_getter(), newest[1])
+        except FileNotFoundError:
+            self._error = f"U1 shared-memory path is unavailable: {path}"
+            self._ready.set()
+        except Exception as exc:
+            self._error = str(exc)[:256]
+            self._ready.set()
+
+
 def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
     """Convert one SDK raw frame to JPEG using only documented metadata."""
     if payload.startswith(b"\xff\xd8\xff"):
@@ -144,7 +302,7 @@ def _jpeg_from_frame(payload: bytes, metadata: dict) -> bytes:
         rgb = np.stack(((298 * c + 409 * v + 128) >> 8,
                         (298 * c - 100 * u - 208 * v + 128) >> 8,
                         (298 * c + 516 * u + 128) >> 8), axis=-1)
-        image = Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8), "RGB")
+        image = Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8))
         import io
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=85, optimize=False)
@@ -221,8 +379,8 @@ class U1Nodes:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
-        from audio_msgs.msg import AudioChunk, AudioInData, AudioOutData, AudioInfo
-        from audio_msgs.srv import EnableAudioIn, EnableAudioOut, SetAudioVolume
+        from audio_msgs.msg import AudioChunk, AudioOutData
+        from audio_msgs.srv import SetAudioVolume
         from std_msgs.msg import UInt8
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
@@ -253,11 +411,7 @@ class U1Nodes:
         self.namespace = namespace
         self.mic_topic = f"/{namespace}/mic/audio"
         self.AudioChunk = AudioChunk
-        self.AudioInData = AudioInData
-        self.EnableAudioIn = EnableAudioIn
-        self.EnableAudioOut = EnableAudioOut
         self.AudioOutData = AudioOutData
-        self.AudioInfo = AudioInfo
         self.UInt8 = UInt8
         self.String = String
         self.CompressedImage = CompressedImage
@@ -271,7 +425,10 @@ class U1Nodes:
         self._speaker_uuid = ""
         self._speaker_frames = 0
         self._video_users = 0
+        self._video_stream = {}
         self._video_lock = threading.Lock()
+        self._video_metadata = {}
+        self._video_metadata_lock = threading.Lock()
 
         reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -283,20 +440,23 @@ class U1Nodes:
         self._mic_forwarding = False
         self._mic_frames = 0
         self._mic_frame_event = threading.Event()
-        self._mic_subscription = self.audio_device.create_subscription(
-            AudioInData, MIC_TOPIC, self._mic_callback, best_effort)
+        self._mic_reader = None
+        self._mic_stream = {}
+        self._mic_stream_open = False
         self._playback_listeners = []
         self._robot_subscriptions = []
         for name, topic in EVENT_TOPICS.items():
             output_topic = f"/{namespace}/u1_pro/{name}"
             self._event_publishers[name] = self.core.create_publisher(String, output_topic, reliable)
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
+        self._robot_subscriptions.append(self.robot.create_subscription(String, VIDEO_METADATA_TOPIC, self._metadata_callback, reliable))
         self._clients = {
-            "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
-            "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
             "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
             "video_open": self.robot.create_client(Trigger, "/robo/video/call/open_stream"),
             "video_close": self.robot.create_client(Trigger, "/robo/video/call/close_stream"),
+            "audio_open": self.robot.create_client(Trigger, SDK_AUDIO_OPEN),
+            "audio_state": self.robot.create_client(Trigger, SDK_AUDIO_STATE),
+            "audio_close": self.robot.create_client(Trigger, SDK_AUDIO_CLOSE),
             # This is the SDK action endpoint used by the deployed U1
             # adapter. The similarly named typed controller service is not
             # usable on the target firmware.
@@ -318,7 +478,7 @@ class U1Nodes:
             self._audio_executor.spin_once(timeout_sec=0.1)
 
     def initialize_robot(self) -> None:
-        """Authorize the SDK without changing vendor autonomous settings."""
+        """Authorize the SDK and disable autonomous behaviors at startup."""
         try:
             auth_state = self.trigger_call("auth_state")
         except Exception:
@@ -330,6 +490,9 @@ class U1Nodes:
             print("[U1 init] vendor SDK is already authorized", flush=True)
         else:
             U1Nodes._authorize_from_credentials(self)
+        for name in ("wakeup_enabled", "wakeup_followup", "vision_enabled"):
+            self.set_system_enabled(name, False)
+        print("[U1 init] autonomous behavior disabled; use system_controls to enable it", flush=True)
 
 
     def _authorize_from_credentials(self) -> None:
@@ -394,6 +557,15 @@ class U1Nodes:
             self._event_publishers[name].publish(output)
         return callback
 
+    def _metadata_callback(self, message) -> None:
+        value = _json_value(_event_json(message))
+        with self._video_metadata_lock:
+            self._video_metadata = _event_data(value)
+
+    def video_metadata(self) -> dict:
+        with self._video_metadata_lock:
+            return dict(self._video_metadata)
+
     def _volume_callback(self, message) -> None:
         self._volume = int(message.data)
 
@@ -401,20 +573,6 @@ class U1Nodes:
         if self._volume is None:
             raise RuntimeError("U1 Pro speaker volume has not been published yet")
         return {"volume": self._volume}
-
-    def _mic_callback(self, message) -> None:
-        if not self._mic_forwarding or message.sample_rate != 16000 or message.channels != 1:
-            return
-        sample_format = str(getattr(message, "sample_format", "")).strip().lower()
-        if sample_format not in MIC_SAMPLE_FORMATS:
-            return
-        chunk = self.AudioChunk()
-        chunk.header = message.header
-        chunk.format = AUDIO_FORMAT
-        chunk.data = list(message.data.data)
-        self._mic_publisher.publish(chunk)
-        self._mic_frames += 1
-        self._mic_frame_event.set()
 
     def call(self, name: str, request) -> Any:
         client = self._clients[name]
@@ -429,26 +587,77 @@ class U1Nodes:
         return future.result()
 
     def set_mic_enabled(self, enabled: bool) -> dict:
-        self._mic_forwarding = False
-        request = self.EnableAudioIn.Request()
-        request.header = self._audio_header()
-        request.enable = bool(enabled)
-        response = self.call("mic_enable", request)
-        code = int(getattr(response, "code", -1))
-        if code != 0:
-            raise RuntimeError(f"U1 Pro microphone enable service failed with code {code}")
         if not enabled:
-            return {"state": "idle", "source_topic": MIC_TOPIC}
-        self._mic_frames = 0
-        self._mic_frame_event.clear()
+            self.stop_mic_reader()
+            if not self._mic_stream_open:
+                return {"state": "idle"}
+            response = self.trigger_call("audio_close")
+            if _vendor_request_failed(response):
+                raise RuntimeError("U1 Pro audio stream close was rejected")
+            self._mic_stream_open = False
+            return response
+        if self._mic_stream_open and self._mic_reader is not None:
+            self._mic_forwarding = True
+            return {"state": "running", "stream": dict(self._mic_stream),
+                    "source": "U1 SDK audio shared-memory stream"}
+        if self._mic_stream_open:
+            self.set_mic_enabled(False)
+        self._mic_forwarding = False
+        self.stop_mic_reader()
+        opened = self.trigger_call("audio_open")
+        if _vendor_request_failed(opened):
+            raise RuntimeError("U1 Pro audio stream open was rejected")
+        self._mic_stream_open = True
+        try:
+            state = self.trigger_call("audio_state")
+            if _vendor_request_failed(state):
+                raise RuntimeError("U1 Pro audio stream state request was rejected")
+            stream = _stream_config(opened, state)
+            if not all(stream.get(key) for key in ("path", "frame_payload_size", "max_frames")):
+                raise RuntimeError("U1 Pro audio stream state did not provide shared-memory configuration")
+            self._mic_frames = 0
+            self._mic_frame_event.clear()
+            self._mic_stream = stream
+            self._mic_reader = VideoSharedMemoryReader(stream, lambda: {}, self._publish_mic_frame)
+            self._mic_reader.start()
+        except Exception as exc:
+            self.stop_mic_reader()
+            try:
+                self.set_mic_enabled(False)
+            except Exception as close_exc:
+                raise RuntimeError(f"{exc}; microphone stream close failed: {close_exc}") from exc
+            raise
         self._mic_forwarding = True
-        return {"state": "running", "source_topic": MIC_TOPIC}
+        return {"state": state, "stream": stream,
+                "source": "U1 SDK audio shared-memory stream"}
+
+    def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
+        if not self._mic_forwarding:
+            return
+        chunk = self.AudioChunk()
+        chunk.format = AUDIO_FORMAT
+        chunk.data = list(payload)
+        chunk.header = self._audio_header()
+        chunk.header.stamp.sec = timestamp_ns // 1_000_000_000
+        chunk.header.stamp.nanosec = timestamp_ns % 1_000_000_000
+        self._mic_publisher.publish(chunk)
+        self._mic_frames += 1
+        self._mic_frame_event.set()
 
     def wait_for_mic_frame(self, timeout: float) -> bool:
-        return self._mic_frame_event.wait(timeout)
+        if self._mic_frame_event.wait(timeout):
+            return True
+        reader_error = getattr(self._mic_reader, "_error", "") if self._mic_reader else ""
+        if reader_error:
+            raise RuntimeError(reader_error)
+        return False
 
     def stop_mic_reader(self) -> None:
         self._mic_forwarding = False
+        if self._mic_reader:
+            self._mic_reader.stop()
+            self._mic_reader = None
+        self._mic_stream = {}
 
     def set_event_enabled(self, name: str, enabled: bool) -> None:
         self._event_forwarding[name] = enabled
@@ -475,26 +684,45 @@ class U1Nodes:
         message = getattr(response, "message", "")
         if isinstance(message, str) and message:
             try:
-                return json.loads(message)
+                value = json.loads(message)
+                if getattr(response, "success", True) is False and isinstance(value, dict):
+                    value.setdefault("success", False)
+                return value
             except json.JSONDecodeError:
                 pass
         if isinstance(response, dict):
             return response
         return {"success": bool(getattr(response, "success", False)), "message": message}
 
-    def open_video_stream(self) -> dict:
-        """Open the vendor video stream shared by the two physical eye topics."""
+    def open_video(self) -> dict:
         with self._video_lock:
             if self._video_users:
                 self._video_users += 1
-                return {"state": "open", "users": self._video_users}
-            result = self.trigger_call("video_open")
-            if result.get("ok") is False:
-                raise RuntimeError(f"U1 Pro video stream open failed: {result.get('message', 'unknown error')}")
+                return {"state": {"state": "OPEN"}, "stream": dict(self._video_stream),
+                        "users": self._video_users}
+            opened = self.trigger_call("video_open")
+            if _vendor_request_failed(opened):
+                raise RuntimeError("U1 Pro video stream open was rejected")
+            try:
+                state = self.trigger_call("video_state")
+                if _vendor_request_failed(state):
+                    raise RuntimeError("U1 Pro video stream state request was rejected")
+                stream = _stream_config(opened, state)
+                if not all(stream.get(key) for key in ("path", "frame_payload_size", "max_frames")):
+                    raise RuntimeError("U1 Pro video stream state did not provide shared-memory configuration")
+                if str(stream.get("state", "OPEN")).upper() == "CLOSED":
+                    raise RuntimeError("U1 Pro video stream remained closed after open_stream")
+            except Exception:
+                try:
+                    self.trigger_call("video_close")
+                except Exception:
+                    pass
+                raise
+            self._video_stream = stream
             self._video_users = 1
-            return {"state": "open", "users": self._video_users, "vendor": result}
+            return {"open": opened, "state": state, "stream": dict(stream), "users": 1}
 
-    def close_video_stream(self) -> dict:
+    def close_video(self) -> dict:
         with self._video_lock:
             if not self._video_users:
                 return {"state": "closed", "users": 0}
@@ -505,16 +733,22 @@ class U1Nodes:
                 result = self.trigger_call("video_close")
             except Exception:
                 self._video_users = 0
+                self._video_stream = {}
                 raise
+            self._video_stream = {}
+            if _vendor_request_failed(result):
+                raise RuntimeError("U1 Pro video stream close was rejected")
             return {"state": "closed", "users": 0, "vendor": result}
 
     def set_system_enabled(self, name: str, enabled: bool) -> dict:
         requested = bool(enabled)
         response = self.string_call(name, {"enabled": requested})
-        if isinstance(response, dict) and response.get("ok") is False:
+        if _vendor_request_failed(response):
             raise RuntimeError(f"U1 Pro {name} request failed: {response.get('code', 'unknown error')}")
         state_name = name.replace("set_", "") + "_state"
         state = self.get_system_enabled(state_name)
+        if _vendor_request_failed(state):
+            raise RuntimeError(f"U1 Pro {name} state readback failed")
         actual = state.get("data", {}).get("enabled") if isinstance(state, dict) else None
         if actual is not requested:
             raise RuntimeError(f"U1 Pro {name} state mismatch: requested {requested}, got {actual!r}")
@@ -539,32 +773,12 @@ class U1Nodes:
         if self._speaker_subscription is not None:
             self.core.destroy_subscription(self._speaker_subscription)
             self._speaker_subscription = None
-            try:
-                request = self.EnableAudioOut.Request()
-                request.header = self._audio_header()
-                request.enable = False
-                request.info = self._audio_info()
-                request.mode = 0
-                request.gain = 0.0
-                self.call("speaker_enable", request)
-            except Exception:
-                pass
 
     def connect_speaker(self, input_topic: str) -> dict:
         self._speaker_forwarding = False
         if self._speaker_subscription is not None:
             self.core.destroy_subscription(self._speaker_subscription)
             self._speaker_subscription = None
-        request = self.EnableAudioOut.Request()
-        request.header = self._audio_header()
-        request.enable = True
-        request.info = self._audio_info()
-        request.mode = 0
-        request.gain = 0.0
-        response = self.call("speaker_enable", request)
-        code = int(getattr(response, "code", -1))
-        if code != 0:
-            raise RuntimeError(f"U1 Pro speaker enable service failed with code {code}")
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
         self._speaker_frames = 0
         self._speaker_subscription = self.core.create_subscription(
@@ -576,14 +790,6 @@ class U1Nodes:
     def _audio_header():
         from std_msgs.msg import Header
         return Header()
-
-    def _audio_info(self):
-        info = self.AudioInfo()
-        info.uuid = self._speaker_uuid or f"u1-{uuid.uuid4().hex}"
-        info.channels = 1
-        info.sample_rate = 16000
-        info.sample_format = "S16LE"
-        return info
 
     def _speaker_callback(self, message) -> None:
         if not self._speaker_forwarding:
@@ -601,7 +807,10 @@ class U1Nodes:
         if self._closed:
             return
         self._closed = True
-        self._mic_forwarding = False
+        try:
+            self.set_mic_enabled(False)
+        except Exception:
+            self.stop_mic_reader()
         self._event_forwarding.clear()
         self.close_speaker_subscription()
         if self._video_users:
@@ -610,6 +819,7 @@ class U1Nodes:
             except Exception:
                 pass
             self._video_users = 0
+            self._video_stream = {}
         self._audio_executor.remove_node(self.audio_device)
         self._audio_executor.shutdown()
         self.audio_device.destroy_node()
@@ -640,7 +850,7 @@ class MicPlugin:
         try:
             self.nodes.set_mic_enabled(True)
             if not self.nodes.wait_for_mic_frame(2.0):
-                raise TimeoutError("no PCM frames received from the U1 microphone topic")
+                raise TimeoutError("no PCM frames received from the U1 audio shared-memory stream")
         except Exception as exc:
             message = f"U1 Pro microphone unavailable: {str(exc)[:256]}"
             try:
@@ -657,14 +867,16 @@ class MicPlugin:
 
     def stop(self):
         if not self._enable_requested:
-            return
-        self._enable_requested = False
+            self.running = False
+            return {"state": "idle"}
         try:
             self.nodes.set_mic_enabled(False)
-        except Exception:
-            pass
-        finally:
+        except Exception as exc:
             self.running = False
+            return {"state": "error", "message": f"microphone disable failed: {str(exc)[:192]}"}
+        self._enable_requested = False
+        self.running = False
+        return {"state": "idle"}
 
     def dispatch(self, action, args):
         if action not in {"start", "stop", "info"}:
@@ -672,8 +884,9 @@ class MicPlugin:
         if action == "start":
             return self.start()
         elif action == "stop":
-            self.stop()
-            return {"state": "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
+            result = self.stop()
+            result["topic_out"] = [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]
+            return result
         return {"state": "running" if self.running else "idle", "topic_out": [{"topic": self.nodes.mic_topic, "format": "audio/pcm-16k"}]}
 
 
@@ -797,9 +1010,7 @@ class AudioPlugin:
         # Some vendor services report rejection in their normal response
         # envelope instead of raising. Do not leave the action barrier active
         # when that happens, because no matching playback event may follow.
-        rejected = isinstance(result, dict) and (
-            result.get("ok") is False or result.get("success") is False)
-        if rejected:
+        if _vendor_request_failed(result):
             with self._lock:
                 if self._active and self._active["action_id"] == action_id:
                     self._active = None
@@ -807,6 +1018,11 @@ class AudioPlugin:
             error = {"state": "error", "message": message[:512], "action_id": action_id}
             _acp_notify(action_id, "error", error, tool_name)
             raise RuntimeError(message)
+        returned_uuid = _vendor_action_uuid(result)
+        if returned_uuid:
+            with self._lock:
+                if self._active and self._active["action_id"] == action_id:
+                    self._active["vendor_uuid"] = returned_uuid
         return {"state": "queued", "action_id": action_id, "request": result}
 
     def _on_playback_state(self, event: dict) -> None:
@@ -883,12 +1099,7 @@ class EventPlugin:
 
 
 class EyeCameraPlugin:
-    """Expose one physical U1 eye camera from its verified ROS image topic.
-
-    The U1 SDK's ``open_stream`` service controls a separate single shared-memory
-    stream and does not select the left or right eye. The physical eye cards use
-    the vendor's ``Image6m`` DDS topics instead.
-    """
+    """Expose the U1 SDK video shared-memory stream as an eye-camera card."""
 
     def __init__(self, nodes: U1Nodes, eye: str):
         self.nodes = nodes
@@ -898,14 +1109,16 @@ class EyeCameraPlugin:
         self.topic = f"/{nodes.namespace}/camera/{eye}"
         self.running = False
         self._publisher = None
-        self._subscription = None
-        self._frame_ready = threading.Event()
         self._metadata = {}
+        self._frame_ready = threading.Event()
         self._frame_condition = threading.Condition()
         self._latest_jpeg = None
         self._frame_sequence = 0
         self._frames = 0
         self._last_error = ""
+        self._reader = None
+        self._subscription = None
+        self._video_open = False
 
     def get_tool(self):
         return tool(
@@ -920,62 +1133,90 @@ class EyeCameraPlugin:
             return self._state()
         self._frame_ready.clear()
         try:
-            self.nodes.open_video_stream()
             if self._publisher is None:
                 self._publisher = self.nodes.core.create_publisher(self.nodes.CompressedImage, self.topic, 1)
-            # The U1 Adapter publishes physical camera streams on its device
-            # domain (2), while vendor control remains on the robot domain.
+            response = self.nodes.open_video()
+            self._video_open = True
+            stream = dict(response.get("stream") or {})
+            if str(stream.get("state", "OPEN")).upper() == "CLOSED":
+                raise RuntimeError("U1 Pro video stream remained closed after open_stream")
+            self._metadata = self.nodes.video_metadata()
+            # The SDK ring is a single stream and has no eye-selection input.
+            # Keep each card bound to its verified physical-eye DDS topic;
+            # use ring frames only if their metadata explicitly identifies
+            # this eye, so a generic stream is never mislabeled as stereo.
             self._subscription = self.nodes.audio_device.create_subscription(
                 self.nodes.Image6m, self.source_topic, self._on_frame, self.nodes._sensor_qos)
-            if not self._frame_ready.wait(3.0):
-                raise TimeoutError(f"no frames received from {self.source_topic}")
-            if self._last_error:
-                raise RuntimeError(self._last_error)
+            self._reader = VideoSharedMemoryReader(
+                stream, self.nodes.video_metadata, self._on_shared_frame)
+            self._reader.start()
+            if not self._frame_ready.wait(CAMERA_FRAME_TIMEOUT):
+                reader_error = getattr(self._reader, "_error", "")
+                raise RuntimeError(reader_error or self._last_error or
+                                   f"no valid JPEG frames received from {self.source_topic} "
+                                   "or an eye-identified U1 video stream")
             self.running = True
             self._last_error = ""
         except Exception as exc:
             self._last_error = str(exc)[:256]
+            if self._reader:
+                self._reader.stop()
+                self._reader = None
             if self._subscription:
                 self.nodes.audio_device.destroy_subscription(self._subscription)
                 self._subscription = None
-            try:
-                self.nodes.close_video_stream()
-            except Exception:
-                pass
+            if self._video_open:
+                try:
+                    self.nodes.close_video()
+                except Exception as close_exc:
+                    self._last_error = f"{self._last_error}; stream close failed: {str(close_exc)[:128]}"[:256]
+                self._video_open = False
             self.running = False
-            self._frame_ready.set()
         return self._state()
 
     def stop(self):
+        if self._reader:
+            self._reader.stop()
+            self._reader = None
         if self._subscription:
             self.nodes.audio_device.destroy_subscription(self._subscription)
             self._subscription = None
-        try:
-            self.nodes.close_video_stream()
-        except Exception:
-            pass
+        if self._video_open:
+            try:
+                self.nodes.close_video()
+            except Exception as exc:
+                self._last_error = str(exc)[:256]
+            else:
+                self._video_open = False
         self.running = False
         return self._state()
 
-    def _on_frame(self, frame):
+    def _on_shared_frame(self, payload: bytes, metadata: dict, timestamp_ns: int):
+        if not isinstance(metadata, dict):
+            return
+        labels = " ".join(str(metadata.get(key, "")) for key in (
+            "eye", "camera", "camera_name", "camera_id", "frame_id", "topic", "stream"))
+        labels = labels.lower()
+        has_left = "left" in labels
+        has_right = "right" in labels
+        if has_left == has_right or (self.eye == "left") != has_left:
+            return
+        self._publish_frame(payload, metadata, timestamp_ns)
+
+    def _publish_frame(self, payload: bytes, metadata: dict, timestamp_ns: int):
         try:
-            metadata = {"width": int(frame.width), "height": int(frame.height),
-                        "step": int(frame.step), "encoding": _message_text(frame.encoding),
-                        "frame_id": _message_text(frame.header.frame_id)}
-            payload = bytes(frame.data[:frame.step * frame.height])
             jpeg = _jpeg_from_frame(payload, metadata)
             message = self.nodes.CompressedImage()
-            # Image6m uses shm_msgs/Header; CompressedImage requires std_msgs/Header.
-            # Copy the fields explicitly so rclpy does not reject the vendor type.
             from std_msgs.msg import Header
             message.header = Header()
-            message.header.stamp.sec = int(getattr(frame.header.stamp, "sec", 0))
-            message.header.stamp.nanosec = int(getattr(frame.header.stamp, "nanosec", 0))
-            message.header.frame_id = metadata["frame_id"]
+            message.header.stamp.sec = int(timestamp_ns // 1_000_000_000)
+            message.header.stamp.nanosec = int(timestamp_ns % 1_000_000_000)
+            message.header.frame_id = str(metadata.get("frame_id", f"{self.eye}_eye"))
             message.format = "jpeg"
             message.data = list(jpeg)
             self._publisher.publish(message)
-            self._metadata = metadata
+            self._metadata = dict(metadata)
+            self._last_error = ""
             with self._frame_condition:
                 self._latest_jpeg = jpeg
                 self._frame_sequence += 1
@@ -984,6 +1225,20 @@ class EyeCameraPlugin:
             self._frame_ready.set()
         except Exception as exc:
             self._last_error = str(exc)[:256]
+            with self._frame_condition:
+                self._frame_condition.notify_all()
+
+    def _on_frame(self, frame):
+        """Compatibility adapter for tests and deployments exposing Image6m."""
+        header = getattr(frame, "header", None)
+        metadata = {"width": int(frame.width), "height": int(frame.height),
+                    "step": int(frame.step), "encoding": _message_text(frame.encoding),
+                    "frame_id": _message_text(getattr(header, "frame_id", ""))}
+        payload = bytes(frame.data[:frame.step * frame.height])
+        stamp = getattr(header, "stamp", None)
+        timestamp = int(getattr(stamp, "sec", 0)) * 1_000_000_000
+        timestamp += int(getattr(stamp, "nanosec", 0))
+        self._publish_frame(payload, metadata, timestamp)
 
     def wait_for_jpeg(self, after_sequence=None, timeout_s=5.0):
         deadline = time.monotonic() + max(0.0, float(timeout_s))
@@ -1058,12 +1313,15 @@ class ExpressionPlugin:
         actions = {
             "start": ([], "Prepare the U1 Pro expression action card."),
             "play": (["name"], "Play an expression using its declared readable name."),
+            "interrupt": ([], "Interrupt the current expression motion."),
             "stop": ([], "Interrupt the current U1 Pro expression or audio motion."),
             "info": ([], "Read the expression card and active playback state."),
         }
         schema = action_schema(actions, {
             "name": {"type": "string", "enum": sorted(self.EXPRESSIONS), "description": "Declared readable expression name, such as smile or blink."},
+            "action_id": {"type": "string", "description": "Optional ACP action correlation ID."},
         })
+        schema["x-completion"] = {"actions": ["play"], "timeout": 120}
         return tool(self.PREFIX, "actuator", "控制 U1 Pro 预设表情和轻量手势，例如微笑和眨眼；头部动作由 head 卡片提供。", schema)
 
     def start(self):
@@ -1081,9 +1339,10 @@ class ExpressionPlugin:
             name = str(args.get("name", "")).strip().lower()
             if name not in self.EXPRESSIONS:
                 raise ValueError("expression.play requires one of the declared expression names")
-            legacy_action, motion_name = self.EXPRESSIONS[name]
-            return self.audio.nodes.play_motion(2, motion_name, legacy_action)
-        if action == "stop":
+            legacy_action, _motion_name = self.EXPRESSIONS[name]
+            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
+            return self.audio._queue("play_action", {"action": legacy_action}, action_id, "expression")
+        if action in ("interrupt", "stop"):
             return self.stop()
         if action == "info":
             with self.audio._lock:
@@ -1216,13 +1475,16 @@ class HeadPlugin:
         actions = {
             "start": ([], "Prepare the U1 Pro head action card."),
             "play": (["name"], "Play a documented preset head motion by readable name."),
+            "interrupt": ([], "Interrupt the current head motion."),
             "stop": ([], "Interrupt the current head motion."),
             "info": ([], "Read head action card state."),
         }
         schema = action_schema(actions, {
             "name": {"type": "string", "enum": sorted(self.HEAD_ACTIONS),
                      "description": "Readable head motion name."},
+            "action_id": {"type": "string", "description": "Optional ACP action correlation ID."},
         })
+        schema["x-completion"] = {"actions": ["play"], "timeout": 120}
         return tool(self.PREFIX, "actuator",
                     "控制 U1 Pro 预设头部动作，不提供原始关节角度控制。",
                     schema)
@@ -1242,9 +1504,10 @@ class HeadPlugin:
             name = str(args.get("name", "")).strip().lower()
             if name not in self.HEAD_ACTIONS:
                 raise ValueError("head.play requires one of the declared head motion names")
-            legacy_action, motion_name = self.HEAD_ACTIONS[name]
-            return self.audio.nodes.play_motion(2, motion_name, legacy_action)
-        if action == "stop":
+            legacy_action, _motion_name = self.HEAD_ACTIONS[name]
+            action_id = str(args.get("action_id") or uuid.uuid4())[:128]
+            return self.audio._queue("play_action", {"action": legacy_action}, action_id, "head")
+        if action in ("interrupt", "stop"):
             return self.stop()
         if action == "info":
             return {"state": "ready" if self.running else "idle"}

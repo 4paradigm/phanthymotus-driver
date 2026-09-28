@@ -3,7 +3,7 @@ ros_namespace: ""
 ros:
   # Vendor control, authorization, TTS, and motion services run on domain 20.
   robot_domain_id: 20
-  # The device audio bridge in the vendor Adapter runtime runs on domain 2.
+  # Device audio and physical-eye camera topics in the vendor Adapter run on domain 2.
   audio_device_domain_id: 2
   core_domain_id: 42
   # The Adapter's vendor graph uses localhost; device streams use domain 2.
