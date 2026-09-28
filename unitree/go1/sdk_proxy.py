@@ -51,6 +51,9 @@ def _execute(client, request, stop_signal, epoch):
 
 def _sdk_worker(cmd_q, result_q, network_iface, target_ip, target_port,
                 local_port, stop_signal, epoch):
+    # spawn starts a fresh interpreter; protect Python logs before SDK import.
+    from common import logsafe
+    logsafe.install(check_fd=False)
     from go1_sdk_client import Go1HighSdkClient
     client = Go1HighSdkClient(network_iface, target_ip, target_port, local_port)
     client._stop_signal = stop_signal

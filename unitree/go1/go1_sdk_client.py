@@ -34,6 +34,7 @@ HIGH_TARGET_PORT = 8082
 HIGH_LOCAL_PORT = 8090
 
 LOOP_HZ = 500.0        # 后台收发频率（高层 2ms 亦可）
+ERROR_LOG_INTERVAL_S = 5.0  # Per-path cap, including failure/recovery flapping.
 
 # ── 控制原语量程（高层 HighCmd 运动；spin 等控制卡用）───────────────────────────
 #   量程取 Go1 高层安全值；控制卡应先自校验拒绝越界，client 再 clamp 作兜底。
@@ -188,6 +189,7 @@ class Go1HighSdkClient:
         self._snapshot_received_at = 0.0
         self._packet_count = 0
         self._last_send_at = 0.0
+        self._error_logs = {}  # Only the SDK loop thread writes these two paths.
         self._stop_signal = threading.Event()
         # 控制目标（move()/stop_move() 写，_loop 读并合成 HighCmd）；None=只发 idle 心跳。
         self._move_cmd = None       # (vx, vy, vyaw, gait) 或 None
@@ -241,14 +243,43 @@ class Go1HighSdkClient:
                 self._last_send_at = time.monotonic()
                 self._set_diag("accessible", True)
                 self._read_udp_state()         # 尽力拉底层 CRC/丢包/标志错误计数
+                self._log_health("loop")
             except Exception as e:
                 self._bump("send_error")
                 self._set_diag("accessible", False)
                 if getattr(self, "_control_owner", None):
                     self._stop_signal.set()
-                print(f"[Go1HighSdk] loop error: {e}", flush=True)
+                self._log_health("loop", e)
             self._bump("total_count")
             time.sleep(period)
+
+    def _log_health(self, path, error=None):
+        """First failure immediately, then at most one line/5s per path.
+
+        Keep the deadline across recovery so a flapping link cannot bypass
+        the limit. Suppressed errors are counted; a pending recovery is
+        reported by a later successful iteration. This never gates counters,
+        the stop latch, command sending or telemetry freshness checks.
+        """
+        state = self._error_logs.get(path)
+        if state is None:
+            if error is None:
+                return
+            state = self._error_logs[path] = {"count": 0, "next_log": 0.0}
+        if error is not None:
+            state["count"] += 1
+        if not state["count"]:
+            return
+        now = time.monotonic()
+        if now < state["next_log"]:
+            return
+        count = state["count"]
+        state["next_log"] = now + ERROR_LOG_INTERVAL_S
+        if error is None:
+            print(f"[Go1HighSdk] {path} recovered after {count} errors", flush=True)
+            state["count"] = 0
+        else:
+            print(f"[Go1HighSdk] {path} error ({count} since recovery): {error}", flush=True)
 
     def _send_cmd(self):
         # Bundled ARM64 SDK: SetSend returns 0; Send returns send(2)'s byte
@@ -344,8 +375,9 @@ class Go1HighSdkClient:
                 # it tied to receipt, not to each subsequent snapshot read.
                 self._snapshot["received_monotonic_s"] = self._snapshot_received_at
                 self._valid_packet_count = getattr(self, "_packet_count", 0)
+            self._log_health("parse_state")
         except Exception as e:
-            print(f"[Go1HighSdk] parse_state error: {e}", flush=True)
+            self._log_health("parse_state", e)
 
     # ── 控制原语（CONTRIBUTING §4：让只读 client 具备下发能力，供 spin 等控制卡用）──
     #   默认不动：无 move 目标时 _compose_cmd 发 idle(mode=0)，loco_state/battery 等状态卡不受影响。
