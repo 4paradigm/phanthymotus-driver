@@ -403,9 +403,7 @@ class U1Nodes:
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
         from audio_msgs.msg import AudioChunk, AudioInData, AudioInfo, AudioOutData
-        from audio_msgs.srv import (EnableAudioIn, EnableAudioOut, GetAudioVolume,
-                                    SetAudioVolume, AudioDeviceInfoList, SetAudioDevice)
-        from driver_msgs.srv import GetManagerState, SetManagerState
+        from audio_msgs.srv import GetAudioVolume, SetAudioVolume
         from std_msgs.msg import UInt8
         from robo_sdk.srv import StringCall
         from std_srvs.srv import Trigger
@@ -447,11 +445,7 @@ class U1Nodes:
         self._volume = None
         self._volume_subscription = self.audio_device.create_subscription(
             UInt8, "/sys/device/audio_out/current_volume", self._volume_callback, 10)
-        self.EnableAudioIn = EnableAudioIn
-        self.EnableAudioOut = EnableAudioOut
         self.GetAudioVolume = GetAudioVolume
-        self.AudioDeviceInfoList = AudioDeviceInfoList
-        self.SetAudioDevice = SetAudioDevice
         self._speaker_subscription = None
         self._speaker_forwarding = False
         self._speaker_uuid = ""
@@ -477,7 +471,6 @@ class U1Nodes:
         self._mic_reader = None
         self._mic_stream = {}
         self._mic_stream_open = False
-        self._mic_device_enabled = False
         self._mic_subscription = self.audio_device.create_subscription(
             AudioInData, MIC_TOPIC, self._mic_topic_callback, self._audio_qos)
         self._mic_asr_subscription = self.audio_device.create_subscription(
@@ -490,16 +483,8 @@ class U1Nodes:
             self._robot_subscriptions.append(self.robot.create_subscription(String, topic, self._event_callback(name), reliable))
         self._robot_subscriptions.append(self.robot.create_subscription(String, VIDEO_METADATA_TOPIC, self._metadata_callback, reliable))
         self._clients = {
-            "mic_enable": self.audio_device.create_client(EnableAudioIn, "/sys/device/audio_in/enable"),
-            "speaker_enable": self.audio_device.create_client(EnableAudioOut, "/sys/device/audio_out/enable"),
             "volume": self.audio_device.create_client(SetAudioVolume, "/sys/device/audio_out/set_volume"),
             "volume_get": self.audio_device.create_client(GetAudioVolume, "/sys/device/audio_out/get_volume"),
-            "audio_in_devices": self.audio_device.create_client(AudioDeviceInfoList, "/sys/device/audio_in/device_list"),
-            "audio_out_devices": self.audio_device.create_client(AudioDeviceInfoList, "/sys/device/audio_out/device_list"),
-            "audio_in_set_device": self.audio_device.create_client(SetAudioDevice, "/sys/device/audio_in/set_device"),
-            "audio_out_set_device": self.audio_device.create_client(SetAudioDevice, "/sys/device/audio_out/set_device"),
-            "camera_manager_get": self.audio_device.create_client(GetManagerState, "/sensor/manager/pegasus_gmsl_camera/get_state"),
-            "camera_manager_set": self.audio_device.create_client(SetManagerState, "/sensor/manager/pegasus_gmsl_camera/set_state"),
             "video_open": self.robot.create_client(Trigger, "/robo/video/call/open_stream"),
             "video_state": self.robot.create_client(Trigger, "/robo/video/call/stream_state"),
             "video_close": self.robot.create_client(Trigger, "/robo/video/call/close_stream"),
@@ -662,12 +647,6 @@ class U1Nodes:
         if not enabled:
             self.stop_mic_reader()
             close_error = None
-            if getattr(self, "_mic_device_enabled", False):
-                try:
-                    self._set_audio_input_enabled(False)
-                except Exception as exc:
-                    close_error = exc
-                self._mic_device_enabled = False
             if self._mic_stream_open:
                 try:
                     response = self.trigger_call("audio_close")
@@ -687,9 +666,6 @@ class U1Nodes:
             self.set_mic_enabled(False)
         self._mic_forwarding = False
         self.stop_mic_reader()
-        self._prepare_audio_device("in")
-        self._set_audio_input_enabled(True)
-        self._mic_device_enabled = True
         opened = self.trigger_call("audio_open")
         if _vendor_request_failed(opened):
             raise RuntimeError("U1 Pro audio stream open was rejected")
@@ -728,54 +704,6 @@ class U1Nodes:
         self._mic_forwarding = True
         return {"state": state, "stream": stream,
                 "source": "U1 SDK audio shared-memory stream"}
-
-    def _set_audio_input_enabled(self, enabled: bool) -> dict:
-        request = self.EnableAudioIn.Request()
-        request.header = self._audio_header()
-        request.enable = bool(enabled)
-        with self._audio_service_lock:
-            response = self.call("mic_enable", request)
-        code = int(getattr(response, "code", 0))
-        if code != 0:
-            raise RuntimeError(f"U1 Pro microphone enable service failed with code {code}")
-        self._mic_device_enabled = bool(enabled)
-        return {"state": "running" if enabled else "idle", "source_topic": MIC_TOPIC}
-
-    def _prepare_audio_device(self, direction: str) -> dict:
-        # Lightweight ROS-free contract tests construct U1Nodes without __init__.
-        # Real nodes always have the generated interface and clients below.
-        if not hasattr(self, "AudioDeviceInfoList"):
-            return {}
-        suffix = "in" if direction == "in" else "out"
-        response = self.call(f"audio_{suffix}_devices", self.AudioDeviceInfoList.Request())
-        devices = list(getattr(response, "devices", []))
-        if not devices:
-            raise RuntimeError(f"U1 Pro audio{suffix} device list is empty")
-        selected = next((item for item in devices if getattr(item, "is_default", False)), devices[0])
-        request = self.SetAudioDevice.Request()
-        request.device_id = int(getattr(selected, "device_id", 0))
-        request.device_name = str(getattr(selected, "device_name", ""))
-        request.sample_rate = int(getattr(selected, "preferred_sample_rate", 16000) or 16000)
-        formats = list(getattr(selected, "supported_sample_formats", []))
-        request.sample_format = "S16LE" if "S16LE" in formats else (str(formats[0]) if formats else "S16LE")
-        result = self.call(f"audio_{suffix}_set_device", request)
-        code = int(getattr(result, "code", 0))
-        if code != 0:
-            raise RuntimeError(f"U1 Pro audio{suffix} device selection failed with code {code}")
-        return {"device_id": request.device_id, "device_name": request.device_name}
-
-    def _enable_camera_manager(self) -> None:
-        if not hasattr(self, "_clients"):
-            return
-        from driver_msgs.srv import GetManagerState, SetManagerState
-        state = self.call("camera_manager_get", GetManagerState.Request())
-        if bool(getattr(state, "enabled", False)):
-            return
-        request = SetManagerState.Request()
-        request.enable = True
-        result = self.call("camera_manager_set", request)
-        if not bool(getattr(result, "success", False)):
-            raise RuntimeError(f"U1 Pro camera manager failed to start: {getattr(result, 'message', '')}")
 
     def _publish_mic_frame(self, payload: bytes, _metadata: dict, timestamp_ns: int) -> None:
         if not self._mic_forwarding:
@@ -878,7 +806,6 @@ class U1Nodes:
                 self._video_users += 1
                 return {"state": {"state": "OPEN"}, "stream": dict(self._video_stream),
                         "users": self._video_users}
-            self._enable_camera_manager()
             opened = self.trigger_call("video_open")
             if _vendor_request_failed(opened):
                 raise RuntimeError("U1 Pro video stream open was rejected")
@@ -976,32 +903,10 @@ class U1Nodes:
             self._speaker_subscription = None
         self._speaker_uuid = f"u1-{uuid.uuid4().hex}"
         self._speaker_frames = 0
-        self._prepare_audio_device("out")
-        request = self.EnableAudioOut.Request()
-        request.header = self._audio_header()
-        request.enable = True
-        request.info = self._audio_info()
-        request.mode = 0
-        request.gain = 0.0
-        with self._audio_service_lock:
-            response = self.call("speaker_enable", request)
-        code = int(getattr(response, "code", 0))
-        if code != 0:
-            raise RuntimeError(f"U1 Pro speaker enable service failed with code {code}")
         self._speaker_subscription = self.core.create_subscription(
             self.AudioChunk, input_topic, self._speaker_callback, self._audio_qos)
         self._speaker_forwarding = True
         return {"state": "running", "input_topic": input_topic, "robot_topic": SPEAKER_TOPIC}
-
-    def _disable_speaker(self) -> None:
-        request = self.EnableAudioOut.Request()
-        request.header = self._audio_header()
-        request.enable = False
-        request.info = self._audio_info()
-        request.mode = 0
-        request.gain = 0.0
-        with self._audio_service_lock:
-            self.call("speaker_enable", request)
 
     def _audio_info(self):
         info = self.AudioInfo()

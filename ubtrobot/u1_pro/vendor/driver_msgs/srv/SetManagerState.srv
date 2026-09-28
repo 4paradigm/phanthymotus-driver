@@ -1,6 +1,0 @@
-bool enable
----
-bool success
-string message
-string[] success_devices
-string[] failed_devices

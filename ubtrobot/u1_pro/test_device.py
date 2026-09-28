@@ -1225,7 +1225,7 @@ class U1CardContractTests(unittest.TestCase):
         nodes.core = types.SimpleNamespace(create_subscription=mock.Mock(return_value="subscription"))
         nodes.AudioChunk = object
         result = nodes.connect_speaker("/tts/audio")
-        nodes.call.assert_called_once_with("speaker_enable", mock.ANY)
+        nodes.call.assert_not_called()
         nodes.core.create_subscription.assert_called_once()
         self.assertEqual(nodes.core.create_subscription.call_args.args[1], "/tts/audio")
         self.assertEqual(result["input_topic"], "/tts/audio")

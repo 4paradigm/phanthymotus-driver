@@ -1,6 +1,0 @@
----
-bool success
-bool enabled
-string message
-string[] running_devices
-string[] stopped_devices
