@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 
 from estop import EStopPlugin
+from battery_status import BatteryStatusReceiver
 try:
     from common import lifecycle as _lifecycle
 except ImportError:  # a checkout rather than the container image, where
@@ -605,7 +606,7 @@ def _best_effort_qos():
     )
 
 
-def _battery_payload(battery, timestamp_ms: int | None = None) -> dict:
+def _battery_payload(battery, timestamp_ms: int | None = None, pac=None) -> dict:
     """Normalize Adam's embedded DDS BMS sample for the battery card.
 
     The BMS is carried inside ``rt/lowstate``.  Keep this conversion separate
@@ -635,6 +636,8 @@ def _battery_payload(battery, timestamp_ms: int | None = None) -> dict:
         "status": str(status) if status not in (None, "") else "unknown",
         "source_topic": "rt/lowstate",
     }
+    if pac is not None:
+        data.update(pac)
     return data
 
 
@@ -676,6 +679,7 @@ class _StatePublisherNode(Node):
         self._pub_robot_state = self.create_publisher(String, self._topic_robot_state, qos)
         self._pub_motor_state = self.create_publisher(String, self._topic_motor_state, qos)
 
+        self._battery_receiver = None
         self._latest_state = None
         self._latest_state_at_ms = None
         self._active = False
@@ -761,25 +765,24 @@ class _StatePublisherNode(Node):
         msg_imu.data = json.dumps(imu_data)
         self._pub_imu.publish(msg_imu)
 
-    def _publish_battery(self):
-        """Publish BMS independently at 1Hz.
-
-        Adam's low-state message contains all three state classes.  A malformed
-        joint or IMU reading must not prevent the dashboard from receiving the
-        BMS stream, and a 50Hz battery stream is unnecessary for this card.
-        """
+    def battery_data(self):
         with self._lock:
             state = self._latest_state
             received_at_ms = self._latest_state_at_ms
+        pac = self._battery_receiver.snapshot() if self._battery_receiver else None
+        data = _battery_payload(getattr(state, "battery_data", None), received_at_ms, pac)
+        data["dds_received_at_ms"] = received_at_ms
+        data["dds_available"] = state is not None
+        return data
+
+    def _publish_battery(self):
+        """Publish battery at 1Hz even when only the PAC source is available."""
+        with self._lock:
             active = self._active
-
-        if not active or state is None:
+        if not active:
             return
-
-        bat_data = _battery_payload(
-            getattr(state, "battery_data", None), received_at_ms)
         msg_bat = String()
-        msg_bat.data = json.dumps(bat_data)
+        msg_bat.data = json.dumps(self.battery_data())
         self._pub_battery.publish(msg_bat)
 
 
@@ -801,6 +804,13 @@ class StatePlugin:
         rate = plugin_config.get("publish_rate_hz", 50)
         self._node = _StatePublisherNode(namespace, variant, rate)
         executor.add_node(self._node)
+        battery_cfg = plugin_config.get("battery_pac", {})
+        self._battery_receiver = BatteryStatusReceiver(
+            battery_cfg.get("url") or kwargs.get("pac_url", "http://localhost:8626"),
+            stale_after_sec=battery_cfg.get("stale_after_sec", 10),
+            reconnect_sec=battery_cfg.get("reconnect_sec", 2),
+        )
+        self._node._battery_receiver = self._battery_receiver
 
         # DDS subscribers (pre-created in main.py before rclpy.init to avoid conflict)
         self._lowstate_sub = dds_lowstate_sub
@@ -858,8 +868,10 @@ class StatePlugin:
             {
                 "name": "battery",
                 "type": "sensor",
-                "description": f"Adam BMS battery — voltage, current, power, accumulated energy and status. The vendor DDS message has no SOC percentage. Publishes at 1Hz to {self._node._topic_battery}",
-                "inputSchema": {"type": "object", "properties": {}},
+                "description": f"Adam battery — DDS electrical data plus PAC state of charge, temperatures, cycles and protection status. Stale PAC values become null. Publishes at 1Hz to {self._node._topic_battery}",
+                "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["get", "info", "start", "stop"]},
+                }},
                 "topic_out": [
                     {"topic": self._node._topic_battery, "format": "data/json"}
                 ],
@@ -867,6 +879,7 @@ class StatePlugin:
         ]
 
     def start(self):
+        self._battery_receiver.start()
         self._running = True
         self._node.set_active(True)
         if self._lowstate_sub:
@@ -883,6 +896,7 @@ class StatePlugin:
                     self._poll_thread.start()
 
     def stop(self):
+        self._battery_receiver.stop()
         self._running = False
         self._node.set_active(False)
         with self._poll_lifecycle_lock:
@@ -901,6 +915,10 @@ class StatePlugin:
         _destroy_ros_node(self._executor, self._node)
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if args.get("_tool_name") == "battery" and action in ("get", "info", "battery"):
+            return {"state": "running" if self._running else "idle",
+                    "data": self._node.battery_data(),
+                    "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
         if action == "start":
             self.start()
             return {"state": "running"}
@@ -4962,6 +4980,8 @@ class AdamDeviceBundle:
                 plugins_cfg.get("state", {}), namespace, executor,
                 variant=variant,
                 dds_lowstate_sub=dds_lowstate_sub,
+                pac_url=plugins_cfg.get("estop", {}).get("pac_url") or
+                    "http://{}:8626".format(os.environ.get("GRPC_HOST", config.get("grpc_host", "localhost"))),
             )
             self._plugins.append(p)
 
