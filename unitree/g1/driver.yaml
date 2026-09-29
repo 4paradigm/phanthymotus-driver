@@ -36,6 +36,7 @@ cards:
   - { name: camera_rgb,             type: sensor }
   - { name: camera_depth,           type: sensor }
   - { name: camera_distance,        type: sensor }
+  - { name: camera_settings,        type: actuator }
   - { name: vision_capture,         type: actuator }
   - { name: lidar_cloud,            type: sensor }
   - { name: controlled_spatial,     type: actuator }

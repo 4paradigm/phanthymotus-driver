@@ -175,6 +175,11 @@ class G1DeviceBundle:
             self._plugins.append(camera_plugin)
             print("[bundle] RealSensePlugin loaded")
 
+        if plugins_cfg.get("camera_settings", {}).get("enabled", False) and camera_plugin is not None:
+            from camera_settings import CameraSettingsPlugin
+            self._plugins.append(CameraSettingsPlugin(camera_plugin))
+            print("[bundle] CameraSettingsPlugin loaded")
+
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
             from device import VisionCapturePlugin
             self._plugins.append(VisionCapturePlugin(
