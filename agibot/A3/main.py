@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """AgiBot A3 (AimDK v3.2) MCP Driver 入口。"""
 
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record (README_dev new-driver logging
+# contract). Must run before anything prints — _select_profile() below emits
+# startup diagnostics long before run_driver() installs it.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError:  # running outside the container image (dev checkout)
+    import sys as _sys
+    _sys.stderr.write("[bundle] logsafe unavailable; stdout unprotected\n")
+
 import os
 import socket
 
@@ -12,13 +23,21 @@ def _robot_subnet_ip() -> str:
     the third-party compute unit running this driver is also on 10.42.10.x.
     UDP-connect trick: no packet leaves the machine, the OS just picks the
     route's source address for that destination.
+
+    The selected source is validated: on a host with no specific route to the
+    robot subnet, connect() picks the *default-route* address (e.g. an office
+    LAN 192.168.x.x), and whitelisting that would silently expose domain 42 on
+    the office LAN while domain 232 still cannot reach the A3 units — worse
+    than setting no profile at all. Return "" unless the answer is a genuine
+    10.42.10.x address.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("10.42.10.10", 1))
-            return sock.getsockname()[0]
+            ip = sock.getsockname()[0]
     except OSError:
         return ""
+    return ip if ip.startswith("10.42.10.") else ""
 
 
 def _select_profile() -> None:

@@ -82,6 +82,10 @@ MC_ACTIONS = {
     "passive": ("MotionControlAction_PASSIVE", "PASSIVE"),
 }
 
+# motion_play duration ceiling — must stay consistent with the 600 s x-completion
+# timeout declared in MotionPlayPlugin.get_tool.
+MOTION_PLAY_MAX_DURATION_MS = 600_000
+
 # 14 fixed arm joints (docs §7.1.4) — order matters, matches arm_joint_state.name.
 ARM_JOINTS = {
     side: [f"{side}_{part}_joint" for part in (
@@ -1555,7 +1559,9 @@ class MotionPlayPlugin:
             "motion_id": {"type": "string",
                           "description": "动作文件绝对路径（list → motion 取 path 字段；"
                                          "SendMotionCommand 要求绝对路径）"},
-            "duration_ms": {"type": "integer", "description": "播放时长 ms（可选，缺省为播放到结束）"},
+            "duration_ms": {"type": "integer",
+                            "description": f"播放时长 ms（可选，缺省为播放到结束；"
+                                           f"0 ≤ duration_ms ≤ {MOTION_PLAY_MAX_DURATION_MS}）"},
         })
         # A3 exposes no motion-status topic/RPC — completion is duration-based:
         # a daemon worker sleeps duration_ms then POSTs /api/acp/complete.
@@ -1576,7 +1582,8 @@ class MotionPlayPlugin:
         pass
 
     def _play_worker(self, action_id, motion_path, duration_ms):
-        time.sleep(max(duration_ms, 0) / 1000.0)
+        # duration_ms already validated non-negative at dispatch.
+        time.sleep(duration_ms / 1000.0)
         _acp_notify(action_id, "completed",
                     {"motion_id": motion_path, "duration_ms": duration_ms},
                     "motion_play")
@@ -1596,6 +1603,13 @@ class MotionPlayPlugin:
             motion_path = str(args.get("motion_id", ""))
             _require(motion_path, "motion_id 不能为空")
             duration_ms = int(args.get("duration_ms", 10000))
+            # Bounds must match the declared x-completion timeout (600 s): a
+            # negative value would report completion instantly while the RPC
+            # still runs, and an over-timeout value would have Agent Core give
+            # up while the robot is still moving.
+            _require(0 <= duration_ms <= MOTION_PLAY_MAX_DURATION_MS,
+                     f"duration_ms={duration_ms} 超出范围 [0, {MOTION_PLAY_MAX_DURATION_MS}]"
+                     f"（与 x-completion 超时 600 s 一致）")
             response = jsonable(self.nodes.rpc.send_motion_command(
                 motion_path, duration_ms, cmd_end=True, cmd_pause=False))
             action_id = f"motion_play_{uuid4().hex[:8]}"
@@ -1920,15 +1934,25 @@ class SkillPlayPlugin:
     ACTIONS = {
         "list": ([], "列出可用 skill 技能包资源（GetResourceList skill 类）"),
         "list_offring_work": ([], "列出可用演出作品资源（GetResourceList offring_work 类）"),
-        "play": (["path"], "播放技能包（返回 session_id）"),
+        "play": (["path"], "播放技能包（异步：返回 action_id，完成后回报 ACP）"),
         "pause": (["session_id"], "暂停技能播放"),
         "stop_play": (["session_id"], "停止技能播放"),
         "state": ([], "查询技能状态流最新快照（核数/电池/自主充电状态）"),
     }
 
+    # 技能（舞蹈）时长上界 —— x-completion 超时与之对齐（g1 导航 180 s 的同款思路）。
+    PLAY_TIMEOUT_S = 600
+    _POLL_INTERVAL_S = 1.0
+
+    # /skill/pilot/skill_status 流快照里可视为“技能已结束”的字段（防御式：流是
+    # SkillPilotStatus protobuf，在线文档无法核对字段名，命中任一即终态）。
+    _TERMINAL_STATES = {"idle", "finished", "complete", "completed", "stop",
+                        "stopped", "stop_play", "error", "failed", "failure"}
+
     def __init__(self, nodes):
         self.nodes = nodes
         self.has_stream = "skill_status" in nodes.streams
+        self._play_action_id = None
 
     def get_tool(self):
         topic_out = None
@@ -1942,8 +1966,12 @@ class SkillPlayPlugin:
         # 技能包/舞蹈驱动全身 —— 与 motion_play 同款全通道声明。
         schema["x-resource"] = ["base", "arm_l", "arm_r", "hand_l", "hand_r",
                                 "waist", "head"]
+        # play 为长时间动作（舞蹈动辄数十秒）：声明 ACP 完成契约，由后台线程
+        # 轮询 skill_status 流快照判定终态后回报（g1/tianyi 导航同款）。
+        schema["x-completion"] = {"actions": ["play"], "timeout": self.PLAY_TIMEOUT_S}
         return tool("skill_play", "actuator", "技能包/舞蹈播放控制 + 技能资源列表（SkillPackage + GetResourceList RPC；"
                                              "播放需 ~2m 安全净空，Start 返回 session_id 供暂停/停止使用；"
+                                             "播放为异步：轮询 skill_status 流回报 ACP 完成事件；"
                                              "state 查询技能状态流）",
                     schema, topic_out=topic_out)
 
@@ -1952,6 +1980,51 @@ class SkillPlayPlugin:
 
     def stop(self):
         pass
+
+    def _snapshot_terminal(self):
+        """Probe the skill_status stream snapshot for a terminal state, defensively.
+
+        The SkillPilotStatus protobuf's field names could not be verified against
+        the online dev guide, so this accepts several shapes: a top-level or
+        nested `state`/`status`/`skill_state`/`session_state` string whose value
+        (name or enum-ish int ≥ 3) marks the skill no longer playing. Anything
+        unrecognized counts as still-playing — the timeout is the backstop.
+        """
+        snapshot = self.nodes.snapshot("skill_status")
+        if not snapshot:
+            return None
+        for key in ("state", "status", "skill_state", "session_state"):
+            value = snapshot.get(key) if isinstance(snapshot, dict) else None
+            if isinstance(value, str) and value.strip().lower() in self._TERMINAL_STATES:
+                return value
+            # Common protobuf enum pattern: 0=IDLE 1=RUNNING 2=PAUSED 3+=done/fail.
+            if isinstance(value, int) and value >= 3:
+                return value
+            nested = snapshot.get("data") if isinstance(snapshot, dict) else None
+            if isinstance(nested, dict):
+                inner = nested.get(key)
+                if isinstance(inner, str) and inner.strip().lower() in self._TERMINAL_STATES:
+                    return inner
+        return None
+
+    def _play_worker(self, action_id, session_id, path):
+        # Superseded guard: a newer play took over the stream — never fire a
+        # stale completion (g1 _acp_wait_nav pattern).
+        if self._play_action_id != action_id:
+            return
+        deadline = time.time() + self.PLAY_TIMEOUT_S
+        result = {"path": path, "session_id": session_id}
+        while time.time() < deadline:
+            time.sleep(self._POLL_INTERVAL_S)
+            if self._play_action_id != action_id:
+                return
+            terminal = self._snapshot_terminal()
+            if terminal is not None:
+                result["final_state"] = terminal
+                _acp_notify(action_id, "completed", result, "skill_play")
+                return
+        result["error"] = f"skill play not finished within {self.PLAY_TIMEOUT_S}s"
+        _acp_notify(action_id, "error", result, "skill_play")
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1969,10 +2042,19 @@ class SkillPlayPlugin:
         if action == "play":
             path = args.get("path", "")
             _require(path, "path 不能为空")
-            return jsonable(self.nodes.rpc.skill_package("Start", path))
+            response = jsonable(self.nodes.rpc.skill_package("Start", path))
+            session_id = (response.get("data") or {}).get("session_id", "")
+            action_id = f"skill_play_{uuid4().hex[:8]}"
+            self._play_action_id = action_id
+            threading.Thread(target=self._play_worker,
+                             args=(action_id, session_id, path), daemon=True).start()
+            return {"state": "playing", "action_id": action_id,
+                    "session_id": session_id, "path": path, "response": response}
         if action == "pause":
             return jsonable(self.nodes.rpc.skill_package("Pause", "", args.get("session_id", "")))
         if action == "stop_play":
+            # Stopping the session also settles any pending ACP waiter.
+            self._play_action_id = None
             return jsonable(self.nodes.rpc.skill_package("Stop", "", args.get("session_id", "")))
         if action == "state":
             snapshot = self.nodes.snapshot("skill_status")
@@ -1996,6 +2078,22 @@ class ControlledSpatialPlugin:
     重定位，导航与重定位需工作在相同 map_id 上；到点精度最大约 0.4 米。
     """
 
+    # 导航为长时间动作：声明 ACP 完成契约（tianyi2.0/g1 的 controlled_spatial
+    # 同款 180 s 超时），由后台线程轮询 PncService/ActionGetState 判定到点。
+    NAV_ACTIONS = ("navi_to_goal", "navi_to_pose", "linear_to_goal",
+                   "linear_to_pose", "move_forward", "spin_turn")
+    NAV_TIMEOUT_S = 180
+    _NAV_POLL_INTERVAL_S = 1.0
+
+    # ActionGetState 响应中可判定“任务已终态”的取值（防御式：响应字段名在线
+    # 文档无法核对，state/status 里出现这些字符串即视为结束）。
+    _NAV_TERMINAL_STATES = {"finished", "finish", "complete", "completed", "done",
+                            "succeed", "succeeded", "success", "arrived", "stop",
+                            "stopped", "cancelled", "canceled", "error", "failed",
+                            "failure"}
+    _NAV_ERROR_STATES = {"stop", "stopped", "cancelled", "canceled", "error",
+                         "failed", "failure"}
+
     ACTIONS = {
         # -- 建图 / 地图管理 --
         "start_mapping": ([], "开始建图（机器人行走采集环境）"),
@@ -2008,12 +2106,12 @@ class ControlledSpatialPlugin:
         "start_relocalization": (["map_dir"], "在指定地图目录上启动普通重定位（导航前置条件）"),
         "stop_relocalization": ([], "停止重定位（可选带 reloc_pose 位姿辅助收敛）"),
         # -- 导航 --
-        "navi_to_goal": (["map_id", "target_id"], "按目标点 ID 规划导航（PlanningNaviToGoal）"),
-        "navi_to_pose": (["map_id", "x", "y", "angle"], "按位姿规划导航（PlanningNaviToPose2D）"),
-        "linear_to_goal": (["map_id", "target_id"], "直线导航到目标点（LinearNaviToGoal，先转后走）"),
-        "linear_to_pose": (["map_id", "x", "y", "angle"], "直线导航到位姿（LinearNaviToPose2D）"),
-        "move_forward": (["map_id", "distance"], "直线平移指定距离（MoveForward，朝向不变）"),
-        "spin_turn": (["map_id", "angle"], "原地旋转指定角度（SpinTurn，rad）"),
+        "navi_to_goal": (["map_id", "target_id"], "按目标点 ID 规划导航（PlanningNaviToGoal；异步：返回 action_id，到点后回报 ACP）"),
+        "navi_to_pose": (["map_id", "x", "y", "angle"], "按位姿规划导航（PlanningNaviToPose2D；异步：到点后回报 ACP）"),
+        "linear_to_goal": (["map_id", "target_id"], "直线导航到目标点（LinearNaviToGoal，先转后走；异步回报 ACP）"),
+        "linear_to_pose": (["map_id", "x", "y", "angle"], "直线导航到位姿（LinearNaviToPose2D；异步回报 ACP）"),
+        "move_forward": (["map_id", "distance"], "直线平移指定距离（MoveForward，朝向不变；异步回报 ACP）"),
+        "spin_turn": (["map_id", "angle"], "原地旋转指定角度（SpinTurn，rad；异步回报 ACP）"),
         "cancel": (["task_id"], "取消导航任务"),
         "pause": (["task_id"], "暂停导航任务"),
         "resume": (["task_id"], "恢复暂停的任务"),
@@ -2025,6 +2123,7 @@ class ControlledSpatialPlugin:
     def __init__(self, nodes):
         self.nodes = nodes
         self.last_task_id = None
+        self._nav_action_id = None
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
@@ -2041,10 +2140,18 @@ class ControlledSpatialPlugin:
         })
         # 建图/导航/重定位期间底盘由 ADU 独占 —— 与 base_drive/auto_charging 同通道。
         schema["x-resource"] = "base"
+        # 导航动作为长时间动作：声明 ACP 完成契约（tianyi2.0/g1 同款 180 s），
+        # 由后台线程轮询 PncService/ActionGetState 判定到点后回报。
+        schema["x-completion"] = {"actions": list(self.NAV_ACTIONS),
+                                  "timeout": self.NAV_TIMEOUT_S}
+        # 建图（start_mapping）刻意不声明 x-completion：它是操作员驱动的开放
+        # 过程（走多久由人决定，stop_save/stop_discard 才是终点），与 tianyi/g1
+        # 只为 navigate 动作声明契约的处理一致。
         return tool("controlled_spatial", "actuator",
                     "建图/导航/重定位一体化控制（ADU MappingService/PncService/SLAMRelocalizationService RPC；"
                     "config 门控模块，默认关闭；导航前置：mc_mode get_up + start_relocalization 且 map_id 一致；"
-                    "task_id 传 0 自动分配，控制/查询动作可缺省复用最近任务 id）",
+                    "task_id 传 0 自动分配，控制/查询动作可缺省复用最近任务 id；"
+                    "导航为异步：返回 action_id，轮询 ActionGetState 到点后回报 ACP 完成事件）",
                     schema)
 
     def start(self):
@@ -2066,6 +2173,70 @@ class ControlledSpatialPlugin:
         if task_id:
             self.last_task_id = task_id
         return jsonable(response)
+
+    def _nav_state_terminal(self, response):
+        """Probe an ActionGetState response for a terminal task state, defensively.
+
+        The exact response field names could not be verified against the online
+        dev guide, so this accepts a `state`/`status`/`task_state` string (or
+        enum-ish int ≥ 3) either top-level or nested under `data`. Unrecognized
+        shapes count as still-navigating — the NAV_TIMEOUT_S is the backstop.
+        Returns the raw value, or "error"/None marker handled by the caller via
+        _NAV_ERROR_STATES.
+        """
+        if not isinstance(response, dict):
+            return None
+        for scope in (response, response.get("data") if isinstance(response.get("data"), dict) else {}):
+            for key in ("state", "status", "task_state"):
+                value = scope.get(key)
+                if isinstance(value, str) and value.strip().lower() in self._NAV_TERMINAL_STATES:
+                    return value
+                # Common protobuf enum pattern: 0=IDLE 1=RUNNING 2=PAUSED 3+=done/fail.
+                if isinstance(value, int) and value >= 3:
+                    return value
+        return None
+
+    def _nav_worker(self, action_id, task_id, action):
+        # Superseded guard: a newer nav action or a cancel took over — never
+        # fire a stale completion (g1 _acp_wait_nav pattern).
+        if self._nav_action_id != action_id:
+            return
+        deadline = time.time() + self.NAV_TIMEOUT_S
+        result = {"action": action, "task_id": task_id}
+        while time.time() < deadline:
+            time.sleep(self._NAV_POLL_INTERVAL_S)
+            if self._nav_action_id != action_id:
+                return
+            try:
+                response = self.nodes.rpc.navi_state(task_id)
+            except Exception as exc:  # noqa: BLE001 — notify and keep polling
+                result["error"] = f"ActionGetState poll failed: {exc}"
+                _acp_notify(action_id, "error", result, "controlled_spatial")
+                return
+            terminal = self._nav_state_terminal(response)
+            if terminal is None:
+                continue
+            state = terminal.strip().lower() if isinstance(terminal, str) else str(terminal)
+            result["final_state"] = terminal
+            if state in self._NAV_ERROR_STATES:
+                result["error"] = f"navigation ended in {terminal}"
+                _acp_notify(action_id, "error", result, "controlled_spatial")
+            else:
+                _acp_notify(action_id, "completed", result, "controlled_spatial")
+            return
+        result["error"] = f"navigation not finished within {self.NAV_TIMEOUT_S}s"
+        _acp_notify(action_id, "error", result, "controlled_spatial")
+
+    def _nav_dispatch(self, action, method, payload):
+        """Send a long-running navigation RPC and arm the ACP completion waiter."""
+        response = self._remember(self.nodes.rpc.navi(method, payload))
+        task_id = (response or {}).get("task_id") or self.last_task_id or 0
+        action_id = f"a3_nav_{uuid4().hex[:8]}"
+        self._nav_action_id = action_id
+        threading.Thread(target=self._nav_worker,
+                         args=(action_id, task_id, action), daemon=True).start()
+        return {"state": "navigating", "action_id": action_id,
+                "task_id": task_id, "response": response}
 
     def dispatch(self, action, args):
         if action == "start":
@@ -2098,36 +2269,39 @@ class ControlledSpatialPlugin:
                 reloc_pose = {"x": float(args.get("x", 0)), "y": float(args.get("y", 0)),
                               "angle": float(args.get("angle", 0))}
             return jsonable(self.nodes.rpc.slam_stop_normal_relocalization(reloc_pose))
-        # -- 导航 --
+        # -- 导航（长时间动作：_nav_dispatch 发 RPC 后返回 action_id 并武装
+        # ACP 完成等待线程，轮询 ActionGetState 判定到点） --
         if action == "navi_to_goal":
-            return self._remember(self.nodes.rpc.navi("PlanningNaviToGoal", {
+            return self._nav_dispatch(action, "PlanningNaviToGoal", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "target_id": int(args.get("target_id", 0)), "guide_line_id": 0,
-                "ackerman_mode": False}))
+                "ackerman_mode": False})
         if action == "navi_to_pose":
-            return self._remember(self.nodes.rpc.navi("PlanningNaviToPose2D", {
+            return self._nav_dispatch(action, "PlanningNaviToPose2D", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "pose": {"position": {"x": float(args.get("x", 0)), "y": float(args.get("y", 0))},
                          "angle": float(args.get("angle", 0))},
-                "ackerman_mode": False}))
+                "ackerman_mode": False})
         if action == "linear_to_goal":
-            return self._remember(self.nodes.rpc.navi("LinearNaviToGoal", {
+            return self._nav_dispatch(action, "LinearNaviToGoal", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "target_id": int(args.get("target_id", 0))}))
+                "target_id": int(args.get("target_id", 0))})
         if action == "linear_to_pose":
-            return self._remember(self.nodes.rpc.navi("LinearNaviToPose2D", {
+            return self._nav_dispatch(action, "LinearNaviToPose2D", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "pose": {"position": {"x": float(args.get("x", 0)), "y": float(args.get("y", 0))},
-                         "angle": float(args.get("angle", 0))}}))
+                         "angle": float(args.get("angle", 0))}})
         if action == "move_forward":
-            return self._remember(self.nodes.rpc.navi("MoveForward", {
+            return self._nav_dispatch(action, "MoveForward", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "angle": 0, "distance": float(args.get("distance", 0))}))
+                "angle": 0, "distance": float(args.get("distance", 0))})
         if action == "spin_turn":
-            return self._remember(self.nodes.rpc.navi("SpinTurn", {
+            return self._nav_dispatch(action, "SpinTurn", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "angle": float(args.get("angle", 0))}))
+                "angle": float(args.get("angle", 0))})
         if action == "cancel":
+            # 取消任务同时结算挂起的 ACP 等待线程（不再回报过期完成事件）。
+            self._nav_action_id = None
             return jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": self._task_id(args)}))
         if action == "pause":
             return jsonable(self.nodes.rpc.navi("ActionPause", {"task_id": self._task_id(args)}))

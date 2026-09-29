@@ -147,6 +147,7 @@ _install_ros_stubs()
 import yaml  # noqa: E402
 
 import device  # noqa: E402
+import main  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +833,18 @@ class RpcDispatchTests(unittest.TestCase):
         schema = find_plugin(self.plugins, "motion_play").get_tool()["inputSchema"]
         self.assertEqual(schema["x-completion"], {"actions": ["play"], "timeout": 600})
 
+    def test_motion_play_rejects_out_of_bounds_duration(self):
+        # duration_ms bounds must match the 600 s x-completion timeout: negative
+        # would complete instantly while the RPC runs; >600000 would outlive the
+        # Agent Core waiter.
+        motion = find_plugin(self.plugins, "motion_play")
+        for bad in (-1, device.MOTION_PLAY_MAX_DURATION_MS + 1):
+            with self.assertRaises(ValueError):
+                motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                         "duration_ms": bad})
+        # Nothing was sent to the robot for the rejected calls.
+        self.assertEqual(self.transport.calls_to("MotionCommandService", "SendMotionCommand"), [])
+
     def test_arm_control_compliance_dispatch(self):
         arm = find_plugin(self.plugins, "arm_control")
         arm.dispatch("compliance_enable", {})
@@ -878,6 +891,61 @@ class RpcDispatchTests(unittest.TestCase):
         (_, body), = self.transport.calls_to("PncService", "ActionPause")
         self.assertEqual(body["task_id"], 9)
 
+    def test_controlled_spatial_schema_declares_x_completion(self):
+        schema = find_plugin(self.plugins, "controlled_spatial").get_tool()["inputSchema"]
+        self.assertEqual(schema["x-completion"], {
+            "actions": ["navi_to_goal", "navi_to_pose", "linear_to_goal",
+                        "linear_to_pose", "move_forward", "spin_turn"],
+            "timeout": 180})
+
+    def test_controlled_spatial_navi_reports_acp_completion(self):
+        # Navigation is a long-running action: dispatch returns immediately with
+        # an action_id and a daemon worker polls PncService/ActionGetState until
+        # a terminal state, then POSTs the ACP completion.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial._NAV_POLL_INTERVAL_S = 0.02
+            # One PncService response serves both the dispatch and the polls
+            # (RecordingTransport matches by service prefix).
+            self.transport.responses["PncService"] = {"task_id": 7, "data": {"state": "finished"}}
+            result = spatial.dispatch("navi_to_pose", {"map_id": 3, "x": 1.0, "y": 1.0, "angle": 0.0})
+            self.assertEqual(result["state"], "navigating")
+            self.assertTrue(result["action_id"].startswith("a3_nav_"))
+            self.assertEqual(result["task_id"], 7)
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            (action_id, status, payload, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "completed")
+            self.assertEqual(payload["task_id"], 7)
+            self.assertEqual(payload["final_state"], "finished")
+            self.assertEqual(tool_name, "controlled_spatial")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_controlled_spatial_cancel_settles_pending_waiter(self):
+        # cancel clears the waiter's action_id first, so a nav worker still in
+        # flight must NOT fire a stale ACP completion afterwards.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial._NAV_POLL_INTERVAL_S = 0.2  # long enough to still be polling
+            self.transport.responses["PncService"] = {"task_id": 5, "data": {"state": "running"}}
+            spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
+            spatial.dispatch("cancel", {})
+            time.sleep(0.5)
+            self.assertEqual(captured, [])
+        finally:
+            device._acp_notify = original_notify
+
     def test_controlled_spatial_relocalization_start(self):
         spatial = find_plugin(self.plugins, "controlled_spatial")
         spatial.dispatch("start_relocalization", {"map_dir": "/agibot/data/map/lobby"})
@@ -915,6 +983,58 @@ class RpcDispatchTests(unittest.TestCase):
         result = skill.dispatch("state", {})
         self.assertEqual(result, {"state": "unknown"})
 
+    def test_skill_play_schema_declares_x_completion(self):
+        schema = find_plugin(self.plugins, "skill_play").get_tool()["inputSchema"]
+        self.assertEqual(schema["x-completion"], {"actions": ["play"], "timeout": 600})
+
+    def test_skill_play_play_reports_acp_completion(self):
+        # play is a long-running action: dispatch returns immediately with an
+        # action_id and a daemon worker polls the skill_status stream snapshot
+        # until a terminal state, then POSTs the ACP completion.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            skill = find_plugin(self.plugins, "skill_play")
+            skill._POLL_INTERVAL_S = 0.02
+            skill.nodes.values["skill_status"] = {"state": "finished"}
+            self.transport.responses["SkillPilotService"] = {"data": {"session_id": "s-9"}}
+            result = skill.dispatch("play", {"path": "/agibot/skills/dance"})
+            self.assertEqual(result["state"], "playing")
+            self.assertTrue(result["action_id"].startswith("skill_play_"))
+            self.assertEqual(result["session_id"], "s-9")
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            (action_id, status, payload, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "completed")
+            self.assertEqual(payload["session_id"], "s-9")
+            self.assertEqual(payload["final_state"], "finished")
+            self.assertEqual(tool_name, "skill_play")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_skill_play_stop_play_settles_pending_waiter(self):
+        # stop_play clears the waiter's action_id first, so a worker still in
+        # flight must NOT fire a stale ACP completion afterwards.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            skill = find_plugin(self.plugins, "skill_play")
+            skill._POLL_INTERVAL_S = 0.2  # long enough to still be polling
+            skill.nodes.values["skill_status"] = {"state": "running"}
+            self.transport.responses["SkillPilotService"] = {"data": {"session_id": "s-2"}}
+            skill.dispatch("play", {"path": "/agibot/skills/dance"})
+            skill.dispatch("stop_play", {"session_id": "s-2"})
+            time.sleep(0.5)
+            self.assertEqual(captured, [])
+        finally:
+            device._acp_notify = original_notify
+
     # -- model resource --
 
     def test_model_returns_urdf(self):
@@ -922,6 +1042,60 @@ class RpcDispatchTests(unittest.TestCase):
         result = model.dispatch("model", {})
         self.assertIn("<robot", result["urdf"])
         self.assertIn("a3_ultra", result["urdf"])
+
+
+class RobotSubnetIpTests(unittest.TestCase):
+    """_robot_subnet_ip must only trust a genuine 10.42.10.x source address.
+
+    On a host with no specific route to the robot subnet, the UDP-connect trick
+    returns the *default-route* address (e.g. an office LAN 192.168.x.x) —
+    whitelisting that would silently expose domain 42 on the office LAN while
+    domain 232 still cannot reach the A3 units. Patch socket to force each path.
+    """
+
+    def _patch_socket(self, getsockname_ip):
+        class FakeSocket:
+            def __init__(self, family, kind):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def connect(self, address):
+                pass
+
+            def getsockname(self):
+                return (getsockname_ip, 12345)
+
+        original_socket = main.socket.socket
+        main.socket.socket = FakeSocket
+        self.addCleanup(setattr, main.socket, "socket", original_socket)
+
+    def test_returns_address_on_robot_subnet(self):
+        self._patch_socket("10.42.10.77")
+        self.assertEqual(main._robot_subnet_ip(), "10.42.10.77")
+
+    def test_rejects_default_route_office_address(self):
+        self._patch_socket("192.168.1.42")
+        self.assertEqual(main._robot_subnet_ip(), "")
+
+    def test_rejects_adjacent_subnet(self):
+        # 10.42.11.x is NOT the A3 body subnet — must not be whitelisted.
+        self._patch_socket("10.42.11.5")
+        self.assertEqual(main._robot_subnet_ip(), "")
+
+    def test_socket_error_returns_empty(self):
+        class FailingSocket:
+            def __init__(self, family, kind):
+                raise OSError("no route to host")
+
+        original_socket = main.socket.socket
+        main.socket.socket = FailingSocket
+        self.addCleanup(setattr, main.socket, "socket", original_socket)
+        self.assertEqual(main._robot_subnet_ip(), "")
 
 
 class MirrorStreamTests(unittest.TestCase):

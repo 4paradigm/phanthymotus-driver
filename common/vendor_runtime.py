@@ -204,7 +204,11 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
         def log_message(self, fmt, *args):
             msg = fmt % args
             if '"POST /mcp' not in msg or "200" not in msg:
-                print(f"[mcp] {self.address_string()} {msg}")
+                # The request line is attacker-controlled: keep it ASCII-safe
+                # (no control chars / homoglyph noise via escapes) and capped,
+                # so a hostile client cannot forge or bloat log records.
+                safe = msg.encode("unicode_escape").decode("ascii")[:200]
+                print(f"[mcp] {self.address_string()} {safe}")
 
         def send_json(self, status: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode()
