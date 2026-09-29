@@ -592,6 +592,11 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+        if plugins_cfg.get("poker_suit", {}).get("enabled", False):
+            from device import PokerSuitPlugin
+            self._plugins.append(PokerSuitPlugin(plugins_cfg["poker_suit"], namespace, ros2))
+            print("[bundle] PokerSuitPlugin loaded")
+
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
     _ALWAYS_START = {
         'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',

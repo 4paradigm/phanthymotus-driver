@@ -132,3 +132,5 @@ plugins:
         sender_path: "/home/ubuntu/audio_sender.py"
   light:
     enabled: true
+  poker_suit:
+    enabled: true

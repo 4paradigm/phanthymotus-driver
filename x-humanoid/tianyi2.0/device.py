@@ -39,6 +39,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   ControlledSpatialPlugin (actuator)      — 空间控制(controlled_spatial)
   ExtMicPlugin        (actuator)           — 外部麦克风(ext_mic)
   LightPlugin         (actuator)           — 灯光控制
+  PokerSuitPlugin     (sensor)             — 扑克牌花色识别
   StatePlugin      (sensor, multi-tool) — 关节/电池/急停/力传感器/URDF
   CameraPlugin     (sensor)             — Orbbec 头部相机
   AsrPlugin        (sensor)             — 语音识别结果
@@ -7452,3 +7453,290 @@ class ChassisRawPlugin:
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PokerSuitPlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PokerSuitPlugin:
+    """扑克牌花色识别 (Poker Suit Recognition)
+
+    使用头部 RGB 相机拍摄当前画面，通过 OpenCV 分析识别扑克牌花色。
+    支持四种花色: heart(红桃), diamond(方块), club(梅花), spade(黑桃)。
+
+    Actions:
+        recognize: 拍摄当前相机画面并识别扑克牌花色
+        info:      返回插件状态
+        start:     启动相机订阅
+        stop:      停止相机订阅
+    """
+
+    _SUITS = ("heart", "diamond", "club", "spade")
+    _SUIT_LABELS = {
+        "heart": "红桃",
+        "diamond": "方块",
+        "club": "梅花",
+        "spade": "黑桃",
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._running = False
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._subscription = None
+        self._sub_node = Node("tianyi2_poker_suit_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        self._min_area = int(plugin_config.get("min_area", 800))
+        self._max_area = int(plugin_config.get("max_area", 50000))
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "poker_suit",
+            "type": "sensor",
+            "description": "天轶2.0 扑克牌花色识别 — 拍摄头部相机画面并识别红桃/方块/梅花/黑桃",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["recognize", "info", "start", "stop"],
+                        "description": "操作类型",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "recognize": {"params": [], "description": "拍摄当前相机画面并识别扑克牌花色"},
+                    "info": {"params": [], "description": "查看识别插件状态"},
+                    "start": {"params": [], "description": "启动相机订阅"},
+                    "stop": {"params": [], "description": "停止相机订阅"},
+                },
+            },
+        }
+
+    def start(self):
+        if self._running:
+            return
+        try:
+            from sensor_msgs.msg import Image
+            import cv2
+            import numpy as np
+
+            CameraPlugin._ensure_orbbec_service()
+            self._cv2 = cv2
+            self._np = np
+            if self._subscription is None:
+                self._subscription = self._sub_node.create_subscription(
+                    Image, "/ob_camera_head/color/image_raw",
+                    self._on_image, _RELIABLE_QOS)
+            self._running = True
+            print("[PokerSuitPlugin] subscribed to head RGB camera", flush=True)
+        except Exception as e:
+            raise RuntimeError(f"poker suit initialization failed: {e}") from e
+
+    def stop(self):
+        self._running = False
+        with self._frame_lock:
+            self._latest_frame = None
+
+    def _on_image(self, msg):
+        if not self._running:
+            return
+        with self._frame_lock:
+            self._latest_frame = msg
+
+    def _decode_frame(self, msg):
+        image = self._np.frombuffer(msg.data, dtype=self._np.uint8)
+        expected = msg.height * msg.width * 3
+        if image.size != expected:
+            raise ValueError(f"unexpected RGB frame size: {image.size}, expected {expected}")
+        image = image.reshape(msg.height, msg.width, 3)
+        if msg.encoding.lower() == "rgb8":
+            image = self._cv2.cvtColor(image, self._cv2.COLOR_RGB2BGR)
+        return image
+
+    def _classify_suit(self, contour) -> str:
+        """根据轮廓几何特征分类花色，证据不足时拒识。"""
+        cv2 = self._cv2
+        np = self._np
+
+        area = cv2.contourArea(contour)
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0 or area <= 0:
+            return "unknown"
+
+        epsilon = 0.02 * perimeter
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        vertices = len(approx)
+
+        hull = cv2.convexHull(contour, returnPoints=False)
+        defects = cv2.convexityDefects(contour, hull)
+        defect_depths = []
+        if defects is not None:
+            defect_depths = [float(d[3]) / 256.0 for d in defects]
+        deep_defects = [depth for depth in defect_depths if depth > 0.08 * perimeter]
+
+        x, y, w, h = cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            return "unknown"
+        points = contour.reshape(-1, 2).astype(float)
+        center_x = x + w / 2.0
+        y_min = float(points[:, 1].min())
+        y_max = float(points[:, 1].max())
+
+        # A heart has two upper lobes separated by a central notch, and its
+        # lowest point is near the vertical centre.  This orientation-aware
+        # test avoids treating every narrow contour as a spade.
+        top_band = points[points[:, 1] <= y_min + 0.35 * h]
+        left_lobe = top_band[top_band[:, 0] < center_x - 0.12 * w]
+        right_lobe = top_band[top_band[:, 0] > center_x + 0.12 * w]
+        notch = points[
+            (np.abs(points[:, 0] - center_x) <= 0.18 * w)
+            & (points[:, 1] <= y_min + 0.55 * h)
+        ]
+        bottom = points[points[:, 1] >= y_max - 0.12 * h]
+        has_two_lobes = len(left_lobe) > 0 and len(right_lobe) > 0
+        has_notch = len(notch) > 0 and float(notch[:, 1].max()) - y_min > 0.12 * h
+        has_central_tip = len(bottom) > 0 and abs(float(bottom[:, 0].mean()) - center_x) < 0.22 * w
+        if has_two_lobes and has_notch and has_central_tip:
+            return "heart"
+
+        # A clean diamond is the only four-corner contour accepted directly.
+        if vertices == 4 and len(deep_defects) <= 1:
+            return "diamond"
+
+        # Clubs have several deep inward notches.  Do not use vertex count as
+        # a fallback because blur and contour approximation make it unstable.
+        if len(deep_defects) >= 3 and vertices >= 6:
+            return "club"
+
+        # Spades require a pointed top and a narrow lower stem.  A generic
+        # aspect-ratio check was deliberately removed: it caused hearts to be
+        # classified as spades and gave arbitrary contours no rejection path.
+        top = points[points[:, 1] <= y_min + 0.08 * h]
+        lower = points[points[:, 1] >= y_min + 0.65 * h]
+        top_width = (float(top[:, 0].max()) - float(top[:, 0].min())) if len(top) else w
+        top_is_pointed = len(top) > 0 and top_width < 0.30 * w
+        lower_width = (float(lower[:, 0].max()) - float(lower[:, 0].min())) if len(lower) else w
+        if top_is_pointed and len(lower) >= 2 and lower_width < 0.45 * w and len(deep_defects) <= 2:
+            return "spade"
+
+        return "unknown"
+
+    def _detect_suit(self, image) -> dict:
+        """在图像中检测扑克牌花色."""
+        cv2 = self._cv2
+        np = self._np
+
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+        # 红色掩膜 (两个区间)
+        lower_red1 = np.array([0, 70, 50])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 70, 50])
+        upper_red2 = np.array([180, 255, 255])
+        mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+
+        # 黑色掩膜
+        lower_black = np.array([0, 0, 0])
+        upper_black = np.array([180, 255, 80])
+        mask_black = cv2.inRange(hsv, lower_black, upper_black)
+
+        best = None
+        best_area = 0
+
+        for color_mask, color_name in ((mask_red, "red"), (mask_black, "black")):
+            # 形态学操作去噪
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < self._min_area or area > self._max_area:
+                    continue
+                if area > best_area:
+                    best_area = area
+                    best = (cnt, color_name)
+
+        if best is None:
+            return {
+                "success": False,
+                "suit": "unknown",
+                "suit_name": "未知",
+                "suit_label": "未知",
+                "confidence": 0.0,
+                "message": "no card-like contour found",
+            }
+
+        contour, color_name = best
+        suit = self._classify_suit(contour)
+        confidence = min(1.0, best_area / float(self._max_area)) if self._max_area > 0 else 0.0
+        if suit == "unknown":
+            return {
+                "success": False,
+                "suit": "unknown",
+                "suit_name": "未知",
+                "suit_label": "未知",
+                "color": color_name,
+                "confidence": 0.0,
+                "area": int(best_area),
+                "message": "contour shape is not confidently recognized",
+            }
+
+        label = self._SUIT_LABELS[suit]
+        return {
+            "success": True,
+            "suit": suit,
+            "suit_name": label,
+            "suit_label": label,
+            "color": color_name,
+            "confidence": round(confidence, 3),
+            "area": int(best_area),
+        }
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            try:
+                self.start()
+            except Exception as e:
+                return {"error": str(e), "state": "error"}
+            return {"state": "ready"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "info":
+            with self._frame_lock:
+                available = self._latest_frame is not None
+            return {
+                "state": "running" if self._running else "idle",
+                "frame_available": available,
+                "source_topic": "/ob_camera_head/color/image_raw",
+            }
+        if action != "recognize":
+            return {"error": f"unknown action: {action}"}
+
+        if not self._running:
+            try:
+                self.start()
+            except Exception as e:
+                return {"error": f"poker suit initialization failed: {e}", "state": "error"}
+
+        with self._frame_lock:
+            msg = self._latest_frame
+        if msg is None:
+            return {
+                "error": "no camera frame received yet",
+                "source_topic": "/ob_camera_head/color/image_raw",
+            }
+
+        try:
+            image = self._decode_frame(msg)
+            result = self._detect_suit(image)
+            result["state"] = "recognized"
+            return result
+        except Exception as e:
+            return {"error": f"failed to analyze frame: {e}", "state": "error"}
