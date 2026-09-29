@@ -117,6 +117,7 @@ class SampleAdapterTests(unittest.TestCase):
         self.assertEqual([None], delivered)
         self.assertTrue(reader.diagnostics()["closed"])
 
+    def test_json_native_materializes_nested_iterable_containers(self):
         class _Repeated:
             def __iter__(self):
                 return iter(("STOP", "STAND_WALK"))
