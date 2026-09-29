@@ -15,6 +15,7 @@ import json
 import struct
 import sys
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -416,6 +417,60 @@ class ToolInventoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             joints.dispatch("query", {"group": "tail"})
 
+    def test_joints_info_returns_selected_topic_out(self):
+        # README.md info contract: info()'s topic_out is authoritative — a multiplexed
+        # card must return the selected group's stream, not just a private mapping.
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        joints = find_plugin(plugins, "joints")
+        for group, key in (("arm", "arm_state"), ("hand", "hand_state"), ("neck", "neck_state")):
+            result = joints.dispatch("info", {"group": group})
+            stream = joints.streams[key]
+            self.assertEqual(result["topic_out"],
+                             [{"topic": stream["topic"], "format": stream["format"]}])
+        # default (no group arg) → arm
+        result = joints.dispatch("info", {})
+        stream = joints.streams["arm_state"]
+        self.assertEqual(result["topic_out"][0]["topic"], stream["topic"])
+
+    def test_camera_dispatch_accepts_every_advertised_stream(self):
+        # Regression for the double-prefix bug: the schema enum advertises unprefixed
+        # names (config.yaml plugins.camera.streams naming) while internal stream
+        # keys carry the camera_ prefix — every advertised value plus the default
+        # must resolve, or the card was unusable as shipped.
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        camera = find_plugin(plugins, "camera")
+        definition = camera.get_tool()
+        enum = definition["inputSchema"]["properties"]["stream"]["enum"]
+        self.assertEqual(enum, ["head_left_fisheye", "chest_front_d457_rgb",
+                                "chest_front_d457_depth"])
+        for name in enum:
+            result = camera.dispatch("query", {"stream": name})
+            self.assertEqual(result["robot_topic"], camera.streams[f"camera_{name}"]["robot_topic"])
+        # default (no stream arg) resolves to the first configured stream
+        default = camera.dispatch("query", {})
+        first = camera.streams["camera_head_left_fisheye"]
+        self.assertEqual(default["robot_topic"], first["robot_topic"])
+        with self.assertRaises(ValueError):
+            camera.dispatch("query", {"stream": "nope"})
+
+    def test_camera_info_returns_selected_topic_out(self):
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        camera = find_plugin(plugins, "camera")
+        for name in ("chest_front_d457_depth", "head_left_fisheye"):
+            result = camera.dispatch("info", {"stream": name})
+            stream = camera.streams[f"camera_{name}"]
+            self.assertEqual(result["topic_out"],
+                             [{"topic": stream["topic"], "format": stream["format"]}])
+        result = camera.dispatch("info", {})
+        stream = camera.streams["camera_head_left_fisheye"]
+        self.assertEqual(result["topic_out"][0]["topic"], stream["topic"])
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle start/stop tests (canvas drags a card on/off — must stay inert)
@@ -720,6 +775,62 @@ class RpcDispatchTests(unittest.TestCase):
         (_, body), = self.transport.calls_to("MotionCommandService", "SendMotionCommand")
         self.assertTrue(body["cmd_end"])
         self.assertEqual(body["motion_id"], "")
+
+    def test_motion_play_play_reports_acp_completion(self):
+        # A3 exposes no motion-status topic/RPC, so play is async: dispatch returns
+        # immediately with an action_id and a daemon worker POSTs the ACP completion
+        # once duration_ms elapses. Stub _acp_notify and wait for the callback.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            motion = find_plugin(self.plugins, "motion_play")
+            result = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                              "duration_ms": 50})
+            self.assertEqual(result["state"], "playing")
+            self.assertTrue(result["action_id"].startswith("motion_play_"))
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            (action_id, status, payload, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "completed")
+            self.assertEqual(payload["motion_id"], "/agibot/motions/wave.mcap")
+            self.assertEqual(payload["duration_ms"], 50)
+            self.assertEqual(tool_name, "motion_play")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_actuator_schemas_declare_x_resource(self):
+        # README_dev x-resource contract: an acting tool must declare the physical
+        # channels it drives on EVERY tool — partial declaration is the unsafe trap.
+        # mc_mode is the one deliberate exception (g1 switch_mode precedent: a whole-
+        # body posture transition must stay exclusive against everything).
+        expected = {
+            "base_drive": "base",
+            "arm_control": ["arm_l", "arm_r"],
+            "hand_control": ["hand_l", "hand_r"],
+            "head_control": "head",
+            "waist_control": "waist",
+            "motion_play": ["base", "arm_l", "arm_r", "hand_l", "hand_r", "waist", "head"],
+            "tts": "mouth",
+            "audio": "mouth",
+            "interaction": "mouth",
+            "face_play": "head",
+            "skill_play": ["base", "arm_l", "arm_r", "hand_l", "hand_r", "waist", "head"],
+            "controlled_spatial": "base",
+            "auto_charging": "base",
+        }
+        for name, channels in expected.items():
+            schema = find_plugin(self.plugins, name).get_tool()["inputSchema"]
+            self.assertEqual(schema.get("x-resource"), channels, f"{name} x-resource")
+        mc_mode_schema = find_plugin(self.plugins, "mc_mode").get_tool()["inputSchema"]
+        self.assertNotIn("x-resource", mc_mode_schema)
+
+    def test_motion_play_schema_declares_x_completion(self):
+        schema = find_plugin(self.plugins, "motion_play").get_tool()["inputSchema"]
+        self.assertEqual(schema["x-completion"], {"actions": ["play"], "timeout": 600})
 
     def test_arm_control_compliance_dispatch(self):
         arm = find_plugin(self.plugins, "arm_control")

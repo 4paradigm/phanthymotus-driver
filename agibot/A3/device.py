@@ -34,8 +34,39 @@ import zlib
 from array import array
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from common.vendor_runtime import action_schema, jsonable, tool
+
+
+def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
+    """POST action completion to Agent Core (module-level ACP helper)."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+    import os as _os
+
+    agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    payload = json.dumps({
+        "action_id": action_id,
+        "status": status,
+        "result": result,
+        "tool": tool,
+        "ts": time.time(),
+    }).encode()
+    try:
+        req = _urllib.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        _urllib.urlopen(req, timeout=5, context=ctx)
+    except Exception as e:
+        import sys
+        print(f"[ACP] callback failed for {action_id}: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -822,7 +853,13 @@ class JointsPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "streams": dict(self.streams)}
+            group = args.get("group", "arm")
+            if group not in self.GROUPS:
+                raise ValueError(f"joints: unknown group {group!r}; available: {list(self.GROUPS)}")
+            stream = self.streams[self.GROUPS[group][0]]
+            return {"state": "running",
+                    "topic_out": [{"topic": stream["topic"], "format": stream["format"]}],
+                    "streams": dict(self.streams)}
         group = args.get("group", "arm")
         if group not in self.GROUPS:
             raise ValueError(f"joints: unknown group {group!r}; available: {list(self.GROUPS)}")
@@ -869,16 +906,23 @@ class CameraPlugin:
     `camera_` prefix is NOT used — driver.yaml lists a single `camera` card, so all
     selected streams are multiplexed through this one tool via the `stream` param."""
 
+    # Schema/dispatch speak the *unprefixed* stream name (as in config.yaml
+    # plugins.camera.streams); internal self.streams keys keep the camera_ prefix.
+    PREFIX = "camera_"
+
     def __init__(self, nodes):
         self.nodes = nodes
         self.streams = {k: v for k, v in nodes.streams.items() if k.startswith("camera_")}
 
+    def _names(self):
+        return [k[len(self.PREFIX):] for k in self.streams]
+
     def get_tool(self):
-        options = list(self.streams)
         return tool("camera", "sensor", "相机画面流（按 stream 参数选择；config.yaml plugins.camera.streams 决定可用路数）", {
             "type": "object",
             "properties": {
-                "stream": {"type": "string", "enum": options, "description": "相机流 key"},
+                "stream": {"type": "string", "enum": self._names(),
+                           "description": "相机流 key（config.yaml plugins.camera.streams 中的名称）"},
             },
         })
 
@@ -888,17 +932,24 @@ class CameraPlugin:
     def stop(self):
         pass
 
+    def _resolve(self, args):
+        name = args.get("stream") or next(iter(self.streams))[len(self.PREFIX):]
+        key = f"{self.PREFIX}{name}"
+        if key not in self.streams:
+            raise ValueError(f"camera: unknown stream {name!r}; available: {self._names()}")
+        return self.streams[key]
+
     def dispatch(self, action, args):
         if action == "start":
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "streams": {k: s for k, s in self.streams.items()}}
-        key = f"camera_{args.get('stream', next(iter(self.streams)))}"
-        if key not in self.streams:
-            raise ValueError(f"camera: unknown stream {args.get('stream')!r}; available: {list(self.streams)}")
-        return {"state": "running", **self.streams[key]}
+            stream = self._resolve(args)
+            return {"state": "running",
+                    "topic_out": [{"topic": stream["topic"], "format": stream["format"]}],
+                    "streams": {k: s for k, s in self.streams.items()}}
+        return {"state": "running", **self._resolve(args)}
 
 
 class LidarCloudPlugin:
@@ -1110,6 +1161,11 @@ class McModePlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        # Deliberately NO x-resource (g1 switch_mode precedent): a posture transition
+        # (get_up/lie_down/damping) moves the whole body, and nothing else should run
+        # during one — undeclared means exclusive against everything, which is exactly
+        # right here. Aborting a controlled get_up/lie_down partway is how a robot
+        # falls over.
         return tool("mc_mode", "actuator", "运动控制状态机查询与模式切换（SetAction：get_up/lie_down/damping/passive；"
                                           "get_state/available 查询当前动作与可用动作；固定迁移：非站立态仅 get_up，"
                                           "MOTION 可 damping/lie_down/passive，非法迁移返回建议）",
@@ -1187,16 +1243,19 @@ class BaseDrivePlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(
+            {"walk": (["forward", "lateral", "angular"], "下发行走速度比例（-1~1），持续下发维持运动，0 为停止")},
+            {
+                "forward": {"type": "number", "description": "前进速度比例 [-1,1]，正为前进，负为后退", "default": 0.0},
+                "lateral": {"type": "number", "description": "横移速度比例 [-1,1]，正为左移", "default": 0.0},
+                "angular": {"type": "number", "description": "旋转速度比例 [-1,1]，正为逆时针", "default": 0.0},
+            },
+        )
+        # 底盘行走 —— 与 controlled_spatial/auto_charging 同一通道（都驱动底盘）。
+        schema["x-resource"] = "base"
         return tool("base_drive", "actuator", "下发底盘行走速度（话题 /motion/control/locomotion_velocity，"
                                               "forward/lateral/angular ∈ [-1,1]，仅 MOTION 模式下生效；停止行走下发全 0）",
-                    action_schema(
-                        {"walk": (["forward", "lateral", "angular"], "下发行走速度比例（-1~1），持续下发维持运动，0 为停止")},
-                        {
-                            "forward": {"type": "number", "description": "前进速度比例 [-1,1]，正为前进，负为后退", "default": 0.0},
-                            "lateral": {"type": "number", "description": "横移速度比例 [-1,1]，正为左移", "default": 0.0},
-                            "angular": {"type": "number", "description": "旋转速度比例 [-1,1]，正为逆时针", "default": 0.0},
-                        },
-                    ))
+                    schema)
 
     def start(self):
         pass
@@ -1253,23 +1312,27 @@ class ArmControlPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(
+            {
+                "send": (["left", "right"], "下发一帧手臂关节位置指令（rad），需按 ~100Hz 循环调用"),
+                **self.ACTIONS,
+            },
+            {
+                "left": {"type": "array", "items": {"type": "number"},
+                         "description": "左臂 7 关节 rad，顺序：shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw"},
+                "right": {"type": "array", "items": {"type": "number"},
+                          "description": "右臂 7 关节 rad，顺序同左臂"},
+                "duration_ms": {"type": "integer", "description": "保持时长（毫秒），期间以 100Hz 重复下发同一帧指令", "default": 100},
+            },
+        )
+        # 双臂关节 —— side 按调用变化而 schema 是静态的，只声明一侧会让双臂动作
+        # 与单臂动作并发抢同一批关节（tianyi arm 同款结论）。
+        schema["x-resource"] = ["arm_l", "arm_r"]
         return tool("arm_control", "actuator", "下发双臂 14 关节位置指令 + 手臂柔顺控制"
                                               "（话题 /motion/control/arm_joint_command 需 100Hz 连续下发、间隔 ≤30ms；"
                                               "velocity/effort 固定 0；柔顺 Enable/Disable/CheckArmCompliance RPC；"
                                               "先经 mc_mode get_up 站立并停止 motion_player）",
-                    action_schema(
-                        {
-                            "send": (["left", "right"], "下发一帧手臂关节位置指令（rad），需按 ~100Hz 循环调用"),
-                            **self.ACTIONS,
-                        },
-                        {
-                            "left": {"type": "array", "items": {"type": "number"},
-                                     "description": "左臂 7 关节 rad，顺序：shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw"},
-                            "right": {"type": "array", "items": {"type": "number"},
-                                      "description": "右臂 7 关节 rad，顺序同左臂"},
-                            "duration_ms": {"type": "integer", "description": "保持时长（毫秒），期间以 100Hz 重复下发同一帧指令", "default": 100},
-                        },
-                    ))
+                    schema)
 
     def start(self):
         pass
@@ -1317,16 +1380,19 @@ class HandControlPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(
+            {"send": (["left", "right"], "下发双手张合等级 0(张开)~2000(握紧)")},
+            {
+                "left": {"type": "array", "items": {"type": "number"}, "description": "左手指张合等级列表 0~2000"},
+                "right": {"type": "array", "items": {"type": "number"}, "description": "右手指张合等级列表 0~2000"},
+                "hand_type": {"type": "string", "enum": ["AgiHand", "O10Hand"], "default": "AgiHand"},
+            },
+        )
+        # 手指关节 —— 与手臂是独立自由度，可以同时动（tianyi hand 同款结论）。
+        schema["x-resource"] = ["hand_l", "hand_r"]
         return tool("hand_control", "actuator", "下发灵巧手张合指令（话题 /motion/control/hand_joint_command，"
                                                 "position 0~2000，frame_id 区分 AgiHand/O10Hand）",
-                    action_schema(
-                        {"send": (["left", "right"], "下发双手张合等级 0(张开)~2000(握紧)")},
-                        {
-                            "left": {"type": "array", "items": {"type": "number"}, "description": "左手指张合等级列表 0~2000"},
-                            "right": {"type": "array", "items": {"type": "number"}, "description": "右手指张合等级列表 0~2000"},
-                            "hand_type": {"type": "string", "enum": ["AgiHand", "O10Hand"], "default": "AgiHand"},
-                        },
-                    ))
+                    schema)
 
     def start(self):
         pass
@@ -1367,16 +1433,19 @@ class HeadControlPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(
+            {"send": (["yaw", "pitch"], "下发一帧头部关节指令（rad）")},
+            {
+                "yaw": {"type": "number", "description": "头部偏航角 rad（左正右负）"},
+                "pitch": {"type": "number", "description": "头部俯仰角 rad（抬头为正）"},
+                "duration_ms": {"type": "integer", "description": "保持时长（毫秒）", "default": 100},
+            },
+        )
+        # 头部双关节 —— 相机云台同源，与 face_play 共用 head 通道。
+        schema["x-resource"] = "head"
         return tool("head_control", "actuator", "下发头部姿态指令（话题 /motion/control/neck_joint_command，"
                                                 "head_yaw ∈ [-1.047,1.047] rad，head_pitch ∈ [-0.436,0.262] rad）",
-                    action_schema(
-                        {"send": (["yaw", "pitch"], "下发一帧头部关节指令（rad）")},
-                        {
-                            "yaw": {"type": "number", "description": "头部偏航角 rad（左正右负）"},
-                            "pitch": {"type": "number", "description": "头部俯仰角 rad（抬头为正）"},
-                            "duration_ms": {"type": "integer", "description": "保持时长（毫秒）", "default": 100},
-                        },
-                    ))
+                    schema)
 
     def start(self):
         pass
@@ -1417,16 +1486,19 @@ class WaistControlPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(
+            {"send": (["pitch", "yaw", "height"], "下发腰部俯仰/旋转/升降指令")},
+            {
+                "pitch": {"type": "number", "description": "腰部俯仰 rad，正为前倾"},
+                "yaw": {"type": "number", "description": "腰部偏航 rad，正为左转"},
+                "height": {"type": "number", "description": "腰部高度偏移 m（-0.3~0，0 为站立基准）"},
+            },
+        )
+        # 腰部三自由度 —— 没有别的工具碰这三个自由度。
+        schema["x-resource"] = "waist"
         return tool("waist_control", "actuator", "下发腰部控制指令（话题 /motion/control/move_waist："
                                                   "pitch/yaw ∈ [-1.6,1.6] rad，height ∈ [-0.3,0] m）",
-                    action_schema(
-                        {"send": (["pitch", "yaw", "height"], "下发腰部俯仰/旋转/升降指令")},
-                        {
-                            "pitch": {"type": "number", "description": "腰部俯仰 rad，正为前倾"},
-                            "yaw": {"type": "number", "description": "腰部偏航 rad，正为左转"},
-                            "height": {"type": "number", "description": "腰部高度偏移 m（-0.3~0，0 为站立基准）"},
-                        },
-                    ))
+                    schema)
 
     def start(self):
         pass
@@ -1479,21 +1551,35 @@ class MotionPlayPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(self.ACTIONS, {
+            "motion_id": {"type": "string",
+                          "description": "动作文件绝对路径（list → motion 取 path 字段；"
+                                         "SendMotionCommand 要求绝对路径）"},
+            "duration_ms": {"type": "integer", "description": "播放时长 ms（可选，缺省为播放到结束）"},
+        })
+        # A3 exposes no motion-status topic/RPC — completion is duration-based:
+        # a daemon worker sleeps duration_ms then POSTs /api/acp/complete.
+        schema["x-completion"] = {"actions": ["play"], "timeout": 600}
+        # 动作文件驱动全身（底盘+双臂+手+腰+头），声明全通道列表让 ACP 排他仲裁。
+        schema["x-resource"] = ["base", "arm_l", "arm_r", "hand_l", "hand_r",
+                                "waist", "head"]
         return tool("motion_play", "actuator", "播放/暂停/停止动作文件 + 动作资源列表"
                                               "（SendMotionCommand + GetResourceList RPC；播放前先停止 MDU 上"
-                                              "的 motion_player 应用，且需 MOTION 模式）",
-                    action_schema(self.ACTIONS, {
-                        "motion_id": {"type": "string",
-                                      "description": "动作文件绝对路径（list → motion 取 path 字段；"
-                                                     "SendMotionCommand 要求绝对路径）"},
-                        "duration_ms": {"type": "integer", "description": "播放时长 ms（可选，缺省为播放到结束）"},
-                    }))
+                                              "的 motion_player 应用，且需 MOTION 模式；播放为异步："
+                                              "按 duration_ms 估时回报 ACP 完成事件）",
+                    schema)
 
     def start(self):
         pass
 
     def stop(self):
         pass
+
+    def _play_worker(self, action_id, motion_path, duration_ms):
+        time.sleep(max(duration_ms, 0) / 1000.0)
+        _acp_notify(action_id, "completed",
+                    {"motion_id": motion_path, "duration_ms": duration_ms},
+                    "motion_play")
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1505,12 +1591,20 @@ class MotionPlayPlugin:
             return {"resources": (response.get("data") or {}).get("resources", [])}
         if action == "play":
             # SendMotionCommand 入参为动作文件绝对路径 + 动作最长运行毫秒数；
-            # cmd_end=true 时播放完自动回初始姿态（默认 True）
+            # cmd_end=true 时播放完自动回初始姿态（默认 True）。
+            # A3 无动作状态反馈通道，异步完成按 duration_ms 估时回报（ACP）。
             motion_path = str(args.get("motion_id", ""))
             _require(motion_path, "motion_id 不能为空")
-            duration_ms = args.get("duration_ms", 10000)
-            return jsonable(self.nodes.rpc.send_motion_command(
-                motion_path, int(duration_ms), cmd_end=True, cmd_pause=False))
+            duration_ms = int(args.get("duration_ms", 10000))
+            response = jsonable(self.nodes.rpc.send_motion_command(
+                motion_path, duration_ms, cmd_end=True, cmd_pause=False))
+            action_id = f"motion_play_{uuid4().hex[:8]}"
+            threading.Thread(target=self._play_worker,
+                             args=(action_id, motion_path, duration_ms),
+                             daemon=True).start()
+            return {"state": "playing", "action_id": action_id,
+                    "motion_id": motion_path, "duration_ms": duration_ms,
+                    "response": response}
         if action == "pause":
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=True))
         if action == "resume":
@@ -1546,18 +1640,21 @@ class TtsPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(self.ACTIONS, {
+            "text": {"type": "string", "description": "播报文本（UTF-8，≤1024 字节）"},
+            "priority_level": {"type": "string",
+                               "enum": ["BACKGROUND_L1", "SERVICE_L2", "INTERACTION_L6"],
+                               "default": "INTERACTION_L6",
+                               "description": "播报优先级，INTERACTION_L6 默认可打断低优先级"},
+            "is_interrupted": {"type": "boolean", "default": True, "description": "是否打断当前播报"},
+            "trace_id": {"type": "string", "description": "播报 id（可选自定义传入，用于状态查询与打断）"},
+            "file_name": {"type": "string", "description": "媒体文件名（audio 卡片 list → audio）"},
+        })
+        # 与 audio 卡共用同一扬声器 —— 同一物理通道，两个工具需互相排队。
+        schema["x-resource"] = "mouth"
         return tool("tts", "actuator", "语音播报：文本转语音/媒体文件播放/状态查询/按 id 打断"
                                       "（TTSService PlayTTS/PlayMediaFile/GetAudioStatus/StopTTSByTraceId RPC）",
-                    action_schema(self.ACTIONS, {
-                        "text": {"type": "string", "description": "播报文本（UTF-8，≤1024 字节）"},
-                        "priority_level": {"type": "string",
-                                           "enum": ["BACKGROUND_L1", "SERVICE_L2", "INTERACTION_L6"],
-                                           "default": "INTERACTION_L6",
-                                           "description": "播报优先级，INTERACTION_L6 默认可打断低优先级"},
-                        "is_interrupted": {"type": "boolean", "default": True, "description": "是否打断当前播报"},
-                        "trace_id": {"type": "string", "description": "播报 id（可选自定义传入，用于状态查询与打断）"},
-                        "file_name": {"type": "string", "description": "媒体文件名（audio 卡片 list → audio）"},
-                    }))
+                    schema)
 
     def start(self):
         pass
@@ -1626,13 +1723,16 @@ class AudioPlugin:
         self.max_volume = min(int(max_volume), VOLUME_HARD_MAX)
 
     def get_tool(self):
+        schema = action_schema(self.ACTIONS, {
+            "file_name": {"type": "string", "description": "音频文件名（list → audio）"},
+            "volume": {"type": "integer", "minimum": 0, "maximum": self.max_volume,
+                       "description": f"目标音量 0~{self.max_volume}"},
+        })
+        # 与 tts 卡共用同一扬声器 —— 同一物理通道，两个工具需互相排队。
+        schema["x-resource"] = "mouth"
         return tool("audio", "actuator", f"音频播放与音量控制 + 音频资源列表（HalAudioService/ResourceService RPC；"
                                           f"音量 0~{self.max_volume}，硬件上限 {VOLUME_HARD_MAX}，超限有损坏风险）",
-                    action_schema(self.ACTIONS, {
-                        "file_name": {"type": "string", "description": "音频文件名（list → audio）"},
-                        "volume": {"type": "integer", "minimum": 0, "maximum": self.max_volume,
-                                   "description": f"目标音量 0~{self.max_volume}"},
-                    }))
+                    schema)
 
     def start(self):
         pass
@@ -1696,11 +1796,14 @@ class InteractionPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(self.ACTIONS, {
+            "enable": {"type": "boolean", "description": "true 开启 / false 关闭语音交互"},
+        })
+        # 拾音/交互配置会改动语音链路状态，与 tts/audio 的扬声器通道同属语音平面。
+        schema["x-resource"] = "mouth"
         return tool("interaction", "actuator", "语音交互开关/工作模式/拾音来源（AgentControlService + HalAudioService RPC；"
                                               "模式修改需重启生效；机内麦克风 v3.2 有已知 BUG 推荐外部）",
-                    action_schema(self.ACTIONS, {
-                        "enable": {"type": "boolean", "description": "true 开启 / false 关闭语音交互"},
-                    }))
+                    schema)
 
     def start(self):
         pass
@@ -1746,18 +1849,21 @@ class FacePlayPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(
+            {"list": ([], "列出可用 emoticon 表情资源（GetResourceList emoticon 类）"),
+             "play": (["e_path"], "播放表情动画（e_id 可选，repeat 为重播次数）"),
+             "cancel": ([], "取消所有表情播放（is_stop=true）")},
+            {
+                "e_path": {"type": "string", "description": "表情文件绝对路径（list → emoticon）"},
+                "e_id": {"type": "integer", "description": "表情资源 id（可选，与 e_path 二选一）"},
+                "repeat": {"type": "integer", "default": 1, "description": "重播次数"},
+            },
+        )
+        # 表情显示在头部屏幕上 —— 与 head_control 同一 head 通道。
+        schema["x-resource"] = "head"
         return tool("face_play", "actuator", "播放/取消表情 + 表情资源列表（话题 /skill/pilot/face/play + "
                                              "GetResourceList RPC；e_path 为 emoticon 资源绝对路径，priority 固定 440）",
-                    action_schema(
-                        {"list": ([], "列出可用 emoticon 表情资源（GetResourceList emoticon 类）"),
-                         "play": (["e_path"], "播放表情动画（e_id 可选，repeat 为重播次数）"),
-                         "cancel": ([], "取消所有表情播放（is_stop=true）")},
-                        {
-                            "e_path": {"type": "string", "description": "表情文件绝对路径（list → emoticon）"},
-                            "e_id": {"type": "integer", "description": "表情资源 id（可选，与 e_path 二选一）"},
-                            "repeat": {"type": "integer", "default": 1, "description": "重播次数"},
-                        },
-                    ))
+                    schema)
 
     def start(self):
         pass
@@ -1829,13 +1935,17 @@ class SkillPlayPlugin:
         if self.has_stream:
             stream = self.nodes.streams["skill_status"]
             topic_out = [{"topic": stream["topic"], "format": stream["format"]}]
+        schema = action_schema(self.ACTIONS, {
+            "path": {"type": "string", "description": "skill 资源目录绝对路径（list → skill）"},
+            "session_id": {"type": "string", "description": "技能会话 id（play 返回）"},
+        })
+        # 技能包/舞蹈驱动全身 —— 与 motion_play 同款全通道声明。
+        schema["x-resource"] = ["base", "arm_l", "arm_r", "hand_l", "hand_r",
+                                "waist", "head"]
         return tool("skill_play", "actuator", "技能包/舞蹈播放控制 + 技能资源列表（SkillPackage + GetResourceList RPC；"
                                              "播放需 ~2m 安全净空，Start 返回 session_id 供暂停/停止使用；"
                                              "state 查询技能状态流）",
-                    action_schema(self.ACTIONS, {
-                        "path": {"type": "string", "description": "skill 资源目录绝对路径（list → skill）"},
-                        "session_id": {"type": "string", "description": "技能会话 id（play 返回）"},
-                    }), topic_out=topic_out)
+                    schema, topic_out=topic_out)
 
     def start(self):
         pass
@@ -1917,22 +2027,25 @@ class ControlledSpatialPlugin:
         self.last_task_id = None
 
     def get_tool(self):
+        schema = action_schema(self.ACTIONS, {
+            "map_name": {"type": "string", "description": "保存时的新地图名称"},
+            "map_id": {"type": "integer", "description": "工作地图 id（需与重定位地图一致）"},
+            "map_dir": {"type": "string", "description": "地图目录（list_maps → map_dir，重定位用）"},
+            "new_name": {"type": "string", "description": "新名称（rename_map）"},
+            "target_id": {"type": "integer", "description": "目标点 id（地图点位）"},
+            "x": {"type": "number", "description": "目标/重定位位姿 x（m）"},
+            "y": {"type": "number", "description": "目标/重定位位姿 y（m）"},
+            "angle": {"type": "number", "description": "目标/重定位朝向角（rad）"},
+            "distance": {"type": "number", "description": "平移距离（m，正为前进）"},
+            "task_id": {"type": "integer", "description": "导航任务 id（0 自动分配；控制/查询动作可传空用最近任务）"},
+        })
+        # 建图/导航/重定位期间底盘由 ADU 独占 —— 与 base_drive/auto_charging 同通道。
+        schema["x-resource"] = "base"
         return tool("controlled_spatial", "actuator",
                     "建图/导航/重定位一体化控制（ADU MappingService/PncService/SLAMRelocalizationService RPC；"
                     "config 门控模块，默认关闭；导航前置：mc_mode get_up + start_relocalization 且 map_id 一致；"
                     "task_id 传 0 自动分配，控制/查询动作可缺省复用最近任务 id）",
-                    action_schema(self.ACTIONS, {
-                        "map_name": {"type": "string", "description": "保存时的新地图名称"},
-                        "map_id": {"type": "integer", "description": "工作地图 id（需与重定位地图一致）"},
-                        "map_dir": {"type": "string", "description": "地图目录（list_maps → map_dir，重定位用）"},
-                        "new_name": {"type": "string", "description": "新名称（rename_map）"},
-                        "target_id": {"type": "integer", "description": "目标点 id（地图点位）"},
-                        "x": {"type": "number", "description": "目标/重定位位姿 x（m）"},
-                        "y": {"type": "number", "description": "目标/重定位位姿 y（m）"},
-                        "angle": {"type": "number", "description": "目标/重定位朝向角（rad）"},
-                        "distance": {"type": "number", "description": "平移距离（m，正为前进）"},
-                        "task_id": {"type": "integer", "description": "导航任务 id（0 自动分配；控制/查询动作可传空用最近任务）"},
-                    }))
+                    schema)
 
     def start(self):
         pass
@@ -2064,9 +2177,12 @@ class AutoChargingPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        schema = action_schema(self.ACTIONS, {})
+        # 自主充电会驱动底盘导航到充电桩 —— 与 base_drive/controlled_spatial 同通道。
+        schema["x-resource"] = "base"
         return tool("auto_charging", "actuator", "自主充电控制（SkillPilotService AutoCharging RPC；config 门控模块，"
                                                 "默认关闭；失败后先 stop 再 reset 复位）",
-                    action_schema(self.ACTIONS, {}))
+                    schema)
 
     def start(self):
         pass
