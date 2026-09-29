@@ -69,9 +69,19 @@ _bundle = None
 class _LatestSampleReader:
     """Expose callback-delivered DDS samples through the controller's Read API."""
 
-    def __init__(self):
+    def __init__(self, channel=None):
+        self._channel = channel
         self._condition = threading.Condition()
         self._samples = deque(maxlen=1)
+
+    def Init(self):
+        if self._channel is None:
+            raise RuntimeError("DDS channel is not configured")
+        self._channel.Init(self.put, 1)
+
+    def Close(self):
+        if self._channel is not None:
+            self._channel.Close()
 
     def put(self, sample):
         with self._condition:
@@ -290,7 +300,6 @@ def main():
     # participant conflicts. One shared rt/handstate reader feeds the hand
     # card's get_state action and its partial-command logic.
     dds_lowstate_sub = None
-    dds_arm_lowstate_sub = None
     dds_arm_lowstate_reader = None
     dds_handstate_sub = None
     dds_hand_pub = None
@@ -337,13 +346,20 @@ def main():
         # preserves the controller's small blocking Read contract without
         # relying on SDK polling behavior that can swallow reader failures.
         if need_arm:
-            dds_arm_lowstate_reader = _LatestSampleReader()
-            dds_arm_lowstate_sub = _init_channel(
-                "rt/lowstate arm reader",
-                lambda: ChannelSubscriber("rt/lowstate", LowState_),
-                init=lambda channel: channel.Init(
-                    dds_arm_lowstate_reader.put, 1),
-            )
+            dds_arm_lowstate_reader = _LatestSampleReader(
+                ChannelSubscriber("rt/lowstate", LowState_))
+            try:
+                dds_arm_lowstate_reader.Init()
+                print("[adam] DDS channel ready: rt/lowstate arm reader")
+            except Exception as exc:
+                try:
+                    dds_arm_lowstate_reader.Close()
+                except Exception:
+                    pass
+                dds_arm_lowstate_reader = None
+                print(
+                    "[adam] WARNING: DDS channel unavailable "
+                    f"(rt/lowstate arm reader): {exc}")
             dds_lowcmd_pub = _init_channel(
                 "rt/lowcmd writer",
                 lambda: ChannelPublisher("rt/lowcmd", LowCmd_),
@@ -401,7 +417,7 @@ def main():
     from device import AdamDeviceBundle
     _bundle = AdamDeviceBundle(cfg, namespace, executor, grpc_client,
                                dds_lowstate_sub=dds_lowstate_sub,
-                               dds_arm_lowstate_sub=dds_arm_lowstate_sub,
+                               dds_arm_lowstate_sub=dds_arm_lowstate_reader,
                                dds_handstate_sub=dds_handstate_sub,
                                dds_hand_pub=dds_hand_pub,
                                dds_lowcmd_pub=dds_lowcmd_pub,
@@ -442,7 +458,7 @@ def main():
         _bundle.close_all()
         for label, channel in (
             ("rt/lowstate reader", dds_lowstate_sub),
-            ("rt/lowstate arm reader", dds_arm_lowstate_sub),
+            ("rt/lowstate arm reader", dds_arm_lowstate_reader),
             ("rt/lowcmd writer", dds_lowcmd_pub),
             ("rt/handcmd writer", dds_hand_pub),
         ):

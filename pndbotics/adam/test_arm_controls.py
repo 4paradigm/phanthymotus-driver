@@ -48,6 +48,30 @@ def _prime_arm_plugin(publisher):
 
 
 class SampleAdapterTests(unittest.TestCase):
+    def test_latest_sample_reader_owns_channel_lifecycle(self):
+        class _Channel:
+            def __init__(self):
+                self.init_args = []
+                self.close_count = 0
+
+            def Init(self, callback, queue_len):
+                self.init_args.append((callback, queue_len))
+
+            def Close(self):
+                self.close_count += 1
+
+        channel = _Channel()
+        reader = adam_main._LatestSampleReader(channel)
+        reader.Init()
+        callback, queue_len = channel.init_args[0]
+        callback("sample")
+        reader.Close()
+
+        self.assertEqual(1, len(channel.init_args))
+        self.assertEqual(1, queue_len)
+        self.assertEqual("sample", reader.Read(timeout=0.01))
+        self.assertEqual(1, channel.close_count)
+
     def test_latest_sample_reader_delivers_only_the_newest_pending_sample(self):
         reader = adam_main._LatestSampleReader()
         reader.put("old")
