@@ -1593,6 +1593,7 @@ class ArmControlPlugin:
             streaming = self._streaming
             soft_arms = self._soft_arms
             release_started_at = self._release_started_at
+            command_generation = self._command_generation
             targets = self._target_q.copy()
             hold_q = self._hold_q.copy()
 
@@ -1645,10 +1646,13 @@ class ArmControlPlugin:
             self._last_error = None
             if finish_release:
                 with self._lock:
-                    self._release_started_at = None
-                    self._active = False
-                    self._target_q.clear()
-                    self._soft_arms = True
+                    if (self._release_started_at == release_started_at
+                            and self._command_generation == command_generation):
+                        self._release_started_at = None
+                        self._active = False
+                        self._target_q.clear()
+                        self._seg_start.clear()
+                        self._soft_arms = True
         except Exception as exc:
             self._last_error = f"rt/lowcmd write failed: {exc}"
 

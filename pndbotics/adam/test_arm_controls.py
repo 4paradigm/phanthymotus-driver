@@ -215,6 +215,69 @@ class ArmControlTests(unittest.TestCase):
         self.assertEqual(publisher.commands[-1].motor_cmd[elbow].kp, 0.0)
         self.assertFalse(plugin._active)
 
+    def test_release_clears_segment_state_before_the_next_writer_tick(self):
+        publisher = _FakePublisher()
+        plugin = _prime_arm_plugin(publisher)
+        elbow = ADAM_PRO_JOINTS.index("elbow_Left")
+        plugin._active = True
+        plugin._streaming = True
+        plugin._target_q[elbow] = -0.5
+        plugin._seg_start[elbow] = plugin._seg_current[elbow]
+        plugin._release_started_at = time.monotonic() - 2.0
+
+        original_factory = getattr(device, "pnd_adam_msg_dds__LowCmd_", None)
+        device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
+        try:
+            plugin._write_command(0.02)
+            plugin._write_command(0.02)
+        finally:
+            if original_factory is None:
+                del device.pnd_adam_msg_dds__LowCmd_
+            else:
+                device.pnd_adam_msg_dds__LowCmd_ = original_factory
+
+        self.assertEqual(2, len(publisher.commands))
+        self.assertEqual({}, plugin._target_q)
+        self.assertEqual({}, plugin._seg_start)
+
+    def test_completed_release_does_not_clear_a_newer_command(self):
+        plugin = _prime_arm_plugin(None)
+        old_elbow = ADAM_PRO_JOINTS.index("elbow_Left")
+        new_elbow = ADAM_PRO_JOINTS.index("elbow_Right")
+        plugin._active = True
+        plugin._streaming = True
+        plugin._target_q[old_elbow] = -0.5
+        plugin._seg_start[old_elbow] = plugin._seg_current[old_elbow]
+        plugin._release_started_at = time.monotonic() - 2.0
+
+        class _RetargetingPublisher(_FakePublisher):
+            def Write(self, command, **kwargs):
+                super().Write(command, **kwargs)
+                with plugin._lock:
+                    plugin._command_generation += 1
+                    plugin._target_q = {new_elbow: 0.25}
+                    plugin._seg_start = {
+                        new_elbow: plugin._seg_current[new_elbow],
+                    }
+                    plugin._release_started_at = None
+                    plugin._active = True
+
+        publisher = _RetargetingPublisher()
+        plugin._publisher = publisher
+        original_factory = getattr(device, "pnd_adam_msg_dds__LowCmd_", None)
+        device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
+        try:
+            plugin._write_command(0.02)
+        finally:
+            if original_factory is None:
+                del device.pnd_adam_msg_dds__LowCmd_
+            else:
+                device.pnd_adam_msg_dds__LowCmd_ = original_factory
+
+        self.assertTrue(plugin._active)
+        self.assertEqual({new_elbow: 0.25}, plugin._target_q)
+        self.assertIn(new_elbow, plugin._seg_start)
+
     def test_stop_waits_for_release_and_includes_waist(self):
         publisher = _FakePublisher()
         plugin = _prime_arm_plugin(publisher)
