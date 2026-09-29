@@ -9,7 +9,7 @@ from unitree.g1.camera_settings import CameraSettingsPlugin, RealSenseSettingsOp
 class FakeSensor:
     def __init__(self):
         self.values = {
-            "enable_auto_exposure": 1, "exposure": 100,
+            "enable_auto_exposure": 1, "exposure": 100, "gain": 16,
             "enable_auto_white_balance": 1, "white_balance": 4000,
             "brightness": 0,
         }
@@ -62,6 +62,11 @@ class CameraSettingsTests(unittest.TestCase):
         self.assertFalse(self.ops.read()["values"]["auto_white_balance"])
         self.ops.reset()
         self.assertTrue(self.ops.read()["values"]["auto_white_balance"])
+
+    def test_gain_uses_manual_exposure_mode(self):
+        self.ops.set({"gain": 20})
+        self.assertEqual(self.sensor.writes[:2],
+                         [("enable_auto_exposure", 0.0), ("gain", 20.0)])
 
     def test_card_sends_one_validated_request(self):
         class Camera:

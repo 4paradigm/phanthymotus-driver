@@ -10,12 +10,14 @@ from __future__ import annotations
 FIELDS = {
     "auto_exposure": "enable_auto_exposure",
     "exposure": "exposure",
+    "gain": "gain",
     "auto_white_balance": "enable_auto_white_balance",
     "white_balance": "white_balance",
     "brightness": "brightness",
 }
 BOOLEAN_FIELDS = {"auto_exposure", "auto_white_balance"}
-MANUAL_MODE = {"exposure": "auto_exposure", "white_balance": "auto_white_balance"}
+MANUAL_MODE = {"exposure": "auto_exposure", "gain": "auto_exposure",
+               "white_balance": "auto_white_balance"}
 
 
 class RealSenseSettingsOps:
@@ -85,7 +87,7 @@ class RealSenseSettingsOps:
     def reset(self):
         """Restore settings read at camera startup, with automatic modes last."""
         initial = self.initial["values"]
-        for name in ("brightness", "exposure", "white_balance"):
+        for name in ("brightness", "exposure", "gain", "white_balance"):
             if name in self.options and not self.sensor.is_option_read_only(self.options[name]):
                 if name in MANUAL_MODE and initial.get(MANUAL_MODE[name], False):
                     continue  # auto mode owns this changing value
@@ -117,6 +119,7 @@ class CameraSettingsPlugin:
                     "action": {"type": "string", "enum": ["get", "set", "reset", "info"]},
                     "auto_exposure": {"type": "boolean"},
                     "exposure": {"type": "number"},
+                    "gain": {"type": "number"},
                     "auto_white_balance": {"type": "boolean"},
                     "white_balance": {"type": "number"},
                     "brightness": {"type": "number"},
@@ -124,7 +127,7 @@ class CameraSettingsPlugin:
                 "x-action-params": {
                     "get": {"params": []}, "info": {"params": []},
                     "set": {"params": list(FIELDS),
-                            "description": "Set exactly one supported field; manual exposure or white balance disables its auto mode"},
+                            "description": "Set exactly one supported field; manual exposure, gain, or white balance disables its auto mode"},
                     "reset": {"params": [], "description": "Restore values read when this camera started"},
                 },
             },
