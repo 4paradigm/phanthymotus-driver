@@ -78,6 +78,15 @@ class CameraSettingsTests(unittest.TestCase):
                          {"action": "set", "values": {"exposure": 200}})
         self.assertFalse(card.dispatch("set", {"exposure": 200, "brightness": 1})["success"])
 
+    def test_canvas_fields_explain_each_setting(self):
+        card = CameraSettingsPlugin(None)
+        schema = card.get_tool()["inputSchema"]
+        for name in self.ops.options:
+            field = schema["properties"][name]
+            self.assertTrue(field["title"])
+            self.assertTrue(field["description"])
+        self.assertIn("只填一个", schema["x-action-params"]["set"]["description"])
+
 
 if __name__ == "__main__":
     unittest.main()

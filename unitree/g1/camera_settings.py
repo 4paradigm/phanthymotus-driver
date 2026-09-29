@@ -110,25 +110,37 @@ class CameraSettingsPlugin:
     def get_tool(self):
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
-            "description": ("G1 RealSense RGB camera settings. Read current auto modes and "
-                            "option ranges, adjust one setting, or restore startup values. "
-                            "The camera remains in automatic mode until explicitly changed."),
+            "description": ("G1 RGB 相机参数：先用 get 查看当前值和合法范围；"
+                            "set 每次只填一个参数；reset 恢复本次相机启动时的设置。"),
             "inputSchema": {
                 "type": "object", "required": ["action"], "additionalProperties": False,
                 "properties": {
-                    "action": {"type": "string", "enum": ["get", "set", "reset", "info"]},
-                    "auto_exposure": {"type": "boolean"},
-                    "exposure": {"type": "number"},
-                    "gain": {"type": "number"},
-                    "auto_white_balance": {"type": "boolean"},
-                    "white_balance": {"type": "number"},
-                    "brightness": {"type": "number"},
+                    "action": {"type": "string", "enum": ["get", "set", "reset", "info"],
+                               "description": "先读取，再单项设置，最后恢复。", "oneOf": [
+                                   {"const": "get", "title": "读取当前设置"},
+                                   {"const": "set", "title": "修改一个参数"},
+                                   {"const": "reset", "title": "恢复启动时设置"},
+                                   {"const": "info", "title": "查看设置说明"},
+                               ]},
+                    "auto_exposure": {"type": "boolean", "title": "自动曝光",
+                                      "description": "true 自动调亮度；false 固定曝光。"},
+                    "exposure": {"type": "number", "title": "曝光",
+                                 "description": "曝光值；越大通常越亮，设置时关闭自动曝光。"},
+                    "gain": {"type": "number", "title": "增益",
+                             "description": "放大信号；越大通常越亮、噪点越多，设置时关闭自动曝光。"},
+                    "auto_white_balance": {"type": "boolean", "title": "自动白平衡",
+                                          "description": "true 自动校正色彩；false 固定色温。"},
+                    "white_balance": {"type": "number", "title": "白平衡色温",
+                                      "description": "色温值（K）；校正偏色，设置时关闭自动白平衡。"},
+                    "brightness": {"type": "number", "title": "亮度",
+                                   "description": "图像亮度；正数更亮，负数更暗。"},
                 },
                 "x-action-params": {
-                    "get": {"params": []}, "info": {"params": []},
+                    "get": {"params": [], "description": "读取当前值、支持项和合法范围。"},
+                    "info": {"params": [], "description": "同 get，读取设置详情。"},
                     "set": {"params": list(FIELDS),
-                            "description": "Set exactly one supported field; manual exposure, gain, or white balance disables its auto mode"},
-                    "reset": {"params": [], "description": "Restore values read when this camera started"},
+                            "description": "六个输入框只填一个；曝光、增益会关闭自动曝光，色温会关闭自动白平衡。"},
+                    "reset": {"params": [], "description": "恢复本次相机启动时读取的设置。"},
                 },
             },
         }
