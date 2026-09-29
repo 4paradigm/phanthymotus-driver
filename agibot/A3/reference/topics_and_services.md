@@ -75,7 +75,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 | `/hal/neck_middle_livox_lidar/pointcloud` | sensor_msgs/PointCloud2 | `lidar_cloud` | neck Livox |
 | `/ros2/body_drive/pelvis_imu/data` | sensor_msgs/Imu | `imu` | pelvis IMU |
 | `/ros2/body_drive/torso_imu/data` | sensor_msgs/Imu | `imu` | torso IMU (merged into one card) |
-| 9× camera topics (see `device.py` `CAMERA_TOPICS`) | sensor_msgs/Image | `camera` | head×3 fisheye, chest D457 rgb+depth, waist D415 rgb+depth, wrist×2 D405; config picks the streams (default includes chest depth, z16) |
+| 9× camera topics (see `device.py` `CAMERA_TOPICS`) | sensor_msgs/Image | `camera` | head×3 fisheye, chest D457 rgb+depth, waist D415 rgb+depth, wrist×2 D405; config picks the streams (default includes chest depth) — RGB re-encoded to `image/jpeg`, depth to `image/depth-zlib` (README_dev renderer formats; raw mirror would be 614KB/frame) |
 
 ### Protobuf-carrier streams (need `a3_aimdk` wheel to decode)
 
@@ -89,9 +89,10 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 
 - Body posture / head-pose "attention" HTTP APIs beyond the four SetAction modes
   (GetAvailableActions returns the authoritative live list at runtime).
-- H265 CompressedVideo foxglove streams for every camera — raw
-  `sensor_msgs/Image` mirrors are preferred (H265 decode support is
-  inconsistent on the consumer side).
+- H265 CompressedVideo foxglove streams for every camera — the raw
+  `sensor_msgs/Image` mirrors are preferred, re-encoded to JPEG (RGB) and
+  zlib uint16 (depth) on the fly (H265 decode support is inconsistent on the
+  consumer side, and `image/raw` has no dashboard renderer at all).
 - MappingService real-time progress callbacks (`no_realtime_data: true` is sent
   when starting mapping; status is polled via the same RPCs).
 - `/agent/wakeup/pb_3Aaimdk_2Eprotocol_2EWakeUpResult` (WakeUpResult pb): only

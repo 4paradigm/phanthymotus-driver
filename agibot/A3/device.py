@@ -30,6 +30,7 @@ import math
 import struct
 import threading
 import time
+import zlib
 from array import array
 from datetime import datetime, timezone
 from pathlib import Path
@@ -139,19 +140,25 @@ RESOURCE_TYPE_NAMES = {
 
 # Sensor topics (docs §7.6.2 table) — only the practically-useful subset gets cards.
 # key -> (robot_topic, format, description)
+# Formats must appear in README_dev § "Data Format & Dashboard Rendering": the dashboard
+# picks its renderer by exact format match. `image/raw` has no renderer at all (falls
+# back to the activity stream — no image shown), so RGB is re-encoded to JPEG and depth
+# to zlib-compressed uint16 (both per README_dev's recommended patterns; the raw
+# sensor_msgs/Image mirror would also cost 614KB/frame on the depth channel).
 CAMERA_TOPICS = {
-    "head_left_fisheye": ("/hal/head_left_fisheye_camera/rgb", "image/raw", "头部左鱼眼相机 RGB"),
-    "head_right_fisheye": ("/hal/head_right_fisheye_camera/rgb", "image/raw", "头部右鱼眼相机 RGB"),
-    "head_rear_fisheye": ("/hal/head_rear_fisheye_camera/rgb", "image/raw", "头部后鱼眼相机 RGB"),
-    "chest_front_d457_rgb": ("/hal/chest_front_d457_camera/rgb", "image/raw", "胸前 D457 相机 RGB"),
-    "chest_front_d457_depth": ("/hal/chest_front_d457_camera/depth", "image/depth-z16", "胸前 D457 相机深度"),
-    "waist_front_d415_rgb": ("/hal/waist_front_d415_camera/rgb", "image/raw", "腰前 D415 相机 RGB"),
-    "waist_front_d415_depth": ("/hal/waist_front_d415_camera/depth", "image/depth-z16", "腰前 D415 相机深度"),
-    "wrist_left_d405_rgb": ("/hal/wrist_left_d405_camera/rgb", "image/raw", "左腕 D405 相机 RGB"),
-    "wrist_right_d405_rgb": ("/hal/wrist_right_d405_camera/rgb", "image/raw", "右腕 D405 相机 RGB"),
+    "head_left_fisheye": ("/hal/head_left_fisheye_camera/rgb", "image/jpeg", "头部左鱼眼相机 RGB"),
+    "head_right_fisheye": ("/hal/head_right_fisheye_camera/rgb", "image/jpeg", "头部右鱼眼相机 RGB"),
+    "head_rear_fisheye": ("/hal/head_rear_fisheye_camera/rgb", "image/jpeg", "头部后鱼眼相机 RGB"),
+    "chest_front_d457_rgb": ("/hal/chest_front_d457_camera/rgb", "image/jpeg", "胸前 D457 相机 RGB"),
+    "chest_front_d457_depth": ("/hal/chest_front_d457_camera/depth", "image/depth-zlib", "胸前 D457 相机深度"),
+    "waist_front_d415_rgb": ("/hal/waist_front_d415_camera/rgb", "image/jpeg", "腰前 D415 相机 RGB"),
+    "waist_front_d415_depth": ("/hal/waist_front_d415_camera/depth", "image/depth-zlib", "腰前 D415 相机深度"),
+    "wrist_left_d405_rgb": ("/hal/wrist_left_d405_camera/rgb", "image/jpeg", "左腕 D405 相机 RGB"),
+    "wrist_right_d405_rgb": ("/hal/wrist_right_d405_camera/rgb", "image/jpeg", "右腕 D405 相机 RGB"),
 }
 # H265 foxglove CompressedVideo streams exist too, but consumer-side H265 decode support
-# is inconsistent — mirror the raw sensor_msgs/Image feeds instead.
+# is inconsistent — the raw sensor_msgs/Image feeds are mirrored and re-encoded instead
+# (JPEG for RGB, zlib uint16 for depth; see _encode_rgb/_encode_depth below).
 
 RESOURCE_DIR = Path(__file__).with_name("resource")
 
@@ -314,16 +321,35 @@ class A3Nodes:
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
 
-        def mirror(key, msg_type, robot_topic, fmt, qos=None, json_filter=None):
+        def mirror(key, msg_type, robot_topic, fmt, qos=None, json_filter=None,
+                   re_encode=None):
             core_topic = f"/{namespace}/agibot_a3/{key}"
             as_json = fmt == "data/json"
-            core_msg_type = String if as_json else msg_type
+            if re_encode is not None:
+                core_msg_type = self._CompressedImage
+            elif as_json:
+                core_msg_type = String
+            else:
+                core_msg_type = msg_type
             pub = self.core.create_publisher(core_msg_type, core_topic, 5)
-            self.robot.create_subscription(
-                msg_type, robot_topic,
-                self._callback(key, pub, as_json=as_json, json_filter=json_filter),
-                qos or sensor_qos,
-            )
+
+            def callback(msg):
+                if re_encode is not None:
+                    out = re_encode(msg)
+                    if out is not None:
+                        pub.publish(out)
+                    return
+                if as_json:
+                    value = json_filter(msg) if json_filter else jsonable(msg)
+                    output = self._String()
+                    output.data = json.dumps(value, ensure_ascii=False)
+                    pub.publish(output)
+                    with self.lock:
+                        self.values[key] = value
+                else:
+                    pub.publish(msg)
+
+            self.robot.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos)
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
         # -- joint / state streams (plain sensor_msgs types) --
@@ -334,15 +360,17 @@ class A3Nodes:
         mirror("imu_pelvis", Imu, "/ros2/body_drive/pelvis_imu/data", "data/json")
         mirror("imu_torso", Imu, "/ros2/body_drive/torso_imu/data", "data/json")
 
-        # -- camera streams, config-selected subset --
+        # -- camera streams, config-selected subset (re-encoded on the fly: RGB → JPEG,
+        # depth → zlib uint16, per README_dev § Data Format) --
         camera_cfg = config.get("plugins", {}).get("camera", {})
         selected = camera_cfg.get("streams") or ["head_left_fisheye", "chest_front_d457_rgb",
                                                  "chest_front_d457_depth"]
         for key in selected:
             topic, fmt, _ = CAMERA_TOPICS[key]
-            mirror(f"camera_{key}", Image, topic, fmt)
+            encoder = self._encode_depth if fmt == "image/depth-zlib" else self._encode_rgb
+            mirror(f"camera_{key}", Image, topic, fmt, re_encode=encoder)
 
-        # -- protobuf-carrier streams (RosMsgWrapper) — decoded to JSON via pb2 if the
+        # -- protobuf-carrier streams (RosMsgWrapper) -- decoded to JSON via pb2 if the
         # wheel is importable, otherwise subscribed raw and passed through opaquely --
         self._pb = None
         try:
@@ -371,6 +399,62 @@ class A3Nodes:
         self.hand_command_pub = self.robot.create_publisher(JointState, "/motion/control/hand_joint_command", 10)
 
     # -- RosMsgWrapper helpers ------------------------------------------------
+
+    @property
+    def _CompressedImage(self):
+        """sensor_msgs/CompressedImage, imported lazily (test stubs provide it)."""
+        if getattr(self, "_compressed_image_type", None) is None:
+            from sensor_msgs.msg import CompressedImage
+            self._compressed_image_type = CompressedImage
+        return self._compressed_image_type
+
+    # -- camera re-encoders (README_dev § Data Format: JPEG for RGB, zlib uint16
+    #    for depth; both fall back to passthrough when numpy/cv2 are missing) --
+
+    _CV2_COLOR = {"rgb8": "COLOR_RGB2BGR", "bgr8": "COLOR_BGR2BGR"}
+
+    def _encode_rgb(self, msg):
+        """sensor_msgs/Image (rgb8/bgr8) → CompressedImage jpeg (quality 50)."""
+        try:
+            import cv2  # noqa: F401 — presence check only
+            import numpy as np
+        except ImportError:
+            return None
+        height, width = int(msg.height), int(msg.width)
+        encoding = str(getattr(msg, "encoding", "rgb8"))
+        if encoding not in self._CV2_COLOR or not height or not width:
+            return None
+        try:
+            import cv2
+            img = np.frombuffer(bytes(msg.data), np.uint8).reshape(height, width, 3)
+            img = cv2.cvtColor(img, getattr(cv2, self._CV2_COLOR[encoding]))
+            ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            if not ok:
+                return None
+            out = self._CompressedImage()
+            out.format = "jpeg"
+            out.data = jpeg.tobytes()
+            return out
+        except Exception:
+            return None
+
+    def _encode_depth(self, msg):
+        """sensor_msgs/Image (16UC1) → CompressedImage "16UC1; compressedDepth zlib"."""
+        try:
+            import numpy as np
+        except ImportError:
+            return None
+        height, width = int(msg.height), int(msg.width)
+        if str(getattr(msg, "encoding", "16UC1")) != "16UC1" or not height or not width:
+            return None
+        try:
+            depth = np.frombuffer(bytes(msg.data), np.uint16).reshape(height, width)
+            out = self._CompressedImage()
+            out.format = "16UC1; compressedDepth zlib"
+            out.data = zlib.compress(depth.tobytes(), 1)
+            return out
+        except Exception:
+            return None
 
     def _wrapper_type(self, ros2):
         """Import ros2_plugin_proto/msg/RosMsgWrapper lazily (test stubs provide it)."""
@@ -494,19 +578,6 @@ class A3Nodes:
         return jsonable(status)
 
     # -- generic mirror callback ------------------------------------------------
-
-    def _callback(self, key, publisher, *, as_json=False, json_filter=None):
-        def callback(msg):
-            if as_json:
-                value = json_filter(msg) if json_filter else jsonable(msg)
-                output = self._String()
-                output.data = json.dumps(value, ensure_ascii=False)
-                publisher.publish(output)
-                with self.lock:
-                    self.values[key] = value
-            else:
-                publisher.publish(msg)
-        return callback
 
     def snapshot(self, key):
         with self.lock:
@@ -746,6 +817,8 @@ class JointsPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
@@ -842,6 +915,8 @@ class LidarCloudPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         return {"state": "running", **self.nodes.streams["lidar_cloud"]}
@@ -867,6 +942,8 @@ class BatteryPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         if self.has_stream:
@@ -892,6 +969,8 @@ class EstopPlugin:
         pass
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         if self.has_stream:
@@ -1404,7 +1483,9 @@ class MotionPlayPlugin:
                                               "（SendMotionCommand + GetResourceList RPC；播放前先停止 MDU 上"
                                               "的 motion_player 应用，且需 MOTION 模式）",
                     action_schema(self.ACTIONS, {
-                        "motion_id": {"type": "integer", "description": "动作资源 id（list → motion）"},
+                        "motion_id": {"type": "string",
+                                      "description": "动作文件绝对路径（list → motion 取 path 字段；"
+                                                     "SendMotionCommand 要求绝对路径）"},
                         "duration_ms": {"type": "integer", "description": "播放时长 ms（可选，缺省为播放到结束）"},
                     }))
 
@@ -1425,11 +1506,11 @@ class MotionPlayPlugin:
         if action == "play":
             # SendMotionCommand 入参为动作文件绝对路径 + 动作最长运行毫秒数；
             # cmd_end=true 时播放完自动回初始姿态（默认 True）
-            motion_id = str(args.get("motion_id", ""))
-            _require(motion_id, "motion_id 不能为空")
+            motion_path = str(args.get("motion_id", ""))
+            _require(motion_path, "motion_id 不能为空")
             duration_ms = args.get("duration_ms", 10000)
             return jsonable(self.nodes.rpc.send_motion_command(
-                motion_id, int(duration_ms), cmd_end=True, cmd_pause=False))
+                motion_path, int(duration_ms), cmd_end=True, cmd_pause=False))
         if action == "pause":
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=True))
         if action == "resume":
@@ -2044,7 +2125,7 @@ class SpatialMapPlugin:
                     topic_out=[{"topic": self.topic, "format": "sensor/mapping"}])
 
     def start(self):
-        """启动后台轮询线程（dispatch 的 start/stop 是画布卡片启停，保持惰性）。"""
+        """启动后台轮询线程（dispatch 的 start/stop 同样会启停该线程）。"""
         if self._thread is not None:
             return
         self._running = True
@@ -2058,13 +2139,18 @@ class SpatialMapPlugin:
             thread.join(timeout=2.0)
 
     def _poll_loop(self):
+        # Sleep first so card start (dispatch "start") returns before any RPC
+        # fires — a card being dragged onto the canvas must not issue an
+        # immediate Get2DWholeMap call.
         while self._running:
+            time.sleep(self.publish_interval)
+            if not self._running:
+                return
             try:
                 response = self.nodes.rpc.get_2d_whole_map(self.map_id)
                 self.publish_map(response)
             except Exception:
                 pass
-            time.sleep(self.publish_interval)
 
     # -- 栅格 → 点云 ----------------------------------------------------------------
 
@@ -2169,10 +2255,17 @@ class SpatialMapPlugin:
         return True
 
     def dispatch(self, action, args):
+        # Canvas card start/stop drives the polling thread too (tianyi pattern):
+        # dragging the card off stops the periodic Get2DWholeMap pulls, dragging
+        # it back on restarts them.
         if action == "start":
-            return {"state": "running"}
+            if not self._running:
+                self.start()
+            return {"state": "running" if self._running else "idle"}
         if action == "stop":
-            return {"state": "idle"}
+            if self._running:
+                self.stop()
+            return {"state": "running" if self._running else "idle"}
         if action == "info":
             return {"state": "running" if self._running else "idle",
                     "topic": self.topic, "map_id": self.map_id}

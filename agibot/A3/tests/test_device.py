@@ -126,7 +126,8 @@ def _install_ros_stubs():
     rclpy.qos = sys.modules["rclpy.qos"]
 
     module("sensor_msgs")
-    module("sensor_msgs.msg", Image=FakeMsg, Imu=FakeMsg, JointState=FakeMsg, PointCloud2=FakeMsg)
+    module("sensor_msgs.msg", Image=FakeMsg, CompressedImage=FakeMsg, Imu=FakeMsg,
+           JointState=FakeMsg, PointCloud2=FakeMsg)
     module("std_msgs")
     # UInt8MultiArray carries the spatial_map sensor/mapping binary payload.
     module("std_msgs.msg", String=FakeMsg, UInt8MultiArray=FakeMsg)
@@ -325,6 +326,83 @@ class ToolInventoryTests(unittest.TestCase):
         self.assertEqual(list(camera.streams), ["camera_head_left_fisheye",
                                                 "camera_chest_front_d457_depth"])
 
+    def test_camera_rgb_stream_reencodes_to_jpeg_when_cv2_available(self):
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        nodes = next(iter(plugins.values())).nodes
+
+        try:
+            import numpy as np  # noqa: F401
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("numpy/cv2 not installed on this host")
+
+        import numpy as np
+        subs = {topic: cb for topic, cb in nodes.robot.subscriptions}
+        rgb_cb = subs["/hal/head_left_fisheye_camera/rgb"]
+        rgb_pub = nodes.core.publishers[f"/{nodes.namespace}/agibot_a3/camera_head_left_fisheye"]
+
+        import sensor_msgs.msg as sensor_msgs_real  # noqa: F401 — must be the stub
+
+        h, w = 4, 6
+        frame = bytes(bytearray(np.arange(h * w * 3, dtype=np.uint8)))
+        msg = FakeMsg()
+        msg.height, msg.width, msg.encoding, msg.data = h, w, "rgb8", frame
+        rgb_cb(msg)
+        self.assertEqual(len(rgb_pub.published), 1, "RGB frame must be re-encoded and published")
+        out = rgb_pub.published[0]
+        self.assertEqual(out.format, "jpeg")
+        self.assertIsInstance(out.data, bytes)
+        self.assertGreater(len(out.data), 0)
+
+    def test_camera_depth_stream_zlib_compresses_uint16(self):
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        nodes = next(iter(plugins.values())).nodes
+
+        try:
+            import numpy as np  # noqa: F401
+        except ImportError:
+            self.skipTest("numpy not installed on this host")
+
+        import zlib
+        subs = {topic: cb for topic, cb in nodes.robot.subscriptions}
+        depth_cb = subs["/hal/chest_front_d457_camera/depth"]
+        depth_pub = nodes.core.publishers[f"/{nodes.namespace}/agibot_a3/camera_chest_front_d457_depth"]
+
+        import numpy as np
+        h, w = 4, 6
+        depth = np.arange(h * w, dtype=np.uint16)
+        msg = FakeMsg()
+        msg.height, msg.width, msg.encoding, msg.data = h, w, "16UC1", depth.tobytes()
+        depth_cb(msg)
+        self.assertEqual(len(depth_pub.published), 1, "depth frame must be compressed and published")
+        out = depth_pub.published[0]
+        self.assertEqual(out.format, "16UC1; compressedDepth zlib")
+        self.assertEqual(zlib.decompress(out.data), depth.tobytes())
+        self.assertLess(len(out.data), len(depth.tobytes()))
+
+    def test_camera_encoder_skips_unknown_encoding(self):
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        nodes = next(iter(plugins.values())).nodes
+        subs = {topic: cb for topic, cb in nodes.robot.subscriptions}
+        rgb_pub = nodes.core.publishers[f"/{nodes.namespace}/agibot_a3/camera_head_left_fisheye"]
+
+        try:
+            import numpy as np  # noqa: F401
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("numpy/cv2 not installed on this host")
+
+        msg = FakeMsg()
+        msg.height, msg.width, msg.encoding, msg.data = 4, 6, "yuyv", bytes(4 * 6 * 3)
+        subs["/hal/head_left_fisheye_camera/rgb"](msg)
+        self.assertEqual(rgb_pub.published, [], "frames with unsupported encoding must be dropped")
+
     def test_joints_card_multiplexes_three_groups(self):
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = FULL_PLUGINS
@@ -369,6 +447,16 @@ class StartStopLifecycleTests(unittest.TestCase):
         for name, plugin in plugins.items():
             self._assert_inert(plugin, name, nodes)
         self.assertEqual(transport.calls, [], "start/stop must not issue any RPC")
+
+        # spatial_map's card lifecycle deliberately drives its polling thread
+        # (tianyi pattern) — the thread is stopped now, so verify it can be
+        # restarted without any RPC leaking out (first poll happens after
+        # publish_interval, not synchronously).
+        spatial_map = find_plugin(plugins, "spatial_map")
+        result = spatial_map.dispatch("start", {"_tool_name": "spatial_map"})
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(transport.calls, [], "card start must not issue any RPC")
+        spatial_map.stop()
 
 
 # ---------------------------------------------------------------------------

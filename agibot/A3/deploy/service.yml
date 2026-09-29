@@ -8,20 +8,22 @@ agibot-a3:
   volumes:
     - /dev:/dev
     - /opt/phanthy-motus/data:/opt/phanthy-motus/data
-    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     # AimDK 开发包 (dev kit): provides prebuilt/a3_aimdk wheel + ros2_plugin_proto.
     # Per dev guide §5.2 the wheel is pip-installed at container start and the
     # ros2_plugin_proto environment is sourced from here by the image CMD. Absent
     # on a non-robot host -- device.py then falls back to its no-wheel code paths.
     - /agibot/software/v0/entry:/agibot-devkit:ro
   environment:
-    # Core (fleet) domain 42 here; the robot domain 232 lives in the driver's
-    # own rclpy context (config.yaml ros.robot_domain_id) -- DualDomainROS2
-    # creates a second context with its own domain id, so this env var only
-    # governs stray ROS processes inheriting the container environment.
-    - ROS_DOMAIN_ID=42
+    # No FASTRTPS_DEFAULT_PROFILES_FILE and no ROS_DOMAIN_ID here, unlike most
+    # drivers — same reason as x-humanoid/tianyi2.0. This process runs two FastDDS
+    # contexts (DualDomainROS2): robot domain 232 must reach the HDU/ADU/MDU at
+    # 10.42.10.10-12 over eth0, which the fleet's loopback-only profile would
+    # silently cut (FastDDS caches profiles process-wide, so per-context selection
+    # is impossible). main.py therefore generates its own profile whitelisting
+    # {robot-subnet IP, 127.0.0.1} before any participant is created — see
+    # main.py _select_profile. Domain 42 is set in code by DualDomainROS2 too;
+    # a container-wide ROS_DOMAIN_ID would only govern stray processes.
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
     - PYTHONUNBUFFERED=1
   logging:
     driver: local
