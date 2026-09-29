@@ -945,6 +945,16 @@ class ArmGestureRegistrationTests(unittest.TestCase):
             self.assertNotIn("waist_gesture", content, filename)
             self.assertNotIn("head_gesture", content, filename)
 
+    def test_config_uses_adam_pro_dds_domain(self):
+        base = __file__.rsplit("/", 1)[0]
+        with open(f"{base}/config.yaml", encoding="utf-8") as stream:
+            lines = stream.readlines()
+        domain_lines = [
+            line for line in lines
+            if line.startswith("dds_domain_id:")
+        ]
+        self.assertEqual(["dds_domain_id: 0\n"], domain_lines)
+
     def test_bundle_registers_gesture_with_the_shared_arm_controller(self):
         bundle = self._bundle()
         arm = bundle._tool_map["arm_control"]
