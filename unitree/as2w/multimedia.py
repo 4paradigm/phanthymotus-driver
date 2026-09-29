@@ -751,7 +751,7 @@ class SpeakerPlugin:
             block_ms,
             min(prefill_ms, int(config.get("continuation_prefill_ms", 500))),
         )
-        max_lead_ms = max(0, min(1000, int(config.get("max_lead_ms", 240))))
+        max_lead_ms = max(0, min(1000, int(config.get("max_lead_ms", 600))))
         self._node = _SpeakerNode(
             network_iface,
             block_ms * 32,

@@ -540,7 +540,7 @@ class TestDriverContracts(unittest.TestCase):
         executor = types.SimpleNamespace(add_node=lambda _node: None)
         with patch.object(self.multimedia, "_SpeakerBackend", FakeBackend):
             plugin = self.multimedia.SpeakerPlugin(
-                {"block_ms": 300, "prefill_ms": 700, "max_lead_ms": 240},
+                {"block_ms": 300, "prefill_ms": 700, "max_lead_ms": 600},
                 "test", executor, "eth0")
             self.assertIsNone(plugin._node._backend)
             self.assertTrue(plugin.start()["ok"])
@@ -548,7 +548,7 @@ class TestDriverContracts(unittest.TestCase):
             self.assertEqual(9600, first.block_bytes)
             self.assertEqual(22400, first.prefill_bytes)
             self.assertEqual(16000, first.continuation_prefill_bytes)
-            self.assertEqual(.24, first.max_lead_s)
+            self.assertEqual(.6, first.max_lead_s)
             self.assertEqual("ready", plugin._node.state)
             plugin.stop()
             self.assertIsNone(plugin._node._backend)
