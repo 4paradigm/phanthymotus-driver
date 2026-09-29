@@ -10,7 +10,9 @@ records every HTTP JSON RPC call, so payload shapes are asserted too.
 
 from __future__ import annotations
 
+import array
 import json
+import struct
 import sys
 import threading
 import types
@@ -126,7 +128,8 @@ def _install_ros_stubs():
     module("sensor_msgs")
     module("sensor_msgs.msg", Image=FakeMsg, Imu=FakeMsg, JointState=FakeMsg, PointCloud2=FakeMsg)
     module("std_msgs")
-    module("std_msgs.msg", String=FakeMsg)
+    # UInt8MultiArray carries the spatial_map sensor/mapping binary payload.
+    module("std_msgs.msg", String=FakeMsg, UInt8MultiArray=FakeMsg)
 
     # ros2_plugin_proto/msg/RosMsgWrapper — device.py publishes command wrappers
     # through it; a plain FakeMsg works (serialization_type / .data attrs).
@@ -157,21 +160,21 @@ BASE_CONFIG = {
 # config.yaml's full plugin set (matching the shipped config), advanced modules ON so
 # the gated tools are covered too.
 FULL_PLUGINS = {
-    "mc_state": {"enabled": True}, "joints": {"enabled": True}, "imu": {"enabled": True},
+    "joints": {"enabled": True}, "imu": {"enabled": True},
     "camera": {"enabled": True, "streams": ["head_left_fisheye", "chest_front_d457_rgb"]},
     "lidar": {"enabled": True}, "bms": {"enabled": True}, "emergency": {"enabled": True},
-    "wakeup": {"enabled": True}, "skill_status": {"enabled": True},
+    "wakeup": {"enabled": True},
     "alerts": {"enabled": True, "poll_interval": 5.0}, "mc_mode": {"enabled": True},
     "locomotion": {"enabled": True}, "arm_command": {"enabled": True},
     "hand_command": {"enabled": True}, "neck_command": {"enabled": True},
     "waist_command": {"enabled": True}, "arm_compliance": {"enabled": True},
-    "motion_play": {"enabled": True}, "tts": {"enabled": True}, "media_play": {"enabled": True},
-    "audio_play": {"enabled": True}, "volume": {"enabled": True, "max_volume": 70},
-    "mic_source": {"enabled": True}, "interaction": {"enabled": True},
+    "motion_play": {"enabled": True}, "tts": {"enabled": True},
+    "audio": {"enabled": True, "max_volume": 70},
+    "interaction": {"enabled": True},
     "resources": {"enabled": True}, "face_play": {"enabled": True},
     "skill_play": {"enabled": True},
-    "mapping": {"enabled": True}, "navigation": {"enabled": True},
-    "relocalization": {"enabled": True}, "auto_charging": {"enabled": True},
+    "controlled_spatial": {"enabled": True}, "spatial_map": {"enabled": True},
+    "auto_charging": {"enabled": True},
 }
 
 
@@ -261,13 +264,12 @@ class ToolInventoryTests(unittest.TestCase):
 
     def test_advanced_modules_gated_by_config(self):
         config = json.loads(json.dumps(BASE_CONFIG))
-        config["plugins"] = dict(FULL_PLUGINS, mapping={"enabled": False},
-                                 navigation={"enabled": False},
-                                 relocalization={"enabled": False},
+        config["plugins"] = dict(FULL_PLUGINS, controlled_spatial={"enabled": False},
+                                 spatial_map={"enabled": False},
                                  auto_charging={"enabled": False})
         plugins, _ = build_bundle_plugins(config)
         names = {d["name"] for d in tool_definitions(plugins)}
-        for gated in ("mapping", "map_get", "navigation", "relocalization", "auto_charging"):
+        for gated in ("controlled_spatial", "spatial_map", "auto_charging"):
             self.assertNotIn(gated, names)
 
     def test_actuator_tools_are_typed_actuator(self):
@@ -278,8 +280,7 @@ class ToolInventoryTests(unittest.TestCase):
         expected_actuators = {
             "resource_list", "mc_mode", "locomotion", "arm_command", "hand_command",
             "neck_command", "waist_command", "arm_compliance", "motion_play", "tts",
-            "media_play", "audio_play", "volume", "mic_source", "interaction",
-            "face_play", "skill_play", "mapping", "navigation", "relocalization",
+            "audio", "interaction", "face_play", "skill_play", "controlled_spatial",
             "auto_charging",
         }
         for name in expected_actuators:
@@ -291,25 +292,25 @@ class ToolInventoryTests(unittest.TestCase):
         plugins, _ = build_bundle_plugins(config)
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
-        self.assertEqual(by_name["map_get"], "processor")
-        for name in ("mc_state", "arm_state", "hand_state", "neck_state", "imu",
-                     "camera", "lidar", "bms", "emergency", "wakeup", "skill_status",
-                     "alerts"):
+        for name in ("joints", "imu", "camera", "lidar", "bms", "emergency", "wakeup",
+                     "alerts", "spatial_map"):
             self.assertEqual(by_name[name], "sensor", f"'{name}' must be a sensor tool")
 
     def test_pb_streams_withheld_without_wheel(self):
         # aimdk (the a3_aimdk wheel) is not installed in the test environment, so the
-        # pb-decoded stream mirrors must be absent from nodes.streams and their plugins
-        # fall back to the no-stream tool description.
+        # pb-decoded stream mirrors must be absent from nodes.streams; the stream cards
+        # fall back to the no-stream tool description and skill_play drops its stream.
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = FULL_PLUGINS
         plugins, _ = build_bundle_plugins(config)
         nodes = next(iter(plugins.values())).nodes
         for key in ("bms", "emergency", "wakeup", "skill_status"):
             self.assertNotIn(key, nodes.streams)
-        for name in ("bms", "emergency", "wakeup", "skill_status"):
+        for name in ("bms", "emergency", "wakeup"):
             plugin = find_plugin(plugins, name)
             self.assertFalse(plugin.has_stream, f"{name} must not claim a stream without the wheel")
+        skill_play = find_plugin(plugins, "skill_play")
+        self.assertFalse(skill_play.has_stream, "skill_play must not claim a stream without the wheel")
 
     def test_camera_streams_follow_config(self):
         config = json.loads(json.dumps(BASE_CONFIG))
@@ -318,6 +319,19 @@ class ToolInventoryTests(unittest.TestCase):
         plugins, _ = build_bundle_plugins(config)
         camera = find_plugin(plugins, "camera")
         self.assertEqual(list(camera.streams), ["camera_head_left_fisheye"])
+
+    def test_joints_card_multiplexes_three_groups(self):
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        joints = find_plugin(plugins, "joints")
+        for group, robot_topic in (("arm", "/motion/control/arm_joint_state"),
+                                   ("hand", "/motion/control/hand_joint_state"),
+                                   ("neck", "/motion/control/neck_joint_state")):
+            result = joints.dispatch("query", {"group": group})
+            self.assertEqual(result["robot_topic"], robot_topic)
+        with self.assertRaises(ValueError):
+            joints.dispatch("query", {"group": "tail"})
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +377,7 @@ class RpcDispatchTests(unittest.TestCase):
         self.plugins, self.transport = build_bundle_plugins(self.config)
         self.nodes = next(iter(self.plugins.values())).nodes
 
-    # -- mc_mode / mc_state (MDU :56322) --
+    # -- mc_mode (MDU :56322, absorbs former mc_state queries) --
 
     def test_mc_mode_set_action_hits_mdu_56322(self):
         mc_mode = find_plugin(self.plugins, "mc_mode")
@@ -372,11 +386,11 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertIn("10.42.10.12:56322", url)
         self.assertEqual(body["command"]["action"], "MotionControlAction_GET_UP")
 
-    def test_mc_state_available_lists_actions(self):
+    def test_mc_mode_available_lists_actions(self):
         response = {"commands": ["MotionControlAction_GET_UP", "MotionControlAction_DAMPING"]}
         self.transport.responses["MotionControlActionService"] = response
-        mc_state = find_plugin(self.plugins, "mc_state")
-        result = mc_state.dispatch("available", {})
+        mc_mode = find_plugin(self.plugins, "mc_mode")
+        result = mc_mode.dispatch("available", {})
         self.assertEqual(result["commands"], response["commands"])
 
     def test_mc_mode_unknown_action_raises(self):
@@ -473,7 +487,8 @@ class RpcDispatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             hand.dispatch("send", {"left": [0], "hand_type": "RobotHand"})
 
-    # -- HDU RPCs: tts / volume / mic / interaction / resources --
+    # -- HDU RPCs: tts (absorbs media_play) / audio (absorbs audio_play+volume) /
+    #    interaction (absorbs mic_source) / resources --
 
     def test_tts_speak_posts_to_hdu_59301(self):
         tts = find_plugin(self.plugins, "tts")
@@ -491,19 +506,33 @@ class RpcDispatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tts.dispatch("speak", {"text": "字" * 400})  # 1200 bytes > 1024
 
-    def test_volume_clamped_to_hard_max(self):
-        volume = find_plugin(self.plugins, "volume")
+    def test_tts_play_media_posts_play_media_file(self):
+        tts = find_plugin(self.plugins, "tts")
+        tts.dispatch("play_media", {"file_name": "welcome.mp3"})
+        (url, body), = self.transport.calls_to("TTSService", "PlayMediaFile")
+        self.assertIn("10.42.10.10:59301", url)
+        self.assertEqual(body["file_name"], "welcome.mp3")
+
+    def test_audio_play_posts_play_file(self):
+        audio = find_plugin(self.plugins, "audio")
+        audio.dispatch("play", {"file_name": "ding.wav"})
+        (url, body), = self.transport.calls_to("HalAudioService", "PlayFile")
+        self.assertIn("10.42.10.10:56666", url)
+        self.assertEqual(body["file_name"], "ding.wav")
+
+    def test_audio_volume_clamped_to_hard_max(self):
+        audio = find_plugin(self.plugins, "audio")
         with self.assertRaises(ValueError):
-            volume.dispatch("set", {"volume": 85})
-        volume.dispatch("set", {"volume": 70})
+            audio.dispatch("set_volume", {"volume": 85})
+        audio.dispatch("set_volume", {"volume": 70})
         (url, body), = self.transport.calls_to("HalAudioService", "SetAudioVolume")
         self.assertIn("10.42.10.10:56666", url)
         self.assertEqual(body["audio_volume"], 70)
         self.assertEqual(body["type"], "SPEAKER_BUILT_IN")
 
-    def test_mic_source_external(self):
-        mic = find_plugin(self.plugins, "mic_source")
-        mic.dispatch("external", {})
+    def test_interaction_mic_external(self):
+        interaction = find_plugin(self.plugins, "interaction")
+        interaction.dispatch("mic_external", {})
         (url, body), = self.transport.calls_to("HalAudioService", "SetMicSourceRequest")
         self.assertEqual(body["mic_source"], 1)
 
@@ -556,44 +585,53 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(self.transport.calls_to("HDSService", "GetAlertList").__len__(), 1)
         self.assertEqual(first["alerts"], second["alerts"])
 
-    # -- ADU mapping / navigation / relocalization / auto_charging --
+    # -- ADU controlled_spatial (mapping + navigation + relocalization + map query) --
 
-    def test_mapping_start_and_save(self):
-        mapping = find_plugin(self.plugins, "mapping")
-        mapping.dispatch("start_mapping", {})
+    def test_controlled_spatial_mapping_start_and_save(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        spatial.dispatch("start_mapping", {})
         (url, body), = self.transport.calls_to("MappingService", "StartMapping")
         self.assertIn("10.42.10.11:50807", url)
         self.assertEqual(body["command"], "MappingCommand_START_MAPPING")
-        mapping.dispatch("stop_save", {"map_name": "lobby"})
+        spatial.dispatch("stop_save", {"map_name": "lobby"})
         (_, save_body), = self.transport.calls_to("MappingService", "StopMapping")
         self.assertEqual(save_body["command"], "MappingCommand_SAVING_MAP")
         self.assertEqual(save_body["map_name"], "lobby")
 
-    def test_navigation_navi_to_pose_payload(self):
-        navigation = find_plugin(self.plugins, "navigation")
+    def test_controlled_spatial_navi_to_pose_payload(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
         self.transport.responses["PncService"] = {"task_id": 7}
-        navigation.dispatch("navi_to_pose", {"map_id": 3, "x": 1.5, "y": -2.0, "angle": 0.3})
+        spatial.dispatch("navi_to_pose", {"map_id": 3, "x": 1.5, "y": -2.0, "angle": 0.3})
         (url, body), = self.transport.calls_to("PncService", "PlanningNaviToPose2D")
         self.assertIn("10.42.10.11:53176", url)
         self.assertEqual(body["map_id"], 3)
         self.assertEqual(body["pose"]["position"], {"x": 1.5, "y": -2.0})
         self.assertEqual(body["pose"]["angle"], 0.3)
-        self.assertEqual(navigation.last_task_id, 7)
+        self.assertEqual(spatial.last_task_id, 7)
 
-    def test_navigation_control_reuses_last_task_id(self):
-        navigation = find_plugin(self.plugins, "navigation")
+    def test_controlled_spatial_control_reuses_last_task_id(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
         self.transport.responses["PncService"] = {"task_id": 9}
-        navigation.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
-        navigation.dispatch("pause", {})
+        spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
+        spatial.dispatch("pause", {})
         (_, body), = self.transport.calls_to("PncService", "ActionPause")
         self.assertEqual(body["task_id"], 9)
 
-    def test_relocalization_start_normal(self):
-        relocalization = find_plugin(self.plugins, "relocalization")
-        relocalization.dispatch("start_normal", {"map_dir": "/agibot/data/map/lobby"})
+    def test_controlled_spatial_relocalization_start(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        spatial.dispatch("start_relocalization", {"map_dir": "/agibot/data/map/lobby"})
         (url, body), = self.transport.calls_to("SLAMRelocalizationService", "SLAMStartNormalRelocalization")
         self.assertIn("10.42.10.11:50583", url)
         self.assertEqual(body["related_map_dir"], "/agibot/data/map/lobby")
+
+    def test_controlled_spatial_get_map_pixel_conversion(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        self.transport.responses["MappingService"] = {
+            "data": {"resolution": 0.05, "origin": {"x": 100, "y": 200}}}
+        result = spatial.dispatch("get_map", {"map_id": 1, "x": 2.0, "y": 4.0})
+        # pixel_x = 100 + 2.0*0.05 = 100.1 -> 100 ; pixel_y = 200 - 4.0*0.05 = 199.8 -> 199
+        self.assertEqual(result["pixel"]["x"], 100)
+        self.assertEqual(result["pixel"]["y"], 199)
 
     def test_auto_charging_start(self):
         charging = find_plugin(self.plugins, "auto_charging")
@@ -611,14 +649,10 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(pause_calls[-1][1]["command"], "Pause")
         self.assertEqual(pause_calls[-1][1]["session_id"], "s-1")
 
-    def test_map_get_pixel_conversion(self):
-        map_get = find_plugin(self.plugins, "map_get")
-        self.transport.responses["MappingService"] = {
-            "data": {"resolution": 0.05, "origin": {"x": 100, "y": 200}}}
-        result = map_get.dispatch("query", {"map_id": 1, "x": 2.0, "y": 4.0})
-        # pixel_x = 100 + 2.0*0.05 = 100.1 -> 100 ; pixel_y = 200 - 4.0*0.05 = 199.8 -> 199
-        self.assertEqual(result["pixel"]["x"], 100)
-        self.assertEqual(result["pixel"]["y"], 199)
+    def test_skill_play_state_without_stream_reports_unknown(self):
+        skill = find_plugin(self.plugins, "skill_play")
+        result = skill.dispatch("state", {})
+        self.assertEqual(result, {"state": "unknown"})
 
     # -- model resource --
 
@@ -668,6 +702,82 @@ class MirrorStreamTests(unittest.TestCase):
         result = imu.dispatch("query", {})
         self.assertEqual(result["pelvis"]["linear_acceleration"]["x"], 0.01)
         self.assertEqual(result["torso"]["linear_acceleration"]["x"], 0.01)
+
+
+class SpatialMapTests(unittest.TestCase):
+    """spatial_map sensor card: occupancy grid → canonical sensor/mapping binary."""
+
+    def setUp(self):
+        self.config = json.loads(json.dumps(BASE_CONFIG))
+        self.config["plugins"] = FULL_PLUGINS
+        self.plugins, self.transport = build_bundle_plugins(self.config)
+        self.nodes = next(iter(self.plugins.values())).nodes
+        self.plugin = find_plugin(self.plugins, "spatial_map")
+
+    def test_tool_declares_mapping_topic(self):
+        definition = self.plugin.get_tool()
+        self.assertEqual(definition["name"], "spatial_map")
+        self.assertEqual(definition["type"], "sensor")
+        self.assertEqual(definition["topic_out"],
+                         [{"topic": "/test_ns/agibot_a3/spatial_map", "format": "sensor/mapping"}])
+
+    def test_publish_map_binary_format(self):
+        response = {"data": {
+            "resolution": 0.05, "origin": {"x": 100, "y": 200},
+            "occupancy_grid": [[127, 0, 1], [0, 127, 0]],
+        }}
+        published = self.plugin.publish_map(response)
+        self.assertTrue(published)
+        pub = self.nodes.core.publishers["/test_ns/agibot_a3/spatial_map"]
+        (msg,) = pub.published
+        buf = bytes(msg.data)
+        self.assertIsInstance(msg.data, array.array)
+
+        # header: robot x/y/yaw, kind=7 (mapping), point count
+        x, y, yaw, kind, point_count = struct.unpack_from("<fffBI", buf, 0)
+        self.assertEqual((x, y, yaw), (0.0, 0.0, 0.0))
+        self.assertEqual(kind, 7)
+        # floor cells (127) at (0,0)/(1,1) + feature cell (1) at (0,2)
+        self.assertEqual(point_count, 3)
+
+        # first point: floor layer at row 0, col 0 → origin + 0.5*res
+        # (header is 17 bytes: 3 floats + 1 byte kind + uint32 count — no packing)
+        header_size = struct.calcsize("<fffBI")
+        px, py, pz = struct.unpack_from("<fff", buf, header_size)
+        self.assertAlmostEqual(px, 100 + 0.5 * 0.05, places=4)
+        self.assertAlmostEqual(py, 200 + 0.5 * 0.05, places=4)
+        self.assertAlmostEqual(pz, -0.03, places=5)
+
+        # trailing meta JSON (version 3, no robot pose available)
+        meta_offset = header_size + point_count * 12
+        (meta_len,) = struct.unpack_from("<I", buf, meta_offset)
+        meta = json.loads(buf[meta_offset + 4:meta_offset + 4 + meta_len])
+        self.assertEqual(meta["version"], 3)
+        self.assertFalse(meta["robot"]["pose_available"])
+        self.assertEqual(meta["floor_points"], 2)
+        self.assertEqual(meta["feature_points"], 1)
+        self.assertEqual(meta["grid_points"], 3)
+        self.assertAlmostEqual(meta["resolution"], 0.05, places=6)
+
+    def test_refresh_polls_rpc_and_publishes(self):
+        self.transport.responses["MappingService"] = {"data": {
+            "resolution": 0.05, "origin": [0, 0], "occupancy_grid": [[0, 100]]}}
+        result = self.plugin.dispatch("refresh", {"map_id": 2})
+        self.assertTrue(result["published"])
+        (url, body), = self.transport.calls_to("MappingService", "Get2DWholeMap")
+        self.assertIn("10.42.10.11:50807", url)
+        self.assertEqual(body["map_id"], 2)
+        pub = self.nodes.core.publishers["/test_ns/agibot_a3/spatial_map"]
+        self.assertEqual(len(pub.published), 1)
+
+    def test_empty_grid_publishes_empty_frame(self):
+        published = self.plugin.publish_map({"data": {"resolution": 0.05}})
+        self.assertTrue(published)
+        pub = self.nodes.core.publishers["/test_ns/agibot_a3/spatial_map"]
+        (msg,) = pub.published
+        buf = bytes(msg.data)
+        *_, point_count = struct.unpack_from("<fffBI", buf, 0)
+        self.assertEqual(point_count, 0)
 
 
 if __name__ == "__main__":

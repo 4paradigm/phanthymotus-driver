@@ -23,10 +23,10 @@ ros:
   robot_interface: "eth0"
 
 plugins:
-  mc_state:
-    enabled: true
+  # --- sensors ---
   joints:
     enabled: true
+    # Which joint groups the card exposes: arm (14-dof arms), hand, neck.
   imu:
     enabled: true
   camera:
@@ -41,12 +41,11 @@ plugins:
     enabled: true
   wakeup:
     enabled: true
-  skill_status:
-    enabled: true
   alerts:
     enabled: true
     # Dev guide hard limit: alert polling must stay <= 0.2 Hz (one call / 5s).
     poll_interval: 5.0
+  # --- actuators ---
   mc_mode:
     enabled: true
   locomotion:
@@ -65,16 +64,10 @@ plugins:
     enabled: true
   tts:
     enabled: true
-  media_play:
-    enabled: true
-  audio_play:
-    enabled: true
-  volume:
+  audio:
     enabled: true
     # Dev guide: volume above 70 risks hardware damage -- hard-clamped in device.py too.
     max_volume: 70
-  mic_source:
-    enabled: true
   interaction:
     enabled: true
   resources:
@@ -84,11 +77,11 @@ plugins:
   skill_play:
     enabled: true
   # --- advanced modules, opt-in like X2's slam ---
-  mapping:
+  controlled_spatial:
     enabled: false
-  navigation:
+  spatial_map:
     enabled: false
-  relocalization:
-    enabled: false
+    # Which saved map to visualize; 0 = current active map.
+    map_id: 0
   auto_charging:
     enabled: false

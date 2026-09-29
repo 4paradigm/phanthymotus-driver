@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import base64
 import json
+import math
+import struct
 import threading
 import time
-import threading
-import time
+from array import array
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,6 +118,14 @@ TTS_MAX_TEXT_BYTES = 1024  # docs: text <= 1024 bytes (~200 chars)
 
 # Volume (docs §7.2.3): 0-100 scale but >70 risks damage — clamped in dispatch too.
 VOLUME_HARD_MAX = 70
+
+# spatial_map renderer budget (same contract as tianyi2.0/g1 map-view cards):
+# canonical binary = struct('<fffBI', x, y, display_yaw, flags=7, n) + xyz points
+# + struct('<I', len) + meta JSON, on a core-domain UInt8MultiArray topic.
+MAP_MAX_POINTS = 80000        # renderer hard cap
+MAP_FLOOR_POINTS = 39000       # traversable (127) cells keep a denser floor layer
+MAP_FEATURE_POINTS = 13000    # walls/obstacles stay on a finer grid
+MAP_PUBLISH_INTERVAL = 0.35
 
 # Resource types (docs §7.5.1 GetResourceList).
 RESOURCE_TYPES = {
@@ -717,14 +726,29 @@ def _stream_tool(key, stream, description):
     return tool(key, "sensor", description, topic_out=[{"topic": stream["topic"], "format": stream["format"]}])
 
 
-class McStatePlugin:
-    """GetAction + GetAvailableActions — A3 has no status topic for the FSM."""
+class JointsPlugin:
+    """joints 状态卡：手臂/灵巧手/头部三路关节状态流合一张卡（camera 卡同款
+    多路复用模式——group 参数选择，镜像话题各自保持不变）。"""
+
+    GROUPS = {
+        "arm": ("arm_state", "14 自由度手臂关节（position/velocity/effort）"),
+        "hand": ("hand_state", "手指（0-4096；frame_id 标识 AgiHand/O10Hand；O10Hand 含压力阵列）"),
+        "neck": ("neck_state", "头部偏航/俯仰关节"),
+    }
 
     def __init__(self, nodes):
         self.nodes = nodes
+        self.streams = {k: nodes.streams[k] for k in ("arm_state", "hand_state", "neck_state")}
 
     def get_tool(self):
-        return tool("mc_state", "sensor", "查询运动控制状态机当前动作/状态（GetAction/GetAvailableActions）")
+        return tool("joints", "sensor", "关节状态流（按 group 选择 arm/hand/neck；"
+                                     "config.yaml plugins.joints 控制启用）", {
+            "type": "object",
+            "properties": {
+                "group": {"type": "string", "enum": list(self.GROUPS),
+                          "description": "关节组：arm 双臂 14 关节 / hand 手指 / neck 头部"},
+            },
+        })
 
     def start(self):
         pass
@@ -733,78 +757,15 @@ class McStatePlugin:
         pass
 
     def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running"}
-        if action == "available":
-            response = self.nodes.rpc.get_available_actions()
-            return {"commands": response.get("commands", [])}
-        response = self.nodes.rpc.get_action()
-        return response.get("info", response)
-
-
-class ArmStatePlugin:
-    def __init__(self, nodes, key=None):
-        self.nodes = nodes
-        self.key = key or "arm_state"
-
-    def get_tool(self):
-        return _stream_tool(self.key, self.nodes.streams[self.key], "14 自由度手臂关节状态流（position/velocity/effort）")
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "stop":
-            return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams[self.key]}
-
-
-class HandStatePlugin:
-    def __init__(self, nodes, key=None):
-        self.nodes = nodes
-        self.key = key or "hand_state"
-
-    def get_tool(self):
-        return _stream_tool(self.key, self.nodes.streams[self.key],
-                            "手指状态流（0-4096；frame_id 标识 AgiHand/O10Hand；O10Hand 含压力阵列）")
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "stop":
-            return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams[self.key]}
-
-
-class NeckStatePlugin:
-    def __init__(self, nodes, key=None):
-        self.nodes = nodes
-        self.key = key or "neck_state"
-
-    def get_tool(self):
-        return _stream_tool(self.key, self.nodes.streams[self.key], "头部偏航/俯仰关节状态流")
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "stop":
-            return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams[self.key]}
+            return {"state": "running", "streams": dict(self.streams)}
+        group = args.get("group", "arm")
+        if group not in self.GROUPS:
+            raise ValueError(f"joints: unknown group {group!r}; available: {list(self.GROUPS)}")
+        key = self.GROUPS[group][0]
+        return {"state": "running", **self.streams[key]}
 
 
 class ImuPlugin:
@@ -973,31 +934,6 @@ class WakeupPlugin:
         return {"state": "running"}
 
 
-class SkillStatusPlugin:
-    def __init__(self, nodes):
-        self.nodes = nodes
-        self.has_stream = "skill_status" in nodes.streams
-
-    def get_tool(self):
-        if self.has_stream:
-            return _stream_tool("skill_status", self.nodes.streams["skill_status"],
-                                "技能状态流（核数/电池/自主充电状态；默认 iceoryx，需开启 ros2 后端）")
-        return tool("skill_status", "sensor", "技能状态（需要 a3_aimdk protobuf wheel + skillpilot 开启 ros2 后端）")
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "stop":
-            return {"state": "idle"}
-        if self.has_stream:
-            return {"state": "running", **self.nodes.streams["skill_status"]}
-        return {"state": "running"}
-
-
 class AlertsPlugin:
     """HDSService/GetAlertList — poll-on-demand sensor. Dev guide hard limit: poll
     frequency <= 0.2 Hz, enforced by a monotonic-clock cooldown between real RPCs."""
@@ -1095,21 +1031,23 @@ class ResourceListPlugin:
 
 
 class McModePlugin:
-    """mc_mode 卡片：运动控制模式切换（GetUp / LieDown / Damping / Passive）。
+    """mc_mode 卡片：运动控制状态机查询 + 模式切换（原 mc_state 状态卡并入）。
 
-    对应 MDU MotionControlActionService/SetAction。切换是异步的——SetAction 返回
-    CommonState_PENDING，最终结果通过 mc_state 卡片轮询 GetAction 确认。
+    对应 MDU MotionControlActionService：SetAction 切换 GetUp/LieDown/Damping/
+    Passive（异步，返回 PENDING，结果经 get_state 轮询 GetAction 确认）；
+    get_state / available 合并自原 mc_state 卡（GetAction / GetAvailableActions）。
     Damping 模式用于跌倒保护/整机关节卸力，切换前请确保机器人周围有足够空间。
     """
 
     ACTIONS = {
         name: ([], desc)
         for name, desc in (
+            ("get_state", "查询当前运动控制动作状态（GetAction，异步切换结果确认）"),
+            ("available", "查询当前可用动作列表（GetAvailableActions）"),
             ("damping", "进入 Damping 阻尼模式（关节卸力，用于软急停/跌倒保护）"),
             ("get_up", "执行 GetUp 起身动作，从坐/躺恢复到站立平衡"),
             ("lie_down", "执行 LieDown 坐/躺下动作"),
             ("passive", "进入 Passive 拖动示教模式（关节可被手拖动）"),
-            ("get_state", "查询当前运动控制动作状态（GetAction，异步切换结果确认）"),
         )
     }
 
@@ -1117,8 +1055,8 @@ class McModePlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("mc_mode", "actuator", "切换 A3 运动控制模式（SetAction：get_up/lie_down/damping/passive），"
-                                     "get_state 查询当前动作状态；切换为异步流程，结果经 mc_state 确认",
+        return tool("mc_mode", "actuator", "运动控制状态机查询与模式切换（SetAction：get_up/lie_down/damping/passive；"
+                                          "get_state/available 查询当前动作与可用动作，切换为异步流程）",
                     action_schema(self.ACTIONS, {}))
 
     def start(self):
@@ -1136,6 +1074,9 @@ class McModePlugin:
             return {"state": "ready"}
         if action == "get_state":
             return jsonable(self.nodes.rpc.get_action())
+        if action == "available":
+            response = self.nodes.rpc.get_available_actions()
+            return {"commands": response.get("commands", [])}
         if action not in MC_ACTIONS:
             raise ValueError(f"mc_mode: unknown action {action!r}")
         service_action, short = MC_ACTIONS[action]
@@ -1509,72 +1450,19 @@ class MotionPlayPlugin:
 
 
 class TtsPlugin:
-    """tts 卡片：文本转语音播报。
+    """tts 卡片：语音播报一体化（原 media_play 卡并入 —— 同为 HDU TTSService）。
 
-    对应 HDU TTSService/PlayTTS。text ≤ 1024 字节；priority_level 分
-    BACKGROUND_L1 / SERVICE_L2 / INTERACTION_L6；is_interrupted=true 可打断
-    当前播报。返回 trace_id 用于经 media_play status 查询播报状态或打断。
-    """
-
-    def __init__(self, nodes):
-        self.nodes = nodes
-
-    def get_tool(self):
-        return tool("tts", "actuator", "文本转语音播报（PlayTTS RPC；text ≤1024 字节，返回 trace_id 用于状态查询）",
-                    action_schema(
-                        {"speak": (["text"], "播报一段中文/英文文本")},
-                        {
-                            "text": {"type": "string", "description": "播报文本（UTF-8，≤1024 字节）"},
-                            "priority_level": {"type": "string",
-                                              "enum": ["BACKGROUND_L1", "SERVICE_L2", "INTERACTION_L6"],
-                                              "default": "INTERACTION_L6",
-                                              "description": "播报优先级，INTERACTION_L6 默认可打断低优先级"},
-                            "is_interrupted": {"type": "boolean", "default": True, "description": "是否打断当前播报"},
-                            "trace_id": {"type": "string", "description": "自定义播报 id（可选），用于状态查询与打断"},
-                        },
-                    ))
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "ready"}
-        if action != "speak":
-            raise ValueError(f"tts: unknown action {action!r}")
-        text = args.get("text", "")
-        _require(len(text.encode("utf-8")) <= TTS_MAX_TEXT_BYTES,
-                 f"播报文本超长（>{TTS_MAX_TEXT_BYTES} 字节）")
-        priority = args.get("priority_level", "INTERACTION_L6")
-        _require(priority in TTS_PRIORITY_LEVELS.values() or priority in TTS_PRIORITY_LEVELS,
-                 f"未知优先级 {priority!r}")
-        response = self.nodes.rpc.play_tts(
-            text,
-            priority_level=priority if priority in TTS_PRIORITY_LEVELS.values() else TTS_PRIORITY_LEVELS[priority],
-            is_interrupted=bool(args.get("is_interrupted", True)),
-            trace_id=str(args.get("trace_id") or ""),
-        )
-        # PlayTTS 出参为扁平结构（trace_id 顶层字段，is_sucess 官方拼写如此）
-        trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
-        return {"trace_id": trace_id, "response": response}
-
-
-class MediaPlayPlugin:
-    """media_play 卡片：媒体文件播报与状态控制。
-
-    对应 HDU TTSService：PlayMediaFile 播放音频/视频文件，GetAudioStatus 按
-    trace_id 查询播报状态，StopTTSByTraceId 按 trace_id 打断。
+      - speak：PlayTTS 文本转语音（text ≤ 1024 字节，priority_level 分
+        BACKGROUND_L1 / SERVICE_L2 / INTERACTION_L6，is_interrupted 可打断）；
+      - play_media：PlayMediaFile 播放音频/视频文件；
+      - status：GetAudioStatus 按 trace_id 查询播报状态
+        （0 未播 / 1 播报中 / 2 播报完成 / 3 异常）；
+      - stop_trace_id：StopTTSByTraceId 按 trace_id 打断。
     """
 
     ACTIONS = {
-        "play": (["file_name"], "播放媒体文件（audio 资源文件名，含扩展名）"),
+        "speak": (["text"], "播报一段中文/英文文本"),
+        "play_media": (["file_name"], "播放媒体文件（audio 资源文件名，含扩展名）"),
         "status": (["trace_id"], "查询播报状态（0 未播/1 播报中/2 播报完成/3 异常）"),
         "stop_trace_id": (["trace_id"], "按 trace_id 打断指定播报"),
     }
@@ -1583,10 +1471,17 @@ class MediaPlayPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("media_play", "actuator", "媒体文件播放/状态查询/按 id 打断（PlayMediaFile/GetAudioStatus/StopTTSByTraceId RPC）",
+        return tool("tts", "actuator", "语音播报：文本转语音/媒体文件播放/状态查询/按 id 打断"
+                                      "（TTSService PlayTTS/PlayMediaFile/GetAudioStatus/StopTTSByTraceId RPC）",
                     action_schema(self.ACTIONS, {
+                        "text": {"type": "string", "description": "播报文本（UTF-8，≤1024 字节）"},
+                        "priority_level": {"type": "string",
+                                           "enum": ["BACKGROUND_L1", "SERVICE_L2", "INTERACTION_L6"],
+                                           "default": "INTERACTION_L6",
+                                           "description": "播报优先级，INTERACTION_L6 默认可打断低优先级"},
+                        "is_interrupted": {"type": "boolean", "default": True, "description": "是否打断当前播报"},
+                        "trace_id": {"type": "string", "description": "播报 id（可选自定义传入，用于状态查询与打断）"},
                         "file_name": {"type": "string", "description": "媒体文件名（resource_list → audio）"},
-                        "trace_id": {"type": "string", "description": "播报 id（play 返回或自定义传入）"},
                     }))
 
     def start(self):
@@ -1602,75 +1497,50 @@ class MediaPlayPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
-        if action == "play":
+        if action == "speak":
+            text = args.get("text", "")
+            _require(len(text.encode("utf-8")) <= TTS_MAX_TEXT_BYTES,
+                     f"播报文本超长（>{TTS_MAX_TEXT_BYTES} 字节）")
+            priority = args.get("priority_level", "INTERACTION_L6")
+            _require(priority in TTS_PRIORITY_LEVELS.values() or priority in TTS_PRIORITY_LEVELS,
+                     f"未知优先级 {priority!r}")
+            response = self.nodes.rpc.play_tts(
+                text,
+                priority_level=priority if priority in TTS_PRIORITY_LEVELS.values() else TTS_PRIORITY_LEVELS[priority],
+                is_interrupted=bool(args.get("is_interrupted", True)),
+                trace_id=str(args.get("trace_id") or ""),
+            )
+            # PlayTTS/PlayMediaFile 出参为扁平结构（is_sucess 官方拼写如此）
+            trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
+            return {"trace_id": trace_id, "response": response}
+        if action == "play_media":
             file_name = args.get("file_name", "")
             _require(file_name, "file_name 不能为空")
             response = self.nodes.rpc.play_media_file(file_name, is_interrupted=True)
-            # PlayMediaFile 出参同样为扁平结构
             trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
             return {"trace_id": trace_id, "response": response}
         if action == "status":
             return jsonable(self.nodes.rpc.get_audio_status(args.get("trace_id", "")))
         if action == "stop_trace_id":
             return jsonable(self.nodes.rpc.stop_tts_trace_id(args.get("trace_id", "")))
-        raise ValueError(f"media_play: unknown action {action!r}")
+        raise ValueError(f"tts: unknown action {action!r}")
 
 
-class AudioPlayPlugin:
-    """audio_play 卡片：音频文件播放与停止。
+class AudioPlugin:
+    """audio 卡片：音频播放 + 音量控制一体化（原 audio_play/volume 两卡并入 —
+    同为 HDU HalAudioService）。
 
-    对应 HDU HalAudioService：PlayFile 播放音频文件（DEFAULT 优先级），StopPlay
-    停止当前播放。
+      - play / stop_play：PlayFile 播放音频文件（DEFAULT 优先级）/ StopPlay 停止；
+      - get_volume / set_volume / mute / unmute：GetAudioVolume / SetAudioVolume。
+    开发文档硬性限制：音量 >70 有损坏硬件风险，本插件在 RPC 之外再次钳制
+    max_volume（config plugins.audio.max_volume，默认 70）。
     """
 
     ACTIONS = {
         "play": (["file_name"], "播放音频文件（audio 资源文件名）"),
         "stop_play": ([], "停止当前正在播放的音频（HalAudioService/StopPlay）"),
-    }
-
-    def __init__(self, nodes):
-        self.nodes = nodes
-
-    def get_tool(self):
-        return tool("audio_play", "actuator", "音频播放/停止（HalAudioService PlayFile/StopPlay RPC）",
-                    action_schema(self.ACTIONS, {
-                        "file_name": {"type": "string", "description": "音频文件名（resource_list → audio）"},
-                    }))
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "ready"}
-        if action == "play":
-            file_name = args.get("file_name", "")
-            _require(file_name, "file_name 不能为空")
-            return jsonable(self.nodes.rpc.play_file(file_name))
-        if action == "stop_play":
-            return jsonable(self.nodes.rpc.stop_play())
-        if action == "stop":
-            return {"state": "idle"}
-        raise ValueError(f"audio_play: unknown action {action!r}")
-
-
-class VolumePlugin:
-    """volume 卡片：音量查询与调节。
-
-    对应 HDU HalAudioService/GetAudioVolume、SetAudioVolume。开发文档硬性限制：
-    音量 >70 有损坏硬件风险，本插件在 RPC 之外再次钳制 max_volume（默认 70）。
-    """
-
-    ACTIONS = {
-        "get": ([], "查询当前音量（返回 is_sucess —— 官方接口拼写如此）"),
-        "set": (["volume"], "设置音量 0~max_volume"),
+        "get_volume": ([], "查询当前音量（返回 is_sucess —— 官方接口拼写如此）"),
+        "set_volume": (["volume"], f"设置音量 0~{VOLUME_HARD_MAX}"),
         "mute": ([], "静音（is_mute=true）"),
         "unmute": ([], "取消静音（is_mute=false）"),
     }
@@ -1680,10 +1550,12 @@ class VolumePlugin:
         self.max_volume = min(int(max_volume), VOLUME_HARD_MAX)
 
     def get_tool(self):
-        return tool("volume", "actuator", f"音量查询/设置（0~{self.max_volume}，硬件上限 70，超限有损坏风险）",
+        return tool("audio", "actuator", f"音频播放与音量控制（HalAudioService RPC；音量 0~{self.max_volume}，"
+                                          f"硬件上限 {VOLUME_HARD_MAX}，超限有损坏风险）",
                     action_schema(self.ACTIONS, {
+                        "file_name": {"type": "string", "description": "音频文件名（resource_list → audio）"},
                         "volume": {"type": "integer", "minimum": 0, "maximum": self.max_volume,
-                                   "description": "目标音量 0~70"},
+                                   "description": f"目标音量 0~{self.max_volume}"},
                     }))
 
     def start(self):
@@ -1699,9 +1571,15 @@ class VolumePlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready", "max_volume": self.max_volume}
-        if action == "get":
+        if action == "play":
+            file_name = args.get("file_name", "")
+            _require(file_name, "file_name 不能为空")
+            return jsonable(self.nodes.rpc.play_file(file_name))
+        if action == "stop_play":
+            return jsonable(self.nodes.rpc.stop_play())
+        if action == "get_volume":
             return jsonable(self.nodes.rpc.get_audio_volume())
-        if action == "set":
+        if action == "set_volume":
             volume = int(args.get("volume", 0))
             _require(0 <= volume <= self.max_volume,
                      f"音量必须在 0~{self.max_volume} 之间（开发文档限制 >70 有硬件损坏风险）")
@@ -1710,60 +1588,18 @@ class VolumePlugin:
             return jsonable(self.nodes.rpc.set_audio_volume(self.max_volume, is_mute=True))
         if action == "unmute":
             return jsonable(self.nodes.rpc.set_audio_volume(self.max_volume, is_mute=False))
-        raise ValueError(f"volume: unknown action {action!r}")
-
-
-class MicSourcePlugin:
-    """mic_source 卡片：拾音来源切换。
-
-    对应 HDU AgentControlService/SetAgentProperties、GetAgentProperties
-    （property_id=1 拾音来源：0 机内麦克风 / 1 外部麦克风）。
-    开发文档 v3.2 已知 BUG：机内麦克风（source=0）存在问题，建议使用外部麦克风（1）。
-    """
-
-    ACTIONS = {
-        "get": ([], "查询当前拾音来源（0 机内 / 1 外部）"),
-        "internal": ([], "切换到机内麦克风（v3.2 已知存在 BUG，不推荐）"),
-        "external": ([], "切换到外部麦克风（推荐）"),
-    }
-
-    def __init__(self, nodes):
-        self.nodes = nodes
-
-    def get_tool(self):
-        return tool("mic_source", "actuator", "拾音来源查询/切换（机内 0 / 外部 1；v3.2 机内麦克风存在已知 BUG，推荐外部）",
-                    action_schema(self.ACTIONS, {}))
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "ready"}
-        if action == "get":
-            return jsonable(self.nodes.rpc.get_mic_source())
-        if action == "internal":
-            return jsonable(self.nodes.rpc.set_mic_source(0))
-        if action == "external":
-            return jsonable(self.nodes.rpc.set_mic_source(1))
-        raise ValueError(f"mic_source: unknown action {action!r}")
+        raise ValueError(f"audio: unknown action {action!r}")
 
 
 class InteractionPlugin:
-    """interaction 卡片：语音交互总开关与工作模式。
+    """interaction 卡片：语音交互开关、工作模式与拾音来源（原 mic_source 卡并入
+    —— 同属 HDU 交互平面 AgentControlService/HalAudioService）。
 
-    对应 HDU AgentControlService：
-      - SetVoiceEnable / GetVoiceEnable —— 语音交互总开关；
-      - SetAgentProperties / GetAgentProperties（property_id=2 工作模式：
-        only_voice 纯语音交互 / normal 完整交互）。
-    注意：SetAgentProperties 修改需重启机器人后生效（开发文档明确说明）。
+      - voice_enable / voice_get：语音交互总开关（SetVoiceEnable/GetVoiceEnable）；
+      - mode_normal / mode_only_voice / mode_get：工作模式（property_id=2，
+        only_voice 纯语音 / normal 完整交互；修改需重启机器人后生效）；
+      - mic_get / mic_internal / mic_external：拾音来源（0 机内 / 1 外部；
+        v3.2 机内麦克风存在已知 BUG，推荐外部）。
     """
 
     ACTIONS = {
@@ -1772,14 +1608,17 @@ class InteractionPlugin:
         "mode_normal": ([], "设置为完整交互模式（重启后生效）"),
         "mode_only_voice": ([], "设置为纯语音交互模式（重启后生效）"),
         "mode_get": ([], "查询当前交互模式"),
+        "mic_get": ([], "查询当前拾音来源（0 机内 / 1 外部）"),
+        "mic_internal": ([], "切换到机内麦克风（v3.2 已知存在 BUG，不推荐）"),
+        "mic_external": ([], "切换到外部麦克风（推荐）"),
     }
 
     def __init__(self, nodes):
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("interaction", "actuator", "语音交互开关与模式设置（SetVoiceEnable/SetAgentProperties RPC；"
-                                              "模式修改需重启生效）",
+        return tool("interaction", "actuator", "语音交互开关/工作模式/拾音来源（AgentControlService + HalAudioService RPC；"
+                                              "模式修改需重启生效；机内麦克风 v3.2 有已知 BUG 推荐外部）",
                     action_schema(self.ACTIONS, {
                         "enable": {"type": "boolean", "description": "true 开启 / false 关闭语音交互"},
                     }))
@@ -1807,6 +1646,12 @@ class InteractionPlugin:
             return jsonable(self.nodes.rpc.set_agent_properties("only_voice"))
         if action == "mode_get":
             return jsonable(self.nodes.rpc.get_agent_properties())
+        if action == "mic_get":
+            return jsonable(self.nodes.rpc.get_mic_source())
+        if action == "mic_internal":
+            return jsonable(self.nodes.rpc.set_mic_source(0))
+        if action == "mic_external":
+            return jsonable(self.nodes.rpc.set_mic_source(1))
         raise ValueError(f"interaction: unknown action {action!r}")
 
 
@@ -1871,29 +1716,39 @@ class FacePlayPlugin:
 
 
 class SkillPlayPlugin:
-    """skill_play 卡片：技能包（舞蹈）播放控制。
+    """skill_play 卡片：技能包（舞蹈）播放控制 + 技能状态查询（原 skill_status
+    状态卡并入）。
 
-    对应 ADU SkillPilotService/SkillPackage。path 为 skill 资源目录
-    （resource_list skill 类）；Start 返回 session_id，Pause/Stop 需回传。
-    舞蹈播放需要约 2 米安全净空（开发文档要求）。
+      - play / pause / stop_play：ADU SkillPilotService/SkillPackage。path 为
+        skill 资源目录（resource_list skill 类）；Start 返回 session_id，
+        Pause/Stop 需回传。舞蹈播放需要约 2 米安全净空（开发文档要求）。
+      - state：查询 /skill/pilot/skill_status 技能状态流最新快照
+        （核数/电池/自主充电状态；流需要 a3_aimdk protobuf wheel + skillpilot
+        开启 ros2 后端，wheel 缺失时返回 unknown）。
     """
 
     ACTIONS = {
         "play": (["path"], "播放技能包（返回 session_id）"),
         "pause": (["session_id"], "暂停技能播放"),
         "stop_play": (["session_id"], "停止技能播放"),
+        "state": ([], "查询技能状态流最新快照（核数/电池/自主充电状态）"),
     }
 
     def __init__(self, nodes):
         self.nodes = nodes
+        self.has_stream = "skill_status" in nodes.streams
 
     def get_tool(self):
+        topic_out = None
+        if self.has_stream:
+            stream = self.nodes.streams["skill_status"]
+            topic_out = [{"topic": stream["topic"], "format": stream["format"]}]
         return tool("skill_play", "actuator", "技能包/舞蹈播放控制（SkillPackage RPC；播放需 ~2m 安全净空，"
-                                             "Start 返回 session_id 供暂停/停止使用）",
+                                             "Start 返回 session_id 供暂停/停止使用；state 查询技能状态流）",
                     action_schema(self.ACTIONS, {
                         "path": {"type": "string", "description": "skill 资源目录绝对路径（resource_list → skill）"},
                         "session_id": {"type": "string", "description": "技能会话 id（play 返回）"},
-                    }))
+                    }), topic_out=topic_out)
 
     def start(self):
         pass
@@ -1907,7 +1762,7 @@ class SkillPlayPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "ready"}
+            return {"state": "ready", "has_stream": self.has_stream}
         if action == "play":
             path = args.get("path", "")
             _require(path, "path 不能为空")
@@ -1916,82 +1771,40 @@ class SkillPlayPlugin:
             return jsonable(self.nodes.rpc.skill_package("Pause", "", args.get("session_id", "")))
         if action == "stop_play":
             return jsonable(self.nodes.rpc.skill_package("Stop", "", args.get("session_id", "")))
-        if action == "stop":
-            return {"state": "idle"}
+        if action == "state":
+            snapshot = self.nodes.snapshot("skill_status")
+            return snapshot or {"state": "unknown"}
         raise ValueError(f"skill_play: unknown action {action!r}")
 
 
-class MappingPlugin:
-    """mapping 卡片：建图控制与地图管理（config 门控，默认关闭）。
+class ControlledSpatialPlugin:
+    """controlled_spatial 执行卡：建图 + 导航 + 重定位一体化（config 门控，默认关闭）。
 
-    对应 ADU MappingService：StartMapping / StopMapping（含保存）/
-    GetStoredMapNames / GetCurrentWorkingMap / RenameMap，以及 SLAM 地图数据
-    Get2DWholeMap / GetTopoMsgs（供 map_get 卡片使用）。
+    参照 tianyi2.0/g1 的 controlled_spatial 卡，把同一 ADU 上的空间能力合并为一张卡：
+      - 建图/地图管理（MappingService）：StartMapping / StopMapping（保存/放弃）/
+        GetStoredMapNames / GetCurrentWorkingMap / RenameMap；
+      - 导航（PncService）：目标点/位姿规划导航、直线行走、平移/原地旋转、
+        暂停/恢复/取消/查询（task_id=0 自动分配，驱动记住返回的 id 供后续控制复用）；
+      - 重定位（SLAMRelocalizationService）：导航的硬性前置条件，在目标地图上
+        StartNormalRelocalization / StopNormalRelocalization；
+      - 地图数据查询（Get2DWholeMap）：含分辨率/原点/占用栅格，并支持物理坐标 →
+        像素坐标换算（合并自原 map_get 处理卡）。
+    前置条件（开发文档 §7.9）：MC 处于 MOTION 模式（mc_mode get_up）且已完成
+    重定位，导航与重定位需工作在相同 map_id 上；到点精度最大约 0.4 米。
     """
 
     ACTIONS = {
+        # -- 建图 / 地图管理 --
         "start_mapping": ([], "开始建图（机器人行走采集环境）"),
         "stop_save": (["map_name"], "结束建图并保存（map_name 为新地图名称）"),
         "stop_discard": ([], "结束建图不保存"),
-        "list": ([], "查询已保存地图列表"),
-        "current": ([], "查询当前工作地图"),
-        "rename": (["map_id", "new_name"], "重命名地图"),
-    }
-
-    def __init__(self, nodes):
-        self.nodes = nodes
-
-    def get_tool(self):
-        return tool("mapping", "actuator", "建图控制与地图管理（MappingService RPC；config 门控模块，默认关闭）",
-                    action_schema(self.ACTIONS, {
-                        "map_name": {"type": "string", "description": "保存时的新地图名称"},
-                        "map_id": {"type": "integer", "description": "目标地图 id（rename）"},
-                        "new_name": {"type": "string", "description": "新名称（rename）"},
-                    }))
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "ready"}
-        if action == "start_mapping":
-            return jsonable(self.nodes.rpc.start_mapping())
-        if action == "stop_save":
-            return jsonable(self.nodes.rpc.stop_mapping(args.get("map_name")))
-        if action == "stop_discard":
-            return jsonable(self.nodes.rpc.stop_mapping(None))
-        if action == "list":
-            return jsonable(self.nodes.rpc.get_stored_map_names())
-        if action == "current":
-            return jsonable(self.nodes.rpc.get_current_working_map())
-        if action == "rename":
-            return jsonable(self.nodes.rpc.rename_map(int(args.get("map_id", 0)),
-                                                      args.get("old_name", ""),
-                                                      args.get("new_name", "")))
-        # 建图控制动作（schema 里 "start"/"stop_save"/"stop_discard" 与生命周期动作重名，
-        # 因此对外命名为 start_mapping，见上）
-        raise ValueError(f"mapping: unknown action {action!r}")
-
-
-class NavigationPlugin:
-    """navigation 卡片：导航任务下发与控制（config 门控，默认关闭）。
-
-    对应 ADU PncService。开发文档 §7.9 硬性约束：
-      - 导航前置条件：MC 处于 MOTION 模式（mc_mode get_up），且已完成重定位
-        （relocalization 卡片）并工作在与重定位时相同的 map_id 上；
-      - task_id 传 0 由底层自动分配，返回的 task_id 用于暂停/恢复/取消/查询；
-      - 到点精度最大约 0.4 米。
-    """
-
-    ACTIONS = {
+        "list_maps": ([], "查询已保存地图列表"),
+        "current_map": ([], "查询当前工作地图"),
+        "rename_map": (["map_id", "new_name"], "重命名地图"),
+        # -- 重定位 --
+        "start_relocalization": (["map_dir"], "在指定地图目录上启动普通重定位（导航前置条件）"),
+        "stop_relocalization": ([], "停止重定位（可选带 reloc_pose 位姿辅助收敛）"),
+        # -- 导航 --
         "navi_to_goal": (["map_id", "target_id"], "按目标点 ID 规划导航（PlanningNaviToGoal）"),
         "navi_to_pose": (["map_id", "x", "y", "angle"], "按位姿规划导航（PlanningNaviToPose2D）"),
         "linear_to_goal": (["map_id", "target_id"], "直线导航到目标点（LinearNaviToGoal，先转后走）"),
@@ -2001,7 +1814,9 @@ class NavigationPlugin:
         "cancel": (["task_id"], "取消导航任务"),
         "pause": (["task_id"], "暂停导航任务"),
         "resume": (["task_id"], "恢复暂停的任务"),
-        "state": (["task_id"], "查询任务状态（task_id=0 查询最近一次任务）"),
+        "nav_state": (["task_id"], "查询导航任务状态（task_id 缺省用最近一次任务）"),
+        # -- 地图数据 --
+        "get_map": (["map_id"], "获取 SLAM 2D 全量栅格地图数据；可选传 x/y 返回像素坐标换算"),
     }
 
     def __init__(self, nodes):
@@ -2009,16 +1824,21 @@ class NavigationPlugin:
         self.last_task_id = None
 
     def get_tool(self):
-        return tool("navigation", "actuator", "导航任务下发/控制（PncService RPC；config 门控模块，默认关闭；"
-                                             "前置：MOTION 模式 + 已重定位；task_id 传 0 自动分配）",
+        return tool("controlled_spatial", "actuator",
+                    "建图/导航/重定位一体化控制（ADU MappingService/PncService/SLAMRelocalizationService RPC；"
+                    "config 门控模块，默认关闭；导航前置：mc_mode get_up + start_relocalization 且 map_id 一致；"
+                    "task_id 传 0 自动分配，控制/查询动作可缺省复用最近任务 id）",
                     action_schema(self.ACTIONS, {
+                        "map_name": {"type": "string", "description": "保存时的新地图名称"},
                         "map_id": {"type": "integer", "description": "工作地图 id（需与重定位地图一致）"},
+                        "map_dir": {"type": "string", "description": "地图目录（list_maps → map_dir，重定位用）"},
+                        "new_name": {"type": "string", "description": "新名称（rename_map）"},
                         "target_id": {"type": "integer", "description": "目标点 id（地图点位）"},
-                        "x": {"type": "number", "description": "目标点 x（m）"},
-                        "y": {"type": "number", "description": "目标点 y（m）"},
-                        "angle": {"type": "number", "description": "目标朝向角（rad）"},
+                        "x": {"type": "number", "description": "目标/重定位位姿 x（m）"},
+                        "y": {"type": "number", "description": "目标/重定位位姿 y（m）"},
+                        "angle": {"type": "number", "description": "目标/重定位朝向角（rad）"},
                         "distance": {"type": "number", "description": "平移距离（m，正为前进）"},
-                        "task_id": {"type": "integer", "description": "任务 id（0 自动分配；控制/查询动作可传空用最近任务）"},
+                        "task_id": {"type": "integer", "description": "导航任务 id（0 自动分配；控制/查询动作可传空用最近任务）"},
                     }))
 
     def start(self):
@@ -2048,6 +1868,31 @@ class NavigationPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready", "last_task_id": self.last_task_id}
+        # -- 建图 / 地图管理 --
+        if action == "start_mapping":
+            return jsonable(self.nodes.rpc.start_mapping())
+        if action == "stop_save":
+            return jsonable(self.nodes.rpc.stop_mapping(args.get("map_name")))
+        if action == "stop_discard":
+            return jsonable(self.nodes.rpc.stop_mapping(None))
+        if action == "list_maps":
+            return jsonable(self.nodes.rpc.get_stored_map_names())
+        if action == "current_map":
+            return jsonable(self.nodes.rpc.get_current_working_map())
+        if action == "rename_map":
+            return jsonable(self.nodes.rpc.rename_map(int(args.get("map_id", 0)),
+                                                      args.get("old_name", ""),
+                                                      args.get("new_name", "")))
+        # -- 重定位 --
+        if action == "start_relocalization":
+            return jsonable(self.nodes.rpc.slam_start_normal_relocalization(args.get("map_dir", "")))
+        if action == "stop_relocalization":
+            reloc_pose = None
+            if args.get("x") is not None or args.get("y") is not None or args.get("angle") is not None:
+                reloc_pose = {"x": float(args.get("x", 0)), "y": float(args.get("y", 0)),
+                              "angle": float(args.get("angle", 0))}
+            return jsonable(self.nodes.rpc.slam_stop_normal_relocalization(reloc_pose))
+        # -- 导航 --
         if action == "navi_to_goal":
             return self._remember(self.nodes.rpc.navi("PlanningNaviToGoal", {
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
@@ -2082,59 +1927,24 @@ class NavigationPlugin:
             return jsonable(self.nodes.rpc.navi("ActionPause", {"task_id": self._task_id(args)}))
         if action == "resume":
             return jsonable(self.nodes.rpc.navi("ActionResume", {"task_id": self._task_id(args)}))
-        if action == "state":
+        if action == "nav_state":
             return jsonable(self.nodes.rpc.navi_state(self._task_id(args)))
-        raise ValueError(f"navigation: unknown action {action!r}")
-
-
-class RelocalizationPlugin:
-    """relocalization 卡片：SLAM 重定位（config 门控，默认关闭）。
-
-    对应 ADU SLAMRelocalizationService：StartNormalRelocalization /
-    StopNormalRelocalization。导航的硬性前置条件：在目标 map_id 上成功重定位。
-    stop 可选传入位姿（reloc_pose）辅助收敛。
-    """
-
-    ACTIONS = {
-        "start_normal": (["map_dir"], "在指定地图目录上启动普通重定位"),
-        "stop_normal": ([], "停止重定位（可带 reloc_pose 位姿参数辅助收敛）"),
-    }
-
-    def __init__(self, nodes):
-        self.nodes = nodes
-
-    def get_tool(self):
-        return tool("relocalization", "actuator", "SLAM 重定位（SLAMRelocalizationService RPC；config 门控模块，"
-                                                 "默认关闭；导航前置条件）",
-                    action_schema(self.ACTIONS, {
-                        "map_dir": {"type": "string", "description": "地图目录（GetStoredMapNames → map_dir）"},
-                        "x": {"type": "number", "description": "stop 时可选 reloc_pose x"},
-                        "y": {"type": "number", "description": "stop 时可选 reloc_pose y"},
-                        "angle": {"type": "number", "description": "stop 时可选 reloc_pose 朝向（rad）"},
-                    }))
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "ready"}
-        if action == "start_normal":
-            return jsonable(self.nodes.rpc.slam_start_normal_relocalization(args.get("map_dir", "")))
-        if action == "stop_normal":
-            reloc_pose = None
-            if args.get("x") is not None or args.get("y") is not None or args.get("angle") is not None:
-                reloc_pose = {"x": float(args.get("x", 0)), "y": float(args.get("y", 0)),
-                              "angle": float(args.get("angle", 0))}
-            return jsonable(self.nodes.rpc.slam_stop_normal_relocalization(reloc_pose))
-        raise ValueError(f"relocalization: unknown action {action!r}")
+        # -- 地图数据（原 map_get 处理卡合并而来） --
+        if action == "get_map":
+            response = self.nodes.rpc.get_2d_whole_map(int(args.get("map_id", 0)))
+            data = response.get("data") or {}
+            result = jsonable(response)
+            if args.get("x") is not None or args.get("y") is not None:
+                resolution = data.get("resolution") or 0.05
+                origin = data.get("origin") or {}
+                origin_x = origin.get("x", 0) if isinstance(origin, dict) else 0
+                origin_y = origin.get("y", 0) if isinstance(origin, dict) else 0
+                px = int(origin_x + float(args.get("x", 0)) * resolution)
+                py = int(origin_y - float(args.get("y", 0)) * resolution)
+                result["pixel"] = {"x": px, "y": py,
+                                   "formula": "pixel_x = origin_x + x*resolution; pixel_y = origin_y - y*resolution"}
+            return result
+        raise ValueError(f"controlled_spatial: unknown action {action!r}")
 
 
 class AutoChargingPlugin:
@@ -2185,60 +1995,192 @@ class AutoChargingPlugin:
         raise ValueError(f"auto_charging: unknown action {action!r}")
 
 
-class MapGetPlugin:
-    """map_get 处理器卡片：获取地图数据并换算像素坐标（config 门控，默认关闭）。
+class SpatialMapPlugin:
+    """spatial_map 状态卡：SLAM 2D 栅格地图可视化流（config 门控，默认关闭）。
 
-    拉取 SLAM 全量栅格地图（Get2DWholeMap），将物理坐标 (x, y) 按分辨率换算为
-    像素坐标：pixel_x = origin_x + x*resolution，pixel_y = origin_y - y*resolution。
+    参照 tianyi2.0/g1 的空间状态卡（tianyi spatial_map / g1 controlled_spatial_map），
+    周期拉取 Get2DWholeMap 的占用栅格，转换成渲染器约定的 sensor/mapping 二进制
+    点云格式发布到 core 域：
+      - 可通行栅格（值 127）→ z=-0.03 的地面层，点数预算 MAP_FLOOR_POINTS；
+      - 墙壁/障碍（其余非零值）→ z=0.04 的特征层，点数预算 MAP_FEATURE_POINTS；
+      - 二维格点抽样 + 总点数上限 MAP_MAX_POINTS（渲染器硬上限 80000）。
+    A3 的颈部 Livox 仅为避障传感器、不提供带里程计位姿的点云，因此不做
+    tianyi 式 3D 点云录制卡（controlled_spatial_map），机器人位姿经
+    pose_available=false 告知渲染器。栅格字段名按防御式解析（文档在线版
+    无法核对时兼容多种形状）。
     """
 
-    def __init__(self, nodes):
+    def __init__(self, nodes, namespace):
         self.nodes = nodes
+        self.namespace = namespace
+        self.topic = f"/{namespace}/agibot_a3/spatial_map"
+        cfg = nodes.config.get("plugins", {}).get("spatial_map", {})
+        self.map_id = int(cfg.get("map_id", 0))
+        interval = float(cfg.get("publish_interval", MAP_PUBLISH_INTERVAL))
+        self.publish_interval = max(interval, MAP_PUBLISH_INTERVAL)
+        from std_msgs.msg import UInt8MultiArray
+        self.pub = nodes.core.create_publisher(UInt8MultiArray, self.topic, 5)
+        self._running = False
+        self._thread = None
+        # None = never published yet — time.monotonic() starts near 0 on a fresh
+        # process, so a numeric sentinel would suppress the very first frame.
+        self._last_publish = None
 
     def get_tool(self):
-        return tool("map_get", "processor", "获取 SLAM 2D 全量地图数据（含分辨率/原点/占用栅格），"
-                                         "并提供物理坐标→像素坐标换算",
-                    action_schema(
-                        {"query": (["map_id"], "获取指定地图的全量栅格数据与元信息；可选传 x/y 返回像素坐标换算")},
-                        {
-                            "map_id": {"type": "integer", "description": "地图 id（GetStoredMapNames 获取）"},
-                            "x": {"type": "number", "description": "物理坐标 x（m），可选"},
-                            "y": {"type": "number", "description": "物理坐标 y（m），可选"},
-                        },
-                    ))
+        return tool("spatial_map", "sensor", "SLAM 2D 地图可视化流（占用栅格 → sensor/mapping 点云；"
+                                            "config 门控模块，默认关闭；建图/导航状态经 controlled_spatial 卡控制）",
+                    topic_out=[{"topic": self.topic, "format": "sensor/mapping"}])
 
     def start(self):
-        pass
+        """启动后台轮询线程（dispatch 的 start/stop 是画布卡片启停，保持惰性）。"""
+        if self._thread is not None:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
 
     def stop(self):
-        pass
+        self._running = False
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def _poll_loop(self):
+        while self._running:
+            try:
+                response = self.nodes.rpc.get_2d_whole_map(self.map_id)
+                self.publish_map(response)
+            except Exception:
+                pass
+            time.sleep(self.publish_interval)
+
+    # -- 栅格 → 点云 ----------------------------------------------------------------
+
+    @staticmethod
+    def _extract_grid(data):
+        """Defensively locate the occupancy grid row-list inside a Get2DWholeMap payload."""
+        if not isinstance(data, dict):
+            return None
+        for key in ("occupancy_grid", "grid", "map_data", "data"):
+            value = data.get(key)
+            if isinstance(value, list) and value and isinstance(value[0], list):
+                return value
+        return None
+
+    @staticmethod
+    def _extract_origin(data, np):
+        origin = data.get("origin")
+        if isinstance(origin, dict):
+            return float(origin.get("x", 0) or 0), float(origin.get("y", 0) or 0)
+        if isinstance(origin, (list, tuple)) and len(origin) >= 2:
+            return float(origin[0]), float(origin[1])
+        return 0.0, 0.0
+
+    @classmethod
+    def _grid_layers(cls, data, np):
+        """Occupancy grid → (floor_points, feature_points) float32 arrays.
+
+        Floor cells (127) become the z=-0.03 traversable layer; every other
+        nonzero cell becomes the z=0.04 obstacle layer. Both layers are lattice
+        -sampled to their own budgets (tianyi `_load_stcm_grid` pattern).
+        """
+        grid = cls._extract_grid(data)
+        if grid is None:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+        rows = np.asarray(grid, dtype=np.uint8) if grid else np.zeros((0, 0), dtype=np.uint8)
+        if rows.ndim != 2 or not rows.size:
+            return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+        resolution = float(data.get("resolution") or 0.05)
+        origin_x, origin_y = cls._extract_origin(data, np)
+
+        def layer(mask, z, limit):
+            row_idx, col_idx = np.nonzero(mask)
+            if not len(row_idx):
+                return np.zeros((0, 3), dtype=np.float32)
+            stride = max(1, int(math.ceil(math.sqrt(len(row_idx) / max(limit, 1)))))
+            keep = (row_idx % stride == 0) & (col_idx % stride == 0)
+            row_idx, col_idx = row_idx[keep], col_idx[keep]
+            xs = origin_x + (col_idx + 0.5) * resolution
+            ys = origin_y + (row_idx + 0.5) * resolution
+            zs = np.full(len(xs), z, dtype=np.float32)
+            return np.column_stack((xs, ys, zs)).astype(np.float32)
+
+        floor = layer(rows == 127, -0.03, MAP_FLOOR_POINTS)
+        feature = layer((rows != 0) & (rows != 127), 0.04, MAP_FEATURE_POINTS)
+        return floor, feature
+
+    def _encode_payload(self, data):
+        import numpy as np
+        floor, feature = self._grid_layers(data, np)
+        parts = [part for part in (floor, feature) if len(part)]
+        if sum(len(part) for part in parts) > MAP_MAX_POINTS:
+            # keep the per-layer budgets intact by trimming the feature layer first
+            budget = max(0, MAP_MAX_POINTS - len(floor))
+            feature = feature[:budget]
+            parts = [part for part in (floor, feature) if len(part)]
+        points = np.vstack(parts) if parts else np.zeros((0, 3), dtype=np.float32)
+        meta = {
+            "version": 3,
+            "active_map": data.get("map_id", self.map_id) if isinstance(data, dict) else self.map_id,
+            "robot": {"x": 0.0, "y": 0.0, "yaw": 0.0, "pose_available": False},
+            "maps": [],
+            "tags": [],
+            "boundary": None,
+            "artifacts": {"walls": [], "tracks": [], "areas": {}},
+            "trajectory_points": 0,
+            "laser_points": 0,
+            "grid_points": int(len(points)),
+            "floor_points": int(len(floor)),
+            "feature_points": int(len(feature)),
+            "resolution": float(data.get("resolution") or 0.05) if isinstance(data, dict) else 0.05,
+            "head_cloud_points": 0,
+            "head_recording_enabled": False,
+        }
+        raw_meta = json.dumps(meta, ensure_ascii=False).encode()
+        payload = struct.pack("<fffBI", 0.0, 0.0, 0.0, 7, len(points)) + points.tobytes()
+        payload += struct.pack("<I", len(raw_meta)) + raw_meta
+        return payload
+
+    def publish_map(self, response):
+        """Encode + publish one sensor/mapping frame from a Get2DWholeMap response."""
+        data = (response or {}).get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+        now = time.monotonic()
+        if self._last_publish is not None and now - self._last_publish < MAP_PUBLISH_INTERVAL:
+            return False
+        self._last_publish = now
+        from std_msgs.msg import UInt8MultiArray
+        out = UInt8MultiArray()
+        out.data = array("B", self._encode_payload(data))
+        self.pub.publish(out)
+        return True
 
     def dispatch(self, action, args):
         if action == "start":
-            return {"state": "ready"}
+            return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "ready"}
-        if action != "query":
-            raise ValueError(f"map_get: unknown action {action!r}")
-        response = self.nodes.rpc.get_2d_whole_map(int(args.get("map_id", 0)))
-        data = response.get("data") or {}
-        result = jsonable(response)
-        if args.get("x") is not None or args.get("y") is not None:
-            resolution = data.get("resolution") or 0.05
-            origin = data.get("origin") or {}
-            origin_x = origin.get("x", 0) if isinstance(origin, dict) else 0
-            origin_y = origin.get("y", 0) if isinstance(origin, dict) else 0
-            px = int(origin_x + float(args.get("x", 0)) * resolution)
-            py = int(origin_y - float(args.get("y", 0)) * resolution)
-            result["pixel"] = {"x": px, "y": py,
-                               "formula": "pixel_x = origin_x + x*resolution; pixel_y = origin_y - y*resolution"}
-        return result
+            return {"state": "running" if self._running else "idle",
+                    "topic": self.topic, "map_id": self.map_id}
+        if action == "refresh":
+            response = self.nodes.rpc.get_2d_whole_map(int(args.get("map_id", self.map_id)))
+            published = self.publish_map(response)
+            return {"state": "running", "topic": self.topic, "published": published}
+        raise ValueError(f"spatial_map: unknown action {action!r}")
 
 
 def build_plugins(config, namespace, ros2):
-    """Instantiate every enabled plugin, mirroring X2's build_plugins."""
+    """Instantiate every enabled plugin, mirroring X2's build_plugins.
+
+    Card consolidation (aligned with tianyi2.0/g1): joints merges the three
+    joint-state streams; mc_mode absorbs mc_state; tts absorbs media_play;
+    audio absorbs audio_play + volume; interaction absorbs mic_source;
+    skill_play absorbs skill_status; controlled_spatial merges mapping +
+    navigation + relocalization + map_get; spatial_map is the new sensor/mapping
+    visualization card.
+    """
     rpc = A3Rpc(config)
     nodes = A3Nodes(config, namespace, ros2, rpc)
     plugins_cfg = config.get("plugins", {})
@@ -2247,12 +2189,8 @@ def build_plugins(config, namespace, ros2):
         return bool(plugins_cfg.get(name, {}).get("enabled", False))
 
     plugins = {}
-    if enabled("mc_state"):
-        plugins["mc_state"] = McStatePlugin(nodes)
     if enabled("joints"):
-        plugins["arm_state"] = ArmStatePlugin(nodes, "arm_state")
-        plugins["hand_state"] = HandStatePlugin(nodes, "hand_state")
-        plugins["neck_state"] = NeckStatePlugin(nodes, "neck_state")
+        plugins["joints"] = JointsPlugin(nodes)
     if enabled("imu"):
         plugins["imu"] = ImuPlugin(nodes)
     if enabled("camera"):
@@ -2265,8 +2203,6 @@ def build_plugins(config, namespace, ros2):
         plugins["emergency"] = EmergencyPlugin(nodes)
     if enabled("wakeup"):
         plugins["wakeup"] = WakeupPlugin(nodes)
-    if enabled("skill_status"):
-        plugins["skill_status"] = SkillStatusPlugin(nodes)
     if enabled("alerts"):
         plugins["alerts"] = AlertsPlugin(nodes)
     if enabled("mc_mode"):
@@ -2287,32 +2223,23 @@ def build_plugins(config, namespace, ros2):
         plugins["motion_play"] = MotionPlayPlugin(nodes)
     if enabled("tts"):
         plugins["tts"] = TtsPlugin(nodes)
-    if enabled("media_play"):
-        plugins["media_play"] = MediaPlayPlugin(nodes)
-    if enabled("audio_play"):
-        plugins["audio_play"] = AudioPlayPlugin(nodes)
-    if enabled("volume"):
-        plugins["volume"] = VolumePlugin(nodes,
-                                          max_volume=plugins_cfg.get("volume", {}).get("max_volume", VOLUME_HARD_MAX))
-    if enabled("mic_source"):
-        plugins["mic_source"] = MicSourcePlugin(nodes)
+    if enabled("audio"):
+        plugins["audio"] = AudioPlugin(nodes,
+                                        max_volume=plugins_cfg.get("audio", {}).get("max_volume", VOLUME_HARD_MAX))
     if enabled("interaction"):
         plugins["interaction"] = InteractionPlugin(nodes)
+    if enabled("resources"):
+        plugins["model"] = ModelPlugin(nodes)
+        plugins["resource_list"] = ResourceListPlugin(nodes)
     if enabled("face_play"):
         plugins["face_play"] = FacePlayPlugin(nodes)
     if enabled("skill_play"):
         plugins["skill_play"] = SkillPlayPlugin(nodes)
-    if enabled("resources"):
-        plugins["model"] = ModelPlugin(nodes)
-        plugins["resource_list"] = ResourceListPlugin(nodes)
     # --- advanced modules, config-gated (like X2's slam) ---
-    if enabled("mapping"):
-        plugins["mapping"] = MappingPlugin(nodes)
-        plugins["map_get"] = MapGetPlugin(nodes)
-    if enabled("navigation"):
-        plugins["navigation"] = NavigationPlugin(nodes)
-    if enabled("relocalization"):
-        plugins["relocalization"] = RelocalizationPlugin(nodes)
+    if enabled("controlled_spatial"):
+        plugins["controlled_spatial"] = ControlledSpatialPlugin(nodes)
+    if enabled("spatial_map"):
+        plugins["spatial_map"] = SpatialMapPlugin(nodes, namespace)
     if enabled("auto_charging"):
         plugins["auto_charging"] = AutoChargingPlugin(nodes)
     return plugins

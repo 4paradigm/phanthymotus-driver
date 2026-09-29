@@ -25,31 +25,31 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 |---|---|---|---|
 | MotionControlActionService@MDU:56322 | SetAction | `mc_mode` | `command.action` = `MotionControlAction_{DAMPING,GET_UP,LIE_DOWN,PASSIVE}` |
 | MotionControlActionService@MDU:56322 | GetAction | `mc_mode` (`get_state`) | |
-| MotionControlActionService@MDU:56322 | GetAvailableActions | `mc_state` (`available`) | |
+| MotionControlActionService@MDU:56322 | GetAvailableActions | `mc_mode` (`available`) | |
 | MotionControlMotionService@MDU:56322 | Enable/Disable/CheckArmCompliance | `arm_compliance` | all take `{}` |
 | MotionCommandService@MDU:56444 | SendMotionCommand | `motion_play` | `motion_id` is the motion file's **absolute path**; `cmd_end` auto-returns to initial pose |
 | HDSService@MDU:50587 | GetAlertList | `alerts` | hard doc limit ≤0.2 Hz — driver enforces a monotonic 5 s cooldown |
 | TTSService@HDU:59301 | PlayTTS | `tts` | `text` ≤1024 bytes, `priority_level` `INTERACTION_L6` |
-| TTSService@HDU:59301 | PlayMediaFile | `media_play` | |
-| TTSService@HDU:59301 | GetAudioStatus | `tts`/`media_play` (`status`) | by `trace_id` |
-| TTSService@HDU:59301 | StopTTSTraceId | `tts` (`stop_play`) | |
+| TTSService@HDU:59301 | PlayMediaFile | `tts` (`play_media`) | |
+| TTSService@HDU:59301 | GetAudioStatus | `tts` (`status`) | by `trace_id` |
+| TTSService@HDU:59301 | StopTTSTraceId | `tts` (`stop_trace_id`) | |
 | AgentControlService@HDU:59301 | SetVoiceEnable / GetVoiceEnable | `interaction` | |
 | AgentControlService@HDU:59301 | SetAgentPropertiesRequest | `interaction` (`mode_*`) | properties `{"2": "normal"\|"only_voice"}` — needs reboot |
-| HalAudioService@HDU:59301 | SetMicSourceRequest / GetMicSourceRequest | `mic_source` | 0=internal (v3.2 hardware BUG — avoid), 1=external |
-| HalAudioService@HDU:56666 | GetAudioVolume / SetAudioVolume | `volume` | `type` `SPEAKER_BUILT_IN`; driver hard-caps at 70 (>70 risks damage) |
-| HalAudioService@HDU:56666 | PlayFile / StopPlay | `audio_play` | raw file playback (TTS alternative) |
+| HalAudioService@HDU:59301 | SetMicSourceRequest / GetMicSourceRequest | `interaction` (`mic_*`) | 0=internal (v3.2 hardware BUG — avoid), 1=external |
+| HalAudioService@HDU:56666 | GetAudioVolume / SetAudioVolume | `audio` (`get_volume`/`set_volume`/`mute`/`unmute`) | `type` `SPEAKER_BUILT_IN`; driver hard-caps at 70 (>70 risks damage) |
+| HalAudioService@HDU:56666 | PlayFile / StopPlay | `audio` (`play`/`stop_play`) | raw file playback (TTS alternative) |
 | ResourceService@HDU:51049 | GetResourceList | `resource_list` | motion/emoticon/audio/skill/map/offring_work |
-| MappingService@ADU:50807 | StartMapping / StopMapping | `mapping` | StopMapping with `map_name` = SAVING_MAP |
-| MappingService@ADU:50807 | Get2DWholeMap | `map_get` | resolution/origin/occupancy grid |
-| MappingService@ADU:50807 | GetStoredMapNames / GetCurrentWorkingMap / RenameMap | `mapping` (`list`/`current`/`rename`) | |
-| LocalizationService@ADU:50807 | GetTopoMsgs | — | not exposed as a card (map_get covers the grid) |
-| PncService@ADU:53176 | ActionNaviToPose / ActionNaviToPoint / … | `navigation` | `task_id=0` auto-assigns; driver remembers the assigned id |
-| PncService@ADU:53176 | ActionGetState | `navigation` (`state`) | |
-| PncService@ADU:53176 | ActionCancelTask / ActionEmergencyStop / … | `navigation` (`cancel`/`stop`) | |
-| SLAMRelocalizationService@ADU:50583 | SLAMStartNormalRelocalization | `relocalization` (`start_normal`) | required before navigation |
-| SLAMRelocalizationService@ADU:50583 | SLAMStopNormalRelocalization | `relocalization` (`stop_normal`) | optional `reloc_pose` |
+| MappingService@ADU:50807 | StartMapping / StopMapping | `controlled_spatial` (`start_mapping`/`stop_save`/`stop_discard`) | StopMapping with `map_name` = SAVING_MAP |
+| MappingService@ADU:50807 | Get2DWholeMap | `controlled_spatial` (`get_map`) / `spatial_map` | resolution/origin/occupancy grid; `spatial_map` republishes it as a `sensor/mapping` point cloud |
+| MappingService@ADU:50807 | GetStoredMapNames / GetCurrentWorkingMap / RenameMap | `controlled_spatial` (`list_maps`/`current_map`/`rename_map`) | |
+| LocalizationService@ADU:50807 | GetTopoMsgs | — | not exposed as a card (the 2D grid covers it) |
+| PncService@ADU:53176 | ActionNaviToPose / ActionNaviToPoint / … | `controlled_spatial` (`navi_to_goal`/`navi_to_pose`/`linear_to_goal`/`linear_to_pose`/`move_forward`/`spin_turn`) | `task_id=0` auto-assigns; driver remembers the assigned id |
+| PncService@ADU:53176 | ActionGetState | `controlled_spatial` (`nav_state`) | |
+| PncService@ADU:53176 | ActionCancelTask / ActionEmergencyStop / … | `controlled_spatial` (`cancel`/`pause`/`resume`) | |
+| SLAMRelocalizationService@ADU:50583 | SLAMStartNormalRelocalization | `controlled_spatial` (`start_relocalization`) | required before navigation |
+| SLAMRelocalizationService@ADU:50583 | SLAMStopNormalRelocalization | `controlled_spatial` (`stop_relocalization`) | optional `reloc_pose` |
 | SkillPilotService@ADU:50583 | AutoCharging | `auto_charging` | command START/STOP/RESET; trigger AGENT=1 |
-| SkillPilotService@ADU:50583 | SkillPackage | `skill_play` | Start/Pause/Continue/Stop by `session_id` |
+| SkillPilotService@ADU:50583 | SkillPackage | `skill_play` | Start/Pause/Continue/Stop by `session_id`; `state` reads the mirrored skill_status stream |
 
 ### ROS 2 topics (robot domain 232, BEST_EFFORT QoS)
 
@@ -61,9 +61,9 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 | `/motion/control/arm_joint_command` | sensor_msgs/JointState | `arm_command` | 100 Hz ≤30 ms gap, velocity/effort = 0, ≤4 rad/s |
 | `/motion/control/hand_joint_command` | sensor_msgs/JointState | `hand_command` | 0..2000 per finger; frame_id = AgiHand/O10Hand |
 | `/motion/control/neck_joint_command` | sensor_msgs/JointState | `neck_command` | head_yaw/head_pitch |
-| `/motion/control/arm_joint_state` | sensor_msgs/JointState | `arm_state` | mirrored to core as JSON |
-| `/motion/control/hand_joint_state` | sensor_msgs/JointState | `hand_state` | frame_id carries hand type |
-| `/motion/control/neck_joint_state` | sensor_msgs/JointState | `neck_state` | |
+| `/motion/control/arm_joint_state` | sensor_msgs/JointState | `joints` (`arm`) | mirrored to core as JSON |
+| `/motion/control/hand_joint_state` | sensor_msgs/JointState | `joints` (`hand`) | frame_id carries hand type |
+| `/motion/control/neck_joint_state` | sensor_msgs/JointState | `joints` (`neck`) | |
 | `/hal/neck_middle_livox_lidar/pointcloud` | sensor_msgs/PointCloud2 | `lidar` | neck Livox |
 | `/ros2/body_drive/pelvis_imu/data` | sensor_msgs/Imu | `imu` | pelvis IMU |
 | `/ros2/body_drive/torso_imu/data` | sensor_msgs/Imu | `imu` | torso IMU (merged into one card) |
@@ -76,7 +76,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 | `/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel` | BmsStateChannel | `bms` |
 | `/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel` | EmergencyStateChannel | `emergency` |
 | `/agent/wakeup/pb_3Aaimdk_2Eprotocol_2EWakeUpResult` | WakeUpResult | `wakeup` |
-| `/skill/pilot/skill_status` | SkillStatus | `skill_status` |
+| `/skill/pilot/skill_status` | SkillStatus | `skill_play` (`state`) |
 
 ## Documented but not wired
 
@@ -99,8 +99,8 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
   `ros2_plugin_proto/msg/RosMsgWrapper`; its `local_setup.bash` is sourced by the
   image CMD from the same mount.
 - Without these the driver degrades gracefully: pb payloads fall back to JSON
-  bytes in `RosMsgWrapper.data`, and the four pb-decoded stream cards
-  (bms/emergency/wakeup/skill_status) are withheld from the tool list.
+  bytes in `RosMsgWrapper.data`, and the pb-decoded stream cards
+  (bms/emergency/wakeup + skill_play's `state` query) are withheld.
 
 ## URDF
 
