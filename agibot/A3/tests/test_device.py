@@ -158,16 +158,20 @@ BASE_CONFIG = {
 }
 
 # config.yaml's full plugin set (matching the shipped config), advanced modules ON so
-# the gated tools are covered too.
+# the gated tools are covered too. Names aligned with tianyi2.0/q5_bundle/g1:
+# lidar_cloud/battery/estop sensors, base_drive/arm_control/hand_control/head_control/
+# waist_control actuators; wakeup/arm_compliance/resource_list cards dissolved.
 FULL_PLUGINS = {
     "joints": {"enabled": True}, "imu": {"enabled": True},
-    "camera": {"enabled": True, "streams": ["head_left_fisheye", "chest_front_d457_rgb"]},
-    "lidar": {"enabled": True}, "bms": {"enabled": True}, "emergency": {"enabled": True},
-    "wakeup": {"enabled": True},
+    "camera": {"enabled": True,
+               "streams": ["head_left_fisheye", "chest_front_d457_rgb",
+                           "chest_front_d457_depth"]},
+    "lidar_cloud": {"enabled": True}, "battery": {"enabled": True},
+    "estop": {"enabled": True},
     "alerts": {"enabled": True, "poll_interval": 5.0}, "mc_mode": {"enabled": True},
-    "locomotion": {"enabled": True}, "arm_command": {"enabled": True},
-    "hand_command": {"enabled": True}, "neck_command": {"enabled": True},
-    "waist_command": {"enabled": True}, "arm_compliance": {"enabled": True},
+    "base_drive": {"enabled": True}, "arm_control": {"enabled": True},
+    "hand_control": {"enabled": True}, "head_control": {"enabled": True},
+    "waist_control": {"enabled": True},
     "motion_play": {"enabled": True}, "tts": {"enabled": True},
     "audio": {"enabled": True, "max_volume": 70},
     "interaction": {"enabled": True},
@@ -208,7 +212,8 @@ class RecordingTransport:
 def build_bundle_plugins(config=None, transport=None):
     config = config if config is not None else json.loads(json.dumps(BASE_CONFIG))
     config.setdefault("plugins", {}).setdefault("camera", {}).setdefault(
-        "streams", ["head_left_fisheye", "chest_front_d457_rgb"])
+        "streams", ["head_left_fisheye", "chest_front_d457_rgb",
+                    "chest_front_d457_depth"])
     if transport is None:
         transport = RecordingTransport()
     # Inject the shared transport through config so A3Rpc hands it to every RpcClient.
@@ -278,10 +283,9 @@ class ToolInventoryTests(unittest.TestCase):
         plugins, _ = build_bundle_plugins(config)
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         expected_actuators = {
-            "resource_list", "mc_mode", "locomotion", "arm_command", "hand_command",
-            "neck_command", "waist_command", "arm_compliance", "motion_play", "tts",
-            "audio", "interaction", "face_play", "skill_play", "controlled_spatial",
-            "auto_charging",
+            "mc_mode", "base_drive", "arm_control", "hand_control", "head_control",
+            "waist_control", "motion_play", "tts", "audio", "interaction",
+            "face_play", "skill_play", "controlled_spatial", "auto_charging",
         }
         for name in expected_actuators:
             self.assertEqual(by_name[name], "actuator", f"'{name}' must be an actuator tool")
@@ -292,7 +296,7 @@ class ToolInventoryTests(unittest.TestCase):
         plugins, _ = build_bundle_plugins(config)
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
-        for name in ("joints", "imu", "camera", "lidar", "bms", "emergency", "wakeup",
+        for name in ("joints", "imu", "camera", "lidar_cloud", "battery", "estop",
                      "alerts", "spatial_map"):
             self.assertEqual(by_name[name], "sensor", f"'{name}' must be a sensor tool")
 
@@ -304,9 +308,9 @@ class ToolInventoryTests(unittest.TestCase):
         config["plugins"] = FULL_PLUGINS
         plugins, _ = build_bundle_plugins(config)
         nodes = next(iter(plugins.values())).nodes
-        for key in ("bms", "emergency", "wakeup", "skill_status"):
+        for key in ("battery", "estop", "skill_status"):
             self.assertNotIn(key, nodes.streams)
-        for name in ("bms", "emergency", "wakeup"):
+        for name in ("battery", "estop"):
             plugin = find_plugin(plugins, name)
             self.assertFalse(plugin.has_stream, f"{name} must not claim a stream without the wheel")
         skill_play = find_plugin(plugins, "skill_play")
@@ -315,10 +319,11 @@ class ToolInventoryTests(unittest.TestCase):
     def test_camera_streams_follow_config(self):
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = dict(FULL_PLUGINS, camera={
-            "enabled": True, "streams": ["head_left_fisheye"]})
+            "enabled": True, "streams": ["head_left_fisheye", "chest_front_d457_depth"]})
         plugins, _ = build_bundle_plugins(config)
         camera = find_plugin(plugins, "camera")
-        self.assertEqual(list(camera.streams), ["camera_head_left_fisheye"])
+        self.assertEqual(list(camera.streams), ["camera_head_left_fisheye",
+                                                "camera_chest_front_d457_depth"])
 
     def test_joints_card_multiplexes_three_groups(self):
         config = json.loads(json.dumps(BASE_CONFIG))
@@ -377,7 +382,7 @@ class RpcDispatchTests(unittest.TestCase):
         self.plugins, self.transport = build_bundle_plugins(self.config)
         self.nodes = next(iter(self.plugins.values())).nodes
 
-    # -- mc_mode (MDU :56322, absorbs former mc_state queries) --
+    # -- mc_mode (MDU :56322, absorbs former mc_state queries + fixed FSM) --
 
     def test_mc_mode_set_action_hits_mdu_56322(self):
         mc_mode = find_plugin(self.plugins, "mc_mode")
@@ -398,11 +403,58 @@ class RpcDispatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mc_mode.dispatch("moonwalk", {})
 
-    # -- locomotion / waist / face (RosMsgWrapper publishers, robot domain) --
+    def test_mc_mode_fsm_rejects_from_resting_state(self):
+        # GetAction → DAMPING: resting state only allows get_up; lie_down must be
+        # rejected with a suggestion and no SetAction RPC may fire.
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "action": "MOTIONCONTROLACTION_DAMPING"}
+        mc_mode = find_plugin(self.plugins, "mc_mode")
+        result = mc_mode.dispatch("lie_down", {})
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["current"], "DAMPING")
+        self.assertEqual(result["requested"], "lie_down")
+        self.assertIn("get_up", result["suggestion"])
+        self.assertEqual(result["allowed"], ["get_up"])
+        self.assertEqual(self.transport.calls_to("MotionControlActionService", "SetAction"), [])
+        # FSM rejection happens before the runtime cross-check
+        self.assertEqual(self.transport.calls_to("MotionControlActionService", "GetAvailableActions"), [])
 
-    def test_locomotion_walk_publishes_wrapper(self):
-        locomotion = find_plugin(self.plugins, "locomotion")
-        result = locomotion.dispatch("walk", {"forward": 0.5, "angular": -0.25})
+    def test_mc_mode_fsm_allows_from_motion_state(self):
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "action": "MOTIONCONTROLACTION_MOTION"}
+        mc_mode = find_plugin(self.plugins, "mc_mode")
+        result = mc_mode.dispatch("lie_down", {})
+        self.assertEqual(result["requested"], "LIE_DOWN")
+        (url, body), = self.transport.calls_to("MotionControlActionService", "SetAction")
+        self.assertEqual(body["command"]["action"], "MotionControlAction_LIE_DOWN")
+
+    def test_mc_mode_runtime_cross_check_rejects(self):
+        # FSM allows it (MOTION), but the live GetAvailableActions list doesn't.
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "data": {"command": {"action": "MOTIONCONTROLACTION_MOTION"}}}
+        self.transport.responses["MotionControlActionService/GetAvailableActions"] = {
+            "commands": ["MotionControlAction_GET_UP"]}
+        mc_mode = find_plugin(self.plugins, "mc_mode")
+        result = mc_mode.dispatch("passive", {})
+        self.assertEqual(result["state"], "rejected")
+        self.assertIn("运行时可用动作列表", result["suggestion"])
+        self.assertEqual(result["available"], ["MotionControlAction_GET_UP"])
+        self.assertEqual(self.transport.calls_to("MotionControlActionService", "SetAction"), [])
+
+    def test_mc_mode_unparseable_state_is_permissive(self):
+        # GetAction returning nothing parseable ('') must not block the transition;
+        # the runtime cross-check (empty commands → skipped) lets SetAction through.
+        self.transport.responses["MotionControlActionService/GetAction"] = {"header": {"code": "0"}}
+        mc_mode = find_plugin(self.plugins, "mc_mode")
+        result = mc_mode.dispatch("damping", {})
+        self.assertEqual(result["requested"], "DAMPING")
+        self.assertEqual(len(self.transport.calls_to("MotionControlActionService", "SetAction")), 1)
+
+    # -- base_drive / waist / face (RosMsgWrapper publishers, robot domain) --
+
+    def test_base_drive_walk_publishes_wrapper(self):
+        base_drive = find_plugin(self.plugins, "base_drive")
+        result = base_drive.dispatch("walk", {"forward": 0.5, "angular": -0.25})
         pub = self.nodes.locomotion_pub
         (msg,) = pub.published
         self.assertEqual(msg.serialization_type, "pb")
@@ -413,21 +465,21 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "MotionControl_LocomotionMode_DEFAULT")
         self.assertEqual(result["state"], "published")
 
-    def test_locomotion_rejects_out_of_range(self):
-        locomotion = find_plugin(self.plugins, "locomotion")
+    def test_base_drive_rejects_out_of_range(self):
+        base_drive = find_plugin(self.plugins, "base_drive")
         with self.assertRaises(ValueError):
-            locomotion.dispatch("walk", {"forward": 1.5})
+            base_drive.dispatch("walk", {"forward": 1.5})
 
-    def test_waist_command_publishes_wrapper(self):
-        waist = find_plugin(self.plugins, "waist_command")
+    def test_waist_control_publishes_wrapper(self):
+        waist = find_plugin(self.plugins, "waist_control")
         waist.dispatch("send", {"pitch": 0.2, "height": -0.1})
         (msg,) = self.nodes.waist_pub.published
         payload = json.loads(bytes(msg.data))
         self.assertEqual(payload["waist_pitch"], 0.2)
         self.assertEqual(payload["waist_height"], -0.1)
 
-    def test_waist_command_rejects_out_of_range(self):
-        waist = find_plugin(self.plugins, "waist_command")
+    def test_waist_control_rejects_out_of_range(self):
+        waist = find_plugin(self.plugins, "waist_control")
         with self.assertRaises(ValueError):
             waist.dispatch("send", {"yaw": 2.0})
 
@@ -443,10 +495,10 @@ class RpcDispatchTests(unittest.TestCase):
         cancel_payload = json.loads(bytes(cancel_msg.data))
         self.assertTrue(cancel_payload["is_stop"])
 
-    # -- arm / neck / hand JointState publishers --
+    # -- arm / head / hand JointState publishers --
 
-    def test_arm_command_publishes_jointstate_with_zero_velocity(self):
-        arm = find_plugin(self.plugins, "arm_command")
+    def test_arm_control_publishes_jointstate_with_zero_velocity(self):
+        arm = find_plugin(self.plugins, "arm_control")
         arm.dispatch("send", {"left": [0.0] * 7, "duration_ms": 0})
         pub = self.nodes.arm_command_pub
         (msg,) = pub.published
@@ -455,26 +507,26 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(msg.velocity, [0.0] * 7)
         self.assertEqual(msg.effort, [0.0] * 7)
 
-    def test_arm_command_rejects_wrong_count(self):
-        arm = find_plugin(self.plugins, "arm_command")
+    def test_arm_control_rejects_wrong_count(self):
+        arm = find_plugin(self.plugins, "arm_control")
         with self.assertRaises(ValueError):
             arm.dispatch("send", {"left": [0.0, 0.1]})
 
-    def test_arm_command_rejects_out_of_limits(self):
-        arm = find_plugin(self.plugins, "arm_command")
+    def test_arm_control_rejects_out_of_limits(self):
+        arm = find_plugin(self.plugins, "arm_control")
         with self.assertRaises(ValueError):
             arm.dispatch("send", {"left": [9.9] + [0.0] * 6})
 
-    def test_neck_command_publishes_and_clamps(self):
-        neck = find_plugin(self.plugins, "neck_command")
-        neck.dispatch("send", {"yaw": 0.5, "duration_ms": 0})
+    def test_head_control_publishes_and_clamps(self):
+        head = find_plugin(self.plugins, "head_control")
+        head.dispatch("send", {"yaw": 0.5, "duration_ms": 0})
         (msg,) = self.nodes.neck_command_pub.published
         self.assertEqual(msg.name, ["head_yaw_joint"])
         with self.assertRaises(ValueError):
-            neck.dispatch("send", {"yaw": 1.2})
+            head.dispatch("send", {"yaw": 1.2})
 
-    def test_hand_command_publishes_with_hand_type(self):
-        hand = find_plugin(self.plugins, "hand_command")
+    def test_hand_control_publishes_with_hand_type(self):
+        hand = find_plugin(self.plugins, "hand_control")
         hand.dispatch("send", {"right": [100, 200], "hand_type": "O10Hand"})
         (msg,) = self.nodes.hand_command_pub.published
         self.assertEqual(msg.name, ["right_hand_joint_0", "right_hand_joint_1"])
@@ -482,8 +534,8 @@ class RpcDispatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             hand.dispatch("send", {"left": [3000]})
 
-    def test_hand_command_rejects_unknown_type(self):
-        hand = find_plugin(self.plugins, "hand_command")
+    def test_hand_control_rejects_unknown_type(self):
+        hand = find_plugin(self.plugins, "hand_control")
         with self.assertRaises(ValueError):
             hand.dispatch("send", {"left": [0], "hand_type": "RobotHand"})
 
@@ -542,14 +594,24 @@ class RpcDispatchTests(unittest.TestCase):
         (url, body), = self.transport.calls_to("AgentControlService", "SetAgentPropertiesRequest")
         self.assertEqual(body["contents"]["properties"]["2"], "only_voice")
 
-    def test_resource_list_maps_type_names(self):
-        resources = find_plugin(self.plugins, "resource_list")
+    def test_resource_list_actions_per_play_card(self):
+        # resource_list card dissolved: each play card exposes its own GetResourceList
+        # query as a `list` action (ResourceService @ HDU :51049).
         self.transport.responses["ResourceService"] = {"data": {"resources": ["握手"]}}
-        result = resources.dispatch("motion", {})
-        (url, body), = self.transport.calls_to("ResourceService", "GetResourceList")
-        self.assertIn("10.42.10.10:51049", url)
-        self.assertEqual(body["resource_type"], "RESOURCE_TYPE_MOTION")
-        self.assertEqual(result["resources"], ["握手"])
+        cases = [
+            (find_plugin(self.plugins, "motion_play"), "list", "RESOURCE_TYPE_MOTION"),
+            (find_plugin(self.plugins, "face_play"), "list", "RESOURCE_TYPE_EMOTICON"),
+            (find_plugin(self.plugins, "audio"), "list", "RESOURCE_TYPE_AUDIO"),
+            (find_plugin(self.plugins, "skill_play"), "list", "RESOURCE_TYPE_SKILL"),
+            (find_plugin(self.plugins, "skill_play"), "list_offring_work", "RESOURCE_TYPE_OFFRING_WORK"),
+        ]
+        for plugin, action, expected_type in cases:
+            result = plugin.dispatch(action, {})
+            self.assertEqual(result["resources"], ["握手"])
+            (url, body), = self.transport.calls_to("ResourceService", "GetResourceList")
+            self.assertIn("10.42.10.10:51049", url)
+            self.assertEqual(body["resource_type"], expected_type)
+            self.transport.calls.clear()
 
     # -- MDU motion_play / arm_compliance / alerts --
 
@@ -571,9 +633,9 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertTrue(body["cmd_end"])
         self.assertEqual(body["motion_id"], "")
 
-    def test_arm_compliance_dispatch(self):
-        compliance = find_plugin(self.plugins, "arm_compliance")
-        compliance.dispatch("enable", {})
+    def test_arm_control_compliance_dispatch(self):
+        arm = find_plugin(self.plugins, "arm_control")
+        arm.dispatch("compliance_enable", {})
         (url, _), = self.transport.calls_to("MotionControlMotionService", "EnableArmCompliance")
         self.assertIn("10.42.10.12:56322", url)
 

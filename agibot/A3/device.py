@@ -330,13 +330,14 @@ class A3Nodes:
         mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json")
         mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json")
         mirror("neck_state", JointState, "/motion/control/neck_joint_state", "data/json")
-        mirror("lidar", PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud", "sensor/pointcloud")
+        mirror("lidar_cloud", PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud", "sensor/pointcloud")
         mirror("imu_pelvis", Imu, "/ros2/body_drive/pelvis_imu/data", "data/json")
         mirror("imu_torso", Imu, "/ros2/body_drive/torso_imu/data", "data/json")
 
         # -- camera streams, config-selected subset --
         camera_cfg = config.get("plugins", {}).get("camera", {})
-        selected = camera_cfg.get("streams") or ["head_left_fisheye", "chest_front_d457_rgb"]
+        selected = camera_cfg.get("streams") or ["head_left_fisheye", "chest_front_d457_rgb",
+                                                 "chest_front_d457_depth"]
         for key in selected:
             topic, fmt, _ = CAMERA_TOPICS[key]
             mirror(f"camera_{key}", Image, topic, fmt)
@@ -351,12 +352,10 @@ class A3Nodes:
             pass
 
         if self._pb is not None:
-            mirror("bms", self._wrapper_type(ros2), "/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel",
+            mirror("battery", self._wrapper_type(ros2), "/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel",
                    "data/json", json_filter=self._decode_bms)
-            mirror("emergency", self._wrapper_type(ros2), "/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel",
+            mirror("estop", self._wrapper_type(ros2), "/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel",
                    "data/json", json_filter=self._decode_emergency)
-            mirror("wakeup", self._wrapper_type(ros2), "/agent/wakeup/pb_3Aaimdk_2Eprotocol_2EWakeUpResult",
-                   "data/json", json_filter=self._decode_wakeup)
             mirror("skill_status", self._wrapper_type(ros2), "/skill/pilot/skill_status",
                    "data/json", json_filter=self._decode_skill_status)
 
@@ -483,16 +482,6 @@ class A3Nodes:
         except Exception:
             return jsonable(msg)
         return jsonable(channel)
-
-    def _decode_wakeup(self, msg):
-        if self._pb is None:
-            return jsonable(msg)
-        result = self._pb.WakeUpResult()
-        try:
-            result.ParseFromString(bytes(msg.data))
-        except Exception:
-            return jsonable(msg)
-        return jsonable(result)
 
     def _decode_skill_status(self, msg):
         if self._pb is None:
@@ -839,12 +828,12 @@ class CameraPlugin:
         return {"state": "running", **self.streams[key]}
 
 
-class LidarPlugin:
+class LidarCloudPlugin:
     def __init__(self, nodes):
         self.nodes = nodes
 
     def get_tool(self):
-        return _stream_tool("lidar", self.nodes.streams["lidar"], "颈部 Livox 激光雷达点云")
+        return _stream_tool("lidar_cloud", self.nodes.streams["lidar_cloud"], "颈部 Livox 激光雷达点云")
 
     def start(self):
         pass
@@ -855,21 +844,21 @@ class LidarPlugin:
     def dispatch(self, action, args):
         if action == "stop":
             return {"state": "idle"}
-        return {"state": "running", **self.nodes.streams["lidar"]}
+        return {"state": "running", **self.nodes.streams["lidar_cloud"]}
 
 
-class BmsPlugin:
+class BatteryPlugin:
     """RosMsgWrapper protobuf stream. With the a3_aimdk wheel the payload is decoded
     (bms_datas[1]=in-use pack, [0]=absent); without it the raw wrapper fields pass through."""
 
     def __init__(self, nodes):
         self.nodes = nodes
-        self.has_stream = "bms" in nodes.streams
+        self.has_stream = "battery" in nodes.streams
 
     def get_tool(self):
         if self.has_stream:
-            return _stream_tool("bms", self.nodes.streams["bms"], "电池状态流（电压/电流/电量/充电状态，双电池包）")
-        return tool("bms", "sensor", "电池状态（需要 a3_aimdk protobuf wheel 才能解码数据流）")
+            return _stream_tool("battery", self.nodes.streams["battery"], "电池状态流（电压/电流/电量/充电状态，双电池包）")
+        return tool("battery", "sensor", "电池状态（需要 a3_aimdk protobuf wheel 才能解码数据流）")
 
     def start(self):
         pass
@@ -881,20 +870,20 @@ class BmsPlugin:
         if action == "stop":
             return {"state": "idle"}
         if self.has_stream:
-            return {"state": "running", **self.nodes.streams["bms"]}
+            return {"state": "running", **self.nodes.streams["battery"]}
         return {"state": "running"}
 
 
-class EmergencyPlugin:
+class EstopPlugin:
     def __init__(self, nodes):
         self.nodes = nodes
-        self.has_stream = "emergency" in nodes.streams
+        self.has_stream = "estop" in nodes.streams
 
     def get_tool(self):
         if self.has_stream:
-            return _stream_tool("emergency", self.nodes.streams["emergency"],
+            return _stream_tool("estop", self.nodes.streams["estop"],
                                 "急停状态流（有线/无线/软件急停 + 各类传感器报警）")
-        return tool("emergency", "sensor", "急停状态（需要 a3_aimdk protobuf wheel 才能解码数据流）")
+        return tool("estop", "sensor", "急停状态（需要 a3_aimdk protobuf wheel 才能解码数据流）")
 
     def start(self):
         pass
@@ -906,31 +895,7 @@ class EmergencyPlugin:
         if action == "stop":
             return {"state": "idle"}
         if self.has_stream:
-            return {"state": "running", **self.nodes.streams["emergency"]}
-        return {"state": "running"}
-
-
-class WakeupPlugin:
-    def __init__(self, nodes):
-        self.nodes = nodes
-        self.has_stream = "wakeup" in nodes.streams
-
-    def get_tool(self):
-        if self.has_stream:
-            return _stream_tool("wakeup", self.nodes.streams["wakeup"], "语音唤醒事件流（关键词/置信度/语言）")
-        return tool("wakeup", "sensor", "语音唤醒事件（需要 a3_aimdk protobuf wheel 才能解码数据流）")
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "stop":
-            return {"state": "idle"}
-        if self.has_stream:
-            return {"state": "running", **self.nodes.streams["wakeup"]}
+            return {"state": "running", **self.nodes.streams["estop"]}
         return {"state": "running"}
 
 
@@ -995,39 +960,46 @@ class ModelPlugin:
         return {"urdf": self.nodes.urdf_text()}
 
 
-class ResourceListPlugin:
-    ACTIONS = {
-        name: ([], f"查询 {desc} 资源列表")
-        for name, desc in (
-            ("motion", "动作"), ("emoticon", "表情"), ("audio", "音频"),
-            ("skill", "技能"), ("map", "地图"), ("offring_work", "演出作品"),
-        )
-    }
+# mc_mode fixed FSM (dev guide §7.1.2 + GetUp example flow). Current state → the
+# SetAction commands allowed from it. The live source of truth is still
+# GetAvailableActions (cross-checked at dispatch time); this map is the fixed
+# doc-level skeleton that lets the driver reject impossible transitions with a
+# suggestion instead of a failed RPC.
+#   DAMPING / PASSIVE / LIE_DOWN / (unknown resting states) → only GET_UP
+#   MOTION (standing after get_up) → DAMPING / LIE_DOWN / PASSIVE
+MC_STATE_TRANSITIONS = {
+    "MOTION": ("damping", "lie_down", "passive"),
+    "DAMPING": ("get_up",),
+    "PASSIVE": ("get_up",),
+    "LIE_DOWN": ("get_up",),
+    # IDLE/UNKNOWN and any unmapped state: allow all four, the runtime check decides
+}
+MC_TRANSITION_SUGGESTIONS = {
+    "damping": "damping 用于关节卸力/跌倒保护，切换前确保机器人周围有足够空间；如当前未站立请先 get_up",
+    "lie_down": "lie_down 仅可从 MOTION 站立状态进入；如需起身请先 get_up",
+    "passive": "passive 拖动示教仅可从 MOTION 站立状态进入；退出示教请执行 get_up",
+}
 
-    def __init__(self, nodes):
-        self.nodes = nodes
 
-    def get_tool(self):
-        return tool("resource_list", "actuator", "查询机上资源列表（GetResourceList：动作/表情/音频/技能/地图/演出）",
-                    action_schema(self.ACTIONS, {}))
+def _mc_allowed_actions(state: str):
+    state = (state or "").strip().upper()
+    if not state or state == "UNKNOWN":
+        return tuple(MC_ACTIONS)
+    # MOTION also accepts GET_UP as a no-op re-stand; resting states reject it too
+    if state == "MOTION":
+        return MC_STATE_TRANSITIONS["MOTION"] + ("get_up",)
+    # IDLE and any unmapped state behave like a resting state: only get_up
+    return MC_STATE_TRANSITIONS.get(state, ("get_up",))
 
-    def start(self):
-        pass
 
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "ready"}
-        if action not in RESOURCE_TYPES:
-            raise ValueError(f"resource_list: unknown action {action!r}")
-        response = self.nodes.rpc.resource_list(action)
-        return {"resources": (response.get("data") or {}).get("resources", [])}
+def _mc_suggestion(state: str, requested: str) -> str:
+    state = (state or "").strip().upper() or "UNKNOWN"
+    allowed = _mc_allowed_actions(state)
+    if requested in allowed:
+        return ""
+    if "get_up" in allowed:
+        return f"当前状态 {state} 仅允许 {list(allowed)}；建议先执行 get_up 恢复站立后再切换"
+    return f"当前状态 {state} 仅允许 {list(allowed)}；建议先经 get_up 恢复站立（MOTION）后再进入 {requested}"
 
 
 class McModePlugin:
@@ -1036,7 +1008,11 @@ class McModePlugin:
     对应 MDU MotionControlActionService：SetAction 切换 GetUp/LieDown/Damping/
     Passive（异步，返回 PENDING，结果经 get_state 轮询 GetAction 确认）；
     get_state / available 合并自原 mc_state 卡（GetAction / GetAvailableActions）。
-    Damping 模式用于跌倒保护/整机关节卸力，切换前请确保机器人周围有足够空间。
+
+    固定状态机（开发文档 §7.1.2 + GetUp 示例流程）：DAMPING/PASSIVE/LIE_DOWN/
+    IDLE 等非站立态只能 get_up；MOTION（站立）可 damping/lie_down/passive。
+    切换请求先与该固定迁移表核对，再与运行时 GetAvailableActions 交叉校验，
+    不合法迁移直接拒绝并返回建议（不发起 RPC）。
     """
 
     ACTIONS = {
@@ -1045,9 +1021,9 @@ class McModePlugin:
             ("get_state", "查询当前运动控制动作状态（GetAction，异步切换结果确认）"),
             ("available", "查询当前可用动作列表（GetAvailableActions）"),
             ("damping", "进入 Damping 阻尼模式（关节卸力，用于软急停/跌倒保护）"),
-            ("get_up", "执行 GetUp 起身动作，从坐/躺恢复到站立平衡"),
-            ("lie_down", "执行 LieDown 坐/躺下动作"),
-            ("passive", "进入 Passive 拖动示教模式（关节可被手拖动）"),
+            ("get_up", "执行 GetUp 起身动作，从坐/躺恢复到站立平衡（MOTION）"),
+            ("lie_down", "执行 LieDown 坐/躺下动作（仅 MOTION 站立态可进入）"),
+            ("passive", "进入 Passive 拖动示教模式（仅 MOTION 站立态可进入）"),
         )
     }
 
@@ -1056,7 +1032,8 @@ class McModePlugin:
 
     def get_tool(self):
         return tool("mc_mode", "actuator", "运动控制状态机查询与模式切换（SetAction：get_up/lie_down/damping/passive；"
-                                          "get_state/available 查询当前动作与可用动作，切换为异步流程）",
+                                          "get_state/available 查询当前动作与可用动作；固定迁移：非站立态仅 get_up，"
+                                          "MOTION 可 damping/lie_down/passive，非法迁移返回建议）",
                     action_schema(self.ACTIONS, {}))
 
     def start(self):
@@ -1064,6 +1041,22 @@ class McModePlugin:
 
     def stop(self):
         pass
+
+    def _current_state(self):
+        """GetAction → normalized current state string ('' when unparseable)."""
+        response = self.nodes.rpc.get_action()
+        for container in (response, response.get("data") or {}):
+            if isinstance(container, dict):
+                for key in ("action", "state", "current_action"):
+                    value = container.get(key)
+                    if isinstance(value, str) and value:
+                        return value
+                command = container.get("command")
+                if isinstance(command, dict):
+                    value = command.get("action")
+                    if isinstance(value, str) and value:
+                        return value
+        return ""
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1079,13 +1072,29 @@ class McModePlugin:
             return {"commands": response.get("commands", [])}
         if action not in MC_ACTIONS:
             raise ValueError(f"mc_mode: unknown action {action!r}")
+        # 1) fixed doc-level FSM check — reject with a suggestion, no RPC
+        current = self._current_state()
+        normalized = current.upper().replace("MOTIONCONTROLACTION_", "")
+        suggestion = _mc_suggestion(normalized, action)
+        if suggestion:
+            return {"state": "rejected", "current": normalized or "UNKNOWN",
+                    "requested": action, "suggestion": suggestion,
+                    "allowed": list(_mc_allowed_actions(normalized))}
+        # 2) runtime cross-check — GetAvailableActions is the live source of truth
         service_action, short = MC_ACTIONS[action]
+        runtime = self.nodes.rpc.get_available_actions()
+        commands = runtime.get("commands") or []
+        if commands and service_action not in commands:
+            return {"state": "rejected", "current": normalized, "requested": action,
+                    "suggestion": f"运行时可用动作列表不含 {service_action}（当前可用 {commands}）；"
+                                  f"请先满足前置状态（通常为 get_up 站立）",
+                    "available": commands}
         response = self.nodes.rpc.set_action(service_action, "")
-        return {"requested": short, "response": response}
+        return {"requested": short, "current": normalized, "response": response}
 
 
-class LocomotionPlugin:
-    """locomotion 卡片：底盘行走速度控制。
+class BaseDrivePlugin:
+    """base_drive 卡片：底盘行走速度控制（命名对齐 q5_bundle）。
 
     对应 /motion/control/locomotion_velocity 话题（RosMsgWrapper + LocomotionVelocity
     消息）。三个速度均为 -1.0~1.0 的归一化比例值：forward/lateral 对应最大
@@ -1099,7 +1108,7 @@ class LocomotionPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("locomotion", "actuator", "下发底盘行走速度（话题 /motion/control/locomotion_velocity，"
+        return tool("base_drive", "actuator", "下发底盘行走速度（话题 /motion/control/locomotion_velocity，"
                                               "forward/lateral/angular ∈ [-1,1]，仅 MOTION 模式下生效；停止行走下发全 0）",
                     action_schema(
                         {"walk": (["forward", "lateral", "angular"], "下发行走速度比例（-1~1），持续下发维持运动，0 为停止")},
@@ -1124,7 +1133,7 @@ class LocomotionPlugin:
         if action == "info":
             return {"state": "ready"}
         if action != "walk":
-            raise ValueError(f"locomotion: unknown action {action!r}")
+            raise ValueError(f"base_drive: unknown action {action!r}")
         forward = _clamp(args.get("forward", 0.0), -1.0, 1.0, "forward")
         lateral = _clamp(args.get("lateral", 0.0), -1.0, 1.0, "lateral")
         angular = _clamp(args.get("angular", 0.0), -1.0, 1.0, "angular")
@@ -1139,26 +1148,41 @@ class LocomotionPlugin:
                 "state": "published"}
 
 
-class ArmCommandPlugin:
-    """arm_command 卡片：左/右臂 14 关节位置控制。
+class ArmControlPlugin:
+    """arm_control 卡片：左/右臂 14 关节位置控制 + 手臂柔顺开关（命名对齐
+    tianyi2.0/q5_bundle 的 arm_control；arm_compliance 卡并入 —— 同属 MDU
+    运动控制平面）。
 
-    对应 /motion/control/arm_joint_command 话题（sensor_msgs/JointState）。开发文档
-    §7.3 硬性要求：
+    对应 /motion/control/arm_joint_command 话题（sensor_msgs/JointState）+
+    MotionControlMotionService/{Enable,Disable,Check}ArmCompliance RPC。
+    开发文档 §7.3 硬性要求：
       - 需以 100 Hz 持续下发，指令间隔 ≤ 30 ms，否则机械臂将回到阻尼状态；
       - 速度、力矩字段必须为 0（底层按位置插值规划）；
       - 关节速度上限 4 rad/s；
       - 仅 MOTION 状态下可用；直接控臂前必须先停止 motion_player（见 motion_play 卡片备注）。
     单次调用只发送一帧指令；维持时间由调用方循环下发实现（上层 Agent 按运动规划循环）。
+    柔顺模式下手臂可被外力拖动（示教/人机交互安全），关闭后恢复刚度控制。
     """
+
+    ACTIONS = {
+        "compliance_enable": ([], "开启手臂柔顺模式（可被外力拖动，示教用）"),
+        "compliance_disable": ([], "关闭手臂柔顺模式（恢复刚度控制）"),
+        "compliance_check": ([], "查询手臂柔顺模式是否开启"),
+    }
 
     def __init__(self, nodes):
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("arm_command", "actuator", "下发双臂 14 关节位置指令（话题 /motion/control/arm_joint_command，"
-                                              "需 100Hz 连续下发、间隔 ≤30ms；velocity/effort 固定 0；先经 mc_mode get_up 站立并停止 motion_player）",
+        return tool("arm_control", "actuator", "下发双臂 14 关节位置指令 + 手臂柔顺控制"
+                                              "（话题 /motion/control/arm_joint_command 需 100Hz 连续下发、间隔 ≤30ms；"
+                                              "velocity/effort 固定 0；柔顺 Enable/Disable/CheckArmCompliance RPC；"
+                                              "先经 mc_mode get_up 站立并停止 motion_player）",
                     action_schema(
-                        {"send": (["left", "right"], "下发一帧手臂关节位置指令（rad），需按 ~100Hz 循环调用")},
+                        {
+                            "send": (["left", "right"], "下发一帧手臂关节位置指令（rad），需按 ~100Hz 循环调用"),
+                            **self.ACTIONS,
+                        },
                         {
                             "left": {"type": "array", "items": {"type": "number"},
                                      "description": "左臂 7 关节 rad，顺序：shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw"},
@@ -1181,8 +1205,11 @@ class ArmCommandPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
+        if action in self.ACTIONS:
+            method = action.replace("compliance_", "")
+            return jsonable(self.nodes.rpc.arm_compliance(method))
         if action != "send":
-            raise ValueError(f"arm_command: unknown action {action!r}")
+            raise ValueError(f"arm_control: unknown action {action!r}")
         positions = {}
         for side in ("left", "right"):
             values = args.get(side)
@@ -1199,20 +1226,20 @@ class ArmCommandPlugin:
         return {"joints": positions, "duration_ms": duration_ms, "state": "published"}
 
 
-class HandCommandPlugin:
-    """hand_command 卡片：灵巧手张合控制。
+class HandControlPlugin:
+    """hand_control 卡片：灵巧手张合控制（命名对齐 tianyi2.0/q5_bundle）。
 
     对应 /motion/control/hand_joint_command 话题（sensor_msgs/JointState）。
     frame_id 标识手部类型：AgiHand（默认）或 O10Hand，当前安装类型可从
-    hand_state 卡片的 frame_id 读取。position 为 0~2000 的张合等级。
+    joints 卡片（group=hand）的 frame_id 读取。position 为 0~2000 的张合等级。
     """
 
     def __init__(self, nodes):
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("hand_command", "actuator", "下发灵巧手张合指令（话题 /motion/control/hand_joint_command，"
-                                               "position 0~2000，frame_id 区分 AgiHand/O10Hand）",
+        return tool("hand_control", "actuator", "下发灵巧手张合指令（话题 /motion/control/hand_joint_command，"
+                                                "position 0~2000，frame_id 区分 AgiHand/O10Hand）",
                     action_schema(
                         {"send": (["left", "right"], "下发双手张合等级 0(张开)~2000(握紧)")},
                         {
@@ -1236,7 +1263,7 @@ class HandCommandPlugin:
         if action == "info":
             return {"state": "ready"}
         if action != "send":
-            raise ValueError(f"hand_command: unknown action {action!r}")
+            raise ValueError(f"hand_control: unknown action {action!r}")
         hand_type = args.get("hand_type", "AgiHand")
         _require(hand_type in HAND_TYPES, f"未知手部类型 {hand_type!r}，可选 {sorted(HAND_TYPES)}")
         positions = {}
@@ -1251,18 +1278,18 @@ class HandCommandPlugin:
         return {"hand_type": hand_type, "positions": positions, "state": "published"}
 
 
-class NeckCommandPlugin:
-    """neck_command 卡片：头部双关节控制。
+class HeadControlPlugin:
+    """head_control 卡片：头部双关节控制（命名对齐 tianyi2.0/q5_bundle）。
 
-    对应 /motion/control/head_command 话题（sensor_msgs/JointState）。
+    对应 /motion/control/neck_joint_command 话题（sensor_msgs/JointState）。
     """
 
     def __init__(self, nodes):
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("neck_command", "actuator", "下发头部姿态指令（话题 /motion/control/head_command，"
-                                               "head_yaw ∈ [-1.047,1.047] rad，head_pitch ∈ [-0.436,0.262] rad）",
+        return tool("head_control", "actuator", "下发头部姿态指令（话题 /motion/control/neck_joint_command，"
+                                                "head_yaw ∈ [-1.047,1.047] rad，head_pitch ∈ [-0.436,0.262] rad）",
                     action_schema(
                         {"send": (["yaw", "pitch"], "下发一帧头部关节指令（rad）")},
                         {
@@ -1286,7 +1313,7 @@ class NeckCommandPlugin:
         if action == "info":
             return {"state": "ready"}
         if action != "send":
-            raise ValueError(f"neck_command: unknown action {action!r}")
+            raise ValueError(f"head_control: unknown action {action!r}")
         positions = {}
         if args.get("yaw") is not None:
             positions["head_yaw_joint"] = float(args["yaw"])
@@ -1300,8 +1327,8 @@ class NeckCommandPlugin:
         return {"joints": positions, "duration_ms": duration_ms, "state": "published"}
 
 
-class WaistCommandPlugin:
-    """waist_command 卡片：腰部三自由度控制。
+class WaistControlPlugin:
+    """waist_control 卡片：腰部三自由度控制（命名对齐 tianyi2.0/q5_bundle）。
 
     对应 /motion/control/move_waist 话题（RosMsgWrapper + MoveWaist 消息）：
     pitch（前倾后仰）、yaw（左右旋转）、height（升降，0 为最低位）。
@@ -1311,8 +1338,8 @@ class WaistCommandPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("waist_command", "actuator", "下发腰部控制指令（话题 /motion/control/move_waist："
-                                                "pitch/yaw ∈ [-1.6,1.6] rad，height ∈ [-0.3,0] m）",
+        return tool("waist_control", "actuator", "下发腰部控制指令（话题 /motion/control/move_waist："
+                                                  "pitch/yaw ∈ [-1.6,1.6] rad，height ∈ [-0.3,0] m）",
                     action_schema(
                         {"send": (["pitch", "yaw", "height"], "下发腰部俯仰/旋转/升降指令")},
                         {
@@ -1336,7 +1363,7 @@ class WaistCommandPlugin:
         if action == "info":
             return {"state": "ready"}
         if action != "send":
-            raise ValueError(f"waist_command: unknown action {action!r}")
+            raise ValueError(f"waist_control: unknown action {action!r}")
         payload = {}
         for field in ("pitch", "yaw", "height"):
             value = args.get(field)
@@ -1349,49 +1376,11 @@ class WaistCommandPlugin:
         return {**payload, "state": "published"}
 
 
-class ArmCompliancePlugin:
-    """arm_compliance 卡片：手臂柔顺控制开关。
-
-    对应 MDU MotionControlMotionService/{Enable,Disable,Check}ArmCompliance。
-    柔顺模式下手臂可被外力拖动（示教/人机交互安全），关闭后恢复刚度控制。
-    """
-
-    ACTIONS = {
-        "enable": ([], "开启手臂柔顺模式（可被外力拖动）"),
-        "disable": ([], "关闭手臂柔顺模式（恢复刚度控制）"),
-        "check": ([], "查询手臂柔顺模式是否开启"),
-    }
-
-    def __init__(self, nodes):
-        self.nodes = nodes
-
-    def get_tool(self):
-        return tool("arm_compliance", "actuator", "手臂柔顺控制（Enable/Disable/CheckArmCompliance RPC）",
-                    action_schema(self.ACTIONS, {}))
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action, args):
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "ready"}
-        if action not in self.ACTIONS:
-            raise ValueError(f"arm_compliance: unknown action {action!r}")
-        return jsonable(self.nodes.rpc.arm_compliance(action))
-
-
 class MotionPlayPlugin:
-    """motion_play 卡片：动作文件播放控制。
+    """motion_play 卡片：动作文件播放控制（示教式回放）+ 动作资源列表。
 
-    对应 MDU MotionCommandService/SendMotionCommand，播放 motion 资源
-    （resource_list motion 类）。注意事项（开发文档 §7.4）：
+    对应 MDU MotionCommandService/SendMotionCommand + HDU ResourceService/
+    GetResourceList（motion 类）。注意事项（开发文档 §7.4）：
       - 播放动作前若 motion_player 在运行，必须先停止：
         登录 MDU 执行 curl -X POST http://127.0.0.1:50080/json/stop_app -d '{"app_name":"motion_player"}'
       - 仅 MOTION 状态下可下发；
@@ -1399,6 +1388,7 @@ class MotionPlayPlugin:
     """
 
     ACTIONS = {
+        "list": ([], "列出可用 motion 动作资源（GetResourceList motion 类）"),
         "play": (["motion_id", "duration_ms"], "播放指定动作（motion_id 为 motion 资源文件绝对路径）"),
         "pause": ([], "暂停当前动作播放"),
         "stop_play": ([], "结束当前动作并自动恢复初始姿态（cmd_end）"),
@@ -1410,10 +1400,11 @@ class MotionPlayPlugin:
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("motion_play", "actuator", "播放/暂停/停止动作文件（SendMotionCommand RPC；播放前先停止 MDU 上"
+        return tool("motion_play", "actuator", "播放/暂停/停止动作文件 + 动作资源列表"
+                                              "（SendMotionCommand + GetResourceList RPC；播放前先停止 MDU 上"
                                               "的 motion_player 应用，且需 MOTION 模式）",
                     action_schema(self.ACTIONS, {
-                        "motion_id": {"type": "integer", "description": "动作资源 id（resource_list → motion）"},
+                        "motion_id": {"type": "integer", "description": "动作资源 id（list → motion）"},
                         "duration_ms": {"type": "integer", "description": "播放时长 ms（可选，缺省为播放到结束）"},
                     }))
 
@@ -1428,6 +1419,9 @@ class MotionPlayPlugin:
             return {"state": "ready"}
         if action == "info":
             return {"state": "ready"}
+        if action == "list":
+            response = self.nodes.rpc.resource_list("motion")
+            return {"resources": (response.get("data") or {}).get("resources", [])}
         if action == "play":
             # SendMotionCommand 入参为动作文件绝对路径 + 动作最长运行毫秒数；
             # cmd_end=true 时播放完自动回初始姿态（默认 True）
@@ -1481,7 +1475,7 @@ class TtsPlugin:
                                            "description": "播报优先级，INTERACTION_L6 默认可打断低优先级"},
                         "is_interrupted": {"type": "boolean", "default": True, "description": "是否打断当前播报"},
                         "trace_id": {"type": "string", "description": "播报 id（可选自定义传入，用于状态查询与打断）"},
-                        "file_name": {"type": "string", "description": "媒体文件名（resource_list → audio）"},
+                        "file_name": {"type": "string", "description": "媒体文件名（audio 卡片 list → audio）"},
                     }))
 
     def start(self):
@@ -1537,6 +1531,7 @@ class AudioPlugin:
     """
 
     ACTIONS = {
+        "list": ([], "列出可用 audio 音频资源（GetResourceList audio 类）"),
         "play": (["file_name"], "播放音频文件（audio 资源文件名）"),
         "stop_play": ([], "停止当前正在播放的音频（HalAudioService/StopPlay）"),
         "get_volume": ([], "查询当前音量（返回 is_sucess —— 官方接口拼写如此）"),
@@ -1550,10 +1545,10 @@ class AudioPlugin:
         self.max_volume = min(int(max_volume), VOLUME_HARD_MAX)
 
     def get_tool(self):
-        return tool("audio", "actuator", f"音频播放与音量控制（HalAudioService RPC；音量 0~{self.max_volume}，"
-                                          f"硬件上限 {VOLUME_HARD_MAX}，超限有损坏风险）",
+        return tool("audio", "actuator", f"音频播放与音量控制 + 音频资源列表（HalAudioService/ResourceService RPC；"
+                                          f"音量 0~{self.max_volume}，硬件上限 {VOLUME_HARD_MAX}，超限有损坏风险）",
                     action_schema(self.ACTIONS, {
-                        "file_name": {"type": "string", "description": "音频文件名（resource_list → audio）"},
+                        "file_name": {"type": "string", "description": "音频文件名（list → audio）"},
                         "volume": {"type": "integer", "minimum": 0, "maximum": self.max_volume,
                                    "description": f"目标音量 0~{self.max_volume}"},
                     }))
@@ -1571,6 +1566,9 @@ class AudioPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready", "max_volume": self.max_volume}
+        if action == "list":
+            response = self.nodes.rpc.resource_list("audio")
+            return {"resources": (response.get("data") or {}).get("resources", [])}
         if action == "play":
             file_name = args.get("file_name", "")
             _require(file_name, "file_name 不能为空")
@@ -1656,24 +1654,25 @@ class InteractionPlugin:
 
 
 class FacePlayPlugin:
-    """face_play 卡片：表情播放。
+    """face_play 卡片：表情播放 + 表情资源列表。
 
-    对应 /skill/pilot/face/play 话题（RosMsgWrapper + FacePlayInfo）。表情资源
-    路径/ID 经 resource_list emoticon 类获取；is_stop=true 可取消所有正在播放
-    的表情（此场景其余字段可空）。
+    对应 /skill/pilot/face/play 话题（RosMsgWrapper + FacePlayInfo）+ HDU
+    ResourceService/GetResourceList（emoticon 类）。is_stop=true 可取消所有
+    正在播放的表情（此场景其余字段可空）。
     """
 
     def __init__(self, nodes):
         self.nodes = nodes
 
     def get_tool(self):
-        return tool("face_play", "actuator", "播放/取消表情（话题 /skill/pilot/face/play；"
-                                             "e_path 为 emoticon 资源绝对路径，priority 固定 440）",
+        return tool("face_play", "actuator", "播放/取消表情 + 表情资源列表（话题 /skill/pilot/face/play + "
+                                             "GetResourceList RPC；e_path 为 emoticon 资源绝对路径，priority 固定 440）",
                     action_schema(
-                        {"play": (["e_path"], "播放表情动画（e_id 可选，repeat 为重播次数）"),
+                        {"list": ([], "列出可用 emoticon 表情资源（GetResourceList emoticon 类）"),
+                         "play": (["e_path"], "播放表情动画（e_id 可选，repeat 为重播次数）"),
                          "cancel": ([], "取消所有表情播放（is_stop=true）")},
                         {
-                            "e_path": {"type": "string", "description": "表情文件绝对路径（resource_list → emoticon）"},
+                            "e_path": {"type": "string", "description": "表情文件绝对路径（list → emoticon）"},
                             "e_id": {"type": "integer", "description": "表情资源 id（可选，与 e_path 二选一）"},
                             "repeat": {"type": "integer", "default": 1, "description": "重播次数"},
                         },
@@ -1692,6 +1691,9 @@ class FacePlayPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
+        if action == "list":
+            response = self.nodes.rpc.resource_list("emoticon")
+            return {"resources": (response.get("data") or {}).get("resources", [])}
         if action == "play":
             e_path = args.get("e_path", "")
             _require(e_path or args.get("e_id") is not None, "需要 e_path 或 e_id")
@@ -1716,18 +1718,21 @@ class FacePlayPlugin:
 
 
 class SkillPlayPlugin:
-    """skill_play 卡片：技能包（舞蹈）播放控制 + 技能状态查询（原 skill_status
-    状态卡并入）。
+    """skill_play 卡片：技能包（舞蹈）播放控制 + 技能状态查询 + 技能资源列表
+    （原 skill_status 状态卡并入；resource_list 的 skill/offring_work 类散入）。
 
       - play / pause / stop_play：ADU SkillPilotService/SkillPackage。path 为
-        skill 资源目录（resource_list skill 类）；Start 返回 session_id，
-        Pause/Stop 需回传。舞蹈播放需要约 2 米安全净空（开发文档要求）。
+        skill 资源目录（list → skill）；Start 返回 session_id，Pause/Stop
+        需回传。舞蹈播放需要约 2 米安全净空（开发文档要求）。
+      - list / list_offring_work：GetResourceList skill / offring_work 类。
       - state：查询 /skill/pilot/skill_status 技能状态流最新快照
         （核数/电池/自主充电状态；流需要 a3_aimdk protobuf wheel + skillpilot
         开启 ros2 后端，wheel 缺失时返回 unknown）。
     """
 
     ACTIONS = {
+        "list": ([], "列出可用 skill 技能包资源（GetResourceList skill 类）"),
+        "list_offring_work": ([], "列出可用演出作品资源（GetResourceList offring_work 类）"),
         "play": (["path"], "播放技能包（返回 session_id）"),
         "pause": (["session_id"], "暂停技能播放"),
         "stop_play": (["session_id"], "停止技能播放"),
@@ -1743,10 +1748,11 @@ class SkillPlayPlugin:
         if self.has_stream:
             stream = self.nodes.streams["skill_status"]
             topic_out = [{"topic": stream["topic"], "format": stream["format"]}]
-        return tool("skill_play", "actuator", "技能包/舞蹈播放控制（SkillPackage RPC；播放需 ~2m 安全净空，"
-                                             "Start 返回 session_id 供暂停/停止使用；state 查询技能状态流）",
+        return tool("skill_play", "actuator", "技能包/舞蹈播放控制 + 技能资源列表（SkillPackage + GetResourceList RPC；"
+                                             "播放需 ~2m 安全净空，Start 返回 session_id 供暂停/停止使用；"
+                                             "state 查询技能状态流）",
                     action_schema(self.ACTIONS, {
-                        "path": {"type": "string", "description": "skill 资源目录绝对路径（resource_list → skill）"},
+                        "path": {"type": "string", "description": "skill 资源目录绝对路径（list → skill）"},
                         "session_id": {"type": "string", "description": "技能会话 id（play 返回）"},
                     }), topic_out=topic_out)
 
@@ -1763,6 +1769,12 @@ class SkillPlayPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready", "has_stream": self.has_stream}
+        if action == "list":
+            response = self.nodes.rpc.resource_list("skill")
+            return {"resources": (response.get("data") or {}).get("resources", [])}
+        if action == "list_offring_work":
+            response = self.nodes.rpc.resource_list("offring_work")
+            return {"resources": (response.get("data") or {}).get("resources", [])}
         if action == "play":
             path = args.get("path", "")
             _require(path, "path 不能为空")
@@ -2174,12 +2186,19 @@ class SpatialMapPlugin:
 def build_plugins(config, namespace, ros2):
     """Instantiate every enabled plugin, mirroring X2's build_plugins.
 
-    Card consolidation (aligned with tianyi2.0/g1): joints merges the three
-    joint-state streams; mc_mode absorbs mc_state; tts absorbs media_play;
-    audio absorbs audio_play + volume; interaction absorbs mic_source;
-    skill_play absorbs skill_status; controlled_spatial merges mapping +
-    navigation + relocalization + map_get; spatial_map is the new sensor/mapping
-    visualization card.
+    Card naming aligned with tianyi2.0/q5_bundle/g1: lidar_cloud (g1), battery /
+    estop (tianyi2.0/q5_bundle), base_drive (q5_bundle), arm_control /
+    hand_control / head_control / waist_control (tianyi2.0/q5_bundle style).
+    Card consolidation: joints merges the three joint-state streams; mc_mode
+    absorbs mc_state and enforces the fixed FSM transition map; arm_control
+    absorbs arm_compliance; tts absorbs media_play; audio absorbs audio_play +
+    volume + the audio resource list; interaction absorbs mic_source; motion_play /
+    face_play / skill_play absorb their own resource-list queries (resource_list
+    card dissolved); skill_play absorbs skill_status; controlled_spatial merges
+    mapping + navigation + relocalization + map_get (incl. the map resource
+    list); spatial_map is the sensor/mapping visualization card. wakeup dropped
+    (AimDK v3.2 exposes no raw mic stream — only wake-word events, useless
+    without audio access).
     """
     rpc = A3Rpc(config)
     nodes = A3Nodes(config, namespace, ros2, rpc)
@@ -2195,30 +2214,26 @@ def build_plugins(config, namespace, ros2):
         plugins["imu"] = ImuPlugin(nodes)
     if enabled("camera"):
         plugins["camera"] = CameraPlugin(nodes)
-    if enabled("lidar"):
-        plugins["lidar"] = LidarPlugin(nodes)
-    if enabled("bms"):
-        plugins["bms"] = BmsPlugin(nodes)
-    if enabled("emergency"):
-        plugins["emergency"] = EmergencyPlugin(nodes)
-    if enabled("wakeup"):
-        plugins["wakeup"] = WakeupPlugin(nodes)
+    if enabled("lidar_cloud"):
+        plugins["lidar_cloud"] = LidarCloudPlugin(nodes)
+    if enabled("battery"):
+        plugins["battery"] = BatteryPlugin(nodes)
+    if enabled("estop"):
+        plugins["estop"] = EstopPlugin(nodes)
     if enabled("alerts"):
         plugins["alerts"] = AlertsPlugin(nodes)
     if enabled("mc_mode"):
         plugins["mc_mode"] = McModePlugin(nodes)
-    if enabled("locomotion"):
-        plugins["locomotion"] = LocomotionPlugin(nodes)
-    if enabled("arm_command"):
-        plugins["arm_command"] = ArmCommandPlugin(nodes)
-    if enabled("hand_command"):
-        plugins["hand_command"] = HandCommandPlugin(nodes)
-    if enabled("neck_command"):
-        plugins["neck_command"] = NeckCommandPlugin(nodes)
-    if enabled("waist_command"):
-        plugins["waist_command"] = WaistCommandPlugin(nodes)
-    if enabled("arm_compliance"):
-        plugins["arm_compliance"] = ArmCompliancePlugin(nodes)
+    if enabled("base_drive"):
+        plugins["base_drive"] = BaseDrivePlugin(nodes)
+    if enabled("arm_control"):
+        plugins["arm_control"] = ArmControlPlugin(nodes)
+    if enabled("hand_control"):
+        plugins["hand_control"] = HandControlPlugin(nodes)
+    if enabled("head_control"):
+        plugins["head_control"] = HeadControlPlugin(nodes)
+    if enabled("waist_control"):
+        plugins["waist_control"] = WaistControlPlugin(nodes)
     if enabled("motion_play"):
         plugins["motion_play"] = MotionPlayPlugin(nodes)
     if enabled("tts"):
@@ -2230,7 +2245,6 @@ def build_plugins(config, namespace, ros2):
         plugins["interaction"] = InteractionPlugin(nodes)
     if enabled("resources"):
         plugins["model"] = ModelPlugin(nodes)
-        plugins["resource_list"] = ResourceListPlugin(nodes)
     if enabled("face_play"):
         plugins["face_play"] = FacePlayPlugin(nodes)
     if enabled("skill_play"):

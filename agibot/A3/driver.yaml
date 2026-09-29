@@ -6,40 +6,37 @@ hardware_model: "a3-ultra"
 image_name: agibot-a3
 port: 15719
 mcp_url: "http://localhost:15719/mcp"
-description: "AgiBot A3 humanoid (AimDK v3.2, HTTP JSON RPC + ROS 2 Jazzy) — motion FSM/arm/waist/neck/hand control, locomotion, TTS+media/audio/volume, mic & interaction mode, camera/lidar/IMU/BMS/emergency sensing, alerts, resources, face play, motion & skill package playback, mapping/navigation via controlled_spatial + spatial_map visualization"
+description: "AgiBot A3 humanoid (AimDK v3.2, HTTP JSON RPC + ROS 2 Jazzy) — fixed-FSM motion mode/arm+compliance/waist/head/hand control, base drive, TTS+media/audio/volume, mic & interaction mode, camera(RGB+depth)/lidar_cloud/IMU/battery/estop sensing, alerts, face play, motion & skill package playback (teach-replay style), mapping/navigation via controlled_spatial + spatial_map visualization"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
 # Kept in sync by hand with config.yaml's plugin enabled flags — controlled_spatial/
 # spatial_map/auto_charging cards only appear when the corresponding plugin is enabled.
 cards:
-  # --- sensors ---
-  - { name: joints,            type: sensor }
-  - { name: imu,               type: sensor }
-  - { name: camera,            type: sensor }
-  - { name: lidar,             type: sensor }
-  - { name: bms,               type: sensor }
-  - { name: emergency,         type: sensor }
-  - { name: wakeup,            type: sensor }
-  - { name: alerts,            type: sensor }
-  - { name: spatial_map,       type: sensor }
+  # --- sensors (names aligned with tianyi2.0/q5_bundle/g1) ---
+  - { name: joints,        type: sensor }
+  - { name: imu,           type: sensor }
+  - { name: camera,        type: sensor }
+  - { name: lidar_cloud,   type: sensor }
+  - { name: battery,       type: sensor }
+  - { name: estop,         type: sensor }
+  - { name: alerts,        type: sensor }
+  - { name: spatial_map,   type: sensor }
   # --- resources / catalogs ---
-  - { name: model,             type: resource }
+  - { name: model,         type: resource }
   # --- actuators ---
-  - { name: resource_list,     type: actuator }
-  - { name: mc_mode,           type: actuator }
-  - { name: locomotion,        type: actuator }
-  - { name: arm_command,       type: actuator }
-  - { name: hand_command,      type: actuator }
-  - { name: neck_command,      type: actuator }
-  - { name: waist_command,     type: actuator }
-  - { name: arm_compliance,    type: actuator }
-  - { name: motion_play,       type: actuator }
-  - { name: tts,               type: actuator }
-  - { name: audio,             type: actuator }
-  - { name: interaction,       type: actuator }
-  - { name: face_play,         type: actuator }
-  - { name: skill_play,        type: actuator }
+  - { name: mc_mode,         type: actuator }
+  - { name: base_drive,      type: actuator }
+  - { name: arm_control,     type: actuator }
+  - { name: hand_control,    type: actuator }
+  - { name: head_control,    type: actuator }
+  - { name: waist_control,   type: actuator }
+  - { name: motion_play,     type: actuator }
+  - { name: tts,             type: actuator }
+  - { name: audio,           type: actuator }
+  - { name: interaction,     type: actuator }
+  - { name: face_play,       type: actuator }
+  - { name: skill_play,      type: actuator }
   # --- config-gated advanced modules (mirrors X2's slam gating) ---
   - { name: controlled_spatial, type: actuator }
   - { name: auto_charging,      type: actuator }

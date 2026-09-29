@@ -32,14 +32,13 @@ plugins:
   camera:
     enabled: true
     # Which camera streams to mirror; keys of the CAMERA_TOPICS table in device.py.
-    streams: ["head_left_fisheye", "chest_front_d457_rgb"]
-  lidar:
+    # Depth included by default (chest D457 depth, z16).
+    streams: ["head_left_fisheye", "chest_front_d457_rgb", "chest_front_d457_depth"]
+  lidar_cloud:
     enabled: true
-  bms:
+  battery:
     enabled: true
-  emergency:
-    enabled: true
-  wakeup:
+  estop:
     enabled: true
   alerts:
     enabled: true
@@ -48,17 +47,19 @@ plugins:
   # --- actuators ---
   mc_mode:
     enabled: true
-  locomotion:
+    # Fixed FSM: non-standing states (DAMPING/PASSIVE/LIE_DOWN/IDLE) only accept get_up;
+    # MOTION accepts damping/lie_down/passive. Illegal transitions are rejected with a
+    # suggestion (cross-checked against runtime GetAvailableActions).
+  base_drive:
     enabled: true
-  arm_command:
+  arm_control:
     enabled: true
-  hand_command:
+    # Also carries arm compliance enable/disable/check (former arm_compliance card).
+  hand_control:
     enabled: true
-  neck_command:
+  head_control:
     enabled: true
-  waist_command:
-    enabled: true
-  arm_compliance:
+  waist_control:
     enabled: true
   motion_play:
     enabled: true

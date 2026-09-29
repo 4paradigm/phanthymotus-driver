@@ -7,6 +7,14 @@ Transcribed from the AimDK A3-Ultra developer guide
 plus **ROS 2 Jazzy topics** (Fast DDS, `ros2_plugin_proto` for protobuf carriers) —
 so this catalog is organized by compute unit / port, not by ROS package.
 
+Card naming is aligned with x-humanoid/tianyi2.0, robotera/q5_bundle and
+unitree/g1: `lidar_cloud` (g1), `battery`/`estop` (tianyi2.0/q5_bundle),
+`base_drive` (q5_bundle), `arm_control`/`hand_control`/`head_control`/
+`waist_control` (tianyi2.0/q5_bundle style). The `resource_list` card is
+dissolved into `list` actions on the play cards; `arm_compliance` is absorbed
+by `arm_control`; `wakeup` is dropped (AimDK v3.2 exposes only wake-word
+events, no raw mic stream — useless without audio access).
+
 Compute units (fixed IPs, subnet 10.42.10.x; third-party host joins the same
 subnet with `ROS_DOMAIN_ID=232` and the robot's `ros_dds_configuration.xml`
 copied from HDU `/agibot/software/v0/entry/cfg/`):
@@ -23,10 +31,10 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 
 | Service@unit:port | Method | Driver tool | Notes |
 |---|---|---|---|
-| MotionControlActionService@MDU:56322 | SetAction | `mc_mode` | `command.action` = `MotionControlAction_{DAMPING,GET_UP,LIE_DOWN,PASSIVE}` |
+| MotionControlActionService@MDU:56322 | SetAction | `mc_mode` | `command.action` = `MotionControlAction_{DAMPING,GET_UP,LIE_DOWN,PASSIVE}`; fixed FSM enforced first (non-standing states only accept get_up, MOTION accepts damping/lie_down/passive), illegal transitions rejected with a suggestion, then cross-checked against runtime GetAvailableActions |
 | MotionControlActionService@MDU:56322 | GetAction | `mc_mode` (`get_state`) | |
 | MotionControlActionService@MDU:56322 | GetAvailableActions | `mc_mode` (`available`) | |
-| MotionControlMotionService@MDU:56322 | Enable/Disable/CheckArmCompliance | `arm_compliance` | all take `{}` |
+| MotionControlMotionService@MDU:56322 | Enable/Disable/CheckArmCompliance | `arm_control` (`compliance_enable`/`compliance_disable`/`compliance_check`) | all take `{}` |
 | MotionCommandService@MDU:56444 | SendMotionCommand | `motion_play` | `motion_id` is the motion file's **absolute path**; `cmd_end` auto-returns to initial pose |
 | HDSService@MDU:50587 | GetAlertList | `alerts` | hard doc limit ≤0.2 Hz — driver enforces a monotonic 5 s cooldown |
 | TTSService@HDU:59301 | PlayTTS | `tts` | `text` ≤1024 bytes, `priority_level` `INTERACTION_L6` |
@@ -38,7 +46,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 | HalAudioService@HDU:59301 | SetMicSourceRequest / GetMicSourceRequest | `interaction` (`mic_*`) | 0=internal (v3.2 hardware BUG — avoid), 1=external |
 | HalAudioService@HDU:56666 | GetAudioVolume / SetAudioVolume | `audio` (`get_volume`/`set_volume`/`mute`/`unmute`) | `type` `SPEAKER_BUILT_IN`; driver hard-caps at 70 (>70 risks damage) |
 | HalAudioService@HDU:56666 | PlayFile / StopPlay | `audio` (`play`/`stop_play`) | raw file playback (TTS alternative) |
-| ResourceService@HDU:51049 | GetResourceList | `resource_list` | motion/emoticon/audio/skill/map/offring_work |
+| ResourceService@HDU:51049 | GetResourceList | `list` actions on `motion_play` (motion) / `face_play` (emoticon) / `audio` (audio) / `skill_play` (skill, `list_offring_work` for offring_work) + `controlled_spatial` (`list_maps`, map class) | resource_list card dissolved into the play cards |
 | MappingService@ADU:50807 | StartMapping / StopMapping | `controlled_spatial` (`start_mapping`/`stop_save`/`stop_discard`) | StopMapping with `map_name` = SAVING_MAP |
 | MappingService@ADU:50807 | Get2DWholeMap | `controlled_spatial` (`get_map`) / `spatial_map` | resolution/origin/occupancy grid; `spatial_map` republishes it as a `sensor/mapping` point cloud |
 | MappingService@ADU:50807 | GetStoredMapNames / GetCurrentWorkingMap / RenameMap | `controlled_spatial` (`list_maps`/`current_map`/`rename_map`) | |
@@ -55,27 +63,26 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 
 | Topic | Message | Driver tool | Notes |
 |---|---|---|---|
-| `/motion/control/locomotion_velocity` | RosMsgWrapper (pb `LocomotionVelocity`) | `locomotion` | forward/lateral/angular normalized −1..1; MOTION mode only |
-| `/motion/control/move_waist` | RosMsgWrapper (pb `MoveWaist`) | `waist_command` | waist_pitch/waist_yaw rad, waist_height m |
+| `/motion/control/locomotion_velocity` | RosMsgWrapper (pb `LocomotionVelocity`) | `base_drive` | forward/lateral/angular normalized −1..1; MOTION mode only |
+| `/motion/control/move_waist` | RosMsgWrapper (pb `MoveWaist`) | `waist_control` | waist_pitch/waist_yaw rad, waist_height m |
 | `/skill/pilot/face/play` | RosMsgWrapper (pb `FacePlayInfo`) | `face_play` | e_path/e_id/repeat/priority(440)/is_stop |
-| `/motion/control/arm_joint_command` | sensor_msgs/JointState | `arm_command` | 100 Hz ≤30 ms gap, velocity/effort = 0, ≤4 rad/s |
-| `/motion/control/hand_joint_command` | sensor_msgs/JointState | `hand_command` | 0..2000 per finger; frame_id = AgiHand/O10Hand |
-| `/motion/control/neck_joint_command` | sensor_msgs/JointState | `neck_command` | head_yaw/head_pitch |
+| `/motion/control/arm_joint_command` | sensor_msgs/JointState | `arm_control` (`send`) | 100 Hz ≤30 ms gap, velocity/effort = 0, ≤4 rad/s |
+| `/motion/control/hand_joint_command` | sensor_msgs/JointState | `hand_control` | 0..2000 per finger; frame_id = AgiHand/O10Hand |
+| `/motion/control/neck_joint_command` | sensor_msgs/JointState | `head_control` | head_yaw/head_pitch |
 | `/motion/control/arm_joint_state` | sensor_msgs/JointState | `joints` (`arm`) | mirrored to core as JSON |
 | `/motion/control/hand_joint_state` | sensor_msgs/JointState | `joints` (`hand`) | frame_id carries hand type |
 | `/motion/control/neck_joint_state` | sensor_msgs/JointState | `joints` (`neck`) | |
-| `/hal/neck_middle_livox_lidar/pointcloud` | sensor_msgs/PointCloud2 | `lidar` | neck Livox |
+| `/hal/neck_middle_livox_lidar/pointcloud` | sensor_msgs/PointCloud2 | `lidar_cloud` | neck Livox |
 | `/ros2/body_drive/pelvis_imu/data` | sensor_msgs/Imu | `imu` | pelvis IMU |
 | `/ros2/body_drive/torso_imu/data` | sensor_msgs/Imu | `imu` | torso IMU (merged into one card) |
-| 9× camera topics (see `device.py` `CAMERA_TOPICS`) | sensor_msgs/Image | `camera` | head×3 fisheye, chest D457 rgb+depth, waist D415 rgb+depth, wrist×2 D405; config picks the streams |
+| 9× camera topics (see `device.py` `CAMERA_TOPICS`) | sensor_msgs/Image | `camera` | head×3 fisheye, chest D457 rgb+depth, waist D415 rgb+depth, wrist×2 D405; config picks the streams (default includes chest depth, z16) |
 
 ### Protobuf-carrier streams (need `a3_aimdk` wheel to decode)
 
 | Topic | pb type | Driver tool |
 |---|---|---|
-| `/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel` | BmsStateChannel | `bms` |
-| `/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel` | EmergencyStateChannel | `emergency` |
-| `/agent/wakeup/pb_3Aaimdk_2Eprotocol_2EWakeUpResult` | WakeUpResult | `wakeup` |
+| `/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel` | BmsStateChannel | `battery` |
+| `/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel` | EmergencyStateChannel | `estop` |
 | `/skill/pilot/skill_status` | SkillStatus | `skill_play` (`state`) |
 
 ## Documented but not wired
@@ -87,6 +94,9 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
   inconsistent on the consumer side).
 - MappingService real-time progress callbacks (`no_realtime_data: true` is sent
   when starting mapping; status is polled via the same RPCs).
+- `/agent/wakeup/pb_3Aaimdk_2Eprotocol_2EWakeUpResult` (WakeUpResult pb): only
+  carries wake-word events, no raw mic stream — a wakeup card would be useless
+  without audio access, so it is intentionally dropped.
 - The A3's 12 leg joints: no dev-interface topic exposes them individually
   (naming is internal to the MC firmware), so they appear in the URDF only.
 
@@ -100,7 +110,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
   image CMD from the same mount.
 - Without these the driver degrades gracefully: pb payloads fall back to JSON
   bytes in `RosMsgWrapper.data`, and the pb-decoded stream cards
-  (bms/emergency/wakeup + skill_play's `state` query) are withheld.
+  (battery/estop + skill_play's `state` query) are withheld.
 
 ## URDF
 
