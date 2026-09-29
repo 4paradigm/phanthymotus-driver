@@ -71,12 +71,23 @@ This feature does not require a motion, control-domain switch or camera restart.
   confirming the mapping matters. Later acceptance samples returned capacity 100,
   cycle count 13, approximately 53.4 / 51.3 / 51.6 Celsius and `Normal`.
   Values are observations, not constants.
-- MCP `get`/`info` and three consecutive ROS battery messages returned fresh PAC
-  readings. All 20 deployed Cards remained registered; non-battery tool contracts
-  and container deployment settings were unchanged. Restart count remained zero.
-- DDS lowstate was unavailable **before** replacement and remained unavailable
-  afterwards. Electrical fields consequently stayed null with `dds_available=false`.
-  PAC functionality was verified independently; restoration of live DDS electrical
-  feedback was not claimed or attempted by changing robot mode.
+- The operator's Canvas screenshot confirmed PAC fields reached the battery topic.
+  Initial DDS fields were null, so the original and patched containers were tested
+  under identical runtime settings before accepting the combined result.
+- Both original and patched containers inherited DDS domain 0: each received zero
+  lowstate messages and zero messages on the four related state topics in 12 seconds.
+  A read-only probe on domain 1 received 4801 callbacks with valid BMS fields.
+  The repository configuration already uses domain 1; only the deployed configuration
+  needed correction. No robot control-mode change was made.
+- After correcting the deployed domain to 1, the unchanged battery patch delivered
+  both sources: approximately 45.90 V, 3.86 A, 177.17 W, 271.12 Wh accumulated,
+  capacity 100, temperatures 53.0 / 50.5 / 51.0 Celsius, cycle count 13 and `Normal`.
+  `dds_available` and `pac_fresh` were both true, with advancing receipt times.
+- Final 12-second checks received 4802 direct DDS callbacks and 11 ROS battery
+  messages; IMU, joints, motor and robot state topics also resumed continuous data.
+  All 20 deployed Cards remained registered. Non-battery tool contracts were unchanged,
+  restart count remained zero, arm command writes remained zero and hand control
+  remained inactive. No movement was requested.
 - The old container/image and a rollback script were retained on the development
-  board. Browser/Canvas acceptance is performed by the operator.
+  board. Final Canvas rechecking is performed by the operator; terminal verification
+  of the combined DDS and PAC output is complete.
