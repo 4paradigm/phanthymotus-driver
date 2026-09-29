@@ -236,6 +236,41 @@ class ArmGestureRoutingTests(RunningArmMixin, unittest.TestCase):
                  in ArmGesturePlugin._GESTURES.items()}
         self.assertEqual(len(set(poses.values())), len(poses), poses)
 
+    def test_high_five_is_an_raised_bent_arm_with_open_palm(self):
+        gestures = self._gesture()
+        control = gestures._control
+        result = gestures.dispatch("high_five", {"side": "right"})
+        self.assertTrue(result["success"], result)
+        expected = {
+            "shoulderPitch_Right": -100.0,
+            "shoulderRoll_Right": -24.0,
+            "shoulderYaw_Right": -18.0,
+            "elbow_Right": -58.0,
+            "wristPitch_Right": 0.0,
+            "wristRoll_Right": 0.0,
+        }
+        for joint, degrees in expected.items():
+            index = ADAM_PRO_JOINTS.index(joint)
+            self.assertAlmostEqual(control._target_q[index], math.radians(degrees))
+        self.assertNotIn(ADAM_PRO_JOINTS.index("elbow_Left"), control._target_q)
+        gestures._cancel_sequence()
+
+    def test_high_five_mirrors_roll_and_yaw_for_left_arm(self):
+        gestures = self._gesture()
+        control = gestures._control
+        result = gestures.dispatch("high_five", {"side": "left"})
+        self.assertTrue(result["success"], result)
+        for joint, degrees in {
+            "shoulderPitch_Left": -100.0,
+            "shoulderRoll_Left": 24.0,
+            "shoulderYaw_Left": 18.0,
+            "elbow_Left": -58.0,
+        }.items():
+            index = ADAM_PRO_JOINTS.index(joint)
+            self.assertAlmostEqual(control._target_q[index], math.radians(degrees))
+        self.assertNotIn(ADAM_PRO_JOINTS.index("elbow_Right"), control._target_q)
+        gestures._cancel_sequence()
+
     def test_semantic_gestures_play_at_a_slower_velocity_ceiling(self):
         """Semantic gestures budget against 0.3 rad/s, not the raw card's 0.5.
 
