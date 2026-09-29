@@ -37,6 +37,8 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -62,6 +64,40 @@ def _resolve_namespace(cfg: dict) -> str:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle = None
+
+
+class _LatestSampleReader:
+    """Expose callback-delivered DDS samples through the controller's Read API."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._samples = deque(maxlen=1)
+
+    def put(self, sample):
+        with self._condition:
+            self._samples.append(sample)
+            self._condition.notify()
+
+    def Read(self, timeout=None):
+        with self._condition:
+            if not self._samples:
+                self._condition.wait(timeout)
+            return self._samples.popleft() if self._samples else None
+
+
+def _json_native(value):
+    """Recursively materialize protobuf/DDS containers for JSON responses."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_native(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_native(item) for item in value]
+    if isinstance(value, (bytes, bytearray)):
+        return list(value)
+    if hasattr(value, "__iter__"):
+        return [_json_native(item) for item in value]
+    raise TypeError(f"Unsupported MCP result type: {type(value).__name__}")
 
 
 def make_handler():
@@ -143,7 +179,10 @@ def make_handler():
                 return
 
             def ok(result):
-                self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}))
+                self._send(200, json.dumps({
+                    "jsonrpc": "2.0", "id": rid,
+                    "result": _json_native(result),
+                }))
 
             def err(code, msg):
                 self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid,
@@ -252,6 +291,7 @@ def main():
     # card's get_state action and its partial-command logic.
     dds_lowstate_sub = None
     dds_arm_lowstate_sub = None
+    dds_arm_lowstate_reader = None
     dds_handstate_sub = None
     dds_hand_pub = None
     dds_lowcmd_pub = None
@@ -267,11 +307,14 @@ def main():
         from pndbotics_sdk_py.core.channel import ChannelSubscriber, ChannelPublisher
         from pndbotics_sdk_py.idl.pnd_adam.msg.dds_ import LowState_, LowCmd_, HandState_, HandCmd_
 
-        def _init_channel(label, factory):
+        def _init_channel(label, factory, init=None):
             channel = None
             try:
                 channel = factory()
-                channel.Init()
+                if init is None:
+                    channel.Init()
+                else:
+                    init(channel)
                 print(f"[adam] DDS channel ready: {label}")
                 return channel
             except Exception as exc:
@@ -290,10 +333,16 @@ def main():
             )
         # Separate reader: DDS readers consume samples independently, and the
         # arm controller must retain its own startup state for full-body hold.
+        # Use the callback API from PNDbotics' low-level examples. The adapter
+        # preserves the controller's small blocking Read contract without
+        # relying on SDK polling behavior that can swallow reader failures.
         if need_arm:
+            dds_arm_lowstate_reader = _LatestSampleReader()
             dds_arm_lowstate_sub = _init_channel(
                 "rt/lowstate arm reader",
                 lambda: ChannelSubscriber("rt/lowstate", LowState_),
+                init=lambda channel: channel.Init(
+                    dds_arm_lowstate_reader.put, 1),
             )
             dds_lowcmd_pub = _init_channel(
                 "rt/lowcmd writer",

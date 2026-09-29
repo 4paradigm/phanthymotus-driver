@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sys
+import threading
 import time
 import types
 import unittest
@@ -11,6 +12,7 @@ import unittest
 sys.modules.setdefault("numpy", types.ModuleType("numpy"))
 
 import device
+import main as adam_main
 from device import (ADAM_PRO_JOINTS, ARM_ACTIONS, ARM_JOINT_CONTROLS,
                     ARM_POSES, ArmControlPlugin, ArmGesturePlugin, HandPlugin,
                     HandGesturePlugin, _arm_target_radians)
@@ -45,7 +47,90 @@ def _prime_arm_plugin(publisher):
     return plugin
 
 
+class SampleAdapterTests(unittest.TestCase):
+    def test_latest_sample_reader_delivers_only_the_newest_pending_sample(self):
+        reader = adam_main._LatestSampleReader()
+        reader.put("old")
+        reader.put("new")
+
+        self.assertEqual("new", reader.Read(timeout=0.01))
+        self.assertIsNone(reader.Read(timeout=0.01))
+
+    def test_latest_sample_reader_unblocks_when_callback_delivers_sample(self):
+        reader = adam_main._LatestSampleReader()
+        delivered = []
+        waiting = threading.Thread(
+            target=lambda: delivered.append(reader.Read(timeout=1.0)))
+        waiting.start()
+        reader.put("sample")
+        waiting.join(1.0)
+
+        self.assertFalse(waiting.is_alive())
+        self.assertEqual(["sample"], delivered)
+
+    def test_json_native_materializes_nested_iterable_containers(self):
+        class _Repeated:
+            def __iter__(self):
+                return iter(("STOP", "STAND_WALK"))
+
+        result = adam_main._json_native({
+            "states": _Repeated(),
+            "nested": (bytearray((1, 2)), {3: True}),
+        })
+
+        self.assertEqual({
+            "states": ["STOP", "STAND_WALK"],
+            "nested": [[1, 2], {"3": True}],
+        }, result)
+
+    def test_json_native_rejects_unknown_non_iterable_objects(self):
+        with self.assertRaisesRegex(TypeError, "Unsupported MCP result type"):
+            adam_main._json_native(object())
+
+
 class ArmControlTests(unittest.TestCase):
+    def test_complete_callback_state_captures_the_startup_pose(self):
+        reader = adam_main._LatestSampleReader()
+        plugin = ArmControlPlugin({}, "", None, dds_arm_lowstate_sub=reader)
+        expected = [index / 100.0 for index in range(31)]
+        reader.put(types.SimpleNamespace(motor_state=[
+            types.SimpleNamespace(q=value) for value in expected
+        ]))
+
+        plugin._read_initial_state()
+
+        self.assertTrue(plugin._state_ready.is_set())
+        self.assertEqual(expected, plugin._hold_q)
+        self.assertEqual(expected, plugin._current_q)
+
+    def test_incomplete_callback_state_does_not_mark_controller_ready(self):
+        reader = adam_main._LatestSampleReader()
+        plugin = ArmControlPlugin({}, "", None, dds_arm_lowstate_sub=reader)
+        reader.put(types.SimpleNamespace(motor_state=[
+            types.SimpleNamespace(q=0.0) for _ in range(30)
+        ]))
+        plugin._stop_event.set()
+
+        plugin._read_initial_state()
+
+        self.assertFalse(plugin._state_ready.is_set())
+        self.assertIsNone(plugin._hold_q)
+
+    def test_nonfinite_callback_state_does_not_mark_controller_ready(self):
+        reader = adam_main._LatestSampleReader()
+        plugin = ArmControlPlugin({}, "", None, dds_arm_lowstate_sub=reader)
+        values = [0.0] * 31
+        values[20] = float("nan")
+        reader.put(types.SimpleNamespace(motor_state=[
+            types.SimpleNamespace(q=value) for value in values
+        ]))
+        plugin._stop_event.set()
+
+        plugin._read_initial_state()
+
+        self.assertFalse(plugin._state_ready.is_set())
+        self.assertIsNone(plugin._hold_q)
+
     def test_control_ids_are_human_facing_and_cover_each_upper_body_joint(self):
         self.assertIn("left_shoulder_pitch", ARM_JOINT_CONTROLS)
         self.assertIn("right_wrist_roll", ARM_JOINT_CONTROLS)
