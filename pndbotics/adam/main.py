@@ -73,26 +73,53 @@ class _LatestSampleReader:
         self._channel = channel
         self._condition = threading.Condition()
         self._samples = deque(maxlen=1)
+        self._closed = False
+        self._received = 0
+        self._last_sample_at = None
+        self._last_motor_count = None
 
     def Init(self):
         if self._channel is None:
             raise RuntimeError("DDS channel is not configured")
+        with self._condition:
+            self._closed = False
         self._channel.Init(self.put, 1)
 
     def Close(self):
         if self._channel is not None:
             self._channel.Close()
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
 
     def put(self, sample):
         with self._condition:
             self._samples.append(sample)
+            self._received += 1
+            self._last_sample_at = time.monotonic()
+            motors = getattr(sample, "motor_state", None)
+            self._last_motor_count = len(motors) if motors is not None else None
             self._condition.notify()
 
     def Read(self, timeout=None):
         with self._condition:
-            if not self._samples:
+            if not self._samples and not self._closed:
                 self._condition.wait(timeout)
             return self._samples.popleft() if self._samples else None
+
+    def diagnostics(self):
+        with self._condition:
+            sample_age = (
+                time.monotonic() - self._last_sample_at
+                if self._last_sample_at is not None else None
+            )
+            return {
+                "received": self._received,
+                "last_motor_count": self._last_motor_count,
+                "last_sample_age_s": sample_age,
+                "has_sample": bool(self._samples),
+                "closed": self._closed,
+            }
 
 
 def _json_native(value):

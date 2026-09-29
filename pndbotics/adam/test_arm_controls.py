@@ -92,7 +92,31 @@ class SampleAdapterTests(unittest.TestCase):
         self.assertFalse(waiting.is_alive())
         self.assertEqual(["sample"], delivered)
 
-    def test_json_native_materializes_nested_iterable_containers(self):
+    def test_latest_sample_reader_reports_receive_diagnostics(self):
+        reader = adam_main._LatestSampleReader()
+        reader.put(types.SimpleNamespace(motor_state=[1, 2, 3]))
+
+        diagnostics = reader.diagnostics()
+
+        self.assertEqual(1, diagnostics["received"])
+        self.assertEqual(3, diagnostics["last_motor_count"])
+        self.assertIsNotNone(diagnostics["last_sample_age_s"])
+        self.assertTrue(diagnostics["has_sample"])
+        self.assertFalse(diagnostics["closed"])
+
+    def test_latest_sample_reader_close_unblocks_waiting_readers(self):
+        reader = adam_main._LatestSampleReader()
+        delivered = []
+        waiting = threading.Thread(
+            target=lambda: delivered.append(reader.Read(timeout=10.0)))
+        waiting.start()
+        reader.Close()
+        waiting.join(1.0)
+
+        self.assertFalse(waiting.is_alive())
+        self.assertEqual([None], delivered)
+        self.assertTrue(reader.diagnostics()["closed"])
+
         class _Repeated:
             def __iter__(self):
                 return iter(("STOP", "STAND_WALK"))
@@ -127,18 +151,36 @@ class ArmControlTests(unittest.TestCase):
         self.assertEqual(expected, plugin._hold_q)
         self.assertEqual(expected, plugin._current_q)
 
-    def test_incomplete_callback_state_does_not_mark_controller_ready(self):
+    def test_incomplete_callback_state_reports_reader_diagnostics(self):
         reader = adam_main._LatestSampleReader()
-        plugin = ArmControlPlugin({}, "", None, dds_arm_lowstate_sub=reader)
+        plugin = ArmControlPlugin({}, "", None, dds_arm_lowstate_sub=reader,
+                                  dds_lowcmd_pub=_FakePublisher())
         reader.put(types.SimpleNamespace(motor_state=[
             types.SimpleNamespace(q=0.0) for _ in range(30)
         ]))
         plugin._stop_event.set()
 
         plugin._read_initial_state()
+        error = plugin._ready_error()
 
         self.assertFalse(plugin._state_ready.is_set())
         self.assertIsNone(plugin._hold_q)
+        self.assertEqual("LOWSTATE_UNAVAILABLE", error["code"])
+        self.assertIn("30 motors", error["message"])
+        self.assertIn("received=1", error["message"])
+
+    def test_no_callback_state_reports_zero_samples(self):
+        reader = adam_main._LatestSampleReader()
+        plugin = ArmControlPlugin({}, "", None, dds_arm_lowstate_sub=reader,
+                                  dds_lowcmd_pub=_FakePublisher())
+        plugin._stop_event.set()
+
+        plugin._read_initial_state()
+        error = plugin._ready_error()
+
+        self.assertEqual("LOWSTATE_UNAVAILABLE", error["code"])
+        self.assertIn("no rt/lowstate samples received", error["message"])
+        self.assertIn("received=0", error["message"])
 
     def test_nonfinite_callback_state_does_not_mark_controller_ready(self):
         reader = adam_main._LatestSampleReader()
@@ -167,19 +209,39 @@ class ArmControlTests(unittest.TestCase):
 
     def test_adam_pro_layout_matches_the_verified_motor_order(self):
         expected = {
-            "waistRoll": 12, "waistPitch": 13, "waistYaw": 14,
-            "neckYaw": 15, "neckPitch": 16,
-            "shoulderPitch_Left": 17, "shoulderRoll_Left": 18,
-            "shoulderYaw_Left": 19, "elbow_Left": 20,
-            "wristYaw_Left": 21, "wristPitch_Left": 22,
-            "wristRoll_Left": 23,
-            "shoulderPitch_Right": 24, "shoulderRoll_Right": 25,
-            "shoulderYaw_Right": 26, "elbow_Right": 27,
-            "wristYaw_Right": 28, "wristPitch_Right": 29,
-            "wristRoll_Right": 30,
+            "waistYaw": 12, "waistRoll": 13, "waistPitch": 14,
+            "shoulderPitch_Left": 15, "shoulderRoll_Left": 16,
+            "shoulderYaw_Left": 17, "elbow_Left": 18,
+            "wristRoll_Left": 19, "wristPitch_Left": 20,
+            "wristYaw_Left": 21,
+            "shoulderPitch_Right": 22, "shoulderRoll_Right": 23,
+            "shoulderYaw_Right": 24, "elbow_Right": 25,
+            "wristRoll_Right": 26, "wristPitch_Right": 27,
+            "wristYaw_Right": 28,
+            "neckYaw": 29, "neckPitch": 30,
         }
         for joint, index in expected.items():
             self.assertEqual(index, ADAM_PRO_JOINTS.index(joint), joint)
+
+    def test_upper_body_pd_matches_vendor_low_level_profile(self):
+        expected = {
+            "shoulderPitch_Left": (18.0, 0.9),
+            "shoulderRoll_Left": (9.0, 0.9),
+            "shoulderYaw_Left": (9.0, 0.9),
+            "elbow_Left": (9.0, 0.9),
+            "wristRoll_Left": (9.0, 0.9),
+            "wristPitch_Left": (9.0, 0.9),
+            "wristYaw_Left": (9.0, 0.9),
+            "shoulderPitch_Right": (18.0, 0.9),
+            "shoulderRoll_Right": (9.0, 0.9),
+            "shoulderYaw_Right": (9.0, 0.9),
+            "elbow_Right": (9.0, 0.9),
+            "wristRoll_Right": (9.0, 0.9),
+            "wristPitch_Right": (9.0, 0.9),
+            "wristYaw_Right": (9.0, 0.9),
+        }
+        for joint, gains in expected.items():
+            self.assertEqual(gains, ArmControlPlugin._pd_for_joint(joint), joint)
 
     def test_each_joint_has_a_distinct_action_and_angle_field(self):
         self.assertEqual("left_elbow", ARM_ACTIONS["set_left_elbow"])
@@ -266,11 +328,47 @@ class ArmControlTests(unittest.TestCase):
                 device.pnd_adam_msg_dds__LowCmd_ = original_factory
 
         command = publisher.commands[-1]
-        self.assertEqual(0.0, command.motor_cmd[15].q)
-        self.assertEqual(0.0, command.motor_cmd[16].q)
-        self.assertAlmostEqual(math.radians(-30), command.motor_cmd[17].q)
-        self.assertAlmostEqual(math.radians(20), command.motor_cmd[18].q)
-        self.assertAlmostEqual(math.radians(10), command.motor_cmd[19].q)
+        self.assertAlmostEqual(math.radians(-30), command.motor_cmd[15].q)
+        self.assertAlmostEqual(math.radians(20), command.motor_cmd[16].q)
+        self.assertAlmostEqual(math.radians(10), command.motor_cmd[17].q)
+
+    def test_upper_body_targets_write_only_verified_hardware_slots(self):
+        publisher = _FakePublisher()
+        plugin = _prime_arm_plugin(publisher)
+        groups = {
+            range(12, 15): 0.12,
+            range(15, 22): 0.15,
+            range(22, 29): 0.22,
+            range(29, 31): 0.29,
+        }
+        for slots, target in groups.items():
+            plugin._target_q.update({slot: target for slot in slots})
+        plugin._seg_start = {
+            slot: plugin._seg_current[slot] for slot in plugin._target_q
+        }
+        plugin._seg_started_at = time.monotonic() - plugin._seg_span
+        plugin._active = True
+
+        original_factory = getattr(device, "pnd_adam_msg_dds__LowCmd_", None)
+        device.pnd_adam_msg_dds__LowCmd_ = _fake_lowcmd
+        try:
+            plugin._write_command(0.02)
+        finally:
+            if original_factory is None:
+                del device.pnd_adam_msg_dds__LowCmd_
+            else:
+                device.pnd_adam_msg_dds__LowCmd_ = original_factory
+
+        command = publisher.commands[-1]
+        for slot in range(12):
+            self.assertEqual(plugin._hold_q[slot], command.motor_cmd[slot].q)
+        for slots, target in groups.items():
+            for slot in slots:
+                self.assertAlmostEqual(target, command.motor_cmd[slot].q)
+                expected_kp, expected_kd = plugin._pd_for_joint(
+                    ADAM_PRO_JOINTS[slot])
+                self.assertEqual(expected_kp, command.motor_cmd[slot].kp)
+                self.assertEqual(expected_kd, command.motor_cmd[slot].kd)
 
     def test_lowcmd_holds_non_arm_joints_and_uses_official_arm_pd(self):
         publisher = _FakePublisher()
@@ -294,11 +392,11 @@ class ArmControlTests(unittest.TestCase):
         command = publisher.commands[-1]
         hip = ADAM_PRO_JOINTS.index("hipPitch_Left")
         self.assertEqual(command.motor_cmd[hip].q, plugin._hold_q[hip])
-        self.assertEqual(command.motor_cmd[hip].kp, 400.0)
+        self.assertEqual(command.motor_cmd[hip].kp, 305.0)
         self.assertEqual(command.motor_cmd[hip].kd, 6.1)
         self.assertLess(command.motor_cmd[elbow].q, plugin._hold_q[elbow])
-        self.assertEqual(command.motor_cmd[elbow].kp, 100.0)
-        self.assertEqual(command.motor_cmd[elbow].kd, 2.0)
+        self.assertEqual(command.motor_cmd[elbow].kp, 9.0)
+        self.assertEqual(command.motor_cmd[elbow].kd, 0.9)
 
     def test_release_writes_zero_arm_gain_before_deactivating(self):
         publisher = _FakePublisher()

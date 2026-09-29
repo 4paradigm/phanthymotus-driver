@@ -138,12 +138,12 @@ ADAM_PRO_JOINTS = [
     "kneePitch_Left", "anklePitch_Left", "ankleRoll_Left",
     "hipPitch_Right", "hipRoll_Right", "hipYaw_Right",
     "kneePitch_Right", "anklePitch_Right", "ankleRoll_Right",
-    "waistRoll", "waistPitch", "waistYaw",
-    "neckYaw", "neckPitch",
+    "waistYaw", "waistRoll", "waistPitch",
     "shoulderPitch_Left", "shoulderRoll_Left", "shoulderYaw_Left", "elbow_Left",
-    "wristYaw_Left", "wristPitch_Left", "wristRoll_Left",
+    "wristRoll_Left", "wristPitch_Left", "wristYaw_Left",
     "shoulderPitch_Right", "shoulderRoll_Right", "shoulderYaw_Right", "elbow_Right",
-    "wristYaw_Right", "wristPitch_Right", "wristRoll_Right",
+    "wristRoll_Right", "wristPitch_Right", "wristYaw_Right",
+    "neckYaw", "neckPitch",
 ]
 
 VARIANT_JOINTS = {
@@ -1461,20 +1461,20 @@ class ArmControlPlugin:
     # distance / _MAX_VELOCITY_RAD_S therefore passes 1.875x the configured
     # limit at its midpoint, so the duration must budget for the peak.
     _EASE_PEAK_RATE = 1.875
-    # Official arm_control_config.json gains. LowCmd owns all 31 motors, so
-    # non-arm joints must also be held with their vendor gains while an arm
-    # command is active; zero gains there causes intermittent posture loss.
+    # Gains from the vendor Adam Pro 31-DOF low-level example. LowCmd owns all
+    # motors, so non-arm joints retain their measured startup positions with the
+    # corresponding vendor gains while an upper-body command is active.
     _JOINT_PD = {
-        "hipPitch": (400.0, 6.1), "hipRoll": (700.0, 30.0),
-        "hipYaw": (405.0, 6.1), "kneePitch": (400.0, 8.0),
-        "anklePitch": (40.0, 2.5), "ankleRoll": (0.0, 0.35),
-        "waistRoll": (405.0, 6.1), "waistPitch": (405.0, 6.1),
-        "waistYaw": (205.0, 4.1), "neckYaw": (40.0, 1.0),
-        "neckPitch": (40.0, 1.0),
-        "shoulderPitch": (150.0, 4.0), "shoulderRoll": (150.0, 4.0),
-        "shoulderYaw": (40.0, 1.0), "elbow": (100.0, 2.0),
-        "wristYaw": (15.0, 0.9), "wristPitch": (15.0, 0.9),
-        "wristRoll": (15.0, 0.9),
+        "hipPitch": (305.0, 6.1), "hipRoll": (700.0, 30.0),
+        "hipYaw": (405.0, 6.1), "kneePitch": (305.0, 6.1),
+        "anklePitch": (30.0, 2.25), "ankleRoll": (0.0, 0.25),
+        "waistYaw": (205.0, 4.1), "waistRoll": (405.0, 6.1),
+        "waistPitch": (405.0, 6.1),
+        "shoulderPitch": (18.0, 0.9), "shoulderRoll": (9.0, 0.9),
+        "shoulderYaw": (9.0, 0.9), "elbow": (9.0, 0.9),
+        "wristRoll": (9.0, 0.9), "wristPitch": (9.0, 0.9),
+        "wristYaw": (9.0, 0.9),
+        "neckYaw": (40.0, 1.0), "neckPitch": (40.0, 1.0),
     }
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
@@ -1501,6 +1501,7 @@ class ArmControlPlugin:
         self._release_started_at = None
         self._writes = 0
         self._last_error = None
+        self._lowstate_error = None
         # Every accepted upper-body target advances this generation. Sequence
         # gestures may only append a segment while the generation from their
         # previous segment is still current, so any newer shared-card command
@@ -1557,24 +1558,38 @@ class ArmControlPlugin:
 
     def _read_initial_state(self):
         if self._lowstate_sub is None:
+            self._lowstate_error = "rt/lowstate reader is unavailable"
             return
         while not self._stop_event.is_set() and not self._state_ready.is_set():
             try:
                 state = self._lowstate_sub.Read(timeout=0.2)
-                motors = getattr(state, "motor_state", None) if state else None
-                if motors is not None and len(motors) >= self._DOF:
-                    hold_q = [float(motors[index].q) for index in range(self._DOF)]
-                    if all(math.isfinite(value) for value in hold_q):
-                        with self._lock:
-                            self._hold_q = hold_q
-                            self._current_q = hold_q.copy()
-                            self._seg_current = hold_q.copy()
-                            self._seg_start = {}
-                            self._seg_started_at = time.monotonic()
-                        self._state_ready.set()
-                        return
+                if state is None:
+                    continue
+                motors = getattr(state, "motor_state", None)
+                if motors is None:
+                    self._lowstate_error = "latest rt/lowstate sample has no motor_state"
+                    continue
+                if len(motors) < self._DOF:
+                    self._lowstate_error = (
+                        f"latest rt/lowstate sample has {len(motors)} motors; "
+                        f"expected at least {self._DOF}")
+                    continue
+                hold_q = [float(motors[index].q) for index in range(self._DOF)]
+                if not all(math.isfinite(value) for value in hold_q):
+                    self._lowstate_error = (
+                        "latest rt/lowstate sample contains a non-finite motor position")
+                    continue
+                with self._lock:
+                    self._hold_q = hold_q
+                    self._current_q = hold_q.copy()
+                    self._seg_current = hold_q.copy()
+                    self._seg_start = {}
+                    self._seg_started_at = time.monotonic()
+                self._lowstate_error = None
+                self._state_ready.set()
+                return
             except Exception as exc:
-                self._last_error = f"rt/lowstate read failed: {exc}"
+                self._lowstate_error = f"rt/lowstate read failed: {exc}"
                 self._stop_event.wait(0.1)
 
     @classmethod
@@ -1853,8 +1868,21 @@ class ArmControlPlugin:
             return {"success": False, "code": "DDS_UNAVAILABLE",
                     "message": "rt/lowcmd publisher is unavailable"}
         if not self._state_ready.is_set():
+            message = self._lowstate_error or "waiting for a complete rt/lowstate sample"
+            diagnostics = getattr(self._lowstate_sub, "diagnostics", None)
+            if diagnostics is not None:
+                details = diagnostics()
+                received = details.get("received", 0)
+                count = details.get("last_motor_count")
+                if received == 0:
+                    message = "no rt/lowstate samples received"
+                elif count is not None and count < self._DOF:
+                    message = f"rt/lowstate sample has {count} motors; expected at least {self._DOF}"
+                if details.get("closed"):
+                    message += " (reader closed)"
+                message += f" [received={received}]"
             return {"success": False, "code": "LOWSTATE_UNAVAILABLE",
-                    "message": "Waiting for a complete rt/lowstate message in developer mode"}
+                    "message": message}
         if self._last_error:
             return {"success": False, "code": "DDS_WRITE_FAILED", "message": self._last_error}
         return None
@@ -2512,7 +2540,7 @@ class ArmGesturePlugin:
         return {
             "name": "arm_gesture", "type": "actuator",
             "description": (
-                "Adam 上肢语义动作：salute 单手敬礼、high_five 单手肩高前伸（击掌预备）、"
+                "Adam 上肢语义动作：salute 单手敬礼、high_five 单手举臂屈肘（击掌预备）、"
                 "handshake 单手屈肘前伸并往复握手、wave 单手挥手（自动完成抬手-摆动-放下）、"
                 "welcome 双臂张开、raise 双手举起、reset 归位。"
                 f"单臂动作（{'/'.join(one_armed)}）只能选 side=left 或 side=right，"
@@ -2530,7 +2558,7 @@ class ArmGesturePlugin:
                     "oneOf": [{"const": name, "title": title}
                               for name, title in (
                                   ("salute", "单手敬礼"),
-                                  ("high_five", "单手肩高前伸（击掌预备）"),
+                                  ("high_five", "单手举臂屈肘（击掌预备）"),
                                   ("handshake", "单手屈肘前伸并往复握手"),
                                   ("wave", "单手挥手（抬手-摆动-放下）"),
                                   ("welcome", "双臂张开"),
