@@ -47,6 +47,7 @@ class CameraSnapshotPlugin:
                 },
                 "required": ["action"], "additionalProperties": False,
                 "x-completion": {"actions": ["capture_photo"], "timeout": 45},
+                "x-resource": "camera",
                 "x-action-params": {
                     "start": {"params": [], "description": "准备抓拍卡，无需启动 camera_rgb。"},
                     "capture_photo": {"params": ["position"], "description": "保存指定机位的新 JPEG。"},
@@ -126,17 +127,23 @@ class CameraSnapshotPlugin:
         payload = json.dumps({"action_id": action_id, "status": status, "result": result,
                               "tool": "camera_snapshot", "ts": time.time()}).encode()
         url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-        try:
-            ctx = ssl.create_default_context()
-            if url.startswith(("https://localhost:", "https://127.0.0.1:")):
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-            request = urllib.request.Request(url + "/api/acp/complete", data=payload,
-                                             headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(request, timeout=3, context=ctx):
-                pass
-        except Exception as exc:
-            log.warning("[camera_snapshot] ACP completion delivery failed for %s: %s", action_id, exc)
+        # 最坏 3×3 秒请求 + 0.5/1 秒退避，留在 45 秒 ACP 超时预算内。
+        for attempt in range(3):
+            try:
+                ctx = ssl.create_default_context()
+                if url.startswith(("https://localhost:", "https://127.0.0.1:")):
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                request = urllib.request.Request(url + "/api/acp/complete", data=payload,
+                                                 headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(request, timeout=3, context=ctx):
+                    pass
+                return
+            except Exception as exc:
+                if attempt == 2:
+                    log.warning("[camera_snapshot] ACP completion delivery failed for %s: %s", action_id, exc)
+                else:
+                    time.sleep(0.5 * 2 ** attempt)
 
     def _capture_async(self, position, action_id):
         try:

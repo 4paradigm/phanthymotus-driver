@@ -149,6 +149,7 @@ def test_snapshot_declares_completion_only_for_capture():
     schema = snapshot.CameraSnapshotPlugin({}).get_tool()["inputSchema"]
     assert schema["x-completion"]["actions"] == ["capture_photo"]
     assert schema["x-completion"]["timeout"] >= 33
+    assert schema["x-resource"] == "camera"
 
 
 @pytest.mark.parametrize("error, code", [
@@ -317,8 +318,10 @@ def test_failed_completion_delivery_keeps_result_and_releases_camera(tmp_path, m
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
     finished = threading.Event()
     notify = card._notify_complete
+    attempts = []
 
     def unreachable(*args, **kwargs):
+        attempts.append(1)
         raise OSError("Core offline")
 
     def notify_and_finish(*args):
@@ -328,6 +331,7 @@ def test_failed_completion_delivery_keeps_result_and_releases_camera(tmp_path, m
             finished.set()
 
     monkeypatch.setattr(urllib.request, "urlopen", unreachable)
+    monkeypatch.setattr(snapshot.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(card, "_notify_complete", notify_and_finish)
     accepted = card.dispatch("capture_photo", {})
     assert finished.wait(3)
@@ -336,7 +340,33 @@ def test_failed_completion_delivery_keeps_result_and_releases_camera(tmp_path, m
     assert info["last_capture"]["action_id"] == accepted["action_id"]
     assert info["last_capture"]["result"]["ok"]
     assert "completion delivery failed" in caplog.text
+    assert len(attempts) == 3
     assert "front" not in snapshot.camera._SNAPSHOT_POSITIONS
+
+
+def test_transient_completion_delivery_failure_retries_successfully(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
+    successful_post = urllib.request.urlopen
+    attempts = []
+    delays = []
+
+    def intermittent(request, **kwargs):
+        attempts.append(json.loads(request.data))
+        if len(attempts) == 1:
+            raise OSError("Core temporarily offline")
+        return successful_post(request, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", intermittent)
+    monkeypatch.setattr(snapshot.time, "sleep", delays.append)
+    accepted = card.dispatch("capture_photo", {})
+    terminal = completions.get(timeout=3)
+    assert len(attempts) == 2
+    assert attempts[0] == attempts[1] == terminal
+    assert delays == [0.5]
+    assert terminal["action_id"] == accepted["action_id"]
+    assert terminal["status"] == "completed"
 
 
 def test_worker_start_failure_does_not_leave_occupancy(tmp_path, monkeypatch, completions):

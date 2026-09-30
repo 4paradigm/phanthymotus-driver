@@ -26,10 +26,21 @@ POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`; only
 `capture_photo` declares `x-completion` (45 seconds). Successful completion
 contains `file_path` under `/opt/phanthy-motus/data/camera_snapshot`, published
 only after the atomic write. `info.last_capture` also keeps the latest terminal
-`{action_id, status, result}`. Callback delivery failures are logged and Core's
-45-second barrier timeout remains the fallback. `stop` reports lifecycle state
+`{action_id, status, result}`. ACP uses the `camera` physical resource. The
+callback is retried up to three times (3-second request timeout, 0.5/1-second
+backoff); after repeated failures the result remains in `info.last_capture`,
+the failure is logged, and Core's 45-second barrier timeout is the fallback.
+Other Go1 actuators without `x-resource` may still wait on this pending action
+under the platform's conservative fallback. `stop` reports lifecycle state
 `idle` and a separate `capture_active` flag; an accepted capture still finishes
 and sends its ACP callback.
+
+**Deployment prerequisite:** run only one Go1 driver process/container per set
+of five Nano cameras. The in-process position registry is not shared across
+driver instances, and the Nano services do not provide a shared lease. Before
+enabling the snapshot card or a second deployment, stop any other Go1 driver
+instance targeting the same Nano IPs and ports. Duplicate deployments can
+interrupt an active stream or make a capture fail.
 
 Within one driver process, snapshot admission and stream startup share a lock:
 an active RGB/depth/pointcloud receiver or another snapshot on the same position
@@ -37,8 +48,7 @@ returns `RESOURCE_BUSY` without an `action_id` or another TCP connection. A
 stream cannot start or switch onto a position occupied by a snapshot or another
 stream. Rejected hot switches preserve the old receiver. Stopping a stream
 retains its occupancy until the receiving thread exits. Other positions remain
-available. Occupancy in another process/container is not observable here and
-still requires coordination by the operator/Nano service.
+available.
 
 Snapshot endpoints use `camera.py`'s five default RGB endpoints. The bundle
 merges `positions` field by field, in increasing precedence:
