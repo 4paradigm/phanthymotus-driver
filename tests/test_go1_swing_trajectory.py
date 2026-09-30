@@ -1,4 +1,6 @@
 """Offline Go1 swing trajectory and world-frame contract checks."""
+import contextlib
+import io
 import math
 import sys
 import time
@@ -138,3 +140,28 @@ def test_lifecycle_idempotent_and_restartable():
     plugin.start()
     assert plugin._thread is not first
     plugin.stop()
+
+
+def test_persistent_sample_error_does_not_flood_logs():
+    class FailingClient:
+        def snapshot(self):
+            raise ValueError("bad sample")
+
+    class BoundedStop:
+        calls = 0
+
+        def is_set(self):
+            self.calls += 1
+            return self.calls > 105
+
+        def wait(self, _interval):
+            pass
+
+    plugin = SwingTrajectoryPlugin({}, "test", None, FailingClient())
+    plugin._stop = BoundedStop()
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        plugin._loop()
+    lines = output.getvalue().splitlines()
+    assert len(lines) == 2
+    assert "(1)" in lines[0] and "(100)" in lines[1]

@@ -1137,6 +1137,8 @@ class SwingTrajectoryPlugin:
                     self._thread = None
 
     def _loop(self):
+        last_error = None
+        repeated_errors = 0
         while not self._stop.is_set():
             try:
                 self.process_sample(self._client.snapshot())
@@ -1144,8 +1146,14 @@ class SwingTrajectoryPlugin:
                     msg = String()
                     msg.data = json.dumps(self._build())
                     self._pub.publish(msg)
+                last_error = None
+                repeated_errors = 0
             except Exception as exc:
-                print(f"[swing_trajectory] sample error: {exc}", flush=True)
+                error = (type(exc).__name__, str(exc))
+                repeated_errors = repeated_errors + 1 if error == last_error else 1
+                last_error = error
+                if repeated_errors == 1 or repeated_errors % 100 == 0:
+                    print(f"[swing_trajectory] sample error ({repeated_errors}): {exc}", flush=True)
             self._stop.wait(1.0 / self._hz)
 
     def process_sample(self, snap, now=None):
