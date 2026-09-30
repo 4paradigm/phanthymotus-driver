@@ -1132,6 +1132,34 @@ class CameraPlugin:
         return {"state": "running", **self._resolve(args)}
 
 
+class CameraStreamPlugin:
+    """One fixed camera card, so canvas can subscribe to several cameras at once."""
+
+    def __init__(self, nodes, card_name, stream_name):
+        self.nodes = nodes
+        self.card_name = card_name
+        self.stream_name = stream_name
+        self.stream = nodes.streams[f"camera_{stream_name}"]
+
+    def get_tool(self):
+        return tool(self.card_name, "sensor", f"A3 {self.stream_name} 相机流",
+                    {"type": "object", "properties": {}},
+                    topic_out=[{"topic": self.stream["topic"], "format": self.stream["format"]}])
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle", "topic_out": [{"topic": self.stream["topic"], "format": self.stream["format"]}]}
+        if action == "info":
+            return {"state": "running", "topic_out": [{"topic": self.stream["topic"], "format": self.stream["format"]}]}
+        return {"state": "running", **self.stream}
+
+
 class LidarCloudPlugin:
     def __init__(self, nodes):
         self.nodes = nodes
@@ -3456,7 +3484,16 @@ def build_plugins(config, namespace, ros2):
         plugins["joint_state"] = JointStatePlugin(nodes)
     if enabled("imu"):
         plugins["imu"] = ImuPlugin(nodes)
-    if enabled("camera"):
+    camera_cfg = plugins_cfg.get("camera", {})
+    selected_cameras = set(camera_cfg.get("streams") or [])
+    if (enabled("camera") or enabled("camera_head")) and "head_left_fisheye" in selected_cameras:
+        plugins["camera_head"] = CameraStreamPlugin(nodes, "camera_head", "head_left_fisheye")
+    if (enabled("camera") or enabled("camera_chest_rgb")) and "chest_front_d457_rgb" in selected_cameras:
+        plugins["camera_chest_rgb"] = CameraStreamPlugin(nodes, "camera_chest_rgb", "chest_front_d457_rgb")
+    if (enabled("camera") or enabled("camera_chest_depth")) and "chest_front_d457_depth" in selected_cameras:
+        plugins["camera_chest_depth"] = CameraStreamPlugin(nodes, "camera_chest_depth", "chest_front_d457_depth")
+    # Keep the legacy multiplexed card available only when explicitly enabled.
+    if enabled("camera") and not any(enabled(name) for name in ("camera_head", "camera_chest_rgb", "camera_chest_depth")):
         plugins["camera"] = CameraPlugin(nodes)
     if enabled("lidar_cloud"):
         plugins["lidar_cloud"] = LidarCloudPlugin(nodes)

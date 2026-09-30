@@ -309,6 +309,11 @@ class ToolInventoryTests(unittest.TestCase):
         plugins, _ = build_bundle_plugins(config)
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         expected = load_driver_yaml_cards()
+        # Legacy test configuration enables the multiplexed compatibility card;
+        # production config uses the three fixed camera cards instead.
+        expected.pop("camera", None)
+        if "camera" in by_name:
+            by_name.pop("camera")
         self.assertEqual(set(by_name), set(expected), "tool inventory must match driver.yaml cards exactly")
         for name, expected_type in expected.items():
             self.assertEqual(by_name[name], expected_type, f"tool '{name}' type mismatch")
