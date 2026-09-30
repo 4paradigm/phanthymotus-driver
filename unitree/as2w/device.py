@@ -331,6 +331,8 @@ class LocoPlugin:
         self._move_thread = None
         self._transition_stop = None
         self._transition_thread = None
+        self._state_override = None
+        self._state_override_until = 0.0
 
     _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING",
                  "AI_STAND_UP", "AI_BALANCE_STAND", "AI_RECOVERY_STAND"}
@@ -364,7 +366,16 @@ class LocoPlugin:
                 "error": "Unable to read robot locomotion state",
                 "reason": "SportClient.GetState failed; refusing an unsafe transition",
                 "suggested_actions": ["get_state"]}
-        name = str(state.get("fsm_name", "")).strip().upper()
+        raw_name = str(state.get("fsm_name", "")).strip().upper()
+        name = raw_name
+        if (raw_name in {"AI_FREE_WALK", "FREE_WALK"} and
+                self._state_override == "BALANCE_STAND" and
+                time.monotonic() < self._state_override_until):
+            state = dict(state)
+            state["raw_fsm_name"] = raw_name
+            state["fsm_name"] = "BALANCE_STAND"
+            state["state_source"] = "stop_move_balance_stand_confirmation"
+            name = "BALANCE_STAND"
         if not name:
             return None, state, {
                 "ret": -1, "current_state": "UNKNOWN",
@@ -721,6 +732,8 @@ class LocoPlugin:
             if state_name not in self._STANDING and not self._is_moving(state_name):
                 return self._move_error_for_state(state_name)
             self._cancel_transition()
+            self._state_override = None
+            self._state_override_until = 0.0
             if duration is None:
                 self._stop_continuous()
                 ret = self.proxy.Move(vx, vy, yaw)
@@ -959,6 +972,8 @@ class LocoPlugin:
                 print(f"[loco] stop stabilization action_id={action_id} state={name} BalanceStand ret={balance_ret}", flush=True)
                 if balance_ret != 0:
                     break
+                self._state_override = "BALANCE_STAND"
+                self._state_override_until = time.monotonic() + 10.0
             time.sleep(0.1)
         # AS2W firmware can keep GetState().fsm_name at AI_FREE_WALK after
         # StopMove has already stopped the velocity command. BalanceStand is
@@ -1340,7 +1355,6 @@ class _SpeakerNode:
         self.last_chunk_ts = 0.0
         self.last_play_ts = 0.0
         self._next_play_time = 0.0
-        self._stream_started = False
         self._last_play_error = 0.0
         self.last_play_error = None
 
@@ -1367,7 +1381,6 @@ class _SpeakerNode:
         self._subscription = self.node.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS)
         self._stop_event.clear()
-        self._stream_started = False
         self._thread = threading.Thread(target=self._drain, daemon=True, name="as2w-speaker")
         self._thread.start()
         self.state = "ready"
@@ -1455,12 +1468,6 @@ class _SpeakerNode:
     def _play_block(self, payload):
         started = time.monotonic()
         try:
-            # The first AS2 voice RPC can be consumed while the firmware opens
-            # the stream. Prime it with a short silent frame so the first real
-            # speech block is not lost (not counted as user audio).
-            if not getattr(self, "_stream_started", False):
-                self._client.Audio_PlayStream(SPEAKER_APP_NAME, "0", b"\x00" * 640)
-                self._stream_started = True
             result = self._client.Audio_PlayStream(SPEAKER_APP_NAME, "0", payload)
             if isinstance(result, tuple) and len(result) == 2:
                 code, detail = result

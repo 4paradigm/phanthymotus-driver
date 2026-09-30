@@ -245,8 +245,8 @@ class TestDriverContracts(unittest.TestCase):
         node.state = "ready"
         node._play_block(b"x" * self.device.SPEAKER_BLOCK_BYTES)
         self.assertEqual(1, node.blocks_sent)
-        self.assertEqual(2, len(calls))
-        self.assertEqual(640, len(calls[0][2]))
+        self.assertEqual(1, len(calls))
+        self.assertEqual(self.device.SPEAKER_BLOCK_BYTES, len(calls[0][2]))
         self.assertEqual(0, node._client.Audio_PlayStream("as2w_speaker", "0", b"x" * self.device.SPEAKER_BLOCK_BYTES)[0])
 
     def test_speaker_does_not_count_failed_play_stream(self):
@@ -612,6 +612,22 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(1, proxy.balance_stands)
         self.assertEqual("completed", notify.call_args.args[1])
         self.assertEqual("stop_move", notify.call_args.args[2]["action"])
+
+    def test_stale_ai_free_walk_is_overridden_after_balance_confirmation(self):
+        class _StaleProxy(_Proxy):
+            def BalanceStand(self):
+                self.balance_stands += 1
+                return 0
+
+        proxy = _StaleProxy()
+        proxy.state = "AI_FREE_WALK"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify"):
+            plugin._await_stopped("as2w_loco_stale_state")
+        name, state, error = plugin._read_state()
+        self.assertIsNone(error)
+        self.assertEqual("BALANCE_STAND", name)
+        self.assertEqual("AI_FREE_WALK", state["raw_fsm_name"])
 
     def test_loco_continuous_transition_reports_move_rpc_failure(self):
         class _FailingMoveProxy(_Proxy):
