@@ -444,26 +444,32 @@ class LocoPlugin:
                 self._stop = stop_event
             move_ret = 0
             move_error = None
-            try:
-                while not stop_event.is_set():
-                    try:
-                        move_ret = self.proxy.Move(vx, vy, yaw)
-                    except Exception as exc:
-                        move_ret = 3104
-                        move_error = f"{type(exc).__name__}: {str(exc)[:160]}"
-                    if move_ret != 0:
-                        break
-                    stop_event.wait(0.1)
-            finally:
+            while not stop_event.is_set():
                 try:
-                    self.proxy.StopMove()
-                except Exception:
-                    pass
+                    move_ret = self.proxy.Move(vx, vy, yaw)
+                except Exception as exc:
+                    move_ret = 3104
+                    move_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                if move_ret != 0:
+                    break
+                stop_event.wait(0.1)
+            stop_error = None
+            try:
+                self.proxy.StopMove()
+            except Exception as exc:
+                stop_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            finally:
                 with self._lock:
                     if self._stop is stop_event:
                         self._stop = None
                 self._finish_transition(stop_event)
-            if move_ret != 0 and not stop_event.is_set():
+            if stop_error and not stop_event.is_set():
+                _acp_notify(action_id, "error", {
+                    "action": "move", "ret": 3104,
+                    "error": "Continuous Move cleanup failed",
+                    "reason": f"StopMove failed after the velocity loop ended: {stop_error}",
+                    "suggested_actions": ["stop_move", "get_state"]})
+            elif move_ret != 0 and not stop_event.is_set():
                 result = {
                     "action": "move",
                     "ret": move_ret,
@@ -485,32 +491,49 @@ class LocoPlugin:
                 })
             return
         deadline = time.monotonic() + duration
-        try:
-            while time.monotonic() < deadline:
-                remaining = deadline - time.monotonic()
-                if stop_event.wait(min(0.1, remaining)):
-                    _acp_notify(action_id, "cancelled", {
-                        "action": "move", "duration": duration,
-                        "reason": "Timed move stopped by stop_move or card shutdown"})
-                    return
-                if time.monotonic() < deadline:
+        cancelled = False
+        move_failure = None
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if stop_event.wait(min(0.1, remaining)):
+                cancelled = True
+                break
+            if time.monotonic() < deadline:
+                try:
                     ret = self.proxy.Move(vx, vy, yaw)
-                    if ret != 0:
-                        _acp_notify(action_id, "error", {
-                            "action": "move", "ret": ret, "rpc_ret": ret,
-                            "duration": duration,
-                            "error": "Timed Move failed",
-                            "reason": "The sport controller stopped accepting the velocity command",
-                            "suggested_actions": ["get_state", "stop_move"]})
-                        return
+                except Exception as exc:
+                    move_failure = {"ret": 3104, "rpc_error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+                    break
+                if ret != 0:
+                    move_failure = {"ret": ret, "rpc_ret": ret}
+                    break
+        stop_error = None
+        try:
+            self.proxy.StopMove()
+        except Exception as exc:
+            stop_error = f"{type(exc).__name__}: {str(exc)[:160]}"
         finally:
-            try:
-                self.proxy.StopMove()
-            finally:
-                self._finish_transition(stop_event)
-        _acp_notify(action_id, "completed",
-                    {"action": "move", "ret": 0, "duration": duration,
-                     "reason": "requested duration elapsed"})
+            self._finish_transition(stop_event)
+        if stop_error:
+            _acp_notify(action_id, "error", {
+                "action": "move", "ret": 3104,
+                "duration": duration, "error": "Timed Move cleanup failed",
+                "reason": f"StopMove failed after the timed command: {stop_error}",
+                "suggested_actions": ["stop_move", "get_state"]})
+        elif move_failure:
+            _acp_notify(action_id, "error", {
+                "action": "move", "duration": duration,
+                "error": "Timed Move failed",
+                "reason": "The sport controller stopped accepting the velocity command",
+                "suggested_actions": ["get_state", "stop_move"], **move_failure})
+        elif cancelled:
+            _acp_notify(action_id, "cancelled", {
+                "action": "move", "duration": duration,
+                "reason": "Timed move stopped by stop_move or card shutdown"})
+        else:
+            _acp_notify(action_id, "completed",
+                        {"action": "move", "ret": 0, "duration": duration,
+                         "reason": "requested duration elapsed and StopMove completed"})
 
     def _move_error_for_state(self, state):
         if state in self._DOWN:
@@ -523,8 +546,8 @@ class LocoPlugin:
     def get_tool(self):
         actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
-                "description": "As2W locomotion. move uses vx forward/back m/s, vy lateral m/s, vyaw rotation rad/s, and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; balance_stand enables active balance; damp releases motor torque; recovery_stand is for fallen/down posture; speed_level accepts slow/normal/fast; body_height/body_position/euler are direct controller offsets. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
-                    "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity rad/s [-2, 2]"},
+                "description": "As2W locomotion. move uses vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; balance_stand enables active balance; damp releases motor torque; recovery_stand is for fallen/down posture; speed_level accepts slow/normal/fast; body_height/body_position/euler are direct controller offsets. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity in degrees/s [-120, 120]; converted to radians/s for Unitree SDK"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
                     "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
                 "x-completion": {"actions": ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand"], "timeout": 45},
@@ -608,7 +631,12 @@ class LocoPlugin:
             self._stop_continuous()
             return {"state": "idle", "ret": self.proxy.StopMove()}
         if action == "move":
-            vx, vy, yaw = max(-1.5, min(1.5, float(args.get("vx", 0)))), max(-1, min(1, float(args.get("vy", 0)))), max(-2, min(2, float(args.get("vyaw", 0))))
+            vx = max(-1.5, min(1.5, float(args.get("vx", 0))))
+            vy = max(-1, min(1, float(args.get("vy", 0))))
+            # Keep the public MCP unit in degrees/s and convert at the single
+            # boundary where commands enter Unitree's radian-based SDK.
+            vyaw_deg = max(-120.0, min(120.0, float(args.get("vyaw", 0))))
+            yaw = math.radians(vyaw_deg)
             duration = args.get("duration")
             if duration == 0:
                 duration = None
@@ -631,7 +659,8 @@ class LocoPlugin:
                 self._stop_continuous()
                 ret = self.proxy.Move(vx, vy, yaw)
                 return {"ret": ret, "accepted": ret == 0, "action": "move",
-                        "current_state": state_name, "vx": vx, "vy": vy, "vyaw": yaw,
+                        "current_state": state_name, "vx": vx, "vy": vy,
+                        "vyaw": vyaw_deg, "vyaw_sdk_rad": yaw,
                         **({} if ret == 0 else {"error": "Sport controller rejected Move",
                           "reason": "The robot is standing but the velocity command was refused",
                           "suggested_actions": ["get_state", "stop_move"]})}

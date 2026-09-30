@@ -122,6 +122,9 @@ Change scope and validation notes:
 
 Loco examples:
 
+`move.vyaw` is expressed in degrees per second by MCP (the driver converts it
+to radians per second at the Unitree SDK boundary).
+
 ```json
 {"action":"move","vx":0.3,"vy":0,"vyaw":0,"duration":2}
 {"action":"move","vx":0.2,"vy":0,"vyaw":0,"duration":-1}

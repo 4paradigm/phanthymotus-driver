@@ -406,6 +406,14 @@ class TestDriverContracts(unittest.TestCase):
         self.assertTrue(result["accepted"])
         self.assertEqual([(0.3, 0, 0)], proxy.moves)
 
+    def test_loco_vyaw_accepts_degrees_and_converts_at_sdk_boundary(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("move", {"vx": 0, "vy": 0, "vyaw": 90})
+        self.assertEqual(0, result["ret"])
+        self.assertAlmostEqual(1.5707963, proxy.moves[-1][2], places=5)
+        self.assertEqual(90, result["vyaw"])
+
     def test_timed_move_returns_action_id_and_reports_acp_completion(self):
         proxy = _Proxy()
         plugin = self.device.LocoPlugin({}, "test", None, proxy)
