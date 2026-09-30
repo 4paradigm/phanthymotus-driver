@@ -1746,6 +1746,9 @@ class MotionPlayPlugin:
     def __init__(self, nodes):
         self.nodes = nodes
         self._play_action_id = None
+        # ThreadingHTTPServer serves MCP calls concurrently — the check-then-set
+        # on _play_action_id (settle prior / arm new) must be atomic.
+        self._play_lock = threading.Lock()
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
@@ -1753,8 +1756,8 @@ class MotionPlayPlugin:
                           "description": "动作文件绝对路径（list → motion 取 path 字段；"
                                          "SendMotionCommand 要求绝对路径）"},
             "duration_ms": {"type": "integer",
-                            "description": f"播放时长 ms（可选，缺省为播放到结束；"
-                                           f"0 ≤ duration_ms ≤ {MOTION_PLAY_MAX_DURATION_MS}）"},
+                            "description": f"播放时长 ms（必填正数，"
+                                           f"1 ≤ duration_ms ≤ {MOTION_PLAY_MAX_DURATION_MS}）"},
         })
         # A3 exposes no motion-status topic/RPC — completion is duration-based:
         # a daemon worker sleeps duration_ms then POSTs /api/acp/complete.
@@ -1775,7 +1778,8 @@ class MotionPlayPlugin:
         """结算挂起的 ACP 等待线程（若有）：清 id 后立刻回报终态。
 
         只清 id 会让 Agent Core 的 barrier 挂到 600 s 超时 —— 取消也必须显式
-        POST cancelled（LocoPlugin._settle_active 同款语义）。
+        POST cancelled（LocoPlugin._settle_active 同款语义）。调用方须持有
+        _play_lock（除插件生命周期 stop() 自行加锁外）。
         """
         action_id, self._play_action_id = self._play_action_id, None
         if action_id is not None:
@@ -1784,8 +1788,11 @@ class MotionPlayPlugin:
     def stop(self):
         # 插件生命周期卸载：与框架 stop 同款 —— 有动作在跑就先物理停掉并结算，
         # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
-        if self._play_action_id is not None:
-            self._settle_active("cancelled", {"reason": "plugin_stopped"})
+        with self._play_lock:
+            active = self._play_action_id is not None
+            if active:
+                self._settle_active("cancelled", {"reason": "plugin_stopped"})
+        if active:
             try:
                 self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True)
             except Exception:
@@ -1825,12 +1832,15 @@ class MotionPlayPlugin:
             _require(motion_path, "motion_id 不能为空")
             duration_ms = int(args.get("duration_ms", 10000))
             # Bounds must match the declared x-completion timeout (600 s): a
-            # negative value would report completion instantly while the RPC
-            # still runs, and an over-timeout value would have Agent Core give
-            # up while the robot is still moving.
-            _require(0 <= duration_ms <= MOTION_PLAY_MAX_DURATION_MS,
-                     f"duration_ms={duration_ms} 超出范围 [0, {MOTION_PLAY_MAX_DURATION_MS}]"
-                     f"（与 x-completion 超时 600 s 一致）")
+            # negative or zero value would report completion instantly while the
+            # RPC still runs — with no motion-status feedback channel the A3
+            # cannot observe an open-ended playback, so a positive bound is
+            # required (9th PR review); an over-timeout value would have Agent
+            # Core give up while the robot is still moving.
+            _require(1 <= duration_ms <= MOTION_PLAY_MAX_DURATION_MS,
+                     f"duration_ms={duration_ms} 超出范围 [1, {MOTION_PLAY_MAX_DURATION_MS}]"
+                     f"（必须为正数：0/缺省时长无法被驱动观测，会让 Agent Core 提前"
+                     f"释放全身资源屏障）")
             # MOTION-state gate (dev guide §7.1: motion_player is a MOTION-mode
             # application; full-body motion while DAMPING/PASSIVE/LIE_DOWN would
             # command joints that are unpowered). Unparseable state → permissive,
@@ -1840,10 +1850,26 @@ class MotionPlayPlugin:
                 return {"state": "rejected", "current": current,
                         "suggestion": "motion_play 仅在 MOTION 站立状态生效；"
                                       "请先执行 mc_mode get_up 恢复站立"}
+            # Atomic settle-then-arm: a second concurrent play must cancel the
+            # first (cmd_end + immediate ACP cancelled) instead of silently
+            # orphaning its barrier — the superseded worker would otherwise
+            # exit on the id mismatch and leave Agent Core pending 600 s
+            # (ThreadingHTTPServer makes concurrent play reachable). The prior
+            # motion is ended BEFORE the new SendMotionCommand fires so the
+            # robot never receives two overlapping plays.
+            with self._play_lock:
+                if self._play_action_id is not None:
+                    self._settle_active("cancelled", {"reason": "replaced_by_new_play"})
+                    try:
+                        self.nodes.rpc.send_motion_command(
+                            motion_id="", duration_ms=0, cmd_end=True)
+                    except Exception:
+                        pass
             response = jsonable(self.nodes.rpc.send_motion_command(
                 motion_path, duration_ms, cmd_end=True, cmd_pause=False))
-            action_id = f"motion_play_{uuid4().hex[:8]}"
-            self._play_action_id = action_id
+            with self._play_lock:
+                action_id = f"motion_play_{uuid4().hex[:8]}"
+                self._play_action_id = action_id
             threading.Thread(target=self._play_worker,
                              args=(action_id, motion_path, duration_ms),
                              daemon=True).start()
@@ -1860,10 +1886,12 @@ class MotionPlayPlugin:
             # Stopping the motion also settles any pending ACP waiter — a
             # cancelled motion must not be reported as completed later, and
             # Agent Core must hear the cancellation now (not at its timeout).
-            self._settle_active("cancelled", {"reason": "cancelled_by_request"})
+            with self._play_lock:
+                self._settle_active("cancelled", {"reason": "cancelled_by_request"})
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True))
         if action == "reset":
-            self._settle_active("cancelled", {"reason": "reset"})
+            with self._play_lock:
+                self._settle_active("cancelled", {"reason": "reset"})
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_reset=True))
         if action == "stop":
             # Framework stop must physically halt the motion — a bare "idle"
@@ -1871,9 +1899,10 @@ class MotionPlayPlugin:
             # free to POST a phantom completed event later. With nothing armed
             # the call stays inert (canvas lifecycle toggles must not spam
             # cancellation RPCs when no motion is running).
-            if self._play_action_id is None:
-                return {"state": "idle"}
-            self._settle_active("cancelled", {"reason": "cancelled_by_framework"})
+            with self._play_lock:
+                if self._play_action_id is None:
+                    return {"state": "idle"}
+                self._settle_active("cancelled", {"reason": "cancelled_by_framework"})
             response = jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True))
             return {"state": "stopped", "response": response}
         raise ValueError(f"motion_play: unknown action {action!r}")

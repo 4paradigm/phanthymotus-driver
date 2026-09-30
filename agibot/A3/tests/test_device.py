@@ -1122,16 +1122,54 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(schema["x-completion"], {"actions": ["play"], "timeout": 600})
 
     def test_motion_play_rejects_out_of_bounds_duration(self):
-        # duration_ms bounds must match the 600 s x-completion timeout: negative
-        # would complete instantly while the RPC runs; >600000 would outlive the
+        # duration_ms bounds must match the 600 s x-completion timeout: a zero
+        # or negative value would report completion instantly while the RPC
+        # still runs (zero is rejected: with no motion-status feedback the A3
+        # cannot observe an open-ended playback); >600000 would outlive the
         # Agent Core waiter.
         motion = find_plugin(self.plugins, "motion_play")
-        for bad in (-1, device.MOTION_PLAY_MAX_DURATION_MS + 1):
+        for bad in (0, -1, device.MOTION_PLAY_MAX_DURATION_MS + 1):
             with self.assertRaises(ValueError):
                 motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
                                          "duration_ms": bad})
         # Nothing was sent to the robot for the rejected calls.
         self.assertEqual(self.transport.calls_to("MotionCommandService", "SendMotionCommand"), [])
+
+    def test_motion_play_second_play_settles_previous(self):
+        # 9th PR review: ThreadingHTTPServer serves MCP calls concurrently, so a
+        # second play can arrive while the first is still running. The first
+        # action must be settled — immediate cancelled post + cmd_end for the
+        # robot — never orphaned on a silent id mismatch.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            motion = find_plugin(self.plugins, "motion_play")
+            motion._PLAY_WORKER_TICK_S = 0.02
+            first = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                             "duration_ms": 5000})
+            second = motion.dispatch("play", {"motion_id": "/agibot/motions/dance.mcap",
+                                              "duration_ms": 5000})
+            self.assertNotEqual(first["action_id"], second["action_id"])
+            time.sleep(0.5)
+            # exactly one post so far: the first action cancelled immediately
+            self.assertEqual([(c[0], c[1], c[3]) for c in captured],
+                             [(first["action_id"], "cancelled", "motion_play")])
+            self.assertEqual(captured[0][2]["reason"], "replaced_by_new_play")
+            # the replacement ended the first motion physically before arming
+            calls = self.transport.calls_to("MotionCommandService", "SendMotionCommand")
+            end_calls = [c for c in calls if c[1]["cmd_end"] and not c[1]["motion_id"]]
+            self.assertEqual(len(end_calls), 1)  # cmd_end for the first motion only
+            self.assertEqual([c[1]["motion_id"] for c in calls],
+                             ["/agibot/motions/wave.mcap", "",
+                              "/agibot/motions/dance.mcap"])
+            self.assertTrue(calls[1][1]["cmd_end"])
+            # the second worker is the only one left armed and must not be able
+            # to report the first action's completion
+            self.assertEqual(motion._play_action_id, second["action_id"])
+        finally:
+            device._acp_notify = original_notify
 
     def test_motion_play_play_rejected_outside_motion_state(self):
         # 7th PR review: motion_player is a MOTION-mode application (dev guide
