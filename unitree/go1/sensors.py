@@ -1198,7 +1198,7 @@ class SwingTrajectoryPlugin:
                     self._pub.publish(msg)
                     for frame, publisher in self._cloud_pubs.items():
                         cloud = UInt8MultiArray()
-                        cloud.data = _swing_pointcloud(data, frame)
+                        cloud.data = list(_swing_pointcloud(data, frame))
                         publisher.publish(cloud)
                 last_error = None
                 repeated_errors = 0

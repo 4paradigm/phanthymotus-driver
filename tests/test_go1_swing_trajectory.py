@@ -182,6 +182,21 @@ def test_ros_topics_publish_json_and_both_3d_frames():
     class Msg:
         data = None
 
+    class UInt8Msg:
+        def __init__(self):
+            self._data = []
+
+        @property
+        def data(self):
+            return self._data
+
+        @data.setter
+        def data(self, value):
+            if not isinstance(value, (list, tuple)) or not all(
+                    isinstance(item, int) and 0 <= item <= 255 for item in value):
+                raise TypeError("UInt8MultiArray.data requires a numeric sequence")
+            self._data = value
+
     class Publisher:
         def __init__(self):
             self.messages = []
@@ -218,7 +233,7 @@ def test_ros_topics_publish_json_and_both_3d_frames():
             patch.object(sensors, "HistoryPolicy", SimpleNamespace(KEEP_LAST=1), create=True), \
             patch.object(sensors, "DurabilityPolicy", SimpleNamespace(VOLATILE=1), create=True), \
             patch.object(sensors, "String", Msg, create=True), \
-            patch.object(sensors, "UInt8MultiArray", Msg, create=True):
+            patch.object(sensors, "UInt8MultiArray", UInt8Msg, create=True):
         plugin = SwingTrajectoryPlugin({}, "test", FakeExecutor(), Client())
         ports = plugin.get_tool()["topic_out"]
         assert [p["format"] for p in ports] == ["data/json", "sensor/pointcloud", "sensor/pointcloud"]
@@ -228,7 +243,7 @@ def test_ros_topics_publish_json_and_both_3d_frames():
             assert plugin._node.publishers[port["topic"]].messages
         for port in ports[1:]:
             payload = plugin._node.publishers[port["topic"]].messages[-1]
-            assert struct.unpack_from("<II", payload) == (12, 1)
+            assert struct.unpack_from("<II", bytes(payload)) == (12, 1)
 
 
 def test_lifecycle_idempotent_and_restartable():
