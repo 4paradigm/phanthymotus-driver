@@ -6,9 +6,12 @@ import struct
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unitree" / "go1"))
 
+import sensors  # noqa: E402
 from sensors import SwingTrajectoryPlugin, _swing_pointcloud, _swing_vector, _swing_world_point  # noqa: E402
 
 
@@ -172,6 +175,59 @@ def test_pointcloud_wire_format_and_both_coordinate_frames():
         assert len(cloud) == 8 + stride * count
         xyz = struct.unpack_from("<fff", cloud, 8)
         assert all(abs(actual - wanted) < 1e-5 for actual, wanted in zip(xyz, expected))
+
+
+def test_ros_topics_publish_json_and_both_3d_frames():
+    class Msg:
+        data = None
+
+    class Publisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(message.data)
+
+    class FakeNode:
+        def __init__(self, _name):
+            self.publishers = {}
+
+        def create_publisher(self, _msg_type, topic, _qos):
+            return self.publishers.setdefault(topic, Publisher())
+
+    class FakeExecutor:
+        def add_node(self, _node):
+            pass
+
+    class OneCycle:
+        def __init__(self):
+            self.checked = 0
+
+        def is_set(self):
+            self.checked += 1
+            return self.checked > 1
+
+        def wait(self, _seconds):
+            pass
+
+    with patch.object(sensors, "_HAS_ROS2", True), \
+            patch.object(sensors, "Node", FakeNode, create=True), \
+            patch.object(sensors, "QoSProfile", lambda **_kw: object(), create=True), \
+            patch.object(sensors, "ReliabilityPolicy", SimpleNamespace(BEST_EFFORT=1), create=True), \
+            patch.object(sensors, "HistoryPolicy", SimpleNamespace(KEEP_LAST=1), create=True), \
+            patch.object(sensors, "DurabilityPolicy", SimpleNamespace(VOLATILE=1), create=True), \
+            patch.object(sensors, "String", Msg, create=True), \
+            patch.object(sensors, "UInt8MultiArray", Msg, create=True):
+        plugin = SwingTrajectoryPlugin({}, "test", FakeExecutor(), Client())
+        ports = plugin.get_tool()["topic_out"]
+        assert [p["format"] for p in ports] == ["data/json", "sensor/pointcloud", "sensor/pointcloud"]
+        plugin._stop = OneCycle()
+        plugin._loop()
+        for port in ports:
+            assert plugin._node.publishers[port["topic"]].messages
+        for port in ports[1:]:
+            payload = plugin._node.publishers[port["topic"]].messages[-1]
+            assert struct.unpack_from("<II", payload) == (12, 1)
 
 
 def test_lifecycle_idempotent_and_restartable():
