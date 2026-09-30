@@ -41,12 +41,9 @@ container `path`, `channel_reply_path`, MIME type and size; `delete` accepts the
 complete `.jpg` or `.mp4` filename. A file currently being written cannot be
 deleted, and an existing name is never accepted for a new capture.
 
-For a manually controlled recording, call `start_recording` with `position` and
-optional `video_name`, then `stop_recording`. The start call returns the planned
-path, while stop returns an `action_id` and finalizes the MP4 in the background.
-Wait for its ACP `completed` callback before using the file. The recording clock
-starts at the first valid camera frame. Lifecycle `stop` cancels an active
-recording instead of saving it.
+For `record_video`, the recording clock starts at the first valid camera frame.
+Wait for its ACP `completed` callback before using the file. Lifecycle `stop`
+cancels an active recording instead of saving it.
 
 Recording first writes the selected JPEGs into a temporary MJPEG stream, then
 encodes that stream to MP4 with `ffmpeg`'s `ultrafast` H.264 preset. This keeps

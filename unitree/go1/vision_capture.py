@@ -42,7 +42,6 @@ class VisionCapturePlugin:
         self._last_capture = None
         self._last_recording = None
         self._recording = None
-        self._manual_recording = None
         self._recording_thread = None
         self._encoder = None
 
@@ -53,7 +52,7 @@ class VisionCapturePlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "start_recording", "stop_recording", "list", "delete", "info", "stop"]},
+                    "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "list", "delete", "info", "stop"]},
                     "position": {"type": "string", "enum": list(POSITIONS), "default": "front"},
                     "duration_s": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5},
                     "image_name": {"type": "string", "description": "照片文件名，不含 .jpg；留空则自动命名。"},
@@ -61,14 +60,12 @@ class VisionCapturePlugin:
                     "name": {"type": "string", "description": "删除时填写完整的 .jpg 或 .mp4 文件名。"},
                 },
                 "required": ["action"], "additionalProperties": False,
-                "x-completion": {"actions": ["capture_photo", "record_video", "stop_recording"], "timeout": 120},
+                "x-completion": {"actions": ["capture_photo", "record_video"], "timeout": 120},
                 "x-resource": "camera",
                 "x-action-params": {
                     "start": {"params": [], "description": "准备拍照录像卡，无需启动 camera_rgb。"},
                     "capture_photo": {"params": ["position", "image_name"], "description": "保存指定机位的新 JPEG。"},
                     "record_video": {"params": ["position", "duration_s", "video_name"], "description": "录制指定机位的 MP4，默认 5 秒，最长 30 秒。"},
-                    "start_recording": {"params": ["position", "video_name"], "description": "开始手动录像。"},
-                    "stop_recording": {"params": [], "description": "结束手动录像并异步保存。"},
                     "list": {"params": [], "description": "列出已保存的照片和视频。"},
                     "delete": {"params": ["name"], "description": "按完整文件名删除照片或视频。"},
                     "info": {"params": [], "description": "查看照片和视频目录。"},
@@ -98,14 +95,12 @@ class VisionCapturePlugin:
             return {"state": "idle", "capture_active": bool(self._active)}
 
     @staticmethod
-    def _receive_exact(connection, size, deadline, cancel=None, finish=None):
+    def _receive_exact(connection, size, deadline, cancel=None):
         chunks = bytearray()
         while len(chunks) < size:
             remaining = deadline - time.monotonic()
             if cancel is not None and cancel.is_set():
                 raise InterruptedError("video recording cancelled")
-            if finish is not None and finish.is_set():
-                raise StopIteration
             if remaining <= 0:
                 raise TimeoutError("camera frame deadline exceeded")
             connection.settimeout(min(remaining, 0.5) if cancel is not None else remaining)
@@ -182,18 +177,6 @@ class VisionCapturePlugin:
             return self._list_files()
         if action == "delete":
             return self._delete_file(args.get("name"))
-        if action == "stop_recording":
-            with camera._CAMERA_LOCK:
-                manual = self._manual_recording
-                if manual is None:
-                    return {"ok": False, "code": "NO_RECORDING", "message": "no manual recording is active"}
-                if manual["action_id"] is not None:
-                    return {"ok": False, "code": "RESOURCE_BUSY", "message": "recording is already finalizing"}
-                action_id = f"vision_capture_{uuid4().hex}"
-                manual["action_id"] = action_id
-                manual["finish"].set()
-                return {"ok": True, "state": "finalizing", "action_id": action_id,
-                        "file_path": str(manual["path"])}
         if action == "info":
             with camera._CAMERA_LOCK:
                 return {"state": "recording" if self._recording else "capturing" if self._active else "ready",
@@ -202,15 +185,15 @@ class VisionCapturePlugin:
                         "videos_dir": str(self._output_dir / "videos"),
                         "positions": list(POSITIONS), "last_capture": self._last_capture,
                         "last_recording": self._last_recording}
-        if action not in ("capture_photo", "record_video", "start_recording"):
+        if action not in ("capture_photo", "record_video"):
             return None
 
         position = args.get("position", "front")
         if position not in POSITIONS:
             return {"ok": False, "code": "INVALID_ARGUMENT", "message": "unknown camera position"}
         duration = args.get("duration_s", 5)
-        if action in ("record_video", "start_recording"):
-            if action == "record_video" and (isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 30):
+        if action == "record_video":
+            if isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 30:
                 return {"ok": False, "code": "INVALID_ARGUMENT", "message": "duration_s must be 1-30 seconds"}
             if not shutil.which("ffmpeg"):
                 return {"ok": False, "code": "ENCODER_UNAVAILABLE", "message": "ffmpeg is required for MP4 recording"}
@@ -233,14 +216,11 @@ class VisionCapturePlugin:
             cancel = threading.Event() if action != "capture_photo" else None
             if cancel is not None:
                 self._recording = cancel
-            manual = {"finish": threading.Event(), "action_id": None, "path": path} if action == "start_recording" else None
-            if manual is not None:
-                self._manual_recording = manual
-        action_id = f"vision_capture_{uuid4().hex}" if manual is None else None
+        action_id = f"vision_capture_{uuid4().hex}"
         # 先确定文件名，画布收到受理结果时即可显示目标路径；完成回调才确认文件存在。
         try:
             target = self._record_async if cancel else self._capture_async
-            worker_args = (position, action_id, path, None if manual else duration, cancel, manual) if manual else (position, action_id, path, duration, cancel) if cancel else (position, action_id, path)
+            worker_args = (position, action_id, path, duration, cancel) if cancel else (position, action_id, path)
             worker = threading.Thread(target=target, args=worker_args, daemon=True)
             if cancel is not None:
                 with camera._CAMERA_LOCK:
@@ -254,15 +234,12 @@ class VisionCapturePlugin:
                 if cancel is not None:
                     self._recording = None
                     self._recording_thread = None
-                    if manual is not None:
-                        self._manual_recording = None
             return {"ok": False, "code": "RECORD_FAILED" if cancel else "CAPTURE_FAILED", "message": str(exc)}
         response = {"ok": True, "state": "recording" if cancel else "capturing",
                     "position": position, "file_path": str(path), "filename": path.name,
                     "channel_reply_path": self._channel_path(path),
                     "mime": "video/mp4" if cancel else "image/jpeg"}
-        if action_id is not None:
-            response["action_id"] = action_id
+        response["action_id"] = action_id
         return response
 
     def _notify_complete(self, action_id, status, result):
@@ -332,9 +309,9 @@ class VisionCapturePlugin:
                 temporary_path.unlink(missing_ok=True)
             return {"ok": False, "code": "SAVE_FAILED", "message": str(exc)}
 
-    def _record_async(self, position, action_id, path, duration, cancel, manual=None):
+    def _record_async(self, position, action_id, path, duration, cancel):
         try:
-            result = self._record_and_save(position, path, duration, cancel, manual["finish"]) if manual else self._record_and_save(position, path, duration, cancel)
+            result = self._record_and_save(position, path, duration, cancel)
         except Exception as exc:
             result = {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
         finally:
@@ -344,23 +321,18 @@ class VisionCapturePlugin:
                 self._active_paths.discard(path)
                 if self._recording is cancel:
                     self._recording = None
-                if manual is not None:
-                    action_id = manual["action_id"]
-                    if self._manual_recording is manual:
-                        self._manual_recording = None
         status = ("completed" if result.get("ok") else
                   "cancelled" if result.get("code") == "RECORD_CANCELLED" else "error")
         with camera._CAMERA_LOCK:
             self._last_recording = {"action_id": action_id, "status": status, "result": result}
         try:
-            if action_id is not None:
-                self._notify_complete(action_id, status, result)
+            self._notify_complete(action_id, status, result)
         finally:
             with camera._CAMERA_LOCK:
                 if self._recording_thread is threading.current_thread():
                     self._recording_thread = None
 
-    def _record_and_save(self, position, path, duration, cancel, finish=None):
+    def _record_and_save(self, position, path, duration, cancel):
         temporary_path = path.with_name(f".{path.stem}.tmp.mp4")
         frames_path = path.with_name(f".{path.stem}.tmp.mjpeg")
         frames_output = None
@@ -376,21 +348,17 @@ class VisionCapturePlugin:
                 frames_output = frames_path.open("wb")
                 frames = 0
                 source_frames = 0
-                total_frames = duration * VIDEO_FPS if duration is not None else None
+                total_frames = duration * VIDEO_FPS
                 deadline = None
                 started_at = None
                 recording_started_at = None
                 last_jpeg = None
                 while not cancel.is_set():
-                    if finish is not None and finish.is_set():
-                        break
                     frame_deadline = min(deadline, time.monotonic() + 2) if deadline else time.monotonic() + 20
                     if deadline and time.monotonic() >= deadline:
                         break
                     try:
-                        length = struct.unpack(">I", self._receive_exact(connection, 4, frame_deadline, cancel, finish))[0]
-                    except StopIteration:
-                        break
+                        length = struct.unpack(">I", self._receive_exact(connection, 4, frame_deadline, cancel))[0]
                     except TimeoutError:
                         if deadline and time.monotonic() >= deadline:
                             break
@@ -398,9 +366,7 @@ class VisionCapturePlugin:
                     if not 0 < length <= 5_000_000:
                         raise OSError(f"invalid JPEG frame length: {length}")
                     try:
-                        jpeg = self._receive_exact(connection, length, frame_deadline, cancel, finish)
-                    except StopIteration:
-                        break
+                        jpeg = self._receive_exact(connection, length, frame_deadline, cancel)
                     except TimeoutError:
                         if deadline and time.monotonic() >= deadline:
                             break
@@ -411,12 +377,10 @@ class VisionCapturePlugin:
                     if deadline is None:
                         started_at = now
                         recording_started_at = datetime.now().astimezone()
-                        if duration is not None:
-                            deadline = now + duration
+                        deadline = now + duration
                     source_frames += 1
                     slot = int((now - started_at) * VIDEO_FPS)
-                    if total_frames is not None:
-                        slot = min(total_frames - 1, slot)
+                    slot = min(total_frames - 1, slot)
                     # 源帧率低于 15 fps 时填补缺口，保持 MP4 播放时长与实际录制时长一致。
                     while frames < slot:
                         frames_output.write(last_jpeg)
@@ -430,8 +394,6 @@ class VisionCapturePlugin:
                 if last_jpeg is None:
                     raise RuntimeError("no camera frames received")
                 recording_ended_at = datetime.now().astimezone()
-                if total_frames is None:
-                    total_frames = max(1, round((time.monotonic() - started_at) * VIDEO_FPS))
                 while frames < total_frames:
                     frames_output.write(last_jpeg)
                     frames += 1
