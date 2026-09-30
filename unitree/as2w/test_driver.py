@@ -406,6 +406,24 @@ class TestDriverContracts(unittest.TestCase):
         self.assertTrue(result["accepted"])
         self.assertEqual([(0.3, 0, 0)], proxy.moves)
 
+    def test_timed_move_returns_action_id_and_reports_acp_completion(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify") as notify:
+            result = plugin.dispatch("move", {
+                "vx": 0.2, "vy": 0, "vyaw": 0, "duration": 0.02})
+            self.assertTrue(result["accepted"])
+            self.assertIn("action_id", result)
+            action_id = result["action_id"]
+            for _ in range(100):
+                if any(call.args[0] == action_id for call in notify.call_args_list):
+                    break
+                __import__("time").sleep(0.01)
+        matching = [call for call in notify.call_args_list if call.args[0] == action_id]
+        self.assertTrue(matching)
+        self.assertEqual("completed", matching[-1].args[1])
+        self.assertEqual(0, matching[-1].args[2]["ret"])
+
     def test_loco_rpc_failure_exposes_code_and_state(self):
         proxy = _Proxy()
         proxy.state = "PASSIVE"
@@ -655,6 +673,10 @@ class TestDriverContracts(unittest.TestCase):
         self.assertAlmostEqual(1.308, x, places=2)
         self.assertAlmostEqual(2.879, y, places=2)
         self.assertAlmostEqual(-2.0, z, places=3)
+
+    def test_lidar_render_budget_is_bounded(self):
+        lidar = _load("as2w_lidar_budget_test", ROOT / "lidar.py")
+        self.assertEqual(2000, lidar._MAX_RENDER_POINTS)
 
     def test_lidar_normalizes_big_endian_xyz(self):
         import struct

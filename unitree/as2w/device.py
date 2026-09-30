@@ -464,16 +464,30 @@ class LocoPlugin:
         deadline = time.monotonic() + duration
         try:
             while time.monotonic() < deadline:
-                time.sleep(min(0.1, deadline - time.monotonic()))
+                remaining = deadline - time.monotonic()
+                if stop_event.wait(min(0.1, remaining)):
+                    _acp_notify(action_id, "cancelled", {
+                        "action": "move", "duration": duration,
+                        "reason": "Timed move stopped by stop_move or card shutdown"})
+                    return
                 if time.monotonic() < deadline:
                     ret = self.proxy.Move(vx, vy, yaw)
                     if ret != 0:
-                        break
+                        _acp_notify(action_id, "error", {
+                            "action": "move", "ret": ret, "rpc_ret": ret,
+                            "duration": duration,
+                            "error": "Timed Move failed",
+                            "reason": "The sport controller stopped accepting the velocity command",
+                            "suggested_actions": ["get_state", "stop_move"]})
+                        return
         finally:
-            self.proxy.StopMove()
-        _acp_notify(action_id, "completed" if ret == 0 else "error",
-                    {"action": "move", "ret": ret, "duration": duration})
-        self._finish_transition(stop_event)
+            try:
+                self.proxy.StopMove()
+            finally:
+                self._finish_transition(stop_event)
+        _acp_notify(action_id, "completed",
+                    {"action": "move", "ret": 0, "duration": duration,
+                     "reason": "requested duration elapsed"})
 
     def _move_error_for_state(self, state):
         if state in self._DOWN:
@@ -567,6 +581,8 @@ class LocoPlugin:
         if action == "move":
             vx, vy, yaw = max(-1.5, min(1.5, float(args.get("vx", 0)))), max(-1, min(1, float(args.get("vy", 0)))), max(-2, min(2, float(args.get("vyaw", 0))))
             duration = args.get("duration")
+            if duration == 0:
+                duration = None
             if duration is not None:
                 duration = float(duration)
                 if not math.isfinite(duration) or duration > 30:
@@ -606,17 +622,62 @@ class LocoPlugin:
                           "suggested_actions": ["get_state", "stop_move"]})}
             duration = float(duration)
             if duration == -1:
-                self._continuous(vx, vy, yaw); return {"ret": 0, "status": "running", "duration": -1}
+                self._cancel_transition()
+                self._stop_continuous()
+                action_id = f"as2w_loco_{uuid4().hex[:8]}"
+                stop_event = threading.Event()
+                with self._lock:
+                    self._stop = stop_event
+                ret = self.proxy.Move(vx, vy, yaw)
+                if ret != 0:
+                    with self._lock:
+                        if self._stop is stop_event:
+                            self._stop = None
+                    return {"ret": ret, "rpc_ret": ret, "accepted": False,
+                            "action": "move", "current_state": state_name,
+                            "error": "Continuous Move was rejected",
+                            "reason": "The sport controller refused the velocity command",
+                            "suggested_actions": ["get_state", "stop_move"]}
+                threading.Thread(target=self._run_continuous_move,
+                                 args=(action_id, vx, vy, yaw, stop_event),
+                                 daemon=True, name="as2w-loco-continuous-move").start()
+                return {"ret": 0, "accepted": True, "status": "running",
+                        "action": "move", "action_id": action_id,
+                        "current_state": state_name, "duration": -1}
             if duration < 0: return {"ret": -1, "message": "duration must be -1, 0, or positive"}
-            self._stop_continuous(); ret = self.proxy.Move(vx, vy, yaw); time.sleep(duration); self.proxy.StopMove(); return {"ret": ret, "duration": duration}
+            self._stop_continuous()
+            ret = self.proxy.Move(vx, vy, yaw)
+            if ret != 0:
+                return {"ret": ret, "rpc_ret": ret, "accepted": False,
+                        "action": "move", "current_state": state_name,
+                        "error": "Timed Move was rejected",
+                        "reason": "The sport controller refused the velocity command",
+                        "suggested_actions": ["get_state", "stop_move"]}
+            action_id = f"as2w_loco_{uuid4().hex[:8]}"
+            stop_event = threading.Event()
+            with self._lock:
+                self._transition_stop = stop_event
+            threading.Thread(target=self._run_timed_move,
+                             args=(action_id, vx, vy, yaw, duration, stop_event),
+                             daemon=True, name="as2w-loco-timed-move").start()
+            return {"ret": 0, "accepted": True, "status": "running",
+                    "action": "move", "action_id": action_id,
+                    "current_state": state_name, "duration": duration}
         if action == "stop_move":
             self._cancel_transition()
             self._stop_continuous()
             ret = self.proxy.StopMove()
-            return {"ret": ret, "accepted": ret == 0, "action": action,
-                    **({} if ret == 0 else {"error": "StopMove was rejected",
-                      "reason": "The controller is not accepting stop commands",
-                      "suggested_actions": ["get_state", "recovery_stand"]})}
+            if ret != 0:
+                return {"ret": ret, "rpc_ret": ret, "accepted": False,
+                        "action": action, "error": "StopMove was rejected",
+                        "reason": "SportClient did not accept the stop command",
+                        "suggested_actions": ["get_state", "retry_stop"]}
+            action_id = f"as2w_loco_{uuid4().hex[:8]}"
+            threading.Thread(target=self._await_stopped,
+                             args=(action_id,), daemon=True,
+                             name="as2w-loco-await-stopped").start()
+            return {"ret": 0, "accepted": True, "status": "stopping",
+                    "action": action, "action_id": action_id}
         methods = {"stand_up": ("StandUp", "STAND_UP"), "stand_down": ("StandDown", "STAND_DOWN"), "balance_stand": ("BalanceStand", "BALANCE_STAND"), "recovery_stand": ("RecoveryStand", "RECOVERY_STAND")}
         if action in methods:
             self._cancel_transition()
@@ -697,6 +758,53 @@ class LocoPlugin:
                     "reason": "SportClient.GetState did not return a state",
                     "suggested_actions": ["retry", "recovery_stand"]}
         return None
+
+    def _run_timed_move(self, action_id, vx, vy, yaw, duration, stop_event):
+        self._run_move_after_transition(action_id, vx, vy, yaw, duration,
+                                        stop_event, move_already_sent=True)
+
+    def _run_continuous_move(self, action_id, vx, vy, yaw, stop_event):
+        try:
+            while not stop_event.wait(0.1):
+                ret = self.proxy.Move(vx, vy, yaw)
+                if ret != 0:
+                    _acp_notify(action_id, "error", {
+                        "action": "move", "ret": ret, "rpc_ret": ret,
+                        "error": "Continuous Move failed",
+                        "reason": "The sport controller stopped accepting the velocity command",
+                        "suggested_actions": ["get_state", "stop_move"]})
+                    return
+        finally:
+            with self._lock:
+                if self._stop is stop_event:
+                    self._stop = None
+            self._finish_transition(stop_event)
+        _acp_notify(action_id, "cancelled", {
+            "action": "move", "ret": 0, "duration": -1,
+            "reason": "Continuous move stopped by stop_move or card shutdown"})
+
+    def _await_stopped(self, action_id):
+        deadline = time.monotonic() + 5.0
+        last_state = "UNKNOWN"
+        while time.monotonic() < deadline:
+            name, state, error = self._read_state()
+            if error:
+                _acp_notify(action_id, "error", {
+                    **error, "action": "stop_move",
+                    "reason": "StopMove was accepted, but state confirmation failed"})
+                return
+            last_state = name
+            if not self._is_moving(name):
+                _acp_notify(action_id, "completed", {
+                    "action": "stop_move", "ret": 0,
+                    "state": state, "reason": "controller left walking state"})
+                return
+            time.sleep(0.1)
+        _acp_notify(action_id, "error", {
+            "action": "stop_move", "ret": 0, "current_state": last_state,
+            "error": "StopMove was accepted but robot still reports walking",
+            "reason": "The controller has not left AI_FREE_WALK within 5 seconds",
+            "suggested_actions": ["get_state", "retry_stop"]})
 
 
 class SpecialActionPlugin:

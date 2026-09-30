@@ -23,7 +23,7 @@ _SOURCE_TIMEOUT_SECONDS = 1.5
 # A large Livox frame is expensive to decode in Python.  The dashboard has no
 # useful visual benefit from all source points, while a smaller uniform sample
 # makes it substantially more likely that the displayed frame is the latest.
-_MAX_RENDER_POINTS = 12000
+_MAX_RENDER_POINTS = 2000
 # Official As2W URDF JT128 fixed joint: rpy=(-pi, 1.4661, -pi).
 # This maps points from the lidar frame into the As2W base frame.  Keeping the
 # values explicit avoids pulling numpy into the latency-sensitive bridge.

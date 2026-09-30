@@ -81,11 +81,14 @@ worker serializes and publishes the newest joint and locomotion samples instead
 of draining stale samples. The microphone's multicast receiver publishes
 compliant 16 kHz mono PCM frames.
 
-The lidar conversion worker is isolated from the main process so large Livox
-frames cannot consume the CPU or DDS callback time budget used by joints and
+The lidar conversion worker is isolated from the DDS callback and uses a bounded
+latest-frame queue. It intentionally renders at most 2,000 points per frame so
+large Livox packets do not consume the CPU budget needed by joints and
 locomotion state. RGB camera RPC polling and JPEG publication also use separate
 workers with a one-frame latest-value queue; a slow or unavailable snapshot does
-not build a stale frame backlog.
+not build a stale frame backlog. The camera RPC remains firmware-dependent: a
+videohub timeout means the firmware did not return a frame, not that the ROS
+publisher is buffering old frames.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.
