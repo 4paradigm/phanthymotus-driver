@@ -342,6 +342,18 @@ class TestDriverContracts(unittest.TestCase):
             data=list(b"\x01\x00\xff\xff\x01\x00\xff\xff")))
         self.assertIs(self.device._SPEAKER_EOF, node._queue.get_nowait())
 
+    def test_speaker_accepts_agent_core_pcm_format_alias(self):
+        node = self.device._SpeakerNode.__new__(self.device._SpeakerNode)
+        import queue
+        node._queue = queue.Queue(maxsize=2)
+        node.state = "ready"
+        node.blocks_received = 0
+        node.last_chunk_ts = 0.0
+        node._record_play_error = lambda *args: None
+        node._on_chunk(types.SimpleNamespace(
+            format="pcm_16k_16bit_mono", data=[0, 1, 2, 3]))
+        self.assertEqual(b"\x00\x01\x02\x03", node._queue.get_nowait())
+
     def test_timed_move_keeps_confirmed_standing_hint_when_firmware_label_is_stale(self):
         class _StaleAfterBalanceProxy(_Proxy):
             def BalanceStand(self):
@@ -470,8 +482,12 @@ class TestDriverContracts(unittest.TestCase):
         proxy.BodyHeight = lambda value: setattr(proxy, "height", value) or 0
         result = plugin.dispatch("body_height", {"height": 0.18})
         self.assertTrue(result["accepted"])
-        self.assertAlmostEqual(-0.17, proxy.height)
-        self.assertAlmostEqual(-0.17, result["sdk_offset_m"])
+        self.assertAlmostEqual(0.18, proxy.height)
+        self.assertAlmostEqual(0.18, result["sdk_height_m"])
+        result = plugin.dispatch("body_height", {"height": 0.35})
+        self.assertTrue(result["accepted"])
+        self.assertAlmostEqual(0.35, proxy.height)
+        self.assertAlmostEqual(0.35, result["sdk_height_m"])
 
     def test_loco_state_marks_zero_height_in_passive_mode_invalid(self):
         node = self.device._StateNode.__new__(self.device._StateNode)

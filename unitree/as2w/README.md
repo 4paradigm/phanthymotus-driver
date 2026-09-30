@@ -154,11 +154,10 @@ accepted standing normalization as an internal state anchor, so a later
 firmware label. A new `move` or posture transition replaces the anchor.
 `body_height` takes an explicit absolute target in meters, for example
 `{"action":"body_height","height":0.35}`. The public range is `0.17` to
-`0.38` m; `0.35` m represents the default high stand-up height
-and `0.38` m is the maximum target. Unitree's
-`BodyHeight` SDK parameter is a relative offset from that default, so the
-driver sends `height - 0.35` (the SDK range is approximately `[-0.18, 0.03]`
-m). The response includes both `height_m` and `sdk_offset_m`.
+`0.35` m; `0.35` m represents approximately the high stand-up height. AS2's
+`BodyHeight` SDK parameter is the target height itself, unlike the relative
+offset convention used by some Go2 SDKs, so the driver sends the requested
+height directly. The response includes both `height_m` and `sdk_height_m`.
 
 The `loco_state.mode`/`mode_name` pair comes from the numeric
 `SportModeState.mode` field (`0=IDLE_DEFAULT_STAND`, `1=BALANCE_STAND`,
@@ -186,10 +185,12 @@ recovery, gives or removes joystick control, or enters/exits a side gait.
 exit. These motions are posture- and firmware-dependent and require a clear
 safety area.
 
-Speaker input is raw signed 16-bit little-endian mono PCM at 16 kHz. The
+Speaker input is raw signed 16-bit little-endian mono PCM at 16 kHz. It accepts
+both `audio/pcm-16k` and the existing Agent Core alias
+`pcm_16k_16bit_mono`. The
 speaker strips the TTS end-of-utterance marker (`01 00 ff ff 01 00 ff ff`)
 instead of sending it to the robot, flushes each utterance at that boundary,
-and forwards approximately 100 ms blocks to keep latency bounded.
+and forwards approximately 300 ms blocks required by AS2 voice startup.
 
 ## Review and validation notes
 

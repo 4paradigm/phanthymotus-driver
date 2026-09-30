@@ -47,8 +47,11 @@ _AS2_SPORT_MODE_NAMES = {
     11: "FRONT_FLIP", 12: "FRONT_JUMP", 13: "FRONT_POUNCE",
 }
 _BODY_HEIGHT_DEFAULT_M = 0.35
-_BODY_HEIGHT_MIN_M = _BODY_HEIGHT_DEFAULT_M - 0.18
-_BODY_HEIGHT_MAX_M = _BODY_HEIGHT_DEFAULT_M + 0.03
+# A2/AS2 BodyHeight is an absolute controller target.  Do not apply the
+# Go2-relative [-0.18, 0.03] mapping here: the AS2 SDK example itself calls
+# BodyHeight(0.18), and the robot's high stand target is approximately 0.35 m.
+_BODY_HEIGHT_MIN_M = 0.17
+_BODY_HEIGHT_MAX_M = 0.35
 _MIC_GROUP = "239.168.123.161"
 _MIC_PORT = 5555
 _MIC_CHUNK_BYTES = 1024
@@ -620,7 +623,7 @@ class LocoPlugin:
                     "stop_move": {"params": [], "description": "Stop movement."},
                     "stand_up": {"params": [], "description": "Stand up."}, "stand_down": {"params": [], "description": "Stand down."},
                     "balance_stand": {"params": [], "description": "Balance stand."}, "recovery_stand": {"params": [], "description": "Recovery stand."},
-                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set absolute body height target in meters; supported range is 0.17-0.38 m. 0.35 m is the default stand-up height and 0.38 m is the SDK's maximum +0.03 m offset."},
+                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set AS2 absolute body height target in meters; supported range is 0.17-0.35 m. 0.35 m is approximately the high stand-up height and is passed directly to the AS2 SDK."},
                     "body_position": {"params": ["x", "y", "z", "yaw"], "description": "Set body position offset."},
                     "switch_joystick": {"params": ["flag"], "description": "true hands control to the wireless joystick; false disables it."}, "left_side_gait": {"params": ["flag"], "description": "Enter or exit left-side gait; true enters, false exits."},
                     "right_side_gait": {"params": ["flag"], "description": "Enter or exit right-side gait; true enters, false exits."}, "auto_recovery": {"params": ["flag"], "description": "Automatic fall recovery; true enables, false disables."},
@@ -893,12 +896,13 @@ class LocoPlugin:
                     action, state_name,
                     "BodyHeight requires a standing, non-walking posture",
                     ["stand_up", "balance_stand", "stop_move"])
-            # Unitree's BodyHeight argument is relative to the default
-            # standing height, not an absolute height in meters.
-            sdk_offset = height - _BODY_HEIGHT_DEFAULT_M
-            ret = self.proxy.BodyHeight(sdk_offset)
+            # AS2/A2's BodyHeight argument is the target height itself.  This
+            # differs from the relative-offset convention used by some Go2
+            # SDKs and is why 0.35 must reach the SDK as 0.35, not as zero.
+            sdk_height = height
+            ret = self.proxy.BodyHeight(sdk_height)
             result = {"ret": ret, "accepted": ret == 0, "action": action,
-                      "height_m": height, "sdk_offset_m": sdk_offset,
+                      "height_m": height, "sdk_height_m": sdk_height,
                       "current_state": state_name}
             if ret != 0:
                 result.update({"rpc_ret": ret,
@@ -1163,9 +1167,10 @@ _AS2_JOINT_NAMES = [
 
 
 MIC_AUDIO_FORMAT = "audio/pcm-16k"
+_AUDIO_FORMAT_ALIASES = {MIC_AUDIO_FORMAT, "pcm_16k_16bit_mono"}
 SPEAKER_APP_NAME = "as2w_speaker"
 _AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
-SPEAKER_BLOCK_BYTES = 3200  # 100 ms at 16 kHz, 16-bit, mono.
+SPEAKER_BLOCK_BYTES = 9600  # 300 ms at 16 kHz, 16-bit, mono; AS2 voice startup needs a full frame.
 SPEAKER_QUEUE_BLOCKS = 8  # Keep the live stream below 800 ms of queued audio.
 _SPEAKER_EOF = object()
 
@@ -1432,7 +1437,7 @@ class _SpeakerNode:
         import queue
         payload = bytes(getattr(msg, "data", []))
         fmt = str(getattr(msg, "format", "") or "")
-        if fmt and fmt != MIC_AUDIO_FORMAT:
+        if fmt and fmt not in _AUDIO_FORMAT_ALIASES:
             self._record_play_error("format", f"unsupported AudioChunk format {fmt[:80]}")
             return
         if payload:
