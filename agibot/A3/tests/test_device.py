@@ -1148,6 +1148,29 @@ class RpcDispatchTests(unittest.TestCase):
         # rejected before any RPC reached the robot
         self.assertEqual(self.transport.calls_to("MotionCommandService", "SendMotionCommand"), [])
 
+    def test_motion_play_play_nonzero_header_code_raises_without_arming(self):
+        # 8th PR review: a rejected SendMotionCommand (nonzero vendor header.code)
+        # must raise instead of returning state=playing — otherwise the ACP
+        # worker later reports completed for a motion the robot never started.
+        self.transport.responses["MotionCommandService/SendMotionCommand"] = {
+            "header": {"code": "3001", "msg": "motion not found"}}
+        motion = find_plugin(self.plugins, "motion_play")
+        with self.assertRaises(device.RpcError) as ctx:
+            motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                     "duration_ms": 5000})
+        self.assertIn("3001", str(ctx.exception))
+        # no completion worker armed → framework stop reports idle, nothing posted
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            self.assertEqual(motion.dispatch("stop", {}), {"state": "idle"})
+            time.sleep(0.3)
+            self.assertEqual(captured, [])
+        finally:
+            device._acp_notify = original_notify
+
     def test_motion_play_play_unparseable_state_is_permissive(self):
         # Same permissive-on-unparseable policy as the loco/arm gates: an
         # unrecognised GetAction body must not lock the operator out.
@@ -1347,10 +1370,37 @@ class RpcDispatchTests(unittest.TestCase):
         spatial = find_plugin(self.plugins, "controlled_spatial")
         self.transport.responses["MappingService"] = {
             "data": {"resolution": 0.05, "origin": {"x": 100, "y": 200}}}
-        result = spatial.dispatch("get_map", {"map_id": 1, "x": 2.0, "y": 4.0})
-        # pixel_x = 100 + 2.0*0.05 = 100.1 -> 100 ; pixel_y = 200 - 4.0*0.05 = 199.8 -> 199
-        self.assertEqual(result["pixel"]["x"], 100)
-        self.assertEqual(result["pixel"]["y"], 199)
+        result = spatial.dispatch("get_map", {"map_id": 1, "x": 101.0, "y": 199.0})
+        # 8th PR review: world→pixel is the INVERSE of the map transform —
+        # subtract the metric origin, divide by resolution (row 0 = highest y):
+        # pixel_x = (101 - 100)/0.05 = 20 ; pixel_y = (200 - 199)/0.05 = 20
+        self.assertEqual(result["pixel"]["x"], 20)
+        self.assertEqual(result["pixel"]["y"], 20)
+
+    def test_controlled_spatial_get_map_pixel_inverse_of_map_transform(self):
+        # Round-trip: publishing maps grid cell (row, col) to world
+        # (origin + (idx + 0.5)*res, origin - (idx + 0.5)*res); querying a
+        # point inside that cell must land back on it. Query slightly inward
+        # from the centre so the round() is unambiguous.
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        mapping = find_plugin(self.plugins, "spatial_map")
+        response = {"data": {
+            "resolution": 0.05, "origin": {"x": 100, "y": 200},
+            "occupancy_grid": [[127, 0], [0, 127]]}}
+        mapping.publish_map(response)
+        pub = self.nodes.core.publishers["/test_ns/agibot_a3/spatial_map"]
+        (msg,) = pub.published
+        buf = bytes(msg.data)
+        header_size = struct.calcsize("<fffBI")
+        # only floor point: row 0, col 0 → world (100.025, 199.975)
+        wx, wy, _ = struct.unpack_from("<fff", buf, header_size)
+        self.assertAlmostEqual(wx, 100 + 0.5 * 0.05, places=4)
+        self.assertAlmostEqual(wy, 200 - 0.5 * 0.05, places=4)
+        self.transport.responses["MappingService"] = response
+        result = spatial.dispatch("get_map", {"map_id": 0, "x": wx - 0.02, "y": wy + 0.02})
+        # continuous pixel (0.1, 0.1) → cell (0, 0)
+        self.assertEqual(result["pixel"]["x"], 0)
+        self.assertEqual(result["pixel"]["y"], 0)
 
     def test_auto_charging_start(self):
         charging = find_plugin(self.plugins, "auto_charging")
@@ -1690,7 +1740,8 @@ class SpatialMapTests(unittest.TestCase):
         header_size = struct.calcsize("<fffBI")
         px, py, pz = struct.unpack_from("<fff", buf, header_size)
         self.assertAlmostEqual(px, 100 + 0.5 * 0.05, places=4)
-        self.assertAlmostEqual(py, 200 + 0.5 * 0.05, places=4)
+        # grid row 0 is the highest y: world_y = origin_y - 0.5*res
+        self.assertAlmostEqual(py, 200 - 0.5 * 0.05, places=4)
         self.assertAlmostEqual(pz, -0.03, places=5)
 
         # trailing meta JSON (version 3, no robot pose available)

@@ -223,6 +223,10 @@ def create_header(control_source: str = "ControlSource_SAFE") -> dict:
     }
 
 
+class RpcError(RuntimeError):
+    """Vendor RPC rejected the request (nonzero header.code in the response)."""
+
+
 class RpcClient:
     """Thin POST-only JSON RPC client aimed at one compute unit.
 
@@ -245,6 +249,17 @@ class RpcClient:
             response = requests.post(url, json=body, timeout=self.timeout).json()
         if not isinstance(response, dict):
             raise ValueError(f"{service}/{method}: non-dict response {response!r}")
+        # Vendor protocol signals failures via header.code — an HTTP 200 with a
+        # nonzero code means the robot REJECTED the command. Raising here keeps
+        # callers from treating the rejection as success (e.g. motion_play must
+        # not arm its completion worker and later report completed for a motion
+        # the robot never started).
+        if not _header_ok(response):
+            header = response.get("header") or {}
+            message = header.get("msg") or header.get("message") or ""
+            raise RpcError(
+                f"{service}/{method} 拒绝请求: header.code={header.get('code')!r}"
+                f" msg={message!r}")
         return response
 
 
@@ -2733,10 +2748,16 @@ class ControlledSpatialPlugin:
                 origin = data.get("origin") or {}
                 origin_x = origin.get("x", 0) if isinstance(origin, dict) else 0
                 origin_y = origin.get("y", 0) if isinstance(origin, dict) else 0
-                px = int(origin_x + float(args.get("x", 0)) * resolution)
-                py = int(origin_y - float(args.get("y", 0)) * resolution)
+                # 逆变换 of the map transform (pixel → world used in
+                # spatial_map._grid_layers): world → pixel must SUBTRACT the
+                # metric origin and DIVIDE by resolution, not add/multiply.
+                # Row 0 of the occupancy grid is the highest y (grid rows grow
+                # downward), hence the y-axis inversion.
+                px = int(round((float(args.get("x", 0)) - origin_x) / resolution))
+                py = int(round((origin_y - float(args.get("y", 0))) / resolution))
                 result["pixel"] = {"x": px, "y": py,
-                                   "formula": "pixel_x = origin_x + x*resolution; pixel_y = origin_y - y*resolution"}
+                                   "formula": "pixel_x = round((x - origin_x) / resolution); "
+                                              "pixel_y = round((origin_y - y) / resolution)"}
             return result
         raise ValueError(f"controlled_spatial: unknown action {action!r}")
 
@@ -2902,8 +2923,11 @@ class SpatialMapPlugin:
             stride = max(1, int(math.ceil(math.sqrt(len(row_idx) / max(limit, 1)))))
             keep = (row_idx % stride == 0) & (col_idx % stride == 0)
             row_idx, col_idx = row_idx[keep], col_idx[keep]
+            # Grid rows grow downward (row 0 = highest y): world_x = origin_x +
+            # (col + 0.5) * resolution, world_y = origin_y - (row + 0.5) *
+            # resolution. get_map's world→pixel branch is the exact inverse.
             xs = origin_x + (col_idx + 0.5) * resolution
-            ys = origin_y + (row_idx + 0.5) * resolution
+            ys = origin_y - (row_idx + 0.5) * resolution
             zs = np.full(len(xs), z, dtype=np.float32)
             return np.column_stack((xs, ys, zs)).astype(np.float32)
 
