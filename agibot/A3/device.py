@@ -191,9 +191,12 @@ RESOURCE_TYPE_NAMES = {
 # to zlib-compressed uint16 (both per README_dev's recommended patterns; the raw
 # sensor_msgs/Image mirror would also cost 614KB/frame on the depth channel).
 CAMERA_TOPICS = {
-    "head_left_fisheye": ("/hal/head_front_left_fisheye_camera/image", "image/jpeg", "头部左鱼眼相机 RGB"),
-    "head_right_fisheye": ("/hal/head_front_right_fisheye_camera/image", "image/jpeg", "头部右鱼眼相机 RGB"),
-    "head_rear_fisheye": ("/hal/head_front_dual_fisheye_camera/image", "image/jpeg", "头部后鱼眼相机 RGB"),
+    # A3 runtime names these as <side>_fisheye_camera/rgb. The similarly named
+    # head_front_*_camera/image paths are documented variants with no publisher
+    # on the deployed Ultra unit.
+    "head_left_fisheye": ("/hal/head_left_fisheye_camera/rgb", "image/jpeg", "头部左鱼眼相机 RGB"),
+    "head_right_fisheye": ("/hal/head_right_fisheye_camera/rgb", "image/jpeg", "头部右鱼眼相机 RGB"),
+    "head_rear_fisheye": ("/hal/head_dual_fisheye_camera/rgb", "image/jpeg", "头部后鱼眼相机 RGB"),
     "chest_front_d457_rgb": ("/hal/chest_front_d457_camera/rgb", "image/jpeg", "胸前 D457 相机 RGB"),
     "chest_front_d457_depth": ("/hal/chest_front_d457_camera/depth", "image/depth-zlib", "胸前 D457 相机深度"),
     "waist_front_d415_rgb": ("/hal/waist_front_d415_camera/rgb", "image/jpeg", "腰前 D415 相机 RGB"),
