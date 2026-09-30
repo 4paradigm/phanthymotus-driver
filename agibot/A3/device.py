@@ -49,6 +49,33 @@ def _core_topic(namespace: str, suffix: str) -> str:
     return f"/{namespace.strip('/')}/{suffix.lstrip('/')}"
 
 
+def _flatten_json(value, prefix, output):
+    """Flatten ROS JSON objects into scalar dashboard fields."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _flatten_json(item, f"{prefix}_{key}" if prefix else str(key), output)
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _flatten_json(item, f"{prefix}_{index}", output)
+    else:
+        output[prefix] = value
+
+
+def _flatten_joint_group(group, prefix, output):
+    if not isinstance(group, dict):
+        return
+    names = group.get("name") or []
+    fields = {field: group.get(field) or [] for field in ("position", "velocity", "effort")}
+    for index, name in enumerate(names):
+        safe_name = str(name).replace("/", "_")
+        for field, values in fields.items():
+            if index < len(values):
+                output[f"{prefix}_{safe_name}_{field}"] = values[index]
+    for field, item in group.items():
+        if field not in ("name", "position", "velocity", "effort"):
+            _flatten_json(item, f"{prefix}_{field}", output)
+
+
 def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
     """POST action completion to Agent Core (module-level ACP helper)."""
     import urllib.request as _urllib
@@ -738,9 +765,7 @@ class A3Nodes:
         raw = {}
         for prefix, group in (("arm", groups["arm_state"]), ("hand", groups["hand_state"]),
                               ("neck", groups["neck_state"])):
-            if isinstance(group, dict):
-                for field, value in group.items():
-                    raw[f"{prefix}_{field}"] = value
+            _flatten_joint_group(group, prefix, raw)
         output = self._String()
         output.data = json.dumps(raw, ensure_ascii=False)
         self._joint_state_pub.publish(output)
@@ -765,9 +790,7 @@ class A3Nodes:
         payload = {}
         for prefix, key in (("pelvis", "imu_pelvis"), ("torso", "imu_torso")):
             value = self.values.get(key, {})
-            if isinstance(value, dict):
-                for field, item in value.items():
-                    payload[f"{prefix}_{field}"] = item
+            _flatten_json(value, prefix, payload)
         output = self._String()
         output.data = json.dumps(payload, ensure_ascii=False)
         self._imu_pub.publish(output)
