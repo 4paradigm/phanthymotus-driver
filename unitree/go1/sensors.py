@@ -1053,6 +1053,40 @@ _MIN_RUNTIME_OBSERVATION_S = 60.0
 _MIN_RUNTIME_SOC_DROP = 3.0
 
 
+def _power_monitor_headers(data: dict) -> dict:
+    """Compact ROS display; MCP info retains the complete diagnostic data."""
+    status = "正常" if data.get("available") else f"数据不可用：{data.get('reason', 'unknown')}"
+    return {"timestamp_ms": data["timestamp_ms"],
+            "control_level": data["control_level"],
+            "fresh": data["fresh"], "status": status}
+
+
+def _battery_power_monitor(data: dict) -> dict:
+    out = _power_monitor_headers(data)
+    for field in ("soc_percent", "power_w", "voltage_v", "current_a", "direction",
+                  "discharged_since_start_wh", "charged_since_start_wh",
+                  "remaining_runtime_minutes"):
+        # Keep stable keys: the latest-value renderer must clear old readings
+        # when telemetry becomes unavailable rather than retaining stale values.
+        out[field] = data.get(field)
+    if data.get("available") and data.get("remaining_runtime_minutes") is None:
+        reason = data.get("runtime_estimate_reason")
+        note = {"insufficient_soc_history": "续航观察中",
+                "soc_unavailable": "电量百分比不可用",
+                "not_discharging": "非放电状态，暂无续航预测"}.get(reason, "续航暂不可用")
+        out["status"] = f"数据正常；{note}"
+    return out
+
+
+def _joint_power_monitor(data: dict) -> dict:
+    out = _power_monitor_headers(data)
+    powers = {joint["name"]: joint["mechanical_power_w"]
+              for joint in data.get("joints", [])} if data.get("available") else {}
+    # A map renders as one row per joint, without torque/speed/index clutter.
+    out["estimated_mechanical_power_w"] = {name: powers.get(name) for name in JOINT_NAMES}
+    return out
+
+
 def _sample_time(snap: dict, now: float) -> float | None:
     """Return a recent source timestamp; a read-time timestamp is not enough."""
     if not snap.get("fresh"):
@@ -1259,7 +1293,7 @@ class BatteryPowerPlugin:
                 return
             try:
                 msg = String()
-                msg.data = json.dumps(self._read_latest())
+                msg.data = json.dumps(_battery_power_monitor(self._read_latest()), ensure_ascii=False)
                 self._pub.publish(msg)
             except Exception as e:
                 self._node.get_logger().error(f"publish {self._topic} error: {e}")
@@ -1366,7 +1400,8 @@ class JointPowerPlugin:
     def _tick(self):
         try:
             msg = String()
-            msg.data = json.dumps(_build_joint_power(self._client.snapshot()))
+            msg.data = json.dumps(_joint_power_monitor(
+                _build_joint_power(self._client.snapshot())), ensure_ascii=False)
             self._pub.publish(msg)
         except Exception as e:
             self._node.get_logger().error(f"publish {self._topic} error: {e}")

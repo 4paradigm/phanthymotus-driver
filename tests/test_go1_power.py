@@ -1,8 +1,10 @@
 """Go1 power cards: units, source freshness, outage handling and registration."""
 
+import json
 import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -227,6 +229,80 @@ def test_joint_power_is_mechanical_and_rejects_stale_or_incomplete_data():
     assert power._build_joint_power(snap, now=103.0)["reason"] == "stale_or_missing_sample"
     snap["joints"] = joints[:11]
     assert power._build_joint_power(snap, now=100.1)["reason"] == "incomplete_joint_state"
+
+
+class CapturePublisher:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, msg):
+        self.messages.append(json.loads(msg.data))
+
+
+def test_battery_topic_is_compact_and_details_remain_available(monkeypatch):
+    monkeypatch.setattr(power, "String", SimpleNamespace, raising=False)
+    monkeypatch.setattr(power.time, "monotonic", lambda: 100.1)
+    card = power.BatteryPowerPlugin({}, "test", None, StubClient())
+    card._pub = CapturePublisher()
+    card._sample(battery_snap(100.0), now=100.1)
+    card._tick()
+    monitor = card._pub.messages[-1]
+    assert monitor["power_w"] == 216.0
+    assert monitor["soc_percent"] == 80
+    assert monitor["remaining_runtime_minutes"] is None
+    assert "续航观察中" in monitor["status"]
+    assert {"timestamp_ms", "control_level", "fresh"} <= monitor.keys()
+    hidden = {"runtime_estimate_method", "measurement_kind", "energy_scope",
+              "sample_monotonic_s", "cell_voltage_indices", "cell_voltage_mv",
+              "unused_cell_voltage_mv", "voltage_source", "covered_duration_s"}
+    assert not hidden.intersection(monitor)
+    details = card.dispatch("info", {})["data"]
+    assert hidden <= details.keys()
+    assert details["cell_count"] == 6
+
+    # Transition to invalid data must clear instantaneous readings, keep totals
+    # and replace status, even in a renderer that retains keys from prior frames.
+    card._sample(battery_snap(101.0), now=101.1)
+    card._sample(battery_snap(102.0, cell_mv=0), now=102.1)
+    card._tick()
+    invalid = card._pub.messages[-1]
+    assert invalid.keys() == monitor.keys()
+    assert invalid["power_w"] is None and invalid["voltage_v"] is None
+    assert invalid["fresh"] is False
+    assert "invalid_bms_values" in invalid["status"]
+    assert invalid["discharged_since_start_wh"] == 0.06
+
+
+def test_joint_topic_shows_named_power_rows_and_clears_invalid_values(monkeypatch):
+    monkeypatch.setattr(power, "String", SimpleNamespace, raising=False)
+    monkeypatch.setattr(power.time, "monotonic", lambda: 100.1)
+    snap = {"fresh": True, "sample_monotonic_s": 100.0,
+            "joints": [{"tau": 2.0, "dq": 3.0} for _ in range(12)]}
+
+    class Client:
+        def snapshot(self):
+            return snap
+
+    card = power.JointPowerPlugin({}, "test", None, Client())
+    card._pub = CapturePublisher()
+    card._tick()
+    monitor = card._pub.messages[-1]
+    assert monitor["status"] == "正常"
+    assert set(monitor["estimated_mechanical_power_w"]) == set(power.JOINT_NAMES)
+    assert set(monitor["estimated_mechanical_power_w"].values()) == {6.0}
+    assert "joints" not in monitor and "measurement_kind" not in monitor
+    assert "electrical_power_available" not in monitor
+    details = card.dispatch("info", {})["data"]
+    assert details["joints"][0]["estimated_torque_nm"] == 2.0
+    assert details["electrical_power_available"] is False
+    snap["fresh"] = False
+    card._tick()
+    invalid = card._pub.messages[-1]
+    assert invalid.keys() == monitor.keys()
+    assert set(invalid["estimated_mechanical_power_w"]) == set(power.JOINT_NAMES)
+    assert all(value is None for value in invalid["estimated_mechanical_power_w"].values())
+    assert invalid["fresh"] is False
+    assert "stale_or_missing_sample" in invalid["status"]
 
 
 @pytest.mark.parametrize("filename", ["config.yaml", "driver.yaml"])
