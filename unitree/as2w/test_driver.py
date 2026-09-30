@@ -545,6 +545,16 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIsNone(plugin._stop)
         plugin.stop()
 
+    def test_stop_move_normalizes_ai_free_walk_before_acp_completion(self):
+        proxy = _Proxy()
+        proxy.state = "AI_FREE_WALK"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify") as notify:
+            plugin._await_stopped("as2w_loco_stop_test")
+        self.assertEqual(1, proxy.balance_stands)
+        self.assertEqual("completed", notify.call_args.args[1])
+        self.assertEqual("stop_move", notify.call_args.args[2]["action"])
+
     def test_loco_continuous_transition_reports_move_rpc_failure(self):
         class _FailingMoveProxy(_Proxy):
             def Move(self, *args):

@@ -531,9 +531,10 @@ class LocoPlugin:
                 "action": "move", "duration": duration,
                 "reason": "Timed move stopped by stop_move or card shutdown"})
         else:
-            _acp_notify(action_id, "completed",
-                        {"action": "move", "ret": 0, "duration": duration,
-                         "reason": "requested duration elapsed and StopMove completed"})
+            self._await_stopped(
+                action_id, "move",
+                {"duration": duration,
+                 "reason": "requested duration elapsed and walking FSM stabilized"})
 
     def _move_error_for_state(self, state):
         if state in self._DOWN:
@@ -829,28 +830,43 @@ class LocoPlugin:
             "action": "move", "ret": 0, "duration": -1,
             "reason": "Continuous move stopped by stop_move or card shutdown"})
 
-    def _await_stopped(self, action_id):
-        deadline = time.monotonic() + 5.0
+    def _await_stopped(self, action_id, completed_action="stop_move", completion_extra=None):
+        """Leave the AS2 walking FSM before reporting an action terminal state."""
+        deadline = time.monotonic() + 8.0
         last_state = "UNKNOWN"
+        balance_requested = False
+        balance_ret = None
         while time.monotonic() < deadline:
             name, state, error = self._read_state()
             if error:
                 _acp_notify(action_id, "error", {
-                    **error, "action": "stop_move",
+                    **error, "action": completed_action,
                     "reason": "StopMove was accepted, but state confirmation failed"})
                 return
             last_state = name
             if not self._is_moving(name):
-                _acp_notify(action_id, "completed", {
-                    "action": "stop_move", "ret": 0,
-                    "state": state, "reason": "controller left walking state"})
+                result = {"action": completed_action, "ret": 0,
+                          "state": state, "reason": "controller left walking state"}
+                if completion_extra:
+                    result.update(completion_extra)
+                _acp_notify(action_id, "completed", result)
                 return
+            if not balance_requested:
+                # On AS2, StopMove may stop the velocity command while the FSM
+                # remains AI_FREE_WALK. BalanceStand is the documented safe
+                # bridge back to a posture from which StandDown is accepted.
+                balance_requested = True
+                balance_ret = self.proxy.BalanceStand()
+                print(f"[loco] stop stabilization action_id={action_id} state={name} BalanceStand ret={balance_ret}", flush=True)
+                if balance_ret != 0:
+                    break
             time.sleep(0.1)
         _acp_notify(action_id, "error", {
-            "action": "stop_move", "ret": 0, "current_state": last_state,
+            "action": completed_action, "ret": 0, "current_state": last_state,
+            "balance_ret": balance_ret,
             "error": "StopMove was accepted but robot still reports walking",
-            "reason": "The controller has not left AI_FREE_WALK within 5 seconds",
-            "suggested_actions": ["get_state", "retry_stop"]})
+            "reason": "The controller did not leave AI_FREE_WALK after StopMove and BalanceStand",
+            "suggested_actions": ["get_state", "retry_stop", "balance_stand"]})
 
     def _stop_move_worker(self, action_id):
         try:
