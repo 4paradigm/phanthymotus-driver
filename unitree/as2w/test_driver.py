@@ -329,6 +329,42 @@ class TestDriverContracts(unittest.TestCase):
         node._on_chunk(types.SimpleNamespace(data=b"new"))
         self.assertEqual([b"two", b"new"], [node._queue.get_nowait(), node._queue.get_nowait()])
 
+    def test_speaker_does_not_enqueue_tts_eof_as_pcm(self):
+        node = self.device._SpeakerNode.__new__(self.device._SpeakerNode)
+        import queue
+        node._queue = queue.Queue(maxsize=4)
+        node.state = "ready"
+        node.blocks_received = 0
+        node.last_chunk_ts = 0.0
+        node._record_play_error = lambda *args: None
+        node._on_chunk(types.SimpleNamespace(
+            format="audio/pcm-16k",
+            data=list(b"\x01\x00\xff\xff\x01\x00\xff\xff")))
+        self.assertIs(self.device._SPEAKER_EOF, node._queue.get_nowait())
+
+    def test_timed_move_keeps_confirmed_standing_hint_when_firmware_label_is_stale(self):
+        class _StaleAfterBalanceProxy(_Proxy):
+            def BalanceStand(self):
+                self.balance_stands += 1
+                return 0
+
+        proxy = _StaleAfterBalanceProxy()
+        proxy.state = "AI_FREE_WALK"
+        proxy.BodyHeight = lambda _offset: 0
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify"):
+            plugin._await_stopped("as2w_loco_timed_stale")
+        # The real firmware can retain AI_FREE_WALK indefinitely.  The
+        # accepted StopMove+BalanceStand transition remains the authoritative
+        # gate for the next posture/height command.
+        plugin._state_override_until = 0.0
+        name, state, error = plugin._read_state()
+        self.assertIsNone(error)
+        self.assertEqual("BALANCE_STAND", name)
+        self.assertEqual("AI_FREE_WALK", state["raw_fsm_name"])
+        result = plugin.dispatch("body_height", {"height": 0.35})
+        self.assertTrue(result["accepted"])
+
     def test_speaker_volume_and_led_action_parameters_are_explicit(self):
         speaker = self.device.SpeakerPlugin.__new__(self.device.SpeakerPlugin)
         speaker._node = types.SimpleNamespace(_client=types.SimpleNamespace(), state="idle", topic=None, blocks_sent=0)

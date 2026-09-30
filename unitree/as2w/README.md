@@ -148,7 +148,10 @@ After `StopMove`, some AS2 firmware keeps `GetState().fsm_name` at
 `AI_FREE_WALK` even though the velocity command has stopped. The driver
 reports a completed ACP result with `state_stale=true` after the accepted
 `BalanceStand` normalization instead of falsely leaving the action running;
-the observed state label is still included in the result.
+the observed state label is still included in the result. It also keeps that
+accepted standing normalization as an internal state anchor, so a later
+`body_height`, `stand_up`, or `balance_stand` is not blocked by a stale
+firmware label. A new `move` or posture transition replaces the anchor.
 `body_height` takes an explicit absolute target in meters, for example
 `{"action":"body_height","height":0.35}`. The public range is `0.17` to
 `0.38` m; `0.35` m represents the default high stand-up height
@@ -182,6 +185,11 @@ recovery, gives or removes joystick control, or enters/exits a side gait.
 `handstand` and `biped_stand` use `enter: true` to enter and `enter: false` to
 exit. These motions are posture- and firmware-dependent and require a clear
 safety area.
+
+Speaker input is raw signed 16-bit little-endian mono PCM at 16 kHz. The
+speaker strips the TTS end-of-utterance marker (`01 00 ff ff 01 00 ff ff`)
+instead of sending it to the robot, flushes each utterance at that boundary,
+and forwards approximately 100 ms blocks to keep latency bounded.
 
 ## Review and validation notes
 

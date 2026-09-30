@@ -333,6 +333,11 @@ class LocoPlugin:
         self._transition_thread = None
         self._state_override = None
         self._state_override_until = 0.0
+        # AS2 firmware may keep reporting AI_FREE_WALK after StopMove and a
+        # successful BalanceStand.  This is a controller-label lag, not proof
+        # that velocity is still active.  Keep the accepted terminal posture
+        # as a state anchor until a new motion/posture command supersedes it.
+        self._state_hint = None
 
     _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING",
                  "AI_STAND_UP", "AI_BALANCE_STAND", "AI_RECOVERY_STAND"}
@@ -369,8 +374,9 @@ class LocoPlugin:
         raw_name = str(state.get("fsm_name", "")).strip().upper()
         name = raw_name
         if (raw_name in {"AI_FREE_WALK", "FREE_WALK"} and
-                self._state_override == "BALANCE_STAND" and
-                time.monotonic() < self._state_override_until):
+                (self._state_hint == "BALANCE_STAND" or
+                 (self._state_override == "BALANCE_STAND" and
+                  time.monotonic() < self._state_override_until))):
             state = dict(state)
             state["raw_fsm_name"] = raw_name
             state["fsm_name"] = "BALANCE_STAND"
@@ -722,6 +728,11 @@ class LocoPlugin:
             self._cancel_transition()
             self._state_override = None
             self._state_override_until = 0.0
+            # A new velocity command makes the previous terminal posture hint
+            # invalid.  The hint is deliberately cleared only after the
+            # current state has been read, so the command can use it as the
+            # gate for body_height/stand transitions immediately beforehand.
+            self._state_hint = None
             if duration is None:
                 self._stop_continuous()
                 ret = self.proxy.Move(vx, vy, yaw)
@@ -901,14 +912,11 @@ class LocoPlugin:
         if action == "left_side_gait": return {"ret": self.proxy.LeftSideGait(1 if args.get("flag", True) else 0)}
         if action == "right_side_gait": return {"ret": self.proxy.RightSideGait(1 if args.get("flag", True) else 0)}
         if action == "get_state":
-            result = self.proxy.GetState()
-            if isinstance(result, tuple) and len(result) == 2:
-                code, state = result
-                return {"ret": code, "state": state}
-            return {"ret": result if isinstance(result, int) else 3104,
-                    "state": {}, "error": "Unable to read robot locomotion state",
-                    "reason": "SportClient.GetState did not return a state",
-                    "suggested_actions": ["retry", "recovery_stand"]}
+            state_name, state, state_error = self._read_state()
+            if state_error:
+                return {**state_error, "action": action, "state": state or {}}
+            return {"ret": 0, "state": state, "current_state": state_name,
+                    "state_source": state.get("state_source", "sport_client.get_state")}
         return None
 
     def _run_timed_move(self, action_id, vx, vy, yaw, duration, stop_event):
@@ -969,6 +977,7 @@ class LocoPlugin:
                     break
                 self._state_override = "BALANCE_STAND"
                 self._state_override_until = time.monotonic() + 10.0
+                self._state_hint = "BALANCE_STAND"
             time.sleep(0.1)
         # AS2W firmware can keep GetState().fsm_name at AI_FREE_WALK after
         # StopMove has already stopped the velocity command. BalanceStand is
@@ -1155,8 +1164,10 @@ _AS2_JOINT_NAMES = [
 
 MIC_AUDIO_FORMAT = "audio/pcm-16k"
 SPEAKER_APP_NAME = "as2w_speaker"
-SPEAKER_BLOCK_BYTES = 9600  # 300 ms at 16 kHz, 16-bit, mono; AS2 voice startup needs a full frame.
+_AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
+SPEAKER_BLOCK_BYTES = 3200  # 100 ms at 16 kHz, 16-bit, mono.
 SPEAKER_QUEUE_BLOCKS = 8  # Keep the live stream below 800 ms of queued audio.
+_SPEAKER_EOF = object()
 
 
 def _audio_chunk(payload):
@@ -1420,11 +1431,18 @@ class _SpeakerNode:
     def _on_chunk(self, msg):
         import queue
         payload = bytes(getattr(msg, "data", []))
+        fmt = str(getattr(msg, "format", "") or "")
+        if fmt and fmt != MIC_AUDIO_FORMAT:
+            self._record_play_error("format", f"unsupported AudioChunk format {fmt[:80]}")
+            return
         if payload:
             self.blocks_received = getattr(self, "blocks_received", 0) + 1
             self.last_chunk_ts = time.monotonic()
+            # TTS publishes this short marker at utterance boundaries. It is
+            # control data, never PCM, and must not be sent to the robot DAC.
+            item = _SPEAKER_EOF if payload == _AUDIO_EOF_MAGIC else payload
             try:
-                self._queue.put_nowait(payload)
+                self._queue.put_nowait(item)
             except queue.Full:
                 # The source is live audio; preserving old audio would make
                 # latency grow without bound. Drop the oldest block instead.
@@ -1433,7 +1451,7 @@ class _SpeakerNode:
                 except queue.Empty:
                     pass
                 try:
-                    self._queue.put_nowait(payload)
+                    self._queue.put_nowait(item)
                 except queue.Full:
                     return
             self.state = "playing"
@@ -1454,6 +1472,12 @@ class _SpeakerNode:
                 continue
             if item is None:
                 break
+            if item is _SPEAKER_EOF:
+                if merged:
+                    self._play_block(bytes(merged))
+                    merged.clear()
+                self._next_play_time = 0.0
+                continue
             idle_polls = 0
             merged.extend(item)
             if len(merged) >= SPEAKER_BLOCK_BYTES:
@@ -1486,7 +1510,7 @@ class _SpeakerNode:
         # stream buffer on longer utterances.
         duration = len(payload) / 32000.0
         self._next_play_time = max(getattr(self, "_next_play_time", 0.0), started) + duration
-        wait_for = self._next_play_time - 0.24 - time.monotonic()
+        wait_for = self._next_play_time - 0.12 - time.monotonic()
         if wait_for > 0:
             self._stop_event.wait(wait_for)
         return result
