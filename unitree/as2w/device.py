@@ -46,12 +46,13 @@ _AS2_SPORT_MODE_NAMES = {
     7: "DAMPING", 8: "RECOVERY_STAND", 9: "RESERVE_2", 10: "SIT",
     11: "FRONT_FLIP", 12: "FRONT_JUMP", 13: "FRONT_POUNCE",
 }
-_BODY_HEIGHT_DEFAULT_M = 0.35
 # A2/AS2 BodyHeight is an absolute controller target.  Do not apply the
 # Go2-relative [-0.18, 0.03] mapping here: the AS2 SDK example itself calls
-# BodyHeight(0.18), and the robot's high stand target is approximately 0.35 m.
+# BodyHeight(0.18), and the URDF leg chain places the high body target near
+# 0.42 m (two 0.212 m vertical leg links before the base/foot offsets; the
+# 0.1054 m hip offset is lateral in the URDF frame).
 _BODY_HEIGHT_MIN_M = 0.17
-_BODY_HEIGHT_MAX_M = 0.35
+_BODY_HEIGHT_MAX_M = 0.45
 _MIC_GROUP = "239.168.123.161"
 _MIC_PORT = 5555
 _MIC_CHUNK_BYTES = 1024
@@ -613,17 +614,17 @@ class LocoPlugin:
     def get_tool(self):
         actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
-                "description": "As2W locomotion. move uses signed vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). A positive duration stops internally when its timer expires; stop_move is only for an active duration=-1 move. stand_up/stand_down change posture; balance_stand enables active balance; recovery_stand is for fallen/down posture; body_height is an absolute target height in meters and is converted to the SDK relative offset; body_position is a direct controller offset. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
+                "description": "As2W locomotion. move uses signed vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). A positive duration stops internally when its timer expires; stop_move is only for an active duration=-1 move. stand_up/stand_down change posture; balance_stand enables active balance; recovery_stand is for fallen/down posture; body_height is an absolute AS2 target height in meters and is passed directly to the SDK; body_position is a direct controller offset. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity in degrees/s [-120, 120]; converted to radians/s for Unitree SDK"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
-                    "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
+                    "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "minimum": 0.17, "maximum": 0.45, "description": "Absolute AS2 body height in meters"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
                 "x-completion": {"actions": ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand"], "timeout": 45},
                 "x-action-params": {
                     "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with optional duration (-1 for continuous)."},
                     "stop_move": {"params": [], "description": "Stop movement."},
                     "stand_up": {"params": [], "description": "Stand up."}, "stand_down": {"params": [], "description": "Stand down."},
                     "balance_stand": {"params": [], "description": "Balance stand."}, "recovery_stand": {"params": [], "description": "Recovery stand."},
-                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set AS2 absolute body height target in meters; supported range is 0.17-0.35 m. 0.35 m is approximately the high stand-up height and is passed directly to the AS2 SDK."},
+                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set AS2 absolute body height target in meters; supported range is 0.17-0.45 m. Around 0.42 m matches the URDF high-stand leg geometry; the value is passed directly to the AS2 SDK."},
                     "body_position": {"params": ["x", "y", "z", "yaw"], "description": "Set body position offset."},
                     "switch_joystick": {"params": ["flag"], "description": "true hands control to the wireless joystick; false disables it."}, "left_side_gait": {"params": ["flag"], "description": "Enter or exit left-side gait; true enters, false exits."},
                     "right_side_gait": {"params": ["flag"], "description": "Enter or exit right-side gait; true enters, false exits."}, "auto_recovery": {"params": ["flag"], "description": "Automatic fall recovery; true enables, false disables."},
@@ -1173,6 +1174,14 @@ _AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
 SPEAKER_BLOCK_BYTES = 9600  # 300 ms at 16 kHz, 16-bit, mono; AS2 voice startup needs a full frame.
 SPEAKER_QUEUE_BLOCKS = 8  # Keep the live stream below 800 ms of queued audio.
 _SPEAKER_EOF = object()
+_SPEAKER_MAX_LEAD_S = 0.0
+
+
+def _pcm_bytes(values):
+    """Convert ROS int8/uint8 sequences without changing PCM bit patterns."""
+    if isinstance(values, (bytes, bytearray, memoryview)):
+        return bytes(values)
+    return bytes(int(value) & 0xff for value in values)
 
 
 def _audio_chunk(payload):
@@ -1435,7 +1444,7 @@ class _SpeakerNode:
 
     def _on_chunk(self, msg):
         import queue
-        payload = bytes(getattr(msg, "data", []))
+        payload = _pcm_bytes(getattr(msg, "data", []))
         fmt = str(getattr(msg, "format", "") or "")
         if fmt and fmt not in _AUDIO_FORMAT_ALIASES:
             self._record_play_error("format", f"unsupported AudioChunk format {fmt[:80]}")
@@ -1515,7 +1524,7 @@ class _SpeakerNode:
         # stream buffer on longer utterances.
         duration = len(payload) / 32000.0
         self._next_play_time = max(getattr(self, "_next_play_time", 0.0), started) + duration
-        wait_for = self._next_play_time - 0.12 - time.monotonic()
+        wait_for = self._next_play_time - _SPEAKER_MAX_LEAD_S - time.monotonic()
         if wait_for > 0:
             self._stop_event.wait(wait_for)
         return result
