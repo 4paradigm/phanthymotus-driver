@@ -61,6 +61,43 @@ def _json_object(value: Any, field: str) -> dict:
         raise ValueError(f"{field}_must_be_json") from exc
 
 
+def _normalise_dashboard_create_args(args: dict) -> dict:
+    """Decode the string values currently emitted by Canvas form fields.
+
+    The public schema stays strongly typed for MCP and LLM callers.  Canvas,
+    however, serializes array/object editors and optional booleans as strings.
+    Normalize only that transport boundary and leave TimerEngine strict.
+    """
+    result = dict(args)
+    for field in ("alarms", "payload"):
+        value = result.get(field)
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if not value:
+            result.pop(field, None)
+            continue
+        try:
+            result[field] = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field}_must_be_valid_json") from exc
+
+    for field in ("replace", "auto_remove"):
+        value = result.get(field)
+        if not isinstance(value, str):
+            continue
+        value = value.strip().lower()
+        if not value:
+            result.pop(field, None)
+        elif value == "true":
+            result[field] = True
+        elif value == "false":
+            result[field] = False
+        else:
+            raise ValueError("boolean_option_required")
+    return result
+
+
 def _round_seconds(value: float | None) -> float | None:
     return None if value is None else round(max(0.0, value), 6)
 
@@ -534,6 +571,8 @@ class TimerPlugin:
         if action == "stop":
             self.stop()
             return {"state": "idle"}
+        if action == "create":
+            clean = _normalise_dashboard_create_args(clean)
 
         with self._condition:
             now, wall = self._monotonic(), self._wall_clock()

@@ -188,6 +188,61 @@ def test_plugin_dispatched_lifecycle_is_idempotent_and_reports_state():
     assert plugin.dispatch("info", {})["state"] == "idle"
 
 
+def test_plugin_accepts_dashboard_serialized_create_fields():
+    plugin = TimerPlugin({}, "test", None)
+    schema = plugin.get_tool()["inputSchema"]["properties"]
+    assert schema["alarms"]["type"] == "array"
+    assert schema["payload"]["type"] == "object"
+    assert schema["replace"]["type"] == "boolean"
+    assert schema["auto_remove"]["type"] == "boolean"
+
+    first = plugin.dispatch("create", {
+        "timer_id": "canvas-test",
+        "mode": "countdown",
+        "duration_sec": 30,
+        "alarms": """[{"alarm_id":"done","trigger_type":"remaining",
+                       "trigger_sec":0,"event":"canvas-done"}]""",
+        "payload": "{\"scene\":\"canvas\"}",
+        "replace": "",
+        "auto_remove": "false",
+    })
+    assert first["next_alarm"]["alarm_id"] == "done"
+    assert first["payload"] == {"scene": "canvas"}
+
+    replacement = plugin.dispatch("create", {
+        "timer_id": "canvas-test",
+        "mode": "countdown",
+        "duration_sec": 5,
+        "alarms": "",
+        "payload": "",
+        "replace": "TRUE",
+        "auto_remove": "",
+    })
+    assert replacement["run_id"] != first["run_id"]
+    assert replacement["next_alarm"] is None
+    assert replacement["payload"] == {}
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("alarms", "[", "alarms_must_be_valid_json"),
+    ("alarms", "111", "invalid_alarms"),
+    ("payload", "{", "payload_must_be_valid_json"),
+    ("payload", "[]", "payload_must_be_object"),
+    ("replace", "yes", "boolean_option_required"),
+    ("auto_remove", "0", "boolean_option_required"),
+])
+def test_plugin_rejects_invalid_dashboard_serialized_fields(field, value, error):
+    plugin = TimerPlugin({}, "test", None)
+    args = {
+        "timer_id": "invalid-canvas-input",
+        "mode": "countdown",
+        "duration_sec": 5,
+        field: value,
+    }
+    with pytest.raises(ValueError, match=error):
+        plugin.dispatch("create", args)
+
+
 def test_plugin_schema_and_background_delivery():
     events, delivered = [], threading.Event()
 
