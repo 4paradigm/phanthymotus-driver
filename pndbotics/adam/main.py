@@ -67,7 +67,7 @@ _bundle = None
 
 
 class _LatestSampleReader:
-    """Expose callback-delivered DDS samples through the controller's Read API."""
+    """Poll DDS directly while retaining diagnostics and a fake-sample hook."""
 
     def __init__(self, channel=None):
         self._channel = channel
@@ -83,7 +83,7 @@ class _LatestSampleReader:
             raise RuntimeError("DDS channel is not configured")
         with self._condition:
             self._closed = False
-        self._channel.Init(self.put, 1)
+        self._channel.Init()
 
     def Close(self):
         if self._channel is not None:
@@ -92,20 +92,33 @@ class _LatestSampleReader:
             self._closed = True
             self._condition.notify_all()
 
+    def _record(self, sample):
+        self._received += 1
+        self._last_sample_at = time.monotonic()
+        motors = getattr(sample, "motor_state", None)
+        self._last_motor_count = len(motors) if motors is not None else None
+
     def put(self, sample):
         with self._condition:
             self._samples.append(sample)
-            self._received += 1
-            self._last_sample_at = time.monotonic()
-            motors = getattr(sample, "motor_state", None)
-            self._last_motor_count = len(motors) if motors is not None else None
+            self._record(sample)
             self._condition.notify()
 
     def Read(self, timeout=None):
         with self._condition:
-            if not self._samples and not self._closed:
+            if self._samples:
+                return self._samples.popleft()
+            if self._closed:
+                return None
+            if self._channel is None:
                 self._condition.wait(timeout)
-            return self._samples.popleft() if self._samples else None
+                return self._samples.popleft() if self._samples else None
+
+        sample = self._channel.Read(timeout=timeout)
+        if sample is not None:
+            with self._condition:
+                self._record(sample)
+        return sample
 
     def diagnostics(self):
         with self._condition:
@@ -369,9 +382,8 @@ def main():
             )
         # Separate reader: DDS readers consume samples independently, and the
         # arm controller must retain its own startup state for full-body hold.
-        # Use the callback API from PNDbotics' low-level examples. The adapter
-        # preserves the controller's small blocking Read contract without
-        # relying on SDK polling behavior that can swallow reader failures.
+        # Poll through the same SDK path used by the working state card while
+        # retaining receive diagnostics for LOWSTATE_UNAVAILABLE responses.
         if need_arm:
             dds_arm_lowstate_reader = _LatestSampleReader(
                 ChannelSubscriber("rt/lowstate", LowState_))

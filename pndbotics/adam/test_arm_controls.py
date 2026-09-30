@@ -48,14 +48,19 @@ def _prime_arm_plugin(publisher):
 
 
 class SampleAdapterTests(unittest.TestCase):
-    def test_latest_sample_reader_owns_channel_lifecycle(self):
+    def test_latest_sample_reader_owns_polling_channel_lifecycle(self):
         class _Channel:
             def __init__(self):
-                self.init_args = []
+                self.init_count = 0
                 self.close_count = 0
+                self.read_timeouts = []
 
-            def Init(self, callback, queue_len):
-                self.init_args.append((callback, queue_len))
+            def Init(self):
+                self.init_count += 1
+
+            def Read(self, timeout=None):
+                self.read_timeouts.append(timeout)
+                return types.SimpleNamespace(motor_state=[1, 2, 3])
 
             def Close(self):
                 self.close_count += 1
@@ -63,14 +68,33 @@ class SampleAdapterTests(unittest.TestCase):
         channel = _Channel()
         reader = adam_main._LatestSampleReader(channel)
         reader.Init()
-        callback, queue_len = channel.init_args[0]
-        callback("sample")
+        sample = reader.Read(timeout=0.2)
         reader.Close()
 
-        self.assertEqual(1, len(channel.init_args))
-        self.assertEqual(1, queue_len)
-        self.assertEqual("sample", reader.Read(timeout=0.01))
+        self.assertEqual(1, channel.init_count)
+        self.assertEqual([0.2], channel.read_timeouts)
+        self.assertEqual([1, 2, 3], sample.motor_state)
+        self.assertEqual(1, reader.diagnostics()["received"])
+        self.assertEqual(3, reader.diagnostics()["last_motor_count"])
         self.assertEqual(1, channel.close_count)
+
+    def test_latest_sample_reader_poll_timeout_does_not_count_as_sample(self):
+        class _Channel:
+            def Init(self):
+                pass
+
+            def Read(self, timeout=None):
+                return None
+
+            def Close(self):
+                pass
+
+        reader = adam_main._LatestSampleReader(_Channel())
+        reader.Init()
+
+        self.assertIsNone(reader.Read(timeout=0.01))
+        self.assertEqual(0, reader.diagnostics()["received"])
+        self.assertIsNone(reader.diagnostics()["last_motor_count"])
 
     def test_latest_sample_reader_delivers_only_the_newest_pending_sample(self):
         reader = adam_main._LatestSampleReader()
