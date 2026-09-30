@@ -87,8 +87,12 @@ def _select_profile() -> None:
         <transport_id>a3_robot_net</transport_id>
         <type>UDPv4</type>
         <interfaceWhiteList>
-          <address>{robot_ip}</address>
+          <!-- Put loopback first: FastDDS uses the first locator for local
+               discovery. The core-domain participant must be discoverable by
+               Agent Core's loopback-only profile, while the same process's
+               robot-domain participant still needs the robot NIC below. -->
           <address>127.0.0.1</address>
+          <address>{robot_ip}</address>
         </interfaceWhiteList>
       </transport_descriptor>
     </transport_descriptors>
