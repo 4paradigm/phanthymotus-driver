@@ -7,6 +7,16 @@ import queue
 import time
 
 
+def _type_name(msg_type):
+    package = msg_type.__module__.split(".")[0]
+    names = {
+        "String": "std_msgs/msg/String", "UInt8MultiArray": "std_msgs/msg/UInt8MultiArray",
+        "CompressedImage": "sensor_msgs/msg/CompressedImage", "Image": "sensor_msgs/msg/Image",
+        "PointCloud2": "sensor_msgs/msg/PointCloud2", "AudioCapture": "audio_msgs/msg/AudioCapture",
+    }
+    return names.get(msg_type.__name__, f"{package}/msg/{msg_type.__name__}")
+
+
 class CoreBridge:
     def __init__(self, profile="/opt/phanthy-motus/dds-local.xml", domain=42):
         self._queue = mp.get_context("spawn").Queue(maxsize=32)
@@ -21,9 +31,11 @@ class CoreBridge:
         self._proc.start()
         print(f"[dds-bridge] started pid={self._proc.pid} domain={self._domain}", flush=True)
 
-    def publish(self, topic, msg):
+    def publish(self, topic, msg, msg_type):
         try:
-            self._queue.put_nowait((topic, msg))
+            from rclpy.serialization import serialize_message
+            type_name = _type_name(msg_type)
+            self._queue.put_nowait((topic, type_name, serialize_message(msg)))
         except (queue.Full, BrokenPipeError, OSError):
             pass
 
@@ -41,13 +53,14 @@ class CoreBridge:
 
 
 class BridgePublisher:
-    def __init__(self, bridge, topic):
+    def __init__(self, bridge, topic, msg_type):
         self.bridge = bridge
         self.topic = topic
+        self.msg_type = msg_type
         self.topic_name = topic
 
     def publish(self, msg):
-        self.bridge.publish(self.topic, msg)
+        self.bridge.publish(self.topic, msg, self.msg_type)
 
 
 def _run(messages, profile, domain):
@@ -61,6 +74,15 @@ def _run(messages, profile, domain):
     rclpy.init()
     node = Node("agibot_a3_core_bridge")
     pubs = {}
+    types = {
+        "std_msgs/msg/String": __import__("std_msgs.msg", fromlist=["String"]).String,
+        "std_msgs/msg/UInt8MultiArray": __import__("std_msgs.msg", fromlist=["UInt8MultiArray"]).UInt8MultiArray,
+        "sensor_msgs/msg/CompressedImage": __import__("sensor_msgs.msg", fromlist=["CompressedImage"]).CompressedImage,
+        "sensor_msgs/msg/Image": __import__("sensor_msgs.msg", fromlist=["Image"]).Image,
+        "sensor_msgs/msg/PointCloud2": __import__("sensor_msgs.msg", fromlist=["PointCloud2"]).PointCloud2,
+        "audio_msgs/msg/AudioCapture": __import__("audio_msgs.msg", fromlist=["AudioCapture"]).AudioCapture,
+    }
+    from rclpy.serialization import deserialize_message
     qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
     try:
         while rclpy.ok():
@@ -71,10 +93,14 @@ def _run(messages, profile, domain):
                 continue
             if item is None:
                 break
-            topic, msg = item
+            topic, type_name, payload = item
+            msg_type = types.get(type_name)
+            if msg_type is None:
+                continue
+            msg = deserialize_message(payload, msg_type)
             pub = pubs.get(topic)
             if pub is None:
-                pub = node.create_publisher(type(msg), topic, qos)
+                pub = node.create_publisher(msg_type, topic, qos)
                 pubs[topic] = pub
             pub.publish(msg)
             rclpy.spin_once(node, timeout_sec=0.0)

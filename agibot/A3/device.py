@@ -391,7 +391,7 @@ class A3Nodes:
 
             def create_publisher(self, msg_type, topic, qos):
                 if self._bridge is not None:
-                    return BridgePublisher(self._bridge, topic)
+                    return BridgePublisher(self._bridge, topic, msg_type)
                 return self._node.create_publisher(msg_type, topic, qos)
 
             def __getattr__(self, name):
