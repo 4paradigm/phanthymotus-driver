@@ -1,13 +1,14 @@
 """Go1 power cards: units, source freshness, outage handling and registration."""
 
 import sys
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 GO1 = ROOT / "unitree" / "go1"
 sys.path.insert(0, str(GO1))
 
-import power  # noqa: E402
+import sensors as power  # noqa: E402
 
 
 class StubClient:
@@ -60,6 +61,52 @@ def test_runtime_requires_observed_soc_drop_and_resets_after_gap_or_charge():
     assert card._sample(battery_snap(170.0, soc=76), now=170.1)["remaining_runtime_minutes"] is None
 
 
+def test_runtime_does_not_invent_time_without_soc_or_after_soc_rebound():
+    card = power.BatteryPowerPlugin({}, "test", None, StubClient())
+    for second in range(61):
+        result = card._sample(battery_snap(100.0 + second, soc=80), now=100.1 + second)
+    assert result["remaining_runtime_minutes"] is None
+    result = card._sample(battery_snap(161.0, soc=None), now=161.1)
+    assert result["runtime_estimate_reason"] == "soc_unavailable"
+    card._sample(battery_snap(162.0, soc=77), now=162.1)
+    result = card._sample(battery_snap(163.0, soc=78), now=163.1)
+    assert result["remaining_runtime_minutes"] is None
+    assert result["runtime_estimate_reason"] == "insufficient_soc_history"
+
+
+def test_cached_battery_data_expires_and_has_required_headers(monkeypatch):
+    card = power.BatteryPowerPlugin({}, "test", None, StubClient())
+    card._sample(battery_snap(100.0), now=100.1)
+    monkeypatch.setattr(power.time, "monotonic", lambda: 104.0)
+    data = card.dispatch("info", {})["data"]
+    assert data["fresh"] is False
+    assert data["available"] is False
+    assert {"timestamp_ms", "control_level", "fresh"} <= data.keys()
+
+
+def test_concurrent_starts_use_one_sampler_and_stop_cancels_it():
+    card = power.BatteryPowerPlugin({}, "test", None, StubClient())
+    barrier = threading.Barrier(6)
+    workers = [threading.Thread(target=lambda: (barrier.wait(), card.start()))
+               for _ in range(6)]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=3)
+            assert not worker.is_alive()
+        sampler = card._thread
+        assert sampler.is_alive()
+        card.start()
+        assert card._thread is sampler
+        assert card.dispatch("stop", {}) == {"state": "idle"}
+        card.stop()
+        assert not sampler.is_alive()
+        assert card.dispatch("unknown", {}) is None
+    finally:
+        card.stop()
+
+
 def test_joint_power_is_mechanical_and_rejects_stale_or_incomplete_data():
     joints = [{"tau": 2.0, "dq": 3.0} for _ in range(12)]
     joints[1] = {"tau": -2.0, "dq": 3.0}
@@ -82,4 +129,4 @@ def test_cards_are_configured_and_copied_into_image():
     for name in ("battery_power", "joint_power"):
         assert f"  {name}:" in config
         assert f"name: {name}," in manifest
-    assert "COPY power.py" in (GO1 / "Dockerfile").read_text()
+    assert "COPY sensors.py" in (GO1 / "Dockerfile").read_text()

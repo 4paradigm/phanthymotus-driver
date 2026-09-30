@@ -3,7 +3,7 @@
 go1_bundle/main.py — Unitree Go1 (EDU) 状态 + 基础控制驱动入口（原始 unitree_legged_sdk）。
 
 一个驱动 = 一个 MCP server。卡片聚合在 4 个文件：
-`sensors.py`（状态/资源卡）/ `power.py`（功率卡）/ `controllers.py`（控制卡）/
+`sensors.py`（状态/资源卡）/ `controllers.py`（控制卡）/
 `ext_devices.py`（4 张外部设备卡）/ `camera.py`（独立注册 RGB、深度、点云三张视觉卡）。
 main.py 按 config.yaml 里启用的卡名**显式导入对应模块**并装配
 （约定：config key == 模块内的 make_* 函数名）。
@@ -86,13 +86,13 @@ class Go1Bundle:
             print("[bundle] battery loaded")
 
         if pc.get("battery_power", {}).get("enabled", False):
-            import power
-            self._plugins.append(power.make_battery_power(pc["battery_power"], namespace, executor, client))
+            import sensors
+            self._plugins.append(sensors.make_battery_power(pc["battery_power"], namespace, executor, client))
             print("[bundle] battery_power loaded")
 
         if pc.get("joint_power", {}).get("enabled", False):
-            import power
-            self._plugins.append(power.make_joint_power(pc["joint_power"], namespace, executor, client))
+            import sensors
+            self._plugins.append(sensors.make_joint_power(pc["joint_power"], namespace, executor, client))
             print("[bundle] joint_power loaded")
 
         if pc.get("imu", {}).get("enabled", False):

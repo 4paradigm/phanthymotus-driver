@@ -3,7 +3,7 @@
 > 一张"卡片" = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
 > 本 bundle 的卡片清单以 `driver.yaml` 和下表为准。
-> 状态卡位于 `sensors.py`、`power.py`，控制卡位于 `controllers.py`，外设和视觉卡分别位于 `ext_devices.py`、`camera.py`。
+> 状态卡位于 `sensors.py`，控制卡位于 `controllers.py`，外设和视觉卡分别位于 `ext_devices.py`、`camera.py`。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
