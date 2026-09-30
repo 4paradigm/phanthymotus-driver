@@ -24,6 +24,7 @@ class CoreBridge:
         self._profile = profile
         self._domain = domain
         self._proc = None
+        self._sent = 0
 
     def start(self):
         self._proc = self._ctx.Process(target=_run, args=(self._queue, self._profile, self._domain),
@@ -36,6 +37,9 @@ class CoreBridge:
             from rclpy.serialization import serialize_message
             type_name = _type_name(msg_type)
             self._queue.put_nowait((topic, type_name, serialize_message(msg)))
+            self._sent += 1
+            if self._sent == 1 or self._sent % 1000 == 0:
+                print(f"[dds-bridge] queued={self._sent} topic={topic}", flush=True)
         except (queue.Full, BrokenPipeError, OSError):
             pass
 
@@ -76,7 +80,7 @@ def _run(messages, profile, domain):
     pubs = {}
     types = {}
     for package, names in (("std_msgs.msg", ("String", "UInt8MultiArray")),
-                           ("sensor_msgs.msg", ("CompressedImage", "Image", "PointCloud2")),
+                           ("sensor_msgs.msg", ("CompressedImage", "Image", "PointCloud2", "JointState")),
                            ("audio_msgs.msg", ("AudioCapture",))):
         try:
             module = __import__(package, fromlist=list(names))
@@ -100,12 +104,18 @@ def _run(messages, profile, domain):
             topic, type_name, payload = item
             msg_type = types.get(type_name)
             if msg_type is None:
+                print(f"[dds-bridge] unsupported type={type_name} topic={topic}", flush=True)
                 continue
-            msg = deserialize_message(payload, msg_type)
+            try:
+                msg = deserialize_message(payload, msg_type)
+            except Exception as exc:
+                print(f"[dds-bridge] deserialize failed topic={topic}: {exc}", flush=True)
+                continue
             pub = pubs.get(topic)
             if pub is None:
                 pub = node.create_publisher(msg_type, topic, qos)
                 pubs[topic] = pub
+                print(f"[dds-bridge] publisher created topic={topic} type={type_name}", flush=True)
             pub.publish(msg)
             rclpy.spin_once(node, timeout_sec=0.0)
     finally:
