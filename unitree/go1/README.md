@@ -23,7 +23,7 @@
 | `battery` | 电量（BMS） | `/{ns}/state/battery`：soc_percent / current_ma / cycle_count / temps / cell_voltage_mv |
 | `imu` | IMU | `/{ns}/state/imu`：四元数 / 角速度 / 加速度 / 欧拉角 / 温度 |
 | `feet` | 足端 | `/{ns}/state/feet`：足底力[4] + 高层时足端相对机身位置/速度 |
-| `swing_trajectory` | 四足摆动轨迹 | `/{ns}/state/swing_trajectory`：实时 3D 轨迹，机身坐标与里程计世界坐标估计；`read` 返回当前及最近完成的一次摆动。只在高层行走模式 `mode=2` 记录，避免趴卧等模式的低足底力被误判为摆动；当前仓库的 SDK 快照没有收包时间戳，卡片按观测到的数值变化采样，无法确认源包新鲜度 |
+| `swing_trajectory` | 四足摆动轨迹 | `/{ns}/state/swing_trajectory` 为 `data/json`，`read` 返回四足当前及最近完成的一次摆动，含机身与里程计世界坐标；另发 `/{ns}/state/swing_trajectory_body_3d` 和 `/{ns}/state/swing_trajectory_world_3d` 两路 `sensor/pointcloud`，可在现有看板作为两个实时 3D 卡片查看。只在高层行走模式 `mode=2` 记录，避免趴卧等模式的低足底力被误判为摆动；当前 SDK 快照没有收包时间戳，卡片按观测到的数值变化采样，无法确认源包新鲜度 |
 | `fall_alarm` | 跌倒/侧翻告警 | `/{ns}/state/fall_alarm`：IMU roll/pitch → ok/tilted/fallen（阈值可配） |
 | `odometry` | 里程计 | `/{ns}/state/odometry`：position/yaw + 相对起点位移（只读） |
 | `obstacle_range` | 超声波避障 | `/{ns}/state/obstacle_range`：range_raw[4]（仅 HIGHLEVEL；方向/单位官方未定义，原样输出） |
@@ -86,6 +86,7 @@ Nano 板 (.13/.14/.15)              Pi 驱动容器 (.161)
 ## 接口约定（与平台其它驱动一致）
 
 - **状态卡读取**：无业务输入。`action=info`（或 `read`/`get`）返回最新数据 + `topic_out`；每条数据带 `timestamp_ms` / `control_level` / `fresh`。当前仓库的 `go1_sdk_client.py` 没有在快照中提供 `received_monotonic_s`，而且这次不修改它。`swing_trajectory` 因此只在快照数值变化时增加轨迹点；相同数值可能来自静止机器人或重复旧包，无法用于确认收包或判断真实采样频率。卡片报 `source_freshness_confirmed=false`、`source_age_s=null`；超过配置时间未观察到变化时，报 `source_unchanged`。如果其他部署已有有效的 `received_monotonic_s`，卡片可使用该字段去重和判断过期，但当前仓库不能依赖它。输出中的 `fresh` 仅表示卡片最近观察到有效变化，不代表已确认新的 SDK 包。
+- **实时 3D 显示**：将 `swing_trajectory_body_3d` 与 `swing_trajectory_world_3d` 两个 topic 加入监控看板，即可分别旋转/缩放查看机身系及里程计世界系轨迹。轨迹以每厘米约一个点绘制；看板现有点云渲染器按高度着色，不能画连续线条、区分四腿颜色或在同一卡片内切换坐标系。原始 JSON 保留四腿标识和精确坐标。世界系依赖 SDK 里程计位置与 IMU 姿态的坐标对齐假设，需真机标定。无轨迹时 3D 卡片只显示原点；状态请同时看 JSON 卡片。
 - **生命周期**：每张卡都处理 `start`/`stop`：`start → {"state":"running"}`、`stop → {"state":"idle"}`。
 - **`dispatch()` 返回**：一律 plain dict（或 `None`），由 MCP 处理器自动包 `{"content":[...]}`，**不要**自己预包。
 - **ROS2 可选**：装了 rclpy → 按各卡频率发 topic；没装 → 只支持 MCP `action=info` 轮询（`topic_out` 为空）。

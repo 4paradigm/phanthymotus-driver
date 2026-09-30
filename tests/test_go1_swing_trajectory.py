@@ -2,13 +2,14 @@
 import contextlib
 import io
 import math
+import struct
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unitree" / "go1"))
 
-from sensors import SwingTrajectoryPlugin, _swing_vector, _swing_world_point  # noqa: E402
+from sensors import SwingTrajectoryPlugin, _swing_pointcloud, _swing_vector, _swing_world_point  # noqa: E402
 
 
 class Client:
@@ -121,12 +122,30 @@ def test_wiring_and_no_hardware_output():
     assert plugin.dispatch("read", {})["data"]["fresh"] is False
     assert plugin.dispatch("read", {})["data"]["control_level"] == "HIGHLEVEL"
     assert plugin.dispatch("read", {})["data"]["source_freshness_confirmed"] is False
+    assert struct.unpack("<IIfff", _swing_pointcloud(plugin._build(), "body")) == (12, 1, 0, 0, 0)
     for file, token in (("main.py", "make_swing_trajectory"),
                         ("config.yaml", "swing_trajectory:"),
                         ("driver.yaml", "name: swing_trajectory"),
                         ("Dockerfile", "COPY sensors.py"),
                         ("sensors.py", "def make_swing_trajectory")):
         assert token in (root / file).read_text()
+
+
+def test_pointcloud_wire_format_and_both_coordinate_frames():
+    plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 1}, "test", None, Client())
+    t = time.monotonic()
+    plugin.process_sample(sample(t, force=0), now=t)
+    plugin.process_sample(sample(t + 0.05, force=0,
+                                 foot={"x": 0.22, "y": -0.1, "z": -0.24}), now=t + 0.05)
+    data = plugin._build()
+    for frame, expected in (("body", (-0.2, -0.1, 0.25)),
+                            ("world", (-1.2, 1.9, -0.25))):
+        cloud = _swing_pointcloud(data, frame)
+        stride, count = struct.unpack_from("<II", cloud)
+        assert stride == 12 and count == 4  # 1 cm path interpolation
+        assert len(cloud) == 8 + stride * count
+        xyz = struct.unpack_from("<fff", cloud, 8)
+        assert all(abs(actual - wanted) < 1e-5 for actual, wanted in zip(xyz, expected))
 
 
 def test_lifecycle_idempotent_and_restartable():

@@ -558,7 +558,6 @@ The Agent Core Web Dashboard automatically selects a renderer based on the `form
 | `sensor/skeleton` | 3D Skeleton (URDF) | `hint === 'sensor/skeleton'` |
 | `sensor/lidar*` | Lidar scan | `hint.startsWith('sensor/lidar')` |
 | `sensor/pointcloud` | 3D Point cloud | `hint === 'sensor/pointcloud'` |
-| `sensor/trajectory3d` | Go1 swing-foot 3D trajectories | `hint === 'sensor/trajectory3d'` |
 | `sensor/mapping` | 2D Occupancy map | `hint === 'sensor/mapping'` |
 | `state/odom` | Text / KV panel | `motus.odom/1` — see "Robot Odometry" |
 | `control/velocity` | Text / KV panel | `motus.control/1` `twist` — see "Continuous Control" |

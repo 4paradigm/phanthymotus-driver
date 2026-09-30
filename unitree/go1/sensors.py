@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 import threading
 import time
 from collections import deque
@@ -20,7 +21,7 @@ from go1_sdk_client import JOINT_NAMES, parse_wireless_remote
 try:
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-    from std_msgs.msg import String
+    from std_msgs.msg import String, UInt8MultiArray
     _HAS_ROS2 = True
     _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -1042,7 +1043,7 @@ def make_activity_monitor(plugin_config, namespace, executor, client):
 # ============================================================================
 
 _SWING_FEET = ("FR", "FL", "RR", "RL")
-_SWING_FORMAT = "sensor/trajectory3d"
+_SWING_FORMAT = "data/json"
 
 
 def _swing_vector(value):
@@ -1080,11 +1081,51 @@ def _swing_world_point(body, position, quaternion):
             round(p[2] + 2*(x*z - w*y)*bx + 2*(y*z + w*x)*by + (1 - 2*(x*x + y*y))*bz, 4)]
 
 
+def _swing_pointcloud(data, frame):
+    """Encode current/last swing paths for Agent Core's existing 3D point renderer.
+
+    The renderer maps wire (x,y,z) to display (y,-z,-x), so the wire
+    coordinates are remapped to show forward, left and up with up positive.
+    Canonical robot coordinates remain in the JSON topic.
+    """
+    key = "body_xyz_m" if frame == "body" else "world_xyz_m"
+    points = []
+    for foot in _SWING_FEET:
+        state = data["feet"][foot]
+        path = state["active"] or state["last_completed"]
+        previous = None
+        for sample in path:
+            point = _swing_vector(sample.get(key))
+            if point is None:
+                previous = None
+                continue
+            if previous is not None:
+                distance = math.dist(previous, point)
+                subdivisions = min(100, max(1, math.ceil(distance / 0.01)))
+                for step in range(1, subdivisions):
+                    fraction = step / subdivisions
+                    points.append([a + (b - a) * fraction for a, b in zip(previous, point)])
+            points.append(point)
+            previous = point
+    # One origin marker clears the preceding frame when there is no path.
+    if not points:
+        points = [[0.0, 0.0, 0.0]]
+    points = points[:40000]
+    payload = bytearray(struct.pack("<II", 12, len(points)))
+    for x, y, z in points:
+        payload.extend(struct.pack("<fff", -x, y, -z))
+    return bytes(payload)
+
+
 class SwingTrajectoryPlugin:
     def __init__(self, plugin_config, namespace, executor, client):
         cfg = plugin_config or {}
         self._client = client
         self._topic = f"/{namespace}/state/swing_trajectory"
+        self._cloud_topics = {
+            "body": f"/{namespace}/state/swing_trajectory_body_3d",
+            "world": f"/{namespace}/state/swing_trajectory_world_3d",
+        }
         self._hz = max(1.0, min(50.0, float(cfg.get("sample_hz", 20))))
         self._force = float(cfg.get("contact_force_threshold_raw", 20))
         self._hysteresis = max(0.0, float(cfg.get("force_hysteresis_raw", 10)))
@@ -1110,6 +1151,10 @@ class SwingTrajectoryPlugin:
                                  history=HistoryPolicy.KEEP_LAST, depth=1,
                                  durability=DurabilityPolicy.VOLATILE)
                 self._pub = self._node.create_publisher(String, self._topic, qos)
+                self._cloud_pubs = {
+                    frame: self._node.create_publisher(UInt8MultiArray, topic, qos)
+                    for frame, topic in self._cloud_topics.items()
+                }
                 executor.add_node(self._node)
             except Exception as exc:
                 print(f"[swing_trajectory] ROS2 unavailable: {exc}", flush=True)
@@ -1119,7 +1164,9 @@ class SwingTrajectoryPlugin:
         return {"name": "swing_trajectory", "type": "sensor", "multiInstance": False,
                 "description": "Go1 four-foot swing trajectories: body frame and estimated odometry-world frame",
                 "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": ([{"topic": self._topic, "format": _SWING_FORMAT}] if self._node else [])}
+                "topic_out": ([{"topic": self._topic, "format": _SWING_FORMAT}] + [
+                    {"topic": topic, "format": "sensor/pointcloud"}
+                    for topic in self._cloud_topics.values()] if self._node else [])}
 
     def start(self):
         with self._lifecycle_lock:
@@ -1143,9 +1190,14 @@ class SwingTrajectoryPlugin:
             try:
                 self.process_sample(self._client.snapshot())
                 if self._node is not None:
+                    data = self._build()
                     msg = String()
-                    msg.data = json.dumps(self._build())
+                    msg.data = json.dumps(data)
                     self._pub.publish(msg)
+                    for frame, publisher in self._cloud_pubs.items():
+                        cloud = UInt8MultiArray()
+                        cloud.data = _swing_pointcloud(data, frame)
+                        publisher.publish(cloud)
                 last_error = None
                 repeated_errors = 0
             except Exception as exc:
