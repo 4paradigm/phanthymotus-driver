@@ -23,6 +23,7 @@
 | `battery` | 电量（BMS） | `/{ns}/state/battery`：soc_percent / current_ma / cycle_count / temps / cell_voltage_mv |
 | `imu` | IMU | `/{ns}/state/imu`：四元数 / 角速度 / 加速度 / 欧拉角 / 温度 |
 | `feet` | 足端 | `/{ns}/state/feet`：足底力[4] + 高层时足端相对机身位置/速度 |
+| `swing_trajectory` | 四足摆动轨迹 | `/{ns}/state/swing_trajectory`：实时 3D 轨迹，机身坐标与里程计世界坐标估计；`read` 返回当前及最近完成的一次摆动。只在高层行走模式 `mode=2` 记录，避免趴卧等模式的低足底力被误判为摆动；优先使用共享快照已有的 `received_monotonic_s`，缺失时以卡片观察时间标记变化并声明无法确认源包新鲜度 |
 | `fall_alarm` | 跌倒/侧翻告警 | `/{ns}/state/fall_alarm`：IMU roll/pitch → ok/tilted/fallen（阈值可配） |
 | `odometry` | 里程计 | `/{ns}/state/odometry`：position/yaw + 相对起点位移（只读） |
 | `obstacle_range` | 超声波避障 | `/{ns}/state/obstacle_range`：range_raw[4]（仅 HIGHLEVEL；方向/单位官方未定义，原样输出） |
@@ -84,7 +85,7 @@ Nano 板 (.13/.14/.15)              Pi 驱动容器 (.161)
 
 ## 接口约定（与平台其它驱动一致）
 
-- **状态卡读取**：无业务输入。`action=info`（或 `read`/`get`）返回最新数据 + `topic_out`；每条数据带 `timestamp_ms` / `control_level` / `fresh`，**无新包不伪造**。
+- **状态卡读取**：无业务输入。`action=info`（或 `read`/`get`）返回最新数据 + `topic_out`；每条数据带 `timestamp_ms` / `control_level` / `fresh`。`swing_trajectory` 优先用共享快照已有的 `received_monotonic_s` 去重和判断过期。没有源时间戳时，只在快照数值变化时增加轨迹点；相同数值可能来自静止机器人或重复旧包，因此报 `source_freshness_confirmed=false`、`source_age_s=null`，超过配置时间未观察到变化则报 `source_unchanged`。
 - **生命周期**：每张卡都处理 `start`/`stop`：`start → {"state":"running"}`、`stop → {"state":"idle"}`。
 - **`dispatch()` 返回**：一律 plain dict（或 `None`），由 MCP 处理器自动包 `{"content":[...]}`，**不要**自己预包。
 - **ROS2 可选**：装了 rclpy → 按各卡频率发 topic；没装 → 只支持 MCP `action=info` 轮询（`topic_out` 为空）。
@@ -97,8 +98,8 @@ go1_bundle/
 ├── main.py                 # MCP server 入口 + 按 config 卡名自动装配（HIGHLEVEL）
 ├── go1_sdk_client.py       # 共享 raw SDK client（已由 sdk_proxy.py 子进程承接）
 ├── sdk_proxy.py            # SDK 子进程代理：隔离 robot_interface 避免 GIL 冲突
-│   ── 聚合卡文件（sensors.py = 12 张）──
-├── sensors.py              # 状态卡合集：battery/imu/feet/fall_alarm/obstacle_range/
+│   ── 聚合卡文件（sensors.py = 13 张）──
+├── sensors.py              # 状态卡合集：battery/imu/feet/swing_trajectory/fall_alarm/obstacle_range/
 │                           #   remote_controller/udp_diagnostics/loco_state/odometry/joints/
 │                           #   activity_monitor/model
 │   ── 聚合卡文件（controllers.py = 5 张）──

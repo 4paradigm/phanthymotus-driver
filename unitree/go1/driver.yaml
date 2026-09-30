@@ -32,6 +32,7 @@ cards:
   - { name: camera_pointcloud,  type: sensor }
   - { name: imu,                type: sensor }
   - { name: feet,               type: sensor }
+  - { name: swing_trajectory,   type: sensor }
   - { name: fall_alarm,         type: sensor }
   - { name: odometry,           type: sensor }
   - { name: obstacle_range,     type: sensor }

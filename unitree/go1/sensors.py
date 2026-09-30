@@ -1035,3 +1035,253 @@ class ActivityMonitorPlugin:
 
 def make_activity_monitor(plugin_config, namespace, executor, client):
     return ActivityMonitorPlugin(plugin_config, namespace, executor, client)
+
+
+# ============================================================================
+# swing_trajectory — Go1 足端轨迹卡
+# ============================================================================
+
+_SWING_FEET = ("FR", "FL", "RR", "RL")
+_SWING_FORMAT = "sensor/trajectory3d"
+
+
+def _swing_vector(value):
+    try:
+        if isinstance(value, dict):
+            values = [value[k] for k in ("x", "y", "z")]
+        else:
+            values = list(value)
+        if len(values) != 3:
+            return None
+        values = [float(v) for v in values]
+        return values if all(math.isfinite(v) for v in values) else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _swing_world_point(body, position, quaternion):
+    """p_world = p_body_odom + R_world_from_body(q_wxyz) p_body."""
+    p = _swing_vector(position)
+    try:
+        q = [float(v) for v in quaternion]
+        if len(q) != 4 or not all(math.isfinite(v) for v in q):
+            return None
+        norm = math.sqrt(sum(v * v for v in q))
+        if not 0.5 <= norm <= 1.5:
+            return None
+        w, x, y, z = (v / norm for v in q)
+    except (TypeError, ValueError):
+        return None
+    if p is None:
+        return None
+    bx, by, bz = body
+    return [round(p[0] + (1 - 2 * (y*y + z*z))*bx + 2*(x*y - w*z)*by + 2*(x*z + w*y)*bz, 4),
+            round(p[1] + 2*(x*y + w*z)*bx + (1 - 2*(x*x + z*z))*by + 2*(y*z - w*x)*bz, 4),
+            round(p[2] + 2*(x*z - w*y)*bx + 2*(y*z + w*x)*by + (1 - 2*(x*x + y*y))*bz, 4)]
+
+
+class SwingTrajectoryPlugin:
+    def __init__(self, plugin_config, namespace, executor, client):
+        cfg = plugin_config or {}
+        self._client = client
+        self._topic = f"/{namespace}/state/swing_trajectory"
+        self._hz = max(1.0, min(50.0, float(cfg.get("sample_hz", 20))))
+        self._force = float(cfg.get("contact_force_threshold_raw", 20))
+        self._hysteresis = max(0.0, float(cfg.get("force_hysteresis_raw", 10)))
+        self._confirm = max(1, min(10, int(cfg.get("phase_confirm_samples", 2))))
+        self._max_points = max(2, min(500, int(cfg.get("max_points_per_swing", 150))))
+        self._max_age = max(0.05, float(cfg.get("max_sample_age_s", 0.5)))
+        self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._last_sample = None
+        self._last_source_stamp = None
+        self._last_signature = None
+        self._last_status = "waiting_for_telemetry"
+        self._feet = {name: {"phase": "unknown", "candidate": None, "candidate_count": 0,
+                             "active": [], "last_completed": [], "swing_id": 0,
+                             "swing_start_s": None} for name in _SWING_FEET}
+        self._node = None
+        if _HAS_ROS2 and executor is not None:
+            try:
+                self._node = Node("go1_swing_trajectory")
+                qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                 history=HistoryPolicy.KEEP_LAST, depth=1,
+                                 durability=DurabilityPolicy.VOLATILE)
+                self._pub = self._node.create_publisher(String, self._topic, qos)
+                executor.add_node(self._node)
+            except Exception as exc:
+                print(f"[swing_trajectory] ROS2 unavailable: {exc}", flush=True)
+                self._node = None
+
+    def get_tool(self):
+        return {"name": "swing_trajectory", "type": "sensor", "multiInstance": False,
+                "description": "Go1 four-foot swing trajectories: body frame and estimated odometry-world frame; read-only",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": ([{"topic": self._topic, "format": _SWING_FORMAT}] if self._node else [])}
+
+    def start(self):
+        with self._lifecycle_lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._stop.clear()
+                self._thread = threading.Thread(target=self._loop, name="go1_swing_trajectory", daemon=True)
+                self._thread.start()
+
+    def stop(self):
+        with self._lifecycle_lock:
+            self._stop.set()
+            if self._thread is not None:
+                self._thread.join(timeout=2)
+                if not self._thread.is_alive():
+                    self._thread = None
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self.process_sample(self._client.snapshot())
+                if self._node is not None:
+                    msg = String()
+                    msg.data = json.dumps(self._build())
+                    self._pub.publish(msg)
+            except Exception as exc:
+                print(f"[swing_trajectory] sample error: {exc}", flush=True)
+            self._stop.wait(1.0 / self._hz)
+
+    def process_sample(self, snap, now=None):
+        """Record changed snapshots without requiring changes to the shared SDK client."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if not isinstance(snap, dict) or not snap.get("fresh"):
+                self._last_status = "source_unavailable"
+                return
+            if snap.get("control_level") not in (None, "HIGHLEVEL") or snap.get("mode") != 2:
+                for state in self._feet.values():
+                    state.update(phase="unknown", candidate=None, candidate_count=0,
+                                 active=[], swing_start_s=None)
+                self._last_signature = None
+                self._last_sample = None
+                self._last_source_stamp = None
+                self._last_status = "not_walking" if snap.get("mode") != 2 else "wrong_control_level"
+                return
+            positions = snap.get("foot_pos")
+            forces = snap.get("foot_force")
+            if not isinstance(positions, (list, tuple)) or len(positions) != 4 or not isinstance(forces, (list, tuple)) or len(forces) != 4:
+                self._last_status = "foot_data_unavailable"
+                return
+            body = [_swing_vector(value) for value in positions]
+            try:
+                force = [float(v) for v in forces]
+            except (TypeError, ValueError):
+                self._last_status = "foot_data_invalid"
+                return
+            if any(v is None for v in body) or not all(math.isfinite(v) and v >= 0 for v in force):
+                self._last_status = "foot_data_invalid"
+                return
+            imu = snap.get("imu") or {}
+            quat = imu.get("quaternion_wxyz")
+            world = ([_swing_world_point(v, snap.get("position"), quat) for v in body]
+                     if imu.get("quaternion_wxyz_valid", True) else [None] * 4)
+            source_stamp = snap.get("received_monotonic_s")
+            if source_stamp is not None:
+                try:
+                    source_stamp = float(source_stamp)
+                except (TypeError, ValueError):
+                    source_stamp = float("nan")
+                if not math.isfinite(source_stamp) or source_stamp > now + 0.1:
+                    self._last_status = "source_timestamp_invalid"
+                    return
+                if now - source_stamp > self._max_age:
+                    self._last_status = "source_stale"
+                    return
+            signature = json.dumps([force, body, snap.get("position"), quat],
+                                   sort_keys=True, default=str)
+            same_snapshot = (source_stamp == self._last_source_stamp if source_stamp is not None
+                             else self._last_source_stamp is None and signature == self._last_signature)
+            if same_snapshot and self._last_sample is not None and now - self._last_sample > self._max_age:
+                return
+            if not same_snapshot and self._last_sample is not None and now - self._last_sample > self._max_age:
+                for state in self._feet.values():
+                    state.update(phase="unknown", candidate=None, candidate_count=0,
+                                 active=[], swing_start_s=None)
+            if not same_snapshot:
+                self._last_signature = signature
+                self._last_source_stamp = source_stamp
+                self._last_sample = source_stamp if source_stamp is not None else now
+            sample_time = source_stamp if source_stamp is not None else now
+            self._last_status = "ok" if all(v is not None for v in world) else "world_pose_unavailable"
+            for i, name in enumerate(_SWING_FEET):
+                state = self._feet[name]
+                f = force[i]
+                started_swing = False
+                desired = ("swing" if f <= self._force else
+                           "stance" if f >= self._force + self._hysteresis else None)
+                if desired is None:
+                    state["candidate"] = None
+                    state["candidate_count"] = 0
+                elif desired != state["phase"]:
+                    state["candidate_count"] = state["candidate_count"] + 1 if state["candidate"] == desired else 1
+                    state["candidate"] = desired
+                    if state["candidate_count"] >= self._confirm:
+                        if state["phase"] == "swing" and desired == "stance":
+                            state["last_completed"] = state["active"]
+                            state["active"] = []
+                        elif desired == "swing":
+                            state["swing_id"] += 1
+                            state["active"] = []
+                            state["swing_start_s"] = sample_time
+                            started_swing = True
+                        state["phase"] = desired
+                        state["candidate"] = None
+                        state["candidate_count"] = 0
+                else:
+                    state["candidate"] = None
+                    state["candidate_count"] = 0
+                if state["phase"] == "swing" and (not same_snapshot or started_swing):
+                    state["active"].append({"t_monotonic_s": round(sample_time, 4),
+                                            "t_from_liftoff_s": round(sample_time - state["swing_start_s"], 4),
+                                            "body_xyz_m": body[i], "world_xyz_m": world[i]})
+                    if len(state["active"]) > self._max_points:
+                        state["active"].pop(0)
+
+    def _build(self):
+        with self._lock:
+            change_age = (None if self._last_sample is None else
+                          max(0.0, time.monotonic() - self._last_sample))
+            status = ("source_stale" if self._last_source_stamp is not None and
+                      change_age is not None and change_age > self._max_age and
+                      self._last_status in ("ok", "world_pose_unavailable") else
+                      "source_unchanged" if self._last_source_stamp is None and change_age is not None and
+                      change_age > self._max_age and self._last_status in ("ok", "world_pose_unavailable")
+                      else self._last_status)
+            feet = {name: {"phase": value["phase"], "swing_id": value["swing_id"],
+                           "active": list(value["active"]),
+                           "last_completed": list(value["last_completed"])}
+                    for name, value in self._feet.items()}
+        return {"timestamp_ms": int(time.time() * 1000), "control_level": "HIGHLEVEL",
+                "status": status,
+                "fresh": status in ("ok", "world_pose_unavailable"),
+                "source_age_s": round(change_age, 3) if self._last_source_stamp is not None and change_age is not None else None,
+                "source_freshness_confirmed": self._last_source_stamp is not None and status in ("ok", "world_pose_unavailable"),
+                "observed_change_age_s": None if change_age is None else round(change_age, 3),
+                "sample_time_basis": ("sdk_receive_monotonic" if self._last_source_stamp is not None
+                                      else "card_observation_monotonic"),
+                "body_frame": "body_instantaneous", "world_frame": "HighState_odometry_inertial_estimate",
+                "world_assumption": "HighState.position and IMU quaternion axes/origin aligned; unverified on robot",
+                "contact_force_threshold_raw": self._force, "feet": feet}
+
+    def dispatch(self, action, args):
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action in ("info", "read", "get", "swing_trajectory"):
+            return {"state": "running" if self._thread and self._thread.is_alive() else "idle",
+                    "data": self._build(), "topic_out": self.get_tool()["topic_out"]}
+        return None
+
+
+def make_swing_trajectory(plugin_config, namespace, executor, client):
+    return SwingTrajectoryPlugin(plugin_config, namespace, executor, client)

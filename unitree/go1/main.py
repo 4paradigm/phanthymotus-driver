@@ -3,7 +3,7 @@
 go1_bundle/main.py — Unitree Go1 (EDU) 状态 + 基础控制驱动入口（原始 unitree_legged_sdk）。
 
 一个驱动 = 一个 MCP server。卡片聚合在 4 个文件：
-`sensors.py`（11 张状态/资源卡）/ `controllers.py`（5 张控制卡）/
+`sensors.py`（12 张状态/资源卡）/ `controllers.py`（5 张控制卡）/
 `ext_devices.py`（4 张外部设备卡）/ `camera.py`（独立注册 RGB、深度、点云三张视觉卡）。
 main.py 按 config.yaml 里启用的卡名**显式导入对应模块**并装配
 （约定：config key == 模块内的 make_* 函数名）。
@@ -94,6 +94,12 @@ class Go1Bundle:
             import sensors
             self._plugins.append(sensors.make_feet(pc["feet"], namespace, executor, client))
             print("[bundle] feet loaded")
+
+        if pc.get("swing_trajectory", {}).get("enabled", False):
+            import sensors
+            self._plugins.append(sensors.make_swing_trajectory(
+                pc["swing_trajectory"], namespace, executor, client))
+            print("[bundle] swing_trajectory loaded")
 
         if pc.get("fall_alarm", {}).get("enabled", False):
             import sensors
