@@ -195,6 +195,12 @@ def test_plugin_accepts_dashboard_serialized_create_fields():
     assert schema["payload"]["type"] == "object"
     assert schema["replace"]["type"] == "boolean"
     assert schema["auto_remove"]["type"] == "boolean"
+    boolean_options = [
+        {"const": False, "title": "否"},
+        {"const": True, "title": "是"},
+    ]
+    assert schema["replace"]["oneOf"] == boolean_options
+    assert schema["auto_remove"]["oneOf"] == boolean_options
 
     first = plugin.dispatch("create", {
         "timer_id": "canvas-test",

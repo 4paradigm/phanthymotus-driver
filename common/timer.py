@@ -479,8 +479,24 @@ class TimerPlugin:
                 "emit_interval_sec": {"type": "number", "minimum": 0,
                                       "maximum": self._engine.max_duration_sec,
                                       "default": 0},
-                "replace": {"type": "boolean", "default": False},
-                "auto_remove": {"type": "boolean", "default": False},
+                "replace": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "同名运行中 Timer 已存在时是否替换",
+                    "oneOf": [
+                        {"const": False, "title": "否"},
+                        {"const": True, "title": "是"},
+                    ],
+                },
+                "auto_remove": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Timer 完成后是否自动从列表移除",
+                    "oneOf": [
+                        {"const": False, "title": "否"},
+                        {"const": True, "title": "是"},
+                    ],
+                },
                 "payload": {"type": "object", "additionalProperties": True},
             },
             "required": ["action"],
