@@ -108,6 +108,34 @@ def test_capture_admission_shows_destination_before_photo_is_saved(tmp_path, mon
     assert path.exists()
 
 
+def test_shutdown_drains_accepted_photo_before_returning(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+
+    def capture(position):
+        entered.set()
+        assert release.wait(3)
+        return b"\xff\xd8photo\xff\xd9"
+
+    monkeypatch.setattr(card, "_capture_jpeg", capture)
+    accepted = card.dispatch("capture_photo", {})
+    assert entered.wait(1)
+    shutdown = threading.Thread(target=lambda: (card.shutdown(), stopped.set()))
+    shutdown.start()
+    try:
+        assert not stopped.wait(0.1), "shutdown returned before the accepted photo completed"
+        assert card.dispatch("capture_photo", {})["code"] == "SHUTTING_DOWN"
+    finally:
+        release.set()
+        shutdown.join(3)
+    assert stopped.is_set()
+    terminal = completions.get(timeout=3)
+    assert terminal["action_id"] == accepted["action_id"]
+    assert terminal["status"] == "completed"
+    assert Path(accepted["file_path"]).exists()
+
+
 def test_failed_capture_does_not_create_advertised_path(tmp_path, monkeypatch, completions):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})

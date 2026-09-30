@@ -44,6 +44,8 @@ deleted, and an existing name is never accepted for a new capture.
 For `record_video`, the recording clock starts at the first valid camera frame.
 Wait for its ACP `completed` callback before using the file. Lifecycle `stop`
 cancels an active recording instead of saving it.
+Driver shutdown waits for accepted photos to finish and report ACP completion;
+the service gives this drain up to 60 seconds before forced container exit.
 
 Recording first writes the selected JPEGs into a temporary MJPEG stream, then
 encodes that stream to MP4 with `ffmpeg`'s `ultrafast` H.264 preset. This keeps

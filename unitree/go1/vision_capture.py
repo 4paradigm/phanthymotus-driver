@@ -46,6 +46,8 @@ class VisionCapturePlugin:
         self._recording = None
         self._recording_thread = None
         self._encoder = None
+        self._capture_threads = set()
+        self._shutting_down = False
 
     def get_tool(self):
         return {
@@ -95,6 +97,16 @@ class VisionCapturePlugin:
             worker.join(timeout=15)
         with camera._CAMERA_LOCK:
             return {"state": "idle", "capture_active": bool(self._active)}
+
+    def shutdown(self):
+        # 进程退出前等待已受理拍照的 ACP 终态；画布 stop 仍保持非阻塞。
+        with camera._CAMERA_LOCK:
+            self._shutting_down = True
+            workers = tuple(self._capture_threads)
+        self.stop()
+        for worker in workers:
+            if worker is not threading.current_thread():
+                worker.join()
 
     @staticmethod
     def _receive_exact(connection, size, deadline, cancel=None):
@@ -205,6 +217,8 @@ class VisionCapturePlugin:
         except ValueError as exc:
             return {"ok": False, "code": "INVALID_ARGUMENT", "message": str(exc)}
         with camera._CAMERA_LOCK:
+            if self._shutting_down:
+                return {"ok": False, "code": "SHUTTING_DOWN", "message": "vision_capture is shutting down"}
             if action != "capture_photo" and self._recording is not None:
                 return {"ok": False, "code": "RESOURCE_BUSY", "message": "a video recording is already active"}
             if position in camera._SNAPSHOT_POSITIONS or camera.running_stream(position) is not None:
@@ -224,10 +238,14 @@ class VisionCapturePlugin:
             target = self._record_async if cancel else self._capture_async
             worker_args = (position, action_id, path, duration, cancel) if cancel else (position, action_id, path)
             worker = threading.Thread(target=target, args=worker_args, daemon=True)
-            if cancel is not None:
-                with camera._CAMERA_LOCK:
+            with camera._CAMERA_LOCK:
+                if self._shutting_down:
+                    raise RuntimeError("vision_capture is shutting down")
+                if cancel is not None:
                     self._recording_thread = worker
-            worker.start()
+                else:
+                    self._capture_threads.add(worker)
+                worker.start()
         except Exception as exc:
             with camera._CAMERA_LOCK:
                 camera._SNAPSHOT_POSITIONS.discard(position)
@@ -236,6 +254,8 @@ class VisionCapturePlugin:
                 if cancel is not None:
                     self._recording = None
                     self._recording_thread = None
+                else:
+                    self._capture_threads.discard(worker)
             return {"ok": False, "code": "RECORD_FAILED" if cancel else "CAPTURE_FAILED", "message": str(exc)}
         response = {"ok": True, "state": "recording" if cancel else "capturing",
                     "position": position, "file_path": str(path), "filename": path.name,
@@ -280,7 +300,11 @@ class VisionCapturePlugin:
         status = "completed" if result.get("ok") else "error"
         with camera._CAMERA_LOCK:
             self._last_capture = {"action_id": action_id, "status": status, "result": result}
-        self._notify_complete(action_id, status, result)
+        try:
+            self._notify_complete(action_id, status, result)
+        finally:
+            with camera._CAMERA_LOCK:
+                self._capture_threads.discard(threading.current_thread())
 
     def _capture_and_save(self, position, path):
         try:

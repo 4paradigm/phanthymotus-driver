@@ -226,7 +226,7 @@ class Go1Bundle:
     def stop_all(self):
         for p in self._plugins:
             try:
-                p.stop()
+                getattr(p, "shutdown", p.stop)()
             except Exception:
                 pass
         print("[bundle] All plugins stopped")
