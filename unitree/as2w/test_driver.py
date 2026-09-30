@@ -439,7 +439,21 @@ class TestDriverContracts(unittest.TestCase):
                                                   velocity=[], position=[]))
         payload = __import__("json").loads(published[0])
         self.assertFalse(payload["body_height_valid"])
-        self.assertEqual("rt/lf/sportmodestate", payload["body_height_source"])
+        self.assertIsNone(payload["body_height_m"])
+        self.assertEqual("unavailable", payload["body_height_status"])
+        self.assertEqual("rt/lf/sportmodestate.body_height", payload["body_height_source"])
+
+    def test_loco_state_exposes_as2_mode_name_and_units(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.loco = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node._publish_sport(types.SimpleNamespace(mode=3, body_height=0.0,
+                                                  velocity=[1, 2, 3], position=[4, 5, 6],
+                                                  yaw_speed=0.25))
+        payload = __import__("json").loads(published[0])
+        self.assertEqual("AI_FREE_WALK", payload["mode_name"])
+        self.assertEqual([1, 2, 3], payload["velocity_mps"])
+        self.assertEqual(0.25, payload["yaw_speed_rad_s"])
 
     def test_timed_move_returns_action_id_and_reports_acp_completion(self):
         proxy = _Proxy()
@@ -515,11 +529,20 @@ class TestDriverContracts(unittest.TestCase):
     def test_as2_ai_free_walk_is_treated_as_moving(self):
         proxy = _Proxy()
         proxy.state = "AI_FREE_WALK"
+        proxy.StandDown = lambda: setattr(proxy, "state", "AI_STAND_DOWN") or 0
         plugin = self.device.LocoPlugin({}, "test", None, proxy)
-        result = plugin.dispatch("stand_down", {})
-        self.assertFalse(result["accepted"])
+        with patch.object(self.device, "_acp_notify") as notify:
+            result = plugin.dispatch("stand_down", {})
+            self.assertTrue(result["accepted"])
+            self.assertEqual("stop_move_then_stand_down", result["transition"])
+            action_id = result["action_id"]
+            for _ in range(100):
+                if any(call.args[0] == action_id for call in notify.call_args_list):
+                    break
+                __import__("time").sleep(0.01)
         self.assertEqual("AI_FREE_WALK", result["current_state"])
-        self.assertIn("stop_move", result["suggested_actions"])
+        self.assertTrue(any(call.args[0] == action_id and call.args[1] == "completed"
+                             for call in notify.call_args_list))
 
     def test_as2_ai_down_states_are_treated_as_down(self):
         proxy = _Proxy()

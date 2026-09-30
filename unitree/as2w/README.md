@@ -60,8 +60,8 @@ the upstream Unitree SDK example `example/a2/audio/a2_audio_client_example.cpp`;
 that example also subscribes to `rt/audio_msg` for ASR text. The AS2
 `AudioClient` exposes playback, TTS, volume, and LED APIs, but not a raw capture
 RPC, so the multicast receiver is the appropriate robot-body input path. The `speaker`
-card subscribes to `/<namespace>/speaker/audio` by default; callers may provide
-an optional `input_topic` to use another `AudioChunk` stream. It streams bounded
+card subscribes to `/remote_control/audio` by default in the AS2W deployment;
+callers may provide an optional `input_topic` to use another `AudioChunk` stream. It streams bounded
 PCM blocks through the AS2 `voice` service and exposes volume get/set actions.
 Audio service availability depends on the AS2 firmware configuration.
 The multicast membership is bound to the same selected robot interface as
@@ -137,8 +137,9 @@ Loco examples:
 to radians per second at the Unitree SDK boundary).
 `body_height` takes an explicit absolute target in meters, for example
 `{"action":"body_height","height":0.18}`. The `loco_state` field
-`body_height_valid` is false when AS2 reports passive mode with a zero height;
-that value is a firmware/status limitation, not a measured 0-meter posture.
+`body_height_valid` is false when `SportModeState.body_height` is zero; AS2
+uses zero for an unavailable/unreported height in the observed modes. That
+value is a firmware/status limitation, not a measured 0-meter posture.
 
 ```json
 {"action":"move","vx":0.3,"vy":0,"vyaw":0,"duration":2}

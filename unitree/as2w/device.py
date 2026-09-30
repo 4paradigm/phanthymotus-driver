@@ -39,6 +39,12 @@ except ImportError:
 
 
 _STATE_PUBLISH_HZ = 60.0
+_AS2_SPORT_MODE_NAMES = {
+    # Values observed in the AS2W SportModeState stream.  Unknown firmware
+    # values remain visible as MODE_<n> instead of being mislabeled.
+    0: "PASSIVE",
+    3: "AI_FREE_WALK",
+}
 _MIC_GROUP = "239.168.123.161"
 _MIC_PORT = 5555
 _MIC_CHUNK_BYTES = 1024
@@ -234,13 +240,20 @@ class _StateNode:
     def _publish_sport(self, msg):
         mode = int(getattr(msg, "mode", 0))
         body_height = _number(getattr(msg, "body_height", 0))
+        mode_name = _AS2_SPORT_MODE_NAMES.get(mode, f"MODE_{mode}")
+        body_height_valid = body_height != 0.0
         loco = {"mode": mode,
+                "mode_name": mode_name,
                 "body_height": body_height,
-                "body_height_m": body_height,
-                "body_height_valid": mode != 0 and body_height != 0.0,
-                "body_height_source": "rt/lf/sportmodestate"}
+                "body_height_m": body_height if body_height_valid else None,
+                "body_height_valid": body_height_valid,
+                "body_height_status": "reported" if body_height_valid else "unavailable",
+                "body_height_source": "rt/lf/sportmodestate.body_height"}
         loco.update(self._flat("velocity", getattr(msg, "velocity", [])))
         loco.update(self._flat("position", getattr(msg, "position", [])))
+        loco["velocity_mps"] = list(getattr(msg, "velocity", []))
+        loco["position_m"] = list(getattr(msg, "position", []))
+        loco["yaw_speed_rad_s"] = _number(getattr(msg, "yaw_speed", 0))
         self._publish(self.loco, loco)
 
 
@@ -301,7 +314,9 @@ class LocoPlugin:
         self.proxy = proxy
         self._lock = threading.Lock()
         self._stop = None
+        self._move_thread = None
         self._transition_stop = None
+        self._transition_thread = None
 
     _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING",
                  "AI_STAND_UP", "AI_BALANCE_STAND", "AI_RECOVERY_STAND"}
@@ -360,14 +375,19 @@ class LocoPlugin:
     def _cancel_transition(self):
         with self._lock:
             event = self._transition_stop
+            thread = self._transition_thread
             self._transition_stop = None
         if event is not None:
             event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=8.0)
 
     def _finish_transition(self, stop_event):
         with self._lock:
             if self._transition_stop is stop_event:
                 self._transition_stop = None
+            if self._transition_thread is threading.current_thread():
+                self._transition_thread = None
 
     def _transition_to_balance_and_move(self, action_id, vx, vy, yaw, duration, stop_event):
         deadline = time.monotonic() + 12.0
@@ -416,9 +436,13 @@ class LocoPlugin:
         transition_stop = threading.Event()
         with self._lock:
             self._transition_stop = transition_stop
-        threading.Thread(target=self._transition_to_balance_and_move,
-                         args=(action_id, vx, vy, yaw, duration, transition_stop),
-                         daemon=True, name="as2w-loco-balance-move").start()
+        transition_thread = threading.Thread(
+            target=self._transition_to_balance_and_move,
+            args=(action_id, vx, vy, yaw, duration, transition_stop),
+            daemon=True, name="as2w-loco-balance-move")
+        with self._lock:
+            self._transition_thread = transition_thread
+        transition_thread.start()
         return action_id, {"ret": 0, "accepted": True, "status": "running",
                            "action": "move", "transition": "balance_stand",
                            "action_id": action_id, "current_state": state_name}
@@ -447,6 +471,7 @@ class LocoPlugin:
         if duration == -1:
             with self._lock:
                 self._stop = stop_event
+                self._move_thread = threading.current_thread()
             move_ret = 0
             move_error = None
             while not stop_event.is_set():
@@ -467,6 +492,8 @@ class LocoPlugin:
                 with self._lock:
                     if self._stop is stop_event:
                         self._stop = None
+                    if self._move_thread is threading.current_thread():
+                        self._move_thread = None
                 self._finish_transition(stop_event)
             if stop_error and not stop_event.is_set():
                 _acp_notify(action_id, "error", {
@@ -574,9 +601,14 @@ class LocoPlugin:
         self._stop_continuous()
         self.proxy.StopMove()
     def _stop_continuous(self):
-        event = self._stop
-        self._stop = None
-        if event: event.set()
+        with self._lock:
+            event = self._stop
+            thread = self._move_thread
+            self._stop = None
+        if event:
+            event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=8.0)
     def _continuous(self, vx, vy, yaw):
         self._stop_continuous(); event = threading.Event(); self._stop = event
         def run():
@@ -691,9 +723,13 @@ class LocoPlugin:
                             "error": "Continuous Move was rejected",
                             "reason": "The sport controller refused the velocity command",
                             "suggested_actions": ["get_state", "stop_move"]}
-                threading.Thread(target=self._run_continuous_move,
-                                 args=(action_id, vx, vy, yaw, stop_event),
-                                 daemon=True, name="as2w-loco-continuous-move").start()
+                move_thread = threading.Thread(
+                    target=self._run_continuous_move,
+                    args=(action_id, vx, vy, yaw, stop_event),
+                    daemon=True, name="as2w-loco-continuous-move")
+                with self._lock:
+                    self._move_thread = move_thread
+                move_thread.start()
                 return {"ret": 0, "accepted": True, "status": "running",
                         "action": "move", "action_id": action_id,
                         "current_state": state_name, "duration": -1}
@@ -713,9 +749,13 @@ class LocoPlugin:
             stop_event = threading.Event()
             with self._lock:
                 self._transition_stop = stop_event
-            threading.Thread(target=self._run_timed_move,
-                             args=(action_id, vx, vy, yaw, duration, stop_event),
-                             daemon=True, name="as2w-loco-timed-move").start()
+            transition_thread = threading.Thread(
+                target=self._run_timed_move,
+                args=(action_id, vx, vy, yaw, duration, stop_event),
+                daemon=True, name="as2w-loco-timed-move")
+            with self._lock:
+                self._transition_thread = transition_thread
+            transition_thread.start()
             return {"ret": 0, "accepted": True, "status": "running",
                     "action": "move", "action_id": action_id,
                     "current_state": state_name, "duration": duration}
@@ -745,9 +785,15 @@ class LocoPlugin:
                     "The robot is already standing; use balance_stand or move",
                     ["balance_stand", "move", "stand_down"])
             if action == "stand_down" and self._is_moving(state_name):
-                return self._not_allowed(action, state_name,
-                    "StandDown cannot be issued while the robot is walking",
-                    ["stop_move", "stand_down"])
+                action_id = f"as2w_loco_{uuid4().hex[:8]}"
+                method, expected_name = methods[action]
+                threading.Thread(target=self._stop_then_posture,
+                                 args=(action_id, action, method, expected_name, state_name),
+                                 daemon=True, name="as2w-loco-stop-then-stand-down").start()
+                return {"ret": 0, "accepted": True, "status": "running",
+                        "action": action, "action_id": action_id,
+                        "current_state": state_name,
+                        "transition": "stop_move_then_stand_down"}
             if action == "stand_down" and state_name in self._DOWN:
                 return self._not_allowed(action, state_name,
                     "The robot is already down or damping",
@@ -861,6 +907,8 @@ class LocoPlugin:
             with self._lock:
                 if self._stop is stop_event:
                     self._stop = None
+                if self._move_thread is threading.current_thread():
+                    self._move_thread = None
             self._finish_transition(stop_event)
         _acp_notify(action_id, "cancelled", {
             "action": "move", "ret": 0, "duration": -1,
@@ -906,6 +954,12 @@ class LocoPlugin:
 
     def _stop_move_worker(self, action_id):
         try:
+            # The sport RPC worker is serialized.  Do not send StopMove while
+            # an old Move loop can still enqueue another command; that race
+            # was leaving AS2 in AI_FREE_WALK after an apparently successful
+            # stop.
+            self._cancel_transition()
+            self._stop_continuous()
             ret = self.proxy.StopMove()
         except Exception as exc:
             _acp_notify(action_id, "error", {
@@ -922,6 +976,46 @@ class LocoPlugin:
                 "suggested_actions": ["get_state", "retry_stop"]})
             return
         self._await_stopped(action_id)
+
+    def _stop_then_posture(self, action_id, action, method, expected_name, state_name):
+        """Serialize a safe StopMove before a posture command from AI walk."""
+        self._cancel_transition()
+        self._stop_continuous()
+        try:
+            stop_ret = self.proxy.StopMove()
+        except Exception as exc:
+            _acp_notify(action_id, "error", {
+                "action": action, "ret": 3104, "current_state": state_name,
+                "error": "StopMove RPC failed before posture transition",
+                "reason": f"Could not stop the active velocity command: {type(exc).__name__}: {str(exc)[:160]}",
+                "suggested_actions": ["get_state", "retry_stop"]})
+            return
+        if stop_ret != 0:
+            _acp_notify(action_id, "error", self._rpc_rejected(
+                action, state_name, stop_ret,
+                "StopMove was rejected, so the posture transition was not sent",
+                ["get_state", "stop_move", action]))
+            return
+        # GetState may retain AI_FREE_WALK while velocity is already zero.  Do
+        # not use that label as a second command gate: the official posture
+        # RPC is the authority on whether StandDown is now acceptable.
+        time.sleep(0.2)
+        try:
+            ret = getattr(self.proxy, method)()
+        except Exception as exc:
+            _acp_notify(action_id, "error", {
+                "action": action, "ret": 3104, "current_state": state_name,
+                "stop_ret": stop_ret, "error": "Posture RPC failed after StopMove",
+                "reason": f"{method} could not reach the sport controller: {type(exc).__name__}: {str(exc)[:160]}",
+                "suggested_actions": ["get_state", "retry_stop", action]})
+            return
+        if ret != 0:
+            _acp_notify(action_id, "error", self._rpc_rejected(
+                action, state_name, ret,
+                f"{method} was rejected after StopMove; the controller still considers the posture unsafe",
+                ["get_state", "retry_stop", "balance_stand", action]))
+            return
+        self._await_posture(action_id, action, expected_name)
 
 
 class SpecialActionPlugin:
@@ -1212,6 +1306,9 @@ class _SpeakerNode:
         self.topic = None
         self.state = "idle"
         self.blocks_sent = 0
+        self.blocks_received = 0
+        self.last_chunk_ts = 0.0
+        self.last_play_ts = 0.0
         self._next_play_time = 0.0
         self._last_play_error = 0.0
         self.last_play_error = None
@@ -1242,6 +1339,7 @@ class _SpeakerNode:
         self._thread = threading.Thread(target=self._drain, daemon=True, name="as2w-speaker")
         self._thread.start()
         self.state = "ready"
+        print(f"[speaker] subscribed topic={topic} format={MIC_AUDIO_FORMAT}; waiting for AudioChunk", flush=True)
         return topic
 
     def stop(self):
@@ -1283,6 +1381,8 @@ class _SpeakerNode:
         import queue
         payload = bytes(getattr(msg, "data", []))
         if payload:
+            self.blocks_received = getattr(self, "blocks_received", 0) + 1
+            self.last_chunk_ts = time.monotonic()
             try:
                 self._queue.put_nowait(payload)
             except queue.Full:
@@ -1333,6 +1433,7 @@ class _SpeakerNode:
                 return result
             self.last_play_error = None
             self.blocks_sent += 1
+            self.last_play_ts = time.monotonic()
         except Exception as exc:
             self._record_play_error("exception", str(exc))
             return None
@@ -1417,7 +1518,12 @@ class SpeakerPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": self._node.state, "topic": self._node.topic,
+                    "blocks_received": self._node.blocks_received,
                     "blocks_sent": self._node.blocks_sent,
+                    "chunk_age_s": (max(0.0, time.monotonic() - self._node.last_chunk_ts)
+                                    if self._node.last_chunk_ts else None),
+                    "last_play_age_s": (max(0.0, time.monotonic() - self._node.last_play_ts)
+                                        if self._node.last_play_ts else None),
                     "last_error": self._node.last_play_error}
         if action == "get_volume":
             result = self._node._client.Audio_GetVolume()
