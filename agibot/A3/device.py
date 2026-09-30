@@ -31,12 +31,17 @@ import struct
 import threading
 import time
 import zlib
+import atexit
 from array import array
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from common.vendor_runtime import action_schema, jsonable, tool
+try:
+    from .domain_bridge import BridgePublisher, CoreBridge
+except ImportError:  # main.py loads this module as a top-level file in the image
+    from domain_bridge import BridgePublisher, CoreBridge
 
 
 def _core_topic(namespace: str, suffix: str) -> str:
@@ -371,9 +376,28 @@ class A3Nodes:
         self.namespace = namespace
         self.rpc = rpc
         self.robot = Node("agibot_a3_driver_robot", context=ros2.ctx_robot)
-        self.core = Node("agibot_a3_driver_core", context=ros2.ctx_core)
+        core_node = Node("agibot_a3_driver_core", context=ros2.ctx_core)
         ros2.executor_robot.add_node(self.robot)
-        ros2.executor_core.add_node(self.core)
+        ros2.executor_core.add_node(core_node)
+        self.core_bridge = None
+        if config.get("ros", {}).get("core_bridge", False):
+            self.core_bridge = CoreBridge()
+            self.core_bridge.start()
+            atexit.register(self.core_bridge.stop)
+
+        class _CoreFacade:
+            def __init__(self, node, bridge):
+                self._node, self._bridge = node, bridge
+
+            def create_publisher(self, msg_type, topic, qos):
+                if self._bridge is not None:
+                    return BridgePublisher(self._bridge, topic)
+                return self._node.create_publisher(msg_type, topic, qos)
+
+            def __getattr__(self, name):
+                return getattr(self._node, name)
+
+        self.core = _CoreFacade(core_node, self.core_bridge)
 
         self.lock = threading.RLock()
         self.values = {}

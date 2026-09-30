@@ -21,6 +21,9 @@ ros:
   robot_domain_id: 232
   core_domain_id: 42
   robot_interface: "eth0"
+  # Publish core-domain streams from an isolated child process so Agent Core's
+  # loopback-only FastDDS profile can discover them.
+  core_bridge: true
 
 plugins:
   # --- sensors ---

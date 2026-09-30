@@ -24,7 +24,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-a3-requirements
 
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py config.yaml driver.yaml /work/agibot/A3/
+COPY main.py device.py domain_bridge.py config.yaml driver.yaml /work/agibot/A3/
 COPY resource/ /work/agibot/A3/resource/
 # service.yml must be INSIDE the image (12th PR review): Agent Core extracts the
 # deployment fragment from the driver image and merges it into the host's unified
