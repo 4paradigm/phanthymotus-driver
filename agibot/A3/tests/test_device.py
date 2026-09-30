@@ -2259,9 +2259,7 @@ class RobotSubnetIpTests(unittest.TestCase):
                              fake_path)
             text = Path(fake_path).read_text(encoding="utf-8")
             self.assertIn("<address>10.42.10.77</address>", text)
-            self.assertIn("<address>127.0.0.1</address>", text)
-            self.assertLess(text.index("<address>127.0.0.1</address>"),
-                            text.index("<address>10.42.10.77</address>"))
+            self.assertNotIn("<address>127.0.0.1</address>", text)
 
     def test_profile_path_lives_in_dockerfile_created_directory(self):
         # /work/agibot/A3/ is COPYied by the Dockerfile; /work/agibot-a3/ never

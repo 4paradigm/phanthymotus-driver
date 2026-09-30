@@ -87,11 +87,6 @@ def _select_profile() -> None:
         <transport_id>a3_robot_net</transport_id>
         <type>UDPv4</type>
         <interfaceWhiteList>
-          <!-- Put loopback first: FastDDS uses the first locator for local
-               discovery. The core-domain participant must be discoverable by
-               Agent Core's loopback-only profile, while the same process's
-               robot-domain participant still needs the robot NIC below. -->
-          <address>127.0.0.1</address>
           <address>{robot_ip}</address>
         </interfaceWhiteList>
       </transport_descriptor>
@@ -116,9 +111,9 @@ def _select_profile() -> None:
               "Both domains will use every interface: domain 42 is NOT isolated.")
         return
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
-    print(f"[ros2] process-wide DDS profile: {profile} "
-          f"(whitelist {robot_ip} + 127.0.0.1 — robot-domain-232 link to "
-          f"10.42.10.x up, other subnets excluded on both contexts)")
+    print(f"[ros2] robot DDS profile: {profile} "
+          f"(robot-domain-232 whitelist {robot_ip}; domain-42 publishing is "
+          "handled by the isolated bridge process)")
 
 
 def main() -> None:
