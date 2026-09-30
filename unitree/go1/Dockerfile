@@ -42,8 +42,8 @@ COPY sensors.py        /work/sensors.py
 COPY controllers.py    /work/controllers.py
 COPY ext_devices.py    /work/ext_devices.py
 COPY camera.py         /work/camera.py
-# vision_capture 复用此模块；照片无额外依赖，录像使用上面安装的 ffmpeg。
-COPY camera_snapshot.py /work/camera_snapshot.py
+# 拍照录像共用 vision_capture 模块；照片无额外依赖，录像使用上面安装的 ffmpeg。
+COPY vision_capture.py /work/vision_capture.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
 COPY resource/         /work/resource/

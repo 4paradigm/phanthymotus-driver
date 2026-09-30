@@ -26,7 +26,7 @@ POSITIONS = tuple(camera._VALID_POSITIONS)
 log = logging.getLogger(__name__)
 
 
-class CameraSnapshotPlugin:
+class VisionCapturePlugin:
     def __init__(self, plugin_config):
         self._endpoints = {
             position: (endpoint["board_ip"], int(endpoint["image_port"]))

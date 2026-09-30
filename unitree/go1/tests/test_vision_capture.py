@@ -47,7 +47,7 @@ def completed_capture(card, completions, position="front"):
 
 
 def test_snapshot_connects_to_selected_camera_and_saves_jpeg(tmp_path, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
     jpeg = b"\xff\xd8photo\xff\xd9"
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
@@ -68,7 +68,7 @@ def test_snapshot_connects_to_selected_camera_and_saves_jpeg(tmp_path, completio
     sender = threading.Thread(target=send_frame, daemon=True)
     sender.start()
     try:
-        card = snapshot.CameraSnapshotPlugin({
+        card = snapshot.VisionCapturePlugin({
             "output_dir": str(tmp_path),
             "positions": {"left": {"board_ip": "127.0.0.1", "image_port": port}},
         })
@@ -83,8 +83,8 @@ def test_snapshot_connects_to_selected_camera_and_saves_jpeg(tmp_path, completio
 
 
 def test_capture_admission_shows_destination_before_photo_is_saved(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     entered, release = threading.Event(), threading.Event()
 
     def capture(position):
@@ -109,8 +109,8 @@ def test_capture_admission_shows_destination_before_photo_is_saved(tmp_path, mon
 
 
 def test_failed_capture_does_not_create_advertised_path(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"invalid")
     accepted = card.dispatch("capture_photo", {})
     terminal = completions.get(timeout=3)
@@ -120,14 +120,14 @@ def test_failed_capture_does_not_create_advertised_path(tmp_path, monkeypatch, c
 
 
 def test_snapshot_rejects_invalid_camera_without_creating_file(tmp_path):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     assert card.dispatch("capture_photo", {"position": "invalid"})["code"] == "INVALID_ARGUMENT"
     assert list(tmp_path.iterdir()) == []
 
 
 def test_snapshot_rejects_incomplete_camera_frame(tmp_path, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(1)
@@ -143,7 +143,7 @@ def test_snapshot_rejects_incomplete_camera_frame(tmp_path, completions):
 
     sender = threading.Thread(target=send_incomplete_frame, daemon=True)
     sender.start()
-    card = snapshot.CameraSnapshotPlugin({
+    card = snapshot.VisionCapturePlugin({
         "output_dir": str(tmp_path),
         "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
     })
@@ -154,15 +154,15 @@ def test_snapshot_rejects_incomplete_camera_frame(tmp_path, completions):
 
 
 def test_snapshot_does_not_leave_a_partial_photo_when_publish_fails(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    monkeypatch.setattr(snapshot.CameraSnapshotPlugin, "_capture_jpeg",
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    monkeypatch.setattr(snapshot.VisionCapturePlugin, "_capture_jpeg",
                         lambda self, position: b"\xff\xd8photo\xff\xd9")
 
     def fail_publish(self, target):
         raise OSError("storage interrupted")
 
     monkeypatch.setattr(Path, "replace", fail_publish)
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     assert completed_capture(card, completions)["code"] == "SAVE_FAILED"
     assert list((tmp_path / "photos").iterdir()) == []
 
@@ -189,16 +189,16 @@ def test_go1_bundle_exposes_snapshot_tool_without_rgb(monkeypatch):
 
 
 def test_snapshot_declares_completion_only_for_capture():
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    schema = snapshot.CameraSnapshotPlugin({}).get_tool()["inputSchema"]
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    schema = snapshot.VisionCapturePlugin({}).get_tool()["inputSchema"]
     assert schema["x-completion"]["actions"] == ["capture_photo", "record_video"]
     assert schema["x-completion"]["timeout"] >= 33
     assert schema["x-resource"] == "camera"
 
 
 def test_video_admission_completes_and_releases_position(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     entered, release = threading.Event(), threading.Event()
 
     def record(position, path, duration, cancel):
@@ -228,8 +228,8 @@ def test_video_admission_completes_and_releases_position(tmp_path, monkeypatch, 
 
 
 def test_video_failure_and_cancel_complete(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
     monkeypatch.setattr(card, "_record_and_save", lambda *args: {"ok": False, "code": "RECORD_FAILED"})
     accepted = card.dispatch("record_video", {})
@@ -254,8 +254,8 @@ def test_video_failure_and_cancel_complete(tmp_path, monkeypatch, completions):
 
 
 def test_video_rejects_invalid_duration_and_missing_encoder(tmp_path, monkeypatch):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     for value in (0, 31, 1.5, True):
         assert card.dispatch("record_video", {"duration_s": value})["code"] == "INVALID_ARGUMENT"
     monkeypatch.setattr(snapshot.shutil, "which", lambda command: None)
@@ -263,7 +263,7 @@ def test_video_rejects_invalid_duration_and_missing_encoder(tmp_path, monkeypatc
 
 
 def test_video_rejects_active_same_position_stream(tmp_path, monkeypatch):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
     camera = importlib.import_module("unitree.go1.camera")
     monkeypatch.setattr(camera, "_HAS_ROS2", False)
     monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
@@ -271,7 +271,7 @@ def test_video_rejects_active_same_position_stream(tmp_path, monkeypatch):
     stream._node = object()
     release = threading.Event()
     monkeypatch.setattr(stream._stream_cls, "_loop", lambda *args: release.wait(3))
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     assert stream.dispatch("start", {"position": "front"})["ok"]
     try:
         busy = card.dispatch("record_video", {"position": "front"})
@@ -315,8 +315,8 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
 
     sender = threading.Thread(target=send_frames, daemon=True)
     sender.start()
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({
         "output_dir": str(tmp_path),
         "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
     })
@@ -340,8 +340,8 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
     (RuntimeError("worker failed"), "CAPTURE_FAILED"),
 ])
 def test_snapshot_failure_completes_and_releases_position(tmp_path, monkeypatch, completions, error, code):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
 
     def fail(position):
         raise error
@@ -353,8 +353,8 @@ def test_snapshot_failure_completes_and_releases_position(tmp_path, monkeypatch,
 
 
 def test_capture_returns_before_network_finishes_and_blocks_same_position(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     results = []
 
@@ -392,14 +392,14 @@ def test_capture_returns_before_network_finishes_and_blocks_same_position(tmp_pa
 
 @pytest.mark.parametrize("camera_type", ["rgb", "depth", "pointcloud"])
 def test_snapshot_rejects_active_same_position_stream(tmp_path, monkeypatch, completions, camera_type):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
     camera = importlib.import_module("unitree.go1.camera")
     monkeypatch.setattr(camera, "_HAS_ROS2", False)
     plugin = camera.Plugin({}, "test", None, None, camera_type)
     plugin._node = object()
     release = threading.Event()
     monkeypatch.setattr(plugin._stream_cls, "_loop", lambda *args: release.wait(3))
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
     assert plugin.dispatch("start", {"position": "left"})["ok"]
     try:
@@ -419,12 +419,12 @@ def test_snapshot_rejects_active_same_position_stream(tmp_path, monkeypatch, com
 
 
 def test_stream_cannot_start_during_snapshot(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
     camera = importlib.import_module("unitree.go1.camera")
     monkeypatch.setattr(camera, "_HAS_ROS2", False)
     plugin = camera.make_camera_rgb({}, "test", None, None)
     plugin._node = object()
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     release = threading.Event()
 
     def capture(position):
@@ -455,16 +455,16 @@ def test_bundle_snapshot_inherits_camera_positions_even_when_stream_disabled(mon
 
 
 def test_snapshot_and_rgb_have_identical_default_endpoints():
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
     camera = importlib.import_module("unitree.go1.camera")
-    card = snapshot.CameraSnapshotPlugin({})
+    card = snapshot.VisionCapturePlugin({})
     rgb = camera.make_camera_rgb({}, "test", None, None)
     assert card._endpoints == {p: (cfg["board_ip"], cfg["image_port"]) for p, cfg in rgb._positions.items()}
 
 
 @pytest.mark.parametrize("jpeg, status", [(b"\xff\xd8photo\xff\xd9", "completed"), (b"bad", "error")])
 def test_completion_reaches_http_endpoint(tmp_path, monkeypatch, jpeg, status):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
     received = queue.Queue()
 
     class Handler(BaseHTTPRequestHandler):
@@ -480,7 +480,7 @@ def test_completion_reaches_http_endpoint(tmp_path, monkeypatch, jpeg, status):
     serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05})
     serving.start()
     monkeypatch.setenv("AGENT_CORE_URL", f"http://127.0.0.1:{server.server_port}")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: jpeg)
     try:
         accepted = card.dispatch("capture_photo", {})
@@ -496,8 +496,8 @@ def test_completion_reaches_http_endpoint(tmp_path, monkeypatch, jpeg, status):
 
 
 def test_failed_completion_delivery_keeps_result_and_releases_camera(tmp_path, monkeypatch, caplog):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
     finished = threading.Event()
     notify = card._notify_complete
@@ -528,8 +528,8 @@ def test_failed_completion_delivery_keeps_result_and_releases_camera(tmp_path, m
 
 
 def test_transient_completion_delivery_failure_retries_successfully(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
     successful_post = urllib.request.urlopen
     attempts = []
@@ -553,8 +553,8 @@ def test_transient_completion_delivery_failure_retries_successfully(tmp_path, mo
 
 
 def test_worker_start_failure_does_not_leave_occupancy(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
 
     def fail_start(self):
         raise RuntimeError("cannot create worker")
@@ -570,7 +570,7 @@ def test_worker_start_failure_does_not_leave_occupancy(tmp_path, monkeypatch, co
 
 
 def test_slow_fragments_cannot_reset_frame_deadline(monkeypatch):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
     times = iter([0.0, 0.4, 1.1])
     timeouts = []
 
@@ -583,13 +583,13 @@ def test_slow_fragments_cannot_reset_frame_deadline(monkeypatch):
 
     monkeypatch.setattr(snapshot.time, "monotonic", lambda: next(times))
     with pytest.raises(TimeoutError, match="deadline"):
-        snapshot.CameraSnapshotPlugin._receive_exact(Connection(), 3, 1.0)
+        snapshot.VisionCapturePlugin._receive_exact(Connection(), 3, 1.0)
     assert timeouts == [1.0, 0.6]
 
 
 def test_simultaneous_snapshots_reserve_position_atomically(tmp_path, monkeypatch, completions):
-    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
-    cards = [snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)}) for _ in range(2)]
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    cards = [snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)}) for _ in range(2)]
     start = threading.Barrier(3)
     release = threading.Event()
     results = queue.Queue()
@@ -602,7 +602,7 @@ def test_simultaneous_snapshots_reserve_position_atomically(tmp_path, monkeypatc
         start.wait(3)
         results.put(card.dispatch("capture_photo", {}))
 
-    monkeypatch.setattr(snapshot.CameraSnapshotPlugin, "_capture_jpeg", capture)
+    monkeypatch.setattr(snapshot.VisionCapturePlugin, "_capture_jpeg", capture)
     callers = [threading.Thread(target=call, args=(card,)) for card in cards]
     for caller in callers:
         caller.start()
