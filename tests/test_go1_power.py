@@ -100,9 +100,66 @@ def test_concurrent_starts_use_one_sampler_and_stop_cancels_it():
         card.start()
         assert card._thread is sampler
         assert card.dispatch("stop", {}) == {"state": "idle"}
-        card.stop()
         assert not sampler.is_alive()
         assert card.dispatch("unknown", {}) is None
+    finally:
+        card.stop()
+
+
+def test_dispatch_stop_halts_sampling_and_start_resumes_without_pause_energy(monkeypatch):
+    sampled = threading.Event()
+    now = [101.1]
+    monkeypatch.setattr(power.time, "monotonic", lambda: now[0])
+
+    class CountingClient:
+        calls = 0
+        stamp = 101.0
+
+        def snapshot(self):
+            self.calls += 1
+            return battery_snap(self.stamp)
+
+    client = CountingClient()
+    card = power.BatteryPowerPlugin({}, "test", None, client)
+    sample = card._sample
+
+    def record_sample(snap):
+        result = sample(snap)
+        sampled.set()
+        return result
+
+    monkeypatch.setattr(card, "_sample", record_sample)
+    sample(battery_snap(100.0), now=100.1)
+    sample(battery_snap(101.0), now=101.1)
+    try:
+        assert card.dispatch("start", {}) == {"state": "running"}
+        assert sampled.wait(timeout=2)
+        first_thread = card._thread
+        assert card.dispatch("stop", {}) == {"state": "idle"}
+        assert not first_thread.is_alive()
+        reads_at_stop = client.calls
+        sampled.clear()
+        assert not sampled.wait(timeout=0.05)
+        assert client.calls == reads_at_stop
+        stopped = card.dispatch("info", {})
+        assert stopped["state"] == "idle"
+        assert stopped["data"]["reason"] == "sampling_stopped"
+        assert stopped["data"]["available"] is False
+        assert stopped["data"]["discharged_since_start_wh"] == 0.1
+        assert card._last is None and card._runtime_start is None
+
+        # A short pause must also be skipped, even within the normal gap limit.
+        client.stamp = 102.0
+        now[0] = 102.1
+        assert card.dispatch("start", {}) == {"state": "running"}
+        assert sampled.wait(timeout=2)
+        assert card._thread is not first_thread and card._thread.is_alive()
+        resumed = card.dispatch("info", {})
+        assert resumed["state"] == "running"
+        assert resumed["data"]["discharged_since_start_wh"] == 0.1
+        assert resumed["data"]["runtime_estimate_reason"] == "insufficient_soc_history"
+        next_sample = sample(battery_snap(103.0), now=103.1)
+        assert next_sample["discharged_since_start_wh"] == 0.2
     finally:
         card.stop()
 
@@ -124,9 +181,16 @@ def test_joint_power_is_mechanical_and_rejects_stale_or_incomplete_data():
 
 
 def test_cards_are_configured_and_copied_into_image():
-    config = (GO1 / "config.yaml").read_text()
-    manifest = (GO1 / "driver.yaml").read_text()
+    import yaml
+
+    config = yaml.safe_load((GO1 / "config.yaml").read_text())
+    manifest = yaml.safe_load((GO1 / "driver.yaml").read_text())
+    enabled = {name for name, settings in config["plugins"].items()
+               if settings.get("enabled", False)}
+    cards = manifest["cards"]
+    assert len({card["name"] for card in cards}) == len(cards)
+    assert {card["name"] for card in cards} == enabled
     for name in ("battery_power", "joint_power"):
-        assert f"  {name}:" in config
-        assert f"name: {name}," in manifest
+        assert name in enabled
+        assert next(card["type"] for card in cards if card["name"] == name) == "sensor"
     assert "COPY sensors.py" in (GO1 / "Dockerfile").read_text()

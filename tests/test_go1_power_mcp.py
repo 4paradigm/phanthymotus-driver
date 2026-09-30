@@ -72,6 +72,16 @@ def _check_http_mcp():
             else:
                 assert data["electrical_power_available"] is False
             assert call(name, "stop") == {"state": "idle"}
+            if name == "battery_power":
+                card = next(card for card in bundle._plugins
+                            if card.get_tool()["name"] == name)
+                stopped_thread = card._thread
+                assert not stopped_thread.is_alive()
+                assert call(name, "info")["state"] == "idle"
+                assert call(name, "start") == {"state": "running"}
+                assert card._thread is not stopped_thread and card._thread.is_alive()
+                assert call(name, "stop") == {"state": "idle"}
+                assert not card._thread.is_alive()
     finally:
         server.shutdown()
         server.server_close()

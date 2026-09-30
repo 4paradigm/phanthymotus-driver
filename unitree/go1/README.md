@@ -38,6 +38,8 @@
 
 `battery_power` 用 10 节有效单体电压之和与 BMS 电流绝对值估算功率。BMS 状态为放电时累计 `discharged_since_start_wh`，充电时累计 `charged_since_start_wh`；其他状态不累计。累计范围是**本次驱动进程运行期间**，重启清零；断流、无效电压或两次有效样本间隔超过 2.5 秒时跳过缺失区间。`covered_duration_s` 只统计实际纳入积分的时间，便于判断累计值覆盖了多少运行时间。电流方向和单体电压需要在 Go1 真机上校核，当前尚未实测。
 
+该卡在驱动启动时开始采样；MCP `stop` 会停止采样和发布，保留已累计电量，并清除连续采样及 SOC 观察历史。`start` 重新启动采样；暂停区间不计入电量或续航预测。停止时 `info` 返回 `state: idle`、`available: false`，不会继续展示停止前的瞬时功率。
+
 `remaining_runtime_minutes` 是按连续放电期间 BMS 的 SOC 下降速度外推的粗略剩余时间，不依赖未经核实的电池额定容量。至少连续观测 60 秒且 SOC 下降 3 个百分点后才给出数值；此前为 `null`，原因见 `runtime_estimate_reason`。充电、数据断流、SOC 无效或回升时重新开始观察。负载变化、电池老化和 BMS SOC 误差会影响预测，不能当作保证的续航时间；真机上尚未校准。
 
 ### 控制卡（actuator，下发 `HighCmd` / 外设动作；须真机验证量程+安全后上架）

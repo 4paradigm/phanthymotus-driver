@@ -1235,12 +1235,15 @@ class BatteryPowerPlugin:
             return dict(self._latest)
 
     def _tick(self):
-        try:
-            msg = String()
-            msg.data = json.dumps(self._read_latest())
-            self._pub.publish(msg)
-        except Exception as e:
-            self._node.get_logger().error(f"publish {self._topic} error: {e}")
+        with self._lifecycle_lock:
+            if self._shutdown.is_set():
+                return
+            try:
+                msg = String()
+                msg.data = json.dumps(self._read_latest())
+                self._pub.publish(msg)
+            except Exception as e:
+                self._node.get_logger().error(f"publish {self._topic} error: {e}")
 
     def get_tool(self):
         return {"name": "battery_power", "type": "sensor", "multiInstance": False,
@@ -1262,15 +1265,29 @@ class BatteryPowerPlugin:
             self._shutdown.set()
             if self._thread is not None:
                 self._thread.join(timeout=2.5)
+                if self._thread.is_alive():
+                    raise RuntimeError("battery sampler did not stop")
+            with self._lock:
+                # Keep process totals, but never integrate across a pause or
+                # reuse SOC history from before sampling was stopped.
+                self._last = None
+                self._runtime_start = None
+                self._runtime_last_soc = None
+                self._latest = self._unavailable("sampling_stopped")
 
     def dispatch(self, action, args):
         if action == "start":
+            self.start()
             return {"state": "running"}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action in ("info", "read", "get", "battery_power"):
-            return {"state": "running", "data": self._read_latest(),
-                    "topic_out": ([{"topic": self._topic, "format": "data/json"}] if self._node else [])}
+            with self._lifecycle_lock:
+                running = (self._thread is not None and self._thread.is_alive()
+                           and not self._shutdown.is_set())
+                return {"state": "running" if running else "idle", "data": self._read_latest(),
+                        "topic_out": ([{"topic": self._topic, "format": "data/json"}] if self._node else [])}
         return None
 
 
