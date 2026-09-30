@@ -1344,6 +1344,10 @@ class LocoPlugin:
     def __init__(self, nodes):
         self.nodes = nodes
         self._move_action_id = None
+        # ThreadingHTTPServer serves MCP calls concurrently — the check-then-set
+        # on _move_action_id (settle prior / arm new) must be atomic
+        # (MotionPlayPlugin._play_lock 同款).
+        self._move_lock = threading.Lock()
 
     def get_tool(self):
         schema = action_schema(
@@ -1374,7 +1378,10 @@ class LocoPlugin:
         pass
 
     def stop(self):
-        self._settle_active("cancelled", {"reason": "plugin_stopped"})
+        with self._move_lock:
+            prior = self._settle_active("cancelled", {"reason": "plugin_stopped"})
+        if prior is not None:
+            self._halt_motion()
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1403,8 +1410,9 @@ class LocoPlugin:
         if current and current != "MOTION":
             return {"state": "rejected", "current": current,
                     "suggestion": "loco 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up 恢复站立"}
-        # 新指令顶替旧指令：先结算旧的等待线程，避免悬挂的 completed 回报。
-        self._settle_active("cancelled", {"reason": "replaced_by_new_command"})
+        # 新指令顶替旧指令：先结算旧的等待线程（发零速 + cancelled 回报），再武装新的。
+        with self._move_lock:
+            prior = self._settle_active("cancelled", {"reason": "replaced_by_new_command"})
         return self._arm_completion(forward, lateral, angular, duration)
 
     # -- 内部 ------------------------------------------------------------------
@@ -1422,15 +1430,34 @@ class LocoPlugin:
         self.nodes.publish_wrapper("locomotion_pub", payload)
 
     def _settle_active(self, status, detail):
-        """结算挂起的 ACP 等待线程（若有）：先清 id 再发零速，杜绝迟到回报。"""
+        """结算挂起的 ACP 等待线程（若有）。调用方必须持有 _move_lock：先清 id
+        再发零速/回报，杜绝迟到回报。返回被结算的 action_id（None 表示无挂起），
+        供调用方决定是否补发物理停障（零速帧在锁外重发有丢失风险）——本方法
+        自己也会发一次零速，调用方锁外的重发仅是加固。"""
         action_id, self._move_action_id = self._move_action_id, None
         if action_id is not None:
-            self._publish(self._velocity_payload(0.0, 0.0, 0.0))
+            try:
+                self._publish(self._velocity_payload(0.0, 0.0, 0.0))
+            except Exception:
+                pass  # 结算回报优先于停障帧；调用方在锁外重试
             _acp_notify(action_id, status, detail, "loco")
+        return action_id
+
+    def _halt_motion(self):
+        """锁外连发零速帧确保停稳（发布通道瞬时故障时尽力而为）。"""
+        for _ in range(self._STOP_FRAMES):
+            try:
+                self._publish(self._velocity_payload(0.0, 0.0, 0.0))
+            except Exception:
+                return
+            time.sleep(self._PUBLISH_INTERVAL_S)
 
     def _stop_walk(self):
-        had_active = self._move_action_id is not None
-        self._settle_active("cancelled", {"reason": "cancelled_by_request"})
+        with self._move_lock:
+            prior = self._settle_active("cancelled", {"reason": "cancelled_by_request"})
+            had_active = prior is not None
+        if prior is not None:
+            self._halt_motion()
         return {"state": "idle", "was_walking": had_active}
 
     def _arm_completion(self, forward, lateral, angular, duration):
@@ -1451,17 +1478,21 @@ class LocoPlugin:
         deadline = time.monotonic() + (duration if duration > 0 else self.COMPLETION_TIMEOUT_S)
         while time.monotonic() < deadline:
             time.sleep(self._PUBLISH_INTERVAL_S)
-            if self._move_action_id != action_id:   # superseded / stopped
-                return
+            with self._move_lock:
+                if self._move_action_id != action_id:   # superseded / stopped
+                    return
             try:
                 self._publish(payload)
             except Exception as exc:                # 发布通道挂了：立即停下并报错
-                self._settle_active("error", {"error": f"publish failed: {exc}"})
+                with self._move_lock:
+                    self._settle_active("error", {"error": f"publish failed: {exc}"})
                 return
-        if self._move_action_id != action_id:
-            return
-        # 正常到点：清 id、连发零速帧、回报 completed。
-        self._move_action_id = None
+        # 正常到点：原子地清 id 并认领终态（与 stop/顶替路径互斥，杜绝双回报）。
+        with self._move_lock:
+            if self._move_action_id != action_id:
+                return
+            self._move_action_id = None
+        # 连发零速帧、回报 completed（锁外：纯输出，无状态竞争）。
         for _ in range(self._STOP_FRAMES):
             try:
                 self._publish(self._velocity_payload(0.0, 0.0, 0.0))
@@ -1749,6 +1780,9 @@ class MotionPlayPlugin:
         # ThreadingHTTPServer serves MCP calls concurrently — the check-then-set
         # on _play_action_id (settle prior / arm new) must be atomic.
         self._play_lock = threading.Lock()
+        # pause suspends the completion countdown (robot-side player is frozen
+        # by cmd_pause, so the estimated duration no longer elapses in real time).
+        self._paused = threading.Event()
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
@@ -1801,14 +1835,18 @@ class MotionPlayPlugin:
     _PLAY_WORKER_TICK_S = 0.2
 
     def _play_worker(self, action_id, motion_path, duration_ms):
-        # Settle when the originally requested duration elapses; a pause merely
-        # suspends the countdown (cmd_pause freezes the robot-side player the
-        # same way), a stop/reset invalidates the waiter entirely.
+        # Settle when the originally requested duration elapses; a pause suspends
+        # the countdown (cmd_pause freezes the robot-side player, so wall-clock
+        # time no longer maps to playback progress), a stop/reset invalidates
+        # the waiter entirely. The terminal post is capture-and-clear under the
+        # lock so pause/resume/stop racing the natural finish never double-report.
         remaining_s = duration_ms / 1000.0
         while remaining_s > 0:
-            time.sleep(self._PLAY_WORKER_TICK_S)
+            self._paused.wait(self._PLAY_WORKER_TICK_S)   # paused → clock frozen
             if self._play_action_id != action_id:
                 return  # superseded by a new play, or settled by stop/reset
+            if self._paused.is_set():
+                continue  # frozen this tick — do not consume the countdown
             remaining_s -= self._PLAY_WORKER_TICK_S
         if self._play_action_id != action_id:
             return
@@ -1878,9 +1916,13 @@ class MotionPlayPlugin:
                     "response": response}
         if action == "pause":
             # cmd_pause freezes the robot-side player; the completion waiter
-            # keeps its countdown armed (resume continues the same motion).
+            # suspends its countdown too (resume continues the same motion) —
+            # otherwise the worker would report completed while the robot is
+            # mid-pose and a resume would move joints with no ACP armed.
+            self._paused.set()
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=True))
         if action == "resume":
+            self._paused.clear()
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=False))
         if action == "stop_play":
             # Stopping the motion also settles any pending ACP waiter — a
@@ -1936,6 +1978,9 @@ class TtsPlugin:
         self.nodes = nodes
         self._play_action_id = None
         self._play_trace_id = None
+        # ThreadingHTTPServer serves MCP calls concurrently — the check-then-set on
+        # _play_action_id / _play_trace_id must be atomic (MotionPlayPlugin 同款).
+        self._play_lock = threading.Lock()
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
@@ -1965,20 +2010,27 @@ class TtsPlugin:
     def _settle_active(self, status, detail):
         """结算挂起的 ACP 等待线程（若有）：清 id 后立刻回报终态。
 
+        调用方必须持有 _play_lock。返回被结算的 (action_id, trace_id)
+        （None 表示无挂起），供调用方在锁外执行物理打断 —— StopTTSTraceId
+        只对旧 trace_id 有效，必须在被新播报覆盖前捕获。
+
         只清 id 会让 Agent Core 的 barrier 挂到 180 s 超时 —— 取消也必须显式
         POST cancelled（LocoPlugin._settle_active 同款语义）。
         """
         action_id, self._play_action_id = self._play_action_id, None
         if action_id is not None:
             _acp_notify(action_id, status, detail, "tts")
+        return (action_id, self._play_trace_id) if action_id is not None else None
 
     def stop(self):
         # 插件生命周期卸载：与框架 stop 同款 —— 有播报在跑就先物理打断并结算，
         # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
-        if self._play_action_id is not None:
-            self._settle_active("cancelled", {"reason": "plugin_stopped"})
+        with self._play_lock:
+            prior = self._settle_active("cancelled", {"reason": "plugin_stopped",
+                                                      "trace_id": self._play_trace_id or ""})
+        if prior is not None:
             try:
-                self.nodes.rpc.stop_tts_trace_id(self._play_trace_id or "")
+                self.nodes.rpc.stop_tts_trace_id(prior[1] or "")
             except Exception:
                 pass
 
@@ -2014,41 +2066,56 @@ class TtsPlugin:
 
     def _play_worker(self, action_id, trace_id, action, detail):
         # Superseded guard: a newer speak/play_media or a stop took over — never
-        # fire a stale completion (g1 _acp_wait_nav pattern).
-        if self._play_action_id != action_id:
-            return
+        # fire a stale completion (g1 _acp_wait_nav pattern). The terminal posts
+        # capture-and-clear the id under the lock so a concurrent cancel and a
+        # natural finish never double-report.
+        with self._play_lock:
+            if self._play_action_id != action_id:
+                return
         deadline = time.time() + TTS_COMPLETION_TIMEOUT_S
         result = {"action": action, "trace_id": trace_id, **detail}
         while time.time() < deadline:
             time.sleep(self._POLL_INTERVAL_S)
-            if self._play_action_id != action_id:
-                return
+            with self._play_lock:
+                if self._play_action_id != action_id:
+                    return
             try:
                 response = self.nodes.rpc.get_audio_status(trace_id)
             except Exception as exc:  # noqa: BLE001 — notify and keep polling
                 result["error"] = f"GetAudioStatus poll failed: {exc}"
-                _acp_notify(action_id, "error", result, "tts")
+                self._finish(action_id, "error", result)
                 return
             state = self._audio_state(response)
-            if state is None or state == TTS_AUDIO_PLAYING:
+            # state 0（未播）也按进行中处理：PlayTTS 刚受理、状态尚未翻转时
+            # 轮询到 0 是正常竞态，误报 error 会让 Agent Core 提前收尸。
+            if state is None or state == TTS_AUDIO_PLAYING or state == 0:
                 continue
             if state == TTS_AUDIO_DONE:
                 result["final_state"] = state
-                _acp_notify(action_id, "completed", result, "tts")
+                self._finish(action_id, "completed", result)
             else:
                 result["error"] = f"playback ended in state {state}"
                 result["final_state"] = state
-                _acp_notify(action_id, "error", result, "tts")
+                self._finish(action_id, "error", result)
             return
         result["error"] = f"playback not finished within {TTS_COMPLETION_TIMEOUT_S}s"
-        _acp_notify(action_id, "error", result, "tts")
+        self._finish(action_id, "error", result)
+
+    def _finish(self, action_id, status, result):
+        """原子终态：锁内确认仍持有该 action_id 才清 id，锁外回报。"""
+        with self._play_lock:
+            if self._play_action_id != action_id:
+                return  # 已被取消/顶替，终态由对方回报
+            self._play_action_id = None
+        _acp_notify(action_id, status, result, "tts")
 
     def _arm_completion(self, action, trace_id, detail):
         action_id = f"tts_{action}_{uuid4().hex[:8]}"
-        self._play_action_id = action_id
-        # 记住当前 trace_id：框架 stop 打断当前播报时要按它调用
-        # StopTTSTraceId，而 stop 入参里并不会带 trace_id。
-        self._play_trace_id = trace_id
+        with self._play_lock:
+            self._play_action_id = action_id
+            # 记住当前 trace_id：框架 stop 打断当前播报时要按它调用
+            # StopTTSTraceId，而 stop 入参里并不会带 trace_id。
+            self._play_trace_id = trace_id
         threading.Thread(target=self._play_worker,
                          args=(action_id, trace_id, action, detail),
                          daemon=True).start()
@@ -2063,11 +2130,14 @@ class TtsPlugin:
             # voice keeps playing and the ACP worker reports completion later.
             # With nothing armed the call stays inert (canvas lifecycle toggles
             # must not spam StopTTSTraceId when nothing is playing).
-            if self._play_action_id is None:
-                return {"state": "idle"}
-            self._settle_active("cancelled", {"reason": "cancelled_by_framework",
-                                              "trace_id": self._play_trace_id or ""})
-            response = jsonable(self.nodes.rpc.stop_tts_trace_id(self._play_trace_id or ""))
+            with self._play_lock:
+                if self._play_action_id is None:
+                    return {"state": "idle"}
+                prior = self._settle_active(
+                    "cancelled", {"reason": "cancelled_by_framework",
+                                  "trace_id": self._play_trace_id or ""})
+                stop_trace = prior[1] or ""
+            response = jsonable(self.nodes.rpc.stop_tts_trace_id(stop_trace))
             return {"state": "stopped", "response": response}
         if action == "info":
             return {"state": "ready"}
@@ -2086,6 +2156,15 @@ class TtsPlugin:
             )
             # PlayTTS/PlayMediaFile 出参为扁平结构（is_sucess 官方拼写如此）
             trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
+            # 新播报顶替旧播报：PlayTTS 已受理后先结算旧等待线程（立即 cancelled）
+            # 并在锁外用旧 trace_id 物理打断 —— 顺序不能反，否则打断的是新播报。
+            with self._play_lock:
+                prior = self._settle_active("cancelled", {"reason": "replaced_by_new_playback"})
+            if prior is not None and prior[1]:
+                try:
+                    self.nodes.rpc.stop_tts_trace_id(prior[1])
+                except Exception:
+                    pass
             # 播报无独立 trace_id 时轮询不到指定会话，等待线程只能靠超时兜底；
             # 此时用空 trace_id 询问当前播报状态（GetAudioStatus 单会话语义）。
             return self._arm_completion("speak", trace_id, {"text": text[:50]})
@@ -2094,6 +2173,14 @@ class TtsPlugin:
             _require(file_name, "file_name 不能为空")
             response = self.nodes.rpc.play_media_file(file_name, is_interrupted=True)
             trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
+            # 同 speak：先结算并打断旧播报，再武装新的等待线程。
+            with self._play_lock:
+                prior = self._settle_active("cancelled", {"reason": "replaced_by_new_playback"})
+            if prior is not None and prior[1]:
+                try:
+                    self.nodes.rpc.stop_tts_trace_id(prior[1])
+                except Exception:
+                    pass
             return self._arm_completion("play_media", trace_id,
                                         {"file_name": file_name, "response": response})
         if action == "status":
@@ -2101,8 +2188,9 @@ class TtsPlugin:
         if action == "stop_trace_id":
             # 打断播报同时结算挂起的 ACP 等待线程（立刻回报 cancelled，
             # 不让 Agent Core 的 barrier 挂到超时）。
-            self._settle_active("cancelled", {"reason": "cancelled_by_request",
-                                              "trace_id": args.get("trace_id", "")})
+            with self._play_lock:
+                self._settle_active("cancelled", {"reason": "cancelled_by_request",
+                                                  "trace_id": args.get("trace_id", "")})
             return jsonable(self.nodes.rpc.stop_tts_trace_id(args.get("trace_id", "")))
         raise ValueError(f"tts: unknown action {action!r}")
 
@@ -2308,8 +2396,6 @@ class FacePlayPlugin:
                        "repeat": 0, "priority": 440, "is_stop": True}
             self.nodes.publish_wrapper("face_play_pub", payload)
             return {"state": "published", "is_stop": True}
-        if action == "stop":
-            return {"state": "idle"}
         raise ValueError(f"face_play: unknown action {action!r}")
 
 
@@ -2349,6 +2435,9 @@ class SkillPlayPlugin:
         self.has_stream = "skill_status" in nodes.streams
         self._play_action_id = None
         self._last_session_id = None
+        # ThreadingHTTPServer serves MCP calls concurrently — the check-then-set on
+        # _play_action_id / _last_session_id must be atomic (MotionPlayPlugin 同款).
+        self._play_lock = threading.Lock()
 
     def get_tool(self):
         topic_out = None
@@ -2377,21 +2466,26 @@ class SkillPlayPlugin:
     def _settle_active(self, status, detail):
         """结算挂起的 ACP 等待线程（若有）：清 id 后立刻回报终态。
 
+        调用方必须持有 _play_lock。返回被结算的 (action_id, session_id)
+        （None 表示无挂起），供调用方在锁外按旧 session_id 执行物理停止。
+
         只清 id 会让 Agent Core 的 barrier 挂到 600 s 超时 —— 取消也必须显式
         POST cancelled（LocoPlugin._settle_active 同款语义）。
         """
         action_id, self._play_action_id = self._play_action_id, None
         if action_id is not None:
             _acp_notify(action_id, status, detail, "skill_play")
+        return (action_id, self._last_session_id) if action_id is not None else None
 
     def stop(self):
         # 插件生命周期卸载：与框架 stop 同款 —— 有技能在跑就先物理停止并结算，
         # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
-        if self._play_action_id is not None:
-            self._settle_active("cancelled", {"reason": "plugin_stopped",
-                                              "session_id": self._last_session_id or ""})
+        with self._play_lock:
+            prior = self._settle_active("cancelled", {"reason": "plugin_stopped",
+                                                      "session_id": self._last_session_id or ""})
+        if prior is not None:
             try:
-                self.nodes.rpc.skill_package("Stop", "", self._last_session_id or "")
+                self.nodes.rpc.skill_package("Stop", "", prior[1] or "")
             except Exception:
                 pass
 
@@ -2423,22 +2517,34 @@ class SkillPlayPlugin:
 
     def _play_worker(self, action_id, session_id, path):
         # Superseded guard: a newer play took over the stream — never fire a
-        # stale completion (g1 _acp_wait_nav pattern).
-        if self._play_action_id != action_id:
-            return
+        # stale completion (g1 _acp_wait_nav pattern). Terminal posts are
+        # capture-and-clear under the lock so a concurrent cancel and a natural
+        # finish never double-report.
+        with self._play_lock:
+            if self._play_action_id != action_id:
+                return
         deadline = time.time() + self.PLAY_TIMEOUT_S
         result = {"path": path, "session_id": session_id}
         while time.time() < deadline:
             time.sleep(self._POLL_INTERVAL_S)
-            if self._play_action_id != action_id:
-                return
+            with self._play_lock:
+                if self._play_action_id != action_id:
+                    return
             terminal = self._snapshot_terminal()
             if terminal is not None:
                 result["final_state"] = terminal
-                _acp_notify(action_id, "completed", result, "skill_play")
+                self._finish(action_id, "completed", result)
                 return
         result["error"] = f"skill play not finished within {self.PLAY_TIMEOUT_S}s"
-        _acp_notify(action_id, "error", result, "skill_play")
+        self._finish(action_id, "error", result)
+
+    def _finish(self, action_id, status, result):
+        """原子终态：锁内确认仍持有该 action_id 才清 id，锁外回报。"""
+        with self._play_lock:
+            if self._play_action_id != action_id:
+                return  # 已被取消/顶替，终态由对方回报
+            self._play_action_id = None
+        _acp_notify(action_id, status, result, "skill_play")
 
     def dispatch(self, action, args):
         if action == "start":
@@ -2448,11 +2554,14 @@ class SkillPlayPlugin:
             # the skill keeps running and the ACP worker reports completion later.
             # With nothing armed the call stays inert (canvas lifecycle toggles
             # must not spam SkillPilot Stop when no skill is playing).
-            if self._play_action_id is None:
-                return {"state": "idle"}
-            self._settle_active("cancelled", {"reason": "cancelled_by_framework",
-                                              "session_id": self._last_session_id or ""})
-            response = jsonable(self.nodes.rpc.skill_package("Stop", "", self._last_session_id or ""))
+            with self._play_lock:
+                if self._play_action_id is None:
+                    return {"state": "idle"}
+                prior = self._settle_active(
+                    "cancelled", {"reason": "cancelled_by_framework",
+                                  "session_id": self._last_session_id or ""})
+                stop_session = prior[1] or ""
+            response = jsonable(self.nodes.rpc.skill_package("Stop", "", stop_session))
             return {"state": "stopped", "response": response}
         if action == "info":
             return {"state": "ready", "has_stream": self.has_stream}
@@ -2465,13 +2574,24 @@ class SkillPlayPlugin:
         if action == "play":
             path = args.get("path", "")
             _require(path, "path 不能为空")
+            # 新播放顶替旧播放：先结算旧等待线程（立即 cancelled）并在锁外按旧
+            # session_id 物理停止 —— 顺序不能反，否则 Stop 打断的是新会话
+            # （ThreadingHTTPServer 使并发 play 可达，MotionPlayPlugin 同款）。
+            with self._play_lock:
+                prior = self._settle_active("cancelled", {"reason": "replaced_by_new_play"})
+            if prior is not None and prior[1]:
+                try:
+                    self.nodes.rpc.skill_package("Stop", "", prior[1])
+                except Exception:
+                    pass
             response = jsonable(self.nodes.rpc.skill_package("Start", path))
             session_id = (response.get("data") or {}).get("session_id", "")
             action_id = f"skill_play_{uuid4().hex[:8]}"
-            self._play_action_id = action_id
-            # 记住当前会话：框架 stop 要按它调用 SkillPilot Stop，
-            # 而 stop 入参里并不会带 session_id。
-            self._last_session_id = session_id
+            with self._play_lock:
+                self._play_action_id = action_id
+                # 记住当前会话：框架 stop 要按它调用 SkillPilot Stop，
+                # 而 stop 入参里并不会带 session_id。
+                self._last_session_id = session_id
             threading.Thread(target=self._play_worker,
                              args=(action_id, session_id, path), daemon=True).start()
             return {"state": "playing", "action_id": action_id,
@@ -2481,8 +2601,9 @@ class SkillPlayPlugin:
         if action == "stop_play":
             # Stopping the session also settles any pending ACP waiter (an
             # immediate cancelled post, not a silent id clear).
-            self._settle_active("cancelled", {"reason": "cancelled_by_request",
-                                              "session_id": args.get("session_id", "")})
+            with self._play_lock:
+                self._settle_active("cancelled", {"reason": "cancelled_by_request",
+                                                  "session_id": args.get("session_id", "")})
             return jsonable(self.nodes.rpc.skill_package("Stop", "", args.get("session_id", "")))
         if action == "state":
             snapshot = self.nodes.snapshot("skill_status")
@@ -2552,6 +2673,9 @@ class ControlledSpatialPlugin:
         self.nodes = nodes
         self.last_task_id = None
         self._nav_action_id = None
+        # ThreadingHTTPServer serves MCP calls concurrently — the check-then-set on
+        # _nav_action_id (settle prior / arm new) must be atomic (MotionPlayPlugin 同款).
+        self._nav_lock = threading.Lock()
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
@@ -2588,21 +2712,27 @@ class ControlledSpatialPlugin:
     def _settle_active(self, status, detail):
         """结算挂起的 ACP 等待线程（若有）：清 id 后立刻回报终态。
 
+        调用方必须持有 _nav_lock。返回被结算的 (action_id, task_id)
+        （None 表示无挂起），供调用方在锁外按旧 task_id 执行物理取消 ——
+        ActionCancel 只对发起中的任务有效，必须在被新任务覆盖前捕获。
+
         只清 id 会让 Agent Core 的 barrier 挂到 180 s 超时 —— 取消也必须显式
         POST cancelled（LocoPlugin._settle_active 同款语义）。
         """
         action_id, self._nav_action_id = self._nav_action_id, None
         if action_id is not None:
             _acp_notify(action_id, status, detail, "controlled_spatial")
+        return (action_id, self.last_task_id) if action_id is not None else None
 
     def stop(self):
         # 插件生命周期卸载：与框架 stop 同款 —— 有导航在跑就先物理取消并结算，
         # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
-        if self._nav_action_id is not None:
-            self._settle_active("cancelled", {"reason": "plugin_stopped",
-                                              "task_id": self.last_task_id or 0})
+        with self._nav_lock:
+            prior = self._settle_active("cancelled", {"reason": "plugin_stopped",
+                                                      "task_id": self.last_task_id or 0})
+        if prior is not None:
             try:
-                self.nodes.rpc.navi("ActionCancel", {"task_id": self.last_task_id or 0})
+                self.nodes.rpc.navi("ActionCancel", {"task_id": prior[1] or 0})
             except Exception:
                 pass
 
@@ -2644,20 +2774,24 @@ class ControlledSpatialPlugin:
 
     def _nav_worker(self, action_id, task_id, action):
         # Superseded guard: a newer nav action or a cancel took over — never
-        # fire a stale completion (g1 _acp_wait_nav pattern).
-        if self._nav_action_id != action_id:
-            return
+        # fire a stale completion (g1 _acp_wait_nav pattern). Terminal posts are
+        # capture-and-clear under the lock so a concurrent cancel and a natural
+        # arrival never double-report.
+        with self._nav_lock:
+            if self._nav_action_id != action_id:
+                return
         deadline = time.time() + self.NAV_TIMEOUT_S
         result = {"action": action, "task_id": task_id}
         while time.time() < deadline:
             time.sleep(self._NAV_POLL_INTERVAL_S)
-            if self._nav_action_id != action_id:
-                return
+            with self._nav_lock:
+                if self._nav_action_id != action_id:
+                    return
             try:
                 response = self.nodes.rpc.navi_state(task_id)
             except Exception as exc:  # noqa: BLE001 — notify and keep polling
                 result["error"] = f"ActionGetState poll failed: {exc}"
-                _acp_notify(action_id, "error", result, "controlled_spatial")
+                self._finish(action_id, "error", result)
                 return
             terminal = self._nav_state_terminal(response)
             if terminal is None:
@@ -2666,19 +2800,41 @@ class ControlledSpatialPlugin:
             result["final_state"] = terminal
             if state in self._NAV_ERROR_STATES:
                 result["error"] = f"navigation ended in {terminal}"
-                _acp_notify(action_id, "error", result, "controlled_spatial")
+                self._finish(action_id, "error", result)
             else:
-                _acp_notify(action_id, "completed", result, "controlled_spatial")
+                self._finish(action_id, "completed", result)
             return
         result["error"] = f"navigation not finished within {self.NAV_TIMEOUT_S}s"
-        _acp_notify(action_id, "error", result, "controlled_spatial")
+        self._finish(action_id, "error", result)
+
+    def _finish(self, action_id, status, result):
+        """原子终态：锁内确认仍持有该 action_id 才清 id，锁外回报。"""
+        with self._nav_lock:
+            if self._nav_action_id != action_id:
+                return  # 已被取消/顶替，终态由对方回报
+            self._nav_action_id = None
+        _acp_notify(action_id, status, result, "controlled_spatial")
 
     def _nav_dispatch(self, action, method, payload):
-        """Send a long-running navigation RPC and arm the ACP completion waiter."""
+        """Send a long-running navigation RPC and arm the ACP completion waiter.
+
+        新导航顶替旧导航：先结算旧等待线程（立即 cancelled）并在锁外按旧
+        task_id 物理取消 —— 不取消的话机器人会同时执行两个导航任务
+        （ThreadingHTTPServer 使并发下发可达，MotionPlayPlugin 同款）。
+        """
+        with self._nav_lock:
+            prior = self._settle_active("cancelled", {"reason": "replaced_by_new_navigation"})
+            prior_task = prior[1] if prior is not None else None
+        if prior is not None and prior_task:
+            try:
+                self.nodes.rpc.navi("ActionCancel", {"task_id": prior_task})
+            except Exception:
+                pass
         response = self._remember(self.nodes.rpc.navi(method, payload))
         task_id = (response or {}).get("task_id") or self.last_task_id or 0
         action_id = f"a3_nav_{uuid4().hex[:8]}"
-        self._nav_action_id = action_id
+        with self._nav_lock:
+            self._nav_action_id = action_id
         threading.Thread(target=self._nav_worker,
                          args=(action_id, task_id, action), daemon=True).start()
         return {"state": "navigating", "action_id": action_id,
@@ -2692,12 +2848,17 @@ class ControlledSpatialPlugin:
             # otherwise the robot keeps driving and the ACP worker reports
             # completion when the task finally ends on its own. With nothing
             # armed the call stays inert (canvas lifecycle toggles must not
-            # spam ActionCancel when no task is navigating).
-            if self._nav_action_id is None:
-                return {"state": "idle"}
-            self._settle_active("cancelled", {"reason": "cancelled_by_framework",
-                                              "task_id": self._task_id(args)})
-            response = jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": self._task_id(args)}))
+            # spam ActionCancel when no task is navigating). The cancelled task
+            # id is captured under the lock: args may omit task_id, and
+            # last_task_id may already point at a newer task.
+            with self._nav_lock:
+                if self._nav_action_id is None:
+                    return {"state": "idle"}
+                prior = self._settle_active(
+                    "cancelled", {"reason": "cancelled_by_framework",
+                                  "task_id": self._task_id(args)})
+                stop_task = prior[1] if prior is not None else self._task_id(args)
+            response = jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": stop_task or 0}))
             return {"state": "stopped", "response": response}
         if action == "info":
             return {"state": "ready", "last_task_id": self.last_task_id}
@@ -2758,8 +2919,9 @@ class ControlledSpatialPlugin:
         if action == "cancel":
             # 取消任务同时结算挂起的 ACP 等待线程（立刻回报 cancelled，
             # 不让 Agent Core 的 barrier 挂到超时）。
-            self._settle_active("cancelled", {"reason": "cancelled_by_request",
-                                              "task_id": self._task_id(args)})
+            with self._nav_lock:
+                self._settle_active("cancelled", {"reason": "cancelled_by_request",
+                                                  "task_id": self._task_id(args)})
             return jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": self._task_id(args)}))
         if action == "pause":
             return jsonable(self.nodes.rpc.navi("ActionPause", {"task_id": self._task_id(args)}))

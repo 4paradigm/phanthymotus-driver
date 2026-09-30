@@ -200,10 +200,13 @@ class RecordingTransport:
     def __init__(self, responses=None):
         self.calls = []
         self.responses = dict(responses or {})
+        self.handler = None  # optional test hook: handler(url, service) -> response
 
     def __call__(self, url, payload, timeout):
         self.calls.append((url, payload))
         service = url.split("/rpc/aimdk.protocol.", 1)[-1]
+        if self.handler is not None:
+            return self.handler(url, service)
         for prefix, response in self.responses.items():
             if service.startswith(prefix):
                 return response
@@ -989,6 +992,64 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_tts_not_yet_played_state_keeps_polling(self):
+        # GetAudioStatus returning 0 (未播) right after PlayTTS is accepted is a
+        # normal race, not a playback error — the worker must keep polling until
+        # state flips to playing/finished (the timeout is the backstop).
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            tts = find_plugin(self.plugins, "tts")
+            tts._POLL_INTERVAL_S = 0.02
+            self.transport.responses["TTSService/PlayTTS"] = {"trace_id": "t-slow"}
+            # every poll answers 未播 (state 0) — the worker must not error out
+            self.transport.responses["TTSService/GetAudioStatus"] = {"state": 0}
+            tts.dispatch("speak", {"text": "刚开始还没播"})
+            time.sleep(0.4)
+            self.assertEqual(captured, [], "state 0 (未播) must be treated as pending")
+            # flip to finished → the same worker reports completion
+            self.transport.responses["TTSService/GetAudioStatus"] = {"state": 2}
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            (action_id, status, _, tool_name), = captured
+            self.assertEqual(status, "completed")
+            self.assertEqual(tool_name, "tts")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_tts_second_speak_settles_previous_and_stops_old_trace(self):
+        # Concurrent MCP calls make a second speak reachable while the first is
+        # still playing: the first action gets an immediate cancelled, the OLD
+        # trace_id is stopped (not the new one), and only the second action
+        # stays armed.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            tts = find_plugin(self.plugins, "tts")
+            tts._POLL_INTERVAL_S = 0.2
+            self.transport.responses["TTSService/PlayTTS"] = {"trace_id": "t-old"}
+            self.transport.responses["TTSService/GetAudioStatus"] = {"state": 1}
+            first = tts.dispatch("speak", {"text": "第一句"})
+            # second speak gets a different trace_id from the service
+            self.transport.responses["TTSService/PlayTTS"] = {"trace_id": "t-new"}
+            second = tts.dispatch("speak", {"text": "第二句"})
+            self.assertNotEqual(first["action_id"], second["action_id"])
+            # the OLD playback is physically interrupted with the OLD trace_id
+            (url, body), = self.transport.calls_to("TTSService", "StopTTSTraceId")
+            self.assertEqual(body["trace_id"], "t-old")
+            time.sleep(0.5)
+            self.assertEqual([(c[0], c[1], c[3]) for c in captured],
+                             [(first["action_id"], "cancelled", "tts")])
+            self.assertEqual(captured[0][2]["reason"], "replaced_by_new_playback")
+            self.assertEqual(tts._play_action_id, second["action_id"])
+        finally:
+            device._acp_notify = original_notify
+
 
     def test_tts_play_media_posts_play_media_file(self):
         tts = find_plugin(self.plugins, "tts")
@@ -1168,6 +1229,39 @@ class RpcDispatchTests(unittest.TestCase):
             # the second worker is the only one left armed and must not be able
             # to report the first action's completion
             self.assertEqual(motion._play_action_id, second["action_id"])
+        finally:
+            device._acp_notify = original_notify
+
+    def test_motion_play_pause_suspends_completion_countdown(self):
+        # cmd_pause freezes the robot-side player, so wall-clock time no longer
+        # maps to playback progress: the completion countdown must freeze too,
+        # otherwise Agent Core is told "completed" while the motion is paused,
+        # and after resume the robot keeps moving with no waiter armed.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            motion = find_plugin(self.plugins, "motion_play")
+            motion._PLAY_WORKER_TICK_S = 0.02
+            result = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                              "duration_ms": 100})
+            self.assertEqual(result["state"], "playing")
+            motion.dispatch("pause", {})
+            # the original 100 ms deadline passes while paused
+            time.sleep(0.4)
+            self.assertEqual(captured, [])  # countdown frozen, no completed post
+            motion.dispatch("resume", {})
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            (action_id, status, payload, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "completed")
+            self.assertEqual(tool_name, "motion_play")
+            # pause/resume reached the robot-side player
+            pause_calls = self.transport.calls_to("MotionCommandService", "SendMotionCommand")
+            self.assertEqual([c[1]["cmd_pause"] for c in pause_calls[1:]], [True, False])
         finally:
             device._acp_notify = original_notify
 
@@ -1397,6 +1491,44 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_controlled_spatial_second_nav_settles_previous_and_cancels_old_task(self):
+        # Same concurrency class as motion_play (ThreadingHTTPServer): a second
+        # nav must settle the first waiter (immediate cancelled) and physically
+        # ActionCancel the OLD task BEFORE the new navi RPC fires — otherwise
+        # the robot executes two nav tasks at once and the first barrier orphans.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial._NAV_POLL_INTERVAL_S = 5.0  # keep both workers polling
+            responses = iter([{"task_id": 11, "data": {"state": "running"}},
+                              {"task_id": 12, "data": {"state": "running"}}])
+            self.transport.handler = lambda url, service: (
+                next(responses) if service.startswith("PncService/MoveForward")
+                else {"header": {"code": "0"}})
+            first = spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
+            second = spatial.dispatch("move_forward", {"map_id": 1, "distance": 1.0})
+            self.assertNotEqual(first["action_id"], second["action_id"])
+            time.sleep(0.3)
+            # exactly one post so far: the first action cancelled immediately
+            self.assertEqual([(c[0], c[1], c[3]) for c in captured],
+                             [(first["action_id"], "cancelled", "controlled_spatial")])
+            self.assertEqual(captured[0][2]["reason"], "replaced_by_new_navigation")
+            # the replacement cancelled the OLD task before the new nav fired
+            (url, body), = self.transport.calls_to("PncService", "ActionCancel")
+            self.assertEqual(body["task_id"], 11)
+            # the two MoveForward RPCs fired in order
+            nav_calls = self.transport.calls_to("PncService", "MoveForward")
+            self.assertEqual(len(nav_calls), 2)
+            self.assertEqual([c[1]["distance"] for c in nav_calls], [0.5, 1.0])
+            # the second worker is the only one left armed
+            self.assertEqual(spatial._nav_action_id, second["action_id"])
+            self.assertEqual(spatial.last_task_id, 12)
+        finally:
+            device._acp_notify = original_notify
+
     def test_controlled_spatial_relocalization_start(self):
         spatial = find_plugin(self.plugins, "controlled_spatial")
         spatial.dispatch("start_relocalization", {"map_dir": "/agibot/data/map/lobby"})
@@ -1540,6 +1672,55 @@ class RpcDispatchTests(unittest.TestCase):
             self.assertEqual(action_id, result["action_id"])
             self.assertEqual(status, "cancelled")
             self.assertEqual(tool_name, "skill_play")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_skill_play_second_play_settles_previous_and_stops_old_session(self):
+        # Same concurrency class as motion_play (ThreadingHTTPServer): a second
+        # play must settle the first waiter (immediate cancelled) and physically
+        # Stop the OLD session_id BEFORE the new Start arms — otherwise the
+        # robot runs two skills at once and the first barrier orphans.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            skill = find_plugin(self.plugins, "skill_play")
+            skill._POLL_INTERVAL_S = 5.0  # keep both workers polling
+            skill.nodes.values["skill_status"] = {"state": "running"}
+            responses = iter([{"data": {"session_id": "s-1"}},
+                              {"data": {"session_id": "s-2"}}])
+            def skill_handler(url, service):
+                if not service.startswith("SkillPilotService/SkillPackage"):
+                    return {"header": {"code": "0"}}
+                body = next(c for u, c in reversed(self.transport.calls)
+                             if "SkillPilotService/SkillPackage" in u)
+                # Start calls consume the queued session_ids; Stop reuses the old one.
+                if body.get("command") == "Start":
+                    return next(responses)
+                return {"data": {"session_id": body.get("session_id", "")}}
+            self.transport.handler = skill_handler
+            first = skill.dispatch("play", {"path": "/agibot/skills/a"})
+            second = skill.dispatch("play", {"path": "/agibot/skills/b"})
+            self.assertEqual(first["session_id"], "s-1")
+            self.assertEqual(second["session_id"], "s-2")
+            self.assertNotEqual(first["action_id"], second["action_id"])
+            time.sleep(0.3)
+            # exactly one post so far: the first action cancelled immediately
+            self.assertEqual([(c[0], c[1], c[3]) for c in captured],
+                             [(first["action_id"], "cancelled", "skill_play")])
+            self.assertEqual(captured[0][2]["reason"], "replaced_by_new_play")
+            # SkillPackage order: Start(path=a) … Stop(s-1) then Start(path=b) —
+            # the replacement stopped the OLD session, never the new one.
+            calls = self.transport.calls_to("SkillPilotService", "SkillPackage")
+            self.assertEqual([(c[1]["command"], c[1].get("session_id"),
+                               c[1].get("path")) for c in calls],
+                             [("Start", "", "/agibot/skills/a"),
+                              ("Stop", "s-1", ""),
+                              ("Start", "", "/agibot/skills/b")])
+            # the second worker is the only one left armed
+            self.assertEqual(skill._play_action_id, second["action_id"])
+            self.assertEqual(skill._last_session_id, "s-2")
         finally:
             device._acp_notify = original_notify
 
