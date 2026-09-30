@@ -150,6 +150,7 @@ import yaml  # noqa: E402
 
 import device  # noqa: E402
 import main  # noqa: E402
+from common.vendor_runtime import DriverBundle  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +290,16 @@ def run_concurrently(fn_a, fn_b):
 # ---------------------------------------------------------------------------
 
 class ToolInventoryTests(unittest.TestCase):
+    def test_driver_bundle_accepts_named_plugin_mapping(self):
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = {"joints": {"enabled": True}}
+        plugins, _ = build_bundle_plugins(config)
+
+        bundle = DriverBundle(plugins)
+        self.assertEqual(len(bundle.plugins), 1)
+        self.assertIs(bundle.plugins[0], plugins["joints"])
+        self.assertTrue(bundle.get_all_tools())
+
     def test_tool_names_and_types_match_driver_yaml(self):
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = FULL_PLUGINS

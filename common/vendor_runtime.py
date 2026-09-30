@@ -16,6 +16,7 @@ import re
 import signal
 import socket
 import threading
+from collections.abc import Mapping
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -164,7 +165,11 @@ def tool(
 
 class DriverBundle:
     def __init__(self, plugins: Iterable[Any]):
-        self.plugins = list(plugins)
+        # Most drivers return a list, while config-gated drivers may retain a
+        # name -> plugin mapping for tests and lookup.  Iterating a mapping
+        # yields its string keys, which later produces misleading errors such
+        # as "str has no attribute get_tool" and "str has no attribute start".
+        self.plugins = list(plugins.values()) if isinstance(plugins, Mapping) else list(plugins)
 
     def start_all(self) -> None:
         for plugin in self.plugins:
