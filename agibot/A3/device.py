@@ -1553,6 +1553,7 @@ class MotionPlayPlugin:
 
     def __init__(self, nodes):
         self.nodes = nodes
+        self._play_action_id = None
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
@@ -1581,9 +1582,20 @@ class MotionPlayPlugin:
     def stop(self):
         pass
 
+    _PLAY_WORKER_TICK_S = 0.2
+
     def _play_worker(self, action_id, motion_path, duration_ms):
-        # duration_ms already validated non-negative at dispatch.
-        time.sleep(duration_ms / 1000.0)
+        # Settle when the originally requested duration elapses; a pause merely
+        # suspends the countdown (cmd_pause freezes the robot-side player the
+        # same way), a stop/reset invalidates the waiter entirely.
+        remaining_s = duration_ms / 1000.0
+        while remaining_s > 0:
+            time.sleep(self._PLAY_WORKER_TICK_S)
+            if self._play_action_id != action_id:
+                return  # superseded by a new play, or settled by stop/reset
+            remaining_s -= self._PLAY_WORKER_TICK_S
+        if self._play_action_id != action_id:
+            return
         _acp_notify(action_id, "completed",
                     {"motion_id": motion_path, "duration_ms": duration_ms},
                     "motion_play")
@@ -1613,6 +1625,7 @@ class MotionPlayPlugin:
             response = jsonable(self.nodes.rpc.send_motion_command(
                 motion_path, duration_ms, cmd_end=True, cmd_pause=False))
             action_id = f"motion_play_{uuid4().hex[:8]}"
+            self._play_action_id = action_id
             threading.Thread(target=self._play_worker,
                              args=(action_id, motion_path, duration_ms),
                              daemon=True).start()
@@ -1620,12 +1633,18 @@ class MotionPlayPlugin:
                     "motion_id": motion_path, "duration_ms": duration_ms,
                     "response": response}
         if action == "pause":
+            # cmd_pause freezes the robot-side player; the completion waiter
+            # keeps its countdown armed (resume continues the same motion).
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=True))
         if action == "resume":
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=False))
         if action == "stop_play":
+            # Stopping the motion also settles any pending ACP waiter — a
+            # cancelled motion must not be reported as completed later.
+            self._play_action_id = None
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True))
         if action == "reset":
+            self._play_action_id = None
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_reset=True))
         if action == "stop":
             return {"state": "idle"}

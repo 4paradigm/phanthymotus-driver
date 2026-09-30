@@ -15,6 +15,13 @@ except ImportError:  # running outside the container image (dev checkout)
 import os
 import socket
 
+# Must live inside a directory the Dockerfile actually creates: /work/agibot/A3/
+# is COPYied from this repo, /work/agibot-a3/ is not. On the robot a missing
+# parent made the profile write fail, the OSError branch cleared the env var,
+# and BOTH domains fell back to every interface — silently defeating the
+# declared DDS isolation.
+PROFILE_PATH = "/work/agibot/A3/dds-profile.xml"
+
 
 def _robot_subnet_ip() -> str:
     """Find this host's address on the robot subnet (10.42.10.0/24, dev guide §7).
@@ -71,7 +78,7 @@ def _select_profile() -> None:
               "no DDS profile selected (dev host; on the robot this would isolate "
               "domain 42 to loopback + robot subnet)")
         return
-    profile = "/work/agibot-a3/dds-profile.xml"
+    profile = PROFILE_PATH
     content = f"""<?xml version="1.0" encoding="UTF-8" ?>
 <dds xmlns="http://www.eprosima.com">
   <profiles>

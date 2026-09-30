@@ -14,6 +14,7 @@ import array
 import json
 import struct
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -845,6 +846,27 @@ class RpcDispatchTests(unittest.TestCase):
         # Nothing was sent to the robot for the rejected calls.
         self.assertEqual(self.transport.calls_to("MotionCommandService", "SendMotionCommand"), [])
 
+    def test_motion_play_stop_play_settles_pending_waiter(self):
+        # stop_play (and reset) must invalidate the duration-based completion
+        # worker: a motion cancelled early must never be reported to Agent Core
+        # as successfully finished afterwards.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            motion = find_plugin(self.plugins, "motion_play")
+            motion._PLAY_WORKER_TICK_S = 0.02
+            motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                     "duration_ms": 5000})
+            motion.dispatch("stop_play", {})
+            time.sleep(0.5)
+            self.assertEqual(captured, [])
+            calls = self.transport.calls_to("MotionCommandService", "SendMotionCommand")
+            self.assertEqual(calls[-1][1]["cmd_end"], True)
+        finally:
+            device._acp_notify = original_notify
+
     def test_arm_control_compliance_dispatch(self):
         arm = find_plugin(self.plugins, "arm_control")
         arm.dispatch("compliance_enable", {})
@@ -1096,6 +1118,56 @@ class RobotSubnetIpTests(unittest.TestCase):
         main.socket.socket = FailingSocket
         self.addCleanup(setattr, main.socket, "socket", original_socket)
         self.assertEqual(main._robot_subnet_ip(), "")
+
+    def test_select_profile_writes_profile_and_sets_env(self):
+        # Successful path: on a robot-subnet host the profile must actually be
+        # written (to a directory the Dockerfile creates) and the env var set.
+        # Regression: the profile used to live in /work/agibot-a3/, which no
+        # build step creates — the write failed on the robot, the OSError
+        # branch cleared FASTRTPS_DEFAULT_PROFILES_FILE, and both domains
+        # fell back to every interface.
+        class FakeSocket:
+            def __init__(self, family, kind):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def connect(self, address):
+                pass
+
+            def getsockname(self):
+                return ("10.42.10.77", 12345)
+
+        original_socket = main.socket.socket
+        main.socket.socket = FakeSocket
+        self.addCleanup(setattr, main.socket, "socket", original_socket)
+        # Redirect the profile path into a temp dir (parent directory exists,
+        # so the write succeeds like it does in the container).
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_path = str(Path(tmp) / "dds-profile.xml")
+            original_profile_path = main.PROFILE_PATH
+            main.PROFILE_PATH = fake_path
+            self.addCleanup(setattr, main, "PROFILE_PATH", original_profile_path)
+            original_env = main.os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+            self.addCleanup(main.os.environ.pop, "FASTRTPS_DEFAULT_PROFILES_FILE", None)
+            if original_env is not None:
+                self.addCleanup(main.os.environ.__setitem__,
+                                "FASTRTPS_DEFAULT_PROFILES_FILE", original_env)
+            main._select_profile()
+            self.assertEqual(main.os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE"),
+                             fake_path)
+            text = Path(fake_path).read_text(encoding="utf-8")
+            self.assertIn("<address>10.42.10.77</address>", text)
+            self.assertIn("<address>127.0.0.1</address>", text)
+
+    def test_profile_path_lives_in_dockerfile_created_directory(self):
+        # /work/agibot/A3/ is COPYied by the Dockerfile; /work/agibot-a3/ never
+        # exists, so writing there would fail on the robot.
+        self.assertTrue(main.PROFILE_PATH.startswith("/work/agibot/A3/"))
 
 
 class MirrorStreamTests(unittest.TestCase):
