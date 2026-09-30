@@ -190,7 +190,10 @@ def test_capture_returns_before_network_finishes_and_blocks_same_position(tmp_pa
         assert entered.wait(1)
         assert returned.wait(1), "dispatch waited for the Nano"
         assert results[0]["action_id"]
-        assert card.dispatch("stop", {})["state"] == "capturing"
+        stopped = card.dispatch("stop", {})
+        assert stopped["state"] == "idle"
+        assert stopped["capture_active"] is True
+        assert card.dispatch("info", {})["state"] == "capturing"
         busy = card.dispatch("capture_photo", {})
         assert busy["code"] == "RESOURCE_BUSY"
         assert "action_id" not in busy
@@ -441,3 +444,95 @@ def test_bundle_stream_and_snapshot_share_occupancy_and_reject_busy_hot_switch(t
         stream._thread.join(3)
         bundle.stop_all()
     assert completions.get(timeout=3)["status"] == "completed"
+
+
+def test_stream_cards_reject_occupied_position_before_opening_receiver(monkeypatch):
+    camera = importlib.import_module("unitree.go1.camera")
+    monkeypatch.setattr(camera, "_HAS_ROS2", False)
+    rgb = camera.make_camera_rgb({}, "test", None, None)
+    depth = camera.make_camera_depth({}, "test", None, None)
+    rgb._node = depth._node = object()
+    release = threading.Event()
+    monkeypatch.setattr(rgb._stream_cls, "_loop", lambda *args: release.wait(3))
+    monkeypatch.setattr(depth._stream_cls, "_loop", lambda *args: release.wait(3))
+    assert rgb.dispatch("start", {"position": "front"})["ok"]
+    try:
+        busy = depth.dispatch("start", {"position": "front"})
+        assert busy["code"] == "RESOURCE_BUSY"
+        assert depth._streams == {}
+        assert depth.dispatch("start", {"position": "left"})["ok"]
+        second = depth._streams["default"]
+        busy = depth.dispatch("config", {"position": "front"})
+        assert busy["code"] == "RESOURCE_BUSY"
+        assert depth._streams["default"] is second
+        assert second._run and second.position == "left"
+        assert depth.dispatch("start", {"instance_id": "another", "position": "left"})["code"] == "RESOURCE_BUSY"
+        assert "another" not in depth._streams
+    finally:
+        rgb.stop()
+        depth.stop()
+        release.set()
+        rgb._streams["default"]._thread.join(3)
+        if "default" in depth._streams:
+            depth._streams["default"]._thread.join(3)
+
+
+def test_stream_hot_switch_keeps_previous_position_when_target_is_busy(monkeypatch):
+    camera = importlib.import_module("unitree.go1.camera")
+    monkeypatch.setattr(camera, "_HAS_ROS2", False)
+    rgb = camera.make_camera_rgb({}, "test", None, None)
+    rgb._node = object()
+    release = threading.Event()
+    monkeypatch.setattr(rgb._stream_cls, "_loop", lambda *args: release.wait(3))
+    assert rgb.dispatch("config", {"instance_id": "first", "position": "front"})["ok"]
+    assert rgb.dispatch("config", {"instance_id": "second", "position": "left"})["ok"]
+    assert rgb.dispatch("start", {"instance_id": "first"})["ok"]
+    assert rgb.dispatch("start", {"instance_id": "second"})["ok"]
+    second = rgb._streams["second"]
+    try:
+        assert rgb.dispatch("start", {"instance_id": "second"})["ok"]
+        assert rgb._streams["second"] is second
+        assert rgb.dispatch("config", {"instance_id": "second", "position": "front"})["code"] == "RESOURCE_BUSY"
+        assert rgb._cfg["second"]["position"] == "left"
+        assert rgb._streams["second"] is second
+        assert second._run and second.position == "left"
+    finally:
+        rgb.stop()
+        release.set()
+        for stream in rgb._streams.values():
+            stream._thread.join(3)
+
+
+def test_simultaneous_stream_starts_admit_only_one_position(monkeypatch):
+    camera = importlib.import_module("unitree.go1.camera")
+    monkeypatch.setattr(camera, "_HAS_ROS2", False)
+    plugins = [camera.make_camera_rgb({}, "test", None, None),
+               camera.make_camera_depth({}, "test", None, None)]
+    release = threading.Event()
+    start = threading.Barrier(3)
+    results = queue.Queue()
+    for plugin in plugins:
+        plugin._node = object()
+        monkeypatch.setattr(plugin._stream_cls, "_loop", lambda *args: release.wait(3))
+
+    def call(plugin):
+        start.wait(3)
+        results.put(plugin.dispatch("start", {"position": "front"}))
+
+    callers = [threading.Thread(target=call, args=(plugin,)) for plugin in plugins]
+    for caller in callers:
+        caller.start()
+    try:
+        start.wait(3)
+        responses = [results.get(timeout=2) for _ in plugins]
+        assert sum(result["ok"] for result in responses) == 1
+        assert next(result for result in responses if not result["ok"])["code"] == "RESOURCE_BUSY"
+    finally:
+        for plugin in plugins:
+            plugin.stop()
+        release.set()
+        for caller in callers:
+            caller.join(3)
+        for plugin in plugins:
+            for stream in plugin._streams.values():
+                stream._thread.join(3)

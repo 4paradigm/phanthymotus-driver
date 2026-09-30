@@ -62,7 +62,7 @@ class CameraSnapshotPlugin:
     def stop(self):
         # 已受理的抓拍继续完成并上报 ACP，不提前释放仍在使用的机位。
         with camera._CAMERA_LOCK:
-            return {"state": "capturing" if self._active else "idle"}
+            return {"state": "idle", "capture_active": bool(self._active)}
 
     @staticmethod
     def _receive_exact(connection, size, deadline):

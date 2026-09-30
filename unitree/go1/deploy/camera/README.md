@@ -27,13 +27,15 @@ POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`; only
 contains `file_path` under `/opt/phanthy-motus/data/camera_snapshot`, published
 only after the atomic write. `info.last_capture` also keeps the latest terminal
 `{action_id, status, result}`. Callback delivery failures are logged and Core's
-45-second barrier timeout remains the fallback. `stop` lets an accepted capture
-finish and reports `capturing` while it is still working.
+45-second barrier timeout remains the fallback. `stop` reports lifecycle state
+`idle` and a separate `capture_active` flag; an accepted capture still finishes
+and sends its ACP callback.
 
 Within one driver process, snapshot admission and stream startup share a lock:
 an active RGB/depth/pointcloud receiver or another snapshot on the same position
 returns `RESOURCE_BUSY` without an `action_id` or another TCP connection. A
-stream cannot start or switch onto a position being captured. Stopping a stream
+stream cannot start or switch onto a position occupied by a snapshot or another
+stream. Rejected hot switches preserve the old receiver. Stopping a stream
 retains its occupancy until the receiving thread exits. Other positions remain
 available. Occupancy in another process/container is not observable here and
 still requires coordination by the operator/Nano service.

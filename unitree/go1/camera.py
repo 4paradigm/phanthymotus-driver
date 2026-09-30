@@ -685,13 +685,17 @@ class Plugin:
         with _CAMERA_LOCK:
             if position in _SNAPSHOT_POSITIONS:
                 return _err("RESOURCE_BUSY", f"camera position {position!r} is capturing a photo")
-            # 清理旧实例
-            if iid in self._streams:
-                self._streams.pop(iid, None).stop()
-            # 创建新实例
-            st = self._stream_cls(self._node, self._topic(iid))
-            self._streams[iid] = st
-            st.start(position, p["board_ip"], int(p.get(self._port_key, self._default_port)))
+            current = self._streams.get(iid)
+            occupied = running_stream(position)
+            if occupied is not None and (occupied is not current or not current._run):
+                return _err("RESOURCE_BUSY", f"camera position {position!r} is already streaming")
+            if current is None or occupied is not current:
+                # 中文说明：先检查目标机位，再停止旧流；拒绝热切换时保留原连接。
+                if current is not None:
+                    self._streams.pop(iid, None).stop()
+                st = self._stream_cls(self._node, self._topic(iid))
+                self._streams[iid] = st
+                st.start(position, p["board_ip"], int(p.get(self._port_key, self._default_port)))
         topic_out = [{"topic": self._topic(iid), "format": self._fmt}]
         return {"ok": True, "card": self._card, "action": "start", "timestamp_ms": _now_ms(),
                 "state": "running", "position": position, "type": self._type,
