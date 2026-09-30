@@ -113,14 +113,18 @@ class CameraSnapshotPlugin:
             camera._SNAPSHOT_POSITIONS.add(position)
             self._active.add(position)
         action_id = f"camera_snapshot_{uuid4().hex}"
+        # 先确定文件名，画布收到受理结果时即可显示目标路径；完成回调才确认文件存在。
+        path = self._output_dir / (
+            f"{position}_{datetime.now():%Y%m%d_%H%M%S_%f}_{uuid4().hex[:8]}.jpg")
         try:
-            threading.Thread(target=self._capture_async, args=(position, action_id), daemon=True).start()
+            threading.Thread(target=self._capture_async, args=(position, action_id, path), daemon=True).start()
         except Exception as exc:
             with camera._CAMERA_LOCK:
                 camera._SNAPSHOT_POSITIONS.discard(position)
                 self._active.discard(position)
             return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
-        return {"ok": True, "state": "capturing", "action_id": action_id, "position": position}
+        return {"ok": True, "state": "capturing", "action_id": action_id,
+                "position": position, "file_path": str(path)}
 
     def _notify_complete(self, action_id, status, result):
         # 仅用标准库，沿用 Go2 vision_capture 的 ACP/TLS 约定，不增加镜像依赖。
@@ -145,9 +149,9 @@ class CameraSnapshotPlugin:
                 else:
                     time.sleep(0.5 * 2 ** attempt)
 
-    def _capture_async(self, position, action_id):
+    def _capture_async(self, position, action_id, path):
         try:
-            result = self._capture_and_save(position)
+            result = self._capture_and_save(position, path)
         except Exception as exc:
             result = {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
         finally:
@@ -159,7 +163,7 @@ class CameraSnapshotPlugin:
             self._last_capture = {"action_id": action_id, "status": status, "result": result}
         self._notify_complete(action_id, status, result)
 
-    def _capture_and_save(self, position):
+    def _capture_and_save(self, position, path):
         try:
             jpeg = self._capture_jpeg(position)
         except OSError as exc:
@@ -172,8 +176,6 @@ class CameraSnapshotPlugin:
         temporary_path = None
         try:
             self._output_dir.mkdir(parents=True, exist_ok=True)
-            path = self._output_dir / (
-                f"{position}_{datetime.now():%Y%m%d_%H%M%S_%f}_{uuid4().hex[:8]}.jpg")
             temporary_path = path.with_name(f".{path.name}.tmp")
             # 中文说明：先写入并同步临时文件，再公开 JPEG 路径，避免重启后留下空照片。
             with temporary_path.open("xb") as output:

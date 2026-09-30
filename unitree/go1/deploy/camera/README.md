@@ -21,7 +21,8 @@ depth, and point cloud at a time.
 then disconnects. In the canvas, call `camera_snapshot` with
 `{"action":"capture_photo","position":"front"}` (or chin/left/right/belly);
 `camera_rgb` does not need to be started. The call immediately returns
-`{ok: true, state: "capturing", action_id, position}`. The background worker
+`{ok: true, state: "capturing", action_id, position, file_path}`. `file_path` is
+the planned destination and may not exist yet. The background worker
 POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`; only
 `capture_photo` declares `x-completion` (45 seconds). Successful completion
 contains `file_path` under `/opt/phanthy-motus/data/camera_snapshot`, published

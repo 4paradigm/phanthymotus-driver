@@ -80,6 +80,43 @@ def test_snapshot_connects_to_selected_camera_and_saves_jpeg(tmp_path, completio
     assert not sender.is_alive()
 
 
+def test_capture_admission_shows_destination_before_photo_is_saved(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    entered, release = threading.Event(), threading.Event()
+
+    def capture(position):
+        entered.set()
+        assert release.wait(3)
+        return b"\xff\xd8photo\xff\xd9"
+
+    monkeypatch.setattr(card, "_capture_jpeg", capture)
+    accepted = card.dispatch("capture_photo", {"position": "front"})
+    try:
+        assert entered.wait(1)
+        path = Path(accepted["file_path"])
+        assert path.parent == tmp_path
+        assert path.name.startswith("front_") and path.suffix == ".jpg"
+        assert not path.exists()
+    finally:
+        release.set()
+    terminal = completions.get(timeout=3)
+    assert terminal["action_id"] == accepted["action_id"]
+    assert terminal["result"]["file_path"] == accepted["file_path"]
+    assert path.exists()
+
+
+def test_failed_capture_does_not_create_advertised_path(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"invalid")
+    accepted = card.dispatch("capture_photo", {})
+    terminal = completions.get(timeout=3)
+    assert terminal["result"]["ok"] is False
+    assert terminal["action_id"] == accepted["action_id"]
+    assert not Path(accepted["file_path"]).exists()
+
+
 def test_snapshot_rejects_invalid_camera_without_creating_file(tmp_path):
     snapshot = importlib.import_module("unitree.go1.camera_snapshot")
     card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
