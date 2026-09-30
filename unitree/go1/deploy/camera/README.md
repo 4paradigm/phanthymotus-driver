@@ -48,6 +48,16 @@ Wait for its ACP `completed` callback before using the file. The recording clock
 starts at the first valid camera frame. Lifecycle `stop` cancels an active
 recording instead of saving it.
 
+Recording first writes the selected JPEGs into a temporary MJPEG stream, then
+encodes that stream to MP4 with `ffmpeg`'s `ultrafast` H.264 preset. This keeps
+slow encoding from blocking Nano frame reception and repeating the last image
+for the rest of the requested duration. Temporary streams are removed after
+success, failure, or cancellation; allow disk space for the temporary stream
+and final MP4 while encoding finishes. The completion result distinguishes
+`recording_started_at` (first valid camera frame), `recording_ended_at` (capture
+finished), and `file_ready_at` (MP4 published). Playback duration follows the
+capture interval; file availability can be later because encoding runs after it.
+
 `config.yaml` sets `vision_capture.output_dir` to
 `/opt/phanthy-motus/data/vision_capture`. Photos go to `photos/*.jpg`, videos
 to `videos/*.mp4`. `deploy/service.yml` bind-mounts `/opt/phanthy-motus/data`

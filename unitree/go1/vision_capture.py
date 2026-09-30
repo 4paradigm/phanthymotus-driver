@@ -362,6 +362,8 @@ class VisionCapturePlugin:
 
     def _record_and_save(self, position, path, duration, cancel, finish=None):
         temporary_path = path.with_name(f".{path.stem}.tmp.mp4")
+        frames_path = path.with_name(f".{path.stem}.tmp.mjpeg")
+        frames_output = None
         process = None
         stderr_thread = None
         stderr_tail = bytearray()
@@ -370,25 +372,14 @@ class VisionCapturePlugin:
             host, port = self._endpoints[position]
             with socket.create_connection((host, port), timeout=8) as connection:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                process = subprocess.Popen([
-                    "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", str(VIDEO_FPS), "-i", "pipe:0",
-                    "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mp4", str(temporary_path),
-                ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-                with camera._CAMERA_LOCK:
-                    self._encoder = process
-
-                def drain_stderr():
-                    while chunk := process.stderr.read(4096):
-                        stderr_tail.extend(chunk)
-                        del stderr_tail[:-16384]
-
-                stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
-                stderr_thread.start()
+                # 先把选中的 JPEG 落到临时流，避免慢编码器阻塞 Nano 收帧。
+                frames_output = frames_path.open("wb")
                 frames = 0
                 source_frames = 0
                 total_frames = duration * VIDEO_FPS if duration is not None else None
                 deadline = None
                 started_at = None
+                recording_started_at = None
                 last_jpeg = None
                 while not cancel.is_set():
                     if finish is not None and finish.is_set():
@@ -419,6 +410,7 @@ class VisionCapturePlugin:
                     now = time.monotonic()
                     if deadline is None:
                         started_at = now
+                        recording_started_at = datetime.now().astimezone()
                         if duration is not None:
                             deadline = now + duration
                     source_frames += 1
@@ -427,23 +419,42 @@ class VisionCapturePlugin:
                         slot = min(total_frames - 1, slot)
                     # 源帧率低于 15 fps 时填补缺口，保持 MP4 播放时长与实际录制时长一致。
                     while frames < slot:
-                        process.stdin.write(last_jpeg)
+                        frames_output.write(last_jpeg)
                         frames += 1
                     if frames <= slot:
-                        process.stdin.write(jpeg)
+                        frames_output.write(jpeg)
                         frames += 1
                     last_jpeg = jpeg
                 if cancel.is_set():
                     raise InterruptedError("video recording cancelled")
                 if last_jpeg is None:
                     raise RuntimeError("no camera frames received")
+                recording_ended_at = datetime.now().astimezone()
                 if total_frames is None:
                     total_frames = max(1, round((time.monotonic() - started_at) * VIDEO_FPS))
                 while frames < total_frames:
-                    process.stdin.write(last_jpeg)
+                    frames_output.write(last_jpeg)
                     frames += 1
-                process.stdin.close()
-                process.wait(timeout=30)
+                frames_output.close()
+                frames_output = None
+                connection.close()
+                with frames_path.open("rb") as frames_input:
+                    process = subprocess.Popen([
+                        "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", str(VIDEO_FPS), "-i", "pipe:0",
+                        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                        "-f", "mp4", str(temporary_path),
+                    ], stdin=frames_input, stderr=subprocess.PIPE)
+                    with camera._CAMERA_LOCK:
+                        self._encoder = process
+
+                    def drain_stderr():
+                        while chunk := process.stderr.read(4096):
+                            stderr_tail.extend(chunk)
+                            del stderr_tail[:-16384]
+
+                    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+                    stderr_thread.start()
+                    process.wait(timeout=30)
                 stderr_thread.join(timeout=2)
                 if stderr_thread.is_alive():
                     raise RuntimeError("ffmpeg error output did not close")
@@ -456,12 +467,16 @@ class VisionCapturePlugin:
                     os.fsync(output.fileno())
                 temporary_path.replace(path)
                 published = True
+                file_ready_at = datetime.now().astimezone()
                 return {"ok": True, "position": position, "media_type": "video",
                         "file_path": str(path), "filename": path.name,
                         "channel_reply_path": self._channel_path(path), "mime": "video/mp4",
                         "size": path.stat().st_size, "recorded_duration_s": frames / VIDEO_FPS, "frames": frames,
                         "source_frames": source_frames,
-                        "captured_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+                        "recording_started_at": recording_started_at.isoformat(timespec="milliseconds"),
+                        "recording_ended_at": recording_ended_at.isoformat(timespec="milliseconds"),
+                        "file_ready_at": file_ready_at.isoformat(timespec="milliseconds"),
+                        "captured_at": file_ready_at.isoformat(timespec="seconds")}
         except InterruptedError:
             return {"ok": False, "code": "RECORD_CANCELLED", "message": "video recording was cancelled"}
         except Exception as exc:
@@ -469,6 +484,8 @@ class VisionCapturePlugin:
                 return {"ok": False, "code": "RECORD_CANCELLED", "message": "video recording was cancelled"}
             return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
         finally:
+            if frames_output is not None:
+                frames_output.close()
             with camera._CAMERA_LOCK:
                 if self._encoder is process:
                     self._encoder = None
@@ -490,6 +507,7 @@ class VisionCapturePlugin:
                 process.stderr.close()
             if not published:
                 temporary_path.unlink(missing_ok=True)
+            frames_path.unlink(missing_ok=True)
 
 
 def make_vision_capture(plugin_config, namespace, executor, client):

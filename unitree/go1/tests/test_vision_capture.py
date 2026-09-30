@@ -384,6 +384,7 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
     ImageStat = pytest.importorskip("PIL.ImageStat")
     import io
     import time
+    from datetime import datetime
 
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
@@ -422,9 +423,16 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
     sender.join(3)
     assert terminal["action_id"] == accepted["action_id"]
     assert terminal["status"] == "completed", terminal["result"]
+    result = terminal["result"]
+    started = datetime.fromisoformat(result["recording_started_at"])
+    ended = datetime.fromisoformat(result["recording_ended_at"])
+    ready = datetime.fromisoformat(result["file_ready_at"])
+    assert 0.8 <= (ended - started).total_seconds() <= 1.3
+    assert ready >= ended
     path = Path(terminal["result"]["file_path"])
     assert path.is_file() and path.stat().st_size > 0
     assert path.name == "test_clip.mp4"
+    assert list(tmp_path.rglob("*.mjpeg")) == []
     assert card.dispatch("list", {})["files"][0]["filename"] == path.name
     probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                             "-show_entries", "stream=codec_name,width,height:format=duration", "-of", "json", str(path)],
@@ -501,6 +509,71 @@ def test_manual_recording_creates_playable_video_after_stop(tmp_path, completion
     assert 0 < float(json.loads(probe.stdout)["format"]["duration"]) <= 1.3
 
 
+def test_slow_encoder_does_not_starve_camera_capture(tmp_path, monkeypatch, completions):
+    import io
+    import time
+
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
+
+    class SlowInput(io.BytesIO):
+        def write(self, data):
+            time.sleep(0.12)
+            return len(data)
+
+    class SlowEncoder:
+        def __init__(self, args, **kwargs):
+            self.path = Path(args[-1])
+            self.stdin = SlowInput()
+            self.stderr = io.BytesIO()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.path.write_bytes(b"mp4")
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = -15
+
+    monkeypatch.setattr(snapshot.subprocess, "Popen", SlowEncoder)
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def send_frames():
+        try:
+            connection, _ = server.accept()
+            with connection:
+                connection.settimeout(2)
+                for index in range(40):
+                    jpeg = b"\xff\xd8" + bytes([index]) * 32768 + b"\xff\xd9"
+                    try:
+                        connection.sendall(struct.pack(">I", len(jpeg)) + jpeg)
+                    except OSError:
+                        break
+                    time.sleep(0.05)
+        finally:
+            server.close()
+
+    sender = threading.Thread(target=send_frames, daemon=True)
+    sender.start()
+    card = snapshot.VisionCapturePlugin({
+        "output_dir": str(tmp_path),
+        "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
+    })
+    accepted = card.dispatch("record_video", {"duration_s": 1})
+    terminal = completions.get(timeout=8)
+    sender.join(3)
+    assert terminal["action_id"] == accepted["action_id"]
+    assert terminal["status"] == "completed", terminal["result"]
+    assert terminal["result"]["source_frames"] >= 12
+
+
 def test_record_video_drains_encoder_errors_while_feeding_frames(tmp_path, monkeypatch, completions):
     """Continuous encoder errors must not block JPEG writes or completion."""
     import sys
@@ -567,7 +640,7 @@ def test_record_video_drains_encoder_errors_while_feeding_frames(tmp_path, monke
         sender.join(3)
 
 
-def test_stop_unblocks_video_writer_and_reports_cancel(tmp_path, monkeypatch, completions):
+def test_stop_unblocks_encoder_finalization_and_reports_cancel(tmp_path, monkeypatch, completions):
     import sys
     import time
 
@@ -591,17 +664,22 @@ def test_stop_unblocks_video_writer_and_reports_cancel(tmp_path, monkeypatch, co
     server.listen(1)
     port = server.getsockname()[1]
 
-    def send_frame():
+    def send_frames():
         try:
             connection, _ = server.accept()
             with connection:
                 frame = b"\xff\xd8" + b"f" * 131072 + b"\xff\xd9"
-                connection.sendall(struct.pack(">I", len(frame)) + frame)
-                time.sleep(2)
+                packet = struct.pack(">I", len(frame)) + frame
+                for _ in range(40):
+                    try:
+                        connection.sendall(packet)
+                    except OSError:
+                        break
+                    time.sleep(0.05)
         finally:
             server.close()
 
-    sender = threading.Thread(target=send_frame, daemon=True)
+    sender = threading.Thread(target=send_frames, daemon=True)
     sender.start()
     card = snapshot.VisionCapturePlugin({
         "output_dir": str(tmp_path),
@@ -609,8 +687,8 @@ def test_stop_unblocks_video_writer_and_reports_cancel(tmp_path, monkeypatch, co
     })
     stopper = None
     try:
-        accepted = card.dispatch("record_video", {"duration_s": 5})
-        assert launched.wait(2)
+        accepted = card.dispatch("record_video", {"duration_s": 1})
+        assert launched.wait(3)
         time.sleep(0.1)
         stopper = threading.Thread(target=card.stop, daemon=True)
         stopper.start()
@@ -620,6 +698,7 @@ def test_stop_unblocks_video_writer_and_reports_cancel(tmp_path, monkeypatch, co
         assert terminal["status"] == "cancelled"
         assert card.dispatch("info", {})["last_recording"]["status"] == "cancelled"
         assert not Path(accepted["file_path"]).exists()
+        assert list(tmp_path.rglob("*.mjpeg")) == []
     finally:
         for process in processes:
             if process.poll() is None:
