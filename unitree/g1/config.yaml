@@ -15,6 +15,13 @@ plugins:
     enabled: true
   arm:
     enabled: true
+  # Generic monotonic timers. Alarm/tick/completion events leave the card as
+  # data/json and only affect Agent Core when the output is connected there.
+  timer:
+    enabled: true
+    max_timers: 64
+    max_duration_sec: 86400
+    max_alarms: 64
   # 双臂 + 双夹爪的连续控制（motus.control/1，16 维）。给执行模型用。
   #
   # **默认关闭。** 它走 rt/arm_sdk 直接写关节指令，与内置控制器通过混合权重共存
