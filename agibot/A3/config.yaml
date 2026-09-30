@@ -27,6 +27,8 @@ plugins:
   joints:
     enabled: true
     # Which joint groups the card exposes: arm (14-dof arms), hand, neck.
+  joint_state:
+    enabled: true
   imu:
     enabled: true
   camera:

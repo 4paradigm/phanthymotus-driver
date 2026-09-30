@@ -169,6 +169,7 @@ BASE_CONFIG = {
 # waist_control actuators; wakeup/arm_compliance/resource_list cards dissolved.
 FULL_PLUGINS = {
     "joints": {"enabled": True}, "imu": {"enabled": True},
+    "joint_state": {"enabled": True},
     "camera": {"enabled": True,
                "streams": ["head_left_fisheye", "chest_front_d457_rgb",
                            "chest_front_d457_depth"]},
@@ -2311,8 +2312,7 @@ class MirrorStreamTests(unittest.TestCase):
         result = imu.dispatch("info", {})
         topics = {(entry["topic"], entry["format"]) for entry in result["topic_out"]}
         self.assertEqual(topics, {
-            ("/test_ns/agibot_a3/imu_pelvis", "data/json"),
-            ("/test_ns/agibot_a3/imu_torso", "data/json"),
+            ("/test_ns/agibot_a3/state/imu", "data/json"),
         })
         self.assertEqual(set(result["streams"]), {"imu_pelvis", "imu_torso"})
 

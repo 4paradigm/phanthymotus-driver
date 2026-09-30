@@ -15,6 +15,7 @@ build_context_extras:
 cards:
   # --- sensors (names aligned with tianyi2.0/q5_bundle/g1) ---
   - { name: joints,        type: sensor }
+  - { name: joint_state,   type: sensor }
   - { name: imu,           type: sensor }
   - { name: camera,        type: sensor }
   - { name: lidar_cloud,   type: sensor }

@@ -379,6 +379,13 @@ class A3Nodes:
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
 
         self.streams = {}
+        self._joint_cache = {}
+        self._joint_skeleton_pub = self.core.create_publisher(
+            String, f"/{namespace}/agibot_a3/state/joints", 5)
+        self._joint_state_pub = self.core.create_publisher(
+            String, f"/{namespace}/agibot_a3/state/joint_state", 5)
+        self._imu_pub = self.core.create_publisher(
+            String, f"/{namespace}/agibot_a3/state/imu", 5)
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
 
@@ -395,6 +402,11 @@ class A3Nodes:
             pub = self.core.create_publisher(core_msg_type, core_topic, 5)
 
             def callback(msg):
+                if key in ("arm_state", "hand_state", "neck_state"):
+                    self._joint_cache[key] = jsonable(msg)
+                    self._publish_joint_streams()
+                elif key in ("imu_pelvis", "imu_torso"):
+                    self._publish_imu_streams(key, jsonable(msg))
                 if re_encode is not None:
                     out = re_encode(msg)
                     if out is not None:
@@ -688,6 +700,38 @@ class A3Nodes:
         with self.lock:
             return self.values.get(key, {})
 
+    def _publish_joint_streams(self):
+        groups = {key: self._joint_cache.get(key, {})
+                  for key in ("arm_state", "hand_state", "neck_state")}
+        raw = {"arm": groups["arm_state"], "hand": groups["hand_state"],
+               "neck": groups["neck_state"]}
+        output = self._String()
+        output.data = json.dumps(raw, ensure_ascii=False)
+        self._joint_state_pub.publish(output)
+        joints = []
+        for group in groups.values():
+            names = group.get("name", []) if isinstance(group, dict) else []
+            positions = group.get("position", []) if isinstance(group, dict) else []
+            velocities = group.get("velocity", []) if isinstance(group, dict) else []
+            efforts = group.get("effort", []) if isinstance(group, dict) else []
+            for index, name in enumerate(names):
+                joints.append({"idx": len(joints), "name": name,
+                               "q": positions[index] if index < len(positions) else 0.0,
+                               "dq": velocities[index] if index < len(velocities) else 0.0,
+                               "tau": efforts[index] if index < len(efforts) else 0.0})
+        output = self._String()
+        output.data = json.dumps({"format": "sensor/skeleton", "available": bool(joints),
+                                  "joints": joints}, ensure_ascii=False)
+        self._joint_skeleton_pub.publish(output)
+
+    def _publish_imu_streams(self, key, value):
+        self.values[key] = value
+        payload = {"pelvis": self.values.get("imu_pelvis", {}),
+                   "torso": self.values.get("imu_torso", {})}
+        output = self._String()
+        output.data = json.dumps(payload, ensure_ascii=False)
+        self._imu_pub.publish(output)
+
     def speaker_start(self, input_topic: str):
         if self._AudioCapture is None or self._AudioPlayback is None:
             raise RuntimeError("audio_msgs package is unavailable; source the AimDK ROS package")
@@ -940,10 +984,8 @@ class JointsPlugin:
                 "group": {"type": "string", "enum": list(self.GROUPS),
                           "description": "关节组：arm 双臂 14 关节 / hand 手指 / neck 头部"},
             },
-        }, topic_out=[
-            {"topic": self.streams[key]["topic"], "format": self.streams[key]["format"]}
-            for key, _ in self.GROUPS.values()
-        ])
+        }, topic_out=[{"topic": f"/{self.nodes.namespace}/agibot_a3/state/joints",
+                       "format": "sensor/skeleton"}])
 
     def start(self):
         pass
@@ -971,6 +1013,30 @@ class JointsPlugin:
         return {"state": "running", **self.streams[key]}
 
 
+class JointStatePlugin:
+    """Raw grouped JointState JSON for consumers that do not render a URDF."""
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.topic = f"/{nodes.namespace}/agibot_a3/state/joint_state"
+
+    def get_tool(self):
+        return tool("joint_state", "sensor", "原始手臂/手/头 JointState 数据（JSON）",
+                    {"type": "object", "properties": {}},
+                    topic_out=[{"topic": self.topic, "format": "data/json"}])
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            return {"state": "idle", "topic_out": [{"topic": self.topic, "format": "data/json"}]}
+        return {"state": "running", "topic_out": [{"topic": self.topic, "format": "data/json"}]}
+
+
 class ImuPlugin:
     """Two body IMUs (pelvis/torso), mirrored individually — `imu` merges their latest
     snapshots on demand instead of fabricating a second chained topic (X2 merges two
@@ -984,10 +1050,8 @@ class ImuPlugin:
         return tool("imu", "sensor", "骨盆+躯干 IMU 数据（pelvis/torso 最新快照）", {
             "type": "object",
             "properties": {},
-        }, topic_out=[
-            {"topic": self.nodes.streams[key]["topic"], "format": self.nodes.streams[key]["format"]}
-            for key in ("imu_pelvis", "imu_torso")
-        ])
+        }, topic_out=[{"topic": f"/{self.nodes.namespace}/agibot_a3/state/imu",
+                       "format": "data/json"}])
 
     def start(self):
         pass
@@ -1003,9 +1067,8 @@ class ImuPlugin:
         if action == "info":
             # Agent Core 用 info 推断可订阅主题：两路 IMU 流都要列出。
             return {"state": "running",
-                    "topic_out": [
-                        {"topic": self.nodes.streams[k]["topic"], "format": self.nodes.streams[k]["format"]}
-                        for k in ("imu_pelvis", "imu_torso") if k in self.nodes.streams],
+                    "topic_out": [{"topic": f"/{self.nodes.namespace}/agibot_a3/state/imu",
+                                   "format": "data/json"}],
                     "streams": {k: self.nodes.streams[k]
                                 for k in ("imu_pelvis", "imu_torso") if k in self.nodes.streams}}
         return {
@@ -1037,10 +1100,11 @@ class CameraPlugin:
                 "stream": {"type": "string", "enum": self._names(),
                            "description": "相机流 key（config.yaml plugins.camera.streams 中的名称）"},
             },
-        }, topic_out=[
-            {"topic": stream["topic"], "format": stream["format"]}
-            for stream in self.streams.values()
-        ])
+        }, topic_out=self._default_topic_out())
+
+    def _default_topic_out(self):
+        stream = self._resolve({})
+        return [{"topic": stream["topic"], "format": stream["format"]}]
 
     def start(self):
         pass
@@ -3388,6 +3452,8 @@ def build_plugins(config, namespace, ros2):
     plugins = {}
     if enabled("joints"):
         plugins["joints"] = JointsPlugin(nodes)
+    if enabled("joint_state"):
+        plugins["joint_state"] = JointStatePlugin(nodes)
     if enabled("imu"):
         plugins["imu"] = ImuPlugin(nodes)
     if enabled("camera"):
