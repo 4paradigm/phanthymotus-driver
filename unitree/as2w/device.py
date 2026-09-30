@@ -1723,6 +1723,7 @@ class CameraPlugin:
         self._proxy = proxy
         self._node = None if self._process_mode else _CameraRgbNode(self._topic, proxy, config.get("fps", 5))
         self._process = None
+        self._process_stop = None
         self._fps = self._node.fps if self._node is not None else max(0.5, min(15.0, float(config.get("fps", 5))))
         if self._process_mode:
             self._fps = max(0.5, min(15.0, float(config.get("fps", 5))))
@@ -1732,12 +1733,14 @@ class CameraPlugin:
 
     def _start_process(self):
         context = multiprocessing.get_context("spawn")
+        stop_event = context.Event()
+        self._process_stop = stop_event
         self._process = context.Process(
             target=_run_camera_process,
-            args=(self._topic, self._fps, self._interface),
+            args=(self._topic, self._fps, self._interface, stop_event),
             # The camera worker creates RpcProxy's own client workers. Python
-            # forbids daemon processes from creating children; lifecycle is
-            # still bounded by CameraPlugin.stop()'s terminate/join path.
+            # forbids daemon processes from creating children; the shared
+            # stop event lets it close those workers before process exit.
             daemon=False, name="as2w-camera-rgb-process")
         self._process.start()
 
@@ -1758,9 +1761,16 @@ class CameraPlugin:
         if self._process_mode:
             process = self._process
             self._process = None
+            stop_event = self._process_stop
+            self._process_stop = None
             if process is not None:
-                process.terminate()
-                process.join(timeout=3)
+                if stop_event is not None:
+                    stop_event.set()
+                process.join(timeout=8)
+                if process.is_alive():
+                    print("[camera_rgb] graceful worker stop timed out; terminating process", flush=True)
+                    process.terminate()
+                    process.join(timeout=3)
         else:
             self._node.stop()
 
@@ -1784,9 +1794,9 @@ class CameraPlugin:
         return None
 
 
-def _run_camera_process(topic, fps, interface):
+def _run_camera_process(topic, fps, interface, stop_event):
     from sensor_worker import run_camera
-    run_camera(topic, fps, interface)
+    run_camera(topic, fps, interface, stop_event)
 
 
 class LedPlugin:
@@ -1844,7 +1854,10 @@ class LedPlugin:
             self._keepalive_stop.wait(0.7)
 
     def dispatch(self, action, args):
-        if action in ("start", "info"):
+        if action == "start":
+            self.start()
+            return {"state": "ready", "color": list(self._color)}
+        if action == "info":
             return {"state": "ready", "color": list(self._color)}
         if action == "stop":
             self.stop()

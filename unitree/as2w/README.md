@@ -131,6 +131,11 @@ Change scope and validation notes:
   and `git diff --check` before submitting. Hardware-dependent audio multicast,
   AS2 voice, videohub, and sport behavior still require validation against the
   target robot firmware.
+- The RGB camera process has an explicit graceful-stop protocol: the parent
+  signals the worker, the worker shuts down its ROS executor and closes the
+  camera node and nested RPC workers, and only then does the parent use a
+  bounded terminate fallback. The LED `start` action also restarts its
+  keepalive thread after a prior `stop` when a non-black color is selected.
 - On the target Orin host, the robot adapter was observed as `eno1` with
   `192.168.123.100/24` while Wi-Fi carried the default route. A read-only
   listener bound explicitly to `eno1` received 31 microphone multicast packets

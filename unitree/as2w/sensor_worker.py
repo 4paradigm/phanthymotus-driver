@@ -35,7 +35,7 @@ def run_lidar(topic, source_topics, max_render_points, interface):
         rclpy.shutdown()
 
 
-def run_camera(topic, fps, interface):
+def run_camera(topic, fps, interface, stop_event=None):
     _setup_logs()
     import rclpy
     from rclpy.executors import SingleThreadedExecutor
@@ -47,9 +47,23 @@ def run_camera(topic, fps, interface):
     node = _CameraRgbNode(topic, proxy, fps)
     executor.add_node(node.node)
     node.start()
+    stop_thread = None
+    if stop_event is not None:
+        import threading
+
+        def wait_for_stop():
+            stop_event.wait()
+            if stop_event.is_set():
+                executor.shutdown()
+
+        stop_thread = threading.Thread(target=wait_for_stop, daemon=True,
+                                       name="as2w-camera-stop-watcher")
+        stop_thread.start()
     try:
         executor.spin()
     finally:
         node.stop()
         proxy.stop()
+        if stop_thread is not None:
+            stop_thread.join(timeout=1.0)
         rclpy.shutdown()

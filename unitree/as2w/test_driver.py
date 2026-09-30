@@ -268,6 +268,52 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn((255, 0, 18), calls)
         plugin.stop()
 
+    def test_led_start_restarts_keepalive_after_stop(self):
+        proxy = types.SimpleNamespace(Audio_LedControl=lambda *args: 0)
+        plugin = self.device.LedPlugin({}, "test", None, proxy)
+        plugin._color = [10, 20, 30]
+        with patch.object(plugin, "start") as start:
+            result = plugin.dispatch("start", {})
+        start.assert_called_once_with()
+        self.assertEqual("ready", result["state"])
+
+    def test_camera_stop_requests_graceful_worker_shutdown_before_terminate(self):
+        class _StopEvent:
+            def __init__(self):
+                self.set_calls = 0
+
+            def set(self):
+                self.set_calls += 1
+
+        class _Process:
+            def __init__(self):
+                self.terminated = False
+                self.join_calls = []
+                self.alive = True
+
+            def join(self, timeout=None):
+                self.join_calls.append(timeout)
+                self.alive = False
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.terminated = True
+
+        process = _Process()
+        stop_event = _StopEvent()
+        plugin = self.device.CameraPlugin.__new__(self.device.CameraPlugin)
+        plugin._process_mode = True
+        plugin._process = process
+        plugin._process_stop = stop_event
+        plugin.stop()
+        self.assertEqual(1, stop_event.set_calls)
+        self.assertFalse(process.terminated)
+        self.assertEqual([8], process.join_calls)
+        self.assertIsNone(plugin._process)
+        self.assertIsNone(plugin._process_stop)
+
     def test_camera_rgb_schema_and_topic(self):
         plugin = self.device.CameraPlugin.__new__(self.device.CameraPlugin)
         plugin._topic = "/test/camera/rgb"
