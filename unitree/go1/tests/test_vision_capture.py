@@ -256,6 +256,8 @@ def test_video_failure_and_cancel_complete(tmp_path, monkeypatch, completions):
     terminal = completions.get(timeout=3)
     assert terminal["action_id"] == accepted["action_id"]
     assert terminal["result"]["code"] == "RECORD_CANCELLED"
+    assert terminal["status"] == "cancelled"
+    assert card.dispatch("info", {})["last_recording"]["status"] == "cancelled"
     assert not Path(accepted["file_path"]).exists()
 
 
@@ -457,6 +459,8 @@ def test_stop_unblocks_video_writer_and_reports_cancel(tmp_path, monkeypatch, co
         terminal = completions.get(timeout=4)
         assert terminal["action_id"] == accepted["action_id"]
         assert terminal["result"]["code"] == "RECORD_CANCELLED"
+        assert terminal["status"] == "cancelled"
+        assert card.dispatch("info", {})["last_recording"]["status"] == "cancelled"
         assert not Path(accepted["file_path"]).exists()
     finally:
         for process in processes:

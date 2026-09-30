@@ -254,7 +254,8 @@ class VisionCapturePlugin:
                 self._active.discard(position)
                 if self._recording is cancel:
                     self._recording = None
-        status = "completed" if result.get("ok") else "error"
+        status = ("completed" if result.get("ok") else
+                  "cancelled" if result.get("code") == "RECORD_CANCELLED" else "error")
         with camera._CAMERA_LOCK:
             self._last_recording = {"action_id": action_id, "status": status, "result": result}
         try:
