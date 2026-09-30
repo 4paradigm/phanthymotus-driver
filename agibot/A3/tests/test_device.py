@@ -703,6 +703,83 @@ class RpcDispatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tts.dispatch("speak", {"text": "字" * 400})  # 1200 bytes > 1024
 
+    def test_tts_schema_declares_x_completion(self):
+        schema = find_plugin(self.plugins, "tts").get_tool()["inputSchema"]
+        self.assertEqual(schema["x-completion"],
+                         {"actions": ["speak", "play_media"], "timeout": 180})
+
+    def test_tts_speak_reports_acp_completion(self):
+        # speak is a long-running action: dispatch returns immediately with an
+        # action_id and a daemon worker polls GetAudioStatus until state 2
+        # (播报完成), then POSTs the ACP completion.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            tts = find_plugin(self.plugins, "tts")
+            tts._POLL_INTERVAL_S = 0.02
+            self.transport.responses["TTSService/PlayTTS"] = {"header": {"code": "0"},
+                                                              "trace_id": "t-7"}
+            self.transport.responses["TTSService/GetAudioStatus"] = {"state": 2}
+            result = tts.dispatch("speak", {"text": "你好"})
+            self.assertEqual(result["state"], "playing")
+            self.assertTrue(result["action_id"].startswith("tts_speak_"))
+            self.assertEqual(result["trace_id"], "t-7")
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            (action_id, status, payload, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "completed")
+            self.assertEqual(payload["trace_id"], "t-7")
+            self.assertEqual(payload["final_state"], 2)
+            self.assertEqual(tool_name, "tts")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_tts_play_media_error_state_reports_error(self):
+        # state 3 (异常) must surface as an ACP error, not a completion.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            tts = find_plugin(self.plugins, "tts")
+            tts._POLL_INTERVAL_S = 0.02
+            self.transport.responses["TTSService/PlayMediaFile"] = {"trace_id": "t-8"}
+            self.transport.responses["TTSService/GetAudioStatus"] = {"data": {"state": 3}}
+            result = tts.dispatch("play_media", {"file_name": "intro.mp4"})
+            self.assertEqual(result["state"], "playing")
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            (action_id, status, payload, tool_name), = captured
+            self.assertEqual(status, "error")
+            self.assertEqual(payload["final_state"], 3)
+            self.assertEqual(tool_name, "tts")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_tts_stop_settles_pending_waiter(self):
+        # stop_trace_id clears the waiter's action_id first, so a worker still
+        # polling must NOT fire a stale ACP completion afterwards.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            tts = find_plugin(self.plugins, "tts")
+            tts._POLL_INTERVAL_S = 0.2  # long enough to still be polling
+            self.transport.responses["TTSService/GetAudioStatus"] = {"state": 1}
+            tts.dispatch("speak", {"text": "你好"})
+            tts.dispatch("stop_trace_id", {"trace_id": ""})
+            time.sleep(0.5)
+            self.assertEqual(captured, [])
+        finally:
+            device._acp_notify = original_notify
+
+
     def test_tts_play_media_posts_play_media_file(self):
         tts = find_plugin(self.plugins, "tts")
         tts.dispatch("play_media", {"file_name": "welcome.mp3"})

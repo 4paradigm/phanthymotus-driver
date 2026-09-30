@@ -151,6 +151,11 @@ MIC_SOURCES = {"internal": 0, "external": 1}
 # TTS priority levels (docs §7.2.1 PlayTTS): INTERACTION_L6 is the documented example.
 TTS_PRIORITY_LEVELS = {"background": "BACKGROUND_L1", "service": "SERVICE_L2", "interaction": "INTERACTION_L6"}
 TTS_MAX_TEXT_BYTES = 1024  # docs: text <= 1024 bytes (~200 chars)
+# GetAudioStatus states (docs §7.2.2): 0 未播 / 1 播报中 / 2 播报完成 / 3 异常。
+TTS_AUDIO_PLAYING, TTS_AUDIO_DONE, TTS_AUDIO_ERROR = 1, 2, 3
+# TTS 完成契约超时（tianyi2.0 tts speak 同款 180 s）：1024 字节文本播报远短于此，
+# 媒体文件播放留出充足裕量；轮询 GetAudioStatus，超时兜底。
+TTS_COMPLETION_TIMEOUT_S = 180
 
 # Volume (docs §7.2.3): 0-100 scale but >70 risks damage — clamped in dispatch too.
 VOLUME_HARD_MAX = 70
@@ -1660,17 +1665,24 @@ class TtsPlugin:
       - status：GetAudioStatus 按 trace_id 查询播报状态
         （0 未播 / 1 播报中 / 2 播报完成 / 3 异常）；
       - stop_trace_id：StopTTSByTraceId 按 trace_id 打断。
+
+    speak / play_media 为长时间动作（tianyi2.0 tts 同款）：声明 ACP 完成契约，
+    后台线程轮询 GetAudioStatus（状态 2 完成 / 3 异常）判定播报真正结束后回报。
     """
 
     ACTIONS = {
-        "speak": (["text"], "播报一段中文/英文文本"),
-        "play_media": (["file_name"], "播放媒体文件（audio 资源文件名，含扩展名）"),
+        "speak": (["text"], "播报一段中文/英文文本（异步：返回 action_id，完成后回报 ACP）"),
+        "play_media": (["file_name"], "播放媒体文件（audio 资源文件名，含扩展名；"
+                                       "异步：返回 action_id，完成后回报 ACP）"),
         "status": (["trace_id"], "查询播报状态（0 未播/1 播报中/2 播报完成/3 异常）"),
         "stop_trace_id": (["trace_id"], "按 trace_id 打断指定播报"),
     }
 
+    _POLL_INTERVAL_S = 1.0
+
     def __init__(self, nodes):
         self.nodes = nodes
+        self._play_action_id = None
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
@@ -1685,8 +1697,13 @@ class TtsPlugin:
         })
         # 与 audio 卡共用同一扬声器 —— 同一物理通道，两个工具需互相排队。
         schema["x-resource"] = "mouth"
+        # 长播报动不出数秒不归：声明 ACP（tianyi2.0 tts 180 s 同款）。
+        schema["x-completion"] = {"actions": ["speak", "play_media"],
+                                  "timeout": TTS_COMPLETION_TIMEOUT_S}
         return tool("tts", "actuator", "语音播报：文本转语音/媒体文件播放/状态查询/按 id 打断"
-                                      "（TTSService PlayTTS/PlayMediaFile/GetAudioStatus/StopTTSByTraceId RPC）",
+                                      "（TTSService PlayTTS/PlayMediaFile/GetAudioStatus/StopTTSByTraceId RPC；"
+                                      "speak/play_media 为异步：返回 action_id，轮询 GetAudioStatus "
+                                      "播报完成后回报 ACP 完成事件）",
                     schema)
 
     def start(self):
@@ -1694,6 +1711,76 @@ class TtsPlugin:
 
     def stop(self):
         pass
+
+    def _audio_state(self, response):
+        """GetAudioStatus response → normalized play state int, or None.
+
+        The response shape could not be verified against the online dev guide, so
+        this accepts a top-level or `data`-nested `state`/`status`/`audio_status`
+        int (or enum name string: 未播/播报中/完成/异常 → 0..3). Unrecognized
+        shapes count as still-playing — the timeout is the backstop.
+        """
+        if not isinstance(response, dict):
+            return None
+        _NAMES = {"not_played": 0, "not_started": 0, "idle": 0,
+                  "playing": TTS_AUDIO_PLAYING, "broadcasting": TTS_AUDIO_PLAYING,
+                  "finished": TTS_AUDIO_DONE, "complete": TTS_AUDIO_DONE,
+                  "completed": TTS_AUDIO_DONE, "done": TTS_AUDIO_DONE,
+                  "error": TTS_AUDIO_ERROR, "failed": TTS_AUDIO_ERROR,
+                  "abnormal": TTS_AUDIO_ERROR}
+        scopes = [response]
+        if isinstance(response.get("data"), dict):
+            scopes.append(response["data"])
+        for scope in scopes:
+            for key in ("state", "status", "audio_status"):
+                value = scope.get(key)
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, int) and 0 <= value <= 3:
+                    return value
+                if isinstance(value, str):
+                    return _NAMES.get(value.strip().lower())
+        return None
+
+    def _play_worker(self, action_id, trace_id, action, detail):
+        # Superseded guard: a newer speak/play_media or a stop took over — never
+        # fire a stale completion (g1 _acp_wait_nav pattern).
+        if self._play_action_id != action_id:
+            return
+        deadline = time.time() + TTS_COMPLETION_TIMEOUT_S
+        result = {"action": action, "trace_id": trace_id, **detail}
+        while time.time() < deadline:
+            time.sleep(self._POLL_INTERVAL_S)
+            if self._play_action_id != action_id:
+                return
+            try:
+                response = self.nodes.rpc.get_audio_status(trace_id)
+            except Exception as exc:  # noqa: BLE001 — notify and keep polling
+                result["error"] = f"GetAudioStatus poll failed: {exc}"
+                _acp_notify(action_id, "error", result, "tts")
+                return
+            state = self._audio_state(response)
+            if state is None or state == TTS_AUDIO_PLAYING:
+                continue
+            if state == TTS_AUDIO_DONE:
+                result["final_state"] = state
+                _acp_notify(action_id, "completed", result, "tts")
+            else:
+                result["error"] = f"playback ended in state {state}"
+                result["final_state"] = state
+                _acp_notify(action_id, "error", result, "tts")
+            return
+        result["error"] = f"playback not finished within {TTS_COMPLETION_TIMEOUT_S}s"
+        _acp_notify(action_id, "error", result, "tts")
+
+    def _arm_completion(self, action, trace_id, detail):
+        action_id = f"tts_{action}_{uuid4().hex[:8]}"
+        self._play_action_id = action_id
+        threading.Thread(target=self._play_worker,
+                         args=(action_id, trace_id, action, detail),
+                         daemon=True).start()
+        return {"state": "playing", "action_id": action_id,
+                "trace_id": trace_id, **detail}
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1717,16 +1804,21 @@ class TtsPlugin:
             )
             # PlayTTS/PlayMediaFile 出参为扁平结构（is_sucess 官方拼写如此）
             trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
-            return {"trace_id": trace_id, "response": response}
+            # 播报无独立 trace_id 时轮询不到指定会话，等待线程只能靠超时兜底；
+            # 此时用空 trace_id 询问当前播报状态（GetAudioStatus 单会话语义）。
+            return self._arm_completion("speak", trace_id, {"text": text[:50]})
         if action == "play_media":
             file_name = args.get("file_name", "")
             _require(file_name, "file_name 不能为空")
             response = self.nodes.rpc.play_media_file(file_name, is_interrupted=True)
             trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
-            return {"trace_id": trace_id, "response": response}
+            return self._arm_completion("play_media", trace_id,
+                                        {"file_name": file_name, "response": response})
         if action == "status":
             return jsonable(self.nodes.rpc.get_audio_status(args.get("trace_id", "")))
         if action == "stop_trace_id":
+            # 打断播报同时结算挂起的 ACP 等待线程（不再回报过期完成事件）。
+            self._play_action_id = None
             return jsonable(self.nodes.rpc.stop_tts_trace_id(args.get("trace_id", "")))
         raise ValueError(f"tts: unknown action {action!r}")
 
