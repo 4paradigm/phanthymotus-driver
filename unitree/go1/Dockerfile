@@ -37,8 +37,9 @@ COPY common/ /work/common/
 COPY main.py           /work/main.py
 COPY go1_sdk_client.py /work/go1_sdk_client.py
 COPY sdk_proxy.py      /work/sdk_proxy.py
-# 聚合卡文件（4 个）
+# 卡片模块
 COPY sensors.py        /work/sensors.py
+COPY power.py          /work/power.py
 COPY controllers.py    /work/controllers.py
 COPY ext_devices.py    /work/ext_devices.py
 COPY camera.py         /work/camera.py

@@ -284,7 +284,10 @@ class Go1HighSdkClient:
         新卡只需写一个 builder 读这些字段即可，不必再碰本文件。见 CONTRIBUTING.md。
         """
         try:
-            out = {"fresh": True, "control_level": "HIGHLEVEL"}
+            # Use the receive time, not a card's read/publish time, to detect
+            # stale telemetry and integrate energy across actual samples.
+            out = {"fresh": True, "control_level": "HIGHLEVEL",
+                   "sample_monotonic_s": time.monotonic()}
             out["mode"] = int(_g(s, "mode", 0))
             out["mode_name"] = MODE_NAMES.get(out["mode"], "unknown")
             gt = int(_g(s, "gaitType", 0))

@@ -26,6 +26,8 @@ build_context_extras:
 cards:
   - { name: loco_state,         type: sensor }
   - { name: battery,            type: sensor }
+  - { name: battery_power,      type: sensor }
+  - { name: joint_power,        type: sensor }
   - { name: face_light,         type: actuator }
   - { name: camera_rgb,         type: sensor }
   - { name: camera_depth,       type: sensor }

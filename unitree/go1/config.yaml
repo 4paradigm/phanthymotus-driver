@@ -10,6 +10,10 @@ plugins:
     enabled: true
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
+  battery_power:                # BMS 电功率与本次驱动运行期间累计充/放电 Wh（只读估算）
+    enabled: true
+  joint_power:                  # 12 关节估计机械功率 tauEst*dq（非电机电功率）
+    enabled: true
 
   face_light:                   # 面部灯带颜色(actuator,MQTT):set_color/preset/off
     enabled: true
