@@ -48,7 +48,7 @@ _AS2_SPORT_MODE_NAMES = {
 }
 _BODY_HEIGHT_DEFAULT_M = 0.35
 _BODY_HEIGHT_MIN_M = _BODY_HEIGHT_DEFAULT_M - 0.18
-_BODY_HEIGHT_MAX_M = _BODY_HEIGHT_DEFAULT_M
+_BODY_HEIGHT_MAX_M = _BODY_HEIGHT_DEFAULT_M + 0.03
 _MIC_GROUP = "239.168.123.161"
 _MIC_PORT = 5555
 _MIC_CHUNK_BYTES = 1024
@@ -604,7 +604,7 @@ class LocoPlugin:
     def get_tool(self):
         actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
-                "description": "As2W locomotion. move uses vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; stand_down automatically releases motor torque after reaching the down posture; balance_stand enables active balance; recovery_stand is for fallen/down posture; body_height is an absolute target height in meters and is converted to the SDK relative offset; body_position is a direct controller offset. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
+                "description": "As2W locomotion. move uses signed vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). A positive duration stops internally when its timer expires; stop_move is only for an active duration=-1 move. stand_up/stand_down change posture; balance_stand enables active balance; recovery_stand is for fallen/down posture; body_height is an absolute target height in meters and is converted to the SDK relative offset; body_position is a direct controller offset. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity in degrees/s [-120, 120]; converted to radians/s for Unitree SDK"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
                     "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
@@ -614,7 +614,7 @@ class LocoPlugin:
                     "stop_move": {"params": [], "description": "Stop movement."},
                     "stand_up": {"params": [], "description": "Stand up."}, "stand_down": {"params": [], "description": "Stand down."},
                     "balance_stand": {"params": [], "description": "Balance stand."}, "recovery_stand": {"params": [], "description": "Recovery stand."},
-                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set absolute body height target in meters; supported range is 0.17-0.35 m and 0.35 m corresponds to the stand-up default."},
+                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set absolute body height target in meters; supported range is 0.17-0.38 m. 0.35 m is the default stand-up height and 0.38 m is the SDK's maximum +0.03 m offset."},
                     "body_position": {"params": ["x", "y", "z", "yaw"], "description": "Set body position offset."},
                     "switch_joystick": {"params": ["flag"], "description": "true hands control to the wireless joystick; false disables it."}, "left_side_gait": {"params": ["flag"], "description": "Enter or exit left-side gait; true enters, false exits."},
                     "right_side_gait": {"params": ["flag"], "description": "Enter or exit right-side gait; true enters, false exits."}, "auto_recovery": {"params": ["flag"], "description": "Automatic fall recovery; true enables, false disables."},
@@ -677,22 +677,10 @@ class LocoPlugin:
             else:
                 matches = 0
             if matches >= 2:
-                if action == "stand_down":
-                    damp_ret = self.proxy.Damp()
-                    if damp_ret != 0:
-                        _acp_notify(action_id, "error", {
-                            "action": action, "ret": damp_ret,
-                            "stand_down_ret": 0, "current_state": name,
-                            "error": "StandDown completed but automatic damping failed",
-                            "reason": "The robot reached the down posture but motor torque was not released",
-                            "suggested_actions": ["get_state", "retry_stand_down"]})
-                        return
-                    _acp_notify(action_id, "completed", {
-                        "action": action, "ret": 0, "stand_down_ret": 0,
-                        "damp_ret": 0, "state": state, "final_state": "DAMPING",
-                        "reason": "StandDown completed and motors were automatically damped"})
-                else:
-                    _acp_notify(action_id, "completed", {"action": action, "state": state})
+                _acp_notify(action_id, "completed", {
+                    "action": action, "ret": 0, "state": state,
+                    "final_state": name,
+                    "reason": "SportClient posture transition completed"})
                 return
             time.sleep(.25)
         _acp_notify(action_id, "error", {"action": action,
@@ -801,6 +789,13 @@ class LocoPlugin:
                     "action": "move", "action_id": action_id,
                     "current_state": state_name, "duration": duration}
         if action == "stop_move":
+            with self._lock:
+                continuous_active = self._stop is not None or self._move_thread is not None
+            if not continuous_active:
+                return {"ret": -1, "accepted": False, "action": action,
+                        "error": "No continuous move is active",
+                        "reason": "stop_move is only the terminator for move with duration=-1",
+                        "suggested_actions": ["move", "get_state"]}
             self._cancel_transition()
             self._stop_continuous()
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
@@ -1160,7 +1155,7 @@ _AS2_JOINT_NAMES = [
 
 MIC_AUDIO_FORMAT = "audio/pcm-16k"
 SPEAKER_APP_NAME = "as2w_speaker"
-SPEAKER_BLOCK_BYTES = 3200  # 100 ms at 16 kHz, 16-bit, mono.
+SPEAKER_BLOCK_BYTES = 9600  # 300 ms at 16 kHz, 16-bit, mono; AS2 voice startup needs a full frame.
 SPEAKER_QUEUE_BLOCKS = 8  # Keep the live stream below 800 ms of queued audio.
 
 
@@ -1446,16 +1441,20 @@ class _SpeakerNode:
     def _drain(self):
         import queue
         merged = bytearray()
+        idle_polls = 0
         while not self._stop_event.is_set():
             try:
                 item = self._queue.get(timeout=0.1)
             except queue.Empty:
-                if merged:
+                idle_polls += 1
+                if merged and (len(merged) >= SPEAKER_BLOCK_BYTES or idle_polls >= 2):
                     self._play_block(bytes(merged))
                     merged.clear()
+                    idle_polls = 0
                 continue
             if item is None:
                 break
+            idle_polls = 0
             merged.extend(item)
             if len(merged) >= SPEAKER_BLOCK_BYTES:
                 self._play_block(bytes(merged))
@@ -1513,11 +1512,13 @@ class SpeakerPlugin:
             # A speaker card must be startable without a hand-written MCP
             # argument.  External producers can publish AudioChunk messages
             # here; an explicit input_topic still overrides this default.
-            self._input_topic = f"/{namespace}/speaker/audio"
+            # The shared TTS card publishes its PCM stream here. An explicit
+            # input_topic still takes precedence for other producers.
+            self._input_topic = "/perception/tts"
         executor.add_node(self._node.node)
 
     def get_tool(self):
-        input_topic = getattr(self, "_input_topic", "/speaker/audio")
+        input_topic = getattr(self, "_input_topic", "/perception/tts")
         return {"name": "speaker", "type": "actuator", "multiInstance": False,
                 "description": f"As2W speaker: subscribes to PCM 16kHz/16bit/mono AudioChunk stream. Default input topic: {input_topic}",
                 "inputSchema": {"type": "object", "properties": {
@@ -1542,13 +1543,13 @@ class SpeakerPlugin:
 
     def dispatch(self, action, args):
         if action in ("start", "play", "speaker"):
-            topic = args.get("input_topic") or args.get("topic_in") or getattr(self, "_input_topic", "/speaker/audio")
+            topic = args.get("input_topic") or args.get("topic_in") or getattr(self, "_input_topic", "/perception/tts")
             if isinstance(topic, dict):
                 topic = topic.get("topic")
             elif isinstance(topic, (list, tuple)):
                 topic = topic[0] if topic else None
             if not topic:
-                topic = getattr(self, "_input_topic", "/speaker/audio")
+                topic = getattr(self, "_input_topic", "/perception/tts")
             try:
                 started_topic = self._node.start(topic)
             except RuntimeError as exc:

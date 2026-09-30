@@ -8,7 +8,7 @@ plugins:
   # This is not an extension-board ALSA capture device.
   mic: {enabled: true, multicast_group: "239.168.123.161", multicast_port: 5555, multicast_interface: ""}
   # External audio bridge topic; MCP input_topic can override it.
-  speaker: {enabled: true, input_topic: "/remote_control/audio"}
+  speaker: {enabled: true, input_topic: "/perception/tts"}
   led: {enabled: true}
   camera_rgb: {enabled: true, fps: 10, process: true}
   loco: {enabled: true}

@@ -9,10 +9,9 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `FrontFlip`, and `BackFlip`.
 
 `Damp` and `Euler` are internal SDK operations and are not exposed as MCP
-actions. `stand_down` waits for the down posture and then calls `Damp` as its
-automatic motor-torque release step. A successful action is reported through
-ACP; a failed stop, posture transition, or automatic damping step reports a
-terminal ACP error with the observed state and recovery suggestions.
+actions. `stand_down` only invokes the AS2 `StandDown` posture operation; it
+does not automatically call `Damp`. A successful action is reported through
+ACP with the observed final state.
 
 Run `python3 main.py <robot-interface>` on the robot network. Set
 `NETWORK_INTERFACE` to the actual host interface name when it is known; when it
@@ -69,7 +68,7 @@ the upstream Unitree SDK example `example/a2/audio/a2_audio_client_example.cpp`;
 that example also subscribes to `rt/audio_msg` for ASR text. The AS2
 `AudioClient` exposes playback, TTS, volume, and LED APIs, but not a raw capture
 RPC, so the multicast receiver is the appropriate robot-body input path. The `speaker`
-card subscribes to `/remote_control/audio` by default in the AS2W deployment;
+card subscribes to `/perception/tts` by default in the AS2W deployment;
 callers may provide an optional `input_topic` to use another `AudioChunk` stream. It streams bounded
 PCM blocks through the AS2 `voice` service and exposes volume get/set actions.
 Audio service availability depends on the AS2 firmware configuration.
@@ -154,7 +153,8 @@ reports a completed ACP result with `state_stale=true` after the accepted
 the observed state label is still included in the result.
 `body_height` takes an explicit absolute target in meters, for example
 `{"action":"body_height","height":0.35}`. The public range is `0.17` to
-`0.35` m; `0.35` m represents the default high stand-up height. Unitree's
+`0.38` m; `0.35` m represents the default high stand-up height
+and `0.38` m is the maximum target. Unitree's
 `BodyHeight` SDK parameter is a relative offset from that default, so the
 driver sends `height - 0.35` (the SDK range is approximately `[-0.18, 0.03]`
 m). The response includes both `height_m` and `sdk_offset_m`.
