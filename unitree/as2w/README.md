@@ -64,6 +64,10 @@ card subscribes to `/<namespace>/speaker/audio` by default; callers may provide
 an optional `input_topic` to use another `AudioChunk` stream. It streams bounded
 PCM blocks through the AS2 `voice` service and exposes volume get/set actions.
 Audio service availability depends on the AS2 firmware configuration.
+The multicast membership is bound to the same selected robot interface as
+Unitree DDS; it does not use the host default route. The speaker subscribes to
+its default topic at bundle startup, while `speaker start` can still select a
+different `AudioChunk` topic.
 
 The `camera_rgb` card polls the verified AS2 `videohub.GetImageSample()` service
 and publishes JPEG `sensor_msgs/CompressedImage` frames to
@@ -119,6 +123,13 @@ Change scope and validation notes:
   and `git diff --check` before submitting. Hardware-dependent audio multicast,
   AS2 voice, videohub, and sport behavior still require validation against the
   target robot firmware.
+- On the target Orin host, the robot adapter was observed as `eno1` with
+  `192.168.123.100/24` while Wi-Fi carried the default route. A read-only
+  listener bound explicitly to `eno1` received 31 microphone multicast packets
+  of 5120 bytes during a five-second sample, confirming that the robot is
+  transmitting audio and that interface selection is material. Speaker output
+  still requires an `AudioChunk` producer on its input topic and AS2 voice
+  service availability.
 
 Loco examples:
 

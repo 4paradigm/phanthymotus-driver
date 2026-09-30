@@ -212,6 +212,11 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn("robot-body microphone multicast", tool["description"])
         self.assertEqual("audio/pcm-16k", tool["topic_out"][0]["format"])
 
+    def test_mic_inherits_selected_robot_interface(self):
+        self.assertEqual("eno1", self.device._resolved_mic_config({}, "eno1")["multicast_interface"])
+        self.assertEqual("usb0", self.device._resolved_mic_config(
+            {"multicast_interface": "usb0"}, "eno1")["multicast_interface"])
+
     def test_mic_aggregates_small_audio_packets_to_asr_frame_size(self):
         node = self.device._MicNode.__new__(self.device._MicNode)
         published = []
@@ -685,6 +690,15 @@ class TestDriverContracts(unittest.TestCase):
                          network.interface_candidates("enp5s0", "eth0"))
         self.assertEqual(["eth2"],
                          network.interface_candidates("", "eth2"))
+
+    def test_network_auto_detection_prefers_as2_subnet(self):
+        network = _load("as2w_network_subnet_test", ROOT / "network.py")
+        with patch.object(network.socket, "if_nameindex", return_value=[
+                (1, "eno1"), (2, "enp2s0")]), \
+             patch.object(network, "_interface_up", return_value=True), \
+             patch.object(network, "_interface_ipv4", side_effect=lambda name: {
+                 "eno1": "192.168.123.100", "enp2s0": "10.100.129.146"}[name]):
+            self.assertEqual(["eno1"], network.interface_candidates("", ""))
 
     def test_empty_positional_interface_uses_environment_override(self):
         source = (ROOT / "main.py").read_text()

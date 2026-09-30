@@ -1,5 +1,7 @@
 mcp_port: 15709
 robot_interface: ""
+# AS2 body/robot Ethernet subnet; used only to rank automatic interface candidates.
+robot_subnet: "192.168.123.0/24"
 ros_namespace: ""
 plugins:
   # Robot-body microphone stream, received from the AS2 audio multicast.

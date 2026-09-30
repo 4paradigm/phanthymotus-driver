@@ -34,7 +34,7 @@ class Bundle:
         from controlled_spatial import ControlledSpatialPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
-        if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor))
+        if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
         if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, proxy))
         if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
         if dds_ready and p.get("camera_rgb", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera_rgb", {}), namespace, executor, proxy, interface))
@@ -184,7 +184,9 @@ def main():
     # A body DDS participant must never silently bind to the office Wi-Fi.
     # Explicit NETWORK_INTERFACE is strict; otherwise only likely wired robot
     # adapters are tried and CycloneDDS may select among those adapters.
-    candidates = interface_candidates(requested_interface, configured_interface)
+    candidates = interface_candidates(
+        requested_interface, configured_interface,
+        str(cfg.get("robot_subnet") or "192.168.123.0/24"))
     for candidate in candidates:
         try:
             ChannelFactoryInitialize(0, candidate or None)

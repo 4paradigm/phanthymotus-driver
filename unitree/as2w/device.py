@@ -997,6 +997,14 @@ def _audio_chunk(payload):
     return message
 
 
+def _resolved_mic_config(config, interface):
+    """Bind robot audio multicast to the same interface as Unitree DDS."""
+    resolved = dict(config or {})
+    if not resolved.get("multicast_interface") and interface and interface != "(auto)":
+        resolved["multicast_interface"] = interface
+    return resolved
+
+
 class _MicNode:
     """Republish AS2's robot-body audio multicast as AudioChunk messages."""
 
@@ -1015,6 +1023,18 @@ class _MicNode:
         self._publish_lock = threading.Lock()
         self._publish_buffer = bytearray()
         self.backend = "robot_multicast"
+        self.node.create_timer(10.0, self._report)
+
+    def _report(self):
+        interface = self._config.get("multicast_interface") or "(default-route)"
+        if self.packet_count:
+            self.node.get_logger().info(
+                f"As2W mic packets={self.packet_count} interface={interface} "
+                f"packet_age_s={time.monotonic() - self.last_packet_ts:.2f}")
+        else:
+            self.node.get_logger().warning(
+                f"As2W mic has received no multicast packets on interface={interface} "
+                f"group={self._config.get('multicast_group', _MIC_GROUP)}:{self._config.get('multicast_port', _MIC_PORT)}")
 
     def start(self):
         if self.state == "running":
@@ -1030,10 +1050,16 @@ class _MicNode:
             sock.bind(("", port))
             interface = self._config.get("multicast_interface", "")
             if interface:
-                membership = struct.pack(
-                    "=4s4si", socket.inet_aton(group),
-                    socket.inet_aton("0.0.0.0"), socket.if_nametoindex(interface))
-            else:
+                if interface == "(auto)":
+                    interface = ""
+                else:
+                    index = socket.if_nametoindex(interface)
+                    # Linux's ip_mreqn form uses the interface index, so the
+                    # membership never follows the host default route.
+                    membership = struct.pack(
+                        "=4s4si", socket.inet_aton(group),
+                        socket.inet_aton("0.0.0.0"), index)
+            if not interface:
                 membership = struct.pack("4s4s", socket.inet_aton(group),
                                          socket.inet_aton("0.0.0.0"))
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
@@ -1091,9 +1117,10 @@ class _MicNode:
 class MicPlugin:
     PREFIX = "mic"
 
-    def __init__(self, config, namespace, executor):
+    def __init__(self, config, namespace, executor, interface=""):
         self._topic = f"/{namespace}/mic/audio"
-        self._node = _MicNode(self._topic, config)
+        mic_config = _resolved_mic_config(config, interface)
+        self._node = _MicNode(self._topic, mic_config)
         executor.add_node(self._node.node)
 
     def get_tool(self):
@@ -1324,7 +1351,9 @@ class SpeakerPlugin:
                 "topic_in": [{"topic": input_topic, "format": "audio/pcm-16k"}]}
 
     def start(self):
-        pass
+        # Speaker is a stream actuator: subscribing at bundle startup makes
+        # the declared topic live without requiring a separate start call.
+        self._node.start(self._input_topic)
 
     def stop(self):
         self._node.stop()
@@ -1451,7 +1480,7 @@ class _CameraRgbNode:
             message = CompressedImage()
             message.header.stamp = self.node.get_clock().now().to_msg()
             message.format = "jpeg"
-            message.data = list(payload)
+            message.data = payload
             self.publisher.publish(message)
             self.frames += 1
             now = time.monotonic()
