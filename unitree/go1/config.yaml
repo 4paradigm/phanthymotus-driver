@@ -19,8 +19,8 @@ plugins:
     enabled: true
     mqtt_host: "localhost"
     mqtt_port: 1883
-    system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
-    enabled: true
+  system_health:                # 显式禁用；原配置嵌套于 face_light，实际未加载
+    enabled: false
     mqtt_host: "localhost"
     mqtt_port: 1883
   # 相机三卡共用同一 camera.py；每张卡均为 multiInstance，可各自选机位。

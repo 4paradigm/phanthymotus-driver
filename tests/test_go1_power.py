@@ -229,6 +229,23 @@ def test_joint_power_is_mechanical_and_rejects_stale_or_incomplete_data():
     assert power._build_joint_power(snap, now=100.1)["reason"] == "incomplete_joint_state"
 
 
+@pytest.mark.parametrize("filename", ["config.yaml", "driver.yaml"])
+def test_go1_yaml_has_no_duplicate_mapping_keys(filename):
+    import yaml
+
+    class UniqueKeyLoader(yaml.SafeLoader):
+        pass
+
+    def unique_mapping(loader, node):
+        keys = [loader.construct_object(key) for key, _ in node.value]
+        assert len(keys) == len(set(keys)), f"Duplicate keys in {filename}: {keys}"
+        return loader.construct_mapping(node)
+
+    UniqueKeyLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
+    yaml.load((GO1 / filename).read_text(), Loader=UniqueKeyLoader)
+
+
 def test_cards_are_configured_and_copied_into_image():
     import yaml
 
