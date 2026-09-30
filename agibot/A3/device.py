@@ -735,8 +735,12 @@ class A3Nodes:
     def _publish_joint_streams(self):
         groups = {key: self._joint_cache.get(key, {})
                   for key in ("arm_state", "hand_state", "neck_state")}
-        raw = {"arm": groups["arm_state"], "hand": groups["hand_state"],
-               "neck": groups["neck_state"]}
+        raw = {}
+        for prefix, group in (("arm", groups["arm_state"]), ("hand", groups["hand_state"]),
+                              ("neck", groups["neck_state"])):
+            if isinstance(group, dict):
+                for field, value in group.items():
+                    raw[f"{prefix}_{field}"] = value
         output = self._String()
         output.data = json.dumps(raw, ensure_ascii=False)
         self._joint_state_pub.publish(output)
@@ -758,8 +762,12 @@ class A3Nodes:
 
     def _publish_imu_streams(self, key, value):
         self.values[key] = value
-        payload = {"pelvis": self.values.get("imu_pelvis", {}),
-                   "torso": self.values.get("imu_torso", {})}
+        payload = {}
+        for prefix, key in (("pelvis", "imu_pelvis"), ("torso", "imu_torso")):
+            value = self.values.get(key, {})
+            if isinstance(value, dict):
+                for field, item in value.items():
+                    payload[f"{prefix}_{field}"] = item
         output = self._String()
         output.data = json.dumps(payload, ensure_ascii=False)
         self._imu_pub.publish(output)

@@ -19,7 +19,10 @@ def _type_name(msg_type):
 
 class CoreBridge:
     def __init__(self, profile="/opt/phanthy-motus/dds-local.xml", domain=42):
-        self._queue = mp.get_context("spawn").Queue(maxsize=32)
+        # Keep enough room for bursty images/point clouds. Frames are lossy at
+        # the bridge boundary; a full queue drops the newest frame rather than
+        # blocking the robot-domain subscription callback.
+        self._queue = mp.get_context("spawn").Queue(maxsize=128)
         self._ctx = mp.get_context("spawn")
         self._profile = profile
         self._domain = domain
@@ -93,7 +96,9 @@ def _run(messages, profile, domain):
             if msg_type is not None:
                 types[_type_name(msg_type)] = msg_type
     from rclpy.serialization import deserialize_message
-    qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
+    # Sensor consumers request BEST_EFFORT. Publishing BEST_EFFORT avoids a
+    # reliable writer retaining large camera/point-cloud samples indefinitely.
+    qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
     try:
         while rclpy.ok():
             try:
