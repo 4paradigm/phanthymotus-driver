@@ -1007,9 +1007,13 @@ class JointsPlugin:
             group = args.get("group", "arm")
             if group not in self.GROUPS:
                 raise ValueError(f"joints: unknown group {group!r}; available: {list(self.GROUPS)}")
-            stream = self.streams[self.GROUPS[group][0]]
+            # The card renders the aggregated skeleton stream. Keep the selected
+            # group's raw stream in metadata, but never replace topic_out with it:
+            # Agent Core treats info().topic_out as authoritative after placement.
             return {"state": "running",
-                    "topic_out": [{"topic": stream["topic"], "format": stream["format"]}],
+                    "topic_out": [{"topic": _core_topic(self.nodes.namespace, "state/joints"),
+                                    "format": "sensor/skeleton"}],
+                    "group": group,
                     "streams": dict(self.streams)}
         group = args.get("group", "arm")
         if group not in self.GROUPS:

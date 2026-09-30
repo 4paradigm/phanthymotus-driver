@@ -527,22 +527,21 @@ class ToolInventoryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             joints.dispatch("query", {"group": "tail"})
 
-    def test_joints_info_returns_selected_topic_out(self):
-        # README.md info contract: info()'s topic_out is authoritative — a multiplexed
-        # card must return the selected group's stream, not just a private mapping.
+    def test_joints_info_keeps_aggregated_skeleton_topic(self):
+        # info().topic_out is authoritative after placement and must remain the
+        # aggregated skeleton stream; raw group streams stay metadata only.
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = FULL_PLUGINS
         plugins, _ = build_bundle_plugins(config)
         joints = find_plugin(plugins, "joints")
         for group, key in (("arm", "arm_state"), ("hand", "hand_state"), ("neck", "neck_state")):
             result = joints.dispatch("info", {"group": group})
-            stream = joints.streams[key]
             self.assertEqual(result["topic_out"],
-                             [{"topic": stream["topic"], "format": stream["format"]}])
+                             [{"topic": "/test_ns/state/joints", "format": "sensor/skeleton"}])
         # default (no group arg) → arm
         result = joints.dispatch("info", {})
-        stream = joints.streams["arm_state"]
-        self.assertEqual(result["topic_out"][0]["topic"], stream["topic"])
+        self.assertEqual(result["topic_out"],
+                         [{"topic": "/test_ns/state/joints", "format": "sensor/skeleton"}])
 
     def test_camera_dispatch_accepts_every_advertised_stream(self):
         # Regression for the double-prefix bug: the schema enum advertises unprefixed
