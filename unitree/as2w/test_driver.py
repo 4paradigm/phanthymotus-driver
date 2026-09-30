@@ -562,6 +562,17 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn('"/mcp/messages"', source)
         self.assertIn("must never silently bind to the office Wi-Fi", source)
 
+    def test_network_interface_candidates_do_not_assume_eth0_or_wifi(self):
+        network = _load("as2w_network_under_test", ROOT / "network.py")
+        with patch.object(network.socket, "if_nameindex", return_value=[
+                (1, "lo"), (2, "wlan0"), (3, "enx001122"), (4, "eth1")]):
+            self.assertEqual(["enx001122", "eth1"],
+                             network.interface_candidates("", ""))
+        self.assertEqual(["enp5s0"],
+                         network.interface_candidates("enp5s0", "eth0"))
+        self.assertEqual(["eth2"],
+                         network.interface_candidates("", "eth2"))
+
     def test_lidar_uses_direct_sensor_topics_not_conditional_slam_clouds(self):
         source = (ROOT / "lidar.py").read_text()
         self.assertIn('"rt/utlidar/cloud_deskewed"', source)

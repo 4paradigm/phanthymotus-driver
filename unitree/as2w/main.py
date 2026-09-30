@@ -14,6 +14,7 @@ import rclpy
 import rclpy.executors
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from rpc_proxy import RpcProxy
+from network import interface_candidates
 
 
 class _UnavailableProxy:
@@ -23,6 +24,7 @@ class _UnavailableProxy:
 
 def load_config():
     return yaml.safe_load(open(os.environ.get("CONFIG_PATH", Path(__file__).with_name("config.yaml"))))
+
 
 class Bundle:
     def __init__(self, cfg, namespace, executor, proxy, interface, dds_ready=True):
@@ -167,7 +169,9 @@ def _start_registration(mcp_port, name, category):
 
 def main():
     cfg = load_config()
-    interface = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NETWORK_INTERFACE") or cfg.get("robot_interface", "eth0")
+    requested_interface = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NETWORK_INTERFACE", "").strip()
+    configured_interface = str(cfg.get("robot_interface") or "").strip()
+    interface = requested_interface or configured_interface or "(auto)"
     profile = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", "")
     if os.environ.get("ROS_DOMAIN_ID") != "42" or os.environ.get("RMW_IMPLEMENTATION") != "rmw_fastrtps_cpp":
         print("[as2w] WARNING: ROS2 is not configured for agent-core Domain 42/FastDDS", flush=True)
@@ -177,8 +181,9 @@ def main():
         print(f"[as2w] ROS2 isolation profile: {profile} (Domain 42, FastDDS); Unitree SDK: CycloneDDS Domain 0 on {interface or '(auto)'}", flush=True)
     dds_ready = False
     # A body DDS participant must never silently bind to the office Wi-Fi.
-    # Configure NETWORK_INTERFACE explicitly for non-eth0 robot adapters.
-    candidates = [interface] if interface else []
+    # Explicit NETWORK_INTERFACE is strict; otherwise only likely wired robot
+    # adapters are tried and CycloneDDS may select among those adapters.
+    candidates = interface_candidates(requested_interface, configured_interface)
     for candidate in candidates:
         try:
             ChannelFactoryInitialize(0, candidate or None)
@@ -187,7 +192,7 @@ def main():
             print(f"[as2w] DDS init failed on {candidate or '(auto)'}: {exc}", flush=True)
             dds_ready = False
         if dds_ready:
-            interface = candidate
+            interface = candidate or "(auto)"
             print(f"[as2w] Unitree DDS initialized on {interface or '(auto)'}", flush=True)
             break
     if not dds_ready:
