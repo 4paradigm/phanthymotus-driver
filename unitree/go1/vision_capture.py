@@ -52,7 +52,7 @@ class VisionCapturePlugin:
                     "duration_s": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5},
                 },
                 "required": ["action"], "additionalProperties": False,
-                "x-completion": {"actions": ["capture_photo", "record_video"], "timeout": 90},
+                "x-completion": {"actions": ["capture_photo", "record_video"], "timeout": 120},
                 "x-resource": "camera",
                 "x-action-params": {
                     "start": {"params": [], "description": "准备拍照录像卡，无需启动 camera_rgb。"},
@@ -175,7 +175,7 @@ class VisionCapturePlugin:
         payload = json.dumps({"action_id": action_id, "status": status, "result": result,
                               "tool": "vision_capture", "ts": time.time()}).encode()
         url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-        # 最坏 3×3 秒请求 + 0.5/1 秒退避，留在 90 秒 ACP 超时预算内。
+        # 最坏 3×3 秒请求 + 0.5/1 秒退避，留在 120 秒 ACP 超时预算内。
         for attempt in range(3):
             try:
                 ctx = ssl.create_default_context()
@@ -302,8 +302,10 @@ class VisionCapturePlugin:
                 if cancel.is_set():
                     raise InterruptedError("video recording cancelled")
                 process.stdin.close()
-                if process.wait(timeout=10) != 0 or not temporary_path.is_file() or temporary_path.stat().st_size == 0:
-                    raise RuntimeError(process.stderr.read().decode("utf-8", "replace") or "ffmpeg failed")
+                process.stdin = None
+                _, stderr = process.communicate(timeout=30)
+                if process.returncode != 0 or not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+                    raise RuntimeError(stderr.decode("utf-8", "replace") or "ffmpeg failed")
                 if cancel.is_set():
                     raise InterruptedError("video recording cancelled")
                 # 录像结束后才公开 MP4，避免画布看到尚未写好索引的文件。

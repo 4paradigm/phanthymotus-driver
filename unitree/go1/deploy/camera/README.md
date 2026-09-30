@@ -23,7 +23,7 @@ for one JPEG or `{"action":"record_video","position":"front","duration_s":5}`
 for an MP4 (1–30 seconds, default 5). The call immediately returns an
 `action_id` and planned `file_path`; the file may not exist yet. The background
 worker POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`.
-Both actions declare `x-completion` (90 seconds). The terminal result contains
+Both actions declare `x-completion` (120 seconds). The terminal result contains
 the confirmed path. `info.last_capture` and `info.last_recording` keep the
 latest terminal `{action_id, status, result}`. ACP uses the `camera` physical resource. The
 callback is retried up to three times (3-second request timeout, 0.5/1-second

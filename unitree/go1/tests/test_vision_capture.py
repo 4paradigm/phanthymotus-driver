@@ -192,7 +192,7 @@ def test_snapshot_declares_completion_only_for_capture():
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     schema = snapshot.VisionCapturePlugin({}).get_tool()["inputSchema"]
     assert schema["x-completion"]["actions"] == ["capture_photo", "record_video"]
-    assert schema["x-completion"]["timeout"] >= 33
+    assert schema["x-completion"]["timeout"] >= 120
     assert schema["x-resource"] == "camera"
 
 
@@ -333,6 +333,59 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
     metadata = json.loads(probe.stdout)
     assert metadata["streams"][0]["codec_name"] == "h264"
     assert 0.5 <= float(metadata["format"]["duration"]) <= 1.5
+
+
+def test_record_video_drains_encoder_errors_before_waiting(tmp_path, monkeypatch, completions):
+    """An encoder that fills stderr must still finish and publish its output."""
+    import sys
+    import time
+
+    encoder = tmp_path / "encoder.py"
+    encoder.write_text(
+        "import pathlib, sys\n"
+        "sys.stdin.buffer.read()\n"
+        "sys.stderr.buffer.write(b'x' * 131072)\n"
+        "sys.stderr.buffer.flush()\n"
+        "pathlib.Path(sys.argv[1]).write_bytes(b'mp4')\n",
+        encoding="utf-8",
+    )
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(snapshot.subprocess, "Popen", lambda args, **kwargs:
+                        real_popen([sys.executable, str(encoder), args[-1]], **kwargs))
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: str(encoder))
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def send_frames():
+        try:
+            connection, _ = server.accept()
+            with connection:
+                frame = b"\xff\xd8frame\xff\xd9"
+                packet = struct.pack(">I", len(frame)) + frame
+                for _ in range(80):
+                    try:
+                        connection.sendall(packet)
+                    except OSError:
+                        break
+                    time.sleep(0.02)
+        finally:
+            server.close()
+
+    sender = threading.Thread(target=send_frames, daemon=True)
+    sender.start()
+    card = snapshot.VisionCapturePlugin({
+        "output_dir": str(tmp_path),
+        "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
+    })
+    accepted = card.dispatch("record_video", {"duration_s": 1})
+    terminal = completions.get(timeout=13)
+    sender.join(3)
+    assert terminal["action_id"] == accepted["action_id"]
+    assert terminal["status"] == "completed", terminal["result"]
+    assert Path(accepted["file_path"]).read_bytes() == b"mp4"
 
 
 @pytest.mark.parametrize("error, code", [
