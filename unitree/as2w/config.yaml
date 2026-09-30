@@ -16,6 +16,7 @@ plugins:
     prefill_ms: 700
     continuation_prefill_ms: 500
     max_lead_ms: 600
+  led: {enabled: true}
   camera:
     enabled: true
     backend: videohub
@@ -25,6 +26,14 @@ plugins:
   state: {enabled: true}
   lidar:
     enabled: true
+    process: true
+    max_render_points: 12000
     # Override only after checking the driver's 15-second lidar diagnostics.
     # source_topics: ["rt/utlidar/cloud_deskewed"]
   controlled_spatial: {enabled: true}
+  slam_mapping:
+    enabled: true
+    voxel_size: 0.06
+    max_input_points: 20000
+    max_map_points: 50000
+    max_buffer_points: 200000

@@ -64,8 +64,9 @@ def _network_interfaces():
 
 def _configured_interface(cfg):
     """Return the highest-priority setting; None means safe auto-detection."""
-    if len(sys.argv) > 1:
-        value = sys.argv[1]
+    positional = str(sys.argv[1]).strip() if len(sys.argv) > 1 else ""
+    if positional:
+        value = positional
     elif "NETWORK_INTERFACE" in os.environ:
         value = os.environ["NETWORK_INTERFACE"]
     else:
@@ -116,10 +117,11 @@ def resolve_robot_interface(cfg):
 
 class Bundle:
     def __init__(self, cfg, namespace, executor, proxy, interface, dds_ready=True):
-        from device import StatePlugin, LocoPlugin, SpecialMotionPlugin
+        from device import LedPlugin, StatePlugin, LocoPlugin, SpecialMotionPlugin
         from multimedia import CameraPlugin, MicPlugin, SpeakerPlugin
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
+        from slam_mapping import SlamMappingPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
@@ -127,9 +129,11 @@ class Bundle:
         if p.get("special_motion", {}).get("enabled", True): self.plugins.append(SpecialMotionPlugin(p.get("special_motion", {}), namespace, executor, proxy))
         if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
         if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, interface))
+        if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
         if dds_ready and p.get("camera", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera", {}), namespace, executor, interface))
-        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
+        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
+        if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):
@@ -160,9 +164,12 @@ def handler(bundle):
             print(f"[mcp] {self.address_string()} {safe}", flush=True)
         def _send_json(self, status, payload):
             body = json.dumps(payload).encode()
-            self.send_response(status); self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers(); self.wfile.write(body)
+            try:
+                self.send_response(status); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers(); self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
         def _send_sse(self, event, data):
             try:
                 self.wfile.write(f"event: {event}\\ndata: {data}\\n\\n".encode())

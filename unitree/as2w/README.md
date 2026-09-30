@@ -40,7 +40,9 @@ official `unitree_ros/robots/as2w_description`; it retains inertial and joint
 limits but omits the vendor STL visual/collision meshes. The driver only needs
 the kinematic chain for the `joints` skeleton card, avoiding large binary
 assets in the repository. As2W has 16 movable joints (12 leg joints plus 4
-continuous wheel-foot joints) and the fixed JT128 sensor mount.
+continuous wheel-foot joints) and the fixed JT128 sensor mount. The live
+`joints`/`joint_state` cards intentionally publish the 12 populated leg-motor
+slots from LowState; the remaining vendor array slots are reserved zeros.
 
 `controlled_spatial` is a thin adapter for Unitree's documented `slam_operate`
 service: mapping, relocalization, and point-goal navigation. The latest AS2
@@ -49,9 +51,33 @@ documented common RPC contract directly in an isolated CycloneDDS process. It
 requires the vendor `unitree_slam` service to be installed and already running
 on the robot or extension host; the driver does not start that service.
 
+`slam_mapping` is the matching read-only visualization card. It listens to the
+vendor mapping and relocation point-cloud topics plus `rt/slam_info`, keeps a
+bounded voxel map, and publishes the shared `sensor/mapping` packet on
+`/<namespace>/spatial/mapping`. The control and visualization cards are kept
+separate, following the G1/Go2 card contract, so stopping the dashboard view
+does not interrupt mapping or navigation.
+
 `special_motion` exposes the AS2 SportClient's `FrontFlip`, `BackFlip`,
 `HandStand`, and `BipedStand` actions. It is intentionally separate from the
-continuous `loco` control card.
+continuous `loco` control card. Dangerous motions validate the current FSM
+state before dispatch, while the existing asynchronous completion and
+cancellation behavior is retained. Timed and continuous locomotion actions
+return action IDs and report completion, cancellation, or RPC failure through
+ACP; `stop_move` also returns immediately and completes through ACP so a slow
+firmware RPC cannot hold the MCP request open. If AS2 reports a standing state
+but rejects the first velocity command, the driver performs the required hidden
+balance transition and retries. AS2 `AI_*` standing, walking, and down states
+are recognized explicitly.
+
+High-rate LowState, BMS, and sport-state callbacks retain only their newest
+sample and publish from a 60 Hz worker, preventing stale JSON work from
+blocking DDS callbacks. Lidar runs in a separate OS process and uses a one-frame
+queue. It probes for an already-installed CuPy CUDA runtime without downloading
+one: CPU fallback is capped at 2,000 latest points, while CUDA may use the
+configured 12,000-point budget. `led` controls the AS2 RGB LED through a
+separate audio-service worker, so its keepalive cannot delay locomotion or
+speaker PCM.
 
 The multimedia cards use transports verified on As2W hardware. `speaker`
 streams PCM-16k through the A2 `voice` service, while `camera` publishes JPEG
@@ -71,4 +97,5 @@ sources `/ros_ws/install/setup.bash` and imports `AudioChunk` as a mandatory
 build-time validation, so a base-image mismatch fails before deployment.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
-action lifecycle, schemas, model resources, and full-size low-state arrays.
+action lifecycle, schemas, model resources, RPC correlation, and full-size
+low-state arrays.

@@ -60,6 +60,7 @@ def _install_device_stubs():
     for name in ("unitree_sdk2py", "unitree_sdk2py.core", "unitree_sdk2py.idl",
                  "unitree_sdk2py.idl.unitree_go", "unitree_sdk2py.idl.unitree_go.msg",
                  "unitree_sdk2py.idl.sensor_msgs", "unitree_sdk2py.idl.sensor_msgs.msg",
+                 "unitree_sdk2py.idl.std_msgs", "unitree_sdk2py.idl.std_msgs.msg",
                  "unitree_sdk2py.idl.unitree_hg", "unitree_sdk2py.idl.unitree_hg.msg"):
         sys.modules.setdefault(name, types.ModuleType(name))
     channel = types.ModuleType("unitree_sdk2py.core.channel")
@@ -72,6 +73,9 @@ def _install_device_stubs():
     sensor_dds = types.ModuleType("unitree_sdk2py.idl.sensor_msgs.msg.dds_")
     sensor_dds.PointCloud2_ = type("PointCloud2_", (), {})
     sys.modules["unitree_sdk2py.idl.sensor_msgs.msg.dds_"] = sensor_dds
+    std_dds = types.ModuleType("unitree_sdk2py.idl.std_msgs.msg.dds_")
+    std_dds.String_ = type("String_", (), {})
+    sys.modules["unitree_sdk2py.idl.std_msgs.msg.dds_"] = std_dds
     hg_dds = types.ModuleType("unitree_sdk2py.idl.unitree_hg.msg.dds_")
     hg_dds.LowState_ = type("LowState_", (), {})
     hg_dds.BmsState_ = type("BmsState_", (), {})
@@ -85,6 +89,11 @@ class _Proxy:
     def __init__(self):
         self.moves = []
         self.stops = 0
+        self.state = "AI_STAND_UP"
+        self.balance_stands = 0
+
+    def GetState(self):
+        return 0, {"fsm_name": self.state}
 
     def Move(self, *args):
         self.moves.append(args)
@@ -92,6 +101,19 @@ class _Proxy:
 
     def StopMove(self):
         self.stops += 1
+        self.state = "AI_STAND_UP"
+        return 0
+
+    def BalanceStand(self):
+        self.balance_stands += 1
+        self.state = "AI_BALANCE_STAND"
+        return 0
+
+    def Damp(self):
+        return 0
+
+    def RecoveryStand(self):
+        self.state = "AI_RECOVERY_STAND"
         return 0
 
 
@@ -102,6 +124,7 @@ class TestDriverContracts(unittest.TestCase):
         cls.device = _load("as2w_device_under_test", ROOT / "device.py")
         cls.multimedia = _load("as2w_multimedia_under_test", ROOT / "multimedia.py")
         cls.spatial = _load("as2w_spatial_under_test", ROOT / "controlled_spatial.py")
+        cls.mapping = _load("as2w_slam_mapping_under_test", ROOT / "slam_mapping.py")
         cls.main = _load("as2w_main_under_test", ROOT / "main.py")
 
     @staticmethod
@@ -153,10 +176,17 @@ class TestDriverContracts(unittest.TestCase):
             self._interface("docker0", "192.168.123.1", virtual=True),
             self._interface("veth123", "192.168.123.2", virtual=True),
         ]
-        with patch.object(self.main.sys, "argv", ["main.py", ""]), \
+        with patch.object(self.main.sys, "argv", ["main.py", "auto"]), \
                 patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
                 patch.object(self.main, "_network_interfaces", return_value=interfaces):
             self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_empty_positional_interface_uses_environment_override(self):
+        with patch.object(self.main.sys, "argv", ["main.py", ""]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=AssertionError("must not scan")):
+            self.assertEqual("eno8", self.main.resolve_robot_interface(
+                {"robot_interface": "eno7"}))
 
     def test_interface_resolver_requires_override_for_multiple_candidates(self):
         interfaces = [
@@ -186,12 +216,161 @@ class TestDriverContracts(unittest.TestCase):
     def test_card_stop_cancels_continuous_move(self):
         proxy = _Proxy()
         plugin = self.device.LocoPlugin({}, "test", None, proxy)
-        result = plugin.dispatch("move", {"vx": 0.1, "vy": 0, "vyaw": 0, "duration": -1})
-        self.assertEqual("running", result["status"])
-        stopped = plugin.dispatch("stop", {})
+        with patch.object(self.device, "_acp_notify") as notify:
+            result = plugin.dispatch("move", {"vx": 0.1, "vy": 0, "vyaw": 0, "duration": -1})
+            self.assertEqual("running", result["status"])
+            stopped = plugin.dispatch("stop", {})
+            for _ in range(50):
+                if notify.called:
+                    break
+                __import__("time").sleep(0.01)
         self.assertEqual("idle", stopped["state"])
         self.assertGreaterEqual(proxy.stops, 1)
         self.assertIsNone(plugin._stop)
+
+    def test_loco_moves_directly_from_as2_ai_stand_up(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+        self.assertEqual(0, result["ret"])
+        self.assertEqual("AI_STAND_UP", result["current_state"])
+        self.assertEqual(0, proxy.balance_stands)
+        self.assertEqual([(0.2, 0, 0)], proxy.moves)
+
+    def test_loco_retries_move_after_stand_up_rejects_first_velocity(self):
+        class _NeedsBalanceProxy(_Proxy):
+            def Move(self, *args):
+                self.moves.append(args)
+                return -1 if len(self.moves) == 1 else 0
+
+        proxy = _NeedsBalanceProxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify") as notify:
+            result = plugin.dispatch("move", {
+                "vx": 0.2, "vy": 0, "vyaw": 0, "duration": 0.02})
+            self.assertTrue(result["accepted"])
+            self.assertEqual("balance_stand", result["transition"])
+            action_id = result["action_id"]
+            for _ in range(100):
+                if any(call.args[0] == action_id for call in notify.call_args_list):
+                    break
+                __import__("time").sleep(0.01)
+        self.assertEqual(1, proxy.balance_stands)
+        self.assertTrue(any(
+            call.args[0] == action_id and call.args[1] == "completed"
+            for call in notify.call_args_list))
+        plugin.stop()
+
+    def test_stop_move_returns_before_blocking_rpc_and_completes_via_acp(self):
+        entered = __import__("threading").Event()
+        release = __import__("threading").Event()
+
+        class _BlockingStopProxy(_Proxy):
+            def StopMove(self):
+                entered.set()
+                release.wait(1)
+                return super().StopMove()
+
+        proxy = _BlockingStopProxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify") as notify:
+            started = __import__("time").monotonic()
+            result = plugin.dispatch("stop_move", {})
+            elapsed = __import__("time").monotonic() - started
+            self.assertTrue(result["accepted"])
+            self.assertEqual("stopping", result["status"])
+            self.assertLess(elapsed, 0.2)
+            self.assertTrue(entered.wait(1))
+            release.set()
+            for _ in range(100):
+                if notify.called:
+                    break
+                __import__("time").sleep(0.01)
+        self.assertTrue(notify.called)
+        self.assertEqual("completed", notify.call_args.args[1])
+
+    def test_loco_recognizes_as2_ai_walking_and_down_states(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        proxy.state = "AI_FREE_WALK"
+        walking = plugin.dispatch("stand_down", {})
+        self.assertFalse(walking["accepted"])
+        self.assertIn("stop_move", walking["suggested_actions"])
+        proxy.state = "AI_STAND_DOWN"
+        down = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+        self.assertEqual(-1, down["ret"])
+        self.assertIn("stand_up", down["suggested_actions"])
+
+    def test_recovery_stand_accepts_as2_ai_fall_state(self):
+        proxy = _Proxy()
+        proxy.state = "AI_FALL"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify") as notify:
+            result = plugin.dispatch("recovery_stand", {})
+            for _ in range(50):
+                if notify.called:
+                    break
+                __import__("time").sleep(0.01)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(0, result["ret"])
+
+    def test_timed_move_reports_acp_completion(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify") as notify:
+            result = plugin.dispatch("move", {
+                "vx": 0.2, "vy": 0, "vyaw": 0, "duration": 0.02})
+            action_id = result["action_id"]
+            for _ in range(100):
+                if any(call.args[0] == action_id for call in notify.call_args_list):
+                    break
+                __import__("time").sleep(0.01)
+        matching = [call for call in notify.call_args_list
+                    if call.args[0] == action_id]
+        self.assertTrue(matching)
+        self.assertEqual("completed", matching[-1].args[1])
+        self.assertEqual(0, matching[-1].args[2]["ret"])
+
+    def test_state_callbacks_keep_only_the_newest_sample(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        node._latest_lock = __import__("threading").Lock()
+        node._latest_low = None
+        node._low_generation = 0
+        node._publisher_thread = object()
+        first = types.SimpleNamespace(marker="first")
+        second = types.SimpleNamespace(marker="second")
+        with patch.object(node, "_publish_low") as publish:
+            node._on_low(first)
+            node._on_low(second)
+        self.assertIs(second, node._latest_low)
+        self.assertEqual(2, node._low_generation)
+        publish.assert_not_called()
+
+    def test_led_clamps_color_and_uses_isolated_audio_rpc(self):
+        calls = []
+        proxy = types.SimpleNamespace(
+            Audio_LedControl=lambda *args: calls.append(args) or 0)
+        plugin = self.device.LedPlugin({}, "test", None, proxy)
+        result = plugin.dispatch(
+            "set_color", {"red": 300, "green": -2, "blue": 18})
+        self.assertEqual([255, 0, 18], result["color"])
+        self.assertIn((255, 0, 18), calls)
+        plugin.stop()
+
+    def test_rpc_channel_ignores_late_timed_out_results(self):
+        rpc = _load("as2w_rpc_under_test", ROOT / "rpc_proxy.py")
+        channel = rpc._RpcChannel.__new__(rpc._RpcChannel)
+        channel._startup_error = None
+        channel._lock = __import__("threading").Lock()
+        channel._timeout = 0.05
+        channel._next_request_id = 1
+        channel._last_error = {}
+        import queue
+        channel._commands = queue.Queue()
+        channel._results = queue.Queue()
+        channel._results.put({"request_id": 1, "result": "late"})
+        channel._results.put({"request_id": 2, "result": "current"})
+        self.assertEqual("current", channel.call("Ping"))
 
     def test_special_actions_are_schema_marked_and_confirmed(self):
         proxy = _Proxy()
@@ -203,12 +382,23 @@ class TestDriverContracts(unittest.TestCase):
             {"front_flip", "back_flip", "handstand", "biped_stand"},
             set(schema["x-completion"]["actions"]),
         )
-        self.assertEqual(30, schema["x-completion"]["timeout"])
+        self.assertEqual(45, schema["x-completion"]["timeout"])
         self.assertIn("confirm", schema["x-action-params"]["front_flip"]["params"])
         self.assertIn("error", plugin.dispatch("front_flip", {}))
 
+    def test_special_motion_refuses_non_standing_state(self):
+        proxy = _Proxy()
+        proxy.state = "AI_STAND_DOWN"
+        plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("front_flip", {"confirm": True})
+        self.assertEqual(-1, result["ret"])
+        self.assertFalse(result["accepted"])
+        self.assertIn("standing", result["reason"])
+
     def test_special_motion_requires_literal_boolean_confirmation(self):
-        proxy = types.SimpleNamespace(FrontFlip=lambda: 0)
+        proxy = types.SimpleNamespace(
+            FrontFlip=lambda: 0,
+            GetState=lambda: (0, {"fsm_name": "AI_BALANCE_STAND"}))
         plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
 
         for confirm in (None, False, "false", "true", 0, 1, {}, []):
@@ -230,6 +420,7 @@ class TestDriverContracts(unittest.TestCase):
         proxy = types.SimpleNamespace(
             HandStand=lambda flag: calls.append(("handstand", flag)) or 0,
             BipedStand=lambda flag: calls.append(("biped_stand", flag)) or 0,
+            GetState=lambda: (0, {"fsm_name": "AI_BALANCE_STAND"}),
         )
         plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
         completed = __import__("threading").Event()
@@ -261,7 +452,9 @@ class TestDriverContracts(unittest.TestCase):
                         exited.set()
                     return 0
 
-                proxy = types.SimpleNamespace(**{method_name: posture})
+                proxy = types.SimpleNamespace(
+                    **{method_name: posture},
+                    GetState=lambda: (0, {"fsm_name": "AI_BALANCE_STAND"}))
                 plugin = self.device.SpecialMotionPlugin(
                     {}, "test", None, proxy)
                 with patch.object(
@@ -303,7 +496,9 @@ class TestDriverContracts(unittest.TestCase):
             release.wait(1)
             return 0
 
-        proxy = types.SimpleNamespace(FrontFlip=front_flip)
+        proxy = types.SimpleNamespace(
+            FrontFlip=front_flip,
+            GetState=lambda: (0, {"fsm_name": "AI_BALANCE_STAND"}))
         plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
         with patch.object(
                 self.device, "_acp_notify",
@@ -335,7 +530,9 @@ class TestDriverContracts(unittest.TestCase):
         def fail():
             raise RuntimeError("motion failed")
 
-        proxy = types.SimpleNamespace(FrontFlip=fail)
+        proxy = types.SimpleNamespace(
+            FrontFlip=fail,
+            GetState=lambda: (0, {"fsm_name": "AI_BALANCE_STAND"}))
         plugin = self.device.SpecialMotionPlugin({}, "test", None, proxy)
         with patch.object(
                 self.device, "_acp_notify",
@@ -375,6 +572,7 @@ class TestDriverContracts(unittest.TestCase):
 
         device = types.ModuleType("device")
         device.StatePlugin = device.LocoPlugin = device.SpecialMotionPlugin = object
+        device.LedPlugin = object
         multimedia = types.ModuleType("multimedia")
         multimedia.CameraPlugin = multimedia.SpeakerPlugin = object
         multimedia.MicPlugin = FakeMicPlugin
@@ -382,15 +580,19 @@ class TestDriverContracts(unittest.TestCase):
         lidar.LidarPlugin = object
         spatial = types.ModuleType("controlled_spatial")
         spatial.ControlledSpatialPlugin = object
+        mapping = types.ModuleType("slam_mapping")
+        mapping.SlamMappingPlugin = object
         config = {"plugins": {
             "state": {"enabled": False},
             "loco": {"enabled": False},
             "special_motion": {"enabled": False},
             "mic": {"enabled": True},
             "speaker": {"enabled": False},
+            "led": {"enabled": False},
             "camera": {"enabled": False},
             "lidar": {"enabled": False},
             "controlled_spatial": {"enabled": False},
+            "slam_mapping": {"enabled": False},
         }}
 
         modules = {
@@ -398,6 +600,7 @@ class TestDriverContracts(unittest.TestCase):
             "multimedia": multimedia,
             "lidar": lidar,
             "controlled_spatial": spatial,
+            "slam_mapping": mapping,
         }
         with patch.dict(sys.modules, modules):
             degraded = self.main.Bundle(
@@ -879,7 +1082,7 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn('<robot name="As2W">', urdf)
         self.assertNotIn("meshes/", urdf)
         for name in ("FL_foot", "FR_foot", "RL_foot", "RR_foot"):
-            self.assertIn(f'<joint name="{name}" type="continuous">', urdf)
+            self.assertIn(f'<joint name="{name}_joint" type="continuous">', urdf)
 
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
@@ -899,8 +1102,8 @@ class TestDriverContracts(unittest.TestCase):
         node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors, bms_state=None))
         self.assertEqual(3, len(published))
         joint_state = __import__("json").loads(published[1])
-        self.assertEqual(16, len([key for key in joint_state if key.endswith("_q")]))
-        self.assertIn("FR_hip_q", joint_state)
+        self.assertEqual(12, len([key for key in joint_state if key.endswith("_q")]))
+        self.assertIn("FR_hip_joint_q", joint_state)
 
     def test_joints_payload_keeps_skeleton_contract(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
@@ -912,7 +1115,7 @@ class TestDriverContracts(unittest.TestCase):
         node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors))
         payload = __import__("json").loads(published[0])
         self.assertEqual({"joints", "imu_quat"}, set(payload))
-        self.assertEqual(16, len(payload["joints"]))
+        self.assertEqual(12, len(payload["joints"]))
         self.assertEqual([1, 0, 0, 0], payload["imu_quat"])
         self.assertEqual({"idx", "name", "q", "dq", "tau", "temperature"},
                          set(payload["joints"][0]))
@@ -939,6 +1142,7 @@ class TestDriverContracts(unittest.TestCase):
         plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
         schema = plugin.get_tool()["inputSchema"]
         self.assertEqual(["slow", "normal", "fast"], schema["properties"]["speed_preset"]["enum"])
+        self.assertIn("stop_move", schema["x-completion"]["actions"])
         self.assertIn("stand_up", schema["x-completion"]["actions"])
         self.assertNotIn("switch_gait", schema["properties"]["action"]["enum"])
 
@@ -986,6 +1190,58 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn('"rt/utlidar/cloud_deskewed"', source)
         self.assertIn('"rt/utlidar/cloud"', source)
         self.assertNotIn('"rt/unitree/slam_mapping/points"', source)
+
+    def test_lidar_render_budget_is_bounded(self):
+        lidar = _load("as2w_lidar_budget_test", ROOT / "lidar.py")
+        self.assertEqual(2000, lidar._MAX_RENDER_POINTS)
+
+    def test_lidar_process_and_optional_backend_are_shipped(self):
+        config = (ROOT / "config.yaml").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        worker = (ROOT / "sensor_worker.py").read_text()
+        self.assertIn("process: true", config)
+        self.assertIn("max_render_points: 12000", config)
+        self.assertIn("lidar_backend.py", dockerfile)
+        self.assertIn("sensor_worker.py", dockerfile)
+        self.assertIn("def run_lidar", worker)
+        self.assertNotIn("def run_camera", worker)
+
+    def test_lidar_backend_falls_back_when_cupy_is_unavailable(self):
+        backend = _load("as2w_lidar_backend_test", ROOT / "lidar_backend.py")
+        with patch.object(backend.importlib.util, "find_spec", return_value=None):
+            instance = backend.PointCloudBackend()
+        self.assertEqual("cpu", instance.kind)
+        self.assertIn("not installed", instance.reason)
+
+    def test_slam_mapping_card_uses_shared_mapping_contract(self):
+        plugin = self.mapping.SlamMappingPlugin.__new__(self.mapping.SlamMappingPlugin)
+        plugin._topic = "/test/spatial/mapping"
+        tool = plugin.get_tool()
+        self.assertEqual("slam_mapping", tool["name"])
+        self.assertEqual("sensor", tool["type"])
+        self.assertEqual(
+            [{"topic": "/test/spatial/mapping", "format": "sensor/mapping"}],
+            tool["topic_out"],
+        )
+
+    def test_slam_mapping_decodes_offset_and_big_endian_xyz(self):
+        raw = b"HEAD" + struct.pack(">fff", 1.25, -2.5, 3.75) + b"TAIL"
+        points = self.mapping._SlamMappingNode._decode_points(
+            raw, 20, 1, {"x": 4, "y": 8, "z": 12}, True, 100)
+        self.assertEqual(1, len(points))
+        self.assertAlmostEqual(1.25, points[0][0])
+        self.assertAlmostEqual(-2.5, points[0][1])
+        self.assertAlmostEqual(3.75, points[0][2])
+
+    def test_slam_mapping_packet_matches_g1_go2_wire_format(self):
+        payload = self.mapping._SlamMappingNode._build_payload(
+            [(1.0, 2.0, 3.0)], {"x": 4.0, "y": 5.0, "yaw": 0.25})
+        x, y, yaw, flags, count = struct.unpack_from("<fffBI", payload, 0)
+        self.assertEqual((4.0, 5.0), (x, y))
+        self.assertAlmostEqual(-0.25, yaw)
+        self.assertEqual(0x03, flags)
+        self.assertEqual(1, count)
+        self.assertEqual((1.0, 2.0, 3.0), struct.unpack_from("<fff", payload, 17))
 
     def test_lidar_normalizes_pointcloud_fields_for_renderer(self):
         import struct

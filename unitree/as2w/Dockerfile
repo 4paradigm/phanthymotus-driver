@@ -24,7 +24,7 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
     source /ros_ws/install/setup.bash && \
     python3 -c "from audio_msgs.msg import AudioChunk"'
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
-COPY main.py device.py multimedia.py lidar.py controlled_spatial.py rpc_proxy.py config.yaml /work/
+COPY main.py device.py multimedia.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY deploy/ /deploy/
