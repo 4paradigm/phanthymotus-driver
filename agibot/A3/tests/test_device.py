@@ -253,6 +253,37 @@ def find_plugin(plugins, tool_name):
     raise KeyError(tool_name)
 
 
+def run_concurrently(fn_a, fn_b):
+    """Run two dispatch calls in lockstep (barrier-released) on separate threads.
+
+    ThreadingHTTPServer serves MCP calls concurrently, so two dispatches of the
+    same long-running action can interleave arbitrarily. This releases both at
+    the same instant and returns both results IN INPUT ORDER (fn_a, fn_b) —
+    either may be the one that wins the lock. Re-raises the first dispatch
+    error so a rejected RPC fails the test loudly.
+    """
+    barrier = threading.Barrier(2)
+    results = [None, None]
+    errors = []
+
+    def _run(index, fn):
+        barrier.wait(timeout=5)
+        try:
+            results[index] = fn()
+        except Exception as exc:  # noqa: BLE001 — re-raised below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_run, args=(i, fn))
+               for i, fn in enumerate((fn_a, fn_b))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    if errors:
+        raise errors[0]
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Inventory / schema tests
 # ---------------------------------------------------------------------------
@@ -799,6 +830,40 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_loco_simultaneous_walks_settle_exactly_one(self):
+        # 10th PR review: the settle→arm transition must be ONE lock-held
+        # section. Two truly simultaneous walks (barrier-released) must never
+        # both observe "no active action": the loser is cancelled immediately,
+        # exactly one walker stays armed, and every action gets exactly one
+        # terminal post.
+        loco = find_plugin(self.plugins, "loco")
+        loco._PUBLISH_INTERVAL_S = 0.2
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            first, second = run_concurrently(
+                lambda: loco.dispatch("walk", {"forward": 0.5, "duration": 30.0}),
+                lambda: loco.dispatch("walk", {"forward": -0.5, "duration": 30.0}))
+            ids = {first["action_id"], second["action_id"]}
+            self.assertEqual(len(ids), 2)  # distinct actions — no id overwrite
+            loser = captured[0][0]
+            self.assertIn(loser, ids)
+            self.assertEqual(captured[0][1], "cancelled")
+            # the survivor is the one still armed, and it is the only walker
+            survivor = second["action_id"] if loser == first["action_id"] else first["action_id"]
+            self.assertEqual(loco._move_action_id, survivor)
+            loco.dispatch("stop", {})
+            time.sleep(0.5)
+            # each action reported exactly once, and both got a terminal —
+            # never a double post for one action, never a silent orphan.
+            self.assertEqual(sorted(c[1] for c in captured), ["cancelled", "cancelled"])
+            for action_id in ids:
+                self.assertEqual(len([c for c in captured if c[0] == action_id]), 1)
+        finally:
+            device._acp_notify = original_notify
+
     def test_waist_control_publishes_wrapper(self):
         waist = find_plugin(self.plugins, "waist_control")
         waist.dispatch("send", {"pitch": 0.2, "height": -0.1})
@@ -1050,6 +1115,43 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_tts_simultaneous_speaks_settle_exactly_one(self):
+        # 10th PR review: two barrier-released speaks must serialise through
+        # the lock-held settle→stop-old-trace→arm transition — distinct ids,
+        # the loser cancelled exactly once, and the OLD trace interrupted.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            tts = find_plugin(self.plugins, "tts")
+            tts._POLL_INTERVAL_S = 5.0  # keep the survivor polling
+            self.transport.responses["TTSService/GetAudioStatus"] = {"state": 1}
+            traces = iter(["t-a", "t-b"])
+            self.transport.handler = lambda url, service: (
+                {"trace_id": next(traces)}
+                if service.startswith("TTSService/PlayTTS")
+                else {"header": {"code": "0"}})
+            first, second = run_concurrently(
+                lambda: tts.dispatch("speak", {"text": "第一句"}),
+                lambda: tts.dispatch("speak", {"text": "第二句"}))
+            self.assertEqual(len({first["action_id"], second["action_id"]}), 2)
+            loser = captured[0][0]
+            self.assertEqual(captured[0][1], "cancelled")
+            self.assertEqual(captured[0][2]["reason"], "replaced_by_new_playback")
+            loser_result = second if loser == second["action_id"] else first
+            survivor_result = second if loser == first["action_id"] else first
+            self.assertEqual(tts._play_action_id, survivor_result["action_id"])
+            # the interrupted trace is the loser's, never the survivor's
+            (url, body), = self.transport.calls_to("TTSService", "StopTTSTraceId")
+            self.assertEqual(body["trace_id"], loser_result["trace_id"])
+            tts.dispatch("stop", {})
+            time.sleep(0.3)
+            for action_id in (first["action_id"], second["action_id"]):
+                self.assertEqual(len([c for c in captured if c[0] == action_id]), 1)
+        finally:
+            device._acp_notify = original_notify
+
 
     def test_tts_play_media_posts_play_media_file(self):
         tts = find_plugin(self.plugins, "tts")
@@ -1118,6 +1220,10 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(body["duration_ms"], 5000)
         self.assertTrue(body["cmd_end"])
         self.assertFalse(body["cmd_pause"])
+        # 1ms of playback — the completion worker settles immediately instead of
+        # outliving the test: a 5 s survivor polls on into later tts tests and
+        # its ACP post lands inside their monkeypatched _acp_notify windows.
+        motion.dispatch("stop_play", {})
 
     def test_motion_play_stop_play_uses_cmd_end(self):
         motion = find_plugin(self.plugins, "motion_play")
@@ -1262,6 +1368,114 @@ class RpcDispatchTests(unittest.TestCase):
             # pause/resume reached the robot-side player
             pause_calls = self.transport.calls_to("MotionCommandService", "SendMotionCommand")
             self.assertEqual([c[1]["cmd_pause"] for c in pause_calls[1:]], [True, False])
+        finally:
+            device._acp_notify = original_notify
+
+    def test_motion_play_completion_vs_stop_race_posts_exactly_one_terminal(self):
+        # 10th PR review: natural completion and a concurrent stop race for the
+        # same action — whoever wins the lock claims the terminal, the loser
+        # stays silent. Exactly one post per action_id, status either completed
+        # or cancelled but never both, never a double post.
+        motion = find_plugin(self.plugins, "motion_play")
+        motion._PLAY_WORKER_TICK_S = 0.02
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            result = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                              "duration_ms": 60})
+            # fire stop_play the instant the 60 ms countdown is about to expire
+            stopper = threading.Timer(0.05, lambda: motion.dispatch("stop_play", {}))
+            stopper.start()
+            stopper.join()
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            time.sleep(0.2)  # let any double-posting bug surface
+            posts = [c for c in captured if c[0] == result["action_id"]]
+            self.assertEqual(len(posts), 1)
+            self.assertIn(posts[0][1], ("completed", "cancelled"))
+            self.assertEqual(motion._play_action_id, None)
+        finally:
+            device._acp_notify = original_notify
+
+    def test_motion_play_simultaneous_plays_never_overlap(self):
+        # 10th PR review: two barrier-released plays must serialise through the
+        # lock-held settle→arm transition — distinct action ids (no overwrite),
+        # the loser cancelled exactly once, the survivor armed, and the robot
+        # sees cmd_end for the first motion BEFORE the second starts.
+        motion = find_plugin(self.plugins, "motion_play")
+        motion._PLAY_WORKER_TICK_S = 0.02
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            first, second = run_concurrently(
+                lambda: motion.dispatch("play", {"motion_id": "/agibot/motions/a.mcap",
+                                                 "duration_ms": 5000}),
+                lambda: motion.dispatch("play", {"motion_id": "/agibot/motions/b.mcap",
+                                                 "duration_ms": 5000}))
+            self.assertEqual(len({first["action_id"], second["action_id"]}), 2)
+            loser = captured[0][0]
+            self.assertIn(loser, (first["action_id"], second["action_id"]))
+            survivor = second["action_id"] if loser == first["action_id"] else first["action_id"]
+            self.assertEqual(captured[0][1], "cancelled")
+            self.assertEqual(captured[0][2]["reason"], "replaced_by_new_play")
+            self.assertEqual(motion._play_action_id, survivor)
+            # the lock serialises the two dispatches into exactly one shape:
+            # [play(lock-winner), cmd_end(settle), play(survivor)] — the robot
+            # never receives two overlapping plays without an end between.
+            motions = [c[1]["motion_id"] for c in
+                       self.transport.calls_to("MotionCommandService", "SendMotionCommand")]
+            self.assertEqual(len(motions), 3)
+            self.assertEqual(motions.count(""), 1)  # exactly one cmd_end separator
+            self.assertEqual(motions[1], "")        # it sits between the two plays
+            loser_motion = motions[0]
+            expected_loser_motion = ("/agibot/motions/a.mcap"
+                                     if loser == first["action_id"]
+                                     else "/agibot/motions/b.mcap")
+            self.assertEqual(loser_motion, expected_loser_motion)
+            self.assertEqual(motions[2], ("/agibot/motions/b.mcap"
+                                          if loser == first["action_id"]
+                                          else "/agibot/motions/a.mcap"))
+            motion.dispatch("stop_play", {})
+            time.sleep(0.3)
+            for action_id in (first["action_id"], second["action_id"]):
+                self.assertEqual(len([c for c in captured if c[0] == action_id]), 1)
+        finally:
+            device._acp_notify = original_notify
+
+    def test_motion_play_pause_stop_then_new_play_completes_without_resume(self):
+        # 10th PR review (pause-state leak): pause belongs to the settled
+        # action only. pause → stop_play → a fresh play with NO resume must
+        # complete — before the fix the stale _paused flag froze the second
+        # worker at _paused.wait() forever.
+        motion = find_plugin(self.plugins, "motion_play")
+        motion._PLAY_WORKER_TICK_S = 0.02
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            first = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                             "duration_ms": 5000})
+            motion.dispatch("pause", {})
+            motion.dispatch("stop_play", {})
+            self.assertEqual([(c[0], c[1]) for c in captured],
+                             [(first["action_id"], "cancelled")])
+            self.assertEqual(captured[0][2]["reason"], "cancelled_by_request")
+            second = motion.dispatch("play", {"motion_id": "/agibot/motions/dance.mcap",
+                                              "duration_ms": 100})
+            # no resume() — the fresh play must run to completion on its own
+            deadline = time.time() + 5
+            while len(captured) < 2 and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual([(c[0], c[1]) for c in captured],
+                             [(first["action_id"], "cancelled"),
+                              (second["action_id"], "completed")])
+            self.assertEqual(motion._play_action_id, None)
         finally:
             device._acp_notify = original_notify
 
@@ -1529,6 +1743,49 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_controlled_spatial_simultaneous_navs_never_overlap(self):
+        # 10th PR review: two barrier-released nav dispatches must serialise
+        # through the lock-held settle→ActionCancel→new-nav→arm transition:
+        # distinct ids, the loser cancelled once, and the OLD task cancelled
+        # before the new nav RPC fires.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial._NAV_POLL_INTERVAL_S = 5.0  # keep the survivor polling
+            task_ids = iter([11, 12])
+            self.transport.handler = lambda url, service: (
+                {"task_id": next(task_ids), "data": {"state": "running"}}
+                if service.startswith("PncService/MoveForward")
+                else {"header": {"code": "0"}})
+            first, second = run_concurrently(
+                lambda: spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5}),
+                lambda: spatial.dispatch("move_forward", {"map_id": 1, "distance": 1.0}))
+            self.assertEqual(len({first["action_id"], second["action_id"]}), 2)
+            loser = captured[0][0]
+            self.assertEqual(captured[0][1], "cancelled")
+            self.assertEqual(captured[0][2]["reason"], "replaced_by_new_navigation")
+            loser_result = second if loser == second["action_id"] else first
+            survivor_result = second if loser == first["action_id"] else first
+            self.assertEqual(spatial._nav_action_id, survivor_result["action_id"])
+            # the cancelled task is the loser's, and it was cancelled BEFORE
+            # the second MoveForward fired (no overlapping nav tasks).
+            cancel_calls = self.transport.calls_to("PncService", "ActionCancel")
+            self.assertEqual([c[1]["task_id"] for c in cancel_calls], [loser_result["task_id"]])
+            nav_calls = self.transport.calls_to("PncService", "MoveForward")
+            self.assertEqual(len(nav_calls), 2)
+            cancel_index = self.transport.calls.index(cancel_calls[0])
+            self.assertLess(cancel_index,
+                            self.transport.calls.index(nav_calls[1]))
+            spatial.dispatch("stop", {})
+            time.sleep(0.3)
+            for action_id in (first["action_id"], second["action_id"]):
+                self.assertEqual(len([c for c in captured if c[0] == action_id]), 1)
+        finally:
+            device._acp_notify = original_notify
+
     def test_controlled_spatial_relocalization_start(self):
         spatial = find_plugin(self.plugins, "controlled_spatial")
         spatial.dispatch("start_relocalization", {"map_dir": "/agibot/data/map/lobby"})
@@ -1721,6 +1978,51 @@ class RpcDispatchTests(unittest.TestCase):
             # the second worker is the only one left armed
             self.assertEqual(skill._play_action_id, second["action_id"])
             self.assertEqual(skill._last_session_id, "s-2")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_skill_play_simultaneous_plays_never_overlap(self):
+        # 10th PR review: two barrier-released plays must serialise through the
+        # lock-held settle→Stop-old-session→Start→arm transition: distinct ids,
+        # the loser cancelled once, and the OLD session stopped before the new
+        # Start fires.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            skill = find_plugin(self.plugins, "skill_play")
+            skill._POLL_INTERVAL_S = 5.0  # keep the survivor polling
+            skill.nodes.values["skill_status"] = {"state": "running"}
+            sessions = iter(["s-a", "s-b"])
+            def skill_handler(url, service):
+                if not service.startswith("SkillPilotService/SkillPackage"):
+                    return {"header": {"code": "0"}}
+                body = next(c for u, c in reversed(self.transport.calls)
+                             if "SkillPilotService/SkillPackage" in u)
+                if body.get("command") == "Start":
+                    return {"data": {"session_id": next(sessions)}}
+                return {"data": {"session_id": body.get("session_id", "")}}
+            self.transport.handler = skill_handler
+            first, second = run_concurrently(
+                lambda: skill.dispatch("play", {"path": "/agibot/skills/a"}),
+                lambda: skill.dispatch("play", {"path": "/agibot/skills/b"}))
+            self.assertEqual(len({first["action_id"], second["action_id"]}), 2)
+            loser = captured[0][0]
+            self.assertEqual(captured[0][1], "cancelled")
+            self.assertEqual(captured[0][2]["reason"], "replaced_by_new_play")
+            loser_result = second if loser == second["action_id"] else first
+            survivor_result = second if loser == first["action_id"] else first
+            self.assertEqual(skill._play_action_id, survivor_result["action_id"])
+            # the stopped session is the loser's, stopped BEFORE the new Start
+            calls = self.transport.calls_to("SkillPilotService", "SkillPackage")
+            stop_calls = [c for c in calls if c[1]["command"] == "Stop"]
+            self.assertEqual([c[1]["session_id"] for c in stop_calls], [loser_result["session_id"]])
+            self.assertLess(calls.index(stop_calls[0]), calls.index(calls[-1]))
+            skill.dispatch("stop", {})
+            time.sleep(0.3)
+            for action_id in (first["action_id"], second["action_id"]):
+                self.assertEqual(len([c for c in captured if c[0] == action_id]), 1)
         finally:
             device._acp_notify = original_notify
 

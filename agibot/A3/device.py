@@ -1411,9 +1411,11 @@ class LocoPlugin:
             return {"state": "rejected", "current": current,
                     "suggestion": "loco 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up 恢复站立"}
         # 新指令顶替旧指令：先结算旧的等待线程（发零速 + cancelled 回报），再武装新的。
+        # 整个转移（结算 → 武装）在同一把锁内完成：两个并发 walk 不会都观察到
+        # “无活动动作”而向机器人下发重叠指令（10th PR review）。
         with self._move_lock:
-            prior = self._settle_active("cancelled", {"reason": "replaced_by_new_command"})
-        return self._arm_completion(forward, lateral, angular, duration)
+            self._settle_active("cancelled", {"reason": "replaced_by_new_command"})
+            return self._arm_completion(forward, lateral, angular, duration)
 
     # -- 内部 ------------------------------------------------------------------
 
@@ -1461,6 +1463,8 @@ class LocoPlugin:
         return {"state": "idle", "was_walking": had_active}
 
     def _arm_completion(self, forward, lateral, angular, duration):
+        # 调用方须持有 _move_lock（dispatch 在锁内完成结算→武装的整段转移，
+        # 10th PR review）：并发 walk 不会重叠下发，也不会互相顶掉对方的 id。
         action_id = f"loco_walk_{uuid4().hex[:8]}"
         self._move_action_id = action_id
         threading.Thread(target=self._walk_worker,
@@ -1814,7 +1818,11 @@ class MotionPlayPlugin:
         只清 id 会让 Agent Core 的 barrier 挂到 600 s 超时 —— 取消也必须显式
         POST cancelled（LocoPlugin._settle_active 同款语义）。调用方须持有
         _play_lock（除插件生命周期 stop() 自行加锁外）。
+
+        同时清除 pause 标记：pause 只属于被结算的那个动作，若残留会让下一次
+        播放的 worker 在 _paused.wait() 上永久冻结（10th PR review）。
         """
+        self._paused.clear()
         action_id, self._play_action_id = self._play_action_id, None
         if action_id is not None:
             _acp_notify(action_id, status, detail, "motion_play")
@@ -1848,11 +1856,24 @@ class MotionPlayPlugin:
             if self._paused.is_set():
                 continue  # frozen this tick — do not consume the countdown
             remaining_s -= self._PLAY_WORKER_TICK_S
-        if self._play_action_id != action_id:
+        if self._finish(action_id, "completed",
+                        {"motion_id": motion_path, "duration_ms": duration_ms}):
             return
-        _acp_notify(action_id, "completed",
-                    {"motion_id": motion_path, "duration_ms": duration_ms},
-                    "motion_play")
+        # _finish 返回 False 表示已被取消/顶替接管，终态由对方回报。
+
+    def _finish(self, action_id, status, result):
+        """原子终态：锁内确认仍持有该 action_id 才清 id，锁外回报。
+
+        与 TtsPlugin._finish 同款（10th PR review：worker 终态不做原子认领时，
+        并发 stop/reset/顶替可在 check 与 POST 之间清 id 并回报 cancelled，
+        之后 worker 再补一发同一 action 的第二终态事件）。返回是否已认领。
+        """
+        with self._play_lock:
+            if self._play_action_id != action_id:
+                return False  # 已被取消/顶替，终态由对方回报
+            self._play_action_id = None
+        _acp_notify(action_id, status, result, "motion_play")
+        return True
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1894,7 +1915,10 @@ class MotionPlayPlugin:
             # exit on the id mismatch and leave Agent Core pending 600 s
             # (ThreadingHTTPServer makes concurrent play reachable). The prior
             # motion is ended BEFORE the new SendMotionCommand fires so the
-            # robot never receives two overlapping plays.
+            # robot never receives two overlapping plays. The whole transition
+            # (settle → physical command → arm) holds the lock: two concurrent
+            # plays can never both observe "no active action" and fire two
+            # overlapping robot commands (10th PR review).
             with self._play_lock:
                 if self._play_action_id is not None:
                     self._settle_active("cancelled", {"reason": "replaced_by_new_play"})
@@ -1903,9 +1927,8 @@ class MotionPlayPlugin:
                             motion_id="", duration_ms=0, cmd_end=True)
                     except Exception:
                         pass
-            response = jsonable(self.nodes.rpc.send_motion_command(
-                motion_path, duration_ms, cmd_end=True, cmd_pause=False))
-            with self._play_lock:
+                response = jsonable(self.nodes.rpc.send_motion_command(
+                    motion_path, duration_ms, cmd_end=True, cmd_pause=False))
                 action_id = f"motion_play_{uuid4().hex[:8]}"
                 self._play_action_id = action_id
             threading.Thread(target=self._play_worker,
@@ -2110,12 +2133,14 @@ class TtsPlugin:
         _acp_notify(action_id, status, result, "tts")
 
     def _arm_completion(self, action, trace_id, detail):
+        # 调用方须持有 _play_lock（speak/play_media 在锁内完成结算→物理打断
+        # →武装的整段转移，10th PR review）：并发播报不会重叠打断，也不会
+        # 互相顶掉对方的 id。
         action_id = f"tts_{action}_{uuid4().hex[:8]}"
-        with self._play_lock:
-            self._play_action_id = action_id
-            # 记住当前 trace_id：框架 stop 打断当前播报时要按它调用
-            # StopTTSTraceId，而 stop 入参里并不会带 trace_id。
-            self._play_trace_id = trace_id
+        self._play_action_id = action_id
+        # 记住当前 trace_id：框架 stop 打断当前播报时要按它调用
+        # StopTTSTraceId，而 stop 入参里并不会带 trace_id。
+        self._play_trace_id = trace_id
         threading.Thread(target=self._play_worker,
                          args=(action_id, trace_id, action, detail),
                          daemon=True).start()
@@ -2156,33 +2181,35 @@ class TtsPlugin:
             )
             # PlayTTS/PlayMediaFile 出参为扁平结构（is_sucess 官方拼写如此）
             trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
-            # 新播报顶替旧播报：PlayTTS 已受理后先结算旧等待线程（立即 cancelled）
-            # 并在锁外用旧 trace_id 物理打断 —— 顺序不能反，否则打断的是新播报。
-            with self._play_lock:
-                prior = self._settle_active("cancelled", {"reason": "replaced_by_new_playback"})
-            if prior is not None and prior[1]:
-                try:
-                    self.nodes.rpc.stop_tts_trace_id(prior[1])
-                except Exception:
-                    pass
+            # 新播报顶替旧播报：先结算旧等待线程（立即 cancelled）并用旧 trace_id
+            # 物理打断 —— 顺序不能反，否则打断的是新播报。结算→打断→武装在同一
+            # 把锁内完成（10th PR review）：并发播报不会都观察到“无活动播报”而
+            # 重叠武装、互相顶掉对方的 id。
             # 播报无独立 trace_id 时轮询不到指定会话，等待线程只能靠超时兜底；
             # 此时用空 trace_id 询问当前播报状态（GetAudioStatus 单会话语义）。
-            return self._arm_completion("speak", trace_id, {"text": text[:50]})
+            with self._play_lock:
+                prior = self._settle_active("cancelled", {"reason": "replaced_by_new_playback"})
+                if prior is not None and prior[1]:
+                    try:
+                        self.nodes.rpc.stop_tts_trace_id(prior[1])
+                    except Exception:
+                        pass
+                return self._arm_completion("speak", trace_id, {"text": text[:50]})
         if action == "play_media":
             file_name = args.get("file_name", "")
             _require(file_name, "file_name 不能为空")
             response = self.nodes.rpc.play_media_file(file_name, is_interrupted=True)
             trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
-            # 同 speak：先结算并打断旧播报，再武装新的等待线程。
+            # 同 speak：在锁内结算并打断旧播报，再武装新的等待线程。
             with self._play_lock:
                 prior = self._settle_active("cancelled", {"reason": "replaced_by_new_playback"})
-            if prior is not None and prior[1]:
-                try:
-                    self.nodes.rpc.stop_tts_trace_id(prior[1])
-                except Exception:
-                    pass
-            return self._arm_completion("play_media", trace_id,
-                                        {"file_name": file_name, "response": response})
+                if prior is not None and prior[1]:
+                    try:
+                        self.nodes.rpc.stop_tts_trace_id(prior[1])
+                    except Exception:
+                        pass
+                return self._arm_completion("play_media", trace_id,
+                                            {"file_name": file_name, "response": response})
         if action == "status":
             return jsonable(self.nodes.rpc.get_audio_status(args.get("trace_id", "")))
         if action == "stop_trace_id":
@@ -2574,20 +2601,21 @@ class SkillPlayPlugin:
         if action == "play":
             path = args.get("path", "")
             _require(path, "path 不能为空")
-            # 新播放顶替旧播放：先结算旧等待线程（立即 cancelled）并在锁外按旧
+            # 新播放顶替旧播放：先结算旧等待线程（立即 cancelled）并在锁内按旧
             # session_id 物理停止 —— 顺序不能反，否则 Stop 打断的是新会话
             # （ThreadingHTTPServer 使并发 play 可达，MotionPlayPlugin 同款）。
+            # 结算→Stop→Start→武装在同一把锁内完成（10th PR review）：并发
+            # play 不会重叠下发，也不会互相顶掉对方的 id。
             with self._play_lock:
                 prior = self._settle_active("cancelled", {"reason": "replaced_by_new_play"})
-            if prior is not None and prior[1]:
-                try:
-                    self.nodes.rpc.skill_package("Stop", "", prior[1])
-                except Exception:
-                    pass
-            response = jsonable(self.nodes.rpc.skill_package("Start", path))
-            session_id = (response.get("data") or {}).get("session_id", "")
-            action_id = f"skill_play_{uuid4().hex[:8]}"
-            with self._play_lock:
+                if prior is not None and prior[1]:
+                    try:
+                        self.nodes.rpc.skill_package("Stop", "", prior[1])
+                    except Exception:
+                        pass
+                response = jsonable(self.nodes.rpc.skill_package("Start", path))
+                session_id = (response.get("data") or {}).get("session_id", "")
+                action_id = f"skill_play_{uuid4().hex[:8]}"
                 self._play_action_id = action_id
                 # 记住当前会话：框架 stop 要按它调用 SkillPilot Stop，
                 # 而 stop 入参里并不会带 session_id。
@@ -2818,22 +2846,22 @@ class ControlledSpatialPlugin:
     def _nav_dispatch(self, action, method, payload):
         """Send a long-running navigation RPC and arm the ACP completion waiter.
 
-        新导航顶替旧导航：先结算旧等待线程（立即 cancelled）并在锁外按旧
+        新导航顶替旧导航：先结算旧等待线程（立即 cancelled）并在锁内按旧
         task_id 物理取消 —— 不取消的话机器人会同时执行两个导航任务
         （ThreadingHTTPServer 使并发下发可达，MotionPlayPlugin 同款）。
+        结算→ActionCancel→新导航→武装在同一把锁内完成（10th PR review）：
+        并发导航不会重叠下发，也不会互相顶掉对方的 id。
         """
         with self._nav_lock:
             prior = self._settle_active("cancelled", {"reason": "replaced_by_new_navigation"})
-            prior_task = prior[1] if prior is not None else None
-        if prior is not None and prior_task:
-            try:
-                self.nodes.rpc.navi("ActionCancel", {"task_id": prior_task})
-            except Exception:
-                pass
-        response = self._remember(self.nodes.rpc.navi(method, payload))
-        task_id = (response or {}).get("task_id") or self.last_task_id or 0
-        action_id = f"a3_nav_{uuid4().hex[:8]}"
-        with self._nav_lock:
+            if prior is not None and prior[1]:
+                try:
+                    self.nodes.rpc.navi("ActionCancel", {"task_id": prior[1]})
+                except Exception:
+                    pass
+            response = self._remember(self.nodes.rpc.navi(method, payload))
+            task_id = (response or {}).get("task_id") or self.last_task_id or 0
+            action_id = f"a3_nav_{uuid4().hex[:8]}"
             self._nav_action_id = action_id
         threading.Thread(target=self._nav_worker,
                          args=(action_id, task_id, action), daemon=True).start()
