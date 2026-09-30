@@ -18,7 +18,7 @@ COPY requirements.txt /work/requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt && \
     pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
-COPY main.py device.py lidar.py controlled_spatial.py rpc_proxy.py network.py config.yaml /work/
+COPY main.py device.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py rpc_proxy.py network.py config.yaml /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY deploy/ /deploy/

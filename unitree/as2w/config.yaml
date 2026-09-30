@@ -7,12 +7,14 @@ plugins:
   mic: {enabled: true, multicast_group: "239.168.123.161", multicast_port: 5555, multicast_interface: ""}
   speaker: {enabled: true}
   led: {enabled: true}
-  camera_rgb: {enabled: true, fps: 10}
+  camera_rgb: {enabled: true, fps: 10, process: true}
   loco: {enabled: true}
   special_motion: {enabled: true}
   state: {enabled: true}
   lidar:
     enabled: true
+    process: true
+    max_render_points: 12000
     # Override only after checking the driver's 15-second lidar diagnostics.
     # source_topics: ["rt/utlidar/cloud_deskewed"]
   controlled_spatial: {enabled: true}

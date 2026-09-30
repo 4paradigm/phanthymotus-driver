@@ -5,6 +5,7 @@ import queue
 import socket
 import struct
 import threading
+import multiprocessing
 import time
 from uuid import uuid4
 
@@ -504,7 +505,7 @@ class LocoPlugin:
                     "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity rad/s [-2, 2]"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
                     "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
-                "x-completion": {"actions": ["move", "stand_up", "stand_down", "balance_stand", "recovery_stand"], "timeout": 45},
+                "x-completion": {"actions": ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand"], "timeout": 45},
                 "x-action-params": {
                     "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with optional duration (-1 for continuous)."},
                     "stop_move": {"params": [], "description": "Stop movement."},
@@ -559,7 +560,12 @@ class LocoPlugin:
             name = str(state.get("fsm_name", "")).upper()
             if name and name != "DAMPING":
                 left_old_state = True
-            if left_old_state and name == expected_name.upper():
+            # AS2 prefixes sport FSM names with AI_ (for example
+            # AI_STAND_UP/AI_STAND_DOWN).  The public action names use the
+            # shorter names, so compare both forms rather than reporting a
+            # false timeout after the robot has completed the transition.
+            expected_names = {expected_name.upper(), "AI_" + expected_name.upper()}
+            if left_old_state and name in expected_names:
                 matches += 1
             else:
                 matches = 0
@@ -571,7 +577,8 @@ class LocoPlugin:
                     "current_state": name or "UNKNOWN",
                     "error": "controller state did not reach the expected posture within 20 seconds",
                     "reason": f"The controller did not enter {expected_name}",
-                    "suggested_actions": ["get_state", "stop_move", "recovery_stand"]})
+                    "suggested_actions": ["get_state", "stop_move", "recovery_stand"],
+                    "observed_state": state})
     def dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
@@ -824,6 +831,7 @@ class SpecialActionPlugin:
                     "confirm": {"type": "boolean", "description": "Safety acknowledgement; must be true."}},
                     "required": ["action"],
                     "x-is-dangerous": True,
+                    "x-completion": {"actions": actions, "timeout": 45},
                     "x-action-params": {
                         "front_flip": {"params": ["confirm"], "description": "One-shot forward flip; normally requires BALANCE_STAND and confirm=true."},
                         "back_flip": {"params": ["confirm"], "description": "One-shot backward flip; normally requires BALANCE_STAND and confirm=true."},
@@ -866,12 +874,30 @@ class SpecialActionPlugin:
                         "error": "Special motion cannot be executed from the current state",
                         "reason": "The robot must be standing and balanced before a special motion",
                         "suggested_actions": ["stand_up", "balance_stand", "recovery_stand"]}
-            ret = methods[action]()
-            return {"ret": ret, "accepted": ret == 0, "action": action,
-                    "current_state": state_name,
-                    **({} if ret == 0 else {"error": "SportClient rejected the special action",
-                      "reason": "The controller refused the special motion from the current posture",
-                      "suggested_actions": ["get_state", "recovery_stand"]})}
+            action_id = f"as2w_special_{uuid4().hex[:8]}"
+            try:
+                ret = methods[action]()
+            except Exception as exc:
+                ret = 3104
+                error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            else:
+                error = None
+            result = {"ret": ret, "accepted": ret == 0, "action": action,
+                      "current_state": state_name, "action_id": action_id}
+            if ret == 0:
+                # SportClient's special-motion calls are synchronous from the
+                # SDK's perspective.  Still publish a terminal ACP event so
+                # callers do not wait forever merely because this is a
+                # one-shot action.
+                _acp_notify(action_id, "completed", {"action": action,
+                             "ret": 0, "current_state": state_name})
+            else:
+                result.update({"error": "SportClient rejected the special action",
+                    "reason": "The controller refused the special motion from the current posture",
+                    "suggested_actions": ["get_state", "recovery_stand"],
+                    **({"rpc_error": error} if error else {})})
+                _acp_notify(action_id, "error", result)
+            return result
         return None
 
 
@@ -1016,7 +1042,7 @@ class MicPlugin:
                 result["error"] = self._node.last_error
             return result
         if action == "stop":
-            self._node.stop()
+            self.stop()
             return {"state": "idle"}
         if action == "info":
             age = None
@@ -1248,7 +1274,7 @@ class SpeakerPlugin:
             return {"state": "ready", "topic": started_topic,
                     "input_topic": started_topic}
         if action == "stop":
-            self._node.stop()
+            self.stop()
             return {"state": "idle"}
         if action == "info":
             return {"state": self._node.state, "topic": self._node.topic,
@@ -1363,38 +1389,74 @@ class _CameraRgbNode:
 class CameraPlugin:
     PREFIX = "camera_rgb"
 
-    def __init__(self, config, namespace, executor, proxy):
+    def __init__(self, config, namespace, executor, proxy, interface=""):
         self._topic = f"/{namespace}/camera/rgb"
-        self._node = _CameraRgbNode(self._topic, proxy, config.get("fps", 5))
-        self._fps = self._node.fps
-        executor.add_node(self._node.node)
+        self._process_mode = bool(config.get("process", False))
+        self._interface = interface
+        self._proxy = proxy
+        self._node = None if self._process_mode else _CameraRgbNode(self._topic, proxy, config.get("fps", 5))
+        self._process = None
+        self._fps = self._node.fps if self._node is not None else max(0.5, min(15.0, float(config.get("fps", 5))))
+        if self._process_mode:
+            self._fps = max(0.5, min(15.0, float(config.get("fps", 5))))
+            self._start_process()
+        else:
+            executor.add_node(self._node.node)
+
+    def _start_process(self):
+        context = multiprocessing.get_context("spawn")
+        self._process = context.Process(
+            target=_run_camera_process,
+            args=(self._topic, self._fps, self._interface),
+            daemon=True, name="as2w-camera-rgb-process")
+        self._process.start()
 
     def get_tool(self):
         return {"name": "camera_rgb", "type": "sensor", "multiInstance": False,
-                "description": f"AS2 videohub RGB JPEG stream at up to {getattr(self, '_fps', 5.0):g} FPS (implementation cap 15 FPS): {self._topic}",
+                "description": f"AS2 videohub RGB JPEG stream in an isolated process at up to {getattr(self, '_fps', 5.0):g} FPS (firmware RPC latency may reduce the effective rate; implementation cap 15 FPS): {self._topic}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
 
     def start(self):
-        self._node.start()
+        if self._process_mode:
+            if self._process is None or not self._process.is_alive():
+                self._start_process()
+        else:
+            self._node.start()
 
     def stop(self):
-        self._node.stop()
+        if self._process_mode:
+            process = self._process
+            self._process = None
+            if process is not None:
+                process.terminate()
+                process.join(timeout=3)
+        else:
+            self._node.stop()
 
     def dispatch(self, action, args):
         if action in ("start", "camera_rgb"):
-            self._node.start()
+            self.start()
             return {"state": "running", "topic": self._topic}
         if action == "stop":
-            self._node.stop()
+            self.stop()
             return {"state": "idle"}
         if action == "info":
+            if self._process_mode:
+                return {"state": "running" if self._process and self._process.is_alive() else "idle",
+                        "process_pid": self._process.pid if self._process else None,
+                        "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
             return {"state": self._node.state, "frames": self._node.frames,
                     "last_frame_interval_s": self._node.last_frame_interval_s,
                     "last_rpc_s": self._node.last_rpc_s,
                     "last_error": self._node.last_error,
                     "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
         return None
+
+
+def _run_camera_process(topic, fps, interface):
+    from sensor_worker import run_camera
+    run_camera(topic, fps, interface)
 
 
 class LedPlugin:

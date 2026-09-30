@@ -90,6 +90,18 @@ not build a stale frame backlog. The camera RPC remains firmware-dependent: a
 videohub timeout means the firmware did not return a frame, not that the ROS
 publisher is buffering old frames.
 
+In the checked-in AS2W configuration, lidar and RGB camera each run in a
+separate OS process. This keeps point-cloud conversion and a blocked videohub
+RPC out of the main MCP/state executor. Lidar probes for an already-installed
+CuPy CUDA runtime and logs either `backend=cuda device=0` or
+`backend=cpu fallback=...`; no CUDA package is downloaded implicitly. CPU
+rendering remains bounded to 2,000 latest points, while `max_render_points`
+(12,000 in the checked-in config) is used only by the CUDA path. The host must
+expose Jetson GPU devices and a compatible CUDA Python runtime inside the
+container. The inspected target container exposed `/dev/nvhost*`, but no
+verified CuPy runtime, so CPU fallback is currently expected until the image
+runtime is rebuilt with the required CUDA access.
+
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, and full-size low-state arrays.
 
