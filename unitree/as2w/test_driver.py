@@ -419,6 +419,28 @@ class TestDriverContracts(unittest.TestCase):
         self.assertAlmostEqual(1.5707963, proxy.moves[-1][2], places=5)
         self.assertEqual(90, result["vyaw"])
 
+    def test_body_height_requires_explicit_absolute_meter_target(self):
+        proxy = _Proxy()
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        missing = plugin.dispatch("body_height", {})
+        self.assertFalse(missing["accepted"])
+        self.assertIn("required", missing["error"])
+        proxy.height = None
+        proxy.BodyHeight = lambda value: setattr(proxy, "height", value) or 0
+        result = plugin.dispatch("body_height", {"height": 0.18})
+        self.assertTrue(result["accepted"])
+        self.assertAlmostEqual(0.18, proxy.height)
+
+    def test_loco_state_marks_zero_height_in_passive_mode_invalid(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.loco = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node._publish_sport(types.SimpleNamespace(mode=0, body_height=0.0,
+                                                  velocity=[], position=[]))
+        payload = __import__("json").loads(published[0])
+        self.assertFalse(payload["body_height_valid"])
+        self.assertEqual("rt/lf/sportmodestate", payload["body_height_source"])
+
     def test_timed_move_returns_action_id_and_reports_acp_completion(self):
         proxy = _Proxy()
         plugin = self.device.LocoPlugin({}, "test", None, proxy)

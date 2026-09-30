@@ -232,8 +232,13 @@ class _StateNode:
             self._publish_sport(msg)
 
     def _publish_sport(self, msg):
-        loco = {"mode": int(getattr(msg, "mode", 0)),
-                "body_height": _number(getattr(msg, "body_height", 0))}
+        mode = int(getattr(msg, "mode", 0))
+        body_height = _number(getattr(msg, "body_height", 0))
+        loco = {"mode": mode,
+                "body_height": body_height,
+                "body_height_m": body_height,
+                "body_height_valid": mode != 0 and body_height != 0.0,
+                "body_height_source": "rt/lf/sportmodestate"}
         loco.update(self._flat("velocity", getattr(msg, "velocity", [])))
         loco.update(self._flat("position", getattr(msg, "position", [])))
         self._publish(self.loco, loco)
@@ -547,7 +552,7 @@ class LocoPlugin:
     def get_tool(self):
         actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
-                "description": "As2W locomotion. move uses vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; balance_stand enables active balance; damp releases motor torque; recovery_stand is for fallen/down posture; speed_level accepts slow/normal/fast; body_height/body_position/euler are direct controller offsets. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
+                "description": "As2W locomotion. move uses vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; balance_stand enables active balance; damp releases motor torque; recovery_stand is for fallen/down posture; body_height sets an absolute target height in meters (typically 0.18) and requires an active standing posture; body_position/euler are direct controller offsets. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity in degrees/s [-120, 120]; converted to radians/s for Unitree SDK"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
                     "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
@@ -558,7 +563,7 @@ class LocoPlugin:
                     "stand_up": {"params": [], "description": "Stand up."}, "stand_down": {"params": [], "description": "Stand down."},
                     "balance_stand": {"params": [], "description": "Balance stand."}, "recovery_stand": {"params": [], "description": "Recovery stand."},
                     "damp": {"params": [], "description": "Damp motors."}, "euler": {"params": ["roll", "pitch", "yaw"], "description": "Set body attitude."},
-                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set body height offset."},
+                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set absolute body height target in meters; typical AS2 value is 0.18."},
                     "body_position": {"params": ["x", "y", "z", "yaw"], "description": "Set body position offset."},
                     "switch_joystick": {"params": ["flag"], "description": "true hands control to the wireless joystick; false disables it."}, "left_side_gait": {"params": ["flag"], "description": "Enter or exit left-side gait; true enters, false exits."},
                     "right_side_gait": {"params": ["flag"], "description": "Enter or exit right-side gait; true enters, false exits."}, "auto_recovery": {"params": ["flag"], "description": "Automatic fall recovery; true enables, false disables."},
@@ -789,7 +794,38 @@ class LocoPlugin:
             preset = args.get("speed_preset", "normal")
             if preset not in {"slow", "normal", "fast"}: return {"ret": -1, "error": "speed_preset must be slow, normal, or fast"}
             return {"ret": self.proxy.SpeedLevel({"slow": -1, "normal": 0, "fast": 1}[preset]), "speed_preset": preset}
-        if action == "body_height": return {"ret": self.proxy.BodyHeight(float(args.get("height", 0)))}
+        if action == "body_height":
+            if "height" not in args:
+                return {"ret": -1, "accepted": False, "action": action,
+                        "error": "height is required",
+                        "reason": "BodyHeight needs an absolute target in meters; zero is not used as an implicit default",
+                        "suggested_actions": ["stand_up", "balance_stand"]}
+            try:
+                height = float(args["height"])
+            except (TypeError, ValueError):
+                return {"ret": -1, "accepted": False, "action": action,
+                        "error": "height must be a number", "suggested_actions": ["get_state"]}
+            if not math.isfinite(height) or not 0.05 <= height <= 0.35:
+                return {"ret": -1, "accepted": False, "action": action,
+                        "error": "height must be between 0.05 and 0.35 meters",
+                        "suggested_actions": ["get_state"]}
+            state_name, state, state_error = self._read_state()
+            if state_error:
+                return {**state_error, "action": action, "height_m": height}
+            if state_name in self._DOWN or self._is_moving(state_name):
+                return self._not_allowed(
+                    action, state_name,
+                    "BodyHeight requires a standing, non-walking posture",
+                    ["stand_up", "balance_stand", "stop_move"])
+            ret = self.proxy.BodyHeight(height)
+            result = {"ret": ret, "accepted": ret == 0, "action": action,
+                      "height_m": height, "current_state": state_name}
+            if ret != 0:
+                result.update({"rpc_ret": ret,
+                               "error": "SportClient rejected BodyHeight",
+                               "reason": "The controller did not accept the target height",
+                               "suggested_actions": ["balance_stand", "get_state"]})
+            return result
         if action == "body_position": return {"ret": self.proxy.BodyPosition(float(args.get("x", 0)), float(args.get("y", 0)), float(args.get("z", 0)), float(args.get("yaw", 0)))}
         if action == "auto_recovery": return {"ret": self.proxy.SetAutoRecovery(1 if args.get("flag", True) else 0)}
         if action == "switch_joystick": return {"ret": self.proxy.SwitchJoystick(1 if args.get("flag", True) else 0)}

@@ -135,6 +135,10 @@ Loco examples:
 
 `move.vyaw` is expressed in degrees per second by MCP (the driver converts it
 to radians per second at the Unitree SDK boundary).
+`body_height` takes an explicit absolute target in meters, for example
+`{"action":"body_height","height":0.18}`. The `loco_state` field
+`body_height_valid` is false when AS2 reports passive mode with a zero height;
+that value is a firmware/status limitation, not a measured 0-meter posture.
 
 ```json
 {"action":"move","vx":0.3,"vy":0,"vyaw":0,"duration":2}
