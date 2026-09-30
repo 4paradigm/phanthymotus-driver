@@ -160,6 +160,34 @@ def test_invalid_inputs_are_rejected(args, error):
         engine.start(args, clock.monotonic, clock.wall)
 
 
+def test_plugin_dispatched_lifecycle_is_idempotent_and_reports_state():
+    plugin = TimerPlugin({}, "test", None)
+    tool = plugin.get_tool()
+    actions = tool["inputSchema"]["properties"]["action"]["enum"]
+    action_params = tool["inputSchema"]["x-action-params"]
+
+    assert {"start", "stop", "create"}.issubset(actions)
+    assert action_params["start"]["params"] == []
+    assert action_params["stop"]["params"] == []
+    assert "timer_id" in action_params["create"]["params"]
+    assert plugin.dispatch("info", {}) == {
+        "state": "idle",
+        "topic_out": [{"topic": "/test/timer/events", "format": "data/json"}],
+    }
+
+    assert plugin.dispatch("start", {}) == {"state": "running"}
+    worker = plugin._thread
+    assert worker is not None and worker.is_alive()
+    assert plugin.dispatch("start", {}) == {"state": "running"}
+    assert plugin._thread is worker
+    assert plugin.dispatch("info", {})["state"] == "running"
+
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    assert plugin._thread is None
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    assert plugin.dispatch("info", {})["state"] == "idle"
+
+
 def test_plugin_schema_and_background_delivery():
     events, delivered = [], threading.Event()
 
@@ -174,9 +202,9 @@ def test_plugin_schema_and_background_delivery():
     assert "once" not in alarm_schema["properties"]
     assert alarm_schema["additionalProperties"] is False
     assert tool["topic_out"] == [{"topic": "/test/timer/events", "format": "data/json"}]
-    plugin.start()
+    assert plugin.dispatch("start", {}) == {"state": "running"}
     try:
-        result = plugin.dispatch("start", {
+        result = plugin.dispatch("create", {
             "timer_id": "short",
             "mode": "countdown",
             "duration_sec": 0.03,
@@ -191,5 +219,9 @@ def test_plugin_schema_and_background_delivery():
             time.sleep(0.005)
         assert [item["type"] for item in events] == [
             "timer_alarm", "timer_completed"]
+        info = plugin.dispatch("info", {"timer_id": "short"})
+        assert info["status"] == "completed"
+        assert info["topic_out"] == [
+            {"topic": "/test/timer/events", "format": "data/json"}]
     finally:
-        plugin.stop()
+        assert plugin.dispatch("stop", {}) == {"state": "idle"}

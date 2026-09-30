@@ -411,7 +411,11 @@ class TimerPlugin:
                 self._publisher = None
 
     def get_tool(self) -> dict:
-        actions = ["start", "pause", "resume", "cancel", "reset", "info", "list"]
+        # start/stop/info are Canvas lifecycle actions.  Creating a timer uses
+        # create so a project start cannot be mistaken for an incomplete timer
+        # request.
+        actions = ["start", "stop", "create", "pause", "resume", "cancel",
+                   "reset", "info", "list"]
         alarm = {
             "type": "object",
             "additionalProperties": False,
@@ -444,8 +448,10 @@ class TimerPlugin:
             },
             "required": ["action"],
             "x-action-params": {
-                "start": {"params": ["timer_id", "mode", "duration_sec", "alarms",
-                                      "emit_interval_sec", "replace", "auto_remove", "payload"]},
+                "start": {"params": []},
+                "stop": {"params": []},
+                "create": {"params": ["timer_id", "mode", "duration_sec", "alarms",
+                                       "emit_interval_sec", "replace", "auto_remove", "payload"]},
                 "pause": {"params": ["timer_id"]},
                 "resume": {"params": ["timer_id"]},
                 "cancel": {"params": ["timer_id"]},
@@ -459,7 +465,7 @@ class TimerPlugin:
             "type": "processor",
             "multiInstance": False,
             "description": (
-                "通用正向/倒计时器。start立即返回；报警、周期进度和完成事件通过"
+                "通用正向/倒计时器。create立即返回；报警、周期进度和完成事件通过"
                 "data/json输出，不执行语音、灯光或机器人动作。"),
             "inputSchema": schema,
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
@@ -519,9 +525,19 @@ class TimerPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         clean = {key: value for key, value in args.items() if key != "_tool_name"}
+
+        # Do not call stop() while holding _condition: stop waits for the worker,
+        # and the worker needs the same condition once more in order to exit.
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+
         with self._condition:
             now, wall = self._monotonic(), self._wall_clock()
-            if action == "start":
+            if action == "create":
                 result = self._engine.start(clean, now, wall)
             elif action == "pause":
                 result = self._engine.pause(clean.get("timer_id"), now)
@@ -535,8 +551,16 @@ class TimerPlugin:
             elif action == "reset":
                 result = self._engine.reset(clean.get("timer_id"), now, wall)
             elif action == "info":
-                result = self._engine.info(clean.get("timer_id"), now)
-                result["topic_out"] = [{"topic": self._topic, "format": "data/json"}]
+                timer_id = clean.get("timer_id")
+                if timer_id is None:
+                    result = {
+                        "state": "running" if not self._shutdown else "idle",
+                        "topic_out": [{"topic": self._topic, "format": "data/json"}],
+                    }
+                else:
+                    result = self._engine.info(timer_id, now)
+                    result["topic_out"] = [
+                        {"topic": self._topic, "format": "data/json"}]
             elif action == "list":
                 result = {"status": "ok", "timers": self._engine.list(now)}
             else:
