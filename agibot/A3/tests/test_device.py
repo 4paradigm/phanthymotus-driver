@@ -943,8 +943,8 @@ class RpcDispatchTests(unittest.TestCase):
             device._acp_notify = original_notify
 
     def test_tts_stop_settles_pending_waiter(self):
-        # stop_trace_id clears the waiter's action_id first, so a worker still
-        # polling must NOT fire a stale ACP completion afterwards.
+        # stop_trace_id must invalidate the polling worker AND post an immediate
+        # cancelled — a silent id clear leaves the ACP barrier pending to timeout.
         captured = []
         original_notify = device._acp_notify
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
@@ -953,10 +953,13 @@ class RpcDispatchTests(unittest.TestCase):
             tts = find_plugin(self.plugins, "tts")
             tts._POLL_INTERVAL_S = 0.2  # long enough to still be polling
             self.transport.responses["TTSService/GetAudioStatus"] = {"state": 1}
-            tts.dispatch("speak", {"text": "你好"})
+            result = tts.dispatch("speak", {"text": "你好"})
             tts.dispatch("stop_trace_id", {"trace_id": ""})
             time.sleep(0.5)
-            self.assertEqual(captured, [])
+            (action_id, status, _, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "cancelled")
+            self.assertEqual(tool_name, "tts")
         finally:
             device._acp_notify = original_notify
 
@@ -964,6 +967,7 @@ class RpcDispatchTests(unittest.TestCase):
         # 6th PR review: the framework "stop" action must physically silence the
         # audio (StopTTSTraceId with the active trace_id) and settle the ACP
         # waiter — not just acknowledge "idle" while the voice keeps playing.
+        # 7th PR review: settling also means an immediate cancelled post.
         captured = []
         original_notify = device._acp_notify
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
@@ -973,12 +977,15 @@ class RpcDispatchTests(unittest.TestCase):
             tts._POLL_INTERVAL_S = 0.2  # long enough to still be polling
             self.transport.responses["TTSService/PlayTTS"] = {"trace_id": "t-active"}
             self.transport.responses["TTSService/GetAudioStatus"] = {"state": 1}
-            tts.dispatch("speak", {"text": "长文本播报"})
+            result = tts.dispatch("speak", {"text": "长文本播报"})
             tts.dispatch("stop", {})
             (url, body), = self.transport.calls_to("TTSService", "StopTTSTraceId")
             self.assertEqual(body["trace_id"], "t-active")
             time.sleep(0.5)
-            self.assertEqual(captured, [])
+            (action_id, status, _, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "cancelled")
+            self.assertEqual(tool_name, "tts")
         finally:
             device._acp_notify = original_notify
 
@@ -1126,10 +1133,35 @@ class RpcDispatchTests(unittest.TestCase):
         # Nothing was sent to the robot for the rejected calls.
         self.assertEqual(self.transport.calls_to("MotionCommandService", "SendMotionCommand"), [])
 
+    def test_motion_play_play_rejected_outside_motion_state(self):
+        # 7th PR review: motion_player is a MOTION-mode application (dev guide
+        # §7.1) — a full-body motion in DAMPING would command unpowered joints.
+        # The gate matches loco/arm: reject before SendMotionCommand fires.
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "action": "MOTIONCONTROLACTION_DAMPING"}
+        motion = find_plugin(self.plugins, "motion_play")
+        result = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                          "duration_ms": 5000})
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["current"], "DAMPING")
+        self.assertIn("get_up", result["suggestion"])
+        # rejected before any RPC reached the robot
+        self.assertEqual(self.transport.calls_to("MotionCommandService", "SendMotionCommand"), [])
+
+    def test_motion_play_play_unparseable_state_is_permissive(self):
+        # Same permissive-on-unparseable policy as the loco/arm gates: an
+        # unrecognised GetAction body must not lock the operator out.
+        self.transport.responses["MotionControlActionService/GetAction"] = {"header": {"code": "0"}}
+        motion = find_plugin(self.plugins, "motion_play")
+        result = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                          "duration_ms": 100})
+        self.assertEqual(result["state"], "playing")
+        motion.dispatch("stop_play", {})
+
     def test_motion_play_stop_play_settles_pending_waiter(self):
         # stop_play (and reset) must invalidate the duration-based completion
-        # worker: a motion cancelled early must never be reported to Agent Core
-        # as successfully finished afterwards.
+        # worker AND post an immediate cancelled to Agent Core — merely clearing
+        # the id would leave the ACP barrier pending until its 600 s timeout.
         captured = []
         original_notify = device._acp_notify
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
@@ -1137,11 +1169,14 @@ class RpcDispatchTests(unittest.TestCase):
         try:
             motion = find_plugin(self.plugins, "motion_play")
             motion._PLAY_WORKER_TICK_S = 0.02
-            motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
-                                     "duration_ms": 5000})
+            result = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                              "duration_ms": 5000})
             motion.dispatch("stop_play", {})
             time.sleep(0.5)
-            self.assertEqual(captured, [])
+            (action_id, status, _, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "cancelled")
+            self.assertEqual(tool_name, "motion_play")
             calls = self.transport.calls_to("MotionCommandService", "SendMotionCommand")
             self.assertEqual(calls[-1][1]["cmd_end"], True)
         finally:
@@ -1149,8 +1184,9 @@ class RpcDispatchTests(unittest.TestCase):
 
     def test_motion_play_framework_stop_sends_cmd_end_and_settles(self):
         # 6th PR review: the framework "stop" action must physically halt the
-        # motion (cmd_end) and invalidate the ACP waiter — not just return idle
+        # motion (cmd_end) and settle the ACP waiter — not just return idle
         # while the robot keeps moving and the worker POSTs a phantom completed.
+        # 7th PR review: settling also means an immediate cancelled post.
         captured = []
         original_notify = device._acp_notify
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
@@ -1158,13 +1194,16 @@ class RpcDispatchTests(unittest.TestCase):
         try:
             motion = find_plugin(self.plugins, "motion_play")
             motion._PLAY_WORKER_TICK_S = 0.02
-            motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
-                                     "duration_ms": 5000})
+            result = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                              "duration_ms": 5000})
             motion.dispatch("stop", {})
             calls = self.transport.calls_to("MotionCommandService", "SendMotionCommand")
             self.assertEqual(calls[-1][1]["cmd_end"], True)
             time.sleep(0.5)
-            self.assertEqual(captured, [])
+            (action_id, status, _, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "cancelled")
+            self.assertEqual(tool_name, "motion_play")
         finally:
             device._acp_notify = original_notify
 
@@ -1252,8 +1291,8 @@ class RpcDispatchTests(unittest.TestCase):
             device._acp_notify = original_notify
 
     def test_controlled_spatial_cancel_settles_pending_waiter(self):
-        # cancel clears the waiter's action_id first, so a nav worker still in
-        # flight must NOT fire a stale ACP completion afterwards.
+        # cancel must invalidate the polling worker AND post an immediate
+        # cancelled — a silent id clear leaves the ACP barrier pending to timeout.
         captured = []
         original_notify = device._acp_notify
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
@@ -1262,10 +1301,13 @@ class RpcDispatchTests(unittest.TestCase):
             spatial = find_plugin(self.plugins, "controlled_spatial")
             spatial._NAV_POLL_INTERVAL_S = 0.2  # long enough to still be polling
             self.transport.responses["PncService"] = {"task_id": 5, "data": {"state": "running"}}
-            spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
+            result = spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
             spatial.dispatch("cancel", {})
             time.sleep(0.5)
-            self.assertEqual(captured, [])
+            (action_id, status, _, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "cancelled")
+            self.assertEqual(tool_name, "controlled_spatial")
         finally:
             device._acp_notify = original_notify
 
@@ -1273,6 +1315,7 @@ class RpcDispatchTests(unittest.TestCase):
         # 6th PR review: the framework "stop" action must physically cancel the
         # running nav task (ActionCancel with the last task_id) and settle the
         # ACP waiter — not just return idle while the robot keeps driving.
+        # 7th PR review: settling also means an immediate cancelled post.
         captured = []
         original_notify = device._acp_notify
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
@@ -1281,12 +1324,15 @@ class RpcDispatchTests(unittest.TestCase):
             spatial = find_plugin(self.plugins, "controlled_spatial")
             spatial._NAV_POLL_INTERVAL_S = 0.2  # long enough to still be polling
             self.transport.responses["PncService"] = {"task_id": 11, "data": {"state": "running"}}
-            spatial.dispatch("navi_to_pose", {"map_id": 3, "x": 1.0, "y": 1.0, "angle": 0.0})
+            result = spatial.dispatch("navi_to_pose", {"map_id": 3, "x": 1.0, "y": 1.0, "angle": 0.0})
             spatial.dispatch("stop", {})
             (url, body), = self.transport.calls_to("PncService", "ActionCancel")
             self.assertEqual(body["task_id"], 11)
             time.sleep(0.5)
-            self.assertEqual(captured, [])
+            (action_id, status, _, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "cancelled")
+            self.assertEqual(tool_name, "controlled_spatial")
         finally:
             device._acp_notify = original_notify
 
@@ -1361,8 +1407,8 @@ class RpcDispatchTests(unittest.TestCase):
             device._acp_notify = original_notify
 
     def test_skill_play_stop_play_settles_pending_waiter(self):
-        # stop_play clears the waiter's action_id first, so a worker still in
-        # flight must NOT fire a stale ACP completion afterwards.
+        # stop_play must invalidate the polling worker AND post an immediate
+        # cancelled — a silent id clear leaves the ACP barrier pending to timeout.
         captured = []
         original_notify = device._acp_notify
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
@@ -1372,10 +1418,13 @@ class RpcDispatchTests(unittest.TestCase):
             skill._POLL_INTERVAL_S = 0.2  # long enough to still be polling
             skill.nodes.values["skill_status"] = {"state": "running"}
             self.transport.responses["SkillPilotService"] = {"data": {"session_id": "s-2"}}
-            skill.dispatch("play", {"path": "/agibot/skills/dance"})
+            result = skill.dispatch("play", {"path": "/agibot/skills/dance"})
             skill.dispatch("stop_play", {"session_id": "s-2"})
             time.sleep(0.5)
-            self.assertEqual(captured, [])
+            (action_id, status, _, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "cancelled")
+            self.assertEqual(tool_name, "skill_play")
         finally:
             device._acp_notify = original_notify
 
@@ -1383,6 +1432,7 @@ class RpcDispatchTests(unittest.TestCase):
         # 6th PR review: the framework "stop" action must physically stop the
         # running skill (SkillPilot Stop with the remembered session_id) and
         # settle the ACP waiter — stop args carry no session_id.
+        # 7th PR review: settling also means an immediate cancelled post.
         captured = []
         original_notify = device._acp_notify
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
@@ -1392,13 +1442,16 @@ class RpcDispatchTests(unittest.TestCase):
             skill._POLL_INTERVAL_S = 0.2  # long enough to still be polling
             skill.nodes.values["skill_status"] = {"state": "running"}
             self.transport.responses["SkillPilotService"] = {"data": {"session_id": "s-7"}}
-            skill.dispatch("play", {"path": "/agibot/skills/dance"})
+            result = skill.dispatch("play", {"path": "/agibot/skills/dance"})
             skill.dispatch("stop", {})
             calls = self.transport.calls_to("SkillPilotService", "SkillPackage")
             self.assertEqual(calls[-1][1]["command"], "Stop")
             self.assertEqual(calls[-1][1]["session_id"], "s-7")
             time.sleep(0.5)
-            self.assertEqual(captured, [])
+            (action_id, status, _, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "cancelled")
+            self.assertEqual(tool_name, "skill_play")
         finally:
             device._acp_notify = original_notify
 
@@ -1603,6 +1656,15 @@ class SpatialMapTests(unittest.TestCase):
         self.assertEqual(definition["type"], "sensor")
         self.assertEqual(definition["topic_out"],
                          [{"topic": "/test_ns/agibot_a3/spatial_map", "format": "sensor/mapping"}])
+
+    def test_info_lists_topic_out(self):
+        # 7th PR review: Agent Core derives subscribable topics from the info
+        # response too — it must mirror the static topic_out declaration.
+        result = self.plugin.dispatch("info", {})
+        self.assertEqual(result["state"], "idle")
+        self.assertEqual(result["topic_out"],
+                         [{"topic": "/test_ns/agibot_a3/spatial_map", "format": "sensor/mapping"}])
+        self.assertEqual(result["topic"], "/test_ns/agibot_a3/spatial_map")
 
     def test_publish_map_binary_format(self):
         response = {"data": {

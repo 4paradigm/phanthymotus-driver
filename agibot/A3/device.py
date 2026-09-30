@@ -1756,11 +1756,21 @@ class MotionPlayPlugin:
     def start(self):
         pass
 
+    def _settle_active(self, status, detail):
+        """结算挂起的 ACP 等待线程（若有）：清 id 后立刻回报终态。
+
+        只清 id 会让 Agent Core 的 barrier 挂到 600 s 超时 —— 取消也必须显式
+        POST cancelled（LocoPlugin._settle_active 同款语义）。
+        """
+        action_id, self._play_action_id = self._play_action_id, None
+        if action_id is not None:
+            _acp_notify(action_id, status, detail, "motion_play")
+
     def stop(self):
         # 插件生命周期卸载：与框架 stop 同款 —— 有动作在跑就先物理停掉并结算，
         # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
         if self._play_action_id is not None:
-            self._play_action_id = None
+            self._settle_active("cancelled", {"reason": "plugin_stopped"})
             try:
                 self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True)
             except Exception:
@@ -1806,6 +1816,15 @@ class MotionPlayPlugin:
             _require(0 <= duration_ms <= MOTION_PLAY_MAX_DURATION_MS,
                      f"duration_ms={duration_ms} 超出范围 [0, {MOTION_PLAY_MAX_DURATION_MS}]"
                      f"（与 x-completion 超时 600 s 一致）")
+            # MOTION-state gate (dev guide §7.1: motion_player is a MOTION-mode
+            # application; full-body motion while DAMPING/PASSIVE/LIE_DOWN would
+            # command joints that are unpowered). Unparseable state → permissive,
+            # matching the loco/arm gates.
+            current = _mc_current_state(self.nodes.rpc)
+            if current and current != "MOTION":
+                return {"state": "rejected", "current": current,
+                        "suggestion": "motion_play 仅在 MOTION 站立状态生效；"
+                                      "请先执行 mc_mode get_up 恢复站立"}
             response = jsonable(self.nodes.rpc.send_motion_command(
                 motion_path, duration_ms, cmd_end=True, cmd_pause=False))
             action_id = f"motion_play_{uuid4().hex[:8]}"
@@ -1824,11 +1843,12 @@ class MotionPlayPlugin:
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=False))
         if action == "stop_play":
             # Stopping the motion also settles any pending ACP waiter — a
-            # cancelled motion must not be reported as completed later.
-            self._play_action_id = None
+            # cancelled motion must not be reported as completed later, and
+            # Agent Core must hear the cancellation now (not at its timeout).
+            self._settle_active("cancelled", {"reason": "cancelled_by_request"})
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True))
         if action == "reset":
-            self._play_action_id = None
+            self._settle_active("cancelled", {"reason": "reset"})
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_reset=True))
         if action == "stop":
             # Framework stop must physically halt the motion — a bare "idle"
@@ -1838,7 +1858,7 @@ class MotionPlayPlugin:
             # cancellation RPCs when no motion is running).
             if self._play_action_id is None:
                 return {"state": "idle"}
-            self._play_action_id = None
+            self._settle_active("cancelled", {"reason": "cancelled_by_framework"})
             response = jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True))
             return {"state": "stopped", "response": response}
         raise ValueError(f"motion_play: unknown action {action!r}")
@@ -1898,11 +1918,21 @@ class TtsPlugin:
     def start(self):
         pass
 
+    def _settle_active(self, status, detail):
+        """结算挂起的 ACP 等待线程（若有）：清 id 后立刻回报终态。
+
+        只清 id 会让 Agent Core 的 barrier 挂到 180 s 超时 —— 取消也必须显式
+        POST cancelled（LocoPlugin._settle_active 同款语义）。
+        """
+        action_id, self._play_action_id = self._play_action_id, None
+        if action_id is not None:
+            _acp_notify(action_id, status, detail, "tts")
+
     def stop(self):
         # 插件生命周期卸载：与框架 stop 同款 —— 有播报在跑就先物理打断并结算，
         # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
         if self._play_action_id is not None:
-            self._play_action_id = None
+            self._settle_active("cancelled", {"reason": "plugin_stopped"})
             try:
                 self.nodes.rpc.stop_tts_trace_id(self._play_trace_id or "")
             except Exception:
@@ -1991,7 +2021,8 @@ class TtsPlugin:
             # must not spam StopTTSTraceId when nothing is playing).
             if self._play_action_id is None:
                 return {"state": "idle"}
-            self._play_action_id = None
+            self._settle_active("cancelled", {"reason": "cancelled_by_framework",
+                                              "trace_id": self._play_trace_id or ""})
             response = jsonable(self.nodes.rpc.stop_tts_trace_id(self._play_trace_id or ""))
             return {"state": "stopped", "response": response}
         if action == "info":
@@ -2024,8 +2055,10 @@ class TtsPlugin:
         if action == "status":
             return jsonable(self.nodes.rpc.get_audio_status(args.get("trace_id", "")))
         if action == "stop_trace_id":
-            # 打断播报同时结算挂起的 ACP 等待线程（不再回报过期完成事件）。
-            self._play_action_id = None
+            # 打断播报同时结算挂起的 ACP 等待线程（立刻回报 cancelled，
+            # 不让 Agent Core 的 barrier 挂到超时）。
+            self._settle_active("cancelled", {"reason": "cancelled_by_request",
+                                              "trace_id": args.get("trace_id", "")})
             return jsonable(self.nodes.rpc.stop_tts_trace_id(args.get("trace_id", "")))
         raise ValueError(f"tts: unknown action {action!r}")
 
@@ -2297,11 +2330,22 @@ class SkillPlayPlugin:
     def start(self):
         pass
 
+    def _settle_active(self, status, detail):
+        """结算挂起的 ACP 等待线程（若有）：清 id 后立刻回报终态。
+
+        只清 id 会让 Agent Core 的 barrier 挂到 600 s 超时 —— 取消也必须显式
+        POST cancelled（LocoPlugin._settle_active 同款语义）。
+        """
+        action_id, self._play_action_id = self._play_action_id, None
+        if action_id is not None:
+            _acp_notify(action_id, status, detail, "skill_play")
+
     def stop(self):
         # 插件生命周期卸载：与框架 stop 同款 —— 有技能在跑就先物理停止并结算，
         # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
         if self._play_action_id is not None:
-            self._play_action_id = None
+            self._settle_active("cancelled", {"reason": "plugin_stopped",
+                                              "session_id": self._last_session_id or ""})
             try:
                 self.nodes.rpc.skill_package("Stop", "", self._last_session_id or "")
             except Exception:
@@ -2362,7 +2406,8 @@ class SkillPlayPlugin:
             # must not spam SkillPilot Stop when no skill is playing).
             if self._play_action_id is None:
                 return {"state": "idle"}
-            self._play_action_id = None
+            self._settle_active("cancelled", {"reason": "cancelled_by_framework",
+                                              "session_id": self._last_session_id or ""})
             response = jsonable(self.nodes.rpc.skill_package("Stop", "", self._last_session_id or ""))
             return {"state": "stopped", "response": response}
         if action == "info":
@@ -2390,8 +2435,10 @@ class SkillPlayPlugin:
         if action == "pause":
             return jsonable(self.nodes.rpc.skill_package("Pause", "", args.get("session_id", "")))
         if action == "stop_play":
-            # Stopping the session also settles any pending ACP waiter.
-            self._play_action_id = None
+            # Stopping the session also settles any pending ACP waiter (an
+            # immediate cancelled post, not a silent id clear).
+            self._settle_active("cancelled", {"reason": "cancelled_by_request",
+                                              "session_id": args.get("session_id", "")})
             return jsonable(self.nodes.rpc.skill_package("Stop", "", args.get("session_id", "")))
         if action == "state":
             snapshot = self.nodes.snapshot("skill_status")
@@ -2494,11 +2541,22 @@ class ControlledSpatialPlugin:
     def start(self):
         pass
 
+    def _settle_active(self, status, detail):
+        """结算挂起的 ACP 等待线程（若有）：清 id 后立刻回报终态。
+
+        只清 id 会让 Agent Core 的 barrier 挂到 180 s 超时 —— 取消也必须显式
+        POST cancelled（LocoPlugin._settle_active 同款语义）。
+        """
+        action_id, self._nav_action_id = self._nav_action_id, None
+        if action_id is not None:
+            _acp_notify(action_id, status, detail, "controlled_spatial")
+
     def stop(self):
         # 插件生命周期卸载：与框架 stop 同款 —— 有导航在跑就先物理取消并结算，
         # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
         if self._nav_action_id is not None:
-            self._nav_action_id = None
+            self._settle_active("cancelled", {"reason": "plugin_stopped",
+                                              "task_id": self.last_task_id or 0})
             try:
                 self.nodes.rpc.navi("ActionCancel", {"task_id": self.last_task_id or 0})
             except Exception:
@@ -2593,7 +2651,8 @@ class ControlledSpatialPlugin:
             # spam ActionCancel when no task is navigating).
             if self._nav_action_id is None:
                 return {"state": "idle"}
-            self._nav_action_id = None
+            self._settle_active("cancelled", {"reason": "cancelled_by_framework",
+                                              "task_id": self._task_id(args)})
             response = jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": self._task_id(args)}))
             return {"state": "stopped", "response": response}
         if action == "info":
@@ -2653,8 +2712,10 @@ class ControlledSpatialPlugin:
                 "task_id": 0, "map_id": int(args.get("map_id", 0)),
                 "angle": float(args.get("angle", 0))})
         if action == "cancel":
-            # 取消任务同时结算挂起的 ACP 等待线程（不再回报过期完成事件）。
-            self._nav_action_id = None
+            # 取消任务同时结算挂起的 ACP 等待线程（立刻回报 cancelled，
+            # 不让 Agent Core 的 barrier 挂到超时）。
+            self._settle_active("cancelled", {"reason": "cancelled_by_request",
+                                              "task_id": self._task_id(args)})
             return jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": self._task_id(args)}))
         if action == "pause":
             return jsonable(self.nodes.rpc.navi("ActionPause", {"task_id": self._task_id(args)}))
@@ -2910,7 +2971,9 @@ class SpatialMapPlugin:
                 self.stop()
             return {"state": "running" if self._running else "idle"}
         if action == "info":
+            # Agent Core 用 info 推断可订阅主题：与静态 topic_out 声明一致。
             return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self.topic, "format": "sensor/mapping"}],
                     "topic": self.topic, "map_id": self.map_id}
         if action == "refresh":
             response = self.nodes.rpc.get_2d_whole_map(int(args.get("map_id", self.map_id)))
