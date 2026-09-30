@@ -74,14 +74,18 @@ def _run(messages, profile, domain):
     rclpy.init()
     node = Node("agibot_a3_core_bridge")
     pubs = {}
-    types = {
-        "std_msgs/msg/String": __import__("std_msgs.msg", fromlist=["String"]).String,
-        "std_msgs/msg/UInt8MultiArray": __import__("std_msgs.msg", fromlist=["UInt8MultiArray"]).UInt8MultiArray,
-        "sensor_msgs/msg/CompressedImage": __import__("sensor_msgs.msg", fromlist=["CompressedImage"]).CompressedImage,
-        "sensor_msgs/msg/Image": __import__("sensor_msgs.msg", fromlist=["Image"]).Image,
-        "sensor_msgs/msg/PointCloud2": __import__("sensor_msgs.msg", fromlist=["PointCloud2"]).PointCloud2,
-        "audio_msgs/msg/AudioCapture": __import__("audio_msgs.msg", fromlist=["AudioCapture"]).AudioCapture,
-    }
+    types = {}
+    for package, names in (("std_msgs.msg", ("String", "UInt8MultiArray")),
+                           ("sensor_msgs.msg", ("CompressedImage", "Image", "PointCloud2")),
+                           ("audio_msgs.msg", ("AudioCapture",))):
+        try:
+            module = __import__(package, fromlist=list(names))
+        except ImportError:
+            continue
+        for name in names:
+            msg_type = getattr(module, name, None)
+            if msg_type is not None:
+                types[_type_name(msg_type)] = msg_type
     from rclpy.serialization import deserialize_message
     qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.RELIABLE)
     try:
