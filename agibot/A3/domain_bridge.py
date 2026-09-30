@@ -4,8 +4,6 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
-import time
-from collections import defaultdict
 
 
 def _type_name(msg_type):
@@ -23,28 +21,45 @@ class CoreBridge:
         # Keep enough room for bursty images/point clouds. Frames are lossy at
         # the bridge boundary; a full queue drops the newest frame rather than
         # blocking the robot-domain subscription callback.
-        self._queues = {
-            lane: mp.get_context("spawn").Queue(maxsize=32)
-            for lane in ("media", "pointcloud", "state", "audio")
-        }
+        self._queues = {lane: mp.get_context("spawn").Queue(maxsize=32)
+                        for lane in ("media0", "media1", "media2", "media3",
+                                     "pointcloud", "state", "audio")}
         self._ctx = mp.get_context("spawn")
         self._profile = profile
         self._domain = domain
-        self._proc = None
+        self._procs = []
         self._sent = 0
 
     def start(self):
-        self._proc = self._ctx.Process(target=_run, args=(self._queues, self._profile, self._domain),
-                                       name="a3-core-domain-bridge", daemon=True)
-        self._proc.start()
-        print(f"[dds-bridge] started pid={self._proc.pid} domain={self._domain}", flush=True)
+        for lane, messages in self._queues.items():
+            proc = self._ctx.Process(target=_run, args=(messages, self._profile, self._domain, lane),
+                                     name=f"a3-core-domain-bridge-{lane}", daemon=True)
+            proc.start()
+            self._procs.append(proc)
+        print(f"[dds-bridge] started workers={[p.pid for p in self._procs]} domain={self._domain}", flush=True)
 
     def publish(self, topic, msg, msg_type):
         try:
             from rclpy.serialization import serialize_message
             type_name = _type_name(msg_type)
-            lane = "pointcloud" if "lidar" in topic or "pointcloud" in topic else (
-                "media" if "camera" in topic else ("audio" if "audio" in topic or "mic" in topic else "state"))
+            if "lidar" in topic or "pointcloud" in topic:
+                lane = "pointcloud"
+            elif "camera" in topic:
+                # Keep each configured camera on its own process.  The explicit
+                # names avoid accidental collisions between the four high-rate
+                # streams (left/right head RGB, chest RGB, chest depth).
+                camera_lane = (
+                    ("head_left", "media0"),
+                    ("head_right", "media1"),
+                    ("chest_front_d457_rgb", "media2"),
+                    ("chest_front_d457_depth", "media3"),
+                )
+                lane = next((value for marker, value in camera_lane if marker in topic),
+                             f"media{sum(topic.encode('utf-8')) % 4}")
+            elif "audio" in topic or "mic" in topic:
+                lane = "audio"
+            else:
+                lane = "state"
             self._queues[lane].put_nowait((topic, type_name, serialize_message(msg)))
             self._sent += 1
             if self._sent == 1 or self._sent % 1000 == 0:
@@ -55,7 +70,7 @@ class CoreBridge:
             print(f"[dds-bridge] enqueue failed topic={topic}: {exc}", flush=True)
 
     def stop(self):
-        if self._proc is None:
+        if not self._procs:
             return
         try:
             for q in self._queues.values():
@@ -63,12 +78,14 @@ class CoreBridge:
                     q.put_nowait(None)
                 except queue.Full:
                     pass
-            self._proc.join(timeout=2)
+            for proc in self._procs:
+                proc.join(timeout=2)
         except Exception:
             pass
-        if self._proc.is_alive():
-            self._proc.terminate()
-        self._proc = None
+        for proc in self._procs:
+            if proc.is_alive():
+                proc.terminate()
+        self._procs = []
 
 
 class BridgePublisher:
@@ -82,7 +99,7 @@ class BridgePublisher:
         self.bridge.publish(self.topic, msg, self.msg_type)
 
 
-def _run(messages, profile, domain):
+def _run(messages, profile, domain, lane):
     os.environ["ROS_DOMAIN_ID"] = str(domain)
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     if os.path.isfile(profile):
@@ -91,7 +108,7 @@ def _run(messages, profile, domain):
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy
     rclpy.init()
-    node = Node("agibot_a3_core_bridge")
+    node = Node(f"agibot_a3_core_bridge_{lane}")
     pubs = {}
     types = {}
     for package, names in (("std_msgs.msg", ("String", "UInt8MultiArray")),
@@ -109,23 +126,14 @@ def _run(messages, profile, domain):
     # Sensor consumers request BEST_EFFORT. Publishing BEST_EFFORT avoids a
     # reliable writer retaining large camera/point-cloud samples indefinitely.
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-    lanes = tuple(messages)
-    stop_count = 0
     try:
         while rclpy.ok():
-            item = None
-            for lane in lanes:
-                try:
-                    item = messages[lane].get_nowait()
-                    break
-                except queue.Empty:
-                    continue
-            if item is None:
-                stop_count += 1
-                if stop_count >= len(lanes):
-                    break
+            try:
+                item = messages.get(timeout=0.05)
+            except queue.Empty:
+                # Keep the node responsive while waiting for the next sample;
+                # an empty queue is normal and must not terminate the worker.
                 rclpy.spin_once(node, timeout_sec=0.0)
-                time.sleep(0.001)
                 continue
             if item is None:
                 break

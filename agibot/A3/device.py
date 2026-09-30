@@ -2532,7 +2532,15 @@ class MicPlugin:
     def get_tool(self):
         stream = self.nodes.audio_topics.get(self.key)
         if stream is None:
-            return tool(self.key, "sensor", "A3 音频输入（audio_msgs 不可用）")
+            # Keep the card discoverable in the canvas even on images that do
+            # not include audio_msgs.  The topic is intentionally declared so
+            # the UI can show the endpoint, while info/query report the actual
+            # unavailable state until a compatible AudioCapture package is
+            # installed in the container.
+            topic = _core_topic(self.nodes.namespace, f"{self.key}/audio")
+            return tool(self.key, "sensor", "A3 音频输入不可用（容器缺少 audio_msgs.msg.AudioCapture）",
+                        {"type": "object", "properties": {}},
+                        topic_out=[{"topic": topic, "format": "audio/pcm-16k"}])
         return tool(self.key, "sensor", "A3 音频输入流（AudioCapture，16 kHz PCM）",
                     {"type": "object", "properties": {}},
                     topic_out=[{"topic": stream["topic"], "format": "audio/pcm-16k"}])
@@ -2545,6 +2553,13 @@ class MicPlugin:
 
     def dispatch(self, action, args):
         stream = self.nodes.audio_topics.get(self.key, {})
+        if not stream:
+            if action in ("info", "query", "start"):
+                return {"state": "unavailable", "reason": "audio_msgs.msg.AudioCapture is not installed",
+                        "topic_out": [{"topic": _core_topic(self.nodes.namespace, f"{self.key}/audio"),
+                                       "format": "audio/pcm-16k"}]}
+            if action == "stop":
+                return {"state": "idle"}
         if action == "stop":
             return {"state": "idle", **stream}
         return {"state": "running", **stream}

@@ -171,7 +171,7 @@ FULL_PLUGINS = {
     "joints": {"enabled": True}, "imu": {"enabled": True},
     "joint_state": {"enabled": True},
     "camera": {"enabled": True,
-               "streams": ["head_left_fisheye", "chest_front_d457_rgb",
+               "streams": ["head_left_fisheye", "head_right_fisheye", "chest_front_d457_rgb",
                            "chest_front_d457_depth"]},
     "lidar_cloud": {"enabled": True}, "battery": {"enabled": True},
     "estop": {"enabled": True},
@@ -554,7 +554,7 @@ class ToolInventoryTests(unittest.TestCase):
         camera = find_plugin(plugins, "camera")
         definition = camera.get_tool()
         enum = definition["inputSchema"]["properties"]["stream"]["enum"]
-        self.assertEqual(enum, ["head_left_fisheye", "chest_front_d457_rgb",
+        self.assertEqual(enum, ["head_left_fisheye", "head_right_fisheye", "chest_front_d457_rgb",
                                 "chest_front_d457_depth"])
         for name in enum:
             result = camera.dispatch("query", {"stream": name})
@@ -2336,6 +2336,20 @@ class MirrorStreamTests(unittest.TestCase):
                 self.assertEqual(result["state"], "unavailable",
                                  f"{name}.{action} must be explicit in degraded mode")
                 self.assertIn("a3_aimdk", result["reason"])
+
+    def test_mic_cards_remain_visible_without_audio_msgs(self):
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        for name in ("mic", "ext_mic"):
+            plugin = find_plugin(plugins, name)
+            definition = plugin.get_tool()
+            self.assertEqual(definition["type"], "sensor")
+            self.assertEqual(definition["topic_out"], [{
+                "topic": f"/test_ns/{name}/audio", "format": "audio/pcm-16k",
+            }])
+            result = plugin.dispatch("info", {})
+            self.assertEqual(result["state"], "unavailable")
 
 
 class SpatialMapTests(unittest.TestCase):
