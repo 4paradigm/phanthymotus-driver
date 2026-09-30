@@ -6,7 +6,7 @@ hardware_model: "a3-ultra"
 image_name: agibot-a3
 port: 15719
 mcp_url: "http://localhost:15719/mcp"
-description: "AgiBot A3 humanoid (AimDK v3.2, HTTP JSON RPC + ROS 2 Jazzy) — fixed-FSM motion mode/arm+compliance/waist/head/hand control, base drive, TTS+media/audio/volume, mic & interaction mode, camera(RGB+depth)/lidar_cloud/IMU/battery/estop sensing, alerts, face play, motion & skill package playback (teach-replay style), mapping/navigation via controlled_spatial + spatial_map visualization"
+description: "AgiBot A3 humanoid (AimDK v3.2, HTTP JSON RPC + ROS 2 Jazzy) — fixed-FSM motion mode/arm+compliance/waist/head/hand control, legged locomotion (loco), TTS+media/audio/volume, mic & interaction mode, camera(RGB+depth)/lidar_cloud/IMU/battery/estop sensing, alerts, face play, motion & skill package playback (teach-replay style), mapping/navigation via controlled_spatial + spatial_map visualization"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -26,7 +26,7 @@ cards:
   - { name: model,         type: resource }
   # --- actuators ---
   - { name: mc_mode,         type: actuator }
-  - { name: base_drive,      type: actuator }
+  - { name: loco,           type: actuator }
   - { name: arm_control,     type: actuator }
   - { name: hand_control,    type: actuator }
   - { name: head_control,    type: actuator }

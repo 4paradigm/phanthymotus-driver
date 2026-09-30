@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import array
 import json
+import math
 import struct
 import sys
 import tempfile
@@ -163,7 +164,7 @@ BASE_CONFIG = {
 
 # config.yaml's full plugin set (matching the shipped config), advanced modules ON so
 # the gated tools are covered too. Names aligned with tianyi2.0/q5_bundle/g1:
-# lidar_cloud/battery/estop sensors, base_drive/arm_control/hand_control/head_control/
+# lidar_cloud/battery/estop sensors, loco/arm_control/hand_control/head_control/
 # waist_control actuators; wakeup/arm_compliance/resource_list cards dissolved.
 FULL_PLUGINS = {
     "joints": {"enabled": True}, "imu": {"enabled": True},
@@ -173,7 +174,7 @@ FULL_PLUGINS = {
     "lidar_cloud": {"enabled": True}, "battery": {"enabled": True},
     "estop": {"enabled": True},
     "alerts": {"enabled": True, "poll_interval": 5.0}, "mc_mode": {"enabled": True},
-    "base_drive": {"enabled": True}, "arm_control": {"enabled": True},
+    "loco": {"enabled": True}, "arm_control": {"enabled": True},
     "hand_control": {"enabled": True}, "head_control": {"enabled": True},
     "waist_control": {"enabled": True},
     "motion_play": {"enabled": True}, "tts": {"enabled": True},
@@ -287,7 +288,7 @@ class ToolInventoryTests(unittest.TestCase):
         plugins, _ = build_bundle_plugins(config)
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         expected_actuators = {
-            "mc_mode", "base_drive", "arm_control", "hand_control", "head_control",
+            "mc_mode", "loco", "arm_control", "hand_control", "head_control",
             "waist_control", "motion_play", "tts", "audio", "interaction",
             "face_play", "skill_play", "controlled_spatial", "auto_charging",
         }
@@ -595,25 +596,106 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(result["requested"], "DAMPING")
         self.assertEqual(len(self.transport.calls_to("MotionControlActionService", "SetAction")), 1)
 
-    # -- base_drive / waist / face (RosMsgWrapper publishers, robot domain) --
+    # -- loco / waist / face (RosMsgWrapper publishers, robot domain) --
 
-    def test_base_drive_walk_publishes_wrapper(self):
-        base_drive = find_plugin(self.plugins, "base_drive")
-        result = base_drive.dispatch("walk", {"forward": 0.5, "angular": -0.25})
+    def _loco_payloads(self):
+        return [json.loads(bytes(msg.data)) for msg in self.nodes.locomotion_pub.published]
+
+    def test_loco_walk_publishes_wrapper(self):
+        loco = find_plugin(self.plugins, "loco")
+        result = loco.dispatch("walk", {"forward": 0.5, "angular": -28.65})
         pub = self.nodes.locomotion_pub
         (msg,) = pub.published
         self.assertEqual(msg.serialization_type, "pb")
         # without the protobuf wheel the payload is the JSON dict — verify round-trip
         payload = json.loads(bytes(msg.data))
         self.assertEqual(payload["forward_velocity"], 0.5)
-        self.assertEqual(payload["angular_velocity"], -0.25)
         self.assertEqual(payload["mode"], "MotionControl_LocomotionMode_DEFAULT")
-        self.assertEqual(result["state"], "published")
+        # angular is declared in deg/s; the wire payload carries the normalized ratio.
+        self.assertAlmostEqual(payload["angular_velocity"], math.radians(-28.65))
+        self.assertEqual(result["state"], "walking")
+        self.assertTrue(result["action_id"].startswith("loco_walk_"))
+        loco.dispatch("stop", {})
 
-    def test_base_drive_rejects_out_of_range(self):
-        base_drive = find_plugin(self.plugins, "base_drive")
+    def test_loco_rejects_out_of_range(self):
+        loco = find_plugin(self.plugins, "loco")
         with self.assertRaises(ValueError):
-            base_drive.dispatch("walk", {"forward": 1.5})
+            loco.dispatch("walk", {"forward": 1.5})
+        with self.assertRaises(ValueError):
+            loco.dispatch("walk", {"angular": 90.0})  # > 57.3 deg/s limit
+        with self.assertRaises(ValueError):
+            loco.dispatch("walk", {"duration": 0.0})
+        with self.assertRaises(ValueError):
+            loco.dispatch("walk", {"duration": 61.0})
+        with self.assertRaises(ValueError):
+            loco.dispatch("walk", {"forward": 0.0, "lateral": 0.0, "angular": 0.0})
+
+    def test_loco_schema_declares_x_completion(self):
+        schema = find_plugin(self.plugins, "loco").get_tool()["inputSchema"]
+        self.assertEqual(schema["x-completion"], {"actions": ["walk"], "timeout": 60})
+
+    def test_loco_walk_reports_acp_completion_after_duration(self):
+        loco = find_plugin(self.plugins, "loco")
+        loco._PUBLISH_INTERVAL_S = 0.02
+        loco._STOP_FRAMES = 2
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda *a: captured.append(a)
+        try:
+            result = loco.dispatch("walk", {"forward": 0.3, "duration": 0.1})
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            (action_id, status, payload, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "completed")
+            self.assertEqual(payload["duration"], 0.1)
+            self.assertTrue(payload["stopped_automatically"])
+            self.assertEqual(tool_name, "loco")
+            # stream kept republishing during the window, then sent zero-velocity frames
+            payloads = self._loco_payloads()
+            self.assertGreater(len(payloads), 2)
+            self.assertTrue(all(p["forward_velocity"] == 0.3 for p in payloads[:-2]))
+            self.assertTrue(all(p["forward_velocity"] == 0.0 for p in payloads[-2:]))
+        finally:
+            device._acp_notify = original_notify
+
+    def test_loco_stop_settles_pending_waiter(self):
+        loco = find_plugin(self.plugins, "loco")
+        loco._PUBLISH_INTERVAL_S = 0.2
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda *a: captured.append(a)
+        try:
+            loco.dispatch("walk", {"forward": 0.5, "duration": 30.0})
+            stop_result = loco.dispatch("stop", {})
+            self.assertEqual(stop_result["state"], "idle")
+            self.assertTrue(stop_result["was_walking"])
+            time.sleep(0.5)
+            # the superseded worker must NOT report completed; only the cancel notify fired
+            self.assertEqual([c[1] for c in captured], ["cancelled"])
+            self.assertIn("reason", captured[0][2])
+            payloads = self._loco_payloads()
+            self.assertEqual(payloads[-1]["forward_velocity"], 0.0)
+        finally:
+            device._acp_notify = original_notify
+
+    def test_loco_new_command_settles_previous(self):
+        loco = find_plugin(self.plugins, "loco")
+        loco._PUBLISH_INTERVAL_S = 0.2
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda *a: captured.append(a)
+        try:
+            first = loco.dispatch("walk", {"forward": 0.5, "duration": 30.0})
+            second = loco.dispatch("walk", {"forward": -0.5, "duration": 30.0})
+            time.sleep(0.5)
+            self.assertEqual([c[1] for c in captured], ["cancelled"])
+            self.assertEqual(captured[0][0], first["action_id"])
+            self.assertNotEqual(first["action_id"], second["action_id"])
+            loco.dispatch("stop", {})
+        finally:
+            device._acp_notify = original_notify
 
     def test_waist_control_publishes_wrapper(self):
         waist = find_plugin(self.plugins, "waist_control")
@@ -887,7 +969,7 @@ class RpcDispatchTests(unittest.TestCase):
         # mc_mode is the one deliberate exception (g1 switch_mode precedent: a whole-
         # body posture transition must stay exclusive against everything).
         expected = {
-            "base_drive": "base",
+            "loco": "base",
             "arm_control": ["arm_l", "arm_r"],
             "hand_control": ["hand_l", "hand_r"],
             "head_control": "head",

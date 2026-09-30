@@ -51,8 +51,10 @@ plugins:
     # Fixed FSM: non-standing states (DAMPING/PASSIVE/LIE_DOWN/IDLE) only accept get_up;
     # MOTION accepts damping/lie_down/passive. Illegal transitions are rejected with a
     # suggestion (cross-checked against runtime GetAvailableActions).
-  base_drive:
+  loco:
     enabled: true
+    # 腿式行走：forward/lateral ∈ [-1,1] 速度比例，angular 为 deg/s（限速 ±57.3），
+    # duration ∈ (0,60] 秒后自动停止（ACP 回报），-1 持续运动直到 stop。
   arm_control:
     enabled: true
     # Also carries arm compliance enable/disable/check (former arm_compliance card).

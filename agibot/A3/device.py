@@ -1237,62 +1237,156 @@ class McModePlugin:
         return {"requested": short, "current": normalized, "response": response}
 
 
-class BaseDrivePlugin:
-    """base_drive 卡片：底盘行走速度控制（命名对齐 q5_bundle）。
+class LocoPlugin:
+    """loco 卡片：腿式底盘行走控制（命名对齐 noetix/bumi 的腿式 `loco`，与
+    tianyi2.0/q5_bundle 轮式的 chassis_raw/base_drive 区分 —— A3 是双足人形）。
 
     对应 /motion/control/locomotion_velocity 话题（RosMsgWrapper + LocomotionVelocity
-    消息）。三个速度均为 -1.0~1.0 的归一化比例值：forward/lateral 对应最大
-    1.0 m/s，angular 对应最大 1.0 rad/s。注意事项（开发文档 §7.3）：
+    消息）。forward/lateral 为归一化比例（对应最大 1.0 m/s），angular 对外用角度制
+    deg/s（底层归一化，1.0 = 1 rad/s = 57.3 deg/s）。注意事项（开发文档 §7.3）：
       - 仅当运动控制处于 MOTION 状态时指令才生效；
       - 指令需以一定频率持续下发，停止行走时下发全零速度；
       - 大幅速度变化请分步过渡，避免急停/急转引起姿态失稳。
+
+    长时间动作（走一个 duration）声明 ACP：驱动以 ~20 Hz 持续下发速度帧直到
+    duration 结束，随后自动下发零速并回报 completed（q5_bundle base_drive 的
+    duration worker 同款）；duration=-1 表示持续运动直到 stop，由 stop 以
+    cancelled 结算。
     """
+
+    # 20 Hz 重发满足“持续下发”要求（间隙 50 ms ≪ 官方示例的 100 ms）；停行走
+    # 时零速帧连发 5 帧确保停稳。
+    _PUBLISH_INTERVAL_S = 0.05
+    _STOP_FRAMES = 5
+    # duration 上界与 x-completion 超时一致（60 s；-1 持续模式同样受此兜底）。
+    MAX_DURATION_S = 60.0
+    COMPLETION_TIMEOUT_S = 60.0
 
     def __init__(self, nodes):
         self.nodes = nodes
+        self._move_action_id = None
 
     def get_tool(self):
         schema = action_schema(
-            {"walk": (["forward", "lateral", "angular"], "下发行走速度比例（-1~1），持续下发维持运动，0 为停止")},
+            {"walk": (["forward", "lateral", "angular", "duration"],
+                      "按速度走行 duration 秒后自动停止（ACP 回报完成）；duration=-1 持续运动直到 stop"),
+             "stop": ([], "立即下发零速并结算进行中的行走")},
             {
                 "forward": {"type": "number", "description": "前进速度比例 [-1,1]，正为前进，负为后退", "default": 0.0},
                 "lateral": {"type": "number", "description": "横移速度比例 [-1,1]，正为左移", "default": 0.0},
-                "angular": {"type": "number", "description": "旋转速度比例 [-1,1]，正为逆时针", "default": 0.0},
+                "angular": {"type": "number",
+                            "description": "旋转速度 (deg/s)，限速 ±57.3 deg/s（= 1 rad/s），正为逆时针",
+                            "minimum": -57.3, "maximum": 57.3, "default": 0.0},
+                "duration": {"type": "number",
+                             "description": "行走持续时间 (秒)，范围 (0, 60]；-1 表示持续运动直到 stop",
+                             "anyOf": [{"const": -1.0, "title": "持续运动（需 stop）"},
+                                       {"minimum": 0.1, "maximum": 60.0}],
+                             "default": -1.0},
             },
         )
         # 底盘行走 —— 与 controlled_spatial/auto_charging 同一通道（都驱动底盘）。
         schema["x-resource"] = "base"
-        return tool("base_drive", "actuator", "下发底盘行走速度（话题 /motion/control/locomotion_velocity，"
-                                              "forward/lateral/angular ∈ [-1,1]，仅 MOTION 模式下生效；停止行走下发全 0）",
+        schema["x-completion"] = {"actions": ["walk"], "timeout": self.COMPLETION_TIMEOUT_S}
+        return tool("loco", "actuator", "腿式底盘行走：forward/lateral ∈ [-1,1] 速度比例，angular 为 deg/s"
+                                 "（限速 ±57.3），持续 duration 秒后自动停止；仅 MOTION 模式下生效",
                     schema)
 
     def start(self):
         pass
 
     def stop(self):
-        pass
+        self._settle_active("cancelled", {"reason": "plugin_stopped"})
 
     def dispatch(self, action, args):
         if action == "start":
             return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
         if action == "info":
-            return {"state": "ready"}
+            return {"state": "walking" if self._move_action_id else "idle"}
+        if action in ("stop", "cancel"):
+            return self._stop_walk()
         if action != "walk":
-            raise ValueError(f"base_drive: unknown action {action!r}")
+            raise ValueError(f"loco: unknown action {action!r}")
         forward = _clamp(args.get("forward", 0.0), -1.0, 1.0, "forward")
         lateral = _clamp(args.get("lateral", 0.0), -1.0, 1.0, "lateral")
-        angular = _clamp(args.get("angular", 0.0), -1.0, 1.0, "angular")
-        payload = {
+        angular = _clamp(args.get("angular", 0.0), -57.3, 57.3, "angular")
+        duration = args.get("duration", -1.0)
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            raise ValueError("loco: duration must be a number")
+        if duration != -1.0 and not 0.0 < duration <= self.MAX_DURATION_S:
+            raise ValueError(f"loco: duration must be in (0, {self.MAX_DURATION_S:g}] or -1 for continuous")
+        if forward == 0.0 and lateral == 0.0 and angular == 0.0:
+            raise ValueError("loco: all velocities are zero — use stop to halt")
+        # 新指令顶替旧指令：先结算旧的等待线程，避免悬挂的 completed 回报。
+        self._settle_active("cancelled", {"reason": "replaced_by_new_command"})
+        return self._arm_completion(forward, lateral, angular, duration)
+
+    # -- 内部 ------------------------------------------------------------------
+
+    def _velocity_payload(self, forward, lateral, angular_degps):
+        return {
             "mode": "MotionControl_LocomotionMode_DEFAULT",
             "forward_velocity": forward,
             "lateral_velocity": lateral,
-            "angular_velocity": angular,
+            # LocomotionVelocity.angular 为归一化比例（1.0 = 1 rad/s）。
+            "angular_velocity": math.radians(angular_degps),
         }
+
+    def _publish(self, payload):
         self.nodes.publish_wrapper("locomotion_pub", payload)
-        return {"forward": forward, "lateral": lateral, "angular": angular,
-                "state": "published"}
+
+    def _settle_active(self, status, detail):
+        """结算挂起的 ACP 等待线程（若有）：先清 id 再发零速，杜绝迟到回报。"""
+        action_id, self._move_action_id = self._move_action_id, None
+        if action_id is not None:
+            self._publish(self._velocity_payload(0.0, 0.0, 0.0))
+            _acp_notify(action_id, status, detail, "loco")
+
+    def _stop_walk(self):
+        had_active = self._move_action_id is not None
+        self._settle_active("cancelled", {"reason": "cancelled_by_request"})
+        return {"state": "idle", "was_walking": had_active}
+
+    def _arm_completion(self, forward, lateral, angular, duration):
+        action_id = f"loco_walk_{uuid4().hex[:8]}"
+        self._move_action_id = action_id
+        threading.Thread(target=self._walk_worker,
+                         args=(action_id, forward, lateral, angular, duration),
+                         daemon=True, name=f"a3_loco_{action_id}").start()
+        return {"state": "walking", "action_id": action_id,
+                "forward": forward, "lateral": lateral, "angular_degps": angular,
+                "duration": duration, "stops_automatically": duration != -1.0,
+                "cancel_action": "stop" if duration == -1.0 else None}
+
+    def _walk_worker(self, action_id, forward, lateral, angular, duration):
+        """持续下发速度帧直到 duration 结束（或被新指令/stop 顶替），然后停并回报。"""
+        payload = self._velocity_payload(forward, lateral, angular)
+        self._publish(payload)
+        deadline = time.monotonic() + (duration if duration > 0 else self.COMPLETION_TIMEOUT_S)
+        while time.monotonic() < deadline:
+            time.sleep(self._PUBLISH_INTERVAL_S)
+            if self._move_action_id != action_id:   # superseded / stopped
+                return
+            try:
+                self._publish(payload)
+            except Exception as exc:                # 发布通道挂了：立即停下并报错
+                self._settle_active("error", {"error": f"publish failed: {exc}"})
+                return
+        if self._move_action_id != action_id:
+            return
+        # 正常到点：清 id、连发零速帧、回报 completed。
+        self._move_action_id = None
+        for _ in range(self._STOP_FRAMES):
+            try:
+                self._publish(self._velocity_payload(0.0, 0.0, 0.0))
+            except Exception:
+                break
+            time.sleep(self._PUBLISH_INTERVAL_S)
+        _acp_notify(action_id, "completed",
+                    {"forward": forward, "lateral": lateral, "angular_degps": angular,
+                     "duration": duration, "stopped_automatically": True},
+                    "loco")
 
 
 class ArmControlPlugin:
@@ -2249,7 +2343,7 @@ class ControlledSpatialPlugin:
             "distance": {"type": "number", "description": "平移距离（m，正为前进）"},
             "task_id": {"type": "integer", "description": "导航任务 id（0 自动分配；控制/查询动作可传空用最近任务）"},
         })
-        # 建图/导航/重定位期间底盘由 ADU 独占 —— 与 base_drive/auto_charging 同通道。
+        # 建图/导航/重定位期间底盘由 ADU 独占 —— 与 loco/auto_charging 同通道。
         schema["x-resource"] = "base"
         # 导航动作为长时间动作：声明 ACP 完成契约（tianyi2.0/g1 同款 180 s），
         # 由后台线程轮询 PncService/ActionGetState 判定到点后回报。
@@ -2463,7 +2557,7 @@ class AutoChargingPlugin:
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {})
-        # 自主充电会驱动底盘导航到充电桩 —— 与 base_drive/controlled_spatial 同通道。
+        # 自主充电会驱动底盘导航到充电桩 —— 与 loco/controlled_spatial 同通道。
         schema["x-resource"] = "base"
         return tool("auto_charging", "actuator", "自主充电控制（SkillPilotService AutoCharging RPC；config 门控模块，"
                                                 "默认关闭；失败后先 stop 再 reset 复位）",
@@ -2681,7 +2775,8 @@ def build_plugins(config, namespace, ros2):
     """Instantiate every enabled plugin, mirroring X2's build_plugins.
 
     Card naming aligned with tianyi2.0/q5_bundle/g1: lidar_cloud (g1), battery /
-    estop (tianyi2.0/q5_bundle), base_drive (q5_bundle), arm_control /
+    estop (tianyi2.0/q5_bundle), loco (noetix/bumi 腿式同款; 轮式驱动叫 base_drive/
+    chassis_raw，A3 是双足人形故取 loco), arm_control /
     hand_control / head_control / waist_control (tianyi2.0/q5_bundle style).
     Card consolidation: joints merges the three joint-state streams; mc_mode
     absorbs mc_state and enforces the fixed FSM transition map; arm_control
@@ -2718,8 +2813,8 @@ def build_plugins(config, namespace, ros2):
         plugins["alerts"] = AlertsPlugin(nodes)
     if enabled("mc_mode"):
         plugins["mc_mode"] = McModePlugin(nodes)
-    if enabled("base_drive"):
-        plugins["base_drive"] = BaseDrivePlugin(nodes)
+    if enabled("loco"):
+        plugins["loco"] = LocoPlugin(nodes)
     if enabled("arm_control"):
         plugins["arm_control"] = ArmControlPlugin(nodes)
     if enabled("hand_control"):

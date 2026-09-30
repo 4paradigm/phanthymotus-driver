@@ -7,9 +7,10 @@ Transcribed from the AimDK A3-Ultra developer guide
 plus **ROS 2 Jazzy topics** (Fast DDS, `ros2_plugin_proto` for protobuf carriers) —
 so this catalog is organized by compute unit / port, not by ROS package.
 
-Card naming is aligned with x-humanoid/tianyi2.0, robotera/q5_bundle and
-unitree/g1: `lidar_cloud` (g1), `battery`/`estop` (tianyi2.0/q5_bundle),
-`base_drive` (q5_bundle), `arm_control`/`hand_control`/`head_control`/
+Card naming is aligned with x-humanoid/tianyi2.0, robotera/q5_bundle, unitree/g1
+and noetix/bumi: `lidar_cloud` (g1), `battery`/`estop` (tianyi2.0/q5_bundle),
+`loco` (noetix/bumi 腿式同款 — 轮式底盘卡才叫 base_drive/chassis_raw，A3 是
+双足人形), `arm_control`/`hand_control`/`head_control`/
 `waist_control` (tianyi2.0/q5_bundle style). The `resource_list` card is
 dissolved into `list` actions on the play cards; `arm_compliance` is absorbed
 by `arm_control`; `wakeup` is dropped (AimDK v3.2 exposes only wake-word
@@ -63,7 +64,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 
 | Topic | Message | Driver tool | Notes |
 |---|---|---|---|
-| `/motion/control/locomotion_velocity` | RosMsgWrapper (pb `LocomotionVelocity`) | `base_drive` | forward/lateral/angular normalized −1..1; MOTION mode only |
+| `/motion/control/locomotion_velocity` | RosMsgWrapper (pb `LocomotionVelocity`) | `loco` | forward/lateral normalized −1..1, angular deg/s (±57.3 = 1 rad/s); MOTION mode only; duration-bounded with ACP |
 | `/motion/control/move_waist` | RosMsgWrapper (pb `MoveWaist`) | `waist_control` | waist_pitch/waist_yaw rad, waist_height m |
 | `/skill/pilot/face/play` | RosMsgWrapper (pb `FacePlayInfo`) | `face_play` | e_path/e_id/repeat/priority(440)/is_stop |
 | `/motion/control/arm_joint_command` | sensor_msgs/JointState | `arm_control` (`send`) | 100 Hz ≤30 ms gap, velocity/effort = 0, ≤4 rad/s |
