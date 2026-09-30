@@ -228,6 +228,20 @@ def test_plugin_accepts_dashboard_serialized_create_fields():
     assert replacement["payload"] == {}
 
 
+def test_plugin_ignores_agent_dispatch_metadata_but_rejects_unknown_timer_fields():
+    plugin = TimerPlugin({}, "test", None)
+    created = plugin.dispatch("create", {
+        "timer_id": "agent-test", "mode": "countdown", "duration_sec": 5,
+        "_tool_name": "timer", "concurrent": False,
+    })
+    assert created["status"] == "running"
+    with pytest.raises(ValueError, match="invalid_start_fields: surprise"):
+        plugin.dispatch("create", {
+            "timer_id": "another-test", "mode": "countdown", "duration_sec": 5,
+            "surprise": True,
+        })
+
+
 @pytest.mark.parametrize("field,value,error", [
     ("alarms", "[", "alarms_must_be_valid_json"),
     ("alarms", "111", "invalid_alarms"),

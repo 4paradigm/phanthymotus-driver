@@ -203,8 +203,9 @@ class TimerEngine:
     def start(self, args: dict, now: float, wall: float) -> dict:
         allowed = {"timer_id", "mode", "duration_sec", "alarms",
                    "emit_interval_sec", "replace", "auto_remove", "payload"}
-        if set(args) - allowed:
-            raise ValueError("invalid_start_fields")
+        unknown = set(args) - allowed
+        if unknown:
+            raise ValueError(f"invalid_start_fields: {', '.join(sorted(unknown))}")
         timer_id = _name(args.get("timer_id"), "timer_id")
         mode = args.get("mode")
         if mode not in ("countup", "countdown"):
@@ -576,7 +577,10 @@ class TimerPlugin:
                 self._condition.wait(timeout=delay)
 
     def dispatch(self, action: str, args: dict) -> dict:
-        clean = {key: value for key, value in args.items() if key != "_tool_name"}
+        # Agent Core may attach scheduling metadata to split action calls.
+        # It controls dispatch timing, not the timer specification.
+        clean = {key: value for key, value in args.items()
+                 if key not in ("_tool_name", "concurrent")}
 
         # Do not call stop() while holding _condition: stop waits for the worker,
         # and the worker needs the same condition once more in order to exit.
