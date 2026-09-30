@@ -86,6 +86,7 @@ Nano 板 (.13/.14/.15)              Pi 驱动容器 (.161)
 ## 接口约定（与平台其它驱动一致）
 
 - **状态卡读取**：无业务输入。`action=info`（或 `read`/`get`）返回最新数据 + `topic_out`；每条数据带 `timestamp_ms` / `control_level` / `fresh`。当前仓库的 `go1_sdk_client.py` 没有在快照中提供 `received_monotonic_s`，而且这次不修改它。`swing_trajectory` 因此只在快照数值变化时增加轨迹点；相同数值可能来自静止机器人或重复旧包，无法用于确认收包或判断真实采样频率。卡片报 `source_freshness_confirmed=false`、`source_age_s=null`；超过配置时间未观察到变化时，报 `source_unchanged`。如果其他部署已有有效的 `received_monotonic_s`，卡片可使用该字段去重和判断过期，但当前仓库不能依赖它。输出中的 `fresh` 仅表示卡片最近观察到有效变化，不代表已确认新的 SDK 包。
+- **启用前标定**：`swing_trajectory` 默认关闭。先用已有 `feet` 卡读取这台 Go1 四足在接触地面及实际离地时的原始足底力，确认两种状态可分离，再把 `config.yaml` 中的 `contact_force_threshold_raw` 和 `force_hysteresis_raw` 改成实测值并设 `enabled: true`。仓库中的 `20` / `10` 只是示例，不能直接作为真机判定依据；记录离地样本需要机器人运动，必须先征得操作授权。标定前不应将摆动状态或世界系轨迹当作已验证的实测结果。
 - **实时 3D 显示**：将 `swing_trajectory_body_3d` 与 `swing_trajectory_world_3d` 两个 topic 加入监控看板，即可分别旋转/缩放查看机身系及里程计世界系轨迹。轨迹以每厘米约一个点绘制；看板现有点云渲染器按高度着色，不能画连续线条、区分四腿颜色或在同一卡片内切换坐标系。原始 JSON 保留四腿标识和精确坐标。世界系依赖 SDK 里程计位置与 IMU 姿态的坐标对齐假设，需真机标定。无轨迹时 3D 卡片只显示原点；状态请同时看 JSON 卡片。
 - **生命周期**：每张卡都处理 `start`/`stop`：`start → {"state":"running"}`、`stop → {"state":"idle"}`。
 - **`dispatch()` 返回**：一律 plain dict（或 `None`），由 MCP 处理器自动包 `{"content":[...]}`，**不要**自己预包。

@@ -53,9 +53,9 @@ plugins:
   feet:                         # 足端：足底力[4] + 高层时足端相对机身位置/速度
     enabled: true
   swing_trajectory:             # 四足摆动轨迹：机身坐标 + 里程计世界坐标估计
-    enabled: true
+    enabled: false               # 足底力阈值未在本机标定前不要启用
     sample_hz: 20
-    contact_force_threshold_raw: 20  # 初始值，须按 Go1 真机足底力标定
+    contact_force_threshold_raw: 20  # 仅示例值；启用前须按本机接触/离地力标定
     force_hysteresis_raw: 10
     phase_confirm_samples: 2
     max_points_per_swing: 150
