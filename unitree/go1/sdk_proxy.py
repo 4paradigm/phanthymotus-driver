@@ -18,6 +18,13 @@ import threading
 def _sdk_worker(cmd_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 network_iface: str, target_ip: str, target_port: int, local_port: int):
     """子进程：持有 Go1HighSdkClient，处理来自主进程的命令队列。"""
+    # A spawn child has fresh stdout/stderr; protect logs before importing SDK.
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except ImportError:  # local checkout without the container's common package
+        pass
+
     from go1_sdk_client import Go1HighSdkClient
 
     client = Go1HighSdkClient(
