@@ -4,6 +4,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 GO1 = ROOT / "unitree" / "go1"
 sys.path.insert(0, str(GO1))
@@ -19,21 +21,68 @@ class StubClient:
 def battery_snap(stamp, status=1, current_ma=10000, cell_mv=3600, soc=80):
     return {"fresh": True, "sample_monotonic_s": stamp,
             "battery": {"status_code": status, "current_ma": current_ma,
-                        "cell_voltage_mv": [cell_mv] * 10, "soc_percent": soc}}
+                        "cell_voltage_mv": [cell_mv, cell_mv, 32, 32, cell_mv,
+                                            cell_mv, cell_mv, 32, 32, cell_mv], "soc_percent": soc}}
 
 
 def test_battery_power_and_energy_skip_duplicate_and_outage():
     card = power.BatteryPowerPlugin({}, "test", None, StubClient())
     first = card._sample(battery_snap(100.0), now=100.1)
-    assert first["power_w"] == 360.0
-    assert first["voltage_v"] == 36.0
+    assert first["power_w"] == 216.0
+    assert first["voltage_v"] == 21.6
     assert first["discharged_since_start_wh"] == 0
     second = card._sample(battery_snap(101.0), now=101.1)
-    assert second["discharged_since_start_wh"] == 0.1
-    assert card._sample(battery_snap(101.0), now=101.2)["discharged_since_start_wh"] == 0.1
+    assert second["discharged_since_start_wh"] == 0.06
+    assert card._sample(battery_snap(101.0), now=101.2)["discharged_since_start_wh"] == 0.06
     assert not card._sample(battery_snap(101.0), now=105.0)["available"]
-    assert card._sample(battery_snap(106.0), now=106.1)["discharged_since_start_wh"] == 0.1
-    assert card._sample(battery_snap(107.0), now=107.1)["discharged_since_start_wh"] == 0.2
+    assert card._sample(battery_snap(106.0), now=106.1)["discharged_since_start_wh"] == 0.06
+    assert card._sample(battery_snap(107.0), now=107.1)["discharged_since_start_wh"] == 0.12
+
+
+def test_observed_go1_six_cell_frame_excludes_unused_channel_offsets():
+    # Captured from the real canvas: current is mA; SDK supplies ten slots.
+    snap = battery_snap(100.0, current_ma=-5117, soc=47)
+    snap["battery"]["cell_voltage_mv"] = [3552, 3584, 32, 32, 3584,
+                                           3584, 3584, 32, 32, 3552]
+    card = power.BatteryPowerPlugin({}, "test", None, StubClient())
+    result = card._sample(snap, now=100.1)
+    assert result["available"] and result["fresh"]
+    assert result["voltage_v"] == 21.44
+    assert result["current_a"] == -5.117
+    assert result["power_w"] == 109.708
+    assert result["direction"] == "discharge"
+    assert result["cell_count"] == 6
+    assert result["cell_voltage_indices"] == [0, 1, 4, 5, 6, 9]
+    assert result["cell_voltage_mv"] == [3552, 3584, 3584, 3584, 3584, 3552]
+    assert result["unused_cell_voltage_mv"] == [32] * 4
+    snap["sample_monotonic_s"] = 101.0
+    assert card._sample(snap, now=101.1)["discharged_since_start_wh"] == 0.0305
+
+
+@pytest.mark.parametrize("index", [0, 1, 4, 5, 6, 9])
+def test_bad_active_cell_is_not_silently_removed(index):
+    snap = battery_snap(100.0)
+    snap["battery"]["cell_voltage_mv"][index] = 32
+    card = power.BatteryPowerPlugin({}, "test", None, StubClient())
+    result = card._sample(snap, now=100.1)
+    assert not result["available"]
+    assert result["reason"] == "invalid_bms_values"
+    assert result["discharged_since_start_wh"] == 0
+    assert result["remaining_runtime_minutes"] is None
+
+
+@pytest.mark.parametrize("slots", [
+    [3600] * 10,  # A different cell layout must not be silently truncated.
+    [3600] * 6,  # An incomplete SDK array is not a supported frame.
+    [3600, 3600, 101, 32, 3600, 3600, 3600, 32, 32, 3600],
+    [3600, 3600, float("nan"), 32, 3600, 3600, 3600, 32, 32, 3600],
+])
+def test_unrecognized_or_invalid_slot_layout_is_unavailable(slots):
+    snap = battery_snap(100.0)
+    snap["battery"]["cell_voltage_mv"] = slots
+    result, reason = power._battery_measurement(snap)
+    assert result is None
+    assert reason in {"invalid_bms_values", "unsupported_bms_cell_layout"}
 
 
 def test_charge_is_separate_and_invalid_cells_do_not_accumulate():
@@ -42,11 +91,11 @@ def test_charge_is_separate_and_invalid_cells_do_not_accumulate():
     transition = card._sample(battery_snap(101.0, status=2), now=101.1)
     assert transition["charged_since_start_wh"] == 0
     charged = card._sample(battery_snap(102.0, status=2), now=102.1)
-    assert charged["signed_power_w"] == -360.0
-    assert charged["charged_since_start_wh"] == 0.1
+    assert charged["signed_power_w"] == -216.0
+    assert charged["charged_since_start_wh"] == 0.06
     assert charged["discharged_since_start_wh"] == 0
     assert card._sample(battery_snap(103.0, cell_mv=0), now=103.1)["reason"] == "invalid_bms_values"
-    assert card._sample(battery_snap(104.0, status=2), now=104.1)["charged_since_start_wh"] == 0.1
+    assert card._sample(battery_snap(104.0, status=2), now=104.1)["charged_since_start_wh"] == 0.06
 
 
 def test_runtime_requires_observed_soc_drop_and_resets_after_gap_or_charge():
@@ -145,7 +194,7 @@ def test_dispatch_stop_halts_sampling_and_start_resumes_without_pause_energy(mon
         assert stopped["state"] == "idle"
         assert stopped["data"]["reason"] == "sampling_stopped"
         assert stopped["data"]["available"] is False
-        assert stopped["data"]["discharged_since_start_wh"] == 0.1
+        assert stopped["data"]["discharged_since_start_wh"] == 0.06
         assert card._last is None and card._runtime_start is None
 
         # A short pause must also be skipped, even within the normal gap limit.
@@ -156,10 +205,10 @@ def test_dispatch_stop_halts_sampling_and_start_resumes_without_pause_energy(mon
         assert card._thread is not first_thread and card._thread.is_alive()
         resumed = card.dispatch("info", {})
         assert resumed["state"] == "running"
-        assert resumed["data"]["discharged_since_start_wh"] == 0.1
+        assert resumed["data"]["discharged_since_start_wh"] == 0.06
         assert resumed["data"]["runtime_estimate_reason"] == "insufficient_soc_history"
         next_sample = sample(battery_snap(103.0), now=103.1)
-        assert next_sample["discharged_since_start_wh"] == 0.2
+        assert next_sample["discharged_since_start_wh"] == 0.12
     finally:
         card.stop()
 

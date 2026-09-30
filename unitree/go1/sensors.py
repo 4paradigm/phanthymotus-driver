@@ -1043,7 +1043,12 @@ def make_activity_monitor(plugin_config, namespace, executor, client):
 
 _STALE_S = 2.5
 _MAX_GAP_S = 2.5
-_CELL_COUNT = 10  # Go1 SDK BmsState.cell_vol[10]
+_BMS_SLOT_COUNT = 10  # SDK array capacity, not the number of physical cells.
+# Go1 six-cell layout observed in live HighState. The active channels match
+# Table 9-3 (6 Cells) at https://www.ti.com/lit/ds/symlink/bq76930.pdf .
+# This correspondence does not identify the installed BMS chip/firmware.
+_GO1_CELL_INDICES = (0, 1, 4, 5, 6, 9)
+_GO1_UNUSED_INDICES = (2, 3, 7, 8)
 _MIN_RUNTIME_OBSERVATION_S = 60.0
 _MIN_RUNTIME_SOC_DROP = 3.0
 
@@ -1066,15 +1071,24 @@ def _battery_measurement(snap: dict) -> tuple[dict | None, str | None]:
     if not isinstance(bat, dict):
         return None, "bms_unavailable"
     try:
-        cells = [float(v) for v in bat["cell_voltage_mv"]]
+        slots = [float(v) for v in bat["cell_voltage_mv"]]
         current_ma = float(bat["current_ma"])
         status = int(bat["status_code"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return None, "invalid_bms_fields"
-    if (len(cells) != _CELL_COUNT or
-            any(not math.isfinite(v) or not 2000 <= v <= 5000 for v in cells) or
+    if (len(slots) != _BMS_SLOT_COUNT or
+            any(not math.isfinite(v) for v in slots) or
             not math.isfinite(current_ma) or abs(current_ma) > 200000):
         return None, "invalid_bms_values"
+    cells = [slots[i] for i in _GO1_CELL_INDICES]
+    unused = [slots[i] for i in _GO1_UNUSED_INDICES]
+    if any(not 2000 <= v <= 5000 for v in cells):
+        return None, "invalid_bms_values"
+    # Shorted/unused channels had a 32 mV offset in the observed frames.
+    # Require near-zero values in these fixed slots; never filter arbitrary
+    # low readings out of the active cells or infer a new layout per sample.
+    if any(not 0 <= v <= 100 for v in unused):
+        return None, "unsupported_bms_cell_layout"
     direction = "discharge" if status == 1 else "charge" if status in (2, 3, 4) else "unknown"
     try:
         soc = float(bat["soc_percent"])
@@ -1084,6 +1098,11 @@ def _battery_measurement(snap: dict) -> tuple[dict | None, str | None]:
     voltage_v = sum(cells) / 1000.0
     power_w = voltage_v * abs(current_ma) / 1000.0
     return {"voltage_v": round(voltage_v, 3),
+            "cell_count": len(cells),
+            "cell_voltage_indices": list(_GO1_CELL_INDICES),
+            "cell_voltage_mv": cells,
+            "unused_cell_voltage_mv": unused,
+            "voltage_source": "go1_six_cell_bms_slots",
             "current_a": round(current_ma / 1000.0, 3),
             "power_w": round(power_w, 3),
             "soc_percent": soc,
