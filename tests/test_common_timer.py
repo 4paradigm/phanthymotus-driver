@@ -170,6 +170,9 @@ def test_plugin_dispatched_lifecycle_is_idempotent_and_reports_state():
     assert action_params["start"]["params"] == []
     assert action_params["stop"]["params"] == []
     assert "timer_id" in action_params["create"]["params"]
+    assert set(action_params) == set(actions)
+    assert all(isinstance(entry["description"], str) and entry["description"].strip()
+               for entry in action_params.values())
     assert plugin.dispatch("info", {}) == {
         "state": "idle",
         "topic_out": [{"topic": "/test/timer/events", "format": "data/json"}],
