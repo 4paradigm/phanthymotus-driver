@@ -159,8 +159,8 @@ accepted standing normalization as an internal state anchor, so a later
 firmware label. A new `move` or posture transition replaces the anchor.
 `body_height` takes an explicit absolute target in meters, for example
 `{"action":"body_height","height":0.35}`. The public range is `0.17` to
-`0.45` m; around `0.42` m matches the high-stand leg geometry in the bundled
-AS2W URDF. AS2's `BodyHeight` SDK parameter is the target height itself,
+`0.50` m; around `0.48` m includes the high-stand leg geometry and wheel
+radius in the bundled AS2W URDF. AS2's `BodyHeight` SDK parameter is the target height itself,
 unlike the relative offset convention used by some Go2 SDKs, so the driver
 sends the requested height directly. The response includes both `height_m`
 and `sdk_height_m`.
@@ -196,7 +196,8 @@ both `audio/pcm-16k` and the existing Agent Core alias
 `pcm_16k_16bit_mono`. The
 speaker strips the TTS end-of-utterance marker (`01 00 ff ff 01 00 ff ff`)
 instead of sending it to the robot, flushes each utterance at that boundary,
-and forwards approximately 300 ms blocks required by AS2 voice startup. The
+and forwards exactly 300 ms blocks required by AS2 voice startup, splitting
+queued data at the SDK boundary. The
 blocks are paced at real time with no intentional lead, preventing the AS2
 voice buffer from being overrun and producing clipped/distorted initial audio.
 

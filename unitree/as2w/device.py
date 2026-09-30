@@ -49,10 +49,10 @@ _AS2_SPORT_MODE_NAMES = {
 # A2/AS2 BodyHeight is an absolute controller target.  Do not apply the
 # Go2-relative [-0.18, 0.03] mapping here: the AS2 SDK example itself calls
 # BodyHeight(0.18), and the URDF leg chain places the high body target near
-# 0.42 m (two 0.212 m vertical leg links before the base/foot offsets; the
-# 0.1054 m hip offset is lateral in the URDF frame).
+# 0.48 m (two 0.212 m vertical leg links plus approximately 0.055 m wheel
+# radius and base/foot offsets; the 0.1054 m hip offset is lateral).
 _BODY_HEIGHT_MIN_M = 0.17
-_BODY_HEIGHT_MAX_M = 0.45
+_BODY_HEIGHT_MAX_M = 0.50
 _MIC_GROUP = "239.168.123.161"
 _MIC_PORT = 5555
 _MIC_CHUNK_BYTES = 1024
@@ -617,14 +617,14 @@ class LocoPlugin:
                 "description": "As2W locomotion. move uses signed vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). A positive duration stops internally when its timer expires; stop_move is only for an active duration=-1 move. stand_up/stand_down change posture; balance_stand enables active balance; recovery_stand is for fallen/down posture; body_height is an absolute AS2 target height in meters and is passed directly to the SDK; body_position is a direct controller offset. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity in degrees/s [-120, 120]; converted to radians/s for Unitree SDK"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
-                    "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "minimum": 0.17, "maximum": 0.45, "description": "Absolute AS2 body height in meters"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
+                    "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "minimum": 0.17, "maximum": 0.50, "description": "Absolute AS2 body height in meters"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
                 "x-completion": {"actions": ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand"], "timeout": 45},
                 "x-action-params": {
                     "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "Move with optional duration (-1 for continuous)."},
                     "stop_move": {"params": [], "description": "Stop movement."},
                     "stand_up": {"params": [], "description": "Stand up."}, "stand_down": {"params": [], "description": "Stand down."},
                     "balance_stand": {"params": [], "description": "Balance stand."}, "recovery_stand": {"params": [], "description": "Recovery stand."},
-                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set AS2 absolute body height target in meters; supported range is 0.17-0.45 m. Around 0.42 m matches the URDF high-stand leg geometry; the value is passed directly to the AS2 SDK."},
+                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set AS2 absolute body height target in meters; supported range is 0.17-0.50 m. Around 0.48 m includes the URDF high-stand leg geometry and wheel radius; the value is passed directly to the AS2 SDK."},
                     "body_position": {"params": ["x", "y", "z", "yaw"], "description": "Set body position offset."},
                     "switch_joystick": {"params": ["flag"], "description": "true hands control to the wireless joystick; false disables it."}, "left_side_gait": {"params": ["flag"], "description": "Enter or exit left-side gait; true enters, false exits."},
                     "right_side_gait": {"params": ["flag"], "description": "Enter or exit right-side gait; true enters, false exits."}, "auto_recovery": {"params": ["flag"], "description": "Automatic fall recovery; true enables, false disables."},
@@ -1479,7 +1479,10 @@ class _SpeakerNode:
                 item = self._queue.get(timeout=0.1)
             except queue.Empty:
                 idle_polls += 1
-                if merged and (len(merged) >= SPEAKER_BLOCK_BYTES or idle_polls >= 2):
+                while len(merged) >= SPEAKER_BLOCK_BYTES:
+                    self._play_block(bytes(merged[:SPEAKER_BLOCK_BYTES]))
+                    del merged[:SPEAKER_BLOCK_BYTES]
+                if merged and idle_polls >= 2:
                     self._play_block(bytes(merged))
                     merged.clear()
                     idle_polls = 0
@@ -1487,6 +1490,9 @@ class _SpeakerNode:
             if item is None:
                 break
             if item is _SPEAKER_EOF:
+                while len(merged) >= SPEAKER_BLOCK_BYTES:
+                    self._play_block(bytes(merged[:SPEAKER_BLOCK_BYTES]))
+                    del merged[:SPEAKER_BLOCK_BYTES]
                 if merged:
                     self._play_block(bytes(merged))
                     merged.clear()
@@ -1494,11 +1500,15 @@ class _SpeakerNode:
                 continue
             idle_polls = 0
             merged.extend(item)
-            if len(merged) >= SPEAKER_BLOCK_BYTES:
+            while len(merged) >= SPEAKER_BLOCK_BYTES:
+                self._play_block(bytes(merged[:SPEAKER_BLOCK_BYTES]))
+                del merged[:SPEAKER_BLOCK_BYTES]
+        if not self._stop_event.is_set():
+            while len(merged) >= SPEAKER_BLOCK_BYTES:
+                self._play_block(bytes(merged[:SPEAKER_BLOCK_BYTES]))
+                del merged[:SPEAKER_BLOCK_BYTES]
+            if merged:
                 self._play_block(bytes(merged))
-                merged.clear()
-        if merged and not self._stop_event.is_set():
-            self._play_block(bytes(merged))
         if self.state == "playing":
             self.state = "ready"
 
@@ -1519,9 +1529,9 @@ class _SpeakerNode:
         except Exception as exc:
             self._record_play_error("exception", str(exc))
             return None
-        # Keep at most 240 ms of audio ahead of the robot decoder.  Without a
-        # cumulative deadline, fast RPC responses can overrun the firmware's
-        # stream buffer on longer utterances.
+        # Pace at the audio timeline. Sending a whole merged block faster than
+        # real time can overrun the AS2 voice buffer and distort the opening
+        # frames or later syllables.
         duration = len(payload) / 32000.0
         self._next_play_time = max(getattr(self, "_next_play_time", 0.0), started) + duration
         wait_for = self._next_play_time - _SPEAKER_MAX_LEAD_S - time.monotonic()
@@ -1822,11 +1832,11 @@ class LedPlugin:
                         "off": {"params": [], "description": "Turn the LED off."},
                         "info": {"params": [], "description": "Read the selected color."}}}}
 
-    def start(self):
+    def start(self, allow_black=False):
         # Do not send a black LED command every 0.7 seconds during bundle
         # startup.  Apart from being unnecessary, that used to occupy the
         # shared voice RPC worker and made live speaker audio appear silent.
-        if not any(self._color):
+        if not allow_black and not any(self._color):
             return
         self._keepalive_stop.clear()
         if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
@@ -1870,9 +1880,7 @@ class LedPlugin:
         else:
             return None
         self._color = list(color)
-        if action == "off":
-            self.stop()
         result = self._proxy.Audio_LedControl(*color)
-        if action != "off" and result == 0:
-            self.start()
+        if result == 0:
+            self.start(allow_black=action == "off")
         return {"ret": result, "color": list(color)}

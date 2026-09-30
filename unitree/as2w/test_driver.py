@@ -277,6 +277,37 @@ class TestDriverContracts(unittest.TestCase):
         start.assert_called_once_with()
         self.assertEqual("ready", result["state"])
 
+    def test_led_off_keeps_black_refresh_alive(self):
+        proxy = types.SimpleNamespace(Audio_LedControl=lambda *args: 0)
+        plugin = self.device.LedPlugin({}, "test", None, proxy)
+        plugin._color = [10, 20, 30]
+        with patch.object(plugin, "start") as start:
+            result = plugin.dispatch("off", {})
+        start.assert_called_once_with(allow_black=True)
+        self.assertEqual([0, 0, 0], result["color"])
+
+    def test_speaker_splits_queued_audio_into_full_as2_blocks(self):
+        node = self.device._SpeakerNode.__new__(self.device._SpeakerNode)
+        import queue
+        import threading
+        node._queue = queue.Queue(maxsize=8)
+        node._stop_event = threading.Event()
+        node.state = "playing"
+        node._next_play_time = 0.0
+        calls = []
+
+        def play(payload):
+            calls.append(payload)
+            if len(calls) == 2:
+                node._stop_event.set()
+
+        node._play_block = play
+        for _ in range(6):
+            node._queue.put_nowait(b"x" * 3200)
+        node._drain()
+        self.assertEqual([self.device.SPEAKER_BLOCK_BYTES] * 2,
+                         [len(payload) for payload in calls])
+
     def test_camera_stop_requests_graceful_worker_shutdown_before_terminate(self):
         class _StopEvent:
             def __init__(self):
@@ -542,10 +573,10 @@ class TestDriverContracts(unittest.TestCase):
         self.assertTrue(result["accepted"])
         self.assertAlmostEqual(0.18, proxy.height)
         self.assertAlmostEqual(0.18, result["sdk_height_m"])
-        result = plugin.dispatch("body_height", {"height": 0.45})
+        result = plugin.dispatch("body_height", {"height": 0.50})
         self.assertTrue(result["accepted"])
-        self.assertAlmostEqual(0.45, proxy.height)
-        self.assertAlmostEqual(0.45, result["sdk_height_m"])
+        self.assertAlmostEqual(0.50, proxy.height)
+        self.assertAlmostEqual(0.50, result["sdk_height_m"])
 
     def test_loco_state_marks_zero_height_in_passive_mode_invalid(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
