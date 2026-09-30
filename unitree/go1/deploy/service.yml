@@ -8,7 +8,7 @@ unitree-go1:                     # 服务名遵循 {provider}-{model} 约定（�
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /dev:/dev
-    - /opt/phanthy-motus/data:/opt/phanthy-motus/data  # vision_capture/photos 和 videos 持久化到宿主机
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
