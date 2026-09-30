@@ -1118,6 +1118,8 @@ def _swing_pointcloud(data, frame):
 
 
 class SwingTrajectoryPlugin:
+    PREFIX = "swing_trajectory"
+
     def __init__(self, plugin_config, namespace, executor, client):
         cfg = plugin_config or {}
         self._client = client
@@ -1161,7 +1163,7 @@ class SwingTrajectoryPlugin:
                 self._node = None
 
     def get_tool(self):
-        return {"name": "swing_trajectory", "type": "sensor", "multiInstance": False,
+        return {"name": self.PREFIX, "type": "sensor", "multiInstance": False,
                 "description": "Go1 four-foot swing trajectories: body frame and estimated odometry-world frame",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": ([{"topic": self._topic, "format": _SWING_FORMAT}] + [
@@ -1339,7 +1341,7 @@ class SwingTrajectoryPlugin:
         if action == "stop":
             self.stop()
             return {"state": "idle"}
-        if action in ("info", "read", "get", "swing_trajectory"):
+        if action in ("info", "read", "get", self.PREFIX):
             return {"state": "running" if self._thread and self._thread.is_alive() else "idle",
                     "data": self._build(), "topic_out": self.get_tool()["topic_out"]}
         return None

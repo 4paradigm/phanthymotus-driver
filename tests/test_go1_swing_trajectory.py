@@ -147,6 +147,7 @@ def test_existing_sdk_receive_timestamp_tracks_identical_new_packets():
 def test_wiring_and_no_hardware_output():
     root = Path(__file__).resolve().parents[1] / "unitree" / "go1"
     plugin = SwingTrajectoryPlugin({}, "test", None, Client())
+    assert plugin.PREFIX == "swing_trajectory"
     assert plugin.get_tool()["name"] == "swing_trajectory"
     assert plugin.dispatch("read", {})["data"]["fresh"] is False
     assert plugin.dispatch("read", {})["data"]["control_level"] == "HIGHLEVEL"
