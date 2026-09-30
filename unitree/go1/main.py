@@ -189,7 +189,7 @@ class Go1Bundle:
             print("[bundle] camera_rgb loaded")
 
         if pc.get("vision_capture", {}).get("enabled", False):
-            from vision_capture import VisionCapturePlugin
+            import vision_capture
             # 共用机位配置（即使推流卡停用）；RGB 优先，拍照/录像卡仅显式覆盖所需字段。
             capture_config = dict(pc["vision_capture"])
             positions = {}
@@ -197,7 +197,8 @@ class Go1Bundle:
                 for position, endpoint in (pc.get(name, {}).get("positions") or {}).items():
                     positions.setdefault(position, {}).update(endpoint)
             capture_config["positions"] = positions
-            self._plugins.append(VisionCapturePlugin(capture_config))
+            self._plugins.append(vision_capture.make_vision_capture(
+                capture_config, namespace, executor, client))
             print("[bundle] vision_capture loaded")
 
         if pc.get("camera_depth", {}).get("enabled", False):

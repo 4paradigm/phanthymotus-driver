@@ -27,7 +27,8 @@ log = logging.getLogger(__name__)
 
 
 class VisionCapturePlugin:
-    def __init__(self, plugin_config):
+    def __init__(self, plugin_config, namespace=None, executor=None, client=None):
+        del namespace, executor, client
         self._endpoints = {
             position: (endpoint["board_ip"], int(endpoint["image_port"]))
             for position, endpoint in camera._resolve_positions_raw(plugin_config).items()
@@ -39,6 +40,7 @@ class VisionCapturePlugin:
         self._last_recording = None
         self._recording = None
         self._recording_thread = None
+        self._encoder = None
 
     def get_tool(self):
         return {
@@ -73,6 +75,12 @@ class VisionCapturePlugin:
             if self._recording:
                 self._recording.set()
             worker = self._recording_thread
+            encoder = self._encoder
+        if encoder is not None and encoder.poll() is None:
+            try:
+                encoder.terminate()
+            except OSError:
+                pass
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=15)
         with camera._CAMERA_LOCK:
@@ -259,6 +267,8 @@ class VisionCapturePlugin:
     def _record_and_save(self, position, path, duration, cancel):
         temporary_path = path.with_name(f".{path.stem}.tmp.mp4")
         process = None
+        stderr_thread = None
+        stderr_tail = bytearray()
         published = False
         try:
             host, port = self._endpoints[position]
@@ -268,6 +278,16 @@ class VisionCapturePlugin:
                     "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", "15", "-i", "pipe:0",
                     "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mp4", str(temporary_path),
                 ], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                with camera._CAMERA_LOCK:
+                    self._encoder = process
+
+                def drain_stderr():
+                    while chunk := process.stderr.read(4096):
+                        stderr_tail.extend(chunk)
+                        del stderr_tail[:-16384]
+
+                stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+                stderr_thread.start()
                 frames = 0
                 deadline = None
                 next_frame_at = 0
@@ -302,10 +322,12 @@ class VisionCapturePlugin:
                 if cancel.is_set():
                     raise InterruptedError("video recording cancelled")
                 process.stdin.close()
-                process.stdin = None
-                _, stderr = process.communicate(timeout=30)
+                process.wait(timeout=30)
+                stderr_thread.join(timeout=2)
+                if stderr_thread.is_alive():
+                    raise RuntimeError("ffmpeg error output did not close")
                 if process.returncode != 0 or not temporary_path.is_file() or temporary_path.stat().st_size == 0:
-                    raise RuntimeError(stderr.decode("utf-8", "replace") or "ffmpeg failed")
+                    raise RuntimeError(stderr_tail.decode("utf-8", "replace") or "ffmpeg failed")
                 if cancel.is_set():
                     raise InterruptedError("video recording cancelled")
                 # 录像结束后才公开 MP4，避免画布看到尚未写好索引的文件。
@@ -319,8 +341,13 @@ class VisionCapturePlugin:
         except InterruptedError:
             return {"ok": False, "code": "RECORD_CANCELLED", "message": "video recording was cancelled"}
         except Exception as exc:
+            if cancel.is_set():
+                return {"ok": False, "code": "RECORD_CANCELLED", "message": "video recording was cancelled"}
             return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
         finally:
+            with camera._CAMERA_LOCK:
+                if self._encoder is process:
+                    self._encoder = None
             if process is not None:
                 if process.stdin and not process.stdin.closed:
                     try:
@@ -334,6 +361,12 @@ class VisionCapturePlugin:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=2)
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=2)
                 process.stderr.close()
             if not published:
                 temporary_path.unlink(missing_ok=True)
+
+
+def make_vision_capture(plugin_config, namespace, executor, client):
+    return VisionCapturePlugin(plugin_config, namespace, executor, client)

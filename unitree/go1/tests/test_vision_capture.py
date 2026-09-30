@@ -188,6 +188,12 @@ def test_go1_bundle_exposes_snapshot_tool_without_rgb(monkeypatch):
     assert bundle.dispatch("vision_capture", {"action": "info"})["state"] == "ready"
 
 
+def test_vision_capture_uses_go1_plugin_factory():
+    module = importlib.import_module("unitree.go1.vision_capture")
+    card = module.make_vision_capture({}, "test", None, None)
+    assert card.get_tool()["name"] == "vision_capture"
+
+
 def test_snapshot_declares_completion_only_for_capture():
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     schema = snapshot.VisionCapturePlugin({}).get_tool()["inputSchema"]
@@ -335,24 +341,30 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
     assert 0.5 <= float(metadata["format"]["duration"]) <= 1.5
 
 
-def test_record_video_drains_encoder_errors_before_waiting(tmp_path, monkeypatch, completions):
-    """An encoder that fills stderr must still finish and publish its output."""
+def test_record_video_drains_encoder_errors_while_feeding_frames(tmp_path, monkeypatch, completions):
+    """Continuous encoder errors must not block JPEG writes or completion."""
     import sys
     import time
 
     encoder = tmp_path / "encoder.py"
     encoder.write_text(
         "import pathlib, sys\n"
-        "sys.stdin.buffer.read()\n"
-        "sys.stderr.buffer.write(b'x' * 131072)\n"
-        "sys.stderr.buffer.flush()\n"
+        "while sys.stdin.buffer.read(4096):\n"
+        "    sys.stderr.buffer.write(b'x' * 8192)\n"
+        "    sys.stderr.buffer.flush()\n"
         "pathlib.Path(sys.argv[1]).write_bytes(b'mp4')\n",
         encoding="utf-8",
     )
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     real_popen = subprocess.Popen
-    monkeypatch.setattr(snapshot.subprocess, "Popen", lambda args, **kwargs:
-                        real_popen([sys.executable, str(encoder), args[-1]], **kwargs))
+    processes = []
+
+    def launch(args, **kwargs):
+        process = real_popen([sys.executable, str(encoder), args[-1]], **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(snapshot.subprocess, "Popen", launch)
     monkeypatch.setattr(snapshot.shutil, "which", lambda command: str(encoder))
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
@@ -363,9 +375,10 @@ def test_record_video_drains_encoder_errors_before_waiting(tmp_path, monkeypatch
         try:
             connection, _ = server.accept()
             with connection:
-                frame = b"\xff\xd8frame\xff\xd9"
+                connection.settimeout(2)
+                frame = b"\xff\xd8" + b"f" * 131072 + b"\xff\xd9"
                 packet = struct.pack(">I", len(frame)) + frame
-                for _ in range(80):
+                for _ in range(100):
                     try:
                         connection.sendall(packet)
                     except OSError:
@@ -380,12 +393,79 @@ def test_record_video_drains_encoder_errors_before_waiting(tmp_path, monkeypatch
         "output_dir": str(tmp_path),
         "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
     })
-    accepted = card.dispatch("record_video", {"duration_s": 1})
-    terminal = completions.get(timeout=13)
-    sender.join(3)
-    assert terminal["action_id"] == accepted["action_id"]
-    assert terminal["status"] == "completed", terminal["result"]
-    assert Path(accepted["file_path"]).read_bytes() == b"mp4"
+    try:
+        accepted = card.dispatch("record_video", {"duration_s": 1})
+        terminal = completions.get(timeout=6)
+        assert terminal["action_id"] == accepted["action_id"]
+        assert terminal["status"] == "completed", terminal["result"]
+        assert Path(accepted["file_path"]).read_bytes() == b"mp4"
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+        sender.join(3)
+
+
+def test_stop_unblocks_video_writer_and_reports_cancel(tmp_path, monkeypatch, completions):
+    import sys
+    import time
+
+    encoder = tmp_path / "stalled_encoder.py"
+    encoder.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    real_popen = subprocess.Popen
+    processes = []
+    launched = threading.Event()
+
+    def launch(args, **kwargs):
+        process = real_popen([sys.executable, str(encoder)], **kwargs)
+        processes.append(process)
+        launched.set()
+        return process
+
+    monkeypatch.setattr(snapshot.subprocess, "Popen", launch)
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: str(encoder))
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def send_frame():
+        try:
+            connection, _ = server.accept()
+            with connection:
+                frame = b"\xff\xd8" + b"f" * 131072 + b"\xff\xd9"
+                connection.sendall(struct.pack(">I", len(frame)) + frame)
+                time.sleep(2)
+        finally:
+            server.close()
+
+    sender = threading.Thread(target=send_frame, daemon=True)
+    sender.start()
+    card = snapshot.VisionCapturePlugin({
+        "output_dir": str(tmp_path),
+        "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
+    })
+    stopper = None
+    try:
+        accepted = card.dispatch("record_video", {"duration_s": 5})
+        assert launched.wait(2)
+        time.sleep(0.1)
+        stopper = threading.Thread(target=card.stop, daemon=True)
+        stopper.start()
+        terminal = completions.get(timeout=4)
+        assert terminal["action_id"] == accepted["action_id"]
+        assert terminal["result"]["code"] == "RECORD_CANCELLED"
+        assert not Path(accepted["file_path"]).exists()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+        if stopper is not None:
+            stopper.join(3)
+        sender.join(3)
 
 
 @pytest.mark.parametrize("error, code", [
