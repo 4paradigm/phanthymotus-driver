@@ -65,7 +65,6 @@ class VisionCapturePlugin:
                 },
                 "required": ["action"], "additionalProperties": False,
                 "x-completion": {"actions": ["capture_photo", "record_video"], "timeout": 120},
-                "x-resource": "camera",
                 "x-action-params": {
                     "start": {"params": [], "description": "准备拍照录像卡，无需启动 camera_rgb。"},
                     "capture_photo": {"params": ["position", "image_name"], "description": "保存指定机位的新 JPEG。"},

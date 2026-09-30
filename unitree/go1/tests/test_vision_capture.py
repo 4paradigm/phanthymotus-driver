@@ -259,7 +259,7 @@ def test_snapshot_declares_completion_only_for_capture():
     assert "start_recording" not in schema["properties"]["action"]["enum"]
     assert "stop_recording" not in schema["properties"]["action"]["enum"]
     assert schema["x-completion"]["timeout"] >= 120
-    assert schema["x-resource"] == "camera"
+    assert "x-resource" not in schema
 
 
 def test_video_admission_completes_and_releases_position(tmp_path, monkeypatch, completions):

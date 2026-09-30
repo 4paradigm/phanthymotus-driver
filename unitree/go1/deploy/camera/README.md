@@ -25,12 +25,13 @@ for an MP4 (1–30 seconds, default 5). The call immediately returns an
 worker POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`.
 These actions declare `x-completion` (120 seconds). The terminal result contains
 the confirmed path. `info.last_capture` and `info.last_recording` keep the
-latest terminal `{action_id, status, result}`. ACP uses the `camera` physical resource. The
+latest terminal `{action_id, status, result}`. Go1 actuators do not declare ACP
+physical resources, so capture keeps the bundle's global pending-action barrier. The
 callback is retried up to three times (3-second request timeout, 0.5/1-second
 backoff); after repeated failures the result remains in `info.last_capture`,
 or `info.last_recording`; the failure is logged, and Core's barrier timeout is the fallback.
-Other Go1 actuators without `x-resource` may still wait on this pending action
-under the platform's conservative fallback. `stop` reports lifecycle state
+Other Go1 actuators wait on this pending action under the platform's conservative
+fallback. `stop` reports lifecycle state
 `idle` and a separate `capture_active` flag; an accepted photo still finishes
 and sends its ACP callback, while an active video is cancelled and reported.
 
