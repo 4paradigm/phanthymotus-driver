@@ -40,11 +40,15 @@ except ImportError:
 
 _STATE_PUBLISH_HZ = 60.0
 _AS2_SPORT_MODE_NAMES = {
-    # Values observed in the AS2W SportModeState stream.  Unknown firmware
-    # values remain visible as MODE_<n> instead of being mislabeled.
-    0: "PASSIVE",
-    3: "AI_FREE_WALK",
+    # SportModeState.mode is numeric high-level mode, not SportClient's FSM.
+    0: "IDLE_DEFAULT_STAND", 1: "BALANCE_STAND", 2: "POSE",
+    3: "LOCOMOTION", 4: "RESERVE", 5: "LIE_DOWN", 6: "JOINT_LOCK",
+    7: "DAMPING", 8: "RECOVERY_STAND", 9: "RESERVE_2", 10: "SIT",
+    11: "FRONT_FLIP", 12: "FRONT_JUMP", 13: "FRONT_POUNCE",
 }
+_BODY_HEIGHT_DEFAULT_M = 0.35
+_BODY_HEIGHT_MIN_M = _BODY_HEIGHT_DEFAULT_M - 0.18
+_BODY_HEIGHT_MAX_M = _BODY_HEIGHT_DEFAULT_M
 _MIC_GROUP = "239.168.123.161"
 _MIC_PORT = 5555
 _MIC_CHUNK_BYTES = 1024
@@ -244,6 +248,7 @@ class _StateNode:
         body_height_valid = body_height != 0.0
         loco = {"mode": mode,
                 "mode_name": mode_name,
+                "mode_name_source": "SportModeState.mode",
                 "body_height": body_height,
                 "body_height_m": body_height if body_height_valid else None,
                 "body_height_valid": body_height_valid,
@@ -577,9 +582,9 @@ class LocoPlugin:
             "The robot is in a transition, special motion, or fault state",
             ["stop_move", "recovery_stand", "get_state"])
     def get_tool(self):
-        actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "damp", "euler", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
+        actions = ["move", "stop_move", "stand_up", "stand_down", "balance_stand", "recovery_stand", "speed_level", "body_height", "body_position", "switch_joystick", "left_side_gait", "right_side_gait", "auto_recovery", "get_state"]
         return {"name": "loco", "type": "actuator", "multiInstance": False,
-                "description": "As2W locomotion. move uses vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; balance_stand enables active balance; damp releases motor torque; recovery_stand is for fallen/down posture; body_height sets an absolute target height in meters (typically 0.18) and requires an active standing posture; body_position/euler are direct controller offsets. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
+                "description": "As2W locomotion. move uses vx forward/back m/s, vy lateral m/s, vyaw rotation degrees/s (converted to radians for the SDK), and duration seconds (-1 means continue until stop_move). stand_up/stand_down change posture; stand_down automatically releases motor torque after reaching the down posture; balance_stand enables active balance; recovery_stand is for fallen/down posture; body_height is an absolute target height in meters and is converted to the SDK relative offset; body_position is a direct controller offset. The flag actions are explicitly documented below.", "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": actions, "description": "Locomotion action"}, "vx": {"type": "number", "description": "Forward velocity m/s [-1.5, 1.5]"}, "vy": {"type": "number", "description": "Lateral velocity m/s [-1, 1]"}, "vyaw": {"type": "number", "description": "Yaw velocity in degrees/s [-120, 120]; converted to radians/s for Unitree SDK"},
                     "duration": {"type": "number", "minimum": -1, "maximum": 30, "description": "Seconds; -1 continues until stop_move"}, "roll": {"type": "number", "description": "Body roll radians"}, "pitch": {"type": "number", "description": "Body pitch radians"}, "yaw": {"type": "number", "description": "Body yaw radians"},
                     "speed_preset": {"type": "string", "enum": ["slow", "normal", "fast"], "description": "Speed limiter preset"}, "height": {"type": "number", "description": "Body height offset"}, "x": {"type": "number", "description": "Body X offset"}, "y": {"type": "number", "description": "Body Y offset"}, "z": {"type": "number", "description": "Body Z offset"}, "flag": {"type": "boolean", "description": "Used by four switch actions: true enables/enters and false disables/exits."}}, "required": ["action"],
@@ -589,8 +594,7 @@ class LocoPlugin:
                     "stop_move": {"params": [], "description": "Stop movement."},
                     "stand_up": {"params": [], "description": "Stand up."}, "stand_down": {"params": [], "description": "Stand down."},
                     "balance_stand": {"params": [], "description": "Balance stand."}, "recovery_stand": {"params": [], "description": "Recovery stand."},
-                    "damp": {"params": [], "description": "Damp motors."}, "euler": {"params": ["roll", "pitch", "yaw"], "description": "Set body attitude."},
-                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set absolute body height target in meters; typical AS2 value is 0.18."},
+                    "speed_level": {"params": ["speed_preset"], "description": "Set speed limiter: slow, normal, or fast."}, "body_height": {"params": ["height"], "description": "Set absolute body height target in meters; supported range is 0.17-0.35 m and 0.35 m corresponds to the stand-up default."},
                     "body_position": {"params": ["x", "y", "z", "yaw"], "description": "Set body position offset."},
                     "switch_joystick": {"params": ["flag"], "description": "true hands control to the wireless joystick; false disables it."}, "left_side_gait": {"params": ["flag"], "description": "Enter or exit left-side gait; true enters, false exits."},
                     "right_side_gait": {"params": ["flag"], "description": "Enter or exit right-side gait; true enters, false exits."}, "auto_recovery": {"params": ["flag"], "description": "Automatic fall recovery; true enables, false disables."},
@@ -653,7 +657,22 @@ class LocoPlugin:
             else:
                 matches = 0
             if matches >= 2:
-                _acp_notify(action_id, "completed", {"action": action, "state": state})
+                if action == "stand_down":
+                    damp_ret = self.proxy.Damp()
+                    if damp_ret != 0:
+                        _acp_notify(action_id, "error", {
+                            "action": action, "ret": damp_ret,
+                            "stand_down_ret": 0, "current_state": name,
+                            "error": "StandDown completed but automatic damping failed",
+                            "reason": "The robot reached the down posture but motor torque was not released",
+                            "suggested_actions": ["get_state", "retry_stand_down"]})
+                        return
+                    _acp_notify(action_id, "completed", {
+                        "action": action, "ret": 0, "stand_down_ret": 0,
+                        "damp_ret": 0, "state": state, "final_state": "DAMPING",
+                        "reason": "StandDown completed and motors were automatically damped"})
+                else:
+                    _acp_notify(action_id, "completed", {"action": action, "state": state})
                 return
             time.sleep(.25)
         _acp_notify(action_id, "error", {"action": action,
@@ -805,7 +824,7 @@ class LocoPlugin:
             if action == "recovery_stand" and state_name not in {"FALL", "FALLEN", "STAND_DOWN", "DAMPING"}:
                 return self._not_allowed(action, state_name,
                     "RecoveryStand is only valid from a fallen or down posture",
-                    ["stand_down", "damp", "recovery_stand"])
+                    ["stand_down", "recovery_stand"])
             if action in {"balance_stand", "recovery_stand"} and self._is_moving(state_name):
                 return self._not_allowed(action, state_name,
                     "Posture transition cannot be issued while the robot is moving",
@@ -819,23 +838,6 @@ class LocoPlugin:
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
             threading.Thread(target=self._await_posture, args=(action_id, action, expected_name), daemon=True).start()
             return {"ret": 0, "accepted": True, "status": "running", "action": action, "action_id": action_id}
-        if action == "damp":
-            self._cancel_transition()
-            state_name, state, state_error = self._read_state()
-            if state_error:
-                return {**state_error, "action": action}
-            if self._is_moving(state_name):
-                return self._not_allowed(action, state_name,
-                    "Damp is refused while the robot is walking or running",
-                    ["stop_move", "damp"])
-            ret = self.proxy.Damp()
-            return {"ret": ret, "accepted": ret == 0, "action": action,
-                    "current_state": state_name,
-                    **({} if ret == 0 else {"error": "SportClient rejected the action",
-                      "reason": "The controller refused damping from the current posture",
-                      "suggested_actions": ["get_state", "stop_move", "recovery_stand"],
-                      "rpc_ret": ret})}
-        if action == "euler": return {"ret": self.proxy.Euler(float(args.get("roll", 0)), float(args.get("pitch", 0)), float(args.get("yaw", 0)))}
         if action == "speed_level":
             preset = args.get("speed_preset", "normal")
             if preset not in {"slow", "normal", "fast"}: return {"ret": -1, "error": "speed_preset must be slow, normal, or fast"}
@@ -851,9 +853,9 @@ class LocoPlugin:
             except (TypeError, ValueError):
                 return {"ret": -1, "accepted": False, "action": action,
                         "error": "height must be a number", "suggested_actions": ["get_state"]}
-            if not math.isfinite(height) or not 0.05 <= height <= 0.35:
+            if not math.isfinite(height) or not _BODY_HEIGHT_MIN_M <= height <= _BODY_HEIGHT_MAX_M:
                 return {"ret": -1, "accepted": False, "action": action,
-                        "error": "height must be between 0.05 and 0.35 meters",
+                        "error": f"height must be between {_BODY_HEIGHT_MIN_M:.2f} and {_BODY_HEIGHT_MAX_M:.2f} meters",
                         "suggested_actions": ["get_state"]}
             state_name, state, state_error = self._read_state()
             if state_error:
@@ -863,9 +865,13 @@ class LocoPlugin:
                     action, state_name,
                     "BodyHeight requires a standing, non-walking posture",
                     ["stand_up", "balance_stand", "stop_move"])
-            ret = self.proxy.BodyHeight(height)
+            # Unitree's BodyHeight argument is relative to the default
+            # standing height, not an absolute height in meters.
+            sdk_offset = height - _BODY_HEIGHT_DEFAULT_M
+            ret = self.proxy.BodyHeight(sdk_offset)
             result = {"ret": ret, "accepted": ret == 0, "action": action,
-                      "height_m": height, "current_state": state_name}
+                      "height_m": height, "sdk_offset_m": sdk_offset,
+                      "current_state": state_name}
             if ret != 0:
                 result.update({"rpc_ret": ret,
                                "error": "SportClient rejected BodyHeight",

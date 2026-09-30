@@ -8,6 +8,12 @@ SDK guide. It vendors Unitree's official `unitree_sdk2_python` master at
 `SwitchGait`, `SpeedLevel`, `SwitchJoystick`, `SetAutoRecovery`, `GetState`,
 `FrontFlip`, and `BackFlip`.
 
+`Damp` and `Euler` are internal SDK operations and are not exposed as MCP
+actions. `stand_down` waits for the down posture and then calls `Damp` as its
+automatic motor-torque release step. A successful action is reported through
+ACP; a failed stop, posture transition, or automatic damping step reports a
+terminal ACP error with the observed state and recovery suggestions.
+
 Run `python3 main.py <robot-interface>` on the robot network. Set
 `NETWORK_INTERFACE` to the actual host interface name when it is known; when it
 is empty, the deployment tries available wired adapters (`eth*`, `en*`, and
@@ -136,10 +142,20 @@ Loco examples:
 `move.vyaw` is expressed in degrees per second by MCP (the driver converts it
 to radians per second at the Unitree SDK boundary).
 `body_height` takes an explicit absolute target in meters, for example
-`{"action":"body_height","height":0.18}`. The `loco_state` field
-`body_height_valid` is false when `SportModeState.body_height` is zero; AS2
-uses zero for an unavailable/unreported height in the observed modes. That
-value is a firmware/status limitation, not a measured 0-meter posture.
+`{"action":"body_height","height":0.35}`. The public range is `0.17` to
+`0.35` m; `0.35` m represents the default high stand-up height. Unitree's
+`BodyHeight` SDK parameter is a relative offset from that default, so the
+driver sends `height - 0.35` (the SDK range is approximately `[-0.18, 0.03]`
+m). The response includes both `height_m` and `sdk_offset_m`.
+
+The `loco_state.mode`/`mode_name` pair comes from the numeric
+`SportModeState.mode` field (`0=IDLE_DEFAULT_STAND`, `1=BALANCE_STAND`,
+`2=POSE`, `3=LOCOMOTION`, `5=LIE_DOWN`, `6=JOINT_LOCK`, `7=DAMPING`,
+`8=RECOVERY_STAND`). It is deliberately not substituted with the separate
+SportClient `GetState().fsm_name`. When the firmware publishes
+`SportModeState.body_height == 0`, the driver reports
+`body_height_valid=false` and `body_height_status=unavailable`; zero is not
+presented as a measured zero-meter body height.
 
 ```json
 {"action":"move","vx":0.3,"vy":0,"vyaw":0,"duration":2}

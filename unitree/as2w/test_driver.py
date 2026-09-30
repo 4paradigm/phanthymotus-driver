@@ -429,7 +429,8 @@ class TestDriverContracts(unittest.TestCase):
         proxy.BodyHeight = lambda value: setattr(proxy, "height", value) or 0
         result = plugin.dispatch("body_height", {"height": 0.18})
         self.assertTrue(result["accepted"])
-        self.assertAlmostEqual(0.18, proxy.height)
+        self.assertAlmostEqual(-0.17, proxy.height)
+        self.assertAlmostEqual(-0.17, result["sdk_offset_m"])
 
     def test_loco_state_marks_zero_height_in_passive_mode_invalid(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
@@ -451,7 +452,8 @@ class TestDriverContracts(unittest.TestCase):
                                                   velocity=[1, 2, 3], position=[4, 5, 6],
                                                   yaw_speed=0.25))
         payload = __import__("json").loads(published[0])
-        self.assertEqual("AI_FREE_WALK", payload["mode_name"])
+        self.assertEqual("LOCOMOTION", payload["mode_name"])
+        self.assertEqual("SportModeState.mode", payload["mode_name_source"])
         self.assertEqual([1, 2, 3], payload["velocity_mps"])
         self.assertEqual(0.25, payload["yaw_speed_rad_s"])
 
@@ -640,14 +642,10 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn("stand_up", result["suggested_actions"])
         self.assertIn("not standing", result["reason"])
 
-    def test_loco_refuses_damp_while_moving_with_recovery_steps(self):
-        proxy = _Proxy()
-        proxy.state = "WALKING"
-        plugin = self.device.LocoPlugin({}, "test", None, proxy)
-        result = plugin.dispatch("damp", {})
-        self.assertEqual(-1, result["ret"])
-        self.assertEqual("WALKING", result["current_state"])
-        self.assertEqual(["stop_move", "damp"], result["suggested_actions"])
+    def test_loco_does_not_expose_removed_direct_actions(self):
+        plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
+        self.assertIsNone(plugin.dispatch("damp", {}))
+        self.assertIsNone(plugin.dispatch("euler", {"roll": 0, "pitch": 0, "yaw": 0}))
 
     def test_special_motion_explains_non_standing_state(self):
         proxy = _Proxy()
@@ -685,6 +683,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(45, schema["x-completion"]["timeout"])
         self.assertIn("stand_up", schema["x-completion"]["actions"])
         self.assertNotIn("switch_gait", schema["properties"]["action"]["enum"])
+        self.assertNotIn("damp", schema["properties"]["action"]["enum"])
+        self.assertNotIn("euler", schema["properties"]["action"]["enum"])
 
     def test_state_stop_then_start_recreates_shared_node(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
