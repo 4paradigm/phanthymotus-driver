@@ -1850,7 +1850,13 @@ class MotionPlayPlugin:
         # lock so pause/resume/stop racing the natural finish never double-report.
         remaining_s = duration_ms / 1000.0
         while remaining_s > 0:
-            self._paused.wait(self._PLAY_WORKER_TICK_S)   # paused → clock frozen
+            if self._paused.is_set():
+                # Event.wait() 在 set 状态下立即返回，直接用它做暂停等待会
+                # 以满速空转打满一个核（最长 600 s，12th PR review）——
+                # 暂停期间改用同粒度的 sleep 轮询，恢复/停止依然在一拍内被看到。
+                time.sleep(self._PLAY_WORKER_TICK_S)
+            else:
+                self._paused.wait(self._PLAY_WORKER_TICK_S)
             if self._play_action_id != action_id:
                 return  # superseded by a new play, or settled by stop/reset
             if self._paused.is_set():

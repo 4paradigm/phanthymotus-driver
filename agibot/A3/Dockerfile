@@ -26,6 +26,14 @@ WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py config.yaml driver.yaml /work/agibot/A3/
 COPY resource/ /work/agibot/A3/resource/
+# service.yml must be INSIDE the image (12th PR review): Agent Core extracts the
+# deployment fragment from the driver image and merges it into the host's unified
+# /opt/phanthy-motus/docker-compose.yml (README_dev deployment contract). Without
+# this COPY the deployment silently falls back to legacy `docker run` — no host
+# networking, no /agibot-devkit mount (so the wheel/ros2_plugin_proto CMD paths
+# never run and the command cards stay withheld/degraded in production), no log
+# rotation, no DDS profile.
+COPY deploy/ /deploy/
 # RCUTILS_COLORIZED_OUTPUT=0: rclpy logging must not emit ANSI color codes —
 # logsafe scrubs them anyway, but the fleet contract (README_dev, 11 drivers)
 # is to keep raw rclpy output plain so every consumer sees identical records.

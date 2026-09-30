@@ -1425,6 +1425,64 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_motion_play_paused_worker_does_not_busy_spin(self):
+        # 12th PR review: Event.wait(timeout) returns IMMEDIATELY while set, so the
+        # old paused loop (`self._paused.wait(tick); if paused: continue`) ran a
+        # tight no-sleep spin for up to 600 s — pegging a CPU core for the whole
+        # pause. While paused the worker must sleep at the tick instead: during a
+        # paused window the worker calls time.sleep (the tick) and never calls
+        # Event.wait. NB: device.py does `import time`, so patching time.sleep
+        # patches the GLOBAL time module — the wrapper delegates to the real
+        # sleep so the test's own polling and other workers keep working.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        real_sleep = time.sleep
+        sleep_calls, wait_calls = [], []
+        motion = find_plugin(self.plugins, "motion_play")
+        motion._PLAY_WORKER_TICK_S = 0.05
+        paused_event = motion._paused
+        real_wait = paused_event.wait
+        try:
+            def counting_wait(timeout=None):
+                if paused_event.is_set():
+                    wait_calls.append(timeout)
+                return real_wait(timeout)
+
+            def counting_sleep(seconds):
+                if paused_event.is_set():
+                    sleep_calls.append(seconds)
+                return real_sleep(seconds)
+
+            paused_event.wait = counting_wait
+            time.sleep = counting_sleep
+            motion.dispatch("play", {"motion_id": "/agibot/motions/long.mcap",
+                                     "duration_ms": 5000})
+            motion.dispatch("pause", {})
+            self.assertTrue(paused_event.is_set())
+            # hold the pause ~0.4 s: the buggy worker would spin thousands of
+            # instant wait() returns, the fixed one sleeps ~8 single ticks.
+            real_sleep(0.4)
+            self.assertGreaterEqual(len(sleep_calls), 4)
+            self.assertEqual(wait_calls, [])  # Event.wait is never the paused wait
+            # the worker's own paused sleeps are exactly one tick each; other
+            # plugins' poll workers may also be sleeping during this window
+            # (e.g. 1.0 s alert polls), so exclude foreign intervals instead of
+            # pinning an exact multiset.
+            own = [s for s in sleep_calls
+                   if abs(s - motion._PLAY_WORKER_TICK_S) < 1e-9]
+            self.assertGreaterEqual(own, [motion._PLAY_WORKER_TICK_S] * 4)
+            self.assertLess(max(own), motion._PLAY_WORKER_TICK_S + 1e-9)
+        finally:
+            paused_event.wait = real_wait
+            time.sleep = real_sleep
+            motion.dispatch("stop_play", {})
+            device._acp_notify = original_notify
+        self.assertEqual([(c[0], c[1]) for c in captured],
+                         [(captured[0][0], "cancelled")])
+        self.assertEqual(captured[0][0], captured[0][0])
+
     def test_motion_play_completion_vs_stop_race_posts_exactly_one_terminal(self):
         # 10th PR review: natural completion and a concurrent stop race for the
         # same action — whoever wins the lock claims the terminal, the loser
