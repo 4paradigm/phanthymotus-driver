@@ -379,12 +379,12 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         pytest.skip("ffmpeg and ffprobe required for encoder integration test")
     Image = pytest.importorskip("PIL.Image")
+    ImageDraw = pytest.importorskip("PIL.ImageDraw")
+    ImageChops = pytest.importorskip("PIL.ImageChops")
+    ImageStat = pytest.importorskip("PIL.ImageStat")
     import io
     import time
 
-    image = io.BytesIO()
-    Image.new("RGB", (32, 32), "red").save(image, format="JPEG")
-    jpeg = image.getvalue()
     server = socket.socket()
     server.bind(("127.0.0.1", 0))
     server.listen(1)
@@ -394,8 +394,14 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
         try:
             connection, _ = server.accept()
             with connection:
-                packet = struct.pack(">I", len(jpeg)) + jpeg
-                for _ in range(40):
+                for index in range(40):
+                    frame = Image.new("RGB", (64, 64), "red")
+                    x = index * 4 % 48
+                    ImageDraw.Draw(frame).rectangle((x, 24, x + 15, 39), fill="white")
+                    image = io.BytesIO()
+                    frame.save(image, format="JPEG")
+                    jpeg = image.getvalue()
+                    packet = struct.pack(">I", len(jpeg)) + jpeg
                     try:
                         connection.sendall(packet)
                     except OSError:
@@ -426,6 +432,15 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
     metadata = json.loads(probe.stdout)
     assert metadata["streams"][0]["codec_name"] == "h264"
     assert 0.8 <= float(metadata["format"]["duration"]) <= 1.2
+    def video_frame(seconds):
+        frame = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(seconds), "-i", str(path),
+                                "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+                               capture_output=True, check=True)
+        return Image.open(io.BytesIO(frame.stdout)).convert("RGB")
+
+    # 模拟 Nano 中移动的物体：成片必须保留变化，不能只重复首帧补足时长。
+    difference = ImageChops.difference(video_frame(0), video_frame(0.8))
+    assert max(ImageStat.Stat(difference).mean) > 5
     assert card.dispatch("delete", {"name": path.name})["ok"] is True
     assert not path.exists()
 
