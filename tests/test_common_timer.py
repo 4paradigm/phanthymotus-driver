@@ -193,14 +193,10 @@ def test_plugin_accepts_dashboard_serialized_create_fields():
     schema = plugin.get_tool()["inputSchema"]["properties"]
     assert schema["alarms"]["type"] == "array"
     assert schema["payload"]["type"] == "object"
-    assert schema["replace"]["type"] == "boolean"
-    assert schema["auto_remove"]["type"] == "boolean"
-    boolean_options = [
-        {"const": False, "title": "否"},
-        {"const": True, "title": "是"},
-    ]
-    assert schema["replace"]["oneOf"] == boolean_options
-    assert schema["auto_remove"]["oneOf"] == boolean_options
+    for field in ("replace", "auto_remove"):
+        assert schema[field]["type"] == "string"
+        assert schema[field]["enum"] == ["false", "true"]
+        assert schema[field]["default"] == "false"
 
     first = plugin.dispatch("create", {
         "timer_id": "canvas-test",
@@ -286,3 +282,34 @@ def test_plugin_schema_and_background_delivery():
             {"topic": "/test/timer/events", "format": "data/json"}]
     finally:
         assert plugin.dispatch("stop", {}) == {"state": "idle"}
+
+
+def test_failing_event_sink_does_not_stop_later_timer_events(capsys):
+    received = []
+    second_completed = threading.Event()
+
+    def sink(event):
+        if event["timer_id"] == "first" and event["type"] == "timer_tick":
+            raise RuntimeError("sink unavailable")
+        received.append(event)
+        if event["timer_id"] == "second" and event["type"] == "timer_completed":
+            second_completed.set()
+
+    plugin = TimerPlugin({}, "test", None, event_sink=sink)
+    plugin.dispatch("start", {})
+    try:
+        plugin.dispatch("create", {
+            "timer_id": "first", "mode": "countdown",
+            "duration_sec": 0.2, "emit_interval_sec": 0.1,
+        })
+        plugin.dispatch("create", {
+            "timer_id": "second", "mode": "countdown", "duration_sec": 0.35,
+        })
+        assert second_completed.wait(1.5)
+        assert plugin.dispatch("info", {"timer_id": "first"})["status"] == "completed"
+        assert plugin.dispatch("info", {"timer_id": "second"})["status"] == "completed"
+        assert any(event["timer_id"] == "first" and event["type"] == "timer_completed"
+                   for event in received)
+        assert "event sink failed: sink unavailable" in capsys.readouterr().out
+    finally:
+        plugin.dispatch("stop", {})

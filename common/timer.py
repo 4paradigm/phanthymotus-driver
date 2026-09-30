@@ -480,22 +480,16 @@ class TimerPlugin:
                                       "maximum": self._engine.max_duration_sec,
                                       "default": 0},
                 "replace": {
-                    "type": "boolean",
-                    "default": False,
+                    "type": "string",
+                    "enum": ["false", "true"],
+                    "default": "false",
                     "description": "同名运行中 Timer 已存在时是否替换",
-                    "oneOf": [
-                        {"const": False, "title": "否"},
-                        {"const": True, "title": "是"},
-                    ],
                 },
                 "auto_remove": {
-                    "type": "boolean",
-                    "default": False,
+                    "type": "string",
+                    "enum": ["false", "true"],
+                    "default": "false",
                     "description": "Timer 完成后是否自动从列表移除",
-                    "oneOf": [
-                        {"const": False, "title": "否"},
-                        {"const": True, "title": "是"},
-                    ],
                 },
                 "payload": {"type": "object", "additionalProperties": True},
             },
@@ -547,7 +541,10 @@ class TimerPlugin:
         self._last_event = copy.deepcopy(event)
         self._published_count += 1
         if self._event_sink is not None:
-            self._event_sink(copy.deepcopy(event))
+            try:
+                self._event_sink(copy.deepcopy(event))
+            except Exception as exc:
+                print(f"[timer] event sink failed: {exc}", flush=True)
         if self._publisher is not None:
             try:
                 from std_msgs.msg import String

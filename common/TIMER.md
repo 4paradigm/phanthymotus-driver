@@ -7,9 +7,9 @@
 G1 默认将事件发布到 `/<机器人 namespace>/timer/events`。在画布上把 Timer 的 JSON
 输出连接到 `decision_core`，Agent 才会收到主动提醒。卡片本身不会调用 TTS、LED 或动作。
 
-MCP/Agent 调用应按 schema 传入原生数组、对象和布尔值。当前 Canvas 表单会把这些可选
-字段序列化成字符串，因此插件边界也兼容 JSON 字符串形式的 `alarms`/`payload`、
-`"true"`/`"false"` 形式的 `replace`/`auto_remove`，空字符串按未填写处理。
+Canvas 将 `replace` 和 `auto_remove` 显示为 `false`/`true` 下拉选项，插件将其转换为
+布尔值；直接调用插件时也接受原生布尔值。Canvas 的数组和对象字段可能序列化成
+字符串，因此插件边界也兼容 JSON 字符串形式的 `alarms`/`payload`，空字符串按未填写处理。
 
 ## 倒计时
 
