@@ -39,6 +39,11 @@ from uuid import uuid4
 from common.vendor_runtime import action_schema, jsonable, tool
 
 
+def _core_topic(namespace: str, suffix: str) -> str:
+    """Build a core-domain topic without duplicating the configured namespace."""
+    return f"/{namespace.strip('/')}/{suffix.lstrip('/')}"
+
+
 def _acp_notify(action_id: str, status: str, result: dict, tool: str = ""):
     """POST action completion to Agent Core (module-level ACP helper)."""
     import urllib.request as _urllib
@@ -381,17 +386,17 @@ class A3Nodes:
         self.streams = {}
         self._joint_cache = {}
         self._joint_skeleton_pub = self.core.create_publisher(
-            String, f"/{namespace}/agibot_a3/state/joints", 5)
+            String, _core_topic(namespace, "state/joints"), 5)
         self._joint_state_pub = self.core.create_publisher(
-            String, f"/{namespace}/agibot_a3/state/joint_state", 5)
+            String, _core_topic(namespace, "state/joint_state"), 5)
         self._imu_pub = self.core.create_publisher(
-            String, f"/{namespace}/agibot_a3/state/imu", 5)
+            String, _core_topic(namespace, "state/imu"), 5)
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
 
         def mirror(key, msg_type, robot_topic, fmt, qos=None, json_filter=None,
                    re_encode=None):
-            core_topic = f"/{namespace}/agibot_a3/{key}"
+            core_topic = _core_topic(namespace, key)
             as_json = fmt == "data/json"
             if re_encode is not None:
                 core_msg_type = self._CompressedImage
@@ -465,7 +470,7 @@ class A3Nodes:
         if AudioCapture is not None and AudioPlayback is not None:
             for key, topic in (("mic", "/audiohal/audio/capture"),
                                ("ext_mic", "/agent/audio/data/external")):
-                core_topic = f"/{namespace}/agibot_a3/{key}/audio"
+                core_topic = _core_topic(namespace, f"{key}/audio")
                 pub = self.core.create_publisher(AudioCapture, core_topic, 5)
                 self.robot.create_subscription(
                     AudioCapture, topic, lambda msg, pub=pub: pub.publish(msg), sensor_qos)
@@ -984,7 +989,7 @@ class JointsPlugin:
                 "group": {"type": "string", "enum": list(self.GROUPS),
                           "description": "关节组：arm 双臂 14 关节 / hand 手指 / neck 头部"},
             },
-        }, topic_out=[{"topic": f"/{self.nodes.namespace}/agibot_a3/state/joints",
+        }, topic_out=[{"topic": _core_topic(self.nodes.namespace, "state/joints"),
                        "format": "sensor/skeleton"}])
 
     def start(self):
@@ -1018,7 +1023,7 @@ class JointStatePlugin:
 
     def __init__(self, nodes):
         self.nodes = nodes
-        self.topic = f"/{nodes.namespace}/agibot_a3/state/joint_state"
+        self.topic = _core_topic(nodes.namespace, "state/joint_state")
 
     def get_tool(self):
         return tool("joint_state", "sensor", "原始手臂/手/头 JointState 数据（JSON）",
@@ -1050,7 +1055,7 @@ class ImuPlugin:
         return tool("imu", "sensor", "骨盆+躯干 IMU 数据（pelvis/torso 最新快照）", {
             "type": "object",
             "properties": {},
-        }, topic_out=[{"topic": f"/{self.nodes.namespace}/agibot_a3/state/imu",
+        }, topic_out=[{"topic": _core_topic(self.nodes.namespace, "state/imu"),
                        "format": "data/json"}])
 
     def start(self):
@@ -1067,7 +1072,7 @@ class ImuPlugin:
         if action == "info":
             # Agent Core 用 info 推断可订阅主题：两路 IMU 流都要列出。
             return {"state": "running",
-                    "topic_out": [{"topic": f"/{self.nodes.namespace}/agibot_a3/state/imu",
+                    "topic_out": [{"topic": _core_topic(self.nodes.namespace, "state/imu"),
                                    "format": "data/json"}],
                     "streams": {k: self.nodes.streams[k]
                                 for k in ("imu_pelvis", "imu_torso") if k in self.nodes.streams}}
@@ -3275,7 +3280,7 @@ class SpatialMapPlugin:
     def __init__(self, nodes, namespace):
         self.nodes = nodes
         self.namespace = namespace
-        self.topic = f"/{namespace}/agibot_a3/spatial_map"
+        self.topic = _core_topic(namespace, "spatial_map")
         cfg = nodes.config.get("plugins", {}).get("spatial_map", {})
         self.map_id = int(cfg.get("map_id", 0))
         interval = float(cfg.get("publish_interval", MAP_PUBLISH_INTERVAL))

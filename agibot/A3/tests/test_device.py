@@ -425,7 +425,7 @@ class ToolInventoryTests(unittest.TestCase):
         import numpy as np
         subs = {topic: cb for topic, cb in nodes.robot.subscriptions}
         rgb_cb = subs["/hal/head_left_fisheye_camera/rgb"]
-        rgb_pub = nodes.core.publishers[f"/{nodes.namespace}/agibot_a3/camera_head_left_fisheye"]
+        rgb_pub = nodes.core.publishers[f"/{nodes.namespace}/camera_head_left_fisheye"]
 
         import sensor_msgs.msg as sensor_msgs_real  # noqa: F401 — must be the stub
 
@@ -457,7 +457,7 @@ class ToolInventoryTests(unittest.TestCase):
 
         subs = {topic: cb for topic, cb in nodes.robot.subscriptions}
         rgb_cb = subs["/hal/head_left_fisheye_camera/rgb"]
-        rgb_pub = nodes.core.publishers[f"/{nodes.namespace}/agibot_a3/camera_head_left_fisheye"]
+        rgb_pub = nodes.core.publishers[f"/{nodes.namespace}/camera_head_left_fisheye"]
 
         h, w = 4, 6
         frame = bytes(bytearray(np.arange(h * w * 3, dtype=np.uint8)))
@@ -483,7 +483,7 @@ class ToolInventoryTests(unittest.TestCase):
         import zlib
         subs = {topic: cb for topic, cb in nodes.robot.subscriptions}
         depth_cb = subs["/hal/chest_front_d457_camera/depth"]
-        depth_pub = nodes.core.publishers[f"/{nodes.namespace}/agibot_a3/camera_chest_front_d457_depth"]
+        depth_pub = nodes.core.publishers[f"/{nodes.namespace}/camera_chest_front_d457_depth"]
 
         import numpy as np
         h, w = 4, 6
@@ -503,7 +503,7 @@ class ToolInventoryTests(unittest.TestCase):
         plugins, _ = build_bundle_plugins(config)
         nodes = next(iter(plugins.values())).nodes
         subs = {topic: cb for topic, cb in nodes.robot.subscriptions}
-        rgb_pub = nodes.core.publishers[f"/{nodes.namespace}/agibot_a3/camera_head_left_fisheye"]
+        rgb_pub = nodes.core.publishers[f"/{nodes.namespace}/camera_head_left_fisheye"]
 
         try:
             import numpy as np  # noqa: F401
@@ -1946,7 +1946,7 @@ class RpcDispatchTests(unittest.TestCase):
             "resolution": 0.05, "origin": {"x": 100, "y": 200},
             "occupancy_grid": [[127, 0], [0, 127]]}}
         mapping.publish_map(response)
-        pub = self.nodes.core.publishers["/test_ns/agibot_a3/spatial_map"]
+        pub = self.nodes.core.publishers["/test_ns/spatial_map"]
         (msg,) = pub.published
         buf = bytes(msg.data)
         header_size = struct.calcsize("<fffBI")
@@ -2293,7 +2293,7 @@ class MirrorStreamTests(unittest.TestCase):
         msg.velocity = [0.0]
         msg.effort = [0.0]
         self._callback("/motion/control/arm_joint_state")(msg)
-        core_pub = self.nodes.core.publishers["/test_ns/agibot_a3/arm_state"]
+        core_pub = self.nodes.core.publishers["/test_ns/arm_state"]
         (out,) = core_pub.published
         payload = json.loads(out.data)
         self.assertEqual(payload["name"], ["left_shoulder_pitch_joint"])
@@ -2317,7 +2317,7 @@ class MirrorStreamTests(unittest.TestCase):
         result = imu.dispatch("info", {})
         topics = {(entry["topic"], entry["format"]) for entry in result["topic_out"]}
         self.assertEqual(topics, {
-            ("/test_ns/agibot_a3/state/imu", "data/json"),
+            ("/test_ns/state/imu", "data/json"),
         })
         self.assertEqual(set(result["streams"]), {"imu_pelvis", "imu_torso"})
 
@@ -2356,7 +2356,7 @@ class SpatialMapTests(unittest.TestCase):
         self.assertEqual(definition["name"], "spatial_map")
         self.assertEqual(definition["type"], "sensor")
         self.assertEqual(definition["topic_out"],
-                         [{"topic": "/test_ns/agibot_a3/spatial_map", "format": "sensor/mapping"}])
+                         [{"topic": "/test_ns/spatial_map", "format": "sensor/mapping"}])
 
     def test_info_lists_topic_out(self):
         # 7th PR review: Agent Core derives subscribable topics from the info
@@ -2364,8 +2364,8 @@ class SpatialMapTests(unittest.TestCase):
         result = self.plugin.dispatch("info", {})
         self.assertEqual(result["state"], "idle")
         self.assertEqual(result["topic_out"],
-                         [{"topic": "/test_ns/agibot_a3/spatial_map", "format": "sensor/mapping"}])
-        self.assertEqual(result["topic"], "/test_ns/agibot_a3/spatial_map")
+                         [{"topic": "/test_ns/spatial_map", "format": "sensor/mapping"}])
+        self.assertEqual(result["topic"], "/test_ns/spatial_map")
 
     def test_publish_map_binary_format(self):
         response = {"data": {
@@ -2374,7 +2374,7 @@ class SpatialMapTests(unittest.TestCase):
         }}
         published = self.plugin.publish_map(response)
         self.assertTrue(published)
-        pub = self.nodes.core.publishers["/test_ns/agibot_a3/spatial_map"]
+        pub = self.nodes.core.publishers["/test_ns/spatial_map"]
         (msg,) = pub.published
         buf = bytes(msg.data)
         self.assertIsInstance(msg.data, array.array)
@@ -2414,13 +2414,13 @@ class SpatialMapTests(unittest.TestCase):
         (url, body), = self.transport.calls_to("MappingService", "Get2DWholeMap")
         self.assertIn("10.42.10.11:50807", url)
         self.assertEqual(body["map_id"], 2)
-        pub = self.nodes.core.publishers["/test_ns/agibot_a3/spatial_map"]
+        pub = self.nodes.core.publishers["/test_ns/spatial_map"]
         self.assertEqual(len(pub.published), 1)
 
     def test_empty_grid_publishes_empty_frame(self):
         published = self.plugin.publish_map({"data": {"resolution": 0.05}})
         self.assertTrue(published)
-        pub = self.nodes.core.publishers["/test_ns/agibot_a3/spatial_map"]
+        pub = self.nodes.core.publishers["/test_ns/spatial_map"]
         (msg,) = pub.published
         buf = bytes(msg.data)
         *_, point_count = struct.unpack_from("<fffBI", buf, 0)
