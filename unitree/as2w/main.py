@@ -169,7 +169,8 @@ def _start_registration(mcp_port, name, category):
 
 def main():
     cfg = load_config()
-    requested_interface = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NETWORK_INTERFACE", "").strip()
+    requested_interface = (sys.argv[1].strip() if len(sys.argv) > 1 and sys.argv[1].strip()
+                           else os.environ.get("NETWORK_INTERFACE", "").strip())
     configured_interface = str(cfg.get("robot_interface") or "").strip()
     interface = requested_interface or configured_interface or "(auto)"
     profile = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", "")

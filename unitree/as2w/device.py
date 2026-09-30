@@ -1,6 +1,7 @@
 """Unitree As2W driver plugins (official AS2 SDK SportClient)."""
 import json
 import math
+import queue
 import socket
 import struct
 import threading
@@ -1171,6 +1172,8 @@ class _CameraRgbNode:
         self.period = 1.0 / self.fps
         self._stop_event = threading.Event()
         self._thread = None
+        self._publish_thread = None
+        self._frame_queue = queue.Queue(maxsize=1)
         self.state = "idle"
         self.frames = 0
         self.last_frame_ts = 0.0
@@ -1183,7 +1186,10 @@ class _CameraRgbNode:
             return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="as2w-camera-rgb")
+        self._publish_thread = threading.Thread(
+            target=self._publish_loop, daemon=True, name="as2w-camera-rgb-publish")
         self._thread.start()
+        self._publish_thread.start()
         self.state = "running"
 
     def stop(self):
@@ -1193,6 +1199,11 @@ class _CameraRgbNode:
             thread.join(timeout=6)
             if not thread.is_alive():
                 self._thread = None
+        publish_thread = self._publish_thread
+        if publish_thread is not None:
+            publish_thread.join(timeout=1)
+            if not publish_thread.is_alive():
+                self._publish_thread = None
         self.state = "idle"
 
     def _loop(self):
@@ -1205,23 +1216,40 @@ class _CameraRgbNode:
                 self.last_error = str(exc)
                 self._stop_event.wait(self.period)
                 continue
-            if self._stop_event.is_set():
-                break
             code, payload = result if isinstance(result, tuple) and len(result) == 2 else (3104, None)
             if code == 0 and payload:
-                message = CompressedImage()
-                message.header.stamp = self.node.get_clock().now().to_msg()
-                message.format = "jpeg"
-                message.data = list(payload)
-                self.publisher.publish(message)
-                self.frames += 1
-                if self.last_frame_ts:
-                    self.last_frame_interval_s = time.monotonic() - self.last_frame_ts
-                self.last_frame_ts = time.monotonic()
+                try:
+                    self._frame_queue.put_nowait(bytes(payload))
+                except queue.Full:
+                    try:
+                        self._frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._frame_queue.put_nowait(bytes(payload))
+                    except queue.Full:
+                        pass
                 self.last_error = None
             elif code != 0:
                 self.last_error = f"videohub returned {code}"
             self._stop_event.wait(self.period)
+
+    def _publish_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                payload = self._frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            message = CompressedImage()
+            message.header.stamp = self.node.get_clock().now().to_msg()
+            message.format = "jpeg"
+            message.data = list(payload)
+            self.publisher.publish(message)
+            self.frames += 1
+            now = time.monotonic()
+            if self.last_frame_ts:
+                self.last_frame_interval_s = now - self.last_frame_ts
+            self.last_frame_ts = now
 
 
 class CameraPlugin:

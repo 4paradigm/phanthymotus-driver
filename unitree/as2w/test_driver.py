@@ -268,6 +268,31 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIn("up to 10 FPS", tool["description"])
         self.assertNotIn("action", tool["inputSchema"]["properties"])
 
+    def test_camera_frame_publisher_converts_binary_payload(self):
+        import queue
+        import threading
+        node = self.device._CameraRgbNode.__new__(self.device._CameraRgbNode)
+        node._stop_event = threading.Event()
+        node._frame_queue = queue.Queue(maxsize=1)
+        node._frame_queue.put_nowait(b"jpeg-bytes")
+        node.node = types.SimpleNamespace(
+            get_clock=lambda: types.SimpleNamespace(
+                now=lambda: types.SimpleNamespace(to_msg=lambda: "stamp")))
+        self.device.CompressedImage = lambda: types.SimpleNamespace(
+            header=types.SimpleNamespace(stamp=None), format=None, data=None)
+        published = []
+        node.publisher = types.SimpleNamespace(publish=published.append)
+        node.frames = 0
+        node.last_frame_ts = 0.0
+        node.last_frame_interval_s = None
+
+        def stop_after_publish(_message):
+            node._stop_event.set()
+
+        node.publisher.publish = stop_after_publish
+        node._publish_loop()
+        self.assertEqual(1, node.frames)
+
     def test_rpc_channel_ignores_late_result_from_timed_out_call(self):
         rpc = _load("as2w_rpc_under_test", ROOT / "rpc_proxy.py")
         channel = rpc._RpcChannel.__new__(rpc._RpcChannel)
@@ -600,6 +625,17 @@ class TestDriverContracts(unittest.TestCase):
                          network.interface_candidates("enp5s0", "eth0"))
         self.assertEqual(["eth2"],
                          network.interface_candidates("", "eth2"))
+
+    def test_empty_positional_interface_uses_environment_override(self):
+        source = (ROOT / "main.py").read_text()
+        self.assertIn('sys.argv[1].strip() if len(sys.argv) > 1', source)
+        self.assertIn('else os.environ.get("NETWORK_INTERFACE", "").strip()', source)
+
+    def test_docker_entrypoint_does_not_append_empty_interface_argument(self):
+        source = (ROOT / "Dockerfile").read_text()
+        self.assertIn('if [ -n \\"${NETWORK_INTERFACE:-}\\" ]', source)
+        entrypoint = (ROOT / "deploy" / "entrypoint.sh").read_text()
+        self.assertIn('if [[ -n "${NETWORK_INTERFACE:-}" ]]', entrypoint)
 
     def test_lidar_uses_direct_sensor_topics_not_conditional_slam_clouds(self):
         source = (ROOT / "lidar.py").read_text()
