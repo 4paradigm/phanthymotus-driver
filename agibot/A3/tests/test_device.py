@@ -321,6 +321,33 @@ class ToolInventoryTests(unittest.TestCase):
         skill_play = find_plugin(plugins, "skill_play")
         self.assertFalse(skill_play.has_stream, "skill_play must not claim a stream without the wheel")
 
+    def test_wrapper_command_cards_withheld_without_ros2_plugin_proto(self):
+        # Degraded startup path (5th PR review): remove the ros2_plugin_proto stub
+        # BEFORE A3Nodes is built — the driver must still start, and the wrapper-
+        # publishing cards (loco/waist_control/face_play) must be withheld entirely
+        # rather than crashing on the first publisher creation.
+        saved = {name: sys.modules.pop(name)
+                 for name in ("ros2_plugin_proto", "ros2_plugin_proto.msg") if name in sys.modules}
+        try:
+            config = json.loads(json.dumps(BASE_CONFIG))
+            config["plugins"] = FULL_PLUGINS
+            plugins, _ = build_bundle_plugins(config)
+            names = {d["name"] for d in tool_definitions(plugins)}
+            for withheld in ("loco", "waist_control", "face_play"):
+                self.assertNotIn(withheld, names,
+                                 f"{withheld} must be withheld without ros2_plugin_proto")
+            nodes = next(iter(plugins.values())).nodes
+            self.assertFalse(nodes.wrapper_available)
+            self.assertTrue(nodes.locomotion_pub is None)
+            self.assertTrue(nodes.waist_pub is None)
+            self.assertTrue(nodes.face_play_pub is None)
+            # non-wrapper cards all still present
+            for name in ("mc_mode", "arm_control", "hand_control", "head_control",
+                         "motion_play", "tts", "skill_play"):
+                self.assertIn(name, names)
+        finally:
+            sys.modules.update(saved)
+
     def test_camera_streams_follow_config(self):
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = dict(FULL_PLUGINS, camera={
@@ -595,6 +622,49 @@ class RpcDispatchTests(unittest.TestCase):
         result = mc_mode.dispatch("damping", {})
         self.assertEqual(result["requested"], "DAMPING")
         self.assertEqual(len(self.transport.calls_to("MotionControlActionService", "SetAction")), 1)
+
+    # -- MOTION-state gate on loco walk / arm send (dev guide §7.3 prerequisite) --
+
+    def test_loco_walk_rejected_outside_motion_state(self):
+        # DAMPING is confidently non-MOTION → walk must be rejected with a get_up
+        # hint and no velocity frame may be published.
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "action": "MOTIONCONTROLACTION_DAMPING"}
+        loco = find_plugin(self.plugins, "loco")
+        result = loco.dispatch("walk", {"forward": 0.5})
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["current"], "DAMPING")
+        self.assertIn("get_up", result["suggestion"])
+        self.assertEqual(self.nodes.locomotion_pub.published, [])
+
+    def test_loco_walk_unparseable_state_is_permissive(self):
+        # State unknown → the gate must not block; walking starts as usual.
+        self.transport.responses["MotionControlActionService/GetAction"] = {"header": {"code": "0"}}
+        loco = find_plugin(self.plugins, "loco")
+        result = loco.dispatch("walk", {"forward": 0.5})
+        self.assertEqual(result["state"], "walking")
+        loco.dispatch("stop", {})
+
+    def test_arm_send_rejected_outside_motion_state(self):
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "data": {"state": "MOTIONCONTROLACTION_LIE_DOWN"}}
+        arm = find_plugin(self.plugins, "arm_control")
+        result = arm.dispatch("send", {"left": [0.0] * 7, "duration_ms": 0})
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["current"], "LIE_DOWN")
+        self.assertIn("get_up", result["suggestion"])
+        self.assertEqual(self.nodes.arm_command_pub.published, [])
+        # compliance RPCs are state-independent and must NOT be gated
+        self.transport.responses["MotionControlActionService/GetAction"] = {
+            "action": "MOTIONCONTROLACTION_DAMPING"}
+        result = arm.dispatch("compliance_check", {})
+        self.assertNotEqual(result.get("state"), "rejected")
+
+    def test_arm_send_unparseable_state_is_permissive(self):
+        self.transport.responses["MotionControlActionService/GetAction"] = {"header": {"code": "0"}}
+        arm = find_plugin(self.plugins, "arm_control")
+        result = arm.dispatch("send", {"left": [0.0] * 7, "duration_ms": 0})
+        self.assertEqual(result["state"], "published")
 
     # -- loco / waist / face (RosMsgWrapper publishers, robot domain) --
 

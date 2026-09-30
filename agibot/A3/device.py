@@ -428,12 +428,23 @@ class A3Nodes:
                    "data/json", json_filter=self._decode_skill_status)
 
         # -- command publishers (robot domain) --
-        self.locomotion_pub = self.robot.create_publisher(
-            self._wrapper_type(ros2), "/motion/control/locomotion_velocity", 10)
-        self.waist_pub = self.robot.create_publisher(
-            self._wrapper_type(ros2), "/motion/control/move_waist", 10)
-        self.face_play_pub = self.robot.create_publisher(
-            self._wrapper_type(ros2), "/skill/pilot/face/play", 10)
+        # RosMsgWrapper needs the dev-kit's ros2_plugin_proto package; without it the
+        # driver still starts (Dockerfile documents a degraded non-robot dev mode) —
+        # wrapper publishers are withheld and their tools reject clearly at dispatch.
+        self.wrapper_available = self._probe_wrapper_type() is not None
+        if self.wrapper_available:
+            self.locomotion_pub = self.robot.create_publisher(
+                self._wrapper_msg_type, "/motion/control/locomotion_velocity", 10)
+            self.waist_pub = self.robot.create_publisher(
+                self._wrapper_msg_type, "/motion/control/move_waist", 10)
+            self.face_play_pub = self.robot.create_publisher(
+                self._wrapper_msg_type, "/skill/pilot/face/play", 10)
+        else:
+            self.locomotion_pub = None
+            self.waist_pub = None
+            self.face_play_pub = None
+            print("[warn] ros2_plugin_proto not importable — loco/waist_control/face_play "
+                  "command publishers withheld (install the AimDK dev-kit prebuilt)")
         self.arm_command_pub = self.robot.create_publisher(JointState, "/motion/control/arm_joint_command", 10)
         self.neck_command_pub = self.robot.create_publisher(JointState, "/motion/control/neck_joint_command", 10)
         self.hand_command_pub = self.robot.create_publisher(JointState, "/motion/control/hand_joint_command", 10)
@@ -496,11 +507,22 @@ class A3Nodes:
         except Exception:
             return None
 
+    def _probe_wrapper_type(self):
+        """Try importing ros2_plugin_proto's RosMsgWrapper; None when absent."""
+        try:
+            from ros2_plugin_proto.msg import RosMsgWrapper
+        except ImportError:
+            return None
+        self._wrapper_msg_type = RosMsgWrapper
+        return RosMsgWrapper
+
     def _wrapper_type(self, ros2):
         """Import ros2_plugin_proto/msg/RosMsgWrapper lazily (test stubs provide it)."""
         if getattr(self, "_wrapper_msg_type", None) is None:
-            from ros2_plugin_proto.msg import RosMsgWrapper
-            self._wrapper_msg_type = RosMsgWrapper
+            if self._probe_wrapper_type() is None:
+                raise RuntimeError(
+                    "ros2_plugin_proto not importable — install the AimDK dev-kit "
+                    "prebuilt (ros2_plugin_proto_aarch64) to publish wrapper commands")
         return self._wrapper_msg_type
 
     def _make_wrapper(self, proto_dict: dict, ros2=None):
@@ -539,6 +561,10 @@ class A3Nodes:
     def publish_wrapper(self, pub_attr, payload):
         """Fill + publish a RosMsgWrapper command onto a robot-domain topic."""
         publisher = getattr(self, pub_attr)
+        if publisher is None:  # wrapper type unavailable — degraded dev mode
+            raise RuntimeError(
+                f"{pub_attr} unavailable: ros2_plugin_proto not importable "
+                "(install the AimDK dev-kit prebuilt to publish wrapper commands)")
         self._pb_topic = getattr(publisher, "topic_name", "") or getattr(publisher, "topic", "")
         wrapper = self._make_wrapper(payload)
         publisher.publish(wrapper)
@@ -1131,6 +1157,29 @@ def _mc_allowed_actions(state: str):
     return MC_STATE_TRANSITIONS.get(state, ("get_up",))
 
 
+def _mc_current_state(rpc):
+    """GetAction → normalized current state string ('' when unparseable).
+
+    Shared by McModePlugin and the MOTION-gate on loco/arm commands (5th PR
+    review): the exact response field name is not in the dev guide, so probe
+    action/state/current_action at the top level and under "data", plus
+    command.action — '' means "could not tell", callers stay permissive then.
+    """
+    response = rpc.get_action()
+    for container in (response, response.get("data") or {}):
+        if isinstance(container, dict):
+            for key in ("action", "state", "current_action"):
+                value = container.get(key)
+                if isinstance(value, str) and value:
+                    return value.upper().replace("MOTIONCONTROLACTION_", "")
+            command = container.get("command")
+            if isinstance(command, dict):
+                value = command.get("action")
+                if isinstance(value, str) and value:
+                    return value.upper().replace("MOTIONCONTROLACTION_", "")
+    return ""
+
+
 def _mc_suggestion(state: str, requested: str) -> str:
     state = (state or "").strip().upper() or "UNKNOWN"
     allowed = _mc_allowed_actions(state)
@@ -1188,19 +1237,7 @@ class McModePlugin:
 
     def _current_state(self):
         """GetAction → normalized current state string ('' when unparseable)."""
-        response = self.nodes.rpc.get_action()
-        for container in (response, response.get("data") or {}):
-            if isinstance(container, dict):
-                for key in ("action", "state", "current_action"):
-                    value = container.get(key)
-                    if isinstance(value, str) and value:
-                        return value
-                command = container.get("command")
-                if isinstance(command, dict):
-                    value = command.get("action")
-                    if isinstance(value, str) and value:
-                        return value
-        return ""
+        return _mc_current_state(self.nodes.rpc)
 
     def dispatch(self, action, args):
         if action == "start":
@@ -1318,6 +1355,12 @@ class LocoPlugin:
             raise ValueError(f"loco: duration must be in (0, {self.MAX_DURATION_S:g}] or -1 for continuous")
         if forward == 0.0 and lateral == 0.0 and angular == 0.0:
             raise ValueError("loco: all velocities are zero — use stop to halt")
+        # MOTION-state gate (dev guide §7.3: locomotion only takes effect in MOTION).
+        # Unparseable state → permissive, matching mc_mode's UNKNOWN handling.
+        current = _mc_current_state(self.nodes.rpc)
+        if current and current != "MOTION":
+            return {"state": "rejected", "current": current,
+                    "suggestion": "loco 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up 恢复站立"}
         # 新指令顶替旧指令：先结算旧的等待线程，避免悬挂的 completed 回报。
         self._settle_active("cancelled", {"reason": "replaced_by_new_command"})
         return self._arm_completion(forward, lateral, angular, duration)
@@ -1455,6 +1498,14 @@ class ArmControlPlugin:
             return jsonable(self.nodes.rpc.arm_compliance(method))
         if action != "send":
             raise ValueError(f"arm_control: unknown action {action!r}")
+        # MOTION-state gate (dev guide §7.3: arm control only takes effect in MOTION;
+        # the docs also require stopping motion_player first). Unparseable state →
+        # permissive, matching mc_mode's UNKNOWN handling.
+        current = _mc_current_state(self.nodes.rpc)
+        if current and current != "MOTION":
+            return {"state": "rejected", "current": current,
+                    "suggestion": "arm_control 仅在 MOTION 站立状态生效（且需先停止 motion_player）；"
+                                  "请先执行 mc_mode get_up 恢复站立"}
         positions = {}
         for side in ("left", "right"):
             values = args.get(side)
@@ -2787,7 +2838,9 @@ def build_plugins(config, namespace, ros2):
     mapping + navigation + relocalization + map_get (incl. the map resource
     list); spatial_map is the sensor/mapping visualization card. wakeup dropped
     (AimDK v3.2 exposes no raw mic stream — only wake-word events, useless
-    without audio access).
+    without audio access). loco/waist_control/face_play need ros2_plugin_proto
+    (dev-kit prebuilt) to publish their RosMsgWrapper commands and are withheld
+    entirely when it is not importable.
     """
     rpc = A3Rpc(config)
     nodes = A3Nodes(config, namespace, ros2, rpc)
@@ -2813,7 +2866,11 @@ def build_plugins(config, namespace, ros2):
         plugins["alerts"] = AlertsPlugin(nodes)
     if enabled("mc_mode"):
         plugins["mc_mode"] = McModePlugin(nodes)
-    if enabled("loco"):
+    # loco/waist_control/face_play publish RosMsgWrapper commands and are withheld
+    # (not just broken at dispatch) when ros2_plugin_proto is absent — degraded
+    # startup must expose no half-working command tools (5th PR review).
+    wrapper_cmds = nodes.wrapper_available
+    if enabled("loco") and wrapper_cmds:
         plugins["loco"] = LocoPlugin(nodes)
     if enabled("arm_control"):
         plugins["arm_control"] = ArmControlPlugin(nodes)
@@ -2821,7 +2878,7 @@ def build_plugins(config, namespace, ros2):
         plugins["hand_control"] = HandControlPlugin(nodes)
     if enabled("head_control"):
         plugins["head_control"] = HeadControlPlugin(nodes)
-    if enabled("waist_control"):
+    if enabled("waist_control") and wrapper_cmds:
         plugins["waist_control"] = WaistControlPlugin(nodes)
     if enabled("motion_play"):
         plugins["motion_play"] = MotionPlayPlugin(nodes)
@@ -2834,7 +2891,7 @@ def build_plugins(config, namespace, ros2):
         plugins["interaction"] = InteractionPlugin(nodes)
     if enabled("resources"):
         plugins["model"] = ModelPlugin(nodes)
-    if enabled("face_play"):
+    if enabled("face_play") and wrapper_cmds:
         plugins["face_play"] = FacePlayPlugin(nodes)
     if enabled("skill_play"):
         plugins["skill_play"] = SkillPlayPlugin(nodes)

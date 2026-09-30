@@ -7,8 +7,10 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 # the robot's AimDK 开发包 prebuilt/ directory instead of this repo. The CMD
 # pip-installs the wheel and sources ros2_plugin_proto's local_setup.bash when
 # the dev-kit directory is mounted at /agibot-devkit; device.py degrades
-# gracefully (JSON payload fallback, pb-stream tools withheld) when they are
-# absent, so the image also runs on any host for development.
+# gracefully when they are absent (pb stream tools withheld, JSON payload
+# fallback), so the image also runs on any host for development — with
+# loco/waist_control/face_play withheld too, since their RosMsgWrapper
+# publishers cannot exist without ros2_plugin_proto.
 COPY requirements.txt /tmp/agibot-a3-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-a3-requirements.txt && rm -f /tmp/agibot-a3-requirements.txt
 
