@@ -20,9 +20,39 @@ depth, and point cloud at a time.
 `camera_snapshot` connects directly to the selected RGB port for one JPEG and
 then disconnects. In the canvas, call `camera_snapshot` with
 `{"action":"capture_photo","position":"front"}` (or chin/left/right/belly);
-`camera_rgb` does not need to be started. The result contains `file_path` under
-`/opt/phanthy-motus/data/camera_snapshot`. Stop any active stream on the same
-physical camera before taking a photo.
+`camera_rgb` does not need to be started. The call immediately returns
+`{ok: true, state: "capturing", action_id, position}`. The background worker
+POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`; only
+`capture_photo` declares `x-completion` (45 seconds). Successful completion
+contains `file_path` under `/opt/phanthy-motus/data/camera_snapshot`, published
+only after the atomic write. `info.last_capture` also keeps the latest terminal
+`{action_id, status, result}`. Callback delivery failures are logged and Core's
+45-second barrier timeout remains the fallback. `stop` lets an accepted capture
+finish and reports `capturing` while it is still working.
+
+Within one driver process, snapshot admission and stream startup share a lock:
+an active RGB/depth/pointcloud receiver or another snapshot on the same position
+returns `RESOURCE_BUSY` without an `action_id` or another TCP connection. A
+stream cannot start or switch onto a position being captured. Stopping a stream
+retains its occupancy until the receiving thread exits. Other positions remain
+available. Occupancy in another process/container is not observable here and
+still requires coordination by the operator/Nano service.
+
+Snapshot endpoints use `camera.py`'s five default RGB endpoints. The bundle
+merges `positions` field by field, in increasing precedence:
+`camera_pointcloud` → `camera_depth` → `camera_rgb` → `camera_snapshot`.
+Configuration is inherited even if a stream card is disabled. Normally configure
+`camera_rgb.positions` once; `camera_snapshot.positions` is only an explicit
+override for deployments that need it. For example, overriding just
+`camera_rgb.positions.left.board_ip` changes both RGB streaming and snapshots;
+the existing `image_port` is retained. Keep depth/pointcloud mappings consistent
+for the same physical position.
+
+No new runtime packages, model downloads, or image decoders are installed.
+JPEG validation remains the frame-size limit and SOI/EOI markers, not a full
+decode. The necessary Dockerfile COPY adds only the small Python source file,
+so image-size impact is negligible; `driver.yaml` only advertises the actuator
+and does not add image contents. Docker image size has not been re-measured.
 
 ## RGB path
 

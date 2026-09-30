@@ -42,6 +42,7 @@ COPY sensors.py        /work/sensors.py
 COPY controllers.py    /work/controllers.py
 COPY ext_devices.py    /work/ext_devices.py
 COPY camera.py         /work/camera.py
+# 抓拍仅增加小型 Python 源文件，无新增运行依赖，镜像体积影响极小。
 COPY camera_snapshot.py /work/camera_snapshot.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
