@@ -1117,7 +1117,7 @@ class SwingTrajectoryPlugin:
 
     def get_tool(self):
         return {"name": "swing_trajectory", "type": "sensor", "multiInstance": False,
-                "description": "Go1 four-foot swing trajectories: body frame and estimated odometry-world frame; read-only",
+                "description": "Go1 four-foot swing trajectories: body frame and estimated odometry-world frame",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": ([{"topic": self._topic, "format": _SWING_FORMAT}] if self._node else [])}
 
