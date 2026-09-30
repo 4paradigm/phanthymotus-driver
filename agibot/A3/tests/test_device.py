@@ -374,11 +374,9 @@ class ToolInventoryTests(unittest.TestCase):
         skill_play = find_plugin(plugins, "skill_play")
         self.assertFalse(skill_play.has_stream, "skill_play must not claim a stream without the wheel")
 
-    def test_wrapper_command_cards_withheld_without_ros2_plugin_proto(self):
-        # Degraded startup path (5th PR review): remove the ros2_plugin_proto stub
-        # BEFORE A3Nodes is built — the driver must still start, and the wrapper-
-        # publishing cards (loco/waist_control/face_play) must be withheld entirely
-        # rather than crashing on the first publisher creation.
+    def test_wrapper_command_cards_visible_without_ros2_plugin_proto(self):
+        # Degraded startup path: the canvas still gets the complete card inventory;
+        # dispatch fails clearly later when a wrapper command is actually requested.
         saved = {name: sys.modules.pop(name)
                  for name in ("ros2_plugin_proto", "ros2_plugin_proto.msg") if name in sys.modules}
         try:
@@ -386,9 +384,9 @@ class ToolInventoryTests(unittest.TestCase):
             config["plugins"] = FULL_PLUGINS
             plugins, _ = build_bundle_plugins(config)
             names = {d["name"] for d in tool_definitions(plugins)}
-            for withheld in ("loco", "waist_control", "face_play"):
-                self.assertNotIn(withheld, names,
-                                 f"{withheld} must be withheld without ros2_plugin_proto")
+            for visible in ("loco", "waist_control", "face_play"):
+                self.assertIn(visible, names,
+                              f"{visible} must remain visible without ros2_plugin_proto")
             nodes = next(iter(plugins.values())).nodes
             self.assertFalse(nodes.wrapper_available)
             self.assertTrue(nodes.locomotion_pub is None)

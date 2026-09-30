@@ -98,10 +98,10 @@ plugins:
     enabled: true
   # --- advanced modules, opt-in like X2's slam ---
   controlled_spatial:
-    enabled: false
+    enabled: true
   spatial_map:
-    enabled: false
+    enabled: true
     # Which saved map to visualize; 0 = current active map.
     map_id: 0
   auto_charging:
-    enabled: false
+    enabled: true

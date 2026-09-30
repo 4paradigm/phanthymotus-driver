@@ -3514,7 +3514,7 @@ def build_plugins(config, namespace, ros2):
     # (not just broken at dispatch) when ros2_plugin_proto is absent — degraded
     # startup must expose no half-working command tools (5th PR review).
     wrapper_cmds = nodes.wrapper_available
-    if enabled("loco") and wrapper_cmds:
+    if enabled("loco"):
         plugins["loco"] = LocoPlugin(nodes)
     if enabled("arm_control"):
         plugins["arm_control"] = ArmControlPlugin(nodes)
@@ -3522,7 +3522,7 @@ def build_plugins(config, namespace, ros2):
         plugins["hand_control"] = HandControlPlugin(nodes)
     if enabled("head_control"):
         plugins["head_control"] = HeadControlPlugin(nodes)
-    if enabled("waist_control") and wrapper_cmds:
+    if enabled("waist_control"):
         plugins["waist_control"] = WaistControlPlugin(nodes)
     if enabled("motion_play"):
         plugins["motion_play"] = MotionPlayPlugin(nodes)
@@ -3541,7 +3541,7 @@ def build_plugins(config, namespace, ros2):
         plugins["interaction"] = InteractionPlugin(nodes)
     if enabled("resources"):
         plugins["model"] = ModelPlugin(nodes)
-    if enabled("face_play") and wrapper_cmds:
+    if enabled("face_play"):
         plugins["face_play"] = FacePlayPlugin(nodes)
     if enabled("skill_play"):
         plugins["skill_play"] = SkillPlayPlugin(nodes)
