@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 
 
 class VisionCapturePlugin:
+    PREFIX = "vision_capture"
+
     def __init__(self, plugin_config, namespace=None, executor=None, client=None):
         del namespace, executor, client
         self._endpoints = {
@@ -47,7 +49,7 @@ class VisionCapturePlugin:
 
     def get_tool(self):
         return {
-            "name": "vision_capture", "type": "actuator", "multiInstance": False,
+            "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": "Capture a Go1 camera photo or record a 1-30 second MP4 video.",
             "inputSchema": {
                 "type": "object",
@@ -245,7 +247,7 @@ class VisionCapturePlugin:
     def _notify_complete(self, action_id, status, result):
         # ACP/TLS 通知仅用标准库；视频编码依赖 Dockerfile 安装的 ffmpeg。
         payload = json.dumps({"action_id": action_id, "status": status, "result": result,
-                              "tool": "vision_capture", "ts": time.time()}).encode()
+                              "tool": self.PREFIX, "ts": time.time()}).encode()
         url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
         # 最坏 3×3 秒请求 + 0.5/1 秒退避，留在 120 秒 ACP 超时预算内。
         for attempt in range(3):

@@ -224,7 +224,9 @@ def test_named_capture_rejects_bad_names_and_existing_file(tmp_path, monkeypatch
 
 def test_snapshot_declares_completion_only_for_capture():
     snapshot = importlib.import_module("unitree.go1.vision_capture")
-    schema = snapshot.VisionCapturePlugin({}).get_tool()["inputSchema"]
+    card = snapshot.VisionCapturePlugin({})
+    assert card.PREFIX == card.get_tool()["name"] == "vision_capture"
+    schema = card.get_tool()["inputSchema"]
     assert schema["x-completion"]["actions"] == ["capture_photo", "record_video"]
     assert "start_recording" not in schema["properties"]["action"]["enum"]
     assert "stop_recording" not in schema["properties"]["action"]["enum"]
