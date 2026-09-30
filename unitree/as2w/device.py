@@ -1508,48 +1508,46 @@ class SpeakerPlugin:
         configured_topic = (config or {}).get("input_topic")
         if configured_topic:
             self._input_topic = str(configured_topic).replace("{namespace}", namespace)
-        else:
-            # A speaker card must be startable without a hand-written MCP
-            # argument.  External producers can publish AudioChunk messages
-            # here; an explicit input_topic still overrides this default.
-            # The shared TTS card publishes its PCM stream here. An explicit
-            # input_topic still takes precedence for other producers.
-            self._input_topic = "/perception/tts"
         executor.add_node(self._node.node)
 
     def get_tool(self):
-        input_topic = getattr(self, "_input_topic", "/perception/tts")
+        input_topic = getattr(self, "_input_topic", None)
+        topic_in = ([{"topic": input_topic, "format": "audio/pcm-16k"}]
+                    if input_topic else [{"format": "audio/pcm-16k"}])
         return {"name": "speaker", "type": "actuator", "multiInstance": False,
-                "description": f"As2W speaker: subscribes to PCM 16kHz/16bit/mono AudioChunk stream. Default input topic: {input_topic}",
+                "description": "As2W speaker: subscribes to an explicitly connected PCM 16kHz/16bit/mono AudioChunk stream; it has no default input topic.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "info", "get_volume", "set_volume"]},
-                    "input_topic": {"type": "string", "description": f"Optional ROS2 AudioChunk topic; defaults to {input_topic}"},
+                    "input_topic": {"type": "string", "description": "ROS2 AudioChunk topic to subscribe for playback; required by start."},
                     "volume": {"type": "integer", "minimum": 0, "maximum": 100}},
                     "required": ["action"],
                     "x-action-params": {
-                    "start": {"params": [], "description": "Start playback on the configured AudioChunk topic; input_topic may override it."},
+                    "start": {"params": ["input_topic"], "description": "Start playback on the explicitly connected AudioChunk topic."},
                     "stop": {"params": [], "description": "Stop playback and clear buffered audio."},
                     "get_volume": {"params": [], "description": "Read the current volume."},
                     "set_volume": {"params": ["volume"], "description": "Set volume from 0 to 100."}}},
-                "topic_in": [{"topic": input_topic, "format": "audio/pcm-16k"}]}
+                "topic_in": topic_in}
 
     def start(self):
-        # Speaker is a stream actuator: subscribing at bundle startup makes
-        # the declared topic live without requiring a separate start call.
-        self._node.start(self._input_topic)
+        # The canvas supplies the upstream topic when playback is started.
+        # Do not subscribe to a hard-coded topic at bundle startup.
+        return None
 
     def stop(self):
         self._node.stop()
 
     def dispatch(self, action, args):
         if action in ("start", "play", "speaker"):
-            topic = args.get("input_topic") or args.get("topic_in") or getattr(self, "_input_topic", "/perception/tts")
+            topic = args.get("input_topic") or args.get("topic_in") or getattr(self, "_input_topic", None)
             if isinstance(topic, dict):
                 topic = topic.get("topic")
             elif isinstance(topic, (list, tuple)):
                 topic = topic[0] if topic else None
             if not topic:
-                topic = getattr(self, "_input_topic", "/perception/tts")
+                return {"state": self._node.state, "accepted": False,
+                        "error": "Missing input_topic",
+                        "reason": "Speaker playback requires an explicitly connected AudioChunk topic",
+                        "suggested_actions": ["start with input_topic"]}
             try:
                 started_topic = self._node.start(topic)
             except RuntimeError as exc:

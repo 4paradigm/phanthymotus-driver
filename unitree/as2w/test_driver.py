@@ -354,18 +354,17 @@ class TestDriverContracts(unittest.TestCase):
         speaker._input_topic = "/test/speaker/audio"
         schema = speaker.get_tool()["inputSchema"]
         self.assertEqual([], schema["x-action-params"]["get_volume"]["params"])
-        self.assertEqual([], schema["x-action-params"]["start"]["params"])
+        self.assertEqual(["input_topic"], schema["x-action-params"]["start"]["params"])
         self.assertEqual("/test/speaker/audio", speaker.get_tool()["topic_in"][0]["topic"])
         self.assertNotIn("x-action-params", speaker.get_tool())
 
-    def test_speaker_start_uses_default_topic_when_input_is_omitted(self):
+    def test_speaker_start_requires_an_explicit_input_topic(self):
         speaker = self.device.SpeakerPlugin.__new__(self.device.SpeakerPlugin)
-        speaker._input_topic = "/test/speaker/audio"
         speaker._node = types.SimpleNamespace(
             start=lambda topic: topic, state="idle")
         result = speaker.dispatch("start", {})
-        self.assertEqual("/test/speaker/audio", result["topic"])
-        self.assertEqual("/test/speaker/audio", result["input_topic"])
+        self.assertFalse(result["accepted"])
+        self.assertEqual("Missing input_topic", result["error"])
 
     def test_state_callbacks_keep_only_the_newest_sample(self):
         node = self.device._StateNode.__new__(self.device._StateNode)

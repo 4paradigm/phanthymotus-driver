@@ -68,16 +68,14 @@ the upstream Unitree SDK example `example/a2/audio/a2_audio_client_example.cpp`;
 that example also subscribes to `rt/audio_msg` for ASR text. The AS2
 `AudioClient` exposes playback, TTS, volume, and LED APIs, but not a raw capture
 RPC, so the multicast receiver is the appropriate robot-body input path. The `speaker`
-card subscribes to `/perception/tts` by default in the AS2W deployment;
-callers may provide an optional `input_topic` to use another `AudioChunk` stream. It streams bounded
+card has no default input topic: `speaker start` must provide the connected
+`input_topic`; callers may use any `AudioChunk` stream. It streams bounded
 PCM blocks through the AS2 `voice` service and exposes volume get/set actions.
 Audio service availability depends on the AS2 firmware configuration.
 The multicast membership is bound to the same selected robot interface as
-Unitree DDS; it does not use the host default route. The speaker subscribes to
-its default topic at bundle startup, while `speaker start` can still select a
-different `AudioChunk` topic. Playback primes the AS2 voice stream with a
-short silent frame so the first real speech block is not consumed during
-firmware stream initialization.
+Unitree DDS; it does not use the host default route. The speaker only
+subscribes after the canvas supplies an explicit `input_topic`; it never
+subscribes to a hard-coded TTS topic at bundle startup.
 
 The `camera_rgb` card polls the verified AS2 `videohub.GetImageSample()` service
 and publishes JPEG `sensor_msgs/CompressedImage` frames to
