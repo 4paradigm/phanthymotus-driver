@@ -2,8 +2,8 @@
 
 > 一张"卡片" = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 的卡片清单以 `driver.yaml` 和下表为准。
-> 状态卡位于 `sensors.py`，控制卡位于 `controllers.py`，外设和视觉卡分别位于 `ext_devices.py`、`camera.py`。
+> 本 bundle 当前发布 **24 张卡**：11 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 3 张独立视觉卡。
+> **4 个聚合文件**：`sensors.py`（11 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（RGB/depth/pointcloud 三张卡），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
@@ -21,8 +21,6 @@
 |---|---|---|
 | `loco_state` | 运动状态 | `/{ns}/loco/state`：mode / gait / velocity_body_mps / yaw_speed_rad_s / body_height_m / position_m（里程计，漂移） |
 | `battery` | 电量（BMS） | `/{ns}/state/battery`：soc_percent / current_ma / cycle_count / temps / cell_voltage_mv |
-| `battery_power` | 电池功率、本次运行累计电量、粗略续航预测 | `/{ns}/state/battery_power`：voltage_v / current_a / power_w / direction / discharged_since_start_wh / charged_since_start_wh / covered_duration_s / remaining_runtime_minutes |
-| `joint_power` | 12 关节估计机械功率 | `/{ns}/state/joint_power`：各关节 estimated_torque_nm × angular_speed_rad_s → mechanical_power_w；并给出正/负功率汇总，**不等于电机电功率** |
 | `imu` | IMU | `/{ns}/state/imu`：四元数 / 角速度 / 加速度 / 欧拉角 / 温度 |
 | `feet` | 足端 | `/{ns}/state/feet`：足底力[4] + 高层时足端相对机身位置/速度 |
 | `fall_alarm` | 跌倒/侧翻告警 | `/{ns}/state/fall_alarm`：IMU roll/pitch → ok/tilted/fallen（阈值可配） |
@@ -35,12 +33,6 @@
 | `camera_rgb` | RGB 去畸变图像（5 机位·multiInstance） | `start` 才连对应 Nano → CompressedImage；`stop` 断开释放相机 |
 | `camera_depth` | 彩色深度图（5 机位·multiInstance） | `start` 才连对应 Nano → CompressedImage；`stop` 断开释放相机 |
 | `camera_pointcloud` | XYZ 点云与 JPEG 俯视预览（5 机位·multiInstance） | `start` 才连对应 Nano → PointCloud2；`stop` 断开释放相机 |
-
-`battery_power` 用 10 节有效单体电压之和与 BMS 电流绝对值估算功率。BMS 状态为放电时累计 `discharged_since_start_wh`，充电时累计 `charged_since_start_wh`；其他状态不累计。累计范围是**本次驱动进程运行期间**，重启清零；断流、无效电压或两次有效样本间隔超过 2.5 秒时跳过缺失区间。`covered_duration_s` 只统计实际纳入积分的时间，便于判断累计值覆盖了多少运行时间。电流方向和单体电压需要在 Go1 真机上校核，当前尚未实测。
-
-该卡在驱动启动时开始采样；MCP `stop` 会停止采样和发布，保留已累计电量，并清除连续采样及 SOC 观察历史。`start` 重新启动采样；暂停区间不计入电量或续航预测。停止时 `info` 返回 `state: idle`、`available: false`，不会继续展示停止前的瞬时功率。
-
-`remaining_runtime_minutes` 是按连续放电期间 BMS 的 SOC 下降速度外推的粗略剩余时间，不依赖未经核实的电池额定容量。至少连续观测 60 秒且 SOC 下降 3 个百分点后才给出数值；此前为 `null`，原因见 `runtime_estimate_reason`。充电、数据断流、SOC 无效或回升时重新开始观察。负载变化、电池老化和 BMS SOC 误差会影响预测，不能当作保证的续航时间；真机上尚未校准。
 
 ### 控制卡（actuator，下发 `HighCmd` / 外设动作；须真机验证量程+安全后上架）
 
@@ -88,7 +80,7 @@ Nano 板 (.13/.14/.15)              Pi 驱动容器 (.161)
 
 > **新增一张卡**：若属于传感类，在 `sensors.py` 末尾追加 `Plugin` + `make_<卡名>`；
 > 控制类加到 `controllers.py`；外部设备加到 `ext_devices.py`。
-> 然后在 `config.yaml` 打开它，并在 `main.py` 的 `Go1Bundle.__init__` 中装配，同时更新 `driver.yaml` 和 Dockerfile。
+> 然后在 `config.yaml` 打开它。不用改 `main.py`。
 
 ## 接口约定（与平台其它驱动一致）
 
