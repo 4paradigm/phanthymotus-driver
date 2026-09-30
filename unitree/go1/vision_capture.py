@@ -430,9 +430,12 @@ class VisionCapturePlugin:
                         "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", str(VIDEO_FPS), "-i", "pipe:0",
                         "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
                         "-f", "mp4", str(temporary_path),
-                    ], stdin=frames_input, stderr=subprocess.PIPE)
+                    ], stdin=frames_input, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                     with camera._CAMERA_LOCK:
                         self._encoder = process
+                        # stop 可能在 Popen 返回前已取消；此时直接进入 finally 清理子进程。
+                        if cancel.is_set():
+                            raise InterruptedError("video recording cancelled")
 
                     def drain_stderr():
                         while chunk := process.stderr.read(4096):
@@ -447,13 +450,15 @@ class VisionCapturePlugin:
                     raise RuntimeError("ffmpeg error output did not close")
                 if process.returncode != 0 or not temporary_path.is_file() or temporary_path.stat().st_size == 0:
                     raise RuntimeError(stderr_tail.decode("utf-8", "replace") or "ffmpeg failed")
-                if cancel.is_set():
-                    raise InterruptedError("video recording cancelled")
                 # 录像结束后才公开 MP4，避免画布看到尚未写好索引的文件。
                 with temporary_path.open("rb+") as output:
                     os.fsync(output.fileno())
-                temporary_path.replace(path)
-                published = True
+                with camera._CAMERA_LOCK:
+                    # 与 stop 的取消信号互斥，避免检查后仍发布已取消的录像。
+                    if cancel.is_set():
+                        raise InterruptedError("video recording cancelled")
+                    temporary_path.replace(path)
+                    published = True
                 file_ready_at = datetime.now().astimezone()
                 return {"ok": True, "position": position, "media_type": "video",
                         "file_path": str(path), "filename": path.name,

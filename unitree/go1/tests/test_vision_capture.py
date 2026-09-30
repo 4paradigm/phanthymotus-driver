@@ -562,7 +562,8 @@ def test_record_video_drains_encoder_errors_while_feeding_frames(tmp_path, monke
         sender.join(3)
 
 
-def test_stop_unblocks_encoder_finalization_and_reports_cancel(tmp_path, monkeypatch, completions):
+@pytest.mark.parametrize("pause_launch", [False, True])
+def test_stop_unblocks_encoder_finalization_and_reports_cancel(tmp_path, monkeypatch, completions, pause_launch):
     import sys
     import time
 
@@ -572,11 +573,15 @@ def test_stop_unblocks_encoder_finalization_and_reports_cancel(tmp_path, monkeyp
     real_popen = subprocess.Popen
     processes = []
     launched = threading.Event()
+    release_launch = threading.Event()
 
     def launch(args, **kwargs):
+        assert kwargs["stdout"] == subprocess.DEVNULL
         process = real_popen([sys.executable, str(encoder)], **kwargs)
         processes.append(process)
         launched.set()
+        if pause_launch:
+            assert release_launch.wait(4)
         return process
 
     monkeypatch.setattr(snapshot.subprocess, "Popen", launch)
@@ -612,22 +617,115 @@ def test_stop_unblocks_encoder_finalization_and_reports_cancel(tmp_path, monkeyp
         accepted = card.dispatch("record_video", {"duration_s": 1})
         assert launched.wait(3)
         time.sleep(0.1)
+        joining = threading.Event()
+        original_join = card._recording_thread.join
+
+        def join_recording(*args, **kwargs):
+            joining.set()
+            return original_join(*args, **kwargs)
+
+        monkeypatch.setattr(card._recording_thread, "join", join_recording)
         stopper = threading.Thread(target=card.stop, daemon=True)
         stopper.start()
+        if pause_launch:
+            assert joining.wait(2)
+            release_launch.set()
         terminal = completions.get(timeout=4)
         assert terminal["action_id"] == accepted["action_id"]
         assert terminal["result"]["code"] == "RECORD_CANCELLED"
         assert terminal["status"] == "cancelled"
         assert card.dispatch("info", {})["last_recording"]["status"] == "cancelled"
         assert not Path(accepted["file_path"]).exists()
+        assert list(tmp_path.rglob("*.mp4")) == []
         assert list(tmp_path.rglob("*.mjpeg")) == []
+        assert all(process.poll() is not None for process in processes)
+        stopper.join(3)
+        assert not stopper.is_alive()
     finally:
+        release_launch.set()
         for process in processes:
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=3)
         if stopper is not None:
             stopper.join(3)
+        sender.join(3)
+
+
+def test_stop_before_mp4_publish_reports_cancel_without_file(tmp_path, monkeypatch, completions):
+    import io
+    import time
+
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
+
+    class Encoder:
+        stdin = None
+
+        def __init__(self, args, **kwargs):
+            self.path = Path(args[-1])
+            self.stderr = io.BytesIO()
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.path.write_bytes(b"mp4")
+            return 0
+
+    monkeypatch.setattr(snapshot.subprocess, "Popen", Encoder)
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def send_frames():
+        try:
+            connection, _ = server.accept()
+            with connection:
+                packet = struct.pack(">I", 8) + b"\xff\xd8data\xff\xd9"
+                for _ in range(40):
+                    try:
+                        connection.sendall(packet)
+                    except OSError:
+                        break
+                    time.sleep(0.05)
+        finally:
+            server.close()
+
+    sender = threading.Thread(target=send_frames, daemon=True)
+    sender.start()
+    card = snapshot.VisionCapturePlugin({
+        "output_dir": str(tmp_path),
+        "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
+    })
+    syncing = threading.Event()
+    release_sync = threading.Event()
+    real_fsync = snapshot.os.fsync
+
+    def pause_sync(fd):
+        syncing.set()
+        assert release_sync.wait(4)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(snapshot.os, "fsync", pause_sync)
+    try:
+        accepted = card.dispatch("record_video", {"duration_s": 1})
+        assert syncing.wait(3)
+        stopper = threading.Thread(target=card.stop, daemon=True)
+        stopper.start()
+        assert card._recording.wait(2)
+        release_sync.set()
+        terminal = completions.get(timeout=3)
+        assert terminal["status"] == "cancelled"
+        assert terminal["result"]["code"] == "RECORD_CANCELLED"
+        assert not Path(accepted["file_path"]).exists()
+        assert list(tmp_path.rglob("*.mp4")) == []
+        stopper.join(3)
+        assert not stopper.is_alive()
+    finally:
+        release_sync.set()
         sender.join(3)
 
 
