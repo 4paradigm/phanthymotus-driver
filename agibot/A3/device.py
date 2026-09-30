@@ -940,7 +940,10 @@ class JointsPlugin:
                 "group": {"type": "string", "enum": list(self.GROUPS),
                           "description": "关节组：arm 双臂 14 关节 / hand 手指 / neck 头部"},
             },
-        })
+        }, topic_out=[
+            {"topic": self.streams[key]["topic"], "format": self.streams[key]["format"]}
+            for key, _ in self.GROUPS.values()
+        ])
 
     def start(self):
         pass
@@ -981,7 +984,10 @@ class ImuPlugin:
         return tool("imu", "sensor", "骨盆+躯干 IMU 数据（pelvis/torso 最新快照）", {
             "type": "object",
             "properties": {},
-        })
+        }, topic_out=[
+            {"topic": self.nodes.streams[key]["topic"], "format": self.nodes.streams[key]["format"]}
+            for key in ("imu_pelvis", "imu_torso")
+        ])
 
     def start(self):
         pass
@@ -1031,7 +1037,10 @@ class CameraPlugin:
                 "stream": {"type": "string", "enum": self._names(),
                            "description": "相机流 key（config.yaml plugins.camera.streams 中的名称）"},
             },
-        })
+        }, topic_out=[
+            {"topic": stream["topic"], "format": stream["format"]}
+            for stream in self.streams.values()
+        ])
 
     def start(self):
         pass
