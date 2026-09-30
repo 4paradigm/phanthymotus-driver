@@ -462,7 +462,11 @@ class A3Nodes:
     # -- camera re-encoders (README_dev § Data Format: JPEG for RGB, zlib uint16
     #    for depth; both fall back to passthrough when numpy/cv2 are missing) --
 
-    _CV2_COLOR = {"rgb8": "COLOR_RGB2BGR", "bgr8": "COLOR_BGR2BGR"}
+    # rgb8 → BGR before JPEG encoding; bgr8 needs no conversion —
+    # cv2.imencode expects BGR natively and "COLOR_BGR2BGR" is not a real
+    # OpenCV constant (a getattr on it raises and the frame is silently
+    # dropped by the fallback below).
+    _CV2_COLOR = {"rgb8": "COLOR_RGB2BGR"}
 
     def _encode_rgb(self, msg):
         """sensor_msgs/Image (rgb8/bgr8) → CompressedImage jpeg (quality 50)."""
@@ -473,12 +477,14 @@ class A3Nodes:
             return None
         height, width = int(msg.height), int(msg.width)
         encoding = str(getattr(msg, "encoding", "rgb8"))
-        if encoding not in self._CV2_COLOR or not height or not width:
+        if encoding not in ("rgb8", "bgr8") or not height or not width:
             return None
         try:
             import cv2
             img = np.frombuffer(bytes(msg.data), np.uint8).reshape(height, width, 3)
-            img = cv2.cvtColor(img, getattr(cv2, self._CV2_COLOR[encoding]))
+            conversion = self._CV2_COLOR.get(encoding)
+            if conversion is not None:
+                img = cv2.cvtColor(img, getattr(cv2, conversion))
             ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 50])
             if not ok:
                 return None
@@ -929,7 +935,13 @@ class ImuPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running"}
+            # Agent Core 用 info 推断可订阅主题：两路 IMU 流都要列出。
+            return {"state": "running",
+                    "topic_out": [
+                        {"topic": self.nodes.streams[k]["topic"], "format": self.nodes.streams[k]["format"]}
+                        for k in ("imu_pelvis", "imu_torso") if k in self.nodes.streams],
+                    "streams": {k: self.nodes.streams[k]
+                                for k in ("imu_pelvis", "imu_torso") if k in self.nodes.streams}}
         return {
             "pelvis": self.nodes.snapshot("imu_pelvis"),
             "torso": self.nodes.snapshot("imu_torso"),
@@ -1005,6 +1017,10 @@ class LidarCloudPlugin:
             return {"state": "running"}
         if action == "stop":
             return {"state": "idle"}
+        if action == "info":
+            stream = self.nodes.streams["lidar_cloud"]
+            return {"state": "running",
+                    "topic_out": [{"topic": stream["topic"], "format": stream["format"]}]}
         return {"state": "running", **self.nodes.streams["lidar_cloud"]}
 
 
@@ -1033,8 +1049,14 @@ class BatteryPlugin:
         if action == "stop":
             return {"state": "idle"}
         if self.has_stream:
-            return {"state": "running", **self.nodes.streams["battery"]}
-        return {"state": "running"}
+            stream = self.nodes.streams["battery"]
+            return {"state": "running",
+                    "topic_out": [{"topic": stream["topic"], "format": stream["format"]}]}
+        # a3_aimdk wheel 缺失 → 无可解码的数据流：显式声明不可用，而不是
+        # 永远返回 running 的占位状态（Agent Core 会把 running 当作可订阅）。
+        return {"state": "unavailable",
+                "reason": "battery 数据流需要 a3_aimdk protobuf wheel；"
+                          "在机器人上挂载 /agibot-devkit 开发包后重启驱动"}
 
 
 class EstopPlugin:
@@ -1060,8 +1082,13 @@ class EstopPlugin:
         if action == "stop":
             return {"state": "idle"}
         if self.has_stream:
-            return {"state": "running", **self.nodes.streams["estop"]}
-        return {"state": "running"}
+            stream = self.nodes.streams["estop"]
+            return {"state": "running",
+                    "topic_out": [{"topic": stream["topic"], "format": stream["format"]}]}
+        # 同 battery：降级时显式 unavailable，而不是伪装成 running。
+        return {"state": "unavailable",
+                "reason": "estop 数据流需要 a3_aimdk protobuf wheel；"
+                          "在机器人上挂载 /agibot-devkit 开发包后重启驱动"}
 
 
 class AlertsPlugin:
@@ -1730,7 +1757,14 @@ class MotionPlayPlugin:
         pass
 
     def stop(self):
-        pass
+        # 插件生命周期卸载：与框架 stop 同款 —— 有动作在跑就先物理停掉并结算，
+        # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
+        if self._play_action_id is not None:
+            self._play_action_id = None
+            try:
+                self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True)
+            except Exception:
+                pass
 
     _PLAY_WORKER_TICK_S = 0.2
 
@@ -1797,7 +1831,16 @@ class MotionPlayPlugin:
             self._play_action_id = None
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_reset=True))
         if action == "stop":
-            return {"state": "idle"}
+            # Framework stop must physically halt the motion — a bare "idle"
+            # acknowledgement would leave the robot moving and the ACP worker
+            # free to POST a phantom completed event later. With nothing armed
+            # the call stays inert (canvas lifecycle toggles must not spam
+            # cancellation RPCs when no motion is running).
+            if self._play_action_id is None:
+                return {"state": "idle"}
+            self._play_action_id = None
+            response = jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_end=True))
+            return {"state": "stopped", "response": response}
         raise ValueError(f"motion_play: unknown action {action!r}")
 
 
@@ -1828,6 +1871,7 @@ class TtsPlugin:
     def __init__(self, nodes):
         self.nodes = nodes
         self._play_action_id = None
+        self._play_trace_id = None
 
     def get_tool(self):
         schema = action_schema(self.ACTIONS, {
@@ -1855,7 +1899,14 @@ class TtsPlugin:
         pass
 
     def stop(self):
-        pass
+        # 插件生命周期卸载：与框架 stop 同款 —— 有播报在跑就先物理打断并结算，
+        # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
+        if self._play_action_id is not None:
+            self._play_action_id = None
+            try:
+                self.nodes.rpc.stop_tts_trace_id(self._play_trace_id or "")
+            except Exception:
+                pass
 
     def _audio_state(self, response):
         """GetAudioStatus response → normalized play state int, or None.
@@ -1921,6 +1972,9 @@ class TtsPlugin:
     def _arm_completion(self, action, trace_id, detail):
         action_id = f"tts_{action}_{uuid4().hex[:8]}"
         self._play_action_id = action_id
+        # 记住当前 trace_id：框架 stop 打断当前播报时要按它调用
+        # StopTTSTraceId，而 stop 入参里并不会带 trace_id。
+        self._play_trace_id = trace_id
         threading.Thread(target=self._play_worker,
                          args=(action_id, trace_id, action, detail),
                          daemon=True).start()
@@ -1931,7 +1985,15 @@ class TtsPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
-            return {"state": "idle"}
+            # Framework stop must physically silence the audio — otherwise the
+            # voice keeps playing and the ACP worker reports completion later.
+            # With nothing armed the call stays inert (canvas lifecycle toggles
+            # must not spam StopTTSTraceId when nothing is playing).
+            if self._play_action_id is None:
+                return {"state": "idle"}
+            self._play_action_id = None
+            response = jsonable(self.nodes.rpc.stop_tts_trace_id(self._play_trace_id or ""))
+            return {"state": "stopped", "response": response}
         if action == "info":
             return {"state": "ready"}
         if action == "speak":
@@ -2209,6 +2271,7 @@ class SkillPlayPlugin:
         self.nodes = nodes
         self.has_stream = "skill_status" in nodes.streams
         self._play_action_id = None
+        self._last_session_id = None
 
     def get_tool(self):
         topic_out = None
@@ -2235,7 +2298,14 @@ class SkillPlayPlugin:
         pass
 
     def stop(self):
-        pass
+        # 插件生命周期卸载：与框架 stop 同款 —— 有技能在跑就先物理停止并结算，
+        # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
+        if self._play_action_id is not None:
+            self._play_action_id = None
+            try:
+                self.nodes.rpc.skill_package("Stop", "", self._last_session_id or "")
+            except Exception:
+                pass
 
     def _snapshot_terminal(self):
         """Probe the skill_status stream snapshot for a terminal state, defensively.
@@ -2286,7 +2356,15 @@ class SkillPlayPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
-            return {"state": "idle"}
+            # Framework stop must physically stop the skill session — otherwise
+            # the skill keeps running and the ACP worker reports completion later.
+            # With nothing armed the call stays inert (canvas lifecycle toggles
+            # must not spam SkillPilot Stop when no skill is playing).
+            if self._play_action_id is None:
+                return {"state": "idle"}
+            self._play_action_id = None
+            response = jsonable(self.nodes.rpc.skill_package("Stop", "", self._last_session_id or ""))
+            return {"state": "stopped", "response": response}
         if action == "info":
             return {"state": "ready", "has_stream": self.has_stream}
         if action == "list":
@@ -2302,6 +2380,9 @@ class SkillPlayPlugin:
             session_id = (response.get("data") or {}).get("session_id", "")
             action_id = f"skill_play_{uuid4().hex[:8]}"
             self._play_action_id = action_id
+            # 记住当前会话：框架 stop 要按它调用 SkillPilot Stop，
+            # 而 stop 入参里并不会带 session_id。
+            self._last_session_id = session_id
             threading.Thread(target=self._play_worker,
                              args=(action_id, session_id, path), daemon=True).start()
             return {"state": "playing", "action_id": action_id,
@@ -2414,7 +2495,14 @@ class ControlledSpatialPlugin:
         pass
 
     def stop(self):
-        pass
+        # 插件生命周期卸载：与框架 stop 同款 —— 有导航在跑就先物理取消并结算，
+        # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
+        if self._nav_action_id is not None:
+            self._nav_action_id = None
+            try:
+                self.nodes.rpc.navi("ActionCancel", {"task_id": self.last_task_id or 0})
+            except Exception:
+                pass
 
     def _task_id(self, args):
         value = args.get("task_id")
@@ -2498,7 +2586,16 @@ class ControlledSpatialPlugin:
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
-            return {"state": "idle"}
+            # Framework stop must physically cancel the running nav task —
+            # otherwise the robot keeps driving and the ACP worker reports
+            # completion when the task finally ends on its own. With nothing
+            # armed the call stays inert (canvas lifecycle toggles must not
+            # spam ActionCancel when no task is navigating).
+            if self._nav_action_id is None:
+                return {"state": "idle"}
+            self._nav_action_id = None
+            response = jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": self._task_id(args)}))
+            return {"state": "stopped", "response": response}
         if action == "info":
             return {"state": "ready", "last_task_id": self.last_task_id}
         # -- 建图 / 地图管理 --

@@ -387,6 +387,35 @@ class ToolInventoryTests(unittest.TestCase):
         self.assertIsInstance(out.data, bytes)
         self.assertGreater(len(out.data), 0)
 
+    def test_camera_bgr8_stream_encodes_to_jpeg_without_conversion(self):
+        # Regression for the COLOR_BGR2BGR bug: "COLOR_BGR2BGR" is not an OpenCV
+        # constant, so getattr raised and every bgr8 frame was silently dropped.
+        # BGR is what cv2.imencode expects natively — no conversion needed.
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, _ = build_bundle_plugins(config)
+        nodes = next(iter(plugins.values())).nodes
+
+        try:
+            import numpy as np  # noqa: F401
+            import cv2  # noqa: F401
+        except ImportError:
+            self.skipTest("numpy/cv2 not installed on this host")
+
+        subs = {topic: cb for topic, cb in nodes.robot.subscriptions}
+        rgb_cb = subs["/hal/head_left_fisheye_camera/rgb"]
+        rgb_pub = nodes.core.publishers[f"/{nodes.namespace}/agibot_a3/camera_head_left_fisheye"]
+
+        h, w = 4, 6
+        frame = bytes(bytearray(np.arange(h * w * 3, dtype=np.uint8)))
+        msg = FakeMsg()
+        msg.height, msg.width, msg.encoding, msg.data = h, w, "bgr8", frame
+        rgb_cb(msg)
+        self.assertEqual(len(rgb_pub.published), 1, "bgr8 frame must be encoded, not dropped")
+        out = rgb_pub.published[0]
+        self.assertEqual(out.format, "jpeg")
+        self.assertGreater(len(out.data), 0)
+
     def test_camera_depth_stream_zlib_compresses_uint16(self):
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = FULL_PLUGINS
@@ -931,6 +960,28 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_tts_framework_stop_interrupts_current_playback(self):
+        # 6th PR review: the framework "stop" action must physically silence the
+        # audio (StopTTSTraceId with the active trace_id) and settle the ACP
+        # waiter — not just acknowledge "idle" while the voice keeps playing.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            tts = find_plugin(self.plugins, "tts")
+            tts._POLL_INTERVAL_S = 0.2  # long enough to still be polling
+            self.transport.responses["TTSService/PlayTTS"] = {"trace_id": "t-active"}
+            self.transport.responses["TTSService/GetAudioStatus"] = {"state": 1}
+            tts.dispatch("speak", {"text": "长文本播报"})
+            tts.dispatch("stop", {})
+            (url, body), = self.transport.calls_to("TTSService", "StopTTSTraceId")
+            self.assertEqual(body["trace_id"], "t-active")
+            time.sleep(0.5)
+            self.assertEqual(captured, [])
+        finally:
+            device._acp_notify = original_notify
+
 
     def test_tts_play_media_posts_play_media_file(self):
         tts = find_plugin(self.plugins, "tts")
@@ -1096,6 +1147,27 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_motion_play_framework_stop_sends_cmd_end_and_settles(self):
+        # 6th PR review: the framework "stop" action must physically halt the
+        # motion (cmd_end) and invalidate the ACP waiter — not just return idle
+        # while the robot keeps moving and the worker POSTs a phantom completed.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            motion = find_plugin(self.plugins, "motion_play")
+            motion._PLAY_WORKER_TICK_S = 0.02
+            motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                     "duration_ms": 5000})
+            motion.dispatch("stop", {})
+            calls = self.transport.calls_to("MotionCommandService", "SendMotionCommand")
+            self.assertEqual(calls[-1][1]["cmd_end"], True)
+            time.sleep(0.5)
+            self.assertEqual(captured, [])
+        finally:
+            device._acp_notify = original_notify
+
     def test_arm_control_compliance_dispatch(self):
         arm = find_plugin(self.plugins, "arm_control")
         arm.dispatch("compliance_enable", {})
@@ -1197,6 +1269,27 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_controlled_spatial_framework_stop_cancels_active_task(self):
+        # 6th PR review: the framework "stop" action must physically cancel the
+        # running nav task (ActionCancel with the last task_id) and settle the
+        # ACP waiter — not just return idle while the robot keeps driving.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial._NAV_POLL_INTERVAL_S = 0.2  # long enough to still be polling
+            self.transport.responses["PncService"] = {"task_id": 11, "data": {"state": "running"}}
+            spatial.dispatch("navi_to_pose", {"map_id": 3, "x": 1.0, "y": 1.0, "angle": 0.0})
+            spatial.dispatch("stop", {})
+            (url, body), = self.transport.calls_to("PncService", "ActionCancel")
+            self.assertEqual(body["task_id"], 11)
+            time.sleep(0.5)
+            self.assertEqual(captured, [])
+        finally:
+            device._acp_notify = original_notify
+
     def test_controlled_spatial_relocalization_start(self):
         spatial = find_plugin(self.plugins, "controlled_spatial")
         spatial.dispatch("start_relocalization", {"map_dir": "/agibot/data/map/lobby"})
@@ -1281,6 +1374,29 @@ class RpcDispatchTests(unittest.TestCase):
             self.transport.responses["SkillPilotService"] = {"data": {"session_id": "s-2"}}
             skill.dispatch("play", {"path": "/agibot/skills/dance"})
             skill.dispatch("stop_play", {"session_id": "s-2"})
+            time.sleep(0.5)
+            self.assertEqual(captured, [])
+        finally:
+            device._acp_notify = original_notify
+
+    def test_skill_play_framework_stop_stops_last_session(self):
+        # 6th PR review: the framework "stop" action must physically stop the
+        # running skill (SkillPilot Stop with the remembered session_id) and
+        # settle the ACP waiter — stop args carry no session_id.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            skill = find_plugin(self.plugins, "skill_play")
+            skill._POLL_INTERVAL_S = 0.2  # long enough to still be polling
+            skill.nodes.values["skill_status"] = {"state": "running"}
+            self.transport.responses["SkillPilotService"] = {"data": {"session_id": "s-7"}}
+            skill.dispatch("play", {"path": "/agibot/skills/dance"})
+            skill.dispatch("stop", {})
+            calls = self.transport.calls_to("SkillPilotService", "SkillPackage")
+            self.assertEqual(calls[-1][1]["command"], "Stop")
+            self.assertEqual(calls[-1][1]["session_id"], "s-7")
             time.sleep(0.5)
             self.assertEqual(captured, [])
         finally:
@@ -1438,6 +1554,37 @@ class MirrorStreamTests(unittest.TestCase):
         result = imu.dispatch("query", {})
         self.assertEqual(result["pelvis"]["linear_acceleration"]["x"], 0.01)
         self.assertEqual(result["torso"]["linear_acceleration"]["x"], 0.01)
+
+    def test_imu_info_lists_both_topic_out_streams(self):
+        # 6th PR review: Agent Core treats info() as authoritative for topic
+        # inference — the imu card must advertise both mirrored streams.
+        imu = find_plugin(self.plugins, "imu")
+        result = imu.dispatch("info", {})
+        topics = {(entry["topic"], entry["format"]) for entry in result["topic_out"]}
+        self.assertEqual(topics, {
+            ("/test_ns/agibot_a3/imu_pelvis", "data/json"),
+            ("/test_ns/agibot_a3/imu_torso", "data/json"),
+        })
+        self.assertEqual(set(result["streams"]), {"imu_pelvis", "imu_torso"})
+
+    def test_lidar_info_lists_topic_out(self):
+        lidar = find_plugin(self.plugins, "lidar_cloud")
+        result = lidar.dispatch("info", {})
+        stream = self.nodes.streams["lidar_cloud"]
+        self.assertEqual(result["topic_out"],
+                         [{"topic": stream["topic"], "format": stream["format"]}])
+
+    def test_battery_and_estop_info_report_unavailable_without_wheel(self):
+        # 6th PR review: in degraded mode (no a3_aimdk wheel) the battery/estop
+        # cards must say "unavailable" instead of a perpetually-running
+        # placeholder that Agent Core would treat as a live stream.
+        for name in ("battery", "estop"):
+            plugin = find_plugin(self.plugins, name)
+            for action in ("query", "info"):
+                result = plugin.dispatch(action, {})
+                self.assertEqual(result["state"], "unavailable",
+                                 f"{name}.{action} must be explicit in degraded mode")
+                self.assertIn("a3_aimdk", result["reason"])
 
 
 class SpatialMapTests(unittest.TestCase):
