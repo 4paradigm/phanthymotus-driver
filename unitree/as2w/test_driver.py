@@ -453,6 +453,30 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(0, proxy.balance_stands)
         self.assertEqual([(0.2, 0, 0)], proxy.moves)
 
+    def test_loco_retries_move_after_as2_stand_up_rejects_first_velocity(self):
+        class _NeedsBalanceProxy(_Proxy):
+            def Move(self, *args):
+                self.moves.append(args)
+                return -1 if len(self.moves) == 1 else 0
+
+        proxy = _NeedsBalanceProxy()
+        proxy.state = "AI_STAND_UP"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        with patch.object(self.device, "_acp_notify") as notify:
+            result = plugin.dispatch("move", {
+                "vx": 0.2, "vy": 0, "vyaw": 0, "duration": 0.02})
+            self.assertTrue(result["accepted"])
+            self.assertEqual("balance_stand", result["transition"])
+            action_id = result["action_id"]
+            for _ in range(100):
+                if any(call.args[0] == action_id for call in notify.call_args_list):
+                    break
+                __import__("time").sleep(0.01)
+        self.assertEqual(1, proxy.balance_stands)
+        self.assertTrue(any(call.args[0] == action_id and call.args[1] == "completed"
+                             for call in notify.call_args_list))
+        plugin.stop()
+
     def test_as2_ai_free_walk_is_treated_as_moving(self):
         proxy = _Proxy()
         proxy.state = "AI_FREE_WALK"

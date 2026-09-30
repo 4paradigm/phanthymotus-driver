@@ -60,14 +60,16 @@ def _values(value):
 
 def _acp_notify(action_id, status, result):
     import os, ssl, urllib.request
+    endpoint = f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete"
     payload = json.dumps({"action_id": action_id, "status": status,
                           "result": result, "tool": "loco", "ts": time.time()}).encode()
     try:
-        request = urllib.request.Request(f"{os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')}/api/acp/complete",
+        request = urllib.request.Request(endpoint,
             data=payload, headers={"Content-Type": "application/json"}, method="POST")
-        urllib.request.urlopen(request, timeout=5, context=ssl._create_unverified_context())
+        with urllib.request.urlopen(request, timeout=5, context=ssl._create_unverified_context()) as response:
+            print(f"[loco] ACP complete action_id={action_id} status={status} http={response.status}", flush=True)
     except Exception as exc:
-        print(f"[loco] ACP callback failed for {action_id}: {exc}", flush=True)
+        print(f"[loco] ACP callback failed action_id={action_id} status={status} endpoint={endpoint} error={str(exc)[:180]}", flush=True)
 
 
 class _StateNode:
@@ -396,6 +398,26 @@ class LocoPlugin:
             ["get_state", "balance_stand", "stand_up", "stop_move"]))
         self._finish_transition(stop_event)
 
+    def _start_balance_move(self, state_name, vx, vy, yaw, duration):
+        """Start the hidden AS2 balance transition and return an ACP action."""
+        self._cancel_transition()
+        balance_ret = self.proxy.BalanceStand()
+        if balance_ret != 0:
+            return None, self._rpc_rejected(
+                "move", state_name, balance_ret,
+                "Move was refused and the automatic balance-stand transition was also refused",
+                ["get_state", "stand_up", "balance_stand", "recovery_stand"])
+        action_id = f"as2w_loco_{uuid4().hex[:8]}"
+        transition_stop = threading.Event()
+        with self._lock:
+            self._transition_stop = transition_stop
+        threading.Thread(target=self._transition_to_balance_and_move,
+                         args=(action_id, vx, vy, yaw, duration, transition_stop),
+                         daemon=True, name="as2w-loco-balance-move").start()
+        return action_id, {"ret": 0, "accepted": True, "status": "running",
+                           "action": "move", "transition": "balance_stand",
+                           "action_id": action_id, "current_state": state_name}
+
     def _run_move_after_transition(self, action_id, vx, vy, yaw, duration,
                                    stop_event, move_already_sent=False):
         if stop_event.is_set():
@@ -600,22 +622,8 @@ class LocoPlugin:
             if state_error:
                 return {**state_error, "action": "move"}
             if state_name in self._BALANCE_REQUIRED:
-                self._cancel_transition()
-                ret = self.proxy.BalanceStand()
-                if ret != 0:
-                    return self._rpc_rejected("move", state_name, ret,
-                        "The robot is not currently accepting the automatic balance-stand transition",
-                        ["get_state", "stand_up", "balance_stand", "recovery_stand"])
-                action_id = f"as2w_loco_{uuid4().hex[:8]}"
-                transition_stop = threading.Event()
-                with self._lock:
-                    self._transition_stop = transition_stop
-                threading.Thread(target=self._transition_to_balance_and_move,
-                    args=(action_id, vx, vy, yaw, duration, transition_stop), daemon=True,
-                    name="as2w-loco-balance-move").start()
-                return {"ret": 0, "accepted": True, "status": "running",
-                        "action": "move", "transition": "balance_stand",
-                        "action_id": action_id, "current_state": state_name}
+                _, result = self._start_balance_move(state_name, vx, vy, yaw, duration)
+                return result
             if state_name not in self._STANDING and not self._is_moving(state_name):
                 return self._move_error_for_state(state_name)
             self._cancel_transition()
@@ -640,6 +648,9 @@ class LocoPlugin:
                     with self._lock:
                         if self._stop is stop_event:
                             self._stop = None
+                    if state_name in self._STANDING:
+                        _, result = self._start_balance_move(state_name, vx, vy, yaw, duration)
+                        return result
                     return {"ret": ret, "rpc_ret": ret, "accepted": False,
                             "action": "move", "current_state": state_name,
                             "error": "Continuous Move was rejected",
@@ -655,6 +666,9 @@ class LocoPlugin:
             self._stop_continuous()
             ret = self.proxy.Move(vx, vy, yaw)
             if ret != 0:
+                if state_name in self._STANDING:
+                    _, result = self._start_balance_move(state_name, vx, vy, yaw, duration)
+                    return result
                 return {"ret": ret, "rpc_ret": ret, "accepted": False,
                         "action": "move", "current_state": state_name,
                         "error": "Timed Move was rejected",
