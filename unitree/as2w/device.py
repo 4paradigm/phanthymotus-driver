@@ -687,16 +687,12 @@ class LocoPlugin:
         if action == "stop_move":
             self._cancel_transition()
             self._stop_continuous()
-            ret = self.proxy.StopMove()
-            if ret != 0:
-                return {"ret": ret, "rpc_ret": ret, "accepted": False,
-                        "action": action, "error": "StopMove was rejected",
-                        "reason": "SportClient did not accept the stop command",
-                        "suggested_actions": ["get_state", "retry_stop"]}
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
-            threading.Thread(target=self._await_stopped,
+            # StopMove can block behind a firmware/RPC timeout.  It must not
+            # hold the MCP request open; ACP owns the asynchronous result.
+            threading.Thread(target=self._stop_move_worker,
                              args=(action_id,), daemon=True,
-                             name="as2w-loco-await-stopped").start()
+                             name="as2w-loco-stop-move").start()
             return {"ret": 0, "accepted": True, "status": "stopping",
                     "action": action, "action_id": action_id}
         methods = {"stand_up": ("StandUp", "STAND_UP"), "stand_down": ("StandDown", "STAND_DOWN"), "balance_stand": ("BalanceStand", "BALANCE_STAND"), "recovery_stand": ("RecoveryStand", "RECOVERY_STAND")}
@@ -826,6 +822,25 @@ class LocoPlugin:
             "error": "StopMove was accepted but robot still reports walking",
             "reason": "The controller has not left AI_FREE_WALK within 5 seconds",
             "suggested_actions": ["get_state", "retry_stop"]})
+
+    def _stop_move_worker(self, action_id):
+        try:
+            ret = self.proxy.StopMove()
+        except Exception as exc:
+            _acp_notify(action_id, "error", {
+                "action": "stop_move", "ret": 3104,
+                "error": "StopMove RPC failed",
+                "reason": f"The stop command could not reach the sport controller: {type(exc).__name__}: {str(exc)[:160]}",
+                "suggested_actions": ["get_state", "retry_stop"]})
+            return
+        if ret != 0:
+            _acp_notify(action_id, "error", {
+                "action": "stop_move", "ret": ret, "rpc_ret": ret,
+                "error": "StopMove was rejected",
+                "reason": "SportClient did not accept the stop command",
+                "suggested_actions": ["get_state", "retry_stop"]})
+            return
+        self._await_stopped(action_id)
 
 
 class SpecialActionPlugin:
