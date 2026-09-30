@@ -294,21 +294,22 @@ class LocoPlugin:
         self._stop = None
         self._transition_stop = None
 
-    _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING"}
-    # AS2 reports fsm_id=0/fsm_name=PASSIVE while the body is not yet in the
-    # balance controller.  It is ambiguous from the name alone whether the
-    # operator has just stood the robot up, so a move request starts the
-    # balance transition in the background and lets the firmware reject it if
-    # the posture is actually unsafe.
-    _BALANCE_REQUIRED = {"STAND_UP", "PASSIVE", "STAND", "STANDING"}
+    _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING",
+                 "AI_STAND_UP", "AI_BALANCE_STAND", "AI_RECOVERY_STAND"}
+    # AS2 reports AI_STAND_UP after StandUp. It is already a usable standing
+    # posture; calling BalanceStand here creates an unnecessary mode change.
+    _BALANCE_REQUIRED = {"PASSIVE", "STAND"}
     _MOVING = {"WALK", "WALKING", "RUN", "RUNNING", "MOVE", "MOVING",
-               "REGULAR_WALK", "REGULAR_RUN"}
+               "REGULAR_WALK", "REGULAR_RUN", "AI_FREE_WALK", "AI_WALK",
+               "AI_RUN"}
     _DOWN = {"STAND_DOWN", "DAMPING", "LYING", "FALL", "FALLEN",
-             "SQUAT"}
+             "SQUAT", "AI_STAND_DOWN", "AI_DAMPING", "AI_FALL",
+             "AI_FALLEN"}
 
     @classmethod
     def _is_moving(cls, state):
-        return state in cls._MOVING or "WALK" in state or "RUN" in state or "MOVE" in state
+        return (state in cls._MOVING or "WALK" in state or "RUN" in state or
+                "MOVE" in state or state.endswith("FREE_WALK"))
 
     def _read_state(self):
         result = self.proxy.GetState()
@@ -371,7 +372,7 @@ class LocoPlugin:
                 return
             name, state, error = self._read_state()
             last_state = name or last_state
-            if name == "BALANCE_STAND":
+            if name in {"BALANCE_STAND", "AI_BALANCE_STAND"}:
                 return self._run_move_after_transition(action_id, vx, vy, yaw, duration, stop_event)
             if error:
                 self._finish_transition(stop_event)

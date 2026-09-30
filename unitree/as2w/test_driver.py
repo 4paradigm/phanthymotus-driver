@@ -400,13 +400,41 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("BALANCE_STAND", result["current_state"])
         self.assertEqual([(0.2, 0, 0)], proxy.moves)
 
-    def test_loco_automatically_balances_before_move_from_stand_up(self):
+    def test_loco_moves_directly_from_as2_ai_stand_up_without_mode_switch(self):
         proxy = _Proxy()
-        proxy.state = "STAND_UP"
+        proxy.state = "AI_STAND_UP"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+        self.assertEqual(0, result["ret"])
+        self.assertEqual("AI_STAND_UP", result["current_state"])
+        self.assertEqual(0, proxy.balance_stands)
+        self.assertEqual([(0.2, 0, 0)], proxy.moves)
+
+    def test_as2_ai_free_walk_is_treated_as_moving(self):
+        proxy = _Proxy()
+        proxy.state = "AI_FREE_WALK"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("stand_down", {})
+        self.assertFalse(result["accepted"])
+        self.assertEqual("AI_FREE_WALK", result["current_state"])
+        self.assertIn("stop_move", result["suggested_actions"])
+
+    def test_as2_ai_down_states_are_treated_as_down(self):
+        proxy = _Proxy()
+        proxy.state = "AI_STAND_DOWN"
+        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        result = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
+        self.assertEqual(-1, result["ret"])
+        self.assertIn("stand_up", result["suggested_actions"])
+
+    def test_loco_automatically_balances_before_move_from_passive(self):
+        proxy = _Proxy()
+        proxy.state = "PASSIVE"
         plugin = self.device.LocoPlugin({}, "test", None, proxy)
         with patch.object(self.device, "_acp_notify"):
             result = plugin.dispatch("move", {"vx": 0.2, "vy": 0, "vyaw": 0})
             self.assertTrue(result["accepted"])
+            self.assertEqual("PASSIVE", result["current_state"])
             self.assertEqual("balance_stand", result["transition"])
             for _ in range(50):
                 if proxy.moves:
@@ -419,7 +447,7 @@ class TestDriverContracts(unittest.TestCase):
 
     def test_loco_continuous_transition_reports_cancelled_on_stop_move(self):
         proxy = _Proxy()
-        proxy.state = "STAND_UP"
+        proxy.state = "PASSIVE"
         plugin = self.device.LocoPlugin({}, "test", None, proxy)
         with patch.object(self.device, "_acp_notify") as notify:
             result = plugin.dispatch("move", {
@@ -449,7 +477,7 @@ class TestDriverContracts(unittest.TestCase):
                 return 0 if len(self.moves) == 1 else -7
 
         proxy = _FailingMoveProxy()
-        proxy.state = "STAND_UP"
+        proxy.state = "PASSIVE"
         plugin = self.device.LocoPlugin({}, "test", None, proxy)
         with patch.object(self.device, "_acp_notify") as notify:
             result = plugin.dispatch("move", {
