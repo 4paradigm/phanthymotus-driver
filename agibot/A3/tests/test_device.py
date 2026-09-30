@@ -180,6 +180,8 @@ FULL_PLUGINS = {
     "waist_control": {"enabled": True},
     "motion_play": {"enabled": True}, "tts": {"enabled": True},
     "audio": {"enabled": True, "max_volume": 70},
+    "mic": {"enabled": True}, "ext_mic": {"enabled": True},
+    "speaker": {"enabled": True},
     "interaction": {"enabled": True},
     "resources": {"enabled": True}, "face_play": {"enabled": True},
     "skill_play": {"enabled": True},

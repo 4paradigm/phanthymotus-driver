@@ -186,9 +186,9 @@ RESOURCE_TYPE_NAMES = {
 # to zlib-compressed uint16 (both per README_dev's recommended patterns; the raw
 # sensor_msgs/Image mirror would also cost 614KB/frame on the depth channel).
 CAMERA_TOPICS = {
-    "head_left_fisheye": ("/hal/head_left_fisheye_camera/rgb", "image/jpeg", "头部左鱼眼相机 RGB"),
-    "head_right_fisheye": ("/hal/head_right_fisheye_camera/rgb", "image/jpeg", "头部右鱼眼相机 RGB"),
-    "head_rear_fisheye": ("/hal/head_rear_fisheye_camera/rgb", "image/jpeg", "头部后鱼眼相机 RGB"),
+    "head_left_fisheye": ("/hal/head_front_left_fisheye_camera/image", "image/jpeg", "头部左鱼眼相机 RGB"),
+    "head_right_fisheye": ("/hal/head_front_right_fisheye_camera/image", "image/jpeg", "头部右鱼眼相机 RGB"),
+    "head_rear_fisheye": ("/hal/head_front_dual_fisheye_camera/image", "image/jpeg", "头部后鱼眼相机 RGB"),
     "chest_front_d457_rgb": ("/hal/chest_front_d457_camera/rgb", "image/jpeg", "胸前 D457 相机 RGB"),
     "chest_front_d457_depth": ("/hal/chest_front_d457_camera/depth", "image/depth-zlib", "胸前 D457 相机深度"),
     "waist_front_d415_rgb": ("/hal/waist_front_d415_camera/rgb", "image/jpeg", "腰前 D415 相机 RGB"),
@@ -354,6 +354,10 @@ class A3Nodes:
         from rclpy.qos import QoSProfile, QoSReliabilityPolicy
         from sensor_msgs.msg import Image, Imu, JointState, PointCloud2
         from std_msgs.msg import String
+        try:
+            from audio_msgs.msg import AudioCapture, AudioPlayback
+        except ImportError:
+            AudioCapture = AudioPlayback = None
 
         self.config = config
         self.namespace = namespace
@@ -369,6 +373,8 @@ class A3Nodes:
         self._String = String
         self._JointState = JointState
         self._Image = Image
+        self._AudioCapture = AudioCapture
+        self._AudioPlayback = AudioPlayback
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
 
@@ -442,6 +448,18 @@ class A3Nodes:
             mirror("skill_status", self._wrapper_type(ros2), "/skill/pilot/skill_status",
                    "data/json", json_filter=self._decode_skill_status)
 
+        self.audio_topics = {}
+        self.speaker_subscription = None
+        if AudioCapture is not None and AudioPlayback is not None:
+            for key, topic in (("mic", "/audiohal/audio/capture"),
+                               ("ext_mic", "/agent/audio/data/external")):
+                core_topic = f"/{namespace}/agibot_a3/{key}/audio"
+                pub = self.core.create_publisher(AudioCapture, core_topic, 5)
+                self.robot.create_subscription(
+                    AudioCapture, topic, lambda msg, pub=pub: pub.publish(msg), sensor_qos)
+                self.audio_topics[key] = {"robot_topic": topic, "topic": core_topic,
+                                          "format": "audio/pcm-16k"}
+
         # -- command publishers (robot domain) --
         # RosMsgWrapper needs the dev-kit's ros2_plugin_proto package; without it the
         # driver still starts (Dockerfile documents a degraded non-robot dev mode) —
@@ -449,9 +467,9 @@ class A3Nodes:
         self.wrapper_available = self._probe_wrapper_type() is not None
         if self.wrapper_available:
             self.locomotion_pub = self.robot.create_publisher(
-                self._wrapper_msg_type, "/motion/control/locomotion_velocity", 10)
+                self._wrapper_msg_type, "/motion/control/locomotion_velocity/pb_3Aaimdk_2Eprotocol_2EMotionControlLocomotionVelocityChannel", 10)
             self.waist_pub = self.robot.create_publisher(
-                self._wrapper_msg_type, "/motion/control/move_waist", 10)
+                self._wrapper_msg_type, "/motion/control/move_waist/pb_3Aaimdk_2Eprotocol_2EMotionControlMoveWaistChannel", 10)
             self.face_play_pub = self.robot.create_publisher(
                 self._wrapper_msg_type, "/skill/pilot/face/play", 10)
         else:
@@ -560,8 +578,8 @@ class A3Nodes:
         return wrapper
 
     _PB_TOPIC_MESSAGES = {
-        "/motion/control/locomotion_velocity": "LocomotionVelocity",
-        "/motion/control/move_waist": "MoveWaist",
+        "/motion/control/locomotion_velocity/pb_3Aaimdk_2Eprotocol_2EMotionControlLocomotionVelocityChannel": "LocomotionVelocity",
+        "/motion/control/move_waist/pb_3Aaimdk_2Eprotocol_2EMotionControlMoveWaistChannel": "MoveWaist",
         "/skill/pilot/face/play": "FacePlayInfo",
     }
 
@@ -669,6 +687,33 @@ class A3Nodes:
     def snapshot(self, key):
         with self.lock:
             return self.values.get(key, {})
+
+    def speaker_start(self, input_topic: str):
+        if self._AudioCapture is None or self._AudioPlayback is None:
+            raise RuntimeError("audio_msgs package is unavailable; source the AimDK ROS package")
+        self.speaker_stop()
+        self.speaker_pub = getattr(self, "speaker_pub", None) or self.robot.create_publisher(
+            self._AudioPlayback, "/audiohal/audio/playback", 10)
+
+        def callback(msg):
+            out = self._AudioPlayback()
+            out.stamps = msg.stamps
+            out.info = msg.info
+            out.data = msg.data
+            out.pkg_name = "phanthymotus"
+            out.token_id = "phanthymotus"
+            self.speaker_pub.publish(out)
+
+        self.speaker_subscription = self.core.create_subscription(
+            self._AudioCapture, input_topic, callback, 5)
+
+    def speaker_stop(self):
+        sub = getattr(self, "speaker_subscription", None)
+        if sub is not None:
+            destroy = getattr(self.core, "destroy_subscription", None)
+            if destroy:
+                destroy(sub)
+            self.speaker_subscription = None
 
     def urdf_text(self, variant=None):
         path = RESOURCE_DIR / "a3_ultra.urdf"
@@ -2311,6 +2356,64 @@ class AudioPlugin:
         raise ValueError(f"audio: unknown action {action!r}")
 
 
+class MicPlugin:
+    def __init__(self, nodes, key):
+        self.nodes = nodes
+        self.key = key
+
+    def get_tool(self):
+        stream = self.nodes.audio_topics.get(self.key)
+        if stream is None:
+            return tool(self.key, "sensor", "A3 音频输入（audio_msgs 不可用）")
+        return tool(self.key, "sensor", "A3 音频输入流（AudioCapture，16 kHz PCM）",
+                    {"type": "object", "properties": {}},
+                    topic_out=[{"topic": stream["topic"], "format": "audio/pcm-16k"}])
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        stream = self.nodes.audio_topics.get(self.key, {})
+        if action == "stop":
+            return {"state": "idle", **stream}
+        return {"state": "running", **stream}
+
+
+class SpeakerPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.topic = ""
+
+    def get_tool(self):
+        return tool("speaker", "actuator", "A3 扬声器（订阅 audio/pcm-16k 并输出到 AudioPlayback）",
+                    {"type": "object", "properties": {
+                        "input_topic": {"type": "string", "description": "输入音频 topic"},
+                    }}, topic_in=[{"format": "audio/pcm-16k"}])
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self.nodes.speaker_stop()
+
+    def dispatch(self, action, args):
+        if action in ("start", "play"):
+            self.topic = str(args.get("input_topic") or "")
+            if not self.topic:
+                return {"state": "ready", "message": "等待 input_topic"}
+            self.nodes.speaker_start(self.topic)
+            return {"state": "running", "topic": self.topic}
+        if action in ("stop", "interrupt"):
+            self.nodes.speaker_stop()
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running" if self.topic else "idle", "topic": self.topic}
+        raise ValueError(f"speaker: unknown action {action!r}")
+
+
 class InteractionPlugin:
     """interaction 卡片：语音交互开关、工作模式与拾音来源（原 mic_source 卡并入
     —— 同属 HDU 交互平面 AgentControlService/HalAudioService）。
@@ -2347,7 +2450,11 @@ class InteractionPlugin:
                     schema)
 
     def start(self):
-        pass
+        if self.nodes.config.get("plugins", {}).get("interaction", {}).get("full_takeover", True):
+            try:
+                self.nodes.rpc.set_voice_enable(False)
+            except Exception as exc:
+                print(f"[warn] failed to disable built-in interaction: {exc}", flush=True)
 
     def stop(self):
         pass
@@ -3307,6 +3414,12 @@ def build_plugins(config, namespace, ros2):
     if enabled("audio"):
         plugins["audio"] = AudioPlugin(nodes,
                                         max_volume=plugins_cfg.get("audio", {}).get("max_volume", VOLUME_HARD_MAX))
+    if enabled("mic"):
+        plugins["mic"] = MicPlugin(nodes, "mic")
+    if enabled("ext_mic"):
+        plugins["ext_mic"] = MicPlugin(nodes, "ext_mic")
+    if enabled("speaker"):
+        plugins["speaker"] = SpeakerPlugin(nodes)
     if enabled("interaction"):
         plugins["interaction"] = InteractionPlugin(nodes)
     if enabled("resources"):

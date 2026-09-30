@@ -34,6 +34,9 @@ cards:
   - { name: motion_play,     type: actuator }
   - { name: tts,             type: actuator }
   - { name: audio,           type: actuator }
+  - { name: mic,             type: sensor }
+  - { name: ext_mic,         type: sensor }
+  - { name: speaker,         type: actuator }
   - { name: interaction,     type: actuator }
   - { name: face_play,       type: actuator }
   - { name: skill_play,      type: actuator }

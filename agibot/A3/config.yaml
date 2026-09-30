@@ -72,8 +72,16 @@ plugins:
     enabled: true
     # Dev guide: volume above 70 risks hardware damage -- hard-clamped in device.py too.
     max_volume: 70
+  mic:
+    enabled: true
+  ext_mic:
+    enabled: true
+  speaker:
+    enabled: true
   interaction:
     enabled: true
+    # Full takeover: disable the robot's built-in voice interaction at startup.
+    full_takeover: true
   resources:
     enabled: true
   face_play:
