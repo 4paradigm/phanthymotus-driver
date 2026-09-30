@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import queue
 import time
+from collections import defaultdict
 
 
 def _type_name(msg_type):
@@ -22,7 +23,10 @@ class CoreBridge:
         # Keep enough room for bursty images/point clouds. Frames are lossy at
         # the bridge boundary; a full queue drops the newest frame rather than
         # blocking the robot-domain subscription callback.
-        self._queue = mp.get_context("spawn").Queue(maxsize=128)
+        self._queues = {
+            lane: mp.get_context("spawn").Queue(maxsize=32)
+            for lane in ("media", "pointcloud", "state", "audio")
+        }
         self._ctx = mp.get_context("spawn")
         self._profile = profile
         self._domain = domain
@@ -30,7 +34,7 @@ class CoreBridge:
         self._sent = 0
 
     def start(self):
-        self._proc = self._ctx.Process(target=_run, args=(self._queue, self._profile, self._domain),
+        self._proc = self._ctx.Process(target=_run, args=(self._queues, self._profile, self._domain),
                                        name="a3-core-domain-bridge", daemon=True)
         self._proc.start()
         print(f"[dds-bridge] started pid={self._proc.pid} domain={self._domain}", flush=True)
@@ -39,7 +43,9 @@ class CoreBridge:
         try:
             from rclpy.serialization import serialize_message
             type_name = _type_name(msg_type)
-            self._queue.put_nowait((topic, type_name, serialize_message(msg)))
+            lane = "pointcloud" if "lidar" in topic or "pointcloud" in topic else (
+                "media" if "camera" in topic else ("audio" if "audio" in topic or "mic" in topic else "state"))
+            self._queues[lane].put_nowait((topic, type_name, serialize_message(msg)))
             self._sent += 1
             if self._sent == 1 or self._sent % 1000 == 0:
                 print(f"[dds-bridge] queued={self._sent} topic={topic}", flush=True)
@@ -52,7 +58,11 @@ class CoreBridge:
         if self._proc is None:
             return
         try:
-            self._queue.put_nowait(None)
+            for q in self._queues.values():
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    pass
             self._proc.join(timeout=2)
         except Exception:
             pass
@@ -99,12 +109,23 @@ def _run(messages, profile, domain):
     # Sensor consumers request BEST_EFFORT. Publishing BEST_EFFORT avoids a
     # reliable writer retaining large camera/point-cloud samples indefinitely.
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+    lanes = tuple(messages)
+    stop_count = 0
     try:
         while rclpy.ok():
-            try:
-                item = messages.get(timeout=0.05)
-            except queue.Empty:
+            item = None
+            for lane in lanes:
+                try:
+                    item = messages[lane].get_nowait()
+                    break
+                except queue.Empty:
+                    continue
+            if item is None:
+                stop_count += 1
+                if stop_count >= len(lanes):
+                    break
                 rclpy.spin_once(node, timeout_sec=0.0)
+                time.sleep(0.001)
                 continue
             if item is None:
                 break

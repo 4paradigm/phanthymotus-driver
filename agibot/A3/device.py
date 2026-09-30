@@ -468,7 +468,7 @@ class A3Nodes:
         # -- camera streams, config-selected subset (re-encoded on the fly: RGB → JPEG,
         # depth → zlib uint16, per README_dev § Data Format) --
         camera_cfg = config.get("plugins", {}).get("camera", {})
-        selected = camera_cfg.get("streams") or ["head_left_fisheye", "chest_front_d457_rgb",
+        selected = camera_cfg.get("streams") or ["head_left_fisheye", "head_right_fisheye", "chest_front_d457_rgb",
                                                  "chest_front_d457_depth"]
         for key in selected:
             topic, fmt, _ = CAMERA_TOPICS[key]
@@ -3532,6 +3532,8 @@ def build_plugins(config, namespace, ros2):
     selected_cameras = set(camera_cfg.get("streams") or [])
     if (enabled("camera") or enabled("camera_head")) and "head_left_fisheye" in selected_cameras:
         plugins["camera_head"] = CameraStreamPlugin(nodes, "camera_head", "head_left_fisheye")
+    if (enabled("camera") or enabled("camera_head_right")) and "head_right_fisheye" in selected_cameras:
+        plugins["camera_head_right"] = CameraStreamPlugin(nodes, "camera_head_right", "head_right_fisheye")
     if (enabled("camera") or enabled("camera_chest_rgb")) and "chest_front_d457_rgb" in selected_cameras:
         plugins["camera_chest_rgb"] = CameraStreamPlugin(nodes, "camera_chest_rgb", "chest_front_d457_rgb")
     if (enabled("camera") or enabled("camera_chest_depth")) and "chest_front_d457_depth" in selected_cameras:

@@ -18,6 +18,7 @@ cards:
   - { name: joint_state,   type: sensor }
   - { name: imu,           type: sensor }
   - { name: camera_head,       type: sensor }
+  - { name: camera_head_right, type: sensor }
   - { name: camera_chest_rgb,  type: sensor }
   - { name: camera_chest_depth, type: sensor }
   - { name: lidar_cloud,   type: sensor }
