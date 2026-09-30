@@ -40,8 +40,10 @@ class CoreBridge:
             self._sent += 1
             if self._sent == 1 or self._sent % 1000 == 0:
                 print(f"[dds-bridge] queued={self._sent} topic={topic}", flush=True)
-        except (queue.Full, BrokenPipeError, OSError):
+        except queue.Full:
             pass
+        except Exception as exc:
+            print(f"[dds-bridge] enqueue failed topic={topic}: {exc}", flush=True)
 
     def stop(self):
         if self._proc is None:
