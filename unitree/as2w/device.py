@@ -1408,7 +1408,10 @@ class CameraPlugin:
         self._process = context.Process(
             target=_run_camera_process,
             args=(self._topic, self._fps, self._interface),
-            daemon=True, name="as2w-camera-rgb-process")
+            # The camera worker creates RpcProxy's own client workers. Python
+            # forbids daemon processes from creating children; lifecycle is
+            # still bounded by CameraPlugin.stop()'s terminate/join path.
+            daemon=False, name="as2w-camera-rgb-process")
         self._process.start()
 
     def get_tool(self):
