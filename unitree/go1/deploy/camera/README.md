@@ -17,24 +17,30 @@ camera, opens it only after the Pi connects, and exits on disconnect so systemd
 returns it to idle. A physical camera can therefore serve only one of RGB,
 depth, and point cloud at a time.
 
-`camera_snapshot` connects directly to the selected RGB port for one JPEG and
-then disconnects. In the canvas, call `camera_snapshot` with
-`{"action":"capture_photo","position":"front"}` (or chin/left/right/belly);
-`camera_rgb` does not need to be started. The call immediately returns
-`{ok: true, state: "capturing", action_id, position, file_path}`. `file_path` is
-the planned destination and may not exist yet. The background worker
-POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`; only
-`capture_photo` declares `x-completion` (45 seconds). Successful completion
-contains `file_path` under `/opt/phanthy-motus/data/camera_snapshot`, published
-only after the atomic write. `info.last_capture` also keeps the latest terminal
-`{action_id, status, result}`. ACP uses the `camera` physical resource. The
+`vision_capture` connects directly to the selected RGB port; `camera_rgb` does
+not need to be started. Use `{"action":"capture_photo","position":"front"}`
+for one JPEG or `{"action":"record_video","position":"front","duration_s":5}`
+for an MP4 (1–30 seconds, default 5). The call immediately returns an
+`action_id` and planned `file_path`; the file may not exist yet. The background
+worker POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`.
+Both actions declare `x-completion` (90 seconds). The terminal result contains
+the confirmed path. `info.last_capture` and `info.last_recording` keep the
+latest terminal `{action_id, status, result}`. ACP uses the `camera` physical resource. The
 callback is retried up to three times (3-second request timeout, 0.5/1-second
 backoff); after repeated failures the result remains in `info.last_capture`,
-the failure is logged, and Core's 45-second barrier timeout is the fallback.
+or `info.last_recording`; the failure is logged, and Core's barrier timeout is the fallback.
 Other Go1 actuators without `x-resource` may still wait on this pending action
 under the platform's conservative fallback. `stop` reports lifecycle state
-`idle` and a separate `capture_active` flag; an accepted capture still finishes
-and sends its ACP callback.
+`idle` and a separate `capture_active` flag; an accepted photo still finishes
+and sends its ACP callback, while an active video is cancelled and reported.
+
+`config.yaml` sets `vision_capture.output_dir` to
+`/opt/phanthy-motus/data/vision_capture`. Photos go to `photos/*.jpg`, videos
+to `videos/*.mp4`. `deploy/service.yml` bind-mounts `/opt/phanthy-motus/data`
+at the same path on the host, so these files persist after container restart.
+The previous `camera_snapshot` card name is replaced by `vision_capture`; update
+existing canvas calls. Previous JPEGs remain in
+`/opt/phanthy-motus/data/camera_snapshot` and are not moved automatically.
 
 **Deployment prerequisite:** run only one Go1 driver process/container per set
 of five Nano cameras. The in-process position registry is not shared across
@@ -43,29 +49,29 @@ enabling the snapshot card or a second deployment, stop any other Go1 driver
 instance targeting the same Nano IPs and ports. Duplicate deployments can
 interrupt an active stream or make a capture fail.
 
-Within one driver process, snapshot admission and stream startup share a lock:
-an active RGB/depth/pointcloud receiver or another snapshot on the same position
+Within one driver process, capture admission and stream startup share a lock:
+an active RGB/depth/pointcloud receiver or another capture on the same position
 returns `RESOURCE_BUSY` without an `action_id` or another TCP connection. A
-stream cannot start or switch onto a position occupied by a snapshot or another
+stream cannot start or switch onto a position occupied by a capture or another
 stream. Rejected hot switches preserve the old receiver. Stopping a stream
 retains its occupancy until the receiving thread exits. Other positions remain
 available.
 
-Snapshot endpoints use `camera.py`'s five default RGB endpoints. The bundle
+Capture endpoints use `camera.py`'s five default RGB endpoints. The bundle
 merges `positions` field by field, in increasing precedence:
-`camera_pointcloud` → `camera_depth` → `camera_rgb` → `camera_snapshot`.
+`camera_pointcloud` → `camera_depth` → `camera_rgb` → `vision_capture`.
 Configuration is inherited even if a stream card is disabled. Normally configure
-`camera_rgb.positions` once; `camera_snapshot.positions` is only an explicit
+`camera_rgb.positions` once; `vision_capture.positions` is only an explicit
 override for deployments that need it. For example, overriding just
-`camera_rgb.positions.left.board_ip` changes both RGB streaming and snapshots;
+`camera_rgb.positions.left.board_ip` changes both RGB streaming and captures;
 the existing `image_port` is retained. Keep depth/pointcloud mappings consistent
 for the same physical position.
 
-No new runtime packages, model downloads, or image decoders are installed.
-JPEG validation remains the frame-size limit and SOI/EOI markers, not a full
-decode. The necessary Dockerfile COPY adds only the small Python source file,
-so image-size impact is negligible; `driver.yaml` only advertises the actuator
-and does not add image contents. Docker image size has not been re-measured.
+The Dockerfile installs `ffmpeg` for MP4 encoding, so the image will grow by
+that package and its dependencies; no model/data artefacts or Python image
+decoder are added. JPEG validation remains the frame-size limit and SOI/EOI
+markers, not a full decode. `driver.yaml` is metadata only. Docker image size
+has not been measured locally.
 
 ## RGB path
 

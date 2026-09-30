@@ -3,8 +3,10 @@
 import importlib
 import json
 import queue
+import shutil
 import socket
 import struct
+import subprocess
 import threading
 import urllib.request
 from contextlib import nullcontext
@@ -37,7 +39,7 @@ def completed_capture(card, completions, position="front"):
     assert accepted["action_id"]
     terminal = completions.get(timeout=3)
     assert terminal["action_id"] == accepted["action_id"]
-    assert terminal["tool"] == "camera_snapshot"
+    assert terminal["tool"] == "vision_capture"
     assert terminal["status"] == ("completed" if terminal["result"]["ok"] else "error")
     assert completions.empty()
     assert card.dispatch("info", {})["last_capture"]["result"] == terminal["result"]
@@ -95,7 +97,7 @@ def test_capture_admission_shows_destination_before_photo_is_saved(tmp_path, mon
     try:
         assert entered.wait(1)
         path = Path(accepted["file_path"])
-        assert path.parent == tmp_path
+        assert path.parent == tmp_path / "photos"
         assert path.name.startswith("front_") and path.suffix == ".jpg"
         assert not path.exists()
     finally:
@@ -162,31 +164,175 @@ def test_snapshot_does_not_leave_a_partial_photo_when_publish_fails(tmp_path, mo
     monkeypatch.setattr(Path, "replace", fail_publish)
     card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
     assert completed_capture(card, completions)["code"] == "SAVE_FAILED"
-    assert list(tmp_path.iterdir()) == []
+    assert list((tmp_path / "photos").iterdir()) == []
 
 
 def test_go1_manifest_lists_snapshot_card():
-    driver = (Path(__file__).resolve().parents[1] / "driver.yaml").read_text(encoding="utf-8")
-    assert "name: camera_snapshot" in driver
+    go1_dir = Path(__file__).resolve().parents[1]
+    driver = (go1_dir / "driver.yaml").read_text(encoding="utf-8")
+    assert "name: vision_capture" in driver
+    config = (go1_dir / "config.yaml").read_text(encoding="utf-8")
+    service = (go1_dir / "deploy/service.yml").read_text(encoding="utf-8")
+    assert 'output_dir: "/opt/phanthy-motus/data/vision_capture"' in config
+    assert "/opt/phanthy-motus/data:/opt/phanthy-motus/data" in service
 
 
 def test_go1_bundle_exposes_snapshot_tool_without_rgb(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     main = importlib.import_module("unitree.go1.main")
     bundle = main.Go1Bundle({"plugins": {
-        "camera_snapshot": {"enabled": True},
+        "vision_capture": {"enabled": True},
     }}, "test_go1", None, None)
     tools = {tool["name"]: tool for tool in bundle.get_all_tools()}
-    assert tools["camera_snapshot"]["type"] == "actuator"
-    assert bundle.dispatch("camera_snapshot", {"action": "info"})["state"] == "ready"
+    assert tools["vision_capture"]["type"] == "actuator"
+    assert bundle.dispatch("vision_capture", {"action": "info"})["state"] == "ready"
 
 
 def test_snapshot_declares_completion_only_for_capture():
     snapshot = importlib.import_module("unitree.go1.camera_snapshot")
     schema = snapshot.CameraSnapshotPlugin({}).get_tool()["inputSchema"]
-    assert schema["x-completion"]["actions"] == ["capture_photo"]
+    assert schema["x-completion"]["actions"] == ["capture_photo", "record_video"]
     assert schema["x-completion"]["timeout"] >= 33
     assert schema["x-resource"] == "camera"
+
+
+def test_video_admission_completes_and_releases_position(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    entered, release = threading.Event(), threading.Event()
+
+    def record(position, path, duration, cancel):
+        assert position == "left" and duration == 2
+        entered.set()
+        assert release.wait(3)
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"video")
+        return {"ok": True, "media_type": "video", "file_path": str(path)}
+
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(card, "_record_and_save", record)
+    accepted = card.dispatch("record_video", {"position": "left", "duration_s": 2})
+    try:
+        assert entered.wait(1)
+        assert accepted["state"] == "recording"
+        assert Path(accepted["file_path"]).parent == tmp_path / "videos"
+        assert card.dispatch("capture_photo", {"position": "left"})["code"] == "RESOURCE_BUSY"
+    finally:
+        release.set()
+    terminal = completions.get(timeout=3)
+    assert terminal["action_id"] == accepted["action_id"]
+    assert terminal["tool"] == "vision_capture"
+    assert terminal["status"] == "completed"
+    assert terminal["result"]["file_path"] == accepted["file_path"]
+    assert card.dispatch("info", {})["last_recording"]["status"] == "completed"
+
+
+def test_video_failure_and_cancel_complete(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(card, "_record_and_save", lambda *args: {"ok": False, "code": "RECORD_FAILED"})
+    accepted = card.dispatch("record_video", {})
+    terminal = completions.get(timeout=3)
+    assert terminal["action_id"] == accepted["action_id"]
+    assert terminal["status"] == "error"
+    entered = threading.Event()
+
+    def cancel_record(position, path, duration, cancel):
+        entered.set()
+        assert cancel.wait(3)
+        return {"ok": False, "code": "RECORD_CANCELLED"}
+
+    monkeypatch.setattr(card, "_record_and_save", cancel_record)
+    accepted = card.dispatch("record_video", {})
+    assert entered.wait(1)
+    assert card.stop()["state"] == "idle"
+    terminal = completions.get(timeout=3)
+    assert terminal["action_id"] == accepted["action_id"]
+    assert terminal["result"]["code"] == "RECORD_CANCELLED"
+    assert not Path(accepted["file_path"]).exists()
+
+
+def test_video_rejects_invalid_duration_and_missing_encoder(tmp_path, monkeypatch):
+    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    for value in (0, 31, 1.5, True):
+        assert card.dispatch("record_video", {"duration_s": value})["code"] == "INVALID_ARGUMENT"
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: None)
+    assert card.dispatch("record_video", {})["code"] == "ENCODER_UNAVAILABLE"
+
+
+def test_video_rejects_active_same_position_stream(tmp_path, monkeypatch):
+    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    camera = importlib.import_module("unitree.go1.camera")
+    monkeypatch.setattr(camera, "_HAS_ROS2", False)
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
+    stream = camera.make_camera_rgb({}, "test", None, None)
+    stream._node = object()
+    release = threading.Event()
+    monkeypatch.setattr(stream._stream_cls, "_loop", lambda *args: release.wait(3))
+    card = snapshot.CameraSnapshotPlugin({"output_dir": str(tmp_path)})
+    assert stream.dispatch("start", {"position": "front"})["ok"]
+    try:
+        busy = card.dispatch("record_video", {"position": "front"})
+        assert busy["code"] == "RESOURCE_BUSY"
+        assert "action_id" not in busy
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        release.set()
+        stream._streams["default"]._thread.join(3)
+        stream.stop()
+
+
+def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completions):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg and ffprobe required for encoder integration test")
+    Image = pytest.importorskip("PIL.Image")
+    import io
+    import time
+
+    image = io.BytesIO()
+    Image.new("RGB", (32, 32), "red").save(image, format="JPEG")
+    jpeg = image.getvalue()
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def send_frames():
+        try:
+            connection, _ = server.accept()
+            with connection:
+                packet = struct.pack(">I", len(jpeg)) + jpeg
+                for _ in range(40):
+                    try:
+                        connection.sendall(packet)
+                    except OSError:
+                        break
+                    time.sleep(0.05)
+        finally:
+            server.close()
+
+    sender = threading.Thread(target=send_frames, daemon=True)
+    sender.start()
+    snapshot = importlib.import_module("unitree.go1.camera_snapshot")
+    card = snapshot.CameraSnapshotPlugin({
+        "output_dir": str(tmp_path),
+        "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
+    })
+    accepted = card.dispatch("record_video", {"duration_s": 1})
+    terminal = completions.get(timeout=6)
+    sender.join(3)
+    assert terminal["action_id"] == accepted["action_id"]
+    assert terminal["status"] == "completed", terminal["result"]
+    path = Path(terminal["result"]["file_path"])
+    assert path.is_file() and path.stat().st_size > 0
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=codec_name,width,height:format=duration", "-of", "json", str(path)],
+                           capture_output=True, text=True, check=True)
+    metadata = json.loads(probe.stdout)
+    assert metadata["streams"][0]["codec_name"] == "h264"
+    assert 0.5 <= float(metadata["format"]["duration"]) <= 1.5
 
 
 @pytest.mark.parametrize("error, code", [
@@ -302,9 +448,9 @@ def test_bundle_snapshot_inherits_camera_positions_even_when_stream_disabled(mon
     main = importlib.import_module("unitree.go1.main")
     bundle = main.Go1Bundle({"plugins": {
         source: {"enabled": False, "positions": {"left": {"board_ip": "10.0.0.8", "image_port": 9923}}},
-        "camera_snapshot": {"enabled": True, "positions": {"left": {"image_port": 9924}}},
+        "vision_capture": {"enabled": True, "positions": {"left": {"image_port": 9924}}},
     }}, "test_go1", None, None)
-    card = next(p for p in bundle._plugins if p.get_tool()["name"] == "camera_snapshot")
+    card = next(p for p in bundle._plugins if p.get_tool()["name"] == "vision_capture")
     assert card._endpoints["left"] == ("10.0.0.8", 9924)
 
 
@@ -478,10 +624,10 @@ def test_bundle_stream_and_snapshot_share_occupancy_and_reject_busy_hot_switch(t
     main = importlib.import_module("unitree.go1.main")
     bundle = main.Go1Bundle({"plugins": {
         "camera_rgb": {"enabled": True},
-        "camera_snapshot": {"enabled": True, "output_dir": str(tmp_path)},
+        "vision_capture": {"enabled": True, "output_dir": str(tmp_path)},
     }}, "test_go1", None, None)
     plugins = {p.get_tool()["name"]: p for p in bundle._plugins}
-    rgb, snapshot = plugins["camera_rgb"], plugins["camera_snapshot"]
+    rgb, snapshot = plugins["camera_rgb"], plugins["vision_capture"]
     camera = importlib.import_module("camera")
     monkeypatch.setattr(camera, "_HAS_ROS2", False)
     rgb._node = object()
@@ -497,8 +643,8 @@ def test_bundle_stream_and_snapshot_share_occupancy_and_reject_busy_hot_switch(t
     assert bundle.dispatch("camera_rgb", {"action": "start"})["ok"]
     stream = rgb._streams["default"]
     try:
-        assert bundle.dispatch("camera_snapshot", {"action": "capture_photo", "position": "left"})["code"] == "RESOURCE_BUSY"
-        accepted = bundle.dispatch("camera_snapshot", {"action": "capture_photo", "position": "right"})
+        assert bundle.dispatch("vision_capture", {"action": "capture_photo", "position": "left"})["code"] == "RESOURCE_BUSY"
+        accepted = bundle.dispatch("vision_capture", {"action": "capture_photo", "position": "right"})
         assert accepted["action_id"]
         result = bundle.dispatch("camera_rgb", {"action": "config", "position": "right"})
         assert result["code"] == "RESOURCE_BUSY"

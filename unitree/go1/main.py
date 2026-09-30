@@ -188,17 +188,17 @@ class Go1Bundle:
             self._plugins.append(camera.make_camera_rgb(pc["camera_rgb"], namespace, executor, client))
             print("[bundle] camera_rgb loaded")
 
-        if pc.get("camera_snapshot", {}).get("enabled", False):
+        if pc.get("vision_capture", {}).get("enabled", False):
             from camera_snapshot import CameraSnapshotPlugin
-            # 共用机位配置（即使推流卡停用）；RGB 优先，snapshot 仅显式覆盖所需字段。
-            snapshot_config = dict(pc["camera_snapshot"])
+            # 共用机位配置（即使推流卡停用）；RGB 优先，拍照/录像卡仅显式覆盖所需字段。
+            snapshot_config = dict(pc["vision_capture"])
             positions = {}
-            for name in ("camera_pointcloud", "camera_depth", "camera_rgb", "camera_snapshot"):
+            for name in ("camera_pointcloud", "camera_depth", "camera_rgb", "vision_capture"):
                 for position, endpoint in (pc.get(name, {}).get("positions") or {}).items():
                     positions.setdefault(position, {}).update(endpoint)
             snapshot_config["positions"] = positions
             self._plugins.append(CameraSnapshotPlugin(snapshot_config))
-            print("[bundle] camera_snapshot loaded")
+            print("[bundle] vision_capture loaded")
 
         if pc.get("camera_depth", {}).get("enabled", False):
             import camera

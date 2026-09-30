@@ -16,7 +16,7 @@ WORKDIR /work
 RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) -exec sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" {} + ; \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client && \
+        python3-pip python3-dev cmake build-essential git libmsgpack-dev sshpass openssh-client ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /work/requirements.txt
@@ -42,7 +42,7 @@ COPY sensors.py        /work/sensors.py
 COPY controllers.py    /work/controllers.py
 COPY ext_devices.py    /work/ext_devices.py
 COPY camera.py         /work/camera.py
-# 抓拍仅增加小型 Python 源文件，无新增运行依赖，镜像体积影响极小。
+# vision_capture 复用此模块；照片无额外依赖，录像使用上面安装的 ffmpeg。
 COPY camera_snapshot.py /work/camera_snapshot.py
 COPY config.yaml       /work/config.yaml
 COPY deploy/           /deploy/
