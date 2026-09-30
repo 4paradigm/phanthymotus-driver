@@ -1270,6 +1270,8 @@ class SwingTrajectoryPlugin:
                 self._last_sample = source_stamp if source_stamp is not None else now
             sample_time = source_stamp if source_stamp is not None else now
             self._last_status = "ok" if all(v is not None for v in world) else "world_pose_unavailable"
+            if same_snapshot:
+                return
             for i, name in enumerate(_SWING_FEET):
                 state = self._feet[name]
                 f = force[i]

@@ -39,23 +39,49 @@ def test_swing_lifecycle_both_frames_and_duplicate_rejection():
     plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 2}, "test", None, Client())
     t = time.monotonic()
     for force in (100, 100, 0, 0):
-        plugin.process_sample(sample(t, force=force), now=t)
+        snap = sample(t, force=force)
+        snap["received_monotonic_s"] = t
+        plugin.process_sample(snap, now=t)
         t += 0.05
     state = plugin._build()["feet"]["FR"]
     assert state["phase"] == "swing" and len(state["active"]) == 1
     assert state["active"][0]["body_xyz_m"] == [0.2, -0.1, -0.25]
     assert state["active"][0]["world_xyz_m"] == [1.2, 1.9, 0.25]
-    plugin.process_sample(sample(t - 0.05, force=0), now=t)
+    plugin.process_sample(snap, now=t)
     assert len(plugin._build()["feet"]["FR"]["active"]) == 1
-    plugin.process_sample(sample(t, force=0, foot={"x": 0.3, "y": -0.1, "z": -0.2}), now=t)
+    snap = sample(t, force=0, foot={"x": 0.3, "y": -0.1, "z": -0.2})
+    snap["received_monotonic_s"] = t
+    plugin.process_sample(snap, now=t)
     t += 0.05
     assert len(plugin._build()["feet"]["FR"]["active"]) == 2
     for force in (100, 100):
-        plugin.process_sample(sample(t, force=force), now=t)
+        snap = sample(t, force=force)
+        snap["received_monotonic_s"] = t
+        plugin.process_sample(snap, now=t)
         t += 0.05
     state = plugin._build()["feet"]["FR"]
     assert state["phase"] == "stance" and not state["active"]
     assert len(state["last_completed"]) == 3  # first contact-confirm frame is retained
+
+
+def test_duplicate_untimestamped_snapshot_cannot_confirm_swing_or_stance():
+    plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 2}, "test", None, Client())
+    t = time.monotonic()
+    first = sample(t, force=0)
+    plugin.process_sample(first, now=t)
+    for offset in (0.05, 0.1, 0.15):
+        plugin.process_sample(first, now=t + offset)
+    state = plugin._feet["FR"]
+    assert state["phase"] == "unknown"
+    assert state["candidate_count"] == 1
+    assert state["active"] == []
+    changed = sample(t, force=0, foot={"x": 0.21, "y": -0.1, "z": -0.25})
+    plugin.process_sample(changed, now=t + 0.2)
+    assert state["phase"] == "swing" and len(state["active"]) == 1
+    contact = sample(t, force=100)
+    plugin.process_sample(contact, now=t + 0.25)
+    plugin.process_sample(contact, now=t + 0.3)
+    assert state["phase"] == "swing" and state["candidate_count"] == 1
 
 
 def test_missing_world_pose_keeps_body_and_unchanged_gap_does_not_join_swings():
