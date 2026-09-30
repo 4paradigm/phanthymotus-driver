@@ -26,6 +26,25 @@ def load_config():
     return yaml.safe_load(open(os.environ.get("CONFIG_PATH", Path(__file__).with_name("config.yaml"))))
 
 
+def initialize_unitree_dds(candidates):
+    """Initialize Unitree DDS only on an explicitly selected candidate.
+
+    An empty candidate list is a deliberate safe failure: passing ``None`` to
+    ChannelFactoryInitialize would re-enable CycloneDDS auto-selection and can
+    put the body participant on a non-robot network.
+    """
+    for candidate in candidates:
+        try:
+            ChannelFactoryInitialize(0, candidate)
+            print(f"[as2w] Unitree DDS initialized on {candidate}", flush=True)
+            return True, candidate
+        except Exception as exc:
+            print(f"[as2w] DDS init failed on {candidate}: {exc}", flush=True)
+    if not candidates:
+        print("[as2w] No eligible wired robot interface found; refusing DDS auto-selection", flush=True)
+    return False, None
+
+
 class Bundle:
     def __init__(self, cfg, namespace, executor, proxy, interface, dds_ready=True):
         from device import (StatePlugin, LocoPlugin, SpecialActionPlugin,
@@ -187,17 +206,9 @@ def main():
     candidates = interface_candidates(
         requested_interface, configured_interface,
         str(cfg.get("robot_subnet") or "192.168.123.0/24"))
-    for candidate in candidates:
-        try:
-            ChannelFactoryInitialize(0, candidate or None)
-            dds_ready = True
-        except Exception as exc:
-            print(f"[as2w] DDS init failed on {candidate or '(auto)'}: {exc}", flush=True)
-            dds_ready = False
-        if dds_ready:
-            interface = candidate or "(auto)"
-            print(f"[as2w] Unitree DDS initialized on {interface or '(auto)'}", flush=True)
-            break
+    dds_ready, selected_interface = initialize_unitree_dds(candidates)
+    if dds_ready:
+        interface = selected_interface
     if not dds_ready:
         print("[as2w] WARNING: Unitree DDS unavailable; starting MCP in degraded mode", flush=True)
     namespace = re.sub(r"[^a-zA-Z0-9_]", "_", cfg.get("ros_namespace") or socket.gethostname())

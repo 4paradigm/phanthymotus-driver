@@ -48,4 +48,8 @@ def interface_candidates(requested="", configured="", robot_subnet="192.168.123.
                             ipaddress.ip_address(address) in network]
         if robot_candidates:
             candidates = robot_candidates
-    return sorted(candidates, key=lambda name: (not name.startswith("enx"), name)) or [""]
+    # Never return an empty sentinel here.  Passing ``None``/``""`` to
+    # ChannelFactoryInitialize lets CycloneDDS choose its own interface and
+    # can silently bind the robot participant to Wi-Fi.  The caller must keep
+    # the driver in degraded mode when no eligible wired adapter exists.
+    return sorted(candidates, key=lambda name: (not name.startswith("enx"), name))

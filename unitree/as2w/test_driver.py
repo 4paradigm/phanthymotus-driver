@@ -722,6 +722,19 @@ class TestDriverContracts(unittest.TestCase):
                  "eno1": "192.168.123.100", "enp2s0": "10.100.129.146"}[name]):
             self.assertEqual(["eno1"], network.interface_candidates("", ""))
 
+    def test_network_auto_detection_has_no_empty_wifi_fallback(self):
+        network = _load("as2w_network_no_wired_test", ROOT / "network.py")
+        with patch.object(network.socket, "if_nameindex", return_value=[
+                (1, "lo"), (2, "wlan0"), (3, "wlP1p1s0")]):
+            self.assertEqual([], network.interface_candidates("", ""))
+
+    def test_dds_initialization_refuses_empty_candidate_list(self):
+        source = (ROOT / "main.py").read_text()
+        self.assertIn("def initialize_unitree_dds(candidates):", source)
+        self.assertIn("if not candidates:", source)
+        self.assertIn("refusing DDS auto-selection", source)
+        self.assertIn("initialize_unitree_dds(candidates)", source)
+
     def test_empty_positional_interface_uses_environment_override(self):
         source = (ROOT / "main.py").read_text()
         self.assertIn('sys.argv[1].strip() if len(sys.argv) > 1', source)

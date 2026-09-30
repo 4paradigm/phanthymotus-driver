@@ -156,3 +156,29 @@ recovery, gives or removes joystick control, or enters/exits a side gait.
 `handstand` and `biped_stand` use `enter: true` to enter and `enter: false` to
 exit. These motions are posture- and firmware-dependent and require a clear
 safety area.
+
+## Review and validation notes
+
+The change scope includes the AS2W audio cards, RGB camera and LED cards,
+high-rate state and lidar publication, isolated sensor/RPC workers, robot
+interface selection, locomotion ACP completion reporting, and `body_height`
+validity metadata. It is not limited to catalog metadata.
+
+The no-hardware contract suite is run with
+`python3 -m unittest unitree/as2w/test_driver.py`; it covers card schemas,
+worker lifecycle behavior, audio/camera payload helpers, ACP contracts, and
+safe interface selection. On the target Orin host, a read-only listener bound
+to the robot adapter received the robot microphone multicast, while the RGB
+camera RPC timed out on the tested firmware. Speaker playback remains
+dependent on an `AudioChunk` producer and the firmware voice service; these
+are runtime limitations, not successful-stream assumptions.
+
+Lidar rendering uses CuPy/CUDA only when an existing runtime provides both a
+visible CUDA device and a usable CuPy installation. Otherwise it uses the
+dependency-free CPU path; this component does not add a CUDA or CuPy image
+dependency.
+
+Automatic interface discovery only considers active wired adapters and prefers
+the configured AS2 subnet (`192.168.123.0/24`). If none is available, DDS
+initialization is refused and MCP starts in degraded mode. An empty interface
+is never passed to CycloneDDS, preventing accidental Wi-Fi selection.
