@@ -35,7 +35,8 @@ The image installs the small CMake toolchain because the SDK's pinned
 build; the vendored CRC `.so` files are the official SDK's architecture-specific
 runtime dependencies and are required on both amd64 and aarch64.
 
-`duration=-1` starts a 10 Hz velocity command loop; `stop_move`, shutdown, and
+`duration=-1` starts a 10 Hz velocity command loop; negative `vx` means
+backward motion and is passed through unchanged. `stop_move`, shutdown, and
 any plugin stop path terminate that loop and issue `StopMove`. Velocity and
 attitude inputs are clamped before reaching the robot. Special actions should only
 be invoked with a clear area and appropriate operator approval.
@@ -47,9 +48,11 @@ the kinematic chain for the `joints` skeleton card, avoiding large binary
 assets in the repository. As2W publishes 12 active leg joints in `rt/lowstate`.
 The skeleton names use the canonical `*_joint` suffix and match the URDF joint
 names exactly. Its fixed-size motor array also contains four reserved zero
-slots. The driver publishes only the 12 active joints so the skeleton does not
-interpret reserved slots as foot pose data. The model retains the four continuous wheel-foot joints
-and the fixed JT128 sensor mount.
+slots. The driver publishes only the 12 active motors as raw joint state. The
+skeleton stream additionally publishes the four wheel-foot joints as
+`virtual: true` with zero position, because they are kinematic URDF joints
+rather than low-state motors; this lets the renderer traverse and display the
+calf-to-wheel links. The model retains the fixed JT128 sensor mount.
 
 `controlled_spatial` is a thin adapter for Unitree's documented `slam_operate`
 service: mapping, relocalization, and point-goal navigation. The latest AS2
@@ -73,7 +76,9 @@ Audio service availability depends on the AS2 firmware configuration.
 The multicast membership is bound to the same selected robot interface as
 Unitree DDS; it does not use the host default route. The speaker subscribes to
 its default topic at bundle startup, while `speaker start` can still select a
-different `AudioChunk` topic.
+different `AudioChunk` topic. Playback primes the AS2 voice stream with a
+short silent frame so the first real speech block is not consumed during
+firmware stream initialization.
 
 The `camera_rgb` card polls the verified AS2 `videohub.GetImageSample()` service
 and publishes JPEG `sensor_msgs/CompressedImage` frames to
@@ -139,8 +144,14 @@ Change scope and validation notes:
 
 Loco examples:
 
+`move.vx` is signed: positive is forward and negative is backward.
 `move.vyaw` is expressed in degrees per second by MCP (the driver converts it
 to radians per second at the Unitree SDK boundary).
+After `StopMove`, some AS2 firmware keeps `GetState().fsm_name` at
+`AI_FREE_WALK` even though the velocity command has stopped. The driver
+reports a completed ACP result with `state_stale=true` after the accepted
+`BalanceStand` normalization instead of falsely leaving the action running;
+the observed state label is still included in the result.
 `body_height` takes an explicit absolute target in meters, for example
 `{"action":"body_height","height":0.35}`. The public range is `0.17` to
 `0.35` m; `0.35` m represents the default high stand-up height. Unitree's

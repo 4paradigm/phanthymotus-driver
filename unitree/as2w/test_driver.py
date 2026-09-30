@@ -188,7 +188,10 @@ class TestDriverContracts(unittest.TestCase):
         node._on_low(types.SimpleNamespace(imu_state=imu, motor_state=motors))
         payload = __import__("json").loads(published[0])
         self.assertEqual({"joints", "imu_quat"}, set(payload))
-        self.assertEqual(12, len(payload["joints"]))
+        self.assertEqual(16, len(payload["joints"]))
+        self.assertEqual({"FR_foot_joint", "FL_foot_joint", "RR_foot_joint", "RL_foot_joint"},
+                         {item["name"] for item in payload["joints"][12:]})
+        self.assertTrue(all(item["virtual"] for item in payload["joints"][12:]))
         self.assertEqual([1, 0, 0, 0], payload["imu_quat"])
         self.assertEqual({"idx", "name", "q", "dq", "tau", "temperature"},
                          set(payload["joints"][0]))
@@ -232,7 +235,8 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("audio/pcm-16k", published[0].format)
 
     def test_speaker_streams_blocks_and_stops(self):
-        client = types.SimpleNamespace(Audio_PlayStream=lambda *args: (0, ""),
+        calls = []
+        client = types.SimpleNamespace(Audio_PlayStream=lambda *args: calls.append(args) or (0, ""),
                                        Audio_PlayStop=lambda *args: 0)
         node = self.device._SpeakerNode.__new__(self.device._SpeakerNode)
         node._client = client
@@ -241,6 +245,8 @@ class TestDriverContracts(unittest.TestCase):
         node.state = "ready"
         node._play_block(b"x" * self.device.SPEAKER_BLOCK_BYTES)
         self.assertEqual(1, node.blocks_sent)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(640, len(calls[0][2]))
         self.assertEqual(0, node._client.Audio_PlayStream("as2w_speaker", "0", b"x" * self.device.SPEAKER_BLOCK_BYTES)[0])
 
     def test_speaker_does_not_count_failed_play_stream(self):

@@ -205,6 +205,15 @@ class _StateNode:
                      "dq": s["dq"], "tau": s["tau"],
                      "temperature": s["temperature"]}
                     for s in states[:len(_AS2_JOINT_NAMES)]]
+        # The four wheel joints are kinematic joints, not low-state motors.
+        # The skeleton renderer still needs them to traverse the URDF from a
+        # calf link to its wheel; omitting them makes the lower leg disappear.
+        for index, name in enumerate(("FR_foot_joint", "FL_foot_joint",
+                                      "RR_foot_joint", "RL_foot_joint"),
+                                     start=len(skeleton)):
+            skeleton.append({"idx": index, "name": name, "q": 0.0,
+                             "dq": 0.0, "tau": 0.0, "temperature": [],
+                             "virtual": True})
         # Keep the established Go2/G1 sensor/skeleton contract.  The frontend
         # expects these two top-level fields and does not consume joint_count.
         self._publish(self.joints, {"joints": skeleton,
@@ -922,7 +931,7 @@ class LocoPlugin:
 
     def _await_stopped(self, action_id, completed_action="stop_move", completion_extra=None):
         """Leave the AS2 walking FSM before reporting an action terminal state."""
-        deadline = time.monotonic() + 8.0
+        deadline = time.monotonic() + 2.0
         last_state = "UNKNOWN"
         balance_requested = False
         balance_ret = None
@@ -951,11 +960,26 @@ class LocoPlugin:
                 if balance_ret != 0:
                     break
             time.sleep(0.1)
+        # AS2W firmware can keep GetState().fsm_name at AI_FREE_WALK after
+        # StopMove has already stopped the velocity command. BalanceStand is
+        # the accepted controller-side normalization; do not report a false
+        # terminal failure solely because that label is stale. The state is
+        # surfaced explicitly so callers can decide whether to issue the next
+        # posture command.
+        if balance_ret == 0:
+            result = {"action": completed_action, "ret": 0,
+                      "current_state": last_state, "balance_ret": 0,
+                      "state_stale": True,
+                      "reason": "StopMove and BalanceStand were accepted; AS2 GetState still reports a stale walking label"}
+            if completion_extra:
+                result.update(completion_extra)
+            _acp_notify(action_id, "completed", result)
+            return
         _acp_notify(action_id, "error", {
             "action": completed_action, "ret": 0, "current_state": last_state,
             "balance_ret": balance_ret,
-            "error": "StopMove was accepted but robot still reports walking",
-            "reason": "The controller did not leave AI_FREE_WALK after StopMove and BalanceStand",
+            "error": "StopMove was accepted but balance normalization failed",
+            "reason": "The controller did not accept BalanceStand after StopMove",
             "suggested_actions": ["get_state", "retry_stop", "balance_stand"]})
 
     def _stop_move_worker(self, action_id):
@@ -1316,6 +1340,7 @@ class _SpeakerNode:
         self.last_chunk_ts = 0.0
         self.last_play_ts = 0.0
         self._next_play_time = 0.0
+        self._stream_started = False
         self._last_play_error = 0.0
         self.last_play_error = None
 
@@ -1342,6 +1367,7 @@ class _SpeakerNode:
         self._subscription = self.node.create_subscription(
             AudioChunk, topic, self._on_chunk, _LOW_LAT_QOS)
         self._stop_event.clear()
+        self._stream_started = False
         self._thread = threading.Thread(target=self._drain, daemon=True, name="as2w-speaker")
         self._thread.start()
         self.state = "ready"
@@ -1429,6 +1455,12 @@ class _SpeakerNode:
     def _play_block(self, payload):
         started = time.monotonic()
         try:
+            # The first AS2 voice RPC can be consumed while the firmware opens
+            # the stream. Prime it with a short silent frame so the first real
+            # speech block is not lost (not counted as user audio).
+            if not getattr(self, "_stream_started", False):
+                self._client.Audio_PlayStream(SPEAKER_APP_NAME, "0", b"\x00" * 640)
+                self._stream_started = True
             result = self._client.Audio_PlayStream(SPEAKER_APP_NAME, "0", payload)
             if isinstance(result, tuple) and len(result) == 2:
                 code, detail = result
