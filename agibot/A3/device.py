@@ -1931,6 +1931,10 @@ class MotionPlayPlugin:
                     motion_path, duration_ms, cmd_end=True, cmd_pause=False))
                 action_id = f"motion_play_{uuid4().hex[:8]}"
                 self._play_action_id = action_id
+                # 每次武装新播放都清 pause 标记：_paused 只属于上一个动作，
+                # 残留会让本动作的 worker 在 _paused.wait() 上永久冻结
+                # （11th PR review）。
+                self._paused.clear()
             threading.Thread(target=self._play_worker,
                              args=(action_id, motion_path, duration_ms),
                              daemon=True).start()
@@ -1942,7 +1946,14 @@ class MotionPlayPlugin:
             # suspends its countdown too (resume continues the same motion) —
             # otherwise the worker would report completed while the robot is
             # mid-pose and a resume would move joints with no ACP armed.
-            self._paused.set()
+            # No active play → the flag must NOT be set (11th PR review): a
+            # stale _paused with no armed worker would freeze the NEXT play's
+            # countdown forever (pause while idle, then play → barrier hangs
+            # to the 600 s timeout).
+            with self._play_lock:
+                if self._play_action_id is None:
+                    return {"state": "idle"}
+                self._paused.set()
             return jsonable(self.nodes.rpc.send_motion_command(motion_id="", duration_ms=0, cmd_pause=True))
         if action == "resume":
             self._paused.clear()

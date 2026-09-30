@@ -1371,6 +1371,60 @@ class RpcDispatchTests(unittest.TestCase):
         finally:
             device._acp_notify = original_notify
 
+    def test_motion_play_pause_while_idle_then_play_completes(self):
+        # 11th PR review: pause with no active play must not latch the pause flag —
+        # a stale _paused with no armed worker would freeze the NEXT play's
+        # countdown forever and hang Agent Core's barrier to the 600 s timeout.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            motion = find_plugin(self.plugins, "motion_play")
+            motion._PLAY_WORKER_TICK_S = 0.02
+            # pause while idle → no-op, no cmd_pause RPC leaves the driver
+            self.assertEqual(motion.dispatch("pause", {}), {"state": "idle"})
+            self.assertFalse(motion._paused.is_set())
+            result = motion.dispatch("play", {"motion_id": "/agibot/motions/wave.mcap",
+                                              "duration_ms": 100})
+            self.assertEqual(result["state"], "playing")
+            deadline = time.time() + 5
+            while not captured and time.time() < deadline:
+                time.sleep(0.02)
+            (action_id, status, payload, tool_name), = captured
+            self.assertEqual(action_id, result["action_id"])
+            self.assertEqual(status, "completed")
+            self.assertEqual(tool_name, "motion_play")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_motion_play_pause_then_stop_clears_flag_for_next_play(self):
+        # 11th PR review companion: pause an ACTIVE play, stop it, then a fresh
+        # play must complete even though nobody ever sent resume — the settle
+        # path clears the flag that belonged to the cancelled action.
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda action_id, status, result, tool="": captured.append(
+            (action_id, status, result, tool))
+        try:
+            motion = find_plugin(self.plugins, "motion_play")
+            motion._PLAY_WORKER_TICK_S = 0.02
+            first = motion.dispatch("play", {"motion_id": "/agibot/motions/a.mcap",
+                                             "duration_ms": 5000})
+            motion.dispatch("pause", {})
+            self.assertTrue(motion._paused.is_set())
+            motion.dispatch("stop_play", {})
+            self.assertEqual([(c[0], c[1]) for c in captured],
+                             [(first["action_id"], "cancelled")])
+            second = motion.dispatch("play", {"motion_id": "/agibot/motions/b.mcap",
+                                              "duration_ms": 100})
+            deadline = time.time() + 5
+            while len(captured) < 2 and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(captured[-1][:2], (second["action_id"], "completed"))
+        finally:
+            device._acp_notify = original_notify
+
     def test_motion_play_completion_vs_stop_race_posts_exactly_one_terminal(self):
         # 10th PR review: natural completion and a concurrent stop race for the
         # same action — whoever wins the lock claims the terminal, the loser

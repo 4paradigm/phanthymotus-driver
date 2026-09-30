@@ -11,6 +11,14 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 # fallback), so the image also runs on any host for development — with
 # loco/waist_control/face_play withheld too, since their RosMsgWrapper
 # publishers cannot exist without ros2_plugin_proto.
+# Wheel pinning (11th PR review): the install below is deliberately version-
+# pinned by filename (a3_aimdk-3.1.0-py3-none-any.whl) rather than a glob, and
+# it comes from the robot's own dev-kit mount (trusted local media, not a
+# network fetch), so a start can never silently pick up a different vendor
+# build. A sha256 pin is not possible here: the vendor dev-kit ships no
+# checksum sidecar, and hardcoding a hash we cannot verify offline would brick
+# the driver on legitimate kit updates; a mismatched wheel only fails the
+# install and the driver starts degraded (warn above), never half-installed.
 COPY requirements.txt /tmp/agibot-a3-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-a3-requirements.txt && rm -f /tmp/agibot-a3-requirements.txt
 
