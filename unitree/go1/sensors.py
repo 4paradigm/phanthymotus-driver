@@ -1,5 +1,5 @@
 """
-sensors.py — Go1 状态/资源卡聚合（battery, imu, feet, fall_alarm, obstacle_range,
+sensors.py — Go1 状态/资源卡聚合（battery, imu, feet, swing_trajectory, fall_alarm, obstacle_range,
              remote_controller, udp_diagnostics, loco_state, odometry, joints, model）。
 
 自包含：一张合并文件 = 多张卡片。main.py 按 config.yaml 里的卡名手动 import 并 make_plugin()。
