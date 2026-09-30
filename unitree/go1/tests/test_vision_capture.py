@@ -194,10 +194,92 @@ def test_vision_capture_uses_go1_plugin_factory():
     assert card.get_tool()["name"] == "vision_capture"
 
 
+def test_named_photo_list_and_delete(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
+    accepted = card.dispatch("capture_photo", {"image_name": "hall_01"})
+    terminal = completions.get(timeout=3)
+    assert terminal["status"] == "completed"
+    assert Path(accepted["file_path"]).name == "hall_01.jpg"
+    listing = card.dispatch("list", {})
+    assert listing["files"][0]["filename"] == "hall_01.jpg"
+    assert listing["files"][0]["size"] > 0
+    assert card.dispatch("delete", {"name": "../hall_01.jpg"})["ok"] is False
+    assert card.dispatch("delete", {"name": "hall_01.jpg"})["state"] == "deleted"
+    assert not Path(accepted["file_path"]).exists()
+
+
+def test_named_capture_rejects_bad_names_and_existing_file(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
+    for name in ("../escape", "a/b", "a.jpg", " "):
+        assert card.dispatch("capture_photo", {"image_name": name})["code"] == "INVALID_ARGUMENT"
+    accepted = card.dispatch("capture_photo", {"image_name": "same"})
+    assert completions.get(timeout=3)["status"] == "completed"
+    assert card.dispatch("capture_photo", {"image_name": "same"})["code"] == "FILE_EXISTS"
+    assert Path(accepted["file_path"]).exists()
+
+
+def test_manual_recording_stops_asynchronously_and_reports_file(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
+    entered = threading.Event()
+
+    def record(position, path, duration, cancel, finish):
+        assert position == "left" and duration is None
+        entered.set()
+        assert finish.wait(3)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"video")
+        return {"ok": True, "media_type": "video", "file_path": str(path)}
+
+    monkeypatch.setattr(card, "_record_and_save", record)
+    started = card.dispatch("start_recording", {"position": "left", "video_name": "walk"})
+    assert started["state"] == "recording" and entered.wait(1)
+    assert Path(started["file_path"]).name == "walk.mp4"
+    assert card.dispatch("capture_photo", {"position": "left"})["code"] == "RESOURCE_BUSY"
+    stopped = card.dispatch("stop_recording", {})
+    assert stopped["state"] == "finalizing" and stopped["action_id"]
+    terminal = completions.get(timeout=3)
+    assert terminal["action_id"] == stopped["action_id"]
+    assert terminal["status"] == "completed"
+    assert Path(stopped["file_path"]).read_bytes() == b"video"
+    assert card.dispatch("info", {})["last_recording"]["status"] == "completed"
+
+
+def test_manual_recording_stop_reports_encoder_failure(tmp_path, monkeypatch, completions):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
+    entered, release = threading.Event(), threading.Event()
+
+    def fail(position, path, duration, cancel, finish):
+        entered.set()
+        assert finish.wait(3)
+        assert release.wait(3)
+        return {"ok": False, "code": "RECORD_FAILED", "message": "encoder failed"}
+
+    monkeypatch.setattr(card, "_record_and_save", fail)
+    assert card.dispatch("stop_recording", {})["code"] == "NO_RECORDING"
+    started = card.dispatch("start_recording", {})
+    assert entered.wait(1)
+    stopped = card.dispatch("stop_recording", {})
+    assert card.dispatch("stop_recording", {})["code"] == "RESOURCE_BUSY"
+    release.set()
+    terminal = completions.get(timeout=3)
+    assert terminal["action_id"] == stopped["action_id"]
+    assert terminal["status"] == "error"
+    assert terminal["result"]["code"] == "RECORD_FAILED"
+    assert not Path(started["file_path"]).exists()
+
+
 def test_snapshot_declares_completion_only_for_capture():
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     schema = snapshot.VisionCapturePlugin({}).get_tool()["inputSchema"]
-    assert schema["x-completion"]["actions"] == ["capture_photo", "record_video"]
+    assert schema["x-completion"]["actions"] == ["capture_photo", "record_video", "stop_recording"]
     assert schema["x-completion"]["timeout"] >= 120
     assert schema["x-resource"] == "camera"
 
@@ -292,7 +374,8 @@ def test_video_rejects_active_same_position_stream(tmp_path, monkeypatch):
         stream.stop()
 
 
-def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completions):
+@pytest.mark.parametrize("frame_interval", [0.05, 0.25])
+def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completions, frame_interval):
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         pytest.skip("ffmpeg and ffprobe required for encoder integration test")
     Image = pytest.importorskip("PIL.Image")
@@ -317,7 +400,7 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
                         connection.sendall(packet)
                     except OSError:
                         break
-                    time.sleep(0.05)
+                    time.sleep(frame_interval)
         finally:
             server.close()
 
@@ -328,19 +411,79 @@ def test_record_video_from_nano_frames_creates_playable_mp4(tmp_path, completion
         "output_dir": str(tmp_path),
         "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
     })
-    accepted = card.dispatch("record_video", {"duration_s": 1})
+    accepted = card.dispatch("record_video", {"duration_s": 1, "video_name": "test_clip"})
     terminal = completions.get(timeout=6)
     sender.join(3)
     assert terminal["action_id"] == accepted["action_id"]
     assert terminal["status"] == "completed", terminal["result"]
     path = Path(terminal["result"]["file_path"])
     assert path.is_file() and path.stat().st_size > 0
+    assert path.name == "test_clip.mp4"
+    assert card.dispatch("list", {})["files"][0]["filename"] == path.name
     probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                             "-show_entries", "stream=codec_name,width,height:format=duration", "-of", "json", str(path)],
                            capture_output=True, text=True, check=True)
     metadata = json.loads(probe.stdout)
     assert metadata["streams"][0]["codec_name"] == "h264"
-    assert 0.5 <= float(metadata["format"]["duration"]) <= 1.5
+    assert 0.8 <= float(metadata["format"]["duration"]) <= 1.2
+    assert card.dispatch("delete", {"name": path.name})["ok"] is True
+    assert not path.exists()
+
+
+def test_manual_recording_creates_playable_video_after_stop(tmp_path, completions):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg and ffprobe required for encoder integration test")
+    Image = pytest.importorskip("PIL.Image")
+    import io
+    import time
+
+    image = io.BytesIO()
+    Image.new("RGB", (32, 32), "blue").save(image, format="JPEG")
+    jpeg = image.getvalue()
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    first_frame = threading.Event()
+
+    def send_frames():
+        try:
+            connection, _ = server.accept()
+            with connection:
+                packet = struct.pack(">I", len(jpeg)) + jpeg
+                for _ in range(30):
+                    try:
+                        connection.sendall(packet)
+                        first_frame.set()
+                    except OSError:
+                        break
+                    time.sleep(0.1)
+        finally:
+            server.close()
+
+    sender = threading.Thread(target=send_frames, daemon=True)
+    sender.start()
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({
+        "output_dir": str(tmp_path),
+        "positions": {"front": {"board_ip": "127.0.0.1", "image_port": port}},
+    })
+    started = card.dispatch("start_recording", {"video_name": "manual_clip"})
+    assert started["state"] == "recording"
+    assert "action_id" not in started
+    assert first_frame.wait(2)
+    time.sleep(0.8)
+    stopped = card.dispatch("stop_recording", {})
+    assert stopped["state"] == "finalizing"
+    terminal = completions.get(timeout=6)
+    sender.join(3)
+    assert terminal["action_id"] == stopped["action_id"]
+    assert terminal["status"] == "completed", terminal["result"]
+    path = Path(terminal["result"]["file_path"])
+    assert path.name == "manual_clip.mp4"
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "json", str(path)], capture_output=True, text=True, check=True)
+    assert 0 < float(json.loads(probe.stdout)["format"]["duration"]) <= 1.3
 
 
 def test_record_video_drains_encoder_errors_while_feeding_frames(tmp_path, monkeypatch, completions):

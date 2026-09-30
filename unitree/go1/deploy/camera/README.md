@@ -23,7 +23,7 @@ for one JPEG or `{"action":"record_video","position":"front","duration_s":5}`
 for an MP4 (1–30 seconds, default 5). The call immediately returns an
 `action_id` and planned `file_path`; the file may not exist yet. The background
 worker POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`.
-Both actions declare `x-completion` (120 seconds). The terminal result contains
+These actions declare `x-completion` (120 seconds). The terminal result contains
 the confirmed path. `info.last_capture` and `info.last_recording` keep the
 latest terminal `{action_id, status, result}`. ACP uses the `camera` physical resource. The
 callback is retried up to three times (3-second request timeout, 0.5/1-second
@@ -34,10 +34,28 @@ under the platform's conservative fallback. `stop` reports lifecycle state
 `idle` and a separate `capture_active` flag; an accepted photo still finishes
 and sends its ACP callback, while an active video is cancelled and reported.
 
+As on Tianyi, `capture_photo` accepts an optional `image_name` and `record_video`
+accepts an optional `video_name`. Use a filename stem without an extension;
+otherwise the card generates one. `list` returns saved files with their full
+container `path`, `channel_reply_path`, MIME type and size; `delete` accepts the
+complete `.jpg` or `.mp4` filename. A file currently being written cannot be
+deleted, and an existing name is never accepted for a new capture.
+
+For a manually controlled recording, call `start_recording` with `position` and
+optional `video_name`, then `stop_recording`. The start call returns the planned
+path, while stop returns an `action_id` and finalizes the MP4 in the background.
+Wait for its ACP `completed` callback before using the file. The recording clock
+starts at the first valid camera frame. Lifecycle `stop` cancels an active
+recording instead of saving it.
+
 `config.yaml` sets `vision_capture.output_dir` to
 `/opt/phanthy-motus/data/vision_capture`. Photos go to `photos/*.jpg`, videos
 to `videos/*.mp4`. `deploy/service.yml` bind-mounts `/opt/phanthy-motus/data`
 at the same path on the host, so these files persist after container restart.
+The `channel_reply_path` for a saved file starts with
+`/work/resource/vision_capture` by default; it is intended for a channel that
+mounts the same host data directory there. Set `PHANTHY_CHANNEL_OUTPUT_DIR` if
+that channel uses a different mount, and verify the mount before sending a file.
 The previous `camera_snapshot` card name is replaced by `vision_capture`; update
 existing canvas calls. Previous JPEGs remain in
 `/opt/phanthy-motus/data/camera_snapshot` and are not moved automatically.
