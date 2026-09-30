@@ -1082,7 +1082,7 @@ def _swing_world_point(body, position, quaternion):
 
 
 def _swing_pointcloud(data, frame):
-    """Encode current/last swing paths for Agent Core's existing 3D point renderer.
+    """Encode recent foot paths for Agent Core's existing 3D point renderer.
 
     The renderer maps wire (x,y,z) to display (y,-z,-x), so the wire
     coordinates are remapped to show forward, left and up with up positive.
@@ -1092,7 +1092,7 @@ def _swing_pointcloud(data, frame):
     points = []
     for foot in _SWING_FEET:
         state = data["feet"][foot]
-        path = state["active"] or state["last_completed"]
+        path = state["active"]
         previous = None
         for sample in path:
             point = _swing_vector(sample.get(key))
@@ -1129,10 +1129,11 @@ class SwingTrajectoryPlugin:
             "world": f"/{namespace}/state/swing_trajectory_world_3d",
         }
         self._hz = max(1.0, min(50.0, float(cfg.get("sample_hz", 20))))
-        self._force = float(cfg.get("contact_force_threshold_raw", 20))
+        raw_force_threshold = cfg.get("contact_force_threshold_raw")
+        self._force = None if raw_force_threshold is None else float(raw_force_threshold)
         self._hysteresis = max(0.0, float(cfg.get("force_hysteresis_raw", 10)))
         self._confirm = max(1, min(10, int(cfg.get("phase_confirm_samples", 2))))
-        self._max_points = max(2, min(500, int(cfg.get("max_points_per_swing", 150))))
+        self._max_points = max(2, min(500, int(cfg.get("max_points_per_foot", 150))))
         self._max_age = max(0.05, float(cfg.get("max_sample_age_s", 0.5)))
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
@@ -1143,7 +1144,7 @@ class SwingTrajectoryPlugin:
         self._last_signature = None
         self._last_status = "waiting_for_telemetry"
         self._feet = {name: {"phase": "unknown", "candidate": None, "candidate_count": 0,
-                             "active": [], "last_completed": [], "swing_id": 0,
+                             "active": [], "swing_active": [], "last_completed": [], "swing_id": 0,
                              "swing_start_s": None} for name in _SWING_FEET}
         self._node = None
         if _HAS_ROS2 and executor is not None:
@@ -1164,7 +1165,7 @@ class SwingTrajectoryPlugin:
 
     def get_tool(self):
         return {"name": self.PREFIX, "type": "sensor", "multiInstance": False,
-                "description": "Go1 four-foot swing trajectories: body frame and estimated odometry-world frame",
+                "description": "Go1 four-foot 3D paths, including contact drag; optional calibrated swing labels",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": ([{"topic": self._topic, "format": _SWING_FORMAT}] + [
                     {"topic": topic, "format": "sensor/pointcloud"}
@@ -1217,29 +1218,26 @@ class SwingTrajectoryPlugin:
             if not isinstance(snap, dict) or not snap.get("fresh"):
                 self._last_status = "source_unavailable"
                 return
-            if snap.get("control_level") not in (None, "HIGHLEVEL") or snap.get("mode") != 2:
-                for state in self._feet.values():
-                    state.update(phase="unknown", candidate=None, candidate_count=0,
-                                 active=[], swing_start_s=None)
-                self._last_signature = None
-                self._last_sample = None
-                self._last_source_stamp = None
-                self._last_status = "not_walking" if snap.get("mode") != 2 else "wrong_control_level"
+            if snap.get("control_level") not in (None, "HIGHLEVEL"):
+                self._last_status = "wrong_control_level"
                 return
             positions = snap.get("foot_pos")
-            forces = snap.get("foot_force")
-            if not isinstance(positions, (list, tuple)) or len(positions) != 4 or not isinstance(forces, (list, tuple)) or len(forces) != 4:
+            if not isinstance(positions, (list, tuple)) or len(positions) != 4:
                 self._last_status = "foot_data_unavailable"
                 return
             body = [_swing_vector(value) for value in positions]
-            try:
-                force = [float(v) for v in forces]
-            except (TypeError, ValueError):
+            if any(v is None for v in body):
                 self._last_status = "foot_data_invalid"
                 return
-            if any(v is None for v in body) or not all(math.isfinite(v) and v >= 0 for v in force):
-                self._last_status = "foot_data_invalid"
-                return
+            force = None
+            forces = snap.get("foot_force")
+            if isinstance(forces, (list, tuple)) and len(forces) == 4:
+                try:
+                    candidate_force = [float(v) for v in forces]
+                    if all(math.isfinite(v) and v >= 0 for v in candidate_force):
+                        force = candidate_force
+                except (TypeError, ValueError):
+                    pass
             imu = snap.get("imu") or {}
             quat = imu.get("quaternion_wxyz")
             world = ([_swing_world_point(v, snap.get("position"), quat) for v in body]
@@ -1256,7 +1254,7 @@ class SwingTrajectoryPlugin:
                 if now - source_stamp > self._max_age:
                     self._last_status = "source_stale"
                     return
-            signature = json.dumps([force, body, snap.get("position"), quat],
+            signature = json.dumps([body, snap.get("position"), quat, force, snap.get("mode")],
                                    sort_keys=True, default=str)
             same_snapshot = (source_stamp == self._last_source_stamp if source_stamp is not None
                              else self._last_source_stamp is None and signature == self._last_signature)
@@ -1265,7 +1263,7 @@ class SwingTrajectoryPlugin:
             if not same_snapshot and self._last_sample is not None and now - self._last_sample > self._max_age:
                 for state in self._feet.values():
                     state.update(phase="unknown", candidate=None, candidate_count=0,
-                                 active=[], swing_start_s=None)
+                                 active=[], swing_active=[], swing_start_s=None)
             if not same_snapshot:
                 self._last_signature = signature
                 self._last_source_stamp = source_stamp
@@ -1276,37 +1274,45 @@ class SwingTrajectoryPlugin:
                 return
             for i, name in enumerate(_SWING_FEET):
                 state = self._feet[name]
-                f = force[i]
-                started_swing = False
-                desired = ("swing" if f <= self._force else
-                           "stance" if f >= self._force + self._hysteresis else None)
-                if desired is None:
-                    state["candidate"] = None
-                    state["candidate_count"] = 0
-                elif desired != state["phase"]:
-                    state["candidate_count"] = state["candidate_count"] + 1 if state["candidate"] == desired else 1
-                    state["candidate"] = desired
-                    if state["candidate_count"] >= self._confirm:
-                        if state["phase"] == "swing" and desired == "stance":
-                            state["last_completed"] = state["active"]
-                            state["active"] = []
-                        elif desired == "swing":
-                            state["swing_id"] += 1
-                            state["active"] = []
-                            state["swing_start_s"] = sample_time
-                            started_swing = True
-                        state["phase"] = desired
+                if self._force is None or force is None or snap.get("mode") != 2:
+                    state.update(phase="unclassified", candidate=None, candidate_count=0,
+                                 swing_active=[], swing_start_s=None)
+                else:
+                    f = force[i]
+                    desired = ("swing" if f <= self._force else
+                               "stance" if f >= self._force + self._hysteresis else None)
+                    if desired is None:
                         state["candidate"] = None
                         state["candidate_count"] = 0
-                else:
-                    state["candidate"] = None
-                    state["candidate_count"] = 0
-                if state["phase"] == "swing" and (not same_snapshot or started_swing):
-                    state["active"].append({"t_monotonic_s": round(sample_time, 4),
-                                            "t_from_liftoff_s": round(sample_time - state["swing_start_s"], 4),
-                                            "body_xyz_m": body[i], "world_xyz_m": world[i]})
-                    if len(state["active"]) > self._max_points:
-                        state["active"].pop(0)
+                    elif desired != state["phase"]:
+                        state["candidate_count"] = state["candidate_count"] + 1 if state["candidate"] == desired else 1
+                        state["candidate"] = desired
+                        if state["candidate_count"] >= self._confirm:
+                            if state["phase"] == "swing" and desired == "stance":
+                                state["last_completed"] = state["swing_active"]
+                                state["swing_active"] = []
+                            elif desired == "swing":
+                                state["swing_id"] += 1
+                                state["swing_active"] = []
+                                state["swing_start_s"] = sample_time
+                            state["phase"] = desired
+                            state["candidate"] = None
+                            state["candidate_count"] = 0
+                    else:
+                        state["candidate"] = None
+                        state["candidate_count"] = 0
+                point = {"t_monotonic_s": round(sample_time, 4),
+                         "t_from_liftoff_s": (round(sample_time - state["swing_start_s"], 4)
+                                               if state["phase"] == "swing" and state["swing_start_s"] is not None
+                                               else None),
+                         "body_xyz_m": body[i], "world_xyz_m": world[i]}
+                state["active"].append(point)
+                if len(state["active"]) > self._max_points:
+                    state["active"].pop(0)
+                if state["phase"] == "swing":
+                    state["swing_active"].append(point)
+                    if len(state["swing_active"]) > self._max_points:
+                        state["swing_active"].pop(0)
 
     def _build(self):
         with self._lock:
@@ -1320,6 +1326,7 @@ class SwingTrajectoryPlugin:
                       else self._last_status)
             feet = {name: {"phase": value["phase"], "swing_id": value["swing_id"],
                            "active": list(value["active"]),
+                           "swing_active": list(value["swing_active"]),
                            "last_completed": list(value["last_completed"])}
                     for name, value in self._feet.items()}
         return {"timestamp_ms": int(time.time() * 1000), "control_level": "HIGHLEVEL",
@@ -1331,7 +1338,9 @@ class SwingTrajectoryPlugin:
                 "sample_time_basis": ("sdk_receive_monotonic" if self._last_source_stamp is not None
                                       else "card_observation_monotonic"),
                 "body_frame": "body_instantaneous", "world_frame": "HighState_odometry_inertial_estimate",
+                "foot_position_source": "HighState.footPosition2Body",
                 "world_assumption": "HighState.position and IMU quaternion axes/origin aligned; unverified on robot",
+                "phase_classifier": "calibrated_force" if self._force is not None else "unclassified",
                 "contact_force_threshold_raw": self._force, "feet": feet}
 
     def dispatch(self, action, args):

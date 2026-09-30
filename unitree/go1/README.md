@@ -23,7 +23,7 @@
 | `battery` | 电量（BMS） | `/{ns}/state/battery`：soc_percent / current_ma / cycle_count / temps / cell_voltage_mv |
 | `imu` | IMU | `/{ns}/state/imu`：四元数 / 角速度 / 加速度 / 欧拉角 / 温度 |
 | `feet` | 足端 | `/{ns}/state/feet`：足底力[4] + 高层时足端相对机身位置/速度 |
-| `swing_trajectory` | 四足摆动轨迹 | `/{ns}/state/swing_trajectory` 为 `data/json`，`read` 返回四足当前及最近完成的一次摆动，含机身与里程计世界坐标；另发 `/{ns}/state/swing_trajectory_body_3d` 和 `/{ns}/state/swing_trajectory_world_3d` 两路 `sensor/pointcloud`，可在现有看板作为两个实时 3D 卡片查看。只在高层行走模式 `mode=2` 记录，避免趴卧等模式的低足底力被误判为摆动；当前 SDK 快照没有收包时间戳，卡片按观测到的数值变化采样，无法确认源包新鲜度 |
+| `swing_trajectory` | 四足连续轨迹与可选摆动标签 | `/{ns}/state/swing_trajectory` 为 `data/json`，`read` 返回四足最近的机身系与里程计世界系轨迹（含触地拖动）；另发 `/{ns}/state/swing_trajectory_body_3d` 和 `/{ns}/state/swing_trajectory_world_3d` 两路 `sensor/pointcloud`，可在现有看板作为两个实时 3D 卡片查看。轨迹不依赖接触力或行走模式；只有按本机标定足底力阈值后才估计摆动/支撑标签。当前 SDK 快照没有收包时间戳，卡片按观测到的数值变化采样，无法确认源包新鲜度 |
 | `fall_alarm` | 跌倒/侧翻告警 | `/{ns}/state/fall_alarm`：IMU roll/pitch → ok/tilted/fallen（阈值可配） |
 | `odometry` | 里程计 | `/{ns}/state/odometry`：position/yaw + 相对起点位移（只读） |
 | `obstacle_range` | 超声波避障 | `/{ns}/state/obstacle_range`：range_raw[4]（仅 HIGHLEVEL；方向/单位官方未定义，原样输出） |
@@ -86,7 +86,8 @@ Nano 板 (.13/.14/.15)              Pi 驱动容器 (.161)
 ## 接口约定（与平台其它驱动一致）
 
 - **状态卡读取**：无业务输入。`action=info`（或 `read`/`get`）返回最新数据 + `topic_out`；每条数据带 `timestamp_ms` / `control_level` / `fresh`。当前仓库的 `go1_sdk_client.py` 没有在快照中提供 `received_monotonic_s`，而且这次不修改它。`swing_trajectory` 因此只在快照数值变化时增加轨迹点；相同数值可能来自静止机器人或重复旧包，无法用于确认收包或判断真实采样频率。卡片报 `source_freshness_confirmed=false`、`source_age_s=null`；超过配置时间未观察到变化时，报 `source_unchanged`。如果其他部署已有有效的 `received_monotonic_s`，卡片可使用该字段去重和判断过期，但当前仓库不能依赖它。输出中的 `fresh` 仅表示卡片最近观察到有效变化，不代表已确认新的 SDK 包。
-- **启用前标定**：`swing_trajectory` 默认关闭。先用已有 `feet` 卡读取这台 Go1 四足在接触地面及实际离地时的原始足底力，确认两种状态可分离，再把 `config.yaml` 中的 `contact_force_threshold_raw` 和 `force_hysteresis_raw` 改成实测值并设 `enabled: true`。仓库中的 `20` / `10` 只是示例，不能直接作为真机判定依据；记录离地样本需要机器人运动，必须先征得操作授权。标定前不应将摆动状态或世界系轨迹当作已验证的实测结果。
+- **轨迹与接触分离**：卡片默认启用，连续轨迹来自 SDK 的 `HighState.footPosition2Body`，与足底力无关，触地拖动也会记录。SDK 未提供足端位置时卡片报告 `foot_data_unavailable`，当前实现不从关节角另行计算正运动学。世界系轨迹将机身系足端位置按 IMU 四元数旋转并加上 `HighState.position`，其坐标对齐和漂移仍需真机验证；IMU 单独不能可靠给出机身平移。`active` 是最近轨迹，`swing_active` / `last_completed` 仅供已标定的摆动分类使用。
+- **可选摆动标签标定**：`contact_force_threshold_raw: null` 时 `phase=unclassified`，不会把低接触力当作离地，也不影响三维轨迹。要启用摆动/支撑标签，先用已有 `feet` 卡读取这台 Go1 四足接触地面及实际离地时的原始足底力，确认两种状态可分离，再填入实测阈值并调整 `force_hysteresis_raw`。记录离地样本需要机器人运动，必须先征得操作授权。
 - **实时 3D 显示**：将 `swing_trajectory_body_3d` 与 `swing_trajectory_world_3d` 两个 topic 加入监控看板，即可分别旋转/缩放查看机身系及里程计世界系轨迹。轨迹以每厘米约一个点绘制；看板现有点云渲染器按高度着色，不能画连续线条、区分四腿颜色或在同一卡片内切换坐标系。原始 JSON 保留四腿标识和精确坐标。世界系依赖 SDK 里程计位置与 IMU 姿态的坐标对齐假设，需真机标定。无轨迹时 3D 卡片只显示原点；状态请同时看 JSON 卡片。
 - **生命周期**：每张卡都处理 `start`/`stop`：`start → {"state":"running"}`、`stop → {"state":"idle"}`。
 - **`dispatch()` 返回**：一律 plain dict（或 `None`），由 MCP 处理器自动包 `{"content":[...]}`，**不要**自己预包。

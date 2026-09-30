@@ -52,13 +52,13 @@ plugins:
     enabled: true
   feet:                         # 足端：足底力[4] + 高层时足端相对机身位置/速度
     enabled: true
-  swing_trajectory:             # 四足摆动轨迹：机身坐标 + 里程计世界坐标估计
-    enabled: false               # 足底力阈值未在本机标定前不要启用
+  swing_trajectory:             # 四足连续轨迹：机身坐标 + 里程计世界坐标估计
+    enabled: true                # 连续轨迹不依赖接触力；未标定时不输出摆动/支撑标签
     sample_hz: 20
-    contact_force_threshold_raw: 20  # 仅示例值；启用前须按本机接触/离地力标定
-    force_hysteresis_raw: 10
+    contact_force_threshold_raw: null  # 可选：标定后填入本机阈值，启用摆动/支撑标签
+    force_hysteresis_raw: 10     # 仅在阈值已标定后使用，亦需按本机数据调整
     phase_confirm_samples: 2
-    max_points_per_swing: 150
+    max_points_per_foot: 150
     max_sample_age_s: 0.5
   fall_alarm:                   # 跌倒/侧翻告警：IMU roll/pitch → ok/tilted/fallen（阈值可配）
     enabled: true

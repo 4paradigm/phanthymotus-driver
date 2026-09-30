@@ -39,7 +39,8 @@ def test_world_rotation_and_translation():
 
 
 def test_swing_lifecycle_both_frames_and_duplicate_rejection():
-    plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 2}, "test", None, Client())
+    plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 2,
+                                    "contact_force_threshold_raw": 20}, "test", None, Client())
     t = time.monotonic()
     for force in (100, 100, 0, 0):
         snap = sample(t, force=force)
@@ -47,28 +48,30 @@ def test_swing_lifecycle_both_frames_and_duplicate_rejection():
         plugin.process_sample(snap, now=t)
         t += 0.05
     state = plugin._build()["feet"]["FR"]
-    assert state["phase"] == "swing" and len(state["active"]) == 1
-    assert state["active"][0]["body_xyz_m"] == [0.2, -0.1, -0.25]
-    assert state["active"][0]["world_xyz_m"] == [1.2, 1.9, 0.25]
+    assert state["phase"] == "swing" and len(state["active"]) == 4
+    assert state["active"][3]["body_xyz_m"] == [0.2, -0.1, -0.25]
+    assert state["active"][3]["world_xyz_m"] == [1.2, 1.9, 0.25]
+    assert len(state["swing_active"]) == 1
     plugin.process_sample(snap, now=t)
-    assert len(plugin._build()["feet"]["FR"]["active"]) == 1
+    assert len(plugin._build()["feet"]["FR"]["active"]) == 4
     snap = sample(t, force=0, foot={"x": 0.3, "y": -0.1, "z": -0.2})
     snap["received_monotonic_s"] = t
     plugin.process_sample(snap, now=t)
     t += 0.05
-    assert len(plugin._build()["feet"]["FR"]["active"]) == 2
+    assert len(plugin._build()["feet"]["FR"]["active"]) == 5
     for force in (100, 100):
         snap = sample(t, force=force)
         snap["received_monotonic_s"] = t
         plugin.process_sample(snap, now=t)
         t += 0.05
     state = plugin._build()["feet"]["FR"]
-    assert state["phase"] == "stance" and not state["active"]
+    assert state["phase"] == "stance" and len(state["active"]) == 7
     assert len(state["last_completed"]) == 3  # first contact-confirm frame is retained
 
 
 def test_duplicate_untimestamped_snapshot_cannot_confirm_swing_or_stance():
-    plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 2}, "test", None, Client())
+    plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 2,
+                                    "contact_force_threshold_raw": 20}, "test", None, Client())
     t = time.monotonic()
     first = sample(t, force=0)
     plugin.process_sample(first, now=t)
@@ -77,10 +80,10 @@ def test_duplicate_untimestamped_snapshot_cannot_confirm_swing_or_stance():
     state = plugin._feet["FR"]
     assert state["phase"] == "unknown"
     assert state["candidate_count"] == 1
-    assert state["active"] == []
+    assert len(state["active"]) == 1
     changed = sample(t, force=0, foot={"x": 0.21, "y": -0.1, "z": -0.25})
     plugin.process_sample(changed, now=t + 0.2)
-    assert state["phase"] == "swing" and len(state["active"]) == 1
+    assert state["phase"] == "swing" and len(state["active"]) == 2
     contact = sample(t, force=100)
     plugin.process_sample(contact, now=t + 0.25)
     plugin.process_sample(contact, now=t + 0.3)
@@ -111,7 +114,7 @@ def test_invalid_available_pose_and_foot_values_are_rejected_by_card():
     assert _swing_world_point([1, 0, 0], [0, 0, 0], [0, 0, 0, 0]) is None
 
 
-def test_damp_mode_does_not_create_false_swing_from_low_foot_force():
+def test_damp_mode_records_position_without_inventing_swing():
     plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 2}, "test", None, Client())
     t = time.monotonic()
     snap = sample(t, force=3)
@@ -119,12 +122,37 @@ def test_damp_mode_does_not_create_false_swing_from_low_foot_force():
     plugin.process_sample(snap, now=t)
     plugin.process_sample(snap, now=t + 0.05)
     data = plugin._build()
-    assert data["status"] == "not_walking" and data["fresh"] is False
-    assert all(not foot["active"] for foot in data["feet"].values())
+    assert data["status"] == "ok" and data["fresh"] is True
+    assert data["feet"]["FR"]["phase"] == "unclassified"
+    assert len(data["feet"]["FR"]["active"]) == 1
+
+
+def test_contact_drag_path_does_not_require_force_or_walking_mode():
+    plugin = SwingTrajectoryPlugin({}, "test", None, Client())
+    t = time.monotonic()
+    first = sample(t, force=100)
+    first["mode"] = 7
+    plugin.process_sample(first, now=t)
+    dragged = sample(t + 0.05, foot={"x": 0.3, "y": -0.1, "z": -0.25},
+                     position=[1.1, 2.0, 0.5])
+    dragged["mode"] = 7
+    dragged["foot_force"] = None
+    plugin.process_sample(dragged, now=t + 0.05)
+    data = plugin._build()
+    path = data["feet"]["FR"]["active"]
+    assert data["phase_classifier"] == "unclassified"
+    assert data["foot_position_source"] == "HighState.footPosition2Body"
+    assert data["feet"]["FR"]["phase"] == "unclassified"
+    assert len(path) == 2
+    assert path[0]["body_xyz_m"] == [0.2, -0.1, -0.25]
+    assert path[1]["body_xyz_m"] == [0.3, -0.1, -0.25]
+    assert path[1]["world_xyz_m"] == [1.4, 1.9, 0.25]
+    assert path[1]["t_from_liftoff_s"] is None
 
 
 def test_existing_sdk_receive_timestamp_tracks_identical_new_packets():
-    plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 2}, "test", None, Client())
+    plugin = SwingTrajectoryPlugin({"phase_confirm_samples": 2,
+                                    "contact_force_threshold_raw": 20}, "test", None, Client())
     t = time.monotonic()
     for index, force in enumerate((100, 100, 0, 0, 0)):
         snap = sample(t, force=force)
@@ -133,15 +161,15 @@ def test_existing_sdk_receive_timestamp_tracks_identical_new_packets():
     data = plugin._build()
     assert data["sample_time_basis"] == "sdk_receive_monotonic"
     assert data["source_freshness_confirmed"] is True
-    assert len(data["feet"]["FR"]["active"]) == 2
-    assert data["feet"]["FR"]["active"][1]["t_from_liftoff_s"] == 0.05
+    assert len(data["feet"]["FR"]["active"]) == 5
+    assert data["feet"]["FR"]["active"][4]["t_from_liftoff_s"] == 0.05
     plugin.process_sample(snap, now=t + 0.25)  # same source timestamp
-    assert len(plugin._feet["FR"]["active"]) == 2
+    assert len(plugin._feet["FR"]["active"]) == 5
     stale = sample(t, force=0)
     stale["received_monotonic_s"] = t + 0.21
     plugin.process_sample(stale, now=t + 1.0)
     assert plugin._last_status == "source_stale"
-    assert len(plugin._feet["FR"]["active"]) == 2
+    assert len(plugin._feet["FR"]["active"]) == 5
 
 
 def test_wiring_and_no_hardware_output():
@@ -172,7 +200,7 @@ def test_pointcloud_wire_format_and_both_coordinate_frames():
                             ("world", (-1.2, 1.9, -0.25))):
         cloud = _swing_pointcloud(data, frame)
         stride, count = struct.unpack_from("<II", cloud)
-        assert stride == 12 and count == 4  # 1 cm path interpolation
+        assert stride == 12 and count == 10  # FR interpolated; three other feet retain two samples each
         assert len(cloud) == 8 + stride * count
         xyz = struct.unpack_from("<fff", cloud, 8)
         assert all(abs(actual - wanted) < 1e-5 for actual, wanted in zip(xyz, expected))
