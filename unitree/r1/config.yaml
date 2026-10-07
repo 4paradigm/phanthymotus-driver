@@ -37,6 +37,13 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  pose_check:
+    enabled: true
+    # Default: /<namespace>/camera/main; BUMI RGB: /<bumi_namespace>/camera/color.
+    input_topic: ""
+    # Optional MediaPipe .task model; requires requirements-pose.txt.
+    # Keep empty until the target runtime's backend has been validated.
+    model_path: ""
   ext_mic:
     enabled: true
   ext_camera:
