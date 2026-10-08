@@ -90,7 +90,7 @@ def test_all_go1_acting_tools_declare_consistent_resources_without_hardware_call
 
 @pytest.mark.parametrize("action,args", [("set_color", {"g": 10}), ("off", {}), ("stop", {}),
                                          ("blink", {"duration_s": 2}),
-                                         ("config", {"mqtt_port": 1884})])
+                                         ("config", {"sdk_exclusive": True})])
 def test_effect_cancelled_completion(light, acp_notify, action, args):
     response = light.dispatch("chase", {"r": 100, "duration_s": 2})
     old = light._thread
@@ -312,76 +312,6 @@ def test_background_connection_failure(light):
     assert light._thread is None
 
 
-@pytest.fixture
-def fake_mqtt(monkeypatch):
-    client = Mock()
-    client.is_connected.return_value = True
-    message = Mock(rc=0)
-    message.is_published.return_value = True
-    client.publish.return_value = message
-    mqtt = SimpleNamespace(Client=Mock(return_value=client),
-                           CallbackAPIVersion=SimpleNamespace(VERSION1=1), MQTT_ERR_SUCCESS=0)
-    monkeypatch.setattr(ext, "_HAS_MQTT", True)
-    monkeypatch.setattr(ext, "mqtt", mqtt, raising=False)
-    return client, message
-
-
-def test_mqtt_three_bytes_compatibility_and_capabilities(fake_mqtt):
-    client, _ = fake_mqtt
-    plugin = ext.FaceLightPlugin({}, "", None, None)
-    try:
-        assert plugin.start()["ok"]
-        assert plugin.dispatch("set_color", {"r": 12, "g": 34, "b": 56})["ok"]
-        client.publish.assert_called_with("face_light/color", bytes([12, 34, 56]), qos=0, retain=False)
-        for action, args in [("set_led", {"index": 0}), ("set_leds", {"colors": [[0, 0, 0]] * 12}), ("chase", {})]:
-            assert plugin.dispatch(action, args)["code"] == "UNSUPPORTED_CAPABILITY"
-        info = plugin._info()
-        assert not info["capabilities"]["per_led"]
-        assert info["capabilities"]["effects"] == ["blink", "breathe", "fade"]
-        for action in ("blink", "breathe", "fade"):
-            assert plugin.dispatch(action, {"r": 20, "to_b": 40, "duration_s": 0.05})["ok"]
-            wait_until(lambda: not plugin._info()["running"])
-    finally:
-        plugin.stop()
-    client.disconnect.assert_called_once()
-    client.loop_stop.assert_called_once()
-
-
-@pytest.mark.parametrize("failure", ["disconnected", "rc", "timeout", "exception"])
-def test_mqtt_failure_is_not_success(fake_mqtt, failure):
-    client, message = fake_mqtt
-    plugin = ext.FaceLightPlugin({}, "", None, None)
-    plugin.start()
-    if failure == "disconnected":
-        client.is_connected.return_value = False
-    elif failure == "rc":
-        message.rc = 4
-    elif failure == "timeout":
-        message.is_published.return_value = False
-    else:
-        message.wait_for_publish.side_effect = RuntimeError("socket lost")
-    try:
-        assert plugin.dispatch("set_color", {"b": 90})["code"] == "NOT_AVAILABLE"
-        assert plugin._info()["colors"] is None
-        if failure != "disconnected":
-            assert plugin._backend.client is None  # failed send cannot replay queued frames
-    finally:
-        plugin.stop()
-
-
-def test_missing_mqtt_and_start_failure(monkeypatch, fake_mqtt):
-    monkeypatch.setattr(ext, "_HAS_MQTT", False)
-    plugin = ext.FaceLightPlugin({}, "", None, None)
-    assert not plugin.start()["ok"] and not plugin._active
-    assert plugin.dispatch("off", {})["code"] == "NOT_AVAILABLE"
-    monkeypatch.setattr(ext, "_HAS_MQTT", True)
-    client, _ = fake_mqtt
-    client.connect_async.side_effect = RuntimeError("connect failed")
-    assert not plugin.start()["ok"]
-    assert plugin._backend.client is None
-    assert plugin.stop()["ok"]
-
-
 def test_single_card_bundle_and_packaging():
     import importlib.util
     import yaml
@@ -398,7 +328,8 @@ def test_single_card_bundle_and_packaging():
         assert bundle.dispatch("face_light", {"action": "set_led", "index": 11, "r": 9})["ok"]
         assert bundle.dispatch("face_light", {"action": "info"})["simulated"]
         config = yaml.safe_load((GO1 / "config.yaml").read_text())
-        assert config["plugins"]["face_light"]["backend"] == "mqtt"
+        assert config["plugins"]["face_light"]["backend"] == "sdk"
+        assert config["plugins"]["face_light"]["sdk_exclusive"] is False
         metadata = yaml.safe_load((GO1 / "driver.yaml").read_text())
         assert sum(item["name"] == "face_light" for item in metadata["cards"]) == 1
         assert "COPY ext_devices.py" in (GO1 / "Dockerfile").read_text()
@@ -406,16 +337,15 @@ def test_single_card_bundle_and_packaging():
         bundle.stop_all()
 
 
-def test_concurrent_start_stop_no_resurrection(fake_mqtt):
-    client, _ = fake_mqtt
+def test_concurrent_start_stop_no_resurrection():
     entered, release = threading.Event(), threading.Event()
 
     def connect(*args):
         entered.set()
         assert release.wait(1)
 
-    client.connect_async.side_effect = connect
-    plugin = ext.FaceLightPlugin({}, "", None, None)
+    plugin = ext.FaceLightPlugin({"backend": "simulated"}, "", None, None)
+    plugin._backend.start = connect
     starter = threading.Thread(target=plugin.start)
     stopper = threading.Thread(target=plugin.stop)
     starter.start()
@@ -425,7 +355,7 @@ def test_concurrent_start_stop_no_resurrection(fake_mqtt):
     starter.join(1)
     stopper.join(1)
     assert not starter.is_alive() and not stopper.is_alive()
-    assert not plugin._active and plugin._backend.client is None
+    assert not plugin._active and not plugin._backend.connected
     assert plugin._info()["mode"] == "stopped"
     assert plugin.dispatch("set_color", {"r": 1})["code"] == "NOT_AVAILABLE"
 
@@ -451,15 +381,22 @@ def test_concurrent_commands_leave_only_one_worker(light):
     assert not any(t.name == "go1-face-light" and t.is_alive() for t in threading.enumerate())
 
 
-def test_publish_exception_drops_connection(fake_mqtt):
-    client, _ = fake_mqtt
-    client.publish.side_effect = RuntimeError("send exception")
+def test_default_sdk_and_exclusive_guard_do_not_use_mqtt(monkeypatch):
+    mqtt_client = Mock()
+    monkeypatch.setattr(ext, "mqtt", mqtt_client, raising=False)
+    popen = Mock()
+    monkeypatch.setattr(ext.subprocess, "Popen", popen)
     plugin = ext.FaceLightPlugin({}, "", None, None)
-    plugin.start()
-    assert not plugin.dispatch("blink", {"r": 255})["ok"]
-    assert plugin._backend.client is None
-    assert not plugin._info()["running"]
-    plugin.stop()
+    assert plugin._backend.name == "sdk"
+    schema = plugin.get_tool()["configSchema"]["properties"]
+    assert schema["backend"]["default"] == "sdk"
+    assert schema["backend"]["enum"] == ["sdk", "simulated"]
+    assert "mqtt_host" not in schema and "mqtt_port" not in schema
+    result = plugin.start()
+    assert not result["ok"] and "sdk_exclusive" in result["message"]
+    assert not plugin._active
+    popen.assert_not_called()
+    assert not mqtt_client.mock_calls
 
 
 def test_invalid_command_leaves_current_effect(light):
@@ -500,18 +437,37 @@ def test_sdk_backend_complete_card_path(sdk_helper):
     assert start["ok"], start
     process = plugin._backend.process
     try:
+        assert plugin.dispatch("set_color", {"r": 12, "g": 34, "b": 56})["applied"]["r"] == 12
+        assert log.read_text().splitlines()[-1].split() == ['12', '34', '56'] * 12
+        assert plugin.dispatch("preset", {"name": "BLUE"})["applied"]["rgb"] == [0, 0, 255]
+        assert plugin.dispatch("set_color", {})["ok"]
+        assert plugin.dispatch("off", {})["applied"]["rgb"] == [0, 0, 0]
         colors = [[i, 10, 255 - i] for i in range(12)]
         assert plugin.dispatch("set_leds", {"colors": colors})["delivery"] == "sdk_udp_socket_sent"
-        assert [int(v) for v in log.read_text().splitlines()[0].split()] == [v for c in colors for v in c]
+        assert [int(v) for v in log.read_text().splitlines()[-1].split()] == [v for c in colors for v in c]
         assert plugin.dispatch("set_led", {"index": 11, "r": 255})["ok"]
-        assert plugin.dispatch("chase", {"g": 20, "duration_s": 0.1, "period_s": 0.2})["ok"]
-        wait_until(lambda: not plugin._info()["running"])
+        for action in ext._FACE_EFFECTS:
+            assert plugin.dispatch(action, {"g": 20, "duration_s": 0.1, "period_s": 0.2})["ok"]
+            wait_until(lambda: not plugin._info()["running"])
         assert plugin._info()["capabilities"]["official_sdk_integrated"]
         assert not plugin._info()["hardware_verified"]
     finally:
         assert plugin.stop()["ok"]
     assert process.poll() is not None and plugin._backend.process is None
     assert [int(v) for v in log.read_text().splitlines()[-1].split()] == [0] * 36
+
+
+def test_old_mqtt_config_is_rejected_without_effect_or_transport_change(light, monkeypatch):
+    light.dispatch('blink', {'r': 30, 'duration_s': 2})
+    worker, backend = light._thread, light._backend
+    popen = Mock()
+    monkeypatch.setattr(ext.subprocess, 'Popen', popen)
+    for action in ('config', 'start'):
+        result = light.dispatch(action, {'backend': 'mqtt'})
+        assert not result['ok'] and result['code'] == 'INVALID_ARGUMENT'
+        assert 'official SDK' in result['message']
+        assert light._thread is worker and worker.is_alive() and light._backend is backend
+    popen.assert_not_called()
 
 
 def test_sdk_exclusive_guard_and_missing_executable(sdk_helper):
@@ -581,7 +537,7 @@ def test_canvas_backend_config_requires_restart(light, sdk_helper):
     assert light._info()['backend'] == 'sdk'
 
 
-@pytest.mark.parametrize('config', [{'backend': 'invalid'}, {'mqtt_port': True}, {'mqtt_port': 0},
+@pytest.mark.parametrize('config', [{'backend': 'invalid'}, {'backend': 'mqtt'}, {'sdk_exclusive': 1},
                                     {'sdk_exclusive': 'true'}, {'sdk_dir': ''}, {'sdk_executable': None}])
 def test_bad_canvas_config_preserves_backend(light, config):
     backend = light._backend

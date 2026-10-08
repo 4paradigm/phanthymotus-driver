@@ -4,7 +4,7 @@ ext_devices.py — Go1 外部设备通信卡合集(actuator)。
 合并了以下外部设备卡（每张卡行为不变）：
   - beep: 头部扬声器蜂鸣控制（HTTP 到 Nano beep_adapter :18082）
   - speaker: 头部扬声器音频流播放（ROS2 订阅 + TCP 二进制帧到 Nano speaker_adapter）
-  - face_light: 面部灯带静态/逐灯/定时灯效（MQTT 整条同色、官方 SDK 或显式模拟）
+  - face_light: 面部灯带静态/逐灯/定时灯效（统一官方 SDK 或显式模拟）
   - system_health: 机器人整体健康检查（CPU/内存/磁盘/电池/MQTT）
 
 
@@ -461,7 +461,7 @@ def make_speaker(plugin_config, namespace, executor, client):
 
 
 # ============================================================================
-# face_light — one card, one serialized output path (MQTT or explicit simulation)
+# face_light — one card, one serialized output path (official SDK or explicit simulation)
 # ============================================================================
 
 CARD_FACE_LIGHT = "face_light"
@@ -537,57 +537,6 @@ class _FaceSimBackend:
 
     def close(self):
         self.connected = False
-
-
-class _FaceMqttBackend:
-    """Only the existing three-byte topic. No LED addressing or hardware feedback."""
-    name = "mqtt"
-    per_led = False
-
-    def __init__(self, host, port):
-        self.host, self.port = host, port
-        self.client = None
-
-    @property
-    def connected(self):
-        return bool(self.client and self.client.is_connected())
-
-    def start(self):
-        if not _HAS_MQTT:
-            raise RuntimeError("paho-mqtt is not installed")
-        # Async connection avoids holding the card lifecycle lock during network connect.
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
-        try:
-            self.client.connect_async(self.host, self.port, 60)
-            self.client.loop_start()
-        except Exception:
-            self.close()
-            raise
-
-    def write(self, frame):
-        if not self.connected:
-            raise RuntimeError("MQTT is not connected; wait for connection or check broker")
-        if any(color != frame[0] for color in frame):
-            raise RuntimeError("MQTT supports only uniform RGB")
-        try:
-            result = self.client.publish("face_light/color", bytes(frame[0]), qos=0, retain=False)
-            if result.rc != mqtt.MQTT_ERR_SUCCESS:
-                raise RuntimeError(f"MQTT publish failed: rc={result.rc}")
-            result.wait_for_publish(timeout=0.5)
-            if not result.is_published():
-                raise RuntimeError("MQTT send timed out")
-        except Exception:
-            # Drop unsent queued frames; reconnect must not replay an interrupted effect.
-            self.close()
-            raise
-
-    def close(self):
-        client, self.client = self.client, None
-        if client:
-            try:
-                client.disconnect()
-            finally:
-                client.loop_stop()
 
 
 class _FaceSdkBackend:
@@ -690,7 +639,7 @@ _FACE_SDK_EXECUTABLE = "/deploy/face_light/run_sdk.sh"
 _FACE_SDK_DIR = "/opt/phanthy-motus/data/go1/faceLightSDK_Nano"
 
 _FACE_CONFIG_DEFAULTS = {
-    "backend": "mqtt", "mqtt_host": "localhost", "mqtt_port": 1883,
+    "backend": "sdk",
     "sdk_executable": _FACE_SDK_EXECUTABLE, "sdk_exclusive": False,
     "sdk_dir": _FACE_SDK_DIR,
 }
@@ -698,12 +647,10 @@ _FACE_CONFIG_DEFAULTS = {
 
 def _face_backend(config):
     backend = config["backend"]
-    if backend not in ("mqtt", "simulated", "sdk"):
-        raise ValueError("face_light backend must be mqtt, simulated or sdk")
-    if not isinstance(config["mqtt_host"], str) or not config["mqtt_host"]:
-        raise ValueError("mqtt_host must be a nonempty string")
-    if type(config["mqtt_port"]) is not int or not 1 <= config["mqtt_port"] <= 65535:
-        raise ValueError("mqtt_port must be an integer in 1..65535")
+    if backend == "mqtt":
+        raise ValueError("face_light now uses the official SDK; select backend=sdk, mount the SDK and stop the old MQTT writer before confirming sdk_exclusive")
+    if backend not in ("simulated", "sdk"):
+        raise ValueError("face_light backend must be sdk or simulated")
     if type(config["sdk_exclusive"]) is not bool:
         raise ValueError("sdk_exclusive must be a boolean")
     for key in ("sdk_dir", "sdk_executable"):
@@ -714,7 +661,7 @@ def _face_backend(config):
         return _FaceSdkBackend(_FACE_SDK_EXECUTABLE, config["sdk_exclusive"], _FACE_SDK_DIR)
     if backend == "simulated":
         return _FaceSimBackend()
-    return _FaceMqttBackend(config["mqtt_host"], config["mqtt_port"])
+    raise ValueError("unsupported face_light backend")
 
 
 def _face_acp_notify(action_id, status, result):
@@ -864,7 +811,7 @@ class FaceLightPlugin:
     def _info(self):
         with self._lock:
             per_led = self._backend.per_led
-            effects = list(_FACE_EFFECTS if per_led else _FACE_EFFECTS[:3])
+            effects = list(_FACE_EFFECTS)
             return _env_face("info", True, state="ready" if self._active else "idle",
                              mode=self._mode, running=bool(self._thread and self._thread.is_alive()),
                              connected=self._backend.connected, backend=self._backend.name,
@@ -911,9 +858,7 @@ class FaceLightPlugin:
                                                               "description": "Auto-off after these seconds"}},
                                 "x-action-params": {a: {"params": p, "description": descriptions[a]} for a, p in actions.items()}},
                 "configSchema": {"type": "object", "properties": {
-                    "backend": {"type": "string", "enum": ["mqtt", "simulated", "sdk"], "default": "mqtt"},
-                    "mqtt_host": {"type": "string", "default": "localhost", "x-sensitive": True},
-                    "mqtt_port": {"type": "integer", "default": 1883, "minimum": 1, "maximum": 65535},
+                    "backend": {"type": "string", "enum": ["sdk", "simulated"], "default": "sdk"},
                     "sdk_exclusive": {"type": "boolean", "default": False,
                                       "description": "Confirm existing faceLightMqtt writer is stopped; keep faceLightServer running"}}},
                 "topic_out": []}
@@ -958,9 +903,6 @@ class FaceLightPlugin:
         except ValueError as exc:
             return _env_face(action, False, code="INVALID_ARGUMENT", message=str(exc))
         with self._ops:
-            if action in ("set_led", "set_leds", "chase") and not self._backend.per_led:
-                return _env_face(action, False, code="UNSUPPORTED_CAPABILITY",
-                                 message="MQTT face_light/color supports only three-byte uniform RGB; select a verified SDK backend for per-LED control")
             self._cancel_effect()
             with self._lock:
                 if not self._active:
@@ -997,7 +939,7 @@ class FaceLightPlugin:
                     applied.update(period_s=period, duration_s=duration, end_behavior="off")
                 return _env_face(action, True, applied=applied, simulated=self._backend.name == "simulated",
                                  **({"action_id": action_id} if action in _FACE_EFFECTS else {}),
-                                 delivery="simulated" if self._backend.name == "simulated" else "sdk_udp_socket_sent" if self._backend.name == "sdk" else "mqtt_socket_sent")
+                                 delivery="simulated" if self._backend.name == "simulated" else "sdk_udp_socket_sent")
 
 
 def make_face_light(plugin_config, namespace, executor, client):

@@ -187,19 +187,21 @@ sudo docker run --rm --name go1_bundle \
 ## face_light：在原卡内控制静态色、12 灯和定时灯效
 
 仍然只注册一张 `face_light`（`ext_devices.py::FaceLightPlugin`），没有新增灯光卡，
-没有修改 Agent Core、运动 SDK 或其他机器人。默认 `backend: mqtt` 保留原
-`face_light/color` 的 **3 字节 RGB**；静态颜色保持到下一次有效指令。
-不再将越界值截断、字符串转整数或将 MQTT 发布错误当作成功。
+没有修改 Agent Core、运动 SDK 或其他机器人。默认 `backend: sdk`，实机所有灯光
+统一调用官方 SDK。保留 `set_color`/`preset`/`off` 的调用接口，静态颜色保持到下一次有效指令。
+不再提供灯光 MQTT 后端；旧画布的 `backend: mqtt` 配置会返回明确迁移提示，需更新为 `sdk`。
+不将越界值截断、字符串转整数或发送错误当作成功。
 
 | 后端 | 静态整条 RGB / preset / off | blink / breathe / fade | set_led / set_leds / chase |
 |---|---|---|---|
-| `mqtt`（默认） | 原 3 字节协议 | 内部定时发送整条 RGB | 返回 `UNSUPPORTED_CAPABILITY`，不发送 36 字节 |
 | `simulated` | 软件模拟 | 软件模拟 | 完整 12 灯软件模拟，无网络或硬件操作 |
-| `sdk` | 官方 SDK | 内部定时调用 SDK | 官方 `setLedColor` + `sendCmd`；已本地编译，待真机显示验收 |
+| `sdk`（默认） | 官方 SDK | 内部定时调用 SDK | 官方 `setLedColor` + `sendCmd`；已本地编译，待真机显示验收 |
 
 本地模拟将 `config.yaml` 中 **现有** `plugins.face_light.backend` 设为 `simulated`；
-默认配置仍是 `mqtt`。模拟结果显式带 `simulated: true`。没有自动回退到模拟成功。
-所有后端共用同一帧写入路径，每个实例只运行一个灯效；不同时创建 MQTT 和 UDP 写入器。
+模拟结果显式带 `simulated: true`。没有自动回退到模拟成功。
+所有指令共用同一帧写入路径，每个实例只运行一个灯效，实机只创建 SDK 写入器。
+默认 `sdk_exclusive: false`，在操作者停止旧 `faceLightMqtt` 写入源并确认独占前启动会失败，
+不会自动停止现场程序。保持 `faceLightServer` 运行，并准备下文规定目录中的官方 SDK。
 
 调用现有 `face_light` 工具，将下列对象作为 `arguments`：
 
@@ -244,14 +246,14 @@ Go1 其他执行类工具也声明资源：`beep`/`speaker` 共用 `mouth`，
 取消灯效、发送黑色、关闭连接并回收线程。停止后指令返回 `NOT_AVAILABLE`，
 需再次 `start`。重复 start/stop 可安全调用。不能连接或发送时返回失败；
 后台发送失败也结束灯效并记录 `last_error`。连接不可用时不能保证硬件已经熄灭。
-MQTT 连接异步建立，`start` 的 ready 表示软件启动；要查看 `info.connected`。
-MQTT 发送失败时丢弃连接，防止重连重放旧队列；恢复须 stop/start。
+SDK 适配器启动握手成功后才返回 ready；`info.connected` 仅表示软件进程存活。
+SDK 发送失败时结束适配器进程，防止继续发送旧帧；恢复须 stop/start。
 
 `info` 返回 `mode`、`running`（灯效线程）、`connected`、能力表、12 灯位置映射、
 最近成功发送的 `colors` 和时间及 `last_error`。首次发送前 `colors: null`。
 这些均为软件记录，统一标注 `state_source: software_record` 和
-`hardware_verified: false`，无硬件状态反馈。MQTT `ok: true` 仅表示消息已由客户端
-发出（QoS 0，无订阅端确认），不表示实际灯带显示成功。
+`hardware_verified: false`，无硬件状态反馈。SDK `ok: true` 仅表示 UDP 发送调用成功，
+不表示实际灯带显示成功。
 
 ### 官方编号与真实 SDK 接入缺口
 
@@ -309,8 +311,8 @@ cmake --build /tmp/go1-face-build
 
 构建产物为 `face_light_sdk_adapter` 和其同目录的 `vendor_sdk/`。
 **两者一起保留/搬移**，适配器通过相对库搜索路径加载匹配的官方库。
-既有 Dockerfile 已复制整个 `deploy/`，其中包括适配器源码；默认 MQTT 镜像无需
-SDK。镜像默认通过 `/deploy/face_light/run_sdk.sh` 在首次启动 SDK 后端时编译，并缓存
+既有 Dockerfile 已复制整个 `deploy/`，其中包括适配器源码；SDK 库由操作者挂载。
+镜像通过 `/deploy/face_light/run_sdk.sh` 在首次启动 SDK 后端时编译，并缓存
 编译产物。只需将完整官方 SDK 放到机器人
 `/opt/phanthy-motus/data/go1/faceLightSDK_Nano`（现有数据卷已映射）；SDK 库不打包进公共镜像。
 启动脚本与 SDK 根目录固定，不在画布暴露路径配置；`config`/`start` 传入其他
@@ -333,9 +335,10 @@ face_light:
 python -m pytest -q tests/test_go1_face_light.py
 ```
 
-测试使用显式模拟帧、假的 MQTT 客户端和 SDK 管道测试进程，覆盖旧接口、严格参数校验、12 灯映射、
+测试使用显式模拟帧和 SDK 管道测试进程，覆盖旧接口在 SDK 下的兼容性、严格参数校验、12 灯映射、
 四种效果的时间变化、到期关闭、静态/效果抢占、停止竞争、停止后无旧帧、
-线程回收、连接/发布失败、SDK 独占前置条件/进程超时/异常/回收和唯一卡片装配。它们不证明真机灯带表现。
+线程回收、发送失败、旧 MQTT 配置迁移提示、SDK 独占前置条件/进程超时/异常/回收和唯一卡片装配。
+它们不证明真机灯带表现。
 
 `tests/face_light_native_check.py` 必须在仅 lo 网卡启用且无 IPv4 路由的断网 Linux 容器运行，
 设置 `SDK_DIR` 和 `REAL_ADAPTER`：原生成功路径用实际 SDK 头文件加假的动态库
@@ -343,7 +346,7 @@ python -m pytest -q tests/test_go1_face_light.py
 RGB 调用、输入校验、错误回报、进程关闭及库包可搬移。
 
 SDK 文件已取得和审查；下一步需要获准部署并切换灯光写入源，再进行真机灯光验收：
-检查旧 MQTT 三字节整条色和关闭，逐灯 0–11 单独点亮拍照验证位置/RGB 通道；
+使用原 `set_color`/`preset`/`off` 接口检查 SDK 整条色和关闭，逐灯 0–11 单独点亮拍照验证位置/RGB 通道；
 发送包含 12 种可区分颜色的帧，观察四种效果的周期/持续时间；效果中切换静态色、
 off 和停止，持续观察旧颜色不再返回；断连时确认失败记录，恢复后检查无旧队列重放。
 记录视频/照片与软件发送记录，分别说明实测和软件结果。本轮没有机器人运动、
