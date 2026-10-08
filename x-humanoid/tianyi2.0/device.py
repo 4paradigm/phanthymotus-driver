@@ -2310,7 +2310,7 @@ class SoundDirectionPlugin:
             out.data = json.dumps(event, ensure_ascii=False)
             self._pub.publish(out)
 
-    def dispatch(self, action: str, args: dict) -> dict:
+    def dispatch(self, action: str, args: dict) -> dict | None:
         result = {"topic_out": [{"topic": self._topic, "format": "data/json"}]}
         if action == "start":
             self.start()
@@ -2319,7 +2319,7 @@ class SoundDirectionPlugin:
             self.stop()
             return {"state": "idle", **result}
         elif action != "info":
-            return {"state": "error", "error": f"Unknown action: {action}"}
+            return None
         with self._lock:
             if not self._running:
                 result["state"] = "idle"

@@ -93,6 +93,7 @@ def test_dispatch_start_stop_report_lifecycle_state(monkeypatch):
     assert plugin.dispatch("info", {})["state"] == "no_event"
     assert plugin.dispatch("stop", {})["state"] == "idle"
     assert plugin.dispatch("start", {})["state"] == "running"
+    assert plugin.dispatch("unsupported", {}) is None
 
 
 def test_old_or_stopped_direction_is_not_current(monkeypatch):
