@@ -879,7 +879,10 @@ class A3Nodes:
     def _wrapper_bytes(msg):
         data = getattr(msg, "data", b"")
         if isinstance(data, (list, tuple)):
-            return b"".join(bytes(part) for part in data)
+            # ROS byte[] is exposed as a list/array of integer octets.  Calling
+            # bytes(part) for each integer interprets it as a zero-filled
+            # length, corrupting every protobuf payload before ParseFromString.
+            return bytes((int(part) & 0xff) for part in data)
         return bytes(data)
 
     def _decode_bms(self, msg):
@@ -890,7 +893,7 @@ class A3Nodes:
             channel.ParseFromString(self._wrapper_bytes(msg))
         except Exception:
             return self._wrapper_json(msg)
-        return self._protobuf_json(channel)
+        return self._protobuf_flat_json(channel)
 
     def _decode_emergency(self, msg):
         if self._pb is None:
@@ -900,7 +903,7 @@ class A3Nodes:
             channel.ParseFromString(self._wrapper_bytes(msg))
         except Exception:
             return self._wrapper_json(msg)
-        return self._protobuf_json(channel)
+        return self._protobuf_flat_json(channel)
 
     @staticmethod
     def _protobuf_json(message):
@@ -910,6 +913,14 @@ class A3Nodes:
             return MessageToDict(message, preserving_proto_field_name=True)
         except Exception:
             return {field.name: jsonable(value) for field, value in message.ListFields()}
+
+    @classmethod
+    def _protobuf_flat_json(cls, message):
+        """Return scalar JSON fields suitable for the dashboard value grid."""
+        nested = cls._protobuf_json(message)
+        flat = {}
+        _flatten_json(nested, "", flat)
+        return flat
 
     @classmethod
     def _wrapper_json(cls, msg):
