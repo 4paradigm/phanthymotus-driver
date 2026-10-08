@@ -29,10 +29,9 @@ agibot-a3:
     # {robot-subnet IP, 127.0.0.1} before any participant is created — see
     # main.py _select_profile. Domain 42 is set in code by DualDomainROS2 too;
     # a container-wide ROS_DOMAIN_ID would only govern stray processes.
-    # Robot-side large Image/PointCloud2 reception uses CycloneDDS. The
-    # isolated domain-42 bridge overrides RMW to FastDDS in its child workers.
-    - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-    - CYCLONEDDS_URI=file:///work/agibot/A3/cyclonedds.xml
+    # Both the robot participant and isolated domain-42 bridge use FastDDS;
+    # main.py generates the constrained robot profile before participants exist.
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - PYTHONUNBUFFERED=1
   logging:
     driver: local
