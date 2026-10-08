@@ -33,6 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import zlib
 import atexit
+import xml.etree.ElementTree as ET
 from array import array
 from datetime import datetime, timezone
 from pathlib import Path
@@ -245,6 +246,29 @@ CAMERA_TOPICS = {
 # (JPEG for RGB, zlib uint16 for depth; see _encode_rgb/_encode_depth below).
 
 RESOURCE_DIR = Path(__file__).with_name("resource")
+
+
+def _skeleton_joint_indices() -> dict[str, int]:
+    """Return stable indices for the A3 URDF's kinematic joints.
+
+    The robot also reports sensor mounts and implementation-only fields in
+    some JointState groups.  Those must not be assigned arbitrary stream-order
+    indices: the canvas uses ``idx`` to look up the URDF joint transform.
+    """
+    path = RESOURCE_DIR / "a3_ultra_t3d0" / "urdf" / "model.urdf"
+    if not path.is_file():
+        path = RESOURCE_DIR / "a3_ultra.urdf"
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return {}
+    # Keep the original URDF element index.  The canvas model indexes joints
+    # using the complete XML order, including fixed joints between actuators.
+    return {
+        joint.get("name"): index
+        for index, joint in enumerate(root.findall("joint"))
+        if joint.get("name") and joint.get("type") in {"revolute", "continuous", "prismatic"}
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -833,13 +857,19 @@ class A3Nodes:
         output.data = json.dumps(raw, ensure_ascii=False)
         self._joint_state_pub.publish(output)
         joints = []
+        model_indices = _skeleton_joint_indices()
         for group in groups.values():
             names = group.get("name", []) if isinstance(group, dict) else []
             positions = group.get("position", []) if isinstance(group, dict) else []
             velocities = group.get("velocity", []) if isinstance(group, dict) else []
             efforts = group.get("effort", []) if isinstance(group, dict) else []
             for index, name in enumerate(names):
-                joints.append({"idx": len(joints), "name": name,
+                # Only actuated joints that exist in the model belong in the
+                # skeleton stream. Unknown metadata/fixed sensor joints remain
+                # available in joint_state's raw JSON stream.
+                if name not in model_indices:
+                    continue
+                joints.append({"idx": model_indices[name], "name": name,
                                "q": positions[index] if index < len(positions) else 0.0,
                                "dq": velocities[index] if index < len(velocities) else 0.0,
                                "tau": efforts[index] if index < len(efforts) else 0.0})
