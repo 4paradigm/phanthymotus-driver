@@ -18,6 +18,21 @@ def _number(value, default=0.0):
         return default
 
 
+def _finite(value):
+    """A measured axis value, or None when it is unreadable or not finite.
+
+    A NaN or infinity from the sport feed is not a measurement, and json.dumps
+    would serialize it as bare NaN/Infinity — which is not valid JSON and breaks
+    every motus.odom/1 consumer. Unreadable is likewise None, never a measured
+    zero.
+    """
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
 def _values(value):
     try:
         return list(value)
@@ -175,10 +190,10 @@ class _StateNode:
             velocity = getattr(msg, "velocity", [])
             velocity = list(velocity)
             row = [
-                velocity[0] if len(velocity) > 0 else None,
-                velocity[1] if len(velocity) > 1 else None,
+                _finite(velocity[0]) if len(velocity) > 0 else None,
+                _finite(velocity[1]) if len(velocity) > 1 else None,
                 None, None, None,  # vz, roll rate, pitch rate are not measured
-                _number(getattr(msg, "yaw_speed", 0)),
+                _finite(getattr(msg, "yaw_speed", None)),
             ]
             stamp_ms, provenance = resolve_stamp_ms(
                 vendor_ms=_timespec_ms(getattr(msg, "stamp", None)),
@@ -251,15 +266,20 @@ class StatePlugin:
                  "inputSchema": {"type": "object", "properties": {}},
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
                 for name, path, fmt, desc in specs]
-    @staticmethod
-    def _odom_interface():
-        from common.odom import build_interface
-
+    @classmethod
+    def _odom_interface(cls):
         # As2W's sport feed reports body-frame forward/lateral velocity and yaw
         # rate, and no pose. Legged dead reckoning drifts unbounded, but with no
         # pose published there is nothing to accumulate, so drift is "none".
-        return build_interface(provides=["vx", "vy", "wz"], rate_hz=10,
-                               pose_drift="none")
+        # Deterministic, so build the declaration once (README_dev guidance)
+        # instead of rebuilding it on every info/dispatch call. Class-level
+        # cache because tests instantiate via __new__ without __init__.
+        if "_odom_interface_cache" not in cls.__dict__:
+            from common.odom import build_interface
+
+            cls._odom_interface_cache = build_interface(
+                provides=["vx", "vy", "wz"], rate_hz=10, pose_drift="none")
+        return cls._odom_interface_cache
     def start(self):
         # Sensor cards share one LowState subscription.  Recreate it when a
         # dashboard stopped the card instead of claiming a dead stream is live.

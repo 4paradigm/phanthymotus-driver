@@ -381,6 +381,22 @@ class TestDriverContracts(unittest.TestCase):
         node._publish_odom(self._sport())
         self.assertEqual([None] * 6, published[0]["twist"])
 
+    def test_odom_non_finite_axis_is_null_not_nan(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport(velocity=[float("nan"), float("inf"), 0.0],
+                                   yaw_speed=float("-inf")))
+        vx, vy, vz, wx, wy, wz = published[0]["twist"]
+        self.assertIsNone(vx)
+        self.assertIsNone(vy)
+        self.assertIsNone(wz)
+
+    def test_odom_unreadable_yaw_speed_is_null_not_zero(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport(yaw_speed=None))
+        self.assertIsNone(published[0]["twist"][5])
+
     def test_odom_unreadable_after_valid_does_not_reuse_stamp(self):
         published = []
         node = self._odom_node(published)
