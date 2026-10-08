@@ -161,7 +161,8 @@ class VisionCapturePlugin:
                                         (self._output_dir / "videos", ".mp4", "video/mp4")):
             if directory.exists():
                 for path in directory.iterdir():
-                    if path.is_file() and path.suffix.lower() == suffix:
+                    # 点号开头的临时文件尚未发布，不应显示为可用媒体。
+                    if path.is_file() and not path.name.startswith(".") and path.suffix.lower() == suffix:
                         files.append({"filename": path.name, "path": str(path),
                                       "channel_reply_path": self._channel_path(path),
                                       "size": path.stat().st_size, "mime": mime})

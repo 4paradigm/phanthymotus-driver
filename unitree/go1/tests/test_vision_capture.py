@@ -238,6 +238,24 @@ def test_named_photo_list_and_delete(tmp_path, monkeypatch, completions):
     assert not Path(accepted["file_path"]).exists()
 
 
+def test_list_hides_unpublished_video_temp_file(tmp_path):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    photos = tmp_path / "photos"
+    videos = tmp_path / "videos"
+    photos.mkdir()
+    videos.mkdir()
+    (photos / "photo.jpg").write_bytes(b"\xff\xd8photo\xff\xd9")
+    (videos / "video.mp4").write_bytes(b"published")
+    temporary = videos / ".front_20260930_074445_842992_30c508ee.tmp.mp4"
+    temporary.touch()
+
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    names = {item["filename"] for item in card.dispatch("list", {})["files"]}
+
+    assert names == {"photo.jpg", "video.mp4"}
+    assert temporary.exists()
+
+
 def test_named_capture_rejects_bad_names_and_existing_file(tmp_path, monkeypatch, completions):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
