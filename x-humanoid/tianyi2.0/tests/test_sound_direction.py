@@ -10,6 +10,7 @@ from pathlib import Path
 
 class _Node:
     def __init__(self, *args, **kwargs):
+        self.context = kwargs.get("context")
         self.subscriptions = []
         self.publishers = []
 
@@ -23,8 +24,11 @@ class _Node:
         self.publishers.append(publisher)
         return publisher
 
+    def destroy_node(self):
+        pass
 
-def _plugin(monkeypatch):
+
+def _plugin(monkeypatch, before_create=None):
     rclpy = types.ModuleType("rclpy")
     rclpy.node = types.ModuleType("rclpy.node")
     rclpy.qos = types.ModuleType("rclpy.qos")
@@ -60,12 +64,15 @@ def _plugin(monkeypatch):
     ros2 = types.SimpleNamespace(ctx_tianyi=object(), ctx_core=object(),
                                  executor_tianyi=types.SimpleNamespace(add_node=lambda node: None),
                                  executor_core=types.SimpleNamespace(add_node=lambda node: None))
+    if before_create:
+        before_create(ros2, rclpy)
     return module.SoundDirectionPlugin({}, "robot", ros2)
 
 
 def test_wake_angle_is_published_and_queryable(monkeypatch):
     plugin = _plugin(monkeypatch)
     tool = plugin.get_tool()
+    assert plugin.PREFIX == "sound_direction"
     assert tool["name"] == "sound_direction"
     assert tool["default_action"] == "info"
     assert plugin.dispatch("info", {})["state"] == "idle"
@@ -85,6 +92,44 @@ def test_wake_angle_is_published_and_queryable(monkeypatch):
     assert result["state"] == "fresh"
     assert result["angle"] == 42
     assert result["age_ms"] >= 0
+
+
+def test_sound_direction_publishes_through_core_bridge(monkeypatch):
+    bridged_messages = []
+    bridge = None
+
+    def enable_bridge(ros2, rclpy):
+        nonlocal bridge
+        rclpy.publisher = types.ModuleType("rclpy.publisher")
+        rclpy.serialization = types.ModuleType("rclpy.serialization")
+        rclpy.publisher.Publisher = type("Publisher", (), {})
+        rclpy.serialization.deserialize_message = lambda *args: None
+        rclpy.serialization.serialize_message = lambda *args: b""
+        monkeypatch.setitem(sys.modules, "rclpy.publisher", rclpy.publisher)
+        monkeypatch.setitem(sys.modules, "rclpy.serialization", rclpy.serialization)
+        root = Path(__file__).parents[1]
+        publisher_module = types.ModuleType("bridged_publisher")
+        source = (root / "bridged_publisher.py").read_text(encoding="utf-8")
+        exec(compile(source, "bridged_publisher.py", "exec"), publisher_module.__dict__)
+        bridged = types.SimpleNamespace(publish=bridged_messages.append)
+        publisher_module.create_bridged_publisher = lambda *args: bridged
+        monkeypatch.setitem(sys.modules, "bridged_publisher", publisher_module)
+        bridge = types.ModuleType("bridge_integration")
+        source = (root / "bridge_integration.py").read_text(encoding="utf-8")
+        exec(compile(source, "bridge_integration.py", "exec"), bridge.__dict__)
+        bridge.enable(ros2.ctx_core)
+
+    try:
+        plugin = _plugin(monkeypatch, before_create=enable_bridge)
+        assert plugin._pub_node.context is not plugin._sub_node.context
+        assert plugin._pub_node.publishers == []
+        plugin.start()
+        plugin._sub_node.subscriptions[0][2](
+            types.SimpleNamespace(keyword="小范小范", angle=42))
+        assert json.loads(bridged_messages[0].data)["angle"] == 42
+    finally:
+        if bridge:
+            bridge.disable()
 
 
 def test_dispatch_start_stop_report_lifecycle_state(monkeypatch):

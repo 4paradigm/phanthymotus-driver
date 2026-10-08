@@ -2260,6 +2260,7 @@ class AsrPlugin:
 class SoundDirectionPlugin:
     """将 Lyre 唤醒词附带的原始声源角度交给 Agent Core。"""
 
+    PREFIX = "sound_direction"
     _FRESH_SECONDS = 10
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -2277,7 +2278,7 @@ class SoundDirectionPlugin:
 
     def get_tool(self) -> dict:
         return {
-            "name": "sound_direction", "type": "sensor", "default_action": "info",
+            "name": self.PREFIX, "type": "sensor", "default_action": "info",
             "description": "天轶2.0 唤醒词声源方向；返回 Lyre 原始 angle，角度零点和单位须实机标定",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
