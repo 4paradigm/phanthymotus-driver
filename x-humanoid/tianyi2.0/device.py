@@ -2264,6 +2264,7 @@ class SoundDirectionPlugin:
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._topic = f"/{namespace}/asr/sound_direction"
+        self._lock = threading.Lock()
         self._running = False
         self._subscription = None
         self._last_event = None
@@ -2283,28 +2284,31 @@ class SoundDirectionPlugin:
         }
 
     def start(self):
-        if self._subscription is None:
-            from lyre_msgs.msg import AsrKeyword
-            self._subscription = self._sub_node.create_subscription(
-                AsrKeyword, "/audio_asr/keyword", self._on_keyword, _RELIABLE_QOS)
-        self._running = True
+        with self._lock:
+            if self._subscription is None:
+                from lyre_msgs.msg import AsrKeyword
+                self._subscription = self._sub_node.create_subscription(
+                    AsrKeyword, "/audio_asr/keyword", self._on_keyword, _RELIABLE_QOS)
+            self._running = True
 
     def stop(self):
-        self._running = False
-        self._last_event = None
-        self._last_seen_monotonic = None
+        with self._lock:
+            self._running = False
+            self._last_event = None
+            self._last_seen_monotonic = None
 
     def _on_keyword(self, msg):
-        if not self._running:
-            return
-        # 原样传递厂家角度；实机标定前不把它解释成机器人左/右或转动量。
-        event = {"keyword": msg.keyword, "angle": msg.angle,
-                 "timestamp_ms": int(time.time() * 1000)}
-        self._last_event = event
-        self._last_seen_monotonic = time.monotonic()
-        out = String()
-        out.data = json.dumps(event, ensure_ascii=False)
-        self._pub.publish(out)
+        with self._lock:
+            if not self._running:
+                return
+            # 原样传递厂家角度；实机标定前不把它解释成机器人左/右或转动量。
+            event = {"keyword": msg.keyword, "angle": msg.angle,
+                     "timestamp_ms": int(time.time() * 1000)}
+            self._last_event = event
+            self._last_seen_monotonic = time.monotonic()
+            out = String()
+            out.data = json.dumps(event, ensure_ascii=False)
+            self._pub.publish(out)
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "start":
@@ -2314,16 +2318,17 @@ class SoundDirectionPlugin:
         elif action != "info":
             return {"state": "error", "error": f"Unknown action: {action}"}
         result = {"topic_out": [{"topic": self._topic, "format": "data/json"}]}
-        if not self._running:
-            result["state"] = "idle"
-        elif self._last_event is None:
-            result["state"] = "no_event"
-        else:
-            age_ms = max(0, int((time.monotonic() - self._last_seen_monotonic) * 1000))
-            result["state"] = "fresh" if age_ms < self._FRESH_SECONDS * 1000 else "stale"
-            result["age_ms"] = age_ms
-            if result["state"] == "fresh":
-                result.update(self._last_event)
+        with self._lock:
+            if not self._running:
+                result["state"] = "idle"
+            elif self._last_event is None:
+                result["state"] = "no_event"
+            else:
+                age_ms = max(0, int((time.monotonic() - self._last_seen_monotonic) * 1000))
+                result["state"] = "fresh" if age_ms < self._FRESH_SECONDS * 1000 else "stale"
+                result["age_ms"] = age_ms
+                if result["state"] == "fresh":
+                    result.update(self._last_event)
         return result
 
 

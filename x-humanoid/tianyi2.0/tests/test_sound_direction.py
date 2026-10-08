@@ -2,6 +2,7 @@
 
 import json
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -101,3 +102,34 @@ def test_old_or_stopped_direction_is_not_current(monkeypatch):
     plugin.start()
     assert plugin.dispatch("info", {})["state"] == "no_event"
     assert len(plugin._sub_node.subscriptions) == 1
+
+
+def test_stop_during_wake_callback_cannot_restore_old_direction(monkeypatch):
+    plugin = _plugin(monkeypatch)
+    plugin.start()
+    callback = plugin._sub_node.subscriptions[0][2]
+    entered = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
+    real_time = time.time
+
+    def paused_time():
+        entered.set()
+        assert release.wait(2)
+        return real_time()
+
+    monkeypatch.setitem(plugin._on_keyword.__globals__, "time",
+                        types.SimpleNamespace(time=paused_time, monotonic=time.monotonic))
+    reader = threading.Thread(target=callback,
+                              args=(types.SimpleNamespace(keyword="小范小范", angle=15),))
+    reader.start()
+    assert entered.wait(2)
+    stopper = threading.Thread(target=lambda: (plugin.stop(), stopped.set()))
+    stopper.start()
+    stopped.wait(0.2)
+    release.set()
+    reader.join(2)
+    stopper.join(2)
+    assert not reader.is_alive() and not stopper.is_alive()
+    plugin.start()
+    assert plugin.dispatch("info", {})["state"] == "no_event"
