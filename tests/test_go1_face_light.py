@@ -213,6 +213,38 @@ def test_blocked_acp_cannot_delay_replacement_frame(light, monkeypatch, action, 
     assert calls[0]['ok'] and not light._completion_threads
 
 
+def test_stop_bounds_total_reporter_wait_and_late_callbacks_do_not_write(light, monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(ext, "_face_acp_notify", lambda *unused: release.wait())
+    light.COMPLETION_SHUTDOWN_TIMEOUT = 0.1
+    try:
+        # Multiple outstanding reports must share one shutdown deadline.
+        for _ in range(3):
+            assert light.dispatch("blink", {"r": 20, "duration_s": 0.05})["ok"]
+            light._thread.join(1)
+        reporters = list(light._completion_threads)
+        assert len(reporters) == 3 and all(t.daemon and t.is_alive() for t in reporters)
+        started = time.monotonic()
+        result = light.stop()
+        assert time.monotonic() - started < 0.25
+        assert result["ok"] and result["completion_pending"] == 3
+        assert not result["completion_cleanup_complete"]
+        assert not light._active and not light._backend.connected and light._thread is None
+        frames = list(light._backend.frames)
+        assert frames[-1][1] == ext._FACE_BLACK
+        release.set()
+        for reporter in reporters:
+            reporter.join(1)
+            assert not reporter.is_alive()
+        assert not light._completion_threads and list(light._backend.frames) == frames
+        assert light.stop()["completion_cleanup_complete"]
+    finally:
+        release.set()
+        for reporter in list(light._completion_threads):
+            reporter.join(1)
+        light.stop()
+
+
 def test_completion_reporters_are_bounded_and_slots_reused(light, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     light._completion_slots = threading.BoundedSemaphore(1)
@@ -482,6 +514,35 @@ def test_info_availability_tracks_process_readiness_and_stop(sdk_helper):
     finally:
         plugin.stop()
     assert not plugin._info()["available"]
+
+
+def test_persisted_mqtt_config_keeps_bundle_discoverable_and_can_migrate(sdk_helper, monkeypatch):
+    import main
+    helper, _ = sdk_helper
+    popen = Mock(side_effect=AssertionError("legacy config must never launch"))
+    with monkeypatch.context() as patch:
+        patch.setattr(ext.subprocess, "Popen", popen)
+        bundle = main.Go1Bundle({"plugins": {"face_light": {"enabled": True, "backend": "mqtt"},
+                                            "system_health": {"enabled": True}}}, "offline", None, None)
+        assert {tool["name"] for tool in bundle.get_all_tools()} == {"face_light", "system_health"}
+        plugin = next(p for p in bundle._plugins if isinstance(p, ext.FaceLightPlugin))
+        for action, args in (("start", {}), ("config", {"backend": "mqtt"}),
+                             ("set_color", {"r": 1}), ("blink", {"r": 1})):
+            result = plugin.dispatch(action, args)
+            assert not result["ok"] and result["code"] == "INVALID_ARGUMENT"
+            assert "official SDK" in result["message"]
+        assert not plugin._info()["available"] and not plugin._info()["config_valid"]
+        plugin.stop()
+        assert "official SDK" in plugin._info()["unavailable_reason"]
+        popen.assert_not_called()
+        result = plugin.dispatch("config", {"backend": "sdk"})
+        assert result["ok"] and result["needs_start"] and plugin._info()["config_valid"]
+    plugin._backend = ext._FaceSdkBackend(str(helper), True)
+    try:
+        assert plugin.start()["ok"] and plugin._info()["available"]
+        assert plugin.dispatch("set_color", {"g": 10})["ok"]
+    finally:
+        plugin.stop()
 
 
 def test_concurrent_start_stop_no_resurrection():
@@ -846,15 +907,23 @@ def test_remote_sdk_path_override_rejected_without_interrupt(light, monkeypatch,
     popen.assert_not_called()
 
 
-def test_sdk_paths_not_editable_and_constructor_rejects_override(tmp_path):
+def test_sdk_paths_not_editable_and_invalid_constructor_config_cannot_launch(tmp_path, monkeypatch):
     plugin = ext.FaceLightPlugin({}, '', None, None)
     schema = plugin.get_tool()['configSchema']['properties']
     assert 'sdk_executable' not in schema and 'sdk_dir' not in schema
     alias = tmp_path / 'launcher'
     alias.symlink_to(ext._FACE_SDK_EXECUTABLE)
+    popen = Mock(side_effect=AssertionError("invalid config must not launch a process"))
+    monkeypatch.setattr(ext.subprocess, "Popen", popen)
     for config in ({'sdk_executable': str(alias)}, {'sdk_dir': '/tmp/vendor-sdk'}):
-        with pytest.raises(ValueError, match='fixed to'):
-            ext.FaceLightPlugin(config, '', None, None)
+        plugin = ext.FaceLightPlugin(config, '', None, None)
+        assert not plugin._info()["config_valid"]
+        for action, args in (("start", {}), ("config", config), ("set_color", {"r": 1})):
+            result = plugin.dispatch(action, args)
+            assert not result["ok"] and result["code"] == "INVALID_ARGUMENT"
+            assert "fixed to" in result["message"]
+        plugin.stop()
+    popen.assert_not_called()
 
 
 def test_sdk_launch_uses_fixed_paths_and_overrides_inherited_environment(monkeypatch):

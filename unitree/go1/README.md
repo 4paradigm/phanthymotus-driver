@@ -189,7 +189,10 @@ sudo docker run --rm --name go1_bundle \
 仍然只注册一张 `face_light`（`ext_devices.py::FaceLightPlugin`），没有新增灯光卡，
 没有修改 Agent Core、运动 SDK 或其他机器人。默认 `backend: sdk`，实机所有灯光
 统一调用官方 SDK。保留 `set_color`/`preset`/`off` 的调用接口，静态颜色保持到下一次有效指令。
-不再提供灯光 MQTT 后端；旧画布的 `backend: mqtt` 配置会返回明确迁移提示，需更新为 `sdk`。
+不再提供灯光 MQTT 后端；旧画布或驱动的 `backend: mqtt` 配置仍能装配并显示原卡，
+不会阻止其他 Go1 卡片启动。`start`、`config` 和灯光控制返回 `INVALID_ARGUMENT` 与迁移提示；
+`info.config_valid: false`、`available: false`。更新实际保存的配置为 `backend: sdk` 后重新启动卡片。
+其他非法配置同样保留诊断入口，且不会启动 SDK 进程；修复前不执行灯光控制。
 不将越界值截断、字符串转整数或发送错误当作成功。
 
 所有静态颜色、逐灯控制和灯效统一使用官方 SDK（`setLedColor` + `sendCmd`）。
@@ -240,7 +243,11 @@ Go1 其他执行类工具也声明资源：`beep`/`speaker` 共用 `mouth`，
 完成结果仍是软件记录，不表示实际灯光已显示；回调连接失败会记录日志，
 HTTP 回报使用独立线程，请求超时为 3 秒，灯效抢占不等待 HTTP。
 最多允许 8 个待回报动作；名额用尽时新灯效返回 `RESOURCE_BUSY`，静态色及 off 仍可执行。
-stop 先发关闭帧、关闭 SDK，再回收回报线程。静态指令保持同步返回，不创建异步动作。
+stop 先发关闭帧、关闭 SDK，再用共享的 0.5 秒预算等待回报线程回收（不按线程数量累加）。
+超过预算的回报线程保持 daemon，不阻止进程退出，且不会继续发送灯光；
+返回 `completion_pending` 和 `completion_cleanup_complete` 明确是否仍有回报待处理。
+最多 8 个名额仍保留到对应回报真正结束，防止反复启停创建无限后台线程。
+静态指令保持同步返回，不创建异步动作。
 定时执行不需要模型反复调用；刷新最多约 120 Hz（短周期）/通常 20 Hz，
 实际速度受发送耗时和调度影响。亮度仅通过 RGB 缩放，无硬件亮度接口假设。
 

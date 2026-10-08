@@ -687,17 +687,24 @@ class FaceLightPlugin:
     def __init__(self, plugin_config, namespace, executor, client):
         c = plugin_config or {}
         self._config = {key: c.get(key, value) for key, value in _FACE_CONFIG_DEFAULTS.items()}
-        self._backend = _face_backend(self._config)
+        self._config_error = None
+        try:
+            self._backend = _face_backend(self._config)
+        except ValueError as exc:
+            # Keep the card discoverable so persisted config cannot abort the bundle.
+            # This inert fixed-path SDK backend cannot start until config is repaired.
+            self._config_error = str(exc)
+            self._backend = _FaceSdkBackend(_FACE_SDK_EXECUTABLE, True, _FACE_SDK_DIR)
         # Operations lock serializes lifecycle + commands; worker takes only state lock.
         self._ops = threading.RLock()
         self._lock = threading.RLock()
         self._thread = None
         self._cancel = None
         self._active = False
-        self._mode = "stopped"
+        self._mode = "error" if self._config_error else "stopped"
         self._colors = _FACE_BLACK
         self._last_sent = None
-        self._last_error = None
+        self._last_error = self._config_error
         self._completion_slots = threading.BoundedSemaphore(8)
         self._completion_threads = set()
 
@@ -739,8 +746,13 @@ class FaceLightPlugin:
         self._last_sent = _now_ms()
         self._last_error = None
 
+    COMPLETION_SHUTDOWN_TIMEOUT = 0.5
+
     def start(self):
         with self._ops, self._lock:
+            if self._config_error:
+                return _env_face("start", False, state="idle", available=False,
+                                 code="INVALID_ARGUMENT", message=self._config_error)
             if not self._active:
                 try:
                     self._backend.start()
@@ -780,8 +792,13 @@ class FaceLightPlugin:
                 reporters = list(self._completion_threads)
             # Lights are already off and the backend is closed before HTTP cleanup.
             # Reporters never write LEDs or take _ops; joining cannot delay the black frame.
+            deadline = time.monotonic() + self.COMPLETION_SHUTDOWN_TIMEOUT
             for reporter in reporters:
-                reporter.join()
+                reporter.join(timeout=max(0, deadline - time.monotonic()))
+            with self._lock:
+                pending = sum(reporter.is_alive() for reporter in self._completion_threads)
+            result["completion_pending"] = pending
+            result["completion_cleanup_complete"] = pending == 0
             return result
 
     def _run_effect(self, cancel, effect, rgb, target, period, duration, started, action_id):
@@ -830,6 +847,7 @@ class FaceLightPlugin:
             stopped = self.stop()
             with self._lock:
                 self._config = candidate
+                self._config_error = None
                 self._backend = backend
                 self._colors = _FACE_BLACK
                 self._last_sent = None
@@ -845,12 +863,12 @@ class FaceLightPlugin:
             available = self._active and connected
             reason = None
             if not available:
-                reason = self._last_error or (
+                reason = self._config_error or self._last_error or (
                     "SDK adapter is not running; stop/start after checking SDK setup"
                     if self._active else "face_light is stopped; prepare the official SDK and call start")
             return _env_face("info", True, state="ready" if available else "idle",
                              available=available, unavailable_reason=reason,
-                             availability_source="software_sdk_process",
+                             availability_source="software_sdk_process", config_valid=self._config_error is None,
                              mode=self._mode, running=bool(self._thread and self._thread.is_alive()),
                              connected=connected, backend=self._backend.name,
                              simulated=self._backend.name == "simulated", last_error=self._last_error,
@@ -942,6 +960,8 @@ class FaceLightPlugin:
         except ValueError as exc:
             return _env_face(action, False, code="INVALID_ARGUMENT", message=str(exc))
         with self._ops:
+            if self._config_error:
+                return _env_face(action, False, code="INVALID_ARGUMENT", message=self._config_error)
             reserved = False
             if action in _FACE_EFFECTS:
                 reserved = self._completion_slots.acquire(blocking=False)
