@@ -2257,6 +2257,76 @@ class AsrPlugin:
         return {"state": "running"}
 
 
+class SoundDirectionPlugin:
+    """将 Lyre 唤醒词附带的原始声源角度交给 Agent Core。"""
+
+    _FRESH_SECONDS = 10
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._topic = f"/{namespace}/asr/sound_direction"
+        self._running = False
+        self._subscription = None
+        self._last_event = None
+        self._last_seen_monotonic = None
+        self._sub_node = Node("tianyi2_sound_direction_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        self._pub_node = Node("tianyi2_sound_direction_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _RELIABLE_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "sound_direction", "type": "sensor", "default_action": "info",
+            "description": "天轶2.0 唤醒词声源方向；返回 Lyre 原始 angle，角度零点和单位须实机标定",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        if self._subscription is None:
+            from lyre_msgs.msg import AsrKeyword
+            self._subscription = self._sub_node.create_subscription(
+                AsrKeyword, "/audio_asr/keyword", self._on_keyword, _RELIABLE_QOS)
+        self._running = True
+
+    def stop(self):
+        self._running = False
+        self._last_event = None
+        self._last_seen_monotonic = None
+
+    def _on_keyword(self, msg):
+        if not self._running:
+            return
+        # 原样传递厂家角度；实机标定前不把它解释成机器人左/右或转动量。
+        event = {"keyword": msg.keyword, "angle": msg.angle,
+                 "timestamp_ms": int(time.time() * 1000)}
+        self._last_event = event
+        self._last_seen_monotonic = time.monotonic()
+        out = String()
+        out.data = json.dumps(event, ensure_ascii=False)
+        self._pub.publish(out)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            self.start()
+        elif action == "stop":
+            self.stop()
+        elif action != "info":
+            return {"state": "error", "error": f"Unknown action: {action}"}
+        result = {"topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        if not self._running:
+            result["state"] = "idle"
+        elif self._last_event is None:
+            result["state"] = "no_event"
+        else:
+            age_ms = max(0, int((time.monotonic() - self._last_seen_monotonic) * 1000))
+            result["state"] = "fresh" if age_ms < self._FRESH_SECONDS * 1000 else "stale"
+            result["age_ms"] = age_ms
+            if result["state"] == "fresh":
+                result.update(self._last_event)
+        return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PowerBoardStatePlugin (sensor) — 电源板状态卡
 # ══════════════════════════════════════════════════════════════════════════════
