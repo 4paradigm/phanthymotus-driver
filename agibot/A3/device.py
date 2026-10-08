@@ -481,6 +481,7 @@ class A3Nodes:
         self._media_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="a3_media")
         self._encode_lock = threading.Lock()
         self._encoding_keys = set()
+        self._media_failures = set()
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
 
@@ -694,7 +695,12 @@ class A3Nodes:
             return None
         try:
             import cv2
-            img = np.frombuffer(bytes(msg.data), np.uint8).reshape(height, width, 3)
+            raw = np.frombuffer(bytes(msg.data), np.uint8)
+            step_value = getattr(msg, "step", 0)
+            step = int(step_value) if isinstance(step_value, (int, float)) else width * 3
+            if step < width * 3 or raw.size < step * height:
+                raise ValueError(f"invalid image layout step={step} width={width} height={height} bytes={raw.size}")
+            img = raw[:step * height].reshape(height, step)[:, :width * 3].reshape(height, width, 3)
             conversion = self._CV2_COLOR.get(encoding)
             if conversion is not None:
                 img = cv2.cvtColor(img, getattr(cv2, conversion))
@@ -718,7 +724,13 @@ class A3Nodes:
         if str(getattr(msg, "encoding", "16UC1")) != "16UC1" or not height or not width:
             return None
         try:
-            depth = np.frombuffer(bytes(msg.data), np.uint16).reshape(height, width)
+            raw = np.frombuffer(bytes(msg.data), np.uint8)
+            step_value = getattr(msg, "step", 0)
+            step = int(step_value) if isinstance(step_value, (int, float)) else width * 2
+            if step < width * 2 or raw.size < step * height:
+                raise ValueError(f"invalid depth layout step={step} width={width} height={height} bytes={raw.size}")
+            depth = raw[:step * height].reshape(height, step)[:, :width * 2].reshape(height, width, 2)
+            depth = depth.view(np.uint16).reshape(height, width)
             out = self._CompressedImage()
             out.format = "16UC1; compressedDepth zlib"
             out.data = zlib.compress(depth.tobytes(), 1)
@@ -850,23 +862,40 @@ class A3Nodes:
 
     def _decode_bms(self, msg):
         if self._pb is None:
-            return jsonable(msg)
+            return self._wrapper_json(msg)
         channel = self._pb["bms"]()
         try:
             channel.ParseFromString(self._wrapper_bytes(msg))
         except Exception:
-            return jsonable(msg)
-        return jsonable(channel)
+            return self._wrapper_json(msg)
+        return self._protobuf_json(channel)
 
     def _decode_emergency(self, msg):
         if self._pb is None:
-            return jsonable(msg)
+            return self._wrapper_json(msg)
         channel = self._pb["estop"]()
         try:
             channel.ParseFromString(self._wrapper_bytes(msg))
         except Exception:
-            return jsonable(msg)
-        return jsonable(channel)
+            return self._wrapper_json(msg)
+        return self._protobuf_json(channel)
+
+    @staticmethod
+    def _protobuf_json(message):
+        """Convert generated protobufs without leaking Descriptor internals."""
+        try:
+            from google.protobuf.json_format import MessageToDict
+            return MessageToDict(message, preserving_proto_field_name=True)
+        except Exception:
+            return {field.name: jsonable(value) for field, value in message.ListFields()}
+
+    @classmethod
+    def _wrapper_json(cls, msg):
+        return {
+            "serialization_type": str(getattr(msg, "serialization_type", "")),
+            "context": [str(item) for item in getattr(msg, "context", [])],
+            "data_size": len(cls._wrapper_bytes(msg)),
+        }
 
     def _decode_skill_status(self, msg):
         if self._pb is None:
@@ -943,12 +972,17 @@ class A3Nodes:
         output.data = json.dumps(payload, ensure_ascii=False)
         self._imu_pub.publish(output)
 
-    @staticmethod
-    def _encode_and_publish_frame(encoder, msg, pub, topic):
+    def _encode_and_publish_frame(self, encoder, msg, pub, topic):
         try:
             out = encoder(msg)
             if out is not None:
                 pub.publish(out)
+            elif topic not in self._media_failures:
+                self._media_failures.add(topic)
+                print(f"[media] encoder produced no frame topic={topic} "
+                      f"encoding={getattr(msg, 'encoding', '')} "
+                      f"size={getattr(msg, 'width', 0)}x{getattr(msg, 'height', 0)} "
+                      f"step={getattr(msg, 'step', 0)}", flush=True)
         except Exception as exc:
             print(f"[media] encode failed topic={topic}: {exc}", flush=True)
 

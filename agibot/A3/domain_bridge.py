@@ -12,6 +12,7 @@ def _type_name(msg_type):
         "String": "std_msgs/msg/String", "UInt8MultiArray": "std_msgs/msg/UInt8MultiArray",
         "CompressedImage": "sensor_msgs/msg/CompressedImage", "Image": "sensor_msgs/msg/Image",
         "PointCloud2": "sensor_msgs/msg/PointCloud2", "AudioCapture": "audio_msgs/msg/AudioCapture",
+        "AudioChunk": "audio_msgs/msg/AudioChunk",
     }
     return names.get(msg_type.__name__, f"{package}/msg/{msg_type.__name__}")
 
@@ -136,6 +137,7 @@ def _run(messages, profile, domain, lane):
     rclpy.init()
     node = Node(f"agibot_a3_core_bridge_{lane}")
     pubs = {}
+    published = {}
     types = {}
     for package, names in (("std_msgs.msg", ("String", "UInt8MultiArray")),
                            ("sensor_msgs.msg", ("CompressedImage", "Image", "PointCloud2", "JointState")),
@@ -179,6 +181,9 @@ def _run(messages, profile, domain, lane):
                 pubs[topic] = pub
                 print(f"[dds-bridge] publisher created topic={topic} type={type_name}", flush=True)
             pub.publish(msg)
+            published[topic] = published.get(topic, 0) + 1
+            if published[topic] == 1 or published[topic] % 1000 == 0:
+                print(f"[dds-bridge] published={published[topic]} topic={topic}", flush=True)
             rclpy.spin_once(node, timeout_sec=0.0)
     finally:
         node.destroy_node()
