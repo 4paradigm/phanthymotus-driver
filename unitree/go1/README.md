@@ -45,7 +45,7 @@
 | `gesture` | 表演/表情 | 作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等（异步） |
 | `beep` | 头部扬声器 beep | Nano `beep_adapter.py`（:18082 /v1/beep/actions） |
 | `speaker` | 头部扬声器播放 | Nano `speaker_adapter.py`（:18083 /v1/speaker/actions）→ 播放远端音频流 |
-| `face_light` | 面部灯带颜色 | `set_color` / `preset` / `off`（经 MQTT） |
+| `face_light` | 面部灯带颜色 | `set_color` / `preset` / `off` + 逐灯接口和内部定时灯效（见下方后端能力） |
 | `system_health` | 整体健康检查 | `robot_info`：CPU/内存/磁盘/电池/MQTT 体检 |
 
 ### 资源卡（resource）
@@ -183,3 +183,159 @@ sudo docker run --rm --name go1_bundle \
 ---
 
 新增卡片请从 **[CONTRIBUTING.md](CONTRIBUTING.md)** 开始。
+
+## face_light：在原卡内控制静态色、12 灯和定时灯效
+
+仍然只注册一张 `face_light`（`ext_devices.py::FaceLightPlugin`），没有新增灯光卡，
+没有修改 Agent Core、运动 SDK 或其他机器人。默认 `backend: mqtt` 保留原
+`face_light/color` 的 **3 字节 RGB**；静态颜色保持到下一次有效指令。
+不再将越界值截断、字符串转整数或将 MQTT 发布错误当作成功。
+
+| 后端 | 静态整条 RGB / preset / off | blink / breathe / fade | set_led / set_leds / chase |
+|---|---|---|---|
+| `mqtt`（默认） | 原 3 字节协议 | 内部定时发送整条 RGB | 返回 `UNSUPPORTED_CAPABILITY`，不发送 36 字节 |
+| `simulated` | 软件模拟 | 软件模拟 | 完整 12 灯软件模拟，无网络或硬件操作 |
+| `sdk` | 官方 SDK | 内部定时调用 SDK | 官方 `setLedColor` + `sendCmd`；已本地编译，待真机显示验收 |
+
+本地模拟将 `config.yaml` 中 **现有** `plugins.face_light.backend` 设为 `simulated`；
+默认配置仍是 `mqtt`。模拟结果显式带 `simulated: true`。没有自动回退到模拟成功。
+所有后端共用同一帧写入路径，每个实例只运行一个灯效；不同时创建 MQTT 和 UDP 写入器。
+
+调用现有 `face_light` 工具，将下列对象作为 `arguments`：
+
+```json
+{"action":"set_color","r":255,"g":40,"b":0}
+{"action":"preset","name":"blue"}
+{"action":"set_led","index":0,"r":255,"g":0,"b":0}
+{"action":"set_leds","colors":[[255,0,0],[0,255,0],[0,0,255],[255,0,0],[0,255,0],[0,0,255],[255,0,0],[0,255,0],[0,0,255],[255,0,0],[0,255,0],[0,0,255]]}
+{"action":"blink","r":255,"g":0,"b":0,"period_s":1,"duration_s":5}
+{"action":"breathe","r":0,"g":80,"b":255,"period_s":2,"duration_s":10}
+{"action":"fade","r":255,"g":0,"b":0,"to_r":0,"to_g":0,"to_b":255,"period_s":2,"duration_s":10}
+{"action":"chase","r":0,"g":255,"b":0,"period_s":2,"duration_s":10}
+{"action":"off"}
+{"action":"info"}
+```
+
+`set_led` 保持其余灯为上一帧的软件记录颜色；从未发送过颜色时，其余灯以黑色初始化，
+不能理解为读取了灯带现状。`colors` 恰好为 12 个 RGB 三元组，数组位置就是 SDK 编号。
+RGB 必须是 0–255 的整数，编号必须是 0–11 整数，不接受 bool、浮点数或字符串。
+为兼容旧 `set_color` 调用，省略的 RGB 通道仍默认 0，省略 preset 名仍默认 off。
+未知预设、错误数组和不合法时长返回 `INVALID_ARGUMENT`，不会改变当前灯效。
+不支持的指令也不会中断当前有效灯效。
+
+`period_s` 是完整周期（0.2–3600 秒，默认 2）：闪烁前半亮、后半灭；
+呼吸按余弦曲线缩放 RGB；渐变从 RGB 到目标 RGB 再返回；流水灯一周期依次通过 0–11。
+`duration_s` 为 0.05–3600 秒（默认 5），到期关闭全部灯，线程结束。
+定时执行不需要模型反复调用；刷新最多约 120 Hz（短周期）/通常 20 Hz，
+实际速度受发送耗时和调度影响。亮度仅通过 RGB 缩放，无硬件亮度接口假设。
+
+有效静态指令、单灯指令和新灯效先取消并等待旧灯效退出，然后发送新帧。
+`off` 取消灯效后发送黑色，但保持后端连接；`stop`（生命周期或 dispatch）
+取消灯效、发送黑色、关闭连接并回收线程。停止后指令返回 `NOT_AVAILABLE`，
+需再次 `start`。重复 start/stop 可安全调用。不能连接或发送时返回失败；
+后台发送失败也结束灯效并记录 `last_error`。连接不可用时不能保证硬件已经熄灭。
+MQTT 连接异步建立，`start` 的 ready 表示软件启动；要查看 `info.connected`。
+MQTT 发送失败时丢弃连接，防止重连重放旧队列；恢复须 stop/start。
+
+`info` 返回 `mode`、`running`（灯效线程）、`connected`、能力表、12 灯位置映射、
+最近成功发送的 `colors` 和时间及 `last_error`。首次发送前 `colors: null`。
+这些均为软件记录，统一标注 `state_source: software_record` 和
+`hardware_verified: false`，无硬件状态反馈。MQTT `ok: true` 仅表示消息已由客户端
+发出（QoS 0，无订阅端确认），不表示实际灯带显示成功。
+
+### 官方编号与真实 SDK 接入缺口
+
+已核对 [官方文档第 5 节](https://github.com/UnitreeSupport/Unitree_Docs/blob/master/docs/get_started/Go1_Edu.md)
+及其 [LED 编号图](https://raw.githubusercontent.com/UnitreeSupport/Unitree_Docs/master/docs/get_started/images/LED.bmp)
+和 [官方示例截图](https://raw.githubusercontent.com/UnitreeSupport/Unitree_Docs/master/docs/get_started/images/example.png)。
+**面向狗头的观察者视角**：画面左侧自上到下为 0–5，画面右侧为 6–11；
+这不是机器人自身左右。`info.led_map.row_from_top` 从 0 开始。
+该对应关系来自官方图，还没有在本机 Go1 上逐灯点亮核对。
+
+2026-10-08 经实机主控 SSH 只读核实：主控为树莓派
+（内网地址 `192.168.123.161`）；从主控访问头部 Nano `192.168.123.13`。
+SDK 实际路径为 `/home/unitree/Unitree/sdk/faceLightSDK_Nano`，
+版本为 **`v1.0.1: first UDP version`**。取得 `FaceLightClient.h`、`LEDPixel.h`、
+`main.cpp`、`CMakeLists.txt`、`version.txt` 和 ARM64/AMD64 两个库，
+本地副本的 SHA-256 与实机逐项一致，证据见 [SDK_AUDIT.md](deploy/face_light/SDK_AUDIT.md)。
+
+真实头文件确认：`setLedColor(uint32_t id, const uint8_t *rgb)`、
+`setAllLed(const uint8_t *rgb)` 和 `void sendCmd()`。
+RGB 数组按 R/G/B 传入，SDK 自己完成内部 GRB 转换和 UDP 打包。
+适配器不构造硬件报文，不猜测目的端口，不增加 MQTT 逐灯字节。
+
+`deploy/face_light/adapter.cpp` 实现独立 SDK 进程：一帧设置 12 个编号，再调用一次
+`sendCmd()`。因为 SDK 无返回值，适配器通过动态符号拦截它实际调用的 `sendto`，
+检查实际发送错误/长度；没有观测到调用也返回失败，不伪装成功。
+SDK 进程通过本地管道回报结果，卡片统一控制抢占与停止；管道超时/退出/错误时
+终止并回收该进程。正常关闭通过 EOF 调用 SDK 析构，进程退出也回收 SDK 分配。
+**SENT 只代表 UDP 套接字接受数据，不代表灯珠已显示或 Nano 服务已接收。**
+`info.connected` 在 SDK 模式中表示本地 SDK 进程就绪，不表示硬件在线。
+画布共享配置通过 `action=config` 应用；配置发生变化会取消灯效并关闭旧后端，需
+重新启动卡片。重复下发相同配置不改变状态，避免平台每次调用前重放配置中断灯效。
+
+已用现场官方 ARM64 库在无网络的本地 Linux 容器编译、链接和加载适配器，
+验证网络不可用时返回失败。此版适配针对已核实的 v1.0.1 API；其他 SDK 版本须重新核对。
+Mac 原生不能加载这些 Linux ELF 库。现场 Nano 为 Ubuntu 18.04，当前验证容器
+为 Ubuntu 22.04；部署时需在目标系统或匹配 sysroot 上重新编译，不能将本地
+容器二进制直接当作 Nano 兼容性证据。库副本保存在被忽略的
+`.local/face-light-sdk/faceLightSDK_Nano/`，未加入 Git，不对外再分发。
+
+现场 `faceLightServer`（接收灯光的服务）和 `faceLightMqtt`（MQTT 写入桥）均在运行。
+它们没有被停止或修改。切换至 SDK 前需由操作者停止 **faceLightMqtt 写入源**，
+保留 **faceLightServer**；也要停止其他正在发送灯光的测试程序，避免抢写。
+卡片不会自动停止现场服务。`sdk_exclusive` 默认 false，未明确声明独占时启动失败。
+此配置是操作者声明，卡片不能远程证明所有写入源均已停止。
+
+### 构建与配置 SDK 后端（尚未部署到实机）
+
+在有对应架构官方 SDK 的 Linux 主机，使用现有 cmake/g++，不增加大型依赖：
+
+```bash
+cmake -S unitree/go1/deploy/face_light -B /tmp/go1-face-build \
+  -DFACE_LIGHT_SDK_DIR=/absolute/path/to/faceLightSDK_Nano
+cmake --build /tmp/go1-face-build
+```
+
+构建产物为 `face_light_sdk_adapter` 和其同目录的 `vendor_sdk/`。
+**两者一起保留/搬移**，适配器通过相对库搜索路径加载匹配的官方库。
+既有 Dockerfile 已复制整个 `deploy/`，其中包括适配器源码；默认 MQTT 镜像无需
+SDK。镜像默认通过 `/deploy/face_light/run_sdk.sh` 在首次启动 SDK 后端时编译，并缓存
+编译产物。只需将完整官方 SDK 放到机器人
+`/opt/phanthy-motus/data/go1/faceLightSDK_Nano`（现有数据卷已映射），或在画布
+配置 `sdk_dir` 为另一个已挂载路径；SDK 库不打包进公共镜像。缺少文件、编译失败
+或架构不匹配时启动失败，不自动回退 MQTT/模拟。也可自行编译后配置适配器路径。
+
+修改原卡配置，不再注册其他卡：
+
+```yaml
+face_light:
+  enabled: true
+  backend: sdk
+  sdk_dir: /opt/phanthy-motus/data/go1/faceLightSDK_Nano
+  sdk_executable: /deploy/face_light/run_sdk.sh
+  sdk_exclusive: true  # 仅在实际停止 faceLightMqtt 等其他写入源后设为 true
+```
+
+### 本地验证与真机验收
+
+```bash
+python -m pytest -q tests/test_go1_face_light.py
+```
+
+测试使用显式模拟帧、假的 MQTT 客户端和 SDK 管道测试进程，覆盖旧接口、严格参数校验、12 灯映射、
+四种效果的时间变化、到期关闭、静态/效果抢占、停止竞争、停止后无旧帧、
+线程回收、连接/发布失败、SDK 独占前置条件/进程超时/异常/回收和唯一卡片装配。它们不证明真机灯带表现。
+
+`tests/face_light_native_check.py` 必须在仅 lo 网卡启用且无 IPv4 路由的断网 Linux 容器运行，
+设置 `SDK_DIR` 和 `REAL_ADAPTER`：原生成功路径用实际 SDK 头文件加假的动态库
+（Unix 域套接字，无机器人网络），真实官方库仅测试断网失败路径；另验证 12 个
+RGB 调用、输入校验、错误回报、进程关闭及库包可搬移。
+
+SDK 文件已取得和审查；下一步需要获准部署并切换灯光写入源，再进行真机灯光验收：
+检查旧 MQTT 三字节整条色和关闭，逐灯 0–11 单独点亮拍照验证位置/RGB 通道；
+发送包含 12 种可区分颜色的帧，观察四种效果的周期/持续时间；效果中切换静态色、
+off 和停止，持续观察旧颜色不再返回；断连时确认失败记录，恢复后检查无旧队列重放。
+记录视频/照片与软件发送记录，分别说明实测和软件结果。本轮没有机器人运动、
+物理灯光验收；目标系统临时编译/导入检查通过，临时目录已清理。
+正式容器/画布验收需使用提交分支构建的镜像；单独 SDK 调用不能代替画布验收。

@@ -6,7 +6,7 @@ hardware_model: "go1"
 image_name: go1
 port: 15715
 mcp_url: "http://localhost:15715/mcp"
-description: "Unitree Go1 — 状态感知 + 运动控制 + 步态/姿态 + 表演动作 + 五机位 RGB/深度/点云视觉 + 蜂鸣/扬声器"
+description: "Unitree Go1 — 状态感知 + 运动控制 + 步态/姿态 + 表演动作 + 五机位 RGB/深度/点云视觉 + 蜂鸣/扬声器 + face_light 静态/逐灯/定时灯效（官方 SDK 或模拟；MQTT 仅整条同色）"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.

@@ -4,7 +4,7 @@ ext_devices.py — Go1 外部设备通信卡合集(actuator)。
 合并了以下外部设备卡（每张卡行为不变）：
   - beep: 头部扬声器蜂鸣控制（HTTP 到 Nano beep_adapter :18082）
   - speaker: 头部扬声器音频流播放（ROS2 订阅 + TCP 二进制帧到 Nano speaker_adapter）
-  - face_light: 面部灯带颜色控制（MQTT face_light/color）
+  - face_light: 面部灯带静态/逐灯/定时灯效（MQTT 整条同色、官方 SDK 或显式模拟）
   - system_health: 机器人整体健康检查（CPU/内存/磁盘/电池/MQTT）
 
 
@@ -14,7 +14,9 @@ ext_devices.py — Go1 外部设备通信卡合集(actuator)。
 from __future__ import annotations
 
 import json
+import math
 import os
+import signal
 import socket
 import struct
 import subprocess
@@ -455,115 +457,507 @@ def make_speaker(plugin_config, namespace, executor, client):
 
 
 # ============================================================================
-# face_light — 面部灯带颜色控制
+# face_light — one card, one serialized output path (MQTT or explicit simulation)
 # ============================================================================
 
 CARD_FACE_LIGHT = "face_light"
 _PRESETS = {"red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
             "yellow": (255, 255, 0), "cyan": (0, 255, 255), "magenta": (255, 0, 255),
             "white": (255, 255, 255), "off": (0, 0, 0)}
+_FACE_BLACK = ((0, 0, 0),) * 12
+_FACE_EFFECTS = ("blink", "breathe", "fade", "chase")
+# Official LED.bmp: sides are the viewer's sides when facing the dog, NOT body sides.
+_FACE_LED_MAP = [{"index": i, "viewer_side": "left" if i < 6 else "right",
+                  "row_from_top": i % 6} for i in range(12)]
 
 
 def _env_face(action, ok, **extra):
     d = {"ok": ok, "action": action, "card": CARD_FACE_LIGHT,
-         "control_level": "HIGHLEVEL", "timestamp_ms": int(time.time() * 1000)}
+         "control_level": "HIGHLEVEL", "timestamp_ms": _now_ms(),
+         "state_source": "software_record", "hardware_verified": False}
     d.update(extra)
     return d
+
+
+def _face_rgb(value, label="RGB"):
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{label} must contain exactly three RGB integers")
+    if any(type(v) is not int or not 0 <= v <= 255 for v in value):
+        raise ValueError(f"{label} channels must be integers in 0..255 (no bool/coercion)")
+    return tuple(value)
+
+
+def _face_seconds(value, label, minimum, maximum):
+    if type(value) not in (int, float) or not math.isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(f"{label} must be a finite number in {minimum}..{maximum} seconds")
+    return float(value)
+
+
+def _face_effect_frame(effect, rgb, target, period, elapsed):
+    """Pure renderer; period is one complete cycle, chase traverses indices 0..11."""
+    phase = (elapsed % period) / period
+    if effect == "chase":
+        frame = list(_FACE_BLACK)
+        frame[min(11, int(phase * 12))] = rgb
+        return tuple(frame)
+    if effect == "blink":
+        color = rgb if phase < 0.5 else (0, 0, 0)
+    elif effect == "breathe":
+        scale = (1 - math.cos(2 * math.pi * phase)) / 2
+        color = tuple(round(c * scale) for c in rgb)
+    elif effect == "fade":
+        weight = 1 - abs(2 * phase - 1)  # RGB -> target -> RGB, no wrap discontinuity
+        color = tuple(round(a + (b - a) * weight) for a, b in zip(rgb, target))
+    else:
+        raise ValueError(f"unknown effect {effect}")
+    return (color,) * 12
+
+
+class _FaceSimBackend:
+    """Explicit software-only backend; bounded history, never contacts a robot."""
+    name = "simulated"
+    per_led = True
+
+    def __init__(self):
+        from collections import deque
+        self.frames = deque(maxlen=256)
+        self.connected = False
+
+    def start(self):
+        self.connected = True
+
+    def write(self, frame):
+        if not self.connected:
+            raise RuntimeError("simulation backend is stopped")
+        self.frames.append((time.monotonic(), frame))
+
+    def close(self):
+        self.connected = False
+
+
+class _FaceMqttBackend:
+    """Only the existing three-byte topic. No LED addressing or hardware feedback."""
+    name = "mqtt"
+    per_led = False
+
+    def __init__(self, host, port):
+        self.host, self.port = host, port
+        self.client = None
+
+    @property
+    def connected(self):
+        return bool(self.client and self.client.is_connected())
+
+    def start(self):
+        if not _HAS_MQTT:
+            raise RuntimeError("paho-mqtt is not installed")
+        # Async connection avoids holding the card lifecycle lock during network connect.
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+        try:
+            self.client.connect_async(self.host, self.port, 60)
+            self.client.loop_start()
+        except Exception:
+            self.close()
+            raise
+
+    def write(self, frame):
+        if not self.connected:
+            raise RuntimeError("MQTT is not connected; wait for connection or check broker")
+        if any(color != frame[0] for color in frame):
+            raise RuntimeError("MQTT supports only uniform RGB")
+        try:
+            result = self.client.publish("face_light/color", bytes(frame[0]), qos=0, retain=False)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError(f"MQTT publish failed: rc={result.rc}")
+            result.wait_for_publish(timeout=0.5)
+            if not result.is_published():
+                raise RuntimeError("MQTT send timed out")
+        except Exception:
+            # Drop unsent queued frames; reconnect must not replay an interrupted effect.
+            self.close()
+            raise
+
+    def close(self):
+        client, self.client = self.client, None
+        if client:
+            try:
+                client.disconnect()
+            finally:
+                client.loop_stop()
+
+
+class _FaceSdkBackend:
+    """One SDK helper process; bounded IPC, no MQTT fallback or UDP reimplementation."""
+    name = "sdk"
+    per_led = True
+
+    def __init__(self, executable, exclusive, sdk_dir=None):
+        self.executable = executable
+        self.exclusive = exclusive
+        self.sdk_dir = sdk_dir
+        self.process = None
+        self._pending = b""
+
+    @property
+    def connected(self):
+        # Process readiness only; the official SDK has no hardware acknowledgement.
+        return self.process is not None and self.process.poll() is None
+
+    def _read(self, timeout=1):
+        import select
+        deadline = time.monotonic() + timeout
+        while b"\n" not in self._pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([self.process.stdout], [], [], max(0, remaining))[0]:
+                raise RuntimeError("face light SDK adapter response timed out")
+            data = os.read(self.process.stdout.fileno(), 4096)
+            if not data:
+                raise RuntimeError("face light SDK adapter exited or closed stdout")
+            self._pending += data
+            if len(self._pending) > 4096:
+                raise RuntimeError("face light SDK adapter returned an oversized response")
+        line, self._pending = self._pending.split(b"\n", 1)
+        return line.decode("utf-8", errors="replace")
+
+    def start(self):
+        if self.exclusive is not True:
+            raise RuntimeError("SDK requires sdk_exclusive=true after the existing faceLightMqtt writer is stopped; do not stop faceLightServer")
+        try:
+            environment = os.environ.copy()
+            if self.sdk_dir:
+                environment["FACE_LIGHT_SDK_DIR"] = self.sdk_dir
+            self.process = subprocess.Popen([self.executable], stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+                                            env=environment, start_new_session=True)
+            self._pending = b""
+            response = self._read(timeout=15)
+            if response != "READY face-light-v1":
+                raise RuntimeError(response if response.startswith("ERROR ") else
+                                   "face light SDK adapter protocol mismatch")
+        except Exception:
+            self.close()
+            raise
+
+    def write(self, frame):
+        if not self.connected:
+            raise RuntimeError("face light SDK adapter is not running")
+        try:
+            payload = (" ".join(str(v) for rgb in frame for v in rgb) + "\n").encode("ascii")
+            self.process.stdin.write(payload)
+            self.process.stdin.flush()
+            response = self._read()
+            if response != "SENT":
+                raise RuntimeError(response)
+        except Exception:
+            # Kill a stalled helper before another command can write/replay old work.
+            self.close()
+            raise
+
+    def close(self):
+        process, self.process = self.process, None
+        self._pending = b""
+        if process is None:
+            return
+        try:
+            try:
+                process.stdin.close()  # EOF: run SDK destructor
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+        finally:
+            process.stdout.close()
+
+
+_FACE_CONFIG_DEFAULTS = {
+    "backend": "mqtt", "mqtt_host": "localhost", "mqtt_port": 1883,
+    "sdk_executable": "/deploy/face_light/run_sdk.sh", "sdk_exclusive": False,
+    "sdk_dir": "/opt/phanthy-motus/data/go1/faceLightSDK_Nano",
+}
+
+
+def _face_backend(config):
+    backend = config["backend"]
+    if backend not in ("mqtt", "simulated", "sdk"):
+        raise ValueError("face_light backend must be mqtt, simulated or sdk")
+    if not isinstance(config["mqtt_host"], str) or not config["mqtt_host"]:
+        raise ValueError("mqtt_host must be a nonempty string")
+    if type(config["mqtt_port"]) is not int or not 1 <= config["mqtt_port"] <= 65535:
+        raise ValueError("mqtt_port must be an integer in 1..65535")
+    if type(config["sdk_exclusive"]) is not bool:
+        raise ValueError("sdk_exclusive must be a boolean")
+    for key in ("sdk_dir", "sdk_executable"):
+        if not isinstance(config[key], str) or not config[key]:
+            raise ValueError(f"{key} must be a nonempty string")
+    if backend == "sdk":
+        return _FaceSdkBackend(config["sdk_executable"], config["sdk_exclusive"], config["sdk_dir"])
+    if backend == "simulated":
+        return _FaceSimBackend()
+    return _FaceMqttBackend(config["mqtt_host"], config["mqtt_port"])
 
 
 class FaceLightPlugin:
     def __init__(self, plugin_config, namespace, executor, client):
         c = plugin_config or {}
-        self._host = c.get("mqtt_host", "localhost")
-        self._port = int(c.get("mqtt_port", 1883))
-        self._client = None
+        self._config = {key: c.get(key, value) for key, value in _FACE_CONFIG_DEFAULTS.items()}
+        self._backend = _face_backend(self._config)
+        # Operations lock serializes lifecycle + commands; worker takes only state lock.
+        self._ops = threading.RLock()
+        self._lock = threading.RLock()
+        self._thread = None
+        self._cancel = None
+        self._active = False
+        self._mode = "stopped"
+        self._colors = _FACE_BLACK
+        self._last_sent = None
+        self._last_error = None
+
+    def _cancel_effect(self):
+        # Called under _ops. No joins while holding worker's lock.
+        with self._lock:
+            if self._cancel:
+                self._cancel.set()
+            worker = self._thread
+        if worker:
+            worker.join()  # backend writes are bounded; guarantees no later old write
+        with self._lock:
+            self._thread = self._cancel = None
+
+    def _write(self, frame):
+        # All callers hold _lock. Do not claim the frame was applied on hardware.
+        self._backend.write(frame)
+        self._colors = frame
+        self._last_sent = _now_ms()
+        self._last_error = None
 
     def start(self):
-        if not _HAS_MQTT:
-            print("[face_light] paho-mqtt 未安装,灯带不可用(模拟)", flush=True)
-            return
-        try:
-            self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
-            self._client.connect(self._host, self._port, 60)
-            self._client.loop_start()
-            print(f"[{CARD_FACE_LIGHT}] MQTT 已连接 → {self._host}:{self._port}", flush=True)
-        except Exception as e:
-            print(f"[{CARD_FACE_LIGHT}] MQTT 连接失败: {e}", flush=True)
-            self._client = None
+        with self._ops, self._lock:
+            if not self._active:
+                try:
+                    self._backend.start()
+                    self._active = True
+                    self._mode = "ready"
+                    self._last_error = None
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    self._mode = "error"
+                    return _env_face("start", False, state="idle", code="NOT_AVAILABLE", message=str(exc))
+            return _env_face("start", True, state="ready", connected=self._backend.connected,
+                             simulated=self._backend.name == "simulated")
 
     def stop(self):
-        try:
-            if self._client:
-                self._pub(0, 0, 0)
-                time.sleep(0.1)
-                self._client.loop_stop()
-                self._client.disconnect()
-        except Exception:
-            pass
+        with self._ops:
+            self._cancel_effect()
+            with self._lock:
+                error = None
+                try:
+                    if self._active:
+                        self._write(_FACE_BLACK)
+                except Exception as exc:
+                    error = str(exc)
+                finally:
+                    self._active = False
+                    self._mode = "stopped"
+                    try:
+                        self._backend.close()
+                    except Exception as exc:
+                        error = error or str(exc)
+                    self._last_error = error
+                if error:
+                    return _env_face("stop", False, state="idle", code="NOT_AVAILABLE", message=error)
+                return _env_face("stop", True, state="idle")
 
-    def _pub(self, r, g, b):
-        if self._client is None:
-            return False
-        self._client.publish("face_light/color", bytes([r & 0xFF, g & 0xFF, b & 0xFF]))
-        return True
+    def _run_effect(self, cancel, effect, rgb, target, period, duration, started):
+        # First frame was sent by dispatch. Absolute elapsed time avoids timing drift.
+        while not cancel.wait(min(0.05, period / 24, max(0.001, duration - (time.monotonic() - started)))):
+            with self._lock:
+                if cancel.is_set() or not self._active:
+                    return
+                elapsed = time.monotonic() - started
+                try:
+                    if elapsed >= duration:
+                        self._write(_FACE_BLACK)
+                        self._mode = "off"
+                        return
+                    self._write(_face_effect_frame(effect, rgb, target, period, elapsed))
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    self._mode = "error"
+                    return
+
+    def _configure(self, args):
+        # Agent Core sends action=config before start and before ordinary calls.
+        # Replayed identical configs must not interrupt a running effect.
+        if not isinstance(args, dict):
+            return _env_face("config", False, code="INVALID_ARGUMENT", message="config must be an object")
+        with self._ops:
+            candidate = dict(self._config)
+            candidate.update({key: args[key] for key in _FACE_CONFIG_DEFAULTS if key in args})
+            if candidate == self._config:
+                return _env_face("config", True, state="ready" if self._active else "idle", changed=False)
+            try:
+                backend = _face_backend(candidate)
+            except ValueError as exc:
+                return _env_face("config", False, code="INVALID_ARGUMENT", message=str(exc))
+            stopped = self.stop()
+            with self._lock:
+                self._config = candidate
+                self._backend = backend
+                self._colors = _FACE_BLACK
+                self._last_sent = None
+                return _env_face("config", True, state="idle", changed=True, needs_start=True,
+                                 previous_shutdown_ok=stopped["ok"],
+                                 message="Configuration changed; start the card to apply it")
+
+    def _info(self):
+        with self._lock:
+            per_led = self._backend.per_led
+            effects = list(_FACE_EFFECTS if per_led else _FACE_EFFECTS[:3])
+            return _env_face("info", True, state="ready" if self._active else "idle",
+                             mode=self._mode, running=bool(self._thread and self._thread.is_alive()),
+                             connected=self._backend.connected, backend=self._backend.name,
+                             simulated=self._backend.name == "simulated", last_error=self._last_error,
+                             last_sent_timestamp_ms=self._last_sent,
+                             colors=[list(c) for c in self._colors] if self._last_sent else None,
+                             capabilities={"uniform_rgb": True, "per_led": per_led,
+                                           "set_leds": per_led, "effects": effects,
+                                           "hardware_feedback": False, "official_sdk_integrated": self._backend.name == "sdk"},
+                             led_map=[dict(item) for item in _FACE_LED_MAP],
+                             led_map_source="Unitree Go1_Edu.md LED.bmp; not verified on this robot")
 
     def get_tool(self):
-        return {
-            "name": CARD_FACE_LIGHT, "type": "actuator", "multiInstance": False,
-            "description": ("Go1 face LED strip STATIC color via MQTT — set a persistent RGB/preset color and hold it "
-                            "(steady-state indication; stays until changed or off). For blink/breathe/fade/timed effects, "
-                            "additional effects cards can be added in the future."),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["set_color", "preset", "off"],
-                               "description": "Light action"},
-                    "r": {"type": "integer", "description": "Red 0-255"},
-                    "g": {"type": "integer", "description": "Green 0-255"},
-                    "b": {"type": "integer", "description": "Blue 0-255"},
-                    "name": {"type": "string",
-                             "description": "Preset: red/green/blue/yellow/cyan/magenta/white/off"},
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "set_color": {"params": ["r", "g", "b"], "description": "Set RGB (0-255 each)"},
-                    "preset": {"params": ["name"], "description": "Preset color by name"},
-                    "off": {"params": [], "description": "Turn light off"},
-                },
-            },
-            "topic_out": [],
-        }
+        rgb_channel = {"type": "integer", "minimum": 0, "maximum": 255, "default": 0}
+        rgb_array = {"type": "array", "minItems": 3, "maxItems": 3,
+                     "items": {"type": "integer", "minimum": 0, "maximum": 255}}
+        actions = {"set_color": ["r", "g", "b"], "preset": ["name"], "off": [],
+                   "set_led": ["index", "r", "g", "b"], "set_leds": ["colors"],
+                   "blink": ["r", "g", "b", "period_s", "duration_s"],
+                   "breathe": ["r", "g", "b", "period_s", "duration_s"],
+                   "fade": ["r", "g", "b", "to_r", "to_g", "to_b", "period_s", "duration_s"],
+                   "chase": ["r", "g", "b", "period_s", "duration_s"], "info": []}
+        descriptions = {"set_color": "Persistent uniform RGB until next command",
+                        "preset": "Persistent named color", "off": "Cancel effect and turn all LEDs off",
+                        "set_led": "Set SDK index 0..11; others retain last software frame (initially off); per-LED backend required",
+                        "set_leds": "Exactly 12 RGB triples in SDK index order; per-LED backend required",
+                        "blink": "Blink uniform RGB on/off", "breathe": "Breathe by scaling RGB",
+                        "fade": "Fade RGB to target RGB and back", "chase": "One LED traverses 0..11; per-LED backend required",
+                        "info": "Software-recorded status and backend capabilities; no hardware feedback"}
+        return {"name": CARD_FACE_LIGHT, "type": "actuator", "multiInstance": False,
+                "description": "Go1 face_light: persistent RGB, 12 LED control and internal timed effects. Check info for backend support; simulation is not hardware evidence.",
+                "inputSchema": {"type": "object", "required": ["action"],
+                                "properties": {"action": {"type": "string", "enum": list(actions)},
+                                               **{k: dict(rgb_channel) for k in ("r", "g", "b", "to_r", "to_g", "to_b")},
+                                               "name": {"type": "string", "enum": list(_PRESETS), "default": "off"},
+                                               "index": {"type": "integer", "minimum": 0, "maximum": 11,
+                                                         "description": "Facing dog: viewer left top-bottom 0..5; right 6..11"},
+                                               "colors": {"type": "array", "minItems": 12, "maxItems": 12, "items": rgb_array},
+                                               "period_s": {"type": "number", "minimum": 0.2, "maximum": 3600, "default": 2,
+                                                            "description": "Seconds per full cycle; chase traverses all 12 LEDs"},
+                                               "duration_s": {"type": "number", "minimum": 0.05, "maximum": 3600, "default": 5,
+                                                              "description": "Auto-off after these seconds"}},
+                                "x-action-params": {a: {"params": p, "description": descriptions[a]} for a, p in actions.items()}},
+                "configSchema": {"type": "object", "properties": {
+                    "backend": {"type": "string", "enum": ["mqtt", "simulated", "sdk"], "default": "mqtt"},
+                    "mqtt_host": {"type": "string", "default": "localhost", "x-sensitive": True},
+                    "mqtt_port": {"type": "integer", "default": 1883, "minimum": 1, "maximum": 65535},
+                    "sdk_executable": {"type": "string", "default": _FACE_CONFIG_DEFAULTS["sdk_executable"]},
+                    "sdk_dir": {"type": "string", "default": _FACE_CONFIG_DEFAULTS["sdk_dir"],
+                                "x-sensitive": True, "description": "Mounted official SDK directory for container-side build"},
+                    "sdk_exclusive": {"type": "boolean", "default": False,
+                                      "description": "Confirm existing faceLightMqtt writer is stopped; keep faceLightServer running"}}},
+                "topic_out": []}
 
     def dispatch(self, action, args):
+        if action == "config":
+            return self._configure(args)
         if action == "start":
-            return {"state": "ready"}
+            if isinstance(args, dict) and any(key in args for key in _FACE_CONFIG_DEFAULTS):
+                configured = self._configure(args)
+                if not configured["ok"]:
+                    return configured
+            return self.start()
         if action == "stop":
-            return {"state": "idle"}
+            return self.stop()
         if action == "info":
-            return {"state": "ready"}
-
-        if self._client is None:
-            return _env_face(action, False, code="NOT_AVAILABLE",
-                             message="MQTT not connected (paho missing or broker unreachable)")
-
-        if action == "off":
-            self._pub(0, 0, 0)
-            return _env_face("off", True, applied={"rgb": [0, 0, 0]})
-        if action == "preset":
-            nm = str(args.get("name", "off")).lower()
-            rgb = _PRESETS.get(nm)
-            if rgb is None:
-                return _env_face("preset", False, code="INVALID_ARG",
-                                 message=f"unknown preset {nm}; available: {', '.join(_PRESETS)}")
-            self._pub(*rgb)
-            return _env_face("preset", True, applied={"name": nm, "rgb": list(rgb)})
-        if action == "set_color":
-            r = max(0, min(255, int(args.get("r", 0))))
-            g = max(0, min(255, int(args.get("g", 0))))
-            b = max(0, min(255, int(args.get("b", 0))))
-            self._pub(r, g, b)
-            return _env_face("set_color", True, applied={"r": r, "g": g, "b": b})
-        return None
+            return self._info()
+        if action not in ("set_color", "preset", "off", "set_led", "set_leds", *_FACE_EFFECTS):
+            return None
+        try:
+            if not isinstance(args, dict):
+                raise ValueError("arguments must be an object")
+            rgb = _face_rgb([args.get(k, 0) for k in ("r", "g", "b")])
+            target = _face_rgb([args.get(k, 0) for k in ("to_r", "to_g", "to_b")], "target RGB")
+            if action == "preset":
+                name = args.get("name", "off")
+                if not isinstance(name, str) or name.lower() not in _PRESETS:
+                    raise ValueError(f"unknown preset; choose {', '.join(_PRESETS)}")
+                rgb = _PRESETS[name.lower()]
+            if action == "set_led":
+                index = args.get("index")
+                if type(index) is not int or not 0 <= index < 12:
+                    raise ValueError("index must be an integer in 0..11")
+            if action == "set_leds":
+                colors = args.get("colors")
+                if not isinstance(colors, (list, tuple)) or len(colors) != 12:
+                    raise ValueError("colors must contain exactly 12 RGB triples in SDK index order")
+                frame = tuple(_face_rgb(c, f"colors[{i}]") for i, c in enumerate(colors))
+            if action in _FACE_EFFECTS:
+                period = _face_seconds(args.get("period_s", 2), "period_s", 0.2, 3600)
+                duration = _face_seconds(args.get("duration_s", 5), "duration_s", 0.05, 3600)
+        except ValueError as exc:
+            return _env_face(action, False, code="INVALID_ARGUMENT", message=str(exc))
+        with self._ops:
+            if action in ("set_led", "set_leds", "chase") and not self._backend.per_led:
+                return _env_face(action, False, code="UNSUPPORTED_CAPABILITY",
+                                 message="MQTT face_light/color supports only three-byte uniform RGB; select a verified SDK backend for per-LED control")
+            self._cancel_effect()
+            with self._lock:
+                if not self._active:
+                    return _env_face(action, False, code="NOT_AVAILABLE", message="face_light is stopped; start it first")
+                if action == "set_led":
+                    changed = list(self._colors)
+                    changed[index] = rgb
+                    frame = tuple(changed)
+                elif action != "set_leds":
+                    frame = (_FACE_BLACK if action == "off" else
+                             _face_effect_frame(action, rgb, target, period, 0) if action in _FACE_EFFECTS else (rgb,) * 12)
+                try:
+                    self._write(frame)
+                    self._mode = action if action in _FACE_EFFECTS else ("off" if frame == _FACE_BLACK else "static")
+                    if action in _FACE_EFFECTS:
+                        self._cancel = threading.Event()
+                        self._thread = threading.Thread(target=self._run_effect, name="go1-face-light",
+                                                        args=(self._cancel, action, rgb, target, period, duration, time.monotonic()),
+                                                        daemon=True)
+                        self._thread.start()
+                except Exception as exc:
+                    self._mode = "error"
+                    self._last_error = str(exc)
+                    return _env_face(action, False, code="NOT_AVAILABLE", message=str(exc))
+                applied = {"colors": [list(c) for c in frame]}
+                if action == "set_color":
+                    applied.update(dict(zip(("r", "g", "b"), rgb)))
+                elif action in ("off", "preset"):
+                    applied["rgb"] = list(frame[0])
+                    if action == "preset":
+                        applied["name"] = name.lower()
+                if action in _FACE_EFFECTS:
+                    applied.update(period_s=period, duration_s=duration, end_behavior="off")
+                return _env_face(action, True, applied=applied, simulated=self._backend.name == "simulated",
+                                 delivery="simulated" if self._backend.name == "simulated" else "sdk_udp_socket_sent" if self._backend.name == "sdk" else "mqtt_socket_sent")
 
 
 def make_face_light(plugin_config, namespace, executor, client):

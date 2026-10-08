@@ -11,8 +11,9 @@ plugins:
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
 
-  face_light:                   # 面部灯带颜色(actuator,MQTT):set_color/preset/off
+  face_light:                   # 同一 face_light 卡：静态色/逐灯接口/定时灯效（能力取决于 backend）
     enabled: true
+    backend: "mqtt"             # mqtt: 整条同色；simulated: 本地模拟；sdk: 官方 SDK（见 README）
     mqtt_host: "localhost"
     mqtt_port: 1883
     system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题

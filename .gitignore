@@ -41,3 +41,6 @@ Thumbs.db
 
 # Docker
 .docker/
+
+# Private SDK copied from the robot; not redistributed
+.local/face-light-sdk/
