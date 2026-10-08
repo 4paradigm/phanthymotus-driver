@@ -20,20 +20,27 @@ depth, and point cloud at a time.
 `vision_capture` connects directly to the selected RGB port; `camera_rgb` does
 not need to be started. Use `{"action":"capture_photo","position":"front"}`
 for one JPEG or `{"action":"record_video","position":"front","duration_s":5}`
-for an MP4 (1–30 seconds, default 5). Both calls return promptly after acceptance,
-with an `action_id`, a planned `file_path` and `channel_reply_path`, and
-`state: capturing` / `recording`. `ok: true` means accepted and
-`file_ready: false` means this response does not confirm a saved file.
+for an MP4 video (1–30 seconds, default 5).
 
-The tool declares `inputSchema.x-completion` for `capture_photo` and
+`capture_photo` waits for the JPEG to be saved and returns its final file paths,
+MIME type, size, capture time, `state: captured`, and `file_ready: true` in the
+same MCP result. Failure returns an error directly. Photos do not return an
+ACP `action_id` or send ACP callbacks. `start`, `stop`, `list`, `delete`, and
+`info` also return directly without their own ACP callbacks; stopping an active
+video still causes that video's terminal cancellation callback.
+
+Only `record_video` is asynchronous. Its initial MCP result returns promptly
+with an `action_id`, a planned `file_path` and `channel_reply_path`, and
+`state: recording`. `ok: true` means accepted and `file_ready: false` does not
+confirm a saved file. The tool declares `inputSchema.x-completion` only for
 `record_video`, with a 120-second completion timeout. The background worker
 reports one terminal outcome (`completed`, `error`, or `cancelled`) to the
 existing local Agent Core `/api/acp/complete` endpoint. Successful completion
-contains final file paths, MIME type, size and capture timing; failure or
+contains final file paths, MIME type, size and recording timing; failure or
 cancellation contains an error code and message. Use this completion result to
-determine file availability, rather than the initial MCP result.
-`info.last_capture` and `info.last_recording` keep the latest
-`{action_id, status, result}` for inspection.
+determine video availability, rather than the initial MCP result.
+`info.last_capture` keeps the latest `{status, result}`;
+`info.last_recording` keeps `{action_id, status, result}` for inspection.
 
 ACP delivery uses `AGENT_CORE_URL` (default `https://localhost:15678`), no bearer
 token, and at most three attempts with a 3-second request timeout and 0.5/1-second
@@ -43,8 +50,9 @@ terminal outcome, not guaranteed exactly-once network delivery. Exhaustion is
 logged; there is no durable retry queue across outages or process restarts.
 The card does not send `/api/event` or require `ACCESS_TOKEN`. ACP completion
 updates orchestration status; it does not implement a separate “录像已保存”
-canvas message. Whether the canvas exposes final file paths has not been
-verified with the disconnected robot.
+canvas message or keep the execute button busy until video completion. The
+current manual canvas call displays the initial MCP result; final video paths
+are carried by ACP and remain available through `list` and `info`.
 
 `stop` reports lifecycle state `idle` and a separate `capture_active` flag;
 an active photo continues while an active video is cancelled. Cancellation
@@ -62,8 +70,9 @@ For `record_video`, the recording clock starts at the first valid camera frame.
 The planned MP4 path becomes ready only after successful ACP completion.
 Lifecycle `stop` cancels an active recording instead of saving it, including
 when the encoder is being created or is finishing. Driver shutdown rejects new
-captures, cancels active video, and waits for all accepted photo/video workers
-and their bounded ACP delivery attempts, even after camera occupancy is released.
+captures, cancels active video, and waits for in-flight photos and all accepted
+video workers including their bounded ACP delivery attempts, even after camera
+occupancy is released.
 The service gives this drain up to 60 seconds before forced container exit.
 
 Recording first writes the selected JPEGs into a temporary MJPEG stream, then

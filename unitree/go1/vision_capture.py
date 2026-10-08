@@ -68,7 +68,7 @@ class VisionCapturePlugin:
                     "name": {"type": "string", "description": "删除时填写完整的 .jpg 或 .mp4 文件名。"},
                 },
                 "required": ["action"], "additionalProperties": False,
-                "x-completion": {"actions": ["capture_photo", "record_video"], "timeout": 120},
+                "x-completion": {"actions": ["record_video"], "timeout": 120},
                 "x-action-params": {
                     "start": {"params": [], "description": "准备拍照录像卡，无需启动 camera_rgb。"},
                     "capture_photo": {"params": ["position", "image_name"], "description": "保存指定机位的新 JPEG。"},
@@ -237,12 +237,13 @@ class VisionCapturePlugin:
             cancel = threading.Event() if action != "capture_photo" else None
             if cancel is not None:
                 self._recording = cancel
-        action_id = f"vision_capture_{uuid4().hex}"
-        # 初始 MCP result 仅表示受理；文件可用性以 ACP 终态为准。
+        action_id = f"vision_capture_{uuid4().hex}" if cancel else None
+        outcome = {}
+        # 拍照等待保存并直接返回；只有录像通过 ACP 报告终态。
         worker = None
         try:
-            target = self._record_async if cancel else self._capture_async
-            worker_args = (position, action_id, path, duration, cancel) if cancel else (position, action_id, path)
+            target = self._record_async if cancel else self._capture_sync
+            worker_args = (position, action_id, path, duration, cancel) if cancel else (position, path, outcome)
             worker = threading.Thread(target=target, args=worker_args, daemon=True)
             with camera._CAMERA_LOCK:
                 if self._shutting_down:
@@ -262,12 +263,15 @@ class VisionCapturePlugin:
                 if worker is not None:
                     self._workers.discard(worker)
             return {"ok": False, "code": "RECORD_FAILED" if cancel else "CAPTURE_FAILED", "message": str(exc)}
-        return {"ok": True, "state": "recording" if cancel else "capturing",
+        if cancel is None:
+            worker.join()
+            return outcome["result"]
+        return {"ok": True, "state": "recording",
                 "action_id": action_id, "position": position,
                 "file_path": str(path), "filename": path.name,
                 "channel_reply_path": self._channel_path(path), "file_ready": False}
 
-    def _capture_async(self, position, action_id, path):
+    def _capture_sync(self, position, path, outcome):
         try:
             result = self._capture_and_save(position, path)
         except Exception as exc:
@@ -277,14 +281,14 @@ class VisionCapturePlugin:
                 camera._SNAPSHOT_POSITIONS.discard(position)
                 self._active.discard(position)
                 self._active_paths.discard(path)
-        status = "completed" if result.get("ok") else "error"
+        result["state"] = "captured" if result.get("ok") else "error"
+        if result.get("ok"):
+            result["file_ready"] = True
         with camera._CAMERA_LOCK:
-            self._last_capture = {"action_id": action_id, "status": status, "result": result}
-        try:
-            self._notify_complete(action_id, status, result)
-        finally:
-            with camera._CAMERA_LOCK:
-                self._workers.discard(threading.current_thread())
+            self._last_capture = {"status": "completed" if result.get("ok") else "error",
+                                  "result": result}
+            outcome["result"] = result
+            self._workers.discard(threading.current_thread())
 
     def _notify_complete(self, action_id, status, result):
         # 同一终态重试同一 payload；不发送 /api/event，也不读取 ACCESS_TOKEN。

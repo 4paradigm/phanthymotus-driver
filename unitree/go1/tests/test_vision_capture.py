@@ -43,12 +43,14 @@ def final_result(accepted):
 
 
 def completed_capture(card, position="front"):
-    result = final_result(card.dispatch("capture_photo", {"position": position}))
-    assert result["state"] == ("completed" if result["ok"] else "error")
+    result = card.dispatch("capture_photo", {"position": position})
+    assert result["state"] == ("captured" if result["ok"] else "error")
+    assert "action_id" not in result
+    assert _completions.empty()
     return result
 
 
-@pytest.mark.parametrize("action", ["capture_photo", "record_video"])
+@pytest.mark.parametrize("action", ["record_video"])
 def test_media_returns_acceptance_before_file_is_saved(tmp_path, monkeypatch, action):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
@@ -81,10 +83,10 @@ def test_media_returns_acceptance_before_file_is_saved(tmp_path, monkeypatch, ac
     result = final_result(accepted)
     assert result["state"] == "completed"
     assert Path(result["file_path"]).read_bytes() == b"saved"
-    assert card.get_tool()["inputSchema"]["x-completion"] == {"actions": ["capture_photo", "record_video"], "timeout": 120}
+    assert card.get_tool()["inputSchema"]["x-completion"] == {"actions": ["record_video"], "timeout": 120}
 
 
-def test_mcp_returns_acceptance_before_photo_is_saved(tmp_path, monkeypatch):
+def test_mcp_photo_returns_saved_file_without_acp(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     main = importlib.import_module("unitree.go1.main")
     bundle = main.Go1Bundle({"plugins": {
@@ -118,22 +120,23 @@ def test_mcp_returns_acceptance_before_photo_is_saved(tmp_path, monkeypatch):
     caller.start()
     try:
         assert entered.wait(1)
-        caller.join(0.5)
-        assert not caller.is_alive(), "dispatch blocked on background work"
-        accepted = response.get_nowait()
-        if "jsonrpc" in accepted:
-            accepted = json.loads(accepted["result"]["content"][0]["text"])
-        assert accepted["state"] in ("capturing", "recording")
-        assert accepted["file_ready"] is False
-        assert not Path(accepted["file_path"]).exists()
+        caller.join(0.1)
+        assert caller.is_alive(), "photo MCP returned before saving"
+        assert response.empty()
+        assert _completions.empty()
     finally:
         release.set()
         caller.join(3)
         server.shutdown()
         serving.join(3)
         server.server_close()
-    result = final_result(accepted)
-    assert result["state"] == "completed"
+    result = response.get_nowait()
+    if "jsonrpc" in result:
+        result = json.loads(result["result"]["content"][0]["text"])
+    assert result["state"] == "captured"
+    assert result["file_ready"] is True
+    assert "action_id" not in result
+    assert _completions.empty()
     assert Path(result["file_path"]).read_bytes() == b"\xff\xd8photo\xff\xd9"
 
 
@@ -173,7 +176,7 @@ def test_snapshot_connects_to_selected_camera_and_saves_jpeg(tmp_path):
     assert not sender.is_alive()
 
 
-def test_capture_acceptance_contains_planned_photo_path(tmp_path, monkeypatch):
+def test_capture_returns_final_photo_path_after_save(tmp_path, monkeypatch):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     entered, release = threading.Event(), threading.Event()
@@ -189,16 +192,18 @@ def test_capture_acceptance_contains_planned_photo_path(tmp_path, monkeypatch):
     caller.start()
     try:
         assert entered.wait(1)
-        caller.join(0.5)
-        assert not caller.is_alive(), "dispatch blocked on background work"
-        accepted = response.get_nowait()
-        assert accepted["state"] in ("capturing", "recording")
-        assert accepted["file_ready"] is False
-        assert not Path(accepted["file_path"]).exists()
+        caller.join(0.1)
+        assert caller.is_alive(), "photo returned before saving"
+        assert response.empty()
+        assert _completions.empty()
     finally:
         release.set()
         caller.join(3)
-    result = final_result(accepted)
+    result = response.get_nowait()
+    assert result["state"] == "captured"
+    assert result["file_ready"] is True
+    assert "action_id" not in result
+    assert _completions.empty()
     path = Path(result["file_path"])
     assert path.parent == tmp_path / "photos"
     assert path.name.startswith("front_") and path.suffix == ".jpg"
@@ -230,8 +235,9 @@ def test_shutdown_drains_active_photo_before_returning(tmp_path, monkeypatch):
         shutdown.join(3)
         caller.join(3)
     assert stopped.is_set()
-    result = final_result(response.get_nowait())
-    assert result["state"] == "completed"
+    result = response.get_nowait()
+    assert result["state"] == "captured"
+    assert _completions.empty()
     assert Path(result["file_path"]).exists()
 
 
@@ -239,7 +245,9 @@ def test_failed_capture_returns_error_without_creating_file(tmp_path, monkeypatc
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"invalid")
-    result = final_result(card.dispatch("capture_photo", {}))
+    result = card.dispatch("capture_photo", {})
+    assert "action_id" not in result
+    assert _completions.empty()
     assert result["ok"] is False
     assert result["state"] == "error"
     assert list(tmp_path.rglob("*.jpg")) == []
@@ -324,15 +332,15 @@ def test_named_photo_list_and_delete(tmp_path, monkeypatch):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
-    accepted = final_result(card.dispatch("capture_photo", {"image_name": "hall_01"}))
-    assert accepted["state"] == "completed"
-    assert Path(accepted["file_path"]).name == "hall_01.jpg"
+    result = card.dispatch("capture_photo", {"image_name": "hall_01"})
+    assert result["state"] == "captured"
+    assert Path(result["file_path"]).name == "hall_01.jpg"
     listing = card.dispatch("list", {})
     assert listing["files"][0]["filename"] == "hall_01.jpg"
     assert listing["files"][0]["size"] > 0
     assert card.dispatch("delete", {"name": "../hall_01.jpg"})["ok"] is False
     assert card.dispatch("delete", {"name": "hall_01.jpg"})["state"] == "deleted"
-    assert not Path(accepted["file_path"]).exists()
+    assert not Path(result["file_path"]).exists()
 
 
 def test_list_hides_unpublished_video_temp_file(tmp_path):
@@ -359,17 +367,17 @@ def test_named_capture_rejects_bad_names_and_existing_file(tmp_path, monkeypatch
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
     for name in ("../escape", "a/b", "a.jpg", " "):
         assert card.dispatch("capture_photo", {"image_name": name})["code"] == "INVALID_ARGUMENT"
-    accepted = final_result(card.dispatch("capture_photo", {"image_name": "same"}))
+    accepted = card.dispatch("capture_photo", {"image_name": "same"})
     assert card.dispatch("capture_photo", {"image_name": "same"})["code"] == "FILE_EXISTS"
     assert Path(accepted["file_path"]).exists()
 
 
-def test_snapshot_declares_acp_completion():
+def test_only_video_declares_acp_completion():
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({})
     assert card.PREFIX == card.get_tool()["name"] == "vision_capture"
     schema = card.get_tool()["inputSchema"]
-    assert schema["x-completion"] == {"actions": ["capture_photo", "record_video"], "timeout": 120}
+    assert schema["x-completion"] == {"actions": ["record_video"], "timeout": 120}
     assert "start_recording" not in schema["properties"]["action"]["enum"]
     assert "stop_recording" not in schema["properties"]["action"]["enum"]
     assert "x-resource" not in schema
@@ -847,7 +855,7 @@ def test_stop_before_mp4_publish_reports_cancel_without_file(tmp_path, monkeypat
     (TimeoutError("Nano timed out"), "CAMERA_UNAVAILABLE"),
     (RuntimeError("worker failed"), "CAPTURE_FAILED"),
 ])
-def test_snapshot_failure_completes_and_releases_position(tmp_path, monkeypatch, error, code):
+def test_snapshot_failure_returns_and_releases_position(tmp_path, monkeypatch, error, code):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
 
@@ -860,7 +868,7 @@ def test_snapshot_failure_completes_and_releases_position(tmp_path, monkeypatch,
     assert completed_capture(card)["ok"] is True
 
 
-def test_capture_returns_before_network_and_blocks_same_position(tmp_path, monkeypatch):
+def test_capture_waits_for_network_and_blocks_same_position(tmp_path, monkeypatch):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
@@ -880,7 +888,7 @@ def test_capture_returns_before_network_and_blocks_same_position(tmp_path, monke
     caller.start()
     try:
         assert entered.wait(1)
-        assert returned.wait(0.5), "dispatch blocked on the Nano"
+        assert not returned.wait(0.1), "photo returned before the Nano frame"
         stopped = card.dispatch("stop", {})
         assert stopped["state"] == "idle"
         assert stopped["capture_active"] is True
@@ -892,7 +900,8 @@ def test_capture_returns_before_network_and_blocks_same_position(tmp_path, monke
         release.set()
         caller.join(3)
     assert returned.is_set()
-    assert final_result(results[0])["state"] == "completed"
+    assert results[0]["state"] == "captured"
+    assert _completions.empty()
 
 
 @pytest.mark.parametrize("camera_type", ["rgb", "depth", "pointcloud"])
@@ -946,7 +955,8 @@ def test_stream_cannot_start_during_snapshot(tmp_path, monkeypatch):
     finally:
         release.set()
         caller.join(3)
-    assert final_result(responses.get_nowait())["state"] == "completed"
+    assert responses.get_nowait()["state"] == "captured"
+    assert _completions.empty()
 
 
 @pytest.mark.parametrize("source", ["camera_rgb", "camera_depth"])
@@ -969,19 +979,16 @@ def test_snapshot_and_rgb_have_identical_default_endpoints():
     assert card._endpoints == {p: (cfg["board_ip"], cfg["image_port"]) for p, cfg in rgb._positions.items()}
 
 
-@pytest.mark.parametrize("action", ["capture_photo", "record_video"])
+@pytest.mark.parametrize("action", ["record_video"])
 def test_accepted_action_has_one_terminal_notification(tmp_path, monkeypatch, action):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
     monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
-    if action == "capture_photo":
-        monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
-    else:
-        def save(position, path, duration, cancel):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"video")
-            return {"ok": True, "media_type": "video", "file_path": str(path), "filename": path.name}
-        monkeypatch.setattr(card, "_record_and_save", save)
+    def save(position, path, duration, cancel):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"video")
+        return {"ok": True, "media_type": "video", "file_path": str(path), "filename": path.name}
+    monkeypatch.setattr(card, "_record_and_save", save)
     result = final_result(card.dispatch(action, {}))
     assert _completions.empty()
     assert result["state"] == "completed"
@@ -1057,7 +1064,8 @@ def test_simultaneous_snapshots_reserve_position_atomically(tmp_path, monkeypatc
         release.set()
         for caller in callers:
             caller.join(3)
-    assert final_result(results.get_nowait())["state"] == "completed"
+    assert results.get_nowait()["state"] == "captured"
+    assert _completions.empty()
 
 
 def test_bundle_stream_and_snapshot_share_occupancy_and_reject_busy_hot_switch(tmp_path, monkeypatch):
@@ -1101,7 +1109,8 @@ def test_bundle_stream_and_snapshot_share_occupancy_and_reject_busy_hot_switch(t
         stream_release.set()
         stream._thread.join(3)
         bundle.stop_all()
-    assert final_result(responses.get_nowait())["state"] == "completed"
+    assert responses.get_nowait()["state"] == "captured"
+    assert _completions.empty()
 
 
 def test_stream_cards_reject_occupied_position_before_opening_receiver(monkeypatch):
@@ -1422,4 +1431,21 @@ def test_oversized_encoded_video_is_not_published(tmp_path, monkeypatch):
     assert launches[0][launches[0].index("-fs") + 1] == "32"
     assert card.dispatch("list", {})["files"] == []
     assert not list(tmp_path.rglob("*.mp4")) and not list(tmp_path.rglob("*.mjpeg"))
+    assert _completions.empty()
+
+
+def test_non_video_operations_do_not_send_acp(tmp_path, monkeypatch):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
+    assert card.dispatch("start", {})["state"] == "ready"
+    photo = card.dispatch("capture_photo", {"image_name": "saved"})
+    assert photo["state"] == "captured"
+    assert photo["file_ready"] is True
+    assert "action_id" not in photo
+    assert card.dispatch("list", {})["files"][0]["filename"] == "saved.jpg"
+    assert card.dispatch("info", {})["last_capture"]["result"] == photo
+    assert card.dispatch("delete", {"name": "saved.jpg"})["state"] == "deleted"
+    assert card.dispatch("stop", {})["state"] == "idle"
+    card.shutdown()
     assert _completions.empty()
