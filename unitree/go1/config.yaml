@@ -12,7 +12,7 @@ plugins:
     enabled: true
 
   face_light:                   # 同一 face_light 卡：静态色/逐灯接口/定时灯效，统一 SDK
-    enabled: false               # 安装并校验外部官方 SDK 后启用，见 README 的部署步骤
+    enabled: true             # 安装并校验外部官方 SDK 后启用，见 README 的部署步骤
     backend: "sdk"              # 所有灯光统一使用官方 SDK，不提供模拟后端
     sdk_exclusive: true          # 默认 SDK 独占；部署前停止 faceLightMqtt，保留 faceLightServer
   system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
