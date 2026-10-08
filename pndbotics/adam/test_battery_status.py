@@ -212,8 +212,12 @@ class RealWebSocketLifecycleTests(unittest.TestCase):
         ws = self.connect(None, 3, True)
         ws.sock.close()  # transport closes before WebSocket state catches up
         r._socket = ws
-        with self.assertLogs('battery_status', level='WARNING'):
+        # Client versions differ in whether abort suppresses a closed-socket
+        # OSError. Both paths must stop safely; a warning is not required.
+        with mock.patch('battery_status.logging.getLogger'):
             r.stop()
+        self.assertIsNone(r._thread)
+        self.assertTrue(r._stop.is_set())
         r._socket = None
         r.stop()
 

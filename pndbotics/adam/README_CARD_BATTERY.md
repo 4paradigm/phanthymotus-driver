@@ -107,11 +107,11 @@ but do not test the HTTP upgrade handshake or the robot network.
 
 Keep the range rather than introducing a one-off version pin. Record the resolved
 version for each deployment and rerun the battery suite when upgrading it; test
-1.6.0 as the compatibility floor. On 2026-10-08 the running Adam image was
+1.6.0 as the compatibility floor. Before the final acceptance deployment on 2026-10-08, the running Adam image was
 `release.260930.34902c1` and **did not have websocket-client installed**. Therefore
-there is no current deployed PAC client version to report, and that image cannot
+that previous deployment had no PAC client version to report and could not
 validate this PR's combined DDS/PAC behavior. This observation does not replace the
-2026-09-29 acceptance record above. No deployment was changed for this review fix.
+2026-09-29 acceptance record above. The final acceptance deployment below supersedes that environment observation.
 
 State shutdown attempts ROS publication deactivation, PAC shutdown and DDS polling
 shutdown independently, logs each failure and reports an aggregate error. Close
@@ -140,3 +140,53 @@ The Driver transfers data between these independently initialized participants;
 the different domain IDs are intentional. The 2026-09-29 correction to domain 1
 concerned the robot SDK's `dds_domain_id`, not the global ROS domain. Neither domain
 nor their initialization is changed by the lifecycle review fix.
+
+
+### Final terminal acceptance (2026-10-08)
+
+- Tested runtime revision: `7846959` (`fix(adam): harden battery PAC receiver
+  lifecycle`). The [CI Build Result](https://github.com/4paradigm/phanthymotus-driver/pull/354#issuecomment-6051583292)
+  associates this revision with image version `release.261008.0db3b03`.
+  The image's `device.py` and `battery_status.py` hashes match the revision.
+- Actual image dependency: **websocket-client 1.9.2**. Runtime introspection
+  confirms `abort()` and `close(timeout=...)`. The closed-socket test checks safe
+  termination rather than requiring a warning: 1.9.2 handles that socket error
+  inside the client, while earlier tested versions may propagate it to our handler.
+- Robot SDK DDS domain **1** and ROS domain **42** were verified independently.
+  Over 12 seconds before restart, a separate read-only SDK subscriber received
+  **4874 lowstate callbacks**; the battery topic received **12 messages**.
+- Normal container stop took **0.883 seconds**, exited with code **0**, and produced
+  no cleanup error or traceback in the stop interval. No forced thread termination
+  or Docker kill was needed. A camera shutdown warning was also present.
+- After normal container start, a second 12-second check received **4865 lowstate
+  callbacks** and **12 battery messages**. IMU, joints and motor topics each
+  received **413 messages**, and robot state received **414**. These topics do not
+  all carry timestamps: changing payloads and robot ticks confirmed updates.
+- DDS and PAC were simultaneously available after restart: approximately **44.43 V,
+  3.95 A, 175.50 W, 110.95 Wh**, capacity **93**, temperatures **30.9 / 30.2 /
+  30.8 Celsius**, cycle count **13**, protection **Normal**. `dds_available`,
+  `pac_connected` and `pac_fresh` were true; `pac_age_ms` was **425** and
+  `pac_last_error` was null. Direct PAC sampling returned capacity **93** versus
+  raw percentage **100**, confirming the intended mapping. Values are samples,
+  not constants. Container restart count remained **0**.
+- **19 Cards** were registered, as expected by this revision. The previous local
+  deployment exposed 20: its extra `arm_gesture` Card was already retired in the
+  repository by commit `ed127ac`, independently of this battery PR. Unrelated
+  non-battery query serialization tracebacks were observed before the stop test;
+  these were not cleanup failures and are outside this acceptance's battery scope.
+- Tests ran in a separate container from the **same deployed CI image**, with
+  networking disabled and no robot device mounts. All **25 battery tests** and
+  **4 Adam contract tests** passed. Full Adam discovery ran **129 tests with 3
+  failures**, reproduced on a second run, all in existing `ArmWaveTests`:
+  `test_a_new_wave_supersedes_the_running_one`,
+  `test_handshake_reports_completion_after_elbow_oscillation`, and
+  `test_stop_cancels_a_running_wave`. Running that group alone passed all **7
+  tests**. This suggests test interaction; its cause is not established here.
+  No arm implementation or tests were changed, and the full suite is not claimed
+  to be green.
+- The previous container and image were retained with a rollback script. No
+  movement commands were issued. The operator confirmed that Canvas displays
+  DDS/PAC values and all three availability/connection flags correctly after
+  restart. The screenshot file has not yet been supplied for the evidence archive.
+  Battery runtime acceptance passed; the full-suite failures remain a separate
+  review caveat.
