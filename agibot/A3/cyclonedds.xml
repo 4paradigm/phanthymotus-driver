@@ -2,11 +2,10 @@
 <CycloneDDS xmlns="https://cdds.io/config">
   <Domain id="any">
     <General>
-      <!-- ADU Thor's robot link is exposed as mgbe0_0. Keep autodetect as a
-           fallback for other A3 carrier boards with a renamed interface. -->
+      <!-- ADU Thor's robot link is exposed as mgbe0_0. Selecting it explicitly
+           avoids CycloneDDS matching the same interface twice. -->
       <Interfaces>
         <NetworkInterface name="mgbe0_0" priority="default" multicast="true" />
-        <NetworkInterface autodetermine="true" priority="default" multicast="true" />
       </Interfaces>
       <MaxMessageSize>16MB</MaxMessageSize>
       <AllowMulticast>spdp</AllowMulticast>
