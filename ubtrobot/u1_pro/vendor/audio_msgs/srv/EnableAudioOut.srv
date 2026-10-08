@@ -1,0 +1,12 @@
+std_msgs/Header header
+bool enable
+AudioInfo info
+uint8 ADD=0
+uint8 INTERRUPT=1
+uint8 INSERT=2
+uint8 INTERRUPT_PROTECTED=3
+uint8 mode
+float32 gain
+---
+int32 code
+string message

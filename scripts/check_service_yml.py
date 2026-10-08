@@ -60,16 +60,15 @@ OWN_PROFILE = {
                             'BridgeROS2 in joints_bridge.py); runs the vendor profile '
                             '/work/dds_profile.xml process-wide, whose whitelist excludes the '
                             'office LAN. Setting the fleet profile here cuts the body link.',
-    'agibot/A3': 'two FastDDS contexts in one process (DualDomainROS2 via common '
-                 'vendor_runtime); the robot-domain-232 context must reach the HDU/ADU/MDU '
-                 'at 10.42.10.10-12 over eth0, which the fleet loopback-only profile would '
-                 'silently cut. main.py _select_profile generates a process-wide profile '
-                 'whitelisting the robot-subnet IP + 127.0.0.1 before any participant.',
 }
 
 # Drivers a FastDDS profile cannot isolate, with what they would need instead. Reported,
 # not fatal — the point is that the gap stays visible rather than passing as compliant.
 KNOWN_GAPS = {
+    'ubtrobot/u1_pro': 'RMW is rmw_cyclonedds_cpp; the U1 SDK robot domain defaults to '
+                       '20 and the driver binds its explicitly configured contexts to '
+                       'loopback through CYCLONEDDS_URI. The FastDDS fleet profile is '
+                       'inert and must not be applied.',
     'engineai/t800': 'RMW is rmw_cyclonedds_cpp (Dockerfile T800_PREFERRED_RMW), so '
                      'FASTRTPS_DEFAULT_PROFILES_FILE is inert; its CYCLONEDDS_URI binds '
                      'NETWORK_INTERFACE for both contexts, leaving the domain-42 one on '
