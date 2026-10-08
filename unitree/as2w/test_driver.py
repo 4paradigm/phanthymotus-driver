@@ -189,6 +189,26 @@ class TestDriverContracts(unittest.TestCase):
         self.assertFalse(payload["active"])
         self.assertIn("timestamp_ms", payload)
 
+    def test_lowstate_throttles_remote_controller_publication(self):
+        node = self.device._StateNode.__new__(self.device._StateNode)
+        published = []
+        node.remote_controller = types.SimpleNamespace(
+            publish=lambda message: published.append(message.data)
+        )
+        node.imu = node.joints = node.joint_state = node.battery = types.SimpleNamespace(
+            publish=lambda message: None
+        )
+        msg = types.SimpleNamespace(
+            wireless_remote=bytes(40),
+            imu_state=types.SimpleNamespace(quaternion=[], gyroscope=[], accelerometer=[], rpy=[]),
+            motor_state=[],
+        )
+        with patch.object(self.device.time, "monotonic", side_effect=(1.0, 1.05, 1.11)):
+            node._on_low(msg)
+            node._on_low(msg)
+            node._on_low(msg)
+        self.assertEqual(2, len(published))
+
     def test_lowstate_extra_motor_slots_are_ignored(self):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []

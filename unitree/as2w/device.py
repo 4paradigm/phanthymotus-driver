@@ -87,6 +87,8 @@ def _acp_notify(action_id, status, result):
 
 
 class _StateNode:
+    _REMOTE_INTERVAL = 0.1
+
     def __init__(self, namespace, executor):
         from rclpy.node import Node
         self.node = Node("as2w_state")
@@ -105,6 +107,7 @@ class _StateNode:
         self._low.Init(self._on_low, 10)
         self._bms.Init(self._on_bms, 10)
         self._sport.Init(self._on_sport, 10)
+        self._last_remote_time = 0.0
         executor.add_node(self.node)
 
     def close(self):
@@ -125,9 +128,13 @@ class _StateNode:
         return {f"{prefix}_{i}": float(value) for i, value in enumerate(values)}
 
     def _on_low(self, msg):
-        remote = _parse_wireless_remote(getattr(msg, "wireless_remote", None))
-        remote["timestamp_ms"] = int(time.time() * 1000)
-        self._publish(self.remote_controller, remote)
+        now = time.monotonic()
+        last_remote_time = getattr(self, "_last_remote_time", 0.0)
+        if now - last_remote_time >= self._REMOTE_INTERVAL:
+            self._last_remote_time = now
+            remote = _parse_wireless_remote(getattr(msg, "wireless_remote", None))
+            remote["timestamp_ms"] = int(time.time() * 1000)
+            self._publish(self.remote_controller, remote)
         imu = getattr(msg, "imu_state", getattr(msg, "imu", None))
         if imu is not None:
             imu_data = {}
