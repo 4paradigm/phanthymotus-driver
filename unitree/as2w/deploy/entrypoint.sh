@@ -15,7 +15,4 @@ if [[ ! -f "${ros_setup}" ]]; then
 fi
 
 source "${ros_setup}"
-if [[ -n "${NETWORK_INTERFACE:-}" ]]; then
-    exec "$@" "${NETWORK_INTERFACE}"
-fi
-exec "$@"
+exec "$@" "${NETWORK_INTERFACE:-}"
