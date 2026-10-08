@@ -442,6 +442,30 @@ class A3Nodes:
         core_node = Node("agibot_a3_driver_core", context=ros2.ctx_core)
         ros2.executor_robot.add_node(self.robot)
         ros2.executor_core.add_node(core_node)
+        self.media_robot = None
+        self._media_ros_executor = None
+        self._media_ros_thread = None
+        try:
+            # Keep large Image/PointCloud2 and audio deserialization out of the
+            # state/command executor.  A separate node is required: a node
+            # cannot be attached to two executors, and a callback group alone
+            # does not protect against executor-level starvation or a malformed
+            # large sample stopping the shared spin loop.
+            import rclpy.executors
+            self.media_robot = Node("agibot_a3_media_robot", context=ros2.ctx_robot)
+            self._media_ros_executor = rclpy.executors.MultiThreadedExecutor(
+                context=ros2.ctx_robot, num_threads=4)
+            self._media_ros_executor.add_node(self.media_robot)
+            self._media_ros_thread = threading.Thread(
+                target=self._media_ros_executor.spin, daemon=True,
+                name="a3-media-ros-executor")
+            self._media_ros_thread.start()
+        except Exception as exc:
+            # Lightweight test doubles and old rclpy builds do not expose a
+            # second executor; production falls back to the main node.
+            self.media_robot = None
+            self._media_ros_executor = None
+            print(f"[media] dedicated executor unavailable: {exc}", flush=True)
         self.core_bridge = None
         if config.get("ros", {}).get("core_bridge", False):
             self.core_bridge = CoreBridge()
@@ -492,6 +516,7 @@ class A3Nodes:
         self._encode_lock = threading.Lock()
         self._encoding_keys = set()
         self._media_failures = set()
+        self._media_received = {}
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
 
@@ -510,6 +535,11 @@ class A3Nodes:
             pub = self.core.create_publisher(core_msg_type, core_topic, 5)
 
             def callback(msg):
+                if re_encode is not None or key in ("lidar_cloud", "mic", "ext_mic"):
+                    count = self._media_received.get(key, 0) + 1
+                    self._media_received[key] = count
+                    if count == 1 or count % 1000 == 0:
+                        print(f"[media] received={count} key={key} topic={robot_topic}", flush=True)
                 if key in ("arm_state", "hand_state", "neck_state"):
                     self._joint_cache[key] = jsonable(msg)
                     self._publish_joint_streams()
@@ -548,11 +578,12 @@ class A3Nodes:
 
             callback_group = self._media_callback_group if (re_encode is not None or key == "lidar_cloud") else None
             kwargs = {"callback_group": callback_group} if callback_group is not None else {}
+            subscription_node = self.media_robot if (callback_group is not None and self.media_robot is not None) else self.robot
             try:
-                self.robot.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos, **kwargs)
+                subscription_node.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos, **kwargs)
             except TypeError:
                 # Test doubles and old rclpy releases may not expose callback_group.
-                self.robot.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos)
+                subscription_node.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos)
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
         self._encode_and_publish = self._encode_and_publish_frame
@@ -616,12 +647,12 @@ class A3Nodes:
                 core_topic = _core_topic(namespace, f"{key}/audio")
                 pub = self.core.create_publisher(AudioChunk, core_topic, 5)
                 try:
-                    self.robot.create_subscription(
+                    (self.media_robot or self.robot).create_subscription(
                         AudioCapture, topic,
                         lambda msg, pub=pub: pub.publish(self._audio_chunk(msg)), sensor_qos,
                         callback_group=self._media_callback_group)
                 except TypeError:
-                    self.robot.create_subscription(
+                    (self.media_robot or self.robot).create_subscription(
                         AudioCapture, topic,
                         lambda msg, pub=pub: pub.publish(self._audio_chunk(msg)), sensor_qos)
                 self.audio_topics[key] = {"robot_topic": topic, "topic": core_topic,
