@@ -879,10 +879,16 @@ class A3Nodes:
     def _wrapper_bytes(msg):
         data = getattr(msg, "data", b"")
         if isinstance(data, (list, tuple)):
-            # ROS byte[] is exposed as a list/array of integer octets.  Calling
-            # bytes(part) for each integer interprets it as a zero-filled
-            # length, corrupting every protobuf payload before ParseFromString.
-            return bytes((int(part) & 0xff) for part in data)
+            # ROS byte[] bindings vary by rclpy version: integer octets,
+            # one-byte ``bytes`` values, or larger bytes chunks are all seen in
+            # the field.  Normalize each representation without interpreting a
+            # byte value as a zero-filled length.
+            if all(isinstance(part, int) for part in data):
+                return bytes((part & 0xff) for part in data)
+            return b"".join(
+                bytes((part & 0xff,)) if isinstance(part, int) else bytes(part)
+                for part in data
+            )
         return bytes(data)
 
     def _decode_bms(self, msg):
