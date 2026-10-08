@@ -915,7 +915,7 @@ def test_completed_video_posts_authenticated_canvas_message(tmp_path, monkeypatc
     requests = []
 
     def post(request, **kwargs):
-        requests.append((request.full_url, json.loads(request.data), request.get_header("Authorization")))
+        requests.append((request.full_url, json.loads(request.data), request.get_header("Authorization"), kwargs["timeout"]))
         return nullcontext()
 
     monkeypatch.setattr(urllib.request, "urlopen", post)
@@ -923,10 +923,12 @@ def test_completed_video_posts_authenticated_canvas_message(tmp_path, monkeypatc
               "file_path": "/data/clip.mp4"}
     card._notify_complete("vision_capture_123", "completed", result)
 
-    assert [url for url, _, _ in requests] == ["http://127.0.0.1:15678/api/acp/complete",
-                                               "http://127.0.0.1:15678/api/event"]
+    assert [url for url, _, _, _ in requests] == ["http://127.0.0.1:15678/api/acp/complete",
+                                                "http://127.0.0.1:15678/api/event"]
     assert requests[0][2] == "Bearer test-token"
     assert requests[1][2] == "Bearer test-token"
+    assert requests[0][3] == 3
+    assert requests[1][3] == 10
     assert requests[1][1]["text"] == ""
     assert requests[1][1]["payload"]["text"] == "vision_capture 录像已保存：clip.mp4（/data/clip.mp4）"
     assert requests[1][1]["payload"]["action_id"] == "vision_capture_123"

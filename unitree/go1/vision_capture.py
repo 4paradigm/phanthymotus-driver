@@ -306,7 +306,7 @@ class VisionCapturePlugin:
         request = urllib.request.Request(url + "/api/event", data=event,
                                          headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=3, context=ctx):
+            with urllib.request.urlopen(request, timeout=10, context=ctx):
                 pass
         except Exception as exc:
             log.warning("[vision_capture] canvas notification failed for %s: %s", action_id, exc)
