@@ -907,6 +907,76 @@ def test_completion_reaches_http_endpoint(tmp_path, monkeypatch, jpeg, status):
         server.server_close()
 
 
+def test_completed_video_posts_authenticated_canvas_message(tmp_path, monkeypatch):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setenv("AGENT_CORE_URL", "http://127.0.0.1:15678")
+    monkeypatch.setenv("AGENT_CORE_TOKEN", "test-token")
+    requests = []
+
+    def post(request, **kwargs):
+        requests.append((request.full_url, json.loads(request.data), request.get_header("Authorization")))
+        return nullcontext()
+
+    monkeypatch.setattr(urllib.request, "urlopen", post)
+    result = {"ok": True, "media_type": "video", "filename": "clip.mp4",
+              "file_path": "/data/clip.mp4"}
+    card._notify_complete("vision_capture_123", "completed", result)
+
+    assert [url for url, _, _ in requests] == ["http://127.0.0.1:15678/api/acp/complete",
+                                               "http://127.0.0.1:15678/api/event"]
+    assert requests[0][2] is None
+    assert requests[1][2] == "Bearer test-token"
+    assert requests[1][1]["text"] == ""
+    assert requests[1][1]["payload"]["text"] == "vision_capture 录像已保存：clip.mp4（/data/clip.mp4）"
+    assert requests[1][1]["payload"]["action_id"] == "vision_capture_123"
+
+    requests.clear()
+    card._notify_complete("vision_capture_124", "error", {"ok": False, "code": "RECORD_FAILED"})
+    assert len(requests) == 1
+
+
+def test_canvas_message_failure_does_not_repeat_acp_completion(tmp_path, monkeypatch):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setenv("AGENT_CORE_URL", "http://127.0.0.1:15678")
+    monkeypatch.setenv("AGENT_CORE_TOKEN", "test-token")
+    requests = []
+
+    def post(request, **kwargs):
+        requests.append(request.full_url)
+        if request.full_url.endswith("/api/event"):
+            raise OSError("event offline")
+        return nullcontext()
+
+    monkeypatch.setattr(urllib.request, "urlopen", post)
+    card._notify_complete("vision_capture_125", "completed", {
+        "ok": True, "media_type": "video", "filename": "clip.mp4", "file_path": "/data/clip.mp4"})
+    assert requests == ["http://127.0.0.1:15678/api/acp/complete",
+                        "http://127.0.0.1:15678/api/event"]
+
+
+def test_saved_video_can_notify_canvas_when_acp_endpoint_fails(tmp_path, monkeypatch):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setenv("AGENT_CORE_URL", "http://127.0.0.1:15678")
+    monkeypatch.setenv("AGENT_CORE_TOKEN", "test-token")
+    monkeypatch.setattr(snapshot.time, "sleep", lambda seconds: None)
+    requests = []
+
+    def post(request, **kwargs):
+        requests.append(request.full_url)
+        if request.full_url.endswith("/api/acp/complete"):
+            raise OSError("acp offline")
+        return nullcontext()
+
+    monkeypatch.setattr(urllib.request, "urlopen", post)
+    card._notify_complete("vision_capture_126", "completed", {
+        "ok": True, "media_type": "video", "filename": "clip.mp4", "file_path": "/data/clip.mp4"})
+    assert requests == ["http://127.0.0.1:15678/api/acp/complete"] * 3 + [
+        "http://127.0.0.1:15678/api/event"]
+
+
 def test_failed_completion_delivery_keeps_result_and_releases_camera(tmp_path, monkeypatch, caplog):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})

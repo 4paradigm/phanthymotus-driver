@@ -1,5 +1,6 @@
 """Save Go1 Nano RGB photos and videos to persistent storage."""
 
+import html
 import json
 import logging
 import os
@@ -280,12 +281,32 @@ class VisionCapturePlugin:
                                                  headers={"Content-Type": "application/json"}, method="POST")
                 with urllib.request.urlopen(request, timeout=3, context=ctx):
                     pass
-                return
+                break
             except Exception as exc:
                 if attempt == 2:
                     log.warning("[vision_capture] ACP completion delivery failed for %s: %s", action_id, exc)
                 else:
                     time.sleep(0.5 * 2 ** attempt)
+
+        if status != "completed" or result.get("media_type") != "video":
+            return
+        token = os.environ.get("AGENT_CORE_TOKEN", "")
+        if not token:
+            log.warning("[vision_capture] canvas notification skipped: AGENT_CORE_TOKEN is not set")
+            return
+        # 只把通知显示在画布：空事件文本不会触发后台模型，payload.text 供活动日志显示。
+        text = (f"vision_capture 录像已保存：{html.escape(result['filename'])}"
+                f"（{html.escape(result['file_path'])}）")
+        event = json.dumps({"source": "mcp:vision_capture", "text": "",
+                            "payload": {"text": text, "action_id": action_id}}, ensure_ascii=False).encode()
+        request = urllib.request.Request(url + "/api/event", data=event,
+                                         headers={"Content-Type": "application/json",
+                                                  "Authorization": f"Bearer {token}"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=3, context=ctx):
+                pass
+        except Exception as exc:
+            log.warning("[vision_capture] canvas notification failed for %s: %s", action_id, exc)
 
     def _capture_async(self, position, action_id, path):
         try:
