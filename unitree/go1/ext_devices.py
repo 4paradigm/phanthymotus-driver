@@ -142,6 +142,7 @@ class BeepPlugin:
         return {"name": CARD_BEEP, "type": "actuator", "multiInstance": False,
           "description": "Go1 头部扬声器蜂鸣控制：播放蜂鸣音、调节音量",
           "inputSchema": {"type": "object",
+            "x-resource": "mouth",
             "properties": {
               "action": {"type": "string", "enum": ["beep", "set_volume", "get_volume"],
                          "description": "要执行的蜂鸣操作"},
@@ -395,6 +396,7 @@ class SpeakerPlugin:
           "description": "Go1 头部扬声器：播放操作员远程麦克风音频流",
           "topic_in": [{"format": "audio/pcm-16k"}],
           "inputSchema": {"type": "object",
+            "x-resource": "mouth",
             "properties": {
               "action": {"type": "string",
                          "enum": ["set_volume", "get_volume"],
@@ -735,6 +737,8 @@ def _face_acp_notify(action_id, status, result):
 
 
 class FaceLightPlugin:
+    PREFIX = CARD_FACE_LIGHT
+
     def __init__(self, plugin_config, namespace, executor, client):
         c = plugin_config or {}
         self._config = {key: c.get(key, value) for key, value in _FACE_CONFIG_DEFAULTS.items()}
@@ -894,6 +898,7 @@ class FaceLightPlugin:
                 "description": "Go1 face_light: persistent RGB, 12 LED control and internal timed effects. Check info for backend support; simulation is not hardware evidence.",
                 "inputSchema": {"type": "object", "required": ["action"],
                                 "x-completion": {"actions": list(_FACE_EFFECTS), "timeout": 3610},
+                                "x-resource": "face_light",
                                 "properties": {"action": {"type": "string", "enum": list(actions)},
                                                **{k: dict(rgb_channel) for k in ("r", "g", "b", "to_r", "to_g", "to_b")},
                                                "name": {"type": "string", "enum": list(_PRESETS), "default": "off"},
@@ -1057,6 +1062,7 @@ class SysHealthPlugin:
                  "(CPU temp/load, memory, disk, power throttle, network, key process) and robot subsystems "
                  "(battery, comm link, motion state); returns per-item OK/WARNING/CRITICAL + overall verdict."),
                 "inputSchema": {"type": "object",
+                                "x-resource": "base",
                                 "properties": {"action": {"type": "string", "enum": ["robot_info"],
                                                            "description": "Get robot overall status / health info"}},
                                 "required": ["action"]}}

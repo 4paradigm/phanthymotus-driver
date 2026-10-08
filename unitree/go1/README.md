@@ -227,6 +227,11 @@ RGB 必须是 0–255 的整数，编号必须是 0–11 整数，不接受 bool
 呼吸按余弦曲线缩放 RGB；渐变从 RGB 到目标 RGB 再返回；流水灯一周期依次通过 0–11。
 `duration_s` 为 0.05–3600 秒（默认 5），到期关闭全部灯，线程结束。
 四种灯效声明 `x-completion`（兜底等待 3610 秒），接受后立即返回唯一 `action_id`。
+`x-resource: face_light` 将灯效的资源等待限定到灯光通道。
+Go1 其他执行类工具也声明资源：`beep`/`speaker` 共用 `mouth`，
+`loco`/`body_pose`/`switch_gait`/`gesture`/`special_motion` 共用 `base`。
+`system_health`/`activity_monitor` 保留既有执行类类型和访问权限，保守归入其读取的
+本体 `base` 通道。这些工具无需等待灯效的资源释放；同一调用序列仍遵循 Agent Core 的动作次序。
 线程向 `AGENT_CORE_URL` 的 `/api/acp/complete` 回报 `completed`（到期且关闭帧发送成功）、
 `cancelled`（指令抢占、停止或配置变化）或 `error`（后台发送失败）。
 完成结果仍是软件记录，不表示实际灯光已显示；回调连接失败会记录日志，

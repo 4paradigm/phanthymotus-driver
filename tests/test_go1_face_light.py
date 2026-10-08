@@ -44,6 +44,8 @@ def test_effect_completion_contract_and_unique_ids(light, acp_notify, action):
     completion = light.get_tool()["inputSchema"]["x-completion"]
     assert set(completion["actions"]) == set(ext._FACE_EFFECTS)
     assert completion["timeout"] > 3600
+    assert light.PREFIX == light.get_tool()["name"] == "face_light"
+    assert light.get_tool()["inputSchema"]["x-resource"] == "face_light"
     ids = []
     for _ in range(2):
         response = light.dispatch(action, {"r": 100, "duration_s": 0.05})
@@ -59,6 +61,31 @@ def test_effect_completion_contract_and_unique_ids(light, acp_notify, action):
         assert result["ok"] and result["mode"] == "off"
         assert result["state_source"] == "software_record" and not result["hardware_verified"]
     assert "action_id" not in light.dispatch("set_color", {"r": 1})
+
+
+def test_all_go1_acting_tools_declare_consistent_resources_without_hardware_calls():
+    import main
+    channels = {
+        'face_light': 'face_light', 'beep': 'mouth', 'speaker': 'mouth',
+        'loco': 'base', 'body_pose': 'base', 'switch_gait': 'base',
+        'gesture': 'base', 'special_motion': 'base',
+        'system_health': 'base', 'activity_monitor': 'base',
+    }
+    config = {'plugins': {name: {'enabled': True} for name in channels}}
+    config['plugins']['face_light']['backend'] = 'simulated'
+    client = Mock()
+    # Only construct tools and inspect declarations. Do not start any card.
+    bundle = main.Go1Bundle(config, 'offline', None, client)
+    tools = {tool['name']: tool for tool in bundle.get_all_tools()}
+    assert set(tools) == set(channels)
+    for name, channel in channels.items():
+        assert tools[name]['type'] == 'actuator'  # preserve existing access policy
+        assert tools[name]['inputSchema']['x-resource'] == channel
+        if name != 'face_light':
+            assert channel != tools['face_light']['inputSchema']['x-resource']
+    # Shared speaker and body hardware cannot be labelled as independent channels.
+    assert tools['beep']['inputSchema']['x-resource'] == tools['speaker']['inputSchema']['x-resource']
+    assert not client.mock_calls
 
 
 @pytest.mark.parametrize("action,args", [("set_color", {"g": 10}), ("off", {}), ("stop", {}),
