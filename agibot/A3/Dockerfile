@@ -6,7 +6,13 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 # PointCloud2 samples ("sequence size exceeds remaining buffer").  Keep
 # FastDDS for the isolated domain-42 bridge, but use CycloneDDS in the main
 # robot participant for robust large-sample reception.
-RUN apt-get update && \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl gnupg lsb-release && \
+    curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+      | gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+      > /etc/apt/sources.list.d/ros2.list && \
+    apt-get update && \
     apt-get install -y --no-install-recommends ros-humble-rmw-cyclonedds-cpp && \
     rm -rf /var/lib/apt/lists/*
 
