@@ -190,7 +190,11 @@ class VisionCapturePlugin:
                 return {"ok": False, "code": "RESOURCE_BUSY", "message": "media file is being written"}
         if not path.is_file():
             return {"ok": False, "code": "NOT_FOUND", "message": f"file not found: {name}"}
-        path.unlink()
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            # 另一条删除请求先完成时，返回正常的不存在结果。
+            return {"ok": False, "code": "NOT_FOUND", "message": f"file not found: {name}"}
         return {"ok": True, "state": "deleted", "filename": name}
 
     def dispatch(self, action, args):

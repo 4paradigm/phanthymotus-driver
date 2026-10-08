@@ -1497,3 +1497,43 @@ def test_list_survives_concurrent_delete(tmp_path, monkeypatch, delete_phase):
     else:
         assert result["files"][0]["size"] == 5
     assert card.dispatch("list", {})["files"] == []
+
+
+def test_concurrent_deletes_return_deleted_and_not_found(tmp_path, monkeypatch):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    path = tmp_path / "photos" / "saved.jpg"
+    path.parent.mkdir()
+    path.write_bytes(b"photo")
+    deleting = threading.Barrier(2)
+    unlink_lock = threading.Lock()
+    responses = queue.Queue()
+    original_unlink = Path.unlink
+
+    def unlink(candidate, *args, **kwargs):
+        if candidate == path:
+            deleting.wait(3)
+            # 固定系统调用顺序，确保第二次删除发生在文件已消失之后。
+            with unlink_lock:
+                return original_unlink(candidate, *args, **kwargs)
+        return original_unlink(candidate, *args, **kwargs)
+
+    def delete():
+        try:
+            responses.put(card.dispatch("delete", {"name": "saved.jpg"}))
+        except Exception as exc:
+            responses.put(exc)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    callers = [threading.Thread(target=delete) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(4)
+        assert not caller.is_alive()
+    results = [responses.get_nowait() for _ in callers]
+    assert all(isinstance(result, dict) for result in results), results
+    assert sum(result.get("state") == "deleted" for result in results) == 1
+    assert sum(result.get("code") == "NOT_FOUND" and result["ok"] is False for result in results) == 1
+    assert not path.exists()
+    assert _completions.empty()
