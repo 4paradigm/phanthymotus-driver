@@ -16,6 +16,7 @@ _LOG = logging.getLogger(__name__)
 
 class LedPlugin:
     PREFIX = "led"
+    _REFRESH_HZ = 5
     _PRIORITY = {"idle": 0, "hearing": 1, "thinking": 3, "speaking": 4, "error": 5}
     _TIMEOUT = {"idle": None, "hearing": 1.2, "thinking": 60, "speaking": 120, "error": 5}
 
@@ -32,7 +33,6 @@ class LedPlugin:
         self._state_ts = 0.0
         self._status = "idle"
         self._rgb = (0, 0, 0)
-        self._hz = 10
         self._stages = []
         self._bounds = []
         self._repeats = 1
@@ -50,14 +50,14 @@ class LedPlugin:
         rgb = {c: {"type": "integer", "minimum": 0, "maximum": 255,
                    "description": f"{c.upper()} 色值，0–255"} for c in "rgb"}
         stage = {"type": "object", "properties": {
-            **rgb, "duration_sec": {"type": "number", "minimum": 0.1, "maximum": 3600}},
+            **rgb, "duration_sec": {"type": "number", "minimum": 0.2, "maximum": 3600}},
             "required": ["r", "g", "b", "duration_sec"], "additionalProperties": False}
         actions = {
             "start": ([], "启动 LED 输出服务，允许状态灯；不自动开始颜色周期。"),
             "state": (["state"], "状态灯。周期/单色/暂停保持期间忽略普通状态；error 会终止周期并显示错误灯。"),
-            "set": (["r", "g", "b", "refresh_hz"], "持续显示单个 RGB 颜色，按5或10Hz刷新，替换当前周期；直到新指令或stop。"),
-            "cycle": (["sequence", "repeat_count", "refresh_hz", "end_behavior"],
-                      "立即异步执行RGB颜色周期，替换旧周期。sequence为阶段数组或其JSON文本，每项含r/g/b/duration_sec；repeat_count=1一次、N为N轮、0无限。驱动自行按5/10Hz刷新及切色，无需Agent循环调用。"),
+            "set": (["r", "g", "b"], "持续显示单个 RGB 颜色，固定按5Hz刷新，替换当前周期；直到新指令或stop。"),
+            "cycle": (["sequence", "repeat_count", "end_behavior"],
+                      "立即异步执行RGB颜色周期，替换旧周期。sequence为阶段数组或其JSON文本，每项含r/g/b/duration_sec；repeat_count=1一次、N为N轮、0无限。驱动自行固定按5Hz刷新及切色，无需Agent循环调用。"),
             "pause": ([], "暂停当前颜色周期，冻结已用时间，仍持续刷新暂停时颜色。用resume继续。"),
             "interrupt": ([], "与pause相同：暂停周期并保持当前色，可resume；彻底终止请用stop。"),
             "resume": ([], "从暂停的阶段及剩余时间继续，不重新计时。"),
@@ -75,8 +75,6 @@ class LedPlugin:
                                  "description": '颜色阶段，支持数组或JSON文本，例如 [{"r":0,"g":255,"b":0,"duration_sec":5},{"r":255,"g":0,"b":0,"duration_sec":3}]'},
                     "repeat_count": {"type": "integer", "minimum": 0, "maximum": 10000,
                                      "default": 1, "description": "完整序列轮数：1一次，N多次，0无限，须stop终止"},
-                    "refresh_hz": {"type": "integer", "enum": [5, 10], "default": 10,
-                                   "description": "每阶段持续发送LED命令的目标频率；实际速度受SDK响应时间限制"},
                     "end_behavior": {"type": "string", "enum": ["release", "hold", "off"], "default": "release",
                                      "description": "周期完成后：release释放控制恢复状态灯；hold持续最后颜色；off持续黑色"}},
                     "required": ["action"],
@@ -107,7 +105,7 @@ class LedPlugin:
             if not isinstance(item, dict) or set(item) != {"r", "g", "b", "duration_sec"}:
                 raise ValueError("stage_requires_rgb_and_duration_sec")
             duration = item["duration_sec"]
-            if type(duration) not in (int, float) or not math.isfinite(duration) or not 0.1 <= duration <= 3600:
+            if type(duration) not in (int, float) or not math.isfinite(duration) or not 0.2 <= duration <= 3600:
                 raise ValueError("invalid_duration_sec")
             stages.append((cls._color(item), float(duration)))
         return stages
@@ -126,7 +124,7 @@ class LedPlugin:
             self._stage = self._cycle = 0
             self._elapsed = self._paused_elapsed = 0.0
             self._origin = self._state_ts = 0.0
-            self._repeats, self._hz = 1, 10
+            self._repeats = 1
             self._end_behavior = "release"
             self._release_pending = False
             self._rgb = (0, 0, 0)
@@ -164,14 +162,11 @@ class LedPlugin:
                 return self._info()
             # Validate completely before replacing the current effect.
             if action in ("cycle", "set", "off"):
-                hz = self._integer(args.get("refresh_hz", 10), 5, 10, "refresh_hz")
-                if hz not in (5, 10):
-                    raise ValueError("refresh_hz_must_be_5_or_10")
+                # Ignore refresh_hz left by older Canvas configurations.
+                # Frequency is fixed, never selected by user input.
                 rgb = self._color(args) if action == "set" else (0, 0, 0)
                 if action == "cycle":
                     stages = self._sequence(args.get("sequence"))
-                    if any(duration < 1 / hz for _, duration in stages):
-                        raise ValueError("stage_duration_shorter_than_refresh_interval")
                     repeats = self._integer(args.get("repeat_count", 1), 0, 10000, "repeat_count")
                     ending = args.get("end_behavior", "release")
                     if ending not in ("release", "hold", "off"):
@@ -180,7 +175,7 @@ class LedPlugin:
                 with self._cv:
                     self._last_error = None
                     self._release_pending = False
-                    self._hz, self._rgb = hz, rgb
+                    self._rgb = rgb
                     self._elapsed = self._paused_elapsed = 0.0
                     self._stage = self._cycle = 0
                     self._stages, self._bounds = [], []
@@ -251,7 +246,7 @@ class LedPlugin:
                     "repeat_count": self._repeats if self._stages else None,
                     "elapsed_sec": elapsed, "remaining_sec": max(0, total - elapsed) if total is not None else None,
                     "r": self._rgb[0], "g": self._rgb[1], "b": self._rgb[2],
-                    "refresh_hz": self._hz, "last_error": self._last_error}
+                    "refresh_hz": self._REFRESH_HZ, "last_error": self._last_error}
 
     def _advance(self, now):
         self._elapsed = max(0.0, now - self._origin)
@@ -280,7 +275,7 @@ class LedPlugin:
             self._rgb = rgb
             return True
         except Exception as exc:
-            # Stop the failed effect, rather than retry/log at 10 Hz indefinitely.
+            # Stop the failed effect, rather than retry/log at 5 Hz indefinitely.
             self._last_error = ascii(str(exc)[:200])[:240]
             self._status, self._mode, self._state = "failed", "state", "idle"
             now = self._clock()
@@ -327,7 +322,7 @@ class LedPlugin:
                     self._cv.wait()
                     continue
                 self._write(rgb)
-                interval = .03 if self._mode == "state" else 1 / self._hz
+                interval = .03 if self._mode == "state" else 1 / self._REFRESH_HZ
                 due = now + min(interval, boundary) if boundary is not None else now + interval
                 # Always yield the lock after a slow RPC, so stop/pause cannot
                 # starve while the SDK takes longer than the refresh interval.

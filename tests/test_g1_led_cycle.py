@@ -107,19 +107,19 @@ def test_infinite_cycles_and_replacement(model):
     cycle(p, sequence=[RED], repeat_count=1)
     assert p._origin == 3000
     assert p._stage == 1
-    p.dispatch("set", {"r": 4, "g": 5, "b": 6, "refresh_hz": 5})
+    p.dispatch("set", {"r": 4, "g": 5, "b": 6})
     assert p._stages == []
     assert p._rgb == (4, 5, 6)
     assert p.dispatch("state", {"state": "speaking"})["ignored"]
 
 
 @pytest.mark.parametrize("overrides", [
-    {"sequence": []}, {"sequence": "bad-json"}, {"refresh_hz": 6},
+    {"sequence": []}, {"sequence": "bad-json"},
     {"repeat_count": True}, {"repeat_count": -1},
     {"sequence": [{**GREEN, "r": 256}]},
     {"sequence": [{**GREEN, "duration_sec": float("nan")}]},
     {"sequence": [{**GREEN, "duration_sec": 1e-300}]},
-    {"sequence": [{**GREEN, "duration_sec": .1}], "refresh_hz": 5},
+    {"sequence": [{**GREEN, "duration_sec": .1}]},
     {"sequence": [{**GREEN, "typo": 1}]},
 ])
 def test_invalid_input_preserves_current_cycle(model, overrides):
@@ -136,7 +136,7 @@ def test_schema_canvas_json_and_native_arguments(model):
     schema = p.get_tool()["inputSchema"]
     Draft202012Validator.check_schema(schema)
     for sequence in ([GREEN, RED], json.dumps([GREEN, RED])):
-        args = {"action": "cycle", "sequence": sequence, "refresh_hz": 5, "repeat_count": 3}
+        args = {"action": "cycle", "sequence": sequence, "repeat_count": 3}
         Draft202012Validator(schema).validate(args)
         assert p.dispatch("cycle", args)["cycle_status"] == "running"
     assert set(schema["properties"]["action"]["enum"]) == set(schema["x-action-params"])
@@ -150,12 +150,12 @@ def wait_for(predicate, timeout=1.5):
         time.sleep(.005)
 
 
-@pytest.mark.parametrize("hz", [5, 10])
-def test_worker_continuous_output_pause_stop_and_restart(hz):
+def test_worker_continuous_output_pause_stop_and_restart():
+    hz = 5
     c = Client()
     p = led.LedPlugin({}, "", None, c)
     try:
-        cycle(p, refresh_hz=hz)
+        cycle(p)
         wait_for(lambda: len(c.calls) >= 3)
         intervals = [c.calls[i + 1][0] - c.calls[i][0] for i in range(2)]
         assert all(.8 / hz <= gap < 2 / hz for gap in intervals)
@@ -181,7 +181,7 @@ def test_release_allows_semantic_effect_after_completion():
     c = Client()
     p = led.LedPlugin({}, "", None, c)
     try:
-        cycle(p, sequence=[{**GREEN, "duration_sec": .1}])
+        cycle(p, sequence=[{**GREEN, "duration_sec": .2}])
         wait_for(lambda: p._status == "completed")
         wait_for(lambda: c.calls[-1][1] == (0, 0, 0))
         p.dispatch("state", {"state": "speaking"})
@@ -244,7 +244,7 @@ def test_stop_waits_for_inflight_sdk_and_prevents_stale_writes():
 def test_slow_sdk_does_not_starve_stop():
     class SlowClient(Client):
         def LedControl(self, *rgb):
-            time.sleep(.12)  # longer than a 10 Hz refresh period
+            time.sleep(.25)  # longer than the fixed 5 Hz refresh period
             return super().LedControl(*rgb)
 
     c = SlowClient()
@@ -305,3 +305,14 @@ def test_repeated_start_preserves_running_cycle():
         assert p._repeats == 2
     finally:
         p.stop()
+
+
+@pytest.mark.parametrize("legacy_hz", [5, "5", 10, "10", "", None, 6])
+def test_legacy_refresh_input_cannot_change_fixed_frequency(model, legacy_hz):
+    p, _ = model
+    for action, args in [("cycle", {"sequence": [GREEN]}), ("set", {"b": 255}), ("off", {})]:
+        result = p.dispatch(action, {**args, "refresh_hz": legacy_hz})
+        assert result["refresh_hz"] == 5
+    schema = p.get_tool()["inputSchema"]
+    assert "refresh_hz" not in schema["properties"]
+    assert all("refresh_hz" not in entry["params"] for entry in schema["x-action-params"].values())

@@ -9,11 +9,11 @@
 | action | 参数 | 行为 |
 |---|---|---|
 | start | 无 | 启动输出线程，空闲时不发灯光命令；不开始周期 |
-| set | r, g, b, refresh_hz | 持续显示全灯带单色，替换当前周期 |
-| cycle | sequence, repeat_count, refresh_hz, end_behavior | 异步启动颜色序列；重复调用会从头替换旧序列 |
+| set | r, g, b | 持续显示全灯带单色，替换当前周期 |
+| cycle | sequence, repeat_count, end_behavior | 异步启动颜色序列；重复调用会从头替换旧序列 |
 | pause / interrupt | 无 | 暂停周期计时，继续刷新当前颜色；可 resume |
 | resume | 无 | 从暂停位置继续，不计算暂停期间的时间 |
-| off | 无 | 取消周期，按默认 10 Hz 持续输出黑色，保持熄灯 |
+| off | 无 | 取消周期，按固定 5 Hz 持续输出黑色，保持熄灯 |
 | stop | 无 | 终止周期、停止所有刷新并尝试发送一次黑色；不可 resume |
 | info | 无 | 查询状态，不发硬件命令 |
 | state | state | 原状态灯：idle/hearing/thinking/speaking/error |
@@ -24,10 +24,10 @@
 - RGB 均为整数 0–255，控制整条灯带，不支持逐灯珠寻址。
 - `sequence` 支持原生数组或画布文本框中的 JSON 数组文本。每阶段必填
   `r/g/b/duration_sec`，不接受未知字段。1–256 个阶段。
-- 阶段时长上限 3600 秒，下限为一次刷新间隔：10 Hz 下 0.1 秒，5 Hz 下 0.2 秒。
+- 阶段时长为 0.2–3600 秒，下限对应固定 5 Hz 的一次刷新间隔。
 - `repeat_count`：1 表示完整序列一次；N 表示 N 次；0 无限循环。
   最大 10000。默认 1。
-- `refresh_hz`：可选 5、10，默认 10。这是后台 SDK 调用的目标频率，
+- 固定 **5 Hz**：不再提供频率输入选项。这是后台 SDK 调用的目标频率，
   不是模型调用频率；受 SDK 阻塞、网络与线程调度影响，不能保证硬实时。
 - `end_behavior`：`release`（默认）完成后发一次黑色，释放控制，允许后续状态灯；
   `hold` 持续最后一个颜色；`off` 持续黑色。后两项即使周期状态为 completed，
@@ -47,7 +47,6 @@
     {"r": 255, "g": 0, "b": 0, "duration_sec": 10}
   ],
   "repeat_count": 3,
-  "refresh_hz": 10,
   "end_behavior": "release"
 }
 ```
@@ -77,7 +76,8 @@ info 返回：
 - `stage_index`、`cycle_index`：从 1 开始；无阶段时为 0。
 - `elapsed_sec`、`remaining_sec`：周期时间；无限循环剩余时间为 null。
 - `r/g/b`：当前逻辑颜色；不是独立硬件反馈。
-- `refresh_hz`：手动输出目标频率；原语义灯仍使用约 30 ms 刷新。
+- `refresh_hz`：只读输出，手动输出固定为 5；原语义灯仍使用约 30 ms 刷新。
+  对旧画布缓存附带的 refresh_hz 参数直接忽略，数字或字符串均不改变频率。
 - `last_error`：最近硬件失败。失败停止该灯效，避免自动高频重试；错误日志最多
   每 5 秒一次。新的 set/cycle/off 清除此错误并可重试。
 
@@ -88,9 +88,9 @@ python3 -m pytest -q tests/test_g1_led_cycle.py
 ```
 
 无硬件测试覆盖阶段边界、有限/无限重复、JSON文本兼容、参数校验、暂停恢复、
-普通hooks抑制/error抢占、SDK错误处理、5/10Hz实际线程输出、停止与在途RPC竞争、
+普通hooks抑制/error抢占、SDK错误处理、固定5Hz实际线程输出、停止与在途RPC竞争、
 完成释放后的语义灯及停止后重启。
 
-部署后仍需实测：5/10Hz能否覆盖固件默认灯效、实际可见颜色、SDK延迟，以及
+用户已反馈 5 Hz 的实机效果足够；本次取消频率选项后仍需复测实际可见颜色、SDK延迟，以及
 说话时是否保持周期色。先使用上述示例的 repeat_count=1；在一个阶段内测试
 pause/resume，再单独测试 stop/off。不可将本地通过解释为已经验证实机灯效。
