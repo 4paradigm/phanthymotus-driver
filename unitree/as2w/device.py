@@ -206,18 +206,26 @@ class _StateNode:
 
             burst, self._odom_burst = self._odom_burst, []
             self._odom_burst_size = len(burst)
+            if burst:
+                stamp_ms = self._odom_stamp_ms
+                provenance = self._odom_stamp_provenance
+            else:
+                # Nothing readable arrived in the window — publishing the
+                # previous stamp would call an empty sample fresh. Fall back
+                # to the publish time with no provenance so is_fresh judges
+                # this honestly.
+                stamp_ms = int(time.time() * 1000)
+                provenance = {"stamp_source": "published",
+                              "stamp_reason": "no readable vendor reading in window"}
             sample = build_sample(
-                # When the reading was taken, when that is knowable — see
-                # `resolve_stamp_ms`. Falls back to the arrival time when the
-                # vendor stamp is missing or not a plausible wall clock.
-                stamp_ms=self._odom_stamp_ms or int(time.time() * 1000),
+                stamp_ms=stamp_ms,
                 twist=mean_twist(burst),
                 vendor={"mode": int(getattr(msg, "mode", 0)),
                         "body_height": _number(getattr(msg, "body_height", 0)),
                         # How many raw readings this average came from. Zero
                         # means the window was empty and every axis is `null`.
                         "samples": self._odom_burst_size,
-                        **self._odom_stamp_provenance},
+                        **provenance},
             )
         except Exception:
             return

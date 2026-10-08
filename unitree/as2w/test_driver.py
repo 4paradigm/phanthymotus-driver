@@ -277,6 +277,29 @@ class TestDriverContracts(unittest.TestCase):
         node._publish_odom(self._sport())
         self.assertEqual([None] * 6, published[0]["twist"])
 
+    def test_odom_unreadable_after_valid_does_not_reuse_stamp(self):
+        published = []
+        node = self._odom_node(published)
+        # First window: a valid reading — stamp/provenance are set.
+        with patch.object(self.device.time, "time", return_value=1000.0):
+            node._on_sport(self._sport())
+        first = published[0]
+        self.assertEqual(1, first["vendor"]["samples"])
+        self.assertEqual(1000_000, first["stamp_ms"])
+        # Second window: callback raises before anything is appended, then the
+        # 10 Hz tick publishes an empty window. It must not quote the first
+        # window's stamp as if it were fresh.
+        node._accumulate_odom(types.SimpleNamespace(velocity=None))  # raises inside, dropped
+        node._last_odom_time = 0.0
+        with patch.object(self.device.time, "time", return_value=2000.0):
+            node._publish_odom(self._sport())
+        second = published[1]
+        self.assertEqual([None] * 6, second["twist"])
+        self.assertEqual(0, second["vendor"]["samples"])
+        self.assertEqual(2000_000, second["stamp_ms"])
+        self.assertEqual("published", second["vendor"]["stamp_source"])
+        self.assertIn("no readable vendor reading", second["vendor"]["stamp_reason"])
+
     def test_odom_timespec_ms_reads_vendor_stamp(self):
         stamp = types.SimpleNamespace(sec=1_700_000_000, nanosec=250_000_000)
         self.assertEqual(1_700_000_000_250, self.device._timespec_ms(stamp))
