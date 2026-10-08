@@ -89,7 +89,10 @@ def _select_profile() -> None:
              producing `sequence size exceeds remaining buffer`. -->
         <sendBufferSize>16777216</sendBufferSize>
         <receiveBufferSize>16777216</receiveBufferSize>
-        <maxMessageSize>16777216</maxMessageSize>
+        <!-- FastDDS UDPv4 limits this field to one RTPS datagram.  Larger
+             Image/PointCloud2 samples are fragmented across datagrams. -->
+        <maxMessageSize>65500</maxMessageSize>
+        <fragmentSize>60000</fragmentSize>
         <interfaceWhiteList>
           <address>{robot_ip}</address>
           <address>127.0.0.1</address>
