@@ -608,10 +608,10 @@ class TimerPlugin:
                 self._condition.wait(timeout=delay)
 
     def dispatch(self, action: str, args: dict) -> dict:
-        # Agent Core may attach scheduling metadata to split action calls.
-        # It controls dispatch timing, not the timer specification.
+        # Agent Core attaches routing/tracing metadata to split action calls.
+        # None of these fields are part of the timer specification.
         clean = {key: value for key, value in args.items()
-                 if key not in ("_tool_name", "concurrent")}
+                 if key not in ("_tool_name", "concurrent", "_trace_id", "instance_id")}
 
         # Do not call stop() while holding _condition: stop waits for the worker,
         # and the worker needs the same condition once more in order to exit.

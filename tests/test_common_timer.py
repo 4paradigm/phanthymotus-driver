@@ -316,6 +316,7 @@ def test_plugin_ignores_agent_dispatch_metadata_but_rejects_unknown_timer_fields
     created = plugin.dispatch("create", {
         "timer_id": "agent-test", "mode": "countdown", "duration_sec": 5,
         "_tool_name": "timer", "concurrent": False,
+        "_trace_id": "trace-123", "instance_id": "canvas-instance",
     })
     assert created["status"] == "running"
     with pytest.raises(ValueError, match="invalid_start_fields: surprise"):
