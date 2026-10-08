@@ -48,34 +48,34 @@ class LedPlugin:
 
     def get_tool(self):
         rgb = {c: {"type": "integer", "minimum": 0, "maximum": 255,
-                   "description": f"{c.upper()} 色值，0–255"} for c in "rgb"}
+                   "description": f"{c.upper()} channel intensity (0-255)."} for c in "rgb"}
         stage = {"type": "object", "properties": {
             **rgb, "duration_sec": {"type": "number", "minimum": 0.2, "maximum": 3600}},
             "required": ["r", "g", "b", "duration_sec"], "additionalProperties": False}
         actions = {
-            "start": ([], "启动 LED 输出服务，允许状态灯；不自动开始颜色周期。"),
-            "state": (["state"], "状态灯。周期/单色/暂停保持期间忽略普通状态；error 会终止周期并显示错误灯。"),
-            "set": (["r", "g", "b"], "持续显示单个 RGB 颜色，固定按5Hz刷新，替换当前周期；直到新指令或stop。"),
+            "start": ([], "Start the LED output service and enable state effects. Does not start a color sequence."),
+            "state": (["state"], "Request a semantic LED state. Ordinary states are ignored during manual or paused output. The error state terminates the sequence and displays the error effect."),
+            "set": (["r", "g", "b"], "Replace the current sequence with a solid RGB color, refreshed continuously at 5 Hz until another command or stop."),
             "cycle": (["sequence", "repeat_count", "end_behavior"],
-                      "立即异步执行RGB颜色周期，替换旧周期。sequence为阶段数组或其JSON文本，每项含r/g/b/duration_sec；repeat_count=1一次、N为N轮、0无限。驱动自行固定按5Hz刷新及切色，无需Agent循环调用。"),
-            "pause": ([], "暂停当前颜色周期，冻结已用时间，仍持续刷新暂停时颜色。用resume继续。"),
-            "resume": ([], "从暂停的阶段及剩余时间继续，不重新计时。"),
-            "off": ([], "结束当前周期，持续刷新黑色以保持熄灯；停止持续刷新请用stop。"),
-            "stop": ([], "终止周期和所有LED刷新，发送一次黑色，停止服务；不能resume。固件可能恢复默认灯效。start/set/cycle/off可重新启动。"),
-            "info": ([], "只读查询服务、周期状态、当前阶段/轮次、RGB、时间及硬件错误；不启动输出。"),
+                      "Start a color sequence asynchronously, replacing the previous sequence. Supply sequence as an array or JSON text with r, g, b, and duration_sec for each stage. repeat_count: 1 for one cycle, N for N cycles, or 0 to loop indefinitely. The driver controls timing and refreshes at 5 Hz; repeated Agent calls are not required."),
+            "pause": ([], "Pause sequence timing while continuously refreshing the current color. Use resume to continue."),
+            "resume": ([], "Resume the paused sequence from its saved position and remaining duration. Does not restart the sequence."),
+            "off": ([], "End the current sequence and continuously refresh black at 5 Hz to keep the LEDs off. Use stop to stop refreshing."),
+            "stop": ([], "Terminate the sequence, attempt one black output, and stop all LED refreshing. Cannot be resumed. Firmware may restore its default effect. Use start, set, cycle, or off to restart the service."),
+            "info": ([], "Read service and sequence status, stage and cycle indices, RGB values, timing, and hardware errors. Does not start output."),
         }
         return {"name": "led", "type": "actuator", "multiInstance": False,
-                "description": "G1 LED：状态灯、持续RGB单色、定时多色周期；驱动线程持续刷新，支持暂停/继续/停止。",
+                "description": "G1 LED control: semantic state effects, continuous RGB colors, and timed color sequences with pause, resume, and stop controls.",
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string", "enum": list(actions)}, **rgb,
                     "state": {"type": "string", "enum": list(self._PRIORITY)},
                     "sequence": {"anyOf": [{"type": "array", "items": stage, "minItems": 1, "maxItems": 256},
                                             {"type": "string"}],
-                                 "description": '颜色阶段，支持数组或JSON文本，例如 [{"r":0,"g":255,"b":0,"duration_sec":5},{"r":255,"g":0,"b":0,"duration_sec":3}]'},
+                                 "description": 'Color stages as an array or JSON text. Example: [{"r":0,"g":255,"b":0,"duration_sec":5},{"r":255,"g":0,"b":0,"duration_sec":3}]'},
                     "repeat_count": {"type": "integer", "minimum": 0, "maximum": 10000,
-                                     "default": 1, "description": "完整序列轮数：1一次，N多次，0无限，须stop终止"},
+                                     "default": 1, "description": "Number of complete sequence cycles: 1 for once, N for N cycles, or 0 to loop indefinitely until explicitly ended."},
                     "end_behavior": {"type": "string", "enum": ["release", "hold", "off"], "default": "release",
-                                     "description": "周期完成后：release释放控制恢复状态灯；hold持续最后颜色；off持续黑色"}},
+                                     "description": "Behavior after completion: release sends black once and allows subsequent state effects; hold continuously refreshes the final color; off continuously refreshes black."}},
                     "required": ["action"],
                     "x-action-params": {k: {"params": p, "description": d} for k, (p, d) in actions.items()},
                     "x-hooks": {f"on_{s}": {"action": "state", "params": {"state": s}} for s in self._PRIORITY}}}
