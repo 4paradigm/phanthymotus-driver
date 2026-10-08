@@ -255,9 +255,7 @@ def _skeleton_joint_indices() -> dict[str, int]:
     some JointState groups.  Those must not be assigned arbitrary stream-order
     indices: the canvas uses ``idx`` to look up the URDF joint transform.
     """
-    path = RESOURCE_DIR / "a3_ultra_t3d0" / "urdf" / "model.urdf"
-    if not path.is_file():
-        path = RESOURCE_DIR / "a3_ultra.urdf"
+    path = RESOURCE_DIR / "a3_ultra.urdf"
     try:
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError):
@@ -939,14 +937,10 @@ class A3Nodes:
             self.speaker_subscription = None
 
     def urdf_text(self, variant=None):
-        # Keep the model self-contained in the driver image.  The official
-        # runtime model was copied from the A3 Ultra T3D0 installation into
-        # resource/a3_ultra_t3d0, including its relative meshes/ directory;
-        # reading /opt/agibot at runtime made the canvas depend on a host-only
-        # mount and produced an unrenderable skeleton on other deployments.
-        path = RESOURCE_DIR / "a3_ultra_t3d0" / "urdf" / "model.urdf"
-        if not path.is_file():
-            path = RESOURCE_DIR / "a3_ultra.urdf"
+        # The canvas skeleton contract needs the kinematic tree and limits,
+        # not the vendor CAD package. Keep this compact model self-contained
+        # so deployments do not carry dozens of megabytes of unused meshes.
+        path = RESOURCE_DIR / "a3_ultra.urdf"
         if not path.exists():
             raise ValueError("no URDF vendored for A3 (placeholder resource)")
         return path.read_text(encoding="utf-8")
