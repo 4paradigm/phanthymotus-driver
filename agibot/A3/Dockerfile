@@ -7,8 +7,8 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 # require a device-specific runtime).  ros2_plugin_proto remains sourced from
 # the mounted dev-kit because it is an AArch64 ROS interface package.
 COPY requirements.txt /tmp/agibot-a3-requirements.txt
-COPY vendor/a3_aimdk-3.2.0-py3-none-any.whl /tmp/a3_aimdk.whl
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-a3-requirements.txt /tmp/a3_aimdk.whl && rm -f /tmp/agibot-a3-requirements.txt /tmp/a3_aimdk.whl
+COPY vendor/a3_aimdk-3.2.0-py3-none-any.whl /tmp/a3_aimdk-3.2.0-py3-none-any.whl
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-a3-requirements.txt /tmp/a3_aimdk-3.2.0-py3-none-any.whl && rm -f /tmp/agibot-a3-requirements.txt /tmp/a3_aimdk-3.2.0-py3-none-any.whl
 COPY audio_msgs/ /tmp/a3_ws/src/audio_msgs/
 COPY ros2_plugin_proto/ /tmp/a3_ws/src/ros2_plugin_proto/
 RUN cd /tmp/a3_ws && \
