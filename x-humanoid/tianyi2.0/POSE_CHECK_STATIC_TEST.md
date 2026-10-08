@@ -58,7 +58,7 @@ docker exec embodied-x-humanoid-tianyi2.0 curl -sS http://127.0.0.1:15740/health
 
 启动日志应出现 `version=socket-bridge-20261007`、`max_fps=10`、`max_width=640`、`camera_domain=0`、`result_domain=42`；`/health` 应有相同 `version`，且相机收到画面后 `fresh: true`、`frames` 递增。原始 RGB 会直接送给 MediaPipe，不再经过 JPEG 编解码；服务只保留最新帧并按 10 fps 推理，因此相机仍可保持 30 fps。结果事件经天轶既有的 socket bridge 发布到 Domain 42；不要直接用 `/work/dds_profile.xml` 的进程对 Agent Core 发布。如果看到 `ModuleNotFoundError: rclpy`，检查启动命令是否包含 `source /opt/ros/humble/setup.bash`。部署后用 `/opt/phanthy-motus/dds-local.xml` 执行 `ros2 topic info /nvidia_desktop/pose_check/result -v`；应显示 `Publisher count: 1`。
 
-MediaPipe 运行时还需要 `libEGL.so.1`；PR 镜像已在 Dockerfile 中安装 `libegl1`。若复测旧镜像时出现 `OSError: libEGL.so.1`，不要继续启动服务，改用包含该依赖的新镜像。
+MediaPipe 运行时还需要 `libEGL.so.1` 和 `libGLESv2.so.2`；PR 镜像在 Dockerfile 中安装 `libegl1` 与 `libgles2`。若复测旧镜像时出现这两项缺失错误，改用包含该依赖的新镜像。
 
 部署后可对比姿态服务 CPU；30 fps 相机是正常的，关键是服务不再把 30 帧全部排队处理：
 
