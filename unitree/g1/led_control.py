@@ -55,12 +55,12 @@ class LedPlugin:
         actions = {
             "start": ([], "Start the LED output service and enable state effects. Does not start a color sequence."),
             "state": (["state"], "Request a semantic LED state. Ordinary states are ignored during manual or paused output. The error state terminates the sequence and displays the error effect."),
-            "set": (["r", "g", "b"], "Replace the current sequence with a solid RGB color, refreshed continuously at 5 Hz until another command or stop."),
+            "set": (["r", "g", "b"], "Replace the current sequence with a solid RGB color. Continuously send LED commands to maintain that color until another command or stop."),
             "cycle": (["sequence", "repeat_count", "end_behavior"],
-                      "Start a color sequence asynchronously, replacing the previous sequence. Supply sequence as an array or JSON text with r, g, b, and duration_sec for each stage. repeat_count: 1 for one cycle, N for N cycles, or 0 to loop indefinitely. The driver controls timing and refreshes at 5 Hz; repeated Agent calls are not required."),
+                      "Start a color sequence asynchronously, replacing the previous sequence. Supply sequence as an array or JSON text with r, g, b, and duration_sec for each stage. repeat_count: 1 for one cycle, N for N cycles, or 0 to loop indefinitely. The driver controls timing and continuously sends LED commands to maintain the color of each stage; repeated Agent calls are not required."),
             "pause": ([], "Pause sequence timing while continuously refreshing the current color. Use resume to continue."),
             "resume": ([], "Resume the paused sequence from its saved position and remaining duration. Does not restart the sequence."),
-            "off": ([], "End the current sequence and continuously refresh black at 5 Hz to keep the LEDs off. Use stop to stop refreshing."),
+            "off": ([], "End the current sequence and continuously send black LED commands to keep the LEDs off. Use stop to stop sending commands."),
             "stop": ([], "Terminate the sequence, attempt one black output, and stop all LED refreshing. Cannot be resumed. Firmware may restore its default effect. Use start, set, cycle, or off to restart the service."),
             "info": ([], "Read service and sequence status, stage and cycle indices, RGB values, timing, and hardware errors. Does not start output."),
         }
