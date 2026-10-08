@@ -1,7 +1,7 @@
 # Copyright (c) 2023, AgiBot Inc.
 # All rights reserved.
 
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.22)
 
 # Set target name
 set(CUR_PACKAGE_NAME ros2_plugin_proto)
