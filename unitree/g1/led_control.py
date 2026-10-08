@@ -59,7 +59,6 @@ class LedPlugin:
             "cycle": (["sequence", "repeat_count", "end_behavior"],
                       "立即异步执行RGB颜色周期，替换旧周期。sequence为阶段数组或其JSON文本，每项含r/g/b/duration_sec；repeat_count=1一次、N为N轮、0无限。驱动自行固定按5Hz刷新及切色，无需Agent循环调用。"),
             "pause": ([], "暂停当前颜色周期，冻结已用时间，仍持续刷新暂停时颜色。用resume继续。"),
-            "interrupt": ([], "与pause相同：暂停周期并保持当前色，可resume；彻底终止请用stop。"),
             "resume": ([], "从暂停的阶段及剩余时间继续，不重新计时。"),
             "off": ([], "结束当前周期，持续刷新黑色以保持熄灯；停止持续刷新请用stop。"),
             "stop": ([], "终止周期和所有LED刷新，发送一次黑色，停止服务；不能resume。固件可能恢复默认灯效。start/set/cycle/off可重新启动。"),
@@ -196,7 +195,7 @@ class LedPlugin:
                     return self._info()
             with self._cv:
                 now = self._clock()
-                if action in ("pause", "interrupt"):
+                if action == "pause":
                     if self._mode == "paused":
                         return self._info()
                     if self._mode != "cycle":

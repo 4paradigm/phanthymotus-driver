@@ -57,11 +57,11 @@ def test_multiple_cycles_boundaries_and_delayed_wakeup(model):
     assert p._mode == "hold"
 
 
-def test_pause_interrupt_resume_freezes_elapsed_and_blocks_hooks(model):
+def test_pause_resume_freezes_elapsed_and_blocks_hooks(model):
     p, clock = model
     cycle(p)
     clock[0] = 101
-    p.dispatch("interrupt", {})
+    p.dispatch("pause", {})
     assert p._rgb == (0, 255, 0)
     for state in ("speaking", "thinking", "hearing", "idle"):
         assert p.dispatch("state", {"state": state})["ignored"]
@@ -316,3 +316,15 @@ def test_legacy_refresh_input_cannot_change_fixed_frequency(model, legacy_hz):
     schema = p.get_tool()["inputSchema"]
     assert "refresh_hz" not in schema["properties"]
     assert all("refresh_hz" not in entry["params"] for entry in schema["x-action-params"].values())
+
+
+def test_interrupt_action_removed_without_changing_other_actions(model):
+    p, _ = model
+    schema = p.get_tool()["inputSchema"]
+    expected = {"start", "state", "set", "cycle", "pause", "resume", "off", "stop", "info"}
+    assert set(schema["properties"]["action"]["enum"]) == expected
+    assert set(schema["x-action-params"]) == expected
+    cycle(p)
+    with pytest.raises(ValueError, match="unsupported_led_action"):
+        p.dispatch("interrupt", {})
+    assert p._status == "running"

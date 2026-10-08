@@ -11,7 +11,7 @@
 | start | 无 | 启动输出线程，空闲时不发灯光命令；不开始周期 |
 | set | r, g, b | 持续显示全灯带单色，替换当前周期 |
 | cycle | sequence, repeat_count, end_behavior | 异步启动颜色序列；重复调用会从头替换旧序列 |
-| pause / interrupt | 无 | 暂停周期计时，继续刷新当前颜色；可 resume |
+| pause | 无 | 暂停周期计时，继续刷新当前颜色；可 resume |
 | resume | 无 | 从暂停位置继续，不计算暂停期间的时间 |
 | off | 无 | 取消周期，按固定 5 Hz 持续输出黑色，保持熄灯 |
 | stop | 无 | 终止周期、停止所有刷新并尝试发送一次黑色；不可 resume |
