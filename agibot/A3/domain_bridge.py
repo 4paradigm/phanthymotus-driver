@@ -18,18 +18,19 @@ def _type_name(msg_type):
 
 class CoreBridge:
     def __init__(self, profile="/opt/phanthy-motus/dds-local.xml", domain=42):
-        # Keep enough room for bursty images/point clouds. Frames are lossy at
-        # the bridge boundary; a full queue drops the newest frame rather than
-        # blocking the robot-domain subscription callback.
-        self._queues = {lane: mp.get_context("spawn").Queue(maxsize=32)
+        # These are live sensor feeds, not recordings: preserve freshness by
+        # keeping at most the newest pending sample for each independent lane.
+        self._queues = {lane: mp.get_context("spawn").Queue(maxsize=1)
                         for lane in ("media0", "media1", "media2", "media3", "media4",
-                                     "media5", "media6", "media7", "media8",
+                                     "media5", "media6", "media7", "media8", "media9",
+                                     "media10", "media11",
                                      "pointcloud", "state", "audio")}
         self._ctx = mp.get_context("spawn")
         self._profile = profile
         self._domain = domain
         self._procs = []
         self._sent = 0
+        self._dropped = 0
 
     def start(self):
         for lane, messages in self._queues.items():
@@ -52,26 +53,40 @@ class CoreBridge:
                 camera_lane = (
                     ("head_left", "media0"),
                     ("head_right", "media1"),
-                    ("head_dual_fisheye", "media2"),
-                    ("chest_front_d457_rgb", "media3"),
-                    ("chest_front_d457_depth", "media4"),
-                    ("waist_front_d415_rgb", "media5"),
-                    ("waist_front_d415_depth", "media6"),
-                    ("wrist_left_d405", "media7"),
-                    ("wrist_right_d405", "media8"),
+                    ("head_rear", "media2"),
+                    ("head_stereo_left", "media3"),
+                    ("head_stereo_right", "media4"),
+                    ("armpit_right", "media5"),
+                    ("chest_front_d457_rgb", "media6"),
+                    ("chest_front_d457_depth", "media7"),
+                    ("waist_front_d415_rgb", "media8"),
+                    ("waist_front_d415_depth", "media9"),
+                    ("wrist_left_d405", "media10"),
+                    ("wrist_right_d405", "media11"),
                 )
                 lane = next((value for marker, value in camera_lane if marker in topic),
-                             f"media{sum(topic.encode('utf-8')) % 9}")
+                             f"media{sum(topic.encode('utf-8')) % 12}")
             elif "audio" in topic or "mic" in topic:
                 lane = "audio"
             else:
                 lane = "state"
-            self._queues[lane].put_nowait((topic, type_name, serialize_message(msg)))
+            item = (topic, type_name, serialize_message(msg))
+            try:
+                self._queues[lane].put_nowait(item)
+            except queue.Full:
+                # Replace stale data rather than showing an old image/scan.
+                try:
+                    self._queues[lane].get_nowait()
+                except queue.Empty:
+                    pass
+                self._queues[lane].put_nowait(item)
+                self._dropped += 1
             self._sent += 1
-            if self._sent == 1 or self._sent % 1000 == 0:
-                print(f"[dds-bridge] queued={self._sent} topic={topic}", flush=True)
+            if self._sent == 1 or self._sent % 10000 == 0:
+                print(f"[dds-bridge] enqueued_total={self._sent} replaced_stale={self._dropped} "
+                      f"lane={lane} topic={topic}", flush=True)
         except queue.Full:
-            pass
+            self._dropped += 1
         except Exception as exc:
             print(f"[dds-bridge] enqueue failed topic={topic}: {exc}", flush=True)
 

@@ -229,7 +229,10 @@ CAMERA_TOPICS = {
     # on the deployed Ultra unit.
     "head_left_fisheye": ("/hal/head_left_fisheye_camera/rgb", "image/jpeg", "头部左鱼眼相机 RGB"),
     "head_right_fisheye": ("/hal/head_right_fisheye_camera/rgb", "image/jpeg", "头部右鱼眼相机 RGB"),
-    "head_rear_fisheye": ("/hal/head_dual_fisheye_camera/rgb", "image/jpeg", "头部后鱼眼相机 RGB"),
+    "head_rear_fisheye": ("/hal/head_rear_fisheye_camera/rgb", "image/jpeg", "头部后鱼眼相机 RGB"),
+    "head_stereo_left_fisheye": ("/hal/head_stereo_left_fisheye_camera/rgb", "image/jpeg", "头部双目交互左相机 RGB"),
+    "head_stereo_right_fisheye": ("/hal/head_stereo_right_fisheye_camera/rgb", "image/jpeg", "头部双目交互右相机 RGB"),
+    "armpit_right_fisheye": ("/hal/armpit_right_fisheye_camera/rgb", "image/jpeg", "右腋下鱼眼相机 RGB"),
     "chest_front_d457_rgb": ("/hal/chest_front_d457_camera/rgb", "image/jpeg", "胸前 D457 相机 RGB"),
     "chest_front_d457_depth": ("/hal/chest_front_d457_camera/depth", "image/depth-zlib", "胸前 D457 相机深度"),
     "waist_front_d415_rgb": ("/hal/waist_front_d415_camera/rgb", "image/jpeg", "腰前 D415 相机 RGB"),
@@ -447,6 +450,8 @@ class A3Nodes:
         self._imu_pub = self.core.create_publisher(
             String, _core_topic(namespace, "state/imu"), 5)
         self._media_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="a3_media")
+        self._encode_lock = threading.Lock()
+        self._encoding_keys = set()
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
 
@@ -469,7 +474,18 @@ class A3Nodes:
                 elif key in ("imu_pelvis", "imu_torso"):
                     self._publish_imu_streams(key, jsonable(msg))
                 if re_encode is not None:
-                    self._media_executor.submit(self._encode_and_publish, re_encode, msg, pub, robot_topic)
+                    # JPEG/depth conversion can be slower than the camera
+                    # cadence. Never build an unbounded executor backlog: one
+                    # frame per camera is in flight, newer frames replace the
+                    # next sample naturally at the ROS callback.
+                    if key not in self._encoding_keys:
+                        with self._encode_lock:
+                            if key not in self._encoding_keys:
+                                self._encoding_keys.add(key)
+                                future = self._media_executor.submit(
+                                    self._encode_and_publish, re_encode, msg, pub, robot_topic)
+                                future.add_done_callback(
+                                    lambda _future, stream_key=key: self._clear_encoding(stream_key))
                     return
                 if as_json:
                     value = json_filter(msg) if json_filter else jsonable(msg)
@@ -554,6 +570,10 @@ class A3Nodes:
         self.arm_command_pub = self.robot.create_publisher(JointState, "/motion/control/arm_joint_command", 10)
         self.neck_command_pub = self.robot.create_publisher(JointState, "/motion/control/neck_joint_command", 10)
         self.hand_command_pub = self.robot.create_publisher(JointState, "/motion/control/hand_joint_command", 10)
+
+    def _clear_encoding(self, key):
+        with self._encode_lock:
+            self._encoding_keys.discard(key)
 
     # -- RosMsgWrapper helpers ------------------------------------------------
 
@@ -848,6 +868,15 @@ class A3Nodes:
             self.speaker_subscription = None
 
     def urdf_text(self, variant=None):
+        # Prefer the vendor model installed on the A3 host.  The bundled
+        # kinematic fallback has no visual meshes, so the dashboard cannot
+        # render a robot model when the runtime mount is available.
+        vendor = Path("/opt/agibot/share/robot_model/models/a3_ultra_t3d0/urdf/model.urdf")
+        if vendor.is_file():
+            try:
+                return vendor.read_text(encoding="utf-8")
+            except OSError:
+                pass
         path = RESOURCE_DIR / "a3_ultra.urdf"
         if not path.exists():
             raise ValueError("no URDF vendored for A3 (placeholder resource)")
@@ -1769,12 +1798,6 @@ class ArmControlPlugin:
     柔顺模式下手臂可被外力拖动（示教/人机交互安全），关闭后恢复刚度控制。
     """
 
-    ACTIONS = {
-        "compliance_enable": ([], "开启手臂柔顺模式（可被外力拖动，示教用）"),
-        "compliance_disable": ([], "关闭手臂柔顺模式（恢复刚度控制）"),
-        "compliance_check": ([], "查询手臂柔顺模式是否开启"),
-    }
-
     def __init__(self, nodes):
         self.nodes = nodes
 
@@ -1791,7 +1814,6 @@ class ArmControlPlugin:
         schema = action_schema(
             {
                 "set_position": (list(named_fields), "按具名关节设置手臂目标位置（rad）"),
-                **self.ACTIONS,
             },
             {
                 "left": {"type": "array", "items": {"type": "number"},
@@ -1824,9 +1846,11 @@ class ArmControlPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
-        if action in self.ACTIONS:
-            method = action.replace("compliance_", "")
-            return jsonable(self.nodes.rpc.arm_compliance(method))
+        # Backward-compatible aliases for callers that used the former
+        # arm-compliance card. They are intentionally omitted from the action
+        # schema: compliance is a setup/safety operation, not a joint move.
+        if action in ("compliance_enable", "compliance_disable", "compliance_check"):
+            return jsonable(self.nodes.rpc.arm_compliance(action.replace("compliance_", "")))
         if action not in ("set_position", "send"):
             raise ValueError(f"arm_control: unknown action {action!r}")
         # MOTION-state gate (dev guide §7.3: arm control only takes effect in MOTION;
@@ -1870,15 +1894,13 @@ class HandControlPlugin:
     def get_tool(self):
         schema = action_schema(
             {
-                "open": ([], "双手完全张开"),
-                "close": ([], "双手完全握紧"),
-                "open_left": ([], "仅左手完全张开"),
-                "open_right": ([], "仅右手完全张开"),
-                "close_left": ([], "仅左手完全握紧"),
-                "close_right": ([], "仅右手完全握紧"),
+                "open": (["side"], "指定手完全张开；side 可选 left/right/both"),
+                "close": (["side"], "指定手完全握紧；side 可选 left/right/both"),
                 "set_position": (["left", "right"], "设置指定手指张合等级；0 张开，2000 握紧"),
             },
             {
+                "side": {"type": "string", "enum": ["left", "right", "both"],
+                         "description": "选择左手、右手或双手"},
                 "left": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_COMMAND_MAX}, "description": "左手各指张合等级，按真机关节顺序"},
                 "right": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_COMMAND_MAX}, "description": "右手各指张合等级，按真机关节顺序"},
                 "hand_type": {"type": "string", "enum": ["AgiHand", "O10Hand"], "default": "AgiHand"},
@@ -1903,23 +1925,18 @@ class HandControlPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
-        if action not in ("open", "close", "open_left", "open_right", "close_left", "close_right", "set_position", "send"):
+        if action not in ("open", "close", "set_position", "send"):
             raise ValueError(f"hand_control: unknown action {action!r}")
         hand_type = args.get("hand_type", "AgiHand")
         _require(hand_type in HAND_TYPES, f"未知手部类型 {hand_type!r}，可选 {sorted(HAND_TYPES)}")
-        if action in ("open_left", "open_right", "close_left", "close_right"):
-            side = "left" if action.endswith("_left") else "right"
-            values = [0] * 6 if action.startswith("open") else [HAND_COMMAND_MAX] * 6
-            args = {**args, side: values}
-            action = "set_position"
         if action in ("open", "close"):
+            side = args.get("side")
+            _require(side in ("left", "right", "both"), "open/close 必须指定 side=left/right/both")
             closed = HAND_COMMAND_MAX
-            presets = {
-                "open": [0, 0, 0, 0, 0, 0],
-                "close": [closed, closed, closed, closed, closed, closed],
-            }
-            values = presets[action]
-            args = {**args, "left": args.get("left", values), "right": args.get("right", values)}
+            values = [0] * 6 if action == "open" else [closed] * 6
+            args = {**args, "left": values if side in ("left", "both") else None,
+                    "right": values if side in ("right", "both") else None}
+            action = "set_position"
         positions = {}
         for side in ("left", "right"):
             values = args.get(side)
@@ -3664,6 +3681,9 @@ def build_plugins(config, namespace, ros2):
         plugins["camera_head_right"] = CameraStreamPlugin(nodes, "camera_head_right", "head_right_fisheye")
     fixed_cameras = {
         "camera_head_rear": "head_rear_fisheye",
+        "camera_head_stereo_left": "head_stereo_left_fisheye",
+        "camera_head_stereo_right": "head_stereo_right_fisheye",
+        "camera_armpit_right": "armpit_right_fisheye",
         "camera_waist_rgb": "waist_front_d415_rgb",
         "camera_waist_depth": "waist_front_d415_depth",
         "camera_wrist_left": "wrist_left_d405_rgb",

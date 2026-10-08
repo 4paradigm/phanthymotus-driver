@@ -73,11 +73,8 @@ def _select_profile() -> None:
     """
     robot_ip = _robot_subnet_ip()
     if not robot_ip:
-        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
-        print("[ros2] no address on the 10.42.10.x robot subnet found — "
-              "no DDS profile selected (dev host; on the robot this would isolate "
-              "domain 42 to loopback + robot subnet)")
-        return
+        raise RuntimeError("A3 requires an address on the 10.42.10.x robot subnet; "
+                           "refusing to start without a constrained DDS profile")
     profile = PROFILE_PATH
     content = f"""<?xml version="1.0" encoding="UTF-8" ?>
 <dds xmlns="http://www.eprosima.com">
@@ -107,10 +104,7 @@ def _select_profile() -> None:
         with open(profile, "w", encoding="utf-8") as handle:
             handle.write(content)
     except OSError as exc:
-        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
-        print(f"[ros2] WARNING cannot write {profile} ({exc}) — no DDS profile. "
-              "Both domains will use every interface: domain 42 is NOT isolated.")
-        return
+        raise RuntimeError(f"cannot write constrained DDS profile {profile}: {exc}") from exc
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
     print(f"[ros2] robot DDS profile: {profile} "
           f"(robot-domain-232 whitelist {robot_ip}; domain-42 publishing is "

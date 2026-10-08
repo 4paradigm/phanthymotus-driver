@@ -172,6 +172,7 @@ FULL_PLUGINS = {
     "joint_state": {"enabled": True},
     "camera": {"enabled": True,
                "streams": ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye",
+                           "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye",
                            "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb",
                            "waist_front_d415_depth", "wrist_left_d405_rgb", "wrist_right_d405_rgb"]},
     "lidar_cloud": {"enabled": True}, "battery": {"enabled": True},
@@ -959,8 +960,18 @@ class RpcDispatchTests(unittest.TestCase):
         hand_actions = hand["inputSchema"]["properties"]["action"]["enum"]
         head_actions = head["inputSchema"]["properties"]["action"]["enum"]
         self.assertTrue({"open", "close", "set_position"}.issubset(hand_actions))
+        self.assertNotIn("open_left", hand_actions)
+        self.assertEqual(hand["inputSchema"]["properties"]["side"]["enum"],
+                         ["left", "right", "both"])
         self.assertTrue({"look_left", "look_right", "look_up", "look_down", "center",
                          "set_position"}.issubset(head_actions))
+
+    def test_hand_open_selects_side_in_one_action(self):
+        hand = find_plugin(self.plugins, "hand_control")
+        hand.dispatch("open", {"side": "left"})
+        (msg,) = self.nodes.hand_command_pub.published
+        self.assertEqual(msg.name, [f"left_hand_joint_{index}" for index in range(6)])
+        self.assertEqual(msg.position, [0] * 6)
 
     # -- HDU RPCs: tts (absorbs media_play) / audio (absorbs audio_play+volume) /
     #    interaction (absorbs mic_source) / resources --

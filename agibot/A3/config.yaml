@@ -39,7 +39,7 @@ plugins:
     # Which camera streams to mirror; keys of the CAMERA_TOPICS table in device.py.
     # RGB is re-encoded to JPEG and depth to zlib-compressed uint16 on the fly
     # (default includes chest D457 depth, image/depth-zlib).
-    streams: ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye", "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb", "waist_front_d415_depth", "wrist_left_d405_rgb", "wrist_right_d405_rgb"]
+    streams: ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye", "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye", "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb", "waist_front_d415_depth", "wrist_left_d405_rgb", "wrist_right_d405_rgb"]
   camera_head:
     enabled: true
   camera_head_right:
@@ -49,6 +49,12 @@ plugins:
   camera_chest_depth:
     enabled: true
   camera_head_rear:
+    enabled: true
+  camera_head_stereo_left:
+    enabled: true
+  camera_head_stereo_right:
+    enabled: true
+  camera_armpit_right:
     enabled: true
   camera_waist_rgb:
     enabled: true
