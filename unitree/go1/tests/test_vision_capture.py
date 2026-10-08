@@ -1449,3 +1449,51 @@ def test_non_video_operations_do_not_send_acp(tmp_path, monkeypatch):
     assert card.dispatch("stop", {})["state"] == "idle"
     card.shutdown()
     assert _completions.empty()
+
+
+@pytest.mark.parametrize("delete_phase", ["before_metadata", "after_metadata"])
+def test_list_survives_concurrent_delete(tmp_path, monkeypatch, delete_phase):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    path = tmp_path / "photos" / "saved.jpg"
+    path.parent.mkdir()
+    path.write_bytes(b"photo")
+    entered, deleted = threading.Event(), threading.Event()
+    responses = queue.Queue()
+    original_stat = Path.stat
+    calls = 0
+
+    def stat(candidate, *args, **kwargs):
+        nonlocal calls
+        if candidate == path and threading.current_thread() is listing:
+            calls += 1
+            if calls == 2:
+                metadata = original_stat(candidate, *args, **kwargs) if delete_phase == "after_metadata" else None
+                entered.set()
+                assert deleted.wait(3)
+                return metadata if metadata is not None else original_stat(candidate, *args, **kwargs)
+        return original_stat(candidate, *args, **kwargs)
+
+    def list_files():
+        try:
+            responses.put(card.dispatch("list", {}))
+        except Exception as exc:
+            responses.put(exc)
+
+    listing = threading.Thread(target=list_files)
+    monkeypatch.setattr(Path, "stat", stat)
+    listing.start()
+    try:
+        assert entered.wait(1)
+        assert card.dispatch("delete", {"name": "saved.jpg"})["state"] == "deleted"
+    finally:
+        deleted.set()
+        listing.join(3)
+    result = responses.get_nowait()
+    assert isinstance(result, dict), f"concurrent deletion broke list: {result!r}"
+    assert result["state"] == "listed"
+    if delete_phase == "before_metadata":
+        assert result["files"] == []
+    else:
+        assert result["files"][0]["size"] == 5
+    assert card.dispatch("list", {})["files"] == []

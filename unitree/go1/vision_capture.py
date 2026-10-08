@@ -168,11 +168,17 @@ class VisionCapturePlugin:
                 for path in directory.iterdir():
                     # 点号开头的临时文件尚未发布，不应显示为可用媒体。
                     if path.is_file() and not path.name.startswith(".") and path.suffix.lower() == suffix:
-                        files.append({"filename": path.name, "path": str(path),
-                                      "channel_reply_path": self._channel_path(path),
-                                      "size": path.stat().st_size, "mime": mime})
-        files.sort(key=lambda item: Path(item["path"]).stat().st_mtime, reverse=True)
-        return {"state": "listed", "files": files}
+                        try:
+                            metadata = path.stat()
+                        except FileNotFoundError:
+                            # 并发删除已移除文件；跳过该项，排序复用本次元数据。
+                            continue
+                        files.append((metadata.st_mtime,
+                                      {"filename": path.name, "path": str(path),
+                                       "channel_reply_path": self._channel_path(path),
+                                       "size": metadata.st_size, "mime": mime}))
+        files.sort(key=lambda item: item[0], reverse=True)
+        return {"state": "listed", "files": [item[1] for item in files]}
 
     def _delete_file(self, name):
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}\.(?:jpg|mp4)", name, re.I):
