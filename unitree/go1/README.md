@@ -377,6 +377,30 @@ python -m pytest -q tests/test_go1_face_light.py
 设置 `SDK_DIR` 和 `REAL_ADAPTER`：原生成功路径用实际 SDK 头文件加假的动态库
 （Unix 域套接字，无机器人网络），真实官方库仅测试断网失败路径；另验证 12 个
 RGB 调用、输入校验、错误回报、进程关闭及库包可搬移。
+此项是涉及 SDK/原生适配器修改时的手工补充检查，不属于普通 pytest 的强制项，也不替代真机验收。
+需要预先取得可信官方 SDK 和本分支构建的 Go1 Linux 镜像；在驱动仓库根目录运行，
+将镜像地址和宿主机 SDK 路径替换为实际值：
+
+```bash
+GO1_TEST_IMAGE='已构建的 Go1 镜像地址'
+GO1_TEST_SDK='/absolute/path/to/faceLightSDK_Nano'
+docker run --rm --pull=never --network none --entrypoint /bin/sh \
+  --mount type=bind,src="$PWD",dst=/src,readonly \
+  --mount type=bind,src="$GO1_TEST_SDK",dst=/sdk,readonly \
+  -e FACE_LIGHT_SDK_DIR=/sdk -e SDK_DIR=/sdk \
+  -e REAL_ADAPTER=/tmp/go1-face-native/face_light_sdk_adapter \
+  "$GO1_TEST_IMAGE" -ec '
+    /src/unitree/go1/deploy/face_light/run_sdk.sh --check
+    cmake -S /src/unitree/go1/deploy/face_light -B /tmp/go1-face-native -DFACE_LIGHT_SDK_DIR=/sdk
+    cmake --build /tmp/go1-face-native
+    python3 /src/tests/face_light_native_check.py
+  '
+```
+
+该命令替换容器入口，不会启动驱动、Nano bootstrap 或运动 SDK；只读挂载源码和 SDK，
+编译产物保存在临时容器中。`--pull=never` 禁止自动拉取镜像，`--network none` 断开测试网络，
+脚本仍检查网卡/路由后才执行原生检查。镜像与 SDK 库须匹配当前容器架构。
+四组 PASS 仅证明假 SDK 成功路径和真实库断网失败路径，不代表物理灯光显示成功。
 
 SDK 文件已取得和审查；下一步需要获准部署并切换灯光写入源，再进行真机灯光验收：
 使用原 `set_color`/`preset`/`off` 接口检查 SDK 整条色和关闭，逐灯 0–11 单独点亮拍照验证位置/RGB 通道；
