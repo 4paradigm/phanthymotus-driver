@@ -1034,19 +1034,27 @@ def test_transient_completion_delivery_failure_retries_successfully(tmp_path, mo
     assert terminal["status"] == "completed"
 
 
-def test_worker_start_failure_does_not_leave_occupancy(tmp_path, monkeypatch, completions):
+@pytest.mark.parametrize("failure_point", ["construct", "start"])
+@pytest.mark.parametrize("action", ["capture_photo", "record_video"])
+def test_worker_failure_does_not_leave_occupancy(tmp_path, monkeypatch, completions,
+                                                 failure_point, action):
     snapshot = importlib.import_module("unitree.go1.vision_capture")
     card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    monkeypatch.setattr(snapshot.shutil, "which", lambda command: "/usr/bin/ffmpeg")
 
-    def fail_start(self):
+    def fail_worker(*args, **kwargs):
         raise RuntimeError("cannot create worker")
 
     with monkeypatch.context() as patch:
-        patch.setattr(threading.Thread, "start", fail_start)
-        result = card.dispatch("capture_photo", {})
-    assert result["code"] == "CAPTURE_FAILED"
+        if failure_point == "construct":
+            patch.setattr(threading, "Thread", fail_worker)
+        else:
+            patch.setattr(threading.Thread, "start", fail_worker)
+        result = card.dispatch(action, {})
+    assert result["code"] == ("CAPTURE_FAILED" if action == "capture_photo" else "RECORD_FAILED")
     assert "action_id" not in result
     assert completions.empty()
+    assert card.dispatch("info", {})["state"] == "ready"
     monkeypatch.setattr(card, "_capture_jpeg", lambda position: b"\xff\xd8photo\xff\xd9")
     assert completed_capture(card, completions)["ok"]
 

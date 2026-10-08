@@ -235,6 +235,7 @@ class VisionCapturePlugin:
                 self._recording = cancel
         action_id = f"vision_capture_{uuid4().hex}"
         # 先确定文件名，画布收到受理结果时即可显示目标路径；完成回调才确认文件存在。
+        worker = None
         try:
             target = self._record_async if cancel else self._capture_async
             worker_args = (position, action_id, path, duration, cancel) if cancel else (position, action_id, path)
@@ -255,7 +256,7 @@ class VisionCapturePlugin:
                 if cancel is not None:
                     self._recording = None
                     self._recording_thread = None
-                else:
+                elif worker is not None:
                     self._capture_threads.discard(worker)
             return {"ok": False, "code": "RECORD_FAILED" if cancel else "CAPTURE_FAILED", "message": str(exc)}
         response = {"ok": True, "state": "recording" if cancel else "capturing",
