@@ -226,7 +226,7 @@ class LedPlugin:
                     self._release_pending = False
                     self._mode, self._state, self._state_ts = "state", state, now
                 else:
-                    raise ValueError("unsupported_led_action")
+                    return None
                 self._next_due = 0.0
                 self._cv.notify_all()
                 return self._info()

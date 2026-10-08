@@ -325,6 +325,19 @@ def test_interrupt_action_removed_without_changing_other_actions(model):
     assert set(schema["properties"]["action"]["enum"]) == expected
     assert set(schema["x-action-params"]) == expected
     cycle(p)
-    with pytest.raises(ValueError, match="unsupported_led_action"):
-        p.dispatch("interrupt", {})
+    assert p.dispatch("interrupt", {}) is None
     assert p._status == "running"
+
+
+@pytest.mark.parametrize("action", ["unknown_action", "interrupt"])
+def test_unknown_action_returns_none_without_changing_output(model, action):
+    p, _ = model
+    assert p.dispatch(action, {}) is None
+    assert not p._enabled
+    cycle(p)
+    before = p.dispatch("info", {})
+    origin, due = p._origin, p._next_due
+    assert p.dispatch(action, {}) is None
+    assert p.dispatch("info", {}) == before
+    assert (p._origin, p._next_due) == (origin, due)
+    assert p._client.calls == []
