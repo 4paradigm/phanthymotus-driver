@@ -423,6 +423,11 @@ class A3Nodes:
     def __init__(self, config, namespace, ros2, rpc: A3Rpc):
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+        try:
+            from rclpy.callback_groups import ReentrantCallbackGroup
+        except ImportError:  # lightweight test doubles / older rclpy
+            class ReentrantCallbackGroup:  # noqa: N801
+                pass
         from sensor_msgs.msg import Image, Imu, JointState, PointCloud2
         from std_msgs.msg import String, UInt8MultiArray
         try:
@@ -479,6 +484,11 @@ class A3Nodes:
         self._imu_pub = self.core.create_publisher(
             String, _core_topic(namespace, "state/imu"), 5)
         self._media_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="a3_media")
+        # rclpy's default callback group is mutually exclusive.  A high-rate
+        # JointState callback can otherwise occupy the only group while image
+        # and PointCloud2 callbacks wait forever, even with a MultiThreadedExecutor.
+        # Keep heavyweight media subscriptions in their own re-entrant group.
+        self._media_callback_group = ReentrantCallbackGroup()
         self._encode_lock = threading.Lock()
         self._encoding_keys = set()
         self._media_failures = set()
@@ -536,7 +546,13 @@ class A3Nodes:
                 else:
                     pub.publish(msg)
 
-            self.robot.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos)
+            callback_group = self._media_callback_group if (re_encode is not None or key == "lidar_cloud") else None
+            kwargs = {"callback_group": callback_group} if callback_group is not None else {}
+            try:
+                self.robot.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos, **kwargs)
+            except TypeError:
+                # Test doubles and old rclpy releases may not expose callback_group.
+                self.robot.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos)
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
 
         self._encode_and_publish = self._encode_and_publish_frame
@@ -599,9 +615,15 @@ class A3Nodes:
                                ("ext_mic", "/agent/audio/data/external")):
                 core_topic = _core_topic(namespace, f"{key}/audio")
                 pub = self.core.create_publisher(AudioChunk, core_topic, 5)
-                self.robot.create_subscription(
-                    AudioCapture, topic,
-                    lambda msg, pub=pub: pub.publish(self._audio_chunk(msg)), sensor_qos)
+                try:
+                    self.robot.create_subscription(
+                        AudioCapture, topic,
+                        lambda msg, pub=pub: pub.publish(self._audio_chunk(msg)), sensor_qos,
+                        callback_group=self._media_callback_group)
+                except TypeError:
+                    self.robot.create_subscription(
+                        AudioCapture, topic,
+                        lambda msg, pub=pub: pub.publish(self._audio_chunk(msg)), sensor_qos)
                 self.audio_topics[key] = {"robot_topic": topic, "topic": core_topic,
                                           "format": "audio/pcm-16k"}
 
