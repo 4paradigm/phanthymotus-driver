@@ -39,7 +39,7 @@ def model():
 
 
 def cycle(p, **kwargs):
-    return p.dispatch("cycle", {"sequence": [GREEN, RED], **kwargs})
+    return p.dispatch("set_sequence", {"sequence": [GREEN, RED], **kwargs})
 
 
 def test_multiple_cycles_boundaries_and_delayed_wakeup(model):
@@ -107,7 +107,7 @@ def test_infinite_cycles_and_replacement(model):
     cycle(p, sequence=[RED], repeat_count=1)
     assert p._origin == 3000
     assert p._stage == 1
-    p.dispatch("set", {"r": 4, "g": 5, "b": 6})
+    p.dispatch("set_once", {"r": 4, "g": 5, "b": 6})
     assert p._stages == []
     assert p._rgb == (4, 5, 6)
     assert p.dispatch("state", {"state": "speaking"})["ignored"]
@@ -136,9 +136,9 @@ def test_schema_canvas_json_and_native_arguments(model):
     schema = p.get_tool()["inputSchema"]
     Draft202012Validator.check_schema(schema)
     for sequence in ([GREEN, RED], json.dumps([GREEN, RED])):
-        args = {"action": "cycle", "sequence": sequence, "repeat_count": 3}
+        args = {"action": "set_sequence", "sequence": sequence, "repeat_count": 3}
         Draft202012Validator(schema).validate(args)
-        assert p.dispatch("cycle", args)["cycle_status"] == "running"
+        assert p.dispatch("set_sequence", args)["cycle_status"] == "running"
     assert set(schema["properties"]["action"]["enum"]) == set(schema["x-action-params"])
     assert all(v["description"] for v in schema["x-action-params"].values())
 
@@ -171,7 +171,7 @@ def test_worker_continuous_output_pause_stop_and_restart():
         assert not p._thread.is_alive()
         assert p.dispatch("state", {"state": "speaking"})["ignored"]
         p.start()
-        p.dispatch("set", {"r": 1, "g": 2, "b": 3})
+        p.dispatch("set_once", {"r": 1, "g": 2, "b": 3})
         wait_for(lambda: c.calls[-1][1] == (1, 2, 3))
     finally:
         p.stop()
@@ -287,7 +287,7 @@ def test_actuator_lifecycle_contract_and_fresh_restart():
         assert info["repeat_count"] is None
         assert info["last_error"] is None
         assert p._stages == p._bounds == []
-        p.dispatch("set", {"r": 1})
+        p.dispatch("set_once", {"r": 1})
         assert p.dispatch("info", {})["cycle_status"] == "idle"
     finally:
         p.stop()
@@ -310,7 +310,7 @@ def test_repeated_start_preserves_running_cycle():
 @pytest.mark.parametrize("legacy_hz", [5, "5", 10, "10", "", None, 6])
 def test_legacy_refresh_input_cannot_change_fixed_frequency(model, legacy_hz):
     p, _ = model
-    for action, args in [("cycle", {"sequence": [GREEN]}), ("set", {"b": 255}), ("off", {})]:
+    for action, args in [("set_sequence", {"sequence": [GREEN]}), ("set_once", {"b": 255}), ("off", {})]:
         result = p.dispatch(action, {**args, "refresh_hz": legacy_hz})
         assert result["refresh_hz"] == 5
     schema = p.get_tool()["inputSchema"]
@@ -321,7 +321,7 @@ def test_legacy_refresh_input_cannot_change_fixed_frequency(model, legacy_hz):
 def test_interrupt_action_removed_without_changing_other_actions(model):
     p, _ = model
     schema = p.get_tool()["inputSchema"]
-    expected = {"start", "state", "set", "cycle", "pause", "resume", "off", "stop", "info"}
+    expected = {"start", "state", "set_once", "set_sequence", "pause", "resume", "off", "stop", "info"}
     assert set(schema["properties"]["action"]["enum"]) == expected
     assert set(schema["x-action-params"]) == expected
     cycle(p)
@@ -329,7 +329,7 @@ def test_interrupt_action_removed_without_changing_other_actions(model):
     assert p._status == "running"
 
 
-@pytest.mark.parametrize("action", ["unknown_action", "interrupt"])
+@pytest.mark.parametrize("action", ["unknown_action", "interrupt", "set", "cycle"])
 def test_unknown_action_returns_none_without_changing_output(model, action):
     p, _ = model
     assert p.dispatch(action, {}) is None

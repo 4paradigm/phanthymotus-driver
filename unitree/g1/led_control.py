@@ -55,13 +55,13 @@ class LedPlugin:
         actions = {
             "start": ([], "Start the LED output service and enable state effects. Does not start a color sequence."),
             "state": (["state"], "Request a semantic LED state. Ordinary states are ignored during manual or paused output. The error state terminates the sequence and displays the error effect."),
-            "set": (["r", "g", "b"], "Replace the current sequence with a solid RGB color. Continuously send LED commands to maintain that color until another command or stop."),
-            "cycle": (["sequence", "repeat_count", "end_behavior"],
+            "set_once": (["r", "g", "b"], "Replace the current sequence with a solid RGB color. Continuously send LED commands to maintain that color until another command or stop."),
+            "set_sequence": (["sequence", "repeat_count", "end_behavior"],
                       "Start a color sequence asynchronously, replacing the previous sequence. Supply sequence as an array or JSON text with r, g, b, and duration_sec for each stage. repeat_count: 1 for one cycle, N for N cycles, or 0 to loop indefinitely. The driver controls timing and continuously sends LED commands to maintain the color of each stage; repeated Agent calls are not required."),
             "pause": ([], "Pause sequence timing while continuously refreshing the current color. Use resume to continue."),
             "resume": ([], "Resume the paused sequence from its saved position and remaining duration. Does not restart the sequence."),
             "off": ([], "End the current sequence and continuously send black LED commands to keep the LEDs off. Use stop to stop sending commands."),
-            "stop": ([], "Terminate the sequence, attempt one black output, and stop all LED refreshing. Cannot be resumed. Firmware may restore its default effect. Use start, set, cycle, or off to restart the service."),
+            "stop": ([], "Terminate the sequence, attempt one black output, and stop all LED refreshing. Cannot be resumed. Firmware may restore its default effect. Use start, set_once, set_sequence, or off to restart the service."),
             "info": ([], "Read service and sequence status, stage and cycle indices, RGB values, timing, and hardware errors. Does not start output."),
         }
         return {"name": "led", "type": "actuator", "multiInstance": False,
@@ -160,11 +160,11 @@ class LedPlugin:
             if action == "info":
                 return self._info()
             # Validate completely before replacing the current effect.
-            if action in ("cycle", "set", "off"):
+            if action in ("set_sequence", "set_once", "off"):
                 # Ignore refresh_hz left by older Canvas configurations.
                 # Frequency is fixed, never selected by user input.
-                rgb = self._color(args) if action == "set" else (0, 0, 0)
-                if action == "cycle":
+                rgb = self._color(args) if action == "set_once" else (0, 0, 0)
+                if action == "set_sequence":
                     stages = self._sequence(args.get("sequence"))
                     repeats = self._integer(args.get("repeat_count", 1), 0, 10000, "repeat_count")
                     ending = args.get("end_behavior", "release")
@@ -178,7 +178,7 @@ class LedPlugin:
                     self._elapsed = self._paused_elapsed = 0.0
                     self._stage = self._cycle = 0
                     self._stages, self._bounds = [], []
-                    if action == "cycle":
+                    if action == "set_sequence":
                         self._stages, self._repeats, self._end_behavior = stages, repeats, ending
                         total = 0.0
                         for _, duration in stages:
