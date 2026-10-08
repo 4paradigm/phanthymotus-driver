@@ -30,6 +30,7 @@ import math
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import zlib
 import atexit
 from array import array
@@ -445,6 +446,7 @@ class A3Nodes:
             String, _core_topic(namespace, "state/joint_state"), 5)
         self._imu_pub = self.core.create_publisher(
             String, _core_topic(namespace, "state/imu"), 5)
+        self._media_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="a3_media")
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
 
@@ -467,9 +469,7 @@ class A3Nodes:
                 elif key in ("imu_pelvis", "imu_torso"):
                     self._publish_imu_streams(key, jsonable(msg))
                 if re_encode is not None:
-                    out = re_encode(msg)
-                    if out is not None:
-                        pub.publish(out)
+                    self._media_executor.submit(self._encode_and_publish, re_encode, msg, pub, robot_topic)
                     return
                 if as_json:
                     value = json_filter(msg) if json_filter else jsonable(msg)
@@ -483,6 +483,8 @@ class A3Nodes:
 
             self.robot.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos)
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
+
+        self._encode_and_publish = self._encode_and_publish_frame
 
         # -- joint / state streams (plain sensor_msgs types) --
         mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json")
@@ -787,13 +789,36 @@ class A3Nodes:
 
     def _publish_imu_streams(self, key, value):
         self.values[key] = value
-        payload = {}
+        payload = {"available": False}
         for prefix, key in (("pelvis", "imu_pelvis"), ("torso", "imu_torso")):
             value = self.values.get(key, {})
-            _flatten_json(value, prefix, payload)
+            if not isinstance(value, dict) or not value:
+                continue
+            payload["available"] = True
+            header = value.get("header") or {}
+            stamp = header.get("stamp") or {}
+            if stamp:
+                payload[f"{prefix}_stamp_sec"] = stamp.get("sec", 0)
+                payload[f"{prefix}_stamp_nanosec"] = stamp.get("nanosec", 0)
+            if header.get("frame_id"):
+                payload[f"{prefix}_frame_id"] = header["frame_id"]
+            for field in ("orientation", "angular_velocity", "linear_acceleration"):
+                vector = value.get(field) or {}
+                for axis in ("x", "y", "z", "w"):
+                    if axis in vector:
+                        payload[f"{prefix}_{field}_{axis}"] = vector[axis]
         output = self._String()
         output.data = json.dumps(payload, ensure_ascii=False)
         self._imu_pub.publish(output)
+
+    @staticmethod
+    def _encode_and_publish_frame(encoder, msg, pub, topic):
+        try:
+            out = encoder(msg)
+            if out is not None:
+                pub.publish(out)
+        except Exception as exc:
+            print(f"[media] encode failed topic={topic}: {exc}", flush=True)
 
     def speaker_start(self, input_topic: str):
         if self._AudioCapture is None or self._AudioPlayback is None:
@@ -1070,9 +1095,10 @@ class JointsPlugin:
             # Agent Core treats info().topic_out as authoritative after placement.
             return {"state": "running",
                     "topic_out": [{"topic": _core_topic(self.nodes.namespace, "state/joints"),
-                                    "format": "sensor/skeleton"}],
+                                   "format": "sensor/skeleton"}],
                     "group": group,
-                    "streams": dict(self.streams)}
+                    "streams": dict(self.streams),
+                    "urdf": self.nodes.urdf_text()}
         group = args.get("group", "arm")
         if group not in self.GROUPS:
             raise ValueError(f"joints: unknown group {group!r}; available: {list(self.GROUPS)}")
@@ -1263,7 +1289,9 @@ class BatteryPlugin:
     def get_tool(self):
         if self.has_stream:
             return _stream_tool("battery", self.nodes.streams["battery"], "电池状态流（电压/电流/电量/充电状态，双电池包）")
-        return tool("battery", "sensor", "电池状态（需要 a3_aimdk protobuf wheel 才能解码数据流）")
+        return tool("battery", "sensor", "电池状态（a3_aimdk protobuf 未加载）",
+                    topic_out=[{"topic": _core_topic(self.nodes.namespace, "battery"),
+                                "format": "data/json"}])
 
     def start(self):
         pass
@@ -1296,7 +1324,9 @@ class EstopPlugin:
         if self.has_stream:
             return _stream_tool("estop", self.nodes.streams["estop"],
                                 "急停状态流（有线/无线/软件急停 + 各类传感器报警）")
-        return tool("estop", "sensor", "急停状态（需要 a3_aimdk protobuf wheel 才能解码数据流）")
+        return tool("estop", "sensor", "急停状态（a3_aimdk protobuf 未加载）",
+                    topic_out=[{"topic": _core_topic(self.nodes.namespace, "estop"),
+                                "format": "data/json"}])
 
     def start(self):
         pass
@@ -1842,6 +1872,10 @@ class HandControlPlugin:
             {
                 "open": ([], "双手完全张开"),
                 "close": ([], "双手完全握紧"),
+                "open_left": ([], "仅左手完全张开"),
+                "open_right": ([], "仅右手完全张开"),
+                "close_left": ([], "仅左手完全握紧"),
+                "close_right": ([], "仅右手完全握紧"),
                 "set_position": (["left", "right"], "设置指定手指张合等级；0 张开，2000 握紧"),
             },
             {
@@ -1869,10 +1903,15 @@ class HandControlPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
-        if action not in ("open", "close", "set_position", "send"):
+        if action not in ("open", "close", "open_left", "open_right", "close_left", "close_right", "set_position", "send"):
             raise ValueError(f"hand_control: unknown action {action!r}")
         hand_type = args.get("hand_type", "AgiHand")
         _require(hand_type in HAND_TYPES, f"未知手部类型 {hand_type!r}，可选 {sorted(HAND_TYPES)}")
+        if action in ("open_left", "open_right", "close_left", "close_right"):
+            side = "left" if action.endswith("_left") else "right"
+            values = [0] * 6 if action.startswith("open") else [HAND_COMMAND_MAX] * 6
+            args = {**args, side: values}
+            action = "set_position"
         if action in ("open", "close"):
             closed = HAND_COMMAND_MAX
             presets = {
@@ -3654,7 +3693,7 @@ def build_plugins(config, namespace, ros2):
     # (not just broken at dispatch) when ros2_plugin_proto is absent — degraded
     # startup must expose no half-working command tools (5th PR review).
     wrapper_cmds = nodes.wrapper_available
-    if enabled("loco"):
+    if enabled("loco") and wrapper_cmds:
         plugins["loco"] = LocoPlugin(nodes)
     if enabled("arm_control"):
         plugins["arm_control"] = ArmControlPlugin(nodes)
@@ -3662,7 +3701,7 @@ def build_plugins(config, namespace, ros2):
         plugins["hand_control"] = HandControlPlugin(nodes)
     if enabled("head_control"):
         plugins["head_control"] = HeadControlPlugin(nodes)
-    if enabled("waist_control"):
+    if enabled("waist_control") and wrapper_cmds:
         plugins["waist_control"] = WaistControlPlugin(nodes)
     if enabled("motion_play"):
         plugins["motion_play"] = MotionPlayPlugin(nodes)
@@ -3681,7 +3720,7 @@ def build_plugins(config, namespace, ros2):
         plugins["interaction"] = InteractionPlugin(nodes)
     if enabled("resources"):
         plugins["model"] = ModelPlugin(nodes)
-    if enabled("face_play"):
+    if enabled("face_play") and wrapper_cmds:
         plugins["face_play"] = FacePlayPlugin(nodes)
     if enabled("skill_play"):
         plugins["skill_play"] = SkillPlayPlugin(nodes)

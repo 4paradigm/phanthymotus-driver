@@ -24,7 +24,8 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/agibot-a3-requirements
 COPY audio_msgs/ /tmp/a3_ws/src/audio_msgs/
 RUN cd /tmp/a3_ws && \
     if [ -f /opt/ros/jazzy/setup.sh ]; then . /opt/ros/jazzy/setup.sh; else . /opt/ros/humble/setup.sh; fi && \
-    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
+    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release && \
+    rm -rf src build log
 
 WORKDIR /work
 COPY common/ /work/common/
@@ -43,4 +44,4 @@ COPY deploy/ /deploy/
 # is to keep raw rclpy output plain so every consumer sees identical records.
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 PYTHONPATH=/work
 EXPOSE 15719
-CMD ["/bin/bash", "-c", "set -e; if [ -f /opt/ros/jazzy/setup.bash ]; then source /opt/ros/jazzy/setup.bash; else source /opt/ros/humble/setup.bash; fi; for setup in /opt/agibot/share/ros2_package/aimrt_protocol_ros2_package/local_setup.bash /opt/agibot/share/ros2_package/aima_protocol_ros2_package/local_setup.bash /agibot-devkit/prebuilt/ros2_plugin_proto_aarch64/local_setup.bash /agibot-devkit/prebuilt/ros2_plugin_proto/local_setup.bash; do if [ -f \"$setup\" ]; then source \"$setup\"; fi; done; source /tmp/a3_ws/install/setup.bash; python3 -c 'from audio_msgs.msg import AudioCapture, AudioPlayback; print(\"[audio] audio_msgs AudioCapture/AudioPlayback available\", flush=True)' || { echo '[warn] A3 audio_msgs unavailable — mic/speaker degraded'; }; wheel=; for candidate in /agibot-devkit/prebuilt/a3_aimdk-*.whl /agibot-devkit/a3_aimdk-*.whl; do if [ -f \"$candidate\" ]; then wheel=\"$candidate\"; break; fi; done; if [ -n \"$wheel\" ]; then pip3 install --no-cache-dir \"$wheel\" || echo '[warn] a3_aimdk wheel install failed — running degraded'; else echo '[warn] a3_aimdk wheel not found under /agibot-devkit/prebuilt — protobuf stream decoding disabled'; fi; python3 /work/agibot/A3/main.py"]
+CMD ["/bin/bash", "-c", "set -e; if [ -f /opt/ros/jazzy/setup.bash ]; then source /opt/ros/jazzy/setup.bash; else source /opt/ros/humble/setup.bash; fi; for setup in /opt/agibot/share/ros2_package/aimrt_protocol_ros2_package/local_setup.bash /opt/agibot/share/ros2_package/aima_protocol_ros2_package/local_setup.bash /agibot-devkit/prebuilt/ros2_plugin_proto_aarch64/local_setup.bash /agibot-devkit/prebuilt/ros2_plugin_proto/local_setup.bash; do if [ -f \"$setup\" ]; then source \"$setup\"; fi; done; source /tmp/a3_ws/install/setup.bash; python3 -c 'from audio_msgs.msg import AudioCapture, AudioPlayback; print(\"[audio] audio_msgs AudioCapture/AudioPlayback available\", flush=True)' || { echo '[warn] A3 audio_msgs unavailable — mic/speaker degraded'; }; wheel=/agibot-devkit/prebuilt/a3_aimdk-3.1.0-py3-none-any.whl; if [ -f \"$wheel\" ]; then pip3 install --no-cache-dir \"$wheel\" || echo '[warn] a3_aimdk wheel install failed — running degraded'; else echo '[warn] a3_aimdk-3.1.0-py3-none-any.whl not found — protobuf stream decoding disabled'; fi; python3 /work/agibot/A3/main.py"]

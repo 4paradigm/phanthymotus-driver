@@ -385,9 +385,9 @@ class ToolInventoryTests(unittest.TestCase):
             config["plugins"] = FULL_PLUGINS
             plugins, _ = build_bundle_plugins(config)
             names = {d["name"] for d in tool_definitions(plugins)}
-            for visible in ("loco", "waist_control", "face_play"):
-                self.assertIn(visible, names,
-                              f"{visible} must remain visible without ros2_plugin_proto")
+            for hidden in ("loco", "waist_control", "face_play"):
+                self.assertNotIn(hidden, names,
+                                 f"{hidden} must be withheld without ros2_plugin_proto")
             nodes = next(iter(plugins.values())).nodes
             self.assertFalse(nodes.wrapper_available)
             self.assertTrue(nodes.locomotion_pub is None)
@@ -490,6 +490,9 @@ class ToolInventoryTests(unittest.TestCase):
         msg = FakeMsg()
         msg.height, msg.width, msg.encoding, msg.data = h, w, "16UC1", depth.tobytes()
         depth_cb(msg)
+        deadline = time.time() + 1.0
+        while not depth_pub.published and time.time() < deadline:
+            time.sleep(0.01)
         self.assertEqual(len(depth_pub.published), 1, "depth frame must be compressed and published")
         out = depth_pub.published[0]
         self.assertEqual(out.format, "16UC1; compressedDepth zlib")
