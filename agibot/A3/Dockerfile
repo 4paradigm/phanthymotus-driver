@@ -4,9 +4,8 @@ ARG PYPI_MIRROR=https://pypi.org/simple/
 
 # The robot publishes Jazzy ROS types. Keep the main participant on FastDDS so
 # its type-hash negotiation matches the robot; the isolated domain-42 bridge
-# also uses FastDDS in its child workers.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    rm -rf /var/lib/apt/lists/*
+# also uses FastDDS in its child workers. The base image already provides the
+# FastDDS RMW, so no extra apt package is needed here.
 
 # A3 has no vendored msgs package to colcon-build (unlike X2's aimdk_msgs zip):
 # The official AimDK v3.2 wheel is vendored below (the vendor package does not
