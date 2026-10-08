@@ -4,7 +4,7 @@ ext_devices.py — Go1 外部设备通信卡合集(actuator)。
 合并了以下外部设备卡（每张卡行为不变）：
   - beep: 头部扬声器蜂鸣控制（HTTP 到 Nano beep_adapter :18082）
   - speaker: 头部扬声器音频流播放（ROS2 订阅 + TCP 二进制帧到 Nano speaker_adapter）
-  - face_light: 面部灯带静态/逐灯/定时灯效（统一官方 SDK 或显式模拟）
+  - face_light: 面部灯带静态/逐灯/定时灯效（统一官方 SDK）
   - system_health: 机器人整体健康检查（CPU/内存/磁盘/电池/MQTT）
 
 
@@ -529,6 +529,8 @@ class _FaceSdkBackend:
         self.process = None
         self._pending = b""
 
+    IO_TIMEOUT = 1.0
+
     @property
     def connected(self):
         # Process readiness only; the official SDK has no hardware acknowledgement.
@@ -560,6 +562,8 @@ class _FaceSdkBackend:
             self.process = subprocess.Popen([self.executable], stdin=subprocess.PIPE,
                                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
                                             env=environment, start_new_session=True)
+            # Raw nonblocking writes cannot stall when the helper stops reading.
+            os.set_blocking(self.process.stdin.fileno(), False)
             self._pending = b""
             response = self._read(timeout=15)
             if response != "READY face-light-v1":
@@ -569,14 +573,32 @@ class _FaceSdkBackend:
             self.close()
             raise
 
+    def _write_request(self, payload, deadline):
+        import select
+        pending = memoryview(payload)
+        fd = self.process.stdin.fileno()
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("face light SDK adapter request write timed out")
+            try:
+                if not select.select([], [fd], [], remaining)[1]:
+                    raise RuntimeError("face light SDK adapter request write timed out")
+                sent = os.write(fd, pending)
+            except (BlockingIOError, InterruptedError):
+                continue  # Retry within the same deadline, including partial writes.
+            if sent <= 0:
+                raise RuntimeError("face light SDK adapter closed stdin")
+            pending = pending[sent:]
+
     def write(self, frame):
         if not self.connected:
             raise RuntimeError("face light SDK adapter is not running")
         try:
             payload = (" ".join(str(v) for rgb in frame for v in rgb) + "\n").encode("ascii")
-            self.process.stdin.write(payload)
-            self.process.stdin.flush()
-            response = self._read()
+            deadline = time.monotonic() + self.IO_TIMEOUT
+            self._write_request(payload, deadline)
+            response = self._read(timeout=max(0, deadline - time.monotonic()))
             if response != "SENT":
                 raise RuntimeError(response)
         except Exception:

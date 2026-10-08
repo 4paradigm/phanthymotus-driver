@@ -410,6 +410,7 @@ def test_single_card_bundle_and_packaging():
         assert bundle.dispatch("face_light", {"action": "set_led", "index": 11, "r": 9})["ok"]
         assert bundle.dispatch("face_light", {"action": "info"})["simulated"]
         config = yaml.safe_load((GO1 / "config.yaml").read_text())
+        assert config["plugins"]["face_light"]["enabled"] is False
         assert config["plugins"]["face_light"]["backend"] == "sdk"
         assert config["plugins"]["face_light"]["sdk_exclusive"] is True
         metadata = yaml.safe_load((GO1 / "driver.yaml").read_text())
@@ -429,6 +430,10 @@ def test_shipped_system_health_is_enabled_assembled_and_listed():
     assert 'mqtt_host' not in plugins['face_light']
     selected = {name: plugins[name] for name in ('face_light', 'system_health')}
     client = Mock()
+    bundle = main.Go1Bundle({'plugins': selected}, 'offline', None, client)
+    assert {tool['name'] for tool in bundle.get_all_tools()} == {'system_health'}
+    # Installing the SDK and opting in restores the same single face_light card.
+    selected['face_light'] = dict(selected['face_light'], enabled=True)
     bundle = main.Go1Bundle({'plugins': selected}, 'offline', None, client)
     assert {tool['name'] for tool in bundle.get_all_tools()} == {'face_light', 'system_health'}
     metadata = yaml.safe_load((GO1 / 'driver.yaml').read_text())
@@ -578,6 +583,88 @@ sys.exit(0 if valid else 1)
                             env=env, capture_output=True, text=True, timeout=2)
     assert result.returncode == 1 and 'checksum verification failed' in result.stdout
     assert 'MUST_NOT_COMPILE' not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("action,args", [("stop", {}), ("off", {}), ("set_color", {"g": 20})])
+def test_sdk_full_stdin_pipe_has_bounded_preemption_and_cleanup(tmp_path, action, args):
+    helper = tmp_path / "no_reader"
+    # READY plus one acknowledgement lets the initial effect frame through. The
+    # helper never reads stdin, so the next frame must hit a full kernel pipe.
+    helper.write_text(f'''#!{sys.executable}
+import time
+print("READY face-light-v1", flush=True)
+print("SENT", flush=True)
+time.sleep(30)
+''')
+    helper.chmod(0o755)
+    plugin = sdk_test_plugin(helper)
+    assert plugin.start()["ok"]
+    backend, process = plugin._backend, plugin._backend.process
+    write_entered = threading.Event()
+    original_write_request = backend._write_request
+    errors = []
+
+    def track_write(payload, deadline):
+        write_entered.set()
+        try:
+            return original_write_request(payload, deadline)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            raise
+
+    try:
+        # Holding the state lock prevents the worker writing before the pipe is full.
+        with plugin._lock:
+            assert plugin.dispatch("blink", {"r": 100, "duration_s": 10})["ok"]
+            worker = plugin._thread
+            fd = process.stdin.fileno()
+            assert not os.get_blocking(fd)
+            filled = 0
+            while True:
+                try:
+                    filled += os.write(fd, b"X" * 4096)
+                except BlockingIOError:
+                    break
+            assert filled > 0
+            backend._write_request = track_write
+        assert write_entered.wait(1), "worker did not enter the blocked write"
+        started = time.monotonic()
+        result = plugin.dispatch(action, args)
+        assert time.monotonic() - started < backend.IO_TIMEOUT + 1.0
+        assert not result["ok"] and result["code"] == "NOT_AVAILABLE"
+        assert any("request write timed out" in error for error in errors)
+        assert process.poll() is not None and backend.process is None
+        assert not worker.is_alive() and plugin._thread is None
+        assert process.stdin.closed and process.stdout.closed
+    finally:
+        plugin.stop()
+
+
+def test_sdk_partial_and_interrupted_writes_preserve_one_frame(sdk_helper, monkeypatch):
+    helper, log = sdk_helper
+    plugin = sdk_test_plugin(helper)
+    assert plugin.start()["ok"]
+    write = os.write
+    attempts = []
+    fd = plugin._backend.process.stdin.fileno()
+
+    def partial_write(descriptor, data):
+        if descriptor != fd:
+            return write(descriptor, data)
+        attempts.append(len(data))
+        if len(attempts) == 1:
+            raise InterruptedError()
+        if len(attempts) == 2:
+            raise BlockingIOError()
+        return write(descriptor, data[:3])
+
+    try:
+        monkeypatch.setattr(ext.os, "write", partial_write)
+        assert plugin.dispatch("set_color", {"r": 12, "g": 34, "b": 56})["ok"]
+        assert len(attempts) > 3
+        assert log.read_text().splitlines() == [" ".join(["12", "34", "56"] * 12)]
+    finally:
+        plugin.stop()
 
 
 def test_sdk_backend_complete_card_path(sdk_helper):

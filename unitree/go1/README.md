@@ -196,6 +196,7 @@ sudo docker run --rm --name go1_bundle \
 画布不再提供后端选择，也不接受 `backend: simulated`。离线测试仅在测试代码中注入记录器，
 不会连接机器人；没有自动回退到模拟成功。真机显示仍需现场验收。
 所有指令共用同一帧写入路径，每个实例只运行一个灯效，实机只创建 SDK 写入器。
+公共镜像不含官方 SDK，随附配置默认 `enabled: false`；完成下文的 SDK 安装和校验后再启用原卡。
 默认配置为 `backend: sdk` 和 `sdk_exclusive: true`（画布显示 Yes），无需每次设置。
 此默认值要求部署前已停止旧 `faceLightMqtt` 等其他灯光写入源，不会自动停止现场程序。
 保持 `faceLightServer` 运行，并准备下文规定目录中的官方 SDK。
@@ -279,8 +280,10 @@ RGB 数组按 R/G/B 传入，SDK 自己完成内部 GRB 转换和 UDP 打包。
 `deploy/face_light/adapter.cpp` 实现独立 SDK 进程：一帧设置 12 个编号，再调用一次
 `sendCmd()`。因为 SDK 无返回值，适配器通过动态符号拦截它实际调用的 `sendto`，
 检查实际发送错误/长度；没有观测到调用也返回失败，不伪装成功。
-SDK 进程通过本地管道回报结果，卡片统一控制抢占与停止；管道超时/退出/错误时
-终止并回收该进程。正常关闭通过 EOF 调用 SDK 析构，进程退出也回收 SDK 分配。
+SDK 进程通过本地管道回报结果，卡片统一控制抢占与停止；每帧非阻塞写入和等待响应
+共享 1 秒截止时间，支持部分写入和中断重试。管道满、超时、退出或错误时终止并回收进程，
+防止停止或替换指令无限等待。正常关闭通过 EOF 调用 SDK 析构，进程退出也回收 SDK 分配。
+连接故障时关闭指令返回失败，不能保证物理灯光已关闭。
 **SENT 只代表 UDP 套接字接受数据，不代表灯珠已显示或 Nano 服务已接收。**
 `info.connected` 在 SDK 模式中表示本地 SDK 进程就绪，不表示硬件在线。
 画布共享配置通过 `action=config` 应用；配置发生变化会取消灯效并关闭旧后端，需
@@ -323,6 +326,25 @@ SDK 头文件、库及示例应由操作者从可信官方来源放入该目录�
 缺失、内容变化或校验工具不可用时拒绝启动。升级 SDK 需重新审查并更新校验值。
 缺少文件、编译失败或架构不匹配时启动失败，不自动回退 MQTT/模拟。
 
+部署准备只需完成一次，镜像构建成功不能替代以下步骤：
+
+1. 将可信官方 SDK 的 `include/`、`lib/`、`version.txt` 放入机器人
+   `/opt/phanthy-motus/data/go1/faceLightSDK_Nano/`，按上文保留示例作为审查依据。
+2. 在已部署的驱动容器内执行只读校验（不会编译或发送灯光指令）：
+
+   ```bash
+   docker exec embodied-unitree-go1 /deploy/face_light/run_sdk.sh --check
+   ```
+
+   只有输出 `VERIFIED official faceLight SDK v1.0.1` 且退出码为 0 才继续；
+   缺失或校验失败时保持禁用。正常部署使用现有数据卷，不需要新增镜像层。
+3. 确认停止 `faceLightMqtt` 等灯光写入源并保留 `faceLightServer`。
+4. 将现有 Go1 配置的 `plugins.face_light.enabled` 改为 true，保留 SDK/Yes 默认值。
+   可把完整 `config.yaml` 持久化到数据卷，例如 `/opt/phanthy-motus/data/go1/config.yaml`，
+   并在部署服务的环境变量中设置 `CONFIG_PATH=/opt/phanthy-motus/data/go1/config.yaml`；
+   修改的是现有配置中的灯光开关，其他卡配置保持原样。重新创建驱动容器应用配置后，
+   再在画布使用原 `face_light` 卡。后续启动会编译适配器并等待 READY，编译失败仍明确报错。
+
 修改原卡配置，不再注册其他卡：
 
 ```yaml
@@ -340,7 +362,7 @@ python -m pytest -q tests/test_go1_face_light.py
 
 测试使用显式模拟帧和 SDK 管道测试进程，覆盖旧接口在 SDK 下的兼容性、严格参数校验、12 灯映射、
 四种效果的时间变化、到期关闭、静态/效果抢占、停止竞争、停止后无旧帧、
-线程回收、发送失败、旧 MQTT 配置迁移提示、SDK 独占前置条件/进程超时/异常/回收和唯一卡片装配。
+线程回收、发送失败、旧 MQTT 配置迁移提示、SDK 独占前置条件/进程超时/异常/回收、满管道下的停止与抢占、部分写入和唯一卡片装配。
 它们不证明真机灯带表现。
 
 `tests/face_light_native_check.py` 必须在仅 lo 网卡启用且无 IPv4 路由的断网 Linux 容器运行，

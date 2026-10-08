@@ -1,6 +1,11 @@
 #!/bin/sh
 # Build against the operator's mounted SDK; vendor libraries stay outside the image.
 set -eu
+case "${1:-}" in
+    '') [ "$#" -eq 0 ] || exit 2 ;;
+    --check) [ "$#" -eq 1 ] || exit 2 ;;
+    *) printf '%s\n' 'ERROR usage: run_sdk.sh [--check]'; exit 2 ;;
+esac
 sdk_root="${FACE_LIGHT_SDK_DIR:-/opt/phanthy-motus/data/go1/faceLightSDK_Nano}"
 build_root="${FACE_LIGHT_BUILD_DIR:-/tmp/go1-face-light-sdk-runtime}"
 source_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -26,6 +31,11 @@ EOF
 ); then
     printf '%s\n' 'ERROR official faceLight SDK checksum verification failed; use the audited v1.0.1 SDK'
     exit 1
+fi
+# Deployment preflight validates the mounted files without loading the library or sending LEDs.
+if [ "${1:-}" = --check ]; then
+    printf '%s\n' 'VERIFIED official faceLight SDK v1.0.1; no hardware command sent'
+    exit 0
 fi
 # CMake copies the matching library beside the adapter and only rebuilds changed inputs.
 if ! cmake -S "$source_root" -B "$build_root" -DFACE_LIGHT_SDK_DIR="$sdk_root" >&2 ||
