@@ -1,5 +1,6 @@
 """Offline face_light contract, timing, cancellation and transport checks; no robot IO."""
 import sys
+import json
 import threading
 import time
 from pathlib import Path
@@ -11,6 +12,16 @@ import pytest
 GO1 = Path(__file__).resolve().parents[1] / "unitree" / "go1"
 sys.path.insert(0, str(GO1))
 import ext_devices as ext
+
+_REAL_ACP_NOTIFY = ext._face_acp_notify
+
+
+@pytest.fixture(autouse=True)
+def acp_notify(monkeypatch):
+    # Offline checks never contact Agent Core or a robot.
+    notify = Mock()
+    monkeypatch.setattr(ext, "_face_acp_notify", notify)
+    return notify
 
 
 @pytest.fixture
@@ -26,6 +37,95 @@ def wait_until(predicate, timeout=1):
     while not predicate():
         assert time.monotonic() < deadline, "condition timed out"
         time.sleep(0.005)
+
+
+@pytest.mark.parametrize("action", ext._FACE_EFFECTS)
+def test_effect_completion_contract_and_unique_ids(light, acp_notify, action):
+    completion = light.get_tool()["inputSchema"]["x-completion"]
+    assert set(completion["actions"]) == set(ext._FACE_EFFECTS)
+    assert completion["timeout"] > 3600
+    ids = []
+    for _ in range(2):
+        response = light.dispatch(action, {"r": 100, "duration_s": 0.05})
+        assert response["ok"] and response["action_id"]
+        ids.append(response["action_id"])
+        light._thread.join(1)
+        assert not light._thread.is_alive()
+    assert len(set(ids)) == 2
+    assert acp_notify.call_count == 2
+    for call, action_id in zip(acp_notify.call_args_list, ids):
+        sent_id, status, result = call.args
+        assert sent_id == action_id and status == "completed"
+        assert result["ok"] and result["mode"] == "off"
+        assert result["state_source"] == "software_record" and not result["hardware_verified"]
+    assert "action_id" not in light.dispatch("set_color", {"r": 1})
+
+
+@pytest.mark.parametrize("action,args", [("set_color", {"g": 10}), ("off", {}), ("stop", {}),
+                                         ("blink", {"duration_s": 2}),
+                                         ("config", {"mqtt_port": 1884})])
+def test_effect_cancelled_completion(light, acp_notify, action, args):
+    response = light.dispatch("chase", {"r": 100, "duration_s": 2})
+    old = light._thread
+    assert light.dispatch(action, args)["ok"]
+    assert not old.is_alive()
+    calls = [call for call in acp_notify.call_args_list if call.args[0] == response["action_id"]]
+    assert len(calls) == 1 and calls[0].args[1] == "cancelled"
+    assert calls[0].args[2]["code"] == "CANCELLED"
+
+
+@pytest.mark.parametrize("final_frame", [False, True])
+def test_effect_error_completion(light, acp_notify, final_frame):
+    original = light._backend.write
+    response = light.dispatch("blink", {"r": 100, "period_s": 1, "duration_s": 0.1})
+    def fail(frame):
+        if not final_frame or frame == ext._FACE_BLACK:
+            raise RuntimeError("offline transport failure")
+        original(frame)
+    with light._lock:
+        light._backend.write = fail
+    light._thread.join(1)
+    acp_notify.assert_called_once()
+    action_id, status, result = acp_notify.call_args.args
+    assert action_id == response["action_id"] and status == "error"
+    assert not result["ok"] and result["message"] == "offline transport failure"
+    assert light._info()["mode"] == "error"
+
+
+def test_rejected_effect_has_no_pending_completion(light, acp_notify):
+    response = light.dispatch("blink", {"duration_s": -1})
+    assert not response["ok"] and "action_id" not in response
+    light._backend.write = Mock(side_effect=RuntimeError("unavailable"))
+    response = light.dispatch("blink", {})
+    assert not response["ok"] and "action_id" not in response
+    acp_notify.assert_not_called()
+
+
+def test_acp_http_payload_and_cleanup(monkeypatch):
+    monkeypatch.setenv("AGENT_CORE_URL", "https://localhost:15678/")
+    response = Mock()
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    urlopen = Mock(return_value=response)
+    monkeypatch.setattr(ext.urllib.request, "urlopen", urlopen)
+    _REAL_ACP_NOTIFY("face_light_test", "completed", {"hardware_verified": False})
+    request = urlopen.call_args.args[0]
+    assert request.full_url == "https://localhost:15678/api/acp/complete"
+    assert request.get_method() == "POST"
+    payload = json.loads(request.data)
+    assert payload["action_id"] == "face_light_test" and payload["status"] == "completed"
+    assert payload["tool"] == "face_light" and payload["result"] == {"hardware_verified": False}
+    assert urlopen.call_args.kwargs["timeout"] == 3
+    response.__exit__.assert_called_once()
+
+
+def test_acp_failure_is_bounded_and_visible(monkeypatch, capsys):
+    urlopen = Mock(side_effect=TimeoutError("offline callback timeout"))
+    monkeypatch.setattr(ext.urllib.request, "urlopen", urlopen)
+    _REAL_ACP_NOTIFY("face_light_failed", "error", {})
+    assert urlopen.call_args.kwargs["timeout"] == 3
+    output = capsys.readouterr().out
+    assert "face_light_failed" in output and "offline callback timeout" in output
 
 
 def test_legacy_static_and_info(light):

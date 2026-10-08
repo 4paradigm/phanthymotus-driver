@@ -17,12 +17,14 @@ import json
 import math
 import os
 import signal
+import ssl
 import socket
 import struct
 import subprocess
 import threading
 import time
 import urllib.request
+from uuid import uuid4
 
 try:
     import paho.mqtt.client as mqtt
@@ -709,6 +711,25 @@ def _face_backend(config):
     return _FaceMqttBackend(config["mqtt_host"], config["mqtt_port"])
 
 
+def _face_acp_notify(action_id, status, result):
+    """Report software completion; socket delivery is not hardware feedback."""
+    url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+    payload = json.dumps({"action_id": action_id, "status": status, "result": result,
+                          "tool": CARD_FACE_LIGHT, "ts": time.time()}).encode("utf-8")
+    request = urllib.request.Request(url + "/api/acp/complete", data=payload,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    context = ssl.create_default_context()
+    if url.startswith(("https://localhost:", "https://127.0.0.1:")):
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(request, timeout=3, context=context):
+            pass
+    except Exception as exc:
+        # Bounded callback failure must not prevent preemption or shutdown.
+        print(f"[face_light] ACP callback failed for {action_id}: {exc}", flush=True)
+
+
 class FaceLightPlugin:
     def __init__(self, plugin_config, namespace, executor, client):
         c = plugin_config or {}
@@ -780,23 +801,33 @@ class FaceLightPlugin:
                     return _env_face("stop", False, state="idle", code="NOT_AVAILABLE", message=error)
                 return _env_face("stop", True, state="idle")
 
-    def _run_effect(self, cancel, effect, rgb, target, period, duration, started):
+    def _run_effect(self, cancel, effect, rgb, target, period, duration, started, action_id):
         # First frame was sent by dispatch. Absolute elapsed time avoids timing drift.
-        while not cancel.wait(min(0.05, period / 24, max(0.001, duration - (time.monotonic() - started)))):
-            with self._lock:
-                if cancel.is_set() or not self._active:
-                    return
-                elapsed = time.monotonic() - started
-                try:
+        status = "cancelled"
+        result = _env_face(effect, False, code="CANCELLED", message="Effect interrupted")
+        try:
+            while not cancel.wait(min(0.05, period / 24, max(0.001, duration - (time.monotonic() - started)))):
+                with self._lock:
+                    if cancel.is_set() or not self._active:
+                        return
+                    elapsed = time.monotonic() - started
                     if elapsed >= duration:
                         self._write(_FACE_BLACK)
                         self._mode = "off"
+                        status = "completed"
+                        result = _env_face(effect, True, mode="off", end_behavior="off",
+                                           simulated=self._backend.name == "simulated")
                         return
                     self._write(_face_effect_frame(effect, rgb, target, period, elapsed))
-                except Exception as exc:
-                    self._last_error = str(exc)
-                    self._mode = "error"
-                    return
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+                self._mode = "error"
+            status = "error"
+            result = _env_face(effect, False, code="NOT_AVAILABLE", message=str(exc))
+        finally:
+            # Exactly one terminal notification per accepted effect, outside state lock.
+            _face_acp_notify(action_id, status, result)
 
     def _configure(self, args):
         # Agent Core sends action=config before start and before ordinary calls.
@@ -858,6 +889,7 @@ class FaceLightPlugin:
         return {"name": CARD_FACE_LIGHT, "type": "actuator", "multiInstance": False,
                 "description": "Go1 face_light: persistent RGB, 12 LED control and internal timed effects. Check info for backend support; simulation is not hardware evidence.",
                 "inputSchema": {"type": "object", "required": ["action"],
+                                "x-completion": {"actions": list(_FACE_EFFECTS), "timeout": 3610},
                                 "properties": {"action": {"type": "string", "enum": list(actions)},
                                                **{k: dict(rgb_channel) for k in ("r", "g", "b", "to_r", "to_g", "to_b")},
                                                "name": {"type": "string", "enum": list(_PRESETS), "default": "off"},
@@ -938,9 +970,10 @@ class FaceLightPlugin:
                     self._write(frame)
                     self._mode = action if action in _FACE_EFFECTS else ("off" if frame == _FACE_BLACK else "static")
                     if action in _FACE_EFFECTS:
+                        action_id = f"face_light_{action}_{uuid4().hex}"
                         self._cancel = threading.Event()
                         self._thread = threading.Thread(target=self._run_effect, name="go1-face-light",
-                                                        args=(self._cancel, action, rgb, target, period, duration, time.monotonic()),
+                                                        args=(self._cancel, action, rgb, target, period, duration, time.monotonic(), action_id),
                                                         daemon=True)
                         self._thread.start()
                 except Exception as exc:
@@ -957,6 +990,7 @@ class FaceLightPlugin:
                 if action in _FACE_EFFECTS:
                     applied.update(period_s=period, duration_s=duration, end_behavior="off")
                 return _env_face(action, True, applied=applied, simulated=self._backend.name == "simulated",
+                                 **({"action_id": action_id} if action in _FACE_EFFECTS else {}),
                                  delivery="simulated" if self._backend.name == "simulated" else "sdk_udp_socket_sent" if self._backend.name == "sdk" else "mqtt_socket_sent")
 
 
