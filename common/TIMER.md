@@ -72,9 +72,13 @@ Canvas 将 `replace` 和 `auto_remove` 显示为 `false`/`true` 下拉选项，�
 
 `emit_interval_sec` 默认为 `0`，此时只发送报警和完成事件。设置为正数后会输出
 `timer_tick`。进程发生延迟时，过期的 tick 会合并为一条，避免一次向 Agent Core 补发
-大量陈旧事件。
+大量陈旧事件。计时到期的同一次检查只发送应触发的报警和完成事件，不再发送刷新 tick。
+完成事件的 `drift_ms` 表示调度线程检查到期时，比计划截止时间晚了多少毫秒；
+不包含 Agent Core 处理事件或机器人执行动作的时间。
 
 `start` 和 `stop` 只管理卡片生命周期；创建具体计时器必须使用 `create`。
+卡片停止时，`create`、`resume` 和 `reset` 返回 `timer_not_started`；可以通过
+不带 `timer_id` 的 `info` 查看卡片是否正在运行。
 
 每次 `create` 或 `reset` 都会生成新的 `run_id`。业务流程应同时核对 `timer_id` 和
 `run_id`，忽略已被替换的旧运行事件。

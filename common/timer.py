@@ -309,7 +309,8 @@ class TimerEngine:
 
     def _event(self, timer: dict, event_type: str, now: float, wall: float,
                *, event: str, alarm: dict | None = None,
-               scheduled_elapsed: float | None = None) -> dict:
+               scheduled_elapsed: float | None = None,
+               actual_elapsed: float | None = None) -> dict:
         timer["event_seq"] += 1
         elapsed = self._elapsed(timer, now)
         remaining = self._remaining(timer, elapsed)
@@ -332,7 +333,8 @@ class TimerEngine:
         }
         if scheduled_elapsed is not None:
             result["scheduled_elapsed_sec"] = _round_seconds(scheduled_elapsed)
-            result["drift_ms"] = round(max(0.0, elapsed - scheduled_elapsed) * 1000, 3)
+            measured = elapsed if actual_elapsed is None else actual_elapsed
+            result["drift_ms"] = round(max(0.0, measured - scheduled_elapsed) * 1000, 3)
         if alarm is not None:
             result.update({
                 "alarm_id": alarm["alarm_id"],
@@ -361,9 +363,11 @@ class TimerEngine:
 
             interval = timer["emit_interval_sec"]
             due_tick = timer["next_tick_elapsed"]
-            if interval and due_tick is not None and effective >= due_tick:
+            if (interval and due_tick is not None and effective >= due_tick and
+                    (duration is None or elapsed < duration)):
                 # Coalesce missed ticks.  A delayed process must not flood the
-                # Agent with one stale event for every missed interval.
+                # Agent with one stale event for every missed interval.  Once
+                # due, completion supersedes a refresh tick for this timer.
                 scheduled = due_tick
                 timer["next_tick_elapsed"] = (math.floor(effective / interval) + 1) * interval
                 events.append(self._event(timer, "timer_tick", now, wall,
@@ -375,7 +379,8 @@ class TimerEngine:
                 timer["status"] = "completed"
                 events.append(self._event(timer, "timer_completed", now, wall,
                                           event="timer-completed",
-                                          scheduled_elapsed=duration))
+                                          scheduled_elapsed=duration,
+                                          actual_elapsed=elapsed))
                 if timer["auto_remove"]:
                     remove.append(timer_id)
         for timer_id in remove:
@@ -595,6 +600,8 @@ class TimerPlugin:
 
         with self._condition:
             now, wall = self._monotonic(), self._wall_clock()
+            if action in ("create", "resume", "reset") and self._shutdown:
+                raise ValueError("timer_not_started")
             if action == "create":
                 result = self._engine.start(clean, now, wall)
             elif action == "pause":

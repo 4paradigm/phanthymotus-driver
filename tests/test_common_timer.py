@@ -92,6 +92,53 @@ def test_tick_coalesces_missed_intervals_instead_of_flooding():
         "timer_tick"]
 
 
+@pytest.mark.parametrize("mode", ["countdown", "countup"])
+@pytest.mark.parametrize("poll_delay", [0, 2])
+def test_due_timer_emits_alarm_and_completion_without_refresh_tick(mode, poll_delay):
+    clock, engine = Clock(), TimerEngine()
+    engine.start({
+        "timer_id": "phase",
+        "mode": mode,
+        "duration_sec": 3,
+        "emit_interval_sec": 1,
+        "alarms": [{"alarm_id": "done", "trigger_type": "elapsed",
+                    "trigger_sec": 3, "event": "phase-done"}],
+    }, clock.monotonic, clock.wall)
+
+    clock.advance(2)
+    assert [event["type"] for event in engine.poll(clock.monotonic, clock.wall)] == [
+        "timer_tick"]
+    clock.advance(1 + poll_delay)
+    assert [event["type"] for event in engine.poll(clock.monotonic, clock.wall)] == [
+        "timer_alarm", "timer_completed"]
+    assert engine.poll(clock.monotonic, clock.wall) == []
+
+
+@pytest.mark.parametrize("mode", ["countdown", "countup"])
+def test_completion_drift_uses_actual_elapsed_time(mode):
+    clock, engine = Clock(), TimerEngine()
+    engine.start({"timer_id": "delayed", "mode": mode, "duration_sec": 3},
+                 clock.monotonic, clock.wall)
+    clock.advance(8)
+    completed, = engine.poll(clock.monotonic, clock.wall)
+    assert completed["elapsed_sec"] == 3
+    assert completed["scheduled_elapsed_sec"] == 3
+    assert completed["drift_ms"] == 5000
+
+
+def test_completion_drift_excludes_paused_time():
+    clock, engine = Clock(), TimerEngine()
+    engine.start({"timer_id": "paused", "mode": "countdown", "duration_sec": 3},
+                 clock.monotonic, clock.wall)
+    clock.advance(1)
+    engine.pause("paused", clock.monotonic)
+    clock.advance(10)
+    engine.resume("paused", clock.monotonic)
+    clock.advance(4)
+    completed, = engine.poll(clock.monotonic, clock.wall)
+    assert completed["drift_ms"] == 2000
+
+
 @pytest.mark.parametrize("terminal_status", ["completed", "cancelled"])
 @pytest.mark.parametrize("restart", ["start", "reset"])
 def test_terminal_timer_does_not_bypass_active_timer_limit(terminal_status, restart):
@@ -193,6 +240,7 @@ def test_plugin_dispatched_lifecycle_is_idempotent_and_reports_state():
 
 def test_plugin_accepts_dashboard_serialized_create_fields():
     plugin = TimerPlugin({}, "test", None)
+    plugin.start()
     schema = plugin.get_tool()["inputSchema"]["properties"]
     assert schema["alarms"]["type"] == "array"
     assert schema["payload"]["type"] == "object"
@@ -226,10 +274,12 @@ def test_plugin_accepts_dashboard_serialized_create_fields():
     assert replacement["run_id"] != first["run_id"]
     assert replacement["next_alarm"] is None
     assert replacement["payload"] == {}
+    plugin.stop()
 
 
 def test_plugin_ignores_agent_dispatch_metadata_but_rejects_unknown_timer_fields():
     plugin = TimerPlugin({}, "test", None)
+    plugin.start()
     created = plugin.dispatch("create", {
         "timer_id": "agent-test", "mode": "countdown", "duration_sec": 5,
         "_tool_name": "timer", "concurrent": False,
@@ -240,6 +290,7 @@ def test_plugin_ignores_agent_dispatch_metadata_but_rejects_unknown_timer_fields
             "timer_id": "another-test", "mode": "countdown", "duration_sec": 5,
             "surprise": True,
         })
+    plugin.stop()
 
 
 @pytest.mark.parametrize("field,value,error", [
@@ -252,6 +303,7 @@ def test_plugin_ignores_agent_dispatch_metadata_but_rejects_unknown_timer_fields
 ])
 def test_plugin_rejects_invalid_dashboard_serialized_fields(field, value, error):
     plugin = TimerPlugin({}, "test", None)
+    plugin.start()
     args = {
         "timer_id": "invalid-canvas-input",
         "mode": "countdown",
@@ -260,6 +312,32 @@ def test_plugin_rejects_invalid_dashboard_serialized_fields(field, value, error)
     }
     with pytest.raises(ValueError, match=error):
         plugin.dispatch("create", args)
+    plugin.stop()
+
+
+def test_plugin_rejects_create_resume_and_reset_without_worker():
+    plugin = TimerPlugin({}, "test", None)
+    with pytest.raises(ValueError, match="timer_not_started"):
+        plugin.dispatch("create", {"timer_id": "demo", "mode": "countdown",
+                                   "duration_sec": 30})
+    assert plugin.dispatch("list", {})["timers"] == []
+
+    plugin.start()
+    try:
+        plugin.dispatch("create", {"timer_id": "demo", "mode": "countdown",
+                                   "duration_sec": 30})
+        plugin.dispatch("pause", {"timer_id": "demo"})
+    finally:
+        plugin.stop()
+    for action in ("resume", "reset"):
+        with pytest.raises(ValueError, match="timer_not_started"):
+            plugin.dispatch(action, {"timer_id": "demo"})
+    assert plugin.dispatch("info", {"timer_id": "demo"})["status"] == "paused"
+    plugin.start()
+    try:
+        assert plugin.dispatch("resume", {"timer_id": "demo"})["status"] == "running"
+    finally:
+        plugin.stop()
 
 
 def test_plugin_schema_and_background_delivery():
