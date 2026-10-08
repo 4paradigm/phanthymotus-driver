@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT.parent.parent))  # make `common` importable, as in the image
 
 
 def _load(name, path):
@@ -138,7 +139,7 @@ class TestDriverContracts(unittest.TestCase):
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
         plugin._namespace = "test"
-        for name in ("imu", "joints", "joint_state", "battery", "loco_state"):
+        for name in ("imu", "joints", "joint_state", "battery", "loco_state", "odometry"):
             result = plugin.dispatch(name, {})
             self.assertEqual("running", result["state"])
             self.assertTrue(result["topic_out"][0]["topic"].startswith("/test/"))
@@ -185,9 +186,122 @@ class TestDriverContracts(unittest.TestCase):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []
         node.loco = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node._odom_burst = []
+        node._odom_stamp_ms = 0
+        node._odom_stamp_provenance = {}
+        node._last_odom_time = 1e9  # far in the future — throttle out the odom publish
         node._on_sport(types.SimpleNamespace(mode=2, velocity=[1, 2, 3], position=[4, 5, 6], body_height=0.2,
-                                              imu_state=types.SimpleNamespace(rpy=[7, 8, 9])))
+                                              imu_state=types.SimpleNamespace(rpy=[7, 8, 9]),
+                                              stamp=None, yaw_speed=0.1))
         self.assertNotIn("imu_rpy_0", __import__("json").loads(published[0]))
+
+    # ── motus.odom/1 contract for the odometry card ─────────────────────────
+
+    @staticmethod
+    def _odom_node(published):
+        """A _StateNode shell whose odom publisher captures JSON payloads."""
+        node = TestDriverContracts.device._StateNode.__new__(
+            TestDriverContracts.device._StateNode)
+        node.odom = types.SimpleNamespace(
+            publish=lambda message: published.append(__import__("json").loads(message.data)))
+        node.loco = types.SimpleNamespace(publish=lambda message: None)
+        node._odom_burst = []
+        node._odom_burst_size = 0
+        node._odom_stamp_ms = 0
+        node._odom_stamp_provenance = {}
+        node._last_odom_time = 0.0
+        return node
+
+    @staticmethod
+    def _sport(**overrides):
+        msg = types.SimpleNamespace(mode=2, gait_type=1, body_height=0.2,
+                                    velocity=[0.3, -0.1, 0.0], yaw_speed=0.05,
+                                    position=[0.0, 0.0, 0.0], stamp=None)
+        for key, value in overrides.items():
+            setattr(msg, key, value)
+        return msg
+
+    def test_odom_sample_follows_motus_odom_1(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport())
+        self.assertEqual(1, len(published))
+        sample = published[0]
+        self.assertEqual("motus.odom/1", sample["schema"])
+        self.assertEqual("body", sample["frame"])
+        self.assertIsInstance(sample["stamp_ms"], int)
+        self.assertEqual("m/s", sample["units"]["linear"])
+        self.assertEqual("rad/s", sample["units"]["angular"])
+        self.assertEqual(6, len(sample["twist"]))
+
+    def test_odom_unmeasured_axes_are_null_not_zero(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport())
+        vx, vy, vz, wx, wy, wz = published[0]["twist"]
+        self.assertAlmostEqual(0.3, vx)
+        self.assertAlmostEqual(-0.1, vy)
+        self.assertAlmostEqual(0.05, wz)
+        # vz, roll rate, pitch rate are not in SportModeState_ — null, not 0.0.
+        self.assertIsNone(vz)
+        self.assertIsNone(wx)
+        self.assertIsNone(wy)
+
+    def test_odom_averages_the_burst_window(self):
+        published = []
+        node = self._odom_node(published)
+        # 20 Hz feed; only the first call publishes (10 Hz throttle) after the
+        # initial one, so accumulate three readings then force a publish.
+        node._accumulate_odom(self._sport(velocity=[0.3, 0.0, 0.0], yaw_speed=0.1))
+        node._accumulate_odom(self._sport(velocity=[0.5, 0.2, 0.0], yaw_speed=0.3))
+        node._accumulate_odom(self._sport(velocity=[0.4, 0.1, 0.0], yaw_speed=0.2))
+        node._publish_odom(self._sport())
+        vx, vy, _, _, _, wz = published[0]["twist"]
+        self.assertAlmostEqual(0.4, vx)
+        self.assertAlmostEqual(0.1, vy)
+        self.assertAlmostEqual(0.2, wz)
+        self.assertEqual(3, published[0]["vendor"]["samples"])
+
+    def test_odom_vendor_block_carries_stamp_provenance(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport())
+        vendor = published[0]["vendor"]
+        self.assertIn("stamp_source", vendor)
+        self.assertIn("mode", vendor)
+        self.assertIn("body_height", vendor)
+
+    def test_odom_empty_burst_publishes_all_null_twist(self):
+        published = []
+        node = self._odom_node(published)
+        node._publish_odom(self._sport())
+        self.assertEqual([None] * 6, published[0]["twist"])
+
+    def test_odom_timespec_ms_reads_vendor_stamp(self):
+        stamp = types.SimpleNamespace(sec=1_700_000_000, nanosec=250_000_000)
+        self.assertEqual(1_700_000_000_250, self.device._timespec_ms(stamp))
+        self.assertIsNone(self.device._timespec_ms(None))
+        self.assertIsNone(self.device._timespec_ms(types.SimpleNamespace(sec=0, nanosec=0)))
+
+    def test_odometry_card_declares_odom_interface(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        result = plugin.dispatch("odometry", {})
+        self.assertEqual("state/odom", result["topic_out"][0]["format"])
+        self.assertEqual("/test/state/odom", result["topic_out"][0]["topic"])
+        interface = result["odom_interface"]
+        self.assertEqual("motus.odom/1", interface["schema"])
+        self.assertEqual("body", interface["frame"])
+        self.assertEqual(["vx", "vy", "wz"], interface["provides"])
+        self.assertEqual("none", interface["pose_drift"])
+        self.assertEqual(10.0, interface["rate_hz"])
+
+    def test_odometry_info_also_returns_odom_interface(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        result = plugin.dispatch("info", {"_tool_name": "odometry"})
+        self.assertEqual("state/odom", result["topic_out"][0]["format"])
+        self.assertEqual("motus.odom/1", result["odom_interface"]["schema"])
 
     def test_loco_uses_presets_and_acp_completion(self):
         plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
