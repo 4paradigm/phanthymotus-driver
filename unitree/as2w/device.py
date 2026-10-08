@@ -25,6 +25,23 @@ def _values(value):
         return [value]
 
 
+def _timespec_ms(stamp):
+    """`unitree_go.msg.dds_.TimeSpec_` as epoch milliseconds, or None.
+
+    Returns None rather than 0 for anything unreadable, so that
+    `common.odom.resolve_stamp_ms` sees "no stamp" instead of "1970" — the two
+    produce the same fallback but only one of them says why in the sample.
+    """
+    try:
+        sec = int(stamp.sec)
+        nanosec = int(stamp.nanosec)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if sec <= 0 and nanosec <= 0:
+        return None
+    return sec * 1000 + nanosec // 1_000_000
+
+
 def _acp_notify(action_id, status, result):
     import os, ssl, urllib.request
     payload = json.dumps({"action_id": action_id, "status": status,
@@ -38,6 +55,8 @@ def _acp_notify(action_id, status, result):
 
 
 class _StateNode:
+    _ODOM_INTERVAL = 0.1  # 10 Hz throttle for the published motus.odom/1 sample
+
     def __init__(self, namespace, executor):
         from rclpy.node import Node
         self.node = Node("as2w_state")
@@ -46,6 +65,15 @@ class _StateNode:
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", 10)
         self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", 10)
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", 10)
+        # Standardized motus.odom/1 stream, published *alongside* the legacy
+        # loco/state vendor stream rather than replacing it — the vendor stream
+        # has consumers not visible from inside this bundle.
+        self.odom = self.node.create_publisher(String, f"/{namespace}/state/odom", 10)
+        self._odom_burst = []
+        self._odom_burst_size = 0
+        self._odom_stamp_ms = 0
+        self._odom_stamp_provenance = {}
+        self._last_odom_time = 0.0
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
         # AS2/As2W's official sport-state example uses the lf namespace.
@@ -112,11 +140,96 @@ class _StateNode:
         self._publish(self.battery, battery)
 
     def _on_sport(self, msg):
+        # Every reading is measured; one in N is published. The cheap part (six
+        # scalars and a timestamp) accumulates on every 20 Hz reading; the
+        # expensive part (the dict, the JSON, the publish) still runs at 10 Hz.
+        # See `common.odom.mean_twist` for why decimating without averaging is
+        # not a neutral choice for a stuck-detector.
+        self._accumulate_odom(msg)
+
         loco = {"mode": int(getattr(msg, "mode", 0)),
                 "body_height": _number(getattr(msg, "body_height", 0))}
         loco.update(self._flat("velocity", getattr(msg, "velocity", [])))
         loco.update(self._flat("position", getattr(msg, "position", [])))
         self._publish(self.loco, loco)
+
+        now = time.monotonic()
+        if now - self._last_odom_time < self._ODOM_INTERVAL:
+            return
+        self._last_odom_time = now
+        self._publish_odom(msg)
+
+    def _accumulate_odom(self, msg):
+        """Read one vendor sport message into the averaging window, ~20 Hz.
+
+        Only the six twist axes and the timestamp are taken. As2W's
+        `SportModeState_` measures `velocity[0]`/`velocity[1]` and `yaw_speed`;
+        `velocity[2]`, roll rate and pitch rate stay `None`, not zero — this
+        message carries no vertical velocity or roll/pitch rate, and reporting
+        zero would claim the robot measured no such motion, which is what makes
+        a stuck-detector fire on a robot that simply cannot answer.
+        """
+        try:
+            from common.odom import resolve_stamp_ms
+
+            velocity = getattr(msg, "velocity", [])
+            velocity = list(velocity)
+            row = [
+                velocity[0] if len(velocity) > 0 else None,
+                velocity[1] if len(velocity) > 1 else None,
+                None, None, None,  # vz, roll rate, pitch rate are not measured
+                _number(getattr(msg, "yaw_speed", 0)),
+            ]
+            stamp_ms, provenance = resolve_stamp_ms(
+                vendor_ms=_timespec_ms(getattr(msg, "stamp", None)),
+                received_ms=int(time.time() * 1000),
+            )
+        except Exception:
+            # A message shape we cannot read is not an averaging window of zeros.
+            # Dropping it leaves the window holding only what was understood.
+            return
+        self._odom_burst.append(row)
+        self._odom_stamp_ms = stamp_ms
+        self._odom_stamp_provenance = provenance
+
+    def _publish_odom(self, msg):
+        """The averaged window as one motus.odom/1 sample.
+
+        The vendor block (`mode`, `body_height`) is read from the message that
+        happens to be current, because averaging a mode enum is meaningless; the
+        numbers a consumer acts on come from the window. The two describe
+        slightly different instants — the twist is the last 100 ms, the mode is
+        right now — which is correct for what each is.
+        """
+        try:
+            from common.odom import build_sample, mean_twist
+
+            burst, self._odom_burst = self._odom_burst, []
+            self._odom_burst_size = len(burst)
+            if burst:
+                stamp_ms = self._odom_stamp_ms
+                provenance = self._odom_stamp_provenance
+            else:
+                # Nothing readable arrived in the window — publishing the
+                # previous stamp would call an empty sample fresh. Fall back
+                # to the publish time with no provenance so is_fresh judges
+                # this honestly.
+                stamp_ms = int(time.time() * 1000)
+                provenance = {"stamp_source": "published",
+                              "stamp_reason": "no readable vendor reading in window"}
+            sample = build_sample(
+                stamp_ms=stamp_ms,
+                twist=mean_twist(burst),
+                vendor={"mode": int(getattr(msg, "mode", 0)),
+                        "body_height": _number(getattr(msg, "body_height", 0)),
+                        # How many raw readings this average came from. Zero
+                        # means the window was empty and every axis is `null`.
+                        "samples": self._odom_burst_size,
+                        **provenance},
+            )
+        except Exception:
+            return
+        self._publish(self.odom, sample)
 
 
 class StatePlugin:
@@ -130,11 +243,23 @@ class StatePlugin:
                  ("joints", "state/joints", "sensor/skeleton", "As2W 16-joint skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "As2W raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "As2W BMS state; current_ma is mA"),
-                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"))
+                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"),
+                 ("odometry", "state/odom", "state/odom",
+                  "As2W odometry as motus.odom/1 — six-axis twist (vx, vy, wz measured; "
+                  "vz, roll, pitch null), averaged to 10Hz from the 20Hz sport feed"))
         return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
                  "inputSchema": {"type": "object", "properties": {}},
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
                 for name, path, fmt, desc in specs]
+    @staticmethod
+    def _odom_interface():
+        from common.odom import build_interface
+
+        # As2W's sport feed reports body-frame forward/lateral velocity and yaw
+        # rate, and no pose. Legged dead reckoning drifts unbounded, but with no
+        # pose published there is nothing to accumulate, so drift is "none".
+        return build_interface(provides=["vx", "vy", "wz"], rate_hz=10,
+                               pose_drift="none")
     def start(self):
         # Sensor cards share one LowState subscription.  Recreate it when a
         # dashboard stopped the card instead of claiming a dead stream is live.
@@ -158,15 +283,23 @@ class StatePlugin:
                      "joints": ("state/joints", "sensor/skeleton"),
                      "joint_state": ("state/joint_state", "data/json"),
                      "battery": ("state/battery", "data/json"),
-                     "loco_state": ("loco/state", "data/json")}
+                     "loco_state": ("loco/state", "data/json"),
+                     "odometry": ("state/odom", "state/odom")}
             if name in paths:
                 path, fmt = paths[name]
-                return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+                result = {"state": "running",
+                          "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+                if name == "odometry":
+                    result["odom_interface"] = self._odom_interface()
+                return result
             return {"state": "running"}
-        if action in ("imu", "joints", "joint_state", "battery", "loco_state"):
-            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
-            fmt = "sensor/skeleton" if action == "joints" else "data/json"
-            return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+        if action in ("imu", "joints", "joint_state", "battery", "loco_state", "odometry"):
+            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state", "odometry": "state/odom"}[action]
+            fmt = {"joints": "sensor/skeleton", "odometry": "state/odom"}.get(action, "data/json")
+            result = {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+            if action == "odometry":
+                result["odom_interface"] = self._odom_interface()
+            return result
         return {"state": "running"} if action == "info" else None
 
 

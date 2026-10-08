@@ -138,7 +138,7 @@ class TestDriverContracts(unittest.TestCase):
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
         plugin._namespace = "test"
-        for name in ("imu", "joints", "joint_state", "battery", "loco_state"):
+        for name in ("imu", "joints", "joint_state", "battery", "loco_state", "odometry"):
             result = plugin.dispatch(name, {})
             self.assertEqual("running", result["state"])
             self.assertTrue(result["topic_out"][0]["topic"].startswith("/test/"))
@@ -185,6 +185,11 @@ class TestDriverContracts(unittest.TestCase):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []
         node.loco = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node.odom = types.SimpleNamespace(publish=lambda message: None)
+        node._odom_burst = []
+        node._odom_stamp_ms = 0
+        node._odom_stamp_provenance = {}
+        node._last_odom_time = 0.0
         node._on_sport(types.SimpleNamespace(mode=2, velocity=[1, 2, 3], position=[4, 5, 6], body_height=0.2,
                                               imu_state=types.SimpleNamespace(rpy=[7, 8, 9])))
         self.assertNotIn("imu_rpy_0", __import__("json").loads(published[0]))
