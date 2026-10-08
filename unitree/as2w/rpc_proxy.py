@@ -19,10 +19,21 @@ def _worker(commands, results, interface):
         client = SportClient()
         client.SetTimeout(10.0)
         client.Init()
+        audio = None
+        audio_error = None
+        try:
+            from unitree_sdk2py.a2.audio.audio_client import AudioClient
+            audio = AudioClient()
+            audio.SetTimeout(10.0)
+            audio.Init()
+        except Exception as exc:
+            audio_error = str(exc)
+            print(f"[as2w-rpc] audio client unavailable: {exc}", flush=True)
         results.put({"ready": True})
     except Exception as exc:
         results.put({"startup_error": str(exc)})
         return
+    audio_methods = {"PlayStream", "PlayStop", "LedControl"}
     while True:
         command = commands.get()
         if command is None:
@@ -32,6 +43,11 @@ def _worker(commands, results, interface):
                 state = {}
                 code = client.GetState(state)
                 results.put({"result": (code, state)})
+            elif command[0] in audio_methods:
+                if audio is None:
+                    results.put({"error": audio_error or "audio client unavailable"})
+                else:
+                    results.put({"result": getattr(audio, command[0])(*command[1])})
             else:
                 results.put({"result": getattr(client, command[0])(*command[1])})
         except Exception as exc:

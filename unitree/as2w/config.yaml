@@ -10,3 +10,11 @@ plugins:
     # Override only after checking the driver's 15-second lidar diagnostics.
     # source_topics: ["rt/utlidar/cloud_deskewed"]
   controlled_spatial: {enabled: true}
+  # Body multicast. Confirm on the robot NIC before relying on the defaults.
+  mic: {enabled: true, group: "239.168.123.161", port: 5555}
+  camera_rgb:
+    enabled: true
+    stream_addr: "230.1.1.1"
+    stream_port: 1720
+  speaker: {enabled: true}
+  led: {enabled: true}

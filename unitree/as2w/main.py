@@ -29,6 +29,7 @@ class Bundle:
         from device import StatePlugin, LocoPlugin, SpecialActionPlugin
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
+        from media import CameraRgbPlugin, LedPlugin, MicPlugin, SpeakerPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
@@ -36,6 +37,10 @@ class Bundle:
         if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy))
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
+        if p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
+        if p.get("camera_rgb", {}).get("enabled", True): self.plugins.append(CameraRgbPlugin(p.get("camera_rgb", {}), namespace, interface))
+        if p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, proxy))
+        if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):
