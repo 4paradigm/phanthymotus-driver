@@ -880,9 +880,9 @@ class FaceLightPlugin:
                         "fade": "Fade RGB to target RGB and back", "chase": "One LED traverses 0..11; per-LED backend required",
                         "info": "Software-recorded status and backend capabilities; no hardware feedback"}
         return {"name": CARD_FACE_LIGHT, "type": "actuator", "multiInstance": False,
-                "description": "Go1 面部灯带（face_light）：整条 RGB、12 灯独立控制、闪烁、呼吸、渐变和流水灯。"
-                               "固定官方 SDK；卡片显示不代表可发送，先查看 info.available 与 unavailable_reason。"
-                               "缺少或校验失败的 SDK 不可用；状态是软件记录，无灯光实测反馈。",
+                "description": "Go1 face_light: persistent RGB, 12 LED control and internal timed effects. "
+                               "Official SDK only; check info.available and unavailable_reason before control. "
+                               "SDK readiness is software-recorded, not hardware display feedback.",
                 "inputSchema": {"type": "object", "required": ["action"],
                                 "x-completion": {"actions": list(_FACE_EFFECTS), "timeout": 3610},
                                 "x-resource": "face_light",

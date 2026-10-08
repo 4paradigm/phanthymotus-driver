@@ -444,7 +444,7 @@ def test_default_face_card_stays_discoverable_when_sdk_setup_is_missing(monkeypa
     bundle = main.Go1Bundle({"plugins": {"face_light": config["plugins"]["face_light"]}},
                             "offline", None, None)
     tool = bundle.get_all_tools()[0]
-    assert tool["name"] == "face_light" and "面部灯带" in tool["description"]
+    assert tool["name"] == "face_light"
     assert "backend" not in tool["configSchema"]["properties"]
     plugin = bundle._plugins[0]
     error = "ERROR official faceLight SDK headers are missing; mount the trusted official SDK"

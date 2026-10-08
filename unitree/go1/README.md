@@ -196,7 +196,7 @@ sudo docker run --rm --name go1_bundle \
 画布不再提供后端选择，也不接受 `backend: simulated`。离线测试仅在测试代码中注入记录器，
 不会连接机器人；没有自动回退到模拟成功。真机显示仍需现场验收。
 所有指令共用同一帧写入路径，每个实例只运行一个灯效，实机只创建 SDK 写入器。
-随附配置默认 `enabled: true`，原卡保持可发现，注册名仍为 `face_light`，中文描述为“面部灯带”。
+随附配置默认 `enabled: true`，原卡保持可发现，注册名仍为 `face_light`。
 这是卡片注册开关，不表示 SDK 或硬件已就绪。公共镜像不含官方 SDK；缺失或校验失败时
 启动和控制返回失败，卡片仍可调用 `info` 查看原因，不会自动回退其他后端。
 默认配置为 `backend: sdk` 和 `sdk_exclusive: true`（画布显示 Yes），无需每次设置。
