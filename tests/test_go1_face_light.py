@@ -1,6 +1,8 @@
 """Offline face_light contract, timing, cancellation and transport checks; no robot IO."""
 import sys
 import json
+import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -54,6 +56,7 @@ def test_effect_completion_contract_and_unique_ids(light, acp_notify, action):
         light._thread.join(1)
         assert not light._thread.is_alive()
     assert len(set(ids)) == 2
+    wait_until(lambda: acp_notify.call_count == 2)
     assert acp_notify.call_count == 2
     for call, action_id in zip(acp_notify.call_args_list, ids):
         sent_id, status, result = call.args
@@ -97,6 +100,8 @@ def test_effect_cancelled_completion(light, acp_notify, action, args):
     assert light.dispatch(action, args)["ok"]
     assert not old.is_alive()
     calls = [call for call in acp_notify.call_args_list if call.args[0] == response["action_id"]]
+    wait_until(lambda: any(call.args[0] == response['action_id'] for call in acp_notify.call_args_list))
+    calls = [call for call in acp_notify.call_args_list if call.args[0] == response["action_id"]]
     assert len(calls) == 1 and calls[0].args[1] == "cancelled"
     assert calls[0].args[2]["code"] == "CANCELLED"
 
@@ -112,6 +117,7 @@ def test_effect_error_completion(light, acp_notify, final_frame):
     with light._lock:
         light._backend.write = fail
     light._thread.join(1)
+    wait_until(lambda: acp_notify.call_count == 1)
     acp_notify.assert_called_once()
     action_id, status, result = acp_notify.call_args.args
     assert action_id == response["action_id"] and status == "error"
@@ -153,6 +159,59 @@ def test_acp_failure_is_bounded_and_visible(monkeypatch, capsys):
     assert urlopen.call_args.kwargs["timeout"] == 3
     output = capsys.readouterr().out
     assert "face_light_failed" in output and "offline callback timeout" in output
+
+
+@pytest.mark.parametrize('action,args', [('off', {}), ('set_color', {'g': 70}), ('stop', {})])
+def test_blocked_acp_cannot_delay_replacement_frame(light, monkeypatch, action, args):
+    entered, release = threading.Event(), threading.Event()
+    def blocked(*unused):
+        entered.set()
+        assert release.wait(2)
+    monkeypatch.setattr(ext, '_face_acp_notify', blocked)
+    light.dispatch('blink', {'r': 50, 'duration_s': 2})
+    calls = []
+    command = threading.Thread(target=lambda: calls.append(light.dispatch(action, args)))
+    try:
+        command.start()
+        assert entered.wait(1)  # old effect's callback is stalled
+        expected = ((0, 70, 0),) * 12 if action == 'set_color' else ext._FACE_BLACK
+        wait_until(lambda: light._backend.frames[-1][1] == expected, timeout=0.5)
+        count = len(light._backend.frames)
+        time.sleep(0.06)
+        assert len(light._backend.frames) == count
+        if action != 'stop':
+            command.join(0.5)
+            assert not command.is_alive()  # off/static return despite blocked HTTP
+        else:
+            assert not light._backend.connected  # closed before waiting for reporter cleanup
+    finally:
+        release.set()
+        command.join(1)
+        light.stop()
+    assert calls[0]['ok'] and not light._completion_threads
+
+
+def test_completion_reporters_are_bounded_and_slots_reused(light, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    light._completion_slots = threading.BoundedSemaphore(1)
+    def blocked(*unused):
+        entered.set()
+        assert release.wait(2)
+    monkeypatch.setattr(ext, '_face_acp_notify', blocked)
+    try:
+        first = light.dispatch('blink', {'r': 20, 'duration_s': 0.05})
+        assert first['ok'] and entered.wait(1)
+        count = len(light._backend.frames)
+        result = light.dispatch('chase', {'g': 40})
+        assert result['code'] == 'RESOURCE_BUSY' and 'action_id' not in result
+        assert len(light._backend.frames) == count and len(light._completion_threads) == 1
+        assert light.dispatch('off', {})['ok']
+    finally:
+        release.set()
+        light.stop()
+    assert not light._completion_threads
+    assert light.start()['ok']
+    assert light.dispatch('chase', {'g': 40})['ok']
 
 
 def test_legacy_static_and_info(light):
@@ -337,6 +396,23 @@ def test_single_card_bundle_and_packaging():
         bundle.stop_all()
 
 
+def test_shipped_system_health_is_enabled_assembled_and_listed():
+    import main
+    import yaml
+    config = yaml.safe_load((GO1 / 'config.yaml').read_text())
+    plugins = config['plugins']
+    assert plugins['system_health']['enabled'] is True
+    assert 'system_health' not in plugins['face_light']
+    assert 'mqtt_host' not in plugins['face_light']
+    selected = {name: plugins[name] for name in ('face_light', 'system_health')}
+    client = Mock()
+    bundle = main.Go1Bundle({'plugins': selected}, 'offline', None, client)
+    assert {tool['name'] for tool in bundle.get_all_tools()} == {'face_light', 'system_health'}
+    metadata = yaml.safe_load((GO1 / 'driver.yaml').read_text())
+    assert sum(card['name'] == 'system_health' for card in metadata['cards']) == 1
+    assert not client.mock_calls  # declaration check only; no lifecycle/hardware calls
+
+
 def test_concurrent_start_stop_no_resurrection():
     entered, release = threading.Event(), threading.Event()
 
@@ -428,6 +504,53 @@ def sdk_test_plugin(executable, exclusive=True, sdk_dir=None):
     plugin = ext.FaceLightPlugin({"backend": "sdk", "sdk_exclusive": exclusive}, "", None, None)
     plugin._backend = ext._FaceSdkBackend(str(executable), exclusive, sdk_dir)
     return plugin
+
+
+def test_native_harness_uses_test_only_backend_injection(sdk_helper):
+    import importlib.util
+    path = Path(__file__).parent / 'face_light_native_check.py'
+    spec = importlib.util.spec_from_file_location('native_face_harness', path)
+    native = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(native)  # importing must not compile, send or inspect host networking
+    helper, _ = sdk_helper
+    plugin = native.sdk_test_plugin(helper, '/test-only-sdk')
+    assert plugin._config['sdk_executable'] == ext._FACE_SDK_EXECUTABLE
+    assert plugin._config['sdk_dir'] == ext._FACE_SDK_DIR
+    assert plugin._backend.executable == str(helper)
+    try:
+        assert plugin.start()['ok']
+        assert plugin.dispatch('set_color', {'r': 7})['ok']
+    finally:
+        plugin.stop()
+
+
+def test_sdk_checksum_failure_prevents_compilation(tmp_path):
+    sdk = tmp_path / 'sdk'
+    (sdk / 'include').mkdir(parents=True)
+    (sdk / 'lib').mkdir()
+    for name in ('include/FaceLightClient.h', 'include/LEDPixel.h', 'version.txt',
+                 'lib/libfaceLight_SDK_arm64.so'):
+        (sdk / name).write_text('untrusted vendor input')
+    commands = tmp_path / 'bin'
+    commands.mkdir()
+    (commands / 'uname').write_text('#!/bin/sh\necho aarch64\n')
+    # Portable implementation of the Linux checksum command, using real hashes.
+    (commands / 'sha256sum').write_text(f'''#!{sys.executable}
+import hashlib, pathlib, sys
+valid = True
+for line in sys.stdin:
+    expected, name = line.strip().split(maxsplit=1)
+    valid = valid and hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() == expected
+sys.exit(0 if valid else 1)
+''')
+    (commands / 'cmake').write_text('#!/bin/sh\necho MUST_NOT_COMPILE\nexit 99\n')
+    for command in commands.iterdir():
+        command.chmod(0o755)
+    env = dict(os.environ, FACE_LIGHT_SDK_DIR=str(sdk), PATH=str(commands) + os.pathsep + os.environ['PATH'])
+    result = subprocess.run(['sh', str(GO1 / 'deploy/face_light/run_sdk.sh')],
+                            env=env, capture_output=True, text=True, timeout=2)
+    assert result.returncode == 1 and 'checksum verification failed' in result.stdout
+    assert 'MUST_NOT_COMPILE' not in result.stdout + result.stderr
 
 
 def test_sdk_backend_complete_card_path(sdk_helper):

@@ -700,6 +700,28 @@ class FaceLightPlugin:
         self._colors = _FACE_BLACK
         self._last_sent = None
         self._last_error = None
+        self._completion_slots = threading.BoundedSemaphore(8)
+        self._completion_threads = set()
+
+    def _report_completion(self, action_id, status, result):
+        def notify():
+            try:
+                _face_acp_notify(action_id, status, result)
+            finally:
+                with self._lock:
+                    self._completion_threads.discard(threading.current_thread())
+                self._completion_slots.release()
+
+        reporter = threading.Thread(target=notify, name="go1-face-light-acp", daemon=True)
+        with self._lock:
+            self._completion_threads.add(reporter)
+        try:
+            reporter.start()
+        except Exception as exc:
+            with self._lock:
+                self._completion_threads.discard(reporter)
+            self._completion_slots.release()
+            print(f"[face_light] ACP reporter failed for {action_id}: {exc}", flush=True)
 
     def _cancel_effect(self):
         # Called under _ops. No joins while holding worker's lock.
@@ -753,8 +775,15 @@ class FaceLightPlugin:
                         error = error or str(exc)
                     self._last_error = error
                 if error:
-                    return _env_face("stop", False, state="idle", code="NOT_AVAILABLE", message=error)
-                return _env_face("stop", True, state="idle")
+                    result = _env_face("stop", False, state="idle", code="NOT_AVAILABLE", message=error)
+                else:
+                    result = _env_face("stop", True, state="idle")
+                reporters = list(self._completion_threads)
+            # Lights are already off and the backend is closed before HTTP cleanup.
+            # Reporters never write LEDs or take _ops; joining cannot delay the black frame.
+            for reporter in reporters:
+                reporter.join()
+            return result
 
     def _run_effect(self, cancel, effect, rgb, target, period, duration, started, action_id):
         # First frame was sent by dispatch. Absolute elapsed time avoids timing drift.
@@ -781,8 +810,9 @@ class FaceLightPlugin:
             status = "error"
             result = _env_face(effect, False, code="NOT_AVAILABLE", message=str(exc))
         finally:
-            # Exactly one terminal notification per accepted effect, outside state lock.
-            _face_acp_notify(action_id, status, result)
+            # Transport POST runs separately from the worker joined by preemption.
+            result["timestamp_ms"] = _now_ms()
+            self._report_completion(action_id, status, result)
 
     def _configure(self, args):
         # Agent Core sends action=config before start and before ordinary calls.
@@ -903,9 +933,17 @@ class FaceLightPlugin:
         except ValueError as exc:
             return _env_face(action, False, code="INVALID_ARGUMENT", message=str(exc))
         with self._ops:
+            reserved = False
+            if action in _FACE_EFFECTS:
+                reserved = self._completion_slots.acquire(blocking=False)
+                if not reserved:
+                    return _env_face(action, False, code="RESOURCE_BUSY",
+                                     message="Completion callbacks are still pending; retry later")
             self._cancel_effect()
             with self._lock:
                 if not self._active:
+                    if reserved:
+                        self._completion_slots.release()
                     return _env_face(action, False, code="NOT_AVAILABLE", message="face_light is stopped; start it first")
                 if action == "set_led":
                     changed = list(self._colors)
@@ -925,6 +963,9 @@ class FaceLightPlugin:
                                                         daemon=True)
                         self._thread.start()
                 except Exception as exc:
+                    if reserved:
+                        self._completion_slots.release()
+                        self._thread = self._cancel = None
                     self._mode = "error"
                     self._last_error = str(exc)
                     return _env_face(action, False, code="NOT_AVAILABLE", message=str(exc))
