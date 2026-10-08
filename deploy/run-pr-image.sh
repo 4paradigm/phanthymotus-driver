@@ -63,7 +63,14 @@ load_state() {
     [ -f "$COMPOSE_FILE" ] || die "Compose file missing: $COMPOSE_FILE"
 }
 
-compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
+compose() {
+    # PR compose 位于 /tmp；读取机器人现有 .env 才能解析驱动的 ACCESS_TOKEN 引用。
+    if [ -z "${COMPOSE_ENV_FILES:-}" ] && [ -f /opt/phanthy-motus/.env ]; then
+        COMPOSE_ENV_FILES=/opt/phanthy-motus/.env docker compose -f "$COMPOSE_FILE" "$@"
+    else
+        docker compose -f "$COMPOSE_FILE" "$@"
+    fi
+}
 
 # ── Extract the service fragment out of the image ─────────────────────────────
 #
