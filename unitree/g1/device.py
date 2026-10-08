@@ -4071,6 +4071,8 @@ class RealSensePlugin:
         self._dist_topic  = f"/{namespace}/camera/distance"
         self._executor = executor
         self._proc = None
+        self._settings_conn = None
+        self._settings_lock = threading.Lock()
         self._frame_node = None
         self._ensure_frame_node()
 
@@ -4123,11 +4125,16 @@ class RealSensePlugin:
         if self._proc is not None and self._proc.is_alive():
             return
         ctx = mp.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe()
+        self._settings_conn = parent_conn
         self._proc = ctx.Process(
-            target=run_realsense_process, args=(self._namespace,),
+            target=run_realsense_process, args=(self._namespace, child_conn),
             name="realsense", daemon=True,
         )
-        self._proc.start()
+        try:
+            self._proc.start()
+        finally:
+            child_conn.close()
         print(f"[bundle] RealSense capture forked → pid={self._proc.pid}")
 
     def stop(self) -> None:
@@ -4138,6 +4145,9 @@ class RealSensePlugin:
                 self._proc.kill()
                 self._proc.join(timeout=2.0)
         self._proc = None
+        if getattr(self, "_settings_conn", None) is not None:
+            self._settings_conn.close()
+            self._settings_conn = None
         node = self._frame_node
         self._frame_node = None
         if node is not None:
@@ -4162,6 +4172,25 @@ class RealSensePlugin:
             return None, 0
         return node.wait_for_frame(after_sequence, timeout_s)
 
+    def request_settings(self, action, values=None):
+        with self._settings_lock:
+            conn = self._settings_conn
+            if not self.is_running() or conn is None:
+                return {"success": False, "error": "RealSense capture process is not running"}
+            try:
+                request_id = str(uuid4())
+                conn.send((request_id, action, values or {}))
+                deadline = time.monotonic() + 3.0
+                while conn.poll(max(0.0, deadline - time.monotonic())):
+                    response_id, result = conn.recv()
+                    if response_id == request_id:
+                        return result
+                    if time.monotonic() >= deadline:
+                        break
+                return {"success": False, "error": "RealSense settings request timed out"}
+            except (EOFError, OSError) as exc:
+                return {"success": False, "error": f"RealSense settings channel failed: {exc}"}
+
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
             return {"state": "running"}
@@ -4177,7 +4206,7 @@ class RealSensePlugin:
         return None
 
 
-def run_realsense_process(namespace: str) -> None:
+def run_realsense_process(namespace: str, settings_conn=None) -> None:
     """RealSense subprocess entry — independent GIL for full 1080p@15fps throughput.
 
     All heavy imports (cv2, numpy, pyrealsense2, sensor_msgs) happen here
@@ -4215,6 +4244,7 @@ def run_realsense_process(namespace: str) -> None:
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
 
             self._pipeline = None
+            self._settings_ops = None
             self._last_ts        = 0.0
             self._last_dist_time = 0.0
 
@@ -4254,6 +4284,12 @@ def run_realsense_process(namespace: str) -> None:
 
             pipeline.start(config, self._on_frame)
             self._pipeline = pipeline
+            try:
+                from camera_settings import RealSenseSettingsOps
+                self._settings_ops = RealSenseSettingsOps(
+                    pipeline.get_active_profile().get_device().first_color_sensor(), rs)
+            except Exception as exc:
+                self.get_logger().warn(f"RealSense settings unavailable: {exc}")
             self.get_logger().info(f"RealSense capture started — device {serial}")
 
         def stop_capture(self):
@@ -4264,6 +4300,7 @@ def run_realsense_process(namespace: str) -> None:
                     pass
                 self._pipeline = None
             self._worker_stop.set()
+            self._settings_ops = None
             if self._depth_worker is not None:
                 self._depth_worker.join(timeout=2.0)
                 self._depth_worker = None
@@ -4271,6 +4308,32 @@ def run_realsense_process(namespace: str) -> None:
                 self._color_worker.join(timeout=2.0)
                 self._color_worker = None
             self.get_logger().info("RealSense capture stopped")
+
+        def service_settings(self):
+            if settings_conn is None or not settings_conn.poll():
+                return
+            request_id = None
+            try:
+                request_id, action, values = settings_conn.recv()
+                if self._settings_ops is None:
+                    raise RuntimeError("RealSense color sensor settings unavailable")
+                if action == "get":
+                    result = {"success": True, "action": "get",
+                              "actual": self._settings_ops.read(),
+                              "initial": self._settings_ops.initial}
+                elif action == "set":
+                    result = self._settings_ops.set(values)
+                elif action == "reset":
+                    result = self._settings_ops.reset()
+                else:
+                    raise ValueError(f"Unknown settings action: {action}")
+            except Exception as exc:
+                result = {"success": False, "error": str(exc)}
+            if request_id is not None:
+                try:
+                    settings_conn.send((request_id, result))
+                except (EOFError, OSError):
+                    pass
 
         def _depth_loop(self):
             while not self._worker_stop.is_set():
@@ -4360,6 +4423,7 @@ def run_realsense_process(namespace: str) -> None:
     rclpy.init()
     node = _RealSenseNode(color_topic, depth_topic, dist_topic)
     node.start_capture()
+    node.create_timer(0.05, node.service_settings)
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     print(f"[realsense-proc] started — {color_topic} (pid={os.getpid()})", flush=True)

@@ -72,6 +72,8 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  camera_settings:
+    enabled: true
   vision_capture:
     enabled: true
     # The existing host bind mount preserves captures across container updates.
