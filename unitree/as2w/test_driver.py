@@ -23,11 +23,24 @@ def _load(name, path):
 
 
 def _install_device_stubs():
+    yaml_module = types.ModuleType("yaml")
+    yaml_module.safe_load = lambda _value: {}
+    sys.modules.setdefault("yaml", yaml_module)
     std_msgs = types.ModuleType("std_msgs.msg")
     std_msgs.String = type("String", (), {})
     std_msgs.UInt8MultiArray = type("UInt8MultiArray", (), {})
     sys.modules["std_msgs"] = types.ModuleType("std_msgs")
     sys.modules["std_msgs.msg"] = std_msgs
+    rclpy = types.ModuleType("rclpy")
+    rclpy_node = types.ModuleType("rclpy.node")
+    rclpy_node.Node = type("Node", (), {})
+    rclpy.node = rclpy_node
+    sys.modules["rclpy"] = rclpy
+    sys.modules["rclpy.node"] = rclpy_node
+    rclpy_executors = types.ModuleType("rclpy.executors")
+    rclpy_executors.MultiThreadedExecutor = type("MultiThreadedExecutor", (), {})
+    rclpy.executors = rclpy_executors
+    sys.modules["rclpy.executors"] = rclpy_executors
     qos = types.ModuleType("rclpy.qos")
     qos.DurabilityPolicy = types.SimpleNamespace(VOLATILE=1)
     qos.HistoryPolicy = types.SimpleNamespace(KEEP_LAST=1)
@@ -41,6 +54,7 @@ def _install_device_stubs():
         sys.modules.setdefault(name, types.ModuleType(name))
     channel = types.ModuleType("unitree_sdk2py.core.channel")
     channel.ChannelSubscriber = type("ChannelSubscriber", (), {})
+    channel.ChannelFactoryInitialize = lambda *_args, **_kwargs: None
     sys.modules["unitree_sdk2py.core.channel"] = channel
     dds = types.ModuleType("unitree_sdk2py.idl.unitree_go.msg.dds_")
     dds.SportModeState_ = type("SportModeState_", (), {})
@@ -52,6 +66,9 @@ def _install_device_stubs():
     hg_dds.LowState_ = type("LowState_", (), {})
     hg_dds.BmsState_ = type("BmsState_", (), {})
     sys.modules["unitree_sdk2py.idl.unitree_hg.msg.dds_"] = hg_dds
+    rpc_proxy = types.ModuleType("rpc_proxy")
+    rpc_proxy.RpcProxy = type("RpcProxy", (), {})
+    sys.modules["rpc_proxy"] = rpc_proxy
 
 
 class _Proxy:
@@ -74,6 +91,93 @@ class TestDriverContracts(unittest.TestCase):
         _install_device_stubs()
         cls.device = _load("as2w_device_under_test", ROOT / "device.py")
         cls.spatial = _load("as2w_spatial_under_test", ROOT / "controlled_spatial.py")
+        cls.main = _load("as2w_main_under_test", ROOT / "main.py")
+
+    @staticmethod
+    def _interface(name, ipv4, *, up=True, wireless=False, virtual=False):
+        return {"name": name, "ipv4": ipv4, "up": up,
+                "wireless": wireless, "virtual": virtual}
+
+    def test_interface_resolver_prefers_cli_over_environment_and_config(self):
+        with patch.object(self.main.sys, "argv", ["main.py", "eno9"]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=AssertionError("must not scan")):
+            self.assertEqual("eno9", self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_interface_resolver_uses_environment_override(self):
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=AssertionError("must not scan")):
+            self.assertEqual("eno8", self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_interface_resolver_uses_explicit_config(self):
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=AssertionError("must not scan")):
+            self.assertEqual("eno7", self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_interface_resolver_auto_selects_unique_unitree_wired_interface(self):
+        interfaces = [
+            self._interface("wlP1p1s0", "10.100.128.225", wireless=True),
+            self._interface("eno1", "192.168.123.222"),
+        ]
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {}, clear=True), \
+                patch.object(self.main, "_network_interfaces", return_value=interfaces):
+            self.assertEqual("eno1", self.main.resolve_robot_interface({"robot_interface": "auto"}))
+
+    def test_interface_resolver_never_selects_wifi_or_office_network(self):
+        interfaces = [
+            self._interface("wlan0", "192.168.123.50", wireless=True),
+            self._interface("eno1", "10.100.128.225"),
+        ]
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "auto"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", return_value=interfaces):
+            self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_interface_resolver_rejects_down_and_virtual_candidates(self):
+        interfaces = [
+            self._interface("eno1", "192.168.123.222", up=False),
+            self._interface("docker0", "192.168.123.1", virtual=True),
+            self._interface("veth123", "192.168.123.2", virtual=True),
+        ]
+        with patch.object(self.main.sys, "argv", ["main.py", "auto"]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", return_value=interfaces):
+            self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_empty_positional_interface_uses_environment_override(self):
+        with patch.object(self.main.sys, "argv", ["main.py", ""]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=AssertionError("must not scan")):
+            self.assertEqual("eno8", self.main.resolve_robot_interface(
+                {"robot_interface": "eno7"}))
+
+    def test_interface_resolver_requires_override_for_multiple_candidates(self):
+        interfaces = [
+            self._interface("eno1", "192.168.123.222"),
+            self._interface("enp2s0", "192.168.123.223"),
+        ]
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {}, clear=True), \
+                patch.object(self.main, "_network_interfaces", return_value=interfaces):
+            self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "auto"}))
+
+    def test_interface_resolver_degrades_when_interface_scan_fails(self):
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=OSError("ioctl unavailable")):
+            self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "auto"}))
+
+    def test_deployment_does_not_hardcode_robot_interface(self):
+        service = (ROOT / "deploy" / "service.yml").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        config = (ROOT / "config.yaml").read_text()
+        self.assertNotIn("NETWORK_INTERFACE=", service)
+        self.assertIn("robot_interface: auto", config)
+        self.assertIn("exec python3 /work/main.py", dockerfile)
+        self.assertNotIn("${NETWORK_INTERFACE", dockerfile)
 
     def test_card_stop_cancels_continuous_move(self):
         proxy = _Proxy()
