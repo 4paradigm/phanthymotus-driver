@@ -34,7 +34,10 @@ class FakeSocket:
     def abort(self):
         self.messages.put(ConnectionError("aborted"))
 
-    def close(self, **kwargs):
+    def close(self, status=1000, reason=b"", timeout=3):
+        self.shutdown()
+
+    def shutdown(self):
         self.closed = True
 
 
@@ -162,3 +165,126 @@ class WorkerTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+class RealWebSocketLifecycleTests(unittest.TestCase):
+    """Real websocket-client framing and shutdown over local socket pairs."""
+
+    def setUp(self):
+        self.peers = []
+        self.clients = []
+
+    def tearDown(self):
+        for client in self.clients:
+            client.shutdown()
+        for peer in self.peers:
+            peer.close()
+
+    def connect(self, url, timeout, enable_multithread):
+        import socket
+        client_sock, peer = socket.socketpair()
+        ws = websocket.WebSocket(enable_multithread=enable_multithread)
+        ws.sock = client_sock
+        ws.connected = True
+        self.clients.append(ws)
+        self.peers.append(peer)
+        return ws
+
+    def test_real_interface_blocked_recv_and_restart(self):
+        r = BatteryStatusReceiver('http://localhost:8626', connector=self.connect)
+        r.stop()  # never started
+        try:
+            for _ in range(2):
+                r.start()
+                wait_for(lambda:r.snapshot()['pac_connected'])
+                # A real unmasked server text frame; the next recv blocks.
+                raw = b'{"capacity":91}'
+                self.peers[-1].sendall(bytes([0x81, len(raw)]) + raw)
+                wait_for(lambda:r.snapshot()['pac_fresh'])
+                r.stop()
+                r.stop()
+                self.assertIsNone(r._thread)
+                self.assertFalse(r.snapshot()['pac_connected'])
+        finally:
+            r.stop()
+
+    def test_already_closed_transport_can_stop(self):
+        r = BatteryStatusReceiver('http://localhost:8626')
+        ws = self.connect(None, 3, True)
+        ws.sock.close()  # transport closes before WebSocket state catches up
+        r._socket = ws
+        with self.assertLogs('battery_status', level='WARNING'):
+            r.stop()
+        r._socket = None
+        r.stop()
+
+    def test_peer_disconnected_then_stop(self):
+        r = BatteryStatusReceiver('http://localhost:8626', connector=self.connect,
+                                  reconnect_sec=60)
+        try:
+            r.start()
+            wait_for(lambda:r.snapshot()['pac_connected'])
+            self.peers[-1].close()
+            wait_for(lambda:not r.snapshot()['pac_connected'])
+            r.stop()  # interrupts the long reconnect wait
+            self.assertIsNone(r._thread)
+        finally:
+            r.stop()
+
+    def test_connection_failure_then_stop_interrupts_reconnect_wait(self):
+        connect = mock.Mock(side_effect=OSError('offline'))
+        r = BatteryStatusReceiver('http://localhost:8626', connector=connect,
+                                  reconnect_sec=60)
+        try:
+            r.start()
+            wait_for(lambda:r.snapshot()['pac_last_error'] == 'offline')
+            r.stop()
+            self.assertIsNone(r._thread)
+            self.assertEqual(connect.call_count, 1)
+        finally:
+            r.stop()
+
+    def test_abort_error_still_joins_and_can_stop_again(self):
+        sock = FakeSocket()
+        sock.abort = mock.Mock(side_effect=RuntimeError('abort failed'))
+        r = BatteryStatusReceiver('http://localhost:8626', connector=lambda *a, **k:sock)
+        r.start()
+        wait_for(lambda:r.snapshot()['pac_connected'])
+        with self.assertLogs('battery_status', level='ERROR'):
+            with self.assertRaisesRegex(RuntimeError, 'abort failed'):
+                r.stop()
+        self.assertIsNone(r._thread)
+        self.assertTrue(sock.closed)
+        r.stop()
+
+    def test_close_error_logged_without_killing_reconnect(self):
+        first, second = FakeSocket(), FakeSocket()
+        first.close = mock.Mock(side_effect=RuntimeError('close failed'))
+        r = BatteryStatusReceiver('http://localhost:8626',
+            connector=mock.Mock(side_effect=[first, second]), reconnect_sec=.01)
+        try:
+            with self.assertLogs('battery_status', level='ERROR') as logs:
+                r.start()
+                wait_for(lambda:r.snapshot()['pac_connected'])
+                first.messages.put(ConnectionError('disconnected'))
+                wait_for(lambda:r._socket is second)
+            self.assertTrue(any('socket close failed' in line for line in logs.output))
+            self.assertTrue(first.closed)
+        finally:
+            r.stop()
+
+    def test_live_thread_reference_retained_when_join_times_out(self):
+        r = BatteryStatusReceiver('http://localhost:8626')
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        r._thread = worker
+        with self.assertLogs('battery_status', level='ERROR'):
+            with self.assertRaisesRegex(RuntimeError, 'did not stop'):
+                r.stop()
+        self.assertIs(r._thread, worker)
+        worker.is_alive.return_value = False
+        r.stop()
+        self.assertIsNone(r._thread)
+
+
+if __name__ == "__main__":
+    unittest.main()

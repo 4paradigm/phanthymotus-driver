@@ -91,3 +91,52 @@ This feature does not require a motion, control-domain switch or camera restart.
 - The old container/image and a rollback script were retained on the development
   board. Final Canvas rechecking is performed by the operator; terminal verification
   of the combined DDS and PAC output is complete.
+
+### Review follow-up: lifecycle and dependency contract (2026-10-08)
+
+`websocket-client>=1.6,<2` remains the supported dependency range. The minimum
+version **1.6.0** was tested with the battery suite, including real
+`websocket.WebSocket` instances over local socket pairs. Its public `abort()`
+interrupts a blocked receive; `close(timeout=...)` bounds the close handshake.
+The battery tests also pass with **1.9.0**, including both shutdown APIs.
+Both calls are retained. See the [1.6.0 implementation](https://github.com/websocket-client/websocket-client/blob/v1.6.0/websocket/_core.py#L430)
+and the [review comment](https://github.com/4paradigm/phanthymotus-driver/pull/354#issuecomment-5889240785).
+The fake socket uses explicit matching shutdown signatures instead of accepting
+arbitrary keyword arguments. Local socket pairs exercise real framing and shutdown,
+but do not test the HTTP upgrade handshake or the robot network.
+
+Keep the range rather than introducing a one-off version pin. Record the resolved
+version for each deployment and rerun the battery suite when upgrading it; test
+1.6.0 as the compatibility floor. On 2026-10-08 the running Adam image was
+`release.260930.34902c1` and **did not have websocket-client installed**. Therefore
+there is no current deployed PAC client version to report, and that image cannot
+validate this PR's combined DDS/PAC behavior. This observation does not replace the
+2026-09-29 acceptance record above. No deployment was changed for this review fix.
+
+State shutdown attempts ROS publication deactivation, PAC shutdown and DDS polling
+shutdown independently, logs each failure and reports an aggregate error. Close
+also attempts ROS executor removal and node destruction even if stop fails. A PAC
+abort failure does not skip joining its worker; a join timeout retains the live
+thread reference. A socket close failure is logged and triggers immediate socket
+shutdown before the reconnect loop continues. No threads are forcibly killed.
+
+Run the commands below with the selected websocket-client version installed:
+
+```sh
+python -m unittest discover -s pndbotics/adam -p 'test_battery*.py'
+python -m unittest discover -s pndbotics/adam -p 'test_*.py'
+python -m unittest discover -s tests -p 'test_adam_driver.py'
+```
+
+### Two independent DDS domains
+
+- **Robot SDK / CycloneDDS, domain 1:** receives raw robot data such as `rt/lowstate`.
+  `main.py` passes `dds_domain_id` to `ChannelFactoryInitialize`, which creates an
+  explicit SDK `DomainParticipant`.
+- **ROS2 / PhanthyMotus, domain 42:** publishes the Driver's platform-facing ROS
+  topics. ROS initializes separately and uses `ROS_DOMAIN_ID=42` from deployment.
+
+The Driver transfers data between these independently initialized participants;
+the different domain IDs are intentional. The 2026-09-29 correction to domain 1
+concerned the robot SDK's `dds_domain_id`, not the global ROS domain. Neither domain
+nor their initialization is changed by the lifecycle review fix.

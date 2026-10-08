@@ -13,6 +13,7 @@ Plugins:
 from __future__ import annotations
 
 import json
+import logging
 import io
 import math
 import os
@@ -895,10 +896,27 @@ class StatePlugin:
                     )
                     self._poll_thread.start()
 
+    @staticmethod
+    def _cleanup(resources):
+        errors = []
+        for name, cleanup in resources:
+            try:
+                cleanup()
+            except Exception as exc:
+                logging.getLogger(__name__).exception("StatePlugin cleanup failed: %s", name)
+                errors.append(f"{name}: {exc}")
+        if errors:
+            raise RuntimeError("StatePlugin cleanup failed: " + "; ".join(errors))
+
     def stop(self):
-        self._battery_receiver.stop()
         self._running = False
-        self._node.set_active(False)
+        self._cleanup([
+            ("ROS publication", lambda: self._node.set_active(False)),
+            ("PAC receiver", self._battery_receiver.stop),
+            ("DDS polling", self._stop_dds_polling),
+        ])
+
+    def _stop_dds_polling(self):
         with self._poll_lifecycle_lock:
             thread = self._poll_thread
             stop_event = self._poll_stop_event
@@ -906,13 +924,18 @@ class StatePlugin:
                 stop_event.set()
             if thread is not None and thread is not threading.current_thread():
                 thread.join(1.5)
-            if thread is None or not thread.is_alive():
-                self._poll_thread = None
-                self._poll_stop_event = None
+            if thread is not None and thread.is_alive():
+                raise RuntimeError("DDS polling thread did not stop")
+            self._poll_thread = None
+            self._poll_stop_event = None
 
     def close(self):
-        self.stop()
-        _destroy_ros_node(self._executor, self._node)
+        resources = [("stop", self.stop)]
+        if self._node is not None:
+            if self._executor is not None:
+                resources.append(("ROS executor detach", lambda: self._executor.remove_node(self._node)))
+            resources.append(("ROS node destruction", self._node.destroy_node))
+        self._cleanup(resources)
 
     def dispatch(self, action: str, args: dict) -> dict:
         if args.get("_tool_name") == "battery" and action in ("get", "info", "battery"):

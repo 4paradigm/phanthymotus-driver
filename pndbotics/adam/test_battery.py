@@ -88,5 +88,49 @@ class PacBatteryIntegrationTests(unittest.TestCase):
         self.assertIsNone(node._battery_receiver._thread)
 
 
+class StateCleanupTests(unittest.TestCase):
+    def make_plugin(self):
+        plugin = object.__new__(StatePlugin)
+        plugin._running = True
+        plugin._node = mock.Mock()
+        plugin._executor = mock.Mock()
+        plugin._battery_receiver = mock.Mock()
+        plugin._battery_receiver.stop.side_effect = RuntimeError('PAC failure')
+        plugin._poll_lifecycle_lock = threading.Lock()
+        plugin._poll_stop_event = threading.Event()
+        plugin._poll_thread = threading.Thread(target=plugin._poll_stop_event.wait)
+        plugin._poll_thread.start()
+        self.addCleanup(plugin._poll_thread.join, 2)
+        self.addCleanup(plugin._poll_stop_event.set)
+        return plugin
+
+    def test_pac_failure_does_not_skip_dds_stop(self):
+        plugin = self.make_plugin()
+        worker = plugin._poll_thread
+        with self.assertLogs('device', level='ERROR'):
+            with self.assertRaisesRegex(RuntimeError, 'PAC failure'):
+                plugin.stop()
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(plugin._poll_thread)
+        self.assertFalse(plugin._running)
+        plugin._node.set_active.assert_called_once_with(False)
+
+    def test_close_attempts_all_resources_and_reports_all_failures(self):
+        plugin = self.make_plugin()
+        worker = plugin._poll_thread
+        plugin._node.set_active.side_effect = ValueError('publisher failure')
+        plugin._executor.remove_node.side_effect = ValueError('detach failure')
+        plugin._node.destroy_node.side_effect = ValueError('destroy failure')
+        with self.assertLogs('device', level='ERROR') as logs:
+            with self.assertRaises(RuntimeError) as raised:
+                plugin.close()
+        self.assertFalse(worker.is_alive())
+        plugin._executor.remove_node.assert_called_once_with(plugin._node)
+        plugin._node.destroy_node.assert_called_once_with()
+        for message in ('PAC failure', 'publisher failure', 'detach failure', 'destroy failure'):
+            self.assertIn(message, str(raised.exception))
+            self.assertTrue(any(message in line for line in logs.output))
+
+
 if __name__ == "__main__":
     unittest.main()

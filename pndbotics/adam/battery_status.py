@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import time
@@ -83,17 +84,30 @@ class BatteryStatusReceiver:
             with self._lock:
                 socket = self._socket
                 self._connected = False
+            errors = []
             if socket is not None:
                 # Interrupt recv without sending an application-level message.
                 try:
                     socket.abort()
                 except OSError:
-                    pass
+                    # The peer or worker may already have closed the transport.
+                    # Still join below; a live worker remains a cleanup failure.
+                    logging.getLogger(__name__).warning(
+                        "PAC battery transport already unavailable during abort", exc_info=True)
+                except Exception as exc:
+                    logging.getLogger(__name__).exception("PAC battery abort failed")
+                    errors.append(f"abort: {exc}")
             if self._thread is not None:
-                self._thread.join(5.0)  # connect timeout is bounded to 3 seconds
-                if self._thread.is_alive():
-                    raise RuntimeError("PAC battery receiver did not stop")
-                self._thread = None
+                try:
+                    self._thread.join(5.0)  # connect timeout is bounded to 3 seconds
+                    if self._thread.is_alive():
+                        raise RuntimeError("PAC battery receiver did not stop")
+                    self._thread = None
+                except Exception as exc:
+                    logging.getLogger(__name__).exception("PAC battery thread cleanup failed")
+                    errors.append(f"thread: {exc}")
+            if errors:
+                raise RuntimeError("PAC battery cleanup failed: " + "; ".join(errors))
 
     def _accept(self, raw):
         sample = parse_sample(raw)
@@ -167,6 +181,14 @@ class BatteryStatusReceiver:
                 if socket is not None:
                     try:
                         socket.close(timeout=0.2)
-                    except OSError:
-                        pass
+                    except Exception as exc:
+                        logging.getLogger(__name__).exception("PAC battery socket close failed")
+                        with self._lock:
+                            self._last_error = f"socket close: {exc}"
+                        try:
+                            socket.shutdown()
+                        except Exception as shutdown_exc:
+                            logging.getLogger(__name__).exception("PAC battery socket shutdown failed")
+                            with self._lock:
+                                self._last_error += f"; socket shutdown: {shutdown_exc}"
             self._stop.wait(self._reconnect)
