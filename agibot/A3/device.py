@@ -424,11 +424,11 @@ class A3Nodes:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, QoSReliabilityPolicy
         from sensor_msgs.msg import Image, Imu, JointState, PointCloud2
-        from std_msgs.msg import String
+        from std_msgs.msg import String, UInt8MultiArray
         try:
-            from audio_msgs.msg import AudioCapture, AudioPlayback
+            from audio_msgs.msg import AudioCapture, AudioPlayback, AudioChunk
         except ImportError:
-            AudioCapture = AudioPlayback = None
+            AudioCapture = AudioPlayback = AudioChunk = None
 
         self.config = config
         self.namespace = namespace
@@ -465,6 +465,8 @@ class A3Nodes:
         self._Image = Image
         self._AudioCapture = AudioCapture
         self._AudioPlayback = AudioPlayback
+        self._AudioChunk = AudioChunk
+        self._UInt8MultiArray = UInt8MultiArray
 
         sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
 
@@ -486,7 +488,9 @@ class A3Nodes:
                    re_encode=None):
             core_topic = _core_topic(namespace, key)
             as_json = fmt == "data/json"
-            if re_encode is not None:
+            if key == "lidar_cloud":
+                core_msg_type = UInt8MultiArray
+            elif re_encode is not None:
                 core_msg_type = self._CompressedImage
             elif as_json:
                 core_msg_type = String
@@ -500,6 +504,13 @@ class A3Nodes:
                     self._publish_joint_streams()
                 elif key in ("imu_pelvis", "imu_torso"):
                     self._publish_imu_streams(key, jsonable(msg))
+                if key == "lidar_cloud":
+                    packet = self._pointcloud_packet(msg)
+                    if packet is not None:
+                        output = UInt8MultiArray()
+                        output.data = list(packet)
+                        pub.publish(output)
+                    return
                 if re_encode is not None:
                     # JPEG/depth conversion can be slower than the camera
                     # cadence. Never build an unbounded executor backlog: one
@@ -582,20 +593,18 @@ class A3Nodes:
 
         self.audio_topics = {}
         self.speaker_subscription = None
-        if AudioCapture is not None and AudioPlayback is not None:
+        if AudioCapture is not None and AudioPlayback is not None and AudioChunk is not None:
             for key, topic in (("mic", "/audiohal/audio/capture"),
                                ("ext_mic", "/agent/audio/data/external")):
                 core_topic = _core_topic(namespace, f"{key}/audio")
-                pub = self.core.create_publisher(AudioCapture, core_topic, 5)
+                pub = self.core.create_publisher(AudioChunk, core_topic, 5)
                 self.robot.create_subscription(
-                    AudioCapture, topic, lambda msg, pub=pub: pub.publish(msg), sensor_qos)
+                    AudioCapture, topic,
+                    lambda msg, pub=pub: pub.publish(self._audio_chunk(msg)), sensor_qos)
                 self.audio_topics[key] = {"robot_topic": topic, "topic": core_topic,
                                           "format": "audio/pcm-16k"}
 
         # -- command publishers (robot domain) --
-        # RosMsgWrapper needs the dev-kit's ros2_plugin_proto package; without it the
-        # driver still starts (Dockerfile documents a degraded non-robot dev mode) —
-        # wrapper publishers are withheld and their tools reject clearly at dispatch.
         self.wrapper_available = self._probe_wrapper_type() is not None
         if self.wrapper_available:
             self.locomotion_pub = self.robot.create_publisher(
@@ -614,6 +623,40 @@ class A3Nodes:
         self.arm_command_pub = self.robot.create_publisher(JointState, "/motion/control/arm_joint_command", 10)
         self.neck_command_pub = self.robot.create_publisher(JointState, "/motion/control/neck_joint_command", 10)
         self.hand_command_pub = self.robot.create_publisher(JointState, "/motion/control/hand_joint_command", 10)
+
+    def _audio_chunk(self, msg):
+        out = self._AudioChunk()
+        out.format = "audio/pcm-16k"
+        payload = getattr(getattr(msg, "data", None), "data", b"")
+        out.data = list(payload)
+        return out
+
+    @staticmethod
+    def _pointcloud_packet(msg):
+        """Encode XYZ PointCloud2 as the UInt8MultiArray sensor/pointcloud contract."""
+        try:
+            import struct
+            fields = {field.name: field.offset for field in msg.fields}
+            if not all(name in fields for name in ("x", "y", "z")):
+                return None
+            endian = ">" if msg.is_bigendian else "<"
+            points = []
+            for row in range(int(msg.height)):
+                base = row * int(msg.row_step)
+                for col in range(int(msg.width)):
+                    offset = base + col * int(msg.point_step)
+                    try:
+                        points.append((
+                            struct.unpack_from(endian + "f", msg.data, offset + fields["x"])[0],
+                            struct.unpack_from(endian + "f", msg.data, offset + fields["y"])[0],
+                            struct.unpack_from(endian + "f", msg.data, offset + fields["z"])[0]))
+                    except struct.error:
+                        continue
+            points = points[:80000]
+            return struct.pack("<II", 12, len(points)) + b"".join(
+                struct.pack("<fff", *point) for point in points)
+        except Exception:
+            return None
 
     def _clear_encoding(self, key):
         with self._encode_lock:
@@ -910,7 +953,7 @@ class A3Nodes:
             print(f"[media] encode failed topic={topic}: {exc}", flush=True)
 
     def speaker_start(self, input_topic: str):
-        if self._AudioCapture is None or self._AudioPlayback is None:
+        if self._AudioChunk is None or self._AudioPlayback is None:
             raise RuntimeError("audio_msgs package is unavailable; source the AimDK ROS package")
         self.speaker_stop()
         self.speaker_pub = getattr(self, "speaker_pub", None) or self.robot.create_publisher(
@@ -918,15 +961,15 @@ class A3Nodes:
 
         def callback(msg):
             out = self._AudioPlayback()
-            out.stamps = msg.stamps
-            out.info = msg.info
+            if hasattr(out, "stamps") and hasattr(msg, "header"):
+                out.stamps = msg.header.stamp
             out.data = msg.data
             out.pkg_name = "phanthymotus"
             out.token_id = "phanthymotus"
             self.speaker_pub.publish(out)
 
         self.speaker_subscription = self.core.create_subscription(
-            self._AudioCapture, input_topic, callback, 5)
+            self._AudioChunk, input_topic, callback, 5)
 
     def speaker_stop(self):
         sub = getattr(self, "speaker_subscription", None)

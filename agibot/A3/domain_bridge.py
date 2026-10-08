@@ -24,7 +24,7 @@ class CoreBridge:
                         for lane in ("media0", "media1", "media2", "media3", "media4",
                                      "media5", "media6", "media7", "media8", "media9",
                                      "media10", "media11",
-                                     "pointcloud", "state", "audio")}
+                                     "pointcloud", "audio", *(f"state{i}" for i in range(8)))}
         self._ctx = mp.get_context("spawn")
         self._profile = profile
         self._domain = domain
@@ -69,7 +69,7 @@ class CoreBridge:
             elif "audio" in topic or "mic" in topic:
                 lane = "audio"
             else:
-                lane = "state"
+                lane = f"state{sum(topic.encode('utf-8')) % 8}"
             item = (topic, type_name, serialize_message(msg))
             try:
                 self._queues[lane].put_nowait(item)
@@ -139,7 +139,7 @@ def _run(messages, profile, domain, lane):
     types = {}
     for package, names in (("std_msgs.msg", ("String", "UInt8MultiArray")),
                            ("sensor_msgs.msg", ("CompressedImage", "Image", "PointCloud2", "JointState")),
-                           ("audio_msgs.msg", ("AudioCapture", "AudioPlayback"))):
+                           ("audio_msgs.msg", ("AudioCapture", "AudioPlayback", "AudioChunk"))):
         try:
             module = __import__(package, fromlist=list(names))
         except ImportError:

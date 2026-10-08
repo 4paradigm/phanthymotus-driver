@@ -6,6 +6,7 @@ find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/AudioChunk.msg"
   "msg/AudioData.msg"
   "msg/AudioInfo.msg"
   "msg/AudioCapture.msg"
