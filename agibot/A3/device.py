@@ -488,6 +488,7 @@ class A3Nodes:
 
         self.lock = threading.RLock()
         self.values = {}
+        self._json_stream_pubs = {}
 
         self._String = String
         self._JointState = JointState
@@ -533,6 +534,8 @@ class A3Nodes:
             else:
                 core_msg_type = msg_type
             pub = self.core.create_publisher(core_msg_type, core_topic, 5)
+            if as_json:
+                self._json_stream_pubs[key] = pub
 
             def callback(msg):
                 if re_encode is not None or key in ("lidar_cloud", "mic", "ext_mic"):
@@ -639,6 +642,12 @@ class A3Nodes:
             mirror("skill_status", self._wrapper_type(ros2), "/skill/pilot/skill_status",
                    "data/json", json_filter=self._decode_skill_status)
 
+        # BMS and emergency channels are event/state reports, not high-rate
+        # sensors.  Republish the latest decoded value once per second so the
+        # dashboard stays fresh even when the robot only emits on change.
+        if hasattr(self.robot, "create_timer"):
+            self._slow_state_timer = self.robot.create_timer(1.0, self._republish_slow_states)
+
         self.audio_topics = {}
         self.speaker_subscription = None
         if AudioCapture is not None and AudioPlayback is not None and AudioChunk is not None:
@@ -677,6 +686,17 @@ class A3Nodes:
         self.arm_command_pub = self.robot.create_publisher(JointState, "/motion/control/arm_joint_command", 10)
         self.neck_command_pub = self.robot.create_publisher(JointState, "/motion/control/neck_joint_command", 10)
         self.hand_command_pub = self.robot.create_publisher(JointState, "/motion/control/hand_joint_command", 10)
+
+    def _republish_slow_states(self):
+        with self.lock:
+            values = {key: self.values.get(key) for key in ("battery", "estop")}
+        for key, value in values.items():
+            pub = self._json_stream_pubs.get(key)
+            if pub is None or not value:
+                continue
+            output = self._String()
+            output.data = json.dumps(value, ensure_ascii=False)
+            pub.publish(output)
 
     def _audio_chunk(self, msg):
         out = self._AudioChunk()
