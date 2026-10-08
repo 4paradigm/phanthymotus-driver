@@ -1566,7 +1566,8 @@ class LocoPlugin:
         schema = action_schema(
             {"walk": (["forward", "lateral", "angular", "duration"],
                       "按速度走行 duration 秒后自动停止（ACP 回报完成）；duration=-1 持续运动直到 stop"),
-             "stop": ([], "立即下发零速并结算进行中的行走")},
+             "stop_move": ([], "立即下发零速并结算进行中的行走"),
+             "stop": ([], "stop_move 的兼容别名")},
             {
                 "forward": {"type": "number", "description": "前进速度比例 [-1,1]，正为前进，负为后退", "default": 0.0},
                 "lateral": {"type": "number", "description": "横移速度比例 [-1,1]，正为左移", "default": 0.0},
@@ -1601,7 +1602,7 @@ class LocoPlugin:
             return {"state": "ready"}
         if action == "info":
             return {"state": "walking" if self._move_action_id else "idle"}
-        if action in ("stop", "cancel"):
+        if action in ("stop_move", "stop", "cancel"):
             return self._stop_walk()
         if action != "walk":
             raise ValueError(f"loco: unknown action {action!r}")
@@ -1686,7 +1687,7 @@ class LocoPlugin:
         return {"state": "walking", "action_id": action_id,
                 "forward": forward, "lateral": lateral, "angular_degps": angular,
                 "duration": duration, "stops_automatically": duration != -1.0,
-                "cancel_action": "stop" if duration == -1.0 else None}
+                "cancel_action": "stop_move" if duration == -1.0 else None}
 
     def _walk_worker(self, action_id, forward, lateral, angular, duration):
         """持续下发速度帧直到 duration 结束（或被新指令/stop 顶替），然后停并回报。"""
@@ -1748,9 +1749,18 @@ class ArmControlPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        named_fields = {}
+        for side, names in ARM_JOINTS.items():
+            for name in names:
+                suffix = name[len(side) + 1:-len("_joint")]
+                low, high = _joint_limit(name, ARM_JOINT_LIMITS)
+                named_fields[name] = {
+                    "type": "number", "minimum": low, "maximum": high,
+                    "description": f"{side} {suffix} 目标角度（rad）",
+                }
         schema = action_schema(
             {
-                "send": (["left", "right"], "下发一帧手臂关节位置指令（rad），需按 ~100Hz 循环调用"),
+                "set_position": (list(named_fields), "按具名关节设置手臂目标位置（rad）"),
                 **self.ACTIONS,
             },
             {
@@ -1758,6 +1768,7 @@ class ArmControlPlugin:
                          "description": "左臂 7 关节 rad，顺序：shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw"},
                 "right": {"type": "array", "items": {"type": "number"},
                           "description": "右臂 7 关节 rad，顺序同左臂"},
+                **named_fields,
                 "duration_ms": {"type": "integer", "description": "保持时长（毫秒），期间以 100Hz 重复下发同一帧指令", "default": 100},
             },
         )
@@ -1786,7 +1797,7 @@ class ArmControlPlugin:
         if action in self.ACTIONS:
             method = action.replace("compliance_", "")
             return jsonable(self.nodes.rpc.arm_compliance(method))
-        if action != "send":
+        if action not in ("set_position", "send"):
             raise ValueError(f"arm_control: unknown action {action!r}")
         # MOTION-state gate (dev guide §7.3: arm control only takes effect in MOTION;
         # the docs also require stopping motion_player first). Unparseable state →
@@ -1797,8 +1808,11 @@ class ArmControlPlugin:
                     "suggestion": "arm_control 仅在 MOTION 站立状态生效（且需先停止 motion_player）；"
                                   "请先执行 mc_mode get_up 恢复站立"}
         positions = {}
+        if action == "set_position":
+            positions.update({name: float(args[name]) for names in ARM_JOINTS.values()
+                              for name in names if args.get(name) is not None})
         for side in ("left", "right"):
-            values = args.get(side)
+            values = args.get(side) if action == "send" else None
             if values is None:
                 continue
             _require(len(values) == 7, f"{side} 臂需要 7 个关节值，收到 {len(values)} 个")
@@ -1825,10 +1839,14 @@ class HandControlPlugin:
 
     def get_tool(self):
         schema = action_schema(
-            {"send": (["left", "right"], "下发双手张合等级 0(张开)~2000(握紧)")},
             {
-                "left": {"type": "array", "items": {"type": "number"}, "description": "左手指张合等级列表 0~2000"},
-                "right": {"type": "array", "items": {"type": "number"}, "description": "右手指张合等级列表 0~2000"},
+                "open": ([], "双手完全张开"),
+                "close": ([], "双手完全握紧"),
+                "set_position": (["left", "right"], "设置指定手指张合等级；0 张开，2000 握紧"),
+            },
+            {
+                "left": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_COMMAND_MAX}, "description": "左手各指张合等级，按真机关节顺序"},
+                "right": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_COMMAND_MAX}, "description": "右手各指张合等级，按真机关节顺序"},
                 "hand_type": {"type": "string", "enum": ["AgiHand", "O10Hand"], "default": "AgiHand"},
             },
         )
@@ -1851,10 +1869,18 @@ class HandControlPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
-        if action != "send":
+        if action not in ("open", "close", "set_position", "send"):
             raise ValueError(f"hand_control: unknown action {action!r}")
         hand_type = args.get("hand_type", "AgiHand")
         _require(hand_type in HAND_TYPES, f"未知手部类型 {hand_type!r}，可选 {sorted(HAND_TYPES)}")
+        if action in ("open", "close"):
+            closed = HAND_COMMAND_MAX
+            presets = {
+                "open": [0, 0, 0, 0, 0, 0],
+                "close": [closed, closed, closed, closed, closed, closed],
+            }
+            values = presets[action]
+            args = {**args, "left": args.get("left", values), "right": args.get("right", values)}
         positions = {}
         for side in ("left", "right"):
             values = args.get(side)
@@ -1877,11 +1903,23 @@ class HeadControlPlugin:
         self.nodes = nodes
 
     def get_tool(self):
+        position_fields = {
+            "yaw": {"type": "number", "minimum": NECK_LIMITS["head_yaw_joint"][0],
+                    "maximum": NECK_LIMITS["head_yaw_joint"][1], "description": "头部偏航目标角（rad）"},
+            "pitch": {"type": "number", "minimum": NECK_LIMITS["head_pitch_joint"][0],
+                      "maximum": NECK_LIMITS["head_pitch_joint"][1], "description": "头部俯仰目标角（rad）"},
+        }
         schema = action_schema(
-            {"send": (["yaw", "pitch"], "下发一帧头部关节指令（rad）")},
             {
-                "yaw": {"type": "number", "description": "头部偏航角 rad（左正右负）"},
-                "pitch": {"type": "number", "description": "头部俯仰角 rad（抬头为正）"},
+                "look_left": ([], "向左转头"),
+                "look_right": ([], "向右转头"),
+                "look_up": ([], "抬头"),
+                "look_down": ([], "低头"),
+                "center": ([], "头部回中"),
+                "set_position": (["yaw", "pitch"], "设置头部偏航/俯仰目标角度（rad）"),
+            },
+            {
+                **position_fields,
                 "duration_ms": {"type": "integer", "description": "保持时长（毫秒）", "default": 100},
             },
         )
@@ -1904,8 +1942,15 @@ class HeadControlPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
-        if action != "send":
+        if action not in ("look_left", "look_right", "look_up", "look_down", "center", "set_position", "send"):
             raise ValueError(f"head_control: unknown action {action!r}")
+        presets = {
+            "look_left": {"yaw": 0.6}, "look_right": {"yaw": -0.6},
+            "look_up": {"pitch": 0.15}, "look_down": {"pitch": -0.3},
+            "center": {"yaw": 0.0, "pitch": 0.0},
+        }
+        if action in presets:
+            args = {**presets[action], **args}
         positions = {}
         if args.get("yaw") is not None:
             positions["head_yaw_joint"] = float(args["yaw"])
@@ -1931,7 +1976,8 @@ class WaistControlPlugin:
 
     def get_tool(self):
         schema = action_schema(
-            {"send": (["pitch", "yaw", "height"], "下发腰部俯仰/旋转/升降指令")},
+            {"set_position": (["pitch", "yaw", "height"], "设置腰部俯仰/旋转/升降目标"),
+             "send": (["pitch", "yaw", "height"], "兼容旧接口：设置腰部目标位置")},
             {
                 "pitch": {"type": "number", "description": "腰部俯仰 rad，正为前倾"},
                 "yaw": {"type": "number", "description": "腰部偏航 rad，正为左转"},
@@ -1957,7 +2003,7 @@ class WaistControlPlugin:
             return {"state": "idle"}
         if action == "info":
             return {"state": "ready"}
-        if action != "send":
+        if action not in ("set_position", "send"):
             raise ValueError(f"waist_control: unknown action {action!r}")
         payload = {}
         for field in ("pitch", "yaw", "height"):

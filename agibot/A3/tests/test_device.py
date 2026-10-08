@@ -782,6 +782,7 @@ class RpcDispatchTests(unittest.TestCase):
     def test_loco_schema_declares_x_completion(self):
         schema = find_plugin(self.plugins, "loco").get_tool()["inputSchema"]
         self.assertEqual(schema["x-completion"], {"actions": ["walk"], "timeout": 60})
+        self.assertIn("stop_move", schema["properties"]["action"]["enum"])
 
     def test_loco_walk_reports_acp_completion_after_duration(self):
         loco = find_plugin(self.plugins, "loco")
@@ -948,6 +949,15 @@ class RpcDispatchTests(unittest.TestCase):
         hand = find_plugin(self.plugins, "hand_control")
         with self.assertRaises(ValueError):
             hand.dispatch("send", {"left": [0], "hand_type": "RobotHand"})
+
+    def test_readable_hand_and_head_actions(self):
+        hand = find_plugin(self.plugins, "hand_control").get_tool()
+        head = find_plugin(self.plugins, "head_control").get_tool()
+        hand_actions = hand["inputSchema"]["properties"]["action"]["enum"]
+        head_actions = head["inputSchema"]["properties"]["action"]["enum"]
+        self.assertTrue({"open", "close", "set_position"}.issubset(hand_actions))
+        self.assertTrue({"look_left", "look_right", "look_up", "look_down", "center",
+                         "set_position"}.issubset(head_actions))
 
     # -- HDU RPCs: tts (absorbs media_play) / audio (absorbs audio_play+volume) /
     #    interaction (absorbs mic_source) / resources --
