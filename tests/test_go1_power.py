@@ -112,6 +112,33 @@ def test_runtime_requires_observed_soc_drop_and_resets_after_gap_or_charge():
     assert card._sample(battery_snap(170.0, soc=76), now=170.1)["remaining_runtime_minutes"] is None
 
 
+def test_runtime_updates_every_ten_seconds_without_delaying_energy():
+    card = power.BatteryPowerPlugin({}, "test", None, StubClient())
+    for second in range(61):
+        first = card._sample(battery_snap(100.0 + second, soc=80 - second // 20),
+                             now=100.1 + second)
+    for second in range(161, 170):
+        held = card._sample(battery_snap(float(second), soc=76), now=second + 0.1)
+        assert held["remaining_runtime_minutes"] == first["remaining_runtime_minutes"]
+        assert held["discharged_since_start_wh"] > first["discharged_since_start_wh"]
+    updated = card._sample(battery_snap(170.0, soc=76), now=170.1)
+    assert updated["remaining_runtime_minutes"] == 22.2
+
+
+@pytest.mark.parametrize("change", ["charge", "invalid", "missing_soc", "rebound", "zero"])
+def test_runtime_hold_does_not_delay_invalid_states_or_empty_battery(change):
+    card = power.BatteryPowerPlugin({}, "test", None, StubClient())
+    for second in range(61):
+        card._sample(battery_snap(100.0 + second, soc=80 - second // 20),
+                     now=100.1 + second)
+    args = {"soc": 77}
+    args.update({"charge": {"status": 2}, "invalid": {"cell_mv": 0},
+                 "missing_soc": {"soc": None}, "rebound": {"soc": 78},
+                 "zero": {"soc": 0}}[change])
+    result = card._sample(battery_snap(161.0, **args), now=161.1)
+    assert result["remaining_runtime_minutes"] == (0.0 if change == "zero" else None)
+
+
 def test_runtime_does_not_invent_time_without_soc_or_after_soc_rebound():
     card = power.BatteryPowerPlugin({}, "test", None, StubClient())
     for second in range(61):
@@ -248,16 +275,20 @@ def test_battery_topic_is_compact_and_details_remain_available(monkeypatch):
     card._tick()
     monitor = card._pub.messages[-1]
     assert monitor["power_w"] == 216.0
-    assert monitor["soc_percent"] == 80
     assert monitor["remaining_runtime_minutes"] is None
     assert "续航观察中" in monitor["status"]
     assert {"timestamp_ms", "control_level", "fresh"} <= monitor.keys()
-    hidden = {"runtime_estimate_method", "measurement_kind", "energy_scope",
+    hidden = {"soc_percent", "voltage_v", "current_a", "direction",
+              "runtime_estimate_method", "measurement_kind", "energy_scope",
               "sample_monotonic_s", "cell_voltage_indices", "cell_voltage_mv",
               "unused_cell_voltage_mv", "voltage_source", "covered_duration_s"}
     assert not hidden.intersection(monitor)
     details = card.dispatch("info", {})["data"]
     assert hidden <= details.keys()
+    assert details["soc_percent"] == 80
+    assert details["voltage_v"] == 21.6
+    assert details["current_a"] == 10.0
+    assert details["direction"] == "discharge"
     assert details["cell_count"] == 6
 
     # Transition to invalid data must clear instantaneous readings, keep totals
@@ -267,7 +298,8 @@ def test_battery_topic_is_compact_and_details_remain_available(monkeypatch):
     card._tick()
     invalid = card._pub.messages[-1]
     assert invalid.keys() == monitor.keys()
-    assert invalid["power_w"] is None and invalid["voltage_v"] is None
+    assert invalid["power_w"] is None
+    assert invalid["remaining_runtime_minutes"] is None
     assert invalid["fresh"] is False
     assert "invalid_bms_values" in invalid["status"]
     assert invalid["discharged_since_start_wh"] == 0.06

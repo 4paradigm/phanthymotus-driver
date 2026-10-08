@@ -1051,6 +1051,7 @@ _GO1_CELL_INDICES = (0, 1, 4, 5, 6, 9)
 _GO1_UNUSED_INDICES = (2, 3, 7, 8)
 _MIN_RUNTIME_OBSERVATION_S = 60.0
 _MIN_RUNTIME_SOC_DROP = 3.0
+_RUNTIME_UPDATE_INTERVAL_S = 10.0
 
 
 def _power_monitor_headers(data: dict) -> dict:
@@ -1063,8 +1064,7 @@ def _power_monitor_headers(data: dict) -> dict:
 
 def _battery_power_monitor(data: dict) -> dict:
     out = _power_monitor_headers(data)
-    for field in ("soc_percent", "power_w", "voltage_v", "current_a", "direction",
-                  "discharged_since_start_wh", "charged_since_start_wh",
+    for field in ("power_w", "discharged_since_start_wh", "charged_since_start_wh",
                   "remaining_runtime_minutes"):
         # Keep stable keys: the latest-value renderer must clear old readings
         # when telemetry becomes unavailable rather than retaining stale values.
@@ -1162,6 +1162,7 @@ class BatteryPowerPlugin:
         self._covered_s = 0.0
         self._runtime_start = None  # (first continuous discharge timestamp, SOC%)
         self._runtime_last_soc = None
+        self._runtime_updated_s = None
         self._latest = self._unavailable("no_sample_yet")
         if _HAS_ROS2 and executor is not None:
             try:
@@ -1253,6 +1254,16 @@ class BatteryPowerPlugin:
                     runtime_reason = None
                 else:
                     runtime_reason = "insufficient_soc_history"
+            if runtime_minutes is not None:
+                # Hold valid estimates between updates; unavailable states and
+                # zero SOC still take effect immediately, without delaying Wh.
+                previous_runtime = self._latest.get("remaining_runtime_minutes")
+                if (soc != 0 and previous_runtime is not None and
+                        self._runtime_updated_s is not None and
+                        0 <= stamp - self._runtime_updated_s < _RUNTIME_UPDATE_INTERVAL_S):
+                    runtime_minutes = previous_runtime
+                else:
+                    self._runtime_updated_s = stamp
             self._latest = {"timestamp_ms": int(time.time() * 1000),
                             "sample_monotonic_s": stamp,
                             "control_level": snap.get("control_level", "HIGHLEVEL"),
