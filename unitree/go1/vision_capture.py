@@ -1,5 +1,6 @@
 """Save Go1 Nano RGB photos and videos to persistent storage."""
 
+import errno
 import json
 import logging
 import os
@@ -25,6 +26,10 @@ else:
 
 POSITIONS = tuple(camera._VALID_POSITIONS)
 VIDEO_FPS = 15
+# 单次录像固定预算；为编码后的 MP4 和宿主其他服务保留空间。
+MAX_SPOOL_BYTES = 128 * 1024 * 1024
+MAX_VIDEO_BYTES = 64 * 1024 * 1024
+MIN_FREE_BYTES = 64 * 1024 * 1024
 
 
 class VisionCapturePlugin:
@@ -367,11 +372,23 @@ class VisionCapturePlugin:
         stderr_tail = bytearray()
         published = False
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if shutil.disk_usage(path.parent).free < MAX_VIDEO_BYTES + MIN_FREE_BYTES:
+                raise OSError(errno.ENOSPC, "insufficient free space for video and reserve")
             host, port = self._endpoints[position]
             with socket.create_connection((host, port), timeout=8) as connection:
-                path.parent.mkdir(parents=True, exist_ok=True)
                 # 先把选中的 JPEG 落到临时流，避免慢编码器阻塞 Nano 收帧。
-                frames_output = frames_path.open("wb")
+                frames_output = frames_path.open("wb", buffering=0)
+
+                def write_frame(jpeg):
+                    # 收帧、间隙补帧和尾部补帧都检查，先拒绝再写入。
+                    if cancel.is_set():
+                        raise InterruptedError("video recording cancelled")
+                    if frames_output.tell() + len(jpeg) > MAX_SPOOL_BYTES:
+                        raise OSError(errno.EFBIG, "temporary MJPEG spool exceeds 128 MiB limit")
+                    if shutil.disk_usage(path.parent).free < len(jpeg) + MAX_VIDEO_BYTES + MIN_FREE_BYTES:
+                        raise OSError(errno.ENOSPC, "insufficient free space for video and reserve")
+                    frames_output.write(jpeg)
                 frames = 0
                 source_frames = 0
                 total_frames = duration * VIDEO_FPS
@@ -409,10 +426,10 @@ class VisionCapturePlugin:
                     slot = min(total_frames - 1, slot)
                     # 源帧率低于 15 fps 时填补缺口，保持 MP4 播放时长与实际录制时长一致。
                     while frames < slot:
-                        frames_output.write(last_jpeg)
+                        write_frame(last_jpeg)
                         frames += 1
                     if frames <= slot:
-                        frames_output.write(jpeg)
+                        write_frame(jpeg)
                         frames += 1
                     last_jpeg = jpeg
                 if cancel.is_set():
@@ -421,7 +438,7 @@ class VisionCapturePlugin:
                     raise RuntimeError("no camera frames received")
                 recording_ended_at = datetime.now().astimezone()
                 while frames < total_frames:
-                    frames_output.write(last_jpeg)
+                    write_frame(last_jpeg)
                     frames += 1
                 frames_output.close()
                 frames_output = None
@@ -430,7 +447,7 @@ class VisionCapturePlugin:
                     process = subprocess.Popen([
                         "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg", "-r", str(VIDEO_FPS), "-i", "pipe:0",
                         "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                        "-f", "mp4", str(temporary_path),
+                        "-fs", str(MAX_VIDEO_BYTES), "-f", "mp4", str(temporary_path),
                     ], stdin=frames_input, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                     with camera._CAMERA_LOCK:
                         self._encoder = process
@@ -451,6 +468,11 @@ class VisionCapturePlugin:
                     raise RuntimeError("ffmpeg error output did not close")
                 if process.returncode != 0 or not temporary_path.is_file() or temporary_path.stat().st_size == 0:
                     raise RuntimeError(stderr_tail.decode("utf-8", "replace") or "ffmpeg failed")
+                # ffmpeg -fs 可能因最后一个包/索引稍超限；超限成片绝不发布。
+                if temporary_path.stat().st_size >= MAX_VIDEO_BYTES:
+                    raise OSError(errno.EFBIG, "encoded MP4 reached 64 MiB limit")
+                if shutil.disk_usage(path.parent).free < MIN_FREE_BYTES:
+                    raise OSError(errno.ENOSPC, "insufficient free space after encoding")
                 # 录像结束后才公开 MP4，避免画布看到尚未写好索引的文件。
                 with temporary_path.open("rb+") as output:
                     os.fsync(output.fileno())
@@ -478,7 +500,8 @@ class VisionCapturePlugin:
         except Exception as exc:
             if cancel.is_set():
                 return {"ok": False, "code": "RECORD_CANCELLED", "message": "video recording was cancelled"}
-            return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
+            code = "STORAGE_ERROR" if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EFBIG) else "RECORD_FAILED"
+            return {"ok": False, "code": code, "message": str(exc)}
         finally:
             if frames_output is not None:
                 frames_output.close()

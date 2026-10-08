@@ -71,7 +71,22 @@ encodes that stream to MP4 with `ffmpeg`'s `ultrafast` H.264 preset. This keeps
 slow encoding from blocking Nano frame reception and repeating the last image
 for the rest of the requested duration. Unpublished temporary files are hidden from `list` and removed after
 success, failure, or cancellation; allow disk space for the temporary stream
-and final MP4 while encoding finishes. The completion result distinguishes
+and final MP4 while encoding finishes.
+
+Each recording has fixed storage limits: the temporary MJPEG spool is at most
+128 MiB and the published MP4 must be below 64 MiB. Before connecting and before
+every received or filler frame is written, the worker checks free space,
+reserving 64 MiB for the encoded MP4 plus 64 MiB for the host. ffmpeg also receives
+`-fs 67108864`; reaching the output limit fails the action instead of publishing
+a shortened video. ffmpeg can exceed its `-fs` target slightly during packet/index
+finalization, so the output size is checked again before publication. Final free
+space is checked as well. Quota exhaustion and filesystem `ENOSPC` / `EFBIG`
+produce one terminal `error` with code `STORAGE_ERROR`, and temporary media are
+removed. These are per-recording limits, not a total archive quota; existing
+saved files require explicit deletion. Free-space checks cannot reserve disk
+against concurrent writes by other services.
+
+The completion result distinguishes
 `recording_started_at` (first valid camera frame), `recording_ended_at` (capture
 finished), and `file_ready_at` (MP4 published). Playback duration follows the
 capture interval; file availability can be later because encoding runs after it.
@@ -116,8 +131,9 @@ for the same physical position.
 The Dockerfile installs `ffmpeg` for MP4 encoding, so the image will grow by
 that package and its dependencies; no model/data artefacts or Python image
 decoder are added. JPEG validation remains the frame-size limit and SOI/EOI
-markers, not a full decode. `driver.yaml` is metadata only. Docker image size
-has not been measured locally.
+markers, not a full decode. `driver.yaml` is metadata only. The ARM64 base does not include ffmpeg. See [image size evidence](image-size.md)
+for measured registry layer sizes and the distinction between total driver
+growth and ffmpeg dependency footprint.
 
 ## RGB path
 

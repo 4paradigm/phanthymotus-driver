@@ -1306,3 +1306,120 @@ def test_shutdown_keeps_old_video_worker_when_new_recording_starts(tmp_path, mon
     assert set(notifications) == {(first["action_id"], "error"), (second["action_id"], "cancelled")}
     assert len(notifications) == 2
     assert not card._workers
+
+
+def unexpected_encoder(*args, **kwargs):
+    raise RuntimeError("encoder should not start before storage checks pass")
+
+
+@pytest.mark.parametrize("phase", ["received", "gap_fill", "tail_fill"])
+def test_video_spool_quota_fails_with_one_terminal_error(tmp_path, monkeypatch, phase):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    jpeg = b"\xff\xd8data\xff\xd9"
+    quota = len(jpeg) - 1 if phase == "received" else len(jpeg) * 2
+    monkeypatch.setattr(snapshot, "MAX_SPOOL_BYTES", quota, raising=False)
+    monkeypatch.setattr(snapshot.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(snapshot.shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(10**9, 0, 10**9))
+    monkeypatch.setattr(snapshot.subprocess, "Popen", unexpected_encoder)
+
+    class Connection:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def close(self):
+            pass
+
+    monkeypatch.setattr(snapshot.socket, "create_connection", lambda *a, **k: Connection())
+    monkeypatch.setattr(snapshot.VisionCapturePlugin, "_receive_exact",
+                        staticmethod(lambda conn, size, *args: struct.pack(">I", len(jpeg)) if size == 4 else jpeg))
+    times = iter([0, 0, 0.5, 0.5, 0.5] if phase == "gap_fill" else [0, 0, 1, 1])
+    monkeypatch.setattr(snapshot.time, "monotonic", lambda: next(times, 1))
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    accepted = card.dispatch("record_video", {"duration_s": 1})
+    result = final_result(accepted)
+    card.shutdown()
+    assert result["state"] == "error", result
+    assert result["code"] == "STORAGE_ERROR"
+    assert "spool" in result["message"]
+    assert not list(tmp_path.rglob("*.mp4")) and not list(tmp_path.rglob("*.mjpeg"))
+    assert card.dispatch("list", {})["files"] == []
+    assert _completions.empty()
+
+
+@pytest.mark.parametrize("low_after_first_frame", [False, True])
+def test_video_preserves_free_space_reserve(tmp_path, monkeypatch, low_after_first_frame):
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    monkeypatch.setattr(snapshot.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    usages = iter([10**9, 10**9, 0] if low_after_first_frame else [0])
+    monkeypatch.setattr(snapshot.shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(10**9, 0, next(usages, 0)))
+    jpeg = b"\xff\xd8data\xff\xd9"
+
+    class Connection:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def close(self):
+            pass
+
+    monkeypatch.setattr(snapshot.socket, "create_connection", lambda *a, **k: Connection())
+    monkeypatch.setattr(snapshot.VisionCapturePlugin, "_receive_exact",
+                        staticmethod(lambda conn, size, *args: struct.pack(">I", len(jpeg)) if size == 4 else jpeg))
+    times = iter([0, 0, 0.5, 0.5, 0.5])
+    monkeypatch.setattr(snapshot.time, "monotonic", lambda: next(times, 1))
+    monkeypatch.setattr(snapshot.subprocess, "Popen", unexpected_encoder)
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    result = final_result(card.dispatch("record_video", {"duration_s": 1}))
+    card.shutdown()
+    assert result["state"] == "error" and result["code"] == "STORAGE_ERROR", result
+    assert "space" in result["message"]
+    assert card.dispatch("list", {})["files"] == []
+    assert not list(tmp_path.rglob("*.mjpeg"))
+    assert _completions.empty()
+
+
+def test_oversized_encoded_video_is_not_published(tmp_path, monkeypatch):
+    import io
+    snapshot = importlib.import_module("unitree.go1.vision_capture")
+    monkeypatch.setattr(snapshot, "MAX_VIDEO_BYTES", 32, raising=False)
+    monkeypatch.setattr(snapshot.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(snapshot.shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(10**9, 0, 10**9))
+    launches = []
+
+    class Encoder:
+        stdin = None
+        returncode = 0
+        def __init__(self, args, **kwargs):
+            self.path = Path(args[-1])
+            self.stderr = io.BytesIO()
+            launches.append(args)
+        def poll(self):
+            return 0
+        def wait(self, timeout=None):
+            self.path.write_bytes(b"v" * 40)
+            return 0
+
+    class Connection:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def close(self):
+            pass
+
+    jpeg = b"\xff\xd8data\xff\xd9"
+    monkeypatch.setattr(snapshot.subprocess, "Popen", Encoder)
+    monkeypatch.setattr(snapshot.socket, "create_connection", lambda *a, **k: Connection())
+    monkeypatch.setattr(snapshot.VisionCapturePlugin, "_receive_exact",
+                        staticmethod(lambda conn, size, *args: struct.pack(">I", len(jpeg)) if size == 4 else jpeg))
+    times = iter([0, 0, 1, 1])
+    monkeypatch.setattr(snapshot.time, "monotonic", lambda: next(times, 1))
+    card = snapshot.VisionCapturePlugin({"output_dir": str(tmp_path)})
+    result = final_result(card.dispatch("record_video", {"duration_s": 1}))
+    card.shutdown()
+    assert result["state"] == "error" and result["code"] == "STORAGE_ERROR", result
+    assert launches[0][launches[0].index("-fs") + 1] == "32"
+    assert card.dispatch("list", {})["files"] == []
+    assert not list(tmp_path.rglob("*.mp4")) and not list(tmp_path.rglob("*.mjpeg"))
+    assert _completions.empty()
