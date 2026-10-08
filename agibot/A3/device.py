@@ -717,6 +717,16 @@ class A3Nodes:
 
     def _audio_chunk(self, msg):
         out = self._AudioChunk()
+        # Match phanthymotus/deploy/ros-base/audio_msgs exactly.  Agent Core
+        # resolves audio/pcm-16k to that AudioChunk type, which includes a
+        # std_msgs/Header; omitting it gives the bridge a different ROS type
+        # hash even though the publisher appears in logs.
+        try:
+            stamp = getattr(msg, "stamps", None)
+            if stamp is not None:
+                out.header.stamp = stamp
+        except (AttributeError, TypeError):
+            pass
         out.format = "audio/pcm-16k"
         payload = getattr(getattr(msg, "data", None), "data", b"")
         out.data = list(payload)
@@ -743,7 +753,10 @@ class A3Nodes:
                             struct.unpack_from(endian + "f", msg.data, offset + fields["z"])[0]))
                     except struct.error:
                         continue
-            points = points[:80000]
+            # Match phanthymotus' sensor/pointcloud contract.  The consumer
+            # caps at 40000 points, while producers should decimate to 20000
+            # to keep DDS/Core latency bounded.
+            points = points[:20000]
             return struct.pack("<II", 12, len(points)) + b"".join(
                 struct.pack("<fff", *point) for point in points)
         except Exception:
