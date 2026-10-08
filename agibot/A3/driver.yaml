@@ -19,8 +19,13 @@ cards:
   - { name: imu,           type: sensor }
   - { name: camera_head,       type: sensor }
   - { name: camera_head_right, type: sensor }
+  - { name: camera_head_rear,  type: sensor }
   - { name: camera_chest_rgb,  type: sensor }
   - { name: camera_chest_depth, type: sensor }
+  - { name: camera_waist_rgb, type: sensor }
+  - { name: camera_waist_depth, type: sensor }
+  - { name: camera_wrist_left, type: sensor }
+  - { name: camera_wrist_right, type: sensor }
   - { name: lidar_cloud,   type: sensor }
   - { name: battery,       type: sensor }
   - { name: estop,         type: sensor }

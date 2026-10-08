@@ -88,6 +88,7 @@ def _select_profile() -> None:
         <type>UDPv4</type>
         <interfaceWhiteList>
           <address>{robot_ip}</address>
+          <address>127.0.0.1</address>
         </interfaceWhiteList>
       </transport_descriptor>
     </transport_descriptors>

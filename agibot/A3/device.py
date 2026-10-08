@@ -2445,10 +2445,15 @@ class TtsPlugin:
         if action == "stop_trace_id":
             # 打断播报同时结算挂起的 ACP 等待线程（立刻回报 cancelled，
             # 不让 Agent Core 的 barrier 挂到超时）。
+            requested_trace = str(args.get("trace_id") or "")
             with self._play_lock:
-                self._settle_active("cancelled", {"reason": "cancelled_by_request",
-                                                  "trace_id": args.get("trace_id", "")})
-            return jsonable(self.nodes.rpc.stop_tts_trace_id(args.get("trace_id", "")))
+                active_trace = self._play_trace_id or ""
+                # An empty trace means "current" in the A3 API.  A non-empty
+                # unrelated trace must never cancel the active ACP waiter.
+                if not requested_trace or requested_trace == active_trace:
+                    self._settle_active("cancelled", {"reason": "cancelled_by_request",
+                                                      "trace_id": requested_trace or active_trace})
+            return jsonable(self.nodes.rpc.stop_tts_trace_id(requested_trace))
         raise ValueError(f"tts: unknown action {action!r}")
 
 
@@ -3572,6 +3577,16 @@ def build_plugins(config, namespace, ros2):
         plugins["camera_head"] = CameraStreamPlugin(nodes, "camera_head", "head_left_fisheye")
     if (enabled("camera") or enabled("camera_head_right")) and "head_right_fisheye" in selected_cameras:
         plugins["camera_head_right"] = CameraStreamPlugin(nodes, "camera_head_right", "head_right_fisheye")
+    fixed_cameras = {
+        "camera_head_rear": "head_rear_fisheye",
+        "camera_waist_rgb": "waist_front_d415_rgb",
+        "camera_waist_depth": "waist_front_d415_depth",
+        "camera_wrist_left": "wrist_left_d405_rgb",
+        "camera_wrist_right": "wrist_right_d405_rgb",
+    }
+    for card_name, stream_name in fixed_cameras.items():
+        if (enabled("camera") or enabled(card_name)) and stream_name in selected_cameras:
+            plugins[card_name] = CameraStreamPlugin(nodes, card_name, stream_name)
     if (enabled("camera") or enabled("camera_chest_rgb")) and "chest_front_d457_rgb" in selected_cameras:
         plugins["camera_chest_rgb"] = CameraStreamPlugin(nodes, "camera_chest_rgb", "chest_front_d457_rgb")
     if (enabled("camera") or enabled("camera_chest_depth")) and "chest_front_d457_depth" in selected_cameras:

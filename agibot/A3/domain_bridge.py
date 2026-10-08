@@ -22,7 +22,8 @@ class CoreBridge:
         # the bridge boundary; a full queue drops the newest frame rather than
         # blocking the robot-domain subscription callback.
         self._queues = {lane: mp.get_context("spawn").Queue(maxsize=32)
-                        for lane in ("media0", "media1", "media2", "media3",
+                        for lane in ("media0", "media1", "media2", "media3", "media4",
+                                     "media5", "media6", "media7", "media8",
                                      "pointcloud", "state", "audio")}
         self._ctx = mp.get_context("spawn")
         self._profile = profile
@@ -51,11 +52,16 @@ class CoreBridge:
                 camera_lane = (
                     ("head_left", "media0"),
                     ("head_right", "media1"),
-                    ("chest_front_d457_rgb", "media2"),
-                    ("chest_front_d457_depth", "media3"),
+                    ("head_dual_fisheye", "media2"),
+                    ("chest_front_d457_rgb", "media3"),
+                    ("chest_front_d457_depth", "media4"),
+                    ("waist_front_d415_rgb", "media5"),
+                    ("waist_front_d415_depth", "media6"),
+                    ("wrist_left_d405", "media7"),
+                    ("wrist_right_d405", "media8"),
                 )
                 lane = next((value for marker, value in camera_lane if marker in topic),
-                             f"media{sum(topic.encode('utf-8')) % 4}")
+                             f"media{sum(topic.encode('utf-8')) % 9}")
             elif "audio" in topic or "mic" in topic:
                 lane = "audio"
             else:
@@ -100,6 +106,11 @@ class BridgePublisher:
 
 
 def _run(messages, profile, domain, lane):
+    try:
+        from common import logsafe
+        logsafe.install()
+    except ImportError:
+        pass
     os.environ["ROS_DOMAIN_ID"] = str(domain)
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     if os.path.isfile(profile):
@@ -113,7 +124,7 @@ def _run(messages, profile, domain, lane):
     types = {}
     for package, names in (("std_msgs.msg", ("String", "UInt8MultiArray")),
                            ("sensor_msgs.msg", ("CompressedImage", "Image", "PointCloud2", "JointState")),
-                           ("audio_msgs.msg", ("AudioCapture",))):
+                           ("audio_msgs.msg", ("AudioCapture", "AudioPlayback"))):
         try:
             module = __import__(package, fromlist=list(names))
         except ImportError:

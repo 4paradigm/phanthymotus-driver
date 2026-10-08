@@ -171,8 +171,9 @@ FULL_PLUGINS = {
     "joints": {"enabled": True}, "imu": {"enabled": True},
     "joint_state": {"enabled": True},
     "camera": {"enabled": True,
-               "streams": ["head_left_fisheye", "head_right_fisheye", "chest_front_d457_rgb",
-                           "chest_front_d457_depth"]},
+               "streams": ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye",
+                           "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb",
+                           "waist_front_d415_depth", "wrist_left_d405_rgb", "wrist_right_d405_rgb"]},
     "lidar_cloud": {"enabled": True}, "battery": {"enabled": True},
     "estop": {"enabled": True},
     "alerts": {"enabled": True, "poll_interval": 5.0}, "mc_mode": {"enabled": True},
@@ -554,8 +555,7 @@ class ToolInventoryTests(unittest.TestCase):
         camera = find_plugin(plugins, "camera")
         definition = camera.get_tool()
         enum = definition["inputSchema"]["properties"]["stream"]["enum"]
-        self.assertEqual(enum, ["head_left_fisheye", "head_right_fisheye", "chest_front_d457_rgb",
-                                "chest_front_d457_depth"])
+        self.assertEqual(enum, FULL_PLUGINS["camera"]["streams"])
         for name in enum:
             result = camera.dispatch("query", {"stream": name})
             self.assertEqual(result["robot_topic"], camera.streams[f"camera_{name}"]["robot_topic"])
@@ -1044,6 +1044,23 @@ class RpcDispatchTests(unittest.TestCase):
             self.assertEqual(action_id, result["action_id"])
             self.assertEqual(status, "cancelled")
             self.assertEqual(tool_name, "tts")
+        finally:
+            device._acp_notify = original_notify
+
+    def test_tts_stop_unrelated_trace_does_not_cancel_current_waiter(self):
+        captured = []
+        original_notify = device._acp_notify
+        device._acp_notify = lambda *args: captured.append(args)
+        try:
+            tts = find_plugin(self.plugins, "tts")
+            tts._POLL_INTERVAL_S = 0.2
+            self.transport.responses["TTSService/PlayTTS"] = {"trace_id": "t-current"}
+            self.transport.responses["TTSService/GetAudioStatus"] = {"state": 1}
+            result = tts.dispatch("speak", {"text": "当前播报"})
+            tts.dispatch("stop_trace_id", {"trace_id": "t-old"})
+            self.assertEqual(tts._play_action_id, result["action_id"])
+            self.assertEqual(captured, [])
+            tts.dispatch("stop", {})
         finally:
             device._acp_notify = original_notify
 
@@ -2259,7 +2276,7 @@ class RobotSubnetIpTests(unittest.TestCase):
                              fake_path)
             text = Path(fake_path).read_text(encoding="utf-8")
             self.assertIn("<address>10.42.10.77</address>", text)
-            self.assertNotIn("<address>127.0.0.1</address>", text)
+            self.assertIn("<address>127.0.0.1</address>", text)
 
     def test_profile_path_lives_in_dockerfile_created_directory(self):
         # /work/agibot/A3/ is COPYied by the Dockerfile; /work/agibot-a3/ never
