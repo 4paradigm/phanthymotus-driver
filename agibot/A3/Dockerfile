@@ -2,6 +2,14 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
 
+# FastDDS in the Humble base image fails to reassemble the A3 Jazzy Image and
+# PointCloud2 samples ("sequence size exceeds remaining buffer").  Keep
+# FastDDS for the isolated domain-42 bridge, but use CycloneDDS in the main
+# robot participant for robust large-sample reception.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ros-humble-rmw-cyclonedds-cpp && \
+    rm -rf /var/lib/apt/lists/*
+
 # A3 has no vendored msgs package to colcon-build (unlike X2's aimdk_msgs zip):
 # The official AimDK v3.2 wheel is vendored below (the vendor package does not
 # require a device-specific runtime).  ros2_plugin_proto remains sourced from
@@ -28,9 +36,10 @@ COPY resource/ /work/agibot/A3/resource/
 # never run and the command cards stay withheld/degraded in production), no log
 # rotation, no DDS profile.
 COPY deploy/ /deploy/
+COPY cyclonedds.xml /work/agibot/A3/cyclonedds.xml
 # RCUTILS_COLORIZED_OUTPUT=0: rclpy logging must not emit ANSI color codes —
 # logsafe scrubs them anyway, but the fleet contract (README_dev, 11 drivers)
 # is to keep raw rclpy output plain so every consumer sees identical records.
-ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 PYTHONPATH=/work
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI=file:///work/agibot/A3/cyclonedds.xml ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 PYTHONPATH=/work
 EXPOSE 15719
 CMD ["/bin/bash", "-c", "set -e; if [ -f /opt/ros/jazzy/setup.bash ]; then source /opt/ros/jazzy/setup.bash; else source /opt/ros/humble/setup.bash; fi; source /tmp/a3_ws/install/setup.bash; for setup in /opt/agibot/share/ros2_package/aimrt_protocol_ros2_package/share/ros2_plugin_proto/local_setup.bash /opt/agibot/share/ros2_package/aima_protocol_ros2_package/share/audio_msgs/local_setup.bash /agibot-devkit/prebuilt/ros2_plugin_proto_aarch64/share/ros2_plugin_proto/local_setup.bash /agibot-devkit/prebuilt/audio_msgs_proto_aarch64/share/audio_msgs/local_setup.bash; do if [ -f \"$setup\" ]; then source \"$setup\"; fi; done; python3 -c 'from audio_msgs.msg import AudioCapture, AudioPlayback; print(\"[audio] audio_msgs AudioCapture/AudioPlayback available\", flush=True)' || { echo '[warn] A3 audio_msgs unavailable — mic/speaker degraded'; }; python3 -c 'from ros2_plugin_proto.msg import RosMsgWrapper; print(\"[ros2_plugin_proto] RosMsgWrapper available\", flush=True)' || { echo '[warn] ros2_plugin_proto unavailable — wrapper command cards degraded'; }; python3 -c 'from aimdk.protocol.hal.bms.hal_bms_channel_pb2 import BmsStateChannel; from aimdk.protocol.hal.state.hal_state_channel_pb2 import EmergencyStateChannel; print(\"[a3_aimdk] 3.2.0 protobuf available\", flush=True)' || { echo '[warn] a3_aimdk protobuf import failed — battery/estop degraded'; }; python3 /work/agibot/A3/main.py"]
