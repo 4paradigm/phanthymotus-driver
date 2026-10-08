@@ -2301,6 +2301,8 @@ class RobotSubnetIpTests(unittest.TestCase):
             text = Path(fake_path).read_text(encoding="utf-8")
             self.assertIn("<address>10.42.10.77</address>", text)
             self.assertIn("<address>127.0.0.1</address>", text)
+            self.assertIn("<receiveBufferSize>16777216</receiveBufferSize>", text)
+            self.assertIn("<maxMessageSize>16777216</maxMessageSize>", text)
 
     def test_profile_path_lives_in_dockerfile_created_directory(self):
         # /work/agibot/A3/ is COPYied by the Dockerfile; /work/agibot-a3/ never

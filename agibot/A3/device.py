@@ -453,8 +453,14 @@ class A3Nodes:
             # large sample stopping the shared spin loop.
             import rclpy.executors
             self.media_robot = Node("agibot_a3_media_robot", context=ros2.ctx_robot)
+            # One worker per configured media lane (12 camera lanes plus lidar
+            # and audio) keeps callbacks independent without creating a dozen
+            # DDS participants.  FastDDS performs deserialization before these
+            # callbacks, so this complements rather than replaces the larger
+            # transport buffers in main.py.
+            media_threads = max(16, len(CAMERA_TOPICS) + 4)
             self._media_ros_executor = rclpy.executors.MultiThreadedExecutor(
-                context=ros2.ctx_robot, num_threads=4)
+                context=ros2.ctx_robot, num_threads=media_threads)
             self._media_ros_executor.add_node(self.media_robot)
             self._media_ros_thread = threading.Thread(
                 target=self._media_ros_executor.spin, daemon=True,

@@ -83,6 +83,13 @@ def _select_profile() -> None:
       <transport_descriptor>
         <transport_id>a3_robot_net</transport_id>
         <type>UDPv4</type>
+        <!-- A3 Image/PointCloud2 samples are fragmented at the RTPS layer.
+             The defaults in the base image are small enough that a burst of
+             fragments can be dropped before Fast-CDR reconstructs the sample,
+             producing `sequence size exceeds remaining buffer`. -->
+        <sendBufferSize>16777216</sendBufferSize>
+        <receiveBufferSize>16777216</receiveBufferSize>
+        <maxMessageSize>16777216</maxMessageSize>
         <interfaceWhiteList>
           <address>{robot_ip}</address>
           <address>127.0.0.1</address>
