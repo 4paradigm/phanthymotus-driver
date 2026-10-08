@@ -66,10 +66,17 @@ class PoseCheckPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["check"]},
+                    "action": {"type": "string",
+                               "enum": ["start", "stop", "info", "check"]},
                     "pose": {"type": "string", "enum": list(POSES)},
                 },
-                "required": ["action", "pose"],
+                "required": ["action"],
+                "x-action-params": {
+                    "start": {"params": [], "description": "启用姿态检查"},
+                    "stop": {"params": [], "description": "停止姿态检查"},
+                    "info": {"params": [], "description": "查询相机输入和模型状态"},
+                    "check": {"params": ["pose"], "description": "检查当前相机画面的姿态"},
+                },
             },
             "topic_in": [{"topic": self._input_topic, "format": "image/jpeg"}],
         }
@@ -126,11 +133,6 @@ class PoseCheckPlugin:
                 "pose": pose,
                 "supported_poses": list(POSES),
             }
-
-        # Keeping this input path makes the geometry independently testable and
-        # gives a future perception adapter a stable integration contract.
-        if "keypoints" in args:
-            return check_pose(args["keypoints"], pose)
 
         with self._lock:
             jpeg = self._latest_jpeg

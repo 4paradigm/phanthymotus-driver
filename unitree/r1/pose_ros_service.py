@@ -3,13 +3,19 @@ import argparse
 import json
 import os
 import ssl
+import sys
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 try:
     # This service is commonly launched outside main.py on Tianyi. Install the
     # driver's line-atomic log writer before MediaPipe or ROS can emit output.
+    # A temporary service runs from /tmp, while the driver image keeps common/
+    # below /work, so expose that package explicitly in this entry point.
+    if Path("/work/common/logsafe.py").is_file() and "/work" not in sys.path:
+        sys.path.insert(0, "/work")
     from common import logsafe
     logsafe.install()
 except ImportError:

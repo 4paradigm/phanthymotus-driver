@@ -66,7 +66,8 @@ BUMI 驱动发布 `sensor_msgs/CompressedImage`：
 接收图像。不要为了 BUMI 图像启动包含 R1 硬件初始化的 `main.py`。
 
 R1 可用后，在已验证的运行环境安装可选推理依赖、挂载 `.task` 文件，
-设置 `plugins.pose_check.model_path`；空 `input_topic` 默认订阅
+将 `plugins.pose_check.enabled` 设为 `true` 并设置
+`plugins.pose_check.model_path`；空 `input_topic` 默认订阅
 `/<r1_namespace>/camera/main`，对应 `camera_main`。
 现有 `pose_check` tool 名称、`check` action、`pose` 枚举保持不变。
 R1 Dockerfile 包含适配器，但未自动安装可选模型依赖；ARM64 包兼容性、

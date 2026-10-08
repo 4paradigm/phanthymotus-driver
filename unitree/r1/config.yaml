@@ -38,7 +38,9 @@ plugins:
   camera:
     enabled: true
   pose_check:
-    enabled: true
+    # Optional backend: install requirements-pose.txt and mount a verified
+    # MediaPipe .task model before enabling this card on a target runtime.
+    enabled: false
     # Default: /<namespace>/camera/main; BUMI RGB: /<bumi_namespace>/camera/color.
     input_topic: ""
     # Optional MediaPipe .task model; requires requirements-pose.txt.

@@ -129,12 +129,25 @@ class PoseCheckTests(unittest.TestCase):
 
     def test_plugin_jpeg_path_and_stale_frame(self):
         plugin = PoseCheckPlugin({}, "test", None)
-        self.assertEqual(plugin.get_tool()["topic_in"][0]["topic"], "/test/camera/main")
+        tool = plugin.get_tool()
+        self.assertEqual(tool["topic_in"][0]["topic"], "/test/camera/main")
+        self.assertEqual(tool["inputSchema"]["required"], ["action"])
+        self.assertEqual(tool["inputSchema"]["x-action-params"], {
+            "start": {"params": [], "description": "启用姿态检查"},
+            "stop": {"params": [], "description": "停止姿态检查"},
+            "info": {"params": [], "description": "查询相机输入和模型状态"},
+            "check": {"params": ["pose"], "description": "检查当前相机画面的姿态"},
+        })
         info = plugin.dispatch("info", {})
         self.assertEqual(info["topic_in"], [{"topic": "/test/camera/main",
                                               "format": "image/jpeg"}])
         self.assertEqual(plugin.dispatch("check", {"pose": "hands_up"})["error"],
                          "camera_no_data")
+        self.assertEqual(plugin.dispatch("check", {
+            "pose": "hands_up",
+            "keypoints": {**self.shoulders, "left_wrist": (.4, .2),
+                          "right_wrist": (.6, .2)},
+        })["error"], "camera_no_data")
         plugin._on_frame(SimpleNamespace(data=b"jpeg"))
         received = []
         points = {**self.shoulders, "left_wrist": (.4, .2), "right_wrist": (.6, .2)}

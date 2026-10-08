@@ -4,9 +4,12 @@
 
 ## 部署临时服务
 
-在 Mac 上把最新的 `/tmp/tianyi-pose-check-bridge.tar.gz` 传到天轶：
+在仓库根目录从已跟踪源码生成临时包，再把它传到天轶。这个包包含
+`pose_ros_service.py`、姿态/会话模块和 socket bridge 依赖，不依赖手工维护的
+`/tmp` 文件：
 
 ```bash
+python3 x-humanoid/tianyi2.0/build_pose_check_bundle.py
 scp /tmp/tianyi-pose-check-bridge.tar.gz nvidia@10.100.129.72:/tmp/
 ```
 

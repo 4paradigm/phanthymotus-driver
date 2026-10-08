@@ -8,6 +8,16 @@ import sys
 import threading
 import time
 
+try:
+    # This harness may be used with --serve in a driver container. Protect its
+    # concurrent per-frame JSON output before any runtime output is produced.
+    from common import logsafe
+    logsafe.install()
+except ImportError:
+    # Local developer virtual environments need not have the repository common/
+    # package on sys.path.
+    pass
+
 from pose_check import POSES, check_pose
 from pose_estimator import MediaPipePoseEstimator
 
