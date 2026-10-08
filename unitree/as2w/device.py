@@ -46,6 +46,8 @@ class _StateNode:
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", 10)
         self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", 10)
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", 10)
+        self.odometry = self.node.create_publisher(String, f"/{namespace}/state/odometry", 10)
+        self._odometry_origin = None
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
         # AS2/As2W's official sport-state example uses the lf namespace.
@@ -112,11 +114,30 @@ class _StateNode:
         self._publish(self.battery, battery)
 
     def _on_sport(self, msg):
+        position = [_number(value) for value in list(getattr(msg, "position", []))[:3]]
+        velocity = [_number(value) for value in list(getattr(msg, "velocity", []))[:3]]
+        position.extend([0.0] * (3 - len(position)))
+        velocity.extend([0.0] * (3 - len(velocity)))
+
         loco = {"mode": int(getattr(msg, "mode", 0)),
                 "body_height": _number(getattr(msg, "body_height", 0))}
-        loco.update(self._flat("velocity", getattr(msg, "velocity", [])))
-        loco.update(self._flat("position", getattr(msg, "position", [])))
+        loco.update(self._flat("velocity", velocity))
+        loco.update(self._flat("position", position))
         self._publish(self.loco, loco)
+
+        if self._odometry_origin is None:
+            self._odometry_origin = position[:2]
+        dx = position[0] - self._odometry_origin[0]
+        dy = position[1] - self._odometry_origin[1]
+        self._publish(self.odometry, {
+            "timestamp_ms": int(time.time() * 1000),
+            "position_m": position,
+            "velocity_mps": {"forward": velocity[0], "lateral": velocity[1], "vertical": velocity[2]},
+            "yaw_speed_rad_s": _number(getattr(msg, "yaw_speed", 0)),
+            "origin_m": list(self._odometry_origin),
+            "displacement_m": {"dx": round(dx, 3), "dy": round(dy, 3),
+                               "distance": round(math.hypot(dx, dy), 3)},
+        })
 
 
 class StatePlugin:
@@ -130,7 +151,8 @@ class StatePlugin:
                  ("joints", "state/joints", "sensor/skeleton", "As2W 16-joint skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "As2W raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "As2W BMS state; current_ma is mA"),
-                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"))
+                 ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"),
+                 ("odometry", "state/odometry", "data/json", "As2W position, velocity, yaw speed, and displacement from first-frame origin"))
         return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
                  "inputSchema": {"type": "object", "properties": {}},
                  "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
@@ -158,13 +180,14 @@ class StatePlugin:
                      "joints": ("state/joints", "sensor/skeleton"),
                      "joint_state": ("state/joint_state", "data/json"),
                      "battery": ("state/battery", "data/json"),
-                     "loco_state": ("loco/state", "data/json")}
+                     "loco_state": ("loco/state", "data/json"),
+                     "odometry": ("state/odometry", "data/json")}
             if name in paths:
                 path, fmt = paths[name]
                 return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
             return {"state": "running"}
-        if action in ("imu", "joints", "joint_state", "battery", "loco_state"):
-            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
+        if action in ("imu", "joints", "joint_state", "battery", "loco_state", "odometry"):
+            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state", "odometry": "state/odometry"}[action]
             fmt = "sensor/skeleton" if action == "joints" else "data/json"
             return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
         return {"state": "running"} if action == "info" else None
