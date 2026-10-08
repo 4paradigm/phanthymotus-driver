@@ -459,9 +459,16 @@ for line in sys.stdin:
     return helper, log
 
 
+def sdk_test_plugin(executable, exclusive=True, sdk_dir=None):
+    # Test-only transport injection; production card config cannot select a process.
+    plugin = ext.FaceLightPlugin({"backend": "sdk", "sdk_exclusive": exclusive}, "", None, None)
+    plugin._backend = ext._FaceSdkBackend(str(executable), exclusive, sdk_dir)
+    return plugin
+
+
 def test_sdk_backend_complete_card_path(sdk_helper):
     helper, log = sdk_helper
-    plugin = ext.FaceLightPlugin({"backend": "sdk", "sdk_executable": str(helper), "sdk_exclusive": True}, "", None, None)
+    plugin = sdk_test_plugin(helper)
     start = plugin.start()
     assert start["ok"], start
     process = plugin._backend.process
@@ -482,11 +489,11 @@ def test_sdk_backend_complete_card_path(sdk_helper):
 
 def test_sdk_exclusive_guard_and_missing_executable(sdk_helper):
     helper, _ = sdk_helper
-    plugin = ext.FaceLightPlugin({"backend": "sdk", "sdk_executable": str(helper)}, "", None, None)
+    plugin = sdk_test_plugin(helper, exclusive=False)
     result = plugin.start()
     assert not result["ok"] and "sdk_exclusive" in result["message"]
     assert plugin._backend.process is None
-    plugin = ext.FaceLightPlugin({"backend": "sdk", "sdk_executable": "/missing/face-light-helper", "sdk_exclusive": True}, "", None, None)
+    plugin = sdk_test_plugin("/missing/face-light-helper")
     assert not plugin.start()["ok"]
     assert not plugin._active and plugin._backend.process is None
 
@@ -505,7 +512,7 @@ for line in sys.stdin:
     {responses[behavior]}
 ''')
     helper.chmod(0o755)
-    plugin = ext.FaceLightPlugin({"backend": "sdk", "sdk_executable": str(helper), "sdk_exclusive": True}, "", None, None)
+    plugin = sdk_test_plugin(helper)
     start = plugin.start()
     assert start["ok"], start
     process = plugin._backend.process
@@ -520,7 +527,7 @@ def test_sdk_bad_handshake(tmp_path):
     helper = tmp_path / "helper"
     helper.write_text(f'#!{sys.executable}\nprint("wrong protocol", flush=True)\n')
     helper.chmod(0o755)
-    plugin = ext.FaceLightPlugin({"backend": "sdk", "sdk_executable": str(helper), "sdk_exclusive": True}, "", None, None)
+    plugin = sdk_test_plugin(helper)
     assert not plugin.start()["ok"]
     assert plugin._backend.process is None
 
@@ -536,9 +543,12 @@ def test_canvas_backend_config_requires_restart(light, sdk_helper):
     helper, _ = sdk_helper
     light.dispatch('chase', {'g': 60, 'duration_s': 2})
     worker = light._thread
-    result = light.dispatch('config', {'backend': 'sdk', 'sdk_executable': str(helper), 'sdk_exclusive': True})
+    result = light.dispatch('config', {'backend': 'sdk', 'sdk_exclusive': True})
     assert result['ok'] and result['needs_start']
     assert not worker.is_alive() and not light._active
+    assert light._backend.executable == ext._FACE_SDK_EXECUTABLE
+    assert light._backend.sdk_dir == ext._FACE_SDK_DIR
+    light._backend = ext._FaceSdkBackend(str(helper), True)  # offline transport injection
     assert light.dispatch('start', {})['ok']
     assert light.dispatch('set_led', {'index': 7, 'r': 10})['ok']
     assert light._info()['backend'] == 'sdk'
@@ -552,10 +562,58 @@ def test_bad_canvas_config_preserves_backend(light, config):
     assert light._backend is backend and light._active
 
 
+@pytest.mark.parametrize('action', ['config', 'start'])
+@pytest.mark.parametrize('override', [
+    {'sdk_executable': '/bin/sh'}, {'sdk_executable': '/usr/bin/python3'},
+    {'sdk_executable': '/deploy/face_light/../face_light/run_sdk.sh'},
+    {'sdk_dir': '/tmp/untrusted-sdk'}, {'sdk_dir': '/opt/phanthy-motus/data/go1/faceLightSDK_Nano/../other'},
+    {'sdk_dir': '/opt/phanthy-motus/data/go1/faceLightSDK_Nano/'},
+    {'sdk_executable': ['run_sdk.sh']}, {'sdk_dir': None},
+])
+def test_remote_sdk_path_override_rejected_without_interrupt(light, monkeypatch, action, override):
+    light.dispatch('chase', {'r': 50, 'duration_s': 2})
+    worker, backend = light._thread, light._backend
+    popen = Mock(side_effect=AssertionError('must not launch a process'))
+    monkeypatch.setattr(ext.subprocess, 'Popen', popen)
+    result = light.dispatch(action, dict(backend='sdk', sdk_exclusive=True, **override))
+    assert not result['ok'] and result['code'] == 'INVALID_ARGUMENT'
+    assert 'fixed to' in result['message']
+    assert light._thread is worker and worker.is_alive()
+    assert light._backend is backend and light._active
+    popen.assert_not_called()
+
+
+def test_sdk_paths_not_editable_and_constructor_rejects_override(tmp_path):
+    plugin = ext.FaceLightPlugin({}, '', None, None)
+    schema = plugin.get_tool()['configSchema']['properties']
+    assert 'sdk_executable' not in schema and 'sdk_dir' not in schema
+    alias = tmp_path / 'launcher'
+    alias.symlink_to(ext._FACE_SDK_EXECUTABLE)
+    for config in ({'sdk_executable': str(alias)}, {'sdk_dir': '/tmp/vendor-sdk'}):
+        with pytest.raises(ValueError, match='fixed to'):
+            ext.FaceLightPlugin(config, '', None, None)
+
+
+def test_sdk_launch_uses_fixed_paths_and_overrides_inherited_environment(monkeypatch):
+    monkeypatch.setenv('FACE_LIGHT_SDK_DIR', '/tmp/untrusted-sdk')
+    popen = Mock(side_effect=OSError('offline: no launcher installed'))
+    monkeypatch.setattr(ext.subprocess, 'Popen', popen)
+    plugin = ext.FaceLightPlugin({'backend': 'sdk', 'sdk_exclusive': True}, '', None, None)
+    assert not plugin.start()['ok']
+    assert popen.call_args.args[0] == [ext._FACE_SDK_EXECUTABLE]
+    assert popen.call_args.kwargs['env']['FACE_LIGHT_SDK_DIR'] == ext._FACE_SDK_DIR
+    assert plugin._backend.process is None
+
+
+def test_sdk_launcher_is_executable_without_docker_permission_churn():
+    launcher = GO1 / 'deploy/face_light/run_sdk.sh'
+    assert launcher.stat().st_mode & 0o111
+    assert 'chmod +x /deploy/face_light/run_sdk.sh' not in (GO1 / 'Dockerfile').read_text()
+
+
 def test_missing_sdk_runtime_launcher_returns_clear_error():
     launcher = GO1 / 'deploy/face_light/run_sdk.sh'
-    plugin = ext.FaceLightPlugin({'backend': 'sdk', 'sdk_executable': str(launcher),
-                                 'sdk_dir': '/missing/official-sdk', 'sdk_exclusive': True}, '', None, None)
+    plugin = sdk_test_plugin(launcher, sdk_dir='/missing/official-sdk')
     result = plugin.start()
     assert not result['ok'] and 'headers are missing' in result['message']
     assert plugin._backend.process is None
@@ -571,7 +629,7 @@ for line in sys.stdin:
     time.sleep(60)
 ''')
     helper.chmod(0o755)
-    plugin = ext.FaceLightPlugin({'backend': 'sdk', 'sdk_executable': str(helper), 'sdk_exclusive': True}, '', None, None)
+    plugin = sdk_test_plugin(helper)
     assert plugin.start()['ok']
     process = plugin._backend.process
     assert not plugin.dispatch('set_color', {'r': 1})['ok']

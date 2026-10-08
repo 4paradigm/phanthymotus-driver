@@ -5,7 +5,7 @@ sdk_root="${FACE_LIGHT_SDK_DIR:-/opt/phanthy-motus/data/go1/faceLightSDK_Nano}"
 build_root="${FACE_LIGHT_BUILD_DIR:-/tmp/go1-face-light-sdk-runtime}"
 source_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ ! -f "$sdk_root/include/FaceLightClient.h" ] || [ ! -f "$sdk_root/include/LEDPixel.h" ]; then
-    printf '%s\n' 'ERROR official faceLight SDK headers are missing; configure sdk_dir to a mounted SDK directory'
+    printf '%s\n' 'ERROR official faceLight SDK headers are missing; mount the trusted official SDK at /opt/phanthy-motus/data/go1/faceLightSDK_Nano'
     exit 1
 fi
 # CMake copies the matching library beside the adapter and only rebuilds changed inputs.

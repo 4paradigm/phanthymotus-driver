@@ -684,10 +684,13 @@ class _FaceSdkBackend:
             process.stdout.close()
 
 
+_FACE_SDK_EXECUTABLE = "/deploy/face_light/run_sdk.sh"
+_FACE_SDK_DIR = "/opt/phanthy-motus/data/go1/faceLightSDK_Nano"
+
 _FACE_CONFIG_DEFAULTS = {
     "backend": "mqtt", "mqtt_host": "localhost", "mqtt_port": 1883,
-    "sdk_executable": "/deploy/face_light/run_sdk.sh", "sdk_exclusive": False,
-    "sdk_dir": "/opt/phanthy-motus/data/go1/faceLightSDK_Nano",
+    "sdk_executable": _FACE_SDK_EXECUTABLE, "sdk_exclusive": False,
+    "sdk_dir": _FACE_SDK_DIR,
 }
 
 
@@ -702,10 +705,11 @@ def _face_backend(config):
     if type(config["sdk_exclusive"]) is not bool:
         raise ValueError("sdk_exclusive must be a boolean")
     for key in ("sdk_dir", "sdk_executable"):
-        if not isinstance(config[key], str) or not config[key]:
-            raise ValueError(f"{key} must be a nonempty string")
+        fixed_path = _FACE_SDK_DIR if key == "sdk_dir" else _FACE_SDK_EXECUTABLE
+        if config[key] != fixed_path:
+            raise ValueError(f"{key} is fixed to {fixed_path}; remote path overrides are not allowed")
     if backend == "sdk":
-        return _FaceSdkBackend(config["sdk_executable"], config["sdk_exclusive"], config["sdk_dir"])
+        return _FaceSdkBackend(_FACE_SDK_EXECUTABLE, config["sdk_exclusive"], _FACE_SDK_DIR)
     if backend == "simulated":
         return _FaceSimBackend()
     return _FaceMqttBackend(config["mqtt_host"], config["mqtt_port"])
@@ -905,9 +909,6 @@ class FaceLightPlugin:
                     "backend": {"type": "string", "enum": ["mqtt", "simulated", "sdk"], "default": "mqtt"},
                     "mqtt_host": {"type": "string", "default": "localhost", "x-sensitive": True},
                     "mqtt_port": {"type": "integer", "default": 1883, "minimum": 1, "maximum": 65535},
-                    "sdk_executable": {"type": "string", "default": _FACE_CONFIG_DEFAULTS["sdk_executable"]},
-                    "sdk_dir": {"type": "string", "default": _FACE_CONFIG_DEFAULTS["sdk_dir"],
-                                "x-sensitive": True, "description": "Mounted official SDK directory for container-side build"},
                     "sdk_exclusive": {"type": "boolean", "default": False,
                                       "description": "Confirm existing faceLightMqtt writer is stopped; keep faceLightServer running"}}},
                 "topic_out": []}

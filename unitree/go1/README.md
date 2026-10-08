@@ -307,9 +307,11 @@ cmake --build /tmp/go1-face-build
 既有 Dockerfile 已复制整个 `deploy/`，其中包括适配器源码；默认 MQTT 镜像无需
 SDK。镜像默认通过 `/deploy/face_light/run_sdk.sh` 在首次启动 SDK 后端时编译，并缓存
 编译产物。只需将完整官方 SDK 放到机器人
-`/opt/phanthy-motus/data/go1/faceLightSDK_Nano`（现有数据卷已映射），或在画布
-配置 `sdk_dir` 为另一个已挂载路径；SDK 库不打包进公共镜像。缺少文件、编译失败
-或架构不匹配时启动失败，不自动回退 MQTT/模拟。也可自行编译后配置适配器路径。
+`/opt/phanthy-motus/data/go1/faceLightSDK_Nano`（现有数据卷已映射）；SDK 库不打包进公共镜像。
+启动脚本与 SDK 根目录固定，不在画布暴露路径配置；`config`/`start` 传入其他
+`sdk_executable` 或 `sdk_dir` 会返回 `INVALID_ARGUMENT`，且保留已有运行状态。
+SDK 头文件、库及示例应由操作者从可信官方来源放入该目录，不能接受未经审查的上传文件。
+缺少文件、编译失败或架构不匹配时启动失败，不自动回退 MQTT/模拟。
 
 修改原卡配置，不再注册其他卡：
 
@@ -317,8 +319,6 @@ SDK。镜像默认通过 `/deploy/face_light/run_sdk.sh` 在首次启动 SDK 后
 face_light:
   enabled: true
   backend: sdk
-  sdk_dir: /opt/phanthy-motus/data/go1/faceLightSDK_Nano
-  sdk_executable: /deploy/face_light/run_sdk.sh
   sdk_exclusive: true  # 仅在实际停止 faceLightMqtt 等其他写入源后设为 true
 ```
 
