@@ -2568,20 +2568,6 @@ class TtsPlugin:
             priority = args.get("priority_level", "INTERACTION_L6")
             _require(priority in TTS_PRIORITY_LEVELS.values() or priority in TTS_PRIORITY_LEVELS,
                      f"未知优先级 {priority!r}")
-            response = self.nodes.rpc.play_tts(
-                text,
-                priority_level=priority if priority in TTS_PRIORITY_LEVELS.values() else TTS_PRIORITY_LEVELS[priority],
-                is_interrupted=bool(args.get("is_interrupted", True)),
-                trace_id=str(args.get("trace_id") or ""),
-            )
-            # PlayTTS/PlayMediaFile 出参为扁平结构（is_sucess 官方拼写如此）
-            trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
-            # 新播报顶替旧播报：先结算旧等待线程（立即 cancelled）并用旧 trace_id
-            # 物理打断 —— 顺序不能反，否则打断的是新播报。结算→打断→武装在同一
-            # 把锁内完成（10th PR review）：并发播报不会都观察到“无活动播报”而
-            # 重叠武装、互相顶掉对方的 id。
-            # 播报无独立 trace_id 时轮询不到指定会话，等待线程只能靠超时兜底；
-            # 此时用空 trace_id 询问当前播报状态（GetAudioStatus 单会话语义）。
             with self._play_lock:
                 prior = self._settle_active("cancelled", {"reason": "replaced_by_new_playback"})
                 if prior is not None and prior[1]:
@@ -2589,13 +2575,17 @@ class TtsPlugin:
                         self.nodes.rpc.stop_tts_trace_id(prior[1])
                     except Exception:
                         pass
+                response = self.nodes.rpc.play_tts(
+                    text,
+                    priority_level=priority if priority in TTS_PRIORITY_LEVELS.values() else TTS_PRIORITY_LEVELS[priority],
+                    is_interrupted=bool(args.get("is_interrupted", True)),
+                    trace_id=str(args.get("trace_id") or ""),
+                )
+                trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
                 return self._arm_completion("speak", trace_id, {"text": text[:50]})
         if action == "play_media":
             file_name = args.get("file_name", "")
             _require(file_name, "file_name 不能为空")
-            response = self.nodes.rpc.play_media_file(file_name, is_interrupted=True)
-            trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
-            # 同 speak：在锁内结算并打断旧播报，再武装新的等待线程。
             with self._play_lock:
                 prior = self._settle_active("cancelled", {"reason": "replaced_by_new_playback"})
                 if prior is not None and prior[1]:
@@ -2603,6 +2593,8 @@ class TtsPlugin:
                         self.nodes.rpc.stop_tts_trace_id(prior[1])
                     except Exception:
                         pass
+                response = self.nodes.rpc.play_media_file(file_name, is_interrupted=True)
+                trace_id = response.get("trace_id", "") or (response.get("data") or {}).get("trace_id", "")
                 return self._arm_completion("play_media", trace_id,
                                             {"file_name": file_name, "response": response})
         if action == "status":
@@ -3739,8 +3731,8 @@ def build_plugins(config, namespace, ros2):
         plugins["imu"] = ImuPlugin(nodes)
     camera_cfg = plugins_cfg.get("camera", {})
     selected_cameras = set(camera_cfg.get("streams") or [])
-    if (enabled("camera") or enabled("camera_head")) and "head_left_fisheye" in selected_cameras:
-        plugins["camera_head"] = CameraStreamPlugin(nodes, "camera_head", "head_left_fisheye")
+    if (enabled("camera") or enabled("camera_head_left")) and "head_left_fisheye" in selected_cameras:
+        plugins["camera_head_left"] = CameraStreamPlugin(nodes, "camera_head_left", "head_left_fisheye")
     if (enabled("camera") or enabled("camera_head_right")) and "head_right_fisheye" in selected_cameras:
         plugins["camera_head_right"] = CameraStreamPlugin(nodes, "camera_head_right", "head_right_fisheye")
     fixed_cameras = {
@@ -3761,7 +3753,7 @@ def build_plugins(config, namespace, ros2):
     if (enabled("camera") or enabled("camera_chest_depth")) and "chest_front_d457_depth" in selected_cameras:
         plugins["camera_chest_depth"] = CameraStreamPlugin(nodes, "camera_chest_depth", "chest_front_d457_depth")
     # Keep the legacy multiplexed card available only when explicitly enabled.
-    if enabled("camera") and not any(enabled(name) for name in ("camera_head", "camera_chest_rgb", "camera_chest_depth")):
+    if enabled("camera") and not any(enabled(name) for name in ("camera_head_left", "camera_chest_rgb", "camera_chest_depth")):
         plugins["camera"] = CameraPlugin(nodes)
     if enabled("lidar_cloud"):
         plugins["lidar_cloud"] = LidarCloudPlugin(nodes)
