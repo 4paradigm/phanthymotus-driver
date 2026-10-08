@@ -313,6 +313,12 @@ class TimerEngine:
             "schema": SCHEMA,
             "source": "timer",
             "type": event_type,
+            # Agent Core routes priority>0 JSON to the main agent.  Progress
+            # ticks stay in the background so short intervals cannot wake the
+            # LLM on every update.
+            "priority": 1 if event_type in (
+                "timer_alarm", "timer_completed", "timer_cancelled"
+            ) else 0,
             "event": event,
             "timer_id": timer["timer_id"],
             "run_id": timer["run_id"],

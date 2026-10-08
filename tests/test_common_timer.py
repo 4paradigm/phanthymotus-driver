@@ -48,6 +48,7 @@ def test_countdown_alarm_and_completion_are_ordered_and_once_only():
         ("timer_alarm", "green-ending")]
     assert events[0]["remaining_sec"] == 10
     assert events[0]["payload"] == {"scene": "traffic", "cycle": 1}
+    assert events[0]["priority"] == 1
 
     clock.advance(10)
     events = engine.poll(clock.monotonic, clock.wall)
@@ -56,6 +57,7 @@ def test_countdown_alarm_and_completion_are_ordered_and_once_only():
         ("timer_completed", "timer-completed"),
     ]
     assert all(event["remaining_sec"] == 0 for event in events)
+    assert [event["priority"] for event in events] == [1, 1]
     assert engine.poll(clock.monotonic, clock.wall) == []
 
 
@@ -90,6 +92,7 @@ def test_tick_coalesces_missed_intervals_instead_of_flooding():
     events = engine.poll(clock.monotonic, clock.wall)
     assert len(events) == 1
     assert events[0]["type"] == "timer_tick"
+    assert events[0]["priority"] == 0
     clock.advance(0.6)
     assert [event["type"] for event in engine.poll(clock.monotonic, clock.wall)] == [
         "timer_tick"]
@@ -189,6 +192,7 @@ def test_replace_invalidates_old_run_and_cancel_is_terminal():
     result, event = engine.cancel("green-light", clock.monotonic)
     assert result["status"] == "cancelled"
     assert event["run_id"] == second["run_id"]
+    assert event["priority"] == 1
     clock.advance(100)
     assert engine.poll(clock.monotonic, clock.wall) == []
 

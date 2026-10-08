@@ -7,6 +7,9 @@
 
 G1 默认将事件发布到 `/<机器人 namespace>/timer/events`。在画布上把 Timer 的 JSON
 输出连接到 `decision_core`，Agent 才会收到主动提醒。卡片本身不会调用 TTS、LED 或动作。
+事件 JSON 顶层的 `priority` 用于 Agent Core 分流：报警、完成和取消事件为 `1`，
+会唤醒主代理；周期 `timer_tick` 为 `0`，只进入后台监控和原始输入缓存，
+不会逐次唤醒主代理。需要按 tick 执行的实时设备控制应由本地消费者完成。
 
 工具 schema 将 `replace` 和 `auto_remove` 定义为 `"false"`/`"true"` 字符串选项，
 插件将其转换为布尔值。`alarms` 和 `payload` 同时接受原生 JSON 数组/对象，以及
