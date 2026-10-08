@@ -410,7 +410,7 @@ def test_single_card_bundle_and_packaging():
         assert bundle.dispatch("face_light", {"action": "set_led", "index": 11, "r": 9})["ok"]
         assert bundle.dispatch("face_light", {"action": "info"})["simulated"]
         config = yaml.safe_load((GO1 / "config.yaml").read_text())
-        assert config["plugins"]["face_light"]["enabled"] is False
+        assert config["plugins"]["face_light"]["enabled"] is True
         assert config["plugins"]["face_light"]["backend"] == "sdk"
         assert config["plugins"]["face_light"]["sdk_exclusive"] is True
         metadata = yaml.safe_load((GO1 / "driver.yaml").read_text())
@@ -431,14 +431,57 @@ def test_shipped_system_health_is_enabled_assembled_and_listed():
     selected = {name: plugins[name] for name in ('face_light', 'system_health')}
     client = Mock()
     bundle = main.Go1Bundle({'plugins': selected}, 'offline', None, client)
-    assert {tool['name'] for tool in bundle.get_all_tools()} == {'system_health'}
-    # Installing the SDK and opting in restores the same single face_light card.
-    selected['face_light'] = dict(selected['face_light'], enabled=True)
-    bundle = main.Go1Bundle({'plugins': selected}, 'offline', None, client)
     assert {tool['name'] for tool in bundle.get_all_tools()} == {'face_light', 'system_health'}
     metadata = yaml.safe_load((GO1 / 'driver.yaml').read_text())
     assert sum(card['name'] == 'system_health' for card in metadata['cards']) == 1
     assert not client.mock_calls  # declaration check only; no lifecycle/hardware calls
+
+
+def test_default_face_card_stays_discoverable_when_sdk_setup_is_missing(monkeypatch):
+    import main
+    import yaml
+    config = yaml.safe_load((GO1 / "config.yaml").read_text())
+    bundle = main.Go1Bundle({"plugins": {"face_light": config["plugins"]["face_light"]}},
+                            "offline", None, None)
+    tool = bundle.get_all_tools()[0]
+    assert tool["name"] == "face_light" and "面部灯带" in tool["description"]
+    assert "backend" not in tool["configSchema"]["properties"]
+    plugin = bundle._plugins[0]
+    error = "ERROR official faceLight SDK headers are missing; mount the trusted official SDK"
+    monkeypatch.setattr(plugin._backend, "start", Mock(side_effect=RuntimeError(error)))
+    try:
+        bundle.start_all()
+        assert [t["name"] for t in bundle.get_all_tools()] == ["face_light"]
+        info = bundle.dispatch("face_light", {"action": "info"})
+        assert info["ok"] and info["state"] == "idle" and not info["available"]
+        assert info["availability_source"] == "software_sdk_process"
+        assert info["unavailable_reason"] == info["last_error"] == error
+        assert not info["hardware_verified"] and info["colors"] is None
+        assert not bundle.dispatch("face_light", {"action": "set_color", "r": 100})["ok"]
+        assert plugin._backend.process is None
+    finally:
+        bundle.stop_all()
+
+
+def test_info_availability_tracks_process_readiness_and_stop(sdk_helper):
+    helper, _ = sdk_helper
+    plugin = sdk_test_plugin(helper)
+    assert not plugin._info()["available"]
+    try:
+        assert plugin.start()["ok"]
+        info = plugin._info()
+        assert info["available"] and info["state"] == "ready"
+        assert info["unavailable_reason"] is None and not info["hardware_verified"]
+        # A crashed helper is unavailable even before the next write discovers it.
+        process = plugin._backend.process
+        process.terminate()
+        process.wait(timeout=1)
+        info = plugin._info()
+        assert not info["available"] and info["state"] == "idle"
+        assert info["unavailable_reason"] and not info["connected"]
+    finally:
+        plugin.stop()
+    assert not plugin._info()["available"]
 
 
 def test_concurrent_start_stop_no_resurrection():

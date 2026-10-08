@@ -196,7 +196,9 @@ sudo docker run --rm --name go1_bundle \
 画布不再提供后端选择，也不接受 `backend: simulated`。离线测试仅在测试代码中注入记录器，
 不会连接机器人；没有自动回退到模拟成功。真机显示仍需现场验收。
 所有指令共用同一帧写入路径，每个实例只运行一个灯效，实机只创建 SDK 写入器。
-公共镜像不含官方 SDK，随附配置默认 `enabled: false`；完成下文的 SDK 安装和校验后再启用原卡。
+随附配置默认 `enabled: true`，原卡保持可发现，注册名仍为 `face_light`，中文描述为“面部灯带”。
+这是卡片注册开关，不表示 SDK 或硬件已就绪。公共镜像不含官方 SDK；缺失或校验失败时
+启动和控制返回失败，卡片仍可调用 `info` 查看原因，不会自动回退其他后端。
 默认配置为 `backend: sdk` 和 `sdk_exclusive: true`（画布显示 Yes），无需每次设置。
 此默认值要求部署前已停止旧 `faceLightMqtt` 等其他灯光写入源，不会自动停止现场程序。
 保持 `faceLightServer` 运行，并准备下文规定目录中的官方 SDK。
@@ -286,6 +288,9 @@ SDK 进程通过本地管道回报结果，卡片统一控制抢占与停止；�
 连接故障时关闭指令返回失败，不能保证物理灯光已关闭。
 **SENT 只代表 UDP 套接字接受数据，不代表灯珠已显示或 Nano 服务已接收。**
 `info.connected` 在 SDK 模式中表示本地 SDK 进程就绪，不表示硬件在线。
+`info.available` 仅在卡片启动且 SDK 进程仍运行时为 true，来源标为 `software_sdk_process`；
+否则为 false，`unavailable_reason` 返回启动/发送错误或停止原因。`capabilities` 列出实现支持的
+操作，并不表示当前可发送；`hardware_verified` 始终为 false，进程就绪不是灯光显示成功的证据。
 画布共享配置通过 `action=config` 应用；配置发生变化会取消灯效并关闭旧后端，需
 重新启动卡片。重复下发相同配置不改变状态，避免平台每次调用前重放配置中断灯效。
 
@@ -337,13 +342,16 @@ SDK 头文件、库及示例应由操作者从可信官方来源放入该目录�
    ```
 
    只有输出 `VERIFIED official faceLight SDK v1.0.1` 且退出码为 0 才继续；
-   缺失或校验失败时保持禁用。正常部署使用现有数据卷，不需要新增镜像层。
+   缺失或校验失败时不要调用灯光控制，使用 `info` 排查；也可自行设置 `enabled: false` 隐藏卡片。
+   正常部署使用现有数据卷，不需要新增镜像层。
 3. 确认停止 `faceLightMqtt` 等灯光写入源并保留 `faceLightServer`。
-4. 将现有 Go1 配置的 `plugins.face_light.enabled` 改为 true，保留 SDK/Yes 默认值。
+4. 保留现有 Go1 配置的 `plugins.face_light.enabled: true` 和 SDK/Yes 默认值；
+   若此前保存了 `enabled: false`，改为 true 才会注册卡片。
    可把完整 `config.yaml` 持久化到数据卷，例如 `/opt/phanthy-motus/data/go1/config.yaml`，
    并在部署服务的环境变量中设置 `CONFIG_PATH=/opt/phanthy-motus/data/go1/config.yaml`；
    修改的是现有配置中的灯光开关，其他卡配置保持原样。重新创建驱动容器应用配置后，
    再在画布使用原 `face_light` 卡。后续启动会编译适配器并等待 READY，编译失败仍明确报错。
+   调用 `info` 确认 `available: true` 后才进行灯光测试；这仍只代表软件就绪。
 
 修改原卡配置，不再注册其他卡：
 

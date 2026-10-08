@@ -461,7 +461,7 @@ def make_speaker(plugin_config, namespace, executor, client):
 
 
 # ============================================================================
-# face_light — one card, one serialized output path (official SDK or explicit simulation)
+# face_light — one card, one serialized official SDK output path
 # ============================================================================
 
 CARD_FACE_LIGHT = "face_light"
@@ -750,7 +750,8 @@ class FaceLightPlugin:
                 except Exception as exc:
                     self._last_error = str(exc)
                     self._mode = "error"
-                    return _env_face("start", False, state="idle", code="NOT_AVAILABLE", message=str(exc))
+                    return _env_face("start", False, state="idle", available=False,
+                                     code="NOT_AVAILABLE", message=str(exc))
             return _env_face("start", True, state="ready", connected=self._backend.connected,
                              simulated=self._backend.name == "simulated")
 
@@ -840,9 +841,18 @@ class FaceLightPlugin:
         with self._lock:
             per_led = self._backend.per_led
             effects = list(_FACE_EFFECTS)
-            return _env_face("info", True, state="ready" if self._active else "idle",
+            connected = self._backend.connected
+            available = self._active and connected
+            reason = None
+            if not available:
+                reason = self._last_error or (
+                    "SDK adapter is not running; stop/start after checking SDK setup"
+                    if self._active else "face_light is stopped; prepare the official SDK and call start")
+            return _env_face("info", True, state="ready" if available else "idle",
+                             available=available, unavailable_reason=reason,
+                             availability_source="software_sdk_process",
                              mode=self._mode, running=bool(self._thread and self._thread.is_alive()),
-                             connected=self._backend.connected, backend=self._backend.name,
+                             connected=connected, backend=self._backend.name,
                              simulated=self._backend.name == "simulated", last_error=self._last_error,
                              last_sent_timestamp_ms=self._last_sent,
                              colors=[list(c) for c in self._colors] if self._last_sent else None,
@@ -870,7 +880,9 @@ class FaceLightPlugin:
                         "fade": "Fade RGB to target RGB and back", "chase": "One LED traverses 0..11; per-LED backend required",
                         "info": "Software-recorded status and backend capabilities; no hardware feedback"}
         return {"name": CARD_FACE_LIGHT, "type": "actuator", "multiInstance": False,
-                "description": "Go1 face_light: persistent RGB, 12 LED control and internal timed effects. Check info for backend support; simulation is not hardware evidence.",
+                "description": "Go1 面部灯带（face_light）：整条 RGB、12 灯独立控制、闪烁、呼吸、渐变和流水灯。"
+                               "固定官方 SDK；卡片显示不代表可发送，先查看 info.available 与 unavailable_reason。"
+                               "缺少或校验失败的 SDK 不可用；状态是软件记录，无灯光实测反馈。",
                 "inputSchema": {"type": "object", "required": ["action"],
                                 "x-completion": {"actions": list(_FACE_EFFECTS), "timeout": 3610},
                                 "x-resource": "face_light",
