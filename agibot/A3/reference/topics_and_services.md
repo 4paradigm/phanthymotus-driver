@@ -66,7 +66,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 |---|---|---|---|
 | `/motion/control/locomotion_velocity` | RosMsgWrapper (pb `LocomotionVelocity`) | `loco` | forward/lateral normalized −1..1, angular deg/s (±57.3 = 1 rad/s); MOTION mode only; duration-bounded with ACP |
 | `/motion/control/move_waist` | RosMsgWrapper (pb `MoveWaist`) | `waist_control` | waist_pitch/waist_yaw rad, waist_height m |
-| `/skill/pilot/face/play` | RosMsgWrapper (pb `FacePlayInfo`) | `face_play` | e_path/e_id/repeat/priority(440)/is_stop |
+| `/skill/pilot/face/play/pb_3Aaimdk_2Eprotocol_2EHFAEmoction` | RosMsgWrapper (pb `HFAEmoction`) | `face_play` | e_path/e_id/repeat/priority(440)/is_stop |
 | `/motion/control/arm_joint_command` | sensor_msgs/JointState | `arm_control` (`send`) | 100 Hz ≤30 ms gap, velocity/effort = 0, ≤4 rad/s |
 | `/motion/control/hand_joint_command` | sensor_msgs/JointState | `hand_control` | 0..2000 per finger; frame_id = AgiHand/O10Hand |
 | `/motion/control/neck_joint_command` | sensor_msgs/JointState | `head_control` | head_yaw/head_pitch |

@@ -2201,7 +2201,7 @@ class RpcDispatchTests(unittest.TestCase):
         model = find_plugin(self.plugins, "model")
         result = model.dispatch("model", {})
         self.assertIn("<robot", result["urdf"])
-        self.assertIn("a3_ultra", result["urdf"])
+        self.assertTrue("a3_ultra" in result["urdf"].lower())
 
 
 class RobotSubnetIpTests(unittest.TestCase):

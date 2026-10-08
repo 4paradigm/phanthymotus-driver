@@ -384,6 +384,11 @@ def _fill_protobuf(message, payload):
                         field.append(item)
         else:
             try:
+                descriptor = message.DESCRIPTOR.fields_by_name.get(key)
+                if descriptor is not None and descriptor.enum_type is not None and isinstance(value, str):
+                    enum_value = descriptor.enum_type.values_by_name.get(value)
+                    if enum_value is not None:
+                        value = enum_value.number
                 setattr(message, key, value)
             except (AttributeError, TypeError):
                 pass
@@ -520,16 +525,32 @@ class A3Nodes:
             encoder = self._encode_depth if fmt == "image/depth-zlib" else self._encode_rgb
             mirror(f"camera_{key}", Image, topic, fmt, re_encode=encoder)
 
-        # -- protobuf-carrier streams (RosMsgWrapper) -- decoded to JSON via pb2 if the
-        # wheel is importable, otherwise subscribed raw and passed through opaquely --
+        # -- protobuf-carrier streams (RosMsgWrapper) -- decoded with the official
+        # AimDK v3.2 generated modules.  There is no ``aimdk.protocol_pb2`` module
+        # in the vendor wheel; importing that old aggregate name silently disabled
+        # battery/estop on otherwise correctly provisioned robots.
         self._pb = None
         try:
-            from aimdk import protocol_pb2  # a3_aimdk wheel
-            self._pb = protocol_pb2
-        except ImportError:
-            pass
-
-        if self._pb is not None:
+            from aimdk.protocol.hal.bms import hal_bms_channel_pb2
+            from aimdk.protocol.hal.state import hal_state_channel_pb2
+            from aimdk.protocol.skill_pilot import skill_pilot_channel_pb2
+            from aimdk.protocol.motion_control.motion import mc_motion_channel_pb2
+            from aimdk.protocol.aim_master import am_channel_pb2
+            self._pb = {
+                "bms": hal_bms_channel_pb2.BmsStateChannel,
+                "estop": hal_state_channel_pb2.EmergencyStateChannel,
+                "skill": getattr(skill_pilot_channel_pb2, "SkillPilotStatus", None),
+                "commands": {
+                    "MotionControlLocomotionVelocityChannel":
+                        mc_motion_channel_pb2.MotionControlLocomotionVelocityChannel,
+                    "MotionControlMoveWaistChannel":
+                        mc_motion_channel_pb2.MotionControlMoveWaistChannel,
+                    "HFAEmoction": am_channel_pb2.HFAEmoction,
+                },
+            }
+        except (ImportError, AttributeError):
+            self._pb = None
+        if self._pb is not None and self._probe_wrapper_type() is not None:
             mirror("battery", self._wrapper_type(ros2), "/aima/bms/data/pb_3Aaimdk_2Eprotocol_2EBmsStateChannel",
                    "data/json", json_filter=self._decode_bms)
             mirror("estop", self._wrapper_type(ros2), "/hal_state/emergency/pb_3Aaimdk_2Eprotocol_2EEmergencyStateChannel",
@@ -560,7 +581,8 @@ class A3Nodes:
             self.waist_pub = self.robot.create_publisher(
                 self._wrapper_msg_type, "/motion/control/move_waist/pb_3Aaimdk_2Eprotocol_2EMotionControlMoveWaistChannel", 10)
             self.face_play_pub = self.robot.create_publisher(
-                self._wrapper_msg_type, "/skill/pilot/face/play", 10)
+                self._wrapper_msg_type,
+                "/skill/pilot/face/play/pb_3Aaimdk_2Eprotocol_2EHFAEmoction", 10)
         else:
             self.locomotion_pub = None
             self.waist_pub = None
@@ -668,23 +690,32 @@ class A3Nodes:
         wrapper = self._wrapper_type(ros2)()
         wrapper.serialization_type = "pb"
         wrapper.data = self._encode_pb(proto_dict)
+        message_type = self._PB_TOPIC_MESSAGES.get(self._pb_topic, "")
+        message_class = (self._pb or {}).get("commands", {}).get(message_type)
+        if message_class is not None and hasattr(wrapper, "context"):
+            wrapper.context = [message_class.DESCRIPTOR.full_name]
         return wrapper
 
     _PB_TOPIC_MESSAGES = {
-        "/motion/control/locomotion_velocity/pb_3Aaimdk_2Eprotocol_2EMotionControlLocomotionVelocityChannel": "LocomotionVelocity",
-        "/motion/control/move_waist/pb_3Aaimdk_2Eprotocol_2EMotionControlMoveWaistChannel": "MoveWaist",
-        "/skill/pilot/face/play": "FacePlayInfo",
+        "/motion/control/locomotion_velocity/pb_3Aaimdk_2Eprotocol_2EMotionControlLocomotionVelocityChannel": "MotionControlLocomotionVelocityChannel",
+        "/motion/control/move_waist/pb_3Aaimdk_2Eprotocol_2EMotionControlMoveWaistChannel": "MotionControlMoveWaistChannel",
+        "/skill/pilot/face/play/pb_3Aaimdk_2Eprotocol_2EHFAEmoction": "HFAEmoction",
     }
 
     def _encode_pb(self, proto_dict):
         if self._pb is None:
             return json.dumps(proto_dict, ensure_ascii=False).encode()
         message_type = self._PB_TOPIC_MESSAGES.get(self._pb_topic, "")
-        cls = getattr(self._pb, message_type, None) if message_type else None
+        cls = self._pb.get("commands", {}).get(message_type) if message_type else None
         if cls is None:
             return json.dumps(proto_dict, ensure_ascii=False).encode()
         message = cls()
         try:
+            # LocomotionVelocityChannel is a real channel envelope; its command
+            # fields live under ``data`` in the v3.2 schema.  The public card
+            # keeps the concise velocity arguments, so add the envelope here.
+            if message.DESCRIPTOR.full_name.endswith("MotionControlLocomotionVelocityChannel"):
+                proto_dict = {"data": proto_dict}
             _fill_protobuf(message, proto_dict)
             return message.SerializeToString()
         except Exception:
@@ -745,12 +776,19 @@ class A3Nodes:
 
     # -- protobuf decoders (best-effort; fall back to raw wrapper fields) ------
 
+    @staticmethod
+    def _wrapper_bytes(msg):
+        data = getattr(msg, "data", b"")
+        if isinstance(data, (list, tuple)):
+            return b"".join(bytes(part) for part in data)
+        return bytes(data)
+
     def _decode_bms(self, msg):
         if self._pb is None:
             return jsonable(msg)
-        channel = self._pb.BmsStateChannel()
+        channel = self._pb["bms"]()
         try:
-            channel.ParseFromString(bytes(msg.data))
+            channel.ParseFromString(self._wrapper_bytes(msg))
         except Exception:
             return jsonable(msg)
         return jsonable(channel)
@@ -758,9 +796,9 @@ class A3Nodes:
     def _decode_emergency(self, msg):
         if self._pb is None:
             return jsonable(msg)
-        channel = self._pb.EmergencyStateChannel()
+        channel = self._pb["estop"]()
         try:
-            channel.ParseFromString(bytes(msg.data))
+            channel.ParseFromString(self._wrapper_bytes(msg))
         except Exception:
             return jsonable(msg)
         return jsonable(channel)
@@ -768,9 +806,12 @@ class A3Nodes:
     def _decode_skill_status(self, msg):
         if self._pb is None:
             return jsonable(msg)
-        status = self._pb.SkillPilotStatus()
+        status_type = self._pb.get("skill")
+        if status_type is None:
+            return jsonable(msg)
+        status = status_type()
         try:
-            status.ParseFromString(bytes(msg.data))
+            status.ParseFromString(self._wrapper_bytes(msg))
         except Exception:
             return jsonable(msg)
         return jsonable(status)
@@ -868,16 +909,14 @@ class A3Nodes:
             self.speaker_subscription = None
 
     def urdf_text(self, variant=None):
-        # Prefer the vendor model installed on the A3 host.  The bundled
-        # kinematic fallback has no visual meshes, so the dashboard cannot
-        # render a robot model when the runtime mount is available.
-        vendor = Path("/opt/agibot/share/robot_model/models/a3_ultra_t3d0/urdf/model.urdf")
-        if vendor.is_file():
-            try:
-                return vendor.read_text(encoding="utf-8")
-            except OSError:
-                pass
-        path = RESOURCE_DIR / "a3_ultra.urdf"
+        # Keep the model self-contained in the driver image.  The official
+        # runtime model was copied from the A3 Ultra T3D0 installation into
+        # resource/a3_ultra_t3d0, including its relative meshes/ directory;
+        # reading /opt/agibot at runtime made the canvas depend on a host-only
+        # mount and produced an unrenderable skeleton on other deployments.
+        path = RESOURCE_DIR / "a3_ultra_t3d0" / "urdf" / "model.urdf"
+        if not path.is_file():
+            path = RESOURCE_DIR / "a3_ultra.urdf"
         if not path.exists():
             raise ValueError("no URDF vendored for A3 (placeholder resource)")
         return path.read_text(encoding="utf-8")
@@ -2778,7 +2817,8 @@ class InteractionPlugin:
 class FacePlayPlugin:
     """face_play 卡片：表情播放 + 表情资源列表。
 
-    对应 /skill/pilot/face/play 话题（RosMsgWrapper + FacePlayInfo）+ HDU
+    对应 /skill/pilot/face/play/pb_3Aaimdk_2Eprotocol_2EHFAEmoction 话题
+    （RosMsgWrapper + HFAEmoction）+ HDU
     ResourceService/GetResourceList（emoticon 类）。is_stop=true 可取消所有
     正在播放的表情（此场景其余字段可空）。
     """
@@ -2799,7 +2839,7 @@ class FacePlayPlugin:
         )
         # 表情显示在头部屏幕上 —— 与 head_control 同一 head 通道。
         schema["x-resource"] = "head"
-        return tool("face_play", "actuator", "播放/取消表情 + 表情资源列表（话题 /skill/pilot/face/play + "
+        return tool("face_play", "actuator", "播放/取消表情 + 表情资源列表（AimDK HFAEmoction 话题 + "
                                              "GetResourceList RPC；e_path 为 emoticon 资源绝对路径，priority 固定 440）",
                     schema)
 
