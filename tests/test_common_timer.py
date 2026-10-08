@@ -313,12 +313,19 @@ def test_canvas_and_native_json_arguments_match_advertised_schema():
 def test_plugin_ignores_agent_dispatch_metadata_but_rejects_unknown_timer_fields():
     plugin = TimerPlugin({}, "test", None)
     plugin.start()
-    created = plugin.dispatch("create", {
+    args = {
         "timer_id": "agent-test", "mode": "countdown", "duration_sec": 5,
         "_tool_name": "timer", "concurrent": False,
         "_trace_id": "trace-123", "instance_id": "canvas-instance",
-    })
+    }
+    created = plugin.dispatch("create", args)
     assert created["status"] == "running"
+    assert args["_trace_id"] == "trace-123"
+    assert args["instance_id"] == "canvas-instance"
+    assert plugin.dispatch("info", {
+        "timer_id": "agent-test", "_trace_id": "trace-456",
+        "instance_id": "canvas-instance",
+    })["status"] == "running"
     with pytest.raises(ValueError, match="invalid_start_fields: surprise"):
         plugin.dispatch("create", {
             "timer_id": "another-test", "mode": "countdown", "duration_sec": 5,
