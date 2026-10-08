@@ -105,6 +105,10 @@ class PoseCheckPlugin:
             return {
                 "state": "ready" if not self._init_error else "error",
                 "input_topic": self._input_topic,
+                # Canvas wiring queries info(), rather than the static tool
+                # descriptor, when it needs to discover a processor input.
+                "topic_in": [{"topic": self._input_topic,
+                              "format": "image/jpeg"}],
                 "format": "image/jpeg",
                 "frames": frames,
                 "latest_frame_age_ms": age_ms,

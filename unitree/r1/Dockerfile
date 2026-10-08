@@ -5,14 +5,6 @@ ARG PYPI_MIRROR
 
 WORKDIR /work
 
-# The Jetson base image may carry an internal Tencent mirror that is not
-# resolvable outside the VPC. Use the public Ubuntu ARM archive when needed.
-RUN sed -i \
-    -e 's#mirrors.tencentyun.com/ubuntu-ports#ports.ubuntu.com/ubuntu-ports#g' \
-    -e 's#mirrors.tencentyun.com/ubuntu#archive.ubuntu.com/ubuntu#g' \
-    /etc/apt/sources.list \
-    /etc/apt/sources.list.d/*.list 2>/dev/null || true
-
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip \
@@ -72,7 +64,6 @@ COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY pose_check.py /work/pose_check.py
 COPY pose_estimator.py /work/pose_estimator.py
-COPY requirements-pose.txt /work/requirements-pose.txt
 COPY pose_plugin.py /work/pose_plugin.py
 # Sibling of device.py — the camera cards' motus.camera/1 declaration lives here
 # rather than in device.py so it can be tested without rclpy. Missing it makes

@@ -130,6 +130,9 @@ class PoseCheckTests(unittest.TestCase):
     def test_plugin_jpeg_path_and_stale_frame(self):
         plugin = PoseCheckPlugin({}, "test", None)
         self.assertEqual(plugin.get_tool()["topic_in"][0]["topic"], "/test/camera/main")
+        info = plugin.dispatch("info", {})
+        self.assertEqual(info["topic_in"], [{"topic": "/test/camera/main",
+                                              "format": "image/jpeg"}])
         self.assertEqual(plugin.dispatch("check", {"pose": "hands_up"})["error"],
                          "camera_no_data")
         plugin._on_frame(SimpleNamespace(data=b"jpeg"))

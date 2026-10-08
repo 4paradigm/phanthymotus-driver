@@ -7,8 +7,45 @@ import threading
 import time
 import urllib.request
 
+try:
+    # This service is commonly launched outside main.py on Tianyi. Install the
+    # driver's line-atomic log writer before MediaPipe or ROS can emit output.
+    from common import logsafe
+    logsafe.install()
+except ImportError:
+    # Keep the standalone developer workflow usable outside the driver image.
+    pass
+
 from pose_estimator import MediaPipePoseEstimator
 from pose_mcp import POSE_CHECK_VERSION, POSE_RESULT_TOPIC, PoseCard, make_server
+
+
+class _FailureReporter:
+    """Log a failure transition, then sample repeats instead of flooding logs."""
+
+    def __init__(self, interval_seconds=10.0):
+        self._interval_seconds = interval_seconds
+        self._failures = {}
+        self._lock = threading.Lock()
+
+    def failure(self, key, detail):
+        now = time.monotonic()
+        with self._lock:
+            previous = self._failures.get(key)
+            count = 1 if previous is None else previous["count"] + 1
+            should_log = previous is None or now - previous["logged_at"] >= self._interval_seconds
+            self._failures[key] = {"count": count,
+                                   "logged_at": now if should_log else previous["logged_at"]}
+        if should_log:
+            repeat = "" if count == 1 else f" (repeated {count} times)"
+            print(f"[pose_check] {key}: {detail}{repeat}", flush=True)
+
+    def recovered(self, key):
+        with self._lock:
+            failure = self._failures.pop(key, None)
+        if failure is not None:
+            print(f"[pose_check] {key} recovered after {failure['count']} failures",
+                  flush=True)
 
 
 def _raw_image_to_bgr(msg):
@@ -150,6 +187,7 @@ def main():
     latest = [None]
     last_accepted_at = [None]
     stop = threading.Event()
+    failures = _FailureReporter()
 
     def reserve_frame_time():
         """Throttle ingress before decode and retain just one current frame."""
@@ -176,8 +214,9 @@ def main():
             frame = _raw_image_to_bgr(msg)
         except Exception as exc:
             card.fail('camera_decode_failed')
-            print(f'camera decode failed: {exc}', flush=True)
+            failures.failure('camera_decode_failed', exc)
             return
+        failures.recovered('camera_decode_failed')
         with lock:
             latest[0] = ('bgr', frame, received_at)
 
@@ -222,9 +261,10 @@ def main():
                     points = model.estimate(frame, max_width=args.max_width)
                 session = card.ingest(points, received_at)
                 publish_events(card.drain_events(), session)
+                failures.recovered('inference_failed')
             except Exception as exc:
                 card.fail('inference_failed')
-                print(f'inference failed: {exc}', flush=True)
+                failures.failure('inference_failed', exc)
 
     def register():
         # Same local registration endpoint as the existing Tianyi bundle.
@@ -243,8 +283,9 @@ def main():
                     data=payload, headers={'Content-Type': 'application/json'})
                 with urllib.request.urlopen(req, context=context, timeout=5) as response:
                     print(f'registration: {response.status}', flush=True)
+                failures.recovered('registration_failed')
             except Exception as exc:
-                print(f'registration failed: {exc}', flush=True)
+                failures.failure('registration_failed', exc)
                 delay = 5
             stop.wait(delay)
 
