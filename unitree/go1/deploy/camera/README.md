@@ -20,14 +20,36 @@ depth, and point cloud at a time.
 `vision_capture` connects directly to the selected RGB port; `camera_rgb` does
 not need to be started. Use `{"action":"capture_photo","position":"front"}`
 for one JPEG or `{"action":"record_video","position":"front","duration_s":5}`
-for an MP4 (1–30 seconds, default 5). The MCP call returns after the JPEG or MP4
-is saved, with `state: completed` and the confirmed `file_path`; errors and
-cancellation return their final status instead. `info.last_capture` and
-`info.last_recording` keep the latest `{action_id, status, result}`. Core gives
-actuator MCP calls 60 seconds, so a slow camera or encoder can still cause a
-timeout, especially for a 30-second recording. `stop` reports lifecycle state
-`idle` and a separate `capture_active` flag; an active photo continues while an
-active video is cancelled.
+for an MP4 (1–30 seconds, default 5). Both calls return promptly after acceptance,
+with an `action_id`, a planned `file_path` and `channel_reply_path`, and
+`state: capturing` / `recording`. `ok: true` means accepted and
+`file_ready: false` means this response does not confirm a saved file.
+
+The tool declares `inputSchema.x-completion` for `capture_photo` and
+`record_video`, with a 120-second completion timeout. The background worker
+reports one terminal outcome (`completed`, `error`, or `cancelled`) to the
+existing local Agent Core `/api/acp/complete` endpoint. Successful completion
+contains final file paths, MIME type, size and capture timing; failure or
+cancellation contains an error code and message. Use this completion result to
+determine file availability, rather than the initial MCP result.
+`info.last_capture` and `info.last_recording` keep the latest
+`{action_id, status, result}` for inspection.
+
+ACP delivery uses `AGENT_CORE_URL` (default `https://localhost:15678`), no bearer
+token, and at most three attempts with a 3-second request timeout and 0.5/1-second
+backoff. Retries reuse the same action ID and terminal payload; an ambiguous
+network failure may deliver the same payload again, so this is one logical
+terminal outcome, not guaranteed exactly-once network delivery. Exhaustion is
+logged; there is no durable retry queue across outages or process restarts.
+The card does not send `/api/event` or require `ACCESS_TOKEN`. ACP completion
+updates orchestration status; it does not implement a separate “录像已保存”
+canvas message. Whether the canvas exposes final file paths has not been
+verified with the disconnected robot.
+
+`stop` reports lifecycle state `idle` and a separate `capture_active` flag;
+an active photo continues while an active video is cancelled. Cancellation
+and MP4 publication share a lock: cancellation before publication prevents a
+successful MP4; once the file is published the recording is already complete.
 
 As on Tianyi, `capture_photo` accepts an optional `image_name` and `record_video`
 accepts an optional `video_name`. Use a filename stem without an extension;
@@ -37,14 +59,17 @@ complete `.jpg` or `.mp4` filename. A file currently being written cannot be
 deleted, and an existing name is never accepted for a new capture.
 
 For `record_video`, the recording clock starts at the first valid camera frame.
-The returned MP4 path is ready to use. Lifecycle `stop` cancels an active
-recording instead of saving it. Driver shutdown waits for active photos to finish;
-the service gives this drain up to 60 seconds before forced container exit.
+The planned MP4 path becomes ready only after successful ACP completion.
+Lifecycle `stop` cancels an active recording instead of saving it, including
+when the encoder is being created or is finishing. Driver shutdown rejects new
+captures, cancels active video, and waits for all accepted photo/video workers
+and their bounded ACP delivery attempts, even after camera occupancy is released.
+The service gives this drain up to 60 seconds before forced container exit.
 
 Recording first writes the selected JPEGs into a temporary MJPEG stream, then
 encodes that stream to MP4 with `ffmpeg`'s `ultrafast` H.264 preset. This keeps
 slow encoding from blocking Nano frame reception and repeating the last image
-for the rest of the requested duration. Temporary streams are removed after
+for the rest of the requested duration. Unpublished temporary files are hidden from `list` and removed after
 success, failure, or cancellation; allow disk space for the temporary stream
 and final MP4 while encoding finishes. The completion result distinguishes
 `recording_started_at` (first valid camera frame), `recording_ended_at` (capture
