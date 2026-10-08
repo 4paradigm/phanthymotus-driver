@@ -270,6 +270,10 @@ class VisionCapturePlugin:
         payload = json.dumps({"action_id": action_id, "status": status, "result": result,
                               "tool": self.PREFIX, "ts": time.time()}).encode()
         url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        token = os.environ.get("AGENT_CORE_TOKEN", "")
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         # 最坏 3×3 秒请求 + 0.5/1 秒退避，留在 120 秒 ACP 超时预算内。
         for attempt in range(3):
             try:
@@ -278,7 +282,7 @@ class VisionCapturePlugin:
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
                 request = urllib.request.Request(url + "/api/acp/complete", data=payload,
-                                                 headers={"Content-Type": "application/json"}, method="POST")
+                                                 headers=headers, method="POST")
                 with urllib.request.urlopen(request, timeout=3, context=ctx):
                     pass
                 break
@@ -290,7 +294,6 @@ class VisionCapturePlugin:
 
         if status != "completed" or result.get("media_type") != "video":
             return
-        token = os.environ.get("AGENT_CORE_TOKEN", "")
         if not token:
             log.warning("[vision_capture] canvas notification skipped: AGENT_CORE_TOKEN is not set")
             return
@@ -300,8 +303,7 @@ class VisionCapturePlugin:
         event = json.dumps({"source": "mcp:vision_capture", "text": "",
                             "payload": {"text": text, "action_id": action_id}}, ensure_ascii=False).encode()
         request = urllib.request.Request(url + "/api/event", data=event,
-                                         headers={"Content-Type": "application/json",
-                                                  "Authorization": f"Bearer {token}"}, method="POST")
+                                         headers=headers, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=3, context=ctx):
                 pass

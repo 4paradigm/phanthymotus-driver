@@ -925,7 +925,7 @@ def test_completed_video_posts_authenticated_canvas_message(tmp_path, monkeypatc
 
     assert [url for url, _, _ in requests] == ["http://127.0.0.1:15678/api/acp/complete",
                                                "http://127.0.0.1:15678/api/event"]
-    assert requests[0][2] is None
+    assert requests[0][2] == "Bearer test-token"
     assert requests[1][2] == "Bearer test-token"
     assert requests[1][1]["text"] == ""
     assert requests[1][1]["payload"]["text"] == "vision_capture 录像已保存：clip.mp4（/data/clip.mp4）"
