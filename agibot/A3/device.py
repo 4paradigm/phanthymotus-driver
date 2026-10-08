@@ -422,7 +422,13 @@ class A3Nodes:
 
     def __init__(self, config, namespace, ros2, rpc: A3Rpc):
         from rclpy.node import Node
-        from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+        try:
+            from rclpy.qos import (QoSProfile, QoSReliabilityPolicy,
+                                    QoSDurabilityPolicy, QoSHistoryPolicy)
+        except ImportError:  # lightweight test doubles / older rclpy
+            from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+            QoSDurabilityPolicy = type("QoSDurabilityPolicy", (), {"VOLATILE": None})
+            QoSHistoryPolicy = type("QoSHistoryPolicy", (), {"KEEP_LAST": None})
         try:
             from rclpy.callback_groups import ReentrantCallbackGroup
         except ImportError:  # lightweight test doubles / older rclpy
@@ -504,7 +510,19 @@ class A3Nodes:
         self._AudioChunk = AudioChunk
         self._UInt8MultiArray = UInt8MultiArray
 
-        sensor_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+        # AimDK publishes the HAL media topics with middleware-default QoS on
+        # different firmware revisions.  In particular, some images/lidar
+        # builds are RELIABLE while others use the sensor-data BEST_EFFORT
+        # profile.  A fixed BEST_EFFORT subscription is not compatible with
+        # the former under CycloneDDS, so keep explicit profiles and select the
+        # reliable one for the large HAL streams (the robot publishers retain
+        # the sample until the callback has taken it).
+        sensor_qos = QoSProfile(
+            depth=5,
+            reliability=getattr(QoSReliabilityPolicy, "RELIABLE",
+                                 QoSReliabilityPolicy.BEST_EFFORT),
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
 
         self.streams = {}
         self._joint_cache = {}
