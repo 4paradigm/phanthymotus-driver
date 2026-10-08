@@ -26,9 +26,32 @@ def acp_notify(monkeypatch):
     return notify
 
 
+class FakeFaceBackend:
+    """Test-only recorder; never contacts a robot."""
+    name = "simulated"
+    per_led = True
+
+    def __init__(self):
+        from collections import deque
+        self.frames = deque(maxlen=256)
+        self.connected = False
+
+    def start(self):
+        self.connected = True
+
+    def write(self, frame):
+        if not self.connected:
+            raise RuntimeError("simulation backend is stopped")
+        self.frames.append((time.monotonic(), frame))
+
+    def close(self):
+        self.connected = False
+
+
 @pytest.fixture
 def light():
-    plugin = ext.make_face_light({"backend": "simulated"}, "test", None, None)
+    plugin = ext.make_face_light({}, "test", None, None)
+    plugin._backend = FakeFaceBackend()
     assert plugin.dispatch("start", {})["ok"]
     yield plugin
     plugin.stop()
@@ -75,7 +98,6 @@ def test_all_go1_acting_tools_declare_consistent_resources_without_hardware_call
         'system_health': 'base', 'activity_monitor': 'base',
     }
     config = {'plugins': {name: {'enabled': True} for name in channels}}
-    config['plugins']['face_light']['backend'] = 'simulated'
     client = Mock()
     # Only construct tools and inspect declarations. Do not start any card.
     bundle = main.Go1Bundle(config, 'offline', None, client)
@@ -93,7 +115,7 @@ def test_all_go1_acting_tools_declare_consistent_resources_without_hardware_call
 
 @pytest.mark.parametrize("action,args", [("set_color", {"g": 10}), ("off", {}), ("stop", {}),
                                          ("blink", {"duration_s": 2}),
-                                         ("config", {"sdk_exclusive": True})])
+                                         ("config", {"sdk_exclusive": False})])
 def test_effect_cancelled_completion(light, acp_notify, action, args):
     response = light.dispatch("chase", {"r": 100, "duration_s": 2})
     old = light._thread
@@ -377,7 +399,8 @@ def test_single_card_bundle_and_packaging():
     spec = importlib.util.spec_from_file_location("go1_face_main", GO1 / "main.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    bundle = module.Go1Bundle({"plugins": {"face_light": {"enabled": True, "backend": "simulated"}}}, "", None, None)
+    bundle = module.Go1Bundle({"plugins": {"face_light": {"enabled": True}}}, "", None, None)
+    bundle._plugins[0]._backend = FakeFaceBackend()
     bundle.start_all()
     try:
         tools = bundle.get_all_tools()
@@ -388,7 +411,7 @@ def test_single_card_bundle_and_packaging():
         assert bundle.dispatch("face_light", {"action": "info"})["simulated"]
         config = yaml.safe_load((GO1 / "config.yaml").read_text())
         assert config["plugins"]["face_light"]["backend"] == "sdk"
-        assert config["plugins"]["face_light"]["sdk_exclusive"] is False
+        assert config["plugins"]["face_light"]["sdk_exclusive"] is True
         metadata = yaml.safe_load((GO1 / "driver.yaml").read_text())
         assert sum(item["name"] == "face_light" for item in metadata["cards"]) == 1
         assert "COPY ext_devices.py" in (GO1 / "Dockerfile").read_text()
@@ -420,7 +443,8 @@ def test_concurrent_start_stop_no_resurrection():
         entered.set()
         assert release.wait(1)
 
-    plugin = ext.FaceLightPlugin({"backend": "simulated"}, "", None, None)
+    plugin = ext.FaceLightPlugin({}, "", None, None)
+    plugin._backend = FakeFaceBackend()
     plugin._backend.start = connect
     starter = threading.Thread(target=plugin.start)
     stopper = threading.Thread(target=plugin.stop)
@@ -457,7 +481,7 @@ def test_concurrent_commands_leave_only_one_worker(light):
     assert not any(t.name == "go1-face-light" and t.is_alive() for t in threading.enumerate())
 
 
-def test_default_sdk_and_exclusive_guard_do_not_use_mqtt(monkeypatch):
+def test_default_sdk_exclusive_yes_and_explicit_no_guard_do_not_use_mqtt(monkeypatch):
     mqtt_client = Mock()
     monkeypatch.setattr(ext, "mqtt", mqtt_client, raising=False)
     popen = Mock()
@@ -465,9 +489,12 @@ def test_default_sdk_and_exclusive_guard_do_not_use_mqtt(monkeypatch):
     plugin = ext.FaceLightPlugin({}, "", None, None)
     assert plugin._backend.name == "sdk"
     schema = plugin.get_tool()["configSchema"]["properties"]
-    assert schema["backend"]["default"] == "sdk"
-    assert schema["backend"]["enum"] == ["sdk", "simulated"]
+    assert "backend" not in schema
+    assert plugin._config["backend"] == "sdk"
+    assert schema["sdk_exclusive"]["default"] is True
+    assert plugin._backend.exclusive is True
     assert "mqtt_host" not in schema and "mqtt_port" not in schema
+    plugin = ext.FaceLightPlugin({"sdk_exclusive": False}, "", None, None)
     result = plugin.start()
     assert not result["ok"] and "sdk_exclusive" in result["message"]
     assert not plugin._active
@@ -641,7 +668,7 @@ def test_sdk_bad_handshake(tmp_path):
 def test_canvas_config_replay_preserves_effect(light):
     light.dispatch('chase', {'g': 60, 'duration_s': 2})
     worker = light._thread
-    assert light.dispatch('config', {'backend': 'simulated'})['changed'] is False
+    assert light.dispatch('config', {'backend': 'sdk'})['changed'] is False
     assert light._thread is worker and worker.is_alive()
 
 
@@ -649,7 +676,7 @@ def test_canvas_backend_config_requires_restart(light, sdk_helper):
     helper, _ = sdk_helper
     light.dispatch('chase', {'g': 60, 'duration_s': 2})
     worker = light._thread
-    result = light.dispatch('config', {'backend': 'sdk', 'sdk_exclusive': True})
+    result = light.dispatch('config', {'backend': 'sdk', 'sdk_exclusive': False})
     assert result['ok'] and result['needs_start']
     assert not worker.is_alive() and not light._active
     assert light._backend.executable == ext._FACE_SDK_EXECUTABLE
@@ -660,7 +687,7 @@ def test_canvas_backend_config_requires_restart(light, sdk_helper):
     assert light._info()['backend'] == 'sdk'
 
 
-@pytest.mark.parametrize('config', [{'backend': 'invalid'}, {'backend': 'mqtt'}, {'sdk_exclusive': 1},
+@pytest.mark.parametrize('config', [{'backend': 'invalid'}, {'backend': 'mqtt'}, {'backend': 'simulated'}, {'sdk_exclusive': 1},
                                     {'sdk_exclusive': 'true'}, {'sdk_dir': ''}, {'sdk_executable': None}])
 def test_bad_canvas_config_preserves_backend(light, config):
     backend = light._backend

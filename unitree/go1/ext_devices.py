@@ -517,28 +517,6 @@ def _face_effect_frame(effect, rgb, target, period, elapsed):
     return (color,) * 12
 
 
-class _FaceSimBackend:
-    """Explicit software-only backend; bounded history, never contacts a robot."""
-    name = "simulated"
-    per_led = True
-
-    def __init__(self):
-        from collections import deque
-        self.frames = deque(maxlen=256)
-        self.connected = False
-
-    def start(self):
-        self.connected = True
-
-    def write(self, frame):
-        if not self.connected:
-            raise RuntimeError("simulation backend is stopped")
-        self.frames.append((time.monotonic(), frame))
-
-    def close(self):
-        self.connected = False
-
-
 class _FaceSdkBackend:
     """One SDK helper process; bounded IPC, no MQTT fallback or UDP reimplementation."""
     name = "sdk"
@@ -640,7 +618,7 @@ _FACE_SDK_DIR = "/opt/phanthy-motus/data/go1/faceLightSDK_Nano"
 
 _FACE_CONFIG_DEFAULTS = {
     "backend": "sdk",
-    "sdk_executable": _FACE_SDK_EXECUTABLE, "sdk_exclusive": False,
+    "sdk_executable": _FACE_SDK_EXECUTABLE, "sdk_exclusive": True,
     "sdk_dir": _FACE_SDK_DIR,
 }
 
@@ -649,8 +627,8 @@ def _face_backend(config):
     backend = config["backend"]
     if backend == "mqtt":
         raise ValueError("face_light now uses the official SDK; select backend=sdk, mount the SDK and stop the old MQTT writer before confirming sdk_exclusive")
-    if backend not in ("simulated", "sdk"):
-        raise ValueError("face_light backend must be sdk or simulated")
+    if backend != "sdk":
+        raise ValueError("face_light backend must be sdk; simulated is not a deployment option")
     if type(config["sdk_exclusive"]) is not bool:
         raise ValueError("sdk_exclusive must be a boolean")
     for key in ("sdk_dir", "sdk_executable"):
@@ -659,8 +637,6 @@ def _face_backend(config):
             raise ValueError(f"{key} is fixed to {fixed_path}; remote path overrides are not allowed")
     if backend == "sdk":
         return _FaceSdkBackend(_FACE_SDK_EXECUTABLE, config["sdk_exclusive"], _FACE_SDK_DIR)
-    if backend == "simulated":
-        return _FaceSimBackend()
     raise ValueError("unsupported face_light backend")
 
 
@@ -822,12 +798,12 @@ class FaceLightPlugin:
         with self._ops:
             candidate = dict(self._config)
             candidate.update({key: args[key] for key in _FACE_CONFIG_DEFAULTS if key in args})
-            if candidate == self._config:
-                return _env_face("config", True, state="ready" if self._active else "idle", changed=False)
             try:
                 backend = _face_backend(candidate)
             except ValueError as exc:
                 return _env_face("config", False, code="INVALID_ARGUMENT", message=str(exc))
+            if candidate == self._config:
+                return _env_face("config", True, state="ready" if self._active else "idle", changed=False)
             stopped = self.stop()
             with self._lock:
                 self._config = candidate
@@ -888,9 +864,8 @@ class FaceLightPlugin:
                                                               "description": "Auto-off after these seconds"}},
                                 "x-action-params": {a: {"params": p, "description": descriptions[a]} for a, p in actions.items()}},
                 "configSchema": {"type": "object", "properties": {
-                    "backend": {"type": "string", "enum": ["sdk", "simulated"], "default": "sdk"},
-                    "sdk_exclusive": {"type": "boolean", "default": False,
-                                      "description": "Confirm existing faceLightMqtt writer is stopped; keep faceLightServer running"}}},
+                    "sdk_exclusive": {"type": "boolean", "default": True,
+                                      "description": "SDK 独占灯光（默认 Yes）；部署前停止 faceLightMqtt，保留 faceLightServer"}}},
                 "topic_out": []}
 
     def dispatch(self, action, args):

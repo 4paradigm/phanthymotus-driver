@@ -11,10 +11,10 @@ plugins:
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
 
-  face_light:                   # 同一 face_light 卡：静态色/逐灯接口/定时灯效（能力取决于 backend）
+  face_light:                   # 同一 face_light 卡：静态色/逐灯接口/定时灯效，统一 SDK
     enabled: true
-    backend: "sdk"              # 实机所有灯光统一使用官方 SDK；simulated 仅用于本地测试
-    sdk_exclusive: false         # 停止旧 faceLightMqtt 写入源后，由操作者确认设为 true
+    backend: "sdk"              # 所有灯光统一使用官方 SDK，不提供模拟后端
+    sdk_exclusive: true          # 默认 SDK 独占；部署前停止 faceLightMqtt，保留 faceLightServer
   system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
     enabled: true
     mqtt_host: "localhost"

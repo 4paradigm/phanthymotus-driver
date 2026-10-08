@@ -192,16 +192,14 @@ sudo docker run --rm --name go1_bundle \
 不再提供灯光 MQTT 后端；旧画布的 `backend: mqtt` 配置会返回明确迁移提示，需更新为 `sdk`。
 不将越界值截断、字符串转整数或发送错误当作成功。
 
-| 后端 | 静态整条 RGB / preset / off | blink / breathe / fade | set_led / set_leds / chase |
-|---|---|---|---|
-| `simulated` | 软件模拟 | 软件模拟 | 完整 12 灯软件模拟，无网络或硬件操作 |
-| `sdk`（默认） | 官方 SDK | 内部定时调用 SDK | 官方 `setLedColor` + `sendCmd`；已本地编译，待真机显示验收 |
-
-本地模拟将 `config.yaml` 中 **现有** `plugins.face_light.backend` 设为 `simulated`；
-模拟结果显式带 `simulated: true`。没有自动回退到模拟成功。
+所有静态颜色、逐灯控制和灯效统一使用官方 SDK（`setLedColor` + `sendCmd`）。
+画布不再提供后端选择，也不接受 `backend: simulated`。离线测试仅在测试代码中注入记录器，
+不会连接机器人；没有自动回退到模拟成功。真机显示仍需现场验收。
 所有指令共用同一帧写入路径，每个实例只运行一个灯效，实机只创建 SDK 写入器。
-默认 `sdk_exclusive: false`，在操作者停止旧 `faceLightMqtt` 写入源并确认独占前启动会失败，
-不会自动停止现场程序。保持 `faceLightServer` 运行，并准备下文规定目录中的官方 SDK。
+默认配置为 `backend: sdk` 和 `sdk_exclusive: true`（画布显示 Yes），无需每次设置。
+此默认值要求部署前已停止旧 `faceLightMqtt` 等其他灯光写入源，不会自动停止现场程序。
+保持 `faceLightServer` 运行，并准备下文规定目录中的官方 SDK。
+已有画布若保存过 No，需要改为 Yes 并保存一次；已保存的配置优先于新的默认值。
 
 调用现有 `face_light` 工具，将下列对象作为 `arguments`：
 
@@ -295,11 +293,11 @@ Mac 原生不能加载这些 Linux ELF 库。现场 Nano 为 Ubuntu 18.04，当�
 容器二进制直接当作 Nano 兼容性证据。库副本保存在被忽略的
 `.local/face-light-sdk/faceLightSDK_Nano/`，未加入 Git，不对外再分发。
 
-现场 `faceLightServer`（接收灯光的服务）和 `faceLightMqtt`（MQTT 写入桥）均在运行。
-它们没有被停止或修改。切换至 SDK 前需由操作者停止 **faceLightMqtt 写入源**，
+先前现场检查时，`faceLightServer`（接收灯光的服务）和 `faceLightMqtt`（MQTT 写入桥）均在运行。
+检查期间没有停止或修改它们；部署时需重新核实当前状态。切换至 SDK 前需由操作者停止 **faceLightMqtt 写入源**，
 保留 **faceLightServer**；也要停止其他正在发送灯光的测试程序，避免抢写。
-卡片不会自动停止现场服务。`sdk_exclusive` 默认 false，未明确声明独占时启动失败。
-此配置是操作者声明，卡片不能远程证明所有写入源均已停止。
+卡片不会自动停止现场服务。`sdk_exclusive` 默认 true；显式设为 false（No）时启动失败。
+默认 Yes 表示按单一 SDK 写入源部署，并不证明其他写入源已经停止；卡片不能远程核实这一点。
 
 ### 构建与配置 SDK 后端（尚未部署到实机）
 
@@ -331,7 +329,7 @@ SDK 头文件、库及示例应由操作者从可信官方来源放入该目录�
 face_light:
   enabled: true
   backend: sdk
-  sdk_exclusive: true  # 仅在实际停止 faceLightMqtt 等其他写入源后设为 true
+  sdk_exclusive: true  # 默认值；部署前停止 faceLightMqtt 等其他写入源
 ```
 
 ### 本地验证与真机验收
