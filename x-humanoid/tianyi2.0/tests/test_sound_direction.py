@@ -87,6 +87,14 @@ def test_wake_angle_is_published_and_queryable(monkeypatch):
     assert result["age_ms"] >= 0
 
 
+def test_dispatch_start_stop_report_lifecycle_state(monkeypatch):
+    plugin = _plugin(monkeypatch)
+    assert plugin.dispatch("start", {})["state"] == "running"
+    assert plugin.dispatch("info", {})["state"] == "no_event"
+    assert plugin.dispatch("stop", {})["state"] == "idle"
+    assert plugin.dispatch("start", {})["state"] == "running"
+
+
 def test_old_or_stopped_direction_is_not_current(monkeypatch):
     plugin = _plugin(monkeypatch)
     plugin.start()

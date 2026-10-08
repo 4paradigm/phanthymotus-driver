@@ -2311,13 +2311,15 @@ class SoundDirectionPlugin:
             self._pub.publish(out)
 
     def dispatch(self, action: str, args: dict) -> dict:
+        result = {"topic_out": [{"topic": self._topic, "format": "data/json"}]}
         if action == "start":
             self.start()
+            return {"state": "running", **result}
         elif action == "stop":
             self.stop()
+            return {"state": "idle", **result}
         elif action != "info":
             return {"state": "error", "error": f"Unknown action: {action}"}
-        result = {"topic_out": [{"topic": self._topic, "format": "data/json"}]}
         with self._lock:
             if not self._running:
                 result["state"] = "idle"
