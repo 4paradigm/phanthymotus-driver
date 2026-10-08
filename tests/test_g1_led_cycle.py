@@ -267,3 +267,41 @@ def test_slow_sdk_does_not_starve_stop():
             stopper.join(1)
         if stopped.is_set():
             p.stop()
+
+
+def test_actuator_lifecycle_contract_and_fresh_restart():
+    p = led.LedPlugin({}, "", None, Client())
+    try:
+        assert p.dispatch("start", {}) == {"state": "ready"}
+        cycle(p, repeat_count=3)
+        p.dispatch("pause", {})
+        assert p.dispatch("stop", {})["state"] == "idle"
+        assert p.dispatch("info", {})["cycle_status"] == "stopped"
+        assert p.dispatch("start", {}) == {"state": "ready"}
+        info = p.dispatch("info", {})
+        assert info["state"] == "ready"
+        assert info["cycle_status"] == "idle"
+        assert info["stage_index"] == info["cycle_index"] == 0
+        assert info["elapsed_sec"] == 0
+        assert info["remaining_sec"] is None
+        assert info["repeat_count"] is None
+        assert info["last_error"] is None
+        assert p._stages == p._bounds == []
+        p.dispatch("set", {"r": 1})
+        assert p.dispatch("info", {})["cycle_status"] == "idle"
+    finally:
+        p.stop()
+
+
+def test_repeated_start_preserves_running_cycle():
+    p = led.LedPlugin({}, "", None, Client())
+    try:
+        cycle(p, repeat_count=2)
+        origin, thread = p._origin, p._thread
+        assert p.dispatch("start", {}) == {"state": "ready"}
+        assert p._origin == origin
+        assert p._thread is thread
+        assert p.dispatch("info", {})["cycle_status"] == "running"
+        assert p._repeats == 2
+    finally:
+        p.stop()

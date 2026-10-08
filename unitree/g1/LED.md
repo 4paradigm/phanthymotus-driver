@@ -53,7 +53,7 @@
 ```
 
 此调用立即返回，驱动自主完成 69 秒颜色流程。不需要 Timer 卡片、Bash、
-后台子代理、模型轮询或逐色调用。返回 running 表示任务已接收，不能据此
+后台子代理、模型轮询或逐色调用。返回 cycle_status=running 表示周期任务已接收，不能据此
 断言硬件已经点亮；可用 info 检查错误。当前不发布周期完成事件到 Core。
 
 ## 控制权及状态
@@ -69,7 +69,9 @@
 
 info 返回：
 
-- `state`：服务 running/idle，区别于具体周期状态。
+- `state`：执行器生命周期 ready/idle，区别于具体周期状态。
+  start 返回 ready；stop 返回 idle。全新 start 清除旧周期进度和错误，
+  cycle_status 恢复 idle；已启动时重复 start 不重置当前周期。
 - `mode`：state（语义灯）/cycle/paused/hold（持续色）。
 - `cycle_status`：idle/running/paused/completed/stopped/interrupted/failed。
 - `stage_index`、`cycle_index`：从 1 开始；无阶段时为 0。

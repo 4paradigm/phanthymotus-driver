@@ -119,7 +119,19 @@ class LedPlugin:
             if self._thread and self._thread.is_alive():
                 raise RuntimeError("led_worker_still_stopping")
             self._enabled = True
+            # Fresh lifecycle session; repeated start above is intentionally a no-op.
             self._mode, self._state = "state", "idle"
+            self._status = "idle"
+            self._stages, self._bounds = [], []
+            self._stage = self._cycle = 0
+            self._elapsed = self._paused_elapsed = 0.0
+            self._origin = self._state_ts = 0.0
+            self._repeats, self._hz = 1, 10
+            self._end_behavior = "release"
+            self._release_pending = False
+            self._rgb = (0, 0, 0)
+            self._next_due = 0.0
+            self._last_error = None
             self._thread = threading.Thread(target=self._worker, name="g1-led", daemon=True)
             self._thread.start()
 
@@ -144,7 +156,7 @@ class LedPlugin:
         with self._commands:
             if action == "start":
                 self.start()
-                return {"state": "running"}
+                return {"state": "ready"}
             if action == "stop":
                 self.stop()
                 return self._info()
@@ -233,7 +245,7 @@ class LedPlugin:
             total = self._bounds[-1] * self._repeats if self._bounds and self._repeats else None
             if total is not None:
                 elapsed = min(elapsed, total)
-            return {"state": "running" if self._enabled else "idle", "mode": self._mode,
+            return {"state": "ready" if self._enabled else "idle", "mode": self._mode,
                     "semantic_state": self._state, "cycle_status": self._status,
                     "stage_index": self._stage, "cycle_index": self._cycle,
                     "repeat_count": self._repeats if self._stages else None,
