@@ -62,12 +62,7 @@ def _json_object(value: Any, field: str) -> dict:
 
 
 def _normalise_dashboard_create_args(args: dict) -> dict:
-    """Decode the string values currently emitted by Canvas form fields.
-
-    The public schema stays strongly typed for MCP and LLM callers.  Canvas,
-    however, serializes array/object editors and optional booleans as strings.
-    Normalize only that transport boundary and leave TimerEngine strict.
-    """
+    """Decode Canvas JSON text fields before handing values to TimerEngine."""
     result = dict(args)
     for field in ("alarms", "payload"):
         value = result.get(field)
@@ -435,6 +430,11 @@ class TimerPlugin:
         self._publisher = None
         self._last_event = None
         self._published_count = 0
+        self._delivery_log_lock = threading.Lock()
+        self._delivery_errors = {
+            "event sink": {"active": False, "last_logged": 0.0, "suppressed": 0},
+            "event publish": {"active": False, "last_logged": 0.0, "suppressed": 0},
+        }
         if executor is not None:
             try:
                 from rclpy.node import Node
@@ -480,7 +480,9 @@ class TimerPlugin:
                 "mode": {"type": "string", "enum": ["countup", "countdown"]},
                 "duration_sec": {"type": "number", "exclusiveMinimum": 0,
                                  "maximum": self._engine.max_duration_sec},
-                "alarms": {"type": "array", "maxItems": self._engine.max_alarms,
+                "alarms": {"type": ["array", "string"],
+                           "description": "报警列表；画布可输入 JSON 数组文本",
+                           "maxItems": self._engine.max_alarms,
                            "items": alarm},
                 "emit_interval_sec": {"type": "number", "minimum": 0,
                                       "maximum": self._engine.max_duration_sec,
@@ -497,7 +499,9 @@ class TimerPlugin:
                     "default": "false",
                     "description": "Timer 完成后是否自动从列表移除",
                 },
-                "payload": {"type": "object", "additionalProperties": True},
+                "payload": {"type": ["object", "string"],
+                            "description": "事件附加数据；画布可输入 JSON 对象文本",
+                            "additionalProperties": True},
             },
             "required": ["action"],
             "x-action-params": {
@@ -545,6 +549,24 @@ class TimerPlugin:
         with self._condition:
             self._thread = None
 
+    def _delivery_succeeded(self, kind: str) -> None:
+        with self._delivery_log_lock:
+            self._delivery_errors[kind]["active"] = False
+            self._delivery_errors[kind]["suppressed"] = 0
+
+    def _delivery_failed(self, kind: str, exc: Exception) -> None:
+        now = self._monotonic()
+        with self._delivery_log_lock:
+            state = self._delivery_errors[kind]
+            if state["active"] and now - state["last_logged"] < 60:
+                state["suppressed"] += 1
+                return
+            suppressed = state["suppressed"]
+            state.update(active=True, last_logged=now, suppressed=0)
+        safe = str(exc)[:160].encode("unicode_escape").decode("ascii")[:200]
+        repeats = f" (suppressed {suppressed} repeats)" if suppressed else ""
+        print(f"[timer] {kind} failed: {safe}{repeats}", flush=True)
+
     def _publish(self, event: dict) -> None:
         self._last_event = copy.deepcopy(event)
         self._published_count += 1
@@ -552,7 +574,9 @@ class TimerPlugin:
             try:
                 self._event_sink(copy.deepcopy(event))
             except Exception as exc:
-                print(f"[timer] event sink failed: {exc}", flush=True)
+                self._delivery_failed("event sink", exc)
+            else:
+                self._delivery_succeeded("event sink")
         if self._publisher is not None:
             try:
                 from std_msgs.msg import String
@@ -561,7 +585,9 @@ class TimerPlugin:
                                           separators=(",", ":"))
                 self._publisher.publish(message)
             except Exception as exc:
-                print(f"[timer] event publish failed: {exc}", flush=True)
+                self._delivery_failed("event publish", exc)
+            else:
+                self._delivery_succeeded("event publish")
 
     def _worker(self) -> None:
         while True:

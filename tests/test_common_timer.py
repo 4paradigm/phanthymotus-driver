@@ -1,5 +1,8 @@
+import json
+import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -242,8 +245,8 @@ def test_plugin_accepts_dashboard_serialized_create_fields():
     plugin = TimerPlugin({}, "test", None)
     plugin.start()
     schema = plugin.get_tool()["inputSchema"]["properties"]
-    assert schema["alarms"]["type"] == "array"
-    assert schema["payload"]["type"] == "object"
+    assert schema["alarms"]["type"] == ["array", "string"]
+    assert schema["payload"]["type"] == ["object", "string"]
     for field in ("replace", "auto_remove"):
         assert schema[field]["type"] == "string"
         assert schema[field]["enum"] == ["false", "true"]
@@ -275,6 +278,36 @@ def test_plugin_accepts_dashboard_serialized_create_fields():
     assert replacement["next_alarm"] is None
     assert replacement["payload"] == {}
     plugin.stop()
+
+
+def test_canvas_and_native_json_arguments_match_advertised_schema():
+    jsonschema = pytest.importorskip("jsonschema")
+    plugin = TimerPlugin({}, "test", None)
+    schema = plugin.get_tool()["inputSchema"]
+    jsonschema.Draft202012Validator.check_schema(schema)
+    validator = jsonschema.Draft202012Validator(schema)
+    alarms = [{"alarm_id": "done", "trigger_type": "remaining",
+               "trigger_sec": 0, "event": "done"}]
+    canvas = {
+        "action": "create", "timer_id": "canvas-wire", "mode": "countdown",
+        "duration_sec": 5, "alarms": json.dumps(alarms),
+        "payload": json.dumps({"scene": "canvas"}),
+        "replace": "false", "auto_remove": "false",
+    }
+    native = {**canvas, "timer_id": "native-wire", "alarms": alarms,
+              "payload": {"scene": "native"}}
+    validator.validate(canvas)
+    validator.validate(native)
+    assert not validator.is_valid({**canvas, "replace": True})
+    plugin.start()
+    try:
+        for wire in (canvas, native):
+            result = plugin.dispatch("create", {k: v for k, v in wire.items()
+                                                 if k != "action"})
+            assert result["status"] == "running"
+            assert result["next_alarm"]["alarm_id"] == "done"
+    finally:
+        plugin.stop()
 
 
 def test_plugin_ignores_agent_dispatch_metadata_but_rejects_unknown_timer_fields():
@@ -408,3 +441,44 @@ def test_failing_event_sink_does_not_stop_later_timer_events(capsys):
         assert "event sink failed: sink unavailable" in capsys.readouterr().out
     finally:
         plugin.dispatch("stop", {})
+
+
+def test_persistent_delivery_failures_are_throttled_and_escaped(capsys, monkeypatch):
+    clock = Clock()
+    failing = True
+
+    def sink(_event):
+        if failing:
+            raise RuntimeError("bad\nline " + "X" * 1000)
+
+    class Publisher:
+        def publish(self, _message):
+            if failing:
+                raise RuntimeError("publish\nline " + "Y" * 1000)
+
+    message_module = types.ModuleType("std_msgs.msg")
+    message_module.String = type("String", (), {})
+    monkeypatch.setitem(sys.modules, "std_msgs", types.ModuleType("std_msgs"))
+    monkeypatch.setitem(sys.modules, "std_msgs.msg", message_module)
+    plugin = TimerPlugin({}, "test", None, monotonic=lambda: clock.monotonic,
+                         event_sink=sink)
+    plugin._publisher = Publisher()
+
+    for _ in range(100):
+        plugin._publish({"type": "timer_tick"})
+    first_logs = capsys.readouterr().out.splitlines()
+    assert len(first_logs) == 2
+    assert all(len(line) < 300 and "\\nline" in line for line in first_logs)
+
+    clock.advance(60)
+    plugin._publish({"type": "timer_tick"})
+    sampled_logs = capsys.readouterr().out.splitlines()
+    assert len(sampled_logs) == 2
+    assert all("suppressed 99 repeats" in line for line in sampled_logs)
+
+    failing = False
+    plugin._publish({"type": "timer_tick"})
+    assert capsys.readouterr().out == ""
+    failing = True
+    plugin._publish({"type": "timer_tick"})
+    assert len(capsys.readouterr().out.splitlines()) == 2

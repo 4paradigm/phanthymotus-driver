@@ -2,14 +2,16 @@
 
 `common.timer.TimerPlugin` 是不包含机器人业务的 `processor` 卡片。它使用单调时钟维护
 多个正向或倒计时器，调用 `create` 后立即返回，之后通过 `data/json` 输出报警、周期进度和
-完成事件。
+完成事件。它通过工具调用接收计时指令，没有输入数据流；由于既接收指令又输出事件，
+在画布中使用可调用的 `processor` 类型。
 
 G1 默认将事件发布到 `/<机器人 namespace>/timer/events`。在画布上把 Timer 的 JSON
 输出连接到 `decision_core`，Agent 才会收到主动提醒。卡片本身不会调用 TTS、LED 或动作。
 
-Canvas 将 `replace` 和 `auto_remove` 显示为 `false`/`true` 下拉选项，插件将其转换为
-布尔值；直接调用插件时也接受原生布尔值。Canvas 的数组和对象字段可能序列化成
-字符串，因此插件边界也兼容 JSON 字符串形式的 `alarms`/`payload`，空字符串按未填写处理。
+工具 schema 将 `replace` 和 `auto_remove` 定义为 `"false"`/`"true"` 字符串选项，
+插件将其转换为布尔值。`alarms` 和 `payload` 同时接受原生 JSON 数组/对象，以及
+Canvas 输入框发送的 JSON 字符串；空字符串按未填写处理。MCP 调用应按 schema
+传入字符串选项；引擎内部使用原生布尔值。
 
 ## 倒计时
 
