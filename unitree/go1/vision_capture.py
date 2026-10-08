@@ -1,18 +1,13 @@
 """Save Go1 Nano RGB photos and videos to persistent storage."""
 
-import html
-import json
-import logging
 import os
 import re
 import shutil
 import socket
-import ssl
 import struct
 import subprocess
 import threading
 import time
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -26,7 +21,6 @@ else:
 
 POSITIONS = tuple(camera._VALID_POSITIONS)
 VIDEO_FPS = 15
-log = logging.getLogger(__name__)
 
 
 class VisionCapturePlugin:
@@ -65,7 +59,6 @@ class VisionCapturePlugin:
                     "name": {"type": "string", "description": "删除时填写完整的 .jpg 或 .mp4 文件名。"},
                 },
                 "required": ["action"], "additionalProperties": False,
-                "x-completion": {"actions": ["capture_photo", "record_video"], "timeout": 120},
                 "x-action-params": {
                     "start": {"params": [], "description": "准备拍照录像卡，无需启动 camera_rgb。"},
                     "capture_photo": {"params": ["position", "image_name"], "description": "保存指定机位的新 JPEG。"},
@@ -82,7 +75,7 @@ class VisionCapturePlugin:
         return {"state": "ready"}
 
     def stop(self):
-        # 已受理的抓拍继续完成；录像收到取消信号后由 worker 释放机位并上报 ACP。
+        # 已开始的拍照继续完成；录像收到取消信号后由 worker 释放机位。
         with camera._CAMERA_LOCK:
             if self._recording:
                 self._recording.set()
@@ -99,7 +92,7 @@ class VisionCapturePlugin:
             return {"state": "idle", "capture_active": bool(self._active)}
 
     def shutdown(self):
-        # 进程退出前等待已受理拍照的 ACP 终态；画布 stop 仍保持非阻塞。
+        # 进程退出前等待已开始的拍照完成；画布 stop 仍保持非阻塞。
         with camera._CAMERA_LOCK:
             self._shutting_down = True
             workers = tuple(self._capture_threads)
@@ -133,7 +126,7 @@ class VisionCapturePlugin:
         host, port = self._endpoints[position]
         # 中文说明：连接会让 Nano 按需开启相机；读完一帧即断开并释放机位。
         with socket.create_connection((host, port), timeout=8) as connection:
-            # 整帧共用 20 秒期限，避免慢速分片反复重置超时导致 ACP 永不完成。
+            # 整帧共用 20 秒期限，避免慢速分片反复重置超时导致 MCP 调用一直等待。
             deadline = time.monotonic() + 20
             length = struct.unpack(">I", self._receive_exact(connection, 4, deadline))[0]
             if not 0 < length <= 5_000_000:
@@ -234,11 +227,12 @@ class VisionCapturePlugin:
             if cancel is not None:
                 self._recording = cancel
         action_id = f"vision_capture_{uuid4().hex}"
-        # 先确定文件名，画布收到受理结果时即可显示目标路径；完成回调才确认文件存在。
+        # 同步等待文件发布后才返回 MCP result。
         worker = None
+        outcome = {}
         try:
             target = self._record_async if cancel else self._capture_async
-            worker_args = (position, action_id, path, duration, cancel) if cancel else (position, action_id, path)
+            worker_args = (position, action_id, path, duration, cancel, outcome) if cancel else (position, action_id, path, outcome)
             worker = threading.Thread(target=target, args=worker_args, daemon=True)
             with camera._CAMERA_LOCK:
                 if self._shutting_down:
@@ -259,59 +253,13 @@ class VisionCapturePlugin:
                 elif worker is not None:
                     self._capture_threads.discard(worker)
             return {"ok": False, "code": "RECORD_FAILED" if cancel else "CAPTURE_FAILED", "message": str(exc)}
-        response = {"ok": True, "state": "recording" if cancel else "capturing",
-                    "position": position, "file_path": str(path), "filename": path.name,
-                    "channel_reply_path": self._channel_path(path),
-                    "mime": "video/mp4" if cancel else "image/jpeg"}
-        response["action_id"] = action_id
-        return response
+        worker.join()
+        result = outcome["result"]
+        return {**result, "state": "completed" if result.get("ok") else
+                "cancelled" if result.get("code") == "RECORD_CANCELLED" else "error",
+                "action_id": action_id}
 
-    def _notify_complete(self, action_id, status, result):
-        # ACP/TLS 通知仅用标准库；视频编码依赖 Dockerfile 安装的 ffmpeg。
-        payload = json.dumps({"action_id": action_id, "status": status, "result": result,
-                              "tool": self.PREFIX, "ts": time.time()}).encode()
-        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
-        token = os.environ.get("AGENT_CORE_TOKEN", "")
-        headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        # 最坏 3×3 秒请求 + 0.5/1 秒退避，留在 120 秒 ACP 超时预算内。
-        for attempt in range(3):
-            try:
-                ctx = ssl.create_default_context()
-                if url.startswith(("https://localhost:", "https://127.0.0.1:")):
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                request = urllib.request.Request(url + "/api/acp/complete", data=payload,
-                                                 headers=headers, method="POST")
-                with urllib.request.urlopen(request, timeout=3, context=ctx):
-                    pass
-                break
-            except Exception as exc:
-                if attempt == 2:
-                    log.warning("[vision_capture] ACP completion delivery failed for %s: %s", action_id, exc)
-                else:
-                    time.sleep(0.5 * 2 ** attempt)
-
-        if status != "completed" or result.get("media_type") != "video":
-            return
-        if not token:
-            log.warning("[vision_capture] canvas notification skipped: AGENT_CORE_TOKEN is not set")
-            return
-        # 只把通知显示在画布：空事件文本不会触发后台模型，payload.text 供活动日志显示。
-        text = (f"vision_capture 录像已保存：{html.escape(result['filename'])}"
-                f"（{html.escape(result['file_path'])}）")
-        event = json.dumps({"source": "mcp:vision_capture", "text": "",
-                            "payload": {"text": text, "action_id": action_id}}, ensure_ascii=False).encode()
-        request = urllib.request.Request(url + "/api/event", data=event,
-                                         headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=10, context=ctx):
-                pass
-        except Exception as exc:
-            log.warning("[vision_capture] canvas notification failed for %s: %s", action_id, exc)
-
-    def _capture_async(self, position, action_id, path):
+    def _capture_async(self, position, action_id, path, outcome):
         try:
             result = self._capture_and_save(position, path)
         except Exception as exc:
@@ -324,11 +272,9 @@ class VisionCapturePlugin:
         status = "completed" if result.get("ok") else "error"
         with camera._CAMERA_LOCK:
             self._last_capture = {"action_id": action_id, "status": status, "result": result}
-        try:
-            self._notify_complete(action_id, status, result)
-        finally:
-            with camera._CAMERA_LOCK:
-                self._capture_threads.discard(threading.current_thread())
+        outcome["result"] = result
+        with camera._CAMERA_LOCK:
+            self._capture_threads.discard(threading.current_thread())
 
     def _capture_and_save(self, position, path):
         try:
@@ -359,7 +305,7 @@ class VisionCapturePlugin:
                 temporary_path.unlink(missing_ok=True)
             return {"ok": False, "code": "SAVE_FAILED", "message": str(exc)}
 
-    def _record_async(self, position, action_id, path, duration, cancel):
+    def _record_async(self, position, action_id, path, duration, cancel, outcome):
         try:
             result = self._record_and_save(position, path, duration, cancel)
         except Exception as exc:
@@ -375,12 +321,10 @@ class VisionCapturePlugin:
                   "cancelled" if result.get("code") == "RECORD_CANCELLED" else "error")
         with camera._CAMERA_LOCK:
             self._last_recording = {"action_id": action_id, "status": status, "result": result}
-        try:
-            self._notify_complete(action_id, status, result)
-        finally:
-            with camera._CAMERA_LOCK:
-                if self._recording_thread is threading.current_thread():
-                    self._recording_thread = None
+        outcome["result"] = result
+        with camera._CAMERA_LOCK:
+            if self._recording_thread is threading.current_thread():
+                self._recording_thread = None
 
     def _record_and_save(self, position, path, duration, cancel):
         temporary_path = path.with_name(f".{path.stem}.tmp.mp4")

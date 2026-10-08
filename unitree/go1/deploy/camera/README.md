@@ -20,20 +20,14 @@ depth, and point cloud at a time.
 `vision_capture` connects directly to the selected RGB port; `camera_rgb` does
 not need to be started. Use `{"action":"capture_photo","position":"front"}`
 for one JPEG or `{"action":"record_video","position":"front","duration_s":5}`
-for an MP4 (1–30 seconds, default 5). The call immediately returns an
-`action_id` and planned `file_path`; the file may not exist yet. The background
-worker POSTs `completed` or `error` to `${AGENT_CORE_URL}/api/acp/complete`.
-These actions declare `x-completion` (120 seconds). The terminal result contains
-the confirmed path. `info.last_capture` and `info.last_recording` keep the
-latest terminal `{action_id, status, result}`. Go1 actuators do not declare ACP
-physical resources, so capture keeps the bundle's global pending-action barrier. The
-callback is retried up to three times (3-second request timeout, 0.5/1-second
-backoff); after repeated failures the result remains in `info.last_capture`,
-or `info.last_recording`; the failure is logged, and Core's barrier timeout is the fallback.
-Other Go1 actuators wait on this pending action under the platform's conservative
-fallback. `stop` reports lifecycle state
-`idle` and a separate `capture_active` flag; an accepted photo still finishes
-and sends its ACP callback, while an active video is cancelled and reported.
+for an MP4 (1–30 seconds, default 5). The MCP call returns after the JPEG or MP4
+is saved, with `state: completed` and the confirmed `file_path`; errors and
+cancellation return their final status instead. `info.last_capture` and
+`info.last_recording` keep the latest `{action_id, status, result}`. Core gives
+actuator MCP calls 60 seconds, so a slow camera or encoder can still cause a
+timeout, especially for a 30-second recording. `stop` reports lifecycle state
+`idle` and a separate `capture_active` flag; an active photo continues while an
+active video is cancelled.
 
 As on Tianyi, `capture_photo` accepts an optional `image_name` and `record_video`
 accepts an optional `video_name`. Use a filename stem without an extension;
@@ -43,9 +37,8 @@ complete `.jpg` or `.mp4` filename. A file currently being written cannot be
 deleted, and an existing name is never accepted for a new capture.
 
 For `record_video`, the recording clock starts at the first valid camera frame.
-Wait for its ACP `completed` callback before using the file. Lifecycle `stop`
-cancels an active recording instead of saving it.
-Driver shutdown waits for accepted photos to finish and report ACP completion;
+The returned MP4 path is ready to use. Lifecycle `stop` cancels an active
+recording instead of saving it. Driver shutdown waits for active photos to finish;
 the service gives this drain up to 60 seconds before forced container exit.
 
 Recording first writes the selected JPEGs into a temporary MJPEG stream, then
