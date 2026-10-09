@@ -63,14 +63,14 @@ def _encode_image(msg, key):
         # Full-resolution JPEG encoding for twelve cameras saturates the ADU
         # CPU and makes every callback arrive in bursts.  The dashboard only
         # needs a preview stream; bound the largest dimension before encoding.
-        max_dimension = 480
+        max_dimension = 384
         largest = max(image.shape[:2])
         if largest > max_dimension:
             scale = max_dimension / float(largest)
             image = cv2.resize(image, (max(1, int(image.shape[1] * scale)),
                                        max(1, int(image.shape[0] * scale))),
                                interpolation=cv2.INTER_AREA)
-        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 35])
+        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 30])
         if not ok:
             return None
         out.format = "jpeg"
@@ -215,7 +215,7 @@ def _media_all():
     # Ten raw 30 FPS cameras cannot all be JPEG encoded at full rate on the
     # ADU CPU. Keep a fresh latest-frame preview at a bounded 4 FPS per stream;
     # the one-slot pending map means this never accumulates latency.
-    min_interval = 1.0 / 4.0
+    min_interval = 1.0 / 6.0
 
     worker_count = 3
 

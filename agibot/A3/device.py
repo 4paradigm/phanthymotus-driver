@@ -534,6 +534,13 @@ class A3Nodes:
             String, _core_topic(namespace, "state/joints"), 5)
         self._joint_state_pub = self.core.create_publisher(
             String, _core_topic(namespace, "state/joint_state"), 5)
+        # Publish a neutral skeleton immediately and keep it alive even when a
+        # firmware build emits joint feedback only on change.  The dashboard
+        # otherwise sees no first sample and never loads/updates the model.
+        self._publish_joint_streams()
+        self._joint_timer = None
+        if hasattr(self.robot, "create_timer"):
+            self._joint_timer = self.robot.create_timer(0.1, self._publish_joint_streams)
         self._imu_pub = self.core.create_publisher(
             String, _core_topic(namespace, "state/imu"), 5)
         self._media_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="a3_media")
@@ -1220,7 +1227,48 @@ class A3Nodes:
         path = RESOURCE_DIR / "a3_ultra.urdf"
         if not path.exists():
             raise ValueError("no URDF vendored for A3 (placeholder resource)")
-        return path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
+        # The compact vendor-neutral URDF intentionally omits CAD geometry,
+        # but Three.js still needs link offsets to draw a visible skeleton.
+        # Supply the measured A3 kinematic proportions at the driver boundary;
+        # no frontend-specific model changes are required.
+        origins = {
+            "waist_roll_joint": (0, 0, 0.08), "waist_yaw_joint": (0, 0, 0.12),
+            "waist_pitch_joint": (0, 0, 0.12), "torso_joint": (0, 0, 0.22),
+            "head_yaw_joint": (0, 0, 0.42), "head_pitch_joint": (0, 0, 0.10),
+            "left_shoulder_pitch_joint": (0.22, 0, 0.30),
+            "left_shoulder_roll_joint": (0.08, 0, 0),
+            "left_shoulder_yaw_joint": (0.16, 0, 0),
+            "left_elbow_joint": (0.24, 0, 0),
+            "left_wrist_roll_joint": (0.20, 0, 0),
+            "left_wrist_pitch_joint": (0.08, 0, 0),
+            "left_wrist_yaw_joint": (0.08, 0, 0),
+            "right_shoulder_pitch_joint": (-0.22, 0, 0.30),
+            "right_shoulder_roll_joint": (-0.08, 0, 0),
+            "right_shoulder_yaw_joint": (-0.16, 0, 0),
+            "right_elbow_joint": (-0.24, 0, 0),
+            "right_wrist_roll_joint": (-0.20, 0, 0),
+            "right_wrist_pitch_joint": (-0.08, 0, 0),
+            "right_wrist_yaw_joint": (-0.08, 0, 0),
+            "left_hand_joint": (0.08, 0, 0), "right_hand_joint": (-0.08, 0, 0),
+            "left_hip_pitch_joint": (0.12, 0, -0.12),
+            "left_hip_roll_joint": (0, 0, -0.12), "left_hip_yaw_joint": (0, 0, -0.18),
+            "left_knee_joint": (0, 0, -0.38), "left_ankle_pitch_joint": (0, 0, -0.38),
+            "left_ankle_roll_joint": (0, 0, -0.08),
+            "right_hip_pitch_joint": (-0.12, 0, -0.12),
+            "right_hip_roll_joint": (0, 0, -0.12), "right_hip_yaw_joint": (0, 0, -0.18),
+            "right_knee_joint": (0, 0, -0.38), "right_ankle_pitch_joint": (0, 0, -0.38),
+            "right_ankle_roll_joint": (0, 0, -0.08),
+        }
+        try:
+            root = ET.fromstring(text)
+            for joint in root.findall("joint"):
+                origin = origins.get(joint.get("name"))
+                if origin is not None and joint.find("origin") is None:
+                    ET.SubElement(joint, "origin", xyz="%g %g %g" % origin, rpy="0 0 0")
+            return ET.tostring(root, encoding="unicode")
+        except ET.ParseError:
+            return text
 
     def close(self):
         self.robot.destroy_node()
