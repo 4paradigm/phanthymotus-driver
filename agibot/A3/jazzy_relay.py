@@ -112,7 +112,7 @@ def _input(queues):
     rclpy.spin(node)
 
 
-def _output(queues):
+def _output_one(key, messages):
     # Keep the converted samples in the robot domain.  The existing isolated
     # A3 core bridge then forwards only these small frontend payloads to 42.
     os.environ["ROS_DOMAIN_ID"] = "232"
@@ -124,24 +124,12 @@ def _output(queues):
     rclpy.init()
     node = Node("a3_jazzy_media_relay_output")
     pubs = {}
-    keys = list(queues)
-    cursor = 0
     while rclpy.ok():
-        item = None
-        # Poll independent one-slot queues round-robin. A busy 30 Hz camera or
-        # lidar must not consume the shared queue and starve the other cameras.
-        for _ in range(len(keys)):
-            key = keys[cursor]
-            cursor = (cursor + 1) % len(keys)
-            try:
-                item = queues[key].get_nowait()
-                break
-            except queue.Empty:
-                pass
-        if item is None:
-            rclpy.spin_once(node, timeout_sec=0.005)
+        try:
+            _, payload = messages.get(timeout=0.05)
+        except queue.Empty:
+            rclpy.spin_once(node, timeout_sec=0.0)
             continue
-        key, payload = item
         try:
             if key == "lidar_cloud":
                 output = _encode_cloud(deserialize_message(payload, PointCloud2))
@@ -166,7 +154,9 @@ def main():
     ctx = mp.get_context("spawn")
     keys = list(CAMERAS) + ["lidar_cloud"]
     queues = {key: ctx.Queue(maxsize=1) for key in keys}
-    processes = [ctx.Process(target=_input, args=(queues,), daemon=True), ctx.Process(target=_output, args=(queues,), daemon=True)]
+    processes = [ctx.Process(target=_input, args=(queues,), daemon=True)]
+    processes.extend(ctx.Process(target=_output_one, args=(key, queues[key]), daemon=True)
+                    for key in keys)
     for process in processes:
         process.start()
     print(f"[relay] started input={processes[0].pid} output={processes[1].pid}", flush=True)

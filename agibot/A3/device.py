@@ -1062,18 +1062,29 @@ class A3Nodes:
         self._joint_state_pub.publish(output)
         joints = []
         model_indices = _skeleton_joint_indices()
-        for group in groups.values():
+        group_aliases = {
+            "arm_state": [*ARM_JOINTS["left"], *ARM_JOINTS["right"]],
+            "neck_state": list(NECK_JOINTS),
+        }
+        for group_key, group in groups.items():
             names = group.get("name", []) if isinstance(group, dict) else []
             positions = group.get("position", []) if isinstance(group, dict) else []
             velocities = group.get("velocity", []) if isinstance(group, dict) else []
             efforts = group.get("effort", []) if isinstance(group, dict) else []
+            aliases = group_aliases.get(group_key, [])
             for index, name in enumerate(names):
+                # AimDK firmware revisions have emitted generic channel names
+                # (for example arm_joint_0) while preserving the documented
+                # order. Map those names by position so the skeleton is still
+                # usable; exact URDF names remain preferred.
+                canonical = name if name in model_indices else (
+                    aliases[index] if index < len(aliases) else name)
                 # Only actuated joints that exist in the model belong in the
                 # skeleton stream. Unknown metadata/fixed sensor joints remain
                 # available in joint_state's raw JSON stream.
-                if name not in model_indices:
+                if canonical not in model_indices:
                     continue
-                joints.append({"idx": model_indices[name], "name": name,
+                joints.append({"idx": model_indices[canonical], "name": canonical,
                                "q": positions[index] if index < len(positions) else 0.0,
                                "dq": velocities[index] if index < len(velocities) else 0.0,
                                "tau": efforts[index] if index < len(efforts) else 0.0})

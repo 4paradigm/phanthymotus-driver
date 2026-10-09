@@ -25,7 +25,8 @@ class CoreBridge:
                         for lane in ("media0", "media1", "media2", "media3", "media4",
                                      "media5", "media6", "media7", "media8", "media9",
                                      "media10", "media11",
-                                     "pointcloud", "audio", *(f"state{i}" for i in range(8)))}
+                                     "pointcloud", "audio_mic", "audio_ext",
+                                     *(f"state{i}" for i in range(8)))}
         self._ctx = mp.get_context("spawn")
         self._profile = profile
         self._domain = domain
@@ -68,7 +69,7 @@ class CoreBridge:
                 lane = next((value for marker, value in camera_lane if marker in topic),
                              f"media{sum(topic.encode('utf-8')) % 12}")
             elif "audio" in topic or "mic" in topic:
-                lane = "audio"
+                lane = "audio_ext" if "ext_mic" in topic else "audio_mic"
             else:
                 lane = f"state{sum(topic.encode('utf-8')) % 8}"
             item = (topic, type_name, serialize_message(msg))
