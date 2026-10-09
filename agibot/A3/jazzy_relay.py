@@ -35,9 +35,27 @@ CAMERAS = {
 # A3_RELAY_STREAMS without changing the relay code.
 _requested = {item.strip() for item in os.environ.get(
     "A3_RELAY_STREAMS",
-    "head_left_fisheye,head_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth",
+    ",".join(CAMERAS),
 ).split(",") if item.strip()}
 CAMERAS = {key: topic for key, topic in CAMERAS.items() if key in _requested}
+
+_control_file = os.environ.get(
+    "A3_RELAY_CONTROL_FILE", "/opt/phanthy-motus/data/a3-relay/active_streams"
+)
+_default_active = {item.strip() for item in os.environ.get(
+    "A3_RELAY_ACTIVE_STREAMS",
+    "head_left_fisheye,head_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth",
+).split(",") if item.strip()}
+
+
+def _active_streams():
+    """Read the driver's latest card activation set without restarting Jazzy."""
+    try:
+        with open(_control_file, "r", encoding="utf-8") as handle:
+            requested = {line.strip() for line in handle if line.strip()}
+        return requested & set(CAMERAS)
+    except OSError:
+        return _default_active & set(CAMERAS)
 
 
 def _encode_image(msg, key):
@@ -208,6 +226,8 @@ def _media_all():
     received = {key: 0 for key in CAMERAS}
     emitted = {key: 0 for key in CAMERAS}
     pending = {key: None for key in CAMERAS}
+    subscriptions = {}
+    subscriptions_lock = threading.Lock()
     pending_lock = threading.Lock()
     wake = threading.Condition(pending_lock)
     # The callback only replaces a pointer. JPEG work never runs in the DDS
@@ -216,8 +236,42 @@ def _media_all():
     # ADU CPU. Keep a fresh latest-frame preview at a bounded 4 FPS per stream;
     # the one-slot pending map means this never accumulates latency.
     min_interval = 1.0 / 6.0
+    active_state = {"keys": _active_streams(), "checked": 0.0}
 
     worker_count = 3
+
+    def sync_subscriptions(active):
+        """Receive raw Image samples only for cards currently on the canvas.
+
+        A callback-side active check is insufficient: DDS deserializes an Image
+        before invoking the callback. Recreating these best-effort subscriptions
+        is what keeps inactive cameras out of the large-sample CPU path.
+        """
+        with subscriptions_lock:
+            wanted = set(active)
+            for key in list(subscriptions):
+                if key not in wanted:
+                    try:
+                        node.destroy_subscription(subscriptions.pop(key))
+                    except Exception:
+                        subscriptions.pop(key, None)
+            for key in wanted - set(subscriptions):
+                topic = CAMERAS[key]
+                pub = publishers[key]
+                def push(msg, stream_key=key):
+                    try:
+                        received[stream_key] += 1
+                        if received[stream_key] == 1 or received[stream_key] % 300 == 0:
+                            print(f"[relay] input received key={stream_key} count={received[stream_key]}", flush=True)
+                        with wake:
+                            if stream_key in active_state["keys"]:
+                                pending[stream_key] = msg
+                            wake.notify()
+                    except Exception as exc:
+                        print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
+                subscriptions[key] = node.create_subscription(Image, topic, push, qos,
+                                                               callback_group=group)
+                print(f"[relay] raw subscription enabled key={key}", flush=True)
 
     def worker(worker_index):
         keys = [key for index, key in enumerate(CAMERAS) if index % worker_count == worker_index]
@@ -227,8 +281,15 @@ def _media_all():
                 stream_key = None
                 while msg is None and rclpy.ok():
                     now = time.monotonic()
+                    if now - active_state["checked"] >= 0.25:
+                        # The control file is intentionally polled at low rate;
+                        # DDS callbacks stay non-blocking and frame freshness is
+                        # still bounded by one preview interval.
+                        active_state["keys"] = _active_streams()
+                        active_state["checked"] = now
+                        sync_subscriptions(active_state["keys"])
                     for key in keys:
-                        if pending[key] is not None and now - last_emit[key] >= min_interval:
+                        if key in active_state["keys"] and pending[key] is not None and now - last_emit[key] >= min_interval:
                             stream_key, msg = key, pending[key]
                             pending[key] = None
                             break
@@ -250,18 +311,8 @@ def _media_all():
         output_topic = f"/agibot_a3/camera_{key}"
         pub = node.create_publisher(CompressedImage, output_topic, qos)
         publishers[key] = pub
-        def push(msg, stream_key=key, stream_pub=pub):
-            try:
-                received[stream_key] += 1
-                if received[stream_key] == 1 or received[stream_key] % 300 == 0:
-                    print(f"[relay] input received key={stream_key} count={received[stream_key]}", flush=True)
-                with wake:
-                    pending[stream_key] = msg
-                    wake.notify()
-            except Exception as exc:
-                print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
-        node.create_subscription(Image, topic, push, qos, callback_group=group)
-        print(f"[relay] Jazzy input ready key={key} topic={output_topic} domain=232", flush=True)
+        print(f"[relay] Jazzy input available key={key} topic={output_topic} domain=232", flush=True)
+    sync_subscriptions(active_state["keys"])
     for worker_index in range(worker_count):
         threading.Thread(target=worker, args=(worker_index,), daemon=True,
                          name=f"a3-camera-encoder-{worker_index}").start()

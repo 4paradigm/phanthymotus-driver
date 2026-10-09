@@ -556,6 +556,8 @@ class A3Nodes:
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
         self._jazzy_relay = os.environ.get("A3_JAZZY_RELAY") == "1"
+        if self._jazzy_relay:
+            _ensure_relay_defaults()
 
         def mirror(key, msg_type, robot_topic, fmt, qos=None, json_filter=None,
                    re_encode=None):
@@ -699,8 +701,12 @@ class A3Nodes:
         self.audio_topics = {}
         self.speaker_subscription = None
         if AudioCapture is not None and AudioPlayback is not None and AudioChunk is not None:
-            for key, topic in (("mic", "/audiohal/audio/capture"),
-                               ("ext_mic", "/agent/audio/data/external")):
+            # The v3.2 internal capture topic is affected by the vendor mic
+            # bug. Expose the external HAL stream as the canonical `mic` card;
+            # retain the raw internal topic only as an explicitly named
+            # diagnostic card.
+            for key, topic in (("mic", "/agent/audio/data/external"),
+                               ("ext_mic", "/audiohal/audio/capture")):
                 core_topic = _core_topic(namespace, f"{key}/audio")
                 pub = self.core.create_publisher(AudioChunk, core_topic, 5)
                 try:
@@ -753,13 +759,28 @@ class A3Nodes:
         # std_msgs/Header; omitting it gives the bridge a different ROS type
         # hash even though the publisher appears in logs.
         try:
-            stamp = getattr(msg, "stamps", None)
+            stamp = getattr(msg, "stamps", None) or getattr(msg, "stamp", None)
             if stamp is not None:
                 out.header.stamp = stamp
+            elif getattr(msg, "header", None) is not None:
+                out.header = msg.header
         except (AttributeError, TypeError):
             pass
         out.format = "audio/pcm-16k"
-        payload = getattr(getattr(msg, "data", None), "data", b"")
+        payload = getattr(msg, "data", None)
+        if hasattr(payload, "data"):
+            payload = payload.data
+        if payload is None:
+            payload = getattr(msg, "pcm", None)
+        if payload is None:
+            payload = getattr(msg, "samples", b"")
+        try:
+            payload = bytes(payload or b"")
+        except (TypeError, ValueError):
+            payload = b""
+        # AudioChunk is signed 16-bit PCM. Never split a sample at a chunk
+        # boundary, even if a HAL implementation reports an odd byte count.
+        payload = payload[:len(payload) - (len(payload) % 2)]
         out.data = list(payload)
         return out
 
@@ -775,6 +796,10 @@ class A3Nodes:
         with self._audio_lock:
             buffer = self._audio_buffers.setdefault(key, bytearray())
             buffer.extend(payload)
+            # The dashboard must see live audio, not a growing recording. If
+            # capture briefly outruns the bridge, retain only the newest audio.
+            if len(buffer) > 4096:
+                del buffer[:-2048]
             frames = []
             while len(buffer) >= 1024:
                 frames.append(bytes(buffer[:1024]))
@@ -1467,6 +1492,53 @@ def _stream_tool(key, stream, description):
     return tool(key, "sensor", description, topic_out=[{"topic": stream["topic"], "format": stream["format"]}])
 
 
+def _set_relay_stream(stream_name, enabled):
+    """Toggle one host-relay encoder through the host-mounted control file."""
+    path = os.environ.get("A3_RELAY_CONTROL_FILE", "/opt/phanthy-motus/data/a3-relay/active_streams")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        current = set()
+        try:
+            with open(path, encoding="utf-8") as handle:
+                current = {line.strip() for line in handle if line.strip()}
+        except OSError:
+            pass
+        if enabled:
+            current.add(stream_name)
+        else:
+            current.discard(stream_name)
+        temporary = f"{path}.tmp.{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write("".join(f"{item}\n" for item in sorted(current)))
+        os.replace(temporary, path)
+    except OSError as exc:
+        print(f"[relay] stream activation unavailable: {exc}", flush=True)
+
+
+def _ensure_relay_defaults():
+    """Seed the shared relay state once per deployment.
+
+    An empty file can be left by a previous canvas session's last stop. A
+    restarted driver should still provide its documented four preview streams;
+    an existing non-empty file remains authoritative for an active session.
+    """
+    path = os.environ.get("A3_RELAY_CONTROL_FILE", "/opt/phanthy-motus/data/a3-relay/active_streams")
+    defaults = os.environ.get(
+        "A3_RELAY_ACTIVE_STREAMS",
+        "head_left_fisheye,head_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth",
+    )
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = f"{path}.tmp.{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write("".join(f"{item.strip()}\n" for item in defaults.split(",") if item.strip()))
+        os.replace(temporary, path)
+    except OSError as exc:
+        print(f"[relay] default activation unavailable: {exc}", flush=True)
+
+
 class JointsPlugin:
     """joints 状态卡：手臂/灵巧手/头部三路关节状态流合一张卡（camera 卡同款
     多路复用模式——group 参数选择，镜像话题各自保持不变）。"""
@@ -1664,7 +1736,11 @@ class CameraStreamPlugin:
 
     def dispatch(self, action, args):
         if action == "stop":
+            _set_relay_stream(self.stream_name, False)
             return {"state": "idle", "topic_out": [{"topic": self.stream["topic"], "format": self.stream["format"]}]}
+        if action == "start":
+            _set_relay_stream(self.stream_name, True)
+            return {"state": "running", **self.stream}
         if action == "info":
             return {"state": "running", "topic_out": [{"topic": self.stream["topic"], "format": self.stream["format"]}]}
         return {"state": "running", **self.stream}
@@ -3111,6 +3187,16 @@ class MicPlugin:
                 return {"state": "idle"}
         if action == "stop":
             return {"state": "idle", **stream}
+        if action == "start" and self.key == "mic":
+            # A3 v3.2's internal source is known-broken. Selecting the
+            # external HAL source when the canonical mic card is started makes
+            # the card produce the real capture stream without changing the
+            # robot's motion/control state.
+            try:
+                source = self.nodes.rpc.set_mic_source(MIC_SOURCES["external"])
+            except Exception as exc:
+                return {"state": "degraded", "reason": f"external mic selection failed: {exc}", **stream}
+            return {"state": "running", "source": "external", "source_result": jsonable(source), **stream}
         return {"state": "running", **stream}
 
 

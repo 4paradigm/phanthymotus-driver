@@ -35,7 +35,9 @@ agibot-a3:
     - A3_JAZZY_RELAY=1
     # Only these four previews are encoded by default. Add keys explicitly for
     # diagnostics; leaving this bounded protects state/control latency.
-    - A3_RELAY_STREAMS=head_left_fisheye,head_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth
+    - A3_RELAY_STREAMS=head_left_fisheye,head_right_fisheye,head_rear_fisheye,head_stereo_left_fisheye,head_stereo_right_fisheye,armpit_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth,waist_front_d415_rgb,waist_front_d415_depth
+    - A3_RELAY_ACTIVE_STREAMS=head_left_fisheye,head_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth
+    - A3_RELAY_CONTROL_FILE=/opt/phanthy-motus/data/a3-relay/active_streams
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

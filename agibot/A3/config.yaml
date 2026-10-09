@@ -45,7 +45,9 @@ plugins:
     # Keep the default live set small. The host relay still has the other
     # topic mappings for explicit opt-in, but encoding ten raw cameras at once
     # starves state/command traffic on the ADU CPU.
-    streams: ["head_left_fisheye", "head_right_fisheye", "chest_front_d457_rgb", "chest_front_d457_depth"]
+    # All non-wrist cards are advertised, but only A3_RELAY_ACTIVE_STREAMS are
+    # encoded until a canvas card is started.
+    streams: ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye", "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye", "chest_front_d457_rgb", "chest_front_d457_depth", "waist_front_d415_rgb", "waist_front_d415_depth"]
   camera_head_left:
     enabled: true
   camera_head_right:
