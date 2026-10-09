@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import sys
 import threading
 import types
@@ -65,6 +66,9 @@ def test_mic_card_reports_direction_only_while_fresh_and_clears_on_stop(
         def terminate(self):
             self.running = False
 
+        def wait(self, timeout=None):
+            return 0
+
     processes = []
 
     def popen(*args, **kwargs):
@@ -120,7 +124,7 @@ def test_concurrent_calibrations_keep_both_directions(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "time", types.SimpleNamespace(
         monotonic=monotonic, sleep=lambda seconds: None))
     media = types.SimpleNamespace(get_audio_capture_data=lambda: types.SimpleNamespace(
-        channels=8, sample_rate=16000, audio_data=[1] * 8))
+        channels=8, sample_rate=16000, audio_data=[1] * (16000 * 8)))
     executor = types.SimpleNamespace(add_node=lambda node: None)
     card = module.MicPlugin({}, "robot", executor, media)
     original_read = Path.read_text
@@ -141,3 +145,107 @@ def test_concurrent_calibrations_keep_both_directions(monkeypatch, tmp_path):
 
     assert all(result["state"] == "calibrated" for result in results)
     assert set(json.loads(path.read_text())) == {"front", "right"}
+
+
+def test_mic_ignores_malformed_direction_messages(monkeypatch):
+    module, String = _load_device(monkeypatch)
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    card = module.MicPlugin({}, "robot", executor, object())
+    card._proc = types.SimpleNamespace(poll=lambda: None)
+
+    for payload in ("{", "[]", "42", '{"state":"fresh","angle":"right"}'):
+        card._on_direction(String(payload))
+        assert card.dispatch("info", {})["sound_direction"] == {"state": "no_event"}
+
+    card._on_direction(String('{"state":"fresh","angle":90}'))
+    assert card.dispatch("info", {})["sound_direction"]["angle"] == 90
+
+
+def test_mic_stop_reaps_subprocess_before_restart(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    media = types.SimpleNamespace(get_wakeup_words=lambda: "小范小范")
+    card = module.MicPlugin({}, "robot", executor, media)
+    events = []
+
+    class Process:
+        stdout = ()
+
+        def poll(self):
+            return None if "reaped" not in events else 0
+
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, timeout=None):
+            events.append("wait")
+            if "kill" not in events:
+                raise subprocess.TimeoutExpired("mic", timeout)
+            events.append("reaped")
+
+        def kill(self):
+            events.append("kill")
+
+    card._proc = Process()
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: (
+        events.append("spawn") or types.SimpleNamespace(stdout=(), poll=lambda: None)))
+
+    assert card.dispatch("stop", {}) == {"state": "idle"}
+    assert events == ["terminate", "wait", "kill", "wait", "reaped"]
+    card.dispatch("start", {})
+    assert events[-1] == "spawn"
+
+
+def test_calibration_rejects_repeated_capture_frames(monkeypatch, tmp_path):
+    module, _ = _load_device(monkeypatch)
+    path = tmp_path / "calibration.json"
+    monkeypatch.setattr(module, "_MIC_DIRECTION_CALIBRATION", path)
+    monkeypatch.setitem(sys.modules, "sound_direction", types.SimpleNamespace(
+        estimate_signature=lambda audio, channels, rate: (1.0, 2.0, 3.0)))
+    ticks = [0.0]
+    sleeps = []
+
+    def monotonic():
+        ticks[0] += 0.01
+        return ticks[0]
+
+    monkeypatch.setattr(module, "time", types.SimpleNamespace(
+        monotonic=monotonic, sleep=lambda seconds: sleeps.append(seconds)))
+    events = []
+
+    class Process:
+        stdout = ()
+        running = True
+
+        def poll(self):
+            return None if self.running else 0
+
+        def terminate(self):
+            events.append("terminate")
+            self.running = False
+
+        def wait(self, timeout=None):
+            events.append("wait")
+            return 0
+
+    old_process = Process()
+    frame = types.SimpleNamespace(channels=8, sample_rate=16000,
+                                  audio_data=[100] * 1280)
+
+    def capture():
+        events.append("capture")
+        return frame
+
+    media = types.SimpleNamespace(get_audio_capture_data=capture,
+                                  get_wakeup_words=lambda: "小范小范")
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    card = module.MicPlugin({}, "robot", executor, media)
+    card._proc = old_process
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: (
+        events.append("spawn") or Process()))
+
+    assert card.dispatch("calibrate_front", {})["state"] == "no_voice"
+    assert events.index("wait") < events.index("capture")
+    assert events[-1] == "spawn"
+    assert sleeps
+    assert not path.exists()

@@ -1057,6 +1057,7 @@ class MicPlugin:
         self._wakeup_word_added = False
         self._last_wakeup_config_time = 0.0
         self._proc: subprocess.Popen | None = None
+        self._process_lock = threading.RLock()
         self._calibration_lock = threading.Lock()
         self._direction_lock = threading.Lock()
         self._last_direction = None
@@ -1067,10 +1068,24 @@ class MicPlugin:
             String, self._direction_topic, self._on_direction, _LOW_LAT_QOS)
 
     def _on_direction(self, msg: String) -> None:
+        try:
+            direction = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(direction, dict) or direction.get("state") not in (
+            "fresh", "uncalibrated", "ambiguous"):
+            return
+        angle = direction.get("angle")
+        if ("angle" in direction and (type(angle) is not int or not 0 <= angle < 360)) or (
+            direction["state"] == "fresh" and angle is None):
+            return
+        if any(type(value) not in (str, int, float, bool, type(None))
+               for value in direction.values()):
+            return
         with self._direction_lock:
             if self._proc is None:
                 return
-            self._last_direction = json.loads(msg.data)
+            self._last_direction = direction
             self._last_direction_time = time.monotonic()
 
     def get_tool(self) -> dict:
@@ -1098,65 +1113,85 @@ class MicPlugin:
         import numpy as np
         from sound_direction import estimate_signature
 
-        # 同一张卡的标定请求依次采集并更新，避免并发覆盖另一方向。
-        with self._calibration_lock:
-            frames = []
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                audio = self._media_ctrl.get_audio_capture_data()
-                if audio.channels == 8 and audio.sample_rate == 16000 and audio.audio_data:
-                    frames.append(np.asarray(audio.audio_data, dtype=np.int16))
-                else:
-                    time.sleep(0.005)
-            signature = estimate_signature(
-                np.concatenate(frames) if frames else [], 8, 16000)
-            if signature is None:
-                return {"state": "no_voice", "message": "未采到可用于标定的声音，请靠近机器人重试"}
+        # 标定期间暂停唯一的采集进程，再从 SDK 读取有节奏的新音频。
+        with self._calibration_lock, self._process_lock:
+            was_running = self._proc is not None and self._proc.poll() is None
+            if was_running:
+                self.stop()
             try:
-                calibration = json.loads(_MIC_DIRECTION_CALIBRATION.read_text())
-            except (FileNotFoundError, ValueError):
-                calibration = {}
-            calibration[direction] = signature
-            _MIC_DIRECTION_CALIBRATION.parent.mkdir(parents=True, exist_ok=True)
-            temporary = _MIC_DIRECTION_CALIBRATION.with_suffix(".tmp")
-            temporary.write_text(json.dumps(calibration))
-            temporary.replace(_MIC_DIRECTION_CALIBRATION)
-            return {"state": "calibrated", "direction": direction,
-                    "remaining": [name for name in ("front", "right") if name not in calibration]}
+                frames = []
+                seen_frames = set()
+                sample_count = 0
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    audio = self._media_ctrl.get_audio_capture_data()
+                    if audio.channels == 8 and audio.sample_rate == 16000 and audio.audio_data:
+                        frame = np.asarray(audio.audio_data, dtype=np.int16)
+                        if frame.size % 8 == 0 and frame.tobytes() not in seen_frames:
+                            seen_frames.add(frame.tobytes())
+                            frames.append(frame)
+                            sample_count += frame.size // 8
+                    time.sleep(0.005)
+                if sample_count < 16000:
+                    return {"state": "no_voice", "message": "未采到足够的新音频，请靠近机器人重试"}
+                signature = estimate_signature(np.concatenate(frames), 8, 16000)
+                if signature is None:
+                    return {"state": "no_voice", "message": "未采到可用于标定的声音，请靠近机器人重试"}
+                try:
+                    calibration = json.loads(_MIC_DIRECTION_CALIBRATION.read_text())
+                except (FileNotFoundError, ValueError):
+                    calibration = {}
+                calibration[direction] = signature
+                _MIC_DIRECTION_CALIBRATION.parent.mkdir(parents=True, exist_ok=True)
+                temporary = _MIC_DIRECTION_CALIBRATION.with_suffix(".tmp")
+                temporary.write_text(json.dumps(calibration))
+                temporary.replace(_MIC_DIRECTION_CALIBRATION)
+                return {"state": "calibrated", "direction": direction,
+                        "remaining": [name for name in ("front", "right") if name not in calibration]}
+            finally:
+                if was_running:
+                    self.start()
 
     def start(self) -> None:
         import sys
-        if self._proc is not None and self._proc.poll() is None:
-            return
-        # 启动麦克风时自动追加默认唤醒词，保留厂商原有词表。
-        wakeup = self.dispatch("add_wakeup_word", {})
-        if wakeup["state"] != "configured":
-            print(f"[mic] wake-up word setup: {wakeup['state']}", flush=True)
-        with self._direction_lock:
-            self._last_direction = None
-            self._last_direction_time = 0.0
-        proc = subprocess.Popen(
-            [sys.executable, "-c",
-             # Protect import-time output as well as the child entry point.
-             "import sys; sys.path.insert(0, '/work'); "
-             "from common import logsafe; logsafe.install(check_fd=False); "
-             f"from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        self._proc = proc
-        # Forward subprocess stdout in background
-        def _fwd():
-            for line in proc.stdout:
-                print(line.decode(errors='replace').rstrip(), flush=True)
-        threading.Thread(target=_fwd, daemon=True).start()
+        with self._process_lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return
+            # 启动麦克风时自动追加默认唤醒词，保留厂商原有词表。
+            wakeup = self.dispatch("add_wakeup_word", {})
+            if wakeup["state"] != "configured":
+                print(f"[mic] wake-up word setup: {wakeup['state']}", flush=True)
+            with self._direction_lock:
+                self._last_direction = None
+                self._last_direction_time = 0.0
+            proc = subprocess.Popen(
+                [sys.executable, "-c",
+                 # Protect import-time output as well as the child entry point.
+                 "import sys; sys.path.insert(0, '/work'); "
+                 "from common import logsafe; logsafe.install(check_fd=False); "
+                 f"from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            self._proc = proc
+            # Forward subprocess stdout in background
+            def _fwd():
+                for line in proc.stdout:
+                    print(line.decode(errors='replace').rstrip(), flush=True)
+            threading.Thread(target=_fwd, daemon=True).start()
 
     def stop(self) -> None:
-        if self._proc:
-            self._proc.terminate()
-            self._proc = None
-        with self._direction_lock:
-            self._last_direction = None
-            self._last_direction_time = 0.0
+        with self._process_lock:
+            if self._proc:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait(timeout=2)
+                self._proc = None
+            with self._direction_lock:
+                self._last_direction = None
+                self._last_direction_time = 0.0
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":

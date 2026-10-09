@@ -21,6 +21,10 @@ One-time setup on Bumi EDU:
 3. Repeat at the robot's right side with `action=calibrate_right`.
 4. Say “小范小范” and inspect the direction output and `mic.info`.
 
+Each calibration temporarily pauses the mic audio stream, collects fresh
+eight-channel audio for two seconds, then resumes the stream. If too few new
+frames arrive, it returns `no_voice` and does not save that direction.
+
 Calibration is stored under `/opt/phanthy-motus/data/bumi/` and survives a
 driver restart. The first four channels of the SDK's eight-channel capture are
 the head microphones; reserved channels and speaker loopback are ignored. The
