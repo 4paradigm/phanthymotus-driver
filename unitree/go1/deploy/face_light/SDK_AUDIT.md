@@ -1,4 +1,8 @@
-# Go1 face light SDK audit — 2026-10-08
+# Go1 face light SDK audit — SDK v1.0.1
+
+This record identifies the inspected SDK by its version and the file hashes below.
+It records historical inspection observations, not current process state or a
+planned audit. Recheck the installation and processes on each target before takeover.
 
 Read-only retrieval from the user's Go1: main controller (pi,
 internal eth0 192.168.123.161), head Nano 192.168.123.13 (unitree, aarch64).
