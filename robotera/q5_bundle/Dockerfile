@@ -43,6 +43,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-std-srvs \
     ros-humble-diagnostic-msgs \
     ros-humble-action-msgs \
+    ros-humble-apriltag-ros \
+    ros-humble-apriltag-msgs \
+    ros-humble-tf2-ros \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
@@ -82,6 +85,8 @@ COPY audio.py /work/audio.py
 COPY camera_rgb.py /work/camera_rgb.py
 COPY camera_depth.py /work/camera_depth.py
 COPY camera_pointcloud.py /work/camera_pointcloud.py
+COPY visual_ee_repeatability.py /work/visual_ee_repeatability.py
+COPY apriltag_q5.yaml /work/apriltag_q5.yaml
 COPY vision_capture.py /work/vision_capture.py
 COPY legacy_device.py /work/legacy_device.py
 COPY legacy_direct_control.py /work/legacy_direct_control.py

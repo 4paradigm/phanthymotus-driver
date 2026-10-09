@@ -1,0 +1,15 @@
+apriltag:
+  ros__parameters:
+    image_transport: raw
+    qos_profile: sensor_data
+    family: 36h11
+    pose_estimation_method: pnp
+    max_hamming: 0
+    detector:
+      threads: 2
+      decimate: 1.0
+    tag:
+      ids: [0, 1]
+      frames: [q5_reference_tag, q5_left_hand_tag]
+      # Replace these with caliper measurements of the printed black squares.
+      sizes: [0.06, 0.06]

@@ -25,6 +25,7 @@ cards:
   - { name: camera_rgb,        type: sensor }
   - { name: camera_depth,      type: sensor }
   - { name: camera_pointcloud, type: sensor }
+  - { name: visual_ee_repeatability, type: sensor }
   - { name: arm_control,       type: actuator }
   - { name: hand_control,      type: actuator }
   - { name: hand_gesture,      type: actuator }

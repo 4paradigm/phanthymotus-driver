@@ -97,6 +97,25 @@ plugins:
     max_depth_m: 5.0
     camera_mount_pitch_rad: 0.14655
     floor_offset_m: 1.15
+  visual_ee_repeatability:
+    enabled: true
+    detections_topic: "/q5/apriltag/detections"
+    camera_info_topic: "/camera/camera/color/camera_info"
+    reference_tag_id: 0
+    hand_tag_id: 1
+    reference_frame: "q5_reference_tag"
+    hand_frame: "q5_left_hand_tag"
+    # Measure both printed black-square edges and set their values in
+    # apriltag_q5.yaml before enabling a measurement session.
+    tag_size_confirmed: false
+    min_decision_margin: 30.0
+    joint_velocity_limit_rad_s: 0.02
+    joint_age_limit_ms: 300
+    departure_delta_rad: 0.03
+    return_tolerance_rad: 0.05
+    min_frames: 15
+    target_frames: 25
+    capture_timeout_s: 8.0
   arm_control:
     enabled: true
     hardware_enable: true
