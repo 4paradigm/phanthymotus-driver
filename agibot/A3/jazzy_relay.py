@@ -81,34 +81,34 @@ def _encode_cloud(msg):
     return out
 
 
-def _input(queues):
+def _input_one(key, topic, msg_type, queue_out):
     os.environ["ROS_DOMAIN_ID"] = "232"
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import Image, PointCloud2
     from rclpy.serialization import serialize_message
     rclpy.init()
-    node = Node("a3_jazzy_media_relay_input")
+    node = Node(f"a3_jazzy_media_relay_input_{key}")
+    received = 0
     def push(key, msg):
+        nonlocal received
         try:
             item = (key, serialize_message(msg))
-            counts[key] = counts.get(key, 0) + 1
-            if counts[key] == 1:
+            received += 1
+            if received == 1:
                 print(f"[relay] input received key={key}", flush=True)
-            queue_out = queues[key]
             try:
                 queue_out.put_nowait(item)
             except queue.Full:
-                queue_out.get_nowait()
+                try:
+                    queue_out.get_nowait()
+                except queue.Empty:
+                    pass
                 queue_out.put_nowait(item)
         except Exception as exc:
             print(f"[relay] input failed key={key}: {exc}", flush=True)
-    counts = {}
-    for key, topic in CAMERAS.items():
-        node.create_subscription(Image, topic, lambda msg, k=key: push(k, msg), qos_profile_sensor_data)
-    node.create_subscription(PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud", lambda msg: push("lidar_cloud", msg), qos_profile_sensor_data)
-    print(f"[relay] Jazzy input ready cameras={len(CAMERAS)} lidar=1 domain=232", flush=True)
+    node.create_subscription(msg_type, topic, push, qos_profile_sensor_data)
+    print(f"[relay] Jazzy input ready key={key} domain=232", flush=True)
     rclpy.spin(node)
 
 
@@ -122,7 +122,7 @@ def _output_one(key, messages):
     from std_msgs.msg import UInt8MultiArray
     from rclpy.serialization import deserialize_message
     rclpy.init()
-    node = Node("a3_jazzy_media_relay_output")
+    node = Node(f"a3_jazzy_media_relay_output_{key}")
     pubs = {}
     while rclpy.ok():
         try:
@@ -154,7 +154,13 @@ def main():
     ctx = mp.get_context("spawn")
     keys = list(CAMERAS) + ["lidar_cloud"]
     queues = {key: ctx.Queue(maxsize=1) for key in keys}
-    processes = [ctx.Process(target=_input, args=(queues,), daemon=True)]
+    from sensor_msgs.msg import Image, PointCloud2
+    processes = [ctx.Process(target=_input_one,
+                             args=(key, topic, Image, queues[key]), daemon=True)
+                 for key, topic in CAMERAS.items()]
+    processes.append(ctx.Process(target=_input_one, args=(
+        "lidar_cloud", "/hal/neck_middle_livox_lidar/pointcloud", PointCloud2,
+        queues["lidar_cloud"]), daemon=True))
     processes.extend(ctx.Process(target=_output_one, args=(key, queues[key]), daemon=True)
                     for key in keys)
     for process in processes:
