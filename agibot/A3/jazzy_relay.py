@@ -81,7 +81,7 @@ def _encode_cloud(msg):
     return out
 
 
-def _input(queue_out):
+def _input(queues):
     os.environ["ROS_DOMAIN_ID"] = "232"
     import rclpy
     from rclpy.node import Node
@@ -93,6 +93,7 @@ def _input(queue_out):
     def push(key, msg):
         try:
             item = (key, serialize_message(msg))
+            queue_out = queues[key]
             try:
                 queue_out.put_nowait(item)
             except queue.Full:
@@ -107,7 +108,7 @@ def _input(queue_out):
     rclpy.spin(node)
 
 
-def _output(queue_in):
+def _output(queues):
     # Keep the converted samples in the robot domain.  The existing isolated
     # A3 core bridge then forwards only these small frontend payloads to 42.
     os.environ["ROS_DOMAIN_ID"] = "232"
@@ -119,12 +120,24 @@ def _output(queue_in):
     rclpy.init()
     node = Node("a3_jazzy_media_relay_output")
     pubs = {}
+    keys = list(queues)
+    cursor = 0
     while rclpy.ok():
-        try:
-            key, payload = queue_in.get(timeout=0.05)
-        except queue.Empty:
-            rclpy.spin_once(node, timeout_sec=0.0)
+        item = None
+        # Poll independent one-slot queues round-robin. A busy 30 Hz camera or
+        # lidar must not consume the shared queue and starve the other cameras.
+        for _ in range(len(keys)):
+            key = keys[cursor]
+            cursor = (cursor + 1) % len(keys)
+            try:
+                item = queues[key].get_nowait()
+                break
+            except queue.Empty:
+                pass
+        if item is None:
+            rclpy.spin_once(node, timeout_sec=0.005)
             continue
+        key, payload = item
         if key == "lidar_cloud":
             output = _encode_cloud(deserialize_message(payload, PointCloud2))
             msg_type = UInt8MultiArray
@@ -143,8 +156,9 @@ def _output(queue_in):
 
 def main():
     ctx = mp.get_context("spawn")
-    q = ctx.Queue(maxsize=2)
-    processes = [ctx.Process(target=_input, args=(q,), daemon=True), ctx.Process(target=_output, args=(q,), daemon=True)]
+    keys = list(CAMERAS) + ["lidar_cloud"]
+    queues = {key: ctx.Queue(maxsize=1) for key in keys}
+    processes = [ctx.Process(target=_input, args=(queues,), daemon=True), ctx.Process(target=_output, args=(queues,), daemon=True)]
     for process in processes:
         process.start()
     print(f"[relay] started input={processes[0].pid} output={processes[1].pid}", flush=True)
