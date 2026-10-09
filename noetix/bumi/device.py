@@ -1621,7 +1621,16 @@ def _camera_subprocess(namespace: str):
         print(f"[camera_subprocess] Realsense pipeline start failed: {e}", flush=True)
         return
 
-    print(f"[camera_subprocess] publishing color→{color_topic} depth→{depth_topic}", flush=True)
+    # VOP detects objects in the RGB image, while navi samples the depth map at
+    # those RGB pixel coordinates.  D435i color and depth come from different
+    # lenses, so equal resolutions alone do not make their pixels correspond.
+    # Register every depth frame onto the color optical plane before publishing
+    # it; the resulting depth image consequently uses the color intrinsics and
+    # camera identity declared by camera_specs.py.
+    align_to_color = rs.align(rs.stream.color)
+
+    print(f"[camera_subprocess] publishing color→{color_topic} "
+          f"depth-aligned-to-color→{depth_topic}", flush=True)
 
     # **The camera knows its own optics; say so out loud.** navi's avoidance
     # corridor is metric, so every frame it converts its half-width back into a
@@ -1637,7 +1646,8 @@ def _camera_subprocess(namespace: str):
     try:
         import json as _json
         _streams = {}
-        for _name, _stream in (("color", rs.stream.color), ("depth", rs.stream.depth)):
+        for _name, _stream in (("color", rs.stream.color),
+                               ("depth_sensor", rs.stream.depth)):
             _intr = (pipeline.get_active_profile()
                      .get_stream(_stream).as_video_stream_profile().intrinsics)
             _streams[_name] = {
@@ -1647,6 +1657,11 @@ def _camera_subprocess(namespace: str):
                 "model": str(_intr.model).rsplit(".", 1)[-1],
                 "coeffs": list(_intr.coeffs),
             }
+        # rs.align projects the depth samples onto the color image plane.  Its
+        # output grid therefore has the color profile's geometry, not the raw
+        # depth sensor's geometry.  Keep the latter in the diagnostic payload
+        # under depth_sensor, but advertise the actual published output here.
+        _streams["depth"] = dict(_streams["color"])
         print("[camera_subprocess] INTRINSICS " + _json.dumps(_streams), flush=True)
     except Exception as _e:
         # Not fatal: the cards fall back to the datasheet-derived declaration in
@@ -1661,6 +1676,8 @@ def _camera_subprocess(namespace: str):
             t0 = _time.monotonic()
             frames = pipeline.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
+
+            frames = align_to_color.process(frames)
 
             color_frame = frames.get_color_frame()
             if color_frame:
@@ -1806,7 +1823,7 @@ class CameraPlugin:
                 "name": "depth",
                 "type": "sensor",
                 "multiInstance": False,
-                "description": f"Bumi Realsense D435i depth camera — 640x480 zlib-compressed Z16 @ 30fps. Publishes to {self._depth_topic}",
+                "description": f"Bumi Realsense D435i depth registered to the RGB image — 640x480 zlib-compressed Z16 @ 30fps. Publishes to {self._depth_topic}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
             },

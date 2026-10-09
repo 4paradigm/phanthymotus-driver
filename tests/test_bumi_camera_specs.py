@@ -12,6 +12,8 @@ Two Bumi-specific things this covers that R1's equivalent does not:
     640x480, which keeps the vertical field and cuts the horizontal one. Taking
     Intel's 69.4 deg at face value would overstate the width of the world by
     about a third — an authoritative-looking wrong number.
+  - **aligned depth.** The driver registers D435i depth onto the RGB pixel grid,
+    so both outputs must declare the same optical identity and geometry.
   - **the runtime intrinsics winning.** The camera knows; the datasheet only
     approximates. The declaration has to prefer the first and still answer
     before the camera has started.
@@ -100,21 +102,24 @@ def test_the_colour_fallback_says_it_was_computed_not_published():
     assert info.source == "manual"
 
 
-def test_the_depth_fallback_is_intels_own_number_because_that_mode_is_native():
-    """The depth stream is natively 4:3 and 640x480 is its own mode, so 87 deg
-    describes the picture this driver actually publishes."""
+def test_aligned_depth_fallback_uses_the_rgb_geometry():
+    """The raw depth lens is wider, but that is not the image being published:
+    rs.align has reprojected it onto the RGB grid."""
+    color = parse(camera_specs.declare("camera", COLOR_TOPIC, "image/jpeg")[0])
     info = parse(camera_specs.declare("depth", DEPTH_TOPIC, "image/depth-zlib")[0])
-    assert info.source == "vendor-spec"
-    assert info.half_fov_rad == pytest.approx(math.radians(87.0) / 2.0)
+    assert info.source == "manual"
+    assert info.half_fov_rad == pytest.approx(color.half_fov_rad)
 
 
-def test_the_two_ports_have_different_ids_and_different_optics():
-    """They are two physical lenses. One `id` for both would make a downstream
-    calibration table look up the wrong row, silently."""
+def test_registered_depth_and_rgb_have_the_same_optical_identity():
+    """navi samples depth at RGB detection pixels, so this equality is the
+    machine-checkable statement that the grids correspond."""
     color = parse(camera_specs.declare("camera", COLOR_TOPIC, "image/jpeg")[0])
     depth = parse(camera_specs.declare("depth", DEPTH_TOPIC, "image/depth-zlib")[0])
-    assert color.id != depth.id
-    assert color.half_fov_rad != depth.half_fov_rad
+    assert color.id == depth.id
+    assert color.half_fov_rad == depth.half_fov_rad
+    assert "realsense/align-to-color" in depth.pipeline
+    assert depth.vendor["depth_aligned_to"] == "color"
 
 
 # ── the runtime intrinsics ───────────────────────────────────────────────────
@@ -151,12 +156,16 @@ def test_the_derived_angle_is_close_to_the_cropped_fallback():
     assert derived == pytest.approx(fallback.half_fov_rad, rel=0.15)
 
 
-def test_intrinsics_for_the_other_stream_do_not_leak_across_ports():
-    """Joined by stream name, not by position — the colour port must not adopt
-    the depth lens' calibration."""
+def test_aligned_depth_adopts_the_published_depth_outputs_rgb_intrinsics():
+    """The subprocess labels the registered output as depth, but its values are
+    the RGB profile because that is the grid rs.align produces."""
+    intrinsics = _color_intrinsics()["color"]
     declaration = camera_specs.declare(
-        "depth", DEPTH_TOPIC, "image/depth-zlib", _color_intrinsics())[0]
-    assert parse(declaration).source == "vendor-spec"
+        "depth", DEPTH_TOPIC, "image/depth-zlib", {"depth": intrinsics})[0]
+    info = parse(declaration)
+    assert info.source == "derived-from-K"
+    assert info.K[0] == 605.0
+    assert info.id == "noetix/bumi/camera_color"
 
 
 def test_rectified_coefficients_are_declared_pinhole():
@@ -235,7 +244,7 @@ def test_a_consumer_finds_the_declaration_by_the_topic_it_bound():
     declarations = (camera_specs.declare("camera", COLOR_TOPIC, "image/jpeg")
                     + camera_specs.declare("depth", DEPTH_TOPIC, "image/depth-zlib"))
     found = for_topic(declarations, DEPTH_TOPIC)
-    assert found is not None and found.id.endswith("camera_depth")
+    assert found is not None and found.id.endswith("camera_color")
 
 
 def test_a_full_angle_in_the_half_angle_field_is_refused():

@@ -28,18 +28,18 @@ fallback is derived from the datasheet by the aspect ratio the driver actually
 opens, and says `source: "manual"` rather than `"vendor-spec"`, because it is an
 arithmetic step past anything Intel published.
 
-The depth port needs no such correction: the D435i's depth stream is natively
-4:3 and 640x480 is its own native mode, so 87 deg is the angle for the picture
-we publish.
+The published depth port is not the raw depth lens. `_camera_subprocess` runs
+`rs.align(rs.stream.color)`, so every depth sample is registered onto the RGB
+pixel grid. Its output geometry and stable camera identity must consequently be
+the RGB port's; the raw depth-lens intrinsics remain diagnostic data only.
 """
 from __future__ import annotations
 
 import math
 
 # Intel's published fields of view for the D435i, full angle, in degrees.
-# Depth 87 x 58, RGB 69.4 x 42.5.
-_DEPTH_FULL_H_DEG = 87.0
-_DEPTH_FULL_V_DEG = 58.0
+# RGB 69.4 x 42.5. The raw depth lens is 87 x 58, but its image is never
+# published: depth is registered to the RGB optical plane first.
 _RGB_FULL_H_DEG = 69.4
 _RGB_FULL_V_DEG = 42.5
 
@@ -83,6 +83,7 @@ def _cropped_half_h(full_h_deg: float, full_v_deg: float) -> float:
 SPECS = {
     "camera": {
         "id": "noetix/bumi/camera_color",
+        "pipeline": ["noetix/bumi/camera_color"],
         "width": _WIDTH, "height": _HEIGHT,
         "half_fov_rad": _cropped_half_h(_RGB_FULL_H_DEG, _RGB_FULL_V_DEG),
         "half_fov_v_rad": _half(_RGB_FULL_V_DEG),
@@ -93,14 +94,22 @@ SPECS = {
                            "就会被运行时内参顶掉。"},
     },
     "depth": {
-        "id": "noetix/bumi/camera_depth",
+        # This is intentionally the same identity as the color output. `id`
+        # names the optical coordinate system a consumer joins through; after
+        # RealSense registration both outputs use the RGB pixel rays.
+        "id": "noetix/bumi/camera_color",
+        "pipeline": ["noetix/bumi/camera_depth_sensor",
+                     "realsense/align-to-color",
+                     "noetix/bumi/camera_color"],
         "width": _WIDTH, "height": _HEIGHT,
-        "half_fov_rad": _half(_DEPTH_FULL_H_DEG),
-        "half_fov_v_rad": _half(_DEPTH_FULL_V_DEG),
-        "source": "vendor-spec",
-        "vendor": {"note": "Intel D435i 手册标称深度 87x58 度。深度流原生就是 4:3，"
-                           "640x480 是它的原生模式，所以这个角对应的就是我们发出去的"
-                           "那张图。"},
+        "half_fov_rad": _cropped_half_h(_RGB_FULL_H_DEG, _RGB_FULL_V_DEG),
+        "half_fov_v_rad": _half(_RGB_FULL_V_DEG),
+        "source": "manual",
+        "vendor": {"note": "原始深度流来自 D435i 的深度镜头，但驱动在发布前用 "
+                           "rs.align(rs.stream.color) 把它重投影到 RGB 像素网格。"
+                           "因此这个输出声明 RGB 的几何；相机起来后会被 RGB "
+                           "运行时内参顶掉。",
+                   "depth_aligned_to": "color"},
     },
 }
 
@@ -226,4 +235,4 @@ def declare(tool_name: str, topic: str, fmt: str, intrinsics: dict = None) -> li
             fields.update(runtime)
 
     return [build(topic=topic, format=fmt, id=spec["id"],
-                  pipeline=[spec["id"]], **fields)]
+                  pipeline=spec.get("pipeline") or [spec["id"]], **fields)]
