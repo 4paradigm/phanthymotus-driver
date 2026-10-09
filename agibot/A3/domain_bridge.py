@@ -159,9 +159,11 @@ def _run(messages, profile, domain, lane):
             try:
                 item = messages.get(timeout=0.05)
             except queue.Empty:
-                # Keep the node responsive while waiting for the next sample;
-                # an empty queue is normal and must not terminate the worker.
-                rclpy.spin_once(node, timeout_sec=0.0)
+                # The bridge node has no subscriptions; spinning an empty
+                # worker is unnecessary.  More importantly, Humble can report
+                # an invalid wait-set context while the parent is tearing down
+                # sibling workers.  Do not turn a normal empty queue into a
+                # traceback and an early worker exit.
                 continue
             if item is None:
                 break
@@ -184,7 +186,11 @@ def _run(messages, profile, domain, lane):
             published[topic] = published.get(topic, 0) + 1
             if published[topic] == 1 or published[topic] % 1000 == 0:
                 print(f"[dds-bridge] published={published[topic]} topic={topic}", flush=True)
-            rclpy.spin_once(node, timeout_sec=0.0)
+            # This node only owns publishers, so no executor spin is needed.
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
