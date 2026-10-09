@@ -5,6 +5,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <sys/socket.h>
+#include <unistd.h>
 namespace {
 std::array<uint8_t, 36> frame{};
 int pair_fds[2];

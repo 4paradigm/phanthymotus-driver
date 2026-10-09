@@ -24,6 +24,7 @@ import struct
 import subprocess
 import threading
 import time
+import urllib.parse
 import urllib.request
 from uuid import uuid4
 
@@ -671,7 +672,8 @@ def _face_acp_notify(action_id, status, result):
     request = urllib.request.Request(url + "/api/acp/complete", data=payload,
                                      headers={"Content-Type": "application/json"}, method="POST")
     context = ssl.create_default_context()
-    if url.startswith(("https://localhost:", "https://127.0.0.1:")):
+    parsed_url = urllib.parse.urlsplit(url)
+    if parsed_url.scheme == "https" and parsed_url.hostname in ("localhost", "127.0.0.1"):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
     try:

@@ -183,6 +183,29 @@ def test_acp_failure_is_bounded_and_visible(monkeypatch, capsys):
     assert "face_light_failed" in output and "offline callback timeout" in output
 
 
+@pytest.mark.parametrize("url,local", [
+    ("https://localhost:15678", True),
+    ("https://127.0.0.1:15678", True),
+    ("https://localhost", True),
+    ("https://localhost.attacker.example:15678", False),
+    ("https://localhost:15678@attacker.example", False),
+    ("https://127.0.0.1:15678@attacker.example", False),
+    ("https://core.example:15678", False),
+    ("http://localhost:15678", False),
+])
+def test_acp_tls_exception_requires_exact_https_loopback_host(monkeypatch, url, local):
+    monkeypatch.setenv("AGENT_CORE_URL", url)
+    response = Mock()
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    urlopen = Mock(return_value=response)
+    monkeypatch.setattr(ext.urllib.request, "urlopen", urlopen)
+    _REAL_ACP_NOTIFY("offline_tls_check", "completed", {})
+    context = urlopen.call_args.kwargs["context"]
+    assert context.check_hostname is not local
+    assert context.verify_mode == (ext.ssl.CERT_NONE if local else ext.ssl.CERT_REQUIRED)
+
+
 @pytest.mark.parametrize('action,args', [('off', {}), ('set_color', {'g': 70}), ('stop', {})])
 def test_blocked_acp_cannot_delay_replacement_frame(light, monkeypatch, action, args):
     entered, release = threading.Event(), threading.Event()
