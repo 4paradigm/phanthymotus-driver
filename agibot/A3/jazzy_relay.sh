@@ -3,6 +3,7 @@ set -euo pipefail
 ROOT=/opt/phanthy-motus/data/a3-relay
 PIDFILE=$ROOT/relay.pid
 SOURCE=/work/agibot/A3/jazzy_relay.py
+HOST_SOURCE=/proc/1/root/tmp/a3-jazzy-relay.py
 mkdir -p "$ROOT"
 case "${1:-start}" in
 start)
@@ -11,26 +12,25 @@ start)
   if [[ -f "$PIDFILE" ]]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
   : > "$ROOT/relay.log"
-  # A container-created bind mount is not visible in PID 1's mount namespace,
-  # even with pid:host and privileged.  Feed the source over stdin instead of
-  # trying to execute a path created by the container.  /bin/sh is present in
-  # both namespaces and /proc/1/root points at the host filesystem after
-  # nsenter, so this does not depend on a shared mount or on nsenter's path
-  # lookup timing.
-  nsenter -t 1 -m -u -n -p -- /bin/sh -c \
+  # Files created in the container's mount namespace are invisible after a
+  # mount-namespace switch.  Write the relay into the host root via /proc/1/root
+  # instead, then enter the host root (without -m) so the host Jazzy install and
+  # /tmp path are visible.  PID/network namespaces are still entered for DDS.
+  cp "$SOURCE" "$HOST_SOURCE"
+  nsenter -t 1 -r -u -n -p -- /usr/bin/bash -lc \
     'set -eu
-     if [ -f /proc/1/root/opt/ros/jazzy/setup.sh ]; then
-       . /proc/1/root/opt/ros/jazzy/setup.sh
-     elif [ -f /proc/1/root/opt/ros/jazzy/setup.bash ]; then
-       . /proc/1/root/opt/ros/jazzy/setup.bash
+     if [ -f /opt/ros/jazzy/setup.sh ]; then
+       . /opt/ros/jazzy/setup.sh
+     elif [ -f /opt/ros/jazzy/setup.bash ]; then
+       . /opt/ros/jazzy/setup.bash
      else
        echo "[relay] ERROR: host Jazzy setup not found" >&2; exit 41
      fi
      python3 -c "import rclpy, sensor_msgs" || {
        echo "[relay] ERROR: host Jazzy rclpy/sensor_msgs unavailable" >&2; exit 42;
      }
-     exec python3 -' \
-    <"$SOURCE" >>"$ROOT/relay.log" 2>&1 &
+     exec python3 /tmp/a3-jazzy-relay.py' \
+    >>"$ROOT/relay.log" 2>&1 &
   echo $! > "$PIDFILE"
   for _ in {1..100}; do
     if grep -q "Jazzy input ready" "$ROOT/relay.log" 2>/dev/null; then
