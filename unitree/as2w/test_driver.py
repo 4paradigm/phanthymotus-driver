@@ -1237,7 +1237,8 @@ class TestDriverContracts(unittest.TestCase):
         plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)
         schema = plugin.get_tool()["inputSchema"]
         self.assertIn("navigate_to", schema["x-completion"]["actions"])
-        self.assertEqual(180, schema["x-completion"]["timeout"])
+        self.assertEqual(210, schema["x-completion"]["timeout"])
+        self.assertIn("resume_navigation", schema["x-completion"]["actions"])
 
     def test_navigation_returns_action_id_without_waiting_for_arrival(self):
         plugin = self.spatial.ControlledSpatialPlugin.__new__(self.spatial.ControlledSpatialPlugin)

@@ -35,6 +35,7 @@ _SOURCE_TIMEOUT_SECONDS = 1.5
 # useful visual benefit from all source points, while a smaller uniform sample
 # makes it substantially more likely that the displayed frame is the latest.
 _MAX_RENDER_POINTS = 2000
+_PROCESS_STARTUP_TIMEOUT_SECONDS = 5.0
 # Official As2W URDF JT128 fixed joint: rpy=(-pi, 1.4661, -pi).
 # This maps points from the lidar frame into the As2W base frame.  Keeping the
 # values explicit avoids pulling numpy into the latency-sensitive bridge.
@@ -262,6 +263,10 @@ class LidarPlugin:
         self._process_mode = bool(config.get("process", False))
         self.node = None
         self._process = None
+        self._status_reader = None
+        self._process_lock = threading.RLock()
+        self._process_state = "idle"
+        self._process_error = None
         if getattr(self, "_process_mode", False):
             self._start_process()
         else:
@@ -272,13 +277,108 @@ class LidarPlugin:
                 self.node = _LidarNode(self.topic, executor, config.get("source_topics"))
 
     def _start_process(self):
-        context = multiprocessing.get_context("spawn")
-        self._process = context.Process(
-            target=_run_lidar_process,
-            args=(self.topic, self._config.get("source_topics"),
-                  self._config.get("max_render_points"), self._interface),
-            daemon=True, name="as2w-lidar-process")
-        self._process.start()
+        with self._process_lock:
+            if not self._dispose_process():
+                self._process_state = "error"
+                self._process_error = "Previous lidar process has not stopped"
+                return
+            self._process_state = "starting"
+            self._process_error = None
+            writer = None
+            try:
+                context = multiprocessing.get_context("spawn")
+                self._status_reader, writer = context.Pipe(duplex=False)
+                self._process = context.Process(
+                    target=_run_lidar_process,
+                    args=(self.topic, self._config.get("source_topics"),
+                          self._config.get("max_render_points"), self._interface, writer),
+                    daemon=True, name="as2w-lidar-process")
+                self._process.start()
+                writer.close()
+                writer = None
+                deadline = time.monotonic() + _PROCESS_STARTUP_TIMEOUT_SECONDS
+                while self._process_state == "starting":
+                    self._check_process()
+                    if self._process_state != "starting":
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._fail_process("Lidar startup timed out waiting for DDS/ROS readiness")
+                        break
+                    self._status_reader.poll(min(0.05, remaining))
+            except Exception as exc:
+                self._fail_process(f"Lidar startup failed: {type(exc).__name__}: {str(exc)[:180]}")
+            finally:
+                if writer is not None:
+                    writer.close()
+
+    def _dispose_process(self):
+        """Close IPC and reap the child; retain its handle if it cannot exit."""
+        reader, self._status_reader = self._status_reader, None
+        if reader is not None:
+            reader.close()
+        process = self._process
+        if process is None:
+            return True
+        try:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1)
+            if process.is_alive():
+                return False
+        except (AssertionError, ValueError):
+            # A failure in Process.start() may leave a never-started handle.
+            pass
+        except OSError:
+            if process.is_alive():
+                return False
+        process.close()
+        self._process = None
+        return True
+
+    def _fail_process(self, error):
+        self._process_state = "error"
+        self._process_error = error
+        if not self._dispose_process():
+            self._process_error += "; child has not exited"
+
+    def _check_process(self):
+        if self._process is None:
+            return
+        try:
+            while self._status_reader is not None and self._status_reader.poll(0):
+                message = self._status_reader.recv()
+                if not isinstance(message, dict):
+                    self._fail_process("Invalid lidar child status")
+                    return
+                if message.get("state") == "ready" and self._process_state == "starting":
+                    self._process_state = "running"
+                elif message.get("state") == "error":
+                    self._fail_process(str(message.get("error", "Lidar child failed"))[:300])
+                    return
+                else:
+                    self._fail_process("Unexpected lidar child status")
+                    return
+        except (EOFError, OSError):
+            self._fail_process("Lidar child closed its status channel")
+            return
+        if not self._process.is_alive():
+            self._fail_process(f"Lidar child exited (code {self._process.exitcode})")
+
+    def _status(self):
+        if getattr(self, "_process_mode", False):
+            with self._process_lock:
+                self._check_process()
+                result = {"state": self._process_state}
+                if self._process_error:
+                    result.update(ret=3104, error=self._process_error)
+        else:
+            result = {"state": "running" if self.node is not None else "idle"}
+        result["topic_out"] = [{"topic": self.topic, "format": "sensor/pointcloud"}]
+        return result
 
     def get_tools(self):
         return [self._cloud_tool()]
@@ -291,8 +391,10 @@ class LidarPlugin:
 
     def start(self):
         if getattr(self, "_process_mode", False):
-            if self._process is None or not self._process.is_alive():
-                self._start_process()
+            with self._process_lock:
+                self._check_process()
+                if self._process_state != "running":
+                    self._start_process()
         elif self.node is None:
             if "max_render_points" in self._config:
                 self.node = _LidarNode(self.topic, self._executor,
@@ -301,30 +403,32 @@ class LidarPlugin:
             else:
                 self.node = _LidarNode(self.topic, self._executor,
                                        self._config.get("source_topics"))
+        return self._status()
 
     def stop(self):
         if getattr(self, "_process_mode", False):
-            process = self._process
-            self._process = None
-            if process is not None:
-                process.terminate()
-                process.join(timeout=3)
+            with self._process_lock:
+                if self._dispose_process():
+                    self._process_state = "idle"
+                    self._process_error = None
+                else:
+                    self._process_state = "error"
+                    self._process_error = "Lidar child has not stopped"
         elif self.node is not None:
             self.node.close()
             self.node = None
+        return self._status()
 
     def dispatch(self, action, args):
         if action == "start":
-            self.start()
-            return {"state": "running", "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
+            return self.start()
         if action == "stop":
-            self.stop()
-            return {"state": "idle"}
-        if action in ("start", "info", "lidar_cloud"):
-            return {"state": "running", "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
+            return self.stop()
+        if action in ("info", "lidar_cloud"):
+            return self._status()
         return None
 
 
-def _run_lidar_process(topic, source_topics, max_render_points, interface):
+def _run_lidar_process(topic, source_topics, max_render_points, interface, status_writer):
     from sensor_worker import run_lidar
-    run_lidar(topic, source_topics, max_render_points, interface)
+    run_lidar(topic, source_topics, max_render_points, interface, status_writer)

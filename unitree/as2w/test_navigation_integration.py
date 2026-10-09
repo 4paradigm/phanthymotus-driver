@@ -85,6 +85,105 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(0, self.servo.Move(.1, 0, 0))
         self.assertEqual([("GetState", ())], self.proxy._sport.calls)
 
+    def test_external_reservation_excludes_all_legacy_writes_but_allows_reads_and_led(self):
+        self.assertTrue(self.proxy.reserve_external_navigation())
+        # Re-reserving for a resume from this same vendor-navigation owner is
+        # idempotent, but never reopens the legacy lane.
+        self.assertTrue(self.proxy.reserve_external_navigation())
+        for method, args in (("Move", (.1, 0, 0)), ("StopMove", ()),
+                             ("Damp", ()), ("StandUp", ()),
+                             ("RecoveryStand", ()), ("BalanceStand", ())):
+            with self.subTest(method=method):
+                self.assertEqual(3104, self.proxy.call(method, *args))
+        self.assertEqual([], self.proxy._sport.calls)
+        self.assertEqual(0, self.proxy.GetState()[0])
+        self.assertEqual(0, self.proxy.Audio_LedControl(255, 0, 0))
+        self.assertEqual([("GetState", ())], self.proxy._sport.calls)
+        self.assertEqual([("LedControl", (255, 0, 0))], self.proxy._audio_led.calls)
+
+    def test_external_reservation_refuses_in_flight_then_unstopped_legacy_motion(self):
+        entered, release = threading.Event(), threading.Event()
+        def call(*_):
+            entered.set()
+            release.wait(1)
+            return 0
+        original_call = self.proxy._sport.call
+        self.proxy._sport.call = call
+        thread = threading.Thread(target=self.proxy.Move, args=(.1, 0, 0))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(self.proxy.reserve_external_navigation())
+        finally:
+            release.set()
+            thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(self.proxy.reserve_external_navigation())
+        self.proxy._sport.call = original_call
+        self.proxy._sport.ret = 3104
+        self.assertEqual(3104, self.proxy.StopMove())
+        self.assertFalse(self.proxy.reserve_external_navigation())
+        self.proxy._sport.ret = 0
+        self.assertEqual(0, self.proxy.StopMove())
+        self.assertTrue(self.proxy.reserve_external_navigation())
+
+    def test_legacy_call_arriving_after_external_reservation_never_reaches_sdk(self):
+        self.assertTrue(self.proxy.reserve_external_navigation())
+        results = []
+        thread = threading.Thread(target=lambda: results.append(self.proxy.Move(.1, 0, 0)))
+        thread.start()
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([3104], results)
+        self.assertEqual([], self.proxy._sport.calls)
+        self.assertEqual(0, self.proxy._legacy_active)
+
+    def test_stop_requires_numeric_success_ack_before_external_handoff(self):
+        for invalid_ack in (False, True, None, "0", {"ret": 0}):
+            with self.subTest(ack=invalid_ack):
+                self.proxy._sport.ret = 0
+                self.proxy.Move(.1, 0, 0)
+                self.proxy._sport.ret = invalid_ack
+                self.proxy.StopMove()
+                self.assertFalse(self.proxy.reserve_external_navigation())
+                self.assertFalse(self.servo.acquire_control()["ok"])
+        self.proxy._sport.ret = 0
+        self.proxy.StopMove()
+        self.assertTrue(self.proxy.reserve_external_navigation())
+
+    def test_queued_move_cannot_be_cleared_by_older_stop_ack(self):
+        stop_entered, stop_release = threading.Event(), threading.Event()
+        move_entered, move_release = threading.Event(), threading.Event()
+        def call(method, *_):
+            if method == "StopMove":
+                stop_entered.set()
+                stop_release.wait(1)
+            else:
+                move_entered.set()
+                move_release.wait(1)
+            return 0
+        self.proxy._sport.call = call
+        stop_thread = threading.Thread(target=self.proxy.StopMove)
+        move_thread = threading.Thread(target=self.proxy.Move, args=(.1, 0, 0))
+        stop_thread.start()
+        try:
+            self.assertTrue(stop_entered.wait(1))
+            move_thread.start()
+            self.assertFalse(move_entered.wait(.02))
+            self.assertFalse(self.proxy.reserve_external_navigation())
+            stop_release.set()
+            self.assertTrue(move_entered.wait(1))
+            self.assertFalse(self.proxy.reserve_external_navigation())
+        finally:
+            stop_release.set()
+            move_release.set()
+            stop_thread.join(1)
+            if move_thread.ident is not None:
+                move_thread.join(1)
+        self.assertFalse(stop_thread.is_alive())
+        self.assertFalse(move_thread.is_alive())
+        self.assertFalse(self.proxy.reserve_external_navigation())
+
     def test_stop_has_independent_lane_after_motion_worker_fault(self):
         self.assertTrue(self.servo.acquire_control()["ok"])
         self.servo._motion.ready = False
@@ -107,18 +206,32 @@ class OwnershipTests(unittest.TestCase):
         spatial = spatial_module.ControlledSpatialPlugin.__new__(spatial_module.ControlledSpatialPlugin)
         spatial.set_chassis_guard(self.proxy)
         reply = {"code": 0, "response": {}}
+        spatial._nav_lock = threading.Lock()
+        spatial._nav_done = threading.Event()
+        spatial._nav_action_id = None
+        spatial._nav_target = None
+        spatial._paused_target = {"x": 1}
         spatial._client = types.SimpleNamespace(call=lambda *_: reply)
-        self.assertEqual(0, spatial.dispatch("resume_navigation", {})["ret"])
+        with patch.object(spatial_module.threading, "Thread"):
+            self.assertEqual(0, spatial.dispatch("resume_navigation", {})["ret"])
+        notify = patch.object(spatial_module, "_acp_notify")
+        notify.start()
+        self.addCleanup(notify.stop)
         refused = self.servo.acquire_control()
         self.assertFalse(refused["ok"])
         self.assertIn("controlled_spatial.pause_navigation", refused["error"])
         self.assertIn("controlled_spatial.shutdown", refused["error"])
         self.assertNotIn("loco.stop_move", refused["error"])
+        self.assertEqual(3104, self.proxy.Move(.1, 0, 0))
+        self.assertEqual(3104, self.proxy.StopMove())
         reply["code"] = 3104
         spatial.dispatch("pause_navigation", {})
         self.assertFalse(self.servo.acquire_control()["ok"])
+        self.assertEqual(3104, self.proxy.Move(.1, 0, 0))
         reply["code"] = 0
         spatial.dispatch("pause_navigation", {})
+        self.assertEqual(0, self.proxy.Move(.1, 0, 0))
+        self.assertEqual(0, self.proxy.StopMove())
         self.assertTrue(self.servo.acquire_control()["ok"])
         self.assertNotEqual(0, spatial.dispatch("resume_navigation", {})["ret"])
 
@@ -126,8 +239,15 @@ class OwnershipTests(unittest.TestCase):
         spatial_module = load("navigation_spatial_uncertain", ROOT / "controlled_spatial.py")
         spatial = spatial_module.ControlledSpatialPlugin.__new__(spatial_module.ControlledSpatialPlugin)
         spatial.set_chassis_guard(self.proxy)
+        spatial._nav_lock = threading.Lock()
+        spatial._nav_done = threading.Event()
+        spatial._nav_action_id = None
+        spatial._paused_target = {"x": 1}
         spatial._client = types.SimpleNamespace(call=lambda *_: {"code": 3104, "response": "timeout"})
-        spatial.dispatch("resume_navigation", {})
+        result = spatial.dispatch("resume_navigation", {})
+        self.assertEqual(3104, result["ret"])
+        self.assertIsNone(spatial._nav_action_id)
+        self.assertIsNone(spatial._paused_target)
         self.assertFalse(self.servo.acquire_control()["ok"])
 
     def test_special_motion_conflict_is_checked_before_claim(self):

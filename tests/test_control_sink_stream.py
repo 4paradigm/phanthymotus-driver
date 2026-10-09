@@ -302,6 +302,19 @@ def test_legacy_watchdog_also_fires_when_first_apply_was_at_monotonic_zero():
     assert stopped == [1]
 
 
+def test_default_policy_allows_equal_priority_source_takeover():
+    # Strict streams keep an equal-priority competing source out. Existing
+    # callers that omit strict_stream must retain their original tie policy.
+    clock = Clock()
+    applied = []
+    sink = ControlSink(descriptor(), lambda values, _: applied.append(values),
+                       clock=lambda: clock.mono, wall_clock=lambda: clock.wall)
+    assert sink.submit(command(clock, source="first", priority=50)).applied
+    assert sink.submit(command(clock, source="second", priority=50)).applied
+    assert len(applied) == 2
+    assert sink.stats()["holder"] == "second"
+
+
 def test_strict_watchdog_before_skewed_ttl_stops_once_and_resumes_from_rest():
     sink, clock, applied, stopped = setup_sink()
     # Allowed future skew yields a 350 ms TTL deadline, after the 300 ms

@@ -178,6 +178,38 @@ accepted vendor pause/shutdown releases that reservation. A timed-out vendor
 request remains reserved because its execution status is unknown. Explicitly
 pause the vendor navigator before switching to the visual velocity stream.
 
+The reservation blocks legacy `loco`/posture writes as well as `loco_servo`,
+including late stop finalizers. Conversely, a legacy write in flight or a
+movement without an accepted stop prevents the vendor navigator from reserving
+the chassis. Read-only state and the independent LED lane remain available.
+
+The observed vendor `task_result` has no reliable goal identity. It is not
+proof that the current target was reached: a delayed result can belong to an
+older goal. The adapter therefore requests an explicit vendor pause on a
+terminal result or navigation timeout, and releases the chassis only on that
+RPC's matching success reply. It reports ACP `error` with `arrival_reported`,
+`arrival_verified=false`, `stop_acknowledged` and `chassis_reserved`; it does
+not report unverified arrival as `completed`. A stale event can conservatively
+stop the current goal. This is an intentional limitation of this vendor
+adapter, not a validation of vendor goal completion. The ActuCore visual navi
+path is separate and does not use these SLAM messages.
+
+`info.last_navigation_result` retains this result. `requires_vendor_pause`
+identifies a retained reservation without an active action. Card `stop` still
+attempts vendor pause in that state, even after a failed navigation RPC or an
+earlier teardown; a failed pause returns an error and preserves the reservation
+across restart. `pause_navigation` and `shutdown` remain the explicit recovery
+paths. Local RPC request IDs prevent an old navigation reply from being mistaken
+for a newer pause acknowledgement. An SDK acknowledgement is not a measured
+physical stop.
+
+Explicitly pausing an active goal saves its target. `resume_navigation` requires
+that saved target and an available completion subscription, allocates a new
+action ID and starts a new 180-second waiter with the same terminal-stop policy.
+An untracked resume is rejected before any motion RPC; `stop` and `shutdown`
+clear the saved target. Both navigation actions advertise a 210-second ACP
+budget to allow the bounded terminal pause RPC to finish after the deadline.
+
 Expired/invalid streams do not refresh the watchdog. Stream loss pauses the
 card and requires an explicit resume; it never automatically replays an old
 goal's velocity. SDK rejection or a failed stop latches a fault and prevents
@@ -228,15 +260,49 @@ preserve the existing DDS isolation and service deployment configuration.
 
 The lidar subprocess receives the resolved robot adapter explicitly. It refuses
 an empty/`auto` interface and exits if DDS binding fails, before creating sensor
-subscriptions. The no-hardware regression follows auto-detected `eno1` through
-bundle construction, spawn arguments and the child's DDS initialization.
+subscriptions. The parent waits at most five seconds for a ready/error handshake;
+ready requires DDS binding, ROS setup and at least one initialized subscription.
+A startup failure/timeout or later child exit is exposed as `state=error`, not
+`running`. Failed children and pipes are reaped/closed; `start` can retry and
+`stop` reports whether cleanup succeeded. The no-hardware regressions follow
+auto-detected `eno1` through child initialization and exercise real OS spawn,
+readiness, failure, repeated stop/start and process cleanup.
 
-The shared sink's opt-in `strict_stream=True` retains bounded finite timestamps,
-required observation age, session/sequence checks and an execution deadline for
-twist streams. Its public reset accepts a zero baseline after a successful stop;
-its vendor gate rechecks freshness after a slow posture query. SDK/stop callback
-failures latch in that same shared sink. Other cards keep the default stream
-policy; these checks are covered in ROS-free shared tests, not copied into AS2W.
+The change to `common/control/sink.py` implements the shared-sink integration
+requested in [PR #369](https://github.com/4paradigm/phanthymotus-driver/pull/369).
+Keeping timestamp, arbitration, limit and stopping decisions in the AS2W
+adapter would create a second safety implementation that could diverge from
+the other drivers. These decisions therefore live in `ControlSink`; AS2W keeps
+only its mailbox, SDK writer, posture gate and ownership/lifecycle boundary.
+
+The shared sink's opt-in `strict_stream=True` adds bounded finite timestamps,
+required observation age, session/sequence checks and execution deadlines for
+twist streams. Its public reset can establish a zero baseline after a successful
+stop; its vendor gate rechecks freshness after a slow posture query. Existing
+cards do not opt in automatically: default source arbitration, step limiting
+and recovery after watchdog stand-down retain their previous policy. Two fixes
+do apply to default callers: exceptions from actuator/stop callbacks latch a
+fault rather than leaving the sink usable, and a first application at monotonic
+time zero now starts the watchdog correctly. A fresh command still resumes a
+normal default watchdog stand-down; a latched callback fault requires reset.
+
+This is shared infrastructure, not an AS2W-only packaging change. `common` is
+used across driver bundles and by the `phanthymotus`/`phanthymotus-driver`
+repositories. All driver consumers and affected main-project images must be
+included in rebuild and regression validation when this shared version is
+released; an AS2W image build alone does not establish cross-repository
+compatibility. No new pip/APT dependency, model, generated workspace or base
+image is introduced by the sink changes. They update source already packaged
+under `common`; this is not a claim of identical image byte size.
+
+The completed offline coverage includes the existing default sink tests,
+strict-stream and rotation tests, AS2W adapter tests, and R1, G1, Tianyi and RM75
+servo regressions. The default tests cover source priority and recovery after
+watchdog stand-down; a separate compatibility case preserves equal-priority
+source takeover without strict mode. G1 numerical end-effector tests requiring
+unavailable `pinocchio` remain skipped. These checks do not constitute builds
+and runtime verification of every image in both repositories, nor hardware
+validation on all robot models. Release validation must retain that distinction.
 
 ## Packaging rationale and validation scope
 

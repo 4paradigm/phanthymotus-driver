@@ -6,6 +6,7 @@ uses Unitree's common RPC protocol, so this module owns the documented client.
 import json
 from contextlib import nullcontext
 import multiprocessing
+import queue
 import threading
 import time
 from uuid import uuid4
@@ -57,8 +58,10 @@ class _SlamClient:
 def _worker(commands, results, interface):
     _install_logsafe()
     try:
+        if not isinstance(interface, str) or not interface.strip() or interface.strip().lower() == "auto":
+            raise ValueError("SLAM requires an explicitly resolved robot interface")
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-        ChannelFactoryInitialize(0, interface or None)
+        ChannelFactoryInitialize(0, interface.strip())
         client = _SlamClient()
         results.put({"ready": True})
     except Exception as exc:
@@ -70,9 +73,9 @@ def _worker(commands, results, interface):
             return
         try:
             code, response = client.call(command["action"], command["data"])
-            results.put({"code": code, "response": response})
+            results.put({"request_id": command["request_id"], "code": code, "response": response})
         except Exception as exc:
-            results.put({"code": 3104, "response": str(exc)})
+            results.put({"request_id": command["request_id"], "code": 3104, "response": str(exc)})
 
 
 class _SpatialRpcProxy:
@@ -84,6 +87,7 @@ class _SpatialRpcProxy:
         self._lock = threading.Lock()
         self._startup_error = None
         self._stopped = False
+        self._next_request_id = 0
         try:
             result = self._results.get(timeout=5)
             self._startup_error = result.get("startup_error")
@@ -94,11 +98,22 @@ class _SpatialRpcProxy:
         with self._lock:
             if self._stopped or self._startup_error:
                 return {"code": 3104, "response": self._startup_error or "SLAM worker is stopped"}
-            self._commands.put({"action": action, "data": data})
-            try:
-                return self._results.get(timeout=20)
-            except Exception:
-                return {"code": 3104, "response": "SLAM service timeout"}
+            self._next_request_id += 1
+            request_id = self._next_request_id
+            self._commands.put({"request_id": request_id, "action": action, "data": data})
+            deadline = time.monotonic() + 20
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"code": 3104, "response": "SLAM service timeout"}
+                try:
+                    result = self._results.get(timeout=remaining)
+                except queue.Empty:
+                    return {"code": 3104, "response": "SLAM service timeout"}
+                # A timed-out navigation reply is not an acknowledgement of a
+                # later pause. Only the matching command may release ownership.
+                if isinstance(result, dict) and result.get("request_id") == request_id:
+                    return result
 
     def stop(self):
         with self._lock:
@@ -125,8 +140,13 @@ class ControlledSpatialPlugin:
         self._nav_done = threading.Event()
         self._nav_result = None
         self._nav_action_id = None
+        self._nav_target = None
+        self._paused_target = None
         self._nav_lock = threading.Lock()
         self._chassis_guard = None
+        self._chassis_reserved = False
+        self._last_navigation_result = None
+        self._last_stop_acknowledged = None
         self._operation_lock = threading.RLock()
         self.start()
 
@@ -162,14 +182,16 @@ class ControlledSpatialPlugin:
                     "q_x": {"type": "number"}, "q_y": {"type": "number"}, "q_z": {"type": "number"}, "q_w": {"type": "number"},
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5},
                     "mode": {"type": "integer", "enum": [0, 1]}}, "required": ["action"],
-                "x-completion": {"actions": ["navigate_to"], "timeout": 180},
+                # The 180-second navigation deadline leaves time for the
+                # bounded terminal pause RPC before ACP itself times out.
+                "x-completion": {"actions": ["navigate_to", "resume_navigation"], "timeout": 210},
                 "x-action-params": {
                     "start_mapping": {"params": [], "description": "Start indoor SLAM mapping."},
                     "stop_mapping": {"params": ["address"], "description": "Stop mapping and save PCD."},
                     "init_pose": {"params": ["address", "x", "y", "z", "q_x", "q_y", "q_z", "q_w"], "description": "Load map and initialize pose."},
                     "navigate_to": {"params": ["x", "y", "z", "q_x", "q_y", "q_z", "q_w", "speed", "mode"], "description": "Navigate to a target pose."},
                     "pause_navigation": {"params": [], "description": "Pause navigation."},
-                    "resume_navigation": {"params": [], "description": "Resume navigation."},
+                    "resume_navigation": {"params": [], "description": "Resume a goal paused by this card, with a new tracked action and timeout."},
                     "shutdown": {"params": [], "description": "Close vendor SLAM service."}}}}
 
     def set_chassis_guard(self, guard):
@@ -181,6 +203,30 @@ class ControlledSpatialPlugin:
         guard = getattr(self, "_chassis_guard", None)
         if guard is not None:
             guard.release_external_navigation()
+        self._chassis_reserved = False
+
+    def _call_vendor(self, action, data):
+        try:
+            result = self._client.call(action, data)
+            if not isinstance(result, dict):
+                raise ValueError("invalid vendor RPC result")
+            return result
+        except Exception as exc:
+            return {"code": 3104, "response": f"{type(exc).__name__}: {exc}"}
+
+    @staticmethod
+    def _accepted(result):
+        code = result.get("code")
+        return isinstance(code, int) and not isinstance(code, bool) and code == 0
+
+    def _acknowledge_stop(self, action="pause_navigation"):
+        result = self._call_vendor(action, {})
+        self._last_stop_acknowledged = self._accepted(result)
+        if self._last_stop_acknowledged:
+            self._release_chassis()
+        return {"stop_acknowledged": self._last_stop_acknowledged,
+                "chassis_reserved": getattr(self, "_chassis_reserved", False),
+                "vendor_stop": result}
 
     def start(self):
         with self._operation_lock:
@@ -192,24 +238,43 @@ class ControlledSpatialPlugin:
             return self._lifecycle_info()
 
     def _lifecycle_info(self):
-        return {"state": "ready" if self._running else "idle",
-                "completion_available": self._nav_sub is not None}
+        return {"state": "ready" if self._running else "error" if self._chassis_reserved else "idle",
+                "completion_available": self._nav_sub is not None,
+                "chassis_reserved": self._chassis_reserved,
+                "stop_acknowledged": self._last_stop_acknowledged,
+                "navigation_state": "navigating" if self._nav_action_id else
+                    "reserved_without_active_action" if self._chassis_reserved else "idle",
+                "requires_vendor_pause": bool(self._chassis_reserved and not self._nav_action_id),
+                "can_resume": self._paused_target is not None,
+                "last_navigation_result": self._last_navigation_result,
+                "completion_policy": "task_result triggers vendor pause; arrival is not goal-correlated"}
 
     def stop(self):
         with self._operation_lock:
-            self._stop()
+            return self._stop()
 
     def _stop(self):
         self._running = False
         with self._nav_lock:
             action_id, self._nav_action_id = self._nav_action_id, None
+            self._nav_target = self._paused_target = None
             self._subscription_generation += 1
             self._nav_done.set()
+        # An RPC timeout or terminal result may have cleared the action id
+        # while the vendor still owns the chassis. Teardown is not a stop ACK.
+        stop_result = None
+        if action_id or getattr(self, "_chassis_reserved", False):
+            if self._client is None:
+                try:
+                    self._client = _SpatialRpcProxy(self._interface)
+                except Exception:
+                    # _call_vendor reports the unavailable client and keeps
+                    # the reservation instead of pretending teardown stopped it.
+                    pass
+            stop_result = self._acknowledge_stop()
         if action_id:
-            paused = self._client.call("pause_navigation", {})
-            if paused.get("code") == 0:
-                self._release_chassis()
-            _acp_notify(action_id, "cancelled", {"reason": "card stopped"})
+            _acp_notify(action_id, "cancelled" if stop_result["stop_acknowledged"] else "error",
+                        {"reason": "card stopped", **stop_result})
         if self._nav_sub is not None:
             subscriber, self._nav_sub = self._nav_sub, None
             try:
@@ -219,13 +284,16 @@ class ControlledSpatialPlugin:
         if self._client is not None:
             client, self._client = self._client, None
             client.stop()
+        return {**self._lifecycle_info(), "ok": not self._chassis_reserved,
+                **({"error": "vendor stop unconfirmed; chassis reservation retained"}
+                   if self._chassis_reserved else {}), **(stop_result or {})}
 
     def _on_slam_key_info(self, message, generation=None):
         try:
             payload = json.loads(message.data)
         except (TypeError, ValueError, AttributeError):
             return
-        if payload.get("type") == "task_result":
+        if isinstance(payload, dict) and payload.get("type") == "task_result" and isinstance(payload.get("data"), dict):
             with self._nav_lock:
                 if generation is not None and generation != self._subscription_generation:
                     return
@@ -241,14 +309,25 @@ class ControlledSpatialPlugin:
                     return
             if completed:
                 result = self._nav_result or {}
-                arrived = bool(result.get("data", {}).get("is_arrived", False))
-                status = "completed" if arrived and result.get("errorCode", 0) == 0 else "error"
-                _acp_notify(action_id, status, {"target": target, "response": result})
+                stopped = self._acknowledge_stop()
+                # The observed vendor message has no goal identity. It can
+                # request a conservative stop, but cannot certify this target's
+                # arrival. Report the limit instead of completing the wrong goal.
+                report = {"target": target, "response": result,
+                          "arrival_reported": result.get("data", {}).get("is_arrived") is True,
+                          "arrival_verified": False, **stopped,
+                          "reason": "uncorrelated_vendor_task_result",
+                          "error": "task_result has no verified goal identity; arrival unverified"}
+                if not stopped["stop_acknowledged"]:
+                    report["error"] += "; vendor stop unconfirmed and chassis remains reserved"
             else:
-                self._client.call("pause_navigation", {})
-                _acp_notify(action_id, "error", {"target": target, "error": "navigation timed out after 180 seconds"})
+                report = {"target": target, "error": "navigation timed out after 180 seconds",
+                          **self._acknowledge_stop()}
             with self._nav_lock:
                 self._nav_action_id = None
+                self._nav_target = None
+            self._last_navigation_result = report
+            _acp_notify(action_id, "error", report)
 
     @staticmethod
     def _pose(args):
@@ -266,13 +345,15 @@ class ControlledSpatialPlugin:
         if action == "start": return self.start()
         if action == "info": return self._lifecycle_info()
         if action == "stop":
-            self.stop()
-            return {"state": "idle"}
+            return self.stop()
         if action not in _APIS: return None
         if not getattr(self, "_running", True):
             return {"ret": 3104, "accepted": False,
                     "error": "card stopped; call start before using vendor SLAM"}
-        if action == "navigate_to" and hasattr(self, "_nav_sub") and self._nav_sub is None:
+        if action == "resume_navigation" and getattr(self, "_paused_target", None) is None:
+            return {"ret": 3104, "accepted": False,
+                    "error": "no tracked paused goal; call navigate_to with a target"}
+        if action in ("navigate_to", "resume_navigation") and hasattr(self, "_nav_sub") and self._nav_sub is None:
             return {"ret": 3104, "accepted": False,
                     "error": "SLAM completion topic unavailable; call start to retry subscription"}
         if action in ("stop_mapping", "init_pose") and not args.get("address"):
@@ -287,10 +368,12 @@ class ControlledSpatialPlugin:
             guard = getattr(self, "_chassis_guard", None)
             if guard is not None and not guard.reserve_external_navigation():
                 return {"ret": 3104, "accepted": False,
-                        "error": "velocity stream owns the chassis; pause it first"}
+                        "error": "another controller owns or is moving the chassis; stop it first"}
+            self._chassis_reserved = True
+            self._last_stop_acknowledged = None
         action_id = None
         previous = None
-        if action == "navigate_to":
+        if action in ("navigate_to", "resume_navigation"):
             # Arm completion state before the RPC. The vendor can publish a very
             # fast task_result before _Call returns, so clearing the event after
             # the call loses that completion and leaves ACP waiting for 180s.
@@ -298,29 +381,51 @@ class ControlledSpatialPlugin:
                 previous = self._nav_action_id
                 action_id = f"as2w_nav_{uuid4().hex[:8]}"
                 self._nav_action_id = action_id
+                target = data["targetPose"] if action == "navigate_to" else dict(self._paused_target)
+                self._nav_target = target
+                self._paused_target = None
                 self._nav_done.set()
                 self._nav_done = threading.Event()
                 self._nav_result = None
             if previous:
                 _acp_notify(previous, "cancelled", {"reason": "superseded by new navigation request"})
 
-        result = self._client.call(action, data)
+        if action in ("pause_navigation", "shutdown"):
+            stop_state = self._acknowledge_stop(action)
+            result = stop_state["vendor_stop"]
+        else:
+            result = self._call_vendor(action, data)
         # Keep ownership on timeout/error: the vendor may have accepted an RPC
         # whose reply was lost. Only an explicit accepted pause/shutdown clears
         # it; an uncorrelated completion topic cannot safely release a new goal.
-        if action in ("pause_navigation", "shutdown") and result["code"] == 0:
-            self._release_chassis()
-        response = result["response"]
+        if action in ("pause_navigation", "shutdown") and self._accepted(result):
+            with self._nav_lock:
+                cancelled, self._nav_action_id = self._nav_action_id, None
+                if action == "shutdown":
+                    self._paused_target = None
+                elif cancelled and self._nav_target is not None:
+                    self._paused_target = dict(self._nav_target)
+                self._nav_target = None
+                self._nav_done.set()
+            if cancelled:
+                _acp_notify(cancelled, "cancelled", {"reason": action,
+                            "stop_acknowledged": True, "chassis_reserved": False})
+        response = result.get("response")
         try: response = json.loads(response) if isinstance(response, str) else response
         except json.JSONDecodeError: pass
-        if action != "navigate_to" or result["code"] != 0:
-            if action == "navigate_to":
+        if action not in ("navigate_to", "resume_navigation") or not self._accepted(result):
+            if action in ("navigate_to", "resume_navigation"):
                 with self._nav_lock:
                     if self._nav_action_id == action_id:
                         self._nav_action_id = None
+                        self._nav_target = None
                         self._nav_done.clear()
-            return {"ret": result["code"], "response": response}
+            return {"ret": result.get("code", 3104), "response": response,
+                    "chassis_reserved": getattr(self, "_chassis_reserved", False),
+                    "stop_acknowledged": getattr(self, "_last_stop_acknowledged", None)}
         threading.Thread(target=self._wait_for_navigation,
-                         args=(action_id, data["targetPose"], self._nav_done), daemon=True).start()
+                         args=(action_id, target, self._nav_done), daemon=True).start()
         return {"ret": 0, "status": "navigating", "action_id": action_id,
-                "target_pose": data["targetPose"], "response": response}
+                "target_pose": target, "response": response,
+                "chassis_reserved": True, "arrival_verified": False,
+                "completion_policy": "task_result triggers vendor pause; arrival is not goal-correlated"}

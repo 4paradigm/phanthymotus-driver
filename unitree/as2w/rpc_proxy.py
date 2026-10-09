@@ -237,6 +237,7 @@ class RpcProxy:
     def __init__(self, network_interface=""):
         self._network_interface = network_interface
         self._ownership_lock = threading.Lock()
+        self._legacy_write_lock = threading.Lock()
         self._owner = "legacy"
         self._legacy_active = 0
         self._legacy_motion_active = False
@@ -252,20 +253,31 @@ class RpcProxy:
         if method == "GetState":
             return self._sport.call(method, *args)
         with self._ownership_lock:
-            if self._owner != "legacy":
+            if self._owner != "legacy" or self._external_navigation:
                 # Includes late finalizers from old loco workers. They must not
-                # overwrite a newly acquired servo command with Move OR Stop.
+                # overwrite servo OR vendor navigation with Move or Stop.
+                # Vendor pause/shutdown uses its own client and releases this
+                # reservation only after an acknowledgement from that client.
                 return 3104
             self._legacy_active += 1
-            self._legacy_motion_active = True
         try:
-            result = self._sport.call(method, *args)
-            with self._ownership_lock:
-                if result == 0 and method in ("StopMove", "Damp"):
-                    self._legacy_motion_active = False
-                else:
+            # Keep the acknowledgement bookkeeping in SDK write order. The
+            # channel's own lock ends before its caller updates this latch;
+            # without this lock, an older StopMove could clear a newer Move.
+            # Pending writes remain counted, so a handoff never waits on this
+            # lock while holding the ownership lock and never skips a queue.
+            with self._legacy_write_lock:
+                with self._ownership_lock:
+                    if self._owner != "legacy" or self._external_navigation:
+                        return 3104
                     self._legacy_motion_active = True
-            return result
+                result = self._sport.call(method, *args)
+                with self._ownership_lock:
+                    self._legacy_motion_active = not (
+                        isinstance(result, (int, float))
+                        and not isinstance(result, bool) and result == 0
+                        and method in ("StopMove", "Damp"))
+                return result
         finally:
             with self._ownership_lock:
                 self._legacy_active -= 1
@@ -283,7 +295,8 @@ class RpcProxy:
     def reserve_external_navigation(self):
         """Vendor SLAM is a separate SDK client but shares the same chassis."""
         with self._ownership_lock:
-            if self._owner != "legacy":
+            if (self._owner != "legacy" or self._legacy_active
+                    or self._legacy_motion_active):
                 return False
             self._external_navigation = True
             return True
