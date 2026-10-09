@@ -27,14 +27,18 @@ class CoreBridge:
             # Audio is an ordered waveform, not a replaceable video frame.
             # Buffer short scheduling bursts; on sustained overload, count and
             # drop the oldest chunk to bound latency.
-            "audio_mic": self._ctx.Queue(maxsize=128),
-            "audio_ext": self._ctx.Queue(maxsize=128),
+            # Keep only a short real-time audio tail. A long FIFO makes the
+            # dashboard play seconds-old PCM after the bridge is overloaded.
+            "audio_mic": self._ctx.Queue(maxsize=16),
+            "audio_ext": self._ctx.Queue(maxsize=16),
             # These lanes publish latest-state data. Separate the two combined
             # joint outputs and IMU from one another so maxsize=1 cannot make
             # unrelated topics overwrite each other.
             "state_joints": self._ctx.Queue(maxsize=1),
             "state_joint_state": self._ctx.Queue(maxsize=1),
             "state_imu": self._ctx.Queue(maxsize=1),
+            "state_battery": self._ctx.Queue(maxsize=1),
+            "state_estop": self._ctx.Queue(maxsize=1),
             "state_motor": self._ctx.Queue(maxsize=16),
             "state_system": self._ctx.Queue(maxsize=16),
         }
@@ -90,7 +94,11 @@ class CoreBridge:
                 lane = "state_imu"
             elif topic.endswith(("/arm_state", "/hand_state", "/neck_state")):
                 lane = "state_motor"
-            elif topic.endswith(("/battery", "/estop", "/skill_status")):
+            elif topic.endswith("/battery"):
+                lane = "state_battery"
+            elif topic.endswith("/estop"):
+                lane = "state_estop"
+            elif topic.endswith("/skill_status"):
                 lane = "state_system"
             else:
                 lane = "state_system"

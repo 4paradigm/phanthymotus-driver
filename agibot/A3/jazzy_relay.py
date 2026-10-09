@@ -12,6 +12,7 @@ import multiprocessing as mp
 import os
 import queue
 import struct
+import time
 import zlib
 
 CAMERAS = {
@@ -180,18 +181,39 @@ def _media_all():
     from std_msgs.msg import UInt8MultiArray
 
     rclpy.init()
+    try:
+        import cv2
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
     node = Node("a3_jazzy_media_relay")
     group = ReentrantCallbackGroup()
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
                      durability=DurabilityPolicy.VOLATILE)
+    last_emit = {key: 0.0 for key in CAMERAS}
+    received = {key: 0 for key in CAMERAS}
+    emitted = {key: 0 for key in CAMERAS}
+    # The dashboard is a preview consumer. Keeping every 30 Hz raw frame in
+    # flight makes JPEG work queue behind itself and starves state callbacks.
+    # A bounded 8 Hz output is smooth enough for inspection and keeps latency
+    # bounded even when all twelve cameras are enabled.
+    min_interval = 1.0 / 8.0
     for key, topic in CAMERAS.items():
         output_topic = f"/agibot_a3/camera_{key}"
         pub = node.create_publisher(CompressedImage, output_topic, qos)
         def push(msg, stream_key=key, stream_pub=pub):
             try:
+                received[stream_key] += 1
+                if received[stream_key] == 1 or received[stream_key] % 300 == 0:
+                    print(f"[relay] input received key={stream_key} count={received[stream_key]}", flush=True)
+                now = time.monotonic()
+                if now - last_emit[stream_key] < min_interval:
+                    return
+                last_emit[stream_key] = now
                 output = _encode_image(msg, stream_key)
                 if output is not None:
                     stream_pub.publish(output)
+                    emitted[stream_key] += 1
             except Exception as exc:
                 print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
         node.create_subscription(Image, topic, push, qos, callback_group=group)

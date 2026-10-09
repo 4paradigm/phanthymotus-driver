@@ -182,6 +182,7 @@ NECK_JOINTS = ("head_yaw_joint", "head_pitch_joint")
 
 # Hand (docs §7.1.5): command position 0 (open) .. 2000 (closed); state 0..4096.
 HAND_COMMAND_MAX = 2000
+HAND_O10_MAX = 4096
 HAND_TYPES = {"AgiHand": "agi_hand", "O10Hand": "o10_hand"}
 
 # Mic source (docs §7.3.5): 0=internal (v3.2 has a known hardware BUG — avoid),
@@ -512,6 +513,8 @@ class A3Nodes:
         self._AudioPlayback = AudioPlayback
         self._AudioChunk = AudioChunk
         self._UInt8MultiArray = UInt8MultiArray
+        self._audio_buffers = {"mic": bytearray(), "ext_mic": bytearray()}
+        self._audio_lock = threading.Lock()
 
         # A3 HAL media publishers use ROS' sensor-data profile.  Keep this
         # exact profile: a RELIABLE subscriber is incompatible with the
@@ -677,7 +680,7 @@ class A3Nodes:
         # sensors.  Republish the latest decoded value once per second so the
         # dashboard stays fresh even when the robot only emits on change.
         if hasattr(self.robot, "create_timer"):
-            self._slow_state_timer = self.robot.create_timer(1.0, self._republish_slow_states)
+            self._slow_state_timer = self.robot.create_timer(0.1, self._republish_slow_states)
 
         self.audio_topics = {}
         self.speaker_subscription = None
@@ -689,12 +692,12 @@ class A3Nodes:
                 try:
                     (self.media_robot or self.robot).create_subscription(
                         AudioCapture, topic,
-                        lambda msg, pub=pub: pub.publish(self._audio_chunk(msg)), sensor_qos,
+                        lambda msg, pub=pub, key=key: self._publish_audio(pub, key, msg), sensor_qos,
                         callback_group=self._media_callback_group)
                 except TypeError:
                     (self.media_robot or self.robot).create_subscription(
                         AudioCapture, topic,
-                        lambda msg, pub=pub: pub.publish(self._audio_chunk(msg)), sensor_qos)
+                        lambda msg, pub=pub, key=key: self._publish_audio(pub, key, msg), sensor_qos)
                 self.audio_topics[key] = {"robot_topic": topic, "topic": core_topic,
                                           "format": "audio/pcm-16k"}
 
@@ -745,6 +748,37 @@ class A3Nodes:
         payload = getattr(getattr(msg, "data", None), "data", b"")
         out.data = list(payload)
         return out
+
+    def _publish_audio(self, publisher, key, msg):
+        """Publish complete 512-sample PCM frames, never tiny capture periods."""
+        chunk = self._audio_chunk(msg)
+        payload = bytes(getattr(chunk, "data", ()))
+        if not payload:
+            return
+        with self._audio_lock:
+            buffer = self._audio_buffers.setdefault(key, bytearray())
+            buffer.extend(payload)
+            frames = []
+            while len(buffer) >= 1024:
+                frames.append(bytes(buffer[:1024]))
+                del buffer[:1024]
+        for data in frames:
+            output = self._AudioChunk()
+            try:
+                output.header = chunk.header
+            except AttributeError:
+                pass
+            output.format = "audio/pcm-16k"
+            output.data = list(data)
+            publisher.publish(output)
+
+    def hand_command_layout(self, hand_type):
+        """Use the real channel names reported by the installed hand."""
+        state = self._joint_cache.get("hand_state") or {}
+        live_type = str(state.get("header", {}).get("frame_id", ""))
+        selected = live_type if hand_type == "AgiHand" and live_type in HAND_TYPES else hand_type
+        names = [str(name) for name in state.get("name", [])]
+        return selected, [n for n in names if n.startswith("left_")], [n for n in names if n.startswith("right_")]
 
     @staticmethod
     def _pointcloud_packet(msg):
@@ -2199,6 +2233,8 @@ class HandControlPlugin:
             {
                 "side": {"type": "string", "enum": ["left", "right", "both"],
                          "description": "选择左手、右手或双手"},
+                "duration_ms": {"type": "integer", "minimum": 100, "maximum": 5000,
+                                 "default": 500, "description": "持续下发时长；设备要求关节指令连续发布"},
                 "left": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_COMMAND_MAX}, "description": "左手各指张合等级，按真机关节顺序"},
                 "right": {"type": "array", "minItems": 1, "items": {"type": "number", "minimum": 0, "maximum": HAND_COMMAND_MAX}, "description": "右手各指张合等级，按真机关节顺序"},
                 "hand_type": {"type": "string", "enum": ["AgiHand", "O10Hand"], "default": "AgiHand"},
@@ -2227,11 +2263,14 @@ class HandControlPlugin:
             raise ValueError(f"hand_control: unknown action {action!r}")
         hand_type = args.get("hand_type", "AgiHand")
         _require(hand_type in HAND_TYPES, f"未知手部类型 {hand_type!r}，可选 {sorted(HAND_TYPES)}")
+        hand_type, live_left, live_right = self.nodes.hand_command_layout(hand_type)
+        max_value = HAND_O10_MAX if hand_type == "O10Hand" else HAND_COMMAND_MAX
         if action in ("open", "close"):
             side = args.get("side")
             _require(side in ("left", "right", "both"), "open/close 必须指定 side=left/right/both")
-            closed = HAND_COMMAND_MAX
-            values = [0] * 6 if action == "open" else [closed] * 6
+            closed = max_value
+            count = max(len(live_left), len(live_right), 6)
+            values = [0] * count if action == "open" else [closed] * count
             args = {**args, "left": values if side in ("left", "both") else None,
                     "right": values if side in ("right", "both") else None}
             action = "set_position"
@@ -2241,10 +2280,26 @@ class HandControlPlugin:
             if values is None:
                 continue
             for i, value in enumerate(values):
-                positions[f"{side}_hand_joint_{i}"] = _clamp(float(value), 0.0, HAND_COMMAND_MAX, f"{side} 手指 {i}")
+                live_names = live_left if side == "left" else live_right
+                name = live_names[i] if i < len(live_names) else f"{side}_hand_joint_{i}"
+                positions[name] = _clamp(float(value), 0.0, max_value, f"{side} 手指 {i}")
         _require(positions, "至少提供 left 或 right 张合等级")
-        self.nodes.publish_joint_command("hand_command_pub", positions, frame_id=hand_type)
-        return {"hand_type": hand_type, "positions": positions, "state": "published"}
+        # AimDK accepts hand joint commands only while the motion controller is
+        # in its active standing mode. Do the read-only check here so a command
+        # is not reported as published while the controller silently ignores it.
+        try:
+            current = _mc_current_state(self.nodes.rpc)
+        except Exception:
+            current = ""
+        if current and current != "MOTION":
+            return {"state": "rejected", "current": current,
+                    "suggestion": "hand_control 仅在 MOTION 状态生效；请先执行 mc_mode get_up"}
+        duration_ms = int(args.get("duration_ms", 500))
+        _require(100 <= duration_ms <= 5000, "duration_ms 必须在 100~5000 毫秒之间")
+        self.nodes.publish_joint_command("hand_command_pub", positions,
+                                         duration_ms=duration_ms, frame_id=hand_type)
+        return {"hand_type": hand_type, "positions": positions,
+                "duration_ms": duration_ms, "state": "published"}
 
 
 class HeadControlPlugin:
