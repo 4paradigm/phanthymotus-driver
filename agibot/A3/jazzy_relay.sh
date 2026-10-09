@@ -17,7 +17,7 @@ start)
   # the host PID/network namespaces so Jazzy DDS sees the robot interfaces.
   : > "$ROOT/relay.log"
   nsenter -t 1 -u -n -p -- /usr/bin/bash -lc \
-    "source /opt/ros/jazzy/setup.bash; exec python3 $ROOT/jazzy_relay.py" \
+    "set -e; test -f /opt/ros/jazzy/setup.bash || { echo '[relay] ERROR: /opt/ros/jazzy is not visible in the relay namespace' >&2; exit 41; }; source /opt/ros/jazzy/setup.bash; python3 -c 'import rclpy, sensor_msgs' || { echo '[relay] ERROR: Jazzy rclpy/sensor_msgs unavailable' >&2; exit 42; }; exec python3 $ROOT/jazzy_relay.py" \
     >"$ROOT/relay.log" 2>&1 &
   echo $! > "$PIDFILE"
   echo "[relay] host Jazzy relay started pid=$(cat "$PIDFILE") domain=232"
