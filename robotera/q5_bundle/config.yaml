@@ -105,8 +105,7 @@ plugins:
     hand_tag_id: 1
     reference_frame: "q5_reference_tag"
     hand_frame: "q5_left_hand_tag"
-    # Measure both printed black-square edges and set their values in
-    # apriltag_q5.yaml before enabling a measurement session.
+    # 用卡尺量出两个 Tag 的实际黑框边长，填入 apriltag_q5.yaml 后再设为 true。
     tag_size_confirmed: false
     min_decision_margin: 30.0
     joint_velocity_limit_rad_s: 0.02

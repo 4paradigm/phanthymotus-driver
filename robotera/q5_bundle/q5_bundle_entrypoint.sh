@@ -30,8 +30,8 @@ driver_uri="${Q5_CYCLONEDDS_URI:-${CYCLONEDDS_URI:-}}"
 ) &
 driver_pid=$!
 
-# The detector shares the vendor-facing ROS domain and publishes timestamped
-# detections plus tag TF. It has no motion command publisher.
+# AprilTag 检测器运行在 Q5 本体 ROS domain，输出带图像时间戳的检测结果和 TF。
+# 它没有运动命令发布接口；测量卡片只读取这些结果。
 (
   export ROS_DOMAIN_ID="${Q5_ROS_DOMAIN_ID:-211}"
   export RMW_IMPLEMENTATION="rmw_cyclonedds_cpp"

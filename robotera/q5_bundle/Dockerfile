@@ -26,8 +26,8 @@ ENV ROS_DOMAIN_ID=211
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ENV PYTHONUNBUFFERED=1
 
-# Runtime-only dependencies. Interface build dependencies stay in the stage
-# above and are absent from the final image.
+# 运行时依赖：检测节点发布 AprilTag 消息和 TF，测量卡片按时间戳读取。
+# 接口编译工具只留在上一阶段，不进入真机镜像。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-numpy \
     python3-pil \

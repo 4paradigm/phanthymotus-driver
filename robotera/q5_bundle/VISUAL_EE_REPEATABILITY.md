@@ -2,6 +2,15 @@
 
 `visual_ee_repeatability` 是只读测量卡片。第一版测量手部 AprilTag 相对躯干 AprilTag 的重复定位离散程度；它不测 TCP 绝对精度，也不发送机械臂控制命令。
 
+## 代码阅读顺序
+
+1. **先看配置**：`apriltag_q5.yaml` 决定 Tag ID、坐标系和实际边长；`config.yaml` 的 `visual_ee_repeatability` 段决定采样阈值。特别注意 `tag_size_confirmed` 在实测前必须保持 `false`。
+2. **再看数据从哪里来**：`q5_bundle_entrypoint.sh` 启动检测器；`visual_ee_repeatability.py` 的 `_on_detections` 读取双 Tag 可见性与质量，`_process_pending` 按图像时间戳查两个 TF，`_joint_state` 检查关节反馈。
+3. **然后看一帧怎样变成一个样本**：`relative_pose` 计算手相对躯干的位姿；`_capture_sample` 等待停稳并收集不同帧；`aggregate_frames` 剔除视觉异常帧并合成为一次到位样本。
+4. **最后看结果怎样形成**：`repeatability_report` 计算多次到位之间的 RMS、P95 等统计量；`_report` 加上可见率与拒收原因。`test_visual_ee_repeatability.py` 包含可在无机器人环境运行的关键测试。
+
+阅读时请区分三层数据：**检测帧**、**单次到位样本**、**整次测量会话**。报告中的重复定位误差使用到位样本计算，不能把同一次到位的 25 帧当作 25 次重复运动。
+
 ## 真机准备
 
 1. 将 ID 0 的 `tag36h11` 固定在能被头部相机持续看到的躯干刚性外壳上，将 ID 1 固定在左手背或腕部刚性外壳上。不要贴在手指、软胶或抓取面。
