@@ -81,43 +81,42 @@ def _encode_cloud(msg):
     return out
 
 
-def _input_one(key, topic, msg_type, queue_out):
+def _media_one(key, topic, msg_type):
+    """Subscribe and convert one raw stream in one Jazzy process.
+
+    Keeping the raw sample inside the callback avoids a second serialization,
+    a multiprocessing feeder queue, and a second deserialization before the
+    converted (small) sample reaches the domain bridge.
+    """
     os.environ["ROS_DOMAIN_ID"] = "232"
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from rclpy.serialization import serialize_message
+    from sensor_msgs.msg import CompressedImage, Image, PointCloud2
+    from std_msgs.msg import UInt8MultiArray
     rclpy.init()
-    node = Node(f"a3_jazzy_media_relay_input_{key}")
+    node = Node(f"a3_jazzy_media_relay_{key}")
+    output_topic = f"/agibot_a3/{'lidar_cloud' if key == 'lidar_cloud' else 'camera_' + key}"
+    output_type = UInt8MultiArray if key == "lidar_cloud" else CompressedImage
+    publisher = node.create_publisher(output_type, output_topic, 1)
     received = 0
+
     def push(msg):
         nonlocal received
         try:
-            item = (key, serialize_message(msg))
             received += 1
             if received == 1:
                 print(f"[relay] input received key={key}", flush=True)
-            try:
-                queue_out.put_nowait(item)
-            except queue.Full:
-                try:
-                    queue_out.get_nowait()
-                except queue.Empty:
-                    pass
-                # multiprocessing.Queue can report Full for one scheduler
-                # tick after get_nowait() because its feeder thread has not
-                # published the free slot yet.  A short blocking put avoids
-                # turning that normal race into a callback failure.
-                try:
-                    queue_out.put(item, timeout=0.05)
-                except queue.Full:
-                    # The consumer is behind; latest-frame semantics permit
-                    # dropping this sample without taking down the input.
-                    pass
+            if key == "lidar_cloud":
+                output = _encode_cloud(msg)
+            else:
+                output = _encode_image(msg, key)
+            if output is not None:
+                publisher.publish(output)
         except Exception as exc:
             print(f"[relay] input failed key={key}: {type(exc).__name__}: {exc!r}", flush=True)
     node.create_subscription(msg_type, topic, push, qos_profile_sensor_data)
-    print(f"[relay] Jazzy input ready key={key} domain=232", flush=True)
+    print(f"[relay] Jazzy input ready key={key} topic={output_topic} domain=232", flush=True)
     rclpy.spin(node)
 
 
@@ -162,19 +161,15 @@ def _output_one(key, messages):
 def main():
     ctx = mp.get_context("spawn")
     keys = list(CAMERAS) + ["lidar_cloud"]
-    queues = {key: ctx.Queue(maxsize=1) for key in keys}
     from sensor_msgs.msg import Image, PointCloud2
-    processes = [ctx.Process(target=_input_one,
-                             args=(key, topic, Image, queues[key]), daemon=True)
+    processes = [ctx.Process(target=_media_one,
+                             args=(key, topic, Image), daemon=True)
                  for key, topic in CAMERAS.items()]
-    processes.append(ctx.Process(target=_input_one, args=(
-        "lidar_cloud", "/hal/neck_middle_livox_lidar/pointcloud", PointCloud2,
-        queues["lidar_cloud"]), daemon=True))
-    processes.extend(ctx.Process(target=_output_one, args=(key, queues[key]), daemon=True)
-                    for key in keys)
+    processes.append(ctx.Process(target=_media_one, args=(
+        "lidar_cloud", "/hal/neck_middle_livox_lidar/pointcloud", PointCloud2), daemon=True))
     for process in processes:
         process.start()
-    print(f"[relay] started input={processes[0].pid} output={processes[1].pid}", flush=True)
+    print(f"[relay] started streams={len(processes)} pids={[p.pid for p in processes]}", flush=True)
     for process in processes:
         process.join()
 
