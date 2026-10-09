@@ -461,7 +461,7 @@ def make_speaker(plugin_config, namespace, executor, client):
 
 
 # ============================================================================
-# face_light — one card, one serialized official SDK output path
+# face_light — 面部灯带颜色控制
 # ============================================================================
 
 CARD_FACE_LIGHT = "face_light"

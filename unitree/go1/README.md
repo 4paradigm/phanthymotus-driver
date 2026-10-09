@@ -167,11 +167,6 @@ sudo docker run --rm --name go1_bundle \
 
 > ⚠ `DEPTH_ENABLE=1` / `PCL_ENABLE=1` 会在 Nano 板上装常驻 systemd 服务。三张视觉卡指向同一物理相机时仍互斥，按需启动即可。
 
-## face_light
-
-`face_light` 为控制卡，默认使用官方 SDK。升级前必须准备 SDK 并停止旧 MQTT 灯光写入源；
-完整安装、挂载、校验、切换和回退步骤见 [face_light 的 SDK 部署与升级](deploy/face_light/readme.md)。
-
 ## 端口
 
 `15715`（MCP）。平台驱动端口区间 `15700–15799`。
