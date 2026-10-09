@@ -798,6 +798,69 @@ class TestDriverContracts(unittest.TestCase):
         thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
 
+    def test_camera_process_builds_and_publishes_frames_locally(self):
+        channel = sys.modules["unitree_sdk2py.core.channel"]
+        channel.ChannelFactoryInitialize = lambda *_: None
+        video_pkg = types.ModuleType("unitree_sdk2py.go2.video")
+        video_client = types.ModuleType("unitree_sdk2py.go2.video.video_client")
+
+        class FakeVideoClient:
+            def SetTimeout(self, _timeout): pass
+            def Init(self): pass
+            def GetImageSample(self): return 0, list(b"\xff\xd8frame\xff\xd9")
+
+        video_client.VideoClient = FakeVideoClient
+        sys.modules["unitree_sdk2py.go2.video"] = video_pkg
+        sys.modules["unitree_sdk2py.go2.video.video_client"] = video_client
+        published = []
+
+        class FakeMessage:
+            def __init__(self):
+                self.header = types.SimpleNamespace(stamp=None)
+                self.format = ""
+                self.data = None
+
+        class FakeNode:
+            def __init__(self, _name): pass
+            def create_publisher(self, *_args):
+                return types.SimpleNamespace(publish=published.append)
+            def get_clock(self):
+                stamp = types.SimpleNamespace(to_msg=lambda: "stamp")
+                return types.SimpleNamespace(now=lambda: stamp)
+            def destroy_node(self): pass
+
+        q = __import__("queue")
+        control, results = q.Queue(), q.Queue()
+        rclpy = sys.modules["rclpy"]
+        with patch.object(self.multimedia, "Node", FakeNode), \
+                patch.object(self.multimedia, "CompressedImage", FakeMessage), \
+                patch.object(rclpy, "init", create=True), \
+                patch.object(rclpy, "shutdown", create=True):
+            thread = __import__("threading").Thread(
+                target=self.multimedia._camera_process,
+                args=(control, results, "/test/camera", "eth0", 10, 1, .1),
+                daemon=True,
+            )
+            thread.start()
+            self.assertTrue(results.get(timeout=1)["ok"])
+            control.put(("start", "start", None))
+            self.assertTrue(results.get(timeout=1)["ok"])
+            status = None
+            for _ in range(100):
+                control.put(("status", "status", None))
+                status = results.get(timeout=1)
+                if status["frames"]:
+                    break
+                __import__("time").sleep(.01)
+            self.assertGreaterEqual(status["frames"], 1)
+            self.assertEqual("running", status["state"])
+            self.assertEqual("jpeg", published[0].format)
+            self.assertEqual(b"\xff\xd8frame\xff\xd9", bytes(published[0].data))
+            control.put(("close", "close", None))
+            self.assertTrue(results.get(timeout=1)["ok"])
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+
     def test_speaker_worker_uses_a2_voice_service(self):
         channel = sys.modules["unitree_sdk2py.core.channel"]
         channel.ChannelFactoryInitialize = lambda *_: None
@@ -859,7 +922,7 @@ class TestDriverContracts(unittest.TestCase):
         thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
 
-    def test_speaker_rebuffers_after_underflow_and_uses_eof_continuation_prefill(self):
+    def test_speaker_rebuffers_after_underflow_but_continues_across_tts_eof(self):
         channel = sys.modules["unitree_sdk2py.core.channel"]
         channel.ChannelFactoryInitialize = lambda *_: None
         for name in ("unitree_sdk2py.a2", "unitree_sdk2py.a2.audio"):
@@ -918,29 +981,23 @@ class TestDriverContracts(unittest.TestCase):
             self.assertEqual(played_before, current["play_calls"])
             self.assertEqual(320, current["buffered_bytes"])
 
-            # Completing the full prefill resumes smoothly.  EOF then selects
-            # the shorter continuation prefill used by split TTS segments.
+            # Completing the full prefill resumes smoothly.  TTS may already
+            # have queued its next internally split segment, so put the EOF and
+            # continuation together: it must play without another fixed
+            # continuation prefill.
             pcm.put(b"\x00" * 640)
+            pcm.put(self.multimedia._AUDIO_EOF_MAGIC)
+            pcm.put(b"\x00" * 320)
             pcm.put(self.multimedia._AUDIO_EOF_MAGIC)
             for _ in range(100):
                 current = status()
-                if current["rebuffer_count"] and current["eof_count"]:
+                if (current["rebuffer_count"] and current["eof_count"] == 2
+                        and current["continuation_resumes"]):
                     break
                 __import__("time").sleep(.01)
             self.assertEqual(1, current["rebuffer_count"])
-            self.assertEqual(640, current["prefill_target_bytes"])
-
-            pcm.put(b"\x00" * 320)
-            __import__("time").sleep(.03)
-            self.assertEqual(current["play_calls"], status()["play_calls"])
-            pcm.put(b"\x00" * 320)
-            pcm.put(self.multimedia._AUDIO_EOF_MAGIC)
-            for _ in range(100):
-                current = status()
-                if current["continuation_resumes"]:
-                    break
-                __import__("time").sleep(.01)
             self.assertEqual(1, current["continuation_resumes"])
+            self.assertEqual(960, current["prefill_target_bytes"])
 
             control.put(("close", "close", None))
             self.assertTrue(results.get(timeout=1)["ok"])
@@ -999,15 +1056,14 @@ class TestDriverContracts(unittest.TestCase):
         self.assertAlmostEqual(5.0, advance(1.3, 1.4, 5.0, .3))
 
     def test_speaker_queue_overflow_is_counted(self):
-        backend = self.multimedia._SpeakerBackend.__new__(
-            self.multimedia._SpeakerBackend)
-        backend.error = ""
-        backend._stats_lock = __import__("threading").Lock()
-        backend._received_chunks = 0
-        backend._received_bytes = 0
-        backend._queue_drops = 0
-        backend._last_input_ts = 0.0
-        backend._max_input_gap_ms = 0.0
+        stats_lock = __import__("threading").Lock()
+        stats = {
+            "received_chunks": 0,
+            "received_bytes": 0,
+            "queue_drops": 0,
+            "last_input_ts": 0.0,
+            "max_input_gap_ms": 0.0,
+        }
 
         class FullOnceQueue:
             def __init__(self):
@@ -1021,13 +1077,37 @@ class TestDriverContracts(unittest.TestCase):
             def get_nowait(self):
                 return self.items.pop(0)
 
-        backend._pcm = FullOnceQueue()
-        backend.put(b"new")
+        pcm = FullOnceQueue()
+        self.multimedia._put_speaker_pcm(pcm, b"new", stats, stats_lock)
 
-        self.assertEqual(1, backend._queue_drops)
-        self.assertEqual(1, backend._received_chunks)
-        self.assertEqual(3, backend._received_bytes)
-        self.assertEqual([b"new"], backend._pcm.items)
+        self.assertEqual(1, stats["queue_drops"])
+        self.assertEqual(1, stats["received_chunks"])
+        self.assertEqual(3, stats["received_bytes"])
+        self.assertEqual([b"new"], pcm.items)
+
+    def test_camera_and_speaker_data_paths_are_isolated_from_main_executor(self):
+        import inspect
+
+        speaker_process = inspect.getsource(self.multimedia._speaker_process)
+        speaker_backend = inspect.getsource(self.multimedia._SpeakerBackend)
+        camera_process = inspect.getsource(self.multimedia._camera_process)
+
+        self.assertIn("create_subscription", speaker_process)
+        self.assertIn("_put_speaker_pcm", speaker_process)
+        self.assertNotIn("self._pcm", speaker_backend)
+        self.assertIn("queue.Queue(maxsize=1)", camera_process)
+        self.assertIn('array("B", frame)', camera_process)
+        self.assertIn("publisher.publish(message)", camera_process)
+
+    def test_camera_plugin_does_not_register_with_main_executor(self):
+        added = []
+        executor = types.SimpleNamespace(add_node=added.append)
+
+        plugin = self.multimedia.CameraPlugin(
+            {"backend": "videohub", "fps": 10}, "test", executor, "eth0")
+
+        self.assertEqual([], added)
+        self.assertEqual("/test/camera/front", plugin._topic)
 
     def test_mic_waiting_state_explains_voice_assistant_precondition(self):
         node = self.multimedia._MicNode.__new__(self.multimedia._MicNode)

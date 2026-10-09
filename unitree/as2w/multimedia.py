@@ -16,6 +16,7 @@ import socket
 import struct
 import threading
 import time
+from array import array
 from uuid import uuid4
 
 from audio_msgs.msg import AudioChunk
@@ -519,13 +520,13 @@ def _speaker_worker(
                 draining = True
                 deadline = play(buffered, deadline)
                 buffered.clear()
-            # TTS uses EOF for every internally split text segment.  Preserve
-            # the playback timeline and use a smaller, still jitter-safe
-            # prefill for the next segment instead of treating it as a cold
-            # stream start.  _next_speaker_deadline() safely re-anchors the
-            # timeline if synthesis of the next segment takes longer.
-            draining = False
-            prefill_target = continuation_prefill_bytes
+            # TTS emits EOF for every internally split text segment.  Keep the
+            # drain timeline alive so the next segment does not pay another
+            # fixed prefill delay.  If the playback deadline actually expires
+            # before more PCM arrives, the normal underflow path below switches
+            # back to the full jitter prefill.
+            draining = deadline is not None
+            prefill_target = prefill_bytes
             continuation_pending = True
             rebuffering = False
             underflow_active = False
@@ -533,12 +534,13 @@ def _speaker_worker(
         if not active or muted_until_eof:
             continue
         buffered.extend(pcm)
+        if draining and continuation_pending:
+            continuation_resumes += 1
+            continuation_pending = False
         if not draining and len(buffered) >= prefill_target:
             draining = True
             if rebuffering:
                 rebuffer_count += 1
-            if continuation_pending:
-                continuation_resumes += 1
             rebuffering = False
             continuation_pending = False
             underflow_active = False
@@ -549,23 +551,225 @@ def _speaker_worker(
             deadline = play(block, deadline)
 
 
+def _put_speaker_pcm(pcm_queue, pcm, stats, stats_lock):
+    """Enqueue PCM inside the speaker process and maintain input diagnostics."""
+    now = time.monotonic()
+    with stats_lock:
+        stats["received_chunks"] += 1
+        stats["received_bytes"] += len(pcm)
+        if pcm == _AUDIO_EOF_MAGIC:
+            stats["last_input_ts"] = 0.0
+        else:
+            if stats["last_input_ts"]:
+                stats["max_input_gap_ms"] = max(
+                    stats["max_input_gap_ms"],
+                    (now - stats["last_input_ts"]) * 1000.0,
+                )
+            stats["last_input_ts"] = now
+    try:
+        pcm_queue.put_nowait(pcm)
+    except queue.Full:
+        with stats_lock:
+            stats["queue_drops"] += 1
+        try:
+            pcm_queue.get_nowait()
+            pcm_queue.put_nowait(pcm)
+        except (queue.Empty, queue.Full):
+            pass
+
+
+def _speaker_process(
+        control_queue, result_queue, interface, block_bytes, prefill_bytes,
+        continuation_prefill_bytes, max_lead_s):
+    """Own the ROS subscription and A2 playback path in one child process.
+
+    PCM remains in this process: the ROS callback feeds a thread-local queue and
+    ``_speaker_worker`` is the sole owner of AudioClient.  Only small lifecycle
+    and status dictionaries cross the multiprocessing boundary.
+    """
+    _install_logsafe()
+    node = None
+    executor = None
+    spin_thread = None
+    subscription = None
+    playback_thread = None
+    rclpy_started = False
+    playback_control = queue.Queue()
+    playback_results = queue.Queue()
+    pcm_queue = queue.Queue(maxsize=64)
+    stats_lock = threading.Lock()
+    stats = {
+        "received_chunks": 0,
+        "received_bytes": 0,
+        "queue_drops": 0,
+        "last_input_ts": 0.0,
+        "max_input_gap_ms": 0.0,
+    }
+    topic = ""
+    state = "idle"
+
+    def respond(request_id, **payload):
+        payload["id"] = request_id
+        result_queue.put(payload)
+
+    def playback_call(operation, value=None, timeout=6.0):
+        request_id = uuid4().hex
+        playback_control.put((request_id, operation, value))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                result = playback_results.get(
+                    timeout=max(0.01, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if result.get("id") == request_id:
+                return result
+        return {"ok": False, "error": "speaker playback operation timed out"}
+
+    def on_audio(message):
+        nonlocal state
+        _put_speaker_pcm(pcm_queue, bytes(message.data), stats, stats_lock)
+        if state == "ready":
+            state = "playing"
+
+    try:
+        import rclpy
+        from rclpy.executors import MultiThreadedExecutor
+
+        rclpy.init(args=None)
+        rclpy_started = True
+        node = Node("as2w_speaker")
+        executor = MultiThreadedExecutor(num_threads=1)
+        executor.add_node(node)
+        spin_thread = threading.Thread(
+            target=executor.spin, name="as2w-speaker-ros", daemon=True)
+        spin_thread.start()
+
+        playback_thread = threading.Thread(
+            target=_speaker_worker,
+            args=(playback_control, playback_results, pcm_queue, interface,
+                  block_bytes, prefill_bytes, continuation_prefill_bytes,
+                  max_lead_s),
+            name="as2w-speaker-playback",
+            daemon=True,
+        )
+        playback_thread.start()
+        try:
+            ready = playback_results.get(timeout=8.0)
+        except queue.Empty:
+            ready = {"ok": False, "error": "speaker playback startup timed out"}
+        if not ready.get("ok"):
+            raise RuntimeError(ready.get("error", "speaker playback unavailable"))
+        state = "ready"
+        result_queue.put({"id": "ready", "ok": True})
+
+        running = True
+        while running:
+            try:
+                request_id, operation, value = control_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if operation == "close":
+                    if subscription is not None:
+                        node.destroy_subscription(subscription)
+                        subscription = None
+                    playback_call("close", timeout=3.0)
+                    respond(request_id, ok=True)
+                    running = False
+                elif operation == "start":
+                    requested_topic = str(value or "")
+                    if not requested_topic:
+                        respond(request_id, ok=False, error="input_topic is required")
+                        continue
+                    if subscription is not None and topic != requested_topic:
+                        node.destroy_subscription(subscription)
+                        subscription = None
+                    if subscription is None:
+                        subscription = node.create_subscription(
+                            AudioChunk, requested_topic, on_audio, _LOW_LAT_QOS)
+                    topic = requested_topic
+                    result = playback_call("reset")
+                    state = "ready" if result.get("ok") else "error"
+                    respond(request_id, **result)
+                elif operation == "stop":
+                    if subscription is not None:
+                        node.destroy_subscription(subscription)
+                        subscription = None
+                    result = playback_call("stop")
+                    topic = ""
+                    state = "idle" if result.get("ok") else "error"
+                    respond(request_id, **result)
+                elif operation in ("interrupt", "pause", "resume",
+                                   "get_volume", "set_volume"):
+                    result = playback_call(operation, value)
+                    if result.get("ok") and operation in ("interrupt", "pause", "resume"):
+                        state = {
+                            "interrupt": "ready",
+                            "pause": "paused",
+                            "resume": "playing",
+                        }[operation]
+                    respond(request_id, **result)
+                elif operation == "status":
+                    result = playback_call("status", timeout=2.0)
+                    result.pop("id", None)
+                    with stats_lock:
+                        result.update({
+                            "received_chunks": stats["received_chunks"],
+                            "received_bytes": stats["received_bytes"],
+                            "queue_drops": stats["queue_drops"],
+                            "max_input_gap_ms": stats["max_input_gap_ms"],
+                            "last_input_ago_ms": (
+                                (time.monotonic() - stats["last_input_ts"]) * 1000.0
+                                if stats["last_input_ts"] else -1
+                            ),
+                        })
+                    result.update({"state": state, "topic": topic})
+                    descriptor = {"format": "audio/pcm-16k"}
+                    if topic:
+                        descriptor["topic"] = topic
+                    result["topic_in"] = [descriptor]
+                    respond(request_id, **result)
+                else:
+                    respond(request_id, ok=False, error="unsupported operation")
+            except Exception as exc:
+                state = "error"
+                respond(request_id, ok=False, error=str(exc))
+    except Exception as exc:
+        result_queue.put({"id": "ready", "ok": False, "error": str(exc)})
+    finally:
+        if playback_thread is not None and playback_thread.is_alive():
+            playback_call("close", timeout=1.0)
+            playback_thread.join(timeout=1.0)
+        if executor is not None:
+            try:
+                executor.shutdown(timeout_sec=1.0)
+            except Exception:
+                pass
+        if spin_thread is not None and spin_thread.is_alive():
+            spin_thread.join(timeout=1.0)
+        if node is not None:
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+        if rclpy_started:
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
+
+
 class _SpeakerBackend:
     def __init__(self, interface, block_bytes, prefill_bytes,
                  continuation_prefill_bytes, max_lead_s):
         context = multiprocessing.get_context("spawn")
         self._control = context.Queue()
         self._results = context.Queue()
-        self._pcm = context.Queue(maxsize=64)
         self._lock = threading.Lock()
-        self._stats_lock = threading.Lock()
-        self._received_chunks = 0
-        self._received_bytes = 0
-        self._queue_drops = 0
-        self._last_input_ts = 0.0
-        self._max_input_gap_ms = 0.0
         self._process = context.Process(
-            target=_speaker_worker,
-            args=(self._control, self._results, self._pcm, interface,
+            target=_speaker_process,
+            args=(self._control, self._results, interface,
                   block_bytes, prefill_bytes, continuation_prefill_bytes,
                   max_lead_s),
             name="as2w_speaker",
@@ -581,48 +785,9 @@ class _SpeakerBackend:
     def is_available(self):
         return not self.error and self._process.is_alive()
 
-    def put(self, pcm):
-        if self.error:
-            return
-        now = time.monotonic()
-        with self._stats_lock:
-            self._received_chunks += 1
-            self._received_bytes += len(pcm)
-            if pcm == _AUDIO_EOF_MAGIC:
-                self._last_input_ts = 0.0
-            else:
-                if self._last_input_ts:
-                    self._max_input_gap_ms = max(
-                        self._max_input_gap_ms,
-                        (now - self._last_input_ts) * 1000.0,
-                    )
-                self._last_input_ts = now
-        try:
-            self._pcm.put_nowait(pcm)
-        except queue.Full:
-            with self._stats_lock:
-                self._queue_drops += 1
-            try:
-                self._pcm.get_nowait()
-                self._pcm.put_nowait(pcm)
-            except (queue.Empty, queue.Full):
-                pass
-
     def status(self):
         worker = self.call("status", timeout=2.0)
         worker.pop("id", None)
-        with self._stats_lock:
-            local = {
-                "received_chunks": self._received_chunks,
-                "received_bytes": self._received_bytes,
-                "queue_drops": self._queue_drops,
-                "max_input_gap_ms": self._max_input_gap_ms,
-                "last_input_ago_ms": (
-                    (time.monotonic() - self._last_input_ts) * 1000.0
-                    if self._last_input_ts else -1
-                ),
-            }
-        worker.update(local)
         return worker
 
     def call(self, operation, value=None, timeout=6.0):
@@ -649,19 +814,18 @@ class _SpeakerBackend:
         self._process.join(timeout=3.0)
         if self._process.is_alive():
             self._process.terminate()
+            self._process.join(timeout=1.0)
 
 
-class _SpeakerNode(Node):
+class _SpeakerNode:
     def __init__(self, interface, block_bytes, prefill_bytes,
                  continuation_prefill_bytes, max_lead_s):
-        super().__init__("as2w_speaker")
         self._interface = interface
         self._block_bytes = block_bytes
         self._prefill_bytes = prefill_bytes
         self._continuation_prefill_bytes = continuation_prefill_bytes
         self._max_lead_s = max_lead_s
         self._backend = None
-        self._subscription = None
         self.topic = ""
         self.state = "idle"
 
@@ -700,38 +864,19 @@ class _SpeakerNode(Node):
         ready = self.start_backend()
         if not ready.get("ok"):
             return ready
-        if self._subscription is not None and self.topic != topic:
-            self.destroy_subscription(self._subscription)
-            self._subscription = None
-        if self._subscription is None:
-            self._subscription = self.create_subscription(
-                AudioChunk, topic, self._on_audio, _LOW_LAT_QOS)
-        self.topic = topic
-        result = self.call_backend("reset")
+        result = self.call_backend("start", topic)
+        if result.get("ok"):
+            self.topic = topic
         self.state = "ready" if result.get("ok") else "error"
         return result
 
-    def _on_audio(self, message):
-        if self._backend is None or not self._backend.is_available():
-            self.state = "error"
-            return
-        self._backend.put(bytes(message.data))
-        if self.state == "ready":
-            self.state = "playing"
-
     def stop_play(self):
-        if self._subscription is not None:
-            self.destroy_subscription(self._subscription)
-            self._subscription = None
         result = self.call_backend("stop")
         self.topic = ""
         self.state = "idle" if result.get("ok") else "error"
         return result
 
     def close(self):
-        if self._subscription is not None:
-            self.destroy_subscription(self._subscription)
-            self._subscription = None
         if self._backend is not None:
             self._backend.close()
             self._backend = None
@@ -746,12 +891,12 @@ class SpeakerPlugin:
         block_ms = max(
             100, min(1000, int(config.get("block_ms", config.get("buffer_ms", 300)))))
         prefill_ms = max(
-            block_ms, min(3000, int(config.get("prefill_ms", 700))))
+            block_ms, min(3000, int(config.get("prefill_ms", 500))))
         continuation_prefill_ms = max(
             block_ms,
             min(prefill_ms, int(config.get("continuation_prefill_ms", 500))),
         )
-        max_lead_ms = max(0, min(1000, int(config.get("max_lead_ms", 600))))
+        max_lead_ms = max(0, min(1000, int(config.get("max_lead_ms", 400))))
         self._node = _SpeakerNode(
             network_iface,
             block_ms * 32,
@@ -759,7 +904,6 @@ class SpeakerPlugin:
             continuation_prefill_ms * 32,
             max_lead_ms / 1000.0,
         )
-        executor.add_node(self._node)
 
     def get_tool(self):
         actions = ["start", "stop", "interrupt", "pause", "resume", "get_volume", "set_volume", "info"]
@@ -818,7 +962,7 @@ class SpeakerPlugin:
             if backend is not None and backend.is_available():
                 result = backend.status()
             else:
-                result = {"ok": False}
+                result = {"ok": False, "state": self._node.state}
             input_topic = args.get("input_topic") or self._node.topic
             reported_topic = input_topic
             descriptor = {"format": "audio/pcm-16k"}
@@ -829,6 +973,8 @@ class SpeakerPlugin:
             return None
         if action != "info":
             reported_topic = self._node.topic
+        if action == "info" and result.get("state"):
+            self._node.state = result["state"]
         result.update({"state": self._node.state, "topic": reported_topic})
         return result
 
@@ -836,7 +982,7 @@ class SpeakerPlugin:
 def _put_latest(target_queue, item):
     try:
         target_queue.put_nowait(item)
-        return
+        return False
     except queue.Full:
         pass
     try:
@@ -846,10 +992,13 @@ def _put_latest(target_queue, item):
     try:
         target_queue.put_nowait(item)
     except queue.Full:
-        pass
+        return True
+    return True
 
 
-def _camera_worker(frame_queue, status_queue, stop_event, interface, fps, timeout_s, retry_s):
+def _camera_worker(
+        frame_queue, status_queue, stop_event, interface, fps, timeout_s,
+        retry_s, metrics=None, metrics_lock=None):
     _install_logsafe()
     try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -868,14 +1017,30 @@ def _camera_worker(frame_queue, status_queue, stop_event, interface, fps, timeou
     failures = 0
     while not stop_event.is_set():
         try:
+            rpc_started = time.monotonic()
             code, data = client.GetImageSample()
+            rpc_ms = (time.monotonic() - rpc_started) * 1000.0
+            convert_started = time.monotonic()
             frame = bytes(data or [])
+            convert_ms = (time.monotonic() - convert_started) * 1000.0
             if code != 0:
                 raise RuntimeError("videohub returned {}".format(code))
             if not (frame.startswith(b"\xff\xd8") and frame.endswith(b"\xff\xd9")):
                 raise RuntimeError("videohub returned an invalid JPEG")
             failures = 0
-            _put_latest(frame_queue, frame)
+            if metrics is not None and metrics_lock is not None:
+                with metrics_lock:
+                    metrics["capture_frames"] += 1
+                    metrics["captured_bytes"] += len(frame)
+                    metrics["rpc_total_ms"] += rpc_ms
+                    metrics["rpc_max_ms"] = max(metrics["rpc_max_ms"], rpc_ms)
+                    metrics["convert_total_ms"] += convert_ms
+                    metrics["convert_max_ms"] = max(
+                        metrics["convert_max_ms"], convert_ms)
+            dropped = _put_latest(frame_queue, frame)
+            if dropped and metrics is not None and metrics_lock is not None:
+                with metrics_lock:
+                    metrics["queue_drops"] += 1
             _put_latest(status_queue, ("running", ""))
         except Exception as exc:
             failures += 1
@@ -891,88 +1056,328 @@ def _camera_worker(frame_queue, status_queue, stop_event, interface, fps, timeou
             deadline = time.monotonic()
 
 
-class _CameraNode(Node):
+def _camera_process(
+        control_queue, result_queue, topic, interface, fps, timeout_s, retry_s):
+    """Own videohub capture and ROS publication in one child process."""
+    _install_logsafe()
+    node = None
+    publisher = None
+    rclpy_started = False
+    capture_thread = None
+    publish_thread = None
+    capture_stop = None
+    frame_queue = None
+    status_queue = None
+    metrics_lock = threading.Lock()
+    metrics = {
+        "state": "idle",
+        "frames": 0,
+        "capture_frames": 0,
+        "captured_bytes": 0,
+        "queue_drops": 0,
+        "last_frame_ts": 0.0,
+        "last_error": "",
+        "capture_started_ts": 0.0,
+        "publish_started_ts": 0.0,
+        "rpc_total_ms": 0.0,
+        "rpc_max_ms": 0.0,
+        "convert_total_ms": 0.0,
+        "convert_max_ms": 0.0,
+        "build_total_ms": 0.0,
+        "build_max_ms": 0.0,
+        "publish_total_ms": 0.0,
+        "publish_max_ms": 0.0,
+    }
+
+    def respond(request_id, **payload):
+        payload["id"] = request_id
+        result_queue.put(payload)
+
+    def camera_status():
+        with metrics_lock:
+            now = time.monotonic()
+            captures = metrics["capture_frames"]
+            published = metrics["frames"]
+            capture_elapsed = (
+                now - metrics["capture_started_ts"]
+                if metrics["capture_started_ts"] else 0.0)
+            publish_elapsed = (
+                now - metrics["publish_started_ts"]
+                if metrics["publish_started_ts"] else 0.0)
+            return {
+                "ok": metrics["state"] != "error",
+                "state": metrics["state"],
+                "frames": published,
+                "capture_frames": captures,
+                "capture_fps": captures / capture_elapsed if capture_elapsed else 0.0,
+                "publish_fps": published / publish_elapsed if publish_elapsed else 0.0,
+                "last_frame_ago_ms": (
+                    int((now - metrics["last_frame_ts"]) * 1000)
+                    if metrics["last_frame_ts"] else -1),
+                "last_error": metrics["last_error"],
+                "queue_drops": metrics["queue_drops"],
+                "frame_bytes_avg": (
+                    metrics["captured_bytes"] / captures if captures else 0.0),
+                "rpc_avg_ms": (
+                    metrics["rpc_total_ms"] / captures if captures else 0.0),
+                "rpc_max_ms": metrics["rpc_max_ms"],
+                "bytes_convert_avg_ms": (
+                    metrics["convert_total_ms"] / captures if captures else 0.0),
+                "bytes_convert_max_ms": metrics["convert_max_ms"],
+                "message_build_avg_ms": (
+                    metrics["build_total_ms"] / published if published else 0.0),
+                "message_build_max_ms": metrics["build_max_ms"],
+                "publish_call_avg_ms": (
+                    metrics["publish_total_ms"] / published if published else 0.0),
+                "publish_call_max_ms": metrics["publish_max_ms"],
+            }
+
+    def publish_loop():
+        while capture_stop is not None and not capture_stop.is_set():
+            try:
+                while True:
+                    camera_state, error = status_queue.get_nowait()
+                    with metrics_lock:
+                        if camera_state == "error":
+                            metrics["state"] = "error"
+                        elif camera_state == "reconnecting":
+                            metrics["state"] = "reconnecting"
+                        elif metrics["frames"] == 0:
+                            metrics["state"] = "starting"
+                        metrics["last_error"] = error
+            except queue.Empty:
+                pass
+            try:
+                frame = frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            # If publication falls behind, publish the newest frame instead of
+            # increasing end-to-end latency with stale queued images.
+            while True:
+                try:
+                    frame = frame_queue.get_nowait()
+                    with metrics_lock:
+                        metrics["queue_drops"] += 1
+                except queue.Empty:
+                    break
+
+            build_started = time.monotonic()
+            message = CompressedImage()
+            message.header.stamp = node.get_clock().now().to_msg()
+            message.format = "jpeg"
+            # rosidl's bytes-to-uint8[] path converts element by element.  The
+            # buffer-compatible array assignment is about three orders faster
+            # for the approximately 300 KB frames returned by videohub.
+            message.data = array("B", frame)
+            build_ms = (time.monotonic() - build_started) * 1000.0
+            publish_started = time.monotonic()
+            publisher.publish(message)
+            publish_ms = (time.monotonic() - publish_started) * 1000.0
+            finished_at = time.monotonic()
+            with metrics_lock:
+                metrics["frames"] += 1
+                if not metrics["publish_started_ts"]:
+                    metrics["publish_started_ts"] = finished_at
+                metrics["last_frame_ts"] = finished_at
+                metrics["state"] = "running"
+                metrics["last_error"] = ""
+                metrics["build_total_ms"] += build_ms
+                metrics["build_max_ms"] = max(metrics["build_max_ms"], build_ms)
+                metrics["publish_total_ms"] += publish_ms
+                metrics["publish_max_ms"] = max(
+                    metrics["publish_max_ms"], publish_ms)
+
+    def stop_threads():
+        nonlocal capture_thread, publish_thread, capture_stop
+        if capture_stop is not None:
+            capture_stop.set()
+        for worker in (capture_thread, publish_thread):
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=max(3.0, timeout_s + 1.0))
+        capture_thread = None
+        publish_thread = None
+        capture_stop = None
+        with metrics_lock:
+            metrics["state"] = "idle"
+
+    try:
+        import rclpy
+
+        rclpy.init(args=None)
+        rclpy_started = True
+        node = Node("as2w_camera")
+        publisher = node.create_publisher(CompressedImage, topic, _IMAGE_QOS)
+        result_queue.put({"id": "ready", "ok": True})
+        running = True
+        while running:
+            try:
+                request_id, operation, _value = control_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if operation == "start":
+                    stop_threads()
+                    frame_queue = queue.Queue(maxsize=1)
+                    status_queue = queue.Queue(maxsize=4)
+                    capture_stop = threading.Event()
+                    with metrics_lock:
+                        for key in metrics:
+                            metrics[key] = "" if key == "last_error" else 0.0
+                        metrics["state"] = "starting"
+                        metrics["frames"] = 0
+                        metrics["capture_frames"] = 0
+                        metrics["queue_drops"] = 0
+                        metrics["capture_started_ts"] = time.monotonic()
+                        metrics["publish_started_ts"] = metrics["capture_started_ts"]
+                    publish_thread = threading.Thread(
+                        target=publish_loop,
+                        name="as2w-camera-publish",
+                        daemon=True,
+                    )
+                    capture_thread = threading.Thread(
+                        target=_camera_worker,
+                        args=(frame_queue, status_queue, capture_stop, interface,
+                              fps, timeout_s, retry_s, metrics, metrics_lock),
+                        name="as2w-camera-capture",
+                        daemon=True,
+                    )
+                    publish_thread.start()
+                    capture_thread.start()
+                    respond(request_id, ok=True, state="starting")
+                elif operation == "stop":
+                    stop_threads()
+                    respond(request_id, **camera_status())
+                elif operation == "status":
+                    respond(request_id, **camera_status())
+                elif operation == "close":
+                    stop_threads()
+                    respond(request_id, ok=True, state="idle")
+                    running = False
+                else:
+                    respond(request_id, ok=False, error="unsupported operation")
+            except Exception as exc:
+                with metrics_lock:
+                    metrics["state"] = "error"
+                    metrics["last_error"] = str(exc)
+                respond(request_id, ok=False, error=str(exc))
+    except Exception as exc:
+        result_queue.put({"id": "ready", "ok": False, "error": str(exc)})
+    finally:
+        stop_threads()
+        if node is not None:
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+        if rclpy_started:
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
+
+
+class _CameraBackend:
     def __init__(self, topic, interface, fps, timeout_s, retry_s):
-        super().__init__("as2w_camera")
+        context = multiprocessing.get_context("spawn")
+        self._control = context.Queue()
+        self._results = context.Queue()
+        self._lock = threading.Lock()
+        self._process = context.Process(
+            target=_camera_process,
+            args=(self._control, self._results, topic, interface, fps,
+                  timeout_s, retry_s),
+            name="as2w_camera",
+            daemon=True,
+        )
+        self._process.start()
+        try:
+            ready = self._results.get(timeout=8.0)
+        except queue.Empty:
+            ready = {"ok": False, "error": "camera process startup timed out"}
+        self.error = "" if ready.get("ok") else ready.get("error", "camera unavailable")
+
+    def is_available(self):
+        return not self.error and self._process.is_alive()
+
+    def call(self, operation, timeout=6.0):
+        if self.error:
+            return {"ok": False, "state": "error", "error": self.error}
+        if not self._process.is_alive():
+            return {"ok": False, "state": "error", "error": "camera process is not running"}
+        with self._lock:
+            request_id = uuid4().hex
+            self._control.put((request_id, operation, None))
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    result = self._results.get(
+                        timeout=max(0.01, deadline - time.monotonic()))
+                except queue.Empty:
+                    break
+                if result.get("id") == request_id:
+                    return result
+            return {"ok": False, "state": "error", "error": "camera operation timed out"}
+
+    def status(self):
+        result = self.call("status", timeout=2.0)
+        result.pop("id", None)
+        return result
+
+    def close(self):
+        if self._process.is_alive():
+            self.call("close", timeout=3.0)
+        self._process.join(timeout=3.0)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=1.0)
+
+
+class _CameraNode:
+    def __init__(self, topic, interface, fps, timeout_s, retry_s):
         self.topic = topic
         self.interface = interface
         self.fps = fps
         self.timeout_s = timeout_s
         self.retry_s = retry_s
-        self.publisher = self.create_publisher(CompressedImage, topic, _IMAGE_QOS)
         self.state = "idle"
         self.frames = 0
-        self.last_frame_ts = 0.0
         self.last_error = ""
-        self._process = None
-        self._thread = None
-        self._stop_event = None
-        self._frames = None
-        self._statuses = None
+        self._backend = None
 
     def start_capture(self):
-        if self._process is not None and self._process.is_alive():
-            return
+        if self._backend is not None and self._backend.is_available():
+            return self._backend.call("start")
         self.stop_capture()
-        context = multiprocessing.get_context("spawn")
-        self._frames = context.Queue(maxsize=2)
-        self._statuses = context.Queue(maxsize=4)
-        self._stop_event = context.Event()
-        self._process = context.Process(
-            target=_camera_worker,
-            args=(self._frames, self._statuses, self._stop_event, self.interface,
-                  self.fps, self.timeout_s, self.retry_s),
-            name="as2w_camera",
-            daemon=True,
+        self._backend = _CameraBackend(
+            self.topic, self.interface, self.fps, self.timeout_s, self.retry_s,
         )
-        self._process.start()
-        self.state = "starting"
-        self._thread = threading.Thread(
-            target=self._publish_loop, name="as2w-camera-publish", daemon=True)
-        self._thread.start()
-
-    def _publish_loop(self):
-        while self._stop_event is not None and not self._stop_event.is_set():
-            try:
-                while True:
-                    state, error = self._statuses.get_nowait()
-                    self.state, self.last_error = state, error
-            except queue.Empty:
-                pass
-            try:
-                frame = self._frames.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            message = CompressedImage()
-            message.header.stamp = self.get_clock().now().to_msg()
-            message.format = "jpeg"
-            message.data = frame
-            self.publisher.publish(message)
-            self.frames += 1
-            self.last_frame_ts = time.monotonic()
-            self.state = "running"
+        if self._backend.error:
+            self.state = "error"
+            self.last_error = self._backend.error
+            return {"ok": False, "state": "error", "error": self.last_error}
+        result = self._backend.call("start")
+        self.state = result.get("state", "starting") if result.get("ok") else "error"
+        self.last_error = result.get("error", "")
+        return result
 
     def stop_capture(self):
-        if self._stop_event is not None:
-            self._stop_event.set()
-        process, self._process = self._process, None
-        if process is not None:
-            process.join(timeout=3.0)
-            if process.is_alive():
-                process.terminate()
-        thread, self._thread = self._thread, None
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=1.0)
-        self._stop_event = None
+        if self._backend is not None:
+            self._backend.close()
+            self._backend = None
         self.state = "idle"
 
     def status(self):
+        if self._backend is not None and self._backend.is_available():
+            result = self._backend.status()
+            self.state = result.get("state", self.state)
+            self.frames = result.get("frames", self.frames)
+            self.last_error = result.get("last_error", result.get("error", ""))
+            return result
         return {
             "state": self.state,
             "frames": self.frames,
-            "last_frame_ago_ms": (
-                int((time.monotonic() - self.last_frame_ts) * 1000)
-                if self.last_frame_ts else -1),
+            "last_frame_ago_ms": -1,
             "last_error": self.last_error,
         }
 
@@ -992,7 +1397,6 @@ class CameraPlugin:
             max(0.2, float(config.get("rpc_timeout", 1.0))),
             max(0.2, float(config.get("retry_interval", 2.0))),
         )
-        executor.add_node(self._node)
 
     def get_tool(self):
         return {

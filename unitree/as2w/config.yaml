@@ -13,9 +13,9 @@ plugins:
   speaker:
     enabled: true
     block_ms: 300
-    prefill_ms: 700
+    prefill_ms: 500
     continuation_prefill_ms: 500
-    max_lead_ms: 600
+    max_lead_ms: 400
   led: {enabled: true}
   camera:
     enabled: true

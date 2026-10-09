@@ -85,13 +85,22 @@ frames returned by the Go2-compatible `videohub` service. `mic` listens for the
 official A2 multicast stream at `239.168.123.161:5555`; when the robot's voice
 assistant / wake-up conversation mode is disabled, the card remains in a
 diagnostic `waiting` state and automatically recovers when packets appear.
-The speaker separates its local jitter prefill (700 ms by default) from its
-`PlayStream` block size (300 ms), while keeping a bounded 240 ms lead over the
-robot playback timeline. Each utterance prefills independently, so synthesis
-stalls do not bypass the jitter buffer. Its `info` response reports input gaps,
-queue drops, partial flushes, estimated underflows, `PlayStream` failures, and
-average/maximum RPC latency so playback gaps can be diagnosed without changing
-the audio path.
+Speaker ROS subscription, jitter buffering, and the A2 audio client now live in
+one spawned process. PCM therefore stays in a thread-local queue instead of
+being copied through a multiprocessing queue, and a busy main ROS executor
+cannot delay playback. The default jitter prefill is 500 ms, the `PlayStream`
+block size is 300 ms, and queued playback lead is capped at 400 ms. Internal EOF
+markers produced by split TTS text preserve the current playback timeline;
+only a real input underflow returns to the full prefill. Its `info` response
+reports input gaps, queue drops, partial flushes, estimated underflows,
+`PlayStream` failures, and average/maximum RPC latency.
+
+Camera capture and ROS publication likewise run together in a spawned process.
+JPEG frames stay in a one-frame, latest-only thread queue and are assigned to
+`CompressedImage.data` through a buffer-compatible byte array, avoiding both a
+roughly 300 KB multiprocessing copy and slow per-byte ROS conversion. Camera
+`info` reports separate capture/publish rates, videohub RPC time, message-build
+and publish-call time, average frame size, and dropped stale frames.
 The shared ROS base workspace must provide `audio_msgs`; the Docker build
 sources `/ros_ws/install/setup.bash` and imports `AudioChunk` as a mandatory
 build-time validation, so a base-image mismatch fails before deployment.
