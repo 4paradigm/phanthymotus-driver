@@ -63,6 +63,10 @@ _AUDIO_AGENT_POLL_INTERVAL_S = 0.1
 # utterance played while the vendor voice agent sat at SLEEPED/CMD_SLEEPED.
 # Only ERROR_SLEEPED means the audio agent itself is down.
 _AUDIO_RESET_RECOVERED_STATUSES = frozenset(("READY", "SLEEPED"))
+_MIC_DIRECTION_CALIBRATION = Path(
+    "/opt/phanthy-motus/data/bumi/sound_direction_calibration.json")
+# 厂商格式为逐字声母、韵母及声调，@ 后是显示名称。
+_MIC_WAKEUP_WORD = "x iǎo f àn x iǎo f àn @小范小范"
 
 # ── Joint Mapping ─────────────────────────────────────────────────────────────
 # SDK motor_id order → URDF joint names (must match URDF exactly for skeleton renderer)
@@ -935,6 +939,8 @@ def _mic_subprocess(namespace: str):
     import time as _time
     import struct as _struct
     import numpy as _np
+    from collections import deque as _deque
+    from sound_direction import estimate_angle, estimate_signature
 
     import rclpy as _rclpy
     from rclpy.node import Node as _Node
@@ -957,16 +963,55 @@ def _mic_subprocess(namespace: str):
     node = _Node("bumi_mic_sub")
     topic = f"/{namespace}/mic/audio"
     pub = node.create_publisher(_AudioChunk, topic, _QOS)
+    direction_pub = node.create_publisher(
+        String, f"/{namespace}/mic/sound_direction", _QOS)
 
     print(f"[mic_subprocess] publishing to {topic}", flush=True)
 
     frame_count = 0
     t_start = _time.monotonic()
     buffer = _np.array([], dtype=_np.int16)
+    recent_audio = _deque(maxlen=100)  # 约 1 秒原始 8 通道音频，供唤醒时定位。
+    next_status_poll = 0.0
+    initial_status = media_ctrl.get_system_status()
+    initial_reason = getattr(initial_status.reason, "name", str(initial_status.reason).rsplit(".", 1)[-1])
+    last_wake_key = (
+        initial_status.header.message_id, initial_status.header.timestamp_us
+    ) if initial_reason == "AUDIO_WAKEUPED" else None
     MIN_CHUNK_SAMPLES = 512  # 1024 bytes = 32ms @ 16kHz
 
     while True:
         try:
+            if _time.monotonic() >= next_status_poll:
+                next_status_poll = _time.monotonic() + 0.1
+                status = media_ctrl.get_system_status()
+                reason = getattr(status.reason, "name", str(status.reason).rsplit(".", 1)[-1])
+                wake_key = (status.header.message_id, status.header.timestamp_us)
+                if reason == "AUDIO_WAKEUPED" and wake_key != last_wake_key:
+                    last_wake_key = wake_key
+                    signature = estimate_signature(
+                        _np.concatenate(recent_audio) if recent_audio else [], 8, 16000)
+                    try:
+                        calibration = json.loads(_MIC_DIRECTION_CALIBRATION.read_text())
+                    except (FileNotFoundError, ValueError):
+                        calibration = {}
+                    angle = None
+                    if signature is not None and {"front", "right"} <= calibration.keys():
+                        angle = estimate_angle(
+                            signature, calibration["front"], calibration["right"])
+                    state = "fresh" if angle is not None else (
+                        "uncalibrated" if len(calibration) < 2 else "ambiguous")
+                    direction = {"state": state, "trigger": "vendor_audio_wakeup",
+                                 "timestamp_ms": int(_time.time() * 1000)}
+                    if angle is not None:
+                        direction.update({"angle": angle, "unit": "deg",
+                                          "reference": "robot_front_clockwise"})
+                    direction_msg = String()
+                    direction_msg.data = json.dumps(direction, ensure_ascii=False)
+                    direction_pub.publish(direction_msg)
+                elif reason != "AUDIO_WAKEUPED":
+                    last_wake_key = None
+
             audio = media_ctrl.get_audio_capture_data()
             if audio.channels == 0 or len(audio.audio_data) == 0:
                 _time.sleep(0.005)
@@ -974,6 +1019,8 @@ def _mic_subprocess(namespace: str):
 
             # Downmix 8ch → mono (channel 0) using numpy for speed
             samples = _np.array(audio.audio_data, dtype=_np.int16)
+            if audio.channels == 8 and audio.sample_rate == 16000:
+                recent_audio.append(samples)
             mono = samples[::audio.channels]
 
             # SDK returns low-amplitude signal (~8-bit dynamic range in 16-bit container)
@@ -1005,21 +1052,81 @@ class MicPlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor, media_ctrl):
         self._namespace = namespace
         self._topic = f"/{namespace}/mic/audio"
+        self._direction_topic = f"/{namespace}/mic/sound_direction"
+        self._media_ctrl = media_ctrl
+        self._wakeup_word_added = False
+        self._last_wakeup_config_time = 0.0
         self._proc: subprocess.Popen | None = None
+        self._direction_lock = threading.Lock()
+        self._last_direction = None
+        self._last_direction_time = 0.0
+        self._direction_node = Node("bumi_mic_direction_sub")
+        executor.add_node(self._direction_node)
+        self._direction_node.create_subscription(
+            String, self._direction_topic, self._on_direction, _LOW_LAT_QOS)
+
+    def _on_direction(self, msg: String) -> None:
+        with self._direction_lock:
+            if self._proc is None:
+                return
+            self._last_direction = json.loads(msg.data)
+            self._last_direction_time = time.monotonic()
 
     def get_tool(self) -> dict:
         return {
             "name": "mic",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"Bumi microphone — 8ch array, outputs mono PCM 16kHz 16bit. Publishes to {self._topic}",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}],
+            "description": "Bumi microphone audio and calibrated wake-up sound direction",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"action": {"type": "string", "enum": [
+                    "start", "stop", "info", "add_wakeup_word",
+                    "calibrate_front", "calibrate_right"]}},
+                "x-action-params": {
+                    "add_wakeup_word": {"params": [], "description": "向 Bumi 语音模块添加‘小范小范’"},
+                    "calibrate_front": {"params": [], "description": "一人在机器人正前方持续说‘测试测试’约 2 秒时调用"},
+                    "calibrate_right": {"params": [], "description": "一人在机器人正右方持续说‘测试测试’约 2 秒时调用"},
+                },
+            },
+            "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"},
+                          {"topic": self._direction_topic, "format": "data/json"}],
         }
+
+    def _calibrate(self, direction: str) -> dict:
+        import numpy as np
+        from sound_direction import estimate_signature
+
+        frames = []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            audio = self._media_ctrl.get_audio_capture_data()
+            if audio.channels == 8 and audio.sample_rate == 16000 and audio.audio_data:
+                frames.append(np.asarray(audio.audio_data, dtype=np.int16))
+            else:
+                time.sleep(0.005)
+        signature = estimate_signature(
+            np.concatenate(frames) if frames else [], 8, 16000)
+        if signature is None:
+            return {"state": "no_voice", "message": "未采到可用于标定的声音，请靠近机器人重试"}
+        try:
+            calibration = json.loads(_MIC_DIRECTION_CALIBRATION.read_text())
+        except (FileNotFoundError, ValueError):
+            calibration = {}
+        calibration[direction] = signature
+        _MIC_DIRECTION_CALIBRATION.parent.mkdir(parents=True, exist_ok=True)
+        _MIC_DIRECTION_CALIBRATION.write_text(json.dumps(calibration))
+        return {"state": "calibrated", "direction": direction,
+                "remaining": [name for name in ("front", "right") if name not in calibration]}
 
     def start(self) -> None:
         import sys
-        self._proc = subprocess.Popen(
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        with self._direction_lock:
+            self._last_direction = None
+            self._last_direction_time = 0.0
+        proc = subprocess.Popen(
             [sys.executable, "-c",
              # Protect import-time output as well as the child entry point.
              "import sys; sys.path.insert(0, '/work'); "
@@ -1027,9 +1134,10 @@ class MicPlugin:
              f"from device import _mic_subprocess; _mic_subprocess({self._namespace!r})"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
+        self._proc = proc
         # Forward subprocess stdout in background
         def _fwd():
-            for line in self._proc.stdout:
+            for line in proc.stdout:
                 print(line.decode(errors='replace').rstrip(), flush=True)
         threading.Thread(target=_fwd, daemon=True).start()
 
@@ -1037,14 +1145,47 @@ class MicPlugin:
         if self._proc:
             self._proc.terminate()
             self._proc = None
+        with self._direction_lock:
+            self._last_direction = None
+            self._last_direction_time = 0.0
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "audio/pcm-16k"}]}
+            self.start()
+            return {"state": "running", "topic_out": self.get_tool()["topic_out"]}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running" if self._proc and self._proc.poll() is None else "idle"}
+            try:
+                calibration = json.loads(_MIC_DIRECTION_CALIBRATION.read_text())
+            except (FileNotFoundError, ValueError):
+                calibration = {}
+            with self._direction_lock:
+                direction = self._last_direction
+                age = time.monotonic() - self._last_direction_time
+            if direction is None:
+                observation = {"state": "no_event"}
+            elif age > 10:
+                observation = {"state": "stale"}
+            else:
+                observation = {**direction, "age_ms": round(age * 1000)}
+            return {"state": "running" if self._proc and self._proc.poll() is None else "idle",
+                    "sound_direction": observation,
+                    "calibrated_directions": [name for name in ("front", "right")
+                                              if name in calibration]}
+        if action == "add_wakeup_word":
+            if self._wakeup_word_added or "小范小范" in self._media_ctrl.get_wakeup_words():
+                return {"state": "configured", "word": "小范小范"}
+            if time.monotonic() - self._last_wakeup_config_time < 0.5:
+                return {"state": "retry_later", "message": "语音模块配置调用需间隔至少 500 毫秒"}
+            self._last_wakeup_config_time = time.monotonic()
+            accepted = self._media_ctrl.add_wakeup_words(_MIC_WAKEUP_WORD)
+            self._wakeup_word_added = accepted
+            return {"state": "configured" if accepted else "rejected",
+                    "word": "小范小范"}
+        if action in ("calibrate_front", "calibrate_right"):
+            return self._calibrate(action.removeprefix("calibrate_"))
         return None
 
 

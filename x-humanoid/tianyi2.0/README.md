@@ -4,17 +4,6 @@ Phanthy Motus driver bundle for the Tianyi 2.0 Pro humanoid robot. The driver
 bridges robot-side ROS2 topics on domain 0 to Agent Core topics on domain 42 and
 exposes the capabilities as MCP tools.
 
-## ASR wake-word direction output
-
-The existing `asr` card still publishes recognized speech to
-`/{namespace}/asr/text`. It also subscribes to Lyre's `/audio_asr/keyword`
-and publishes each wake-word event to `/{namespace}/asr/sound_direction`.
-The card's `info` result includes the latest angle only for 10 seconds after
-the event; otherwise `sound_direction.state` is `no_event` or `stale`.
-The angle is the vendor's raw value: its unit, zero direction, and sign still
-need on-robot calibration before an Agent uses it to rotate or approach a
-speaker. This output does not locate arbitrary sounds or move the robot.
-
 ## Head camera snapshot card
 
 The `vision_capture` card subscribes to `/ob_camera_head/color/image_raw` and

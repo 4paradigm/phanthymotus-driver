@@ -2,6 +2,37 @@
 
 The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
 
+## `mic` wake-up direction
+
+The existing `mic` card still publishes mono PCM on `/<namespace>/mic/audio`.
+It also publishes a JSON wake-up observation on
+`/<namespace>/mic/sound_direction`. The `angle` field is present only when
+calibration and audio quality permit an estimate. It is in degrees clockwise
+from the robot's front. `info.sound_direction` keeps the latest observation for
+10 seconds, then reports `stale` without an angle.
+
+One-time setup on Bumi EDU:
+
+1. Call `mic` with `action=add_wakeup_word` to append “小范小范” to the vendor
+   voice module's wake words. The factory wake words remain available.
+2. Have one person stand directly in front of the robot and speak “测试测试”
+   continuously while calling `action=calibrate_front`.
+3. Repeat at the robot's right side with `action=calibrate_right`.
+4. Say “小范小范” and inspect the direction output and `mic.info`.
+
+Calibration is stored under `/opt/phanthy-motus/data/bumi/` and survives a
+driver restart. The first four channels of the SDK's eight-channel capture are
+the head microphones; reserved channels and speaker loopback are ignored. The
+driver derives relative arrival delays from those four channels and uses the
+two known speaking positions to map them to the robot's front/right axes.
+No angle is published when the channels do not show a coherent source.
+
+The vendor wake status reports that an acoustic wake-up happened but does not
+identify which wake word caused it. Thus an event cannot truthfully claim that
+“小范小范” was the recognized word, and simultaneous speakers may cause an
+ambiguous or wrong direction. Confirm the phrase, angle convention, and
+performance on the actual robot before using the angle for motion.
+
 ## App 图传与 Phanthy Camera Card
 
 Bumi 的官方 App 图传服务 `noetix-video-capture.service` 会占用 RealSense。

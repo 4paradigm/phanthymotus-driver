@@ -2102,18 +2102,10 @@ def _extract_after_keyword(text: str, keyword_text: str, end_pos: int) -> str:
 class AsrPlugin:
     """语音识别结果 (lyre ASR)"""
 
-    _DIRECTION_FRESH_SECONDS = 10
-
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
         self._topic = f"/{namespace}/asr/text"
-        self._direction_topic = f"/{namespace}/asr/sound_direction"
-        self._direction_lock = threading.Lock()
-        self._last_direction_event = None
-        self._last_direction_monotonic = None
-        self._asr_subscription = None
-        self._keyword_subscription = None
         self._running = False
 
         # KWS config (defaults: enabled, keyword=小范小范)
@@ -2128,14 +2120,12 @@ class AsrPlugin:
         self._pub_node = Node("tianyi2_asr_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
         self._pub = self._pub_node.create_publisher(String, self._topic, _RELIABLE_QOS)
-        self._direction_pub = self._pub_node.create_publisher(
-            String, self._direction_topic, _RELIABLE_QOS)
 
     def get_tool(self) -> dict:
         return {
             "name": "asr",
             "type": "sensor",
-            "description": "天轶2.0 语音识别与唤醒词声源方向；角度为 Lyre 原始值，须实机标定",
+            "description": "天轶2.0 语音识别 (lyre ASR) — 实时语音转文字",
             "inputSchema": {"type": "object", "properties": {}},
             "configSchema": {
                 "type": "object",
@@ -2162,51 +2152,24 @@ class AsrPlugin:
                     },
                 },
             },
-            "topic_out": [{"topic": self._topic, "format": "data/json"},
-                          {"topic": self._direction_topic, "format": "data/json"}],
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
 
     def start(self):
-        with self._direction_lock:
-            if self._asr_subscription is None:
-                try:
-                    from lyre_msgs.msg import AsrIat
-                    self._asr_subscription = self._sub_node.create_subscription(
-                        AsrIat, "/audio_asr/iat", self._on_asr, _RELIABLE_QOS)
-                    print("[AsrPlugin] subscription created")
-                except ImportError:
-                    # Fallback: subscribe as String
-                    self._asr_subscription = self._sub_node.create_subscription(
-                        String, "/audio_asr/iat", self._on_asr_string, _RELIABLE_QOS)
-                    print("[AsrPlugin] fallback to String subscription")
-            if self._keyword_subscription is None:
-                try:
-                    from lyre_msgs.msg import AsrKeyword
-                except ImportError:
-                    pass  # 旧版 Lyre 消息缺失时仍保留原有文本 ASR。
-                else:
-                    self._keyword_subscription = self._sub_node.create_subscription(
-                        AsrKeyword, "/audio_asr/keyword", self._on_keyword, _RELIABLE_QOS)
-            self._running = True
+        self._running = True
+        try:
+            from lyre_msgs.msg import AsrIat
+            self._sub_node.create_subscription(
+                AsrIat, "/audio_asr/iat", self._on_asr, _RELIABLE_QOS)
+            print("[AsrPlugin] subscription created")
+        except ImportError:
+            # Fallback: subscribe as String
+            self._sub_node.create_subscription(
+                String, "/audio_asr/iat", self._on_asr_string, _RELIABLE_QOS)
+            print("[AsrPlugin] fallback to String subscription")
 
     def stop(self):
-        with self._direction_lock:
-            self._running = False
-            self._last_direction_event = None
-            self._last_direction_monotonic = None
-
-    def _on_keyword(self, msg):
-        with self._direction_lock:
-            if not self._running:
-                return
-            # 原样传递厂家角度；实机标定前不把它解释成机器人左/右或转动量。
-            event = {"keyword": msg.keyword, "angle": msg.angle,
-                     "timestamp_ms": int(time.time() * 1000)}
-            self._last_direction_event = event
-            self._last_direction_monotonic = time.monotonic()
-            out = String()
-            out.data = json.dumps(event, ensure_ascii=False)
-            self._direction_pub.publish(out)
+        self._running = False
 
     def _ensure_keyword_ipa(self):
         """Lazy-init keyword IPA on first use (phonemizer import is slow)."""
@@ -2276,7 +2239,7 @@ class AsrPlugin:
             out.data = filtered
             self._pub.publish(out)
 
-    def dispatch(self, action: str, args: dict) -> dict | None:
+    def dispatch(self, action: str, args: dict) -> dict:
         if action == "config":
             if 'kws_enabled' in args:
                 self._kws_enabled = bool(args['kws_enabled'])
@@ -2288,26 +2251,10 @@ class AsrPlugin:
                 self._kws_threshold = float(args['kws_threshold'])
             return {"status": "configured", "kws_enabled": self._kws_enabled,
                     "kws_keyword": self._kws_keyword, "kws_threshold": self._kws_threshold}
-        if action == "start":
-            self.start()
-        elif action == "stop":
-            self.stop()
-        elif action != "info":
-            return None
-        result = {"state": "running" if self._running else "idle",
-                  "topic_out": [{"topic": self._topic, "format": "data/json"},
-                                {"topic": self._direction_topic, "format": "data/json"}]}
-        if action == "info":
-            with self._direction_lock:
-                direction = {"state": "idle" if not self._running else "no_event"}
-                if self._running and self._last_direction_event is not None:
-                    age_ms = max(0, int((time.monotonic() - self._last_direction_monotonic) * 1000))
-                    direction = {"state": "fresh" if age_ms < self._DIRECTION_FRESH_SECONDS * 1000 else "stale",
-                                 "age_ms": age_ms}
-                    if direction["state"] == "fresh":
-                        direction.update(self._last_direction_event)
-                result["sound_direction"] = direction
-        return result
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

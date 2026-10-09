@@ -68,6 +68,7 @@ COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
+COPY sound_direction.py /work/sound_direction.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

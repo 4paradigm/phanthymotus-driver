@@ -124,6 +124,9 @@ class MediaController {
         // 获取当前所有唤醒词
         std::string get_wakeup_words();
 
+        // 追加自定义唤醒词；底层库已提供该接口。
+        bool add_wakeup_words(const std::string &words);
+
         //=========================================================
         // Audio Stream
         //=========================================================
