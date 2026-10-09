@@ -23,7 +23,9 @@ One-time setup on Bumi EDU:
 
 Each calibration temporarily pauses the mic audio stream, collects fresh
 eight-channel audio for two seconds, then resumes the stream. If too few new
-frames arrive, it returns `no_voice` and does not save that direction.
+frames arrive, or a basic voice-spectrum check rejects the audio, it returns
+`no_voice` and does not save that direction. This check is not speech recognition;
+verify the result with a person at known positions.
 
 Calibration is stored under `/opt/phanthy-motus/data/bumi/` and survives a
 driver restart. The first four channels of the SDK's eight-channel capture are
@@ -37,6 +39,9 @@ identify which wake word caused it. Thus an event cannot truthfully claim that
 “小范小范” was the recognized word, and simultaneous speakers may cause an
 ambiguous or wrong direction. Confirm the phrase, angle convention, and
 performance on the actual robot before using the angle for motion.
+The bundled SDK exposes only current-status polling. The driver checks as
+often as the capture loop permits, but a wake status that appears and disappears
+between checks can still be missed.
 
 ## App 图传与 Phanthy Camera Card
 

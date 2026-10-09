@@ -7,6 +7,8 @@ import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
+
 
 def _load_device(monkeypatch):
     class Node:
@@ -114,7 +116,8 @@ def test_concurrent_calibrations_keep_both_directions(monkeypatch, tmp_path):
     path = tmp_path / "calibration.json"
     monkeypatch.setattr(module, "_MIC_DIRECTION_CALIBRATION", path)
     monkeypatch.setitem(sys.modules, "sound_direction", types.SimpleNamespace(
-        estimate_signature=lambda audio, channels, rate: (1.0, 2.0, 3.0)))
+        estimate_signature=lambda audio, channels, rate: (1.0, 2.0, 3.0),
+        is_voiced_audio=lambda audio, channels, rate: True))
     clock = threading.local()
 
     def monotonic():
@@ -201,7 +204,8 @@ def test_calibration_rejects_repeated_capture_frames(monkeypatch, tmp_path):
     path = tmp_path / "calibration.json"
     monkeypatch.setattr(module, "_MIC_DIRECTION_CALIBRATION", path)
     monkeypatch.setitem(sys.modules, "sound_direction", types.SimpleNamespace(
-        estimate_signature=lambda audio, channels, rate: (1.0, 2.0, 3.0)))
+        estimate_signature=lambda audio, channels, rate: (1.0, 2.0, 3.0),
+        is_voiced_audio=lambda audio, channels, rate: True))
     ticks = [0.0]
     sleeps = []
 
@@ -249,3 +253,60 @@ def test_calibration_rejects_repeated_capture_frames(monkeypatch, tmp_path):
     assert events[-1] == "spawn"
     assert sleeps
     assert not path.exists()
+
+
+def test_calibration_does_not_save_coherent_noise(monkeypatch, tmp_path):
+    module, _ = _load_device(monkeypatch)
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    path = tmp_path / "calibration.json"
+    monkeypatch.setattr(module, "_MIC_DIRECTION_CALIBRATION", path)
+    rng = np.random.default_rng(37)
+    source = rng.normal(0, 800, 32000).astype(np.int16)
+    channels = [np.roll(source, shift) for shift in (0, 2, -3, 1)]
+    channels.extend([np.zeros_like(source) for _ in range(4)])
+    frames = iter(np.stack(channels, axis=1).reshape(-1, 1280))
+    ticks = [0.0]
+
+    def monotonic():
+        ticks[0] += 0.01
+        return ticks[0]
+
+    monkeypatch.setattr(module, "time", types.SimpleNamespace(
+        monotonic=monotonic, sleep=lambda seconds: None))
+
+    def capture():
+        frame = next(frames, [])
+        return types.SimpleNamespace(channels=8, sample_rate=16000,
+                                     audio_data=frame.tolist() if len(frame) else [])
+
+    executor = types.SimpleNamespace(add_node=lambda node: None)
+    card = module.MicPlugin({}, "robot", executor, types.SimpleNamespace(
+        get_audio_capture_data=capture))
+
+    assert card.dispatch("calibrate_front", {})["state"] == "no_voice"
+    assert not path.exists()
+
+
+def test_wake_status_sampling_catches_short_separate_updates(monkeypatch):
+    module, _ = _load_device(monkeypatch)
+
+    def status(reason, message_id):
+        return types.SimpleNamespace(
+            reason=types.SimpleNamespace(name=reason),
+            header=types.SimpleNamespace(message_id=message_id,
+                                         timestamp_us=message_id * 1000))
+
+    statuses = iter((status("CMD_SLEEPED", 1), status("AUDIO_WAKEUPED", 2),
+                     status("CMD_SLEEPED", 3), status("AUDIO_WAKEUPED", 4),
+                     status("AUDIO_WAKEUPED", 4)))
+    media = types.SimpleNamespace(get_system_status=lambda: next(statuses))
+    next_poll = 0.0
+    last_key = None
+    detected = []
+    for now in (0.0, 0.01, 0.02, 0.03, 0.04):
+        next_poll, last_key, event = module._poll_mic_wake_status(
+            media, now, next_poll, last_key)
+        if event is not None:
+            detected.append(event)
+
+    assert detected == [(2, 2000), (4, 4000)]

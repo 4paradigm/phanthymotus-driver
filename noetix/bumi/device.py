@@ -925,6 +925,16 @@ class LocoPlugin:
 
 # ── MicPlugin (sensor, subprocess) ────────────────────────────────────────────
 
+def _poll_mic_wake_status(media_ctrl, now, next_poll, last_key):
+    if now < next_poll:
+        return next_poll, last_key, None
+    status = media_ctrl.get_system_status()
+    reason = getattr(status.reason, "name", str(status.reason).rsplit(".", 1)[-1])
+    key = (status.header.message_id, status.header.timestamp_us)
+    event = key if reason == "AUDIO_WAKEUPED" and key != last_key else None
+    return now + 0.005, event or last_key, event
+
+
 def _mic_subprocess(namespace: str):
     """Mic capture subprocess — polls MediaController, publishes AudioChunk."""
     # A fresh interpreter does not inherit the parent's atomic log writer.
@@ -982,36 +992,29 @@ def _mic_subprocess(namespace: str):
 
     while True:
         try:
-            if _time.monotonic() >= next_status_poll:
-                next_status_poll = _time.monotonic() + 0.1
-                status = media_ctrl.get_system_status()
-                reason = getattr(status.reason, "name", str(status.reason).rsplit(".", 1)[-1])
-                wake_key = (status.header.message_id, status.header.timestamp_us)
-                if reason == "AUDIO_WAKEUPED" and wake_key != last_wake_key:
-                    last_wake_key = wake_key
-                    signature = estimate_signature(
-                        _np.concatenate(recent_audio) if recent_audio else [], 8, 16000)
-                    try:
-                        calibration = json.loads(_MIC_DIRECTION_CALIBRATION.read_text())
-                    except (FileNotFoundError, ValueError):
-                        calibration = {}
-                    angle = None
-                    if signature is not None and {"front", "right"} <= calibration.keys():
-                        angle = estimate_angle(
-                            signature, calibration["front"], calibration["right"])
-                    state = "fresh" if angle is not None else (
-                        "uncalibrated" if len(calibration) < 2 else "ambiguous")
-                    direction = {"state": state, "trigger": "vendor_audio_wakeup",
-                                 "timestamp_ms": int(_time.time() * 1000)}
-                    if angle is not None:
-                        direction.update({"angle": angle, "unit": "deg",
-                                          "reference": "robot_front_clockwise"})
-                    direction_msg = String()
-                    direction_msg.data = json.dumps(direction, ensure_ascii=False)
-                    direction_pub.publish(direction_msg)
-                elif reason != "AUDIO_WAKEUPED":
-                    last_wake_key = None
-
+            next_status_poll, last_wake_key, wake_key = _poll_mic_wake_status(
+                media_ctrl, _time.monotonic(), next_status_poll, last_wake_key)
+            if wake_key is not None:
+                signature = estimate_signature(
+                    _np.concatenate(recent_audio) if recent_audio else [], 8, 16000)
+                try:
+                    calibration = json.loads(_MIC_DIRECTION_CALIBRATION.read_text())
+                except (FileNotFoundError, ValueError):
+                    calibration = {}
+                angle = None
+                if signature is not None and {"front", "right"} <= calibration.keys():
+                    angle = estimate_angle(
+                        signature, calibration["front"], calibration["right"])
+                state = "fresh" if angle is not None else (
+                    "uncalibrated" if len(calibration) < 2 else "ambiguous")
+                direction = {"state": state, "trigger": "vendor_audio_wakeup",
+                             "timestamp_ms": int(_time.time() * 1000)}
+                if angle is not None:
+                    direction.update({"angle": angle, "unit": "deg",
+                                      "reference": "robot_front_clockwise"})
+                direction_msg = String()
+                direction_msg.data = json.dumps(direction, ensure_ascii=False)
+                direction_pub.publish(direction_msg)
             audio = media_ctrl.get_audio_capture_data()
             if audio.channels == 0 or len(audio.audio_data) == 0:
                 _time.sleep(0.005)
@@ -1111,7 +1114,7 @@ class MicPlugin:
 
     def _calibrate(self, direction: str) -> dict:
         import numpy as np
-        from sound_direction import estimate_signature
+        from sound_direction import estimate_signature, is_voiced_audio
 
         # 标定期间暂停唯一的采集进程，再从 SDK 读取有节奏的新音频。
         with self._calibration_lock, self._process_lock:
@@ -1134,7 +1137,10 @@ class MicPlugin:
                     time.sleep(0.005)
                 if sample_count < 16000:
                     return {"state": "no_voice", "message": "未采到足够的新音频，请靠近机器人重试"}
-                signature = estimate_signature(np.concatenate(frames), 8, 16000)
+                captured = np.concatenate(frames)
+                if not is_voiced_audio(captured, 8, 16000):
+                    return {"state": "no_voice", "message": "未采到清晰人声，请靠近机器人重试"}
+                signature = estimate_signature(captured, 8, 16000)
                 if signature is None:
                     return {"state": "no_voice", "message": "未采到可用于标定的声音，请靠近机器人重试"}
                 try:

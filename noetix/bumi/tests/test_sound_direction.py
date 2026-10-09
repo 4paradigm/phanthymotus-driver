@@ -5,7 +5,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sound_direction import estimate_angle, estimate_signature
+from sound_direction import estimate_angle, estimate_signature, is_voiced_audio
 
 
 def test_estimate_signature_uses_interleaved_head_microphones():
@@ -58,3 +58,24 @@ def test_estimate_signature_resolves_subsample_delays():
 
     assert signature is not None
     assert np.allclose(signature, shifts[1:], atol=0.35)
+
+
+def test_calibration_voice_check_rejects_coherent_noise_and_tone():
+    rng = np.random.default_rng(31)
+    t = np.arange(32000) / 16000
+    speech_like = (400 + 500 * np.sin(2 * np.pi * 2 * t) ** 2) * sum(
+        np.sin(2 * np.pi * 150 * harmonic * t) / harmonic
+        for harmonic in range(1, 9))
+    white_noise = rng.normal(0, 800, len(t))
+    single_tone = 900 * np.sin(2 * np.pi * 500 * t)
+
+    def microphone_audio(source):
+        channels = [np.roll(source.astype(np.int16), shift)
+                    for shift in (0, 2, -3, 1)]
+        channels.extend([np.zeros(len(source), dtype=np.int16) for _ in range(4)])
+        return np.stack(channels, axis=1).reshape(-1)
+
+    assert is_voiced_audio(microphone_audio(speech_like), 8, 16000)
+    assert estimate_signature(microphone_audio(white_noise), 8, 16000) is not None
+    assert not is_voiced_audio(microphone_audio(white_noise), 8, 16000)
+    assert not is_voiced_audio(microphone_audio(single_tone), 8, 16000)
