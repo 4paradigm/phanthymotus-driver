@@ -62,7 +62,6 @@ RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
 # ROS2 domain isolation
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV FASTDDS_BUILTIN_TRANSPORTS=DEFAULT
 
 COPY resource/ /work/resource/
 COPY common/ /work/common/
