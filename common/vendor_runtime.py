@@ -340,6 +340,12 @@ def run_driver(
     ros_cfg = config.get("ros", {})
     port = int(config["mcp_port"])
     robot_domain = int(ros_cfg.get("robot_domain_id", 0))
+    # Zenoh carries the vendor DDS domain through an isolated bridge.  The
+    # driver must subscribe/publish on the bridge-side domain, not keep a
+    # second direct participant on the robot domain (which reintroduces the
+    # Humble/Jazzy large-sample deserialization path).
+    if os.environ.get("A3_ZENOH_BRIDGE") == "1":
+        robot_domain = int(os.environ.get("A3_ZENOH_CORE_DOMAIN", 42))
     core_domain = int(ros_cfg.get("core_domain_id", 42))
     print(f"[bundle] {driver_id} namespace={namespace} domains={robot_domain}->{core_domain} interface={interface} port={port}")
 

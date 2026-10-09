@@ -32,6 +32,8 @@ agibot-a3:
     # Both the robot participant and isolated domain-42 bridge use FastDDS;
     # main.py generates the constrained robot profile before participants exist.
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - A3_ZENOH_BRIDGE=1
+    - A3_ZENOH_CORE_DOMAIN=42
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

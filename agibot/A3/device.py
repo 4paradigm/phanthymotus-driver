@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 import struct
 import threading
 import time
@@ -481,7 +482,7 @@ class A3Nodes:
             self._media_ros_executor = None
             print(f"[media] dedicated executor unavailable: {exc}", flush=True)
         self.core_bridge = None
-        if config.get("ros", {}).get("core_bridge", False):
+        if config.get("ros", {}).get("core_bridge", False) and os.environ.get("A3_ZENOH_BRIDGE") != "1":
             self.core_bridge = CoreBridge()
             self.core_bridge.start()
             atexit.register(self.core_bridge.stop)
