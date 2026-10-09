@@ -118,7 +118,7 @@ def _encode_cloud(msg):
     return out
 
 
-def _media_one(key, topic, msg_type):
+def _media_one(key, topic, msg_type, node=None, publisher=None, callback_group=None):
     """Subscribe and convert one raw stream in one Jazzy process.
 
     Keeping the raw sample inside the callback avoids a second serialization,
@@ -131,11 +131,14 @@ def _media_one(key, topic, msg_type):
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import CompressedImage, Image, PointCloud2
     from std_msgs.msg import UInt8MultiArray
-    rclpy.init()
-    node = Node(f"a3_jazzy_media_relay_{key}")
+    owns_node = node is None
+    if owns_node:
+        rclpy.init()
+        node = Node(f"a3_jazzy_media_relay_{key}")
     output_topic = f"/agibot_a3/{'lidar_cloud' if key == 'lidar_cloud' else 'camera_' + key}"
     output_type = UInt8MultiArray if key == "lidar_cloud" else CompressedImage
-    publisher = node.create_publisher(output_type, output_topic, 1)
+    if publisher is None:
+        publisher = node.create_publisher(output_type, output_topic, 1)
     received = 0
 
     def push(msg):
@@ -152,9 +155,61 @@ def _media_one(key, topic, msg_type):
                 publisher.publish(output)
         except Exception as exc:
             print(f"[relay] input failed key={key}: {type(exc).__name__}: {exc!r}", flush=True)
-    node.create_subscription(msg_type, topic, push, qos_profile_sensor_data)
+    kwargs = {"callback_group": callback_group} if callback_group is not None else {}
+    node.create_subscription(msg_type, topic, push, qos_profile_sensor_data, **kwargs)
     print(f"[relay] Jazzy input ready key={key} topic={output_topic} domain=232", flush=True)
-    rclpy.spin(node)
+    if owns_node:
+        rclpy.spin(node)
+
+
+def _media_all():
+    """One Jazzy participant with concurrent callbacks for all raw streams.
+
+    A participant per camera made the ADU spend most of its CPU in DDS and
+    Python process management.  OpenCV releases the GIL while encoding, so a
+    multi-threaded executor retains parallel conversion without thirteen DDS
+    participants or thirteen interpreter processes.
+    """
+    os.environ["ROS_DOMAIN_ID"] = "232"
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.callback_groups import ReentrantCallbackGroup
+    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+    from sensor_msgs.msg import CompressedImage, Image, PointCloud2
+    from std_msgs.msg import UInt8MultiArray
+
+    rclpy.init()
+    node = Node("a3_jazzy_media_relay")
+    group = ReentrantCallbackGroup()
+    qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
+                     durability=DurabilityPolicy.VOLATILE)
+    for key, topic in CAMERAS.items():
+        output_topic = f"/agibot_a3/camera_{key}"
+        pub = node.create_publisher(CompressedImage, output_topic, qos)
+        def push(msg, stream_key=key, stream_pub=pub):
+            try:
+                output = _encode_image(msg, stream_key)
+                if output is not None:
+                    stream_pub.publish(output)
+            except Exception as exc:
+                print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
+        node.create_subscription(Image, topic, push, qos, callback_group=group)
+        print(f"[relay] Jazzy input ready key={key} topic={output_topic} domain=232", flush=True)
+    lidar_pub = node.create_publisher(UInt8MultiArray, "/agibot_a3/lidar_cloud", qos)
+    def push_lidar(msg):
+        try:
+            output = _encode_cloud(msg)
+            if output is not None:
+                lidar_pub.publish(output)
+        except Exception as exc:
+            print(f"[relay] input failed key=lidar_cloud: {type(exc).__name__}: {exc!r}", flush=True)
+    node.create_subscription(PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud",
+                             push_lidar, qos, callback_group=group)
+    print("[relay] Jazzy input ready key=lidar_cloud topic=/agibot_a3/lidar_cloud domain=232", flush=True)
+    executor = MultiThreadedExecutor(num_threads=8)
+    executor.add_node(node)
+    executor.spin()
 
 
 def _output_one(key, messages):
@@ -196,19 +251,7 @@ def _output_one(key, messages):
 
 
 def main():
-    ctx = mp.get_context("spawn")
-    keys = list(CAMERAS) + ["lidar_cloud"]
-    from sensor_msgs.msg import Image, PointCloud2
-    processes = [ctx.Process(target=_media_one,
-                             args=(key, topic, Image), daemon=True)
-                 for key, topic in CAMERAS.items()]
-    processes.append(ctx.Process(target=_media_one, args=(
-        "lidar_cloud", "/hal/neck_middle_livox_lidar/pointcloud", PointCloud2), daemon=True))
-    for process in processes:
-        process.start()
-    print(f"[relay] started streams={len(processes)} pids={[p.pid for p in processes]}", flush=True)
-    for process in processes:
-        process.join()
+    _media_all()
 
 
 if __name__ == "__main__":
