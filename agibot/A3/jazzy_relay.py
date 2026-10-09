@@ -90,7 +90,7 @@ def _input_one(key, topic, msg_type, queue_out):
     rclpy.init()
     node = Node(f"a3_jazzy_media_relay_input_{key}")
     received = 0
-    def push(key, msg):
+    def push(msg):
         nonlocal received
         try:
             item = (key, serialize_message(msg))
