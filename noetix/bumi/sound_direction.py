@@ -27,7 +27,14 @@ def estimate_signature(audio, channels: int, sample_rate: int):
         nearby = np.concatenate((correlation[-max_lag:], correlation[:max_lag + 1]))
         if np.max(nearby) < 0.12:
             return None
-        delays.append(float(np.argmax(nearby) - max_lag))
+        peak = int(np.argmax(nearby))
+        offset = 0.0
+        if 0 < peak < len(nearby) - 1:
+            left, middle, right = nearby[peak - 1:peak + 2]
+            curvature = left - 2 * middle + right
+            if abs(curvature) > 1e-12:
+                offset = 0.5 * (left - right) / curvature
+        delays.append(float(peak + offset - max_lag))
     return tuple(delays)
 
 

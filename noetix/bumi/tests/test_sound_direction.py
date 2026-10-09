@@ -43,3 +43,18 @@ def test_unrelated_loud_sounds_do_not_look_like_one_source():
     unrelated = rng.normal(0, 2000, (4096, 8)).astype(np.int16)
 
     assert estimate_signature(unrelated.reshape(-1), 8, 16000) is None
+
+
+def test_estimate_signature_resolves_subsample_delays():
+    rng = np.random.default_rng(19)
+    source = rng.normal(0, 2000, 4096)
+    shifts = (0.0, 1.5, -2.25, 0.75)
+    channels = [np.fft.irfft(
+        np.fft.rfft(source) * np.exp(-2j * np.pi * np.fft.rfftfreq(len(source)) * shift),
+        n=len(source)).astype(np.int16) for shift in shifts]
+    channels.extend([np.zeros(len(source), dtype=np.int16) for _ in range(4)])
+
+    signature = estimate_signature(np.stack(channels, axis=1).reshape(-1), 8, 16000)
+
+    assert signature is not None
+    assert np.allclose(signature, shifts[1:], atol=0.35)
