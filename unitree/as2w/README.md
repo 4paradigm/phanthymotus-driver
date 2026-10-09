@@ -115,3 +115,91 @@ image receives only the generated `/as2w_ws/install` overlay and validates an
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, RPC correlation, and full-size
 low-state arrays.
+
+## Visual navigation with ActuCore
+
+`loco_servo` accepts the shared `motus.control/1` body twist stream from
+ActuCore `navi`. This enables visual-object approach using the existing VOP
+and `visual_depth` cards without installing `unitree_slam`. The navigation
+policy remains in the main project's ActuCore component; this driver supplies
+the AS2W control adapter. `controlled_spatial` retains its vendor-SLAM role.
+
+Connect the same front camera to VOP and Visual Depth, both processors to
+`navi`, `loco_state`'s **state/odom** output to `navi`, and `navi`'s
+**control/velocity** output to `loco_servo`. Use the complete depth image
+(`image/depth-zlib`), not just the three-band summary. The optional original
+camera input to `navi` supplies the debugging overlay. These are local visual
+targets, not map coordinates or global path planning.
+
+The default is **dry_run=true**: starting a wired card validates the stream
+without sending motion. Bundle startup alone never subscribes to a control
+topic. After inspecting `info`, explicitly pause, configure `dry_run=false`,
+then resume for supervised low-speed commissioning. Each real start/resume
+acquires the chassis, requests `StopMove`, checks the controller posture and
+accepts only frames generated after the new start epoch. It never stands the
+robot up or changes its gait implicitly. Use `loco.stop_move` before handing
+over from a previous direct locomotion command.
+
+Default commissioning ceilings are 0.30 m/s forward, 0.20 m/s lateral and
+0.50 rad/s yaw. These are software limits, not measured AS2W capabilities.
+The `plugins.loco_servo` YAML configuration accepts `vx_limit`, `vy_limit`,
+`wz_limit`, `expected_hz`, `watchdog_ms`, `max_obs_age_ms`,
+`linear_acceleration`, `angular_acceleration` and a measured/vendor-specified
+`footprint`. Runtime canvas configuration exposes `dry_run` and `rotate_only`;
+entering dry run first stops real motion. Limits are immutable for a running
+driver so the descriptor cannot change underneath an existing navigator.
+
+The ROS callback performs bounded validation and replaces a single pending
+frame. One worker owns SDK writes, enforces time-based acceleration and
+processes stops before queued motion. Short-timeout SDK processes isolate
+velocity, state queries and the fallback stop path from legacy multi-second
+RPCs. A timed-out velocity process is terminated and cannot queue later
+commands; an RPC already delivered to firmware cannot be retracted by Python.
+The driver refuses legacy writes while the servo owns the chassis, including
+late finalizers from old locomotion workers. Explicit canvas locomotion and
+special-motion requests first wait for the servo's stop acknowledgement.
+
+Expired/invalid streams do not refresh the watchdog. Stream loss pauses the
+card and requires an explicit resume; it never automatically replays an old
+goal's velocity. SDK rejection or a failed stop latches a fault and prevents
+further nonzero commands. `reset_fault` retries stopping, clears a successful
+software fault and leaves the card paused; a terminated RPC process requires
+a driver restart. After changing a navigation goal following a stop/arrival,
+resume `loco_servo` as well as the navigator when the receiver is paused.
+
+`info` separates received/validated/simulated frames, SDK attempts, SDK
+acceptances and errors. `stop_acknowledged` only means the SDK accepted the
+request. `physical_stop_verified` remains unknown unless fresh body-frame
+vx/vy/wz measurements confirm rest over several samples. A configured
+watchdog threshold is not a guaranteed physical stopping time: scheduling,
+RPC latency, braking and firmware behaviour after host/link failure must be
+measured on the actual robot. The receiver itself does not detect obstacles.
+
+`loco_state` preserves its original raw JSON output and additionally publishes
+`motus.odom/1` at `/<namespace>/state/odom`. By default all motion axes are
+null. After checking frame, units and signs, configure
+`plugins.state.odom.frame`, `verified_axes` and `verified_on`; only the
+explicitly verified axes become measurements. No global pose is inferred
+from the vendor's position fields. Timestamp provenance and sample freshness
+are exposed in `info`; republishing does not renew the measurement timestamp.
+
+The camera declares `motus.camera/1` with stable ID
+`unitree/as2w/camera_front`. Lens geometry remains unknown until supplied
+under `plugins.camera.camera_info`; no R1 calibration is borrowed. Continue
+using the existing Visual Depth model, accounting for its distance error
+when selecting clearance, speed and stopping distance. Missing geometry,
+partial odometry, and optical/depth error remain explicit commissioning
+limitations, not implicit guarantees of obstacle clearance.
+
+Run the navigation regressions separately from SDK-stubbing tests for other
+robot models:
+
+```bash
+python3 -m unittest unitree/as2w/test_driver.py
+python3 -m unittest unitree/as2w/test_loco_servo.py
+python3 -m unittest unitree/as2w/test_navigation_integration.py
+```
+
+The extra Dockerfile COPY entries package only the Python navigation adapter
+and metadata helpers. They introduce no additional system/pip dependency and
+preserve the existing DDS isolation and service deployment configuration.

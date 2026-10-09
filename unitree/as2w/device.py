@@ -1,4 +1,5 @@
 """Unitree As2W driver plugins (official AS2 SDK SportClient)."""
+import copy
 import json
 import math
 import threading
@@ -9,6 +10,13 @@ from std_msgs.msg import String
 from unitree_sdk2py.core.channel import ChannelSubscriber
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_, LowState_
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
+
+try:
+    from odom_specs import OdomAdapter
+except ModuleNotFoundError as exc:
+    if exc.name != "odom_specs":
+        raise
+    from unitree.as2w.odom_specs import OdomAdapter
 
 
 _LOW_LAT_QOS = None
@@ -59,14 +67,16 @@ def _acp_notify(action_id, status, result, tool="loco"):
 
 
 class _StateNode:
-    def __init__(self, namespace, executor):
+    def __init__(self, namespace, executor, odom_config=None):
         from rclpy.node import Node
+        self._odom_adapter = OdomAdapter(odom_config)
         self.node = Node("as2w_state")
         self.imu = self.node.create_publisher(String, f"/{namespace}/state/imu", _LOW_LAT_QOS or 1)
         self.joints = self.node.create_publisher(String, f"/{namespace}/state/joints", _LOW_LAT_QOS or 1)
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", _LOW_LAT_QOS or 1)
         self.battery = self.node.create_publisher(String, f"/{namespace}/state/battery", _LOW_LAT_QOS or 1)
         self.loco = self.node.create_publisher(String, f"/{namespace}/loco/state", _LOW_LAT_QOS or 1)
+        self.odom = self.node.create_publisher(String, f"/{namespace}/state/odom", _LOW_LAT_QOS or 1)
         self._low = ChannelSubscriber("rt/lowstate", LowState_)
         self._bms = ChannelSubscriber("rt/lf/bmsstate", BmsState_)
         # AS2/As2W's official sport-state example uses the lf namespace.
@@ -80,6 +90,9 @@ class _StateNode:
         self._latest_low = None
         self._latest_bms = None
         self._latest_sport = None
+        self._latest_sport_received_ms = None
+        self._latest_sport_received_monotonic = None
+        self._last_odom_sample = None
         self._low_generation = 0
         self._bms_generation = 0
         self._sport_generation = 0
@@ -126,6 +139,7 @@ class _StateNode:
                 low = self._latest_low
                 bms = self._latest_bms
                 sport = self._latest_sport
+                sport_received_ms = self._latest_sport_received_ms
                 low_generation = self._low_generation
                 bms_generation = self._bms_generation
                 sport_generation = self._sport_generation
@@ -136,7 +150,7 @@ class _StateNode:
                 self._publish_bms(bms)
                 self._published_bms_generation = bms_generation
             if sport is not None and sport_generation != self._published_sport_generation:
-                self._publish_sport(sport)
+                self._publish_sport(sport, received_ms=sport_received_ms)
                 self._published_sport_generation = sport_generation
             self._stop_event.wait(wait_for)
 
@@ -207,22 +221,60 @@ class _StateNode:
         self._publish(self.battery, battery)
 
     def _on_sport(self, msg):
+        # Timestamp at DDS receipt, not when the publisher thread gets CPU.
+        # Otherwise a queued old sample would look like a current measurement.
+        received_ms = int(time.time() * 1000)
+        received_monotonic = time.monotonic()
         latest_lock = getattr(self, "_latest_lock", None)
         if latest_lock is None:
-            self._publish_sport(msg)
+            self._publish_sport(msg, received_ms=received_ms)
             return
         with latest_lock:
             self._latest_sport = msg
+            self._latest_sport_received_ms = received_ms
+            self._latest_sport_received_monotonic = received_monotonic
             self._sport_generation += 1
         if getattr(self, "_publisher_thread", None) is None:
-            self._publish_sport(msg)
+            self._publish_sport(msg, received_ms=received_ms)
 
-    def _publish_sport(self, msg):
+    def _publish_sport(self, msg, received_ms=None):
         loco = {"mode": int(getattr(msg, "mode", 0)),
                 "body_height": _number(getattr(msg, "body_height", 0))}
         loco.update(self._flat("velocity", getattr(msg, "velocity", [])))
         loco.update(self._flat("position", getattr(msg, "position", [])))
         self._publish(self.loco, loco)
+        # Retain the established raw topic. This second port is the explicit
+        # contract for consumers that compare commanded and measured motion.
+        if getattr(self, "odom", None) is not None:
+            sample = self._odom_adapter.sample(
+                msg, received_ms=(int(time.time() * 1000)
+                                  if received_ms is None else received_ms))
+            self._publish(self.odom, sample)
+            with self._latest_lock:
+                self._last_odom_sample = sample
+
+    def odom_status(self):
+        with self._latest_lock:
+            sample = self._last_odom_sample
+            received_at = self._latest_sport_received_monotonic
+            received_samples = self._sport_generation
+        age_ms = (int(time.time() * 1000) - sample["stamp_ms"]
+                  if sample is not None else None)
+        receive_age_ms = (max(0, int((time.monotonic() - received_at) * 1000))
+                          if received_at is not None else None)
+        fresh = (age_ms is not None and receive_age_ms is not None
+                 and 0 <= age_ms <= self._odom_adapter.max_age_ms
+                 and receive_age_ms <= self._odom_adapter.max_age_ms)
+        return {"received_samples": received_samples,
+                "sample_age_ms": age_ms, "receive_age_ms": receive_age_ms,
+                "fresh": fresh, "max_age_ms": self._odom_adapter.max_age_ms,
+                "stamp_source": (sample["vendor"]["stamp_source"]
+                                 if sample is not None else None)}
+
+    def odom_snapshot(self):
+        """Return a detached sample without renewing its measurement stamp."""
+        with self._latest_lock:
+            return copy.deepcopy(self._last_odom_sample)
 
 
 class StatePlugin:
@@ -230,22 +282,50 @@ class StatePlugin:
     def __init__(self, config, namespace, executor):
         self._namespace = namespace
         self._executor = executor
-        self._state = _StateNode(namespace, executor)
+        self._odom_config = config.get("odom", {})
+        self._odom_adapter = OdomAdapter(self._odom_config)
+        self._state = self._create_node()
+
+    def _create_node(self):
+        config = getattr(self, "_odom_config", {})
+        if config:
+            return _StateNode(self._namespace, self._executor, odom_config=config)
+        return _StateNode(self._namespace, self._executor)
+
+    def _odom_interface(self):
+        adapter = getattr(self, "_odom_adapter", None) or OdomAdapter()
+        return adapter.interface(publish_hz=_STATE_PUBLISH_HZ)
+
+    def odom_snapshot(self):
+        # A concurrent stop may clear self._state; retain one local reference.
+        state = self._state
+        return state.odom_snapshot() if state is not None else None
+
     def get_tools(self):
         specs = (("imu", "state/imu", "data/json", "As2W IMU state"),
                  ("joints", "state/joints", "sensor/skeleton", "As2W 12-joint leg skeleton for model animation"),
                  ("joint_state", "state/joint_state", "data/json", "As2W raw motor position, velocity, torque, and temperature"),
                  ("battery", "state/battery", "data/json", "As2W BMS state; current_ma is mA"),
                  ("loco_state", "loco/state", "data/json", "As2W high-level locomotion state"))
-        return [{"name": name, "type": "sensor", "multiInstance": False, "description": desc,
-                 "inputSchema": {"type": "object", "properties": {}},
-                 "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
-                for name, path, fmt, desc in specs]
+        tools = []
+        for name, path, fmt, desc in specs:
+            tool = {"name": name, "type": "sensor", "multiInstance": False,
+                    "description": desc,
+                    "inputSchema": {"type": "object", "properties": {}},
+                    "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
+            if name == "loco_state":
+                tool["topic_out"].append(
+                    {"topic": f"/{self._namespace}/state/odom", "format": "state/odom"})
+                tool["odom_interface"] = self._odom_interface()
+                tool["description"] += (
+                    "; also motus.odom/1. Unverified velocity axes are null; no pose is claimed")
+            tools.append(tool)
+        return tools
     def start(self):
         # Sensor cards share one LowState subscription.  Recreate it when a
         # dashboard stopped the card instead of claiming a dead stream is live.
         if self._state is None:
-            self._state = _StateNode(self._namespace, self._executor)
+            self._state = self._create_node()
 
     def stop(self):
         if self._state is not None:
@@ -258,22 +338,23 @@ class StatePlugin:
         if action == "stop":
             self.stop()
             return {"state": "idle"}
-        if action == "info":
-            name = args.get("_tool_name")
-            paths = {"imu": ("state/imu", "data/json"),
-                     "joints": ("state/joints", "sensor/skeleton"),
-                     "joint_state": ("state/joint_state", "data/json"),
-                     "battery": ("state/battery", "data/json"),
-                     "loco_state": ("loco/state", "data/json")}
-            if name in paths:
-                path, fmt = paths[name]
-                return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
-            return {"state": "running"}
-        if action in ("imu", "joints", "joint_state", "battery", "loco_state"):
-            path = {"imu": "state/imu", "joints": "state/joints", "joint_state": "state/joint_state", "battery": "state/battery", "loco_state": "loco/state"}[action]
-            fmt = "sensor/skeleton" if action == "joints" else "data/json"
-            return {"state": "running", "topic_out": [{"topic": f"/{self._namespace}/{path}", "format": fmt}]}
-        return {"state": "running"} if action == "info" else None
+        if action == "info" or action in ("imu", "joints", "joint_state", "battery", "loco_state"):
+            name = args.get("_tool_name") if action == "info" else action
+            state = getattr(self, "_state", True)
+            result = {"state": "running" if state is not None else "idle"}
+            tool = next((t for t in self.get_tools() if t["name"] == name), None)
+            if tool is not None:
+                result["topic_out"] = tool["topic_out"]
+            if name == "loco_state":
+                result["odom_interface"] = self._odom_interface()
+                result["odom_status"] = (state.odom_status()
+                    if hasattr(state, "odom_status") else {
+                        "received_samples": 0, "sample_age_ms": None,
+                        "receive_age_ms": None, "fresh": False,
+                        "max_age_ms": self._odom_interface()["vendor"]["max_age_ms"],
+                        "stamp_source": None})
+            return result
+        return None
 
 
 class LocoPlugin:
@@ -283,6 +364,13 @@ class LocoPlugin:
         self._lock = threading.Lock()
         self._stop = None
         self._transition_stop = None
+
+    def is_moving(self):
+        with self._lock:
+            active = any(event is not None and not event.is_set()
+                         for event in (self._stop, self._transition_stop))
+        checker = getattr(self.proxy, "legacy_motion_active", None)
+        return active or (bool(checker()) if callable(checker) else False)
 
     _STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING",
                  "AI_STAND_UP", "AI_BALANCE_STAND", "AI_RECOVERY_STAND"}
@@ -840,6 +928,10 @@ class SpecialMotionPlugin:
         self._state_lock = threading.Lock()
         self._motion_lock = threading.Lock()
         self._motion_generation = 0
+
+    def is_moving(self):
+        with self._state_lock:
+            return self._motion_lock.locked() or self._active_posture is not None
 
     def get_tool(self):
         actions = ["front_flip", "back_flip", "handstand", "biped_stand"]

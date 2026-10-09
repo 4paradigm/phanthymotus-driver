@@ -124,6 +124,7 @@ class Bundle:
         from slam_mapping import SlamMappingPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
+        self._servo = None
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
         if p.get("special_motion", {}).get("enabled", True): self.plugins.append(SpecialMotionPlugin(p.get("special_motion", {}), namespace, executor, proxy))
@@ -134,10 +135,32 @@ class Bundle:
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
         if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
+        if dds_ready and p.get("loco_servo", {}).get("enabled", False):
+            from loco_servo import LocoServoPlugin
+            loco = next((item for item in self.plugins if isinstance(item, LocoPlugin)), None)
+            state = next((item for item in self.plugins if isinstance(item, StatePlugin)), None)
+            special = next((item for item in self.plugins if isinstance(item, SpecialMotionPlugin)), None)
+            client = proxy.create_control_client()
+            def conflict():
+                if loco is not None and loco.is_moving():
+                    return "loco motion is active; stop it before resuming navigation"
+                if special is not None and special.is_moving():
+                    return "special motion is active; exit it before navigation"
+                return None
+            client.conflict_check = conflict
+            self._servo = LocoServoPlugin(
+                p.get("loco_servo", {}), namespace, executor, client,
+                loco_plugin=loco,
+                odom_provider=state.odom_snapshot if state is not None else None)
+            self.plugins.append(self._servo)
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):
-        for plugin in self.plugins: plugin.stop()
+        if self._servo is not None:
+            self._servo.stop()
+        for plugin in self.plugins:
+            if plugin is not self._servo:
+                plugin.stop()
     def tools(self):
         out = [
             {"name": "model", "type": "resource", "description": "Unitree As2W wheel-legged robot URDF model", "inputSchema": {"type": "object", "properties": {}}},
@@ -150,7 +173,16 @@ class Bundle:
         for plugin in self.plugins:
             defs = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
             if any(item["name"] == name for item in defs):
-                return plugin.dispatch(args.pop("action", name), {**args, "_tool_name": name})
+                action = args.get("action", name)
+                if (self._servo is not None
+                        and name in ("loco", "special_motion", "controlled_spatial")
+                        and action not in ("start", "info", "get_state", "config")):
+                    halted = self._servo.pause_for_explicit_command(f"{name}.{action}")
+                    if not halted.get("ok"):
+                        return {"ret": 3104, "accepted": False,
+                                "error": "Navigation has not acknowledged stopping",
+                                "navigation_stop": halted}
+                return plugin.dispatch(action, {**{k: v for k, v in args.items() if k != "action"}, "_tool_name": name})
         return None
 
 def handler(bundle):

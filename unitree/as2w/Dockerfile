@@ -39,6 +39,8 @@ RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
     python3 -c "from audio_msgs.msg import AudioChunk"'
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
 COPY main.py device.py multimedia.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
+# Navigation adapters are pure Python; no extra runtime dependency or base image.
+COPY loco_servo.py as2w_control.py odom_specs.py camera_specs.py /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY deploy/ /deploy/

@@ -24,6 +24,13 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
 
+try:
+    from camera_specs import jpeg_dimensions
+except ModuleNotFoundError as exc:
+    if exc.name != "camera_specs":
+        raise
+    from unitree.as2w.camera_specs import jpeg_dimensions
+
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1136,6 +1143,8 @@ def _camera_process(
         "captured_bytes": 0,
         "queue_drops": 0,
         "last_frame_ts": 0.0,
+        "frame_width": None,
+        "frame_height": None,
         "last_error": "",
         "capture_started_ts": 0.0,
         "publish_started_ts": 0.0,
@@ -1168,6 +1177,8 @@ def _camera_process(
                 "ok": metrics["state"] != "error",
                 "state": metrics["state"],
                 "frames": published,
+                "frame_width": metrics["frame_width"],
+                "frame_height": metrics["frame_height"],
                 "capture_frames": captures,
                 "capture_fps": captures / capture_elapsed if capture_elapsed else 0.0,
                 "publish_fps": published / publish_elapsed if publish_elapsed else 0.0,
@@ -1230,6 +1241,7 @@ def _camera_process(
             # buffer-compatible array assignment is about three orders faster
             # for the approximately 300 KB frames returned by videohub.
             message.data = array("B", frame)
+            dimensions = jpeg_dimensions(frame)
             build_ms = (time.monotonic() - build_started) * 1000.0
             publish_started = time.monotonic()
             publisher.publish(message)
@@ -1240,6 +1252,10 @@ def _camera_process(
                 if not metrics["publish_started_ts"]:
                     metrics["publish_started_ts"] = finished_at
                 metrics["last_frame_ts"] = finished_at
+                # These dimensions describe the published JPEG. They do not
+                # establish intrinsics, distortion, or field of view.
+                metrics["frame_width"] = dimensions[0] if dimensions else None
+                metrics["frame_height"] = dimensions[1] if dimensions else None
                 metrics["state"] = "running"
                 metrics["last_error"] = ""
                 metrics["build_total_ms"] += build_ms
@@ -1287,6 +1303,8 @@ def _camera_process(
                         metrics["state"] = "starting"
                         metrics["frames"] = 0
                         metrics["capture_frames"] = 0
+                        metrics["frame_width"] = None
+                        metrics["frame_height"] = None
                         metrics["queue_drops"] = 0
                         metrics["capture_started_ts"] = time.monotonic()
                         metrics["publish_started_ts"] = metrics["capture_started_ts"]
@@ -1463,6 +1481,9 @@ class CameraPlugin:
         if backend != "videohub":
             raise ValueError("As2W camera backend must be videohub")
         self._topic = "/{}/camera/front".format(namespace)
+        self._camera_info_config = config.get("camera_info", {})
+        # Validate declarations before any camera child process is started.
+        self._camera_info()
         self._node = _CameraNode(
             self._topic,
             network_iface,
@@ -1470,6 +1491,18 @@ class CameraPlugin:
             max(0.2, float(config.get("rpc_timeout", 1.0))),
             max(0.2, float(config.get("retry_interval", 2.0))),
         )
+
+    def _camera_info(self, status=None):
+        try:
+            from camera_specs import declare
+        except ModuleNotFoundError as exc:
+            if exc.name != "camera_specs":
+                raise
+            from unitree.as2w.camera_specs import declare
+        if status is not None and "frame_width" in status and "frame_height" in status:
+            self._observed_dimensions = (status["frame_width"], status["frame_height"])
+        return declare(self._topic, getattr(self, "_camera_info_config", {}),
+                       observed_dimensions=getattr(self, "_observed_dimensions", None))
 
     def get_tool(self):
         return {
@@ -1479,6 +1512,7 @@ class CameraPlugin:
             "description": "As2W front camera — JPEG frames from the verified videohub service.",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
+            "camera_info": self._camera_info(),
         }
 
     def start(self):
@@ -1506,6 +1540,7 @@ class CameraPlugin:
                 result["state"] = "running"
             result["topic_out"] = [
                 {"topic": self._topic, "format": "image/jpeg"}]
+            result["camera_info"] = self._camera_info(result)
             return result
         elif action == "stop":
             # Match G1 camera_rgb: stopping intelligent control detaches the
@@ -1515,10 +1550,12 @@ class CameraPlugin:
             result["stream_state"] = result.get("state", "error")
             result["state"] = "idle"
             result["topic_out"] = [{"topic": self._topic, "format": "image/jpeg"}]
+            result["camera_info"] = self._camera_info(result)
             return result
         if action == "info":
             result = self._node.status()
             result["topic_out"] = [
                 {"topic": self._topic, "format": "image/jpeg"}]
+            result["camera_info"] = self._camera_info(result)
             return result
         return None

@@ -3,6 +3,10 @@ robot_interface: auto
 ros_namespace: ""
 plugins:
   loco: {enabled: true}
+  loco_servo:
+    enabled: true
+    # Observe the navigation stream before explicitly enabling physical control.
+    dry_run: true
   special_motion: {enabled: true}
   mic:
     enabled: true
@@ -23,7 +27,13 @@ plugins:
     fps: 10
     rpc_timeout: 1.0
     retry_interval: 2.0
-  state: {enabled: true}
+  state:
+    enabled: true
+    odom:
+      # Unknown axes remain null until their frame/sign/units are verified.
+      frame: body
+      verified_axes: []
+      max_age_ms: 500
   lidar:
     enabled: true
     process: true
