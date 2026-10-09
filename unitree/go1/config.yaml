@@ -10,15 +10,11 @@ plugins:
     enabled: true
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
+  system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
+    enabled: true
+    mqtt_host: "localhost"
+    mqtt_port: 1883
 
-  face_light:                   # 面部灯带颜色(actuator,MQTT):set_color/preset/off
-    enabled: true
-    mqtt_host: "localhost"
-    mqtt_port: 1883
-    system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
-    enabled: true
-    mqtt_host: "localhost"
-    mqtt_port: 1883
   # 相机三卡共用同一 camera.py；每张卡均为 multiInstance，可各自选机位。
   # 同一物理机位的三种流仍互斥：谁先 start 谁占用相机。
   camera_rgb:
@@ -78,7 +74,12 @@ plugins:
     max_integration_dt: 2.0
 
 
-  # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
+  # ── 控制卡（灯光 SDK / 音频适配器 / HighCmd；运动须真机验证量程+安全后上架）──
+  face_light:                   # face_light卡：静态色/逐灯接口/定时灯效，统一 SDK
+    enabled: true
+    backend: "sdk"
+    sdk_exclusive: true
+
   beep:                         # 头部扬声器 beep 动作卡 → Nano beep_adapter.py（:18082 /v1/beep/actions）
     enabled: true
     adapter_host: "192.168.123.13"   # Head Nano IP
