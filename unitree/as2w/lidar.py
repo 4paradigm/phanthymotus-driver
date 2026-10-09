@@ -1,5 +1,6 @@
 """As2W lidar bridge from Unitree DDS PointCloud2 to sensor/pointcloud."""
 import array
+import multiprocessing
 import queue
 import struct
 import threading
@@ -9,6 +10,16 @@ from std_msgs.msg import UInt8MultiArray
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from unitree_sdk2py.core.channel import ChannelSubscriber
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
+try:
+    from lidar_backend import PointCloudBackend
+except ImportError:  # keep the no-hardware contract loader self-contained
+    import importlib.util
+    from pathlib import Path
+    _backend_spec = importlib.util.spec_from_file_location(
+        "as2w_lidar_backend", Path(__file__).with_name("lidar_backend.py"))
+    _backend_module = importlib.util.module_from_spec(_backend_spec)
+    _backend_spec.loader.exec_module(_backend_module)
+    PointCloudBackend = _backend_module.PointCloudBackend
 
 
 # As2W firmware revisions have used different names for the direct lidar
@@ -23,7 +34,8 @@ _SOURCE_TIMEOUT_SECONDS = 1.5
 # A large Livox frame is expensive to decode in Python.  The dashboard has no
 # useful visual benefit from all source points, while a smaller uniform sample
 # makes it substantially more likely that the displayed frame is the latest.
-_MAX_RENDER_POINTS = 12000
+_MAX_RENDER_POINTS = 2000
+_PROCESS_STARTUP_TIMEOUT_SECONDS = 5.0
 # Official As2W URDF JT128 fixed joint: rpy=(-pi, 1.4661, -pi).
 # This maps points from the lidar frame into the As2W base frame.  Keeping the
 # values explicit avoids pulling numpy into the latency-sensitive bridge.
@@ -44,12 +56,13 @@ _LIDAR_QOS = QoSProfile(
 
 
 class _LidarNode:
-    def __init__(self, topic, executor, source_topics=None):
+    def __init__(self, topic, executor, source_topics=None, max_render_points=None):
         from rclpy.node import Node
         self.node = Node("as2w_lidar")
         self.pub = self.node.create_publisher(UInt8MultiArray, topic, _LIDAR_QOS)
         configured = source_topics or _DEFAULT_SOURCE_TOPICS
         self.source_topics = tuple(dict.fromkeys(configured))
+        self.max_render_points = max(256, int(max_render_points or _MAX_RENDER_POINTS))
         self.subs = []
         self._lock = threading.Lock()
         self._active_source = None
@@ -59,6 +72,7 @@ class _LidarNode:
         self._published = 0
         self._dropped = 0
         self._processing_seconds = 0.0
+        self._backend = PointCloudBackend(self.node.get_logger())
         # A live Livox frame can exceed 1 MiB. Do not serialize and publish it
         # from the CycloneDDS callback; that starves the DDS reader and causes
         # the intermittent one-frame behaviour observed on As2W.
@@ -81,8 +95,10 @@ class _LidarNode:
     def _report(self):
         now = time.monotonic()
         with self._lock:
+            timed_out_source = None
             if (self._active_source and
                     now - self._last_seen[self._active_source] > _SOURCE_TIMEOUT_SECONDS):
+                timed_out_source = self._active_source
                 self.node.get_logger().warning(
                     f"As2W lidar source {self._active_source} timed out; waiting for another source")
                 self._active_source = None
@@ -93,6 +109,14 @@ class _LidarNode:
         timing = f"published={published}, dropped={dropped}, avg_convert={processing / published * 1000:.1f}ms" if published else "published=0"
         if active:
             self.node.get_logger().info(f"As2W lidar active source {active}; {summary}; {timing}")
+        elif timed_out_source or any(frames.values()):
+            # A source can publish a burst and then go quiet while the robot
+            # is idle.  That is different from never receiving a cloud; the
+            # old message caused a misleading watchdog alarm after every
+            # burst and hid the actual received/published counters.
+            self.node.get_logger().warning(
+                "As2W lidar sources are currently inactive; "
+                f"last source={timed_out_source or 'none'}; {summary}; {timing}")
         else:
             self.node.get_logger().warning(
                 "As2W lidar has received no PointCloud2 frames. "
@@ -106,7 +130,14 @@ class _LidarNode:
                 continue
             try:
                 start = time.monotonic()
-                data = self._to_xyz(data, point_step, point_count, offsets, endian)
+                data_raw = data
+                render_limit = self.max_render_points if self._backend.kind == "cuda" else min(self.max_render_points, _MAX_RENDER_POINTS)
+                data = self._backend.convert(
+                    data_raw, point_step, point_count, offsets, endian,
+                    render_limit, _JT128_R)
+                if not data:
+                    data = self._to_xyz(data_raw, point_step, point_count, offsets,
+                                        endian, render_limit)
                 if not data:
                     continue
                 # The dashboard renderer intentionally consumes compact XYZ points
@@ -124,7 +155,7 @@ class _LidarNode:
                 self.node.get_logger().warning(f"As2W lidar publish failed; continuing: {exc}")
 
     @staticmethod
-    def _to_xyz(data, point_step, point_count, offsets, endian):
+    def _to_xyz(data, point_step, point_count, offsets, endian, max_points=_MAX_RENDER_POINTS):
         """Extract little-endian compact XYZ for the dashboard renderer.
 
         Unitree's direct cloud uses the standard lidar frame (x forward, y
@@ -138,7 +169,7 @@ class _LidarNode:
             offsets = {"x": 0, "y": 4, "z": 8}
         raw = memoryview(data)
         fmt = ">f" if endian else "<f"
-        count = min(point_count, _MAX_RENDER_POINTS)
+        count = min(point_count, max_points)
         stride = max(1, point_count // count)
         selected = min(count, (point_count + stride - 1) // stride)
         out = bytearray(selected * 12)
@@ -224,37 +255,180 @@ class _LidarNode:
 class LidarPlugin:
     PREFIX = "lidar"
 
-    def __init__(self, config, namespace, executor):
+    def __init__(self, config, namespace, executor, interface=""):
         self.topic = f"/{namespace}/lidar/cloud"
         self._config = config
         self._executor = executor
-        self.node = _LidarNode(self.topic, executor, config.get("source_topics"))
+        self._interface = interface
+        self._process_mode = bool(config.get("process", False))
+        self.node = None
+        self._process = None
+        self._status_reader = None
+        self._process_lock = threading.RLock()
+        self._process_state = "idle"
+        self._process_error = None
+        if getattr(self, "_process_mode", False):
+            self._start_process()
+        else:
+            if "max_render_points" in config:
+                self.node = _LidarNode(self.topic, executor, config.get("source_topics"),
+                                       config.get("max_render_points"))
+            else:
+                self.node = _LidarNode(self.topic, executor, config.get("source_topics"))
+
+    def _start_process(self):
+        with self._process_lock:
+            if not self._dispose_process():
+                self._process_state = "error"
+                self._process_error = "Previous lidar process has not stopped"
+                return
+            self._process_state = "starting"
+            self._process_error = None
+            writer = None
+            try:
+                context = multiprocessing.get_context("spawn")
+                self._status_reader, writer = context.Pipe(duplex=False)
+                self._process = context.Process(
+                    target=_run_lidar_process,
+                    args=(self.topic, self._config.get("source_topics"),
+                          self._config.get("max_render_points"), self._interface, writer),
+                    daemon=True, name="as2w-lidar-process")
+                self._process.start()
+                writer.close()
+                writer = None
+                deadline = time.monotonic() + _PROCESS_STARTUP_TIMEOUT_SECONDS
+                while self._process_state == "starting":
+                    self._check_process()
+                    if self._process_state != "starting":
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._fail_process("Lidar startup timed out waiting for DDS/ROS readiness")
+                        break
+                    self._status_reader.poll(min(0.05, remaining))
+            except Exception as exc:
+                self._fail_process(f"Lidar startup failed: {type(exc).__name__}: {str(exc)[:180]}")
+            finally:
+                if writer is not None:
+                    writer.close()
+
+    def _dispose_process(self):
+        """Close IPC and reap the child; retain its handle if it cannot exit."""
+        reader, self._status_reader = self._status_reader, None
+        if reader is not None:
+            reader.close()
+        process = self._process
+        if process is None:
+            return True
+        try:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1)
+            if process.is_alive():
+                return False
+        except (AssertionError, ValueError):
+            # A failure in Process.start() may leave a never-started handle.
+            pass
+        except OSError:
+            if process.is_alive():
+                return False
+        process.close()
+        self._process = None
+        return True
+
+    def _fail_process(self, error):
+        self._process_state = "error"
+        self._process_error = error
+        if not self._dispose_process():
+            self._process_error += "; child has not exited"
+
+    def _check_process(self):
+        if self._process is None:
+            return
+        try:
+            while self._status_reader is not None and self._status_reader.poll(0):
+                message = self._status_reader.recv()
+                if not isinstance(message, dict):
+                    self._fail_process("Invalid lidar child status")
+                    return
+                if message.get("state") == "ready" and self._process_state == "starting":
+                    self._process_state = "running"
+                elif message.get("state") == "error":
+                    self._fail_process(str(message.get("error", "Lidar child failed"))[:300])
+                    return
+                else:
+                    self._fail_process("Unexpected lidar child status")
+                    return
+        except (EOFError, OSError):
+            self._fail_process("Lidar child closed its status channel")
+            return
+        if not self._process.is_alive():
+            self._fail_process(f"Lidar child exited (code {self._process.exitcode})")
+
+    def _status(self):
+        if getattr(self, "_process_mode", False):
+            with self._process_lock:
+                self._check_process()
+                result = {"state": self._process_state}
+                if self._process_error:
+                    result.update(ret=3104, error=self._process_error)
+        else:
+            result = {"state": "running" if self.node is not None else "idle"}
+        result["topic_out"] = [{"topic": self.topic, "format": "sensor/pointcloud"}]
+        return result
 
     def get_tools(self):
         return [self._cloud_tool()]
 
     def _cloud_tool(self):
         return {"name": "lidar_cloud", "type": "sensor", "multiInstance": False,
-                "description": f"As2W live lidar PointCloud2 passthrough. Binary format [uint32 point_step][uint32 point_count][raw data], published to {self.topic}",
+                "description": f"As2W live lidar stream in an isolated process. Uses CUDA/CuPy when exposed, otherwise CPU fallback; CPU is capped at 2,000 latest points and CUDA may render up to {self._config.get('max_render_points', _MAX_RENDER_POINTS)}. Format [uint32 point_step][uint32 point_count][XYZ float32], published to {self.topic}",
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
 
     def start(self):
-        if self.node is None:
-            self.node = _LidarNode(self.topic, self._executor, self._config.get("source_topics"))
+        if getattr(self, "_process_mode", False):
+            with self._process_lock:
+                self._check_process()
+                if self._process_state != "running":
+                    self._start_process()
+        elif self.node is None:
+            if "max_render_points" in self._config:
+                self.node = _LidarNode(self.topic, self._executor,
+                                       self._config.get("source_topics"),
+                                       self._config.get("max_render_points"))
+            else:
+                self.node = _LidarNode(self.topic, self._executor,
+                                       self._config.get("source_topics"))
+        return self._status()
 
     def stop(self):
-        if self.node is not None:
+        if getattr(self, "_process_mode", False):
+            with self._process_lock:
+                if self._dispose_process():
+                    self._process_state = "idle"
+                    self._process_error = None
+                else:
+                    self._process_state = "error"
+                    self._process_error = "Lidar child has not stopped"
+        elif self.node is not None:
             self.node.close()
             self.node = None
+        return self._status()
 
     def dispatch(self, action, args):
         if action == "start":
-            self.start()
-            return {"state": "running", "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
+            return self.start()
         if action == "stop":
-            self.stop()
-            return {"state": "idle"}
-        if action in ("start", "info", "lidar_cloud"):
-            return {"state": "running", "topic_out": [{"topic": self.topic, "format": "sensor/pointcloud"}]}
+            return self.stop()
+        if action in ("info", "lidar_cloud"):
+            return self._status()
         return None
+
+
+def _run_lidar_process(topic, source_topics, max_render_points, interface, status_writer):
+    from sensor_worker import run_lidar
+    run_lidar(topic, source_topics, max_render_points, interface, status_writer)

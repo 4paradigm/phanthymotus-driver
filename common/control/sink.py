@@ -78,6 +78,7 @@ fake clock on a laptop. See tests/test_control_sink.py.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -159,6 +160,14 @@ class ControlSink:
         wall_clock: `() -> int` Unix 毫秒 —— **只**用来和消息里的 `stamp_ms` /
             `obs_stamp_ms` 比，因为那两个字段是另一个进程按 Unix 纪元打的。
             默认 `_wall_ms`；测试注入。两个时钟不是疏忽，见 `_wall_ms`。
+        strict_stream: opt-in for twist streams. Requires finite, recent
+            observation timestamps, TTL <= watchdog, bounded source/session
+            identities and sequence/priority fields; tracks execution deadlines
+            using the monotonic clock. Zero commands bypass slew to stop.
+        before_apply: optional synchronous vendor gate after shared checks.
+            Exceptions latch and stop. This and ``apply`` may return a dropped
+            or rejected Outcome to cancel an in-flight adapter generation;
+            returning None means success. Callbacks must not queue work.
     """
 
     def __init__(
@@ -171,10 +180,16 @@ class ControlSink:
         escalate_after: int = 5,
         clock=None,
         wall_clock=None,
+        strict_stream: bool = False,
+        before_apply=None,
     ):
         self.descriptor: Descriptor = (
             descriptor if isinstance(descriptor, Descriptor) else parse_descriptor(descriptor)
         )
+        if strict_stream and self.descriptor.mode != "twist":
+            raise ValueError("strict_stream requires a twist descriptor")
+        self._strict_stream = bool(strict_stream)
+        self._before_apply = before_apply
         if escalate_after < 1:
             raise ValueError("escalate_after must be at least 1")
 
@@ -222,57 +237,101 @@ class ControlSink:
         self._watchdog_strikes = 0
         self._last_watchdog_ms: int | None = None
 
+        self._sessions_by_source: dict[str, str] = {}
+        self._minimum_stamp_ms = None
+        self._active_deadline_ms = None
+        self._fault_reason = ""
+        self._last_stop_reason = ""
         self.counters: dict[str, int] = {}
 
     # ── public API ───────────────────────────────────────────────────────────
 
     def submit(self, message: dict) -> Outcome:
-        """Run one command through the chain. Calls `apply` only if it passes."""
+        """Validate and synchronously apply one command.
+
+        ``apply`` must finish the bounded actuator write before returning. A
+        transport queue belongs *before* this method, not inside ``apply``:
+        queued work has not reached the motor and cannot refresh its watchdog.
+        Drivers serialize submit/tick/reset with their one actuator writer.
+        """
         if self._latched:
             return self._count(Outcome(Verdict.ABORTED, "sink is aborted; call reset()"))
 
-        now = self._clock()
-
+        now, wall_now = self._clock(), self._wall_clock()
         outcome = self._check_contract(message)
         if outcome is not None:
             return self._count(outcome)
-
-        outcome = self._check_freshness(message, self._wall_clock())
+        outcome = self._check_freshness(message, wall_now)
         if outcome is not None:
             return self._count(outcome)
-
-        outcome = self._check_arbitration(message, now)
+        outcome = self._check_arbitration(message, now, commit=not self._strict_stream)
         if outcome is not None:
             return self._count(outcome)
 
         values = tuple(float(v) for v in message["values"])
         warnings: list[str] = []
-
-        values, clamped = self._clamp_step(values)
+        # A velocity outside the declared space must not be disguised as a
+        # valid one by the slew clamp (including the three pinned twist axes).
+        if self._strict_stream:
+            outcome = self._check_hard_limits(values, now, bounds_only=True)
+            if outcome is not None:
+                return self._count(outcome)
+        zero = self._strict_stream and not any(values)
+        values, clamped = (values, []) if zero else self._clamp_step(values)
         if clamped:
-            warnings.append(
-                f"step clamped on {len(clamped)} joint(s): {', '.join(clamped)}"
-            )
-
+            warnings.append(f"step clamped on {len(clamped)} joint(s): {', '.join(clamped)}")
         outcome = self._check_hard_limits(values, now)
         if outcome is not None:
             return self._count(outcome)
 
+        # Convert external timestamps into a monotonic deadline once, before
+        # the posture RPC. A wall-clock correction must not extend a command.
+        deadline = None
+        if self._strict_stream:
+            remaining = message["ttl_ms"] - (wall_now - message["stamp_ms"])
+            if self.descriptor.max_obs_age_ms is not None:
+                remaining = min(remaining, self.descriptor.max_obs_age_ms -
+                                (wall_now - message["obs_stamp_ms"]))
+            deadline = now + remaining
         gripper = message.get("gripper")
-        self._apply(values, float(gripper) if gripper is not None else None)
+        try:
+            gripper = float(gripper) if gripper is not None else None
+            if self._before_apply is not None:
+                gate = self._before_apply(values, gripper)
+                if isinstance(gate, Outcome) and not gate.applied:
+                    return self._count(gate)
+        except Exception as exc:
+            return self.abort(f"before_apply failed: {type(exc).__name__}: {exc}")
+
+        if self._strict_stream:
+            outcome = self._check_freshness(message, self._wall_clock(), check_sequence=False)
+            if outcome is not None or self._clock() >= deadline:
+                reason = (outcome.reason if outcome is not None else
+                          "command expired before actuator dispatch")
+                return self.stop(reason)
+        try:
+            applied = self._apply(values, gripper)
+            if isinstance(applied, Outcome) and not applied.applied:
+                return self._count(applied)
+        except Exception as exc:
+            return self.abort(f"apply failed: {type(exc).__name__}: {exc}")
 
         self._last_values = values
         self._last_apply_ms = now
-        self._active = True
+        self._active = not zero
+        self._active_deadline_ms = deadline if not zero else None
+        if self._strict_stream:
+            self._record_source(message, now)
         self._holding = False
-        # A command that passed every check is the evidence the silence is over,
-        # so it is also what ends a stand-down. Cleared here rather than at the
-        # top of submit(): a command that then gets dropped or rejected is not
-        # evidence of anything.
         self._stood_down = False
         self._watchdog_strikes = 0
         self._last_watchdog_ms = None
 
+        # A slow SDK ACK must not keep an already expired velocity alive.
+        if self._strict_stream:
+            expired = self.tick()
+            if expired is not None:
+                return expired
         verdict = Verdict.CLAMPED if clamped else Verdict.APPLIED
         return self._count(Outcome(verdict, values=values, warnings=warnings))
 
@@ -291,9 +350,16 @@ class ControlSink:
             return None
 
         now = self._clock()
-        since = now - (self._last_apply_ms or now)
+        if self._active_deadline_ms is not None and now >= self._active_deadline_ms:
+            return self.stop("executed command TTL or observation deadline expired")
+        since = now - (self._last_apply_ms if self._last_apply_ms is not None else now)
         if since < self.descriptor.watchdog_ms:
             return None
+        if self._strict_stream:
+            # Up to 50 ms of clock skew is accepted on input, so its TTL can
+            # outlast this watchdog. This is still a velocity stop: clear the
+            # active deadline and use rest as the next slew baseline.
+            return self.stop(f"watchdog: no valid command for {since} ms")
 
         # One strike per elapsed watchdog period, not one per tick — otherwise
         # the escalation threshold would depend on how often the caller ticks.
@@ -312,13 +378,10 @@ class ControlSink:
                 f"({since} ms)"
             ))
 
-        if self._on_watchdog is not None:
-            self._on_watchdog()
-        return self._count(Outcome(
-            Verdict.DROPPED,
-            f"watchdog: no valid command for {since} ms (strike "
-            f"{self._watchdog_strikes}/{self._escalate_after})",
-        ))
+        reason = (f"watchdog: no valid command for {since} ms (strike "
+                  f"{self._watchdog_strikes}/{self._escalate_after})")
+        failure = self._call_stop(self._on_watchdog, reason)
+        return self._count(failure or Outcome(Verdict.DROPPED, reason))
 
     def force_torque(self, readings) -> Outcome | None:
         """Feed a force-torque sample. Aborts immediately if any axis is over.
@@ -342,14 +405,31 @@ class ControlSink:
                 ))
         return None
 
-    def reset(self) -> None:
+    def reset(self, initial_values=None, minimum_stamp_ms=None) -> None:
         """Clear state for a new session. The only way out of `aborted`.
 
-        Deliberately explicit: an abort that cleared itself on the next command
-        would turn a fault into a stutter, and the next command after a
-        force-torque abort is exactly the one that should not run.
+        Call this after the adapter has successfully stopped, with an explicit
+        ``initial_values`` baseline to slew the next command from rest. A
+        ``minimum_stamp_ms`` Unix timestamp excludes packets from before resume.
+        Validation finishes before any existing fault is cleared.
         """
-        self._last_values = None
+        baseline = None
+        if initial_values is not None:
+            if (not isinstance(initial_values, (list, tuple)) or
+                    len(initial_values) != self.descriptor.dof or
+                    not all(self._finite(v) for v in initial_values)):
+                raise ValueError("initial_values must contain finite values for every axis")
+            baseline = tuple(float(v) for v in initial_values)
+            if self._check_hard_limits(baseline, self._clock(), bounds_only=True) is not None:
+                raise ValueError("initial_values are outside declared limits")
+        if minimum_stamp_ms is not None and not self._finite(minimum_stamp_ms):
+            raise ValueError("minimum_stamp_ms must be finite")
+        self._last_values = baseline
+        self._minimum_stamp_ms = minimum_stamp_ms
+        self._active_deadline_ms = None
+        self._fault_reason = ""
+        self._last_stop_reason = ""
+        self._sessions_by_source.clear()
         self._last_apply_ms = None
         self._holder = None
         self._holder_priority = 0
@@ -362,9 +442,37 @@ class ControlSink:
         self._watchdog_strikes = 0
         self._last_watchdog_ms = None
 
+    def stop(self, reason="stopped") -> Outcome:
+        """Synchronously hold and discard any active command deadline.
+
+        A successful hold does not clear an existing fault; only reset does.
+        The caller may retry this method while faulted to establish a safe
+        baseline before explicitly acknowledging the fault.
+        """
+        self._active = False
+        self._active_deadline_ms = None
+        self._holding = True
+        failure = self._call_stop(self._on_watchdog, reason)
+        if failure is None and self._strict_stream:
+            self._last_values = (0.0,) * self.descriptor.dof
+            self._last_apply_ms = None
+        return self._count(failure or Outcome(Verdict.DROPPED, reason))
+
+    def abort(self, reason) -> Outcome:
+        """Latch a transport/vendor fault and synchronously request a stop."""
+        return self._count(self._abort(str(reason)))
+
+    @property
+    def fault_reason(self) -> str:
+        return self._fault_reason
+
+    @property
+    def last_stop_reason(self) -> str:
+        return self._last_stop_reason
+
     @property
     def aborted(self) -> bool:
-        """Refusing everything until `reset()` — i.e. force-torque only.
+        """Refusing everything until `reset()` — force-torque or callback fault.
 
         A stood-down sink is not aborted in this sense: it is holding and will
         resume on its own. `stats()["stood_down"]` is where to look for that.
@@ -388,6 +496,8 @@ class ControlSink:
             "holder": self._holder,
             "watchdog_strikes": self._watchdog_strikes,
             "counters": dict(self.counters),
+            "fault_reason": self._fault_reason,
+            "last_stop_reason": self._last_stop_reason,
         }
 
     # ── chain ────────────────────────────────────────────────────────────────
@@ -452,9 +562,21 @@ class ControlSink:
 
         if not isinstance(message.get("source"), str) or not message["source"]:
             return Outcome(Verdict.REJECTED, "source is required and must be a string")
+        if self._strict_stream:
+            if isinstance(dof, bool) or not isinstance(dof, int):
+                return Outcome(Verdict.REJECTED, "dof must be an integer")
+            if not all(self._finite(v) for v in values):
+                return Outcome(Verdict.REJECTED, "values must be finite")
+            if len(message["source"]) > 160:
+                return Outcome(Verdict.REJECTED, "source exceeds 160 characters")
+            session = message.get("session_id", "")
+            if not isinstance(session, str) or len(session) > 160:
+                return Outcome(Verdict.REJECTED, "session_id must be a bounded string")
+            if message.get("gripper") is not None and not self._finite(message["gripper"]):
+                return Outcome(Verdict.REJECTED, "gripper must be finite")
         return None
 
-    def _check_freshness(self, message: dict, now: int) -> Outcome | None:
+    def _check_freshness(self, message: dict, now: int, *, check_sequence=True) -> Outcome | None:
         """2. Age and ordering. Routine failures — dropped, not rejected.
 
         A command can be freshly generated and still act on an 800 ms old
@@ -467,6 +589,22 @@ class ControlSink:
             return Outcome(Verdict.REJECTED, "stamp_ms is required")
         if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or ttl <= 0:
             return Outcome(Verdict.REJECTED, "ttl_ms is required and must be positive")
+
+        if self._strict_stream:
+            obs_stamp = message.get("obs_stamp_ms")
+            if not all(self._finite(v) for v in (stamp, ttl, obs_stamp)):
+                return Outcome(Verdict.REJECTED, "finite command and observation timestamps and TTL are required")
+            if ttl > self.descriptor.watchdog_ms:
+                return Outcome(Verdict.REJECTED, "ttl_ms exceeds watchdog_ms")
+            if stamp > now + 50 or obs_stamp > now + 50 or obs_stamp > stamp + 50:
+                return Outcome(Verdict.REJECTED, "command or observation timestamp is in the future")
+            if now - stamp >= ttl:
+                return Outcome(Verdict.DROPPED, "command TTL expired")
+            max_obs_age = self.descriptor.max_obs_age_ms
+            if max_obs_age is not None and now - obs_stamp >= max_obs_age:
+                return Outcome(Verdict.DROPPED, "observation expired")
+        if self._minimum_stamp_ms is not None and stamp < self._minimum_stamp_ms:
+            return Outcome(Verdict.DROPPED, "command predates this start/resume epoch")
 
         age = now - stamp
         if age > ttl:
@@ -485,13 +623,23 @@ class ControlSink:
         seq = message.get("seq")
         if not isinstance(seq, int) or isinstance(seq, bool):
             return Outcome(Verdict.REJECTED, "seq is required and must be an integer")
+        if self._strict_stream and not 0 <= seq < 2**63:
+            return Outcome(Verdict.REJECTED, "seq must be a nonnegative 63-bit integer")
+        if not check_sequence:
+            return None
         source = message["source"]
         last = self._seq_by_source.get(source)
         if last is not None and seq <= last:
             return Outcome(Verdict.DROPPED, f"seq {seq} not newer than {last}")
+        if self._strict_stream:
+            previous_session = self._sessions_by_source.get(source)
+            if previous_session is not None and previous_session != message.get("session_id", ""):
+                return Outcome(Verdict.DROPPED, "source session changed; reset establishes a new epoch")
+            if source not in self._seq_by_source and len(self._seq_by_source) >= 32:
+                return Outcome(Verdict.REJECTED, "too many control sources in this session")
         return None
 
-    def _check_arbitration(self, message: dict, now: int) -> Outcome | None:
+    def _check_arbitration(self, message: dict, now: int, *, commit=True) -> Outcome | None:
         """3. Priority between sources.
 
         A higher-priority source holds the channel for as long as it keeps
@@ -503,13 +651,17 @@ class ControlSink:
         priority = message.get("priority", 0)
         if isinstance(priority, bool) or not isinstance(priority, (int, float)):
             return Outcome(Verdict.REJECTED, f"priority is not a number: {priority!r}")
+        if self._strict_stream and (not isinstance(priority, int) or not 0 <= priority <= 100):
+            return Outcome(Verdict.REJECTED, "priority must be an integer in [0,100]")
         priority = int(priority)
 
         holder_stale = (
             self._holder is None
             or now - self._holder_seen_ms > self.descriptor.watchdog_ms
         )
-        if not holder_stale and source != self._holder and priority < self._holder_priority:
+        outranked = (priority <= self._holder_priority if self._strict_stream else
+                     priority < self._holder_priority)
+        if not holder_stale and source != self._holder and outranked:
             return Outcome(
                 Verdict.DROPPED,
                 f"outranked: {source} at {priority} vs {self._holder} at "
@@ -519,11 +671,17 @@ class ControlSink:
         # Record the seq only once the message has won arbitration; an outranked
         # source must not advance its own counter, or the command it sends after
         # winning the channel back would look like a replay.
-        self._seq_by_source[source] = message["seq"]
-        self._holder = source
-        self._holder_priority = priority
-        self._holder_seen_ms = now
+        if commit:
+            self._record_source(message, now)
         return None
+
+    def _record_source(self, message, now):
+        source = message["source"]
+        self._seq_by_source[source] = message["seq"]
+        self._sessions_by_source[source] = message.get("session_id", "")
+        self._holder = source
+        self._holder_priority = int(message.get("priority", 0))
+        self._holder_seen_ms = now
 
     def _clamp_step(self, values: tuple[float, ...]):
         """4. Limit how far one step may move. Clamp, do not reject.
@@ -568,7 +726,7 @@ class ControlSink:
                 clamped.append(self.descriptor.joint_names[offset])
         return tuple(out), clamped
 
-    def _check_hard_limits(self, values: tuple[float, ...], now: int) -> Outcome | None:
+    def _check_hard_limits(self, values: tuple[float, ...], now: int, *, bounds_only=False) -> Outcome | None:
         """5. Physical limits. Reject the whole command; never clamp to the bound.
 
         The opposite of step clamping, and deliberately so. Clamping to a joint
@@ -597,6 +755,8 @@ class ControlSink:
                     f"[{lo}, {hi}]",
                 )
 
+        if bounds_only:
+            return None
         max_velocity = self.descriptor.max_velocity
         if max_velocity is None or self._last_values is None or self._last_apply_ms is None:
             return None
@@ -628,26 +788,47 @@ class ControlSink:
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _finite(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
+
+    def _call_stop(self, callback, reason):
+        # Publish the reason before calling the adapter, so its state machine
+        # can pause on watchdog expiry and retain ownership on a fault.
+        self._last_stop_reason = str(reason)
+        try:
+            if callback is not None:
+                callback()
+        except Exception as exc:
+            self._latched = True
+            self._holding = True
+            self._active = False
+            self._active_deadline_ms = None
+            self._fault_reason = f"{reason}; stop callback failed: {type(exc).__name__}: {exc}"
+            return Outcome(Verdict.ABORTED, self._fault_reason)
+        return None
+
     def _abort(self, reason: str) -> Outcome:
-        """Force-torque. Latches: only `reset()` gets out of this."""
+        """Latch, then stop once; a failed stop never recursively aborts."""
         self._latched = True
         self._holding = True
-        if self._on_abort is not None:
-            self._on_abort()
-        return Outcome(Verdict.ABORTED, reason)
+        self._active = False
+        self._active_deadline_ms = None
+        self._fault_reason = reason
+        failure = self._call_stop(self._on_abort, reason)
+        return failure or Outcome(Verdict.ABORTED, reason)
 
     def _stand_down(self, reason: str) -> Outcome:
-        """Watchdog escalation. Same response, but it does not latch.
-
-        Reported as ABORTED because that is what it is to the operator watching
-        — the card has stopped driving and said why — while the sink itself
-        stays willing to resume on a command that passes every check.
-        """
+        """Escalation holds but resumes on fresh input unless stopping fails."""
         self._stood_down = True
         self._holding = True
-        if self._on_abort is not None:
-            self._on_abort()
-        return Outcome(Verdict.ABORTED, reason)
+        failure = self._call_stop(self._on_abort, reason)
+        return failure or Outcome(Verdict.ABORTED, reason)
 
     def _count(self, outcome: Outcome) -> Outcome:
         key = outcome.verdict.value
