@@ -93,7 +93,13 @@ class LocoServoPlugin:
                                "real control requires explicit configuration and a ready standing chassis.",
                 "inputSchema": {"type": "object", "required": ["action"], "properties": {
                     "action": {"type": "string", "enum": actions},
-                    "input_topic": {"type": "string"}},
+                    "input_topic": {"type": "string", "description":
+                        "control/velocity topic supplied by Agent Core from canvas wiring."}},
+                    # These entries become LLM-callable functions. Canvas
+                    # start/stop are system lifecycle calls: Core injects the
+                    # wired input_topic directly, independently of this map.
+                    # Keep them out, as R1 loco_servo does; a model must not
+                    # invent a topic or disconnect a stream it cannot rewire.
                     "x-action-params": {
                         "pause": {"params": [], "description": "Stop and pause the navigation stream."},
                         "resume": {"params": [], "description": "Reacquire control and accept only fresh commands."},

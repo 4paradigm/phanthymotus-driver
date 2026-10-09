@@ -309,6 +309,44 @@ unavailable `pinocchio` remain skipped. These checks do not constitute builds
 and runtime verification of every image in both repositories, nor hardware
 validation on all robot models. Release validation must retain that distinction.
 
+## Canvas startup and LLM actions
+
+`loco_servo` deliberately exposes only `pause`, `resume` and `reset_fault` in
+`x-action-params`, matching the existing R1 servo design. Agent Core's
+[actual schema converter](https://github.com/4paradigm/phanthymotus/blob/b42effb65b395d0860e36f85ba40f6e10129e55a/agent-core/src/mcp_client.py#L361-L407)
+generates one LLM function per entry: no `loco_servo__start` function exists.
+Adding an entry would expose manual topic selection to the model.
+
+The raw MCP endpoint still accepts `start`, `stop` and `info` for system
+lifecycle calls. The [canvas startup path](https://github.com/4paradigm/phanthymotus/blob/b42effb65b395d0860e36f85ba40f6e10129e55a/agent-core/src/api/config.py#L588-L646)
+resolves the incoming connection and sends `action=start` with `input_topic`
+directly; it does not use the split-action map. The
+[canvas UI](https://github.com/4paradigm/phanthymotus/blob/b42effb65b395d0860e36f85ba40f6e10129e55a/agent-core/web/js/canvas.js#L1079-L1093)
+also hides lifecycle actions and topic fields for actuator/processor cards.
+Connect the navi output and start the project to establish the subscription;
+use pause/resume to control an established stream. Starting without a topic
+still fails before activation, and changing a live subscription requires an
+explicit system stop first.
+
+`tests/test_as2w_agent_core_wiring.py` loads the real schema converter and
+project start/stop functions at the pinned platform revision below, with
+temporary SQLite and fake external ROS/MCP/channel/dashboard boundaries.
+Its four tests verify the model's action list, canvas topic injection into
+the real AS2W dry-run receiver, unwired-start rollback and refusal to start
+when an upstream topic cannot be resolved. The synthetic upstream is not a
+real navi publisher; publisher serialization is tested separately below.
+With the platform's test dependencies installed, run:
+
+```bash
+PHANTHYMOTUS_CHECKOUT=/path/to/phanthymotus \
+  python3 -m pytest tests/test_as2w_agent_core_wiring.py -q
+```
+
+These four tests and the four producer/receiver tests passed together. The
+platform's existing project-start control-plane suite also passed all 16
+tests after installing its dependencies in an isolated test directory.
+Neither this test setup nor its dependencies are added to the driver image.
+
 ## Control stream transport and cross-repository validation
 
 `control/velocity` is a logical canvas port format. The `motus.control/1`
@@ -349,7 +387,7 @@ R1/G1/Tianyi/RM75 consumer regressions passed 231 cases; the G1 EEF module was
 skipped because `pinocchio` is unavailable. The platform's ActuCore suite
 passed 451 cases with 21 OpenCV render tests skipped; Agent Core's actual
 ROS format resolver passed its eight tests. Agent Core project-start tests
-could not be collected without `fastapi` and are not counted as passed.
+are now covered by the separate 16-test run described above.
 These results check the protocol and consumer behavior without claiming real
 DDS discovery, generated type support, final-image builds or robot validation.
 

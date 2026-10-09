@@ -84,6 +84,36 @@ class Client:
         return [event[1] for event in self.events if isinstance(event, tuple)]
 
 
+class ToolContractTests(unittest.TestCase):
+    def test_llm_actions_preserve_canvas_owned_wiring(self):
+        plugin = servo.LocoServoPlugin.__new__(servo.LocoServoPlugin)
+        tool = plugin.get_tool()
+        schema = tool["inputSchema"]
+        self.assertIn("input_topic", schema["properties"])
+        self.assertTrue({"start", "stop", "info"}.issubset(
+            schema["properties"]["action"]["enum"]))
+        # Lifecycle actions exist on the raw MCP endpoint, but only these
+        # topic-free controls belong in the model's split function list.
+        self.assertEqual({"pause", "resume", "reset_fault"},
+                         set(schema["x-action-params"]))
+        for action in schema["x-action-params"].values():
+            self.assertEqual([], action["params"])
+        self.assertNotIn("input_topic", schema["required"])
+
+    def test_start_without_canvas_topic_does_not_activate_controller(self):
+        client = Client()
+        plugin = servo.LocoServoPlugin({}, "test", None, client)
+        try:
+            result = plugin.dispatch("start", {})
+            self.assertFalse(result["ok"])
+            self.assertEqual("input_topic is required", result["error"])
+            self.assertIsNone(plugin._node)
+            self.assertEqual("paused", plugin._controller.info()["state"])
+            self.assertEqual([], client.events)
+        finally:
+            plugin.stop()
+
+
 class StreamTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
