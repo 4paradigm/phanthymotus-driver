@@ -1123,6 +1123,10 @@ class MicPlugin:
         import sys
         if self._proc is not None and self._proc.poll() is None:
             return
+        # 启动麦克风时自动追加默认唤醒词，保留厂商原有词表。
+        wakeup = self.dispatch("add_wakeup_word", {})
+        if wakeup["state"] != "configured":
+            print(f"[mic] wake-up word setup: {wakeup['state']}", flush=True)
         with self._direction_lock:
             self._last_direction = None
             self._last_direction_time = 0.0

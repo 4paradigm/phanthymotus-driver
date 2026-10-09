@@ -79,12 +79,11 @@ def test_mic_card_reports_direction_only_while_fresh_and_clears_on_stop(
     )
     card = module.MicPlugin({}, "robot", executor, media)
 
-    assert card.dispatch("add_wakeup_word", {})["state"] == "configured"
+    assert card.dispatch("start", {})["state"] == "running"
+    assert card.dispatch("start", {})["state"] == "running"
+    assert added_words == [module._MIC_WAKEUP_WORD]
     assert card.dispatch("add_wakeup_word", {})["state"] == "configured"
     assert len(added_words) == 1
-
-    assert card.dispatch("start", {})["state"] == "running"
-    assert card.dispatch("start", {})["state"] == "running"
     assert len(processes) == 1
     assert len(card.get_tool()["topic_out"]) == 2
 
@@ -93,6 +92,9 @@ def test_mic_card_reports_direction_only_while_fresh_and_clears_on_stop(
     card._last_direction_time -= 11
     assert card.dispatch("info", {})["sound_direction"] == {"state": "stale"}
 
+    assert card.dispatch("stop", {}) == {"state": "idle"}
+    assert card.dispatch("start", {})["state"] == "running"
+    assert len(added_words) == 1
     assert card.dispatch("stop", {}) == {"state": "idle"}
     assert card.dispatch("info", {})["sound_direction"] == {"state": "no_event"}
     card._on_direction(String(json.dumps({"state": "fresh", "angle": 180})))

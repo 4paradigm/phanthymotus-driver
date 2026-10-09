@@ -13,8 +13,9 @@ from the robot's front. `info.sound_direction` keeps the latest observation for
 
 One-time setup on Bumi EDU:
 
-1. Call `mic` with `action=add_wakeup_word` to append “小范小范” to the vendor
-   voice module's wake words. The factory wake words remain available.
+1. Starting `mic` automatically appends “小范小范” to the vendor voice module's
+   wake words. The factory wake words remain available. The explicit
+   `action=add_wakeup_word` remains available to retry a rejected setup.
 2. Have one person stand directly in front of the robot and speak “测试测试”
    continuously while calling `action=calibrate_front`.
 3. Repeat at the robot's right side with `action=calibrate_right`.
