@@ -286,11 +286,12 @@ fault rather than leaving the sink usable, and a first application at monotonic
 time zero now starts the watchdog correctly. A fresh command still resumes a
 normal default watchdog stand-down; a latched callback fault requires reset.
 
-This is shared infrastructure, not an AS2W-only packaging change. `common` is
-used across driver bundles and by the `phanthymotus`/`phanthymotus-driver`
-repositories. All driver consumers and affected main-project images must be
-included in rebuild and regression validation when this shared version is
-released; an AS2W image build alone does not establish cross-repository
+This sink is shared by driver bundles, not only AS2W. At the pinned platform
+revision below, ActuCore uses its own producer/negotiation code and does not
+import `common.control` or `ControlSink`: the cross-repository dependency is
+the descriptor and command contract. Driver consumers must be included in
+rebuild/regression validation, and platform producers must be checked against
+the changed receiver. An AS2W image build alone does not establish that
 compatibility. No new pip/APT dependency, model, generated workspace or base
 image is introduced by the sink changes. They update source already packaged
 under `common`; this is not a claim of identical image byte size.
@@ -303,6 +304,50 @@ source takeover without strict mode. G1 numerical end-effector tests requiring
 unavailable `pinocchio` remain skipped. These checks do not constitute builds
 and runtime verification of every image in both repositories, nor hardware
 validation on all robot models. Release validation must retain that distinction.
+
+## Control stream transport and cross-repository validation
+
+`control/velocity` is a logical canvas port format. The `motus.control/1`
+command is a structured JSON object carried in `std_msgs/msg/String.data`;
+it does not require a custom control ROS message. This is explicitly specified
+in the [platform protocol](https://github.com/4paradigm/phanthymotus-driver/blob/8a7632fc93bac53b4e20b661cec3f7c953b23855/README_dev.md#L1528-L1556).
+The actual [ActuCore navi publisher](https://github.com/4paradigm/phanthymotus/blob/b42effb65b395d0860e36f85ba40f6e10129e55a/actucore/plugins/navi/plugin.py#L992-L998)
+creates a `String` publisher and [serializes the command into its data field](https://github.com/4paradigm/phanthymotus/blob/b42effb65b395d0860e36f85ba40f6e10129e55a/actucore/plugins/navi/plugin.py#L1146-L1150).
+Agent Core independently [maps every `control/*` format to `String`](https://github.com/4paradigm/phanthymotus/blob/b42effb65b395d0860e36f85ba40f6e10129e55a/agent-core/src/ros2_bridge.py#L226-L242).
+AS2W uses the matching `String` subscription and JSON decoder. Both endpoints
+use ROS's integer-depth RELIABLE/VOLATILE defaults; producer depth 10 and
+subscriber depth 1 do not change message-type or QoS compatibility.
+
+`info.transport` exposes that contract. `connected` means the local subscription
+was created, not that DDS discovery or message delivery has been verified.
+During dry-run integration, check that the controller's `simulated` counter
+increases and inspect `last_outcome` / `last_rejection`; a connected card with no
+accepted samples is not evidence of a working stream. Actual DDS discovery and
+delivery must still be checked on the final image.
+
+For reproducible cross-repository validation, check out `phanthymotus` at
+`b42effb65b395d0860e36f85ba40f6e10129e55a` and run from this driver repository:
+
+```bash
+PHANTHYMOTUS_CHECKOUT=/path/to/phanthymotus \
+  python3 -m pytest tests/test_as2w_control_stream_compat.py -q
+```
+
+These four tests execute the real navi startup negotiation, policy, publisher
+and JSON serialization, then the real AS2W callback and shared sink through
+fake ROS endpoints in dry run. They cover nonzero command delivery, expired
+commands, stale observation timestamps and incompatible descriptors. The test
+requires that exact producer revision and explicitly skips when no platform
+checkout is supplied; it does not copy producer code into this repository.
+
+At that revision, cross-repository tests plus shared sink/rotation and
+R1/G1/Tianyi/RM75 consumer regressions passed 231 cases; the G1 EEF module was
+skipped because `pinocchio` is unavailable. The platform's ActuCore suite
+passed 451 cases with 21 OpenCV render tests skipped; Agent Core's actual
+ROS format resolver passed its eight tests. Agent Core project-start tests
+could not be collected without `fastapi` and are not counted as passed.
+These results check the protocol and consumer behavior without claiming real
+DDS discovery, generated type support, final-image builds or robot validation.
 
 ## Packaging rationale and validation scope
 
@@ -319,6 +364,12 @@ The service fragment no longer forces `NETWORK_INTERFACE=eth0`, because the
 robot interface name varies between hosts (the commissioning machine uses
 `eno1`). Explicit overrides remain supported; automatic selection requires a
 unique active wired interface on the Unitree subnet and fails closed otherwise.
+The automatic resolver specifically requires exactly one active, nonvirtual,
+nonwireless IPv4 interface on `192.168.123.0/24`. On a nonstandard robot subnet,
+or a host with multiple matching adapters, set `NETWORK_INTERFACE` explicitly
+to the robot-facing adapter (for example `eno1`) in the deployment environment.
+An override bypasses subnet selection; verify its actual robot-network wiring
+before deployment. There is no fallback to the default-route/office interface.
 `driver.yaml` advertises the implemented cards, including `loco_servo`, so the
 catalog matches `tools/list`. These two metadata changes add no runtime package.
 

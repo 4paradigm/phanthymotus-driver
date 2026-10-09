@@ -1,4 +1,9 @@
-"""AS2W motus.control/1 twist card. SDK writes live in one bounded worker."""
+"""AS2W motus.control/1 twist card; JSON carried by std_msgs/msg/String.
+
+README_dev.md's continuous-control Message contract defines this serialization.
+ActuCore navi publishes String.data=json.dumps(command), not a custom ROS type.
+SDK writes live in one bounded worker.
+"""
 from __future__ import annotations
 
 import json
@@ -96,7 +101,7 @@ class LocoServoPlugin:
                     "x-hooks": {"on_interrupt_motion": {"action": "pause"},
                                 "on_interrupt_all": {"action": "pause"}},
                     "x-is-dangerous": True, "x-resource": ["base"]},
-                "topic_in": [{"format": "control/velocity", "desc": "motus.control/1 twist [vx,vy,vz,wx,wy,wz]"}],
+                "topic_in": [{"format": "control/velocity", "desc": "motus.control/1 twist [vx,vy,vz,wx,wy,wz]; JSON in std_msgs/msg/String"}],
                 "configSchema": {"type": "object", "properties": {
                     "dry_run": {"type": "boolean", "default": True,
                                 "description": "Validate without moving. Entering dry_run first stops real motion; resume is explicit."},
@@ -164,6 +169,9 @@ class LocoServoPlugin:
                 from rclpy.node import Node
                 from std_msgs.msg import String
                 node = Node("as2w_loco_servo")
+                # control/velocity names the logical port format. The platform
+                # wire contract is String(JSON), as in ActuCore navi. Integer
+                # depth uses RELIABLE/VOLATILE defaults on both endpoints.
                 node.create_subscription(String, topic.strip(), self._on_message, 1)
                 self._executor.add_node(node)
                 self._node, self._topic = node, topic.strip()
@@ -219,6 +227,9 @@ class LocoServoPlugin:
         if "footprint" not in descriptor:
             degraded.append("AS2W footprint is undeclared; upstream fallback geometry is not a measured clearance.")
         return {**status, "input": self._topic, "connected": self._node is not None,
+                "transport": {"message_type": "std_msgs/msg/String", "encoding": "json",
+                              "reliability": "reliable", "durability": "volatile",
+                              "history": "keep_last", "depth": 1},
                 "control_interface": descriptor, "degraded": degraded,
                 "transport_stop": getattr(self._controller.client, "stop_diagnostics", {}),
                 "last_rejection": self._last_rejection}
