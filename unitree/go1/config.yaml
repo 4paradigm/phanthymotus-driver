@@ -10,11 +10,6 @@ plugins:
     enabled: true
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
-
-  face_light:                   # 同一 face_light 卡：静态色/逐灯接口/定时灯效，统一 SDK
-    enabled: true               # 注册并显示原卡；SDK 未就绪时 info.available=false，控制返回失败
-    backend: "sdk"              # 所有灯光统一使用官方 SDK，不提供模拟后端
-    sdk_exclusive: true          # 默认 SDK 独占；部署前停止 faceLightMqtt，保留 faceLightServer
   system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
     enabled: true
     mqtt_host: "localhost"
@@ -79,6 +74,11 @@ plugins:
 
 
   # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
+  face_light:                   # face_light卡：静态色/逐灯接口/定时灯效，统一 SDK
+    enabled: true
+    backend: "sdk"
+    sdk_exclusive: true
+
   beep:                         # 头部扬声器 beep 动作卡 → Nano beep_adapter.py（:18082 /v1/beep/actions）
     enabled: true
     adapter_host: "192.168.123.13"   # Head Nano IP
