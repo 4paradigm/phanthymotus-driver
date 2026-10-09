@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=/opt/phanthy-motus/data/a3-relay
+HOST_ROOT=/dev/shm/a3-relay
 PIDFILE=$ROOT/relay.pid
 SOURCE=/work/agibot/A3/jazzy_relay.py
-RUNNER=$ROOT/relay-bash
+RUNNER=$HOST_ROOT/relay-bash
 mkdir -p "$ROOT"
 case "${1:-start}" in
 start)
@@ -11,16 +12,17 @@ start)
       && grep -q "Jazzy input ready" "$ROOT/relay.log" 2>/dev/null; then exit 0; fi
   if [[ -f "$PIDFILE" ]]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
-  cp "$SOURCE" "$ROOT/jazzy_relay.py"
+  mkdir -p "$HOST_ROOT"
+  cp "$SOURCE" "$HOST_ROOT/jazzy_relay.py"
   : > "$ROOT/relay.log"
   # The ADU runtime does not expose a usable systemd/D-Bus control path from
-  # containers.  Place the interpreter in the shared data mount, then execute
+  # containers.  Place the interpreter in the host-shared IPC mount, then execute
   # it after entering PID 1's mount namespace.  The executable path exists in
   # both namespaces, avoiding nsenter's post-setns path lookup problem.
   cp /bin/bash "$RUNNER"
   chmod 0755 "$RUNNER"
   nsenter -t 1 -m -u -n -p -- "$RUNNER" -lc \
-    "set -e; if [ -f /opt/ros/jazzy/setup.sh ]; then . /opt/ros/jazzy/setup.sh; elif [ -f /opt/ros/jazzy/setup.bash ]; then . /opt/ros/jazzy/setup.bash; else echo '[relay] ERROR: host Jazzy setup not found' >&2; exit 41; fi; python3 -c 'import rclpy, sensor_msgs' || { echo '[relay] ERROR: host Jazzy rclpy/sensor_msgs unavailable' >&2; exit 42; }; exec python3 $ROOT/jazzy_relay.py" \
+    "set -e; if [ -f /opt/ros/jazzy/setup.sh ]; then . /opt/ros/jazzy/setup.sh; elif [ -f /opt/ros/jazzy/setup.bash ]; then . /opt/ros/jazzy/setup.bash; else echo '[relay] ERROR: host Jazzy setup not found' >&2; exit 41; fi; python3 -c 'import rclpy, sensor_msgs' || { echo '[relay] ERROR: host Jazzy rclpy/sensor_msgs unavailable' >&2; exit 42; }; exec python3 $HOST_ROOT/jazzy_relay.py" \
     >>"$ROOT/relay.log" 2>&1 &
   echo $! > "$PIDFILE"
   echo "[relay] host Jazzy relay started via shared runner pid=$(cat "$PIDFILE") domain=232"
