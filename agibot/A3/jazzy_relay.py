@@ -104,9 +104,18 @@ def _input_one(key, topic, msg_type, queue_out):
                     queue_out.get_nowait()
                 except queue.Empty:
                     pass
-                queue_out.put_nowait(item)
+                # multiprocessing.Queue can report Full for one scheduler
+                # tick after get_nowait() because its feeder thread has not
+                # published the free slot yet.  A short blocking put avoids
+                # turning that normal race into a callback failure.
+                try:
+                    queue_out.put(item, timeout=0.05)
+                except queue.Full:
+                    # The consumer is behind; latest-frame semantics permit
+                    # dropping this sample without taking down the input.
+                    pass
         except Exception as exc:
-            print(f"[relay] input failed key={key}: {exc}", flush=True)
+            print(f"[relay] input failed key={key}: {type(exc).__name__}: {exc!r}", flush=True)
     node.create_subscription(msg_type, topic, push, qos_profile_sensor_data)
     print(f"[relay] Jazzy input ready key={key} domain=232", flush=True)
     rclpy.spin(node)
