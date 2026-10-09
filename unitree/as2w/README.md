@@ -109,11 +109,15 @@ JPEG frames stay in a one-frame, latest-only thread queue and are assigned to
 `CompressedImage.data` through a buffer-compatible byte array, avoiding both a
 roughly 300 KB multiprocessing copy and slow per-byte ROS conversion. Camera
 `info` reports separate capture/publish rates, videohub RPC time, message-build
-and publish-call time, average frame size, and dropped stale frames. Like G1
-`camera_rgb`, it is an always-on state source: canvas lifecycle `stop` detaches
-intelligent control but does not stop publication. The spawned process is
-physically closed only when the driver bundle shuts down; repeated canvas
-starts reuse the live stream without resetting frame counters.
+and publish-call time, average frame size, and dropped stale frames. AS2W camera
+`stop` closes the spawned capture/publication process and reports idle only
+after it exits. A later `start` creates a new backend; repeated starts while
+capture is already active reuse it without resetting frame counters. Lifecycle
+requests are serialized so restart cannot race shutdown. If shutdown fails,
+the card keeps the process handle and reports an error until it can stop it;
+it does not create a replacement alongside the old process. This is AS2W's
+explicit-stop behavior, rather than the optional always-on sensor lifecycle
+described in the general driver guide.
 The component uses the three-field `audio_msgs/AudioChunk` interface already
 built by the [shared ROS base](https://github.com/4paradigm/phanthymotus/blob/b42effb65b395d0860e36f85ba40f6e10129e55a/deploy/ros-base/Dockerfile).
 Its `/ros_ws/install` overlay supplies `header`, `format` and byte-array `data`.

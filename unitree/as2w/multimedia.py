@@ -17,6 +17,7 @@ import struct
 import threading
 import time
 from array import array
+from contextlib import nullcontext
 from uuid import uuid4
 
 from audio_msgs.msg import AudioChunk
@@ -1376,12 +1377,12 @@ class _CameraBackend:
         self.error = "" if ready.get("ok") else ready.get("error", "camera unavailable")
 
     def is_available(self):
-        return not self.error and self._process.is_alive()
+        return not self.error and self._process is not None and self._process.is_alive()
 
     def call(self, operation, timeout=6.0):
         if self.error:
             return {"ok": False, "state": "error", "error": self.error}
-        if not self._process.is_alive():
+        if self._process is None or not self._process.is_alive():
             return {"ok": False, "state": "error", "error": "camera process is not running"}
         with self._lock:
             request_id = uuid4().hex
@@ -1403,12 +1404,32 @@ class _CameraBackend:
         return result
 
     def close(self):
+        if self._process is None:
+            return {"ok": True, "state": "idle"}
         if self._process.is_alive():
-            self.call("close", timeout=3.0)
+            try:
+                self.call("close", timeout=3.0)
+            except Exception:
+                # A broken control queue must not prevent OS-level shutdown.
+                pass
         self._process.join(timeout=3.0)
         if self._process.is_alive():
             self._process.terminate()
             self._process.join(timeout=1.0)
+        if self._process.is_alive():
+            self._process.kill()
+            self._process.join(timeout=1.0)
+        if self._process.is_alive():
+            # Keep the handle so callers can retry. An unconfirmed shutdown
+            # must not be reported as idle or allow another capture process.
+            return {"ok": False, "state": "error",
+                    "error": "camera process has not stopped"}
+        self._process.close()
+        self._process = None
+        for channel in (self._control, self._results):
+            channel.cancel_join_thread()
+            channel.close()
+        return {"ok": True, "state": "idle"}
 
 
 class _CameraNode:
@@ -1422,13 +1443,16 @@ class _CameraNode:
         self.frames = 0
         self.last_error = ""
         self._backend = None
+        self._stop_failed = False
 
     def start_capture(self):
-        if self._backend is not None and self._backend.is_available():
-            # Camera is an always-on state source. Repeated canvas lifecycle
-            # starts must not reset the videohub stream or its frame counters.
+        if (not self._stop_failed and self._backend is not None
+                and self._backend.is_available()):
+            # Repeated starts keep a healthy active capture and its counters.
             return self._backend.status()
-        self.stop_capture()
+        stopped = self.stop_capture()
+        if not stopped["ok"]:
+            return stopped
         self._backend = _CameraBackend(
             self.topic, self.interface, self.fps, self.timeout_s, self.retry_s,
         )
@@ -1443,11 +1467,25 @@ class _CameraNode:
 
     def stop_capture(self):
         if self._backend is not None:
-            self._backend.close()
+            try:
+                result = self._backend.close() or {"ok": True}
+            except Exception as exc:
+                result = {"ok": False, "error": f"camera shutdown failed: {exc}"}
+            if not result.get("ok"):
+                self._stop_failed = True
+                self.state = "error"
+                self.last_error = result.get("error", "camera stop unconfirmed")
+                return {"ok": False, "state": "error", "error": self.last_error}
             self._backend = None
+        self._stop_failed = False
         self.state = "idle"
+        self.last_error = ""
+        return {"ok": True, "state": "idle"}
 
     def status(self):
+        if self._stop_failed:
+            return {"ok": False, "state": "error", "frames": self.frames,
+                    "last_frame_ago_ms": -1, "last_error": self.last_error}
         if self._backend is not None and self._backend.is_available():
             result = self._backend.status()
             self.state = result.get("state", self.state)
@@ -1481,6 +1519,7 @@ class CameraPlugin:
         if backend != "videohub":
             raise ValueError("As2W camera backend must be videohub")
         self._topic = "/{}/camera/front".format(namespace)
+        self._lifecycle_lock = threading.RLock()
         self._camera_info_config = config.get("camera_info", {})
         # Validate declarations before any camera child process is started.
         self._camera_info()
@@ -1516,12 +1555,20 @@ class CameraPlugin:
         }
 
     def start(self):
-        return self._node.start_capture()
+        with getattr(self, "_lifecycle_lock", nullcontext()):
+            return self._node.start_capture()
 
     def stop(self):
-        self._node.stop_capture()
+        with getattr(self, "_lifecycle_lock", nullcontext()):
+            return self._node.stop_capture()
 
     def dispatch(self, action, args):
+        # Bundle start/stop and MCP lifecycle requests share this lock. A new
+        # start cannot replace the capture backend before stop confirms exit.
+        with getattr(self, "_lifecycle_lock", nullcontext()):
+            return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
         if action == "start":
             started = self.start() or {}
             result = self._node.status()
@@ -1543,12 +1590,11 @@ class CameraPlugin:
             result["camera_info"] = self._camera_info(result)
             return result
         elif action == "stop":
-            # Match G1 camera_rgb: stopping intelligent control detaches the
-            # logical card but keeps the state stream alive. Physical shutdown
-            # remains CameraPlugin.stop(), called by Bundle.stop_all().
+            stopped = self.stop() or {}
             result = self._node.status()
-            result["stream_state"] = result.get("state", "error")
-            result["state"] = "idle"
+            if not stopped.get("ok", True):
+                result.update(ok=False, state="error",
+                              last_error=stopped.get("error", "camera stop unconfirmed"))
             result["topic_out"] = [{"topic": self._topic, "format": "image/jpeg"}]
             result["camera_info"] = self._camera_info(result)
             return result

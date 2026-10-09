@@ -5,6 +5,7 @@ Run with: python3 -m unittest unitree/as2w/test_driver.py
 import importlib.util
 import struct
 import sys
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -664,30 +665,309 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("error", result["readiness"])
         self.assertEqual("videohub unavailable", result["last_error"])
 
-    def test_camera_canvas_stop_keeps_state_stream_running(self):
-        plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
-        plugin._topic = "/test/camera/front"
+    @staticmethod
+    def _fake_camera_backend():
+        class Backend:
+            instances = []
+
+            def __init__(self, *_args):
+                self.error = ""
+                self.state = "idle"
+                self.closed = False
+                self.close_error = ""
+                self.close_calls = 0
+                self.operations = []
+                self.instances.append(self)
+
+            def is_available(self):
+                return not self.closed and not self.error
+
+            def call(self, operation, **_kwargs):
+                self.operations.append(operation)
+                if operation == "start":
+                    self.state = "running"
+                return self.status()
+
+            def status(self):
+                return {
+                    "ok": True, "state": self.state, "frames": 42,
+                    "last_frame_ago_ms": 10, "last_error": "",
+                }
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_error:
+                    return {"ok": False, "state": "error",
+                            "error": self.close_error}
+                self.closed = True
+                self.state = "idle"
+                # None remains a successful close for legacy/test backends.
+                return None
+
+        return Backend
+
+    def test_camera_dispatch_stop_closes_backend_and_reports_idle(self):
+        backend_class = self._fake_camera_backend()
+        with patch.object(self.multimedia, "_CameraBackend", backend_class):
+            plugin = self.multimedia.CameraPlugin({}, "test", None, "eno1")
+            self.assertEqual("running", plugin.dispatch("start", {})["state"])
+            backend = backend_class.instances[0]
+
+            result = plugin.dispatch("stop", {})
+
+            self.assertEqual(1, backend.close_calls)
+            self.assertTrue(backend.closed)
+            self.assertIsNone(plugin._node._backend)
+            self.assertEqual("idle", result["state"])
+            self.assertEqual("idle", plugin.dispatch("info", {})["state"])
+            self.assertEqual([{"topic": "/test/camera/front",
+                               "format": "image/jpeg"}], result["topic_out"])
+
+    def test_camera_start_after_dispatch_stop_creates_new_backend(self):
+        backend_class = self._fake_camera_backend()
+        with patch.object(self.multimedia, "_CameraBackend", backend_class):
+            plugin = self.multimedia.CameraPlugin({}, "test", None, "eno1")
+            plugin.dispatch("start", {})
+            first = backend_class.instances[0]
+            plugin.dispatch("stop", {})
+
+            result = plugin.dispatch("start", {})
+            second = backend_class.instances[1]
+            plugin.dispatch("start", {})
+
+            self.assertEqual("running", result["state"])
+            self.assertTrue(first.closed)
+            self.assertFalse(second.closed)
+            self.assertIs(second, plugin._node._backend)
+            self.assertEqual(2, len(backend_class.instances))
+            self.assertEqual(["start"], first.operations)
+            self.assertEqual(["start"], second.operations)
+            plugin.stop()
+
+    def test_camera_dispatch_stop_is_idempotent_before_and_after_start(self):
+        backend_class = self._fake_camera_backend()
+        with patch.object(self.multimedia, "_CameraBackend", backend_class):
+            plugin = self.multimedia.CameraPlugin({}, "test", None, "eno1")
+            self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+            self.assertEqual([], backend_class.instances)
+            plugin.dispatch("start", {})
+            backend = backend_class.instances[0]
+
+            plugin.dispatch("stop", {})
+            self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+            plugin.stop()
+
+            self.assertEqual(1, backend.close_calls)
+            self.assertIsNone(plugin._node._backend)
+
+    def test_camera_failed_stop_retains_backend_until_acknowledged_close(self):
+        backend_class = self._fake_camera_backend()
+        with patch.object(self.multimedia, "_CameraBackend", backend_class):
+            plugin = self.multimedia.CameraPlugin({}, "test", None, "eno1")
+            plugin.dispatch("start", {})
+            backend = backend_class.instances[0]
+            backend.close_error = "camera process still alive"
+
+            result = plugin.dispatch("stop", {})
+
+            self.assertEqual("error", result["state"])
+            self.assertIn("camera process still alive", result["last_error"])
+            self.assertEqual("error", plugin.dispatch("info", {})["state"])
+            self.assertIs(backend, plugin._node._backend)
+            self.assertFalse(backend.closed)
+            self.assertEqual("error", plugin.dispatch("start", {})["state"])
+            self.assertEqual(1, len(backend_class.instances))
+            self.assertEqual(["start"], backend.operations)
+
+            backend.close_error = ""
+            self.assertEqual("idle", plugin.dispatch("stop", {})["state"])
+            self.assertIsNone(plugin._node._backend)
+            self.assertTrue(backend.closed)
+            self.assertEqual("running", plugin.dispatch("start", {})["state"])
+            self.assertEqual(2, len(backend_class.instances))
+            plugin.stop()
+
+    def test_camera_start_waits_for_inflight_stop_before_creating_backend(self):
+        backend_class = self._fake_camera_backend()
+        close_entered = threading.Event()
+        release_close = threading.Event()
+        start_entered = threading.Event()
         stopped = []
-        plugin._node = types.SimpleNamespace(
-            status=lambda: {
-                "ok": True,
-                "state": "running",
-                "frames": 42,
-                "last_frame_ago_ms": 10,
-                "last_error": "",
-            },
-            stop_capture=lambda: stopped.append(True),
-        )
+        started = []
+        with patch.object(self.multimedia, "_CameraBackend", backend_class):
+            plugin = self.multimedia.CameraPlugin({}, "test", None, "eno1")
+            plugin.dispatch("start", {})
+            backend = backend_class.instances[0]
+            original_close = backend.close
 
-        result = plugin.dispatch("stop", {})
+            def blocked_close():
+                close_entered.set()
+                if not release_close.wait(2.0):
+                    raise RuntimeError("test did not release camera close")
+                return original_close()
 
-        self.assertEqual([], stopped)
+            def concurrent_start():
+                start_entered.set()
+                started.append(plugin.dispatch("start", {}))
+
+            backend.close = blocked_close
+            stop_thread = threading.Thread(
+                target=lambda: stopped.append(plugin.dispatch("stop", {})))
+            start_thread = threading.Thread(target=concurrent_start)
+            try:
+                stop_thread.start()
+                self.assertTrue(close_entered.wait(1.0))
+                start_thread.start()
+                self.assertTrue(start_entered.wait(1.0))
+                start_thread.join(0.05)
+                self.assertEqual([], started)
+                self.assertEqual(1, len(backend_class.instances))
+            finally:
+                release_close.set()
+                stop_thread.join(2.0)
+                if start_thread.ident is not None:
+                    start_thread.join(2.0)
+
+            self.assertFalse(stop_thread.is_alive())
+            self.assertFalse(start_thread.is_alive())
+            self.assertEqual("idle", stopped[0]["state"])
+            self.assertEqual("running", started[0]["state"])
+            self.assertTrue(backend.closed)
+            self.assertEqual(2, len(backend_class.instances))
+            plugin.stop()
+
+    def _camera_backend_with_fake_process(self, exit_on):
+        class Process:
+            def __init__(self):
+                self.alive = False
+                self.closed = False
+                self.exit_on = exit_on
+                self.events = []
+
+            def start(self):
+                self.alive = True
+
+            def is_alive(self):
+                if self.closed:
+                    raise ValueError("process object is closed")
+                return self.alive
+
+            def join(self, timeout=None):
+                self.events.append(("join", timeout))
+
+            def terminate(self):
+                self.events.append(("terminate", None))
+                if self.exit_on == "terminate":
+                    self.alive = False
+
+            def kill(self):
+                self.events.append(("kill", None))
+                if self.exit_on == "kill":
+                    self.alive = False
+
+            def close(self):
+                if self.alive:
+                    raise ValueError("cannot close a live process")
+                self.closed = True
+
+        class Queue:
+            def __init__(self):
+                self.closed = False
+                self.cancelled_join = False
+
+            def get(self, timeout=None):
+                return {"id": "ready", "ok": True}
+
+            def close(self):
+                self.closed = True
+
+            def cancel_join_thread(self):
+                self.cancelled_join = True
+
+        process = Process()
+        queues = []
+
+        def make_queue():
+            queue = Queue()
+            queues.append(queue)
+            return queue
+
+        context = types.SimpleNamespace(
+            Queue=make_queue, Process=lambda **_kwargs: process)
+        with patch.object(self.multimedia.multiprocessing, "get_context", return_value=context):
+            backend = self.multimedia._CameraBackend(
+                "/test/camera/front", "eno1", 10, 1, 2)
+
+        def call(operation, **_kwargs):
+            process.events.append((operation, None))
+            if operation == "close" and process.exit_on == "close":
+                process.alive = False
+            return {"ok": True}
+
+        backend.call = call
+        return backend, process, queues
+
+    def test_camera_backend_close_reaps_child_and_closes_ipc_idempotently(self):
+        backend, process, queues = self._camera_backend_with_fake_process("close")
+
+        result = backend.close()
+        again = backend.close()
+
+        self.assertTrue(result["ok"])
         self.assertEqual("idle", result["state"])
-        self.assertEqual("running", result["stream_state"])
-        self.assertEqual(42, result["frames"])
+        self.assertTrue(again["ok"])
+        self.assertFalse(process.alive)
+        self.assertTrue(process.closed)
+        self.assertEqual(1, sum(event[0] == "close" for event in process.events))
+        self.assertFalse(any(event[0] in {"terminate", "kill"} for event in process.events))
+        self.assertTrue(all(queue.closed for queue in queues))
 
-        plugin.stop()
-        self.assertEqual([True], stopped)
+    def test_camera_backend_close_kills_child_if_terminate_does_not_stop_it(self):
+        backend, process, queues = self._camera_backend_with_fake_process("kill")
+
+        result = backend.close()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("idle", result["state"])
+        self.assertFalse(process.alive)
+        self.assertTrue(process.closed)
+        operations = [event[0] for event in process.events]
+        self.assertLess(operations.index("terminate"), operations.index("kill"))
+        self.assertTrue(all(queue.closed for queue in queues))
+
+    def test_camera_backend_close_terminates_child_if_graceful_rpc_raises(self):
+        backend, process, queues = self._camera_backend_with_fake_process("terminate")
+
+        def broken_call(_operation, **_kwargs):
+            raise OSError("camera control queue is broken")
+
+        backend.call = broken_call
+        result = backend.close()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual("idle", result["state"])
+        self.assertFalse(process.alive)
+        self.assertTrue(process.closed)
+        self.assertIn(("terminate", None), process.events)
+        self.assertNotIn(("kill", None), process.events)
+        self.assertTrue(all(queue.closed for queue in queues))
+
+    def test_camera_backend_close_retains_live_child_and_ipc_for_retry(self):
+        backend, process, queues = self._camera_backend_with_fake_process("never")
+
+        result = backend.close()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual("error", result["state"])
+        self.assertTrue(process.alive)
+        self.assertFalse(process.closed)
+        self.assertIs(process, backend._process)
+        self.assertTrue(all(not queue.closed for queue in queues))
+        process.exit_on = "kill"
+        self.assertTrue(backend.close()["ok"])
+        self.assertFalse(process.alive)
+        self.assertTrue(process.closed)
+        self.assertTrue(all(queue.closed for queue in queues))
 
     def test_camera_repeated_start_reuses_live_backend(self):
         calls = []
