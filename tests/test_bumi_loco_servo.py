@@ -7,8 +7,8 @@ chassis-shaped concerns in test_r1_loco_servo.py. This file covers what is
   - **the unit conversion**, because `publish_cmd` takes `[-1, 1]` while the
     protocol is m/s, and a factor error there is a robot that travels at the
     wrong speed while every counter reports success
-  - **the calibration being an estimate**, because nothing has measured this
-    chassis and the policy upstream has no other way to find that out
+  - **the calibration source being explicit**, because the policy upstream has
+    no other way to distinguish measured values from fallback defaults
   - **holding means republishing zero**, not publishing nothing: a Bumi command
     does not persist the way R1's `Move(..., True)` does, so "stop sending" is
     not a stop
@@ -169,14 +169,11 @@ def test_force_torque_is_declared_null_rather_than_omitted():
     assert "force_torque" in descriptor and descriptor["force_torque"] is None
 
 
-def test_the_footprint_says_it_is_an_estimate():
-    """navi reads `source` and repeats the caveat in its `degraded` list. The
-    meshes are stripped out of `bumi_model.urdf`, so nothing in this repo knows
-    how wide this robot really is, and a footprint that did not say so would be
-    believed."""
+def test_the_footprint_records_the_hardware_measurement():
+    """The arms-at-rest outside width was measured as 0.42 m."""
     footprint = loco_servo.build_descriptor(loco_servo.Calibration())["footprint"]
-    assert footprint["source"] == "estimate"
-    assert footprint["half_width"] > 0
+    assert footprint["source"] == "measured"
+    assert footprint["half_width"] == 0.21
 
 
 # ── the calibration ──────────────────────────────────────────────────────────
@@ -276,14 +273,15 @@ def test_dry_run_reaches_neither_the_sdk_nor_the_repeat_thread():
     assert card._applied == 1          # it still counted, so info() is truthful
 
 
-def test_dry_run_is_on_by_default_because_nothing_has_measured_this_chassis():
+def test_dry_run_is_on_by_default_until_the_full_pipeline_is_validated():
     """The opposite of R1's default, and the difference is the reason.
 
     R1's `dry_run` defaults off because a deployed chassis that silently refuses
     to move is worse than one that moves — `applied: 33, refused: 0` on screen
     while the robot stood still cost an afternoon there. That holds once the
-    numbers are right. Here `x = 1.0` has never been measured on a Bumi, so the
-    first connection has to be an observation of what the card wants to send.
+    numbers are right. Hardware calibration does not prove that a newly wired
+    vision policy has the correct signs, so its first connection still has to
+    be an observation of what the card wants to send.
     """
     card = loco_servo.LocoServoPlugin({}, "bumi", None, FakeHighCtrl())
     assert card._dry_run is True

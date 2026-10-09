@@ -60,18 +60,14 @@ DOF = 6
 
 # ── the calibration, and why it is a config block rather than five constants ─
 #
-# Everything below describes **this chassis' velocity space**, and not one of
-# these numbers has been measured on a Bumi. They are grouped because they are
-# measured together, in one session, with the robot walking — and because a
-# consumer needs to be told, as one fact, that the space it is commanding into
-# is an estimate.
+# Everything below describes **this chassis' velocity space**. All seven values
+# were measured on the Bumi hardware on 2026-10-09.
 #
-# `full_scale_*` answer "what does x = 1.0 mean in m/s". Chosen to be plausible
-# for a ~0.95 m humanoid and **deliberately low**: reading the full scale as
-# slower than it is makes the card ask for a smaller normalised number than it
-# meant, so the robot under-runs the policy. Reading it as faster does the
-# opposite, and a chassis that travels at twice the commanded speed towards a
-# person is the failure that is not recoverable.
+# `full_scale_*` answer "what does x = 1.0 mean in m/s". The conversion divides
+# a metric request by this value, so setting it too low makes the normalised
+# command too large and the robot over-runs the requested speed. Repeated trials
+# are used rather than a single gait cycle because the stopping foot changes the
+# measured displacement.
 #
 # `min_magnitude*` are the deadband — below these a legged robot does nothing at
 # all, because from a standstill it has to assemble a whole gait cycle and there
@@ -82,20 +78,19 @@ DOF = 6
 # Zero is not the safe choice here, it is the claim that this robot can creep.
 #
 # On R1 the same deadband collapsed by 20x once the robot was already walking
-# (1.0 rad/s standing, 0.05 rad/s mid-stride), which is why there are two.
-# Bumi's have not been measured either way; the moving figures are the standing
-# ones until somebody walks the robot, because inventing a smaller one would be
-# the same mistake in the other direction.
+# (1.0 rad/s standing, 0.05 rad/s mid-stride), which is why there are two. On
+# this Bumi the measured normalised thresholds are 0.40 standing and 0.30 while
+# walking; multiplying by 0.83 rad/s gives the two metric values below.
 #
 # README.md § "标定 loco_servo" has the procedure. It is about twenty minutes.
 DEFAULTS = {
-    "full_scale_vx_mps": 0.5,
-    "full_scale_vy_mps": 0.3,
-    "full_scale_wz_rads": 1.0,
-    "min_vx_mps": 0.15,
-    "min_vy_mps": 0.15,
-    "min_wz_rads": 0.3,
-    "min_wz_moving_rads": 0.3,
+    "full_scale_vx_mps": 0.55,
+    "full_scale_vy_mps": 0.20,
+    "full_scale_wz_rads": 0.83,
+    "min_vx_mps": 0.25,
+    "min_vy_mps": 0.12,
+    "min_wz_rads": 0.33,
+    "min_wz_moving_rads": 0.25,
 }
 
 # `measured` | `estimate`. Rides along in `control_interface` so the policy
@@ -122,16 +117,9 @@ PINNED_ACCEL = 1e-6
 # navi's avoidance corridor is metric, so it needs this to turn a range of image
 # columns into "is there room for my shoulders".
 #
-# **`source: "estimate"`, and it matters that it says so.** `resource/
-# bumi_model.urdf` has had its meshes stripped, so there is no envelope anywhere
-# in this repository — this half-width is inferred from the shoulder joint
-# origins (+-0.084 m) plus an arm. navi's `_adopt_footprint` reads the `source`
-# field and repeats the caveat in its `degraded` list.
-#
-# Unlike the deadband, every failure mode of *this* number is one-sided:
-# believing the robot is wider than it is costs some unnecessary slowing,
-# believing it is narrower puts a shoulder into a doorframe. So it errs wide.
-FOOTPRINT_HALF_WIDTH = 0.22      # m — arms at rest, estimated, erring wide
+# Measured on the Bumi hardware with both arms resting naturally: the maximum
+# outside width is 0.42 m, so navi's symmetric half-width is 0.21 m.
+FOOTPRINT_HALF_WIDTH = 0.21
 FOOTPRINT_FRONT = 0.12
 FOOTPRINT_REAR = 0.12
 FOOTPRINT_HEIGHT = 0.95
@@ -325,7 +313,7 @@ def build_descriptor(calibration: Calibration,
             "rear": FOOTPRINT_REAR,
             "height": FOOTPRINT_HEIGHT,
             # "vendor-spec" | "measured" | "estimate".
-            "source": "estimate",
+            "source": "measured",
             "arms": "at-rest",
         },
         # Whether the three metric ceilings above mean anything. See
