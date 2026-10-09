@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=/opt/phanthy-motus/data/a3-relay
-HOST_ROOT=/dev/shm/a3-relay
 PIDFILE=$ROOT/relay.pid
 SOURCE=/work/agibot/A3/jazzy_relay.py
-RUNNER=$HOST_ROOT/relay-bash
 mkdir -p "$ROOT"
 case "${1:-start}" in
 start)
@@ -12,20 +10,42 @@ start)
       && grep -q "Jazzy input ready" "$ROOT/relay.log" 2>/dev/null; then exit 0; fi
   if [[ -f "$PIDFILE" ]]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
-  mkdir -p "$HOST_ROOT"
-  cp "$SOURCE" "$HOST_ROOT/jazzy_relay.py"
   : > "$ROOT/relay.log"
-  # The ADU runtime does not expose a usable systemd/D-Bus control path from
-  # containers.  Place the interpreter in the host-shared IPC mount, then execute
-  # it after entering PID 1's mount namespace.  The executable path exists in
-  # both namespaces, avoiding nsenter's post-setns path lookup problem.
-  cp /bin/bash "$RUNNER"
-  chmod 0755 "$RUNNER"
-  nsenter -t 1 -m -u -n -p -- "$RUNNER" -lc \
-    "set -e; if [ -f /opt/ros/jazzy/setup.sh ]; then . /opt/ros/jazzy/setup.sh; elif [ -f /opt/ros/jazzy/setup.bash ]; then . /opt/ros/jazzy/setup.bash; else echo '[relay] ERROR: host Jazzy setup not found' >&2; exit 41; fi; python3 -c 'import rclpy, sensor_msgs' || { echo '[relay] ERROR: host Jazzy rclpy/sensor_msgs unavailable' >&2; exit 42; }; exec python3 $HOST_ROOT/jazzy_relay.py" \
-    >>"$ROOT/relay.log" 2>&1 &
+  # A container-created bind mount is not visible in PID 1's mount namespace,
+  # even with pid:host and privileged.  Feed the source over stdin instead of
+  # trying to execute a path created by the container.  /bin/sh is present in
+  # both namespaces and /proc/1/root points at the host filesystem after
+  # nsenter, so this does not depend on a shared mount or on nsenter's path
+  # lookup timing.
+  nsenter -t 1 -m -u -n -p -- /bin/sh -c \
+    'set -eu
+     if [ -f /proc/1/root/opt/ros/jazzy/setup.sh ]; then
+       . /proc/1/root/opt/ros/jazzy/setup.sh
+     elif [ -f /proc/1/root/opt/ros/jazzy/setup.bash ]; then
+       . /proc/1/root/opt/ros/jazzy/setup.bash
+     else
+       echo "[relay] ERROR: host Jazzy setup not found" >&2; exit 41
+     fi
+     python3 -c "import rclpy, sensor_msgs" || {
+       echo "[relay] ERROR: host Jazzy rclpy/sensor_msgs unavailable" >&2; exit 42;
+     }
+     exec python3 -' \
+    <"$SOURCE" >>"$ROOT/relay.log" 2>&1 &
   echo $! > "$PIDFILE"
-  echo "[relay] host Jazzy relay started via shared runner pid=$(cat "$PIDFILE") domain=232"
+  for _ in {1..100}; do
+    if grep -q "Jazzy input ready" "$ROOT/relay.log" 2>/dev/null; then
+      echo "[relay] host Jazzy relay ready pid=$(cat "$PIDFILE") domain=232"
+      exit 0
+    fi
+    if ! kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "[relay] ERROR: host Jazzy relay exited; see $ROOT/relay.log" >&2
+      tail -20 "$ROOT/relay.log" >&2 || true
+      exit 43
+    fi
+    sleep 0.1
+  done
+  echo "[relay] ERROR: host Jazzy relay did not become ready; see $ROOT/relay.log" >&2
+  exit 44
   ;;
 stop)
   kill "$(cat "$PIDFILE" 2>/dev/null || echo 0)" 2>/dev/null || true
