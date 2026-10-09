@@ -114,11 +114,12 @@ and publish-call time, average frame size, and dropped stale frames. Like G1
 intelligent control but does not stop publication. The spawned process is
 physically closed only when the driver bundle shuts down; repeated canvas
 starts reuse the live stream without resetting frame counters.
-The component vendors the three-field `audio_msgs/AudioChunk` interface used by
-the perception audio bus and builds it in a dedicated Docker stage. The runtime
-image receives only the generated `/as2w_ws/install` overlay and validates an
-`AudioChunk` import during the build; it does not depend on an undocumented
-`/ros_ws` artifact in the shared ROS base image.
+The component uses the three-field `audio_msgs/AudioChunk` interface already
+built by the [shared ROS base](https://github.com/4paradigm/phanthymotus/blob/b42effb65b395d0860e36f85ba40f6e10129e55a/deploy/ros-base/Dockerfile).
+Its `/ros_ws/install` overlay supplies `header`, `format` and byte-array `data`.
+The AS2W image validates those fields and native type support at build time and
+sources that same overlay at runtime. It does not build or copy a second audio
+interface. Custom `ROS_BASE_IMAGE` overrides must provide this shared contract.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, RPC correlation, and full-size
@@ -215,3 +216,35 @@ python3 -m unittest unitree/as2w/test_navigation_integration.py
 The extra Dockerfile COPY entries package only the Python navigation adapter
 and metadata helpers. They introduce no additional system/pip dependency and
 preserve the existing DDS isolation and service deployment configuration.
+
+## Packaging rationale and validation scope
+
+The full diff against main also includes the latest AS2W card baseline from
+PR #285. `multimedia.py`, `lidar_backend.py`, `sensor_worker.py` and
+`slam_mapping.py` are imported runtime modules needed to preserve those cards.
+The navigation addition packages `loco_servo.py`, `as2w_control.py`,
+`odom_specs.py` and `camera_specs.py`; no model weights, tests or build workspace
+are copied with them. Removing the duplicate audio overlay avoids redundant
+generated libraries. Application source still contributes bytes to the image;
+this is not a claim that the complete image has zero size increase.
+
+The service fragment no longer forces `NETWORK_INTERFACE=eth0`, because the
+robot interface name varies between hosts (the commissioning machine uses
+`eno1`). Explicit overrides remain supported; automatic selection requires a
+unique active wired interface on the Unitree subnet and fails closed otherwise.
+`driver.yaml` advertises the implemented cards, including `loco_servo`, so the
+catalog matches `tools/list`. These two metadata changes add no runtime package.
+
+Offline tests cover restartable vendor-navigation resources and completion
+notifications, cancellation, servo stream validation, RPC failure/ownership,
+measured-stop confirmation, camera/odom contracts, and deployment packaging.
+The lifecycle regression uses fake SDK transports; it is not a vendor-SLAM
+hardware result. The AS2W commissioning machine has no `unitree_slam` service,
+so vendor mapping/navigation completion cannot be validated there.
+
+The pre-navigation robot baseline has been observed publishing camera frames,
+and a stationary stop-only check confirmed fresh linear/yaw samples. These
+observations do not validate the new image's audio playback quality, microphone
+capture, SLAM, obstacle clearance or physical navigation. The final reviewed
+image still needs dry-run integration followed by supervised low-speed motion
+and stop tests. Preserve concurrent robot fixes before replacing its driver.

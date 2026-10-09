@@ -861,18 +861,18 @@ class TestDriverContracts(unittest.TestCase):
         self.assertIs(plugin._node._backend, created[0])
         self.assertEqual({"ok": True, "state": "ready", "topic": ""}, result)
 
-    def test_docker_image_builds_and_validates_owned_audio_msgs(self):
+    def test_docker_image_validates_shared_audio_msgs_without_duplicate_overlay(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
-        audio_message = (ROOT / "vendor/audio_msgs/msg/AudioChunk.msg").read_text()
-        self.assertIn("COPY vendor/audio_msgs/", dockerfile)
-        self.assertIn("colcon build --packages-select audio_msgs", dockerfile)
-        self.assertIn("test -f /as2w_ws/install/setup.bash", dockerfile)
-        self.assertNotIn("/ros_ws/install/setup.bash", dockerfile)
+        self.assertNotIn("audio-interface-builder", dockerfile)
+        self.assertNotIn("COPY vendor/audio_msgs/", dockerfile)
+        self.assertNotIn("/as2w_ws/install", dockerfile)
+        self.assertIn("test -f /ros_ws/install/setup.bash", dockerfile)
         self.assertIn("from audio_msgs.msg import AudioChunk", dockerfile)
-        self.assertEqual(
-            ["std_msgs/Header header", "string format", "uint8[] data"],
-            audio_message.splitlines(),
-        )
+        self.assertIn("AudioChunk.get_fields_and_field_types()", dockerfile)
+        self.assertIn("msg.header.stamp.sec = 1", dockerfile)
+        self.assertIn("msg.format = str()", dockerfile)
+        self.assertIn("msg.data = [0, 255]", dockerfile)
+        self.assertIn("__import_type_support__()", dockerfile)
 
     def test_camera_worker_is_pinned_to_verified_videohub_client(self):
         source = (ROOT / "multimedia.py").read_text()
