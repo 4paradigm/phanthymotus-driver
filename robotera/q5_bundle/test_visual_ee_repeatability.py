@@ -36,6 +36,15 @@ def _tf(x):
 
 
 class VisualRepeatabilityTests(unittest.TestCase):
+    def test_canvas_start_stop_are_read_only_lifecycle_actions(self):
+        """画布启动和停止需返回传感器状态，且不改变正在运行的测量节点。"""
+        plugin = Plugin({"tag_size_confirmed": False}, "test", None, _Client())
+        actions = plugin.get_tool()["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("start", actions)
+        self.assertIn("stop", actions)
+        self.assertEqual(plugin.dispatch("start", {}), {"state": "running"})
+        self.assertEqual(plugin.dispatch("stop", {}), {"state": "idle"})
+
     def test_relative_pose_cancels_camera_translation_and_rotation(self):
         """相机整体平移与旋转不应改变两 Tag 的相对位姿。"""
         # 相机绕 Z 轴旋转 90 度后，参考系下的手部位移仍应沿 X 轴。

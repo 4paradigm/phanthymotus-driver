@@ -26,7 +26,8 @@ ENV ROS_DOMAIN_ID=211
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ENV PYTHONUNBUFFERED=1
 
-# 运行时依赖：检测节点发布 AprilTag 消息和 TF，测量卡片按时间戳读取。
+# 运行时只显式安装检测器；apriltag_msgs 与 tf2_ros 是 apriltag_ros 的依赖，
+# 由 apt 一并安装。检测节点发布消息和 TF，测量卡片按时间戳读取。
 # 接口编译工具只留在上一阶段，不进入真机镜像。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-numpy \
@@ -44,8 +45,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-diagnostic-msgs \
     ros-humble-action-msgs \
     ros-humble-apriltag-ros \
-    ros-humble-apriltag-msgs \
-    ros-humble-tf2-ros \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

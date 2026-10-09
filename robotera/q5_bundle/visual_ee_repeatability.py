@@ -233,19 +233,21 @@ class Plugin:
             executor.add_node(self._node)
 
     def get_tool(self):
-        """声明画布可见的五个动作及其参数。"""
+        """声明画布生命周期动作和五个测量动作及其参数。"""
         return {
             "name": CARD, "type": "sensor", "multiInstance": False,
             "description": "Q5 左手相对躯干 AprilTag 视觉重复定位测量；只读，不控制机器人",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["info", "start_session", "capture_sample", "report", "reset"]},
+                    "action": {"type": "string", "enum": ["start", "stop", "info", "start_session", "capture_sample", "report", "reset"]},
                     "side": {"type": "string", "enum": ["left"], "default": "left"},
                     "expected_samples": {"type": "integer", "minimum": 2, "maximum": 100, "default": 10},
                 },
                 "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
+                    "start": {"params": []},
+                    "stop": {"params": []},
                     "info": {"params": []},
                     "start_session": {"params": ["side", "expected_samples"]},
                     "capture_sample": {"params": []},
@@ -570,6 +572,11 @@ class Plugin:
 
     def dispatch(self, action, args):
         """按 MCP action 分发；这里只调用观测和会话方法。"""
+        # ROS 订阅随驱动常驻；画布 start/stop 只确认卡片状态，不销毁节点或触发运动。
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return self._info()
         if action == "start_session":
