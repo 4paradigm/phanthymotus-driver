@@ -11,13 +11,12 @@ start)
   if [[ -f "$PIDFILE" ]]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
   cp "$SOURCE" "$ROOT/jazzy_relay.py"
-  # The container already exposes the host's /opt/ros/jazzy tree.  Do not
-  # enter the host mount namespace: ADU denies that namespace transition and
-  # its minimal root does not contain the container shell path.  Enter only
-  # the host PID/network namespaces so Jazzy DDS sees the robot interfaces.
+  # Enter the host mount namespace so this process uses the host's Python 3.12
+  # and Jazzy ROS installation.  Use the minimal POSIX shell available on the
+  # ADU root filesystem; the previous bash paths were not present there.
   : > "$ROOT/relay.log"
-  nsenter -t 1 -u -n -p -- /usr/bin/bash -lc \
-    "set -e; test -f /opt/ros/jazzy/setup.bash || { echo '[relay] ERROR: /opt/ros/jazzy is not visible in the relay namespace' >&2; exit 41; }; source /opt/ros/jazzy/setup.bash; python3 -c 'import rclpy, sensor_msgs' || { echo '[relay] ERROR: Jazzy rclpy/sensor_msgs unavailable' >&2; exit 42; }; exec python3 $ROOT/jazzy_relay.py" \
+  nsenter -t 1 -m -u -n -p -- /bin/sh -c \
+    "set -e; if [ -f /opt/ros/jazzy/setup.sh ]; then . /opt/ros/jazzy/setup.sh; elif [ -f /opt/ros/jazzy/setup.bash ]; then . /opt/ros/jazzy/setup.bash; else echo '[relay] ERROR: /opt/ros/jazzy is not visible in host mount namespace' >&2; exit 41; fi; python3 -c 'import rclpy, sensor_msgs' || { echo '[relay] ERROR: host Jazzy rclpy/sensor_msgs unavailable' >&2; exit 42; }; exec python3 $ROOT/jazzy_relay.py" \
     >"$ROOT/relay.log" 2>&1 &
   echo $! > "$PIDFILE"
   echo "[relay] host Jazzy relay started pid=$(cat "$PIDFILE") domain=232"
