@@ -28,6 +28,9 @@ python3 /work/g1_motion/fetch_assets.py --check
 ```sh
 python -m pytest -q unitree/g1/tests/test_motion_control_numeric.py
 python -m pytest -q unitree/g1/tests/test_motion_control_contract.py
+python -m pytest -q unitree/g1/tests/test_motion_control_threads.py
 ```
 
 第二组6项为明确执行器/数值替身的卡片协议测试，覆盖最新值、会话栅栏、失败后同映射恢复、完整参考及包络。它不证明SDK执行或物理完成。缺少真实数值ABI时第一组会skip，不能把skip记作通过。
+
+第三组运行真实遥操线程、运动协调线程和数值 IPC 子进程，验证最新待处理帧覆盖、通信超时、旧进程退出、重启、新代次拒绝旧结果以及新帧恢复发布。测试复用硬件替身，并以可阻塞的合成求解器替代 IK；需要 pytest、NumPy 和 SciPy，不需要 ROS、SDK 或 Pinocchio。它不验证实际求解精度或物理停止。
