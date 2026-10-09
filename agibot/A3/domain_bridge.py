@@ -4,6 +4,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
+import threading
 
 
 def _type_name(msg_type):
@@ -19,20 +20,31 @@ def _type_name(msg_type):
 
 class CoreBridge:
     def __init__(self, profile="/opt/phanthy-motus/dds-local.xml", domain=42):
-        # These are live sensor feeds, not recordings: preserve freshness by
-        # keeping at most the newest pending sample for each independent lane.
-        self._queues = {lane: mp.get_context("spawn").Queue(maxsize=1)
-                        for lane in ("media0", "media1", "media2", "media3", "media4",
-                                     "media5", "media6", "media7", "media8", "media9",
-                                     "media10", "media11",
-                                     "pointcloud", "audio_mic", "audio_ext",
-                                     "state")}
         self._ctx = mp.get_context("spawn")
+        self._queues = {
+            **{f"media{i}": self._ctx.Queue(maxsize=1) for i in range(12)},
+            "pointcloud": self._ctx.Queue(maxsize=1),
+            # Audio is an ordered waveform, not a replaceable video frame.
+            # Buffer short scheduling bursts; on sustained overload, count and
+            # drop the oldest chunk to bound latency.
+            "audio_mic": self._ctx.Queue(maxsize=128),
+            "audio_ext": self._ctx.Queue(maxsize=128),
+            # These lanes publish latest-state data. Separate the two combined
+            # joint outputs and IMU from one another so maxsize=1 cannot make
+            # unrelated topics overwrite each other.
+            "state_joints": self._ctx.Queue(maxsize=1),
+            "state_joint_state": self._ctx.Queue(maxsize=1),
+            "state_imu": self._ctx.Queue(maxsize=1),
+            "state_motor": self._ctx.Queue(maxsize=16),
+            "state_system": self._ctx.Queue(maxsize=16),
+        }
         self._profile = profile
         self._domain = domain
         self._procs = []
         self._sent = 0
         self._dropped = 0
+        self._topic_counts = {}
+        self._metrics_lock = threading.Lock()
 
     def start(self):
         for lane, messages in self._queues.items():
@@ -70,27 +82,48 @@ class CoreBridge:
                              f"media{sum(topic.encode('utf-8')) % 12}")
             elif "audio" in topic or "mic" in topic:
                 lane = "audio_ext" if "ext_mic" in topic else "audio_mic"
+            elif topic.endswith("/state/joints"):
+                lane = "state_joints"
+            elif topic.endswith("/state/joint_state"):
+                lane = "state_joint_state"
+            elif topic.endswith("/state/imu"):
+                lane = "state_imu"
+            elif topic.endswith(("/arm_state", "/hand_state", "/neck_state")):
+                lane = "state_motor"
+            elif topic.endswith(("/battery", "/estop", "/skill_status")):
+                lane = "state_system"
             else:
-                # State topics are small; one publisher process avoids eight
-                # extra DDS participants competing with the media workers.
-                lane = "state"
+                lane = "state_system"
             item = (topic, type_name, serialize_message(msg))
             try:
                 self._queues[lane].put_nowait(item)
             except queue.Full:
-                # Replace stale data rather than showing an old image/scan.
+                # Video, point clouds and latest-state snapshots may replace
+                # stale pending values. Audio instead preserves FIFO order.
                 try:
-                    self._queues[lane].get_nowait()
+                    if lane.startswith("audio_"):
+                        self._queues[lane].get_nowait()
+                        with self._metrics_lock:
+                            self._dropped += 1
+                    else:
+                        self._queues[lane].get_nowait()
                 except queue.Empty:
                     pass
                 self._queues[lane].put_nowait(item)
-                self._dropped += 1
-            self._sent += 1
-            if self._sent == 1 or self._sent % 10000 == 0:
+                if not lane.startswith("audio_"):
+                    with self._metrics_lock:
+                        self._dropped += 1
+            with self._metrics_lock:
+                self._sent += 1
+                count = self._topic_counts.get(topic, 0) + 1
+                self._topic_counts[topic] = count
+                sent, dropped = self._sent, self._dropped
+            if count == 1 or count % 5000 == 0:
                 print(f"[dds-bridge] enqueued_total={self._sent} replaced_stale={self._dropped} "
-                      f"lane={lane} topic={topic}", flush=True)
+                      f"lane={lane} topic={topic} topic_count={count}", flush=True)
         except queue.Full:
-            self._dropped += 1
+            with self._metrics_lock:
+                self._dropped += 1
         except Exception as exc:
             print(f"[dds-bridge] enqueue failed topic={topic}: {exc}", flush=True)
 

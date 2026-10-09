@@ -50,7 +50,17 @@ def _encode_image(msg, key):
         image = raw[:step * height].reshape(height, step)[:, :width * 3].reshape(height, width, 3)
         if str(msg.encoding) == "rgb8":
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 50])
+        # Full-resolution JPEG encoding for twelve cameras saturates the ADU
+        # CPU and makes every callback arrive in bursts.  The dashboard only
+        # needs a preview stream; bound the largest dimension before encoding.
+        max_dimension = 640
+        largest = max(image.shape[:2])
+        if largest > max_dimension:
+            scale = max_dimension / float(largest)
+            image = cv2.resize(image, (max(1, int(image.shape[1] * scale)),
+                                       max(1, int(image.shape[0] * scale))),
+                               interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 42])
         if not ok:
             return None
         out.format = "jpeg"
@@ -65,19 +75,46 @@ def _encode_cloud(msg):
     fields = {field.name: field for field in msg.fields}
     if not all(name in fields for name in ("x", "y", "z")):
         return None
-    points = []
-    for row in range(int(msg.height)):
-        for col in range(int(msg.width)):
-            base = row * int(msg.row_step) + col * int(msg.point_step)
-            try:
-                xyz = tuple(float(np.frombuffer(bytes(msg.data), dtype=np.float32, count=1, offset=base + fields[n].offset)[0]) for n in ("x", "y", "z"))
-            except (ValueError, IndexError):
-                continue
-            if all(np.isfinite(xyz)):
-                points.append(xyz)
-    points = points[:20000]
+    # PointCloud2 is normally dense and little-endian. A per-point Python loop
+    # stalls the relay callback for tens of milliseconds and turns a 10 Hz
+    # Livox stream into visible bursts. Build one structured view and stride
+    # sample it in C/NumPy; retain a defensive scalar fallback for unusual
+    # row/point layouts.
+    try:
+        count = int(msg.height) * int(msg.width)
+        raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+        if int(msg.row_step) == int(msg.point_step) * int(msg.width):
+            dtype = np.dtype({"names": ["x", "y", "z"],
+                              "formats": ["<f4", "<f4", "<f4"],
+                              "offsets": [fields[n].offset for n in ("x", "y", "z")],
+                              "itemsize": int(msg.point_step)})
+            view = np.ndarray((count,), dtype=dtype, buffer=raw[:count * int(msg.point_step)])
+            points = np.column_stack((view["x"], view["y"], view["z"]))
+            if len(points) > 20000:
+                points = points[::max(1, len(points) // 20000)][:20000]
+            points = points[np.isfinite(points).all(axis=1)]
+        else:
+            raise ValueError("non-dense PointCloud2 layout")
+    except (ValueError, TypeError, IndexError):
+        points = []
+        data = bytes(msg.data)
+        for row in range(int(msg.height)):
+            for col in range(int(msg.width)):
+                base = row * int(msg.row_step) + col * int(msg.point_step)
+                try:
+                    xyz = tuple(float(np.frombuffer(data, dtype=np.float32, count=1, offset=base + fields[n].offset)[0]) for n in ("x", "y", "z"))
+                except (ValueError, IndexError):
+                    continue
+                if all(np.isfinite(xyz)):
+                    points.append(xyz)
+                if len(points) >= 20000:
+                    break
+            if len(points) >= 20000:
+                break
+        points = np.asarray(points, dtype=np.float32)
+    points = np.asarray(points, dtype=np.float32)
     out = UInt8MultiArray()
-    out.data = list(struct.pack("<II", 12, len(points)) + b"".join(struct.pack("<fff", *p) for p in points))
+    out.data = list(struct.pack("<II", 12, len(points)) + points.astype("<f4", copy=False).tobytes())
     return out
 
 

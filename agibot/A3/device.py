@@ -1090,6 +1090,8 @@ class A3Nodes:
                                "tau": efforts[index] if index < len(efforts) else 0.0})
         output = self._String()
         output.data = json.dumps({"format": "sensor/skeleton", "available": bool(joints),
+                                  "fresh": bool(joints), "joint_count": len(joints),
+                                  "timestamp_ms": int(time.time() * 1000),
                                   "joints": joints}, ensure_ascii=False)
         self._joint_skeleton_pub.publish(output)
 
