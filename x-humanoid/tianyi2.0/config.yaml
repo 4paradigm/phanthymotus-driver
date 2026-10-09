@@ -52,8 +52,6 @@ plugins:
     floor_offset_m: 1.50
   asr:
     enabled: true
-  sound_direction:
-    enabled: true
   nav_state:
     enabled: true
   power_board:

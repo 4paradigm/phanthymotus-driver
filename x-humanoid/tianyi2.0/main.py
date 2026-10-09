@@ -466,11 +466,6 @@ class TianyiDeviceBundle:
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, ros2))
             print("[bundle] AsrPlugin loaded")
 
-        if plugins_cfg.get("sound_direction", {}).get("enabled", False):
-            from device import SoundDirectionPlugin
-            self._plugins.append(SoundDirectionPlugin(plugins_cfg["sound_direction"], namespace, ros2))
-            print("[bundle] SoundDirectionPlugin loaded")
-
         if plugins_cfg.get("nav_state", {}).get("enabled", False):
             from device import NavStatePlugin
             self._plugins.append(NavStatePlugin(plugins_cfg["nav_state"], namespace, ros2, slamtec_client))
@@ -599,7 +594,7 @@ class TianyiDeviceBundle:
 
     # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
     _ALWAYS_START = {
-        'StatePlugin', 'AsrPlugin', 'SoundDirectionPlugin', 'RemoteStatePlugin', 'TtsPlugin',
+        'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
         'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
     }
 

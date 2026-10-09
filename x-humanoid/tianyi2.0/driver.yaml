@@ -25,7 +25,6 @@ cards:
   - { name: camera_depth,       type: sensor }
   - { name: camera_pointcloud,  type: sensor }
   - { name: asr,                type: sensor }
-  - { name: sound_direction,    type: sensor }
   - { name: nav_state,          type: sensor }
   - { name: power_board,        type: sensor }
   - { name: motors,             type: sensor }
