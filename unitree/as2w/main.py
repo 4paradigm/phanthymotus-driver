@@ -14,6 +14,7 @@ import rclpy
 import rclpy.executors
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from rpc_proxy import RpcProxy
+from network import interface_candidates
 
 
 class _UnavailableProxy:
@@ -24,17 +25,43 @@ class _UnavailableProxy:
 def load_config():
     return yaml.safe_load(open(os.environ.get("CONFIG_PATH", Path(__file__).with_name("config.yaml"))))
 
+
+def initialize_unitree_dds(candidates):
+    """Initialize Unitree DDS only on an explicitly selected candidate.
+
+    An empty candidate list is a deliberate safe failure: passing ``None`` to
+    ChannelFactoryInitialize would re-enable CycloneDDS auto-selection and can
+    put the body participant on a non-robot network.
+    """
+    for candidate in candidates:
+        try:
+            ChannelFactoryInitialize(0, candidate)
+            print(f"[as2w] Unitree DDS initialized on {candidate}", flush=True)
+            return True, candidate
+        except Exception as exc:
+            print(f"[as2w] DDS init failed on {candidate}: {exc}", flush=True)
+    if not candidates:
+        print("[as2w] No eligible wired robot interface found; refusing DDS auto-selection", flush=True)
+    return False, None
+
+
 class Bundle:
     def __init__(self, cfg, namespace, executor, proxy, interface, dds_ready=True):
-        from device import StatePlugin, LocoPlugin, SpecialActionPlugin
+        from device import (StatePlugin, LocoPlugin, SpecialActionPlugin,
+                            MicPlugin, SpeakerPlugin, LedPlugin, CameraPlugin)
         from lidar import LidarPlugin
         from controlled_spatial import ControlledSpatialPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
+        if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
+        if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, proxy))
+        if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
+        if dds_ready and p.get("camera_rgb", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera_rgb", {}), namespace, executor, proxy, interface))
         if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
         if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
-        if p.get("special_action", {}).get("enabled", True): self.plugins.append(SpecialActionPlugin(p.get("special_action", {}), namespace, executor, proxy))
-        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor))
+        special_cfg = p.get("special_motion", p.get("special_action", {}))
+        if special_cfg.get("enabled", True): self.plugins.append(SpecialActionPlugin(special_cfg, namespace, executor, proxy))
+        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
@@ -66,9 +93,15 @@ def handler(bundle):
             print(f"[mcp] {self.address_string()} {safe}", flush=True)
         def _send_json(self, status, payload):
             body = json.dumps(payload).encode()
-            self.send_response(status); self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers(); self.wfile.write(body)
+            try:
+                self.send_response(status); self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body))); self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers(); self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # MCP clients are allowed to cancel a request.  A cancelled
+                # response must not produce a noisy traceback in the driver
+                # container or obscure the next hardware error.
+                return
         def _send_sse(self, event, data):
             try:
                 self.wfile.write(f"event: {event}\\ndata: {data}\\n\\n".encode())
@@ -155,7 +188,10 @@ def _start_registration(mcp_port, name, category):
 
 def main():
     cfg = load_config()
-    interface = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("NETWORK_INTERFACE") or cfg.get("robot_interface", "eth0")
+    requested_interface = (sys.argv[1].strip() if len(sys.argv) > 1 and sys.argv[1].strip()
+                           else os.environ.get("NETWORK_INTERFACE", "").strip())
+    configured_interface = str(cfg.get("robot_interface") or "").strip()
+    interface = requested_interface or configured_interface or "(auto)"
     profile = os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE", "")
     if os.environ.get("ROS_DOMAIN_ID") != "42" or os.environ.get("RMW_IMPLEMENTATION") != "rmw_fastrtps_cpp":
         print("[as2w] WARNING: ROS2 is not configured for agent-core Domain 42/FastDDS", flush=True)
@@ -165,19 +201,14 @@ def main():
         print(f"[as2w] ROS2 isolation profile: {profile} (Domain 42, FastDDS); Unitree SDK: CycloneDDS Domain 0 on {interface or '(auto)'}", flush=True)
     dds_ready = False
     # A body DDS participant must never silently bind to the office Wi-Fi.
-    # Configure NETWORK_INTERFACE explicitly for non-eth0 robot adapters.
-    candidates = [interface] if interface else []
-    for candidate in candidates:
-        try:
-            ChannelFactoryInitialize(0, candidate or None)
-            dds_ready = True
-        except Exception as exc:
-            print(f"[as2w] DDS init failed on {candidate or '(auto)'}: {exc}", flush=True)
-            dds_ready = False
-        if dds_ready:
-            interface = candidate
-            print(f"[as2w] Unitree DDS initialized on {interface or '(auto)'}", flush=True)
-            break
+    # Explicit NETWORK_INTERFACE is strict; otherwise only likely wired robot
+    # adapters are tried and CycloneDDS may select among those adapters.
+    candidates = interface_candidates(
+        requested_interface, configured_interface,
+        str(cfg.get("robot_subnet") or "192.168.123.0/24"))
+    dds_ready, selected_interface = initialize_unitree_dds(candidates)
+    if dds_ready:
+        interface = selected_interface
     if not dds_ready:
         print("[as2w] WARNING: Unitree DDS unavailable; starting MCP in degraded mode", flush=True)
     namespace = re.sub(r"[^a-zA-Z0-9_]", "_", cfg.get("ros_namespace") or socket.gethostname())

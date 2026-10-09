@@ -14,7 +14,9 @@ unitree-as2w:
     - /unitree/module:/unitree/module:ro
     - /home/unitree/maps:/home/unitree/maps
   environment:
-    - NETWORK_INTERFACE=eth0
+    # Leave empty to auto-detect the host's wired robot adapter. Set this to
+    # the exact host interface name when more than one wired adapter exists.
+    - NETWORK_INTERFACE=${NETWORK_INTERFACE:-}
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
