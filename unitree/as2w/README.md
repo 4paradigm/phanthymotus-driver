@@ -158,6 +158,10 @@ commands; an RPC already delivered to firmware cannot be retracted by Python.
 The driver refuses legacy writes while the servo owns the chassis, including
 late finalizers from old locomotion workers. Explicit canvas locomotion and
 special-motion requests first wait for the servo's stop acknowledgement.
+Vendor `controlled_spatial` navigation also reserves the chassis; only an
+accepted vendor pause/shutdown releases that reservation. A timed-out vendor
+request remains reserved because its execution status is unknown. Explicitly
+pause the vendor navigator before switching to the visual velocity stream.
 
 Expired/invalid streams do not refresh the watchdog. Stream loss pauses the
 card and requires an explicit resume; it never automatically replays an old

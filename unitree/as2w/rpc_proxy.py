@@ -153,17 +153,19 @@ class _ServoClient:
     process timed out and was terminated. None of these timeouts is a physical
     stopping-time guarantee.
     """
-    max_call_seconds = 0.35
+    # Stop may use both lanes once; the declared budget includes that retry.
+    max_call_seconds = 0.5
 
     def __init__(self, owner, network_interface, channel_factory=_RpcChannel):
         self._owner = owner
-        kwargs = {"timeout": self.max_call_seconds, "sdk_timeout": 0.15,
+        kwargs = {"timeout": 0.25, "sdk_timeout": 0.10,
                   "fail_closed": True}
         self._motion = channel_factory(network_interface, "sport", **kwargs)
         self._state = channel_factory(network_interface, "sport", **kwargs)
         self._emergency = channel_factory(network_interface, "sport", **kwargs)
         self._active = 0
         self.conflict_check = None
+        self.stop_diagnostics = {}
 
     @property
     def control_ready(self):
@@ -177,7 +179,8 @@ class _ServoClient:
         with self._owner._ownership_lock:
             if not self.control_ready:
                 return {"ok": False, "error": "short-timeout control RPC unavailable"}
-            if self._owner._legacy_active or self._owner._legacy_motion_active:
+            if (self._owner._legacy_active or self._owner._legacy_motion_active
+                    or self._owner._external_navigation):
                 return {"ok": False, "error": "legacy motion active; call loco.stop_move first"}
             if self._owner._owner not in ("legacy", "servo"):
                 return {"ok": False, "error": "chassis is unavailable"}
@@ -200,7 +203,15 @@ class _ServoClient:
             channel = self._motion
             if method == "StopMove" and not channel.ready:
                 channel = self._emergency
-            return channel.call(method, *args)
+            result = channel.call(method, *args)
+            if method == "StopMove":
+                self.stop_diagnostics = {"primary_ret": result, "fallback_ret": None}
+                if result != 0 and channel is self._motion and not self._motion.ready:
+                    # The primary StopMove itself may be the call that times
+                    # out. Do not wait for a human reset to use the spare lane.
+                    result = self._emergency.call("StopMove")
+                    self.stop_diagnostics["fallback_ret"] = result
+            return result
         finally:
             with self._owner._ownership_lock:
                 self._active -= 1
@@ -227,6 +238,7 @@ class RpcProxy:
         self._owner = "legacy"
         self._legacy_active = 0
         self._legacy_motion_active = False
+        self._external_navigation = False
         self._servo_client = None
         self._sport = _RpcChannel(network_interface, "sport", 7.0)
         # The speaker card has its own verified backend. Keep LED refreshes in
@@ -263,7 +275,20 @@ class RpcProxy:
 
     def legacy_motion_active(self):
         with self._ownership_lock:
-            return bool(self._legacy_active or self._legacy_motion_active)
+            return bool(self._legacy_active or self._legacy_motion_active
+                        or self._external_navigation)
+
+    def reserve_external_navigation(self):
+        """Vendor SLAM is a separate SDK client but shares the same chassis."""
+        with self._ownership_lock:
+            if self._owner != "legacy":
+                return False
+            self._external_navigation = True
+            return True
+
+    def release_external_navigation(self):
+        with self._ownership_lock:
+            self._external_navigation = False
 
     def __getattr__(self, name):
         return lambda *args: self.call(name, *args)

@@ -89,6 +89,40 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual([("StopMove", ())], self.servo._emergency.calls)
         self.assertFalse(self.servo.control_ready)
 
+    def test_first_stop_timeout_immediately_uses_spare_lane(self):
+        self.assertTrue(self.servo.acquire_control()["ok"])
+        def timed_out(*_):
+            self.servo._motion.ready = False
+            return 3104
+        self.servo._motion.call = timed_out
+        self.assertEqual(0, self.servo.StopMove())
+        self.assertEqual([("StopMove", ())], self.servo._emergency.calls)
+        self.assertEqual({"primary_ret": 3104, "fallback_ret": 0}, self.servo.stop_diagnostics)
+
+    def test_vendor_navigation_blocks_servo_until_accepted_pause(self):
+        spatial_module = load("navigation_spatial", ROOT / "controlled_spatial.py")
+        spatial = spatial_module.ControlledSpatialPlugin.__new__(spatial_module.ControlledSpatialPlugin)
+        spatial.set_chassis_guard(self.proxy)
+        reply = {"code": 0, "response": {}}
+        spatial._client = types.SimpleNamespace(call=lambda *_: reply)
+        self.assertEqual(0, spatial.dispatch("resume_navigation", {})["ret"])
+        self.assertFalse(self.servo.acquire_control()["ok"])
+        reply["code"] = 3104
+        spatial.dispatch("pause_navigation", {})
+        self.assertFalse(self.servo.acquire_control()["ok"])
+        reply["code"] = 0
+        spatial.dispatch("pause_navigation", {})
+        self.assertTrue(self.servo.acquire_control()["ok"])
+        self.assertNotEqual(0, spatial.dispatch("resume_navigation", {})["ret"])
+
+    def test_uncertain_vendor_resume_keeps_chassis_reserved(self):
+        spatial_module = load("navigation_spatial_uncertain", ROOT / "controlled_spatial.py")
+        spatial = spatial_module.ControlledSpatialPlugin.__new__(spatial_module.ControlledSpatialPlugin)
+        spatial.set_chassis_guard(self.proxy)
+        spatial._client = types.SimpleNamespace(call=lambda *_: {"code": 3104, "response": "timeout"})
+        spatial.dispatch("resume_navigation", {})
+        self.assertFalse(self.servo.acquire_control()["ok"])
+
     def test_special_motion_conflict_is_checked_before_claim(self):
         self.servo.conflict_check = lambda: "special motion active"
         self.assertFalse(self.servo.acquire_control()["ok"])

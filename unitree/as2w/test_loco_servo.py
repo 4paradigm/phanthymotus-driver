@@ -401,6 +401,39 @@ class StreamTests(unittest.TestCase):
 
 
 class ThreadOrderingTests(unittest.TestCase):
+    def test_resume_cannot_rearm_between_stop_ack_and_disconnect(self):
+        client = Client()
+        plugin = servo.LocoServoPlugin({}, "test", None, client)
+        plugin._node = object()
+        plugin._controller.activate()
+        entered, finish, resumed = threading.Event(), threading.Event(), threading.Event()
+        results = {}
+        def disconnect():
+            entered.set()
+            finish.wait(1)
+            plugin._node = None
+        plugin._disconnect = disconnect
+        stop = threading.Thread(target=lambda: results.update(stop=plugin.dispatch("stop", {})))
+        def resume():
+            results["resume"] = plugin.dispatch("resume", {})
+            resumed.set()
+        start = threading.Thread(target=resume)
+        try:
+            stop.start()
+            self.assertTrue(entered.wait(.5))
+            start.start()
+            self.assertFalse(resumed.wait(.05))
+            finish.set()
+            stop.join(1)
+            start.join(1)
+            self.assertEqual("idle", results["stop"]["state"])
+            self.assertFalse(results["resume"]["ok"])
+            self.assertEqual("paused", plugin._controller.info()["state"])
+            self.assertFalse(client.moves)
+        finally:
+            finish.set()
+            plugin._controller.close()
+
     def test_inflight_move_then_pause_is_stop_last_and_callback_is_nonblocking(self):
         client = Client()
         entered, finish = threading.Event(), threading.Event()

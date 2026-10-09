@@ -109,11 +109,18 @@ class LocoServoPlugin:
         pass
 
     def stop(self):
-        result = self._controller.close()
-        self._disconnect()
-        return result
+        with self._lock:
+            result = self._controller.close()
+            self._disconnect()
+            return result
 
     def dispatch(self, action, args):
+        # Keep connection checks, state transitions and disconnect atomic.
+        # Otherwise resume can re-arm between stop's ACK and its disconnect.
+        with self._lock:
+            return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
         if action == "info":
             return self._info()
         if action == "config":
@@ -190,7 +197,8 @@ class LocoServoPlugin:
             self._last_rejection = result["reason"]
 
     def pause_for_explicit_command(self, reason="explicit chassis action", timeout=1.5):
-        return self._controller.pause(reason, timeout=timeout)
+        with self._lock:
+            return self._controller.pause(reason, timeout=timeout)
 
     def owns_chassis(self):
         return self._controller.info()["owner_acquired"]
@@ -209,4 +217,5 @@ class LocoServoPlugin:
             degraded.append("AS2W footprint is undeclared; upstream fallback geometry is not a measured clearance.")
         return {**status, "input": self._topic, "connected": self._node is not None,
                 "control_interface": descriptor, "degraded": degraded,
+                "transport_stop": getattr(self._controller.client, "stop_diagnostics", {}),
                 "last_rejection": self._last_rejection}

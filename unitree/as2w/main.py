@@ -133,7 +133,10 @@ class Bundle:
         if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
         if dds_ready and p.get("camera", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera", {}), namespace, executor, interface))
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
-        if dds_ready and p.get("controlled_spatial", {}).get("enabled", True): self.plugins.append(ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface))
+        if dds_ready and p.get("controlled_spatial", {}).get("enabled", True):
+            spatial = ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface)
+            spatial.set_chassis_guard(proxy)
+            self.plugins.append(spatial)
         if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
         if dds_ready and p.get("loco_servo", {}).get("enabled", False):
             from loco_servo import LocoServoPlugin

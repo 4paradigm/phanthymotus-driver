@@ -4,6 +4,7 @@ The SDK currently publishes no AS2-specific SLAM wrapper. The service itself
 uses Unitree's common RPC protocol, so this module owns the documented client.
 """
 import json
+from contextlib import nullcontext
 import multiprocessing
 import threading
 import time
@@ -113,6 +114,8 @@ class ControlledSpatialPlugin:
         self._nav_result = None
         self._nav_action_id = None
         self._nav_lock = threading.Lock()
+        self._chassis_guard = None
+        self._operation_lock = threading.RLock()
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
@@ -142,12 +145,24 @@ class ControlledSpatialPlugin:
                     "resume_navigation": {"params": [], "description": "Resume navigation."},
                     "shutdown": {"params": [], "description": "Close vendor SLAM service."}}}}
 
+    def set_chassis_guard(self, guard):
+        self._chassis_guard = guard
+        if not hasattr(self, "_operation_lock"):
+            self._operation_lock = threading.RLock()
+
+    def _release_chassis(self):
+        guard = getattr(self, "_chassis_guard", None)
+        if guard is not None:
+            guard.release_external_navigation()
+
     def start(self): pass
     def stop(self):
         with self._nav_lock:
             action_id, self._nav_action_id = self._nav_action_id, None
         if action_id:
-            self._client.call("pause_navigation", {})
+            paused = self._client.call("pause_navigation", {})
+            if paused.get("code") == 0:
+                self._release_chassis()
             _acp_notify(action_id, "cancelled", {"reason": "card stopped"})
         if self._nav_sub is not None:
             try:
@@ -188,6 +203,13 @@ class ControlledSpatialPlugin:
             "x": 0, "y": 0, "z": 0, "q_x": 0, "q_y": 0, "q_z": 0, "q_w": 1}.items()}
 
     def dispatch(self, action, args):
+        # Serialize reservations and their RPC outcomes as one transaction.
+        # A concurrent resume must not sit behind an acknowledged pause while
+        # that pause has already released the chassis to the visual navigator.
+        with getattr(self, "_operation_lock", nullcontext()):
+            return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
             self.stop()
@@ -201,6 +223,11 @@ class ControlledSpatialPlugin:
         elif action == "navigate_to":
             data = {"targetPose": self._pose(args), "mode": int(args.get("mode", 1)), "speed": float(args.get("speed", 0.5))}
         else: data = {}
+        if action in ("navigate_to", "resume_navigation"):
+            guard = getattr(self, "_chassis_guard", None)
+            if guard is not None and not guard.reserve_external_navigation():
+                return {"ret": 3104, "accepted": False,
+                        "error": "velocity stream owns the chassis; pause it first"}
         action_id = None
         previous = None
         if action == "navigate_to":
@@ -217,6 +244,11 @@ class ControlledSpatialPlugin:
                 _acp_notify(previous, "cancelled", {"reason": "superseded by new navigation request"})
 
         result = self._client.call(action, data)
+        # Keep ownership on timeout/error: the vendor may have accepted an RPC
+        # whose reply was lost. Only an explicit accepted pause/shutdown clears
+        # it; an uncorrelated completion topic cannot safely release a new goal.
+        if action in ("pause_navigation", "shutdown") and result["code"] == 0:
+            self._release_chassis()
         response = result["response"]
         try: response = json.loads(response) if isinstance(response, str) else response
         except json.JSONDecodeError: pass
