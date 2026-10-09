@@ -158,9 +158,15 @@ The `plugins.loco_servo` YAML configuration accepts `vx_limit`, `vy_limit`,
 entering dry run first stops real motion. Limits are immutable for a running
 driver so the descriptor cannot change underneath an existing navigator.
 
-The ROS callback performs bounded validation and replaces a single pending
-frame. One worker owns SDK writes, enforces time-based acceleration and
-processes stops before queued motion. Short-timeout SDK processes isolate
+The ROS callback decodes JSON and replaces one raw pending frame; `QUEUED`
+means admission to that mailbox, not validation or SDK acceptance. One worker
+calls the shared `common.control.ControlSink` immediately before SDK writes.
+The sink owns contract/freshness checks, source arbitration, velocity bounds,
+step limiting, TTL/watchdog and fault latching. AS2W supplies its posture gate,
+SDK conversion and chassis ownership boundary. The standard
+`limits.max_delta_per_step` declares acceleration divided by `expected_hz`;
+the worker sends nonzero commands no faster than that rate. A validated full
+zero stops immediately instead of ramping down. Short-timeout SDK processes isolate
 velocity, state queries and the fallback stop path from legacy multi-second
 RPCs. A timed-out velocity process is terminated and cannot queue later
 commands; an RPC already delivered to firmware cannot be retracted by Python.
@@ -180,8 +186,9 @@ software fault and leaves the card paused; a terminated RPC process requires
 a driver restart. After changing a navigation goal following a stop/arrival,
 resume `loco_servo` as well as the navigator when the receiver is paused.
 
-`info` separates received/validated/simulated frames, SDK attempts, SDK
-acceptances and errors. `stop_acknowledged` only means the SDK accepted the
+`info` separates received/queued/validated/simulated frames, SDK attempts, SDK
+acceptances and errors. `last_outcome` and `safety_sink` expose the worker's
+shared verdict and fault state. `stop_acknowledged` only means the SDK accepted the
 request. `physical_stop_verified` remains unknown unless fresh body-frame
 vx/vy/wz measurements confirm rest over several samples. A configured
 watchdog threshold is not a guaranteed physical stopping time: scheduling,
@@ -211,11 +218,25 @@ robot models:
 python3 -m unittest unitree/as2w/test_driver.py
 python3 -m unittest unitree/as2w/test_loco_servo.py
 python3 -m unittest unitree/as2w/test_navigation_integration.py
+python3 -m unittest unitree/as2w/test_lidar_interface.py
+python3 -m pytest tests/test_control_sink.py tests/test_control_sink_stream.py
 ```
 
 The extra Dockerfile COPY entries package only the Python navigation adapter
 and metadata helpers. They introduce no additional system/pip dependency and
 preserve the existing DDS isolation and service deployment configuration.
+
+The lidar subprocess receives the resolved robot adapter explicitly. It refuses
+an empty/`auto` interface and exits if DDS binding fails, before creating sensor
+subscriptions. The no-hardware regression follows auto-detected `eno1` through
+bundle construction, spawn arguments and the child's DDS initialization.
+
+The shared sink's opt-in `strict_stream=True` retains bounded finite timestamps,
+required observation age, session/sequence checks and an execution deadline for
+twist streams. Its public reset accepts a zero baseline after a successful stop;
+its vendor gate rechecks freshness after a slow posture query. SDK/stop callback
+failures latch in that same shared sink. Other cards keep the default stream
+policy; these checks are covered in ROS-free shared tests, not copied into AS2W.
 
 ## Packaging rationale and validation scope
 

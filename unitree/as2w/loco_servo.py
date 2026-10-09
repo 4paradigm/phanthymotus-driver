@@ -22,21 +22,24 @@ def build_descriptor(config=None):
     vx = number("vx_limit", 0.30, 0.01, 1.5)
     vy = number("vy_limit", 0.20, 0.01, 1.0)
     wz = number("wz_limit", 0.50, 0.01, 2.0)
-    acceleration = [number("linear_acceleration", 0.30, 0.01, 2.0)] * 2 + [0.0] * 3 + [
-        number("angular_acceleration", 0.50, 0.01, 4.0)]
+    # For twist, velocity change per step is an acceleration cap. The worker
+    # sends nonzero commands no faster than expected_hz. Pinned axes need a
+    # positive step limit; their lower == upper == 0 bound prevents motion.
+    step = [number("linear_acceleration", 0.30, 0.01, 2.0) / hz] * 2 + [1e-6] * 3 + [
+        number("angular_acceleration", 0.50, 0.01, 4.0) / hz]
     descriptor = {
         "control_interface": "motus.control/1", "mode": "twist", "dof": 6,
         "joint_names": list(AXES), "frame": "base_link",
         "units": {"linear": "m/s", "angular": "rad/s", "time": "s"},
         "limits": {"lower": [-vx, -vy, 0.0, 0.0, 0.0, -wz],
-                   "upper": [vx, vy, 0.0, 0.0, 0.0, wz]},
+                   "upper": [vx, vy, 0.0, 0.0, 0.0, wz],
+                   "max_delta_per_step": step},
         "groups": [{"name": "base", "offset": 0, "count": 6,
                     "unit": "m/s", "resource": "base"}],
         "rate": {"max_hz": 20.0, "expected_hz": hz,
                  "watchdog_ms": int(number("watchdog_ms", 300, 100, 1000)),
                  "max_obs_age_ms": int(number("max_obs_age_ms", 500, 50, 1000))},
         "force_torque": None,
-        "acceleration_limits": acceleration,
         "calibration": {"axes_verified": False, "deadband": "unknown",
                         "footprint": "unknown", "limits_source": "commissioning-policy"},
     }

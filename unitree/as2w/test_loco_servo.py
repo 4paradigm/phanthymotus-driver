@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -103,6 +104,13 @@ class StreamTests(unittest.TestCase):
         out.update(kwargs)
         return out
 
+    def dispatch_frame(self, controller, message):
+        """Mailbox admission is distinct from shared sink validation."""
+        queued = controller.submit(message)
+        self.assertEqual(queued["verdict"], "QUEUED")
+        controller.pump()
+        return controller.info()["last_outcome"]
+
     def test_default_dry_run_never_claims_or_calls_sdk(self):
         c = self.controller()
         self.assertTrue(c.activate()["ok"])
@@ -164,8 +172,8 @@ class StreamTests(unittest.TestCase):
                  dict(priority=float("nan")), dict(dof=True)]
         for invalid in cases:
             with self.subTest(invalid=invalid):
-                self.assertFalse(c.submit(self.command(**invalid))["ok"])
-        c.pump()
+                outcome = self.dispatch_frame(c, self.command(**invalid))
+                self.assertIn(outcome["verdict"], ("rejected", "dropped"))
         self.assertEqual(c.info()["simulated"], 0)
 
     def test_latest_only_queue_and_slew_from_rest(self):
@@ -228,7 +236,7 @@ class StreamTests(unittest.TestCase):
         self.assertTrue(c.pause()["ok"])
         self.clock.advance(.01)
         self.assertTrue(c.activate()["ok"])
-        self.assertFalse(c.submit(old)["ok"])
+        self.assertEqual(self.dispatch_frame(c, old)["verdict"], "dropped")
         self.assertTrue(c.submit(self.command())["ok"])
         c.pump()
         self.assertEqual(len(self.client.moves), 1)
@@ -236,9 +244,10 @@ class StreamTests(unittest.TestCase):
     def test_source_restart_requires_explicit_new_epoch(self):
         c = self.controller()
         c.activate()
-        self.assertTrue(c.submit(self.command(seq=10))["ok"])
-        self.assertFalse(c.submit(self.command(seq=1, session_id="two"))["ok"])
-        self.assertFalse(c.submit(self.command(seq=9))["ok"])
+        self.assertEqual(self.dispatch_frame(c, self.command(seq=10))["verdict"], "clamped")
+        self.clock.advance(.11)
+        self.assertEqual(self.dispatch_frame(c, self.command(seq=1, session_id="two"))["verdict"], "dropped")
+        self.assertEqual(self.dispatch_frame(c, self.command(seq=9))["verdict"], "dropped")
         c.pause()
         self.clock.advance(.01)
         c.activate()
@@ -247,9 +256,10 @@ class StreamTests(unittest.TestCase):
     def test_equal_priority_other_source_cannot_steal_lease(self):
         c = self.controller()
         c.activate()
-        self.assertTrue(c.submit(self.command())["ok"])
-        self.assertFalse(c.submit(self.command(source="other"))["ok"])
-        self.assertTrue(c.submit(self.command(source="other", priority=60))["ok"])
+        self.assertEqual(self.dispatch_frame(c, self.command())["verdict"], "clamped")
+        self.clock.advance(.11)
+        self.assertEqual(self.dispatch_frame(c, self.command(source="other"))["verdict"], "dropped")
+        self.assertEqual(self.dispatch_frame(c, self.command(source="other", priority=60))["verdict"], "clamped")
 
     def test_queue_expiry_is_rechecked_after_posture_rpc(self):
         c = self.controller(dry_run=False)
@@ -288,7 +298,7 @@ class StreamTests(unittest.TestCase):
         self.clock.advance(.201)
         c.pump()
         self.assertEqual(c.info()["state"], "paused")
-        self.assertEqual(c.info()["reason"], "executed command TTL expired")
+        self.assertIn("deadline expired", c.info()["reason"])
         self.assertEqual(self.client.events[-2:], ["stop", "release"])
 
     def test_fresh_successful_frame_replaces_executed_deadline(self):
@@ -395,12 +405,145 @@ class StreamTests(unittest.TestCase):
         self.assertNotIn("min_magnitude", self.descriptor["limits"])
         self.assertNotIn("footprint", self.descriptor)
         self.assertEqual(self.descriptor["limits"]["upper"][2:5], [0, 0, 0])
+        self.assertNotIn("acceleration_limits", self.descriptor)
+        step = self.descriptor["limits"]["max_delta_per_step"]
+        self.assertAlmostEqual(step[0], .03)
+        self.assertAlmostEqual(step[5], .05)
         for key in ("vx_limit", "expected_hz", "watchdog_ms"):
             with self.assertRaises(ValueError):
                 servo.build_descriptor({key: float("nan")})
 
+    def test_shared_sink_rejection_prevents_sdk_dispatch(self):
+        c = self.controller(dry_run=False)
+        c.activate()
+        refused = control.Outcome(control.Verdict.REJECTED, "shared safety refused")
+        with patch.object(control.ControlSink, "submit", return_value=refused) as sink_submit:
+            self.assertTrue(c.submit(self.command())["ok"])
+            self.assertEqual(self.client.moves, [])
+            c.pump()
+        sink_submit.assert_called_once()
+        self.assertEqual(self.client.moves, [])
+        self.assertEqual(c.info()["last_outcome"]["reason"], "shared safety refused")
+        self.assertEqual(c.info()["validated"], 0)
+
+    def test_rejected_frame_does_not_refresh_active_deadline(self):
+        c = self.controller(dry_run=False)
+        c.activate()
+        self.dispatch_frame(c, self.command(ttl_ms=200))
+        self.clock.advance(.11)
+        outcome = self.dispatch_frame(c, self.command(seq=2, values=[2, 0, 0, 0, 0, 0]))
+        self.assertEqual(outcome["verdict"], "rejected")
+        self.clock.advance(.091)
+        c.pump()
+        self.assertEqual(len(self.client.moves), 1)
+        self.assertEqual(self.client.events[-2:], ["stop", "release"])
+        self.assertEqual(c.info()["state"], "paused")
+
+    def test_mailbox_copies_raw_frame_before_shared_validation(self):
+        c = self.controller(dry_run=False)
+        c.activate()
+        message = self.command(values=[.2, 0, 0, 0, 0, 0])
+        c.submit(message)
+        message["values"][0] = 0
+        c.pump()
+        self.assertAlmostEqual(self.client.moves[-1][0], .03)
+
+    def test_sdk_frequency_cannot_bypass_shared_step_limit(self):
+        c = self.controller(dry_run=False)
+        c.activate()
+        self.dispatch_frame(c, self.command())
+        self.clock.advance(.02)
+        c.submit(self.command(seq=2))
+        c.pump()
+        self.assertEqual(len(self.client.moves), 1)
+        self.clock.advance(.081)
+        c.pump()
+        self.assertEqual(len(self.client.moves), 2)
+        self.assertAlmostEqual(self.client.moves[-1][0], .06)
+
+    def test_failed_sdk_write_latches_shared_sink_without_applied_verdict(self):
+        c = self.controller(dry_run=False)
+        c.activate()
+        self.client.move_ret = 127
+        result = self.dispatch_frame(c, self.command())
+        self.assertEqual(result["verdict"], "aborted")
+        status = c.info()
+        self.assertTrue(status["safety_sink"]["aborted"])
+        self.assertIn("Move failed", status["safety_sink"]["fault_reason"])
+        self.assertEqual(status["validated"], 0)
+        self.assertTrue(self.client.owned)
+
 
 class ThreadOrderingTests(unittest.TestCase):
+    def test_pause_waits_for_shared_fault_after_control_release_failure(self):
+        client = Client()
+        callback_failed, finish, pause_done = threading.Event(), threading.Event(), threading.Event()
+        original = control.VelocityController._on_sink_stop
+        result = {}
+        def delayed_failure(controller):
+            try:
+                return original(controller)
+            except Exception:
+                callback_failed.set()
+                if not finish.wait(1):
+                    raise TimeoutError("test callback was not released")
+                raise
+        def fail_release():
+            raise RuntimeError("ownership release failed")
+        with patch.object(control.VelocityController, "_on_sink_stop", delayed_failure):
+            c = control.VelocityController(client, servo.build_descriptor(), dry_run=False)
+        def pause():
+            result.update(c.pause(timeout=.5))
+            pause_done.set()
+        thread = threading.Thread(target=pause)
+        try:
+            self.assertTrue(c.activate()["ok"])
+            client.release_control = fail_release
+            thread.start()
+            self.assertTrue(callback_failed.wait(.5))
+            self.assertFalse(pause_done.wait(.03))
+            self.assertFalse(c._stop_event.is_set())
+            finish.set()
+            thread.join(1)
+            self.assertTrue(pause_done.is_set())
+            self.assertFalse(result["ok"])
+            self.assertTrue(c.info()["fault_latched"])
+            self.assertTrue(client.owned)
+        finally:
+            finish.set()
+            thread.join(1)
+            c.close()
+
+    def test_pause_during_posture_query_cancels_before_move_without_fault(self):
+        client, clock = Client(), Clock()
+        entered, finish = threading.Event(), threading.Event()
+        c = control.VelocityController(client, servo.build_descriptor(), dry_run=False,
+                                       clock=clock.now, wall_clock=clock.now)
+        original = client.GetState
+        def blocked_state():
+            entered.set()
+            if not finish.wait(1):
+                raise TimeoutError("test posture query was not released")
+            return original()
+        try:
+            self.assertTrue(c.activate()["ok"])
+            client.GetState = blocked_state
+            clock.advance(.26)
+            c.submit(dict(schema="motus.control/1", mode="twist", dof=6,
+                          source="navi", seq=1, stamp_ms=clock.now() * 1000,
+                          obs_stamp_ms=clock.now() * 1000, ttl_ms=200,
+                          values=[.2, 0, 0, 0, 0, 0]))
+            self.assertTrue(entered.wait(.5))
+            self.assertFalse(c.pause(timeout=.01)["ok"])
+            finish.set()
+            self.assertTrue(c._stop_event.wait(.5))
+            self.assertFalse(c.info()["fault_latched"])
+            self.assertEqual(client.moves, [])
+            self.assertEqual(client.events[-2:], ["stop", "release"])
+        finally:
+            finish.set()
+            c.close()
+
     def test_resume_cannot_rearm_between_stop_ack_and_disconnect(self):
         client = Client()
         plugin = servo.LocoServoPlugin({}, "test", None, client)

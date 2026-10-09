@@ -1,21 +1,18 @@
-"""Latest-value AS2W control, independent of ROS and of the vendor SDK.
+"""AS2W SDK scheduling and ownership boundary around the shared ControlSink.
 
-The injected client must be a dedicated bounded control channel, implementing
-Move/StopMove/GetState, acquire_control/release_control, control_ready and
-max_call_seconds. A normal RpcProxy with multi-second serialized calls is not
-this interface. There is exactly one SDK writer here; a stop invalidates queued
-frames and runs immediately after any already in-flight bounded call.
-
-SDK acknowledgement is deliberately separate from measured physical stopping.
-No software timeout here establishes the firmware's behaviour after link loss.
+ROS callbacks replace one raw mailbox entry. The sole writer runs the shared
+safety chain immediately before bounded SDK dispatch, so queued or rejected
+frames never refresh the watchdog or advance the applied velocity baseline.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import math
 import threading
 import time
 
+from common.control import ControlSink, Outcome, Verdict
 
 AXES = ("vx", "vy", "vz", "wx", "wy", "wz")
 STANDING = {"STAND_UP", "BALANCE_STAND", "RECOVERY_STAND", "STANDING",
@@ -31,77 +28,61 @@ def finite(value):
 
 @dataclass(frozen=True)
 class Frame:
-    values: tuple
-    deadline: float
+    message: object
     generation: int
 
 
 class VelocityController:
-    """The ROS callback only validates and replaces one pending frame.
-
-    ``pump`` is also the deterministic no-hardware test seam. Production calls
-    it from one worker, never from the ROS subscriber or timer.
-    """
+    """One SDK writer, with protocol/safety decisions owned by ControlSink."""
 
     def __init__(self, client, descriptor, *, dry_run=True, rotate_only=False,
                  state_provider=None, conflict=None, odom_provider=None,
                  clock=time.monotonic, wall_clock=time.time, threaded=True):
-        self.client = client
-        self.descriptor = descriptor
+        self.client, self.descriptor = client, descriptor
         self._clock, self._wall = clock, wall_clock
-        self._state_provider = state_provider
-        self._conflict = conflict
+        self._state_provider, self._conflict = state_provider, conflict
         self._odom_provider = odom_provider
         self._cv = threading.Condition(threading.RLock())
         self._writer = threading.Lock()
         self._transition = threading.Lock()
-        self._threaded = threaded
-        self._thread = None
+        self._threaded, self._thread = threaded, None
         self._closing = False
         self._generation = 0
-        self._epoch_ms = 0
+        self._executing_generation = None
         self._latest = None
-        self._seq = {}
-        self._holder = None
-        self._holder_priority = 0
-        self._holder_seen = 0
-        self._last_frame = None
-        self._last_send = None
-        self._active_deadline = None
-        self._last_values = (0.0,) * 6
-        self._state_checked = float("-inf")
-        self._state_problem = ""
-        self._paused = True
-        self._owned = False
+        self._last_frame = self._last_send = None
+        self._state_checked, self._state_problem = float("-inf"), ""
+        self._paused, self._owned = True, False
         self._stop_pending = False
+        self._completed_stop_generation = None
         self._stop_event = threading.Event()
         self._stop_event.set()
         self._release_after_stop = False
         self._pending_dry_run = False
-        self._fault = ""
         self._reason = "not started"
-        self._dry_run = bool(dry_run)
-        self._rotate_only = bool(rotate_only)
-        self._last_ret = None
-        self._last_move_ret = None
-        self._last_stop_ret = None
-        self._stop_accepted = None
-        self._physical_stopped = None
-        self._stop_ack_ms = None
-        self._stationary_since = None
+        self._dry_run, self._rotate_only = bool(dry_run), bool(rotate_only)
+        self._last_ret = self._last_move_ret = self._last_stop_ret = None
+        self._stop_accepted = self._physical_stopped = None
+        self._stop_ack_ms = self._stationary_since = self._last_stop_sample = None
         self._stationary_samples = 0
-        self._last_stop_sample = None
-        self._stats = dict(received=0, validated=0, rejected=0, replaced=0,
-                           simulated=0, attempted=0, sdk_accepted=0,
+        self._last_outcome = None
+        self._stats = dict(received=0, queued=0, validated=0, rejected=0,
+                           replaced=0, simulated=0, attempted=0, sdk_accepted=0,
                            sdk_errors=0, stop_attempts=0, stop_accepted=0)
-
-    @property
-    def watchdog_s(self):
-        return self.descriptor["rate"]["watchdog_ms"] / 1000.0
+        self._sink = ControlSink(
+            descriptor, self._apply, strict_stream=True,
+            before_apply=self._before_apply,
+            on_watchdog=self._on_sink_stop, on_abort=self._on_sink_abort,
+            clock=lambda: self._clock() * 1000,
+            wall_clock=lambda: self._wall() * 1000)
 
     @property
     def period_s(self):
         return 1.0 / self.descriptor["rate"]["expected_hz"]
+
+    @property
+    def _fault(self):
+        return self._sink.fault_reason
 
     def _client_problem(self):
         if self.client is None:
@@ -139,15 +120,13 @@ class VelocityController:
         return problem
 
     def activate(self):
-        """Explicit start/resume. Never consumes pre-resume frames."""
+        """Acquire the SDK writer and establish a fresh sink session from rest."""
         with self._transition:
             with self._cv:
-                if self._fault:
+                if self._sink.aborted:
                     return self._result(False, "fault is latched; call reset_fault first")
-                if self._stop_pending:
-                    return self._result(False, "stop acknowledgement is pending")
-                if self._closing:
-                    return self._result(False, "controller is closed")
+                if self._stop_pending or self._closing:
+                    return self._result(False, "controller is stopping or closed")
                 if not self._paused:
                     return self._result(True)
                 dry_run = self._dry_run
@@ -162,126 +141,89 @@ class VelocityController:
                 except Exception as exc:
                     return self._result(False, f"control acquisition failed: {exc}")
                 if not isinstance(claim, dict) or claim.get("ok") is not True:
-                    return self._result(False, (claim or {}).get("error", "chassis is occupied")
-                                        if isinstance(claim, dict) else "invalid control acquisition result")
+                    return self._result(False, "chassis is occupied or acquisition failed")
                 with self._cv:
                     self._owned = True
-                    self._request_stop_locked("clearing prior velocity before stream start", release=False)
-                with self._writer:
-                    self._stop_hardware()
+            with self._writer:
                 with self._cv:
-                    if self._fault:
-                        return self._result(False)
-                problem = self._read_posture(force=True)
-                if problem:
-                    # No Move has been issued. Release only this unused claim.
-                    self.client.release_control()
-                    with self._cv:
-                        self._owned = False
-                    return self._result(False, problem)
-            with self._cv:
-                self._generation += 1
-                self._epoch_ms = self._wall() * 1000
-                self._latest = None
-                self._seq.clear()
-                self._holder = None
-                self._last_frame = None
-                self._last_send = None
-                self._active_deadline = None
-                self._last_values = (0.0,) * 6
-                self._paused = False
-                self._reason = ""
-                if self._threaded and self._thread is None:
-                    self._thread = threading.Thread(target=self._run, daemon=True,
-                                                    name="as2w-control-stream")
-                    self._thread.start()
-                self._cv.notify_all()
+                    self._request_stop_locked("clearing prior velocity before stream start", release=False)
+                self._execute_stop()
+                if self._sink.aborted:
+                    return self._result(False)
+                if not dry_run:
+                    problem = self._read_posture(force=True)
+                    if problem:
+                        try:
+                            self.client.release_control()
+                        except Exception as exc:
+                            self._sink.abort(f"control release failed: {exc}")
+                            self._finish_sink_operation()
+                        else:
+                            with self._cv:
+                                self._owned = False
+                        return self._result(False, problem)
+                # This baseline is commanded zero, not a claim of measured rest.
+                self._sink.reset(initial_values=(0.0,) * 6,
+                                 minimum_stamp_ms=self._wall() * 1000)
+                with self._cv:
+                    self._generation += 1
+                    self._latest = None
+                    self._last_frame = self._last_send = None
+                    self._last_outcome = None
+                    self._paused = False
+                    self._reason = ""
+                    if self._threaded and self._thread is None:
+                        self._thread = threading.Thread(target=self._run, daemon=True,
+                                                        name="as2w-control-stream")
+                        self._thread.start()
+                    self._cv.notify_all()
             return self._result(True)
 
     def _result(self, ok, error=""):
         with self._cv:
-            return {"ok": ok, "state": "error" if error or self._fault else
+            problem = error or self._fault
+            return {"ok": ok, "state": "error" if problem else
                     "stopping" if self._stop_pending else "paused" if self._paused else "running",
-                    **({"error": error or self._fault} if error or self._fault else {})}
-
-    def _reject(self, reason):
-        self._stats["rejected"] += 1
-        return {"ok": False, "verdict": "REJECTED", "reason": reason}
+                    **({"error": problem} if problem else {})}
 
     def submit(self, message):
-        """No SDK or ROS calls; bounded validation then latest-only replacement."""
+        """Queue only; actual verdict is published after the worker runs the sink."""
         with self._cv:
             self._stats["received"] += 1
-            if self._paused or self._fault or self._closing:
-                return self._reject("controller is paused or faulted")
-            if not isinstance(message, dict):
-                return self._reject("command must be an object")
-            if (message.get("schema") != "motus.control/1" or message.get("mode") != "twist"
-                    or isinstance(message.get("dof"), bool) or message.get("dof") != 6):
-                return self._reject("expected motus.control/1 twist with dof=6")
-            values = message.get("values")
-            if not isinstance(values, (list, tuple)) or len(values) != 6 or not all(map(finite, values)):
-                return self._reject("values must contain six finite numbers")
-            limits = self.descriptor["limits"]
-            if any(v < lo or v > hi for v, lo, hi in zip(values, limits["lower"], limits["upper"])):
-                return self._reject("velocity is outside declared limits")
-            stamp, obs, ttl = (message.get(k) for k in ("stamp_ms", "obs_stamp_ms", "ttl_ms"))
-            if not all(map(finite, (stamp, obs, ttl))):
-                return self._reject("finite stamp_ms, obs_stamp_ms and ttl_ms are required")
-            now_ms = self._wall() * 1000
-            max_obs = self.descriptor["rate"]["max_obs_age_ms"]
-            if ttl <= 0 or ttl > self.watchdog_s * 1000:
-                return self._reject("ttl_ms must be positive and no greater than watchdog_ms")
-            if stamp < self._epoch_ms:
-                return self._reject("command predates this start/resume epoch")
-            if stamp > now_ms + 50 or obs > now_ms + 50 or obs > stamp + 50:
-                return self._reject("command or observation timestamp is in the future")
-            remaining_ms = min(ttl - (now_ms - stamp), max_obs - (now_ms - obs))
-            if remaining_ms <= 0:
-                return self._reject("command or observation has expired")
-            source, session, seq = message.get("source"), message.get("session_id", ""), message.get("seq")
-            if not isinstance(source, str) or not source or len(source) > 160:
-                return self._reject("source must be a non-empty bounded string")
-            if not isinstance(session, str) or len(session) > 160:
-                return self._reject("session_id must be a bounded string")
-            if isinstance(seq, bool) or not isinstance(seq, int) or not 0 <= seq < 2**63:
-                return self._reject("seq must be a nonnegative integer")
-            previous = self._seq.get(source)
-            if previous and (session != previous[0] or seq <= previous[1]):
-                return self._reject("source restarted or sequence replayed; pause/resume establishes a new session")
-            if source not in self._seq and len(self._seq) >= 32:
-                return self._reject("too many control sources in this session")
-            priority = message.get("priority", 0)
-            if isinstance(priority, bool) or not isinstance(priority, int) or not 0 <= priority <= 100:
-                return self._reject("priority must be an integer in [0,100]")
-            now = self._clock()
-            if (self._holder and source != self._holder and
-                    now - self._holder_seen <= self.watchdog_s and priority <= self._holder_priority):
-                return self._reject("another stream owns the current control lease")
-            self._seq[source] = (session, seq)
-            self._holder, self._holder_priority, self._holder_seen = source, priority, now
-            self._last_frame = now
-            self._stats["validated"] += 1
+            if self._paused or self._sink.aborted or self._closing:
+                self._stats["rejected"] += 1
+                return {"ok": False, "verdict": "REJECTED", "reason": "controller is paused or faulted"}
             if self._latest is not None:
                 self._stats["replaced"] += 1
-            # Monotonic deadlines remain valid if the wall clock later changes.
-            self._latest = Frame(tuple(float(v) for v in values),
-                                 now + remaining_ms / 1000, self._generation)
+            self._latest = Frame(deepcopy(message), self._generation)
+            self._stats["queued"] += 1
             self._cv.notify_all()
             return {"ok": True, "verdict": "QUEUED"}
 
-    def _request_stop_locked(self, reason, *, release=True, fault=False):
+    def _request_stop_locked(self, reason, *, release=True):
         self._generation += 1
         self._latest = None
         self._paused = True
         self._reason = reason
-        if fault:
-            self._fault = reason
-        self._release_after_stop = bool(release and not self._fault)
-        self._stop_accepted = None
+        self._release_after_stop = release
         self._stop_pending = True
+        self._stop_accepted = None
         self._stop_event.clear()
         self._cv.notify_all()
+
+    def _execute_stop(self):
+        try:
+            self._sink.stop(self._reason)
+        finally:
+            self._finish_sink_operation()
+
+    def _finish_sink_operation(self):
+        # A callback can throw after StopMove succeeds (e.g. release fails).
+        # Publish completion only after ControlSink has latched that failure.
+        with self._cv:
+            if self._stop_pending and self._completed_stop_generation == self._generation:
+                self._stop_pending = False
+                self._stop_event.set()
 
     def pause(self, reason="paused", *, timeout=0.0):
         with self._transition:
@@ -293,29 +235,34 @@ class VelocityController:
         if timeout > 0:
             self._stop_event.wait(timeout)
         with self._cv:
-            ok = not self._stop_pending and self._stop_accepted is True and not self._fault
-            return self._result(ok, "stop acknowledgement pending" if self._stop_pending else self._fault)
+            ok = not self._stop_pending and self._stop_accepted is True and not self._sink.aborted
+            return self._result(ok, "stop acknowledgement pending" if self._stop_pending else "")
 
     def reset_fault(self, timeout=1.5):
-        """An explicit acknowledgement, only after StopMove has succeeded."""
         with self._transition:
             with self._cv:
                 self._request_stop_locked("resetting fault", release=False)
             if not self._threaded or self._thread is None:
                 self.pump()
             self._stop_event.wait(timeout)
-            with self._cv:
-                if self._stop_pending or self._stop_accepted is not True:
-                    return self._result(False, "cannot reset without successful StopMove acknowledgement")
-                if self._owned:
-                    self.client.release_control()
-                    self._owned = False
-                self._fault = ""
-                self._reason = "fault reset; explicitly resume to accept new frames"
-                if self._pending_dry_run:
-                    self._dry_run = True
-                    self._pending_dry_run = False
-                return self._result(True)
+            with self._writer:
+                with self._cv:
+                    if self._stop_pending or self._stop_accepted is not True:
+                        return self._result(False, "cannot reset without successful StopMove acknowledgement")
+                    if self._owned:
+                        try:
+                            self.client.release_control()
+                        except Exception as exc:
+                            self._sink.abort(f"control release failed: {exc}")
+                            self._finish_sink_operation()
+                            return self._result(False)
+                        self._owned = False
+                    self._sink.reset(initial_values=(0.0,) * 6,
+                                     minimum_stamp_ms=self._wall() * 1000)
+                    self._reason = "fault reset; explicitly resume to accept new frames"
+                    if self._pending_dry_run:
+                        self._dry_run, self._pending_dry_run = True, False
+                    return self._result(True)
 
     def configure(self, *, dry_run=None, rotate_only=None):
         for name, value in (("dry_run", dry_run), ("rotate_only", rotate_only)):
@@ -328,22 +275,39 @@ class VelocityController:
                         return self._result(False, "pause before changing rotate_only")
                     self._rotate_only = rotate_only
                 if dry_run is None or dry_run == self._dry_run:
-                    return self._result(not bool(self._fault))
+                    return self._result(not self._sink.aborted)
                 if not dry_run:
-                    if not self._paused or self._stop_pending or self._fault:
+                    if not self._paused or self._stop_pending or self._sink.aborted:
                         return self._result(False, "pause/reset_fault before enabling real control")
                     self._dry_run = False
                     self._generation += 1
                     self._latest = None
                     return self._result(True)
-                # Never let dry_run suppress the stop for a previous real Move.
                 self._pending_dry_run = True
                 self._request_stop_locked("stopping before entering dry_run")
             if not self._threaded or self._thread is None:
                 self.pump()
-            return self._result(not bool(self._fault))
+            return self._result(not self._sink.aborted)
 
-    def _stop_hardware(self):
+    def _on_sink_stop(self):
+        with self._cv:
+            # Explicit stops set their release policy before entering the sink;
+            # expiry/watchdog stops arrive directly from the sink worker.
+            if not self._stop_pending:
+                self._request_stop_locked(self._sink.last_stop_reason)
+            generation = self._generation
+        try:
+            self._stop_hardware()
+        finally:
+            with self._cv:
+                self._completed_stop_generation = generation
+
+    def _on_sink_abort(self):
+        with self._cv:
+            self._request_stop_locked(self._sink.fault_reason, release=False)
+        self._on_sink_stop()
+
+    def _stop_hardware(self, *, release=None):
         with self._cv:
             owned = self._owned
             self._stats["stop_attempts"] += int(owned)
@@ -352,32 +316,69 @@ class VelocityController:
         except Exception as exc:
             ret = f"{type(exc).__name__}: {exc}"
         with self._cv:
-            self._last_ret = ret
-            self._last_stop_ret = ret
-            self._stop_accepted = (ret == 0 and not isinstance(ret, bool))
+            self._last_ret = self._last_stop_ret = ret
+            self._stop_accepted = ret == 0 and not isinstance(ret, bool)
             self._physical_stopped = None
-            self._active_deadline = None
             self._stop_ack_ms = self._wall() * 1000 if owned and self._stop_accepted else None
-            self._stationary_since = None
+            self._stationary_since = self._last_stop_sample = None
             self._stationary_samples = 0
-            self._last_stop_sample = None
-            if self._stop_accepted:
-                self._stats["stop_accepted"] += int(owned)
-                self._last_values = (0.0,) * 6
-                if self._release_after_stop and self._owned:
-                    try:
-                        self.client.release_control()
-                    except Exception as exc:
-                        self._fault = f"control release failed: {exc}"
-                    else:
-                        self._owned = False
-                if self._pending_dry_run and not self._fault:
-                    self._dry_run = True
-                    self._pending_dry_run = False
-            else:
-                self._fault = f"StopMove failed: {ret}; control remains latched"
-            self._stop_pending = False
-            self._stop_event.set()
+            if not self._stop_accepted:
+                raise RuntimeError(f"StopMove failed: {ret}; control remains held")
+            self._stats["stop_accepted"] += int(owned)
+            should_release = self._release_after_stop if release is None else release
+            if should_release and self._owned and not self._sink.aborted:
+                self.client.release_control()
+                self._owned = False
+            if self._pending_dry_run and not self._sink.aborted:
+                self._dry_run, self._pending_dry_run = True, False
+
+    def _cancelled(self):
+        with self._cv:
+            return (self._paused or self._stop_pending or
+                    self._executing_generation != self._generation)
+
+    def _before_apply(self, values, gripper):
+        if self._cancelled():
+            return Outcome(Verdict.DROPPED, "control session was cancelled")
+        if not self._dry_run and any(values):
+            problem = self._read_posture()
+            if problem:
+                raise RuntimeError(problem)
+        if self._cancelled():
+            return Outcome(Verdict.DROPPED, "control session was cancelled")
+        # ControlSink rechecks freshness after this potentially slow SDK query.
+
+    def _apply(self, values, gripper):
+        with self._cv:
+            if self._cancelled():
+                return Outcome(Verdict.DROPPED, "control session was cancelled")
+            self._last_send = self._clock()
+            if self._dry_run:
+                self._stats["simulated"] += 1
+                return
+            vx, vy, wz = values[0], values[1], values[5]
+            if self._rotate_only:
+                vx = vy = 0.0
+            zero = not any((vx, vy, wz))
+            if not zero:
+                self._stats["attempted"] += 1
+                self._physical_stopped = self._stop_ack_ms = None
+                self._stop_accepted = None
+        if zero:
+            # A validated zero command holds ownership and keeps the stream
+            # armed. Explicit pause/watchdog/abort instead use sink callbacks.
+            self._stop_hardware(release=False)
+            return
+        try:
+            ret = self.client.Move(vx, vy, wz)
+        except Exception as exc:
+            ret = f"{type(exc).__name__}: {exc}"
+        with self._cv:
+            self._last_ret = self._last_move_ret = ret
+            if ret != 0 or isinstance(ret, bool):
+                self._stats["sdk_errors"] += 1
+                raise RuntimeError(f"Move failed: {ret}")
+            self._stats["sdk_accepted"] += 1
 
     def _verify_stopped(self):
         """Only fresh, measured body vx/vy/wz after the ACK can confirm rest.
@@ -422,107 +423,56 @@ class VelocityController:
                 self._physical_stopped = True
 
     def pump(self):
-        """One worker turn. Stop work always wins over any queued frame."""
+        """Run the shared check chain and SDK application on the sole writer."""
         with self._writer:
             self._verify_stopped()
             with self._cv:
-                now = self._clock()
-                if (not self._paused and self._active_deadline is not None
-                        and now >= self._active_deadline):
-                    self._request_stop_locked("executed command TTL expired")
-                elif (not self._paused and self._last_frame is not None
-                        and now - self._last_frame >= self.watchdog_s):
-                    self._request_stop_locked("control stream watchdog expired")
                 stopping = self._stop_pending
-                if not stopping:
-                    if self._paused or self._latest is None:
-                        return
-                    zero = not any(self._latest.values[2:] if self._rotate_only else self._latest.values)
-                    if (not zero and self._last_send is not None
-                            and now - self._last_send < self.period_s):
-                        return
-                    frame, self._latest = self._latest, None
-                    dry_run = self._dry_run
+                paused = self._paused
             if stopping:
-                self._stop_hardware()
+                self._execute_stop()
                 return
-            if not dry_run and not zero:
-                problem = self._read_posture()
-                if problem:
-                    with self._cv:
-                        self._request_stop_locked(problem, release=False, fault=True)
-                    self._stop_hardware()
-                    return
+            if paused:
+                return
+            # Only ControlSink owns TTL/watchdog state. Mailbox arrivals cannot
+            # reset it; neither can rejected frames or an SDK failure.
+            self._sink.tick()
+            self._finish_sink_operation()
             with self._cv:
-                now = self._clock()
-                if frame.generation != self._generation or self._paused or self._stop_pending:
+                if self._paused or self._latest is None:
                     return
-                if now >= frame.deadline:
+                frame = self._latest
+                values = frame.message.get("values") if isinstance(frame.message, dict) else None
+                zero = isinstance(values, (list, tuple)) and len(values) == 6 and not any(values)
+                if (not zero and self._last_send is not None and
+                        self._clock() - self._last_send < self.period_s):
+                    return
+                self._latest = None
+                self._executing_generation = frame.generation
+            outcome = self._sink.submit(frame.message)
+            self._finish_sink_operation()
+            with self._cv:
+                self._last_outcome = {"verdict": outcome.verdict.value,
+                                      "reason": outcome.reason,
+                                      "values": outcome.values,
+                                      "warnings": list(outcome.warnings)}
+                if outcome.applied:
+                    self._last_frame = self._clock()
+                    self._stats["validated"] += 1
+                else:
                     self._stats["rejected"] += 1
-                    self._request_stop_locked("queued command expired before SDK dispatch")
-                    return
-                values = list(frame.values)
-                if self._rotate_only:
-                    values[0] = values[1] = 0.0
-                # Slew from rest, based on elapsed monotonic time. A full zero
-                # command bypasses acceleration shaping and stops immediately.
-                zero = not any(values)
-                dt = min(self.period_s if self._last_send is None else now - self._last_send,
-                         self.watchdog_s)
-                if not zero:
-                    for i, acceleration in enumerate(self.descriptor["acceleration_limits"]):
-                        delta = acceleration * dt
-                        values[i] = max(self._last_values[i] - delta,
-                                        min(self._last_values[i] + delta, values[i]))
-                self._last_send = now
-                if dry_run:
-                    self._stats["simulated"] += 1
-                    self._last_values = tuple(values)
-                    self._active_deadline = frame.deadline if not zero else None
-                    return
-                self._stats["stop_attempts" if zero else "attempted"] += 1
-                if not zero:
-                    self._physical_stopped = None
-                    self._stop_ack_ms = None
-            try:
-                ret = (self.client.StopMove() if zero else
-                       self.client.Move(values[0], values[1], values[5]))
-            except Exception as exc:
-                ret = f"{type(exc).__name__}: {exc}"
-            with self._cv:
-                self._last_ret = ret
-                if zero:
-                    self._last_stop_ret = ret
-                else:
-                    self._last_move_ret = ret
-                if ret != 0 or isinstance(ret, bool):
-                    self._stats["sdk_errors"] += 1
-                    self._request_stop_locked(f"{'StopMove' if zero else 'Move'} failed: {ret}",
-                                              release=False, fault=True)
-                else:
-                    self._stats["stop_accepted" if zero else "sdk_accepted"] += 1
-                    self._last_values = tuple(values)
-                    self._active_deadline = frame.deadline if not zero else None
-                    self._stop_accepted = True if zero else None
-                    if zero and self._stop_ack_ms is None:
-                        self._stop_ack_ms = self._wall() * 1000
-                        self._stationary_since = None
-                        self._stationary_samples = 0
-                        self._last_stop_sample = None
-                    if not zero and self._clock() >= frame.deadline:
-                        self._request_stop_locked("command TTL expired while awaiting SDK acknowledgement")
                 stopping = self._stop_pending
             if stopping:
-                self._stop_hardware()
+                self._execute_stop()
 
     def _run(self):
         while True:
             try:
                 self.pump()
             except Exception as exc:
-                with self._cv:
-                    self._request_stop_locked(f"control worker failed: {type(exc).__name__}: {exc}",
-                                              release=False, fault=True)
+                with self._writer:
+                    self._sink.abort(f"control worker failed: {type(exc).__name__}: {exc}")
+                    self._finish_sink_operation()
             with self._cv:
                 if self._closing and not self._stop_pending:
                     return
@@ -539,10 +489,10 @@ class VelocityController:
 
     def info(self):
         with self._cv:
-            return {**self._result(not bool(self._fault)), "dry_run": self._dry_run,
+            return {**self._result(not self._sink.aborted), "dry_run": self._dry_run,
                     "rotate_only": self._rotate_only, "require_standing": True,
                     "owner_acquired": self._owned, "generation": self._generation,
-                    "reason": self._reason, "fault_latched": bool(self._fault),
+                    "reason": self._reason, "fault_latched": self._sink.aborted,
                     "last_ret": self._last_ret, "stop_acknowledged": self._stop_accepted,
                     "last_move_ret": self._last_move_ret, "last_stop_ret": self._last_stop_ret,
                     "physical_stop_verified": self._physical_stopped,
@@ -550,4 +500,6 @@ class VelocityController:
                     "stop_dispatch_note": "Stop waits for at most one in-flight bounded call, then a stop RPC; scheduling and physical braking are additional.",
                     "pending_frames": int(self._latest is not None),
                     "last_command_age_ms": None if self._last_frame is None else
-                    round((self._clock() - self._last_frame) * 1000), **self._stats}
+                    round((self._clock() - self._last_frame) * 1000),
+                    "safety_sink": self._sink.stats(), "last_outcome": self._last_outcome,
+                    **self._stats}

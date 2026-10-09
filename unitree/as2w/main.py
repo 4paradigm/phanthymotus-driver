@@ -137,7 +137,9 @@ class Bundle:
         if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, interface))
         if p.get("led", {}).get("enabled", True): self.plugins.append(LedPlugin(p.get("led", {}), namespace, executor, proxy))
         if dds_ready and p.get("camera", {}).get("enabled", True): self.plugins.append(CameraPlugin(p.get("camera", {}), namespace, executor, interface))
-        if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
+        if dds_ready and p.get("lidar", {}).get("enabled", True):
+            self.plugins.append(LidarPlugin(
+                p.get("lidar", {}), namespace, executor, interface=interface))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True):
             spatial = ControlledSpatialPlugin(p.get("controlled_spatial", {}), namespace, executor, interface)
             spatial.set_chassis_guard(proxy)
