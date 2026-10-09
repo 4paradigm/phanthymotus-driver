@@ -42,7 +42,9 @@
    同时停止其他 SDK 灯光客户端。停止桥接后，依赖旧 `face_light/color` MQTT 主题的程序将无法控制灯带。
    回退前先停止 SDK 卡片，再恢复备份的自启配置和 MQTT 灯光服务，避免两个写入源同时运行。
 4. 保持 `plugins.face_light` 的 `enabled: true`、`backend: sdk`、`sdk_exclusive: true`。
-   已保存的画布配置若为 MQTT 或 No，需更新为 SDK/Yes。默认 Yes 是部署前提声明，卡片不会代为停止现场进程。
+   卡片不再提供配置齿轮，SDK 独占默认开启（Yes）。刷新驱动工具信息后，
+   平台不再自动应用旧的画布 MQTT/No 配置；宿主机驱动配置仍需满足以上取值。
+   默认 Yes 是部署前提声明，卡片不会代为停止现场进程。
    启动卡片后先调用 `info`，检查 `config_valid`、`available` 和 `connected`；失败时查看 `unavailable_reason`。
    首次启动会编译 SDK 适配器；若首次编译超时，确认编译完成后重试。
    `--check` 成功和 `info` 可用都不代表灯带已实际显示，颜色和灯效仍需现场观察验收。
@@ -50,7 +52,7 @@
 `set_color`、`preset`、`off` 保留原调用方式。`set_led` 编号范围 0–11；
 `set_leds` 可选 `color_format: hex`（12 个以空格或逗号分隔的六位 RGB 颜色）或
 `rgb_array`（原 12 组 RGB 数组，画布可粘贴 JSON）。RGB 与编号留空按 0 执行，
-`colors` 留空将全部灯设为黑色。周期、时长留空分别使用 2 秒、5 秒的有效默认值。
+`colors` 留空将全部灯设为黑色。RGB 输入框底字为 `0`，周期、时长底字分别为 `2`、`5`；
+底字只是提示，不会覆盖手动输入，留空分别使用对应默认值（周期、时长单位为秒）。
 `fade` 在 `duration_s` 内单向切换起始 RGB 到目标 `to_r/to_g/to_b`，随后保持目标颜色；
 闪烁、呼吸、流水灯到期关闭。新灯光指令会抢占旧灯效。
-

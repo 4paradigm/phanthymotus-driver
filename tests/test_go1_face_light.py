@@ -500,7 +500,7 @@ def test_default_face_card_stays_discoverable_when_sdk_setup_is_missing(monkeypa
                             "offline", None, None)
     tool = bundle.get_all_tools()[0]
     assert tool["name"] == "face_light"
-    assert "backend" not in tool["configSchema"]["properties"]
+    assert "configSchema" not in tool
     plugin = bundle._plugins[0]
     error = "ERROR official faceLight SDK headers are missing; mount the trusted official SDK"
     monkeypatch.setattr(plugin._backend, "start", Mock(side_effect=RuntimeError(error)))
@@ -620,12 +620,10 @@ def test_default_sdk_exclusive_yes_and_explicit_no_guard_do_not_use_mqtt(monkeyp
     monkeypatch.setattr(ext.subprocess, "Popen", popen)
     plugin = ext.FaceLightPlugin({}, "", None, None)
     assert plugin._backend.name == "sdk"
-    schema = plugin.get_tool()["configSchema"]["properties"]
-    assert "backend" not in schema
+    assert "configSchema" not in plugin.get_tool()
     assert plugin._config["backend"] == "sdk"
-    assert schema["sdk_exclusive"]["default"] is True
+    assert plugin._config["sdk_exclusive"] is True
     assert plugin._backend.exclusive is True
-    assert "mqtt_host" not in schema and "mqtt_port" not in schema
     plugin = ext.FaceLightPlugin({"sdk_exclusive": False}, "", None, None)
     result = plugin.start()
     assert not result["ok"] and "sdk_exclusive" in result["message"]
@@ -932,8 +930,7 @@ def test_remote_sdk_path_override_rejected_without_interrupt(light, monkeypatch,
 
 def test_sdk_paths_not_editable_and_invalid_constructor_config_cannot_launch(tmp_path, monkeypatch):
     plugin = ext.FaceLightPlugin({}, '', None, None)
-    schema = plugin.get_tool()['configSchema']['properties']
-    assert 'sdk_executable' not in schema and 'sdk_dir' not in schema
+    assert 'configSchema' not in plugin.get_tool()
     alias = tmp_path / 'launcher'
     alias.symlink_to(ext._FACE_SDK_EXECUTABLE)
     popen = Mock(side_effect=AssertionError("invalid config must not launch a process"))
@@ -1032,6 +1029,11 @@ def test_numeric_zero_defaults_and_simpler_action_parameters(light):
     props = schema["properties"]
     for key in ("index", "r", "g", "b", "to_r", "to_g", "to_b"):
         assert props[key]["default"] == 0
+    for key in ("r", "g", "b", "to_r", "to_g", "to_b"):
+        assert props[key]["description"] == "0"
+    assert props["period_s"]["description"] == "2"
+    assert props["duration_s"]["description"] == "5"
+    assert "configSchema" not in light.get_tool()
     assert props["period_s"]["default"] >= props["period_s"]["minimum"] > 0
     assert props["duration_s"]["default"] >= props["duration_s"]["minimum"] > 0
     assert "period_s" not in schema["x-action-params"]["fade"]["params"]

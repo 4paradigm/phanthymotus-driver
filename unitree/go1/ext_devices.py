@@ -885,7 +885,8 @@ class FaceLightPlugin:
                              led_map_source="Unitree Go1_Edu.md LED.bmp; not verified on this robot")
 
     def get_tool(self):
-        rgb_channel = {"type": "integer", "minimum": 0, "maximum": 255, "default": 0}
+        # Canvas uses description as placeholder; keep the channel hint short.
+        rgb_channel = {"type": "integer", "minimum": 0, "maximum": 255, "default": 0, "description": "0"}
         rgb_array = {"type": "array", "minItems": 3, "maxItems": 3,
                      "items": {"type": "integer", "minimum": 0, "maximum": 255}}
         actions = {"set_color": ["r", "g", "b"], "preset": ["name"], "off": [],
@@ -898,8 +899,10 @@ class FaceLightPlugin:
                         "preset": "Persistent named color", "off": "Cancel effect and turn all LEDs off",
                         "set_led": "Set SDK index 0..11; others retain last software frame (initially off); per-LED backend required",
                         "set_leds": "12 RGB hex colors in index order, separated by spaces (e.g. FF0000); legacy RGB arrays accepted",
-                        "blink": "Blink uniform RGB on/off", "breathe": "Breathe by scaling RGB",
-                        "fade": "Transition RGB to target RGB over duration_s, then hold target until next command", "chase": "One LED traverses 0..11; per-LED backend required",
+                        "blink": "Blink uniform RGB on/off; period_s per full cycle, auto-off after duration_s",
+                        "breathe": "Breathe by scaling RGB; period_s per full cycle, auto-off after duration_s",
+                        "fade": "Transition RGB to target RGB over duration_s, then hold target until next command",
+                        "chase": "One LED traverses 0..11 per period_s; auto-off after duration_s; per-LED backend required",
                         "info": "Software-recorded status and backend capabilities; no hardware feedback"}
         return {"name": CARD_FACE_LIGHT, "type": "actuator", "multiInstance": False,
                 "description": "Go1 face_light: persistent RGB, 12 LED control and internal timed effects. "
@@ -921,13 +924,10 @@ class FaceLightPlugin:
                                                           "default": " ".join(["000000"] * 12),
                                                           "description": "12 RGB hex colors (0..11), separated by spaces; FF0000=red, 000000=off"},
                                                "period_s": {"type": "number", "minimum": 0.2, "maximum": 3600, "default": 2,
-                                                            "description": "Seconds per full cycle; chase traverses all 12 LEDs"},
+                                                            "description": "2"},
                                                "duration_s": {"type": "number", "minimum": 0.05, "maximum": 3600, "default": 5,
-                                                              "description": "Fade transition time, then hold target; other effects auto-off after these seconds"}},
+                                                              "description": "5"}},
                                 "x-action-params": {a: {"params": p, "description": descriptions[a]} for a, p in actions.items()}},
-                "configSchema": {"type": "object", "properties": {
-                    "sdk_exclusive": {"type": "boolean", "default": True,
-                                      "description": "SDK 独占灯光（默认 Yes）；部署前停止 faceLightMqtt，保留 faceLightServer"}}},
                 "topic_out": []}
 
     def dispatch(self, action, args):
