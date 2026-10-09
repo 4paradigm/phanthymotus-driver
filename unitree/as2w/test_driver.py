@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT.parent.parent))  # make `common` importable, as in the image
 
 
 def _load(name, path):
@@ -22,11 +23,24 @@ def _load(name, path):
 
 
 def _install_device_stubs():
+    yaml_module = types.ModuleType("yaml")
+    yaml_module.safe_load = lambda _value: {}
+    sys.modules.setdefault("yaml", yaml_module)
     std_msgs = types.ModuleType("std_msgs.msg")
     std_msgs.String = type("String", (), {})
     std_msgs.UInt8MultiArray = type("UInt8MultiArray", (), {})
     sys.modules["std_msgs"] = types.ModuleType("std_msgs")
     sys.modules["std_msgs.msg"] = std_msgs
+    rclpy = types.ModuleType("rclpy")
+    rclpy_node = types.ModuleType("rclpy.node")
+    rclpy_node.Node = type("Node", (), {})
+    rclpy.node = rclpy_node
+    sys.modules["rclpy"] = rclpy
+    sys.modules["rclpy.node"] = rclpy_node
+    rclpy_executors = types.ModuleType("rclpy.executors")
+    rclpy_executors.MultiThreadedExecutor = type("MultiThreadedExecutor", (), {})
+    rclpy.executors = rclpy_executors
+    sys.modules["rclpy.executors"] = rclpy_executors
     qos = types.ModuleType("rclpy.qos")
     qos.DurabilityPolicy = types.SimpleNamespace(VOLATILE=1)
     qos.HistoryPolicy = types.SimpleNamespace(KEEP_LAST=1)
@@ -40,6 +54,7 @@ def _install_device_stubs():
         sys.modules.setdefault(name, types.ModuleType(name))
     channel = types.ModuleType("unitree_sdk2py.core.channel")
     channel.ChannelSubscriber = type("ChannelSubscriber", (), {})
+    channel.ChannelFactoryInitialize = lambda *_args, **_kwargs: None
     sys.modules["unitree_sdk2py.core.channel"] = channel
     dds = types.ModuleType("unitree_sdk2py.idl.unitree_go.msg.dds_")
     dds.SportModeState_ = type("SportModeState_", (), {})
@@ -51,6 +66,9 @@ def _install_device_stubs():
     hg_dds.LowState_ = type("LowState_", (), {})
     hg_dds.BmsState_ = type("BmsState_", (), {})
     sys.modules["unitree_sdk2py.idl.unitree_hg.msg.dds_"] = hg_dds
+    rpc_proxy = types.ModuleType("rpc_proxy")
+    rpc_proxy.RpcProxy = type("RpcProxy", (), {})
+    sys.modules["rpc_proxy"] = rpc_proxy
 
 
 class _Proxy:
@@ -73,6 +91,93 @@ class TestDriverContracts(unittest.TestCase):
         _install_device_stubs()
         cls.device = _load("as2w_device_under_test", ROOT / "device.py")
         cls.spatial = _load("as2w_spatial_under_test", ROOT / "controlled_spatial.py")
+        cls.main = _load("as2w_main_under_test", ROOT / "main.py")
+
+    @staticmethod
+    def _interface(name, ipv4, *, up=True, wireless=False, virtual=False):
+        return {"name": name, "ipv4": ipv4, "up": up,
+                "wireless": wireless, "virtual": virtual}
+
+    def test_interface_resolver_prefers_cli_over_environment_and_config(self):
+        with patch.object(self.main.sys, "argv", ["main.py", "eno9"]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=AssertionError("must not scan")):
+            self.assertEqual("eno9", self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_interface_resolver_uses_environment_override(self):
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=AssertionError("must not scan")):
+            self.assertEqual("eno8", self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_interface_resolver_uses_explicit_config(self):
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=AssertionError("must not scan")):
+            self.assertEqual("eno7", self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_interface_resolver_auto_selects_unique_unitree_wired_interface(self):
+        interfaces = [
+            self._interface("wlP1p1s0", "10.100.128.225", wireless=True),
+            self._interface("eno1", "192.168.123.222"),
+        ]
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {}, clear=True), \
+                patch.object(self.main, "_network_interfaces", return_value=interfaces):
+            self.assertEqual("eno1", self.main.resolve_robot_interface({"robot_interface": "auto"}))
+
+    def test_interface_resolver_never_selects_wifi_or_office_network(self):
+        interfaces = [
+            self._interface("wlan0", "192.168.123.50", wireless=True),
+            self._interface("eno1", "10.100.128.225"),
+        ]
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "auto"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", return_value=interfaces):
+            self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_interface_resolver_rejects_down_and_virtual_candidates(self):
+        interfaces = [
+            self._interface("eno1", "192.168.123.222", up=False),
+            self._interface("docker0", "192.168.123.1", virtual=True),
+            self._interface("veth123", "192.168.123.2", virtual=True),
+        ]
+        with patch.object(self.main.sys, "argv", ["main.py", "auto"]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", return_value=interfaces):
+            self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "eno7"}))
+
+    def test_empty_positional_interface_uses_environment_override(self):
+        with patch.object(self.main.sys, "argv", ["main.py", ""]), \
+                patch.dict(self.main.os.environ, {"NETWORK_INTERFACE": "eno8"}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=AssertionError("must not scan")):
+            self.assertEqual("eno8", self.main.resolve_robot_interface(
+                {"robot_interface": "eno7"}))
+
+    def test_interface_resolver_requires_override_for_multiple_candidates(self):
+        interfaces = [
+            self._interface("eno1", "192.168.123.222"),
+            self._interface("enp2s0", "192.168.123.223"),
+        ]
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {}, clear=True), \
+                patch.object(self.main, "_network_interfaces", return_value=interfaces):
+            self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "auto"}))
+
+    def test_interface_resolver_degrades_when_interface_scan_fails(self):
+        with patch.object(self.main.sys, "argv", ["main.py"]), \
+                patch.dict(self.main.os.environ, {}, clear=True), \
+                patch.object(self.main, "_network_interfaces", side_effect=OSError("ioctl unavailable")):
+            self.assertIsNone(self.main.resolve_robot_interface({"robot_interface": "auto"}))
+
+    def test_deployment_does_not_hardcode_robot_interface(self):
+        service = (ROOT / "deploy" / "service.yml").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        config = (ROOT / "config.yaml").read_text()
+        self.assertNotIn("NETWORK_INTERFACE=", service)
+        self.assertIn("robot_interface: auto", config)
+        self.assertIn("exec python3 /work/main.py", dockerfile)
+        self.assertNotIn("${NETWORK_INTERFACE", dockerfile)
 
     def test_card_stop_cancels_continuous_move(self):
         proxy = _Proxy()
@@ -138,7 +243,7 @@ class TestDriverContracts(unittest.TestCase):
     def test_state_sensor_info_includes_topic(self):
         plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
         plugin._namespace = "test"
-        for name in ("imu", "joints", "joint_state", "battery", "loco_state"):
+        for name in ("imu", "joints", "joint_state", "battery", "loco_state", "odometry"):
             result = plugin.dispatch(name, {})
             self.assertEqual("running", result["state"])
             self.assertTrue(result["topic_out"][0]["topic"].startswith("/test/"))
@@ -185,9 +290,161 @@ class TestDriverContracts(unittest.TestCase):
         node = self.device._StateNode.__new__(self.device._StateNode)
         published = []
         node.loco = types.SimpleNamespace(publish=lambda message: published.append(message.data))
+        node._odom_burst = []
+        node._odom_stamp_ms = 0
+        node._odom_stamp_provenance = {}
+        node._last_odom_time = 1e9  # far in the future — throttle out the odom publish
         node._on_sport(types.SimpleNamespace(mode=2, velocity=[1, 2, 3], position=[4, 5, 6], body_height=0.2,
-                                              imu_state=types.SimpleNamespace(rpy=[7, 8, 9])))
+                                              imu_state=types.SimpleNamespace(rpy=[7, 8, 9]),
+                                              stamp=None, yaw_speed=0.1))
         self.assertNotIn("imu_rpy_0", __import__("json").loads(published[0]))
+
+    # ── motus.odom/1 contract for the odometry card ─────────────────────────
+
+    @staticmethod
+    def _odom_node(published):
+        """A _StateNode shell whose odom publisher captures JSON payloads."""
+        node = TestDriverContracts.device._StateNode.__new__(
+            TestDriverContracts.device._StateNode)
+        node.odom = types.SimpleNamespace(
+            publish=lambda message: published.append(__import__("json").loads(message.data)))
+        node.loco = types.SimpleNamespace(publish=lambda message: None)
+        node._odom_burst = []
+        node._odom_burst_size = 0
+        node._odom_stamp_ms = 0
+        node._odom_stamp_provenance = {}
+        node._last_odom_time = 0.0
+        return node
+
+    @staticmethod
+    def _sport(**overrides):
+        msg = types.SimpleNamespace(mode=2, gait_type=1, body_height=0.2,
+                                    velocity=[0.3, -0.1, 0.0], yaw_speed=0.05,
+                                    position=[0.0, 0.0, 0.0], stamp=None)
+        for key, value in overrides.items():
+            setattr(msg, key, value)
+        return msg
+
+    def test_odom_sample_follows_motus_odom_1(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport())
+        self.assertEqual(1, len(published))
+        sample = published[0]
+        self.assertEqual("motus.odom/1", sample["schema"])
+        self.assertEqual("body", sample["frame"])
+        self.assertIsInstance(sample["stamp_ms"], int)
+        self.assertEqual("m/s", sample["units"]["linear"])
+        self.assertEqual("rad/s", sample["units"]["angular"])
+        self.assertEqual(6, len(sample["twist"]))
+
+    def test_odom_unmeasured_axes_are_null_not_zero(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport())
+        vx, vy, vz, wx, wy, wz = published[0]["twist"]
+        self.assertAlmostEqual(0.3, vx)
+        self.assertAlmostEqual(-0.1, vy)
+        self.assertAlmostEqual(0.05, wz)
+        # vz, roll rate, pitch rate are not in SportModeState_ — null, not 0.0.
+        self.assertIsNone(vz)
+        self.assertIsNone(wx)
+        self.assertIsNone(wy)
+
+    def test_odom_averages_the_burst_window(self):
+        published = []
+        node = self._odom_node(published)
+        # 20 Hz feed; only the first call publishes (10 Hz throttle) after the
+        # initial one, so accumulate three readings then force a publish.
+        node._accumulate_odom(self._sport(velocity=[0.3, 0.0, 0.0], yaw_speed=0.1))
+        node._accumulate_odom(self._sport(velocity=[0.5, 0.2, 0.0], yaw_speed=0.3))
+        node._accumulate_odom(self._sport(velocity=[0.4, 0.1, 0.0], yaw_speed=0.2))
+        node._publish_odom(self._sport())
+        vx, vy, _, _, _, wz = published[0]["twist"]
+        self.assertAlmostEqual(0.4, vx)
+        self.assertAlmostEqual(0.1, vy)
+        self.assertAlmostEqual(0.2, wz)
+        self.assertEqual(3, published[0]["vendor"]["samples"])
+
+    def test_odom_vendor_block_carries_stamp_provenance(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport())
+        vendor = published[0]["vendor"]
+        self.assertIn("stamp_source", vendor)
+        self.assertIn("mode", vendor)
+        self.assertIn("body_height", vendor)
+
+    def test_odom_empty_burst_publishes_all_null_twist(self):
+        published = []
+        node = self._odom_node(published)
+        node._publish_odom(self._sport())
+        self.assertEqual([None] * 6, published[0]["twist"])
+
+    def test_odom_non_finite_axis_is_null_not_nan(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport(velocity=[float("nan"), float("inf"), 0.0],
+                                   yaw_speed=float("-inf")))
+        vx, vy, vz, wx, wy, wz = published[0]["twist"]
+        self.assertIsNone(vx)
+        self.assertIsNone(vy)
+        self.assertIsNone(wz)
+
+    def test_odom_unreadable_yaw_speed_is_null_not_zero(self):
+        published = []
+        node = self._odom_node(published)
+        node._on_sport(self._sport(yaw_speed=None))
+        self.assertIsNone(published[0]["twist"][5])
+
+    def test_odom_unreadable_after_valid_does_not_reuse_stamp(self):
+        published = []
+        node = self._odom_node(published)
+        # First window: a valid reading — stamp/provenance are set.
+        with patch.object(self.device.time, "time", return_value=1000.0):
+            node._on_sport(self._sport())
+        first = published[0]
+        self.assertEqual(1, first["vendor"]["samples"])
+        self.assertEqual(1000_000, first["stamp_ms"])
+        # Second window: callback raises before anything is appended, then the
+        # 10 Hz tick publishes an empty window. It must not quote the first
+        # window's stamp as if it were fresh.
+        node._accumulate_odom(types.SimpleNamespace(velocity=None))  # raises inside, dropped
+        node._last_odom_time = 0.0
+        with patch.object(self.device.time, "time", return_value=2000.0):
+            node._publish_odom(self._sport())
+        second = published[1]
+        self.assertEqual([None] * 6, second["twist"])
+        self.assertEqual(0, second["vendor"]["samples"])
+        self.assertEqual(2000_000, second["stamp_ms"])
+        self.assertEqual("published", second["vendor"]["stamp_source"])
+        self.assertIn("no readable vendor reading", second["vendor"]["stamp_reason"])
+
+    def test_odom_timespec_ms_reads_vendor_stamp(self):
+        stamp = types.SimpleNamespace(sec=1_700_000_000, nanosec=250_000_000)
+        self.assertEqual(1_700_000_000_250, self.device._timespec_ms(stamp))
+        self.assertIsNone(self.device._timespec_ms(None))
+        self.assertIsNone(self.device._timespec_ms(types.SimpleNamespace(sec=0, nanosec=0)))
+
+    def test_odometry_card_declares_odom_interface(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        result = plugin.dispatch("odometry", {})
+        self.assertEqual("state/odom", result["topic_out"][0]["format"])
+        self.assertEqual("/test/state/odom", result["topic_out"][0]["topic"])
+        interface = result["odom_interface"]
+        self.assertEqual("motus.odom/1", interface["schema"])
+        self.assertEqual("body", interface["frame"])
+        self.assertEqual(["vx", "vy", "wz"], interface["provides"])
+        self.assertEqual("none", interface["pose_drift"])
+        self.assertEqual(10.0, interface["rate_hz"])
+
+    def test_odometry_info_also_returns_odom_interface(self):
+        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
+        plugin._namespace = "test"
+        result = plugin.dispatch("info", {"_tool_name": "odometry"})
+        self.assertEqual("state/odom", result["topic_out"][0]["format"])
+        self.assertEqual("motus.odom/1", result["odom_interface"]["schema"])
 
     def test_loco_uses_presets_and_acp_completion(self):
         plugin = self.device.LocoPlugin({}, "test", None, _Proxy())
