@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import signal
 import ssl
 import socket
@@ -510,7 +511,7 @@ def _face_effect_frame(effect, rgb, target, period, elapsed):
         scale = (1 - math.cos(2 * math.pi * phase)) / 2
         color = tuple(round(c * scale) for c in rgb)
     elif effect == "fade":
-        weight = 1 - abs(2 * phase - 1)  # RGB -> target -> RGB, no wrap discontinuity
+        weight = min(1.0, max(0.0, elapsed / period))  # One-way transition, then hold target
         color = tuple(round(a + (b - a) * weight) for a, b in zip(rgb, target))
     else:
         raise ValueError(f"unknown effect {effect}")
@@ -812,13 +813,14 @@ class FaceLightPlugin:
                         return
                     elapsed = time.monotonic() - started
                     if elapsed >= duration:
-                        self._write(_FACE_BLACK)
-                        self._mode = "off"
+                        self._write((target,) * 12 if effect == "fade" else _FACE_BLACK)
+                        self._mode = "static" if effect == "fade" else "off"
                         status = "completed"
-                        result = _env_face(effect, True, mode="off", end_behavior="off",
+                        result = _env_face(effect, True, mode=self._mode,
+                                           end_behavior="hold_target" if effect == "fade" else "off",
                                            simulated=self._backend.name == "simulated")
                         return
-                    self._write(_face_effect_frame(effect, rgb, target, period, elapsed))
+                    self._write(_face_effect_frame(effect, rgb, target, duration if effect == "fade" else period, elapsed))
         except Exception as exc:
             with self._lock:
                 self._last_error = str(exc)
@@ -885,17 +887,17 @@ class FaceLightPlugin:
         rgb_array = {"type": "array", "minItems": 3, "maxItems": 3,
                      "items": {"type": "integer", "minimum": 0, "maximum": 255}}
         actions = {"set_color": ["r", "g", "b"], "preset": ["name"], "off": [],
-                   "set_led": ["index", "r", "g", "b"], "set_leds": ["colors"],
+                   "set_led": ["index", "r", "g", "b"], "set_leds": ["color_format", "colors"],
                    "blink": ["r", "g", "b", "period_s", "duration_s"],
                    "breathe": ["r", "g", "b", "period_s", "duration_s"],
-                   "fade": ["r", "g", "b", "to_r", "to_g", "to_b", "period_s", "duration_s"],
+                   "fade": ["r", "g", "b", "to_r", "to_g", "to_b", "duration_s"],
                    "chase": ["r", "g", "b", "period_s", "duration_s"], "info": []}
         descriptions = {"set_color": "Persistent uniform RGB until next command",
                         "preset": "Persistent named color", "off": "Cancel effect and turn all LEDs off",
                         "set_led": "Set SDK index 0..11; others retain last software frame (initially off); per-LED backend required",
-                        "set_leds": "Exactly 12 RGB triples in SDK index order; per-LED backend required",
+                        "set_leds": "12 RGB hex colors in index order, separated by spaces (e.g. FF0000); legacy RGB arrays accepted",
                         "blink": "Blink uniform RGB on/off", "breathe": "Breathe by scaling RGB",
-                        "fade": "Fade RGB to target RGB and back", "chase": "One LED traverses 0..11; per-LED backend required",
+                        "fade": "Transition RGB to target RGB over duration_s, then hold target until next command", "chase": "One LED traverses 0..11; per-LED backend required",
                         "info": "Software-recorded status and backend capabilities; no hardware feedback"}
         return {"name": CARD_FACE_LIGHT, "type": "actuator", "multiInstance": False,
                 "description": "Go1 face_light: persistent RGB, 12 LED control and internal timed effects. "
@@ -907,13 +909,19 @@ class FaceLightPlugin:
                                 "properties": {"action": {"type": "string", "enum": list(actions)},
                                                **{k: dict(rgb_channel) for k in ("r", "g", "b", "to_r", "to_g", "to_b")},
                                                "name": {"type": "string", "enum": list(_PRESETS), "default": "off"},
-                                               "index": {"type": "integer", "minimum": 0, "maximum": 11,
+                                               "index": {"type": "integer", "minimum": 0, "maximum": 11, "default": 0,
                                                          "description": "Facing dog: viewer left top-bottom 0..5; right 6..11"},
-                                               "colors": {"type": "array", "minItems": 12, "maxItems": 12, "items": rgb_array},
+                                               "color_format": {"type": "string", "enum": ["hex", "rgb_array"],
+                                                                "default": "hex", "description": "hex: RGB hex colors; rgb_array: JSON list of 12 RGB triples"},
+                                               "colors": {"anyOf": [
+                                                   {"type": "string"},
+                                                   {"type": "array", "minItems": 12, "maxItems": 12, "items": rgb_array}],
+                                                          "default": " ".join(["000000"] * 12),
+                                                          "description": "12 RGB hex colors (0..11), separated by spaces; FF0000=red, 000000=off"},
                                                "period_s": {"type": "number", "minimum": 0.2, "maximum": 3600, "default": 2,
                                                             "description": "Seconds per full cycle; chase traverses all 12 LEDs"},
                                                "duration_s": {"type": "number", "minimum": 0.05, "maximum": 3600, "default": 5,
-                                                              "description": "Auto-off after these seconds"}},
+                                                              "description": "Fade transition time, then hold target; other effects auto-off after these seconds"}},
                                 "x-action-params": {a: {"params": p, "description": descriptions[a]} for a, p in actions.items()}},
                 "configSchema": {"type": "object", "properties": {
                     "sdk_exclusive": {"type": "boolean", "default": True,
@@ -946,11 +954,32 @@ class FaceLightPlugin:
                     raise ValueError(f"unknown preset; choose {', '.join(_PRESETS)}")
                 rgb = _PRESETS[name.lower()]
             if action == "set_led":
-                index = args.get("index")
+                index = args.get("index", 0)
                 if type(index) is not int or not 0 <= index < 12:
                     raise ValueError("index must be an integer in 0..11")
             if action == "set_leds":
-                colors = args.get("colors")
+                color_format = args.get("color_format")
+                if color_format is not None and color_format not in ("hex", "rgb_array"):
+                    raise ValueError("color_format must be hex or rgb_array")
+                colors = args.get("colors", [[0, 0, 0] for _ in range(12)]
+                                  if color_format == "rgb_array" else " ".join(["000000"] * 12))
+                if color_format == "rgb_array" and isinstance(colors, str):
+                    try:
+                        colors = json.loads(colors)
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError("colors must be a JSON list of 12 RGB triples in rgb_array mode") from exc
+                if color_format == "hex" and not isinstance(colors, str):
+                    raise ValueError("colors must be RGB hex text in hex mode")
+                if isinstance(colors, str) and color_format != "rgb_array":
+                    tokens = colors.replace(",", " ").split()
+                    if len(tokens) != 12:
+                        raise ValueError("colors must contain exactly 12 RGB hex colors in index order")
+                    colors = []
+                    for i, token in enumerate(tokens):
+                        if not re.fullmatch(r"#?[0-9a-fA-F]{6}", token):
+                            raise ValueError(f"colors[{i}] must be six RGB hex digits, e.g. FF0000 or #FF0000")
+                        token = token.lstrip("#")
+                        colors.append([int(token[j:j + 2], 16) for j in (0, 2, 4)])
                 if not isinstance(colors, (list, tuple)) or len(colors) != 12:
                     raise ValueError("colors must contain exactly 12 RGB triples in SDK index order")
                 frame = tuple(_face_rgb(c, f"colors[{i}]") for i, c in enumerate(colors))
@@ -1006,7 +1035,9 @@ class FaceLightPlugin:
                     if action == "preset":
                         applied["name"] = name.lower()
                 if action in _FACE_EFFECTS:
-                    applied.update(period_s=period, duration_s=duration, end_behavior="off")
+                    applied.update(duration_s=duration, end_behavior="hold_target" if action == "fade" else "off")
+                    if action != "fade":
+                        applied["period_s"] = period
                 return _env_face(action, True, applied=applied, simulated=self._backend.name == "simulated",
                                  **({"action_id": action_id} if action in _FACE_EFFECTS else {}),
                                  delivery="simulated" if self._backend.name == "simulated" else "sdk_udp_socket_sent")

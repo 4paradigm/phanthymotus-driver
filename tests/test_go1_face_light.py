@@ -84,7 +84,7 @@ def test_effect_completion_contract_and_unique_ids(light, acp_notify, action):
     for call, action_id in zip(acp_notify.call_args_list, ids):
         sent_id, status, result = call.args
         assert sent_id == action_id and status == "completed"
-        assert result["ok"] and result["mode"] == "off"
+        assert result["ok"] and result["mode"] == ("static" if action == "fade" else "off")
         assert result["state_source"] == "software_record" and not result["hardware_verified"]
     assert "action_id" not in light.dispatch("set_color", {"r": 1})
 
@@ -338,11 +338,11 @@ def test_render_time_and_live_auto_off(light, action):
     worker = light._thread
     wait_until(lambda: not worker.is_alive())
     assert len(set(frame for _, frame in light._backend.frames)) > 1
-    assert light._backend.frames[-1][1] == ext._FACE_BLACK
+    assert light._backend.frames[-1][1] == (((0, 0, 240),) * 12 if action == "fade" else ext._FACE_BLACK)
     count = len(light._backend.frames)
     time.sleep(0.06)
     assert len(light._backend.frames) == count
-    assert light._info()["mode"] == "off"
+    assert light._info()["mode"] == ("static" if action == "fade" else "off")
 
 
 @pytest.mark.parametrize("field,value", [("period_s", 0), ("period_s", 0.19), ("period_s", True),
@@ -967,3 +967,88 @@ for line in sys.stdin:
     assert not plugin.dispatch('set_color', {'r': 1})['ok']
     assert process.poll() is not None
     plugin.stop()
+
+
+def test_fade_is_one_way_and_holds_target_until_next_command(light):
+    source, target = (255, 0, 0), (0, 0, 255)
+    assert ext._face_effect_frame("fade", source, target, 2, 0) == (source,) * 12
+    assert ext._face_effect_frame("fade", source, target, 2, 1) == ((128, 0, 128),) * 12
+    for elapsed in (2, 3, 4):
+        assert ext._face_effect_frame("fade", source, target, 2, elapsed) == (target,) * 12
+    result = light.dispatch("fade", {"r": 255, "to_b": 255, "duration_s": 0.1})
+    assert result["ok"] and result["applied"]["end_behavior"] == "hold_target"
+    light._thread.join(1)
+    assert light._backend.frames[-1][1] == (target,) * 12
+    count = len(light._backend.frames)
+    time.sleep(0.1)
+    assert len(light._backend.frames) == count
+    assert light.dispatch("set_color", {"g": 20})["ok"]
+    assert light._backend.frames[-1][1] == ((0, 20, 0),) * 12
+
+
+@pytest.mark.parametrize("separator", [" ", ","])
+def test_hex_colors_map_all_twelve_leds(light, separator):
+    colors = [[i, 20 + i, 255 - i] for i in range(12)]
+    text = separator.join("#" + "".join(f"{c:02x}" for c in rgb) for rgb in colors)
+    assert light.dispatch("set_leds", {"colors": text})["ok"]
+    assert light._backend.frames[-1][1] == tuple(tuple(rgb) for rgb in colors)
+
+
+@pytest.mark.parametrize("text", ["", "000000 " * 11, "000000 " * 13,
+                                   "GG0000 " + "000000 " * 11,
+                                   "FFF " + "000000 " * 11])
+def test_bad_hex_colors_preserve_frame(light, text):
+    light.dispatch("set_color", {"g": 20})
+    count = len(light._backend.frames)
+    assert light.dispatch("set_leds", {"colors": text})["code"] == "INVALID_ARGUMENT"
+    assert len(light._backend.frames) == count
+
+
+def test_numeric_zero_defaults_and_simpler_action_parameters(light):
+    schema = light.get_tool()["inputSchema"]
+    props = schema["properties"]
+    for key in ("index", "r", "g", "b", "to_r", "to_g", "to_b"):
+        assert props[key]["default"] == 0
+    assert props["period_s"]["default"] >= props["period_s"]["minimum"] > 0
+    assert props["duration_s"]["default"] >= props["duration_s"]["minimum"] > 0
+    assert "period_s" not in schema["x-action-params"]["fade"]["params"]
+    assert light.dispatch("set_led", {})["ok"]
+    assert light.dispatch("set_leds", {"colors": props["colors"]["default"]})["ok"]
+
+
+@pytest.mark.parametrize("color_format,colors", [
+    ("hex", " ".join(["FF0000"] * 12)),
+    ("rgb_array", [[255, 0, 0]] * 12),
+    ("rgb_array", json.dumps([[255, 0, 0]] * 12)),
+])
+def test_set_leds_color_format_selection(light, color_format, colors):
+    assert light.dispatch("set_leds", {"color_format": color_format, "colors": colors})["ok"]
+    assert light._backend.frames[-1][1] == ((255, 0, 0),) * 12
+
+
+@pytest.mark.parametrize("color_format,colors", [
+    ("unknown", "000000 " * 12), ("rgb_array", "000000 " * 12),
+    ("hex", [[0, 0, 0]] * 12), ("rgb_array", json.dumps([[0, 0, 0]] * 11)),
+    ("rgb_array", json.dumps([[True, 0, 0]] * 12)),
+])
+def test_set_leds_bad_selected_format_preserves_frame(light, color_format, colors):
+    count = len(light._backend.frames)
+    result = light.dispatch("set_leds", {"color_format": color_format, "colors": colors})
+    assert not result["ok"] and result["code"] == "INVALID_ARGUMENT"
+    assert len(light._backend.frames) == count
+
+
+@pytest.mark.parametrize("args", [{}, {"color_format": "hex"}, {"color_format": "rgb_array"}])
+def test_set_leds_omitted_colors_means_all_zero(light, args):
+    assert light.dispatch("set_color", {"r": 100})["ok"]
+    assert light.dispatch("set_leds", args)["ok"]
+    assert light._backend.frames[-1][1] == ((0, 0, 0),) * 12
+
+
+def test_omitted_channels_and_index_execute_as_zero(light):
+    assert light.dispatch("set_color", {"g": 40})["ok"]
+    assert light._backend.frames[-1][1] == ((0, 40, 0),) * 12
+    assert light.dispatch("set_led", {"b": 80})["ok"]
+    assert light._backend.frames[-1][1] == ((0, 0, 80),) + ((0, 40, 0),) * 11
+    assert light.dispatch("set_color", {})["ok"]
+    assert light._backend.frames[-1][1] == ((0, 0, 0),) * 12
