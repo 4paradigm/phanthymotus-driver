@@ -223,6 +223,96 @@ def test_dry_run_is_not_the_default():
     assert card._dry_run is False
 
 
+# ── the operator's switches, settable at runtime ─────────────────────────────
+#
+# These lived only in config.yaml, so changing one meant editing a file inside a
+# container and restarting the bundle. `dry_run` in particular is reached for in
+# the second before a new policy is tried on a real robot, not after a redeploy.
+
+def test_the_three_toggles_are_declared_in_the_config_schema():
+    """Declared, or the frontend renders no form and they stay unreachable."""
+    schema = _card().get_tool()["configSchema"]["properties"]
+    assert set(schema) == {"dry_run", "rotate_only", "require_standing"}
+    assert all(field["type"] == "boolean" for field in schema.values())
+
+
+def test_the_declared_defaults_leave_the_robot_movable():
+    """A default that cannot move is the failure `dry_run` already caused once.
+
+    The schema's defaults are also what a form sends for a field nobody touched,
+    so a `dry_run: true` default here would silently kill every freshly wired
+    chassis — exactly what the old constructor default did.
+    """
+    schema = _card().get_tool()["configSchema"]["properties"]
+    assert schema["dry_run"]["default"] is False
+    assert schema["rotate_only"]["default"] is False
+    assert schema["require_standing"]["default"] is True
+
+
+def test_config_takes_effect_while_the_card_is_streaming():
+    """A toggle that reports success and changes nothing until a restart is the
+    shape of failure this bundle keeps hitting — a setting that looks applied."""
+    client = FakeClient()
+    card = _card(client)
+    card.dispatch("config", {"dry_run": True})
+    _sink(card).submit(_command([0.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert client.moves == []
+    assert card._dry_run is True
+
+
+def test_clearing_dry_run_hands_a_live_stream_to_the_motors():
+    """The direction to be careful about, and it is honoured deliberately.
+
+    Nothing else stands between this flag and the chassis once a stream is
+    already subscribed, so the operator's act is the authorisation. It is logged
+    for the same reason — a robot that starts moving with nothing in the log
+    saying why is the worse outcome.
+    """
+    client = FakeClient()
+    card = _card(client, dry_run=True)
+    card.dispatch("config", {"dry_run": False})
+    _sink(card).submit(_command([0.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert len(client.moves) == 1
+
+
+def test_config_only_touches_keys_that_were_sent():
+    """A form rendering an unchecked box for a field nobody set would otherwise
+    send `require_standing: false` and silently drop a posture check."""
+    card = _card(None, require_standing=True, rotate_only=True)
+    card.dispatch("config", {"dry_run": True})
+    assert card._require_standing is True
+    assert card._rotate_only is True
+
+
+def test_config_ignores_keys_that_are_not_toggles():
+    """`config` and `start` share an argument dict on this card, so an
+    unfiltered assignment would turn a stray `input_topic` into an attribute."""
+    card = _card()
+    card.dispatch("config", {"input_topic": "/x", "action": "config",
+                             "_tool_name": "loco_servo", "dry_run": True})
+    assert card._dry_run is True
+    assert not hasattr(card, "_input_topic_") and card._input_topic == ""
+
+
+def test_config_reports_what_is_now_in_force():
+    card = _card()
+    out = card.dispatch("config", {"rotate_only": True})
+    assert out["ok"] is True
+    assert out["rotate_only"] is True
+    assert out["dry_run"] is False
+    assert out["require_standing"] is True
+
+
+def test_info_reports_all_three_so_the_card_is_readable():
+    """What this card is enforcing right now must not have to be inferred from
+    a config file that may no longer be what is in force."""
+    card = _card()
+    card.dispatch("config", {"require_standing": False})
+    info = card.dispatch("info", {})
+    assert info["require_standing"] is False
+    assert "dry_run" in info and "rotate_only" in info
+
+
 # ── arbitration with the call-shaped card ────────────────────────────────────
 
 def test_starting_is_refused_while_loco_is_driving():
