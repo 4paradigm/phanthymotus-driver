@@ -21,7 +21,8 @@ agibot-a3:
     # The container installs/starts the host-side Jazzy relay through systemd
     # D-Bus; users do not need to configure the ADU manually.
     - /etc/systemd/system:/host-systemd/system:rw
-    - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+    - /run/dbus:/run/dbus:rw
+    - /run/systemd:/run/systemd:ro
     - /usr/bin/systemctl:/usr/local/bin/host-systemctl:ro
   environment:
     # No FASTRTPS_DEFAULT_PROFILES_FILE and no ROS_DOMAIN_ID here, unlike most
