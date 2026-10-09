@@ -18,12 +18,6 @@ agibot-a3:
     # The main A3 process uses its robot profile for domain 232; its isolated
     # child publishers read the loopback profile for Agent Core domain 42.
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
-    # The container installs/starts the host-side Jazzy relay through systemd
-    # D-Bus; users do not need to configure the ADU manually.
-    - /etc/systemd/system:/host-systemd/system:rw
-    - /run/dbus:/run/dbus:rw
-    - /run/systemd:/run/systemd:ro
-    - /usr/bin/systemctl:/usr/local/bin/host-systemctl:ro
   environment:
     # No FASTRTPS_DEFAULT_PROFILES_FILE and no ROS_DOMAIN_ID here, unlike most
     # drivers — same reason as x-humanoid/tianyi2.0. This process runs two FastDDS
