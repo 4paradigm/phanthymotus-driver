@@ -93,6 +93,9 @@ def _input(queues):
     def push(key, msg):
         try:
             item = (key, serialize_message(msg))
+            counts[key] = counts.get(key, 0) + 1
+            if counts[key] == 1:
+                print(f"[relay] input received key={key}", flush=True)
             queue_out = queues[key]
             try:
                 queue_out.put_nowait(item)
@@ -101,6 +104,7 @@ def _input(queues):
                 queue_out.put_nowait(item)
         except Exception as exc:
             print(f"[relay] input failed key={key}: {exc}", flush=True)
+    counts = {}
     for key, topic in CAMERAS.items():
         node.create_subscription(Image, topic, lambda msg, k=key: push(k, msg), qos_profile_sensor_data)
     node.create_subscription(PointCloud2, "/hal/neck_middle_livox_lidar/pointcloud", lambda msg: push("lidar_cloud", msg), qos_profile_sensor_data)
@@ -138,12 +142,16 @@ def _output(queues):
             rclpy.spin_once(node, timeout_sec=0.005)
             continue
         key, payload = item
-        if key == "lidar_cloud":
-            output = _encode_cloud(deserialize_message(payload, PointCloud2))
-            msg_type = UInt8MultiArray
-        else:
-            output = _encode_image(deserialize_message(payload, Image), key)
-            msg_type = CompressedImage
+        try:
+            if key == "lidar_cloud":
+                output = _encode_cloud(deserialize_message(payload, PointCloud2))
+                msg_type = UInt8MultiArray
+            else:
+                output = _encode_image(deserialize_message(payload, Image), key)
+                msg_type = CompressedImage
+        except Exception as exc:
+            print(f"[relay] encode failed key={key}: {exc}", flush=True)
+            continue
         if output is None:
             continue
         topic = f"/agibot_a3/{'lidar_cloud' if key == 'lidar_cloud' else 'camera_' + key}"
