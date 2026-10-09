@@ -1789,6 +1789,16 @@ def _mc_suggestion(state: str, requested: str) -> str:
     return f"当前状态 {state} 仅允许 {list(allowed)}；建议先经 get_up 恢复站立（MOTION）后再进入 {requested}"
 
 
+def _mc_runtime_names(commands):
+    """Normalize AimDK GetAvailableActions entries to action-name strings."""
+    names = set()
+    for item in commands or ():
+        value = item.get("action") if isinstance(item, dict) else item
+        if isinstance(value, str):
+            names.add(value.upper().replace("MOTIONCONTROLACTION_", ""))
+    return names
+
+
 class McModePlugin:
     """mc_mode 卡片：运动控制状态机查询 + 模式切换（原 mc_state 状态卡并入）。
 
@@ -1864,7 +1874,8 @@ class McModePlugin:
         service_action, short = MC_ACTIONS[action]
         runtime = self.nodes.rpc.get_available_actions()
         commands = runtime.get("commands") or []
-        if commands and service_action not in commands:
+        runtime_names = _mc_runtime_names(commands)
+        if runtime_names and short not in runtime_names:
             return {"state": "rejected", "current": normalized, "requested": action,
                     "suggestion": f"运行时可用动作列表不含 {service_action}（当前可用 {commands}）；"
                                   f"请先满足前置状态（通常为 get_up 站立）",
