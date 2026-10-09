@@ -12,10 +12,11 @@ start)
   rm -f "$PIDFILE"
   cp "$SOURCE" "$ROOT/jazzy_relay.py"
   # Enter the host mount namespace so this process uses the host's Python 3.12
-  # and Jazzy ROS installation.  Use the minimal POSIX shell available on the
-  # ADU root filesystem; the previous bash paths were not present there.
+  # and Jazzy ROS installation.  Resolve the interpreter through PID 1's root:
+  # after setns the container's /bin/sh path is not necessarily present in the
+  # ADU root filesystem, even though /proc/1/root/bin/bash is.
   : > "$ROOT/relay.log"
-  nsenter -t 1 -m -u -n -p -- /bin/sh -c \
+  nsenter -t 1 -m -u -n -p -- /proc/1/root/usr/bin/bash -lc \
     "set -e; if [ -f /opt/ros/jazzy/setup.sh ]; then . /opt/ros/jazzy/setup.sh; elif [ -f /opt/ros/jazzy/setup.bash ]; then . /opt/ros/jazzy/setup.bash; else echo '[relay] ERROR: /opt/ros/jazzy is not visible in host mount namespace' >&2; exit 41; fi; python3 -c 'import rclpy, sensor_msgs' || { echo '[relay] ERROR: host Jazzy rclpy/sensor_msgs unavailable' >&2; exit 42; }; exec python3 $ROOT/jazzy_relay.py" \
     >"$ROOT/relay.log" 2>&1 &
   echo $! > "$PIDFILE"
