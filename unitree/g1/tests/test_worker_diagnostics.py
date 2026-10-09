@@ -74,10 +74,16 @@ def test_real_worker_sanitizes_child_stderr_before_solver_import(tmp_path):
 
 def test_g1_transport_selection_does_not_override_xml_profile():
     from pathlib import Path
-    import xml.etree.ElementTree as ET
     root = Path(__file__).resolve().parents[1]
-    assert 'ENV FASTDDS_BUILTIN_TRANSPORTS=' not in (root / 'Dockerfile').read_text()
-    profile = ET.parse(root / 'dds-local.xml').getroot()
-    ns = {'dds': 'http://www.eprosima.com'}
-    assert profile.find('.//dds:useBuiltinTransports', ns).text == 'false'
-    assert profile.find('.//dds:interfaceWhiteList/dds:address', ns).text == '127.0.0.1'
+    docker = (root / 'Dockerfile').read_text()
+    assert 'ENV FASTDDS_BUILTIN_TRANSPORTS=' not in docker
+    assert 'COPY dds-local.xml' not in docker
+    assert not (root / 'dds-local.xml').exists()
+    service = (root / 'deploy/service.yml').read_text()
+    assert '/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro' in service
+    assert 'FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml' in service
+    main = (root / 'main.py').read_text()
+    assert 'FASTRTPS_DEFAULT_PROFILES_FILE' not in main
+    assert "os.environ['ROS_DOMAIN_ID']" not in main
+    assert '    rclpy.init()' in main
+    assert 'rclpy.init(domain_id=' not in main

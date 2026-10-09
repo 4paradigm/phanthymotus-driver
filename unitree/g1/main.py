@@ -504,11 +504,7 @@ def main():
     print("[bundle] MotionSwitcherClient ready")
 
     # ROS2
-    if (cfg.get('motion_control', {}).get('enabled', False)
-            or cfg.get('teleop_control', {}).get('enabled', False)):
-        os.environ['ROS_DOMAIN_ID'] = '42'
-        os.environ['FASTRTPS_DEFAULT_PROFILES_FILE'] = str(Path(__file__).with_name('dds-local.xml'))
-    rclpy.init(domain_id=42)
+    rclpy.init()
     executor = rclpy.executors.MultiThreadedExecutor()
 
     # Safety Harness (SmartMotion) — independent subprocess

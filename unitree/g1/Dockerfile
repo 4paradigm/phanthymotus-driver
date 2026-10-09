@@ -61,7 +61,6 @@ COPY servo.py /work/servo.py
 COPY arm_sdk.py /work/arm_sdk.py
 COPY arm_stream.py motion_control.py motion_bus.py teleop_control.py teleop_bus.py ros_spin.py /work/
 COPY g1_motion/ /work/g1_motion/
-COPY dds-local.xml /work/dds-local.xml
 COPY --from=motion-numeric-installer /bin/micromamba /usr/local/bin/micromamba
 RUN micromamba create --yes --prefix /opt/g1-motion --file /work/g1_motion/requirements.numeric-linux-aarch64.lock && \
     micromamba clean --all --yes && \

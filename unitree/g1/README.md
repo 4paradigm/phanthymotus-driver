@@ -55,3 +55,9 @@ Canvas 监控的 `input_status` 区分 `waiting_binding`、`stopped`、`waiting_
 ## 离线回归
 
 常规测试位于 `unitree/g1/tests/`。`scripts/compare_g1_teleop_baseline.py` 使用明确 Git 基线、同一 profile 及已有录制，分别比较相对映射和固定时钟执行输出；它使用 SDK 替身，不是完整 IK 回放或真机验收。旧四卡专用、依赖外部 mapper 的 `validate_g1_offline.py` 已移除。真实模型 profile 对照见 `test_motion_control_numeric.py`。
+
+## ROS 配置来源
+
+ROS 初始化沿用主线 `rclpy.init()`，读取部署环境变量；Driver 不新增初始化校验或内置 XML 副本。
+`deploy/service.yml` 统一挂载 `/opt/phanthy-motus/dds-local.xml`，指定该 profile 和 `ROS_DOMAIN_ID=42`。
+开发和测试由启动环境显式提供相同配置。遥操开关不覆盖配置；Unitree SDK 的 domain 0 与网卡配置不变。
