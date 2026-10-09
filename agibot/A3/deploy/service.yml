@@ -15,9 +15,8 @@ agibot-a3:
     - /agibot/software/v0/entry:/agibot-devkit:ro
     # Runtime ROS interfaces installed by AimDK on the ADU/HDU image.
     - /opt/agibot:/opt/agibot:ro
-    # Domain-42 bridge must use the same loopback-only FastDDS profile as Agent
-    # Core. The main A3 process uses its own robot-only profile for domain 232;
-    # the isolated child process reads this file independently.
+    # The main A3 process uses its robot profile for domain 232; its isolated
+    # child publishers read the loopback profile for Agent Core domain 42.
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
     # No FASTRTPS_DEFAULT_PROFILES_FILE and no ROS_DOMAIN_ID here, unlike most
@@ -29,11 +28,11 @@ agibot-a3:
     # {robot-subnet IP, 127.0.0.1} before any participant is created — see
     # main.py _select_profile. Domain 42 is set in code by DualDomainROS2 too;
     # a container-wide ROS_DOMAIN_ID would only govern stray processes.
-    # Both the robot participant and isolated domain-42 bridge use FastDDS;
-    # main.py generates the constrained robot profile before participants exist.
+    # The Jazzy relay is started in the host mount namespace by the container
+    # and publishes converted media back to robot domain 232. The A3 process
+    # then forwards those small samples to domain 42 through its child bridge.
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    - A3_ZENOH_BRIDGE=1
-    - A3_ZENOH_CORE_DOMAIN=42
+    - A3_JAZZY_RELAY=1
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

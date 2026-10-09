@@ -538,6 +538,7 @@ class A3Nodes:
         self._media_received = {}
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
+        self._jazzy_relay = os.environ.get("A3_JAZZY_RELAY") == "1"
 
         def mirror(key, msg_type, robot_topic, fmt, qos=None, json_filter=None,
                    re_encode=None):
@@ -545,7 +546,7 @@ class A3Nodes:
             as_json = fmt == "data/json"
             if key == "lidar_cloud":
                 core_msg_type = UInt8MultiArray
-            elif re_encode is not None:
+            elif re_encode is not None or (self._jazzy_relay and key.startswith("camera_")):
                 core_msg_type = self._CompressedImage
             elif as_json:
                 core_msg_type = String
@@ -567,11 +568,17 @@ class A3Nodes:
                 elif key in ("imu_pelvis", "imu_torso"):
                     self._publish_imu_streams(key, jsonable(msg))
                 if key == "lidar_cloud":
-                    packet = self._pointcloud_packet(msg)
-                    if packet is not None:
-                        output = UInt8MultiArray()
-                        output.data = list(packet)
-                        pub.publish(output)
+                    if self._jazzy_relay:
+                        pub.publish(msg)
+                    else:
+                        packet = self._pointcloud_packet(msg)
+                        if packet is not None:
+                            output = UInt8MultiArray()
+                            output.data = list(packet)
+                            pub.publish(output)
+                    return
+                if self._jazzy_relay and key.startswith("camera_"):
+                    pub.publish(msg)
                     return
                 if re_encode is not None:
                     # JPEG/depth conversion can be slower than the camera
@@ -600,6 +607,12 @@ class A3Nodes:
             callback_group = self._media_callback_group if (re_encode is not None or key == "lidar_cloud") else None
             kwargs = {"callback_group": callback_group} if callback_group is not None else {}
             subscription_node = self.media_robot if (callback_group is not None and self.media_robot is not None) else self.robot
+            if self._jazzy_relay and key == "lidar_cloud":
+                msg_type = UInt8MultiArray
+                robot_topic = _core_topic(namespace, "lidar_cloud")
+            elif self._jazzy_relay and key.startswith("camera_"):
+                msg_type = self._CompressedImage
+                robot_topic = _core_topic(namespace, key)
             try:
                 subscription_node.create_subscription(msg_type, robot_topic, callback, qos or sensor_qos, **kwargs)
             except TypeError:
@@ -625,7 +638,7 @@ class A3Nodes:
         for key in selected:
             topic, fmt, _ = CAMERA_TOPICS[key]
             encoder = self._encode_depth if fmt == "image/depth-zlib" else self._encode_rgb
-            mirror(f"camera_{key}", Image, topic, fmt, re_encode=encoder)
+            mirror(f"camera_{key}", Image, topic, fmt, re_encode=None if self._jazzy_relay else encoder)
 
         # -- protobuf-carrier streams (RosMsgWrapper) -- decoded with the official
         # AimDK v3.2 generated modules.  There is no ``aimdk.protocol_pb2`` module

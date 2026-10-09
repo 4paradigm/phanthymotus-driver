@@ -2,16 +2,6 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
 
-# Download at image-build time (the build worker has external network access;
-# ADU does not). The official arm64 standalone archive contains the bridge
-# executable and embeds its DDS implementation.
-ADD --checksum=sha256:fdb64d942d4b6beccbe9b1f8a359a01a2fca95a023c27535bf97b233603fad5f \
-    https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases/download/1.10.1/zenoh-plugin-ros2dds-1.10.1-aarch64-unknown-linux-gnu-standalone.zip \
-    /tmp/a3-zenoh.zip
-RUN python3 -c "import zipfile; z=zipfile.ZipFile('/tmp/a3-zenoh.zip'); z.extract('zenoh-bridge-ros2dds', '/usr/local/libexec/a3-zenoh');" && \
-    chmod 0755 /usr/local/libexec/a3-zenoh/zenoh-bridge-ros2dds && \
-    rm -f /tmp/a3-zenoh.zip
-
 # The robot publishes Jazzy ROS types. Keep the main participant on FastDDS so
 # its type-hash negotiation matches the robot; the isolated domain-42 bridge
 # also uses FastDDS in its child workers. The base image already provides the
@@ -34,8 +24,8 @@ RUN cd /tmp/a3_ws && \
 WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py domain_bridge.py config.yaml driver.yaml /work/agibot/A3/
-COPY zenoh_bridge.sh /work/agibot/A3/zenoh_bridge.sh
-RUN chmod 0755 /work/agibot/A3/zenoh_bridge.sh
+COPY zenoh_bridge.sh jazzy_relay.py jazzy_relay.sh /work/agibot/A3/
+RUN chmod 0755 /work/agibot/A3/zenoh_bridge.sh /work/agibot/A3/jazzy_relay.sh
 COPY resource/ /work/agibot/A3/resource/
 # service.yml must be INSIDE the image (12th PR review): Agent Core extracts the
 # deployment fragment from the driver image and merges it into the host's unified
@@ -50,4 +40,4 @@ COPY deploy/ /deploy/
 # is to keep raw rclpy output plain so every consumer sees identical records.
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0 PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 PYTHONPATH=/work
 EXPOSE 15719
-CMD ["/bin/bash", "-c", "set -e; source /opt/ros/humble/setup.bash; source /tmp/a3_ws/install/setup.bash; if [ \"${A3_ZENOH_BRIDGE:-0}\" = 1 ]; then /work/agibot/A3/zenoh_bridge.sh start; trap '/work/agibot/A3/zenoh_bridge.sh stop' EXIT; fi; python3 -c 'from audio_msgs.msg import AudioCapture, AudioPlayback; print(\"[audio] audio_msgs AudioCapture/AudioPlayback available\", flush=True)' || { echo '[warn] A3 audio_msgs unavailable — mic/speaker degraded'; }; python3 -c 'from ros2_plugin_proto.msg import RosMsgWrapper; print(\"[ros2_plugin_proto] RosMsgWrapper available\", flush=True)' || { echo '[warn] ros2_plugin_proto unavailable — wrapper command cards degraded'; }; python3 -c 'from aimdk.protocol.hal.bms.hal_bms_channel_pb2 import BmsStateChannel; from aimdk.protocol.hal.state.hal_state_channel_pb2 import EmergencyStateChannel; print(\"[a3_aimdk] 3.2.0 protobuf available\", flush=True)' || { echo '[warn] a3_aimdk protobuf import failed — battery/estop degraded'; }; python3 /work/agibot/A3/main.py"]
+CMD ["/bin/bash", "-c", "set -e; source /opt/ros/humble/setup.bash; source /tmp/a3_ws/install/setup.bash; if [ \"${A3_JAZZY_RELAY:-0}\" = 1 ]; then /work/agibot/A3/jazzy_relay.sh start; trap '/work/agibot/A3/jazzy_relay.sh stop' EXIT; fi; python3 -c 'from audio_msgs.msg import AudioCapture, AudioPlayback; print(\"[audio] audio_msgs AudioCapture/AudioPlayback available\", flush=True)' || { echo '[warn] A3 audio_msgs unavailable — mic/speaker degraded'; }; python3 -c 'from ros2_plugin_proto.msg import RosMsgWrapper; print(\"[ros2_plugin_proto] RosMsgWrapper available\", flush=True)' || { echo '[warn] ros2_plugin_proto unavailable — wrapper command cards degraded'; }; python3 -c 'from aimdk.protocol.hal.bms.hal_bms_channel_pb2 import BmsStateChannel; from aimdk.protocol.hal.state.hal_state_channel_pb2 import EmergencyStateChannel; print(\"[a3_aimdk] 3.2.0 protobuf available\", flush=True)' || { echo '[warn] a3_aimdk protobuf import failed — battery/estop degraded'; }; python3 /work/agibot/A3/main.py"]
