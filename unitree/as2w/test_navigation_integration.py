@@ -53,7 +53,10 @@ class OwnershipTests(unittest.TestCase):
 
     def test_legacy_motion_requires_acknowledged_stop_before_acquire(self):
         self.proxy.Move(.1, 0, 0)
-        self.assertFalse(self.servo.acquire_control()["ok"])
+        refused = self.servo.acquire_control()
+        self.assertFalse(refused["ok"])
+        self.assertIn("loco.stop_move", refused["error"])
+        self.assertNotIn("controlled_spatial", refused["error"])
         self.proxy._sport.ret = 3104
         self.proxy.StopMove()
         self.assertFalse(self.servo.acquire_control()["ok"])
@@ -106,7 +109,11 @@ class OwnershipTests(unittest.TestCase):
         reply = {"code": 0, "response": {}}
         spatial._client = types.SimpleNamespace(call=lambda *_: reply)
         self.assertEqual(0, spatial.dispatch("resume_navigation", {})["ret"])
-        self.assertFalse(self.servo.acquire_control()["ok"])
+        refused = self.servo.acquire_control()
+        self.assertFalse(refused["ok"])
+        self.assertIn("controlled_spatial.pause_navigation", refused["error"])
+        self.assertIn("controlled_spatial.shutdown", refused["error"])
+        self.assertNotIn("loco.stop_move", refused["error"])
         reply["code"] = 3104
         spatial.dispatch("pause_navigation", {})
         self.assertFalse(self.servo.acquire_control()["ok"])

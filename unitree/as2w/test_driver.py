@@ -272,7 +272,15 @@ class TestDriverContracts(unittest.TestCase):
                 return super().StopMove()
 
         proxy = _BlockingStopProxy()
-        plugin = self.device.LocoPlugin({}, "test", None, proxy)
+        generation = [0]
+        def motion_snapshot():
+            generation[0] += 1
+            return {"velocity": [0, 0, 0], "yaw_speed": 0,
+                    "received_monotonic": __import__("time").monotonic(),
+                    "timestamp": __import__("time").time(),
+                    "generation": generation[0], "stream_id": "blocking-stop-test"}
+        plugin = self.device.LocoPlugin({}, "test", None, proxy,
+                                       motion_snapshot=motion_snapshot)
         with patch.object(self.device, "_acp_notify") as notify:
             started = __import__("time").monotonic()
             result = plugin.dispatch("stop_move", {})

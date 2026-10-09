@@ -70,6 +70,14 @@ but rejects the first velocity command, the driver performs the required hidden
 balance transition and retries. AS2 `AI_*` standing, walking, and down states
 are recognized explicitly.
 
+`loco.stop_move` confirms physical stopping from fresh SportModeState linear
+velocity and `yaw_speed`, not from the selected FSM mode. Confirmation requires
+at least three distinct post-command samples spanning 0.3 seconds, with linear
+speed at most 0.03 m/s and yaw speed at most 0.05 rad/s. Missing, stale, invalid,
+repeated or restarted telemetry cannot establish a stop. A timed move reports
+an error if its final StopMove fails; an accepted final stop alone does not claim
+physical confirmation. These checks preserve the robot's deployed stop fix.
+
 High-rate LowState, BMS, and sport-state callbacks retain only their newest
 sample and publish from a 60 Hz worker, preventing stale JSON work from
 blocking DDS callbacks. Lidar runs in a separate OS process and uses a one-frame

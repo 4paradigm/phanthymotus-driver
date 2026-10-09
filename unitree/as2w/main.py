@@ -125,8 +125,13 @@ class Bundle:
         p = cfg.get("plugins", {})
         self.plugins = []
         self._servo = None
-        if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
-        if p.get("loco", {}).get("enabled", True): self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy))
+        state_plugin = None
+        if dds_ready and p.get("state", {}).get("enabled", True):
+            state_plugin = StatePlugin(p.get("state", {}), namespace, executor)
+            self.plugins.append(state_plugin)
+        if p.get("loco", {}).get("enabled", True):
+            self.plugins.append(LocoPlugin(p.get("loco", {}), namespace, executor, proxy,
+                motion_snapshot=state_plugin.motion_snapshot if state_plugin else None))
         if p.get("special_motion", {}).get("enabled", True): self.plugins.append(SpecialMotionPlugin(p.get("special_motion", {}), namespace, executor, proxy))
         if dds_ready and p.get("mic", {}).get("enabled", True): self.plugins.append(MicPlugin(p.get("mic", {}), namespace, executor, interface))
         if dds_ready and p.get("speaker", {}).get("enabled", True): self.plugins.append(SpeakerPlugin(p.get("speaker", {}), namespace, executor, interface))

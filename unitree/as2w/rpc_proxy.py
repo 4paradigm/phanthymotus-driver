@@ -179,8 +179,10 @@ class _ServoClient:
         with self._owner._ownership_lock:
             if not self.control_ready:
                 return {"ok": False, "error": "short-timeout control RPC unavailable"}
-            if (self._owner._legacy_active or self._owner._legacy_motion_active
-                    or self._owner._external_navigation):
+            if self._owner._external_navigation:
+                return {"ok": False, "error": "external navigation active; call "
+                        "controlled_spatial.pause_navigation or controlled_spatial.shutdown first"}
+            if self._owner._legacy_active or self._owner._legacy_motion_active:
                 return {"ok": False, "error": "legacy motion active; call loco.stop_move first"}
             if self._owner._owner not in ("legacy", "servo"):
                 return {"ok": False, "error": "chassis is unavailable"}

@@ -158,6 +158,7 @@ def test_delayed_publication_keeps_dds_receipt_stamp_and_legacy_fields(cards):
         node._publish_sport(node._latest_sport, received_ms=node._latest_sport_received_ms)
         status = node.odom_status()
     assert node.raw_messages == [{"mode": 2, "body_height": 0.42,
+        "yaw_speed": 0.3, "timestamp": EPOCH_MS / 1000,
         "velocity_0": 0.2, "velocity_1": -0.1, "velocity_2": 0.05,
         "position_0": 11.0, "position_1": 12.0, "position_2": 13.0}]
     assert node.odom_messages[0]["stamp_ms"] == EPOCH_MS

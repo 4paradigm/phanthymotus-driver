@@ -43,6 +43,17 @@ def _number(value, default=0.0):
         return default
 
 
+def _finite_number(value):
+    """A missing/invalid measurement must never be reported as stopped."""
+    if isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _values(value):
     try:
         return list(value)
@@ -92,6 +103,7 @@ class _StateNode:
         self._latest_sport = None
         self._latest_sport_received_ms = None
         self._latest_sport_received_monotonic = None
+        self._sport_stream_id = uuid4().hex
         self._last_odom_sample = None
         self._low_generation = 0
         self._bms_generation = 0
@@ -237,9 +249,27 @@ class _StateNode:
         if getattr(self, "_publisher_thread", None) is None:
             self._publish_sport(msg, received_ms=received_ms)
 
+    def motion_snapshot(self):
+        with self._latest_lock:
+            msg = self._latest_sport
+            if msg is None or self._stop_event.is_set():
+                return None
+            try:
+                velocity = [_finite_number(v) for v in msg.velocity]
+            except (AttributeError, TypeError):
+                velocity = None
+            return {"velocity": velocity,
+                    "yaw_speed": _finite_number(getattr(msg, "yaw_speed", None)),
+                    "received_monotonic": self._latest_sport_received_monotonic,
+                    "timestamp": (self._latest_sport_received_ms / 1000.0 if self._latest_sport_received_ms is not None else None),
+                    "stream_id": self._sport_stream_id,
+                    "generation": self._sport_generation}
+
     def _publish_sport(self, msg, received_ms=None):
         loco = {"mode": int(getattr(msg, "mode", 0)),
-                "body_height": _number(getattr(msg, "body_height", 0))}
+                "body_height": _number(getattr(msg, "body_height", 0)),
+                "yaw_speed": _finite_number(getattr(msg, "yaw_speed", None)),
+                "timestamp": received_ms / 1000.0 if received_ms is not None else None}
         loco.update(self._flat("velocity", getattr(msg, "velocity", [])))
         loco.update(self._flat("position", getattr(msg, "position", [])))
         self._publish(self.loco, loco)
@@ -301,6 +331,11 @@ class StatePlugin:
         state = self._state
         return state.odom_snapshot() if state is not None else None
 
+    def motion_snapshot(self):
+        # Resolve on every call: stopping/starting sensor cards replaces _state.
+        state = self._state
+        return state.motion_snapshot() if state is not None else None
+
     def get_tools(self):
         specs = (("imu", "state/imu", "data/json", "As2W IMU state"),
                  ("joints", "state/joints", "sensor/skeleton", "As2W 12-joint leg skeleton for model animation"),
@@ -359,8 +394,9 @@ class StatePlugin:
 
 class LocoPlugin:
     PREFIX = "loco"
-    def __init__(self, config, namespace, executor, proxy):
+    def __init__(self, config, namespace, executor, proxy, motion_snapshot=None):
         self.proxy = proxy
+        self._motion_snapshot = motion_snapshot
         self._lock = threading.Lock()
         self._stop = None
         self._transition_stop = None
@@ -412,6 +448,27 @@ class LocoPlugin:
                 "reason": "The current FSM state is unknown; refusing the action",
                 "suggested_actions": ["get_state"]}
         return name, state, None
+
+    def _motion_status(self):
+        try:
+            sample = self._motion_snapshot() if self._motion_snapshot else None
+        except Exception:
+            sample = None
+        sample = sample if isinstance(sample, dict) else {}
+        received = _finite_number(sample.get("received_monotonic"))
+        velocity = sample.get("velocity")
+        velocity = ([_finite_number(v) for v in velocity]
+                    if isinstance(velocity, (list, tuple)) else [])
+        yaw_speed = _finite_number(sample.get("yaw_speed"))
+        age = time.monotonic() - received if received is not None else None
+        valid = len(velocity) == 3 and None not in velocity and yaw_speed is not None
+        fresh = age is not None and 0 <= age <= 0.5
+        return {"valid": valid, "fresh": fresh, "age_sec": age,
+                "velocity": velocity, "yaw_speed": yaw_speed,
+                "timestamp": sample.get("timestamp"),
+                "generation": sample.get("generation"),
+                "stationary_sample": (math.hypot(*velocity) <= 0.03 and abs(yaw_speed) <= 0.05
+                                      if valid and fresh else None)}
 
     @staticmethod
     def _not_allowed(action, state, reason, suggested):
@@ -561,6 +618,8 @@ class LocoPlugin:
                 })
             return
         deadline = time.monotonic() + duration
+        stop_ret = 0
+        stop_error = None
         try:
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
@@ -581,12 +640,25 @@ class LocoPlugin:
                         return
         finally:
             try:
-                self.proxy.StopMove()
+                stop_ret = self.proxy.StopMove()
+            except Exception as exc:
+                stop_ret = 3104
+                stop_error = f"{type(exc).__name__}: {str(exc)[:160]}"
             finally:
                 self._finish_transition(stop_event)
+        if stop_ret != 0:
+            result = {"action": "move", "ret": stop_ret, "rpc_ret": stop_ret,
+                      "duration": duration, "error": "Timed Move final stop failed",
+                      "reason": "Requested duration elapsed, but StopMove was not accepted",
+                      "suggested_actions": ["get_state", "stop_move"]}
+            if stop_error:
+                result["rpc_error"] = stop_error
+            _acp_notify(action_id, "error", result)
+            return
         _acp_notify(action_id, "completed",
                     {"action": "move", "ret": 0, "duration": duration,
-                     "reason": "requested duration elapsed"})
+                     "stop_accepted": True, "stopped_confirmed": False,
+                     "reason": "requested duration elapsed; stop command accepted, physical stop not yet verified"})
 
     def _move_error_for_state(self, state):
         if state in self._DOWN:
@@ -844,7 +916,7 @@ class LocoPlugin:
             result = self.proxy.GetState()
             if isinstance(result, tuple) and len(result) == 2:
                 code, state = result
-                return {"ret": code, "state": state}
+                return {"ret": code, "state": state, "motion": self._motion_status()}
             return {"ret": result if isinstance(result, int) else 3104,
                     "state": {}, "error": "Unable to read robot locomotion state",
                     "reason": "SportClient.GetState did not return a state",
@@ -875,30 +947,93 @@ class LocoPlugin:
             "action": "move", "ret": 0, "duration": -1,
             "reason": "Continuous move stopped by stop_move or card shutdown"})
 
-    def _await_stopped(self, action_id):
+    def _await_stopped(self, action_id, requested_at):
+        # GetState reports the selected controller mode, not measured movement.
+        # AI_FREE_WALK can remain selected while all measured speeds are zero.
+        try:
+            name, state, state_error = self._read_state()
+        except Exception as exc:
+            name, state = None, None
+            state_error = {"reason": f"{type(exc).__name__}: {str(exc)[:160]}"}
+        diagnostic = {"current_state": name or "UNKNOWN"}
+        if state is not None:
+            diagnostic["state"] = state
+        if state_error:
+            diagnostic["state_error"] = state_error
+        # Diagnostic RPC latency must not consume the physical confirmation
+        # window: GetState can be slow while sport telemetry remains healthy.
         deadline = time.monotonic() + 5.0
-        last_state = "UNKNOWN"
+        stable_since = None
+        stable_samples = 0
+        last_key = None
+        last_received = None
+        reason = "No fresh motion telemetry available"
         while time.monotonic() < deadline:
-            name, state, error = self._read_state()
-            if error:
-                _acp_notify(action_id, "error", {
-                    **error, "action": "stop_move",
-                    "reason": "StopMove was accepted, but state confirmation failed"})
-                return
-            last_state = name
-            if not self._is_moving(name):
-                _acp_notify(action_id, "completed", {
-                    "action": "stop_move", "ret": 0,
-                    "state": state, "reason": "controller left walking state"})
-                return
+            try:
+                sample = self._motion_snapshot() if self._motion_snapshot else None
+            except Exception:
+                sample = None
+            sample = sample if isinstance(sample, dict) else {}
+            received = _finite_number(sample.get("received_monotonic"))
+            yaw_speed = _finite_number(sample.get("yaw_speed"))
+            generation = sample.get("generation")
+            raw_velocity = sample.get("velocity")
+            velocity = ([_finite_number(v) for v in raw_velocity]
+                        if isinstance(raw_velocity, (list, tuple)) else [])
+            now = time.monotonic()
+            valid = (received is not None and received > requested_at
+                     and 0 <= now - received <= 0.5
+                     and type(generation) is int and generation > 0
+                     and len(velocity) == 3 and None not in velocity
+                     and yaw_speed is not None)
+            if not valid:
+                stable_since, stable_samples = None, 0
+                reason = "Motion telemetry is missing, invalid, stale, or predates the stop command"
+            else:
+                key = (sample.get("stream_id"), generation)
+                # The same cached frame must not count as multiple observations.
+                if key != last_key:
+                    if (last_key is not None and (
+                            key[0] != last_key[0] or generation <= last_key[1]
+                            or received <= last_received
+                            or received - last_received > 0.5)):
+                        stable_since, stable_samples = None, 0
+                    if last_received is not None and received <= last_received:
+                        stable_since, stable_samples = None, 0
+                        reason = "Motion telemetry did not advance in time"
+                    elif math.hypot(*velocity) > 0.03 or abs(yaw_speed) > 0.05:
+                        stable_since, stable_samples = None, 0
+                        reason = "Measured linear or yaw speed remains above the stop threshold"
+                    else:
+                        if stable_since is None:
+                            stable_since = received
+                        stable_samples += 1
+                        reason = "Waiting for distinct stable motion samples"
+                        if stable_samples >= 3 and received - stable_since >= 0.3:
+                            print(f"[loco] stop verified action_id={action_id} "
+                                  f"linear_mps={math.hypot(*velocity):.6f} "
+                                  f"yaw_rad_s={yaw_speed:.6f} samples={stable_samples} "
+                                  f"stable_sec={received - stable_since:.3f}", flush=True)
+                            _acp_notify(action_id, "completed", {
+                                "action": "stop_move", "ret": 0, **diagnostic,
+                                "stopped_confirmed": True,
+                                "velocity": velocity, "yaw_speed": yaw_speed,
+                                "sample_age_sec": now - received,
+                                "stable_samples": stable_samples,
+                                "stable_duration_sec": received - stable_since,
+                                "reason": "Fresh linear and yaw measurements confirm the robot stopped"})
+                            return
+                    last_key, last_received = key, received
             time.sleep(0.1)
         _acp_notify(action_id, "error", {
-            "action": "stop_move", "ret": 0, "current_state": last_state,
-            "error": "StopMove was accepted but robot still reports walking",
-            "reason": "The controller has not left AI_FREE_WALK within 5 seconds",
+            "action": "stop_move", "ret": 0, **diagnostic,
+            "stopped_confirmed": False,
+            "error": "StopMove was accepted but physical stop could not be confirmed",
+            "reason": reason,
             "suggested_actions": ["get_state", "retry_stop"]})
 
     def _stop_move_worker(self, action_id):
+        requested_at = time.monotonic()
         try:
             ret = self.proxy.StopMove()
         except Exception as exc:
@@ -915,7 +1050,7 @@ class LocoPlugin:
                 "reason": "SportClient did not accept the stop command",
                 "suggested_actions": ["get_state", "retry_stop"]})
             return
-        self._await_stopped(action_id)
+        self._await_stopped(action_id, requested_at)
 
 
 class SpecialMotionPlugin:
