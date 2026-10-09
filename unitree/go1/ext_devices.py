@@ -1012,8 +1012,10 @@ class FaceLightPlugin:
                 elif action != "set_leds":
                     frame = (_FACE_BLACK if action == "off" else
                              _face_effect_frame(action, rgb, target, period, 0) if action in _FACE_EFFECTS else (rgb,) * 12)
+                frame_sent = False
                 try:
                     self._write(frame)
+                    frame_sent = True
                     self._mode = action if action in _FACE_EFFECTS else ("off" if frame == _FACE_BLACK else "static")
                     if action in _FACE_EFFECTS:
                         action_id = f"face_light_{action}_{uuid4().hex}"
@@ -1023,12 +1025,28 @@ class FaceLightPlugin:
                                                         daemon=True)
                         self._thread.start()
                 except Exception as exc:
+                    message = str(exc)
+                    cleanup = {}
                     if reserved:
                         self._completion_slots.release()
                         self._thread = self._cancel = None
+                        if frame_sent:
+                            # No accepted action/worker owns this frame. Clear it before
+                            # returning failure, under the same serialized write lock.
+                            try:
+                                self._write(_FACE_BLACK)
+                                cleanup["initial_frame_cleanup_ok"] = True
+                            except Exception as clear_exc:
+                                cleanup["initial_frame_cleanup_ok"] = False
+                                message += f"; initial effect frame cleanup failed: {clear_exc}"
+                                self._active = False
+                                try:
+                                    self._backend.close()
+                                except Exception as close_exc:
+                                    message += f"; SDK close failed: {close_exc}"
                     self._mode = "error"
-                    self._last_error = str(exc)
-                    return _env_face(action, False, code="NOT_AVAILABLE", message=str(exc))
+                    self._last_error = message
+                    return _env_face(action, False, code="NOT_AVAILABLE", message=message, **cleanup)
                 applied = {"colors": [list(c) for c in frame]}
                 if action == "set_color":
                     applied.update(dict(zip(("r", "g", "b"), rgb)))

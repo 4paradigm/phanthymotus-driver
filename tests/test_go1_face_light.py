@@ -1075,3 +1075,78 @@ def test_omitted_channels_and_index_execute_as_zero(light):
     assert light._backend.frames[-1][1] == ((0, 0, 80),) + ((0, 40, 0),) * 11
     assert light.dispatch("set_color", {})["ok"]
     assert light._backend.frames[-1][1] == ((0, 0, 0),) * 12
+
+
+@pytest.mark.parametrize("effect", ["blink", "breathe", "fade", "chase"])
+@pytest.mark.parametrize("failure", ["construct", "start"])
+def test_effect_worker_startup_failure_clears_initial_frame_and_reuses_slot(light, monkeypatch, acp_notify, effect, failure):
+    light._completion_slots = threading.BoundedSemaphore(1)
+    original_thread, original_start = threading.Thread, threading.Thread.start
+
+    def fail_construct(*args, **kwargs):
+        if kwargs.get("name") == "go1-face-light":
+            raise RuntimeError("offline worker construction failed")
+        return original_thread(*args, **kwargs)
+
+    def fail_start(worker):
+        if worker.name == "go1-face-light":
+            raise RuntimeError("offline worker start failed")
+        return original_start(worker)
+
+    with monkeypatch.context() as patch:
+        if failure == "construct":
+            patch.setattr(ext.threading, "Thread", fail_construct)
+        else:
+            patch.setattr(threading.Thread, "start", fail_start)
+        for _ in range(2):
+            count = len(light._backend.frames)
+            result = light.dispatch(effect, {"r": 80, "to_g": 40, "duration_s": 0.05})
+            assert not result["ok"] and result["code"] == "NOT_AVAILABLE"
+            assert result["initial_frame_cleanup_ok"] and "action_id" not in result
+            assert len(light._backend.frames) == count + 2
+            assert light._backend.frames[-1][1] == ext._FACE_BLACK
+            assert light._thread is None and light._cancel is None
+            assert not light.dispatch("info", {})["running"]
+            acp_notify.assert_not_called()
+        count = len(light._backend.frames)
+        time.sleep(0.1)
+        assert len(light._backend.frames) == count
+    # A single slot remains usable after repeated rejected starts.
+    assert light.dispatch("blink", {"g": 20, "duration_s": 0.05})["ok"]
+    light._thread.join(1)
+    wait_until(lambda: not light._completion_threads)
+    assert light._backend.frames[-1][1] == ext._FACE_BLACK
+
+
+def test_effect_startup_failure_and_failed_clear_close_backend_honestly(light, monkeypatch, acp_notify):
+    original_start, original_write = threading.Thread.start, light._backend.write
+
+    def fail_start(worker):
+        if worker.name == "go1-face-light":
+            raise RuntimeError("offline worker start failed")
+        return original_start(worker)
+
+    def fail_clear(frame):
+        if frame == ext._FACE_BLACK:
+            raise RuntimeError("offline clear send failed")
+        original_write(frame)
+
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    monkeypatch.setattr(light._backend, "write", fail_clear)
+    result = light.dispatch("blink", {"r": 80})
+    assert not result["ok"] and not result["initial_frame_cleanup_ok"]
+    assert "worker start failed" in result["message"] and "clear send failed" in result["message"]
+    assert "action_id" not in result
+    info = light.dispatch("info", {})
+    assert not info["available"] and not info["connected"] and not info["running"]
+    assert info["mode"] == "error" and info["last_error"] == result["message"]
+    assert info["colors"] == [[80, 0, 0]] * 12  # Only the successful send is recorded.
+    assert not info["hardware_verified"]
+    assert light._thread is None and light._cancel is None
+    assert not light.dispatch("set_color", {"g": 40})["ok"]
+    assert light._completion_slots.acquire(blocking=False)
+    light._completion_slots.release()
+    acp_notify.assert_not_called()
+    count = len(light._backend.frames)
+    time.sleep(0.1)
+    assert len(light._backend.frames) == count
