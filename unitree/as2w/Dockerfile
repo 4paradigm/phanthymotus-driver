@@ -1,5 +1,6 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 ARG PYPI_MIRROR=https://pypi.org/simple/
+
 FROM ${ROS_BASE_IMAGE}
 WORKDIR /work
 ARG PYPI_MIRROR
@@ -16,8 +17,17 @@ COPY requirements.txt /work/requirements.txt
 # packages also purges ros-humble-rclpy under this image's APT dependency graph.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r requirements.txt && \
     pip3 install --no-cache-dir --no-binary cyclonedds -i ${PYPI_MIRROR} cyclonedds==0.10.5
+# The shared ros-base already builds audio_msgs in /ros_ws. Reuse its overlay
+# instead of shipping a second generated interface. Fail the build if a custom
+# ROS_BASE_IMAGE lacks the three-field AudioChunk or its native type support.
+RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && \
+    test -f /ros_ws/install/setup.bash && \
+    source /ros_ws/install/setup.bash && \
+    python3 -B -c "from audio_msgs.msg import AudioChunk; assert len(AudioChunk.get_fields_and_field_types()) == 3; msg = AudioChunk(); msg.header.stamp.sec = 1; msg.format = str(); msg.data = [0, 255]; type(AudioChunk).__import_type_support__(); assert type(AudioChunk)._TYPE_SUPPORT is not None"'
 COPY unitree_sdk2py/ /work/unitree_sdk2py/
-COPY main.py device.py lidar.py controlled_spatial.py rpc_proxy.py config.yaml /work/
+COPY main.py device.py multimedia.py lidar.py lidar_backend.py sensor_worker.py controlled_spatial.py slam_mapping.py rpc_proxy.py config.yaml /work/
+# Navigation adapters are pure Python; no extra runtime dependency or base image.
+COPY loco_servo.py as2w_control.py odom_specs.py camera_specs.py /work/
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY deploy/ /deploy/
@@ -27,4 +37,4 @@ ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 \
     RCUTILS_COLORIZED_OUTPUT=0 \
     CYCLONEDDS_URI='<CycloneDDS><Domain><Tracing><Verbosity>severe</Verbosity><OutputFile>/dev/null</OutputFile></Tracing></Domain></CycloneDDS>'
 EXPOSE 15709
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && python3 /work/main.py ${NETWORK_INTERFACE:-}"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && exec python3 /work/main.py"]
