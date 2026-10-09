@@ -26,7 +26,7 @@ class CoreBridge:
                                      "media5", "media6", "media7", "media8", "media9",
                                      "media10", "media11",
                                      "pointcloud", "audio_mic", "audio_ext",
-                                     *(f"state{i}" for i in range(8)))}
+                                     "state")}
         self._ctx = mp.get_context("spawn")
         self._profile = profile
         self._domain = domain
@@ -71,7 +71,9 @@ class CoreBridge:
             elif "audio" in topic or "mic" in topic:
                 lane = "audio_ext" if "ext_mic" in topic else "audio_mic"
             else:
-                lane = f"state{sum(topic.encode('utf-8')) % 8}"
+                # State topics are small; one publisher process avoids eight
+                # extra DDS participants competing with the media workers.
+                lane = "state"
             item = (topic, type_name, serialize_message(msg))
             try:
                 self._queues[lane].put_nowait(item)
