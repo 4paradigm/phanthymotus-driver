@@ -27,8 +27,6 @@ CAMERAS = {
     "chest_front_d457_depth": "/hal/chest_front_d457_camera/depth",
     "waist_front_d415_rgb": "/hal/waist_front_d415_camera/rgb",
     "waist_front_d415_depth": "/hal/waist_front_d415_camera/depth",
-    "wrist_left_d405_rgb": "/hal/wrist_left_d405_camera/rgb",
-    "wrist_right_d405_rgb": "/hal/wrist_right_d405_camera/rgb",
 }
 
 
@@ -55,14 +53,14 @@ def _encode_image(msg, key):
         # Full-resolution JPEG encoding for twelve cameras saturates the ADU
         # CPU and makes every callback arrive in bursts.  The dashboard only
         # needs a preview stream; bound the largest dimension before encoding.
-        max_dimension = 640
+        max_dimension = 480
         largest = max(image.shape[:2])
         if largest > max_dimension:
             scale = max_dimension / float(largest)
             image = cv2.resize(image, (max(1, int(image.shape[1] * scale)),
                                        max(1, int(image.shape[0] * scale))),
                                interpolation=cv2.INTER_AREA)
-        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 42])
+        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 35])
         if not ok:
             return None
         out.format = "jpeg"
@@ -204,10 +202,15 @@ def _media_all():
     wake = threading.Condition(pending_lock)
     # The callback only replaces a pointer. JPEG work never runs in the DDS
     # callback, so a slow encoder cannot block discovery or state delivery.
-    min_interval = 1.0 / 5.0
+    # Ten raw 30 FPS cameras cannot all be JPEG encoded at full rate on the
+    # ADU CPU. Keep a fresh latest-frame preview at a bounded 4 FPS per stream;
+    # the one-slot pending map means this never accumulates latency.
+    min_interval = 1.0 / 4.0
+
+    worker_count = 3
 
     def worker(worker_index):
-        keys = [key for index, key in enumerate(CAMERAS) if index % 4 == worker_index]
+        keys = [key for index, key in enumerate(CAMERAS) if index % worker_count == worker_index]
         while rclpy.ok():
             with wake:
                 msg = None
@@ -249,7 +252,7 @@ def _media_all():
                 print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
         node.create_subscription(Image, topic, push, qos, callback_group=group)
         print(f"[relay] Jazzy input ready key={key} topic={output_topic} domain=232", flush=True)
-    for worker_index in range(4):
+    for worker_index in range(worker_count):
         threading.Thread(target=worker, args=(worker_index,), daemon=True,
                          name=f"a3-camera-encoder-{worker_index}").start()
     lidar_pub = node.create_publisher(UInt8MultiArray, "/agibot_a3/lidar_cloud", qos)

@@ -240,8 +240,8 @@ CAMERA_TOPICS = {
     "chest_front_d457_depth": ("/hal/chest_front_d457_camera/depth", "image/depth-zlib", "胸前 D457 相机深度"),
     "waist_front_d415_rgb": ("/hal/waist_front_d415_camera/rgb", "image/jpeg", "腰前 D415 相机 RGB"),
     "waist_front_d415_depth": ("/hal/waist_front_d415_camera/depth", "image/depth-zlib", "腰前 D415 相机深度"),
-    "wrist_left_d405_rgb": ("/hal/wrist_left_d405_camera/rgb", "image/jpeg", "左腕 D405 相机 RGB"),
-    "wrist_right_d405_rgb": ("/hal/wrist_right_d405_camera/rgb", "image/jpeg", "右腕 D405 相机 RGB"),
+    "wrist_left_d405_rgb": ("/hal/wrist_left_d405_camera/rgb", "image/jpeg", "左腕 D405 相机 RGB（当前设备无实际帧）"),
+    "wrist_right_d405_rgb": ("/hal/wrist_right_d405_camera/rgb", "image/jpeg", "右腕 D405 相机 RGB（当前设备无实际帧）"),
 }
 # H265 foxglove CompressedVideo streams exist too, but consumer-side H265 decode support
 # is inconsistent — the raw sensor_msgs/Image feeds are mirrored and re-encoded instead
@@ -4087,8 +4087,6 @@ def build_plugins(config, namespace, ros2):
         "camera_armpit_right": "armpit_right_fisheye",
         "camera_waist_rgb": "waist_front_d415_rgb",
         "camera_waist_depth": "waist_front_d415_depth",
-        "camera_wrist_left": "wrist_left_d405_rgb",
-        "camera_wrist_right": "wrist_right_d405_rgb",
     }
     for card_name, stream_name in fixed_cameras.items():
         if (enabled("camera") or enabled(card_name)) and stream_name in selected_cameras:
