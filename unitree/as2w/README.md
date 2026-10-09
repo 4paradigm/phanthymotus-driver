@@ -88,19 +88,24 @@ diagnostic `waiting` state and automatically recovers when packets appear.
 Speaker ROS subscription, jitter buffering, and the A2 audio client now live in
 one spawned process. PCM therefore stays in a thread-local queue instead of
 being copied through a multiprocessing queue, and a busy main ROS executor
-cannot delay playback. The default jitter prefill is 500 ms, the `PlayStream`
-block size is 300 ms, and queued playback lead is capped at 400 ms. Internal EOF
-markers produced by split TTS text preserve the current playback timeline;
-only a real input underflow returns to the full prefill. Its `info` response
-reports input gaps, queue drops, partial flushes, estimated underflows,
-`PlayStream` failures, and average/maximum RPC latency.
+cannot delay playback. Cold playback uses the G1/R1-proven 300 ms prefill and
+300 ms `PlayStream` blocks with a 240 ms maximum queued lead. A genuine
+underflow uses a separate 500 ms recovery prefill, so lowering startup latency
+does not make a delayed TTS segment resume one block at a time. Internal EOF
+markers produced by split TTS text preserve the current playback timeline. Its
+`info` response reports first-input-to-play latency, recovery wait, input gaps,
+queue drops, partial flushes, underflows, `PlayStream` failures, and RPC latency.
 
 Camera capture and ROS publication likewise run together in a spawned process.
 JPEG frames stay in a one-frame, latest-only thread queue and are assigned to
 `CompressedImage.data` through a buffer-compatible byte array, avoiding both a
 roughly 300 KB multiprocessing copy and slow per-byte ROS conversion. Camera
 `info` reports separate capture/publish rates, videohub RPC time, message-build
-and publish-call time, average frame size, and dropped stale frames.
+and publish-call time, average frame size, and dropped stale frames. Like G1
+`camera_rgb`, it is an always-on state source: canvas lifecycle `stop` detaches
+intelligent control but does not stop publication. The spawned process is
+physically closed only when the driver bundle shuts down; repeated canvas
+starts reuse the live stream without resetting frame counters.
 The component vendors the three-field `audio_msgs/AudioChunk` interface used by
 the perception audio bus and builds it in a dedicated Docker stage. The runtime
 image receives only the generated `/as2w_ws/install` overlay and validates an

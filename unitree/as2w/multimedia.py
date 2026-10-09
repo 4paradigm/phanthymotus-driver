@@ -303,7 +303,7 @@ def _next_speaker_deadline(deadline, started_at, finished_at, duration):
 
 def _speaker_worker(
         control_queue, result_queue, pcm_queue, interface,
-        block_bytes, prefill_bytes, continuation_prefill_bytes, max_lead_s):
+        block_bytes, startup_prefill_bytes, rebuffer_prefill_bytes, max_lead_s):
     _install_logsafe()
     try:
         from unitree_sdk2py.a2.audio.audio_client import AudioClient
@@ -325,7 +325,8 @@ def _speaker_worker(
     stream_id = "as2w_{}".format(uuid4().hex)
     deadline = None
     draining = False
-    prefill_target = prefill_bytes
+    prefill_target = startup_prefill_bytes
+    prefill_mode = "startup"
     continuation_pending = False
     rebuffering = False
     idle_polls = 0
@@ -343,6 +344,12 @@ def _speaker_worker(
     rpc_total_ms = 0.0
     rpc_max_ms = 0.0
     last_play_error = ""
+    first_input_at = None
+    first_input_bytes = 0
+    first_input_to_play_ms = -1.0
+    first_play_rpc_ms = -1.0
+    rebuffer_started_at = None
+    last_rebuffer_wait_ms = -1.0
 
     def respond(request_id, **payload):
         payload["id"] = request_id
@@ -351,9 +358,13 @@ def _speaker_worker(
     def play(block, current_deadline):
         nonlocal play_calls, play_errors, attempted_bytes, played_bytes
         nonlocal rpc_total_ms, rpc_max_ms, last_play_error
+        nonlocal first_input_to_play_ms, first_play_rpc_ms
         if not block or not active or paused:
             return current_deadline
         started_at = time.monotonic()
+        first_play = first_input_at is not None and first_input_to_play_ms < 0
+        if first_play:
+            first_input_to_play_ms = (started_at - first_input_at) * 1000.0
         try:
             result = client.PlayStream(
                 _SPEAKER_APP_NAME, stream_id, bytes(block))
@@ -372,6 +383,8 @@ def _speaker_worker(
         attempted_bytes += len(block)
         rpc_total_ms += rpc_ms
         rpc_max_ms = max(rpc_max_ms, rpc_ms)
+        if first_play:
+            first_play_rpc_ms = rpc_ms
         duration = len(block) / _SPEAKER_BYTES_PER_SECOND
         current_deadline = _next_speaker_deadline(
             current_deadline, started_at, finished_at, duration)
@@ -395,6 +408,12 @@ def _speaker_worker(
                     running = False
                     break
                 if operation in ("reset", "interrupt", "stop"):
+                    first_input_at = None
+                    first_input_bytes = 0
+                    first_input_to_play_ms = -1.0
+                    first_play_rpc_ms = -1.0
+                    rebuffer_started_at = None
+                    last_rebuffer_wait_ms = -1.0
                     buffered.clear()
                     while True:
                         try:
@@ -404,7 +423,8 @@ def _speaker_worker(
                     client.PlayStop(_SPEAKER_APP_NAME)
                     deadline = None
                     draining = False
-                    prefill_target = prefill_bytes
+                    prefill_target = startup_prefill_bytes
+                    prefill_mode = "startup"
                     continuation_pending = False
                     rebuffering = False
                     idle_polls = 0
@@ -447,9 +467,20 @@ def _speaker_worker(
                         continuation_resumes=continuation_resumes,
                         eof_count=eof_count,
                         block_bytes=block_bytes,
-                        prefill_bytes=prefill_bytes,
-                        continuation_prefill_bytes=continuation_prefill_bytes,
+                        block_ms=block_bytes / 32.0,
+                        # Keep prefill_bytes as a compatibility alias for older
+                        # diagnostics consumers.
+                        prefill_bytes=startup_prefill_bytes,
+                        startup_prefill_bytes=startup_prefill_bytes,
+                        startup_prefill_ms=startup_prefill_bytes / 32.0,
+                        rebuffer_prefill_bytes=rebuffer_prefill_bytes,
+                        rebuffer_prefill_ms=rebuffer_prefill_bytes / 32.0,
                         prefill_target_bytes=prefill_target,
+                        prefill_mode=prefill_mode,
+                        first_input_bytes=first_input_bytes,
+                        first_input_to_play_ms=first_input_to_play_ms,
+                        first_play_rpc_ms=first_play_rpc_ms,
+                        last_rebuffer_wait_ms=last_rebuffer_wait_ms,
                         max_lead_ms=max_lead_s * 1000.0,
                         rpc_avg_ms=(rpc_total_ms / play_calls if play_calls else 0.0),
                         rpc_max_ms=rpc_max_ms,
@@ -481,6 +512,7 @@ def _speaker_worker(
                 # letting a 200-400ms synthesis stall bypass the jitter buffer.
                 draining = True
                 prefill_fallbacks += 1
+                prefill_mode = "streaming"
                 deadline = play(buffered, deadline)
                 buffered.clear()
                 idle_polls = 0
@@ -493,7 +525,9 @@ def _speaker_worker(
                 # cannot turn into repeated audible gaps.
                 draining = False
                 deadline = None
-                prefill_target = prefill_bytes
+                prefill_target = rebuffer_prefill_bytes
+                prefill_mode = "rebuffer"
+                rebuffer_started_at = time.monotonic()
                 continuation_pending = False
                 rebuffering = True
                 idle_polls = 0
@@ -512,7 +546,8 @@ def _speaker_worker(
                 buffered.clear()
                 draining = False
                 deadline = None
-                prefill_target = prefill_bytes
+                prefill_target = startup_prefill_bytes
+                prefill_mode = "startup"
                 continuation_pending = False
                 rebuffering = False
                 continue
@@ -526,13 +561,17 @@ def _speaker_worker(
             # before more PCM arrives, the normal underflow path below switches
             # back to the full jitter prefill.
             draining = deadline is not None
-            prefill_target = prefill_bytes
+            prefill_target = startup_prefill_bytes
+            prefill_mode = "streaming"
             continuation_pending = True
             rebuffering = False
             underflow_active = False
             continue
         if not active or muted_until_eof:
             continue
+        if first_input_at is None:
+            first_input_at = time.monotonic()
+            first_input_bytes = len(pcm)
         buffered.extend(pcm)
         if draining and continuation_pending:
             continuation_resumes += 1
@@ -541,10 +580,15 @@ def _speaker_worker(
             draining = True
             if rebuffering:
                 rebuffer_count += 1
+                if rebuffer_started_at is not None:
+                    last_rebuffer_wait_ms = (
+                        time.monotonic() - rebuffer_started_at) * 1000.0
             rebuffering = False
+            rebuffer_started_at = None
             continuation_pending = False
             underflow_active = False
-            prefill_target = prefill_bytes
+            prefill_target = startup_prefill_bytes
+            prefill_mode = "streaming"
         while draining and len(buffered) >= block_bytes:
             block = bytes(buffered[:block_bytes])
             del buffered[:block_bytes]
@@ -579,8 +623,8 @@ def _put_speaker_pcm(pcm_queue, pcm, stats, stats_lock):
 
 
 def _speaker_process(
-        control_queue, result_queue, interface, block_bytes, prefill_bytes,
-        continuation_prefill_bytes, max_lead_s):
+        control_queue, result_queue, interface, block_bytes,
+        startup_prefill_bytes, rebuffer_prefill_bytes, max_lead_s):
     """Own the ROS subscription and A2 playback path in one child process.
 
     PCM remains in this process: the ROS callback feeds a thread-local queue and
@@ -648,7 +692,7 @@ def _speaker_process(
         playback_thread = threading.Thread(
             target=_speaker_worker,
             args=(playback_control, playback_results, pcm_queue, interface,
-                  block_bytes, prefill_bytes, continuation_prefill_bytes,
+                  block_bytes, startup_prefill_bytes, rebuffer_prefill_bytes,
                   max_lead_s),
             name="as2w-speaker-playback",
             daemon=True,
@@ -761,8 +805,8 @@ def _speaker_process(
 
 
 class _SpeakerBackend:
-    def __init__(self, interface, block_bytes, prefill_bytes,
-                 continuation_prefill_bytes, max_lead_s):
+    def __init__(self, interface, block_bytes, startup_prefill_bytes,
+                 rebuffer_prefill_bytes, max_lead_s):
         context = multiprocessing.get_context("spawn")
         self._control = context.Queue()
         self._results = context.Queue()
@@ -770,7 +814,7 @@ class _SpeakerBackend:
         self._process = context.Process(
             target=_speaker_process,
             args=(self._control, self._results, interface,
-                  block_bytes, prefill_bytes, continuation_prefill_bytes,
+                  block_bytes, startup_prefill_bytes, rebuffer_prefill_bytes,
                   max_lead_s),
             name="as2w_speaker",
             daemon=True,
@@ -818,12 +862,12 @@ class _SpeakerBackend:
 
 
 class _SpeakerNode:
-    def __init__(self, interface, block_bytes, prefill_bytes,
-                 continuation_prefill_bytes, max_lead_s):
+    def __init__(self, interface, block_bytes, startup_prefill_bytes,
+                 rebuffer_prefill_bytes, max_lead_s):
         self._interface = interface
         self._block_bytes = block_bytes
-        self._prefill_bytes = prefill_bytes
-        self._continuation_prefill_bytes = continuation_prefill_bytes
+        self._startup_prefill_bytes = startup_prefill_bytes
+        self._rebuffer_prefill_bytes = rebuffer_prefill_bytes
         self._max_lead_s = max_lead_s
         self._backend = None
         self.topic = ""
@@ -839,8 +883,8 @@ class _SpeakerNode:
         self._backend = _SpeakerBackend(
             self._interface,
             self._block_bytes,
-            self._prefill_bytes,
-            self._continuation_prefill_bytes,
+            self._startup_prefill_bytes,
+            self._rebuffer_prefill_bytes,
             self._max_lead_s,
         )
         if self._backend.error:
@@ -890,18 +934,22 @@ class SpeakerPlugin:
     def __init__(self, config, namespace, executor, network_iface="eth0"):
         block_ms = max(
             100, min(1000, int(config.get("block_ms", config.get("buffer_ms", 300)))))
-        prefill_ms = max(
-            block_ms, min(3000, int(config.get("prefill_ms", 500))))
-        continuation_prefill_ms = max(
+        startup_prefill_ms = max(
             block_ms,
-            min(prefill_ms, int(config.get("continuation_prefill_ms", 500))),
+            min(3000, int(config.get(
+                "startup_prefill_ms", config.get("prefill_ms", 300)))),
         )
-        max_lead_ms = max(0, min(1000, int(config.get("max_lead_ms", 400))))
+        rebuffer_prefill_ms = max(
+            block_ms,
+            min(3000, int(config.get(
+                "rebuffer_prefill_ms", config.get("prefill_ms", 500)))),
+        )
+        max_lead_ms = max(0, min(1000, int(config.get("max_lead_ms", 240))))
         self._node = _SpeakerNode(
             network_iface,
             block_ms * 32,
-            prefill_ms * 32,
-            continuation_prefill_ms * 32,
+            startup_prefill_ms * 32,
+            rebuffer_prefill_ms * 32,
             max_lead_ms / 1000.0,
         )
 
@@ -922,10 +970,10 @@ class SpeakerPlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "start": {
-                        "params": [],
+                        "params": ["input_topic"],
                         "description": (
-                            "Initialize the speaker; subscribes immediately when "
-                            "input_topic is supplied."
+                            "Subscribe to the wired PCM topic. Internal lifecycle "
+                            "start without a topic only initializes the backend."
                         ),
                     },
                     "stop": {"params": []},
@@ -1359,7 +1407,9 @@ class _CameraNode:
 
     def start_capture(self):
         if self._backend is not None and self._backend.is_available():
-            return self._backend.call("start")
+            # Camera is an always-on state source. Repeated canvas lifecycle
+            # starts must not reset the videohub stream or its frame counters.
+            return self._backend.status()
         self.stop_capture()
         self._backend = _CameraBackend(
             self.topic, self.interface, self.fps, self.timeout_s, self.retry_s,
@@ -1386,6 +1436,17 @@ class _CameraNode:
             self.frames = result.get("frames", self.frames)
             self.last_error = result.get("last_error", result.get("error", ""))
             return result
+        if self._backend is not None:
+            self.state = "error"
+            self.last_error = (
+                self._backend.error or "camera process is not running")
+            return {
+                "ok": False,
+                "state": "error",
+                "frames": self.frames,
+                "last_frame_ago_ms": -1,
+                "last_error": self.last_error,
+            }
         return {
             "state": self.state,
             "frames": self.frames,
@@ -1421,21 +1482,43 @@ class CameraPlugin:
         }
 
     def start(self):
-        self._node.start_capture()
+        return self._node.start_capture()
 
     def stop(self):
         self._node.stop_capture()
 
     def dispatch(self, action, args):
         if action == "start":
-            self.start()
-        elif action == "stop":
-            self.stop()
-        if action in ("start", "stop", "info"):
+            started = self.start() or {}
             result = self._node.status()
-            if action == "start":
-                result["readiness"] = result["state"]
+            actual_state = result.get("state", started.get("state", "error"))
+            result["readiness"] = actual_state
+            if (not started.get("ok", True)
+                    or not result.get("ok", actual_state != "error")
+                    or actual_state == "error"):
+                result["state"] = "error"
+                if not result.get("last_error"):
+                    result["last_error"] = started.get(
+                        "error", "camera failed to start")
+            else:
+                # Sensor lifecycle is ready for the canvas while asynchronous
+                # frame readiness remains visible in the separate field.
                 result["state"] = "running"
+            result["topic_out"] = [
+                {"topic": self._topic, "format": "image/jpeg"}]
+            return result
+        elif action == "stop":
+            # Match G1 camera_rgb: stopping intelligent control detaches the
+            # logical card but keeps the state stream alive. Physical shutdown
+            # remains CameraPlugin.stop(), called by Bundle.stop_all().
+            result = self._node.status()
+            result["stream_state"] = result.get("state", "error")
+            result["state"] = "idle"
             result["topic_out"] = [{"topic": self._topic, "format": "image/jpeg"}]
+            return result
+        if action == "info":
+            result = self._node.status()
+            result["topic_out"] = [
+                {"topic": self._topic, "format": "image/jpeg"}]
             return result
         return None

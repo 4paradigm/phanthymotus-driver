@@ -635,6 +635,70 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual("starting", result["readiness"])
         self.assertEqual("starting", plugin.dispatch("info", {})["state"])
 
+    def test_camera_start_preserves_backend_failure(self):
+        plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
+        plugin._topic = "/test/camera/front"
+        plugin._node = types.SimpleNamespace(
+            start_capture=lambda: {
+                "ok": False, "state": "error", "error": "videohub unavailable"},
+            status=lambda: {
+                "ok": False,
+                "state": "error",
+                "frames": 0,
+                "last_frame_ago_ms": -1,
+                "last_error": "videohub unavailable",
+            },
+        )
+
+        result = plugin.dispatch("start", {})
+
+        self.assertEqual("error", result["state"])
+        self.assertEqual("error", result["readiness"])
+        self.assertEqual("videohub unavailable", result["last_error"])
+
+    def test_camera_canvas_stop_keeps_state_stream_running(self):
+        plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
+        plugin._topic = "/test/camera/front"
+        stopped = []
+        plugin._node = types.SimpleNamespace(
+            status=lambda: {
+                "ok": True,
+                "state": "running",
+                "frames": 42,
+                "last_frame_ago_ms": 10,
+                "last_error": "",
+            },
+            stop_capture=lambda: stopped.append(True),
+        )
+
+        result = plugin.dispatch("stop", {})
+
+        self.assertEqual([], stopped)
+        self.assertEqual("idle", result["state"])
+        self.assertEqual("running", result["stream_state"])
+        self.assertEqual(42, result["frames"])
+
+        plugin.stop()
+        self.assertEqual([True], stopped)
+
+    def test_camera_repeated_start_reuses_live_backend(self):
+        calls = []
+        backend = types.SimpleNamespace(
+            is_available=lambda: True,
+            status=lambda: {
+                "ok": True, "state": "running", "frames": 12,
+                "last_frame_ago_ms": 5, "last_error": ""},
+            call=lambda *_args: calls.append(_args),
+        )
+        node = self.multimedia._CameraNode(
+            "/test/camera/front", "eth0", 10, 1, 2)
+        node._backend = backend
+
+        result = node.start_capture()
+
+        self.assertEqual([], calls)
+        self.assertEqual(12, result["frames"])
+
     def test_zero_pcm_has_no_variation(self):
         self.assertFalse(self.multimedia._pcm_has_variation(b"\x00" * 1024))
 
@@ -725,12 +789,12 @@ class TestDriverContracts(unittest.TestCase):
         created = []
 
         class FakeBackend:
-            def __init__(self, interface, block_bytes, prefill_bytes,
-                         continuation_prefill_bytes, max_lead_s):
+            def __init__(self, interface, block_bytes, startup_prefill_bytes,
+                         rebuffer_prefill_bytes, max_lead_s):
                 self.interface = interface
                 self.block_bytes = block_bytes
-                self.prefill_bytes = prefill_bytes
-                self.continuation_prefill_bytes = continuation_prefill_bytes
+                self.startup_prefill_bytes = startup_prefill_bytes
+                self.rebuffer_prefill_bytes = rebuffer_prefill_bytes
                 self.max_lead_s = max_lead_s
                 self.error = ""
                 self.alive = True
@@ -743,15 +807,16 @@ class TestDriverContracts(unittest.TestCase):
         executor = types.SimpleNamespace(add_node=lambda _node: None)
         with patch.object(self.multimedia, "_SpeakerBackend", FakeBackend):
             plugin = self.multimedia.SpeakerPlugin(
-                {"block_ms": 300, "prefill_ms": 700, "max_lead_ms": 600},
+                {"block_ms": 300, "startup_prefill_ms": 300,
+                 "rebuffer_prefill_ms": 500, "max_lead_ms": 240},
                 "test", executor, "eth0")
             self.assertIsNone(plugin._node._backend)
             self.assertTrue(plugin.start()["ok"])
             first = plugin._node._backend
             self.assertEqual(9600, first.block_bytes)
-            self.assertEqual(22400, first.prefill_bytes)
-            self.assertEqual(16000, first.continuation_prefill_bytes)
-            self.assertEqual(.6, first.max_lead_s)
+            self.assertEqual(9600, first.startup_prefill_bytes)
+            self.assertEqual(16000, first.rebuffer_prefill_bytes)
+            self.assertEqual(.24, first.max_lead_s)
             self.assertEqual("ready", plugin._node.state)
             plugin.stop()
             self.assertIsNone(plugin._node._backend)
@@ -779,7 +844,7 @@ class TestDriverContracts(unittest.TestCase):
         with patch.object(self.multimedia, "_SpeakerBackend", FakeBackend):
             plugin = self.multimedia.SpeakerPlugin({}, "test", executor, "eth0")
             self.assertEqual(
-                [],
+                ["input_topic"],
                 plugin.get_tool()["inputSchema"]["x-action-params"]["start"]["params"],
             )
             result = plugin.dispatch("start", {})
@@ -921,33 +986,35 @@ class TestDriverContracts(unittest.TestCase):
         control, results, pcm = q.Queue(), q.Queue(), q.Queue()
         thread = __import__("threading").Thread(
             target=self.multimedia._speaker_worker,
-            args=(control, results, pcm, "eth0", 9600, 22400, 16000, .24),
+            args=(control, results, pcm, "eth0", 9600, 9600, 16000, .24),
             daemon=True)
         thread.start()
         self.assertTrue(results.get(timeout=1)["ok"])
-        pcm.put(b"\x00" * 19200)
-        # A synthesis gap must not bypass the independent 700ms startup jitter
-        # prefill used for the TTS stream.
-        __import__("time").sleep(.3)
+        pcm.put(b"\x00" * 6400)
+        # Playback waits for the configured 300ms startup prefill.
+        __import__("time").sleep(.05)
         self.assertEqual([], FakeAudioClient.instance.played)
         pcm.put(b"\x00" * 3200)
         for _ in range(100):
-            if len(FakeAudioClient.instance.played) == 2:
+            if len(FakeAudioClient.instance.played) == 1:
                 break
             __import__("time").sleep(.01)
         self.assertEqual(
-            [b"\x00" * 9600, b"\x00" * 9600],
+            [b"\x00" * 9600],
             FakeAudioClient.instance.played,
         )
         control.put(("status", "status", None))
         status = results.get(timeout=1)
-        self.assertEqual(2, status["play_calls"])
+        self.assertEqual(1, status["play_calls"])
         self.assertEqual(0, status["play_errors"])
-        self.assertEqual(19200, status["played_bytes"])
-        self.assertEqual(3200, status["buffered_bytes"])
+        self.assertEqual(9600, status["played_bytes"])
+        self.assertEqual(0, status["buffered_bytes"])
         self.assertEqual(9600, status["block_bytes"])
-        self.assertEqual(22400, status["prefill_bytes"])
-        self.assertEqual(16000, status["continuation_prefill_bytes"])
+        self.assertEqual(9600, status["startup_prefill_bytes"])
+        self.assertEqual(16000, status["rebuffer_prefill_bytes"])
+        self.assertEqual(6400, status["first_input_bytes"])
+        self.assertGreaterEqual(status["first_input_to_play_ms"], 0)
+        self.assertGreaterEqual(status["first_play_rpc_ms"], 0)
         control.put(("volume", "get_volume", None))
         self.assertEqual((0, {"volume": 100}), results.get(timeout=1)["result"])
         control.put(("close", "close", None))
@@ -990,12 +1057,12 @@ class TestDriverContracts(unittest.TestCase):
                 patch.object(self.multimedia, "_SPEAKER_PREFILL_FALLBACK_IDLE", 1000):
             thread = __import__("threading").Thread(
                 target=self.multimedia._speaker_worker,
-                args=(control, results, pcm, "eth0", 320, 960, 640, 0),
+                args=(control, results, pcm, "eth0", 320, 640, 960, 0),
                 daemon=True)
             thread.start()
             self.assertTrue(results.get(timeout=1)["ok"])
 
-            pcm.put(b"\x00" * 960)
+            pcm.put(b"\x00" * 640)
             current = None
             for _ in range(100):
                 current = status()
@@ -1030,7 +1097,11 @@ class TestDriverContracts(unittest.TestCase):
                 __import__("time").sleep(.01)
             self.assertEqual(1, current["rebuffer_count"])
             self.assertEqual(1, current["continuation_resumes"])
+            # With zero allowed playback lead in this accelerated test, the
+            # second EOF can immediately expire its deadline and enter the
+            # configured recovery buffer again.
             self.assertEqual(960, current["prefill_target_bytes"])
+            self.assertGreaterEqual(current["last_rebuffer_wait_ms"], 0)
 
             control.put(("close", "close", None))
             self.assertTrue(results.get(timeout=1)["ok"])
