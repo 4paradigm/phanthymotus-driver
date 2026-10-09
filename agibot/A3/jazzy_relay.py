@@ -12,6 +12,7 @@ import multiprocessing as mp
 import os
 import queue
 import struct
+import threading
 import time
 import zlib
 
@@ -114,6 +115,11 @@ def _encode_cloud(msg):
                 break
         points = np.asarray(points, dtype=np.float32)
     points = np.asarray(points, dtype=np.float32)
+    # The dashboard's sensor/pointcloud renderer maps its vertical axis as
+    # y=-z.  Normalize the ROS lidar convention here so the rendered cloud is
+    # upright instead of vertically mirrored.
+    if len(points):
+        points[:, 2] *= -1.0
     out = UInt8MultiArray()
     out.data = list(struct.pack("<II", 12, len(points)) + points.astype("<f4", copy=False).tobytes())
     return out
@@ -193,31 +199,59 @@ def _media_all():
     last_emit = {key: 0.0 for key in CAMERAS}
     received = {key: 0 for key in CAMERAS}
     emitted = {key: 0 for key in CAMERAS}
-    # The dashboard is a preview consumer. Keeping every 30 Hz raw frame in
-    # flight makes JPEG work queue behind itself and starves state callbacks.
-    # A bounded 8 Hz output is smooth enough for inspection and keeps latency
-    # bounded even when all twelve cameras are enabled.
-    min_interval = 1.0 / 8.0
+    pending = {key: None for key in CAMERAS}
+    pending_lock = threading.Lock()
+    wake = threading.Condition(pending_lock)
+    # The callback only replaces a pointer. JPEG work never runs in the DDS
+    # callback, so a slow encoder cannot block discovery or state delivery.
+    min_interval = 1.0 / 5.0
+
+    def worker(worker_index):
+        keys = [key for index, key in enumerate(CAMERAS) if index % 4 == worker_index]
+        while rclpy.ok():
+            with wake:
+                msg = None
+                stream_key = None
+                while msg is None and rclpy.ok():
+                    now = time.monotonic()
+                    for key in keys:
+                        if pending[key] is not None and now - last_emit[key] >= min_interval:
+                            stream_key, msg = key, pending[key]
+                            pending[key] = None
+                            break
+                    if msg is None:
+                        wake.wait(timeout=0.02)
+            if msg is None or stream_key is None:
+                continue
+            try:
+                last_emit[stream_key] = time.monotonic()
+                output = _encode_image(msg, stream_key)
+                if output is not None:
+                    publishers[stream_key].publish(output)
+                    emitted[stream_key] += 1
+            except Exception as exc:
+                print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
+
+    publishers = {}
     for key, topic in CAMERAS.items():
         output_topic = f"/agibot_a3/camera_{key}"
         pub = node.create_publisher(CompressedImage, output_topic, qos)
+        publishers[key] = pub
         def push(msg, stream_key=key, stream_pub=pub):
             try:
                 received[stream_key] += 1
                 if received[stream_key] == 1 or received[stream_key] % 300 == 0:
                     print(f"[relay] input received key={stream_key} count={received[stream_key]}", flush=True)
-                now = time.monotonic()
-                if now - last_emit[stream_key] < min_interval:
-                    return
-                last_emit[stream_key] = now
-                output = _encode_image(msg, stream_key)
-                if output is not None:
-                    stream_pub.publish(output)
-                    emitted[stream_key] += 1
+                with wake:
+                    pending[stream_key] = msg
+                    wake.notify()
             except Exception as exc:
                 print(f"[relay] input failed key={stream_key}: {type(exc).__name__}: {exc!r}", flush=True)
         node.create_subscription(Image, topic, push, qos, callback_group=group)
         print(f"[relay] Jazzy input ready key={key} topic={output_topic} domain=232", flush=True)
+    for worker_index in range(4):
+        threading.Thread(target=worker, args=(worker_index,), daemon=True,
+                         name=f"a3-camera-encoder-{worker_index}").start()
     lidar_pub = node.create_publisher(UInt8MultiArray, "/agibot_a3/lidar_cloud", qos)
     def push_lidar(msg):
         try:

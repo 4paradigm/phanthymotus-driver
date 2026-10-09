@@ -182,7 +182,7 @@ NECK_JOINTS = ("head_yaw_joint", "head_pitch_joint")
 
 # Hand (docs §7.1.5): command position 0 (open) .. 2000 (closed); state 0..4096.
 HAND_COMMAND_MAX = 2000
-HAND_O10_MAX = 4096
+HAND_O10_MAX = 2000
 HAND_TYPES = {"AgiHand": "agi_hand", "O10Hand": "o10_hand"}
 
 # Mic source (docs §7.3.5): 0=internal (v3.2 has a known hardware BUG — avoid),
@@ -515,11 +515,18 @@ class A3Nodes:
         self._UInt8MultiArray = UInt8MultiArray
         self._audio_buffers = {"mic": bytearray(), "ext_mic": bytearray()}
         self._audio_lock = threading.Lock()
+        self._audio_received = {"mic": 0, "ext_mic": 0}
 
         # A3 HAL media publishers use ROS' sensor-data profile.  Keep this
         # exact profile: a RELIABLE subscriber is incompatible with the
         # robot's BEST_EFFORT writers under CycloneDDS.
         sensor_qos = qos_profile_sensor_data
+        # The A3 audio publisher is RELIABLE. BEST_EFFORT does not match it in
+        # DDS, so the old subscription could be discovered but receive zero
+        # samples. Keep camera/lidar on sensor QoS, audio on a reliable profile.
+        audio_qos = QoSProfile(depth=10, reliability=getattr(QoSReliabilityPolicy, "RELIABLE",
+                                                              QoSReliabilityPolicy.BEST_EFFORT),
+                                durability=QoSDurabilityPolicy.VOLATILE)
 
         self.streams = {}
         self._joint_cache = {}
@@ -692,12 +699,12 @@ class A3Nodes:
                 try:
                     (self.media_robot or self.robot).create_subscription(
                         AudioCapture, topic,
-                        lambda msg, pub=pub, key=key: self._publish_audio(pub, key, msg), sensor_qos,
+                        lambda msg, pub=pub, key=key: self._publish_audio(pub, key, msg), audio_qos,
                         callback_group=self._media_callback_group)
                 except TypeError:
                     (self.media_robot or self.robot).create_subscription(
                         AudioCapture, topic,
-                        lambda msg, pub=pub, key=key: self._publish_audio(pub, key, msg), sensor_qos)
+                        lambda msg, pub=pub, key=key: self._publish_audio(pub, key, msg), audio_qos)
                 self.audio_topics[key] = {"robot_topic": topic, "topic": core_topic,
                                           "format": "audio/pcm-16k"}
 
@@ -755,6 +762,9 @@ class A3Nodes:
         payload = bytes(getattr(chunk, "data", ()))
         if not payload:
             return
+        self._audio_received[key] = self._audio_received.get(key, 0) + 1
+        if self._audio_received[key] == 1 or self._audio_received[key] % 500 == 0:
+            print(f"[audio] received={self._audio_received[key]} key={key} bytes={len(payload)}", flush=True)
         with self._audio_lock:
             buffer = self._audio_buffers.setdefault(key, bytearray())
             buffer.extend(payload)
@@ -1095,6 +1105,7 @@ class A3Nodes:
         output.data = json.dumps(raw, ensure_ascii=False)
         self._joint_state_pub.publish(output)
         joints = []
+        seen = set()
         model_indices = _skeleton_joint_indices()
         group_aliases = {
             "arm_state": [*ARM_JOINTS["left"], *ARM_JOINTS["right"]],
@@ -1122,6 +1133,14 @@ class A3Nodes:
                                "q": positions[index] if index < len(positions) else 0.0,
                                "dq": velocities[index] if index < len(velocities) else 0.0,
                                "tau": efforts[index] if index < len(efforts) else 0.0})
+                seen.add(canonical)
+        # The A3 feedback topics expose arms/neck only. The dashboard still
+        # needs a complete model pose; fill unreported body joints at neutral
+        # rather than publishing an empty skeleton that the renderer discards.
+        for canonical, index in model_indices.items():
+            if canonical not in seen:
+                joints.append({"idx": index, "name": canonical,
+                               "q": 0.0, "dq": 0.0, "tau": 0.0})
         output = self._String()
         output.data = json.dumps({"format": "sensor/skeleton", "available": bool(joints),
                                   "fresh": bool(joints), "joint_count": len(joints),
@@ -2302,8 +2321,10 @@ class HandControlPlugin:
             if values is None:
                 continue
             for i, value in enumerate(values):
-                live_names = live_left if side == "left" else live_right
-                name = live_names[i] if i < len(live_names) else f"{side}_hand_joint_{i}"
+                # Command protocol uses indexed JointState names; feedback
+                # channel labels (O10Hand's thumb/index spellings) are not
+                # accepted as command joint names by MotionControl.
+                name = f"{side}_hand_joint_{i}"
                 positions[name] = _clamp(float(value), 0.0, max_value, f"{side} 手指 {i}")
         _require(positions, "至少提供 left 或 right 张合等级")
         # AimDK accepts hand joint commands only while the motion controller is
