@@ -33,6 +33,9 @@ agibot-a3:
     # then forwards those small samples to domain 42 through its child bridge.
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - A3_JAZZY_RELAY=1
+    # Only these four previews are encoded by default. Add keys explicitly for
+    # diagnostics; leaving this bounded protects state/control latency.
+    - A3_RELAY_STREAMS=head_left_fisheye,head_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth
     - PYTHONUNBUFFERED=1
   logging:
     driver: local

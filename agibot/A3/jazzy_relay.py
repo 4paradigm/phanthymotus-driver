@@ -29,6 +29,16 @@ CAMERAS = {
     "waist_front_d415_depth": "/hal/waist_front_d415_camera/depth",
 }
 
+# The relay runs on the host, but inherits this environment from the driver
+# container. Keep the default set aligned with config.yaml so unused raw
+# cameras do not consume CPU. Operators can opt in to an additional key with
+# A3_RELAY_STREAMS without changing the relay code.
+_requested = {item.strip() for item in os.environ.get(
+    "A3_RELAY_STREAMS",
+    "head_left_fisheye,head_right_fisheye,chest_front_d457_rgb,chest_front_d457_depth",
+).split(",") if item.strip()}
+CAMERAS = {key: topic for key, topic in CAMERAS.items() if key in _requested}
+
 
 def _encode_image(msg, key):
     from sensor_msgs.msg import CompressedImage

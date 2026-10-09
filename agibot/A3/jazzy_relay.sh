@@ -11,6 +11,11 @@ start)
       && grep -q "Jazzy input ready" "$ROOT/relay.log" 2>/dev/null; then exit 0; fi
   if [[ -f "$PIDFILE" ]]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
+  # Keep the host-side log bounded; Docker's rotation does not cover this
+  # file because the relay lives in the host mount namespace.
+  if [[ -f "$ROOT/relay.log" ]] && [[ $(stat -c %s "$ROOT/relay.log" 2>/dev/null || echo 0) -gt 10485760 ]]; then
+    mv -f "$ROOT/relay.log" "$ROOT/relay.log.1" || true
+  fi
   : > "$ROOT/relay.log"
   # Files created in the container's mount namespace are invisible after a
   # mount-namespace switch.  Write the relay into the host root via /proc/1/root
