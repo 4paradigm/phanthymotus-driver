@@ -37,9 +37,10 @@ start() {
     log "host bridge already running pid=$(cat "${HOST_PID}")"
   else
     rm -f "${HOST_PID}"
-    # Enter ADU's host namespaces. The binary is on /opt/phanthy-motus/data,
-    # which is shared with the host by the deployment fragment.
-    nsenter -t 1 -m -u -i -n -p -- /usr/bin/bash -lc \
+    # Enter ADU's host PID/network namespaces. Do not enter the host mount
+    # namespace: the container's /usr/bin/bash and shared /opt/phanthy-motus
+    # path are the executable view available to this process.
+    nsenter -t 1 -u -i -n -p -- /usr/bin/bash -lc \
       "export ROS_DOMAIN_ID=232; exec '${BIN}' router" \
       >"${ROOT}/host.log" 2>&1 &
     echo $! > "${HOST_PID}"
