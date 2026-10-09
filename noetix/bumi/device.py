@@ -1057,6 +1057,7 @@ class MicPlugin:
         self._wakeup_word_added = False
         self._last_wakeup_config_time = 0.0
         self._proc: subprocess.Popen | None = None
+        self._calibration_lock = threading.Lock()
         self._direction_lock = threading.Lock()
         self._last_direction = None
         self._last_direction_time = 0.0
@@ -1097,27 +1098,31 @@ class MicPlugin:
         import numpy as np
         from sound_direction import estimate_signature
 
-        frames = []
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            audio = self._media_ctrl.get_audio_capture_data()
-            if audio.channels == 8 and audio.sample_rate == 16000 and audio.audio_data:
-                frames.append(np.asarray(audio.audio_data, dtype=np.int16))
-            else:
-                time.sleep(0.005)
-        signature = estimate_signature(
-            np.concatenate(frames) if frames else [], 8, 16000)
-        if signature is None:
-            return {"state": "no_voice", "message": "未采到可用于标定的声音，请靠近机器人重试"}
-        try:
-            calibration = json.loads(_MIC_DIRECTION_CALIBRATION.read_text())
-        except (FileNotFoundError, ValueError):
-            calibration = {}
-        calibration[direction] = signature
-        _MIC_DIRECTION_CALIBRATION.parent.mkdir(parents=True, exist_ok=True)
-        _MIC_DIRECTION_CALIBRATION.write_text(json.dumps(calibration))
-        return {"state": "calibrated", "direction": direction,
-                "remaining": [name for name in ("front", "right") if name not in calibration]}
+        # 同一张卡的标定请求依次采集并更新，避免并发覆盖另一方向。
+        with self._calibration_lock:
+            frames = []
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                audio = self._media_ctrl.get_audio_capture_data()
+                if audio.channels == 8 and audio.sample_rate == 16000 and audio.audio_data:
+                    frames.append(np.asarray(audio.audio_data, dtype=np.int16))
+                else:
+                    time.sleep(0.005)
+            signature = estimate_signature(
+                np.concatenate(frames) if frames else [], 8, 16000)
+            if signature is None:
+                return {"state": "no_voice", "message": "未采到可用于标定的声音，请靠近机器人重试"}
+            try:
+                calibration = json.loads(_MIC_DIRECTION_CALIBRATION.read_text())
+            except (FileNotFoundError, ValueError):
+                calibration = {}
+            calibration[direction] = signature
+            _MIC_DIRECTION_CALIBRATION.parent.mkdir(parents=True, exist_ok=True)
+            temporary = _MIC_DIRECTION_CALIBRATION.with_suffix(".tmp")
+            temporary.write_text(json.dumps(calibration))
+            temporary.replace(_MIC_DIRECTION_CALIBRATION)
+            return {"state": "calibrated", "direction": direction,
+                    "remaining": [name for name in ("front", "right") if name not in calibration]}
 
     def start(self) -> None:
         import sys
@@ -1175,6 +1180,7 @@ class MicPlugin:
             else:
                 observation = {**direction, "age_ms": round(age * 1000)}
             return {"state": "running" if self._proc and self._proc.poll() is None else "idle",
+                    "topic_out": self.get_tool()["topic_out"],
                     "sound_direction": observation,
                     "calibrated_directions": [name for name in ("front", "right")
                                               if name in calibration]}
