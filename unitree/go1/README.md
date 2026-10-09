@@ -2,8 +2,8 @@
 
 > 一张"卡片" = Driver 暴露的一个 MCP 工具 = 平台画布上一个可拖拽、可被大模型单独调用的能力。
 >
-> 本 bundle 当前发布 **24 张卡**：11 张传感卡（sensor）+ 9 张控制卡（actuator）+ 1 张资源卡（resource）+ 3 张独立视觉卡。
-> **4 个聚合文件**：`sensors.py`（11 张）/ `controllers.py`（5 张）/ `ext_devices.py`（4 张）/ `camera.py`（RGB/depth/pointcloud 三张卡），每张卡仍然是自包含的类 + 工厂函数，方便按组评审、多人并行不撞车。
+> 原有 24 张卡保留；新增独立控制卡 `loco_confirmed`（开发版，默认禁止控制），共 25 张卡。
+> 原有 4 个聚合文件保持分工；新卡实现位于 `loco_control.py`，与原 `controllers.py` 中的 `loco` 并存，共享一个 SDK 客户端。
 > 目的有二：① 把这些卡干净地上架；② 作为后来者新增其它卡片的开发起点 —— 怎么加卡见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 实现基座
@@ -38,7 +38,8 @@
 
 | 卡片（= 文件） | 能力 | 关键动作 |
 |---|---|---|
-| `loco` | 基础运动 | `move`（三维速度）/ `stop_move` / `balance_stand` / `stand_up` / `stand_down` / `damp` / `recovery_stand` |
+| `loco` | 原有基础运动（保留） | `move` / `stop` / `balance_stand` / `stand_up` / `stand_down` / `damp` / `recovery_stand` |
+| `loco_confirmed` | 新增有反馈运动控制（待真机验收） | `start/stop` 为生命周期；`move` / `stop_move`（停稳确认）/ `status` / 姿态动作；姿态完成后保持控制权，后续动作前须显式 `stop_move`；默认 control_enabled=false，详见 [LOCO_ACCEPTANCE.md](LOCO_ACCEPTANCE.md) |
 | `body_pose` | 机身姿态与高度 | `set_attitude`（roll/pitch/yaw）/ `set_body_height` / `set_foot_raise_height` / `reset` |
 | `switch_gait` | 步态切换 | `idle` / `trot` / `trot_run` / `climb_stair` / `trot_obstacle`（高风险步态须 `confirm=true`） |
 | `special_motion` | 特殊动作 | `jump_yaw_left` / `straight_hand`（同步阻塞执行，须 `confirm=true`） |
@@ -103,6 +104,7 @@ go1_bundle/
 │                           #   activity_monitor/model
 │   ── 聚合卡文件（controllers.py = 5 张）──
 ├── controllers.py          # 运动控制合集：loco/body_pose/switch_gait/gesture/special_motion
+├── loco_control.py         # 新卡 loco_confirmed；不替换 controllers 中的 loco
 │   ── 聚合卡文件（ext_devices.py = 4 张）──
 ├── ext_devices.py          # 外部设备合集：beep/speaker/face_light/system_health
 │   ── 视觉卡（三合一）──

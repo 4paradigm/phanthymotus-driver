@@ -43,6 +43,7 @@ cards:
   - { name: beep,               type: actuator }
   - { name: speaker,            type: actuator }
   - { name: loco,               type: actuator }
+  - { name: loco_confirmed,     type: actuator }
   - { name: body_pose,          type: actuator }
   - { name: gesture,            type: actuator }
   - { name: switch_gait,        type: actuator }

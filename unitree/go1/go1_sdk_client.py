@@ -34,6 +34,7 @@ HIGH_TARGET_PORT = 8082
 HIGH_LOCAL_PORT = 8090
 
 LOOP_HZ = 500.0        # 后台收发频率（高层 2ms 亦可）
+ERROR_LOG_INTERVAL_S = 5.0  # Per-path cap, including failure/recovery flapping.
 
 # ── 控制原语量程（高层 HighCmd 运动；spin 等控制卡用）───────────────────────────
 #   量程取 Go1 高层安全值；控制卡应先自校验拒绝越界，client 再 clamp 作兜底。
@@ -185,9 +186,15 @@ class Go1HighSdkClient:
         self._running = False
         self._thread = None
         self._snapshot: dict = {}
+        self._snapshot_received_at = 0.0
+        self._packet_count = 0
+        self._last_send_at = 0.0
+        self._error_logs = {}  # Only the SDK loop thread writes these two paths.
+        self._stop_signal = threading.Event()
         # 控制目标（move()/stop_move() 写，_loop 读并合成 HighCmd）；None=只发 idle 心跳。
         self._move_cmd = None       # (vx, vy, vyaw, gait) 或 None
         self._move_deadline = 0.0   # monotonic 截止；过期即回 idle
+        self._move_started_at = 0.0 # 同一连续速度目标首次被接受的 monotonic 时间
         self._posture = None        # 【纯新增】dict: mode/euler/body_height/foot_raise/speed_level；持续保持(loco/gesture 用)
         self._desired_gait = 1      # 常驻期望步态（switch_gait 卡写；move 未显式指定 gait 时用它）。默认 1=trot
         # ── UDP 诊断计数（udp_diagnostics 卡读取；纯新增，不影响只读语义）──
@@ -229,20 +236,72 @@ class Go1HighSdkClient:
             try:
                 self._udp.Recv()
                 self._udp.GetRecv(self._state)
-                self._bump("recv_count")
+                self._accept_received_state()
                 self._compose_cmd()            # 合成 _cmd：默认 idle；有 move 目标且未过期则下发速度
-                self._udp.SetSend(self._cmd)
-                self._udp.Send()
+                self._send_cmd()
                 self._bump("send_count")
+                self._last_send_at = time.monotonic()
                 self._set_diag("accessible", True)
                 self._read_udp_state()         # 尽力拉底层 CRC/丢包/标志错误计数
-                self._parse_state(self._state)
+                self._log_health("loop")
             except Exception as e:
                 self._bump("send_error")
                 self._set_diag("accessible", False)
-                print(f"[Go1HighSdk] loop error: {e}", flush=True)
+                if getattr(self, "_control_owner", None):
+                    self._stop_signal.set()
+                self._log_health("loop", e)
             self._bump("total_count")
             time.sleep(period)
+
+    def _log_health(self, path, error=None):
+        """First failure immediately, then at most one line/5s per path.
+
+        Keep the deadline across recovery so a flapping link cannot bypass
+        the limit. Suppressed errors are counted; a pending recovery is
+        reported by a later successful iteration. This never gates counters,
+        the stop latch, command sending or telemetry freshness checks.
+        """
+        state = self._error_logs.get(path)
+        if state is None:
+            if error is None:
+                return
+            state = self._error_logs[path] = {"count": 0, "next_log": 0.0}
+        if error is not None:
+            state["count"] += 1
+        if not state["count"]:
+            return
+        now = time.monotonic()
+        if now < state["next_log"]:
+            return
+        count = state["count"]
+        state["next_log"] = now + ERROR_LOG_INTERVAL_S
+        if error is None:
+            print(f"[Go1HighSdk] {path} recovered after {count} errors", flush=True)
+            state["count"] = 0
+        else:
+            print(f"[Go1HighSdk] {path} error ({count} since recovery): {error}", flush=True)
+
+    def _send_cmd(self):
+        # Bundled ARM64 SDK: SetSend returns 0; Send returns send(2)'s byte
+        # count, or 0 when disconnected. Positive bytes are NOT an error.
+        if self._udp.SetSend(self._cmd) != 0:
+            raise RuntimeError("UDP command buffering failed")
+        if self._udp.Send() <= 0:
+            raise RuntimeError("UDP send failed or disconnected")
+
+    def _accept_received_state(self):
+        # GetRecv may return an old buffered frame. Require a new packet counter.
+        stats = getattr(self._udp, "udpState", None)
+        count = int(getattr(stats, "RecvCount", 0))
+        errors = (int(getattr(stats, "RecvCRCError", 0)),
+                  int(getattr(stats, "FlagError", 0)))
+        previous_errors = getattr(self, "_packet_errors", (0, 0))
+        self._packet_errors = errors
+        if count > self._packet_count:
+            self._packet_count = count
+            if errors == previous_errors:
+                self._parse_state(self._state)
+                self._set_diag("recv_count", count)
 
     # ── UDP 诊断计数（纯新增，供 udp_diagnostics 卡读取）─────────────────────────
 
@@ -311,8 +370,14 @@ class Go1HighSdkClient:
             out["battery"] = parse_battery(_g(s, "bms", None))
             with self._lock:
                 self._snapshot = out
+                self._snapshot_received_at = time.monotonic()
+                # Existing onboard temperature cards use this timestamp; keep
+                # it tied to receipt, not to each subsequent snapshot read.
+                self._snapshot["received_monotonic_s"] = self._snapshot_received_at
+                self._valid_packet_count = getattr(self, "_packet_count", 0)
+            self._log_health("parse_state")
         except Exception as e:
-            print(f"[Go1HighSdk] parse_state error: {e}", flush=True)
+            self._log_health("parse_state", e)
 
     # ── 控制原语（CONTRIBUTING §4：让只读 client 具备下发能力，供 spin 等控制卡用）──
     #   默认不动：无 move 目标时 _compose_cmd 发 idle(mode=0)，loco_state/battery 等状态卡不受影响。
@@ -323,7 +388,7 @@ class Go1HighSdkClient:
         except Exception:
             return 0.0
 
-    def move(self, vx=0.0, vy=0.0, vyaw=0.0, gait=None):
+    def move(self, vx=0.0, vy=0.0, vyaw=0.0, gait=None, until=None):
         """设置一次高层速度目标（mode=2）并刷新看门狗；后台 _loop 下发。
         控制卡按节奏（如每 50ms）重发以持续运动，停发 0.5s 后自动回 idle 停下。
         gait=None 时用常驻期望步态 self._desired_gait（由 switch_gait 卡设定）；
@@ -331,10 +396,17 @@ class Go1HighSdkClient:
         vx = self._clamp(vx, VX_MAX)
         vy = self._clamp(vy, VY_MAX)
         vyaw = self._clamp(vyaw, VYAW_MAX)
+        now = time.monotonic()
         with self._lock:
             g = self._desired_gait if gait is None else int(gait)
-            self._move_cmd = (vx, vy, vyaw, g)
-            self._move_deadline = time.monotonic() + MOVE_WATCHDOG_S
+            next_cmd = (vx, vy, vyaw, g)
+            # loco 的定时运动会每 100ms 重发同一命令。只在新命令、命令改变或
+            # 看门狗已过期时重置起点，避免 motion_feedback 永远停在 starting。
+            if (self._move_cmd is None or now >= self._move_deadline
+                    or self._move_cmd != next_cmd):
+                self._move_started_at = now
+            self._move_cmd = next_cmd
+            self._move_deadline = min(now + MOVE_WATCHDOG_S, until) if until is not None else now + MOVE_WATCHDOG_S
             self._posture = None   # 速度命令优先，清掉姿态
         return {"vx": vx, "vy": vy, "vyaw": vyaw, "gait": g}
 
@@ -343,6 +415,7 @@ class Go1HighSdkClient:
         with self._lock:
             self._move_cmd = None
             self._move_deadline = 0.0
+            self._move_started_at = 0.0
             self._posture = None
 
     def set_posture(self, mode, euler=(0.0, 0.0, 0.0), body_height=0.0,
@@ -353,6 +426,8 @@ class Go1HighSdkClient:
         不影响任何现有 move/idle/状态读取逻辑。"""
         with self._lock:
             self._move_cmd = None
+            self._move_deadline = 0.0
+            self._move_started_at = 0.0
             self._posture = {"mode": int(mode),
                              "euler": [float(euler[0]), float(euler[1]), float(euler[2])],
                              "body_height": float(body_height),
@@ -384,13 +459,35 @@ class Go1HighSdkClient:
         with self._lock:
             mc = self._move_cmd if (self._move_cmd is not None and now < self._move_deadline) else None
             pose = None if mc is not None else self._posture   # 【纯新增】move 优先,否则用 posture
+            signal = getattr(self, "_stop_signal", None)
+            latched = bool(signal and signal.is_set())
+            if latched:
+                self._move_cmd = None
+                self._move_deadline = 0.0
+                self._posture = None
         try:
-            if mc is not None:
+            if latched:
+                # Persistent neutral HIGHLEVEL command, never an automatic damp
+                # or recovery. Physical stopping still needs fresh confirmation.
+                self._cmd.mode = 0
+                self._cmd.gaitType = 0
+                self._cmd.velocity = [0.0, 0.0]
+                self._cmd.yawSpeed = 0.0
+                self._cmd.euler = [0.0, 0.0, 0.0]
+                self._cmd.bodyHeight = 0.0
+                self._cmd.footRaiseHeight = 0.0
+                self._cmd.speedLevel = 0
+            elif mc is not None:
                 vx, vy, vyaw, gait = mc
                 self._cmd.mode = 2
-                self._cmd.gaitType = self._desired_gait
+                self._cmd.gaitType = int(gait)
                 self._cmd.velocity = [float(vx), float(vy)]
                 self._cmd.yawSpeed = float(vyaw)
+                # Do not inherit offsets left in HighCmd by a posture card.
+                self._cmd.euler = [0.0, 0.0, 0.0]
+                self._cmd.bodyHeight = 0.0
+                self._cmd.footRaiseHeight = 0.0
+                self._cmd.speedLevel = 0
             elif pose is not None:                             # 【纯新增分支】姿态命令(loco 站起/姿态、gesture)
                 self._cmd.mode = int(pose["mode"])
                 self._cmd.gaitType = self._desired_gait
@@ -407,7 +504,41 @@ class Go1HighSdkClient:
                 self._cmd.yawSpeed = 0.0
         except Exception as e:  # noqa: BLE001
             print(f"[Go1HighSdk] compose_cmd error: {e}", flush=True)
+            raise  # Never transmit a partially composed or previous command.
 
     def snapshot(self) -> dict:
+        """返回遥测快照，并附上当前仍受看门狗保护的运动指令上下文。
+
+        commanded_motion 是进程内已接受指令的只读元数据，不改变 HighState，也不
+        下发额外命令。状态卡可据此区分“没有下达运动”与“已下达但没有运动”。
+        """
+        now = time.monotonic()
         with self._lock:
-            return dict(self._snapshot) if self._snapshot else {"fresh": False}
+            out = dict(self._snapshot) if self._snapshot else {"fresh": False}
+            out["telemetry_age_sec"] = (
+                round(max(0.0, now - self._snapshot_received_at), 3)
+                if self._snapshot_received_at > 0.0 else None
+            )
+            out["sample_seq"] = getattr(self, "_valid_packet_count", 0)
+            out["fresh"] = bool(out.get("fresh") and out["telemetry_age_sec"] is not None
+                                and out["telemetry_age_sec"] <= 0.5)
+            signal = getattr(self, "_stop_signal", None)
+            out["stop_latched"] = bool(signal and signal.is_set())
+            sent_at = getattr(self, "_last_send_at", 0.0)
+            out["last_send_age_sec"] = max(0.0, now - sent_at) if sent_at else None
+            out["send_error_count"] = getattr(self, "_diag", {}).get("send_error", 0)
+            active = self._move_cmd is not None and now < self._move_deadline
+            if active:
+                vx, vy, vyaw, gait = self._move_cmd
+                out["commanded_motion"] = {
+                    "active": True,
+                    "vx": vx,
+                    "vy": vy,
+                    "vyaw": vyaw,
+                    "gait": gait,
+                    "active_for_sec": round(max(0.0, now - self._move_started_at), 3),
+                    "watchdog_remaining_sec": round(max(0.0, self._move_deadline - now), 3),
+                }
+            else:
+                out["commanded_motion"] = {"active": False}
+            return out

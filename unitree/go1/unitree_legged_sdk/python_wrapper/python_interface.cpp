@@ -49,7 +49,8 @@ PYBIND11_MODULE(robot_interface, m) {
       .def("SetSend", py::overload_cast<LowCmd &>(&UDP::SetSend))
       .def("GetRecv", py::overload_cast<char *>(&UDP::GetRecv))
       .def("GetRecv", py::overload_cast<HighState &>(&UDP::GetRecv))
-      .def("GetRecv", py::overload_cast<LowState &>(&UDP::GetRecv));
+      .def("GetRecv", py::overload_cast<LowState &>(&UDP::GetRecv))
+      .def_readonly("udpState", &UDP::udpState);
 
   py::class_<Safety>(m, "Safety")
       .def(py::init<LeggedType>())

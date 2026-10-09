@@ -98,6 +98,12 @@ plugins:
 
   loco:                         # 基础运动:三维速度 move + 站起/趴下/平衡/姿态/身高
     enabled: true
+  loco_confirmed:               # 新卡；原 loco 不替换，共享唯一 SDK/UDP 客户端
+    enabled: true
+    control_enabled: false      # 展示/只读查询；现场验收前不得开启运动
+    max_duration_sec: 10         # 本地开发默认限时；真机验收前不得扩大范围
+    stop_timeout_sec: 3          # 未确认停稳返回 STOP_UNCONFIRMED
+    posture_timeout_sec: 8
   body_pose:                    # 机身姿态/高度:set_attitude(roll/pitch/yaw)/set_body_height/set_foot_raise_height/reset(能力卡片§4.3)
     enabled: true
   gesture:                      # 表演/表情:作揖/点头/摇头/歪头/环视/跳舞/俯卧撑/坐/昂首等(异步)
