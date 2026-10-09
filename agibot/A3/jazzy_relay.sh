@@ -18,7 +18,14 @@ start)
   # /tmp path are visible.  PID/network namespaces are still entered for DDS.
   cp "$SOURCE" "$HOST_SOURCE"
   nsenter -t 1 -r -u -n -p -- /usr/bin/bash -lc \
-    'set -eu
+    'set -e
+     cd /tmp
+     # The launcher inherits the Humble process environment.  Jazzy setup
+     # rejects a preselected ROS_DISTRO and its setup files use optional
+     # variables that are not compatible with bash -u.
+     unset ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION AMENT_PREFIX_PATH
+     unset COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH
+     unset AMENT_TRACE_SETUP_FILES AMENT_TRACE_SETUP
      if [ -f /opt/ros/jazzy/setup.sh ]; then
        . /opt/ros/jazzy/setup.sh
      elif [ -f /opt/ros/jazzy/setup.bash ]; then
