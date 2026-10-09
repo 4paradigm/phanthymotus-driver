@@ -74,7 +74,7 @@ plugins:
     max_integration_dt: 2.0
 
 
-  # ── 控制卡（下发 HighCmd；须真机验证量程+安全后上架）──
+  # ── 控制卡（灯光 SDK / 音频适配器 / HighCmd；运动须真机验证量程+安全后上架）──
   face_light:                   # face_light卡：静态色/逐灯接口/定时灯效，统一 SDK
     enabled: true
     backend: "sdk"

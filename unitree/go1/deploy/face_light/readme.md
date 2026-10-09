@@ -9,8 +9,9 @@
    和与运行主控架构匹配的 `lib/libfaceLight_SDK_arm64.so` 或 `lib/libfaceLight_SDK_amd64.so`。
    校验值及接入依据见 [SDK_AUDIT.md](SDK_AUDIT.md)。其他版本需重新审计，不能跳过校验。
 2. 将 SDK 放在主控宿主机 `/opt/phanthy-motus/data/go1/faceLightSDK_Nano`，
-   确保驱动容器内同一路径可读。若部署已经挂载整个 data 目录，沿用该挂载；
-   否则在驱动服务的 Compose `volumes` 中添加以下只读挂载，再重建该驱动容器：
+   确保驱动容器内同一路径可读。在驱动服务的 Compose `volumes` 中添加以下只读挂载，
+   再重建该驱动容器。即使整个 data 目录已按读写挂载，也可添加这个更具体的 SDK 子目录只读挂载；
+   保留其他卡片使用的 data 挂载及权限，不要把整个共享目录改为只读：
 
    ```yaml
    volumes:

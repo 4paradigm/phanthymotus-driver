@@ -455,6 +455,59 @@ def test_single_card_bundle_and_packaging():
 
 
 
+def test_shipped_configuration_assembles_face_light_and_system_health_without_hardware():
+    import main
+    import yaml
+    config = yaml.safe_load((GO1 / "config.yaml").read_text())
+    plugins = config["plugins"]
+    assert plugins["system_health"] == {"enabled": True, "mqtt_host": "localhost", "mqtt_port": 1883}
+    assert "system_health" not in plugins["face_light"]
+    client = Mock()
+    bundle = main.Go1Bundle({"plugins": {name: plugins[name] for name in ("face_light", "system_health")}},
+                            "offline", None, client)
+    tools = bundle.get_all_tools()
+    assert {tool["name"] for tool in tools} == {"face_light", "system_health"}
+    assert len(tools) == 2
+    metadata = yaml.safe_load((GO1 / "driver.yaml").read_text())
+    for name in ("face_light", "system_health"):
+        assert sum(card["name"] == name and card["type"] == "actuator" for card in metadata["cards"]) == 1
+    assert not client.mock_calls
+
+
+def test_system_health_mqtt_stop_restart_and_repeated_lifecycle_are_offline(monkeypatch):
+    first, second = Mock(), Mock()
+    factory = Mock(side_effect=[first, second])
+    monkeypatch.setattr(ext, "_HAS_MQTT", True)
+    monkeypatch.setattr(ext, "mqtt", SimpleNamespace(Client=factory))
+    plugin = ext.SysHealthPlugin({"mqtt_host": "offline-broker", "mqtt_port": 1883}, "", None, None)
+    assert plugin.dispatch("start", {}) == {"state": "ready"}
+    first.connect.assert_called_once_with("offline-broker", 1883, 60)
+    first.subscribe.assert_called_once_with("bms/state")
+    first.loop_start.assert_called_once_with()
+    assert first.on_message == plugin._on_msg
+    assert plugin.dispatch("start", {}) == {"state": "ready"}
+    assert plugin.dispatch("info", {}) == {"state": "ready"}
+    assert factory.call_count == 1
+    first.loop_start.assert_called_once_with()
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    assert plugin._mqtt is None
+    first.loop_stop.assert_called_once_with()
+    first.disconnect.assert_called_once_with()
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    first.loop_stop.assert_called_once_with()
+    first.disconnect.assert_called_once_with()
+    assert plugin.dispatch("start", {}) == {"state": "ready"}
+    assert factory.call_count == 2
+    second.connect.assert_called_once_with("offline-broker", 1883, 60)
+    second.subscribe.assert_called_once_with("bms/state")
+    second.loop_start.assert_called_once_with()
+    assert plugin._mqtt is second
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    second.loop_stop.assert_called_once_with()
+    second.disconnect.assert_called_once_with()
+    assert plugin._mqtt is None
+
+
 def test_default_face_card_stays_discoverable_when_sdk_setup_is_missing(monkeypatch):
     import main
     import yaml

@@ -1093,6 +1093,8 @@ class SysHealthPlugin:
         self._lock = threading.Lock()
 
     def start(self):
+        if self._mqtt is not None:
+            return
         if not _HAS_MQTT:
             return
         try:
@@ -1113,6 +1115,8 @@ class SysHealthPlugin:
                 self._mqtt.disconnect()
         except Exception:
             pass
+        finally:
+            self._mqtt = None
 
     def _on_msg(self, cl, userdata, msg):
         with self._lock:
@@ -1130,9 +1134,13 @@ class SysHealthPlugin:
                                 "required": ["action"]}}
 
     def dispatch(self, action, args):
-        if action in ("start", "info"):
+        if action == "start":
+            self.start()
+            return {"state": "ready"}
+        if action == "info":
             return {"state": "ready"}
         if action == "stop":
+            self.stop()
             return {"state": "idle"}
         if action not in ("robot_info", "diagnose"):
             return None
