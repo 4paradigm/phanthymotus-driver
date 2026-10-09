@@ -6,10 +6,9 @@ set -euo pipefail
 # host's Jazzy Python/ROS environment. Only the host network/PID namespaces
 # are needed for the robot-side participant.
 readonly VERSION="1.10.1"
-readonly URL="https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases/download/${VERSION}/zenoh-bridge-ros2dds-${VERSION}-aarch64-unknown-linux-gnu-standalone.zip"
-readonly SHA256="fdb64d942d4b6beccbe9b1f8a359a01a2fca95a023c27535bf97b233603fad5f"
 readonly ROOT="/opt/phanthy-motus/data/a3-zenoh"
 readonly BIN="${ROOT}/zenoh-bridge-ros2dds"
+readonly IMAGE_BIN="/usr/local/libexec/a3-zenoh/zenoh-bridge-ros2dds"
 readonly VERSION_FILE="${ROOT}/version"
 readonly HOST_PID="${ROOT}/host.pid"
 readonly CONTAINER_PID="${ROOT}/container.pid"
@@ -21,15 +20,15 @@ install_bridge() {
   if [[ -x "${BIN}" ]] && [[ "$(cat "${VERSION_FILE}" 2>/dev/null || true)" = "${VERSION}" ]]; then
     return
   fi
-  local tmp="${ROOT}/bridge.zip.tmp"
-  log "downloading official bridge ${VERSION}"
-  curl --fail --location --retry 3 --silent --show-error "${URL}" -o "${tmp}"
-  echo "${SHA256}  ${tmp}" | sha256sum -c -
-  unzip -p "${tmp}" zenoh-bridge-ros2dds > "${BIN}.tmp"
+  if [[ ! -x "${IMAGE_BIN}" ]]; then
+    log "ERROR: image does not contain the verified Zenoh bridge" >&2
+    return 1
+  fi
+  cp "${IMAGE_BIN}" "${BIN}.tmp"
   chmod 0755 "${BIN}.tmp"
   mv -f "${BIN}.tmp" "${BIN}"
   printf '%s\n' "${VERSION}" > "${VERSION_FILE}"
-  rm -f "${tmp}"
+  log "installed verified bridge ${VERSION} from image"
 }
 
 start() {

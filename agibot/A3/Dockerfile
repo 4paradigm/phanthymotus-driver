@@ -2,6 +2,16 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR=https://pypi.org/simple/
 
+# Download at image-build time (the build worker has external network access;
+# ADU does not). The official arm64 standalone archive contains the bridge
+# executable and embeds its DDS implementation.
+ADD --checksum=sha256:fdb64d942d4b6beccbe9b1f8a359a01a2fca95a023c27535bf97b233603fad5f \
+    https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases/download/1.10.1/zenoh-plugin-ros2dds-1.10.1-aarch64-unknown-linux-gnu-standalone.zip \
+    /tmp/a3-zenoh.zip
+RUN python3 -c "import zipfile; z=zipfile.ZipFile('/tmp/a3-zenoh.zip'); z.extract('zenoh-bridge-ros2dds', '/usr/local/libexec/a3-zenoh');" && \
+    chmod 0755 /usr/local/libexec/a3-zenoh/zenoh-bridge-ros2dds && \
+    rm -f /tmp/a3-zenoh.zip
+
 # The robot publishes Jazzy ROS types. Keep the main participant on FastDDS so
 # its type-hash negotiation matches the robot; the isolated domain-42 bridge
 # also uses FastDDS in its child workers. The base image already provides the
