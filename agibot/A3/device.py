@@ -1825,13 +1825,35 @@ def _mc_suggestion(state: str, requested: str) -> str:
     return f"当前状态 {state} 仅允许 {list(allowed)}；建议先经 get_up 恢复站立（MOTION）后再进入 {requested}"
 
 
+def _motion_gate(rpc, card: str):
+    """Return a structured rejection for actuators that require MOTION mode."""
+    try:
+        current = _mc_current_state(rpc)
+    except Exception:
+        current = ""
+    if current and current != "MOTION":
+        return {"state": "rejected", "current": current,
+                "suggestion": f"{card} 仅在 MOTION 站立状态生效；请先执行 mc_mode get_up"}
+    return None
+
+
 def _mc_runtime_names(commands):
     """Normalize AimDK GetAvailableActions entries to action-name strings."""
     names = set()
     for item in commands or ():
-        value = item.get("action") if isinstance(item, dict) else item
-        if isinstance(value, str):
-            names.add(value.upper().replace("MOTIONCONTROLACTION_", ""))
+        values = []
+        if isinstance(item, dict):
+            # Firmware revisions have returned either the fully qualified
+            # action, the short ext_action, or both.
+            values.extend(item.get(key) for key in ("action", "ext_action", "name"))
+        else:
+            values.append(item)
+        for value in values:
+            if isinstance(value, str) and value:
+                normalized = value.upper().strip()
+                if "MOTIONCONTROLACTION_" in normalized:
+                    normalized = normalized.split("MOTIONCONTROLACTION_", 1)[1]
+                names.add(normalized)
     return names
 
 
@@ -2366,6 +2388,9 @@ class HeadControlPlugin:
         if args.get("pitch") is not None:
             positions["head_pitch_joint"] = float(args["pitch"])
         _require(positions, "至少提供 yaw 或 pitch")
+        rejected = _motion_gate(self.nodes.rpc, "head_control")
+        if rejected:
+            return rejected
         _check_joint_limits(positions, NECK_LIMITS)
         duration_ms = int(args.get("duration_ms", 100))
         _require(duration_ms >= 0, "duration_ms 不能为负")
@@ -2422,6 +2447,9 @@ class WaistControlPlugin:
             low, high = WAIST_LIMITS[f"waist_{field}"]
             payload[f"waist_{field}"] = _clamp(float(value), low, high, field)
         _require(payload, "至少提供 pitch/yaw/height 之一")
+        rejected = _motion_gate(self.nodes.rpc, "waist_control")
+        if rejected:
+            return rejected
         self.nodes.publish_wrapper("waist_pub", payload)
         return {**payload, "state": "published"}
 
@@ -3168,6 +3196,9 @@ class FacePlayPlugin:
         if action == "play":
             e_path = args.get("e_path", "")
             _require(e_path or args.get("e_id") is not None, "需要 e_path 或 e_id")
+            rejected = _motion_gate(self.nodes.rpc, "face_play")
+            if rejected:
+                return rejected
             payload = {
                 "header": create_header(),
                 "e_path": e_path,
@@ -3361,6 +3392,9 @@ class SkillPlayPlugin:
         if action == "play":
             path = args.get("path", "")
             _require(path, "path 不能为空")
+            rejected = _motion_gate(self.nodes.rpc, "skill_play")
+            if rejected:
+                return rejected
             # 新播放顶替旧播放：先结算旧等待线程（立即 cancelled）并在锁内按旧
             # session_id 物理停止 —— 顺序不能反，否则 Stop 打断的是新会话
             # （ThreadingHTTPServer 使并发 play 可达，MotionPlayPlugin 同款）。
