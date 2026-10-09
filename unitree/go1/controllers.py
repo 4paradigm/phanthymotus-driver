@@ -109,7 +109,6 @@ class LocoPlugin:
         return {
             "name": CARD_LOCO, "type": TYPE_LOCO, "multiInstance": False, "description": DESC_LOCO,
             "inputSchema": {
-                "x-resource": "base",
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
@@ -268,7 +267,6 @@ class BodyPosePlugin:
         return {
             "name": CARD_BODY_POSE, "type": TYPE_BODY_POSE, "multiInstance": False, "description": DESC_BODY_POSE,
             "inputSchema": {
-                "x-resource": "base",
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
@@ -406,7 +404,6 @@ class SwitchGaitPlugin:
         return {
             "name": CARD_SWITCH_GAIT, "type": TYPE_SWITCH_GAIT, "multiInstance": False, "description": DESC_SWITCH_GAIT,
             "inputSchema": {
-                "x-resource": "base",
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": list(_GAITS.keys()),
@@ -667,7 +664,6 @@ class GesturePlugin:
         return {
             "name": CARD_GESTURE, "type": TYPE_GESTURE, "multiInstance": False, "description": DESC_GESTURE,
             "inputSchema": {
-                "x-resource": "base",
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
@@ -792,7 +788,6 @@ class SpecialMotionPlugin:
         return {
             "name": CARD_SPECIAL_MOTION, "type": TYPE_SPECIAL_MOTION, "multiInstance": False, "description": DESC_SPECIAL_MOTION,
             "inputSchema": {
-                "x-resource": "base",
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",

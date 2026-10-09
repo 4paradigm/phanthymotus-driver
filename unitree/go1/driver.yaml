@@ -15,15 +15,18 @@ build_context_extras:
 # pointcloud_stream systemd services) are deployed by nano_bootstrap.sh with
 # DEPTH_ENABLE=1 / PCL_ENABLE=1 and are on-demand (camera opens only while a
 # Pi-side card is streaming, so they don't fight the RGB card for the device
-# outside of active streams). system_health is enabled as a sibling plugin.
-# activity_monitor is listed as
+# outside of active streams). `system_health` is intentionally excluded:
+# config.yaml has a YAML indentation bug (line ~18) that nests `system_health:`
+# as a dead key inside `face_light`'s mapping instead of a sibling plugin key,
+# so `pc.get("system_health", {})` in main.py never finds it and the card never
+# loads — confirmed by parsing config.yaml with PyYAML. Fix that indentation
+# bug first if system_health should ship. activity_monitor is listed as
 # `actuator` because that's what its own get_tool() declares in sensors.py,
 # even though the card is read-only (samples velocity/mode, action=report).
 cards:
   - { name: loco_state,         type: sensor }
   - { name: battery,            type: sensor }
   - { name: face_light,         type: actuator }
-  - { name: system_health,      type: actuator }
   - { name: camera_rgb,         type: sensor }
   - { name: camera_depth,       type: sensor }
   - { name: camera_pointcloud,  type: sensor }

@@ -18,8 +18,6 @@ import threading
 def _sdk_worker(cmd_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 network_iface: str, target_ip: str, target_port: int, local_port: int):
     """子进程：持有 Go1HighSdkClient，处理来自主进程的命令队列。"""
-    from common import logsafe
-    logsafe.install(check_fd=False)
     from go1_sdk_client import Go1HighSdkClient
 
     client = Go1HighSdkClient(

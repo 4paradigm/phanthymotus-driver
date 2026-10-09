@@ -89,28 +89,6 @@ def test_effect_completion_contract_and_unique_ids(light, acp_notify, action):
     assert "action_id" not in light.dispatch("set_color", {"r": 1})
 
 
-def test_all_go1_acting_tools_declare_consistent_resources_without_hardware_calls():
-    import main
-    channels = {
-        'face_light': 'face_light', 'beep': 'mouth', 'speaker': 'mouth',
-        'loco': 'base', 'body_pose': 'base', 'switch_gait': 'base',
-        'gesture': 'base', 'special_motion': 'base',
-        'system_health': 'base', 'activity_monitor': 'base',
-    }
-    config = {'plugins': {name: {'enabled': True} for name in channels}}
-    client = Mock()
-    # Only construct tools and inspect declarations. Do not start any card.
-    bundle = main.Go1Bundle(config, 'offline', None, client)
-    tools = {tool['name']: tool for tool in bundle.get_all_tools()}
-    assert set(tools) == set(channels)
-    for name, channel in channels.items():
-        assert tools[name]['type'] == 'actuator'  # preserve existing access policy
-        assert tools[name]['inputSchema']['x-resource'] == channel
-        if name != 'face_light':
-            assert channel != tools['face_light']['inputSchema']['x-resource']
-    # Shared speaker and body hardware cannot be labelled as independent channels.
-    assert tools['beep']['inputSchema']['x-resource'] == tools['speaker']['inputSchema']['x-resource']
-    assert not client.mock_calls
 
 
 @pytest.mark.parametrize("action,args", [("set_color", {"g": 10}), ("off", {}), ("stop", {}),
@@ -475,21 +453,6 @@ def test_single_card_bundle_and_packaging():
         bundle.stop_all()
 
 
-def test_shipped_system_health_is_enabled_assembled_and_listed():
-    import main
-    import yaml
-    config = yaml.safe_load((GO1 / 'config.yaml').read_text())
-    plugins = config['plugins']
-    assert plugins['system_health']['enabled'] is True
-    assert 'system_health' not in plugins['face_light']
-    assert 'mqtt_host' not in plugins['face_light']
-    selected = {name: plugins[name] for name in ('face_light', 'system_health')}
-    client = Mock()
-    bundle = main.Go1Bundle({'plugins': selected}, 'offline', None, client)
-    assert {tool['name'] for tool in bundle.get_all_tools()} == {'face_light', 'system_health'}
-    metadata = yaml.safe_load((GO1 / 'driver.yaml').read_text())
-    assert sum(card['name'] == 'system_health' for card in metadata['cards']) == 1
-    assert not client.mock_calls  # declaration check only; no lifecycle/hardware calls
 
 
 def test_default_face_card_stays_discoverable_when_sdk_setup_is_missing(monkeypatch):

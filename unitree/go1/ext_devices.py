@@ -144,7 +144,6 @@ class BeepPlugin:
         return {"name": CARD_BEEP, "type": "actuator", "multiInstance": False,
           "description": "Go1 头部扬声器蜂鸣控制：播放蜂鸣音、调节音量",
           "inputSchema": {"type": "object",
-            "x-resource": "mouth",
             "properties": {
               "action": {"type": "string", "enum": ["beep", "set_volume", "get_volume"],
                          "description": "要执行的蜂鸣操作"},
@@ -398,7 +397,6 @@ class SpeakerPlugin:
           "description": "Go1 头部扬声器：播放操作员远程麦克风音频流",
           "topic_in": [{"format": "audio/pcm-16k"}],
           "inputSchema": {"type": "object",
-            "x-resource": "mouth",
             "properties": {
               "action": {"type": "string",
                          "enum": ["set_volume", "get_volume"],
@@ -899,6 +897,8 @@ class FaceLightPlugin:
                         "preset": "Persistent named color", "off": "Cancel effect and turn all LEDs off",
                         "set_led": "Set SDK index 0..11; others retain last software frame (initially off); per-LED backend required",
                         "set_leds": "12 RGB hex colors in index order, separated by spaces (e.g. FF0000); legacy RGB arrays accepted",
+                        # hex format:FF0000 00FF00 0000FF FF0000 00FF00 0000FF FF0000 00FF00 0000FF FF0000 00FF00 0000FF
+                        # RGB array format:[[255,0,0],[0,255,0],[0,0,255],[255,0,0],[0,255,0],[0,0,255],[255,0,0],[0,255,0],[0,0,255],[255,0,0],[0,255,0],[0,0,255]]
                         "blink": "Blink uniform RGB on/off; period_s per full cycle, auto-off after duration_s",
                         "breathe": "Breathe by scaling RGB; period_s per full cycle, auto-off after duration_s",
                         "fade": "Transition RGB to target RGB over duration_s, then hold target until next command",
@@ -1125,7 +1125,6 @@ class SysHealthPlugin:
                  "(CPU temp/load, memory, disk, power throttle, network, key process) and robot subsystems "
                  "(battery, comm link, motion state); returns per-item OK/WARNING/CRITICAL + overall verdict."),
                 "inputSchema": {"type": "object",
-                                "x-resource": "base",
                                 "properties": {"action": {"type": "string", "enum": ["robot_info"],
                                                            "description": "Get robot overall status / health info"}},
                                 "required": ["action"]}}

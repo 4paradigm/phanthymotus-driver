@@ -10,10 +10,7 @@ plugins:
     enabled: true
   battery:                      # BMS：SOC%/电流/循环/温度/单体电压
     enabled: true
-  system_health:                # 诊断执行卡(actuator):主控板+子系统体检,自动判断哪里有问题
-    enabled: true
-    mqtt_host: "localhost"
-    mqtt_port: 1883
+
   # 相机三卡共用同一 camera.py；每张卡均为 multiInstance，可各自选机位。
   # 同一物理机位的三种流仍互斥：谁先 start 谁占用相机。
   camera_rgb:
@@ -78,6 +75,7 @@ plugins:
     enabled: true
     backend: "sdk"
     sdk_exclusive: true
+    system_health:                # 保留原仓库嵌套的空配置；不改动该卡装配状态
 
   beep:                         # 头部扬声器 beep 动作卡 → Nano beep_adapter.py（:18082 /v1/beep/actions）
     enabled: true

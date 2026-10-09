@@ -1007,7 +1007,6 @@ class ActivityMonitorPlugin:
             "multiInstance": False, "description": desc,
             "inputSchema": {
                 "type": "object",
-                "x-resource": "base",
                 "properties": {
                     "action": {
                         "type": "string",
