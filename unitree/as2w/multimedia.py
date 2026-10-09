@@ -921,7 +921,13 @@ class SpeakerPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "start": {"params": ["input_topic"]},
+                    "start": {
+                        "params": [],
+                        "description": (
+                            "Initialize the speaker; subscribes immediately when "
+                            "input_topic is supplied."
+                        ),
+                    },
                     "stop": {"params": []},
                     "interrupt": {"params": []},
                     "pause": {"params": []},
@@ -942,7 +948,13 @@ class SpeakerPlugin:
 
     def dispatch(self, action, args):
         reported_topic = self._node.topic
-        if action in ("start", "play"):
+        if action == "start":
+            input_topic = args.get("input_topic", "")
+            result = (
+                self._node.start_play(input_topic)
+                if input_topic else self.start()
+            )
+        elif action == "play":
             result = self._node.start_play(args.get("input_topic", ""))
         elif action == "stop":
             self.stop()

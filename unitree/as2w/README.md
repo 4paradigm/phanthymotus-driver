@@ -101,9 +101,11 @@ JPEG frames stay in a one-frame, latest-only thread queue and are assigned to
 roughly 300 KB multiprocessing copy and slow per-byte ROS conversion. Camera
 `info` reports separate capture/publish rates, videohub RPC time, message-build
 and publish-call time, average frame size, and dropped stale frames.
-The shared ROS base workspace must provide `audio_msgs`; the Docker build
-sources `/ros_ws/install/setup.bash` and imports `AudioChunk` as a mandatory
-build-time validation, so a base-image mismatch fails before deployment.
+The component vendors the three-field `audio_msgs/AudioChunk` interface used by
+the perception audio bus and builds it in a dedicated Docker stage. The runtime
+image receives only the generated `/as2w_ws/install` overlay and validates an
+`AudioChunk` import during the build; it does not depend on an undocumented
+`/ros_ws` artifact in the shared ROS base image.
 
 No-hardware checks are available with `python3 test_driver.py`; they cover
 action lifecycle, schemas, model resources, RPC correlation, and full-size

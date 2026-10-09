@@ -763,10 +763,43 @@ class TestDriverContracts(unittest.TestCase):
             self.assertTrue(second.alive)
             self.assertEqual(2, len(created))
 
-    def test_docker_image_validates_audio_msgs_at_build_time(self):
+    def test_speaker_lifecycle_start_without_topic_returns_ready(self):
+        created = []
+
+        class FakeBackend:
+            def __init__(self, *_args):
+                self.error = ""
+                self.alive = True
+                created.append(self)
+            def is_available(self): return self.alive
+            def close(self): self.alive = False
+            def call(self, *_args, **_kwargs): return {"ok": True}
+
+        executor = types.SimpleNamespace(add_node=lambda _node: None)
+        with patch.object(self.multimedia, "_SpeakerBackend", FakeBackend):
+            plugin = self.multimedia.SpeakerPlugin({}, "test", executor, "eth0")
+            self.assertEqual(
+                [],
+                plugin.get_tool()["inputSchema"]["x-action-params"]["start"]["params"],
+            )
+            result = plugin.dispatch("start", {})
+
+        self.assertEqual(1, len(created))
+        self.assertIs(plugin._node._backend, created[0])
+        self.assertEqual({"ok": True, "state": "ready", "topic": ""}, result)
+
+    def test_docker_image_builds_and_validates_owned_audio_msgs(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
-        self.assertIn("test -f /ros_ws/install/setup.bash", dockerfile)
+        audio_message = (ROOT / "vendor/audio_msgs/msg/AudioChunk.msg").read_text()
+        self.assertIn("COPY vendor/audio_msgs/", dockerfile)
+        self.assertIn("colcon build --packages-select audio_msgs", dockerfile)
+        self.assertIn("test -f /as2w_ws/install/setup.bash", dockerfile)
+        self.assertNotIn("/ros_ws/install/setup.bash", dockerfile)
         self.assertIn("from audio_msgs.msg import AudioChunk", dockerfile)
+        self.assertEqual(
+            ["std_msgs/Header header", "string format", "uint8[] data"],
+            audio_message.splitlines(),
+        )
 
     def test_camera_worker_is_pinned_to_verified_videohub_client(self):
         source = (ROOT / "multimedia.py").read_text()
