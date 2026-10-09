@@ -4,6 +4,7 @@ The SDK currently publishes no AS2-specific SLAM wrapper. The service itself
 uses Unitree's common RPC protocol, so this module owns the documented client.
 """
 import json
+from contextlib import nullcontext
 import multiprocessing
 import threading
 import time
@@ -82,6 +83,7 @@ class _SpatialRpcProxy:
         self._process.start()
         self._lock = threading.Lock()
         self._startup_error = None
+        self._stopped = False
         try:
             result = self._results.get(timeout=5)
             self._startup_error = result.get("startup_error")
@@ -89,9 +91,9 @@ class _SpatialRpcProxy:
             self._startup_error = "SLAM worker did not become ready"
 
     def call(self, action, data):
-        if self._startup_error:
-            return {"code": 3104, "response": self._startup_error}
         with self._lock:
+            if self._stopped or self._startup_error:
+                return {"code": 3104, "response": self._startup_error or "SLAM worker is stopped"}
             self._commands.put({"action": action, "data": data})
             try:
                 return self._results.get(timeout=20)
@@ -99,8 +101,15 @@ class _SpatialRpcProxy:
                 return {"code": 3104, "response": "SLAM service timeout"}
 
     def stop(self):
-        self._commands.put(None)
-        self._process.join(timeout=3)
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            self._commands.put(None)
+            self._process.join(timeout=3)
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=1)
 
 
 class ControlledSpatialPlugin:
@@ -108,18 +117,39 @@ class ControlledSpatialPlugin:
     PREFIX = "controlled_spatial"
 
     def __init__(self, config, namespace, executor, interface):
-        self._client = _SpatialRpcProxy(interface)
+        self._interface = interface
+        self._client = None
+        self._nav_sub = None
+        self._running = False
+        self._subscription_generation = 0
         self._nav_done = threading.Event()
         self._nav_result = None
         self._nav_action_id = None
         self._nav_lock = threading.Lock()
+        self._chassis_guard = None
+        self._operation_lock = threading.RLock()
+        self.start()
+
+    def _open_completion_subscription(self):
+        self._subscription_generation += 1
+        generation = self._subscription_generation
+        subscriber = None
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
             from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
-            self._nav_sub = ChannelSubscriber("rt/slam_key_info", String_)
-            self._nav_sub.Init(self._on_slam_key_info, 10)
+            subscriber = ChannelSubscriber("rt/slam_key_info", String_)
+            # A queued DDS callback from the previous subscription must not
+            # complete a navigation request started after a stop/start cycle.
+            def on_message(message):
+                self._on_slam_key_info(message, generation)
+            subscriber.Init(on_message, 10)
+            self._nav_sub = subscriber
         except Exception as exc:
-            self._nav_sub = None
+            if subscriber is not None:
+                try:
+                    subscriber.Close()
+                except Exception:
+                    pass
             print(f"[controlled_spatial] SLAM completion topic unavailable: {exc}", flush=True)
 
     def get_tool(self):
@@ -142,44 +172,82 @@ class ControlledSpatialPlugin:
                     "resume_navigation": {"params": [], "description": "Resume navigation."},
                     "shutdown": {"params": [], "description": "Close vendor SLAM service."}}}}
 
-    def start(self): pass
+    def set_chassis_guard(self, guard):
+        self._chassis_guard = guard
+        if not hasattr(self, "_operation_lock"):
+            self._operation_lock = threading.RLock()
+
+    def _release_chassis(self):
+        guard = getattr(self, "_chassis_guard", None)
+        if guard is not None:
+            guard.release_external_navigation()
+
+    def start(self):
+        with self._operation_lock:
+            if self._client is None:
+                self._client = _SpatialRpcProxy(self._interface)
+            self._running = True
+            if self._nav_sub is None:
+                self._open_completion_subscription()
+            return self._lifecycle_info()
+
+    def _lifecycle_info(self):
+        return {"state": "ready" if self._running else "idle",
+                "completion_available": self._nav_sub is not None}
+
     def stop(self):
+        with self._operation_lock:
+            self._stop()
+
+    def _stop(self):
+        self._running = False
         with self._nav_lock:
             action_id, self._nav_action_id = self._nav_action_id, None
+            self._subscription_generation += 1
+            self._nav_done.set()
         if action_id:
-            self._client.call("pause_navigation", {})
+            paused = self._client.call("pause_navigation", {})
+            if paused.get("code") == 0:
+                self._release_chassis()
             _acp_notify(action_id, "cancelled", {"reason": "card stopped"})
         if self._nav_sub is not None:
+            subscriber, self._nav_sub = self._nav_sub, None
             try:
-                self._nav_sub.Close()
+                subscriber.Close()
             except Exception:
                 pass
-        self._client.stop()
+        if self._client is not None:
+            client, self._client = self._client, None
+            client.stop()
 
-    def _on_slam_key_info(self, message):
+    def _on_slam_key_info(self, message, generation=None):
         try:
             payload = json.loads(message.data)
         except (TypeError, ValueError, AttributeError):
             return
         if payload.get("type") == "task_result":
-            self._nav_result = payload
-            self._nav_done.set()
+            with self._nav_lock:
+                if generation is not None and generation != self._subscription_generation:
+                    return
+                if self._nav_action_id is not None:
+                    self._nav_result = payload
+                    self._nav_done.set()
 
-    def _wait_for_navigation(self, action_id, target):
-        completed = self._nav_done.wait(timeout=180)
-        with self._nav_lock:
-            if self._nav_action_id != action_id:
-                return
-        if completed:
-            result = self._nav_result or {}
-            arrived = bool(result.get("data", {}).get("is_arrived", False))
-            status = "completed" if arrived and result.get("errorCode", 0) == 0 else "error"
-            _acp_notify(action_id, status, {"target": target, "response": result})
-        else:
-            self._client.call("pause_navigation", {})
-            _acp_notify(action_id, "error", {"target": target, "error": "navigation timed out after 180 seconds"})
-        with self._nav_lock:
-            if self._nav_action_id == action_id:
+    def _wait_for_navigation(self, action_id, target, done=None):
+        completed = (done if done is not None else self._nav_done).wait(timeout=180)
+        with getattr(self, "_operation_lock", nullcontext()):
+            with self._nav_lock:
+                if self._nav_action_id != action_id:
+                    return
+            if completed:
+                result = self._nav_result or {}
+                arrived = bool(result.get("data", {}).get("is_arrived", False))
+                status = "completed" if arrived and result.get("errorCode", 0) == 0 else "error"
+                _acp_notify(action_id, status, {"target": target, "response": result})
+            else:
+                self._client.call("pause_navigation", {})
+                _acp_notify(action_id, "error", {"target": target, "error": "navigation timed out after 180 seconds"})
+            with self._nav_lock:
                 self._nav_action_id = None
 
     @staticmethod
@@ -188,11 +256,25 @@ class ControlledSpatialPlugin:
             "x": 0, "y": 0, "z": 0, "q_x": 0, "q_y": 0, "q_z": 0, "q_w": 1}.items()}
 
     def dispatch(self, action, args):
-        if action in ("start", "info"): return {"state": "ready"}
+        # Serialize reservations and their RPC outcomes as one transaction.
+        # A concurrent resume must not sit behind an acknowledged pause while
+        # that pause has already released the chassis to the visual navigator.
+        with getattr(self, "_operation_lock", nullcontext()):
+            return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
+        if action == "start": return self.start()
+        if action == "info": return self._lifecycle_info()
         if action == "stop":
             self.stop()
             return {"state": "idle"}
         if action not in _APIS: return None
+        if not getattr(self, "_running", True):
+            return {"ret": 3104, "accepted": False,
+                    "error": "card stopped; call start before using vendor SLAM"}
+        if action == "navigate_to" and hasattr(self, "_nav_sub") and self._nav_sub is None:
+            return {"ret": 3104, "accepted": False,
+                    "error": "SLAM completion topic unavailable; call start to retry subscription"}
         if action in ("stop_mapping", "init_pose") and not args.get("address"):
             return {"error": "address is required for this action"}
         if action == "start_mapping": data = {"slam_type": "indoor"}
@@ -201,6 +283,11 @@ class ControlledSpatialPlugin:
         elif action == "navigate_to":
             data = {"targetPose": self._pose(args), "mode": int(args.get("mode", 1)), "speed": float(args.get("speed", 0.5))}
         else: data = {}
+        if action in ("navigate_to", "resume_navigation"):
+            guard = getattr(self, "_chassis_guard", None)
+            if guard is not None and not guard.reserve_external_navigation():
+                return {"ret": 3104, "accepted": False,
+                        "error": "velocity stream owns the chassis; pause it first"}
         action_id = None
         previous = None
         if action == "navigate_to":
@@ -211,12 +298,18 @@ class ControlledSpatialPlugin:
                 previous = self._nav_action_id
                 action_id = f"as2w_nav_{uuid4().hex[:8]}"
                 self._nav_action_id = action_id
-                self._nav_done.clear()
+                self._nav_done.set()
+                self._nav_done = threading.Event()
                 self._nav_result = None
             if previous:
                 _acp_notify(previous, "cancelled", {"reason": "superseded by new navigation request"})
 
         result = self._client.call(action, data)
+        # Keep ownership on timeout/error: the vendor may have accepted an RPC
+        # whose reply was lost. Only an explicit accepted pause/shutdown clears
+        # it; an uncorrelated completion topic cannot safely release a new goal.
+        if action in ("pause_navigation", "shutdown") and result["code"] == 0:
+            self._release_chassis()
         response = result["response"]
         try: response = json.loads(response) if isinstance(response, str) else response
         except json.JSONDecodeError: pass
@@ -228,6 +321,6 @@ class ControlledSpatialPlugin:
                         self._nav_done.clear()
             return {"ret": result["code"], "response": response}
         threading.Thread(target=self._wait_for_navigation,
-                         args=(action_id, data["targetPose"]), daemon=True).start()
+                         args=(action_id, data["targetPose"], self._nav_done), daemon=True).start()
         return {"ret": 0, "status": "navigating", "action_id": action_id,
                 "target_pose": data["targetPose"], "response": response}
