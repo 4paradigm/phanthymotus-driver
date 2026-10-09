@@ -1,12 +1,39 @@
 mcp_port: 15709
-robot_interface: eth0
+robot_interface: auto
 ros_namespace: ""
 plugins:
   loco: {enabled: true}
-  special_action: {enabled: true}
+  special_motion: {enabled: true}
+  mic:
+    enabled: true
+    group: "239.168.123.161"
+    port: 5555
+    startup_grace_s: 3
+    chunk_bytes: 1024
+  speaker:
+    enabled: true
+    block_ms: 300
+    startup_prefill_ms: 300
+    rebuffer_prefill_ms: 500
+    max_lead_ms: 240
+  led: {enabled: true}
+  camera:
+    enabled: true
+    backend: videohub
+    fps: 10
+    rpc_timeout: 1.0
+    retry_interval: 2.0
   state: {enabled: true}
   lidar:
     enabled: true
+    process: true
+    max_render_points: 12000
     # Override only after checking the driver's 15-second lidar diagnostics.
     # source_topics: ["rt/utlidar/cloud_deskewed"]
   controlled_spatial: {enabled: true}
+  slam_mapping:
+    enabled: true
+    voxel_size: 0.06
+    max_input_points: 20000
+    max_map_points: 50000
+    max_buffer_points: 200000
