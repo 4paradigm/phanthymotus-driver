@@ -30,6 +30,7 @@ ENV PYTHONUNBUFFERED=1
 # above and are absent from the final image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-numpy \
+    python3-pip \
     python3-pil \
     ffmpeg \
     openssh-client \
@@ -44,6 +45,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-diagnostic-msgs \
     ros-humble-action-msgs \
     && rm -rf /var/lib/apt/lists/*
+
+# ArUco is part of OpenCV contrib; the headless wheel needs no display stack.
+RUN pip3 install --no-cache-dir --only-binary=:all: \
+    numpy==1.23.5 opencv-contrib-python-headless==4.11.0.86 \
+    && python3 -c "import cv2; assert hasattr(cv2, 'aruco')"
 
 WORKDIR /work
 COPY --from=interface-builder /q5_ws/install /q5_ws/install
@@ -80,6 +86,7 @@ COPY mic.py /work/mic.py
 COPY speaker.py /work/speaker.py
 COPY audio.py /work/audio.py
 COPY camera_rgb.py /work/camera_rgb.py
+COPY aruco_zones.py /work/aruco_zones.py
 COPY camera_depth.py /work/camera_depth.py
 COPY camera_pointcloud.py /work/camera_pointcloud.py
 COPY vision_capture.py /work/vision_capture.py
