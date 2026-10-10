@@ -86,6 +86,25 @@ def test_does_not_accept_a_distant_replacement_inside_old_matching_radius():
     assert tracker.lost
 
 
+def test_same_position_with_different_appearance_does_not_take_lock():
+    tracker = TargetTracker()
+    original = Detection("person", .40, .2, .60, .70, .9, (220, 20, 20))
+    newcomer = Detection("person", .41, .2, .61, .71, .9, (20, 20, 220))
+    assert tracker.update([original]) == original
+    assert tracker.update([newcomer]) is None
+    assert tracker.lost
+
+
+def test_appearance_keeps_original_when_bystander_is_closer_to_old_box():
+    tracker = TargetTracker()
+    original = Detection("person", .40, .2, .60, .70, .9, (220, 20, 20))
+    moved = Detection("person", .47, .2, .67, .71, .9, (215, 25, 20))
+    bystander = Detection("person", .41, .2, .61, .71, .9, (20, 20, 220))
+    tracker.update([original])
+    assert tracker.update([bystander, moved]) == moved
+    assert not tracker.lost
+
+
 def test_follow_command_stops_for_missing_far_or_close_target():
     assert follow_command(None) == (0.0, 0.0)
     assert follow_command(box("shoe", .4, .8, .6, .92)) == (0.0, 0.0)
@@ -123,12 +142,54 @@ class Client:
     def stop_move(self):
         self.stops += 1
 
+    def set_posture(self, mode, **kwargs):
+        return {"mode": mode}
+
 
 def test_card_requires_model_before_following():
     client = Client()
     card = PersonFollowPlugin({"model_path": ""}, client=client)
     assert card.dispatch("follow", {"confirm": True})["code"] == "MODEL_UNAVAILABLE"
     assert not client.moves
+
+
+def test_follow_advertises_physical_motion_as_dangerous():
+    schema = PersonFollowPlugin({"model_path": ""}, client=Client()).get_tool()["inputSchema"]
+    assert schema["x-is-dangerous"] is True
+
+
+@pytest.mark.parametrize("action,args", [
+    ("stop", {}),
+    ("move", {"vx": .1}),
+    ("stand_down", {}),
+])
+def test_other_loco_action_cancels_follow_before_taking_control(tmp_path, monkeypatch, action, args):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    main = importlib.import_module("unitree.go1.main")
+    client = Client()
+    model = tmp_path / "shoes.onnx"
+    model.write_bytes(b"model")
+    bundle = main.Go1Bundle({"plugins": {"loco": {"enabled": True},
+                                        "person_follow": {"enabled": True,
+                                                          "model_path": str(model)}}},
+                            "test_go1", None, client)
+    follow = next(p for p in bundle._plugins if p.get_tool()["name"] == "person_follow")
+    entered = threading.Event()
+
+    def run():
+        entered.set()
+        while not follow._cancel.wait(.01):
+            client.move(.1, 0, 0)
+
+    monkeypatch.setattr(follow, "_run", run)
+    try:
+        assert bundle.dispatch("person_follow", {"action": "follow", "confirm": True})["ok"]
+        assert entered.wait(1)
+        assert bundle.dispatch("loco", {"action": action, **args})["ok"]
+        assert follow._cancel.is_set()
+        assert not follow._worker.is_alive()
+    finally:
+        follow.stop()
 
 
 def test_card_stop_cancels_worker_and_stops_robot(tmp_path, monkeypatch):
@@ -149,6 +210,26 @@ def test_card_stop_cancels_worker_and_stops_robot(tmp_path, monkeypatch):
     assert card.dispatch("stop", {})["ok"]
     assert client.stops >= 1
     assert not card._worker.is_alive()
+
+
+def test_cancelled_follow_cleanup_does_not_stop_new_owner(tmp_path, monkeypatch):
+    client = Client()
+    model = tmp_path / "shoes.onnx"
+    model.write_bytes(b"model")
+    card = PersonFollowPlugin({"model_path": str(model)}, client=client)
+    entered = threading.Event()
+
+    def run():
+        card.stop()
+        client.move(.1, 0, 0)
+        entered.set()
+
+    monkeypatch.setattr(card, "_run", run)
+    assert card.dispatch("follow", {"confirm": True})["ok"]
+    assert entered.wait(1)
+    card._worker.join(1)
+    assert client.stops == 1
+    assert client.moves == [(.1, 0, 0)]
 
 
 def test_yolox_decoder_maps_person_and_shoe_boxes():
@@ -230,6 +311,7 @@ def test_detector_accepts_jpeg_and_two_class_onnx_output(monkeypatch):
     Image.new("RGB", (416, 416), "white").save(encoded, format="JPEG")
     found = YoloXOnnxDetector("unused.onnx").detect(encoded.getvalue())
     assert len(found) == 1 and found[0].kind == "shoe"
+    assert len(found[0].appearance) == 48
 
 
 def test_runtime_stops_when_locked_shoe_disappears(tmp_path, monkeypatch):
@@ -266,6 +348,7 @@ def test_runtime_stops_when_locked_shoe_disappears(tmp_path, monkeypatch):
 
     client = Client()
     card = PersonFollowPlugin({"model_path": str(tmp_path / "model.onnx")}, client=client)
+    card._owns_motion = True
     monkeypatch.setattr(person_follow, "YoloXOnnxDetector", Detector)
     monkeypatch.setattr(person_follow.socket, "create_connection", lambda *args, **kwargs: Connection())
     monkeypatch.setattr(person_follow.select, "select", lambda connections, *args: (connections, [], []))
@@ -273,3 +356,46 @@ def test_runtime_stops_when_locked_shoe_disappears(tmp_path, monkeypatch):
         card._run()
     assert client.moves and client.moves[0][0] > 0
     assert client.stops >= 1
+
+
+def test_cancel_during_diagnostics_prevents_late_follow_move(tmp_path, monkeypatch):
+    from struct import pack
+    from unitree.go1 import person_follow
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def setblocking(self, value):
+            pass
+
+        def recv(self, size):
+            if not hasattr(self, "sent"):
+                self.sent = True
+                return pack(">I", 1) + b"a"
+            raise BlockingIOError()
+
+    class Detector:
+        def __init__(self, path):
+            pass
+
+        def detect(self, jpeg):
+            return [box("shoe", .4, .4, .6, .62)]
+
+    client = Client()
+    card = PersonFollowPlugin({"model_path": str(tmp_path / "model.onnx")}, client=client)
+    card._owns_motion = True
+
+    def diagnostics():
+        card.stop()
+        return {"accessible": True, "recv_count": 1}
+
+    monkeypatch.setattr(client, "diagnostics", diagnostics)
+    monkeypatch.setattr(person_follow, "YoloXOnnxDetector", Detector)
+    monkeypatch.setattr(person_follow.socket, "create_connection", lambda *args, **kwargs: Connection())
+    monkeypatch.setattr(person_follow.select, "select", lambda connections, *args: (connections, [], []))
+    card._run()
+    assert client.moves == []

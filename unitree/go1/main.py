@@ -206,8 +206,9 @@ class Go1Bundle:
             # 中文说明：跟随与 RGB 推流共用前向机位配置，实际运动只由 follow 动作启动。
             follow_config = dict(pc["person_follow"])
             follow_config["positions"] = pc.get("camera_rgb", {}).get("positions", {})
-            self._plugins.append(person_follow.make_person_follow(
-                follow_config, namespace, executor, client))
+            self._follow_plugin = person_follow.make_person_follow(
+                follow_config, namespace, executor, client)
+            self._plugins.append(self._follow_plugin)
             print("[bundle] person_follow loaded")
 
         if pc.get("camera_depth", {}).get("enabled", False):
@@ -258,6 +259,10 @@ class Go1Bundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args["_tool_name"] = tool_name
+                    # 中文说明：其他运动卡接管前撤销跟随，普通 loco.stop 不能被下一帧覆盖。
+                    if (tool_name in ("loco", "body_pose", "switch_gait", "gesture", "special_motion")
+                            and action not in ("start", "info") and hasattr(self, "_follow_plugin")):
+                        self._follow_plugin.preempt()
                     return p.dispatch(action, args)
         return None
 

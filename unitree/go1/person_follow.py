@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 import select
@@ -25,6 +25,7 @@ class Detection:
     x2: float
     y2: float
     score: float
+    appearance: tuple[int, ...] | None = None
 
     @property
     def center_x(self):
@@ -51,8 +52,17 @@ def _candidates(detections):
         used.add(partner)
         result.append(Detection("shoe", shoe.x1, min(shoe.y1, other.y1),
                                 other.x2, max(shoe.y2, other.y2),
-                                min(shoe.score, other.score)))
+                                min(shoe.score, other.score), shoe.appearance))
     return result
+
+
+def _appearance_matches(previous, current):
+    if previous.appearance is None or current.appearance is None:
+        return True
+    if len(previous.appearance) != len(current.appearance):
+        return False
+    difference = sum(abs(a - b) for a, b in zip(previous.appearance, current.appearance))
+    return difference <= .2 * 255 * len(previous.appearance)
 
 
 class TargetTracker:
@@ -77,7 +87,9 @@ class TargetTracker:
         matches = sorted(((abs(d.center_x - self.target.center_x) +
                            abs(d.y2 - self.target.y2), d) for d in candidates
                           if abs(d.center_x - self.target.center_x) <= .15
-                          and abs(d.y2 - self.target.y2) <= .15), key=lambda item: item[0])
+                          and abs(d.y2 - self.target.y2) <= .15
+                          and (d.kind != self.target.kind or
+                               _appearance_matches(self.target, d))), key=lambda item: item[0])
         if not matches or (len(matches) > 1 and matches[1][0] - matches[0][0] < .08):
             self.target = None
             self.lost = True
@@ -178,7 +190,16 @@ class YoloXOnnxDetector:
         canvas[:rgb.shape[0], :rgb.shape[1]] = rgb[:, :, ::-1]
         tensor = np.ascontiguousarray(canvas.transpose(2, 0, 1), dtype=np.float32)[None]
         output = self._session.run(None, {self._input.name: tensor})[0]
-        return decode_yolox(output, width, height, ratio)
+        detections = decode_yolox(output, width, height, ratio)
+        # 中文说明：只保留每个框的 4×4 色彩摘要，供锁定后的身份连续性检查。
+        result = []
+        for box in detections:
+            x1, y1 = int(box.x1 * width), int(box.y1 * height)
+            x2, y2 = max(x1 + 1, int(box.x2 * width)), max(y1 + 1, int(box.y2 * height))
+            pixels = image.crop((x1, y1, x2, y2)).resize((4, 4)).getdata()
+            result.append(replace(box, appearance=tuple(channel for pixel in pixels
+                                                        for channel in pixel)))
+        return result
 
 
 def extract_latest_frame(pending):
@@ -207,22 +228,26 @@ class PersonFollowPlugin:
         self._endpoint = endpoint["board_ip"], int(endpoint["image_port"])
         self._cancel = threading.Event()
         self._lock = threading.Lock()
+        self._motion_lock = threading.Lock()
+        self._owns_motion = False
         self._worker = None
         self._state = "ready"
         self._reason = None
 
     def get_tool(self):
+        # 中文说明：follow 是持续状态的启动动作；不占 ACP 异步屏障，stop 和 loco.stop 才能随时接管。
         return {"name": "person_follow", "type": "actuator", "multiInstance": False,
                 "description": "Follow the apparent nearest person, including a shoe-only view; stop on uncertainty.",
                 "inputSchema": {
                     "type": "object", "required": ["action"], "additionalProperties": False,
+                    "x-is-dangerous": True,
                     "properties": {
                         "action": {"type": "string", "enum": ["start", "follow", "stop", "info"]},
                         "confirm": {"type": "boolean", "description": "跟随运动前需明确确认。"},
                     },
                     "x-action-params": {
                         "start": {"params": [], "description": "准备跟随卡；不会让机器人运动。"},
-                        "follow": {"params": ["confirm"], "description": "跟随画面中最近的人。"},
+                        "follow": {"params": ["confirm"], "description": "启动持续跟随；stop 结束，info 查询状态。"},
                         "stop": {"params": [], "description": "立即停车并停止跟随。"},
                         "info": {"params": [], "description": "查看跟随状态。"},
                     },
@@ -233,8 +258,10 @@ class PersonFollowPlugin:
 
     def stop(self):
         self._cancel.set()
-        if self._client is not None:
-            self._client.stop_move()
+        with self._motion_lock:
+            if self._owns_motion:
+                self._client.stop_move()
+                self._owns_motion = False
         with self._lock:
             worker = self._worker
         if worker is not None and worker is not threading.current_thread():
@@ -242,6 +269,12 @@ class PersonFollowPlugin:
         with self._lock:
             self._state = "idle"
         return {"ok": True, "state": "idle"}
+
+    def preempt(self):
+        with self._lock:
+            active = self._worker is not None and self._worker.is_alive()
+        if active:
+            self.stop()
 
     def dispatch(self, action, args):
         args = args or {}
@@ -272,6 +305,8 @@ class PersonFollowPlugin:
                 self._cancel.clear()
                 self._state = "starting"
                 self._reason = None
+                with self._motion_lock:
+                    self._owns_motion = True
                 self._worker = threading.Thread(target=self._run_guarded, daemon=True,
                                                 name="go1_person_follow")
                 self._worker.start()
@@ -287,7 +322,10 @@ class PersonFollowPlugin:
                     self._reason = str(exc)
         finally:
             self._cancel.set()
-            self._client.stop_move()
+            with self._motion_lock:
+                if self._owns_motion:
+                    self._client.stop_move()
+                    self._owns_motion = False
             with camera._CAMERA_LOCK:
                 camera._SNAPSHOT_POSITIONS.discard("front")
             with self._lock:
@@ -329,7 +367,7 @@ class PersonFollowPlugin:
                 latest = extract_latest_frame(pending)
                 if latest is None:
                     if time.monotonic() - last_frame > .5:
-                        self._client.stop_move()
+                        self._stop_owned_motion()
                         if first_frame:
                             raise TimeoutError("camera frame is stale")
                     if not first_frame and time.monotonic() - last_frame > 10:
@@ -341,26 +379,35 @@ class PersonFollowPlugin:
                 if self._cancel.is_set():
                     break
                 if time.monotonic() - last_frame > .4:
-                    self._client.stop_move()
+                    self._stop_owned_motion()
                     raise TimeoutError("inference is too slow")
                 target = tracker.update(detections)
                 if tracker.lost:
-                    self._client.stop_move()
+                    self._stop_owned_motion()
                     raise RuntimeError("target lost or ambiguous")
                 vx, yaw = follow_command(target)
                 if vx == 0 and yaw == 0:
-                    self._client.stop_move()
+                    self._stop_owned_motion()
                     continue
                 diag = self._client.diagnostics()
                 recv = diag.get("recv_count", 0)
                 if (not diag.get("accessible") or
                         (previous_recv is not None and recv <= previous_recv) or
                         time.monotonic() - last_frame > .4):
-                    self._client.stop_move()
+                    self._stop_owned_motion()
                     raise RuntimeError("Go1 feedback or camera frame is stale")
                 previous_recv = recv
-                if self._client.move(vx, 0.0, yaw, gait=1) is None:
+                with self._motion_lock:
+                    if self._cancel.is_set() or not self._owns_motion:
+                        break
+                    result = self._client.move(vx, 0.0, yaw, gait=1)
+                if result is None:
                     raise RuntimeError("Go1 rejected the follow command")
+
+    def _stop_owned_motion(self):
+        with self._motion_lock:
+            if self._owns_motion:
+                self._client.stop_move()
 
 
 def make_person_follow(plugin_config, namespace, executor, client):
